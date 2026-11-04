@@ -1,0 +1,29 @@
+{% extends "layouts/application.html" %}
+{% block title %}Config rules · MaxNines{% endblock title %}
+{% block content %}
+<div class="title-row">
+  <h1>Config rules</h1>
+  <div class="actions"><a class="button" href="/rules/new">New rule</a></div>
+</div>
+<p class="hint">Every matching rule applies, lowest priority first, so higher priorities win.</p>
+{% if rules %}
+<table>
+  <thead>
+    <tr><th>Priority</th><th>Name</th><th>Applies to</th><th>Sets</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for rule in rules %}
+    <tr{% if not rule.enabled %} class="disabled"{% endif %}>
+      <td>{{ rule.priority }}</td>
+      <td><a href="/rules/{{ rule.id }}/edit">{{ rule.name }}</a></td>
+      <td>{% if rule.description %}{{ rule.description }}{% elif rule.condition %}<code>{{ rule.condition }}</code>{% else %}Every agent{% endif %}</td>
+      <td>{{ rule.summary }}</td>
+      <td>{% if not rule.enabled %}<span class="badge neutral">Disabled</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">There are no rules, so agents have nothing to monitor.</p>
+{% endif %}
+{% endblock content %}

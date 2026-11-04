@@ -1,11 +1,18 @@
-mod admin;
+mod app_state;
+mod cli;
+mod condition_builder;
 mod config;
-mod connection;
-mod database;
+mod controllers;
+mod fact_history;
 mod facts;
+mod migrations;
+mod models;
 mod presence;
 mod registration;
+mod rule_engine;
+mod rule_preview;
 mod store;
+mod views;
 
 #[cfg(test)]
 mod tests;
@@ -16,19 +23,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use axum::Router;
-use axum::routing::get;
+use axum_csrf::CsrfConfig;
 use clap::{Parser, Subcommand};
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use app_state::{AppState, Heartbeat};
 use config::Config;
-use connection::{AppState, Heartbeat};
-use database::Database;
+use models::Database;
 use presence::Presence;
 use registration::{Registry, Rules, hash_token};
 use store::WriterCommand;
+use views::Views;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Receives and stores metrics from MaxNines agents")]
@@ -74,13 +82,13 @@ fn main() -> Result<()> {
         Command::Agents(command) => {
             let config = Config::load(&cli.config)?;
             match command {
-                AgentsCommand::List => admin::print_agents(&config),
-                AgentsCommand::Facts { id, history: false } => admin::print_facts(&config, &id),
+                AgentsCommand::List => cli::print_agents(&config),
+                AgentsCommand::Facts { id, history: false } => cli::print_facts(&config, &id),
                 AgentsCommand::Facts { id, history: true } => {
-                    admin::print_facts_history(&config, &id)
+                    cli::print_facts_history(&config, &id)
                 }
-                AgentsCommand::Approve { id } => admin::change_agent(&config, &id, "approve"),
-                AgentsCommand::Revoke { id } => admin::change_agent(&config, &id, "revoke"),
+                AgentsCommand::Approve { id } => cli::change_agent(&config, &id, "approve"),
+                AgentsCommand::Revoke { id } => cli::change_agent(&config, &id, "revoke"),
             }
         }
     }
@@ -98,7 +106,7 @@ async fn serve(path: &Path) -> Result<()> {
 
     let config = Config::load(path)?;
     let rules = Rules::compile(&config.registration)?;
-    let admin_token = admin::load_or_create_token(&config.admin_token_file)?;
+    let admin_token = controllers::admin::load_or_create_token(&config.admin_token_file)?;
 
     let database = Database::connect(&config.database.resolve_url()?).await?;
     let agents = database.load_agents().await.context("loading agents")?;
@@ -113,6 +121,7 @@ async fn serve(path: &Path) -> Result<()> {
             database.clone(),
         )),
         database,
+        config_changes: Arc::new(watch::Sender::new(0)),
         writer: writer.clone(),
         heartbeat: Heartbeat {
             interval: Duration::from_secs(config.heartbeat_interval_secs),
@@ -121,6 +130,8 @@ async fn serve(path: &Path) -> Result<()> {
         audience: config.audience().into(),
         trusted_proxies: config.trusted_networks()?.into(),
         admin_token_hash: hash_token(&admin_token).into(),
+        views: Arc::new(Views::load()?),
+        csrf: CsrfConfig::default().with_secure(config.audience().starts_with("wss://")),
     };
 
     let listener = TcpListener::bind(config.listen)
@@ -133,7 +144,7 @@ async fn serve(path: &Path) -> Result<()> {
         "server started"
     );
 
-    let service = app(state).into_make_service_with_connect_info::<SocketAddr>();
+    let service = controllers::app(state).into_make_service_with_connect_info::<SocketAddr>();
     tokio::select! {
         result = axum::serve(listener, service).into_future() => result?,
         result = tokio::signal::ctrl_c() => result?,
@@ -145,11 +156,4 @@ async fn serve(path: &Path) -> Result<()> {
         .await?
         .ok();
     Ok(())
-}
-
-fn app(state: AppState) -> Router {
-    Router::new()
-        .route("/ws", get(connection::upgrade))
-        .merge(admin::routes(state.clone()))
-        .with_state(state)
 }

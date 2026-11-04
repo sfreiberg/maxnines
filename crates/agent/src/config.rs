@@ -12,77 +12,44 @@ const FACTS: &str = "facts";
 const MAX_FACT_VALUE_LEN: usize = 255;
 const MAX_FACT_NAME_LEN: usize = 255 - "custom.".len();
 
+/// Only what's needed to reach the server. What to monitor comes from the
+/// server, and custom facts stay here because the server's rules match on them.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    #[serde(default = "default_interval_secs")]
-    pub interval_secs: u64,
-    /// Where this agent's private key is stored.
-    #[serde(default = "default_key_file")]
-    pub key_file: PathBuf,
-    /// How often to report facts, on top of reporting them on every connection.
-    #[serde(default = "default_facts_interval_secs")]
-    pub facts_interval_secs: u64,
+    pub server: ServerConfig,
+    /// Where the agent keeps its key and the last config it received.
+    #[serde(default = "default_state_dir")]
+    pub state_dir: PathBuf,
     /// Your own facts by full name, reported under `custom`. These are gathered
     /// by [`take_facts`] rather than deserialized.
     #[serde(skip)]
     pub facts: BTreeMap<String, Value>,
-    /// `collector "<name>" { ... }` blocks, keyed by label.
-    #[serde(default)]
-    pub collector: BTreeMap<String, CollectorConfig>,
-    /// `exporter "<name>" { ... }` blocks, keyed by label.
-    #[serde(default)]
-    pub exporter: BTreeMap<String, ExporterConfig>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CollectorConfig {
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
-    /// Disk collector only: limit output to these mount points.
-    pub mount_points: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExporterConfig {
-    /// Stdout exporter only.
-    #[serde(default)]
-    pub format: OutputFormat,
-    /// WebSocket exporter only: the server's address.
-    pub url: Option<String>,
-    /// WebSocket exporter only: enrollment token for automatic approval.
+pub struct ServerConfig {
+    pub url: String,
+    /// Enrollment token for automatic approval.
     pub token_file: Option<PathBuf>,
-    /// WebSocket exporter only: trust this CA instead of the public roots.
+    /// Trust this CA instead of the public roots.
     pub ca_file: Option<PathBuf>,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum OutputFormat {
-    #[default]
-    Json,
-    Pretty,
-}
-
-fn default_interval_secs() -> u64 {
-    15
-}
-
-fn default_key_file() -> PathBuf {
-    PathBuf::from("agent.key")
-}
-
-fn default_facts_interval_secs() -> u64 {
-    3600
-}
-
-fn default_enabled() -> bool {
-    true
+fn default_state_dir() -> PathBuf {
+    PathBuf::from("state")
 }
 
 impl Config {
+    pub fn key_file(&self) -> PathBuf {
+        self.state_dir.join("agent.key")
+    }
+
+    pub fn saved_config_file(&self) -> PathBuf {
+        self.state_dir.join("config.json")
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config file {}", path.display()))?;
@@ -94,11 +61,6 @@ impl Config {
         let (body, facts) = take_facts(body)?;
         let mut config: Config = hcl::from_body(body)?;
         config.facts = facts;
-        ensure!(config.interval_secs > 0, "interval_secs must be at least 1");
-        ensure!(
-            config.facts_interval_secs > 0,
-            "facts_interval_secs must be at least 1"
-        );
         Ok(config)
     }
 }
@@ -215,50 +177,62 @@ fn is_valid_fact_name(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    const SERVER: &str = "server {\n  url = \"ws://127.0.0.1:9000/ws\"\n}\n";
+
+    fn parse(text: &str) -> Result<Config> {
+        Config::parse(&format!("{SERVER}{text}"))
+    }
+
     #[test]
     fn shipped_config_parses() {
-        let config = Config::parse(include_str!("../agent.hcl")).unwrap();
-        assert_eq!(config.interval_secs, 15);
-        assert_eq!(config.collector.len(), 5);
-        assert_eq!(config.exporter["stdout"].format, OutputFormat::Json);
-        assert_eq!(
-            config.exporter["websocket"].url.as_deref(),
-            Some("ws://127.0.0.1:9000/ws")
-        );
+        let config = Config::parse(include_str!("../config/agent.hcl")).unwrap();
+
+        assert_eq!(config.server.url, "ws://127.0.0.1:9000/ws");
+        assert_eq!(config.server.token_file, None);
+        assert_eq!(config.key_file(), PathBuf::from("data.nosync/agent.key"));
     }
 
     #[test]
-    fn labeled_blocks_keep_their_own_settings() {
-        let config = Config::parse(
-            r#"
-            collector "cpu" {
-              enabled = false
-            }
-            collector "disk" {
-              mount_points = ["/", "/data"]
-            }
-            "#,
-        )
-        .unwrap();
+    fn only_the_server_is_required() {
+        let config = parse("").unwrap();
 
-        assert!(!config.collector["cpu"].enabled);
-        assert!(config.collector["disk"].enabled);
+        assert_eq!(config.key_file(), PathBuf::from("state/agent.key"));
         assert_eq!(
-            config.collector["disk"].mount_points.as_deref(),
-            Some(&["/".to_string(), "/data".to_string()][..])
+            config.saved_config_file(),
+            PathBuf::from("state/config.json")
         );
+        assert!(config.facts.is_empty());
     }
 
     #[test]
-    fn defaults_apply_to_an_empty_file() {
-        let config = Config::parse("").unwrap();
-        assert_eq!(config.interval_secs, 15);
-        assert!(config.collector.is_empty());
+    fn the_server_is_required() {
+        assert!(Config::parse("").is_err());
+    }
+
+    #[test]
+    fn monitoring_settings_are_refused_because_they_come_from_the_server() {
+        for text in [
+            "interval_secs = 5\n",
+            "facts_interval_secs = 5\n",
+            "collector \"cpu\" {}\n",
+            "exporter \"stdout\" {}\n",
+        ] {
+            assert!(parse(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn taking_facts_leaves_the_rest_of_the_config_alone() {
+        let text = "state_dir = \"/var/lib/maxnines\"\nfacts \"a\" {\n  b = 1\n}\n";
+        let config = parse(text).unwrap();
+
+        assert_eq!(config.state_dir, PathBuf::from("/var/lib/maxnines"));
+        assert_eq!(config.facts["a.b"], 1);
     }
 
     #[test]
     fn custom_facts_are_read_from_the_facts_block() {
-        let config = Config::parse(
+        let config = parse(
             r#"
             facts {
               role       = "web"
@@ -270,12 +244,11 @@ mod tests {
 
         assert_eq!(config.facts["role"], "web");
         assert_eq!(config.facts["datacenter"], "fra1");
-        assert_eq!(config.facts_interval_secs, 3600);
     }
 
     #[test]
     fn custom_fact_names_can_hold_dots_and_dashes() {
-        let config = Config::parse(
+        let config = parse(
             r#"
             facts = {
               "one.thing" = "x"
@@ -295,7 +268,7 @@ mod tests {
 
     #[test]
     fn a_labeled_facts_block_prefixes_its_names() {
-        let config = Config::parse(
+        let config = parse(
             r#"
             facts "toplevelname" {
               thing1 = "1"
@@ -322,7 +295,7 @@ mod tests {
             [another, labeled, plain, attribute].concat(),
             [labeled, attribute, another, plain].concat(),
         ] {
-            let config = Config::parse(&text).unwrap();
+            let config = parse(&text).unwrap();
             assert_eq!(config.facts["role"], "web");
             assert_eq!(config.facts["one.thing"], "x");
             assert_eq!(config.facts["rack"], 12);
@@ -335,7 +308,7 @@ mod tests {
     #[test]
     fn the_same_label_twice_merges_its_facts() {
         let text = "facts \"web\" {\n  a = 1\n}\nfacts \"web\" {\n  b = 2\n}\n";
-        let config = Config::parse(text).unwrap();
+        let config = parse(text).unwrap();
 
         assert_eq!(config.facts["web.a"], 1);
         assert_eq!(config.facts["web.b"], 2);
@@ -343,7 +316,7 @@ mod tests {
 
     #[test]
     fn nested_facts_become_dotted_names() {
-        let config = Config::parse(
+        let config = parse(
             r#"
             facts = {
               a = { b = 1 }
@@ -373,15 +346,15 @@ mod tests {
             "facts = {\n  \"web.a\" = 1\n}\nfacts \"web\" {\n  a = 2\n}\n",
             "facts = {\n  a = 1\n}\nfacts {\n  a = 1\n}\n",
         ] {
-            let error = format!("{:#}", Config::parse(text).unwrap_err());
+            let error = format!("{:#}", parse(text).unwrap_err());
             assert!(error.contains("more than once"), "{error}");
         }
     }
 
     #[test]
     fn facts_must_be_a_map() {
-        assert!(Config::parse("facts = 5\n").is_err());
-        assert!(Config::parse("facts = \"web\"\n").is_err());
+        assert!(parse("facts = 5\n").is_err());
+        assert!(parse("facts = \"web\"\n").is_err());
     }
 
     #[test]
@@ -391,23 +364,14 @@ mod tests {
             "facts \"web\" {\n  a = var.x\n}\n",
             "facts \"web\" {\n  a = [var.x]\n}\n",
         ] {
-            assert!(Config::parse(text).is_err(), "{text}");
+            assert!(parse(text).is_err(), "{text}");
         }
-    }
-
-    #[test]
-    fn taking_facts_leaves_the_rest_of_the_config_alone() {
-        let text = "interval_secs = 7\nfacts \"a\" {\n  b = 1\n}\ncollector \"cpu\" {}\n";
-        let config = Config::parse(text).unwrap();
-
-        assert_eq!(config.interval_secs, 7);
-        assert_eq!(config.collector.len(), 1);
     }
 
     #[test]
     fn a_name_and_a_longer_name_starting_with_it_can_coexist() {
         let text = "facts = {\n  \"one\" = 1\n  \"one.thing\" = 2\n}\n";
-        assert_eq!(Config::parse(text).unwrap().facts.len(), 2);
+        assert_eq!(parse(text).unwrap().facts.len(), 2);
     }
 
     #[test]
@@ -415,19 +379,19 @@ mod tests {
         let long = "x".repeat(249);
         for name in ["", ".", "a..b", ".a", "a.", "has space", "é", long.as_str()] {
             let text = format!("facts = {{\n  \"{name}\" = \"x\"\n}}\n");
-            assert!(Config::parse(&text).is_err(), "{name:?}");
+            assert!(parse(&text).is_err(), "{name:?}");
         }
     }
 
     #[test]
     fn the_longest_allowed_fact_name_is_accepted() {
         let text = format!("facts = {{\n  \"{}\" = 1\n}}\n", "x".repeat(248));
-        assert!(Config::parse(&text).is_ok());
+        assert!(parse(&text).is_ok());
     }
 
     #[test]
     fn custom_facts_keep_their_types() {
-        let config = Config::parse(
+        let config = parse(
             r#"
             facts {
               role    = "web"
@@ -447,7 +411,7 @@ mod tests {
 
     #[test]
     fn custom_facts_can_be_lists() {
-        let config = Config::parse(
+        let config = parse(
             r#"
             facts = {
               tags  = ["web", "prod"]
@@ -472,7 +436,7 @@ mod tests {
 
     #[test]
     fn lists_can_hold_maps_and_other_lists() {
-        let config = Config::parse(
+        let config = parse(
             r#"
             facts = {
               disks = [{ mount = "/" }, { mount = "/data" }]
@@ -492,7 +456,7 @@ mod tests {
             "facts = {{\n  tags = [\"ok\", \"{}\"]\n}}\n",
             "x".repeat(256)
         );
-        assert!(Config::parse(&text).is_err());
+        assert!(parse(&text).is_err());
     }
 
     #[test]
@@ -508,34 +472,13 @@ mod tests {
             "\"web-${var.id}\"",
         ] {
             let text = format!("facts = {{\n  role = {value}\n}}\n");
-            assert!(Config::parse(&text).is_err(), "{value}");
+            assert!(parse(&text).is_err(), "{value}");
         }
     }
 
     #[test]
     fn rejects_a_custom_fact_that_is_too_long() {
         let text = format!("facts = {{\n  note = \"{}\"\n}}\n", "x".repeat(256));
-        assert!(Config::parse(&text).is_err());
-    }
-
-    #[test]
-    fn rejects_a_zero_facts_interval() {
-        assert!(Config::parse("facts_interval_secs = 0").is_err());
-    }
-
-    #[test]
-    fn rejects_zero_interval() {
-        assert!(Config::parse("interval_secs = 0").is_err());
-    }
-
-    #[test]
-    fn rejects_unknown_settings() {
-        assert!(Config::parse("intervl_secs = 5").is_err());
-        assert!(Config::parse("collector \"cpu\" {\n  enabeld = false\n}\n").is_err());
-    }
-
-    #[test]
-    fn rejects_unknown_output_format() {
-        assert!(Config::parse("exporter \"stdout\" {\n  format = \"xml\"\n}\n").is_err());
+        assert!(parse(&text).is_err());
     }
 }

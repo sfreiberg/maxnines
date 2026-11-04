@@ -25,8 +25,15 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 ureq = { version = "3.5.1", default-features = false }
 wildmatch = "2.7.0"
+cel = "0.15"
+tera = "2.4"
+axum_csrf = "0.12"
+rust-embed = { version = "8.13", features = ["mime-guess"] }
 
 [dev-dependencies]
 futures-util.workspace = true
 tempfile = "3"
 tokio-tungstenite.workspace = true
+
+[build-dependencies]
+vergen-gitcl = { version = "10", features = ["build"] }

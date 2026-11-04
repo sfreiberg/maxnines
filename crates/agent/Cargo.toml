@@ -21,3 +21,6 @@ webpki-roots = "0.26"
 
 [dev-dependencies]
 tempfile = "3"
+
+[build-dependencies]
+vergen-gitcl = { version = "10", features = ["build"] }

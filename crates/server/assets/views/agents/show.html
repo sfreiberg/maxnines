@@ -1,0 +1,58 @@
+{% extends "layouts/application.html" %}
+{% block title %}{{ agent.host }} · MaxNines{% endblock title %}
+{% block content %}
+<p class="breadcrumb"><a href="/agents">Agents</a></p>
+<div class="title-row">
+  <h1>{{ agent.host }}</h1>
+  <div class="actions">
+    {% if agent.state != "approved" %}
+    <form method="post" action="/agents/{{ agent.id }}/approve">
+      <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+      <button type="submit">Approve</button>
+    </form>
+    {% endif %}
+    {% if agent.state != "revoked" %}
+    <form method="post" action="/agents/{{ agent.id }}/revoke">
+      <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+      <button type="submit" class="danger">Revoke</button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+
+<dl class="summary">
+  <dt>Agent ID</dt><dd><code>{{ agent.id }}</code></dd>
+  <dt>Status</dt><dd>{{ agent.state }}{% if decided_by %} by {{ decided_by }}{% endif %}</dd>
+  <dt>Online</dt><dd>{% if agent.online %}Yes{% else %}No{% endif %}</dd>
+</dl>
+
+<h2>Config</h2>
+<p><span class="badge {{ agent.config.class }}">{{ agent.config.label }}</span>
+  {% if matched_rules %}from {{ matched_rules | join(sep=", ") }}{% else %}No rules match this agent.{% endif %}</p>
+{% if reported and reported.error %}
+<p class="error">The agent rejected its config: {{ reported.error }}</p>
+{% endif %}
+{% if skipped_collectors %}
+<p class="notice">This agent can't run: {{ skipped_collectors | join(sep=", ") }}</p>
+{% endif %}
+<pre>{{ config }}</pre>
+
+<h2>Facts</h2>
+{% if has_facts %}
+<pre>{{ facts }}</pre>
+{% else %}
+<p class="empty">This agent hasn't reported any facts yet.</p>
+{% endif %}
+
+{% if history %}
+<h2>Fact history</h2>
+<ul class="history">
+  {% for entry in history %}
+  <li>
+    <time>{{ entry.time }}</time>
+    <ul>{% for change in entry.changes %}<li><code>{{ change }}</code></li>{% endfor %}</ul>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% endblock content %}

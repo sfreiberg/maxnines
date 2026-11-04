@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn shipped_config_parses() {
-        let config = parse(include_str!("../server.hcl")).unwrap();
+        let config = parse(include_str!("../config/server.hcl")).unwrap();
         assert_eq!(
             config.metrics,
             MetricsConfig::Duckdb {

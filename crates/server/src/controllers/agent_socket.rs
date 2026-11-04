@@ -1,6 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use axum::body::Bytes;
@@ -11,39 +10,24 @@ use axum::response::Response;
 use ipnet::IpNet;
 use maxnines_protocol::{AgentMessage, RegistrationStatus, ServerMessage, auth};
 use serde_json::Value;
-use tokio::sync::mpsc;
 use tokio::time::{Instant, interval, timeout};
 use tracing::{info, warn};
 
-use crate::database::Database;
+use crate::app_state::AppState;
 use crate::facts::flatten;
+use crate::models::ConfigStatus;
 use crate::presence::Presence;
-use crate::registration::{Admission, Registry};
+use crate::registration::Admission;
 use crate::store::WriterCommand;
 
 /// The longest hostname DNS allows, and what the database column holds.
 const MAX_HOST_LEN: usize = 255;
 /// Far more than real facts need, so one agent can't fill the database.
 const MAX_FACTS_LEN: usize = 64 * 1024;
-
-#[derive(Debug, Clone, Copy)]
-pub struct Heartbeat {
-    pub interval: Duration,
-    pub timeout: Duration,
-}
-
-#[derive(Clone)]
-pub struct AppState {
-    pub presence: Arc<Presence>,
-    pub registry: Arc<Registry>,
-    pub database: Database,
-    pub writer: mpsc::Sender<WriterCommand>,
-    pub heartbeat: Heartbeat,
-    /// The URL agents must have signed.
-    pub audience: Arc<str>,
-    pub trusted_proxies: Arc<[IpNet]>,
-    pub admin_token_hash: Arc<[u8]>,
-}
+/// What the database column holds.
+const MAX_VERSION_LEN: usize = 32;
+/// Plenty to explain a problem, without letting an agent store anything it likes.
+const MAX_ERROR_LEN: usize = 1000;
 
 pub async fn upgrade(
     socket: WebSocketUpgrade,
@@ -213,7 +197,13 @@ async fn send(socket: &mut WebSocket, message: &ServerMessage) -> Result<()> {
 async fn serve(socket: &mut WebSocket, agent: &Agent, state: &AppState) -> &'static str {
     let mut ping = interval(state.heartbeat.interval);
     let mut changes = state.registry.subscribe();
+    let mut config_changes = state.config_changes.subscribe();
     let mut last_heard = Instant::now();
+    let mut sent_version = None;
+
+    if !send_config(socket, agent, state, &mut sent_version).await {
+        return "send failed";
+    }
 
     loop {
         tokio::select! {
@@ -230,12 +220,24 @@ async fn serve(socket: &mut WebSocket, agent: &Agent, state: &AppState) -> &'sta
                     return "revoked";
                 }
             }
+            Ok(()) = config_changes.changed() => {
+                if !send_config(socket, agent, state, &mut sent_version).await {
+                    return "send failed";
+                }
+            }
             message = socket.recv() => {
                 last_heard = Instant::now();
                 state.presence.seen(&agent.id);
 
                 match message {
-                    Some(Ok(Message::Text(text))) => receive(&text, agent, state).await,
+                    Some(Ok(Message::Text(text))) => {
+                        let facts_changed = receive(&text, agent, state).await;
+                        if facts_changed
+                            && !send_config(socket, agent, state, &mut sent_version).await
+                        {
+                            return "send failed";
+                        }
+                    }
                     Some(Ok(Message::Close(_))) | None => return "connection closed",
                     Some(Ok(_)) => {}
                     Some(Err(_)) => return "connection lost",
@@ -245,8 +247,52 @@ async fn serve(socket: &mut WebSocket, agent: &Agent, state: &AppState) -> &'sta
     }
 }
 
+/// Sends the agent its config if it's different from what it was last sent.
+/// Returns false only if the connection failed. If the config can't be worked
+/// out, the agent keeps what it has, and it's tried again on the next change.
+async fn send_config(
+    socket: &mut WebSocket,
+    agent: &Agent,
+    state: &AppState,
+    sent_version: &mut Option<String>,
+) -> bool {
+    let resolved = match state.config_for(&agent.id).await {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            warn!(
+                id = agent.id,
+                error = format!("{error:#}"),
+                "working out config failed"
+            );
+            return true;
+        }
+    };
+
+    if sent_version.as_ref() == Some(&resolved.version) {
+        return true;
+    }
+    if !resolved.skipped_collectors.is_empty() {
+        warn!(
+            id = agent.id,
+            skipped = resolved.skipped_collectors.join(", "),
+            "agent doesn't support these collectors"
+        );
+    }
+
+    let message = ServerMessage::Config {
+        version: resolved.version.clone(),
+        config: resolved.config,
+    };
+    if send(socket, &message).await.is_err() {
+        return false;
+    }
+    *sent_version = Some(resolved.version);
+    true
+}
+
 /// A bad message is logged and skipped rather than ending the connection.
-async fn receive(text: &str, agent: &Agent, state: &AppState) {
+/// Returns whether the agent's facts changed, which can change its config.
+async fn receive(text: &str, agent: &Agent, state: &AppState) -> bool {
     match serde_json::from_str(text) {
         Ok(AgentMessage::Sample(sample)) => {
             let command = WriterCommand::Save {
@@ -257,18 +303,65 @@ async fn receive(text: &str, agent: &Agent, state: &AppState) {
             if state.writer.send(command).await.is_err() {
                 warn!(id = agent.id, "writer stopped, sample dropped");
             }
+            false
         }
         Ok(AgentMessage::Facts { facts }) => save_facts(text.len(), facts, agent, state).await,
-        Ok(AgentMessage::Hello { .. }) => warn!(id = agent.id, "ignoring repeated hello"),
-        Err(error) => warn!(id = agent.id, %error, "skipping invalid message"),
+        Ok(AgentMessage::ConfigResult { version, error }) => {
+            save_config_result(version, error, agent, state).await;
+            false
+        }
+        Ok(AgentMessage::Hello { .. }) => {
+            warn!(id = agent.id, "ignoring repeated hello");
+            false
+        }
+        Err(error) => {
+            warn!(id = agent.id, %error, "skipping invalid message");
+            false
+        }
     }
 }
 
+async fn save_config_result(
+    version: String,
+    error: Option<String>,
+    agent: &Agent,
+    state: &AppState,
+) {
+    if let Some(error) = &error {
+        warn!(id = agent.id, version, error, "agent rejected its config");
+    }
+    if version.len() > MAX_VERSION_LEN {
+        warn!(id = agent.id, "skipping an oversized config version");
+        return;
+    }
+
+    let status = ConfigStatus {
+        version,
+        error: error.map(|error| error.chars().take(MAX_ERROR_LEN).collect()),
+        reported_at_ms: now_ms(),
+    };
+    if let Err(error) = state.database.save_config_status(&agent.id, &status).await {
+        warn!(
+            id = agent.id,
+            error = format!("{error:#}"),
+            "saving config status failed"
+        );
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 /// Failing to save loses nothing, because the agent reports again later.
-async fn save_facts(size: usize, facts: Value, agent: &Agent, state: &AppState) {
+/// Returns whether anything changed.
+async fn save_facts(size: usize, facts: Value, agent: &Agent, state: &AppState) -> bool {
     if size > MAX_FACTS_LEN {
         warn!(id = agent.id, size, "skipping oversized facts");
-        return;
+        return false;
     }
     let facts = match flatten(&facts) {
         Ok(facts) => facts,
@@ -278,22 +371,28 @@ async fn save_facts(size: usize, facts: Value, agent: &Agent, state: &AppState) 
                 error = format!("{error:#}"),
                 "skipping invalid facts"
             );
-            return;
+            return false;
         }
     };
 
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    match state.database.record_facts(&agent.id, &facts, now_ms).await {
-        Ok(true) => info!(id = agent.id, host = agent.host, "facts changed"),
-        Ok(false) => {}
-        Err(error) => warn!(
-            id = agent.id,
-            error = format!("{error:#}"),
-            "saving facts failed"
-        ),
+    match state
+        .database
+        .record_facts(&agent.id, &facts, now_ms())
+        .await
+    {
+        Ok(true) => {
+            info!(id = agent.id, host = agent.host, "facts changed");
+            true
+        }
+        Ok(false) => false,
+        Err(error) => {
+            warn!(
+                id = agent.id,
+                error = format!("{error:#}"),
+                "saving facts failed"
+            );
+            false
+        }
     }
 }
 

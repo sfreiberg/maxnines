@@ -1,0 +1,24 @@
+{% extends "layouts/application.html" %}
+{% block title %}Agents · MaxNines{% endblock title %}
+{% block content %}
+<h1>Agents</h1>
+{% if agents %}
+<table>
+  <thead>
+    <tr><th>Host</th><th>Status</th><th>Online</th><th>Config</th></tr>
+  </thead>
+  <tbody>
+    {% for agent in agents %}
+    <tr>
+      <td><a href="/agents/{{ agent.id }}">{{ agent.host }}</a></td>
+      <td>{{ agent.state }}</td>
+      <td>{% if agent.online %}<span class="badge good">Online</span>{% else %}<span class="badge neutral">Offline</span>{% endif %}</td>
+      <td><span class="badge {{ agent.config.class }}">{{ agent.config.label }}</span></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">No agents have connected yet.</p>
+{% endif %}
+{% endblock content %}

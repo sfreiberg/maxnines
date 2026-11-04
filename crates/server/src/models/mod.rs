@@ -1,11 +1,14 @@
 //! Everything the server keeps except metrics, in SQLite, Postgres or MySQL.
 //! The URL picks the database, and SeaORM handles the differences between them.
+//! Schema changes live in [`crate::migrations`].
 
 mod agent;
+mod agent_config_status;
 mod agent_fact;
-mod migration;
+mod config_rule;
+mod config_rule_setting;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,17 +17,17 @@ use anyhow::{Context, Result};
 use sea_orm::sea_query::Expr;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
-    ColumnTrait, ConnectOptions, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectOptions, ConnectionTrait, DatabaseConnection,
+    EntityTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
 };
 use sea_orm_migration::MigratorTrait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::facts::{FlatFacts, decode, encode};
+use crate::facts::{FlatFacts, decode, encode, flatten, unflatten};
+use crate::migrations::Migrator;
 use crate::registration::{AgentRecord, AgentState};
-use migration::Migrator;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Registry calls run one at a time, so a small pool is plenty.
@@ -37,6 +40,39 @@ pub struct FactVersion {
     pub value: Value,
     pub valid_from_ms: u64,
     pub valid_to_ms: Option<u64>,
+}
+
+/// A rule as stored, with its settings in their natural shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigRule {
+    pub id: i64,
+    #[serde(flatten)]
+    pub rule: RuleInput,
+}
+
+/// What can be set on a rule. Validated by [`crate::rule_engine::check_rule`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuleInput {
+    pub name: String,
+    /// Higher priorities apply later, so they win.
+    pub priority: i32,
+    /// A CEL expression. An empty condition matches every agent.
+    pub condition: Option<String>,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    pub settings: Value,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+/// What an agent last said about its config.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigStatus {
+    pub version: String,
+    pub error: Option<String>,
+    pub reported_at_ms: u64,
 }
 
 #[derive(Clone)]
@@ -197,6 +233,50 @@ impl Database {
         rows.into_iter().map(to_fact_version).collect()
     }
 
+    /// Every agent's current facts, in one query so that looking across all
+    /// agents doesn't cost a query each.
+    pub async fn all_current_facts(&self) -> Result<BTreeMap<String, FlatFacts>> {
+        let rows = agent_fact::Entity::find()
+            .filter(agent_fact::Column::ValidToMs.is_null())
+            .all(&self.connection)
+            .await
+            .context("loading facts")?;
+
+        let mut agents: BTreeMap<String, FlatFacts> = BTreeMap::new();
+        for row in rows {
+            let agent = row.agent_id.clone();
+            let fact = to_fact_version(row)?;
+            agents
+                .entry(agent)
+                .or_default()
+                .insert(fact.name, fact.value);
+        }
+        Ok(agents)
+    }
+
+    /// Every fact name in use and how its values are written, for offering in
+    /// forms. A list appears once under its own name, as a list item's type.
+    pub async fn known_facts(&self) -> Result<BTreeMap<String, String>> {
+        let rows = agent_fact::Entity::find()
+            .filter(agent_fact::Column::ValidToMs.is_null())
+            .all(&self.connection)
+            .await
+            .context("loading fact names")?;
+
+        let mut known = BTreeMap::new();
+        for row in rows {
+            let name = match row.name.strip_suffix(']').and_then(|n| n.rsplit_once('[')) {
+                Some((list, _)) => list.to_string(),
+                None => row.name,
+            };
+            // Items inside lists of maps can't be reached by a simple condition.
+            if !name.contains('[') {
+                known.insert(name, row.value_type);
+            }
+        }
+        Ok(known)
+    }
+
     /// Every value each fact has had, oldest first. Rows are ordered by ID, not
     /// time, because two reports can share a timestamp and clocks can go back.
     pub async fn facts_history(&self, agent_id: &str) -> Result<Vec<FactVersion>> {
@@ -208,6 +288,197 @@ impl Database {
             .context("loading facts history")?;
         rows.into_iter().map(to_fact_version).collect()
     }
+}
+
+impl Database {
+    /// Lowest priority first, which is the order they're applied in.
+    pub async fn list_rules(&self) -> Result<Vec<ConfigRule>> {
+        let rows = config_rule::Entity::find()
+            .order_by_asc(config_rule::Column::Priority)
+            .order_by_asc(config_rule::Column::Id)
+            .all(&self.connection)
+            .await
+            .context("loading rules")?;
+
+        let settings = config_rule_setting::Entity::find()
+            .all(&self.connection)
+            .await
+            .context("loading rule settings")?;
+
+        rows.into_iter()
+            .map(|row| {
+                let mine = settings.iter().filter(|setting| setting.rule_id == row.id);
+                to_rule(row.clone(), mine)
+            })
+            .collect()
+    }
+
+    pub async fn get_rule(&self, id: i64) -> Result<Option<ConfigRule>> {
+        let row = config_rule::Entity::find_by_id(id)
+            .one(&self.connection)
+            .await
+            .context("loading rule")?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let settings = config_rule_setting::Entity::find()
+            .filter(config_rule_setting::Column::RuleId.eq(id))
+            .all(&self.connection)
+            .await
+            .context("loading rule settings")?;
+        to_rule(row, settings.iter()).map(Some)
+    }
+
+    pub async fn create_rule(&self, input: &RuleInput) -> Result<i64> {
+        let transaction = self.connection.begin().await.context("saving rule")?;
+        let row = config_rule::ActiveModel {
+            name: Set(input.name.clone()),
+            priority: Set(input.priority),
+            condition_expr: Set(input.condition.clone()),
+            enabled: Set(input.enabled),
+            ..Default::default()
+        }
+        .insert(&transaction)
+        .await
+        .context("saving rule")?;
+
+        save_settings(&transaction, row.id, &input.settings).await?;
+        transaction.commit().await.context("saving rule")?;
+        Ok(row.id)
+    }
+
+    /// Returns false if there's no such rule.
+    pub async fn update_rule(&self, id: i64, input: &RuleInput) -> Result<bool> {
+        let transaction = self.connection.begin().await.context("saving rule")?;
+        let found = config_rule::Entity::find_by_id(id)
+            .one(&transaction)
+            .await
+            .context("loading rule")?;
+        let Some(row) = found else {
+            return Ok(false);
+        };
+
+        let mut row: config_rule::ActiveModel = row.into();
+        row.name = Set(input.name.clone());
+        row.priority = Set(input.priority);
+        row.condition_expr = Set(input.condition.clone());
+        row.enabled = Set(input.enabled);
+        row.update(&transaction).await.context("saving rule")?;
+
+        config_rule_setting::Entity::delete_many()
+            .filter(config_rule_setting::Column::RuleId.eq(id))
+            .exec(&transaction)
+            .await
+            .context("replacing rule settings")?;
+        save_settings(&transaction, id, &input.settings).await?;
+
+        transaction.commit().await.context("saving rule")?;
+        Ok(true)
+    }
+
+    /// Returns false if there's no such rule.
+    pub async fn delete_rule(&self, id: i64) -> Result<bool> {
+        let transaction = self.connection.begin().await.context("deleting rule")?;
+        config_rule_setting::Entity::delete_many()
+            .filter(config_rule_setting::Column::RuleId.eq(id))
+            .exec(&transaction)
+            .await
+            .context("deleting rule settings")?;
+        let deleted = config_rule::Entity::delete_by_id(id)
+            .exec(&transaction)
+            .await
+            .context("deleting rule")?;
+        transaction.commit().await.context("deleting rule")?;
+        Ok(deleted.rows_affected > 0)
+    }
+
+    pub async fn save_config_status(&self, agent_id: &str, status: &ConfigStatus) -> Result<()> {
+        let row = agent_config_status::ActiveModel {
+            agent_id: Set(agent_id.to_string()),
+            version: Set(status.version.clone()),
+            error: Set(status.error.clone()),
+            reported_at_ms: Set(status.reported_at_ms as i64),
+        };
+        let on_conflict = OnConflict::column(agent_config_status::Column::AgentId)
+            .update_columns([
+                agent_config_status::Column::Version,
+                agent_config_status::Column::Error,
+                agent_config_status::Column::ReportedAtMs,
+            ])
+            .to_owned();
+
+        agent_config_status::Entity::insert(row)
+            .on_conflict(on_conflict)
+            .exec_without_returning(&self.connection)
+            .await
+            .context("saving config status")?;
+        Ok(())
+    }
+
+    pub async fn config_status(&self, agent_id: &str) -> Result<Option<ConfigStatus>> {
+        let row = agent_config_status::Entity::find_by_id(agent_id)
+            .one(&self.connection)
+            .await
+            .context("loading config status")?;
+        Ok(row.map(|row| ConfigStatus {
+            version: row.version,
+            error: row.error,
+            reported_at_ms: row.reported_at_ms as u64,
+        }))
+    }
+}
+
+async fn save_settings(
+    connection: &impl ConnectionTrait,
+    rule_id: i64,
+    settings: &Value,
+) -> Result<()> {
+    let rows: Vec<config_rule_setting::ActiveModel> = flatten(settings)?
+        .iter()
+        .map(|(name, value)| {
+            let (text, value_type) = encode(value);
+            config_rule_setting::ActiveModel {
+                rule_id: Set(rule_id),
+                name: Set(name.clone()),
+                value: Set(text),
+                value_type: Set(value_type.to_string()),
+                ..Default::default()
+            }
+        })
+        .collect();
+
+    if !rows.is_empty() {
+        config_rule_setting::Entity::insert_many(rows)
+            .exec_without_returning(connection)
+            .await
+            .context("saving rule settings")?;
+    }
+    Ok(())
+}
+
+fn to_rule<'a>(
+    row: config_rule::Model,
+    settings: impl Iterator<Item = &'a config_rule_setting::Model>,
+) -> Result<ConfigRule> {
+    let flat = settings
+        .map(|setting| {
+            let value = decode(&setting.value, &setting.value_type)
+                .with_context(|| format!("setting {} has an invalid value", setting.name))?;
+            Ok((setting.name.clone(), value))
+        })
+        .collect::<Result<FlatFacts>>()?;
+
+    Ok(ConfigRule {
+        id: row.id,
+        rule: RuleInput {
+            name: row.name,
+            priority: row.priority,
+            condition: row.condition_expr,
+            enabled: row.enabled,
+            settings: unflatten(&flat),
+        },
+    })
 }
 
 fn to_fact_version(row: agent_fact::Model) -> Result<FactVersion> {
@@ -259,6 +530,10 @@ impl Database {
     pub async fn break_for_test(&self) {
         use sea_orm::ConnectionTrait;
         self.connection
+            .execute_unprepared("DROP TABLE agent_config_status")
+            .await
+            .unwrap();
+        self.connection
             .execute_unprepared("DROP TABLE agent_facts")
             .await
             .unwrap();
@@ -271,7 +546,15 @@ impl Database {
     async fn clear_for_test(&self) {
         use sea_orm::ConnectionTrait;
         self.connection
+            .execute_unprepared("DELETE FROM agent_config_status")
+            .await
+            .unwrap();
+        self.connection
             .execute_unprepared("DELETE FROM agent_facts")
+            .await
+            .unwrap();
+        self.connection
+            .execute_unprepared("DELETE FROM config_rules WHERE name <> 'Default'")
             .await
             .unwrap();
         self.connection
@@ -352,6 +635,8 @@ mod tests {
         );
 
         exercise_facts(&database, &approved.id, &unusual.id).await;
+        exercise_rules(&database).await;
+        exercise_config_status(&database, &approved.id).await;
 
         // A second connection sees it all, and migrating again changes nothing.
         let reopened = Database::connect(url).await.unwrap();
@@ -376,6 +661,131 @@ mod tests {
             .filter(|version| version.valid_to_ms.is_none())
             .map(|version| (version.name.as_str(), &version.value))
             .collect()
+    }
+
+    fn rule_input(name: &str, priority: i32) -> RuleInput {
+        RuleInput {
+            name: name.to_string(),
+            priority,
+            condition: Some("facts.os.family == \"linux\"".to_string()),
+            enabled: true,
+            settings: json!({
+                "interval_secs": 10,
+                "collectors": {
+                    "disk": { "enabled": true, "mount_points": ["/", "/data"] },
+                },
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn known_facts_lists_each_name_once_with_its_type() {
+        let database = Database::in_memory().await;
+        database.save_agent(&record("agent-1")).await.unwrap();
+        database.save_agent(&record("agent-2")).await.unwrap();
+        let facts = flatten(&json!({
+            "os": { "family": "linux" },
+            "custom": { "tags": ["a", "b"], "rack": 12, "disks": [{ "mount": "/" }] },
+        }))
+        .unwrap();
+        database.record_facts("agent-1", &facts, 1).await.unwrap();
+        database.record_facts("agent-2", &facts, 1).await.unwrap();
+
+        let known = database.known_facts().await.unwrap();
+
+        assert_eq!(
+            known,
+            BTreeMap::from([
+                ("custom.rack".to_string(), "number".to_string()),
+                ("custom.tags".to_string(), "string".to_string()),
+                ("os.family".to_string(), "string".to_string()),
+            ])
+        );
+    }
+
+    async fn exercise_rules(database: &Database) {
+        // A new install has a default rule, from the migration.
+        let rules = database.list_rules().await.unwrap();
+        assert_eq!(rules[0].rule.name, "Default");
+        assert_eq!(rules[0].rule.condition, None);
+        assert_eq!(rules[0].rule.settings["interval_secs"], 15);
+        assert_eq!(rules[0].rule.settings["collectors"]["cpu"]["enabled"], true);
+
+        // Settings come back with their types and shape.
+        let later = database
+            .create_rule(&rule_input("later", 200))
+            .await
+            .unwrap();
+        let earlier = database
+            .create_rule(&rule_input("earlier", 100))
+            .await
+            .unwrap();
+        let rule = database.get_rule(later).await.unwrap().unwrap();
+        assert_eq!(rule.rule, rule_input("later", 200));
+
+        // Lowest priority first.
+        let names: Vec<String> = database
+            .list_rules()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|rule| rule.rule.name)
+            .collect();
+        assert_eq!(names, ["Default", "earlier", "later"]);
+
+        // Updating replaces the settings instead of adding to them.
+        let mut changed = rule_input("renamed", 300);
+        changed.condition = None;
+        changed.enabled = false;
+        changed.settings = json!({ "interval_secs": 5 });
+        assert!(database.update_rule(later, &changed).await.unwrap());
+        assert_eq!(
+            database.get_rule(later).await.unwrap().unwrap().rule,
+            changed
+        );
+
+        // Unknown rules are reported, not errors.
+        assert!(!database.update_rule(9_999_999, &changed).await.unwrap());
+        assert!(!database.delete_rule(9_999_999).await.unwrap());
+        assert_eq!(database.get_rule(9_999_999).await.unwrap(), None);
+
+        // A second rule can't take a name that's in use.
+        assert!(
+            database
+                .create_rule(&rule_input("earlier", 1))
+                .await
+                .is_err()
+        );
+
+        assert!(database.delete_rule(later).await.unwrap());
+        assert!(database.delete_rule(earlier).await.unwrap());
+        assert_eq!(database.list_rules().await.unwrap().len(), 1);
+    }
+
+    async fn exercise_config_status(database: &Database, agent: &str) {
+        assert_eq!(database.config_status(agent).await.unwrap(), None);
+
+        let failed = ConfigStatus {
+            version: "v1".to_string(),
+            error: Some("unknown collector".to_string()),
+            reported_at_ms: 100,
+        };
+        database.save_config_status(agent, &failed).await.unwrap();
+        assert_eq!(
+            database.config_status(agent).await.unwrap(),
+            Some(failed.clone())
+        );
+
+        // Saving identical data, which MySQL reports as zero rows changed.
+        database.save_config_status(agent, &failed).await.unwrap();
+
+        let applied = ConfigStatus {
+            version: "v2".to_string(),
+            error: None,
+            reported_at_ms: 200,
+        };
+        database.save_config_status(agent, &applied).await.unwrap();
+        assert_eq!(database.config_status(agent).await.unwrap(), Some(applied));
     }
 
     async fn exercise_facts(database: &Database, agent: &str, other: &str) {
@@ -436,6 +846,16 @@ mod tests {
         assert!(database.record_facts(other, &number, 500).await.unwrap());
         assert!(database.record_facts(other, &text, 600).await.unwrap());
         let levels = database.current_facts(other).await.unwrap();
+
+        // Each agent's current values, and none of the ones they replaced.
+        assert_eq!(
+            database.all_current_facts().await.unwrap(),
+            BTreeMap::from([
+                (agent.to_string(), first.clone()),
+                (other.to_string(), text.clone())
+            ])
+        );
+
         assert_eq!(levels[0].value, json!("1"));
 
         // Changing a list only touches the items that changed.

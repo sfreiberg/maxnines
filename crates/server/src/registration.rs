@@ -16,7 +16,7 @@ use tracing::{info, warn};
 use wildmatch::WildMatch;
 
 use crate::config::{RegistrationConfig, RuleAction, RuleConfig, parse_network};
-use crate::database::Database;
+use crate::models::Database;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

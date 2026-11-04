@@ -1,6 +1,6 @@
 //! Metrics storage. To add a metrics database: implement [`Store`] in a new
 //! module, add a variant to [`MetricsConfig`], and add a match arm to [`open`].
-//! Everything else the server keeps lives in [`crate::database`].
+//! Everything else the server keeps lives in [`crate::models`].
 
 mod duckdb;
 

@@ -1,26 +1,26 @@
 mod collector;
 mod config;
-mod exporter;
 mod facts;
 mod identity;
+mod saved_config;
 mod websocket;
 
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 use maxnines_protocol::Sample;
 use maxnines_protocol::auth::Identity;
-use tokio::time::{MissedTickBehavior, interval, sleep};
+use tokio::time::{Instant, Interval, MissedTickBehavior, interval_at};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use collector::Collector;
 use config::Config;
-use exporter::Exporter;
+use websocket::{ConfigUpdate, ServerLink};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Reports system metrics to a MaxNines server")]
@@ -69,8 +69,10 @@ fn main() -> Result<()> {
         Command::Identity(command) => {
             let config = Config::load(&cli.config)?;
             let identity = match command {
-                IdentityCommand::Generate { force } => identity::generate(&config.key_file, force)?,
-                IdentityCommand::Show => identity::load(&config.key_file)?,
+                IdentityCommand::Generate { force } => {
+                    identity::generate(&config.key_file(), force)?
+                }
+                IdentityCommand::Show => identity::load(&config.key_file())?,
             };
             print_identity(&identity);
             Ok(())
@@ -83,9 +85,37 @@ fn print_identity(identity: &Identity) {
     println!("public key: {}", identity.public_key());
 }
 
+/// The monitoring the agent is currently doing.
+struct Monitoring {
+    version: String,
+    collectors: Vec<Box<dyn Collector>>,
+    ticker: Interval,
+}
+
+impl Monitoring {
+    /// Fails without side effects, so a bad config leaves the old one running.
+    fn start(update: &ConfigUpdate) -> Result<Self> {
+        let collectors = catch_unwind(AssertUnwindSafe(|| {
+            update.config.validate()?;
+            collector::build_all(&update.config)
+        }))
+        .map_err(|_| anyhow!("building collectors panicked"))??;
+
+        // CPU usage is measured between refreshes, so the first sample waits.
+        let period = Duration::from_secs(update.config.interval_secs);
+        let mut ticker = interval_at(Instant::now() + collector::WARMUP, period);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        Ok(Self {
+            version: update.version.clone(),
+            collectors,
+            ticker,
+        })
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn run(path: PathBuf) -> Result<()> {
-    // Logs go to stderr so stdout carries nothing but samples.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -94,46 +124,86 @@ async fn run(path: PathBuf) -> Result<()> {
         .init();
 
     let config = Config::load(&path)?;
-    let host = collector::host_name();
+    let identity = identity::load_or_create(&config.key_file())?;
+    let mut link = ServerLink::start(&config, &collector::host_name(), identity)?;
+    info!(config = %path.display(), "agent started");
 
-    let mut collectors = config
-        .collector
-        .iter()
-        .filter(|(_, c)| c.enabled)
-        .map(|(name, c)| collector::build(name, c))
-        .collect::<Result<Vec<_>>>()?;
-    let mut exporters = config
-        .exporter
-        .iter()
-        .map(|(name, e)| exporter::build(name, e, &config, &host))
-        .collect::<Result<Vec<_>>>()?;
-
-    ensure!(!collectors.is_empty(), "no collectors are enabled");
-    ensure!(!exporters.is_empty(), "no exporters are configured");
-
-    info!(
-        config = %path.display(),
-        interval_secs = config.interval_secs,
-        collectors = collectors.len(),
-        "agent started"
-    );
-
-    sleep(collector::WARMUP).await;
-
-    let mut ticker = interval(Duration::from_secs(config.interval_secs));
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // The last good config means monitoring carries on through a server outage.
+    let saved_file = config.saved_config_file();
+    let mut monitoring = None;
+    if let Some(update) = saved_config::load(&saved_file) {
+        match Monitoring::start(&update) {
+            Ok(started) => {
+                info!(version = update.version, "using the saved config");
+                link.set_facts_interval(Duration::from_secs(update.config.facts_interval_secs));
+                monitoring = Some(started);
+            }
+            Err(error) => warn!(error = format!("{error:#}"), "saved config is unusable"),
+        }
+    }
 
     loop {
         tokio::select! {
-            _ = ticker.tick() => {
-                let sample = collect(&mut collectors);
-                export(&mut exporters, &sample)?;
+            () = next_tick(&mut monitoring) => {
+                if let Some(active) = &mut monitoring {
+                    link.send_sample(&collect(&mut active.collectors))?;
+                }
+            }
+            Some(update) = link.next_config() => {
+                apply(update, &mut monitoring, &link, &saved_file)?;
             }
             result = tokio::signal::ctrl_c() => {
                 result?;
                 info!("shutting down");
                 return Ok(());
             }
+        }
+    }
+}
+
+/// Waits forever until there's a config, because only the server says what to do.
+async fn next_tick(monitoring: &mut Option<Monitoring>) {
+    match monitoring {
+        Some(active) => {
+            active.ticker.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Swaps in a new config, or keeps the current one and tells the server why not.
+fn apply(
+    update: ConfigUpdate,
+    monitoring: &mut Option<Monitoring>,
+    link: &ServerLink,
+    saved_file: &Path,
+) -> Result<()> {
+    let already_running = monitoring
+        .as_ref()
+        .is_some_and(|active| active.version == update.version);
+    if already_running {
+        return link.report_config(&update.version, None);
+    }
+
+    match Monitoring::start(&update) {
+        Ok(started) => {
+            info!(
+                version = update.version,
+                collectors = started.collectors.len(),
+                interval_secs = update.config.interval_secs,
+                "config applied"
+            );
+            *monitoring = Some(started);
+            link.set_facts_interval(Duration::from_secs(update.config.facts_interval_secs));
+            if let Err(error) = saved_config::save(saved_file, &update) {
+                warn!(error = format!("{error:#}"), "saving the config failed");
+            }
+            link.report_config(&update.version, None)
+        }
+        Err(error) => {
+            let error = format!("{error:#}");
+            warn!(version = update.version, error, "config rejected");
+            link.report_config(&update.version, Some(error))
         }
     }
 }
@@ -162,18 +232,6 @@ fn collect(collectors: &mut [Box<dyn Collector>]) -> Sample {
         timestamp_ms,
         metrics,
     }
-}
-
-/// An export error stops the agent: for stdout it means the reader has gone.
-/// A panic only loses this sample for that exporter.
-fn export(exporters: &mut [Box<dyn Exporter>], sample: &Sample) -> Result<()> {
-    for exporter in exporters {
-        match catch_unwind(AssertUnwindSafe(|| exporter.export(sample))) {
-            Ok(result) => result?,
-            Err(_) => error!("exporter panicked, sample dropped"),
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -205,20 +263,10 @@ mod tests {
         }
     }
 
-    struct PanickingExporter;
-
-    impl Exporter for PanickingExporter {
-        fn export(&mut self, _: &Sample) -> Result<()> {
-            panic!("deliberate test panic");
-        }
-    }
-
-    struct CountingExporter(usize);
-
-    impl Exporter for CountingExporter {
-        fn export(&mut self, _: &Sample) -> Result<()> {
-            self.0 += 1;
-            Ok(())
+    fn update(version: &str, config: Value) -> ConfigUpdate {
+        ConfigUpdate {
+            version: version.to_string(),
+            config: serde_json::from_value(config).unwrap(),
         }
     }
 
@@ -275,15 +323,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn panicking_exporter_does_not_stop_the_agent() {
-        let sample = Sample {
-            timestamp_ms: 0,
-            metrics: BTreeMap::new(),
-        };
-        let mut exporters: Vec<Box<dyn Exporter>> =
-            vec![Box::new(PanickingExporter), Box::new(CountingExporter(0))];
+    #[tokio::test]
+    async fn a_good_config_starts_its_collectors() {
+        let config = json!({ "collectors": { "cpu": {} } });
+        let started = Monitoring::start(&update("v1", config)).unwrap();
 
-        assert!(export(&mut exporters, &sample).is_ok());
+        assert_eq!(started.version, "v1");
+        assert_eq!(started.collectors.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_bad_config_is_refused() {
+        for config in [
+            json!({ "interval_secs": 0 }),
+            json!({ "collectors": { "gpu": {} } }),
+        ] {
+            assert!(Monitoring::start(&update("v1", config)).is_err());
+        }
     }
 }

@@ -5,26 +5,30 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum_csrf::CsrfConfig;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use maxnines_protocol::auth::Identity;
-use maxnines_protocol::{AgentMessage, RegistrationStatus, Sample, ServerMessage};
-use serde_json::json;
+use maxnines_protocol::{AgentConfig, AgentMessage, RegistrationStatus, Sample, ServerMessage};
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tokio::time::{Instant, sleep};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
+use crate::app_state::{AppState, Heartbeat};
 use crate::config::Config;
-use crate::connection::{AppState, Heartbeat};
-use crate::database::{Database, FactVersion};
+use crate::controllers::app;
+use crate::models::{Database, FactVersion, RuleInput};
 use crate::presence::Presence;
 use crate::registration::{AgentState, Registry, Rules, hash_token};
 use crate::store::spawn_writer;
 use crate::store::testing::{MemoryStore, Saved};
-use crate::{AgentsCommand, Cli, Command, app};
+use crate::views::Views;
+use crate::{AgentsCommand, Cli, Command};
 
 const AUDIENCE: &str = "wss://monitor.example.com/ws";
 const ADMIN_TOKEN: &str = "test-admin-token";
@@ -61,6 +65,7 @@ async fn start_with(config: &str) -> TestServer {
             database.clone(),
         )),
         database,
+        config_changes: Arc::new(watch::Sender::new(0)),
         writer,
         heartbeat: Heartbeat {
             interval: Duration::from_millis(50),
@@ -69,6 +74,8 @@ async fn start_with(config: &str) -> TestServer {
         audience: AUDIENCE.into(),
         trusted_proxies: config.trusted_networks().unwrap().into(),
         admin_token_hash: hash_token(ADMIN_TOKEN).into(),
+        views: Arc::new(Views::load().unwrap()),
+        csrf: CsrfConfig::default(),
     };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -770,6 +777,978 @@ async fn the_history_api_returns_every_change_in_order() {
     assert_eq!(history.last().unwrap().value, "24.10");
 }
 
+// ---- agent config
+
+impl TestServer {
+    /// Reads what a connected agent is sent until the config arrives.
+    async fn next_config(client: &mut Client) -> (String, AgentConfig) {
+        let reading = async {
+            loop {
+                if let ServerMessage::Config { version, config } = read_server_message(client).await
+                {
+                    return (version, config);
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), reading)
+            .await
+            .expect("no config arrived")
+    }
+
+    async fn create_rule(&self, name: &str, priority: i32, condition: &str, settings: Value) {
+        let input = RuleInput {
+            name: name.to_string(),
+            priority,
+            condition: Some(condition.to_string()),
+            enabled: true,
+            settings,
+        };
+        self.state.database.create_rule(&input).await.unwrap();
+        self.state.config_changed();
+    }
+
+    async fn request(&self, method: &str, path: &str, body: &str) -> String {
+        let mut stream = TcpStream::connect(self.address).await.unwrap();
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {ADMIN_TOKEN}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    }
+}
+
+#[tokio::test]
+async fn an_approved_agent_is_sent_the_default_config() {
+    let server = start().await;
+    let mut client = server.connect_approved(&identity(), "web-1").await;
+
+    let (version, config) = TestServer::next_config(&mut client).await;
+
+    assert_eq!(version, config.version().unwrap());
+    assert_eq!(config.interval_secs, 15);
+    assert_eq!(config.collectors.len(), 5);
+}
+
+#[tokio::test]
+async fn a_rule_change_reaches_connected_agents() {
+    let server = start().await;
+    let mut client = server.connect_approved(&identity(), "web-1").await;
+    TestServer::next_config(&mut client).await;
+
+    server
+        .create_rule("faster", 100, "true", json!({ "interval_secs": 5 }))
+        .await;
+
+    let (_, config) = TestServer::next_config(&mut client).await;
+    assert_eq!(config.interval_secs, 5);
+}
+
+#[tokio::test]
+async fn an_agent_gets_a_new_config_when_its_facts_start_matching_a_rule() {
+    let server = start().await;
+    server
+        .create_rule(
+            "linux",
+            100,
+            r#"facts.os.family == "linux""#,
+            json!({ "interval_secs": 7 }),
+        )
+        .await;
+    let mut client = server.connect_approved(&identity(), "web-1").await;
+
+    let (_, first) = TestServer::next_config(&mut client).await;
+    assert_eq!(first.interval_secs, 15);
+
+    send(&mut client, &facts("24.04")).await;
+
+    let (_, second) = TestServer::next_config(&mut client).await;
+    assert_eq!(second.interval_secs, 7);
+}
+
+#[tokio::test]
+async fn an_unchanged_config_is_not_sent_again() {
+    let server = start().await;
+    let mut client = server.connect_approved(&identity(), "web-1").await;
+    TestServer::next_config(&mut client).await;
+
+    // Matches nothing, so the config stays the same.
+    server
+        .create_rule("nothing", 100, "false", json!({ "interval_secs": 5 }))
+        .await;
+
+    let next = tokio::time::timeout(
+        Duration::from_millis(150),
+        TestServer::next_config(&mut client),
+    );
+    assert!(next.await.is_err());
+}
+
+#[tokio::test]
+async fn an_agent_is_only_sent_collectors_it_supports() {
+    let server = start().await;
+    let agent = identity();
+    let mut client = server.connect_approved(&agent, "web-1").await;
+    TestServer::next_config(&mut client).await;
+
+    let older = AgentMessage::Facts {
+        facts: json!({ "agent": { "collectors": ["cpu", "memory"] } }),
+    };
+    send(&mut client, &older).await;
+
+    let (_, config) = TestServer::next_config(&mut client).await;
+    let names: Vec<&str> = config.collectors.keys().map(String::as_str).collect();
+    assert_eq!(names, ["cpu", "memory"]);
+}
+
+#[tokio::test]
+async fn an_agents_config_result_is_recorded_and_shown() {
+    let server = start().await;
+    let agent = identity();
+    let id = agent.id();
+    let mut client = server.connect_approved(&agent, "web-1").await;
+    let (version, _) = TestServer::next_config(&mut client).await;
+
+    let result = AgentMessage::ConfigResult {
+        version: version.clone(),
+        error: Some("x".repeat(5000)),
+    };
+    send(&mut client, &result).await;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = server.state.database.config_status(&id).await.unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "no status arrived");
+        sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(status.version, version);
+    assert_eq!(status.error.unwrap().len(), 1000);
+
+    let path = format!("/admin/agents/{id}/config");
+    let response = server.request("GET", &path, "").await;
+    let body = response.split("\r\n\r\n").nth(1).unwrap();
+    let view: Value = serde_json::from_str(body).unwrap();
+
+    assert_eq!(view["desired"]["version"], json!(version));
+    assert_eq!(view["desired"]["config"]["interval_secs"], 15);
+    assert_eq!(view["desired"]["matched_rules"], json!(["Default"]));
+    assert_eq!(view["reported"]["version"], json!(version));
+}
+
+#[tokio::test]
+async fn rules_can_be_managed_through_the_api() {
+    let server = start().await;
+
+    let body = r#"{"name":"web","priority":100,"condition":"facts.custom.role == \"web\"","settings":{"interval_secs":5}}"#;
+    let created = server.request("POST", "/admin/rules", body).await;
+    assert!(created.starts_with("HTTP/1.1 201"), "{created}");
+    let id: Value = serde_json::from_str(created.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let path = format!("/admin/rules/{}", id["id"]);
+
+    let shown = server.request("GET", &path, "").await;
+    assert!(shown.contains(r#""interval_secs":5"#), "{shown}");
+
+    let changed = r#"{"name":"web","priority":100,"condition":null,"enabled":false,"settings":{}}"#;
+    let updated = server.request("PUT", &path, changed).await;
+    assert!(updated.starts_with("HTTP/1.1 204"), "{updated}");
+
+    let listed = server.request("GET", "/admin/rules", "").await;
+    assert!(listed.contains(r#""enabled":false"#), "{listed}");
+
+    let deleted = server.request("DELETE", &path, "").await;
+    assert!(deleted.starts_with("HTTP/1.1 204"), "{deleted}");
+    let gone = server.request("GET", &path, "").await;
+    assert!(gone.starts_with("HTTP/1.1 404"), "{gone}");
+}
+
+#[tokio::test]
+async fn invalid_rules_are_refused_with_a_reason() {
+    let server = start().await;
+
+    let cases = [
+        (
+            r#"{"name":"","priority":1,"condition":null,"settings":{}}"#,
+            "name",
+        ),
+        (
+            r#"{"name":"a","priority":1,"condition":"1 +","settings":{}}"#,
+            "condition",
+        ),
+        (
+            r#"{"name":"a","priority":1,"condition":null,"settings":{"intervl":5}}"#,
+            "settings",
+        ),
+        (
+            r#"{"name":"a","priority":1,"condition":null,"settings":{"interval_secs":0}}"#,
+            "at least 1",
+        ),
+        (
+            r#"{"name":"a","priority":1,"condition":null,"settings":{"collectors":{"gpu":{}}}}"#,
+            "unknown collector",
+        ),
+        (
+            r#"{"name":"Default","priority":1,"condition":null,"settings":{}}"#,
+            "already exists",
+        ),
+    ];
+
+    for (body, reason) in cases {
+        let response = server.request("POST", "/admin/rules", body).await;
+        assert!(response.starts_with("HTTP/1.1 422"), "{body}: {response}");
+        assert!(response.contains(reason), "{body}: {response}");
+    }
+    assert_eq!(server.state.database.list_rules().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn the_rules_api_needs_the_token() {
+    let server = start().await;
+    let response = server.http("GET", "/admin/rules", None).await;
+    assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+}
+
+// ---- web pages
+
+/// A browser: keeps the CSRF cookie and reads tokens out of forms.
+#[derive(Default)]
+struct Browser {
+    cookie: String,
+}
+
+struct Page {
+    status: u16,
+    headers: String,
+    body: String,
+}
+
+impl Page {
+    fn token(&self) -> String {
+        let marker = r#"name="authenticity_token" value=""#;
+        let start = self.body.find(marker).expect("no form on this page") + marker.len();
+        let end = self.body[start..].find('"').unwrap();
+        self.body[start..start + end].to_string()
+    }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        let prefix = format!("{}: ", name.to_lowercase());
+        self.headers.lines().find_map(|line| {
+            line.to_lowercase()
+                .starts_with(&prefix)
+                .then(|| &line[prefix.len()..])
+        })
+    }
+}
+
+impl Browser {
+    async fn send(&mut self, server: &TestServer, request: String) -> Page {
+        let mut stream = TcpStream::connect(server.address).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).await.unwrap();
+        let response = String::from_utf8_lossy(&bytes);
+
+        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+        for line in headers.lines() {
+            if line.to_lowercase().starts_with("set-cookie: ") {
+                let cookie = &line["set-cookie: ".len()..];
+                self.cookie = cookie.split(';').next().unwrap().to_string();
+            }
+        }
+        Page {
+            status: headers.split_whitespace().nth(1).unwrap().parse().unwrap(),
+            headers: headers.to_string(),
+            body: body.to_string(),
+        }
+    }
+
+    async fn get(&mut self, server: &TestServer, path: &str) -> Page {
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: x\r\nCookie: {}\r\nConnection: close\r\n\r\n",
+            self.cookie
+        );
+        self.send(server, request).await
+    }
+
+    async fn post(&mut self, server: &TestServer, path: &str, fields: &[(&str, &str)]) -> Page {
+        let body: Vec<String> = fields
+            .iter()
+            .map(|(name, value)| format!("{name}={}", encode(value)))
+            .collect();
+        let body = body.join("&");
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: x\r\nCookie: {}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            self.cookie,
+            body.len()
+        );
+        self.send(server, request).await
+    }
+
+    /// Opens a page and submits its form, as a person would.
+    async fn submit(
+        &mut self,
+        server: &TestServer,
+        form_page: &str,
+        path: &str,
+        fields: &[(&str, &str)],
+    ) -> Page {
+        let token = self.get(server, form_page).await.token();
+        let mut all = vec![("authenticity_token", token.as_str())];
+        all.extend_from_slice(fields);
+        self.post(server, path, &all).await
+    }
+}
+
+fn encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+const RULE_FIELDS: [(&str, &str); 7] = [
+    ("name", "Web servers"),
+    ("priority", "100"),
+    ("clause_fact_0", "custom.role"),
+    ("clause_operator_0", "equals"),
+    ("clause_value_0", "web"),
+    ("enabled", "on"),
+    ("interval_secs", "30"),
+];
+
+#[tokio::test]
+async fn every_page_renders() {
+    let server = start().await;
+    let agent = identity();
+    server.connect_approved(&agent, "web-1").await;
+    let rule = server.state.database.list_rules().await.unwrap()[0].id;
+    let mut browser = Browser::default();
+
+    for path in [
+        "/agents".to_string(),
+        format!("/agents/{}", agent.id()),
+        "/rules".to_string(),
+        "/rules/new".to_string(),
+        format!("/rules/{rule}/edit"),
+    ] {
+        let page = browser.get(&server, &path).await;
+        assert_eq!(page.status, 200, "{path}: {}", page.body);
+        assert!(page.body.contains("MaxNines"), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn the_home_page_goes_to_agents() {
+    let server = start().await;
+    let page = Browser::default().get(&server, "/").await;
+
+    assert_eq!(page.status, 303);
+    assert_eq!(page.header("location"), Some("/agents"));
+}
+
+#[tokio::test]
+async fn unknown_pages_are_a_friendly_not_found() {
+    let server = start().await;
+    let mut browser = Browser::default();
+
+    for path in ["/nope", "/agents/nope", "/rules/9999/edit"] {
+        let page = browser.get(&server, path).await;
+        assert_eq!(page.status, 404, "{path}");
+        assert!(page.body.contains("Page not found"), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn embedded_assets_are_served_and_nothing_else_is() {
+    let server = start().await;
+    let mut browser = Browser::default();
+
+    let css = browser.get(&server, "/assets/css/application.css").await;
+    assert_eq!(css.status, 200);
+    assert_eq!(css.header("content-type"), Some("text/css"));
+
+    for path in [
+        "/assets/nope.css",
+        "/assets/../Cargo.toml",
+        "/assets/%2e%2e/Cargo.toml",
+        "/assets/..%2f..%2fCargo.toml",
+    ] {
+        let page = browser.get(&server, path).await;
+        assert_eq!(page.status, 404, "{path}");
+        assert!(!page.body.contains("[package]"), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn pages_carry_security_headers() {
+    let server = start().await;
+    let page = Browser::default().get(&server, "/agents").await;
+
+    let policy = page.header("content-security-policy").unwrap();
+    assert!(policy.contains("default-src 'none'"), "{policy}");
+    assert!(policy.contains("frame-ancestors 'none'"), "{policy}");
+    assert_eq!(page.header("x-frame-options"), Some("DENY"));
+    assert_eq!(page.header("x-content-type-options"), Some("nosniff"));
+}
+
+#[tokio::test]
+async fn a_rule_created_in_the_browser_is_stored_and_reaches_agents() {
+    let server = start().await;
+    let agent = identity();
+    let mut client = server.connect_approved(&agent, "web-1").await;
+    TestServer::next_config(&mut client).await;
+    let role = AgentMessage::Facts {
+        facts: json!({ "custom": { "role": "web" } }),
+    };
+    send(&mut client, &role).await;
+    server.wait_for_facts(&agent.id(), 1).await;
+
+    let mut browser = Browser::default();
+    let page = browser
+        .submit(&server, "/rules/new", "/rules", &RULE_FIELDS)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+
+    let rules = server.state.database.list_rules().await.unwrap();
+    let rule = &rules.last().unwrap().rule;
+    assert_eq!(rule.name, "Web servers");
+    assert_eq!(rule.priority, 100);
+    assert_eq!(rule.settings, json!({ "interval_secs": 30 }));
+
+    let (_, config) = TestServer::next_config(&mut client).await;
+    assert_eq!(config.interval_secs, 30);
+
+    let list = browser.get(&server, "/rules").await;
+    assert!(list.body.contains("Web servers"));
+    assert!(list.body.contains("every 30s"));
+}
+
+#[tokio::test]
+async fn a_rule_can_be_edited_and_deleted_in_the_browser() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    browser
+        .submit(&server, "/rules/new", "/rules", &RULE_FIELDS)
+        .await;
+    let id = server.state.database.list_rules().await.unwrap()[1].id;
+    let edit = format!("/rules/{id}/edit");
+
+    let form = browser.get(&server, &edit).await;
+    assert!(
+        form.body.contains(r#"value="Web servers""#),
+        "{}",
+        form.body
+    );
+
+    let page = browser
+        .submit(
+            &server,
+            &edit,
+            &format!("/rules/{id}"),
+            &[
+                ("name", "Renamed"),
+                ("priority", "5"),
+                ("collector_cpu", "off"),
+            ],
+        )
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+
+    let rule = server
+        .state
+        .database
+        .get_rule(id)
+        .await
+        .unwrap()
+        .unwrap()
+        .rule;
+    assert_eq!(rule.name, "Renamed");
+    assert!(!rule.enabled);
+    assert_eq!(rule.condition, None);
+    assert_eq!(
+        rule.settings,
+        json!({ "collectors": { "cpu": { "enabled": false } } })
+    );
+
+    let page = browser
+        .submit(&server, &edit, &format!("/rules/{id}/delete"), &[])
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    assert_eq!(server.state.database.get_rule(id).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn an_invalid_rule_shows_why_and_keeps_what_was_typed() {
+    let server = start().await;
+    let mut browser = Browser::default();
+
+    let cases: [(&[(&str, &str)], &str); 5] = [
+        (&[("name", ""), ("priority", "1")], "needs a name"),
+        (&[("name", "a"), ("priority", "high")], "priority"),
+        (
+            &[
+                ("name", "a"),
+                ("priority", "1"),
+                ("condition_mode", "expression"),
+                ("condition", "1 +"),
+            ],
+            "invalid condition",
+        ),
+        (
+            &[("name", "a"), ("priority", "1"), ("interval_secs", "0")],
+            "at least 1",
+        ),
+        (&[("name", "Default"), ("priority", "1")], "already exists"),
+    ];
+
+    for (fields, reason) in cases {
+        let page = browser
+            .submit(&server, "/rules/new", "/rules", fields)
+            .await;
+        assert_eq!(page.status, 422, "{fields:?}: {}", page.body);
+        assert!(page.body.contains(reason), "{fields:?}: {}", page.body);
+    }
+
+    let typed = [
+        ("name", "Keep me"),
+        ("priority", "1"),
+        ("condition_mode", "expression"),
+        ("condition", "1 +"),
+    ];
+    let page = browser
+        .submit(&server, "/rules/new", "/rules", &typed)
+        .await;
+    assert!(page.body.contains(r#"value="Keep me""#), "{}", page.body);
+    assert_eq!(server.state.database.list_rules().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn agents_can_be_approved_and_revoked_in_the_browser() {
+    let server = start().await;
+    let agent = identity();
+    let id = agent.id();
+    let mut client = server.connect().await;
+    handshake(&mut client, &agent, "web-1", None).await;
+
+    let path = format!("/agents/{id}");
+    let mut browser = Browser::default();
+
+    let page = browser
+        .submit(&server, &path, &format!("{path}/approve"), &[])
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    assert!(server.state.registry.is_approved(&id).await);
+
+    let page = browser
+        .submit(&server, &path, &format!("{path}/revoke"), &[])
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    assert!(!server.state.registry.is_approved(&id).await);
+}
+
+#[tokio::test]
+async fn every_form_refuses_a_missing_or_wrong_csrf_token() {
+    let server = start().await;
+    let agent = identity();
+    let id = agent.id();
+    let mut client = server.connect().await;
+    handshake(&mut client, &agent, "web-1", None).await;
+    let rule = server.state.database.list_rules().await.unwrap()[0].id;
+
+    let paths = [
+        "/rules".to_string(),
+        format!("/rules/{rule}"),
+        format!("/rules/{rule}/delete"),
+        format!("/agents/{id}/approve"),
+        format!("/agents/{id}/revoke"),
+    ];
+    let mut browser = Browser::default();
+    browser.get(&server, "/rules/new").await;
+
+    for path in &paths {
+        let missing = browser
+            .post(&server, path, &[("name", "x"), ("priority", "1")])
+            .await;
+        assert_eq!(missing.status, 403, "{path}");
+
+        let wrong = [
+            ("authenticity_token", "wrong"),
+            ("name", "x"),
+            ("priority", "1"),
+        ];
+        let page = browser.post(&server, path, &wrong).await;
+        assert_eq!(page.status, 403, "{path}");
+    }
+
+    // Nothing happened.
+    assert_eq!(server.state.database.list_rules().await.unwrap().len(), 1);
+    assert!(!server.state.registry.is_approved(&id).await);
+}
+
+#[tokio::test]
+async fn a_token_from_another_browser_is_refused() {
+    let server = start().await;
+    let mut victim = Browser::default();
+    let mut attacker = Browser::default();
+
+    let stolen = attacker.get(&server, "/rules/new").await.token();
+    victim.get(&server, "/rules/new").await;
+
+    let fields = [
+        ("authenticity_token", stolen.as_str()),
+        ("name", "x"),
+        ("priority", "1"),
+    ];
+    let page = victim.post(&server, "/rules", &fields).await;
+
+    assert_eq!(page.status, 403, "{}", page.body);
+}
+
+#[tokio::test]
+async fn agent_reported_text_can_not_inject_html() {
+    let server = start().await;
+    let attack = "<script>alert(1)</script>";
+    let agent = identity();
+    let id = agent.id();
+    let mut client = server.connect_approved(&agent, attack).await;
+    let facts = AgentMessage::Facts {
+        facts: json!({ "custom": { "note": attack } }),
+    };
+    send(&mut client, &facts).await;
+    server.wait_for_facts(&id, 1).await;
+
+    let rejected = AgentMessage::ConfigResult {
+        version: "v1".to_string(),
+        error: Some(attack.to_string()),
+    };
+    send(&mut client, &rejected).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while server
+        .state
+        .database
+        .config_status(&id)
+        .await
+        .unwrap()
+        .is_none()
+    {
+        assert!(Instant::now() < deadline, "no status arrived");
+        sleep(Duration::from_millis(10)).await;
+    }
+
+    let mut browser = Browser::default();
+    for path in ["/agents".to_string(), format!("/agents/{id}")] {
+        let page = browser.get(&server, &path).await;
+        assert_eq!(page.status, 200, "{path}");
+        assert!(!page.body.contains("<script"), "{path}: {}", page.body);
+        assert!(page.body.contains("&lt;script"), "{path}: {}", page.body);
+    }
+}
+
+#[tokio::test]
+async fn text_in_a_rule_can_not_inject_html() {
+    let server = start().await;
+    let attack = r#""><script>alert(1)</script>"#;
+    let mut browser = Browser::default();
+    let fields = [
+        ("name", attack),
+        ("priority", "1"),
+        ("condition_mode", "expression"),
+        ("condition", "true"),
+    ];
+    browser
+        .submit(&server, "/rules/new", "/rules", &fields)
+        .await;
+    let id = server.state.database.list_rules().await.unwrap()[1].id;
+
+    for path in ["/rules".to_string(), format!("/rules/{id}/edit")] {
+        let page = browser.get(&server, &path).await;
+        assert_eq!(page.status, 200, "{path}");
+        assert!(!page.body.contains("<script"), "{path}: {}", page.body);
+    }
+}
+
+// ---- condition builder
+
+async fn only_custom_rule(server: &TestServer) -> RuleInput {
+    let rules = server.state.database.list_rules().await.unwrap();
+    assert_eq!(rules.len(), 2, "{rules:?}");
+    rules[1].rule.clone()
+}
+
+#[tokio::test]
+async fn a_rule_built_with_form_fields_stores_a_real_expression() {
+    let server = start().await;
+    let mut browser = Browser::default();
+
+    let fields = [
+        ("name", "Linux web"),
+        ("priority", "100"),
+        ("match", "all"),
+        ("clause_fact_0", "os.family"),
+        ("clause_operator_0", "equals"),
+        ("clause_value_0", "linux"),
+        ("clause_fact_1", "host.name"),
+        ("clause_operator_1", "starts_with"),
+        ("clause_value_1", "web-"),
+        ("enabled", "on"),
+    ];
+    let page = browser
+        .submit(&server, "/rules/new", "/rules", &fields)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+
+    assert_eq!(
+        only_custom_rule(&server).await.condition.as_deref(),
+        Some(r#"facts.os.family == "linux" && facts.host.name.startsWith("web-")"#)
+    );
+
+    let list = browser.get(&server, "/rules").await;
+    assert!(
+        list.body
+            .contains("os.family is linux and host.name starts with web-"),
+        "{}",
+        list.body
+    );
+}
+
+#[tokio::test]
+async fn the_builder_buttons_work_without_saving_or_losing_what_was_typed() {
+    let server = start().await;
+    let mut browser = Browser::default();
+
+    let fields = [
+        ("name", "Half done"),
+        ("priority", "100"),
+        ("clause_fact_0", "os.family"),
+        ("clause_operator_0", "equals"),
+        ("clause_value_0", "linux"),
+        ("form_action", "add_clause"),
+    ];
+    let page = browser
+        .submit(&server, "/rules/new", "/rules", &fields)
+        .await;
+
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(
+        page.body.contains(r#"name="clause_fact_1""#),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains(r#"value="linux""#), "{}", page.body);
+    assert!(page.body.contains(r#"value="Half done""#), "{}", page.body);
+    assert_eq!(server.state.database.list_rules().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn the_builder_buttons_need_a_csrf_token_too() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    browser.get(&server, "/rules/new").await;
+
+    let page = browser
+        .post(&server, "/rules", &[("form_action", "add_clause")])
+        .await;
+
+    assert_eq!(page.status, 403);
+}
+
+#[tokio::test]
+async fn enter_saves_the_rule_instead_of_pressing_a_builder_button() {
+    let server = start().await;
+    let page = Browser::default().get(&server, "/rules/new").await;
+
+    let first_button = page.body.find("<button").unwrap();
+    assert!(
+        page.body[first_button..].starts_with(r#"<button type="submit" class="default-submit""#),
+        "{}",
+        &page.body[first_button..first_button + 80]
+    );
+}
+
+#[tokio::test]
+async fn a_rule_opens_in_the_builder_when_it_fits() {
+    let server = start().await;
+    server
+        .create_rule("r", 100, r#"facts.os.family == "linux""#, json!({}))
+        .await;
+    let id = server.state.database.list_rules().await.unwrap()[1].id;
+
+    let page = Browser::default()
+        .get(&server, &format!("/rules/{id}/edit"))
+        .await;
+
+    assert!(
+        page.body
+            .contains(r#"name="clause_fact_0" value="os.family""#),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains(r#"value="linux""#), "{}", page.body);
+    assert!(!page.body.contains("too complex"), "{}", page.body);
+}
+
+#[tokio::test]
+async fn saving_a_complex_rule_from_its_form_leaves_the_expression_unchanged() {
+    let server = start().await;
+    let condition = r#"(facts.a == "x" || facts.b == "y") && facts.c != "z""#;
+    server.create_rule("r", 100, condition, json!({})).await;
+    let id = server.state.database.list_rules().await.unwrap()[1].id;
+    let edit = format!("/rules/{id}/edit");
+    let mut browser = Browser::default();
+
+    let form = browser.get(&server, &edit).await;
+    assert!(form.body.contains("too complex"), "{}", form.body);
+
+    let fields = [
+        ("name", "r"),
+        ("priority", "100"),
+        ("enabled", "on"),
+        ("condition_mode", "expression"),
+        ("condition", condition),
+    ];
+    let page = browser
+        .submit(&server, &edit, &format!("/rules/{id}"), &fields)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+
+    assert_eq!(
+        only_custom_rule(&server).await.condition.as_deref(),
+        Some(condition)
+    );
+}
+
+#[tokio::test]
+async fn the_builder_suggests_facts_agents_have_reported() {
+    let server = start().await;
+    let agent = identity();
+    let mut client = server.connect_approved(&agent, "web-1").await;
+    let reported = AgentMessage::Facts {
+        facts: json!({ "custom": { "tags": ["a", "b"] }, "os": { "family": "linux" } }),
+    };
+    send(&mut client, &reported).await;
+    server.wait_for_facts(&agent.id(), 3).await;
+
+    let page = Browser::default().get(&server, "/rules/new").await;
+
+    assert!(
+        page.body.contains(r#"<option value="os.family">"#),
+        "{}",
+        page.body
+    );
+    assert!(
+        page.body.contains(r#"<option value="custom.tags">"#),
+        "{}",
+        page.body
+    );
+    assert!(!page.body.contains("custom.tags[0]"), "{}", page.body);
+}
+
+#[tokio::test]
+async fn a_number_fact_is_compared_as_a_number() {
+    let server = start().await;
+    let agent = identity();
+    let mut client = server.connect_approved(&agent, "web-1").await;
+    TestServer::next_config(&mut client).await;
+    let reported = AgentMessage::Facts {
+        facts: json!({ "custom": { "rack": 12 } }),
+    };
+    send(&mut client, &reported).await;
+    server.wait_for_facts(&agent.id(), 1).await;
+
+    let fields = [
+        ("name", "Rack 12"),
+        ("priority", "100"),
+        ("enabled", "on"),
+        ("clause_fact_0", "custom.rack"),
+        ("clause_operator_0", "equals"),
+        ("clause_value_0", "12"),
+        ("interval_secs", "3"),
+    ];
+    let page = Browser::default()
+        .submit(&server, "/rules/new", "/rules", &fields)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+
+    let (_, config) = TestServer::next_config(&mut client).await;
+    assert_eq!(config.interval_secs, 3);
+}
+
+#[tokio::test]
+async fn a_quote_in_a_value_stays_a_value_all_the_way_through() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    let attack = r#"x" || true || "y"#;
+
+    let fields = [
+        ("name", "Quoted"),
+        ("priority", "100"),
+        ("enabled", "on"),
+        ("clause_fact_0", "custom.role"),
+        ("clause_operator_0", "equals"),
+        ("clause_value_0", attack),
+        ("interval_secs", "3"),
+    ];
+    let page = browser
+        .submit(&server, "/rules/new", "/rules", &fields)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+
+    // It matches nothing, instead of everything.
+    let agent = identity();
+    let mut client = server.connect_approved(&agent, "web-1").await;
+    let (_, config) = TestServer::next_config(&mut client).await;
+    assert_eq!(config.interval_secs, 15);
+
+    // Editing shows the same text, safely.
+    let id = server.state.database.list_rules().await.unwrap()[1].id;
+    let form = browser.get(&server, &format!("/rules/{id}/edit")).await;
+    assert!(form.body.contains("x&quot; || true"), "{}", form.body);
+}
+
+#[tokio::test]
+async fn bad_conditions_are_explained_on_the_form() {
+    let server = start().await;
+    let mut browser = Browser::default();
+
+    let cases = [
+        ("os family", "equals", "x", "a fact name"),
+        ("os.family", "equals", "", "needs a value"),
+        (
+            "memory.total_bytes",
+            "greater_than",
+            "lots",
+            "needs a number",
+        ),
+        ("os.family", "nonsense", "x", "unknown comparison"),
+    ];
+    for (fact, operator, value, reason) in cases {
+        let fields = [
+            ("name", "Bad"),
+            ("priority", "100"),
+            ("clause_fact_0", fact),
+            ("clause_operator_0", operator),
+            ("clause_value_0", value),
+        ];
+        let page = browser
+            .submit(&server, "/rules/new", "/rules", &fields)
+            .await;
+        assert_eq!(page.status, 422, "{fact}: {}", page.body);
+        assert!(page.body.contains(reason), "{fact}: {}", page.body);
+    }
+    assert_eq!(server.state.database.list_rules().await.unwrap().len(), 1);
+}
+
 // ---- admin API
 
 #[tokio::test]
@@ -857,4 +1836,235 @@ fn parses_commands() {
 
     assert!(parse("agents approve").is_err());
     assert!(parse("agents delete abc").is_err());
+}
+
+// ---- rule preview
+
+async fn report_role(server: &TestServer, client: &mut Client, id: &str, role: &str) {
+    TestServer::next_config(client).await;
+    let facts = AgentMessage::Facts {
+        facts: json!({ "custom": { "role": role } }),
+    };
+    send(client, &facts).await;
+    server.wait_for_facts(id, 1).await;
+}
+
+fn with_preview<'a>(fields: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    let mut all = fields.to_vec();
+    all.push(("form_action", "preview"));
+    all
+}
+
+#[tokio::test]
+async fn a_preview_shows_the_effect_and_saves_nothing() {
+    let server = start().await;
+    let (web, db) = (identity(), identity());
+    let mut web_client = server.connect_approved(&web, "web-1").await;
+    let mut db_client = server.connect_approved(&db, "db-1").await;
+    report_role(&server, &mut web_client, &web.id(), "web").await;
+    report_role(&server, &mut db_client, &db.id(), "db").await;
+    let revision = *server.state.config_changes.borrow();
+
+    let mut browser = Browser::default();
+    let page = browser
+        .submit(&server, "/rules/new", "/rules", &with_preview(&RULE_FIELDS))
+        .await;
+
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains(r#"id="preview""#), "{}", page.body);
+    assert!(page.body.contains("web-1"), "{}", page.body);
+    assert!(page.body.contains("db-1"), "{}", page.body);
+    assert!(page.body.contains("Sample interval: 15s → 30s"));
+    assert_eq!(page.body.matches("Sample interval: 15s").count(), 1);
+    // What was typed is still there to carry on with.
+    assert!(page.body.contains(r#"value="Web servers""#));
+    assert!(page.body.contains(r#"value="custom.role""#));
+
+    assert_eq!(server.state.database.list_rules().await.unwrap().len(), 1);
+    assert_eq!(*server.state.config_changes.borrow(), revision);
+
+    // Saving then does what the preview said.
+    let saved = browser
+        .submit(&server, "/rules/new", "/rules", &RULE_FIELDS)
+        .await;
+    assert_eq!(saved.status, 303, "{}", saved.body);
+    let (_, config) = TestServer::next_config(&mut web_client).await;
+    assert_eq!(config.interval_secs, 30);
+}
+
+#[tokio::test]
+async fn a_preview_of_an_edit_uses_the_form_and_leaves_the_saved_rule_alone() {
+    let server = start().await;
+    let web = identity();
+    let mut client = server.connect_approved(&web, "web-1").await;
+    report_role(&server, &mut client, &web.id(), "web").await;
+
+    let mut browser = Browser::default();
+    browser
+        .submit(&server, "/rules/new", "/rules", &RULE_FIELDS)
+        .await;
+    TestServer::next_config(&mut client).await;
+    let saved = only_custom_rule(&server).await;
+    let id = server.state.database.list_rules().await.unwrap()[1].id;
+
+    let mut fields = RULE_FIELDS.to_vec();
+    fields.retain(|(name, _)| *name != "interval_secs");
+    fields.push(("interval_secs", "60"));
+    let page = browser
+        .submit(
+            &server,
+            &format!("/rules/{id}/edit"),
+            &format!("/rules/{id}"),
+            &with_preview(&fields),
+        )
+        .await;
+
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(
+        page.body.contains("Sample interval: 30s → 60s"),
+        "{}",
+        page.body
+    );
+    assert_eq!(only_custom_rule(&server).await, saved);
+}
+
+#[tokio::test]
+async fn a_preview_only_covers_approved_agents_but_includes_offline_ones() {
+    let server = start().await;
+    let (offline, pending, revoked) = (identity(), identity(), identity());
+
+    let mut client = server.connect_approved(&offline, "offline-1").await;
+    report_role(&server, &mut client, &offline.id(), "web").await;
+    drop(client);
+    server.wait_for_online(&offline.id(), false).await;
+
+    let mut client = server.connect().await;
+    handshake(&mut client, &pending, "pending-1", None).await;
+    let mut client = server.connect().await;
+    handshake(&mut client, &revoked, "revoked-1", None).await;
+    server
+        .state
+        .registry
+        .decide(&revoked.id(), AgentState::Revoked)
+        .await
+        .unwrap();
+
+    let mut browser = Browser::default();
+    let page = browser
+        .submit(&server, "/rules/new", "/rules", &with_preview(&RULE_FIELDS))
+        .await;
+
+    assert!(page.body.contains("offline-1"), "{}", page.body);
+    assert!(page.body.contains("Offline"), "{}", page.body);
+    assert!(!page.body.contains("pending-1"), "{}", page.body);
+    assert!(!page.body.contains("revoked-1"), "{}", page.body);
+}
+
+#[tokio::test]
+async fn a_rule_can_be_previewed_before_it_has_a_name() {
+    let server = start().await;
+    let fields = [("priority", "100"), ("form_action", "preview")];
+
+    let mut browser = Browser::default();
+    let page = browser
+        .submit(&server, "/rules/new", "/rules", &fields)
+        .await;
+
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("no approved agents"), "{}", page.body);
+}
+
+#[tokio::test]
+async fn a_preview_of_a_broken_rule_explains_what_is_wrong() {
+    let server = start().await;
+    for (name, value) in [("condition", "facts.os =="), ("interval_secs", "soon")] {
+        let fields = [
+            ("name", "Broken"),
+            ("priority", "100"),
+            ("condition_mode", "expression"),
+            (name, value),
+            ("form_action", "preview"),
+        ];
+
+        let mut browser = Browser::default();
+        let page = browser
+            .submit(&server, "/rules/new", "/rules", &fields)
+            .await;
+
+        assert_eq!(page.status, 422, "{}", page.body);
+        assert!(page.body.contains(r#"class="error""#), "{}", page.body);
+        assert!(!page.body.contains(r#"id="preview""#), "{}", page.body);
+    }
+}
+
+#[tokio::test]
+async fn the_preview_button_brings_the_results_into_view() {
+    let server = start().await;
+    let id = server.state.database.list_rules().await.unwrap()[0].id;
+
+    let mut browser = Browser::default();
+    for (form, action) in [
+        ("/rules/new".to_string(), "/rules#preview".to_string()),
+        (format!("/rules/{id}/edit"), format!("/rules/{id}#preview")),
+    ] {
+        let page = browser.get(&server, &form).await;
+        let wanted = format!(r#"formaction="{action}""#);
+        assert!(page.body.contains(&wanted), "{form}: {}", page.body);
+    }
+}
+
+#[tokio::test]
+async fn a_preview_needs_a_csrf_token() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    browser.get(&server, "/rules/new").await;
+
+    let page = browser
+        .post(&server, "/rules", &with_preview(&RULE_FIELDS))
+        .await;
+
+    assert_eq!(page.status, 403, "{}", page.body);
+}
+
+#[tokio::test]
+async fn text_from_an_agent_can_not_inject_html_into_a_preview() {
+    let server = start().await;
+    let attack = identity();
+    let host = "<script>alert(1)</script>";
+    let mut client = server.connect_approved(&attack, host).await;
+    TestServer::next_config(&mut client).await;
+    let facts = AgentMessage::Facts {
+        facts: json!({ "custom": { "role": "<script>alert(2)</script>" } }),
+    };
+    send(&mut client, &facts).await;
+    server.wait_for_facts(&attack.id(), 1).await;
+
+    let mut browser = Browser::default();
+    let page = browser
+        .submit(&server, "/rules/new", "/rules", &with_preview(&RULE_FIELDS))
+        .await;
+
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(
+        page.body.contains("&lt;script&gt;alert(1)"),
+        "{}",
+        page.body
+    );
+    assert!(!page.body.contains("<script"), "{}", page.body);
+}
+
+// ---- build details
+
+#[tokio::test]
+async fn every_page_shows_which_build_of_the_server_is_running() {
+    let server = start().await;
+    let build = maxnines_protocol::build_info!();
+
+    let mut browser = Browser::default();
+    for path in ["/agents", "/rules", "/rules/new", "/nope"] {
+        let page = browser.get(&server, path).await;
+        assert!(page.body.contains(&build.version), "{path}: {}", page.body);
+        assert!(page.body.contains(&build.commit), "{path}: {}", page.body);
+        assert!(page.body.contains(&build.built_at), "{path}: {}", page.body);
+    }
 }

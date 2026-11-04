@@ -1,0 +1,171 @@
+{% extends "layouts/application.html" %}
+{% block title %}{% if id %}Edit rule{% else %}New rule{% endif %} · MaxNines{% endblock title %}
+{% block content %}
+<p class="breadcrumb"><a href="/rules">Config rules</a></p>
+<h1>{% if id %}Edit rule{% else %}New rule{% endif %}</h1>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<form method="post" action="{% if id %}/rules/{{ id }}{% else %}/rules{% endif %}" class="stacked">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  {# Pressing Enter uses the first button in a form, so it has to be Save. #}
+  <button type="submit" class="default-submit" tabindex="-1" aria-hidden="true">Save rule</button>
+
+  <label>Name
+    <input type="text" name="name" value="{{ rule.name }}" required maxlength="255">
+  </label>
+
+  <label>Priority
+    <input type="number" name="priority" value="{{ rule.priority }}" required>
+    <small>Higher priorities apply later, so they win.</small>
+  </label>
+
+  <fieldset>
+    <legend>Applies to</legend>
+    {% if rule.note %}<p class="notice">{{ rule.note }}</p>{% endif %}
+
+    {% if rule.use_expression %}
+    <input type="hidden" name="condition_mode" value="expression">
+    {% for clause in rule.clauses %}
+    <input type="hidden" name="clause_fact_{{ loop.index0 }}" value="{{ clause.fact }}">
+    <input type="hidden" name="clause_operator_{{ loop.index0 }}" value="{{ clause.operator }}">
+    <input type="hidden" name="clause_value_{{ loop.index0 }}" value="{{ clause.value }}">
+    <input type="hidden" name="clause_kind_{{ loop.index0 }}" value="{{ clause.kind }}">
+    {% endfor %}
+    <label>Expression
+      <input type="text" name="condition" value="{{ rule.condition }}" spellcheck="false" placeholder='facts.os.family == "linux"'>
+      <small>Leave empty for every agent. Facts are available as <code>facts</code>, such as <code>facts.custom.role == "web"</code>.</small>
+    </label>
+    <div class="actions">
+      <button type="submit" name="form_action" value="use_builder" class="secondary" formnovalidate>Use the builder</button>
+    </div>
+    {% else %}
+    <label>Match
+      <select name="match">
+        <option value="all"{% if not rule.match_any %} selected{% endif %}>All of these conditions</option>
+        <option value="any"{% if rule.match_any %} selected{% endif %}>Any of these conditions</option>
+      </select>
+    </label>
+
+    {% for clause in rule.clauses %}
+    <div class="clause">
+      <label>Fact
+        <input type="text" name="clause_fact_{{ loop.index0 }}" value="{{ clause.fact }}" list="known-facts" spellcheck="false" placeholder="os.family">
+      </label>
+      <label>Comparison
+        <select name="clause_operator_{{ loop.index0 }}">
+          {% for operator in operators %}
+          <option value="{{ operator.name }}"{% if operator.name == clause.operator %} selected{% endif %}>{{ operator.label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Value
+        <input type="text" name="clause_value_{{ loop.index0 }}" value="{{ clause.value }}" spellcheck="false">
+      </label>
+      <input type="hidden" name="clause_kind_{{ loop.index0 }}" value="{{ clause.kind }}">
+      <button type="submit" name="form_action" value="remove_clause_{{ loop.index0 }}" class="secondary" formnovalidate aria-label="Remove this condition">Remove</button>
+    </div>
+    {% endfor %}
+    <datalist id="known-facts">
+      {% for name in known_facts %}<option value="{{ name }}"></option>{% endfor %}
+    </datalist>
+    <input type="hidden" name="condition" value="{{ rule.condition }}">
+
+    <small class="hint">With no conditions, this rule applies to every agent.</small>
+    <div class="actions">
+      <button type="submit" name="form_action" value="add_clause" class="secondary" formnovalidate>Add condition</button>
+      <button type="submit" name="form_action" value="use_expression" class="secondary" formnovalidate>Write an expression</button>
+    </div>
+    {% endif %}
+  </fieldset>
+
+  <label class="checkbox">
+    <input type="checkbox" name="enabled"{% if rule.enabled %} checked{% endif %}> Enabled
+  </label>
+
+  <fieldset>
+    <legend>Settings</legend>
+    <p class="hint">Anything left empty is decided by other rules.</p>
+
+    <label>Sample interval (seconds)
+      <input type="number" name="interval_secs" value="{{ rule.interval_secs }}" min="1">
+    </label>
+
+    <label>Fact report interval (seconds)
+      <input type="number" name="facts_interval_secs" value="{{ rule.facts_interval_secs }}" min="1">
+    </label>
+
+    {% for collector in rule.collectors %}
+    <label>Collector: {{ collector.name }}
+      <select name="collector_{{ collector.name }}">
+        <option value="inherit"{% if collector.choice == "inherit" %} selected{% endif %}>Decided by other rules</option>
+        <option value="on"{% if collector.choice == "on" %} selected{% endif %}>On</option>
+        <option value="off"{% if collector.choice == "off" %} selected{% endif %}>Off</option>
+      </select>
+    </label>
+    {% endfor %}
+
+    <label>Disk mount points
+      <textarea name="mount_points" rows="3" spellcheck="false">{{ rule.mount_points }}</textarea>
+      <small>One per line. Leave empty for every disk.</small>
+    </label>
+  </fieldset>
+
+  <div class="actions">
+    <button type="submit">Save rule</button>
+    {# The fragment brings the results into view, since the page reloads at the top. #}
+    <button type="submit" name="form_action" value="preview" class="secondary" formaction="{% if id %}/rules/{{ id }}{% else %}/rules{% endif %}#preview" formnovalidate>Preview</button>
+    <a class="button secondary" href="/rules">Cancel</a>
+  </div>
+</form>
+
+{% if preview %}
+<section id="preview" class="preview">
+  <h2>Preview</h2>
+  <p class="hint">Nothing has been saved. This shows what saving the form above would do, compared with the rules saved now.</p>
+  {% if not preview.enabled %}<p class="notice">This rule isn't enabled, so it won't apply to any agent. The table still shows who its condition matches.</p>{% endif %}
+
+  {% if preview.total == 0 %}
+  <p class="empty">There are no approved agents to try this rule on yet.</p>
+  {% else %}
+  <dl class="summary">
+    <dt>Approved agents</dt><dd>{{ preview.total }}</dd>
+    <dt>Match this rule</dt><dd>{{ preview.matching }}</dd>
+    <dt>Would change</dt><dd>{{ preview.changing }}</dd>
+  </dl>
+  <table>
+    <thead>
+      <tr><th>Agent</th><th>Status</th><th>Condition</th><th>What changes</th></tr>
+    </thead>
+    <tbody>
+      {% for agent in preview.agents %}
+      <tr>
+        <td>{{ agent.host }}</td>
+        <td>{% if agent.online %}<span class="badge good">Online</span>{% else %}<span class="badge neutral">Offline</span>{% endif %}</td>
+        <td>{% if agent.matches %}<span class="badge good">Matches</span>{% else %}<span class="badge neutral">No match</span>{% endif %}</td>
+        <td>
+          {% if agent.changes %}
+          <ul class="changes">
+            {% for change in agent.changes %}<li>{{ change }}</li>{% endfor %}
+          </ul>
+          {% else %}
+          <span class="hint">No change</span>
+          {% endif %}
+          {% if agent.note %}<small class="hint">{{ agent.note }}</small>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% if preview.hidden > 0 %}<p class="hint">{{ preview.hidden }} more not shown. Agents that change are listed first.</p>{% endif %}
+  {% endif %}
+</section>
+{% endif %}
+
+{% if id %}
+<form method="post" action="/rules/{{ id }}/delete" class="delete-form">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  <button type="submit" class="danger">Delete rule</button>
+</form>
+{% endif %}
+{% endblock content %}

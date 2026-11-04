@@ -1,13 +1,17 @@
 use std::collections::BTreeMap;
 
 use anyhow::Result;
+use maxnines_protocol::build_info;
 use serde_json::{Value, json};
 use sysinfo::{CpuRefreshKind, System};
+
+use crate::collector;
 
 /// Gathers what this machine is, as opposed to what it's doing. Everything here
 /// should rarely change, because each change is kept as history. That's why
 /// swap size, which some systems resize on demand, isn't included.
 pub fn gather(custom: &BTreeMap<String, Value>) -> Result<Value> {
+    let build = build_info!();
     let mut system = System::new()?;
     system.refresh_memory();
     system.refresh_cpu_list(CpuRefreshKind::nothing());
@@ -32,6 +36,12 @@ pub fn gather(custom: &BTreeMap<String, Value>) -> Result<Value> {
         "memory": {
             "total_bytes": system.total_memory(),
         },
+        "agent": {
+            "version": build.version,
+            "commit": build.commit,
+            "built_at": build.built_at,
+            "collectors": collector::SUPPORTED,
+        },
         "custom": custom,
     }))
 }
@@ -48,6 +58,22 @@ mod tests {
         assert!(facts["host"]["arch"].is_string());
         assert!(facts["cpu"]["logical_cores"].as_u64().unwrap() > 0);
         assert!(facts["memory"]["total_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(facts["agent"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(facts["agent"]["collectors"], json!(collector::SUPPORTED));
+    }
+
+    #[test]
+    fn reports_which_build_this_is() {
+        let facts = gather(&BTreeMap::new()).unwrap();
+        let agent = &facts["agent"];
+
+        let commit = agent["commit"].as_str().unwrap();
+        assert!(!commit.is_empty() && !commit.contains("VERGEN"), "{commit}");
+        let built_at = agent["built_at"].as_str().unwrap();
+        assert!(
+            built_at.starts_with("20") && built_at.ends_with('Z'),
+            "{built_at}"
+        );
     }
 
     #[test]

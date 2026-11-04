@@ -1,10 +1,12 @@
 use std::time::Duration;
 
 use anyhow::{Result, bail};
+use maxnines_protocol::{AgentConfig, COLLECTORS, CollectorSettings};
 use serde_json::{Value, json};
 use sysinfo::{Disks, Networks, System};
 
-use crate::config::CollectorConfig;
+/// What this agent can run, reported to the server as a fact.
+pub const SUPPORTED: [&str; 5] = COLLECTORS;
 
 /// How long to wait after building collectors before the first sample.
 /// CPU usage is measured between two refreshes, so it needs this gap.
@@ -22,7 +24,17 @@ pub fn host_name() -> String {
     System::host_name().unwrap_or_else(|_| "unknown".to_string())
 }
 
-pub fn build(name: &str, config: &CollectorConfig) -> Result<Box<dyn Collector>> {
+/// Builds everything a config turns on.
+pub fn build_all(config: &AgentConfig) -> Result<Vec<Box<dyn Collector>>> {
+    config
+        .collectors
+        .iter()
+        .filter(|(_, settings)| settings.enabled)
+        .map(|(name, settings)| build(name, settings))
+        .collect()
+}
+
+fn build(name: &str, config: &CollectorSettings) -> Result<Box<dyn Collector>> {
     Ok(match name {
         "host" => Box::new(HostCollector),
         "cpu" => Box::new(CpuCollector::new()?),
@@ -201,5 +213,46 @@ impl Collector for NetworkCollector {
             .collect();
 
         Ok(Value::Object(interfaces))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn config(collectors: Value) -> AgentConfig {
+        serde_json::from_value(json!({ "collectors": collectors })).unwrap()
+    }
+
+    #[test]
+    fn every_supported_collector_can_be_built() {
+        let settings = SUPPORTED.map(|name| (name, json!({})));
+        let collectors = Value::Object(
+            settings
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value))
+                .collect(),
+        );
+
+        assert_eq!(
+            build_all(&config(collectors)).unwrap().len(),
+            SUPPORTED.len()
+        );
+    }
+
+    #[test]
+    fn disabled_collectors_are_left_out() {
+        let collectors = json!({ "cpu": {}, "memory": { "enabled": false } });
+        let built = build_all(&config(collectors)).unwrap();
+
+        assert_eq!(built.len(), 1);
+        assert_eq!(built[0].name(), "cpu");
+    }
+
+    #[test]
+    fn an_unknown_collector_is_an_error() {
+        assert!(build_all(&config(json!({ "gpu": {} }))).is_err());
     }
 }
