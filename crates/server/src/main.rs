@@ -5,6 +5,8 @@ mod config;
 mod controllers;
 mod fact_history;
 mod facts;
+mod metric_charts;
+mod metrics;
 mod migrations;
 mod models;
 mod presence;
@@ -32,6 +34,7 @@ use tracing_subscriber::EnvFilter;
 
 use app_state::{AppState, Heartbeat};
 use config::Config;
+use metrics::Metrics;
 use models::Database;
 use presence::Presence;
 use registration::{Registry, Rules, hash_token};
@@ -110,7 +113,9 @@ async fn serve(path: &Path) -> Result<()> {
 
     let database = Database::connect(&config.database.resolve_url()?).await?;
     let agents = database.load_agents().await.context("loading agents")?;
-    let (writer, writer_thread) = store::spawn_writer(store::open(&config.metrics)?);
+    let store = store::open(&config.metrics)?;
+    let metrics = Metrics::new(store.reader()?);
+    let (writer, writer_thread) = store::spawn_writer(store);
 
     let state = AppState {
         presence: Arc::new(Presence::default()),
@@ -123,6 +128,7 @@ async fn serve(path: &Path) -> Result<()> {
         database,
         config_changes: Arc::new(watch::Sender::new(0)),
         writer: writer.clone(),
+        metrics,
         heartbeat: Heartbeat {
             interval: Duration::from_secs(config.heartbeat_interval_secs),
             timeout: Duration::from_secs(config.heartbeat_timeout_secs),

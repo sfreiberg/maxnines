@@ -7,7 +7,7 @@ use std::net::IpAddr;
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
-use axum::extract::{Path as UrlPath, Request, State};
+use axum::extract::{Path as UrlPath, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -20,6 +20,7 @@ use tracing::{error, info};
 
 use crate::app_state::AppState;
 use crate::facts::unflatten;
+use crate::metrics::{self, METRICS, Metric, SeriesResult, TimeRange, Unit, now_ms};
 use crate::models::{ConfigStatus, RuleInput};
 use crate::presence::AgentPresence;
 use crate::registration::{AgentRecord, AgentState, hash_token};
@@ -60,6 +61,9 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/admin/agents/{id}/facts", get(facts))
         .route("/admin/agents/{id}/facts/history", get(facts_history))
         .route("/admin/agents/{id}/config", get(agent_config))
+        .route("/admin/agents/{id}/metrics/{metric}", get(agent_metric))
+        .route("/admin/metrics", get(metric_catalog))
+        .route("/admin/metrics/current", get(current_metrics))
         .route("/admin/rules", get(list_rules).post(create_rule))
         .route(
             "/admin/rules/{id}",
@@ -150,6 +154,76 @@ async fn agent_config(State(state): State<AppState>, UrlPath(id): UrlPath<String
     };
     match state.database.config_status(&id).await {
         Ok(reported) => Json(AgentConfigView { desired, reported }).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// How much a query covers unless it says otherwise.
+const DEFAULT_RANGE_MS: i64 = 3_600_000;
+
+/// Enough for any real machine, while an agent inventing names can't make a
+/// response huge.
+const MAX_SERIES: usize = 100;
+
+async fn metric_catalog() -> Json<&'static [Metric]> {
+    Json(METRICS)
+}
+
+async fn current_metrics(State(state): State<AppState>) -> Response {
+    match state.metrics.current(now_ms()).await {
+        Ok(current) => Json(current).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MetricParams {
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct MetricView {
+    metric: &'static str,
+    unit: Unit,
+    from_ms: i64,
+    to_ms: i64,
+    step_ms: i64,
+    #[serde(flatten)]
+    result: SeriesResult,
+}
+
+async fn agent_metric(
+    State(state): State<AppState>,
+    UrlPath((id, name)): UrlPath<(String, String)>,
+    Query(params): Query<MetricParams>,
+) -> Response {
+    let (Some(agent), Some(metric)) = (state.registry.get(&id).await, metrics::find(&name)) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let to_ms = params.to_ms.unwrap_or_else(now_ms);
+    let from_ms = params
+        .from_ms
+        .unwrap_or_else(|| to_ms.saturating_sub(DEFAULT_RANGE_MS));
+    let Some(range) = TimeRange::new(from_ms, to_ms) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+
+    match state
+        .metrics
+        .series(&agent.id, metric, range, MAX_SERIES)
+        .await
+    {
+        Ok(result) => Json(MetricView {
+            metric: metric.name,
+            unit: metric.unit,
+            from_ms,
+            to_ms,
+            step_ms: range.step_ms,
+            result,
+        })
+        .into_response(),
         Err(error) => server_error(&error),
     }
 }

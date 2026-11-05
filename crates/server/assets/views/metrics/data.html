@@ -1,0 +1,24 @@
+{% extends "layouts/application.html" %}
+{% block title %}{{ chart.title }} on {{ host }} · MaxNines{% endblock title %}
+{% block content %}
+<p class="breadcrumb"><a href="/agents/{{ agent_id }}/metrics?range={{ range }}">{{ host }}</a></p>
+<h1>{{ chart.title }}</h1>
+<p class="hint">The last {{ range_label }}, as shown on the chart. Each value is an average for that period.</p>
+{% if chart.has_data %}
+<table>
+  <thead>
+    <tr><th>Time</th>{% for row in chart.summary %}<th class="number">{{ row.name }}</th>{% endfor %}</tr>
+  </thead>
+  <tbody>
+    {% for column in chart.columns %}
+    <tr>
+      <td>{{ column.time }}</td>
+      {% for cell in column.cells %}<td class="number">{% if cell %}{{ cell }}{% else %}–{% endif %}</td>{% endfor %}
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">No data in this range.</p>
+{% endif %}
+{% endblock content %}

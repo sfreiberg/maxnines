@@ -22,11 +22,12 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use crate::app_state::{AppState, Heartbeat};
 use crate::config::Config;
 use crate::controllers::app;
+use crate::metrics::{Metrics, TimeRange, now_ms};
 use crate::models::{Database, FactVersion, RuleInput};
 use crate::presence::Presence;
 use crate::registration::{AgentState, Registry, Rules, hash_token};
-use crate::store::spawn_writer;
 use crate::store::testing::{MemoryStore, Saved};
+use crate::store::{self, MetricsReader, Store, spawn_writer};
 use crate::views::Views;
 use crate::{AgentsCommand, Cli, Command};
 
@@ -39,6 +40,8 @@ struct TestServer {
     address: SocketAddr,
     state: AppState,
     saved: Saved,
+    /// Holds the metrics database, for tests that use a real one.
+    _folder: Option<tempfile::TempDir>,
 }
 
 fn identity() -> Identity {
@@ -50,12 +53,34 @@ async fn start() -> TestServer {
 }
 
 async fn start_with(config: &str) -> TestServer {
+    let saved = Saved::default();
+    let store = Box::new(MemoryStore(saved.clone()));
+    let reader = store.reader().unwrap();
+    start_on(config, store, reader, saved, None).await
+}
+
+/// Starts with a real metrics database, for tests of what's stored.
+async fn start_with_metrics() -> TestServer {
+    let folder = tempfile::tempdir().unwrap();
+    let path = folder.path().join("metrics.duckdb");
+    let text = format!("metrics \"duckdb\" {{\n  path = {path:?}\n}}\n");
+    let store = store::open(&Config::parse(&text).unwrap().metrics).unwrap();
+    let reader = store.reader().unwrap();
+    start_on("", store, reader, Saved::default(), Some(folder)).await
+}
+
+async fn start_on(
+    config: &str,
+    store: Box<dyn Store>,
+    reader: Arc<dyn MetricsReader>,
+    saved: Saved,
+    folder: Option<tempfile::TempDir>,
+) -> TestServer {
     let text = format!("{config}\nmetrics \"duckdb\" {{\n  path = \"x\"\n}}\n");
     let config = Config::parse(&text).unwrap();
 
     let database = Database::in_memory().await;
-    let saved = Saved::default();
-    let (writer, _thread) = spawn_writer(Box::new(MemoryStore(saved.clone())));
+    let (writer, _thread) = spawn_writer(store);
     let state = AppState {
         presence: Arc::new(Presence::default()),
         registry: Arc::new(Registry::new(
@@ -67,6 +92,7 @@ async fn start_with(config: &str) -> TestServer {
         database,
         config_changes: Arc::new(watch::Sender::new(0)),
         writer,
+        metrics: Metrics::new(reader),
         heartbeat: Heartbeat {
             interval: Duration::from_millis(50),
             timeout: Duration::from_millis(200),
@@ -87,6 +113,7 @@ async fn start_with(config: &str) -> TestServer {
         address,
         state,
         saved,
+        _folder: folder,
     }
 }
 
@@ -2067,4 +2094,549 @@ async fn every_page_shows_which_build_of_the_server_is_running() {
         assert!(page.body.contains(&build.commit), "{path}: {}", page.body);
         assert!(page.body.contains(&build.built_at), "{path}: {}", page.body);
     }
+}
+
+// ---- metrics
+
+/// What a real agent sends, for the keys the server reads.
+fn full_sample(timestamp_ms: u64, mount_point: &str) -> AgentMessage {
+    AgentMessage::Sample(Sample {
+        timestamp_ms,
+        metrics: BTreeMap::from([
+            (
+                "cpu".to_string(),
+                json!({
+                    "usage_percent": 42.5,
+                    "load_average": { "one": 1.5, "five": 1.0, "fifteen": 0.5 },
+                }),
+            ),
+            (
+                "memory".to_string(),
+                json!({
+                    "total_bytes": 1000,
+                    "used_bytes": 250,
+                    "swap_total_bytes": 100,
+                    "swap_used_bytes": 10,
+                }),
+            ),
+            (
+                "disk".to_string(),
+                json!([{ "mount_point": mount_point, "total_bytes": 100, "used_bytes": 60 }]),
+            ),
+            (
+                "network".to_string(),
+                json!({ "en0": { "received_bytes": 3000, "transmitted_bytes": 1500 } }),
+            ),
+        ]),
+    })
+}
+
+/// Connects an agent and waits until what it sent can be read back.
+async fn report_samples(server: &TestServer, mount_point: &str) -> (Identity, Client) {
+    let agent = identity();
+    let mut client = server.connect_approved(&agent, "web-1").await;
+
+    let now = now_ms() as u64;
+    for seconds_ago in [60, 45, 30, 15] {
+        send(
+            &mut client,
+            &full_sample(now - seconds_ago * 1000, mount_point),
+        )
+        .await;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let current = server.state.metrics.current(now_ms()).await.unwrap();
+        if current
+            .get(&agent.id())
+            .is_some_and(|v| v.time_ms >= (now - 15_000) as i64)
+        {
+            return (agent, client);
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the samples never arrived");
+}
+
+#[tokio::test]
+async fn samples_from_an_agent_reach_the_fleet_page() {
+    let server = start_with_metrics().await;
+    let (agent, _client) = report_samples(&server, "/data").await;
+
+    let page = Browser::default().get(&server, "/metrics").await;
+
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(
+        page.body
+            .contains(&format!("/agents/{}/metrics", agent.id()))
+    );
+    assert!(page.body.contains("web-1"));
+    for value in ["42.5%", "25%", "60%", "/data"] {
+        assert!(page.body.contains(value), "{value}: {}", page.body);
+    }
+}
+
+#[tokio::test]
+async fn samples_from_an_agent_reach_its_charts() {
+    let server = start_with_metrics().await;
+    let (agent, _client) = report_samples(&server, "/data").await;
+
+    let page = Browser::default()
+        .get(&server, &format!("/agents/{}/metrics", agent.id()))
+        .await;
+
+    assert_eq!(page.status, 200, "{}", page.body);
+    for title in [
+        "CPU usage",
+        "Load average",
+        "Memory usage",
+        "Disk usage",
+        "Network received",
+        "Network sent",
+    ] {
+        assert!(page.body.contains(title), "{title}");
+    }
+    assert!(page.body.contains("<polyline"), "{}", page.body);
+    assert!(
+        !page.body.contains("No data in this range"),
+        "{}",
+        page.body
+    );
+    // Every metric got a chart with something in it.
+    assert_eq!(
+        page.body.matches("<table class=\"chart-summary\">").count(),
+        6
+    );
+    assert!(
+        page.body.contains("200 B/s"),
+        "3000 bytes in 15s: {}",
+        page.body
+    );
+}
+
+#[tokio::test]
+async fn the_range_links_change_what_is_shown() {
+    let server = start_with_metrics().await;
+    let (agent, _client) = report_samples(&server, "/data").await;
+    let path = format!("/agents/{}/metrics", agent.id());
+    let mut browser = Browser::default();
+
+    let page = browser.get(&server, &format!("{path}?range=7d")).await;
+    assert_eq!(page.body.matches("class=\"selected\"").count(), 1);
+    assert!(
+        page.body.contains("metrics?range=7d\" class=\"selected\""),
+        "{}",
+        page.body
+    );
+    assert!(
+        page.body.contains("/metrics/cpu.usage?range=7d"),
+        "{}",
+        page.body
+    );
+
+    let page = browser
+        .get(&server, &format!("{path}?range=nonsense"))
+        .await;
+    assert_eq!(page.status, 200);
+    assert!(
+        page.body.contains("metrics?range=1h\" class=\"selected\""),
+        "{}",
+        page.body
+    );
+}
+
+#[tokio::test]
+async fn metric_pages_keep_themselves_up_to_date() {
+    let server = start_with_metrics().await;
+    let (agent, _client) = report_samples(&server, "/").await;
+    let mut browser = Browser::default();
+
+    for path in [
+        "/metrics".to_string(),
+        format!("/agents/{}/metrics", agent.id()),
+    ] {
+        let page = browser.get(&server, &path).await;
+        assert!(
+            page.body
+                .contains("<meta http-equiv=\"refresh\" content=\"60\">"),
+            "{path}"
+        );
+    }
+}
+
+/// How many samples of `metric` are stored in a range around now.
+async fn stored_points(server: &TestServer, agent: &Identity) -> usize {
+    let now = now_ms();
+    let range = TimeRange::new(now - 3_600_000, now + 3_600_000).unwrap();
+    let metric = crate::metrics::find("cpu.usage").unwrap();
+    let id = agent.id();
+    let result = server.state.metrics.series(&id, metric, range, 8);
+    let result = result.await.unwrap();
+    result
+        .series
+        .first()
+        .map_or(0, |series| series.points.len())
+}
+
+async fn wait_for_points(server: &TestServer, agent: &Identity, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while stored_points(server, agent).await < count {
+        assert!(Instant::now() < deadline, "the samples never arrived");
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn only_recent_samples_count_as_current() {
+    let server = start_with_metrics().await;
+    let agent = identity();
+    let mut client = server.connect_approved(&agent, "web-1").await;
+    let now = now_ms() as u64;
+
+    send(&mut client, &full_sample(now - 600_000, "/")).await;
+    wait_for_points(&server, &agent, 1).await;
+    let current = server.state.metrics.current(now_ms()).await.unwrap();
+    assert!(!current.contains_key(&agent.id()), "ten minutes old");
+
+    send(&mut client, &full_sample(now + 1_800_000, "/")).await;
+    wait_for_points(&server, &agent, 2).await;
+    let current = server.state.metrics.current(now_ms()).await.unwrap();
+    assert!(!current.contains_key(&agent.id()), "from the future");
+
+    send(&mut client, &full_sample(now - 240_000, "/")).await;
+    wait_for_points(&server, &agent, 3).await;
+    let current = server.state.metrics.current(now_ms()).await.unwrap();
+    assert!(current.contains_key(&agent.id()), "four minutes old");
+}
+
+#[tokio::test]
+async fn a_charts_numbers_can_be_read_as_a_table() {
+    let server = start_with_metrics().await;
+    let (agent, _client) = report_samples(&server, "/data").await;
+
+    let path = format!("/agents/{}/metrics/memory.usage?range=6h", agent.id());
+    let page = Browser::default().get(&server, &path).await;
+
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(
+        page.body.contains("<th class=\"number\">Swap</th>"),
+        "{}",
+        page.body
+    );
+    assert!(
+        page.body.contains("<td class=\"number\">25%</td>"),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains("The last 6 hours"), "{}", page.body);
+}
+
+#[tokio::test]
+async fn names_from_agents_are_escaped_on_metric_pages() {
+    let server = start_with_metrics().await;
+    let (agent, _client) = report_samples(&server, "<script>alert(1)</script>").await;
+    let mut browser = Browser::default();
+
+    for path in [
+        "/metrics".to_string(),
+        format!("/agents/{}/metrics", agent.id()),
+        format!("/agents/{}/metrics/disk.usage", agent.id()),
+    ] {
+        let page = browser.get(&server, &path).await;
+        assert_eq!(page.status, 200, "{path}");
+        assert!(
+            page.body.contains("&lt;script&gt;"),
+            "{path}: {}",
+            page.body
+        );
+        assert!(!page.body.contains("<script"), "{path}: {}", page.body);
+    }
+}
+
+#[tokio::test]
+async fn host_names_from_agents_are_escaped_on_metric_pages() {
+    let server = start().await;
+    let agent = identity();
+    let host = "<script>alert(2)</script>";
+    let _client = server.connect_approved(&agent, host).await;
+    let id = agent.id();
+    let mut browser = Browser::default();
+
+    for path in [
+        "/metrics".to_string(),
+        format!("/agents/{id}/metrics"),
+        format!("/agents/{id}/metrics/cpu.usage"),
+    ] {
+        let page = browser.get(&server, &path).await;
+        assert_eq!(page.status, 200, "{path}");
+        assert!(
+            page.body.contains("&lt;script&gt;"),
+            "{path}: {}",
+            page.body
+        );
+        assert!(!page.body.contains("<script"), "{path}: {}", page.body);
+    }
+}
+
+#[tokio::test]
+async fn fixed_series_are_listed_in_their_natural_order() {
+    let server = start_with_metrics().await;
+    let (agent, _client) = report_samples(&server, "/").await;
+
+    let path = format!("/agents/{}/metrics", agent.id());
+    let page = Browser::default().get(&server, &path).await;
+
+    // Sorted by name, 15 minutes would come before 5 minutes.
+    let position = |name: &str| {
+        let row = format!("</span>{name}</td>");
+        page.body.find(&row).unwrap_or_else(|| panic!("{name}"))
+    };
+    assert!(position("1 minute") < position("5 minutes"));
+    assert!(position("5 minutes") < position("15 minutes"));
+}
+
+#[tokio::test]
+async fn metric_pages_need_nothing_the_security_policy_blocks() {
+    let server = start_with_metrics().await;
+    let (agent, _client) = report_samples(&server, "/").await;
+
+    let path = format!("/agents/{}/metrics", agent.id());
+    let page = Browser::default().get(&server, &path).await;
+
+    assert_eq!(
+        page.header("content-security-policy").unwrap(),
+        "default-src 'none'; style-src 'self'; img-src 'self'; form-action 'self'; \
+         base-uri 'none'; frame-ancestors 'none'"
+    );
+    assert!(!page.body.contains(" style="), "inline styles are blocked");
+}
+
+#[tokio::test]
+async fn an_agent_with_no_metrics_gets_empty_charts() {
+    let server = start_with_metrics().await;
+    let agent = identity();
+    let _client = server.connect_approved(&agent, "quiet").await;
+    let mut browser = Browser::default();
+
+    let page = browser
+        .get(&server, &format!("/agents/{}/metrics", agent.id()))
+        .await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert_eq!(page.body.matches("No data in this range").count(), 6);
+
+    let page = browser.get(&server, "/metrics").await;
+    assert!(
+        page.body.contains("None in the last 5 minutes"),
+        "{}",
+        page.body
+    );
+}
+
+#[tokio::test]
+async fn only_approved_agents_are_on_the_fleet_page() {
+    let server = start().await;
+    let approved = identity();
+    let _client = server.connect_approved(&approved, "approved-host").await;
+    let mut pending = server.connect().await;
+    handshake(&mut pending, &identity(), "pending-host", None).await;
+
+    let page = Browser::default().get(&server, "/metrics").await;
+
+    assert!(page.body.contains("approved-host"));
+    assert!(!page.body.contains("pending-host"));
+}
+
+#[tokio::test]
+async fn unknown_agents_and_metrics_are_not_found() {
+    let server = start().await;
+    let agent = identity();
+    let _client = server.connect_approved(&agent, "web-1").await;
+    let id = agent.id();
+    let mut browser = Browser::default();
+
+    for path in [
+        "/agents/nope/metrics".to_string(),
+        "/agents/nope/metrics/cpu.usage".to_string(),
+        format!("/agents/{id}/metrics/nonsense"),
+    ] {
+        assert_eq!(browser.get(&server, &path).await.status, 404, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn the_agent_and_metric_pages_link_to_each_other() {
+    let server = start().await;
+    let agent = identity();
+    let _client = server.connect_approved(&agent, "web-1").await;
+    let id = agent.id();
+    let mut browser = Browser::default();
+
+    let page = browser.get(&server, &format!("/agents/{id}")).await;
+    assert!(
+        page.body
+            .contains(&format!("href=\"/agents/{id}/metrics\""))
+    );
+
+    let page = browser.get(&server, &format!("/agents/{id}/metrics")).await;
+    assert!(page.body.contains(&format!("href=\"/agents/{id}\"")));
+    assert!(page.body.contains("href=\"/metrics\""));
+}
+
+#[tokio::test]
+async fn the_metrics_api_needs_the_admin_token() {
+    let server = start().await;
+    for path in [
+        "/admin/metrics",
+        "/admin/metrics/current",
+        "/admin/agents/x/metrics/cpu.usage",
+    ] {
+        let response = server.http("GET", path, None).await;
+        assert!(response.starts_with("HTTP/1.1 401"), "{path}: {response}");
+    }
+}
+
+fn json_body(response: &str) -> Value {
+    let (_, body) = response.split_once("\r\n\r\n").unwrap();
+    serde_json::from_str(body).unwrap_or_else(|_| panic!("not JSON: {response}"))
+}
+
+#[tokio::test]
+async fn the_metrics_api_lists_what_can_be_asked_for() {
+    let server = start().await;
+
+    let response = server
+        .http("GET", "/admin/metrics", Some(ADMIN_TOKEN))
+        .await;
+
+    let catalog = json_body(&response);
+    assert_eq!(catalog.as_array().unwrap().len(), 6);
+    assert_eq!(
+        catalog[0],
+        json!({ "name": "cpu.usage", "title": "CPU usage", "unit": "percent", "collector": "cpu" })
+    );
+}
+
+#[tokio::test]
+async fn the_metrics_api_returns_series_and_current_values() {
+    let server = start_with_metrics().await;
+    let (agent, _client) = report_samples(&server, "/data").await;
+    let id = agent.id();
+
+    let path = format!("/admin/agents/{id}/metrics/cpu.usage");
+    let body = json_body(&server.http("GET", &path, Some(ADMIN_TOKEN)).await);
+
+    assert_eq!(body["metric"], "cpu.usage");
+    assert_eq!(body["unit"], "percent");
+    assert_eq!(body["step_ms"], 15_000);
+    assert_eq!(body["hidden"], 0);
+    assert_eq!(body["series"][0]["name"], "CPU");
+    let point = &body["series"][0]["points"][0];
+    assert_eq!(point["avg"], 42.5);
+    assert_eq!(point["min"], 42.5);
+    assert_eq!(point["max"], 42.5);
+
+    let body = json_body(
+        &server
+            .http("GET", "/admin/metrics/current", Some(ADMIN_TOKEN))
+            .await,
+    );
+    assert_eq!(body[&id]["cpu_percent"], 42.5);
+    assert_eq!(body[&id]["disk_mount_point"], "/data");
+}
+
+#[tokio::test]
+async fn the_metrics_api_can_be_given_a_time_range() {
+    let server = start_with_metrics().await;
+    let (agent, _client) = report_samples(&server, "/").await;
+    let now = now_ms();
+    let base = format!("/admin/agents/{}/metrics/cpu.usage", agent.id());
+
+    let path = format!(
+        "{base}?from_ms={}&to_ms={}",
+        now - 7_200_000,
+        now - 3_600_000
+    );
+    let body = json_body(&server.http("GET", &path, Some(ADMIN_TOKEN)).await);
+    assert_eq!(body["series"], json!([]));
+
+    let path = format!("{base}?from_ms={}&to_ms={now}", now - 86_400_000);
+    let body = json_body(&server.http("GET", &path, Some(ADMIN_TOKEN)).await);
+    assert_eq!(body["step_ms"], 600_000);
+    assert_eq!(body["series"][0]["name"], "CPU");
+}
+
+#[tokio::test]
+async fn the_metrics_api_refuses_what_it_can_not_answer() {
+    let server = start().await;
+    let agent = identity();
+    let _client = server.connect_approved(&agent, "web-1").await;
+    let id = agent.id();
+    let token = Some(ADMIN_TOKEN);
+
+    let metric = format!("/admin/agents/{id}/metrics/cpu.usage");
+    for query in [
+        "from_ms=5&to_ms=1",
+        "from_ms=-1&to_ms=5",
+        "to_ms=not-a-number",
+    ] {
+        let response = server
+            .http("GET", &format!("{metric}?{query}"), token)
+            .await;
+        assert!(response.starts_with("HTTP/1.1 400"), "{query}: {response}");
+    }
+    let far_future = format!("{metric}?to_ms={}", i64::MAX);
+    assert!(
+        server
+            .http("GET", &far_future, token)
+            .await
+            .starts_with("HTTP/1.1 400")
+    );
+
+    for path in [
+        format!("/admin/agents/{id}/metrics/nonsense"),
+        "/admin/agents/nope/metrics/cpu.usage".to_string(),
+    ] {
+        let response = server.http("GET", &path, token).await;
+        assert!(response.starts_with("HTTP/1.1 404"), "{path}: {response}");
+    }
+}
+
+/// Fails the way a real database might.
+struct BrokenReader;
+
+impl MetricsReader for BrokenReader {
+    fn series(
+        &self,
+        _query: &crate::metrics::SeriesQuery,
+    ) -> anyhow::Result<crate::metrics::SeriesResult> {
+        panic!("deliberate test panic");
+    }
+
+    fn latest(
+        &self,
+        _since_ms: i64,
+        _until_ms: i64,
+    ) -> anyhow::Result<Vec<crate::metrics::LatestSample>> {
+        anyhow::bail!("deliberate test failure with a secret in it");
+    }
+}
+
+#[tokio::test]
+async fn a_failing_metrics_query_only_fails_that_request() {
+    let saved = Saved::default();
+    let store = Box::new(MemoryStore(saved.clone()));
+    let server = start_on("", store, Arc::new(BrokenReader), saved, None).await;
+    let agent = identity();
+    let _client = server.connect_approved(&agent, "web-1").await;
+    let mut browser = Browser::default();
+
+    let path = format!("/agents/{}/metrics", agent.id());
+    assert_eq!(browser.get(&server, &path).await.status, 500, "a panic");
+
+    let page = browser.get(&server, "/metrics").await;
+    assert_eq!(page.status, 500, "an error");
+    assert!(!page.body.contains("secret"), "{}", page.body);
+
+    assert_eq!(browser.get(&server, "/agents").await.status, 200);
 }

@@ -5,12 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}MaxNines{% endblock title %}</title>
   <link rel="stylesheet" href="/assets/css/application.css">
+  {% block head %}{% endblock head %}
 </head>
 <body>
   <header class="site-header">
     <a class="brand" href="/">MaxNines</a>
     <nav>
       <a href="/agents">Agents</a>
+      <a href="/metrics">Metrics</a>
       <a href="/rules">Config rules</a>
     </nav>
   </header>

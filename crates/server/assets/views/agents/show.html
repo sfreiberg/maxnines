@@ -26,6 +26,8 @@
   <dt>Online</dt><dd>{% if agent.online %}Yes{% else %}No{% endif %}</dd>
 </dl>
 
+<p><a href="/agents/{{ agent.id }}/metrics">View metrics</a></p>
+
 <h2>Config</h2>
 <p><span class="badge {{ agent.config.class }}">{{ agent.config.label }}</span>
   {% if matched_rules %}from {{ matched_rules | join(sep=", ") }}{% else %}No rules match this agent.{% endif %}</p>

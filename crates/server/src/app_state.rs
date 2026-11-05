@@ -8,6 +8,7 @@ use ipnet::IpNet;
 use tokio::sync::{mpsc, watch};
 
 use crate::facts::{FlatFacts, unflatten};
+use crate::metrics::Metrics;
 use crate::models::{Database, RuleInput};
 use crate::presence::Presence;
 use crate::registration::{AgentState, Registry};
@@ -31,6 +32,7 @@ pub struct AppState {
     /// Bumped when rules change, so live connections work out their config again.
     pub config_changes: Arc<watch::Sender<u64>>,
     pub writer: mpsc::Sender<WriterCommand>,
+    pub metrics: Metrics,
     pub heartbeat: Heartbeat,
     /// The URL agents must have signed.
     pub audience: Arc<str>,

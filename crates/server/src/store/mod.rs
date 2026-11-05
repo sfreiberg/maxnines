@@ -1,10 +1,12 @@
-//! Metrics storage. To add a metrics database: implement [`Store`] in a new
-//! module, add a variant to [`MetricsConfig`], and add a match arm to [`open`].
+//! Metrics storage. To add a metrics database: implement [`Store`] and
+//! [`MetricsReader`] in a new module, add a variant to [`MetricsConfig`], and add
+//! a match arm to [`open`].
 //! Everything else the server keeps lives in [`crate::models`].
 
 mod duckdb;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use anyhow::Result;
@@ -13,6 +15,7 @@ use tokio::sync::mpsc;
 use tracing::error;
 
 use crate::config::MetricsConfig;
+use crate::metrics::{LatestSample, SeriesQuery, SeriesResult};
 
 /// Samples waiting to be written. When this fills up, connections stop reading
 /// from their agents until the database catches up.
@@ -22,6 +25,22 @@ const WRITE_QUEUE_SIZE: usize = 1024;
 pub trait Store: Send {
     /// Saves a whole sample: either all of it is stored or none of it is.
     fn write(&mut self, agent_id: &str, host: &str, sample: &Sample) -> Result<()>;
+
+    /// Something to read with, which can run alongside writes.
+    fn reader(&self) -> Result<Arc<dyn MetricsReader>>;
+
+    /// Called once at shutdown, after the last write.
+    fn close(&mut self) -> Result<()>;
+}
+
+/// Answers questions about what's been saved.
+pub trait MetricsReader: Send + Sync {
+    /// Buckets a metric for one agent. Series are sorted by name, and values
+    /// that aren't usable numbers are skipped.
+    fn series(&self, query: &SeriesQuery) -> Result<SeriesResult>;
+
+    /// The newest sample from each agent's collectors, between two times.
+    fn latest(&self, since_ms: i64, until_ms: i64) -> Result<Vec<LatestSample>>;
 }
 
 pub fn open(config: &MetricsConfig) -> Result<Box<dyn Store>> {
@@ -68,11 +87,17 @@ fn run_writer(mut store: Box<dyn Store>, mut commands: mpsc::Receiver<WriterComm
             WriterCommand::Stop => break,
         }
     }
+
+    match catch_unwind(AssertUnwindSafe(|| store.close())) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => error!(error = format!("{error:#}"), "closing the store failed"),
+        Err(_) => error!("store panicked while closing"),
+    }
 }
 
 #[cfg(test)]
 pub mod testing {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
     use anyhow::bail;
 
@@ -84,6 +109,20 @@ pub mod testing {
     pub struct Saved {
         /// (agent ID, host, timestamp)
         pub samples: Arc<Mutex<Vec<(String, String, u64)>>>,
+        pub closed: Arc<Mutex<bool>>,
+    }
+
+    /// Has nothing to report, for tests that aren't about metrics.
+    pub struct EmptyReader;
+
+    impl MetricsReader for EmptyReader {
+        fn series(&self, _query: &SeriesQuery) -> Result<SeriesResult> {
+            Ok(SeriesResult::default())
+        }
+
+        fn latest(&self, _since_ms: i64, _until_ms: i64) -> Result<Vec<LatestSample>> {
+            Ok(Vec::new())
+        }
     }
 
     /// Fails or panics when given those words as a host name.
@@ -100,6 +139,15 @@ pub mod testing {
                     sample.timestamp_ms,
                 )),
             }
+            Ok(())
+        }
+
+        fn reader(&self) -> Result<Arc<dyn MetricsReader>> {
+            Ok(Arc::new(EmptyReader))
+        }
+
+        fn close(&mut self) -> Result<()> {
+            *self.0.closed.lock().unwrap() = true;
             Ok(())
         }
     }
@@ -141,5 +189,16 @@ mod tests {
 
         let timestamps: Vec<u64> = saved.samples.lock().unwrap().iter().map(|s| s.2).collect();
         assert_eq!(timestamps, [1, 4]);
+    }
+
+    #[test]
+    fn stopping_closes_the_store() {
+        let saved = Saved::default();
+        let (sender, handle) = spawn_writer(Box::new(MemoryStore(saved.clone())));
+
+        sender.blocking_send(WriterCommand::Stop).unwrap();
+        handle.join().unwrap();
+
+        assert!(*saved.closed.lock().unwrap());
     }
 }

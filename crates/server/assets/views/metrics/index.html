@@ -1,0 +1,27 @@
+{% extends "layouts/application.html" %}
+{% block title %}Metrics · MaxNines{% endblock title %}
+{% block head %}<meta http-equiv="refresh" content="60">{% endblock head %}
+{% block content %}
+<h1>Metrics</h1>
+{% if agents %}
+<table class="fleet">
+  <thead>
+    <tr><th>Agent</th><th>Status</th><th>CPU</th><th>Memory</th><th>Fullest disk</th><th>Last sample</th></tr>
+  </thead>
+  <tbody>
+    {% for agent in agents %}
+    <tr>
+      <td><a href="/agents/{{ agent.id }}/metrics">{{ agent.host }}</a></td>
+      <td>{% if agent.online %}<span class="badge good">Online</span>{% else %}<span class="badge neutral">Offline</span>{% endif %}</td>
+      <td class="number">{% if agent.cpu %}{{ agent.cpu }}{% else %}–{% endif %}</td>
+      <td class="number">{% if agent.memory %}{{ agent.memory }}{% else %}–{% endif %}</td>
+      <td class="number">{% if agent.disk %}{{ agent.disk }} <small class="hint">{{ agent.disk_mount_point }}</small>{% else %}–{% endif %}</td>
+      <td>{% if agent.updated %}{{ agent.updated }}{% else %}<span class="hint">None in the last 5 minutes</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">There are no approved agents yet.</p>
+{% endif %}
+{% endblock content %}

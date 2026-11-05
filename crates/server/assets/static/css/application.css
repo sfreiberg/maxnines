@@ -12,6 +12,15 @@
   --bad: #b3261e;
   --bad-surface: #fbe9e7;
   --neutral-surface: #ececf0;
+  --grid: #e8e9ed;
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+  --series-5: #e87ba4;
+  --series-6: #008300;
+  --series-7: #6250d6;
+  --series-8: #e34948;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -28,6 +37,15 @@
     --bad: #f2a29b;
     --bad-surface: #3d1f1d;
     --neutral-surface: #2b2d35;
+    --grid: #2c2e36;
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #c98500;
+    --series-5: #d55181;
+    --series-6: #008300;
+    --series-7: #9085e9;
+    --series-8: #e66767;
   }
 }
 
@@ -134,7 +152,58 @@ fieldset .hint { margin: 0; }
 .preview td small { display: block; overflow-wrap: anywhere; }
 .changes { margin: 0; padding-left: 1.125rem; }
 
+td.number, th.number { text-align: right; font-variant-numeric: tabular-nums; }
+.fleet small { display: block; overflow-wrap: anywhere; }
+
+.ranges { display: flex; flex-wrap: wrap; gap: 0.25rem; margin: 1rem 0 0.25rem; }
+.ranges a { padding: 0.1875rem 0.625rem; border-radius: 6px; color: var(--muted); font-size: 0.875rem; text-decoration: none; }
+.ranges a:hover { background: var(--neutral-surface); color: var(--text); }
+.ranges a.selected { background: var(--accent); color: var(--accent-text); }
+
+.charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; margin-top: 1rem; }
+.chart-card { min-width: 0; padding: 0.75rem; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; }
+.chart-card .empty, .chart-card .hint { margin: 0.5rem 0 0; font-size: 0.875rem; }
+.chart-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; font-size: 0.8125rem; }
+.chart-heading h2 { margin: 0; font-size: 1rem; }
+
+svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font: 11px system-ui, -apple-system, "Segoe UI", sans-serif; }
+.chart .grid { stroke: var(--grid); stroke-width: 1; }
+.chart .tick { fill: var(--muted); font-variant-numeric: tabular-nums; }
+.chart .line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.chart .hit { fill: transparent; }
+.chart .reading { visibility: hidden; pointer-events: none; }
+.chart .column:hover .reading { visibility: visible; }
+.chart .crosshair { stroke: var(--muted); stroke-width: 1; }
+.chart .marker { stroke: var(--surface); stroke-width: 2; }
+.chart .tooltip { fill: var(--surface); stroke: var(--border); }
+.chart .tooltip-time { fill: var(--muted); }
+.chart .tooltip-row { fill: var(--muted); }
+.chart .tooltip-value { fill: var(--text); font-weight: 600; }
+.chart .key { stroke-width: 2; stroke-linecap: round; }
+
+.line.s1, .key.s1 { stroke: var(--series-1); } .dot.s1, .marker.s1 { fill: var(--series-1); } .key-swatch.s1 { background: var(--series-1); }
+.line.s2, .key.s2 { stroke: var(--series-2); } .dot.s2, .marker.s2 { fill: var(--series-2); } .key-swatch.s2 { background: var(--series-2); }
+.line.s3, .key.s3 { stroke: var(--series-3); } .dot.s3, .marker.s3 { fill: var(--series-3); } .key-swatch.s3 { background: var(--series-3); }
+.line.s4, .key.s4 { stroke: var(--series-4); } .dot.s4, .marker.s4 { fill: var(--series-4); } .key-swatch.s4 { background: var(--series-4); }
+.line.s5, .key.s5 { stroke: var(--series-5); } .dot.s5, .marker.s5 { fill: var(--series-5); } .key-swatch.s5 { background: var(--series-5); }
+.line.s6, .key.s6 { stroke: var(--series-6); } .dot.s6, .marker.s6 { fill: var(--series-6); } .key-swatch.s6 { background: var(--series-6); }
+.line.s7, .key.s7 { stroke: var(--series-7); } .dot.s7, .marker.s7 { fill: var(--series-7); } .key-swatch.s7 { background: var(--series-7); }
+.line.s8, .key.s8 { stroke: var(--series-8); } .dot.s8, .marker.s8 { fill: var(--series-8); } .key-swatch.s8 { background: var(--series-8); }
+
+.chart-summary { margin-top: 0.5rem; border: 0; font-size: 0.8125rem; }
+.chart-summary th, .chart-summary td { padding: 0.1875rem 0.25rem; overflow-wrap: anywhere; }
+.key-swatch { display: inline-block; width: 0.75rem; height: 2px; margin-right: 0.375rem; border-radius: 1px; vertical-align: middle; }
+
+@media (max-width: 48rem) {
+  .charts { grid-template-columns: minmax(0, 1fr); }
+}
+
 @media (max-width: 40rem) {
+  /* The drawing scales down with the page, so its text starts out larger. */
+  .chart .tick { font-size: 14px; }
+  /* Four short columns fit, and scrolling would hide the numbers. */
+  .chart-summary { display: table; }
+  .chart-summary td, .chart-summary td:first-child { min-width: 0; }
   main { padding: 1rem; }
   .site-footer { padding: 1rem; }
   .site-header { padding: 0.75rem 1rem; gap: 1rem; }
