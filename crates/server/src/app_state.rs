@@ -1,15 +1,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use axum::extract::FromRef;
 use axum_csrf::CsrfConfig;
 use ipnet::IpNet;
 use tokio::sync::{mpsc, watch};
 
+use crate::alerting::{self, AlertRuleInput, ChannelInput};
 use crate::facts::{FlatFacts, unflatten};
 use crate::metrics::Metrics;
 use crate::models::{Database, RuleInput};
+use crate::notifier::Mailer;
 use crate::presence::Presence;
 use crate::registration::{AgentState, Registry};
 use crate::rule_engine::{self, ResolvedConfig};
@@ -33,6 +35,8 @@ pub struct AppState {
     pub config_changes: Arc<watch::Sender<u64>>,
     pub writer: mpsc::Sender<WriterCommand>,
     pub metrics: Metrics,
+    /// Set when the config has a mail server.
+    pub mailer: Option<Arc<Mailer>>,
     pub heartbeat: Heartbeat,
     /// The URL agents must have signed.
     pub audience: Arc<str>,
@@ -85,6 +89,42 @@ impl AppState {
         tokio::task::spawn_blocking(move || rule_preview::preview(&rules, id, &rule, &agents))
             .await
             .context("working out the preview")
+    }
+
+    /// Everything that has to be true for an alert rule to be saved. `id` is the
+    /// saved rule it would replace.
+    pub async fn check_alert_rule(&self, input: &AlertRuleInput, id: Option<i64>) -> Result<()> {
+        alerting::check_rule(input)?;
+
+        let rules = self.database.list_alert_rules().await?;
+        let taken = rules
+            .iter()
+            .any(|rule| rule.rule.name == input.name && Some(rule.id) != id);
+        ensure!(
+            !taken,
+            "an alert rule named {:?} already exists",
+            input.name
+        );
+
+        let channels = self.database.list_channels().await?;
+        for wanted in &input.channels {
+            if !channels.iter().any(|channel| channel.id == *wanted) {
+                bail!("there's no notification channel {wanted}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Everything that has to be true for a channel to be saved. `id` is the
+    /// saved channel it would replace.
+    pub async fn check_channel(&self, input: &ChannelInput, id: Option<i64>) -> Result<()> {
+        alerting::check_channel(input)?;
+        let channels = self.database.list_channels().await?;
+        let taken = channels
+            .iter()
+            .any(|channel| channel.channel.name == input.name && Some(channel.id) != id);
+        ensure!(!taken, "a channel named {:?} already exists", input.name);
+        Ok(())
     }
 
     /// Tells live connections that rules changed.

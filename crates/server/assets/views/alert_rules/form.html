@@ -1,0 +1,101 @@
+{% extends "layouts/application.html" %}
+{% block title %}{% if id %}Edit alert rule{% else %}New alert rule{% endif %} · MaxNines{% endblock title %}
+{% block content %}
+<p class="breadcrumb"><a href="/alerts/rules">Alert rules</a></p>
+<h1>{% if id %}Edit alert rule{% else %}New alert rule{% endif %}</h1>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<form method="post" action="{% if id %}/alerts/rules/{{ id }}{% else %}/alerts/rules{% endif %}" class="stacked alert-rule">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  {# Pressing Enter uses the first button in a form, so it has to be Save. #}
+  <button type="submit" class="default-submit" tabindex="-1" aria-hidden="true">Save rule</button>
+
+  <label>Name
+    <input type="text" name="name" value="{{ rule.name }}" required maxlength="255">
+  </label>
+
+  <fieldset>
+    <legend>Alert when</legend>
+    <label>Type
+      <select name="kind">
+        <option value="metric"{% if rule.kind == "metric" %} selected{% endif %}>A metric crosses a threshold</option>
+        <option value="offline"{% if rule.kind == "offline" %} selected{% endif %}>An agent goes offline</option>
+      </select>
+    </label>
+
+    <div class="metric-fields">
+      <label>Metric
+        <select name="metric">
+          {% for metric in metrics %}
+          <option value="{{ metric.name }}"{% if metric.name == rule.metric %} selected{% endif %}>{{ metric.label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+
+      <label>Comparison
+        <select name="comparison">
+          <option value="above"{% if rule.comparison == "above" %} selected{% endif %}>Above</option>
+          <option value="below"{% if rule.comparison == "below" %} selected{% endif %}>Below</option>
+        </select>
+      </label>
+
+      <label>Threshold
+        <input type="text" name="threshold" value="{{ rule.threshold }}" inputmode="decimal" spellcheck="false">
+      </label>
+
+      <label>Series
+        <input type="text" name="series" value="{{ rule.series }}" spellcheck="false" placeholder="/data*">
+        <small>Limits this to matching disks, interfaces or lines on the chart, with <code>*</code> as a wildcard. Leave empty to watch each one separately.</small>
+      </label>
+    </div>
+
+    <label>For at least (seconds)
+      <input type="number" name="for_secs" value="{{ rule.for_secs }}" min="0" required>
+      <small>The problem has to last this long to alert, and be gone this long to resolve.</small>
+    </label>
+
+    <label>Severity
+      <select name="severity">
+        <option value="warning"{% if rule.severity == "warning" %} selected{% endif %}>Warning</option>
+        <option value="critical"{% if rule.severity == "critical" %} selected{% endif %}>Critical</option>
+      </select>
+    </label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Applies to</legend>
+    {% include "rules/_applies_to.html" %}
+  </fieldset>
+
+  <fieldset>
+    <legend>Notify</legend>
+    {% if channels %}
+    {% for channel in channels %}
+    <label class="checkbox">
+      <input type="checkbox" name="channel_{{ channel.id }}"{% if channel.selected %} checked{% endif %}> {{ channel.name }}
+    </label>
+    {% endfor %}
+    <small class="hint">With none chosen, alerts only show on the Alerts page.</small>
+    {% else %}
+    <p class="hint">There are no <a href="/alerts/channels">notification channels</a> yet, so alerts will only show on the Alerts page.</p>
+    {% endif %}
+  </fieldset>
+
+  <label class="checkbox">
+    <input type="checkbox" name="enabled"{% if rule.enabled %} checked{% endif %}> Enabled
+  </label>
+
+  <div class="actions">
+    <button type="submit">Save rule</button>
+    <a class="button secondary" href="/alerts/rules">Cancel</a>
+  </div>
+</form>
+
+{% if id %}
+<form method="post" action="/alerts/rules/{{ id }}/delete" class="delete-form">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  <button type="submit" class="danger">Delete rule</button>
+</form>
+{% endif %}
+{% endblock content %}

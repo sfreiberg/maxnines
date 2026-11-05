@@ -161,12 +161,20 @@ fn describe_changes(before: &ResolvedConfig, after: &ResolvedConfig) -> Vec<Stri
             _ => {}
         }
         if let Some(now) = now {
-            let was = was.and_then(|settings| settings.mount_points.as_ref());
-            if was != now.mount_points.as_ref() {
+            let old_mounts = was.and_then(|settings| settings.mount_points.as_ref());
+            if old_mounts != now.mount_points.as_ref() {
                 changes.push(format!(
                     "{name} mount points: {} → {}",
-                    describe_mounts(was),
+                    describe_mounts(old_mounts),
                     describe_mounts(now.mount_points.as_ref())
+                ));
+            }
+            let old_names = was.and_then(|settings| settings.names.as_ref());
+            if old_names != now.names.as_ref() {
+                changes.push(format!(
+                    "{name} watches: {} → {}",
+                    describe_names(old_names),
+                    describe_names(now.names.as_ref())
                 ));
             }
         }
@@ -189,11 +197,34 @@ fn describe_mounts(mounts: Option<&Vec<String>>) -> String {
     mounts.map_or("every disk".to_string(), |mounts| mounts.join(", "))
 }
 
+fn describe_names(names: Option<&Vec<String>>) -> String {
+    names.map_or("nothing".to_string(), |names| names.join(", "))
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn watched_processes_are_part_of_what_changes() {
+        let config = |names: Value| -> AgentConfig {
+            serde_json::from_value(json!({ "collectors": { "processes": { "names": names } } }))
+                .unwrap()
+        };
+        let resolved = |config: AgentConfig| ResolvedConfig {
+            version: String::new(),
+            config,
+            matched_rules: Vec::new(),
+            skipped_collectors: Vec::new(),
+        };
+        let changes = describe_changes(
+            &resolved(config(json!(["nginx"]))),
+            &resolved(config(json!(["nginx", "postgres"]))),
+        );
+        assert_eq!(changes, ["processes watches: nginx → nginx, postgres"]);
+    }
 
     fn saved(
         id: i64,

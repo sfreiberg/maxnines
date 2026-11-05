@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{error, info};
 
+use crate::alerting::{AlertRuleInput, ChannelInput, ChannelKind};
 use crate::app_state::AppState;
 use crate::facts::unflatten;
 use crate::metrics::{self, METRICS, Metric, SeriesResult, TimeRange, Unit, now_ms};
@@ -68,6 +69,25 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route(
             "/admin/rules/{id}",
             get(show_rule).put(update_rule).delete(delete_rule),
+        )
+        .route("/admin/alerts", get(list_alerts))
+        .route(
+            "/admin/alert-rules",
+            get(list_alert_rules).post(create_alert_rule),
+        )
+        .route(
+            "/admin/alert-rules/{id}",
+            get(show_alert_rule)
+                .put(update_alert_rule)
+                .delete(delete_alert_rule),
+        )
+        .route(
+            "/admin/notification-channels",
+            get(list_channels).post(create_channel),
+        )
+        .route(
+            "/admin/notification-channels/{id}",
+            get(show_channel).put(update_channel).delete(delete_channel),
         )
         .route("/admin/agents/{id}/approve", post(approve))
         .route("/admin/agents/{id}/revoke", post(revoke))
@@ -280,6 +300,151 @@ async fn delete_rule(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -
             state.config_changed();
             StatusCode::NO_CONTENT.into_response()
         }
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// How many ended alerts the API returns.
+const RESOLVED_ALERTS: u64 = 200;
+
+async fn list_alerts(State(state): State<AppState>) -> Response {
+    let alerts = async {
+        let open = state.database.open_alerts().await?;
+        let resolved = state.database.resolved_alerts(RESOLVED_ALERTS).await?;
+        anyhow::Ok(json!({ "open": open, "resolved": resolved }))
+    };
+    match alerts.await {
+        Ok(alerts) => Json(alerts).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+fn refused(error: &anyhow::Error) -> Response {
+    let body = Json(json!({ "error": format!("{error:#}") }));
+    (StatusCode::UNPROCESSABLE_ENTITY, body).into_response()
+}
+
+async fn list_alert_rules(State(state): State<AppState>) -> Response {
+    match state.database.list_alert_rules().await {
+        Ok(rules) => Json(rules).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn show_alert_rule(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.get_alert_rule(id).await {
+        Ok(Some(rule)) => Json(rule).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn create_alert_rule(
+    State(state): State<AppState>,
+    Json(input): Json<AlertRuleInput>,
+) -> Response {
+    if let Err(error) = state.check_alert_rule(&input, None).await {
+        return refused(&error);
+    }
+    match state.database.create_alert_rule(&input).await {
+        Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn update_alert_rule(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<i64>,
+    Json(input): Json<AlertRuleInput>,
+) -> Response {
+    if let Err(error) = state.check_alert_rule(&input, Some(id)).await {
+        return refused(&error);
+    }
+    match state.database.update_alert_rule(id, &input).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn delete_alert_rule(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.delete_alert_rule(id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// A channel as the API shows it. A webhook's URL can be set but not read back.
+#[derive(Debug, Serialize)]
+struct ChannelView {
+    id: i64,
+    name: String,
+    kind: ChannelKind,
+    target_preview: String,
+}
+
+impl ChannelView {
+    fn new(channel: crate::alerting::Channel) -> Self {
+        Self {
+            id: channel.id,
+            target_preview: channel.channel.target_preview(),
+            name: channel.channel.name,
+            kind: channel.channel.kind,
+        }
+    }
+}
+
+async fn list_channels(State(state): State<AppState>) -> Response {
+    match state.database.list_channels().await {
+        Ok(channels) => {
+            let views: Vec<ChannelView> = channels.into_iter().map(ChannelView::new).collect();
+            Json(views).into_response()
+        }
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn show_channel(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.get_channel(id).await {
+        Ok(Some(channel)) => Json(ChannelView::new(channel)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn create_channel(
+    State(state): State<AppState>,
+    Json(input): Json<ChannelInput>,
+) -> Response {
+    if let Err(error) = state.check_channel(&input, None).await {
+        return refused(&error);
+    }
+    match state.database.create_channel(&input).await {
+        Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn update_channel(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<i64>,
+    Json(input): Json<ChannelInput>,
+) -> Response {
+    if let Err(error) = state.check_channel(&input, Some(id)).await {
+        return refused(&error);
+    }
+    match state.database.update_channel(id, &input).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn delete_channel(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.delete_channel(id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),
     }

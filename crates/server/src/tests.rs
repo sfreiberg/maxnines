@@ -1,5 +1,7 @@
 //! Tests that run the real router over real sockets.
 
+mod alerting;
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -22,6 +24,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use crate::app_state::{AppState, Heartbeat};
 use crate::config::Config;
 use crate::controllers::app;
+use crate::facts::FlatFacts;
 use crate::metrics::{Metrics, TimeRange, now_ms};
 use crate::models::{Database, FactVersion, RuleInput};
 use crate::presence::Presence;
@@ -93,6 +96,7 @@ async fn start_on(
         config_changes: Arc::new(watch::Sender::new(0)),
         writer,
         metrics: Metrics::new(reader),
+        mailer: None,
         heartbeat: Heartbeat {
             interval: Duration::from_millis(50),
             timeout: Duration::from_millis(200),
@@ -2510,7 +2514,7 @@ async fn the_metrics_api_lists_what_can_be_asked_for() {
         .await;
 
     let catalog = json_body(&response);
-    assert_eq!(catalog.as_array().unwrap().len(), 6);
+    assert_eq!(catalog.as_array().unwrap().len(), 9);
     assert_eq!(
         catalog[0],
         json!({ "name": "cpu.usage", "title": "CPU usage", "unit": "percent", "collector": "cpu" })
@@ -2618,6 +2622,15 @@ impl MetricsReader for BrokenReader {
         _since_ms: i64,
         _until_ms: i64,
     ) -> anyhow::Result<Vec<crate::metrics::LatestSample>> {
+        anyhow::bail!("deliberate test failure with a secret in it");
+    }
+
+    fn newest(
+        &self,
+        _metric: &crate::metrics::Metric,
+        _since_ms: i64,
+        _until_ms: i64,
+    ) -> anyhow::Result<Vec<crate::metrics::NewestReading>> {
         anyhow::bail!("deliberate test failure with a secret in it");
     }
 }

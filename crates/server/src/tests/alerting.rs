@@ -1,0 +1,1935 @@
+//! Alerting from end to end: real rules in a real database, agents on real
+//! sockets, and webhooks and email delivered to local servers. Readings are
+//! scripted so each test decides what the metrics say, and time is passed in.
+
+use std::sync::Mutex;
+
+use axum::Router;
+use axum::http::StatusCode;
+use axum::routing::post;
+use tokio::io::{AsyncBufReadExt, BufReader};
+
+use super::*;
+use crate::alert_evaluator::Evaluator;
+use crate::alerting::{
+    AlertRuleInput, ChannelInput, ChannelKind, Comparison, Delivery, Event, RuleKind, Severity,
+};
+use crate::metrics::{Metric, NewestReading};
+use crate::notifier::{Mailer, Notifier};
+
+const MINUTE_MS: i64 = 60_000;
+
+/// What the metrics store will say next.
+#[derive(Clone, Default)]
+struct Script {
+    readings: Arc<Mutex<Vec<NewestReading>>>,
+    broken: Arc<Mutex<bool>>,
+}
+
+impl Script {
+    fn set(&self, readings: Vec<NewestReading>) {
+        *self.readings.lock().unwrap() = readings;
+    }
+
+    fn set_broken(&self, broken: bool) {
+        *self.broken.lock().unwrap() = broken;
+    }
+}
+
+impl MetricsReader for Script {
+    fn series(
+        &self,
+        _query: &crate::metrics::SeriesQuery,
+    ) -> anyhow::Result<crate::metrics::SeriesResult> {
+        Ok(Default::default())
+    }
+
+    fn latest(
+        &self,
+        _since_ms: i64,
+        _until_ms: i64,
+    ) -> anyhow::Result<Vec<crate::metrics::LatestSample>> {
+        Ok(Vec::new())
+    }
+
+    fn newest(
+        &self,
+        _metric: &Metric,
+        _since_ms: i64,
+        _until_ms: i64,
+    ) -> anyhow::Result<Vec<NewestReading>> {
+        if *self.broken.lock().unwrap() {
+            anyhow::bail!("deliberate test failure");
+        }
+        Ok(self.readings.lock().unwrap().clone())
+    }
+}
+
+/// A server with one connected agent, and an evaluator that started an hour ago.
+struct Harness {
+    server: TestServer,
+    script: Script,
+    evaluator: Evaluator,
+    agent: Identity,
+    client: Option<Client>,
+    /// A time to count from. Later than any presence change in the test.
+    now: i64,
+}
+
+impl Harness {
+    async fn start() -> Self {
+        let script = Script::default();
+        let saved = Saved::default();
+        let store = Box::new(crate::store::testing::MemoryStore(saved.clone()));
+        let server = start_on("", store, Arc::new(script.clone()), saved, None).await;
+
+        let agent = identity();
+        let client = server.connect_approved(&agent, "web-1").await;
+        let now = now_ms() + MINUTE_MS;
+        let evaluator = evaluator(&server, now - 60 * MINUTE_MS);
+        Self {
+            server,
+            script,
+            evaluator,
+            agent,
+            client: Some(client),
+            now,
+        }
+    }
+
+    fn database(&self) -> &Database {
+        &self.server.state.database
+    }
+
+    fn id(&self) -> String {
+        self.agent.id()
+    }
+
+    fn reading(&self, series: &str, time_ms: i64, value: f64) -> NewestReading {
+        NewestReading {
+            agent_id: self.id(),
+            series: series.to_string(),
+            time_ms,
+            value,
+        }
+    }
+
+    /// Checks rules at `offset_ms` with a new CPU reading.
+    async fn cpu(&mut self, offset_ms: i64, value: f64) {
+        let time = self.now + offset_ms;
+        self.script.set(vec![self.reading("CPU", time, value)]);
+        self.evaluate(offset_ms).await;
+    }
+
+    async fn evaluate(&mut self, offset_ms: i64) {
+        self.evaluator.evaluate(self.now + offset_ms).await.unwrap();
+    }
+
+    async fn open(&self) -> Vec<crate::alerting::Alert> {
+        self.database().open_alerts().await.unwrap()
+    }
+
+    async fn resolved(&self) -> Vec<crate::alerting::Alert> {
+        self.database().resolved_alerts(100).await.unwrap()
+    }
+
+    async fn go_offline(&mut self) {
+        self.client.take();
+        self.server.wait_for_online(&self.id(), false).await;
+    }
+}
+
+fn evaluator(server: &TestServer, started_ms: i64) -> Evaluator {
+    Evaluator::new(
+        server.state.database.clone(),
+        server.state.registry.clone(),
+        server.state.presence.clone(),
+        server.state.metrics.clone(),
+        started_ms,
+    )
+}
+
+fn cpu_rule() -> AlertRuleInput {
+    AlertRuleInput {
+        name: "High CPU".to_string(),
+        kind: RuleKind::Metric,
+        metric: Some("cpu.usage".to_string()),
+        series: None,
+        comparison: Some(Comparison::Above),
+        threshold: Some(90.0),
+        for_secs: 120,
+        severity: Severity::Critical,
+        condition: None,
+        enabled: true,
+        channels: Vec::new(),
+    }
+}
+
+fn offline_rule() -> AlertRuleInput {
+    AlertRuleInput {
+        name: "Gone".to_string(),
+        kind: RuleKind::Offline,
+        metric: None,
+        comparison: None,
+        threshold: None,
+        for_secs: 60,
+        ..cpu_rule()
+    }
+}
+
+// ---- when alerts start and end
+
+#[tokio::test]
+async fn a_metric_alert_fires_once_and_resolves_when_it_clears() {
+    let mut test = Harness::start().await;
+    test.database()
+        .create_alert_rule(&cpu_rule())
+        .await
+        .unwrap();
+
+    test.cpu(0, 95.0).await;
+    test.cpu(MINUTE_MS, 95.0).await;
+    assert!(test.open().await.is_empty(), "it hasn't lasted long enough");
+
+    test.cpu(2 * MINUTE_MS, 96.5).await;
+    let open = test.open().await;
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].value, Some(96.5));
+    assert_eq!(open[0].host, "web-1");
+    assert_eq!(open[0].severity, Severity::Critical);
+    assert_eq!(
+        open[0].summary,
+        "CPU usage on web-1 is 96.5%, above 90% for 2 minutes"
+    );
+
+    test.cpu(3 * MINUTE_MS, 97.0).await;
+    assert_eq!(
+        test.open().await.len(),
+        1,
+        "one alert, however long it lasts"
+    );
+
+    test.cpu(4 * MINUTE_MS, 10.0).await;
+    test.cpu(5 * MINUTE_MS, 10.0).await;
+    assert_eq!(
+        test.open().await.len(),
+        1,
+        "it hasn't been clear long enough"
+    );
+
+    test.cpu(6 * MINUTE_MS, 10.0).await;
+    assert!(test.open().await.is_empty());
+    let resolved = test.resolved().await;
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(
+        resolved[0].resolve_reason.as_deref(),
+        Some("The problem cleared")
+    );
+    assert_eq!(resolved[0].resolved_ms, Some(test.now + 6 * MINUTE_MS));
+}
+
+#[tokio::test]
+async fn a_short_spike_does_not_alert() {
+    let mut test = Harness::start().await;
+    test.database()
+        .create_alert_rule(&cpu_rule())
+        .await
+        .unwrap();
+
+    test.cpu(0, 95.0).await;
+    test.cpu(MINUTE_MS, 10.0).await;
+    test.cpu(2 * MINUTE_MS, 95.0).await;
+    test.cpu(3 * MINUTE_MS, 95.0).await;
+    assert!(test.open().await.is_empty());
+}
+
+#[tokio::test]
+async fn the_same_sample_is_not_counted_twice() {
+    let mut test = Harness::start().await;
+    test.database()
+        .create_alert_rule(&cpu_rule())
+        .await
+        .unwrap();
+
+    test.cpu(0, 95.0).await;
+    // Time passes, but the agent hasn't reported anything new.
+    test.evaluate(5 * MINUTE_MS).await;
+    assert!(test.open().await.is_empty());
+
+    test.cpu(6 * MINUTE_MS, 95.0).await;
+    assert_eq!(test.open().await.len(), 1);
+}
+
+#[tokio::test]
+async fn below_rules_fire_on_low_readings() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        comparison: Some(Comparison::Below),
+        threshold: Some(5.0),
+        for_secs: 0,
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+
+    test.cpu(0, 6.0).await;
+    assert!(test.open().await.is_empty());
+    test.cpu(MINUTE_MS, 4.0).await;
+    assert_eq!(test.open().await.len(), 1);
+}
+
+#[tokio::test]
+async fn each_series_alerts_separately() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        metric: Some("disk.usage".to_string()),
+        for_secs: 0,
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+
+    let readings = vec![
+        test.reading("/", test.now, 95.0),
+        test.reading("/data", test.now, 96.0),
+        test.reading("/tmp", test.now, 5.0),
+    ];
+    test.script.set(readings);
+    test.evaluate(0).await;
+
+    let mut series: Vec<String> = test.open().await.into_iter().map(|a| a.series).collect();
+    series.sort();
+    assert_eq!(series, ["/", "/data"]);
+}
+
+#[tokio::test]
+async fn a_rule_can_be_limited_to_some_series() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        metric: Some("disk.usage".to_string()),
+        series: Some("/data*".to_string()),
+        for_secs: 0,
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+
+    let readings = vec![
+        test.reading("/", test.now, 95.0),
+        test.reading("/data/logs", test.now, 96.0),
+    ];
+    test.script.set(readings);
+    test.evaluate(0).await;
+
+    let open = test.open().await;
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].series, "/data/logs");
+}
+
+#[tokio::test]
+async fn a_condition_limits_which_agents_a_rule_watches() {
+    let mut test = Harness::start().await;
+    let other = identity();
+    let _client = test.server.connect_approved(&other, "db-1").await;
+    let facts = |role: &str| FlatFacts::from([("custom.role".to_string(), json!(role))]);
+    let now = now_ms() as u64;
+    test.database()
+        .record_facts(&test.id(), &facts("web"), now)
+        .await
+        .unwrap();
+    test.database()
+        .record_facts(&other.id(), &facts("db"), now)
+        .await
+        .unwrap();
+
+    let rule = AlertRuleInput {
+        condition: Some(r#"facts.custom.role == "db""#.to_string()),
+        for_secs: 0,
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+
+    let mut readings = vec![test.reading("CPU", test.now, 95.0)];
+    readings.push(NewestReading {
+        agent_id: other.id(),
+        ..test.reading("CPU", test.now, 95.0)
+    });
+    test.script.set(readings);
+    test.evaluate(0).await;
+
+    let open = test.open().await;
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].host, "db-1");
+}
+
+#[tokio::test]
+async fn a_disabled_rule_watches_nothing_and_closes_its_alerts() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        for_secs: 0,
+        ..cpu_rule()
+    };
+    let id = test.database().create_alert_rule(&rule).await.unwrap();
+    test.cpu(0, 95.0).await;
+    assert_eq!(test.open().await.len(), 1);
+
+    let disabled = AlertRuleInput {
+        enabled: false,
+        ..rule
+    };
+    test.database()
+        .update_alert_rule(id, &disabled)
+        .await
+        .unwrap();
+    test.cpu(MINUTE_MS, 96.0).await;
+
+    assert!(test.open().await.is_empty());
+    assert_eq!(
+        test.resolved().await[0].resolve_reason.as_deref(),
+        Some("The rule was deleted or disabled")
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_rule_closes_its_alerts_and_keeps_the_history() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        for_secs: 0,
+        ..cpu_rule()
+    };
+    let id = test.database().create_alert_rule(&rule).await.unwrap();
+    test.cpu(0, 95.0).await;
+
+    assert!(test.database().delete_alert_rule(id).await.unwrap());
+    test.evaluate(MINUTE_MS).await;
+
+    assert!(test.open().await.is_empty());
+    let resolved = test.resolved().await;
+    assert_eq!(resolved[0].rule_id, None);
+    assert_eq!(resolved[0].rule_name, "High CPU");
+}
+
+#[tokio::test]
+async fn a_rule_that_stops_matching_closes_its_alerts() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        for_secs: 0,
+        ..cpu_rule()
+    };
+    let id = test.database().create_alert_rule(&rule).await.unwrap();
+    test.cpu(0, 95.0).await;
+
+    let narrowed = AlertRuleInput {
+        condition: Some("false".to_string()),
+        ..rule
+    };
+    test.database()
+        .update_alert_rule(id, &narrowed)
+        .await
+        .unwrap();
+    test.cpu(MINUTE_MS, 96.0).await;
+
+    assert_eq!(
+        test.resolved().await[0].resolve_reason.as_deref(),
+        Some("The rule no longer applies to this agent")
+    );
+}
+
+#[tokio::test]
+async fn revoking_an_agent_closes_its_alerts() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        for_secs: 0,
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    test.cpu(0, 95.0).await;
+
+    let id = test.id();
+    test.server
+        .state
+        .registry
+        .decide(&id, AgentState::Revoked)
+        .await
+        .unwrap();
+    test.cpu(MINUTE_MS, 96.0).await;
+
+    assert_eq!(
+        test.resolved().await[0].resolve_reason.as_deref(),
+        Some("The agent is no longer approved")
+    );
+}
+
+#[tokio::test]
+async fn missing_data_does_not_close_an_alert() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        for_secs: 0,
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    test.cpu(0, 95.0).await;
+
+    test.script.set(Vec::new());
+    test.evaluate(10 * MINUTE_MS).await;
+    assert_eq!(test.open().await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_failed_metrics_read_changes_nothing() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        for_secs: 0,
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    test.cpu(0, 95.0).await;
+
+    test.script.set_broken(true);
+    test.evaluate(MINUTE_MS).await;
+    assert_eq!(test.open().await.len(), 1);
+
+    test.script.set_broken(false);
+    test.cpu(2 * MINUTE_MS, 10.0).await;
+    assert!(test.open().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_series_that_disappears_closes_its_alert() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        metric: Some("disk.usage".to_string()),
+        for_secs: 0,
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+
+    let readings = vec![
+        test.reading("/mnt/usb", test.now, 95.0),
+        test.reading("/", test.now, 5.0),
+    ];
+    test.script.set(readings);
+    test.evaluate(0).await;
+    assert_eq!(test.open().await.len(), 1);
+
+    // The agent is still reporting, so the disk really has gone.
+    let time = test.now + MINUTE_MS;
+    let readings = vec![test.reading("/", time, 5.0)];
+    test.script.set(readings);
+    test.evaluate(MINUTE_MS).await;
+
+    assert!(test.open().await.is_empty());
+    assert_eq!(
+        test.resolved().await[0].resolve_reason.as_deref(),
+        Some("This series is no longer reported")
+    );
+}
+
+#[tokio::test]
+async fn a_restart_does_not_repeat_an_open_alert() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        for_secs: 0,
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    test.cpu(0, 95.0).await;
+
+    test.evaluator = evaluator(&test.server, test.now);
+    test.cpu(MINUTE_MS, 95.0).await;
+    assert_eq!(test.open().await.len(), 1);
+    assert!(test.resolved().await.is_empty());
+
+    test.cpu(2 * MINUTE_MS, 10.0).await;
+    assert!(test.open().await.is_empty());
+}
+
+#[tokio::test]
+async fn names_agents_choose_are_cleaned_before_they_are_kept() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        metric: Some("disk.usage".to_string()),
+        for_secs: 0,
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+
+    let long = format!("/evil\r\nBcc: x@example.com\0{}", "x".repeat(400));
+    let readings = vec![test.reading(&long, test.now, 95.0)];
+    test.script.set(readings);
+    test.evaluate(0).await;
+    let readings = vec![test.reading(&long, test.now + 1, 95.0)];
+    test.script.set(readings);
+    test.evaluate(1).await;
+
+    let open = test.open().await;
+    assert_eq!(open.len(), 1, "the cleaned name still matches itself");
+    assert!(!open[0].series.chars().any(char::is_control));
+    assert!(!open[0].summary.chars().any(char::is_control));
+    assert_eq!(open[0].series.chars().count(), 255);
+}
+
+#[tokio::test]
+async fn an_agent_cannot_flood_alerts_by_inventing_series() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        metric: Some("disk.usage".to_string()),
+        for_secs: 0,
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+
+    let readings = (0..500)
+        .map(|index| test.reading(&format!("/m{index:03}"), test.now, 95.0))
+        .collect();
+    test.script.set(readings);
+    test.evaluate(0).await;
+
+    assert_eq!(test.open().await.len(), 64);
+}
+
+#[tokio::test]
+async fn an_agent_going_offline_alerts_after_the_wait() {
+    let mut test = Harness::start().await;
+    test.database()
+        .create_alert_rule(&offline_rule())
+        .await
+        .unwrap();
+
+    test.evaluate(0).await;
+    assert!(test.open().await.is_empty(), "it's online");
+
+    test.go_offline().await;
+    let gone = test.server.state.presence.get(&test.id()).unwrap().since_ms as i64;
+
+    test.evaluator.evaluate(gone + 59_000).await.unwrap();
+    assert!(test.open().await.is_empty());
+
+    test.evaluator.evaluate(gone + 60_000).await.unwrap();
+    let open = test.open().await;
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].summary, "web-1 has been offline for 1 minute");
+    assert_eq!(open[0].series, "");
+}
+
+#[tokio::test]
+async fn an_agent_coming_back_resolves_after_the_wait() {
+    let mut test = Harness::start().await;
+    test.database()
+        .create_alert_rule(&offline_rule())
+        .await
+        .unwrap();
+    test.go_offline().await;
+    let gone = test.server.state.presence.get(&test.id()).unwrap().since_ms as i64;
+    test.evaluator.evaluate(gone + 60_000).await.unwrap();
+    assert_eq!(test.open().await.len(), 1);
+
+    let mut client = test.server.connect().await;
+    let status = handshake(&mut client, &test.agent, "web-1", None).await;
+    assert_eq!(status, RegistrationStatus::Approved);
+    test.server.wait_for_online(&test.id(), true).await;
+    let back = test.server.state.presence.get(&test.id()).unwrap().since_ms as i64;
+
+    test.evaluator.evaluate(back + 59_000).await.unwrap();
+    assert_eq!(test.open().await.len(), 1);
+    test.evaluator.evaluate(back + 60_000).await.unwrap();
+    assert!(test.open().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_restart_does_not_look_like_the_fleet_going_down() {
+    let test = Harness::start().await;
+    test.database()
+        .create_alert_rule(&offline_rule())
+        .await
+        .unwrap();
+
+    // As after a restart: nothing has connected yet, as far as this knows.
+    let server = start().await;
+    let agent = identity();
+    server
+        .state
+        .database
+        .create_alert_rule(&offline_rule())
+        .await
+        .unwrap();
+    server.connect_approved(&agent, "web-1").await;
+    server.wait_for_online(&agent.id(), false).await;
+
+    let started = now_ms() + MINUTE_MS;
+    let mut restarted = evaluator(&server, started);
+    restarted.evaluate(started + 119_000).await.unwrap();
+    assert!(
+        server
+            .state
+            .database
+            .open_alerts()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // The grace period is over, and it really is gone.
+    restarted.evaluate(started + 120_000).await.unwrap();
+    assert_eq!(server.state.database.open_alerts().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn an_open_offline_alert_survives_the_grace_period_after_a_restart() {
+    let mut test = Harness::start().await;
+    test.database()
+        .create_alert_rule(&offline_rule())
+        .await
+        .unwrap();
+    test.go_offline().await;
+    let gone = test.server.state.presence.get(&test.id()).unwrap().since_ms as i64;
+    test.evaluator.evaluate(gone + 60_000).await.unwrap();
+
+    let restart = gone + 120_000;
+    let mut restarted = evaluator(&test.server, restart);
+    restarted.evaluate(restart + 1000).await.unwrap();
+
+    assert_eq!(test.open().await.len(), 1);
+    assert!(test.resolved().await.is_empty());
+}
+
+#[tokio::test]
+async fn an_agent_never_seen_since_a_restart_counts_as_offline() {
+    let server = start().await;
+    let agent = identity();
+    let mut client = server.connect().await;
+    assert_eq!(
+        handshake(&mut client, &agent, "quiet-1", None).await,
+        RegistrationStatus::Pending
+    );
+    server.approve(&agent).await;
+    drop(client);
+
+    // A fresh presence table, as after a restart, for an agent that stays away.
+    let mut state = server.state.clone();
+    state.presence = Arc::new(Presence::default());
+    state
+        .database
+        .create_alert_rule(&offline_rule())
+        .await
+        .unwrap();
+
+    let started = now_ms();
+    let mut restarted = Evaluator::new(
+        state.database.clone(),
+        state.registry.clone(),
+        state.presence.clone(),
+        state.metrics.clone(),
+        started,
+    );
+    restarted.evaluate(started + 120_000).await.unwrap();
+
+    let open = state.database.open_alerts().await.unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].host, "quiet-1");
+}
+
+#[tokio::test]
+async fn a_stopped_process_alerts_from_what_an_agent_really_sends() {
+    let server = start_with_metrics().await;
+    let agent = identity();
+    let mut client = server.connect_approved(&agent, "web-1").await;
+    let rule = AlertRuleInput {
+        name: "nginx down".to_string(),
+        metric: Some("process.count".to_string()),
+        series: Some("nginx".to_string()),
+        comparison: Some(Comparison::Below),
+        threshold: Some(1.0),
+        for_secs: 0,
+        ..cpu_rule()
+    };
+    server
+        .state
+        .database
+        .create_alert_rule(&rule)
+        .await
+        .unwrap();
+
+    let sample = |timestamp_ms: i64, count: u64| {
+        AgentMessage::Sample(Sample {
+            timestamp_ms: timestamp_ms as u64,
+            metrics: BTreeMap::from([(
+                "processes".to_string(),
+                json!([
+                    { "name": "nginx", "count": count, "cpu_percent": 0.0, "memory_percent": 0.0 },
+                    { "name": "sshd", "count": 0, "cpu_percent": 0.0, "memory_percent": 0.0 },
+                ]),
+            )]),
+        })
+    };
+    let wait_for = |count: f64, after: i64| {
+        let metrics = server.state.metrics.clone();
+        async move {
+            let metric = crate::metrics::find("process.count").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                let rows = metrics.newest(metric, now_ms()).await.unwrap();
+                if rows
+                    .iter()
+                    .any(|r| r.series == "nginx" && r.value == count && r.time_ms >= after)
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+            panic!("the reading never arrived");
+        }
+    };
+
+    let mut evaluator = evaluator(&server, now_ms() - 60 * MINUTE_MS);
+    let first = now_ms() - 2000;
+    send(&mut client, &sample(first, 2)).await;
+    wait_for(2.0, first).await;
+    evaluator.evaluate(now_ms()).await.unwrap();
+    assert!(
+        server
+            .state
+            .database
+            .open_alerts()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let second = now_ms() - 1000;
+    send(&mut client, &sample(second, 0)).await;
+    wait_for(0.0, second).await;
+    evaluator.evaluate(now_ms()).await.unwrap();
+
+    let open = server.state.database.open_alerts().await.unwrap();
+    assert_eq!(open.len(), 1, "only the rule's own process");
+    assert_eq!(
+        open[0].summary,
+        "Running processes (nginx) on web-1 is 0, below 1"
+    );
+}
+
+#[tokio::test]
+async fn process_charts_only_appear_for_agents_that_report_processes() {
+    let server = start_with_metrics().await;
+    let (agent, mut client) = report_samples(&server, "/").await;
+    let path = format!("/agents/{}/metrics", agent.id());
+    let mut browser = Browser::default();
+
+    let page = browser.get(&server, &path).await;
+    assert!(page.body.contains("CPU usage"));
+    assert!(!page.body.contains("Running processes"), "{}", page.body);
+
+    let sample = AgentMessage::Sample(Sample {
+        timestamp_ms: now_ms() as u64 - 1000,
+        metrics: BTreeMap::from([(
+            "processes".to_string(),
+            json!([{ "name": "nginx", "count": 2, "cpu_percent": 1.0, "memory_percent": 1.0 }]),
+        )]),
+    });
+    send(&mut client, &sample).await;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let page = browser.get(&server, &path).await;
+        if page.body.contains("Running processes") {
+            assert!(page.body.contains("nginx"));
+            assert!(page.body.contains("Process CPU usage"));
+            break;
+        }
+        assert!(Instant::now() < deadline, "the chart never appeared");
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+// ---- delivery
+
+/// A webhook that records what it's sent and answers with the next status.
+#[derive(Clone, Default)]
+struct Hook {
+    received: Arc<Mutex<Vec<Value>>>,
+    statuses: Arc<Mutex<Vec<StatusCode>>>,
+}
+
+impl Hook {
+    async fn start(&self) -> String {
+        let hook = self.clone();
+        let router = Router::new()
+            .route(
+                "/secret-token",
+                post(move |body: String| async move {
+                    hook.received
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_str(&body).unwrap());
+                    let mut statuses = hook.statuses.lock().unwrap();
+                    if statuses.is_empty() {
+                        StatusCode::OK
+                    } else {
+                        statuses.remove(0)
+                    }
+                }),
+            )
+            .route(
+                "/moved",
+                post(|| async {
+                    (
+                        StatusCode::TEMPORARY_REDIRECT,
+                        [("location", "/secret-token")],
+                    )
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        format!("http://{address}")
+    }
+
+    fn events(&self) -> Vec<String> {
+        let received = self.received.lock().unwrap();
+        received
+            .iter()
+            .map(|body| body["event"].as_str().unwrap().to_string())
+            .collect()
+    }
+}
+
+fn webhook_channel(url: &str) -> ChannelInput {
+    ChannelInput {
+        name: "Ops".to_string(),
+        kind: ChannelKind::Webhook,
+        target: url.to_string(),
+    }
+}
+
+/// A firing alert with a channel, ready to deliver.
+async fn firing_with_channel(test: &mut Harness, url: &str) -> Notifier {
+    let database = test.database().clone();
+    let channel = database
+        .create_channel(&webhook_channel(url))
+        .await
+        .unwrap();
+    let rule = AlertRuleInput {
+        for_secs: 0,
+        channels: vec![channel],
+        ..cpu_rule()
+    };
+    database.create_alert_rule(&rule).await.unwrap();
+    test.cpu(0, 95.0).await;
+    Notifier::new(database, None)
+}
+
+async fn due(test: &Harness, at_ms: i64) -> Vec<Delivery> {
+    test.database().due_deliveries(at_ms, 16).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_webhook_hears_about_an_alert_starting_and_ending_once_each() {
+    let mut test = Harness::start().await;
+    let hook = Hook::default();
+    let url = format!("{}/secret-token", hook.start().await);
+    let notifier = firing_with_channel(&mut test, &url).await;
+
+    notifier.deliver_due(test.now).await.unwrap();
+    notifier.deliver_due(test.now + 1).await.unwrap();
+    assert_eq!(hook.events(), ["firing"]);
+
+    test.cpu(MINUTE_MS, 10.0).await;
+    notifier.deliver_due(test.now + MINUTE_MS).await.unwrap();
+    assert_eq!(hook.events(), ["firing", "resolved"]);
+
+    let received = hook.received.lock().unwrap();
+    assert_eq!(received[0]["version"], 1);
+    assert_eq!(received[0]["alert"]["host"], "web-1");
+    assert_eq!(received[0]["alert"]["severity"], "critical");
+    assert_eq!(received[0]["text"], "CPU usage on web-1 is 95%, above 90%");
+    assert_eq!(
+        received[1]["text"],
+        "Resolved: CPU usage on web-1 is 95%, above 90%"
+    );
+    assert_eq!(
+        received[1]["alert"]["resolve_reason"],
+        "The problem cleared"
+    );
+    assert_ne!(received[0]["id"], received[1]["id"]);
+}
+
+#[tokio::test]
+async fn an_alert_with_no_channels_sends_nothing() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        for_secs: 0,
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    test.cpu(0, 95.0).await;
+    test.cpu(MINUTE_MS, 10.0).await;
+    assert!(due(&test, test.now + 2 * MINUTE_MS).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_delivery_is_retried_later_and_shown_until_it_works() {
+    let mut test = Harness::start().await;
+    let hook = Hook::default();
+    hook.statuses
+        .lock()
+        .unwrap()
+        .push(StatusCode::INTERNAL_SERVER_ERROR);
+    let url = format!("{}/secret-token", hook.start().await);
+    let notifier = firing_with_channel(&mut test, &url).await;
+
+    notifier.deliver_due(test.now).await.unwrap();
+    assert_eq!(hook.events().len(), 1);
+
+    let problems = test.database().delivery_problems(10).await.unwrap();
+    assert_eq!(problems[0].error, "the webhook returned status 500");
+    assert_eq!(problems[0].state, "pending");
+    assert_eq!(problems[0].attempts, 1);
+
+    assert!(due(&test, test.now + 29_999).await.is_empty(), "too soon");
+    notifier.deliver_due(test.now + 30_000).await.unwrap();
+    assert_eq!(hook.events().len(), 2);
+    assert!(
+        test.database()
+            .delivery_problems(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(due(&test, test.now + 10 * MINUTE_MS).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_resolved_notice_waits_for_its_firing_notice() {
+    let mut test = Harness::start().await;
+    let hook = Hook::default();
+    hook.statuses
+        .lock()
+        .unwrap()
+        .push(StatusCode::SERVICE_UNAVAILABLE);
+    let url = format!("{}/secret-token", hook.start().await);
+    let notifier = firing_with_channel(&mut test, &url).await;
+
+    notifier.deliver_due(test.now).await.unwrap();
+    test.cpu(1000, 10.0).await;
+
+    notifier.deliver_due(test.now + 2000).await.unwrap();
+    assert_eq!(hook.events(), ["firing"], "only the failed attempt so far");
+
+    notifier.deliver_due(test.now + 31_000).await.unwrap();
+    notifier.deliver_due(test.now + 31_001).await.unwrap();
+    assert_eq!(hook.events(), ["firing", "firing", "resolved"]);
+}
+
+#[tokio::test]
+async fn a_delivery_is_given_up_on_after_a_day_and_says_so() {
+    let mut test = Harness::start().await;
+    let hook = Hook::default();
+    hook.statuses
+        .lock()
+        .unwrap()
+        .extend([StatusCode::BAD_GATEWAY, StatusCode::BAD_GATEWAY]);
+    let url = format!("{}/secret-token", hook.start().await);
+    let notifier = firing_with_channel(&mut test, &url).await;
+
+    notifier.deliver_due(test.now).await.unwrap();
+    let day = 24 * 60 * MINUTE_MS;
+    notifier.deliver_due(test.now + day).await.unwrap();
+
+    let problems = test.database().delivery_problems(10).await.unwrap();
+    assert_eq!(problems[0].state, "failed");
+    assert!(due(&test, test.now + 2 * day).await.is_empty());
+
+    let page = Browser::default().get(&test.server, "/alerts").await;
+    assert!(page.body.contains("Gave up"), "{}", page.body);
+    assert!(page.body.contains("the webhook returned status 502"));
+}
+
+#[tokio::test]
+async fn queued_notifications_survive_a_restart() {
+    let mut test = Harness::start().await;
+    let hook = Hook::default();
+    let url = format!("{}/secret-token", hook.start().await);
+    firing_with_channel(&mut test, &url).await;
+
+    let restarted = Notifier::new(test.database().clone(), None);
+    restarted.deliver_due(test.now).await.unwrap();
+    assert_eq!(hook.events(), ["firing"]);
+}
+
+#[tokio::test]
+async fn resolved_notices_go_to_whoever_heard_it_fired_even_if_the_rule_is_gone() {
+    let mut test = Harness::start().await;
+    let hook = Hook::default();
+    let url = format!("{}/secret-token", hook.start().await);
+    let notifier = firing_with_channel(&mut test, &url).await;
+    notifier.deliver_due(test.now).await.unwrap();
+
+    let rule = test.database().list_alert_rules().await.unwrap()[0].id;
+    test.database().delete_alert_rule(rule).await.unwrap();
+    test.evaluate(MINUTE_MS).await;
+    notifier.deliver_due(test.now + MINUTE_MS).await.unwrap();
+
+    assert_eq!(hook.events(), ["firing", "resolved"]);
+}
+
+#[tokio::test]
+async fn resolving_an_alert_twice_only_tells_people_once() {
+    let mut test = Harness::start().await;
+    let hook = Hook::default();
+    let url = format!("{}/secret-token", hook.start().await);
+    let notifier = firing_with_channel(&mut test, &url).await;
+    notifier.deliver_due(test.now).await.unwrap();
+
+    let alert = test.open().await[0].id;
+    let later = test.now + MINUTE_MS;
+    test.database()
+        .resolve_alert(alert, later, "first")
+        .await
+        .unwrap();
+    test.database()
+        .resolve_alert(alert, later + 1, "second")
+        .await
+        .unwrap();
+    notifier.deliver_due(later + 2).await.unwrap();
+    notifier.deliver_due(later + 3).await.unwrap();
+
+    assert_eq!(hook.events(), ["firing", "resolved"]);
+    assert_eq!(
+        test.resolved().await[0].resolve_reason.as_deref(),
+        Some("first")
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_channel_drops_what_was_queued_for_it() {
+    let mut test = Harness::start().await;
+    let notifier = firing_with_channel(&mut test, "http://127.0.0.1:1/x").await;
+
+    let channel = test.database().list_channels().await.unwrap()[0].id;
+    assert!(test.database().delete_channel(channel).await.unwrap());
+
+    notifier.deliver_due(test.now).await.unwrap();
+    assert!(due(&test, test.now).await.is_empty());
+    assert_eq!(test.open().await.len(), 1, "the alert itself stays");
+}
+
+#[tokio::test]
+async fn a_webhook_url_never_appears_in_a_saved_error() {
+    let mut test = Harness::start().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let url = format!("http://{address}/secret-token");
+    let notifier = firing_with_channel(&mut test, &url).await;
+
+    notifier.deliver_due(test.now).await.unwrap();
+
+    let problems = test.database().delivery_problems(10).await.unwrap();
+    assert_eq!(problems[0].error, "couldn't connect to the webhook");
+    let page = Browser::default().get(&test.server, "/alerts").await;
+    assert!(!page.body.contains("secret-token"));
+}
+
+#[tokio::test]
+async fn webhook_redirects_are_not_followed() {
+    let mut test = Harness::start().await;
+    let hook = Hook::default();
+    let url = format!("{}/moved", hook.start().await);
+    let notifier = firing_with_channel(&mut test, &url).await;
+
+    notifier.deliver_due(test.now).await.unwrap();
+
+    assert!(hook.events().is_empty());
+    let problems = test.database().delivery_problems(10).await.unwrap();
+    assert_eq!(problems[0].error, "the webhook returned status 307");
+}
+
+/// A mail server that accepts one message and hands back everything it heard.
+async fn start_mail_server() -> (u16, tokio::task::JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        writer.write_all(b"220 test ESMTP\r\n").await.unwrap();
+
+        let mut heard = String::new();
+        let mut in_data = false;
+        while let Some(line) = lines.next_line().await.unwrap() {
+            heard.push_str(&line);
+            heard.push('\n');
+            let reply: &[u8] = if in_data {
+                if line != "." {
+                    continue;
+                }
+                in_data = false;
+                b"250 ok\r\n"
+            } else if line.starts_with("DATA") {
+                in_data = true;
+                b"354 go\r\n"
+            } else if line.starts_with("QUIT") {
+                writer.write_all(b"221 bye\r\n").await.unwrap();
+                break;
+            } else {
+                b"250 ok\r\n"
+            };
+            writer.write_all(reply).await.unwrap();
+        }
+        heard
+    });
+    (port, handle)
+}
+
+fn mailer(port: u16) -> Arc<Mailer> {
+    let text = format!(
+        "email {{\n  host = \"127.0.0.1\"\n  port = {port}\n  security = \"none\"\n  \
+         from = \"MaxNines <alerts@example.com>\"\n}}\n\
+         metrics \"duckdb\" {{\n  path = \"x\"\n}}\n"
+    );
+    let config = Config::parse(&text).unwrap();
+    Arc::new(Mailer::new(config.email.as_ref().unwrap()).unwrap())
+}
+
+#[tokio::test]
+async fn email_channels_send_a_message_to_every_address() {
+    let mut test = Harness::start().await;
+    let channel = ChannelInput {
+        name: "On call".to_string(),
+        kind: ChannelKind::Email,
+        target: "a@example.com, b@example.com".to_string(),
+    };
+    let channel = test.database().create_channel(&channel).await.unwrap();
+    let rule = AlertRuleInput {
+        for_secs: 0,
+        channels: vec![channel],
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    test.cpu(0, 95.0).await;
+
+    let (port, heard) = start_mail_server().await;
+    let notifier = Notifier::new(test.database().clone(), Some(mailer(port)));
+    notifier.deliver_due(test.now).await.unwrap();
+
+    let heard = heard.await.unwrap();
+    assert!(heard.contains("MAIL FROM:<alerts@example.com>"), "{heard}");
+    assert!(heard.contains("RCPT TO:<a@example.com>"), "{heard}");
+    assert!(heard.contains("RCPT TO:<b@example.com>"), "{heard}");
+    assert!(
+        heard.contains("Subject: [MaxNines CRITICAL] CPU usage on web-1 is 95%, above 90%"),
+        "{heard}"
+    );
+    assert!(heard.contains("Rule: High CPU"), "{heard}");
+    assert!(due(&test, test.now + 10 * MINUTE_MS).await.is_empty());
+}
+
+#[tokio::test]
+async fn an_email_channel_without_a_mail_server_says_so() {
+    let mut test = Harness::start().await;
+    let channel = ChannelInput {
+        name: "On call".to_string(),
+        kind: ChannelKind::Email,
+        target: "a@example.com".to_string(),
+    };
+    let channel = test.database().create_channel(&channel).await.unwrap();
+    let rule = AlertRuleInput {
+        for_secs: 0,
+        channels: vec![channel],
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    test.cpu(0, 95.0).await;
+
+    Notifier::new(test.database().clone(), None)
+        .deliver_due(test.now)
+        .await
+        .unwrap();
+
+    let problems = test.database().delivery_problems(10).await.unwrap();
+    assert_eq!(problems[0].error, "email isn't set up in the server config");
+}
+
+#[test]
+fn an_unencrypted_mail_server_cannot_be_given_a_password() {
+    let text = "email {\n  host = \"x\"\n  security = \"none\"\n  username = \"u\"\n  \
+                password_file = \"p\"\n  from = \"a@example.com\"\n}\n\
+                metrics \"duckdb\" {\n  path = \"x\"\n}\n";
+    let error = format!("{:#}", Config::parse(text).unwrap_err());
+    assert!(error.contains("unencrypted"), "{error}");
+}
+
+#[test]
+fn a_username_needs_a_password_file() {
+    let text = "email {\n  host = \"x\"\n  username = \"u\"\n  from = \"a@example.com\"\n}\n\
+                metrics \"duckdb\" {\n  path = \"x\"\n}\n";
+    let error = format!("{:#}", Config::parse(text).unwrap_err());
+    assert!(error.contains("password_file"), "{error}");
+}
+
+// ---- pages
+
+const ALERT_RULE_FIELDS: [(&str, &str); 9] = [
+    ("name", "High CPU"),
+    ("kind", "metric"),
+    ("metric", "cpu.usage"),
+    ("comparison", "above"),
+    ("threshold", "90"),
+    ("series", ""),
+    ("for_secs", "120"),
+    ("severity", "critical"),
+    ("enabled", "on"),
+];
+
+#[tokio::test]
+async fn every_alert_page_renders() {
+    let server = start().await;
+    let rule = server
+        .state
+        .database
+        .create_alert_rule(&cpu_rule())
+        .await
+        .unwrap();
+    let channel = server
+        .state
+        .database
+        .create_channel(&webhook_channel("https://example.com/x"))
+        .await
+        .unwrap();
+    let mut browser = Browser::default();
+
+    for path in [
+        "/alerts".to_string(),
+        "/alerts/rules".to_string(),
+        "/alerts/rules/new".to_string(),
+        format!("/alerts/rules/{rule}/edit"),
+        "/alerts/channels".to_string(),
+        "/alerts/channels/new".to_string(),
+        format!("/alerts/channels/{channel}/edit"),
+    ] {
+        let page = browser.get(&server, &path).await;
+        assert_eq!(page.status, 200, "{path}: {}", page.body);
+        assert!(page.body.contains("MaxNines"), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn missing_alert_things_are_not_found() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    for path in ["/alerts/rules/99/edit", "/alerts/channels/99/edit"] {
+        assert_eq!(browser.get(&server, path).await.status, 404, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn an_alert_rule_can_be_created_changed_and_deleted_from_the_form() {
+    let server = start().await;
+    let mut browser = Browser::default();
+
+    let page = browser
+        .submit(
+            &server,
+            "/alerts/rules/new",
+            "/alerts/rules",
+            &ALERT_RULE_FIELDS,
+        )
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+
+    let rules = server.state.database.list_alert_rules().await.unwrap();
+    assert_eq!(rules[0].rule, cpu_rule());
+    let id = rules[0].id;
+
+    let list = browser.get(&server, "/alerts/rules").await;
+    assert!(
+        list.body.contains("CPU usage above 90% for 2 minutes"),
+        "{}",
+        list.body
+    );
+    assert!(list.body.contains("Every agent"));
+
+    let mut fields = ALERT_RULE_FIELDS.to_vec();
+    fields[4] = ("threshold", "75.5");
+    let path = format!("/alerts/rules/{id}");
+    let edit = format!("/alerts/rules/{id}/edit");
+    let page = browser.submit(&server, &edit, &path, &fields).await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    let rule = server.state.database.get_alert_rule(id).await.unwrap();
+    assert_eq!(rule.unwrap().rule.threshold, Some(75.5));
+
+    let page = browser
+        .submit(&server, &edit, &format!("/alerts/rules/{id}/delete"), &[])
+        .await;
+    assert_eq!(page.status, 303);
+    assert!(
+        server
+            .state
+            .database
+            .list_alert_rules()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn an_offline_rule_can_be_made_from_the_form() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    let mut fields = ALERT_RULE_FIELDS.to_vec();
+    fields[0] = ("name", "Gone");
+    fields[1] = ("kind", "offline");
+    fields[4] = ("threshold", "");
+    fields[6] = ("for_secs", "60");
+
+    let page = browser
+        .submit(&server, "/alerts/rules/new", "/alerts/rules", &fields)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    let rules = server.state.database.list_alert_rules().await.unwrap();
+    assert_eq!(rules[0].rule, offline_rule());
+}
+
+#[tokio::test]
+async fn a_rejected_rule_keeps_what_was_typed_and_says_why() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    let mut fields = ALERT_RULE_FIELDS.to_vec();
+    fields[0] = ("name", "Typed name");
+    fields[4] = ("threshold", "lots");
+
+    let page = browser
+        .submit(&server, "/alerts/rules/new", "/alerts/rules", &fields)
+        .await;
+    assert_eq!(page.status, 422);
+    assert!(
+        page.body.contains("the threshold must be a number"),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains(r#"value="Typed name""#));
+    assert!(page.body.contains(r#"value="lots""#));
+    assert!(
+        server
+            .state
+            .database
+            .list_alert_rules()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn two_rules_cannot_share_a_name() {
+    let server = start().await;
+    server
+        .state
+        .database
+        .create_alert_rule(&cpu_rule())
+        .await
+        .unwrap();
+
+    let page = Browser::default()
+        .submit(
+            &server,
+            "/alerts/rules/new",
+            "/alerts/rules",
+            &ALERT_RULE_FIELDS,
+        )
+        .await;
+    assert_eq!(page.status, 422);
+    assert!(page.body.contains("already exists"), "{}", page.body);
+}
+
+#[tokio::test]
+async fn the_condition_builder_works_on_alert_rules() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    let mut fields = ALERT_RULE_FIELDS.to_vec();
+    fields.extend([
+        ("clause_fact_0", "custom.role"),
+        ("clause_operator_0", "equals"),
+        ("clause_value_0", "web"),
+        ("clause_kind_0", "text"),
+    ]);
+
+    let mut pressed = fields.clone();
+    pressed.push(("form_action", "add_clause"));
+    let page = browser
+        .submit(&server, "/alerts/rules/new", "/alerts/rules", &pressed)
+        .await;
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("clause_fact_1"), "{}", page.body);
+    assert!(
+        server
+            .state
+            .database
+            .list_alert_rules()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let page = browser
+        .submit(&server, "/alerts/rules/new", "/alerts/rules", &fields)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    let rules = server.state.database.list_alert_rules().await.unwrap();
+    assert_eq!(
+        rules[0].rule.condition.as_deref(),
+        Some(r#"facts.custom.role == "web""#)
+    );
+}
+
+#[tokio::test]
+async fn a_rule_can_choose_its_channels_from_the_form() {
+    let server = start().await;
+    let channel = server
+        .state
+        .database
+        .create_channel(&webhook_channel("https://example.com/x"))
+        .await
+        .unwrap();
+    let box_name = format!("channel_{channel}");
+    let mut fields = ALERT_RULE_FIELDS.to_vec();
+    fields.push((box_name.as_str(), "on"));
+
+    let mut browser = Browser::default();
+    let form = browser.get(&server, "/alerts/rules/new").await;
+    assert!(form.body.contains(&box_name), "{}", form.body);
+
+    let page = browser
+        .submit(&server, "/alerts/rules/new", "/alerts/rules", &fields)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    let rules = server.state.database.list_alert_rules().await.unwrap();
+    assert_eq!(rules[0].rule.channels, [channel]);
+
+    let edit = format!("/alerts/rules/{}/edit", rules[0].id);
+    let page = browser.get(&server, &edit).await;
+    assert!(
+        page.body.contains(&format!(r#"name="{box_name}" checked"#)),
+        "{}",
+        page.body
+    );
+}
+
+#[tokio::test]
+async fn a_rule_cannot_use_a_channel_that_does_not_exist() {
+    let server = start().await;
+    let mut fields = ALERT_RULE_FIELDS.to_vec();
+    fields.push(("channel_99", "on"));
+
+    let page = Browser::default()
+        .submit(&server, "/alerts/rules/new", "/alerts/rules", &fields)
+        .await;
+    assert_eq!(page.status, 422);
+    assert!(
+        page.body.contains("no notification channel 99"),
+        "{}",
+        page.body
+    );
+}
+
+#[tokio::test]
+async fn alert_forms_refuse_a_bad_csrf_token() {
+    let server = start().await;
+    let id = server
+        .state
+        .database
+        .create_alert_rule(&cpu_rule())
+        .await
+        .unwrap();
+    let channel = server
+        .state
+        .database
+        .create_channel(&webhook_channel("https://example.com/x"))
+        .await
+        .unwrap();
+
+    let mut browser = Browser::default();
+    browser.get(&server, "/alerts/rules/new").await;
+    for path in [
+        "/alerts/rules".to_string(),
+        format!("/alerts/rules/{id}"),
+        format!("/alerts/rules/{id}/delete"),
+        "/alerts/channels".to_string(),
+        format!("/alerts/channels/{channel}"),
+        format!("/alerts/channels/{channel}/delete"),
+        format!("/alerts/channels/{channel}/test"),
+    ] {
+        let page = browser
+            .post(&server, &path, &[("authenticity_token", "wrong")])
+            .await;
+        assert_eq!(page.status, 403, "{path}");
+    }
+    assert_eq!(
+        server
+            .state
+            .database
+            .list_alert_rules()
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        server.state.database.list_channels().await.unwrap().len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_saved_webhook_url_is_never_shown_again() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    let url = "https://hooks.example.com/services/secret-token";
+
+    let fields = [("name", "Ops"), ("kind", "webhook"), ("target", url)];
+    let page = browser
+        .submit(&server, "/alerts/channels/new", "/alerts/channels", &fields)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    let id = server.state.database.list_channels().await.unwrap()[0].id;
+
+    let edit = format!("/alerts/channels/{id}/edit");
+    for path in ["/alerts/channels", edit.as_str(), "/alerts/rules/new"] {
+        let page = browser.get(&server, path).await;
+        assert!(!page.body.contains("secret-token"), "{path}");
+    }
+    let page = browser.get(&server, "/alerts/channels").await;
+    assert!(
+        page.body.contains("https://hooks.example.com/…"),
+        "{}",
+        page.body
+    );
+
+    // A failed save shows the form again, and mustn't bring it back either.
+    let path = format!("/alerts/channels/{id}");
+    let fields = [("name", ""), ("kind", "webhook"), ("target", "")];
+    let page = browser.submit(&server, &edit, &path, &fields).await;
+    assert_eq!(page.status, 422);
+    assert!(!page.body.contains("secret-token"));
+
+    // Saving without touching the box keeps it.
+    let fields = [("name", "Renamed"), ("kind", "webhook"), ("target", "")];
+    let page = browser.submit(&server, &edit, &path, &fields).await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    let channel = server
+        .state
+        .database
+        .get_channel(id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(channel.channel.name, "Renamed");
+    assert_eq!(channel.channel.target, url);
+
+    let page = browser
+        .submit(&server, &edit, &format!("{path}/delete"), &[])
+        .await;
+    assert_eq!(page.status, 303);
+    assert!(
+        server
+            .state
+            .database
+            .list_channels()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_bad_channel_is_refused_without_repeating_the_url() {
+    let server = start().await;
+    let fields = [
+        ("name", "Ops"),
+        ("kind", "webhook"),
+        ("target", "ftp://example.com/nope"),
+    ];
+    let page = Browser::default()
+        .submit(&server, "/alerts/channels/new", "/alerts/channels", &fields)
+        .await;
+    assert_eq!(page.status, 422);
+    assert!(page.body.contains("must start with http"), "{}", page.body);
+}
+
+#[tokio::test]
+async fn the_test_button_says_how_it_went() {
+    let server = start().await;
+    let hook = Hook::default();
+    let url = format!("{}/secret-token", hook.start().await);
+    let id = server
+        .state
+        .database
+        .create_channel(&webhook_channel(&url))
+        .await
+        .unwrap();
+    let path = format!("/alerts/channels/{id}/test");
+    let mut browser = Browser::default();
+
+    let page = browser
+        .submit(&server, "/alerts/channels", &path, &[])
+        .await;
+    assert_eq!(page.status, 200);
+    assert!(
+        page.body.contains("A test notification was sent to Ops."),
+        "{}",
+        page.body
+    );
+    assert_eq!(hook.events(), ["test"]);
+
+    hook.statuses.lock().unwrap().push(StatusCode::FORBIDDEN);
+    let page = browser
+        .submit(&server, "/alerts/channels", &path, &[])
+        .await;
+    assert!(
+        page.body.contains("the webhook returned status 403"),
+        "{}",
+        page.body
+    );
+    assert!(!page.body.contains("secret-token"));
+}
+
+#[tokio::test]
+async fn the_alerts_page_shows_what_is_firing_and_what_ended() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        for_secs: 0,
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    let mut browser = Browser::default();
+
+    let page = browser.get(&test.server, "/alerts").await;
+    assert!(page.body.contains("Nothing is firing."), "{}", page.body);
+
+    test.cpu(0, 95.0).await;
+    let page = browser.get(&test.server, "/alerts").await;
+    assert!(!page.body.contains("Nothing is firing."));
+    assert!(page.body.contains("CPU usage on web-1 is 95%, above 90%"));
+    assert!(page.body.contains("Critical"));
+
+    test.cpu(MINUTE_MS, 10.0).await;
+    let page = browser.get(&test.server, "/alerts").await;
+    assert!(page.body.contains("Nothing is firing."));
+    assert!(page.body.contains("The problem cleared"), "{}", page.body);
+}
+
+#[tokio::test]
+async fn names_from_agents_are_escaped_on_the_alerts_page() {
+    let server = start_with("").await;
+    let agent = identity();
+    let host = "<script>alert(1)</script>";
+    let _client = server.connect_approved(&agent, host).await;
+    server
+        .state
+        .database
+        .create_alert_rule(&AlertRuleInput {
+            for_secs: 0,
+            ..offline_rule()
+        })
+        .await
+        .unwrap();
+    server
+        .state
+        .database
+        .fire_alert(
+            &crate::alerting::NewAlert {
+                rule_id: 1,
+                rule_name: "<b>rule</b>".to_string(),
+                severity: Severity::Warning,
+                agent_id: agent.id(),
+                host: host.to_string(),
+                series: "<i>series</i>".to_string(),
+                value: None,
+                summary: format!("{host} is offline"),
+                started_ms: 1000,
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let page = Browser::default().get(&server, "/alerts").await;
+    assert_eq!(page.status, 200);
+    assert!(!page.body.contains("<script>alert"), "{}", page.body);
+    assert!(!page.body.contains("<b>rule"), "{}", page.body);
+    assert!(page.body.contains("&lt;script&gt;"), "{}", page.body);
+}
+
+#[tokio::test]
+async fn alert_pages_keep_the_strict_security_policy() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    for path in ["/alerts", "/alerts/rules/new", "/alerts/channels/new"] {
+        let page = browser.get(&server, path).await;
+        let policy = page.header("content-security-policy").unwrap();
+        assert!(policy.starts_with("default-src 'none'"), "{path}");
+        assert!(!page.body.contains("<script"), "{path}");
+        assert!(!page.body.contains(" style="), "{path}");
+    }
+}
+
+// ---- the API
+
+async fn api(server: &TestServer, method: &str, path: &str, body: &Value) -> (u16, Value) {
+    let body = body.to_string();
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {ADMIN_TOKEN}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let page = Browser::default().send(server, request).await;
+    let body = page.body.lines().find(|line| line.starts_with(['{', '[']));
+    (
+        page.status,
+        body.map_or(Value::Null, |text| serde_json::from_str(text).unwrap()),
+    )
+}
+
+#[tokio::test]
+async fn the_alert_api_needs_the_admin_token() {
+    let server = start().await;
+    for path in [
+        "/admin/alerts",
+        "/admin/alert-rules",
+        "/admin/alert-rules/1",
+        "/admin/notification-channels",
+        "/admin/notification-channels/1",
+    ] {
+        let response = server.http("GET", path, None).await;
+        assert!(response.starts_with("HTTP/1.1 401"), "{path}: {response}");
+    }
+}
+
+#[tokio::test]
+async fn alert_rules_can_be_managed_through_the_api() {
+    let server = start().await;
+    let rule = json!({
+        "name": "High CPU",
+        "kind": "metric",
+        "metric": "cpu.usage",
+        "comparison": "above",
+        "threshold": 90,
+        "for_secs": 120,
+        "severity": "critical",
+    });
+
+    let (status, created) = api(&server, "POST", "/admin/alert-rules", &rule).await;
+    assert_eq!(status, 201, "{created}");
+    let path = format!("/admin/alert-rules/{}", created["id"]);
+
+    let (status, shown) = api(&server, "GET", &path, &Value::Null).await;
+    assert_eq!(status, 200);
+    assert_eq!(shown["name"], "High CPU");
+    assert_eq!(shown["enabled"], true);
+
+    let mut changed = rule.clone();
+    changed["threshold"] = json!(50);
+    assert_eq!(api(&server, "PUT", &path, &changed).await.0, 204);
+    let (_, shown) = api(&server, "GET", &path, &Value::Null).await;
+    assert_eq!(shown["threshold"], 50.0);
+
+    let (status, list) = api(&server, "GET", "/admin/alert-rules", &Value::Null).await;
+    assert_eq!(status, 200);
+    assert_eq!(list.as_array().unwrap().len(), 1);
+
+    assert_eq!(api(&server, "DELETE", &path, &Value::Null).await.0, 204);
+    assert_eq!(api(&server, "GET", &path, &Value::Null).await.0, 404);
+    assert_eq!(api(&server, "DELETE", &path, &Value::Null).await.0, 404);
+    assert_eq!(api(&server, "PUT", &path, &rule).await.0, 404);
+}
+
+#[tokio::test]
+async fn the_api_refuses_bad_rules_and_says_why() {
+    let server = start().await;
+    let rule = json!({
+        "name": "Bad",
+        "kind": "metric",
+        "metric": "nonsense",
+        "comparison": "above",
+        "threshold": 1,
+        "for_secs": 0,
+        "severity": "warning",
+    });
+    let (status, body) = api(&server, "POST", "/admin/alert-rules", &rule).await;
+    assert_eq!(status, 422);
+    assert!(
+        body["error"].as_str().unwrap().contains("unknown metric"),
+        "{body}"
+    );
+
+    let mut rule = rule;
+    rule["metric"] = json!("cpu.usage");
+    rule["channels"] = json!([42]);
+    let (status, body) = api(&server, "POST", "/admin/alert-rules", &rule).await;
+    assert_eq!(status, 422);
+    assert!(
+        body["error"].as_str().unwrap().contains("channel 42"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn the_api_takes_a_webhook_url_but_never_gives_it_back() {
+    let server = start().await;
+    let channel = json!({
+        "name": "Ops",
+        "kind": "webhook",
+        "target": "https://hooks.example.com/secret-token",
+    });
+
+    let (status, created) = api(&server, "POST", "/admin/notification-channels", &channel).await;
+    assert_eq!(status, 201, "{created}");
+    let path = format!("/admin/notification-channels/{}", created["id"]);
+
+    let (status, shown) = api(&server, "GET", &path, &Value::Null).await;
+    assert_eq!(status, 200);
+    assert_eq!(shown["target_preview"], "https://hooks.example.com/…");
+    assert!(!shown.to_string().contains("secret-token"));
+
+    let (_, list) = api(&server, "GET", "/admin/notification-channels", &Value::Null).await;
+    assert!(!list.to_string().contains("secret-token"));
+
+    let mut changed = channel.clone();
+    changed["name"] = json!("Renamed");
+    assert_eq!(api(&server, "PUT", &path, &changed).await.0, 204);
+    assert_eq!(api(&server, "DELETE", &path, &Value::Null).await.0, 204);
+    assert_eq!(api(&server, "GET", &path, &Value::Null).await.0, 404);
+}
+
+#[tokio::test]
+async fn the_api_lists_open_and_resolved_alerts() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        for_secs: 0,
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    test.cpu(0, 95.0).await;
+
+    let (status, alerts) = api(&test.server, "GET", "/admin/alerts", &Value::Null).await;
+    assert_eq!(status, 200);
+    assert_eq!(alerts["open"][0]["rule_name"], "High CPU");
+    assert_eq!(alerts["resolved"].as_array().unwrap().len(), 0);
+
+    test.cpu(MINUTE_MS, 10.0).await;
+    let (_, alerts) = api(&test.server, "GET", "/admin/alerts", &Value::Null).await;
+    assert_eq!(alerts["open"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        alerts["resolved"][0]["resolve_reason"],
+        "The problem cleared"
+    );
+}
+
+#[test]
+fn events_read_back_as_written() {
+    assert_eq!(Event::parse(Event::Firing.as_str()).unwrap(), Event::Firing);
+    assert_eq!(
+        Event::parse(Event::Resolved.as_str()).unwrap(),
+        Event::Resolved
+    );
+    assert!(Event::parse("test").is_err(), "tests are never queued");
+}

@@ -11,6 +11,7 @@ impl MigratorTrait for Migrator {
             Box::new(CreateAgents),
             Box::new(CreateAgentFacts),
             Box::new(CreateConfigRules),
+            Box::new(CreateAlerting),
         ]
     }
 }
@@ -347,5 +348,343 @@ impl MigrationTrait for CreateConfigRules {
         manager
             .drop_table(Table::drop().table(ConfigRules::Table).to_owned())
             .await
+    }
+}
+
+struct CreateAlerting;
+
+impl MigrationName for CreateAlerting {
+    fn name(&self) -> &str {
+        "m20261104_000004_create_alerting"
+    }
+}
+
+#[derive(Iden)]
+enum AlertRules {
+    Table,
+    Id,
+    Name,
+    Kind,
+    Metric,
+    Series,
+    Comparison,
+    Threshold,
+    ForSecs,
+    Severity,
+    ConditionExpr,
+    Enabled,
+}
+
+#[derive(Iden)]
+enum NotificationChannels {
+    Table,
+    Id,
+    Name,
+    Kind,
+    Target,
+}
+
+#[derive(Iden)]
+enum AlertRuleChannels {
+    Table,
+    RuleId,
+    ChannelId,
+}
+
+#[derive(Iden)]
+enum Alerts {
+    Table,
+    Id,
+    RuleId,
+    RuleName,
+    Severity,
+    AgentId,
+    Host,
+    Series,
+    Value,
+    Summary,
+    StartedMs,
+    ResolvedMs,
+    ResolveReason,
+}
+
+#[derive(Iden)]
+enum Notifications {
+    Table,
+    Id,
+    AlertId,
+    ChannelId,
+    Event,
+    State,
+    Attempts,
+    NextAttemptMs,
+    LastError,
+    CreatedMs,
+    SentMs,
+}
+
+/// Rules say what to watch and channels say who to tell. An alert is one rule
+/// firing for one agent, and stays as history once it resolves, so it keeps its
+/// own copy of what it was about. Notifications are a queue, which lets a
+/// delivery survive a restart and be retried.
+#[async_trait::async_trait]
+impl MigrationTrait for CreateAlerting {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(AlertRules::Table)
+                    .col(
+                        ColumnDef::new(AlertRules::Id)
+                            .big_integer()
+                            .not_null()
+                            .auto_increment()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(AlertRules::Name)
+                            .string_len(255)
+                            .not_null()
+                            .unique_key(),
+                    )
+                    .col(ColumnDef::new(AlertRules::Kind).string_len(16).not_null())
+                    .col(ColumnDef::new(AlertRules::Metric).string_len(64))
+                    .col(ColumnDef::new(AlertRules::Series).string_len(255))
+                    .col(ColumnDef::new(AlertRules::Comparison).string_len(16))
+                    .col(ColumnDef::new(AlertRules::Threshold).double())
+                    .col(ColumnDef::new(AlertRules::ForSecs).big_integer().not_null())
+                    .col(
+                        ColumnDef::new(AlertRules::Severity)
+                            .string_len(16)
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(AlertRules::ConditionExpr).text())
+                    .col(ColumnDef::new(AlertRules::Enabled).boolean().not_null())
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(NotificationChannels::Table)
+                    .col(
+                        ColumnDef::new(NotificationChannels::Id)
+                            .big_integer()
+                            .not_null()
+                            .auto_increment()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(NotificationChannels::Name)
+                            .string_len(255)
+                            .not_null()
+                            .unique_key(),
+                    )
+                    .col(
+                        ColumnDef::new(NotificationChannels::Kind)
+                            .string_len(16)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(NotificationChannels::Target)
+                            .text()
+                            .not_null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(AlertRuleChannels::Table)
+                    .col(
+                        ColumnDef::new(AlertRuleChannels::RuleId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(AlertRuleChannels::ChannelId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .primary_key(
+                        Index::create()
+                            .col(AlertRuleChannels::RuleId)
+                            .col(AlertRuleChannels::ChannelId),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(AlertRuleChannels::Table, AlertRuleChannels::RuleId)
+                            .to(AlertRules::Table, AlertRules::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(AlertRuleChannels::Table, AlertRuleChannels::ChannelId)
+                            .to(NotificationChannels::Table, NotificationChannels::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(Alerts::Table)
+                    .col(
+                        ColumnDef::new(Alerts::Id)
+                            .big_integer()
+                            .not_null()
+                            .auto_increment()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(Alerts::RuleId).big_integer())
+                    .col(ColumnDef::new(Alerts::RuleName).string_len(255).not_null())
+                    .col(ColumnDef::new(Alerts::Severity).string_len(16).not_null())
+                    .col(ColumnDef::new(Alerts::AgentId).string_len(32).not_null())
+                    .col(ColumnDef::new(Alerts::Host).string_len(255).not_null())
+                    .col(ColumnDef::new(Alerts::Series).string_len(255).not_null())
+                    .col(ColumnDef::new(Alerts::Value).double())
+                    .col(ColumnDef::new(Alerts::Summary).text().not_null())
+                    .col(ColumnDef::new(Alerts::StartedMs).big_integer().not_null())
+                    .col(ColumnDef::new(Alerts::ResolvedMs).big_integer())
+                    .col(ColumnDef::new(Alerts::ResolveReason).text())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(Alerts::Table, Alerts::RuleId)
+                            .to(AlertRules::Table, AlertRules::Id)
+                            .on_delete(ForeignKeyAction::SetNull),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(Alerts::Table, Alerts::AgentId)
+                            .to(Agents::Table, Agents::Id),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        // Finding what's firing, which happens on every evaluation.
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_alerts_resolved")
+                    .table(Alerts::Table)
+                    .col(Alerts::ResolvedMs)
+                    .to_owned(),
+            )
+            .await?;
+
+        // Showing the newest history.
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_alerts_started")
+                    .table(Alerts::Table)
+                    .col(Alerts::StartedMs)
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(Notifications::Table)
+                    .col(
+                        ColumnDef::new(Notifications::Id)
+                            .big_integer()
+                            .not_null()
+                            .auto_increment()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(Notifications::AlertId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(Notifications::ChannelId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(Notifications::Event)
+                            .string_len(16)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(Notifications::State)
+                            .string_len(16)
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(Notifications::Attempts).integer().not_null())
+                    .col(
+                        ColumnDef::new(Notifications::NextAttemptMs)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(Notifications::LastError).text())
+                    .col(
+                        ColumnDef::new(Notifications::CreatedMs)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(Notifications::SentMs).big_integer())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(Notifications::Table, Notifications::AlertId)
+                            .to(Alerts::Table, Alerts::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(Notifications::Table, Notifications::ChannelId)
+                            .to(NotificationChannels::Table, NotificationChannels::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        // Finding what's waiting to be sent, which happens every few seconds.
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_notifications_state")
+                    .table(Notifications::Table)
+                    .col(Notifications::State)
+                    .col(Notifications::Id)
+                    .to_owned(),
+            )
+            .await?;
+
+        // Finding who heard about an alert, to tell them when it resolves.
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_notifications_alert")
+                    .table(Notifications::Table)
+                    .col(Notifications::AlertId)
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for table in [
+            Notifications::Table.to_string(),
+            Alerts::Table.to_string(),
+            AlertRuleChannels::Table.to_string(),
+            NotificationChannels::Table.to_string(),
+            AlertRules::Table.to_string(),
+        ] {
+            manager
+                .drop_table(Table::drop().table(Alias::new(table)).to_owned())
+                .await?;
+        }
+        Ok(())
     }
 }

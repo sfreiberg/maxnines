@@ -1,0 +1,38 @@
+{% extends "layouts/application.html" %}
+{% block title %}Notification channels · MaxNines{% endblock title %}
+{% block content %}
+<p class="breadcrumb"><a href="/alerts">Alerts</a></p>
+<div class="title-row">
+  <h1>Notification channels</h1>
+  <div class="actions"><a class="button" href="/alerts/channels/new">New channel</a></div>
+</div>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+{% if notice %}<p class="notice">{{ notice }}</p>{% endif %}
+
+{% if channels %}
+<table>
+  <thead>
+    <tr><th>Name</th><th>Type</th><th>Sends to</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for channel in channels %}
+    <tr>
+      <td><a href="/alerts/channels/{{ channel.id }}/edit">{{ channel.name }}</a></td>
+      <td>{% if channel.kind == "email" %}Email{% else %}Webhook{% endif %}</td>
+      <td>{{ channel.target }}</td>
+      <td>
+        <form method="post" action="/alerts/channels/{{ channel.id }}/test">
+          <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+          <button type="submit" class="secondary">Send a test</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">There are no channels, so alerts only show on the Alerts page.</p>
+{% endif %}
+{% if not email_ready %}<p class="hint">To send email, add an <code>email</code> block to the server config.</p>{% endif %}
+{% endblock content %}

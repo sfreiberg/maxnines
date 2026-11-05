@@ -23,7 +23,8 @@ serde_json.workspace = true
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
-ureq = { version = "3.5.1", default-features = false }
+ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "rustls", "ring", "webpki-roots"] }
 wildmatch = "2.7.0"
 cel = "0.15"
 tera = "2.4"

@@ -8,7 +8,7 @@ use tracing::debug;
 
 use super::{MetricsReader, Store};
 use crate::metrics::{
-    LatestSample, Metric, Point, Reading, Series, SeriesQuery, SeriesResult, Source,
+    LatestSample, Metric, NewestReading, Point, Reading, Series, SeriesQuery, SeriesResult, Source,
 };
 
 /// A schema change. SeaORM doesn't support DuckDB, so this mirrors how its
@@ -177,7 +177,7 @@ fn reading(json: &str, reading: Reading) -> String {
     }
 }
 
-/// One row per value, as `t`, `series` and `v`. Everything here comes from the
+/// One row per value, as `agent_id`, `t`, `series` and `v`. Everything here comes from the
 /// metric catalog. `json_each` is used for keys because agents choose them, and
 /// a name like `eth0.100` would be misread as a path.
 fn readings(source: Source) -> String {
@@ -186,19 +186,19 @@ fn readings(source: Source) -> String {
             .iter()
             .map(|(name, field)| {
                 format!(
-                    "SELECT t, '{name}' AS series, {} AS v FROM samples",
+                    "SELECT agent_id, t, '{name}' AS series, {} AS v FROM samples",
                     self::reading("data", *field)
                 )
             })
             .collect::<Vec<_>>()
             .join(" UNION ALL "),
         Source::Items { name, reading } => format!(
-            "SELECT t, item.value->>'{name}' AS series, {} AS v
+            "SELECT agent_id, t, item.value->>'{name}' AS series, {} AS v
              FROM samples, json_each(samples.data) AS item",
             self::reading("item.value", reading)
         ),
         Source::Entries(reading) => format!(
-            "SELECT t, item.key AS series, {} AS v
+            "SELECT agent_id, t, item.key AS series, {} AS v
              FROM samples, json_each(samples.data) AS item",
             self::reading("item.value", reading)
         ),
@@ -233,7 +233,7 @@ fn series_sql(metric: &Metric) -> String {
 
     format!(
         "WITH samples AS (
-             SELECT epoch_ms(time) AS t, data FROM metrics
+             SELECT agent_id, epoch_ms(time) AS t, data FROM metrics
              WHERE agent_id = $1 AND collector = $2
                AND time >= epoch_ms($3::BIGINT) AND time < epoch_ms($4::BIGINT)
          ),
@@ -254,6 +254,35 @@ fn series_sql(metric: &Metric) -> String {
          WHERE position <= $6::BIGINT
          GROUP BY series, bucket, total
          ORDER BY series, bucket",
+        readings = readings(metric.source),
+    )
+}
+
+/// Parameters: collector, from and to.
+fn newest_sql(metric: &Metric) -> String {
+    let values = if is_rate(metric.source) {
+        "SELECT agent_id, t, series,
+                v * 1000.0 / NULLIF(
+                    t - lag(t) OVER (PARTITION BY agent_id, series ORDER BY t), 0
+                ) AS v
+         FROM readings"
+    } else {
+        "SELECT agent_id, t, series, v FROM readings"
+    };
+
+    format!(
+        "WITH samples AS (
+             SELECT agent_id, epoch_ms(time) AS t, data FROM metrics
+             WHERE collector = $1
+               AND time >= epoch_ms($2::BIGINT) AND time <= epoch_ms($3::BIGINT)
+         ),
+         readings AS ({readings}),
+         computed AS ({values})
+         SELECT agent_id, series, max(t), arg_max(v, t)
+         FROM computed
+         WHERE series IS NOT NULL AND abs(v) <= {LARGEST_VALUE}
+         GROUP BY agent_id, series
+         ORDER BY agent_id, series",
         readings = readings(metric.source),
     )
 }
@@ -331,6 +360,20 @@ impl MetricsReader for DuckDbReader {
             }
         }
         Ok(samples)
+    }
+
+    fn newest(&self, metric: &Metric, since_ms: i64, until_ms: i64) -> Result<Vec<NewestReading>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(&newest_sql(metric))?;
+        let rows = statement.query_map(params![metric.collector, since_ms, until_ms], |row| {
+            Ok(NewestReading {
+                agent_id: row.get(0)?,
+                series: row.get(1)?,
+                time_ms: row.get(2)?,
+                value: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 }
 
@@ -739,6 +782,202 @@ mod tests {
             .connection
             .query_row("SELECT count(*) FROM metrics", [], |row| row.get(0))
             .unwrap()
+    }
+
+    fn newest(store: &DuckDbStore, metric: &str, since: i64, until: i64) -> Vec<NewestReading> {
+        store
+            .reader()
+            .unwrap()
+            .newest(find(metric).unwrap(), since, until)
+            .unwrap()
+    }
+
+    fn values(readings: &[NewestReading]) -> Vec<(&str, &str, i64, f64)> {
+        readings
+            .iter()
+            .map(|r| (r.agent_id.as_str(), r.series.as_str(), r.time_ms, r.value))
+            .collect()
+    }
+
+    #[test]
+    fn newest_gives_each_agents_latest_value() {
+        let mut store = in_memory();
+        write_metric(
+            &mut store,
+            "a",
+            1000,
+            "cpu",
+            json!({ "usage_percent": 10.0 }),
+        );
+        write_metric(
+            &mut store,
+            "a",
+            2000,
+            "cpu",
+            json!({ "usage_percent": 20.0 }),
+        );
+        write_metric(
+            &mut store,
+            "b",
+            1500,
+            "cpu",
+            json!({ "usage_percent": 30.0 }),
+        );
+
+        assert_eq!(
+            values(&newest(&store, "cpu.usage", 0, HOUR_MS)),
+            [("a", "CPU", 2000, 20.0), ("b", "CPU", 1500, 30.0)]
+        );
+    }
+
+    #[test]
+    fn newest_keeps_each_series_apart() {
+        let mut store = in_memory();
+        let disk = |used: u64| {
+            json!([
+                { "mount_point": "/", "total_bytes": 100, "used_bytes": used },
+                { "mount_point": "/data", "total_bytes": 100, "used_bytes": 50 },
+            ])
+        };
+        write_metric(&mut store, "a", 1000, "disk", disk(10));
+        write_metric(&mut store, "a", 2000, "disk", disk(20));
+
+        assert_eq!(
+            values(&newest(&store, "disk.usage", 0, HOUR_MS)),
+            [("a", "/", 2000, 20.0), ("a", "/data", 2000, 50.0)]
+        );
+    }
+
+    #[test]
+    fn newest_ignores_samples_outside_its_window() {
+        let mut store = in_memory();
+        write_metric(
+            &mut store,
+            "a",
+            1000,
+            "cpu",
+            json!({ "usage_percent": 10.0 }),
+        );
+        write_metric(
+            &mut store,
+            "a",
+            2000,
+            "cpu",
+            json!({ "usage_percent": 20.0 }),
+        );
+        write_metric(
+            &mut store,
+            "a",
+            3000,
+            "cpu",
+            json!({ "usage_percent": 30.0 }),
+        );
+
+        assert_eq!(
+            values(&newest(&store, "cpu.usage", 1500, 2500)),
+            [("a", "CPU", 2000, 20.0)]
+        );
+    }
+
+    #[test]
+    fn newest_turns_counts_into_rates_per_agent() {
+        let mut store = in_memory();
+        let count = |bytes: u64| json!({ "en0": { "received_bytes": bytes } });
+        write_metric(&mut store, "a", 10_000, "network", count(1000));
+        write_metric(&mut store, "a", 20_000, "network", count(5000));
+        // Sampled between the other agent's, which mustn't affect its rate.
+        write_metric(&mut store, "b", 15_000, "network", count(100));
+        write_metric(&mut store, "b", 16_000, "network", count(100));
+
+        assert_eq!(
+            values(&newest(&store, "network.received", 0, HOUR_MS)),
+            [("a", "en0", 20_000, 500.0), ("b", "en0", 16_000, 100.0)]
+        );
+    }
+
+    #[test]
+    fn newest_needs_two_samples_for_a_rate() {
+        let mut store = in_memory();
+        let data = json!({ "en0": { "received_bytes": 1000 } });
+        write_metric(&mut store, "a", 10_000, "network", data);
+
+        assert!(newest(&store, "network.received", 0, HOUR_MS).is_empty());
+    }
+
+    #[test]
+    fn newest_skips_values_that_are_not_usable_numbers() {
+        let mut store = in_memory();
+        write_metric(
+            &mut store,
+            "a",
+            1000,
+            "cpu",
+            json!({ "usage_percent": 10.0 }),
+        );
+        write_metric(
+            &mut store,
+            "a",
+            2000,
+            "cpu",
+            json!({ "usage_percent": "lots" }),
+        );
+        write_metric(
+            &mut store,
+            "a",
+            3000,
+            "cpu",
+            json!({ "usage_percent": 1.7e308 }),
+        );
+        write_metric(&mut store, "b", 1000, "cpu", json!({ "other": 1 }));
+
+        assert_eq!(
+            values(&newest(&store, "cpu.usage", 0, HOUR_MS)),
+            [("a", "CPU", 1000, 10.0)]
+        );
+    }
+
+    #[test]
+    fn newest_handles_names_agents_choose() {
+        let mut store = in_memory();
+        let count = |bytes: u64| json!({ "eth0.100": { "received_bytes": bytes } });
+        write_metric(&mut store, "a", 10_000, "network", count(100));
+        write_metric(&mut store, "a", 20_000, "network", count(100));
+
+        let readings = newest(&store, "network.received", 0, HOUR_MS);
+        assert_eq!(readings[0].series, "eth0.100");
+    }
+
+    #[test]
+    fn process_metrics_keep_each_watched_name_apart() {
+        let mut store = in_memory();
+        let data = json!([
+            { "name": "nginx", "count": 3, "cpu_percent": 1.5, "memory_percent": 2.5 },
+            { "name": "postgres", "count": 0, "cpu_percent": 0.0, "memory_percent": 0.0 },
+        ]);
+        write_metric(&mut store, "a", 1000, "processes", data);
+
+        assert_eq!(
+            values(&newest(&store, "process.count", 0, HOUR_MS)),
+            [("a", "nginx", 1000, 3.0), ("a", "postgres", 1000, 0.0)]
+        );
+        assert_eq!(newest(&store, "process.cpu", 0, HOUR_MS)[0].value, 1.5);
+        assert_eq!(newest(&store, "process.memory", 0, HOUR_MS)[0].value, 2.5);
+        assert_eq!(
+            names(&query(&store, "a", "process.count", 10)),
+            ["nginx", "postgres"]
+        );
+    }
+
+    #[test]
+    fn every_metric_can_be_read_across_agents() {
+        let store = in_memory();
+        for metric in METRICS {
+            assert!(
+                newest(&store, metric.name, 0, HOUR_MS).is_empty(),
+                "{}",
+                metric.name
+            );
+        }
     }
 
     #[test]

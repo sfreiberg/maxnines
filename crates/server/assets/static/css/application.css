@@ -11,6 +11,8 @@
   --good-surface: #e3f4ea;
   --bad: #b3261e;
   --bad-surface: #fbe9e7;
+  --warn: #8a5a00;
+  --warn-surface: #fbf0d9;
   --neutral-surface: #ececf0;
   --grid: #e8e9ed;
   --series-1: #2a78d6;
@@ -36,6 +38,8 @@
     --good-surface: #17332a;
     --bad: #f2a29b;
     --bad-surface: #3d1f1d;
+    --warn: #f0c674;
+    --warn-surface: #3a2f17;
     --neutral-surface: #2b2d35;
     --grid: #2c2e36;
     --series-1: #3987e5;
@@ -94,6 +98,7 @@ tr.disabled td { color: var(--muted); }
 .badge { display: inline-block; padding: 0.0625rem 0.5rem; border-radius: 999px; font-size: 0.8125rem; }
 .badge.good { background: var(--good-surface); color: var(--good); }
 .badge.bad { background: var(--bad-surface); color: var(--bad); }
+.badge.warn { background: var(--warn-surface); color: var(--warn); }
 .badge.neutral { background: var(--neutral-surface); color: var(--muted); }
 
 .error, .notice { padding: 0.625rem 0.75rem; border-radius: 6px; overflow-wrap: anywhere; }
@@ -221,3 +226,7 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
   .preview td { min-width: 0; padding: 0; border: 0; overflow-wrap: anywhere; }
   .preview td:last-child { grid-column: 1 / -1; }
 }
+
+/* An offline rule has no metric to choose. Without :has() the fields just stay. */
+.alert-rule:has(select[name="kind"] option[value="offline"]:checked) .metric-fields { display: none; }
+.metric-fields { display: contents; }

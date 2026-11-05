@@ -1,0 +1,55 @@
+    {% if rule.note %}<p class="notice">{{ rule.note }}</p>{% endif %}
+
+    {% if rule.use_expression %}
+    <input type="hidden" name="condition_mode" value="expression">
+    {% for clause in rule.clauses %}
+    <input type="hidden" name="clause_fact_{{ loop.index0 }}" value="{{ clause.fact }}">
+    <input type="hidden" name="clause_operator_{{ loop.index0 }}" value="{{ clause.operator }}">
+    <input type="hidden" name="clause_value_{{ loop.index0 }}" value="{{ clause.value }}">
+    <input type="hidden" name="clause_kind_{{ loop.index0 }}" value="{{ clause.kind }}">
+    {% endfor %}
+    <label>Expression
+      <input type="text" name="condition" value="{{ rule.condition }}" spellcheck="false" placeholder='facts.os.family == "linux"'>
+      <small>Leave empty for every agent. Facts are available as <code>facts</code>, such as <code>facts.custom.role == "web"</code>.</small>
+    </label>
+    <div class="actions">
+      <button type="submit" name="form_action" value="use_builder" class="secondary" formnovalidate>Use the builder</button>
+    </div>
+    {% else %}
+    <label>Match
+      <select name="match">
+        <option value="all"{% if not rule.match_any %} selected{% endif %}>All of these conditions</option>
+        <option value="any"{% if rule.match_any %} selected{% endif %}>Any of these conditions</option>
+      </select>
+    </label>
+
+    {% for clause in rule.clauses %}
+    <div class="clause">
+      <label>Fact
+        <input type="text" name="clause_fact_{{ loop.index0 }}" value="{{ clause.fact }}" list="known-facts" spellcheck="false" placeholder="os.family">
+      </label>
+      <label>Comparison
+        <select name="clause_operator_{{ loop.index0 }}">
+          {% for operator in operators %}
+          <option value="{{ operator.name }}"{% if operator.name == clause.operator %} selected{% endif %}>{{ operator.label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Value
+        <input type="text" name="clause_value_{{ loop.index0 }}" value="{{ clause.value }}" spellcheck="false">
+      </label>
+      <input type="hidden" name="clause_kind_{{ loop.index0 }}" value="{{ clause.kind }}">
+      <button type="submit" name="form_action" value="remove_clause_{{ loop.index0 }}" class="secondary" formnovalidate aria-label="Remove this condition">Remove</button>
+    </div>
+    {% endfor %}
+    <datalist id="known-facts">
+      {% for name in known_facts %}<option value="{{ name }}"></option>{% endfor %}
+    </datalist>
+    <input type="hidden" name="condition" value="{{ rule.condition }}">
+
+    <small class="hint">With no conditions, this applies to every agent.</small>
+    <div class="actions">
+      <button type="submit" name="form_action" value="add_clause" class="secondary" formnovalidate>Add condition</button>
+      <button type="submit" name="form_action" value="use_expression" class="secondary" formnovalidate>Write an expression</button>
+    </div>
+    {% endif %}

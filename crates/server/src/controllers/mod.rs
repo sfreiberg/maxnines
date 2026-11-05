@@ -1,11 +1,15 @@
-//! Routes and request handling. Pages live in `agents`, `metrics` and `rules`,
-//! the token protected API in `admin`, and agent connections in `agent_socket`.
+//! Routes and request handling. Pages live in `agents`, `alerts`, `alert_rules`,
+//! `metrics`, `notification_channels` and `rules`, the token protected API in `admin`, and agent connections in `agent_socket`.
 
 pub mod admin;
 pub mod agent_socket;
 mod agents;
+mod alert_rules;
+mod alerts;
 mod assets;
+mod condition_form;
 mod metrics;
+mod notification_channels;
 mod rules;
 
 use std::collections::BTreeMap;
@@ -31,6 +35,9 @@ pub fn app(state: AppState) -> Router {
         .route("/", get(home))
         .route("/ws", get(agent_socket::upgrade))
         .merge(agents::routes())
+        .merge(alerts::routes())
+        .merge(alert_rules::routes())
+        .merge(notification_channels::routes())
         .merge(metrics::routes())
         .merge(rules::routes())
         .merge(assets::routes())

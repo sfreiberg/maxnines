@@ -1,3 +1,5 @@
+mod alert_evaluator;
+mod alerting;
 mod app_state;
 mod cli;
 mod condition_builder;
@@ -9,6 +11,7 @@ mod metric_charts;
 mod metrics;
 mod migrations;
 mod models;
+mod notifier;
 mod presence;
 mod registration;
 mod rule_engine;
@@ -32,10 +35,12 @@ use tokio::sync::watch;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use alert_evaluator::Evaluator;
 use app_state::{AppState, Heartbeat};
 use config::Config;
-use metrics::Metrics;
+use metrics::{Metrics, now_ms};
 use models::Database;
+use notifier::{Mailer, Notifier};
 use presence::Presence;
 use registration::{Registry, Rules, hash_token};
 use store::WriterCommand;
@@ -116,6 +121,13 @@ async fn serve(path: &Path) -> Result<()> {
     let store = store::open(&config.metrics)?;
     let metrics = Metrics::new(store.reader()?);
     let (writer, writer_thread) = store::spawn_writer(store);
+    let mailer = config
+        .email
+        .as_ref()
+        .map(Mailer::new)
+        .transpose()
+        .context("setting up email")?
+        .map(Arc::new);
 
     let state = AppState {
         presence: Arc::new(Presence::default()),
@@ -129,6 +141,7 @@ async fn serve(path: &Path) -> Result<()> {
         config_changes: Arc::new(watch::Sender::new(0)),
         writer: writer.clone(),
         metrics,
+        mailer,
         heartbeat: Heartbeat {
             interval: Duration::from_secs(config.heartbeat_interval_secs),
             timeout: Duration::from_secs(config.heartbeat_timeout_secs),
@@ -149,6 +162,16 @@ async fn serve(path: &Path) -> Result<()> {
         public_url = %state.audience,
         "server started"
     );
+
+    Evaluator::new(
+        state.database.clone(),
+        state.registry.clone(),
+        state.presence.clone(),
+        state.metrics.clone(),
+        now_ms(),
+    )
+    .spawn();
+    Notifier::new(state.database.clone(), state.mailer.clone()).spawn();
 
     let service = controllers::app(state).into_make_service_with_connect_info::<SocketAddr>();
     tokio::select! {

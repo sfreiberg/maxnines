@@ -1,0 +1,41 @@
+{% extends "layouts/application.html" %}
+{% block title %}{% if id %}Edit channel{% else %}New channel{% endif %} · MaxNines{% endblock title %}
+{% block content %}
+<p class="breadcrumb"><a href="/alerts/channels">Notification channels</a></p>
+<h1>{% if id %}Edit channel{% else %}New channel{% endif %}</h1>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<form method="post" action="{% if id %}/alerts/channels/{{ id }}{% else %}/alerts/channels{% endif %}" class="stacked">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+
+  <label>Name
+    <input type="text" name="name" value="{{ channel.name }}" required maxlength="255">
+  </label>
+
+  <label>Type
+    <select name="kind">
+      <option value="webhook"{% if channel.kind == "webhook" %} selected{% endif %}>Webhook</option>
+      <option value="email"{% if channel.kind == "email" %} selected{% endif %}>Email</option>
+    </select>
+    {% if not email_ready %}<small>Email needs an <code>email</code> block in the server config.</small>{% endif %}
+  </label>
+
+  <label>Sends to
+    <input type="text" name="target" value="{{ channel.target }}" spellcheck="false" autocomplete="off"{% if channel.preview %} placeholder="{{ channel.preview }}"{% endif %}>
+    <small>{% if channel.preview %}Leave empty to keep the saved URL, which isn't shown because it can work like a password.{% else %}A webhook's URL, or email addresses separated by commas.{% endif %}</small>
+  </label>
+
+  <div class="actions">
+    <button type="submit">Save channel</button>
+    <a class="button secondary" href="/alerts/channels">Cancel</a>
+  </div>
+</form>
+
+{% if id %}
+<form method="post" action="/alerts/channels/{{ id }}/delete" class="delete-form">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  <button type="submit" class="danger">Delete channel</button>
+</form>
+{% endif %}
+{% endblock content %}

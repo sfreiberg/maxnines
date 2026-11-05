@@ -142,7 +142,8 @@ async fn show(
     let mut charts = Vec::new();
     for metric in METRICS {
         match chart(&state, &agent, metric, range).await {
-            Ok(chart) => charts.push(chart),
+            Ok(chart) if chart.has_data || !metric.is_optional() => charts.push(chart),
+            Ok(_) => {}
             Err(error) => return server_error(&error),
         }
     }

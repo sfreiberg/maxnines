@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tracing::error;
 
 use crate::config::MetricsConfig;
-use crate::metrics::{LatestSample, SeriesQuery, SeriesResult};
+use crate::metrics::{LatestSample, Metric, NewestReading, SeriesQuery, SeriesResult};
 
 /// Samples waiting to be written. When this fills up, connections stop reading
 /// from their agents until the database catches up.
@@ -41,6 +41,10 @@ pub trait MetricsReader: Send + Sync {
 
     /// The newest sample from each agent's collectors, between two times.
     fn latest(&self, since_ms: i64, until_ms: i64) -> Result<Vec<LatestSample>>;
+
+    /// The newest value of each series of a metric, across every agent, between
+    /// two times. Values that aren't usable numbers are skipped.
+    fn newest(&self, metric: &Metric, since_ms: i64, until_ms: i64) -> Result<Vec<NewestReading>>;
 }
 
 pub fn open(config: &MetricsConfig) -> Result<Box<dyn Store>> {
@@ -121,6 +125,15 @@ pub mod testing {
         }
 
         fn latest(&self, _since_ms: i64, _until_ms: i64) -> Result<Vec<LatestSample>> {
+            Ok(Vec::new())
+        }
+
+        fn newest(
+            &self,
+            _metric: &Metric,
+            _since_ms: i64,
+            _until_ms: i64,
+        ) -> Result<Vec<NewestReading>> {
             Ok(Vec::new())
         }
     }

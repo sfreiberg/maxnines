@@ -58,3 +58,21 @@ registration {
   #   source_cidrs = ["10.99.0.0/16"]
   # }
 }
+
+# The mail server for email notifications. Leave this out if you don't use them.
+#
+# email {
+#   host = "smtp.example.com"
+#
+#   # "starttls" (the default), "tls", or "none" for a relay on this machine.
+#   security = "starttls"
+#
+#   # Defaults to the usual port for the security setting.
+#   # port = 587
+#
+#   # The password is read from a file to keep it out of this one.
+#   username      = "alerts@example.com"
+#   password_file = "/etc/maxnines/smtp.password"
+#
+#   from = "MaxNines <alerts@example.com>"
+# }

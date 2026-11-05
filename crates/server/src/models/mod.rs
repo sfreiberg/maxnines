@@ -5,8 +5,14 @@
 mod agent;
 mod agent_config_status;
 mod agent_fact;
+mod alert;
+mod alert_rule;
+mod alert_rule_channel;
+mod alerting;
 mod config_rule;
 mod config_rule_setting;
+mod notification;
+mod notification_channel;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -558,6 +564,10 @@ impl Database {
             .await
             .unwrap();
         self.connection
+            .execute_unprepared("DELETE FROM alerts")
+            .await
+            .unwrap();
+        self.connection
             .execute_unprepared("DELETE FROM agents")
             .await
             .unwrap();
@@ -911,6 +921,105 @@ mod tests {
 
         // Each agent has its own facts.
         assert_eq!(database.current_facts(agent).await.unwrap().len(), 5);
+
+        exercise_alerting(database, agent).await;
+    }
+
+    /// Names are unique per run, because real databases keep their rows.
+    async fn exercise_alerting(database: &Database, agent: &str) {
+        use crate::alerting::{
+            AlertRuleInput, ChannelInput, ChannelKind, Comparison, Event, NewAlert, RuleKind,
+            Severity,
+        };
+
+        let suffix = crate::metrics::now_ms();
+        let channel = database
+            .create_channel(&ChannelInput {
+                name: format!("Ops {suffix}"),
+                kind: ChannelKind::Webhook,
+                target: "https://example.com/hook".to_string(),
+            })
+            .await
+            .unwrap();
+        let mut input = AlertRuleInput {
+            name: format!("High CPU {suffix}"),
+            kind: RuleKind::Metric,
+            metric: Some("cpu.usage".to_string()),
+            series: Some("/data*".to_string()),
+            comparison: Some(Comparison::Above),
+            threshold: Some(90.5),
+            for_secs: 120,
+            severity: Severity::Critical,
+            condition: Some("true".to_string()),
+            enabled: true,
+            channels: vec![channel],
+        };
+        let rule = database.create_alert_rule(&input).await.unwrap();
+        assert_eq!(
+            database.get_alert_rule(rule).await.unwrap().unwrap().rule,
+            input
+        );
+
+        input.threshold = Some(75.25);
+        assert!(database.update_alert_rule(rule, &input).await.unwrap());
+        assert_eq!(
+            database.get_alert_rule(rule).await.unwrap().unwrap().rule,
+            input
+        );
+
+        let started_ms = suffix;
+        let new = NewAlert {
+            rule_id: rule,
+            rule_name: input.name.clone(),
+            severity: input.severity,
+            agent_id: agent.to_string(),
+            host: "é".repeat(255),
+            series: "é".repeat(255),
+            value: Some(91.5),
+            summary: "x".repeat(5000),
+            started_ms,
+        };
+        let alert = database.fire_alert(&new, &[channel]).await.unwrap();
+        let open = database.open_alerts().await.unwrap();
+        let saved = open.iter().find(|a| a.id == alert).unwrap();
+        assert_eq!(saved.host, new.host);
+        assert_eq!(saved.value, Some(91.5));
+
+        let due = database.due_deliveries(started_ms, 500).await.unwrap();
+        let firing = due.iter().find(|d| d.alert.id == alert).unwrap();
+        assert_eq!(firing.event, Event::Firing);
+        database
+            .delivery_failed(
+                firing.id,
+                1,
+                "the webhook returned status 500",
+                Some(started_ms + 5),
+            )
+            .await
+            .unwrap();
+        let problems = database.delivery_problems(10).await.unwrap();
+        assert_eq!(problems[0].error, "the webhook returned status 500");
+        database
+            .delivery_sent(firing.id, 2, started_ms + 5)
+            .await
+            .unwrap();
+
+        database
+            .resolve_alert(alert, started_ms + 10, "The problem cleared")
+            .await
+            .unwrap();
+        let due = database.due_deliveries(started_ms + 10, 500).await.unwrap();
+        let resolved = due.iter().find(|d| d.alert.id == alert).unwrap();
+        assert_eq!(resolved.event, Event::Resolved);
+
+        // The alert outlives its rule, and its queue goes with its channel.
+        assert!(database.delete_alert_rule(rule).await.unwrap());
+        let history = database.resolved_alerts(10).await.unwrap();
+        let ended = history.iter().find(|a| a.id == alert).unwrap();
+        assert_eq!(ended.rule_id, None);
+        assert!(database.delete_channel(channel).await.unwrap());
+        let due = database.due_deliveries(started_ms + 10, 500).await.unwrap();
+        assert!(!due.iter().any(|d| d.alert.id == alert));
     }
 
     #[tokio::test]

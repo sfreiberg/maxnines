@@ -151,6 +151,36 @@ pub const METRICS: &[Metric] = &[
         collector: "network",
         source: Source::Entries(Reading::Rate("$.transmitted_bytes")),
     },
+    Metric {
+        name: "process.count",
+        title: "Running processes",
+        unit: Unit::Number,
+        collector: "processes",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.count"),
+        },
+    },
+    Metric {
+        name: "process.cpu",
+        title: "Process CPU usage",
+        unit: Unit::Percent,
+        collector: "processes",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.cpu_percent"),
+        },
+    },
+    Metric {
+        name: "process.memory",
+        title: "Process memory usage",
+        unit: Unit::Percent,
+        collector: "processes",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.memory_percent"),
+        },
+    },
 ];
 
 pub fn now_ms() -> i64 {
@@ -166,6 +196,12 @@ pub fn find(name: &str) -> Option<&'static Metric> {
 }
 
 impl Metric {
+    /// Most agents aren't set up to watch processes, and a page of empty charts
+    /// about them says nothing.
+    pub fn is_optional(&self) -> bool {
+        self.collector == "processes"
+    }
+
     /// Where a series sits in the catalog, for metrics with fixed series.
     pub fn position(&self, series: &str) -> Option<usize> {
         match self.source {
@@ -274,6 +310,15 @@ fn fullest_disk(data: &Value) -> Option<(f64, String)> {
         .max_by(|a, b| a.0.total_cmp(&b.0))
 }
 
+/// A series' newest value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewestReading {
+    pub agent_id: String,
+    pub series: String,
+    pub time_ms: i64,
+    pub value: f64,
+}
+
 fn current_values(samples: Vec<LatestSample>) -> BTreeMap<String, CurrentValues> {
     let mut agents: BTreeMap<String, CurrentValues> = BTreeMap::new();
     for sample in samples {
@@ -335,6 +380,16 @@ impl Metrics {
             .series
             .sort_by_key(|series| metric.position(&series.name));
         Ok(result)
+    }
+
+    /// The newest value of each series, across every agent.
+    pub async fn newest(&self, metric: &'static Metric, now_ms: i64) -> Result<Vec<NewestReading>> {
+        let reader = self.reader.clone();
+        tokio::task::spawn_blocking(move || {
+            reader.newest(metric, now_ms - CURRENT_WINDOW_MS, now_ms + CLOCK_SKEW_MS)
+        })
+        .await
+        .context("reading metrics")?
     }
 
     pub async fn current(&self, now_ms: i64) -> Result<BTreeMap<String, CurrentValues>> {

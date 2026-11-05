@@ -33,6 +33,59 @@ pub struct Config {
     pub database: DatabaseConfig,
     #[serde(default)]
     pub registration: RegistrationConfig,
+    /// The mail server for email notifications. Without it, they can't be sent.
+    pub email: Option<EmailConfig>,
+}
+
+/// How to reach a mail server. The password lives in a file, so this one can be
+/// shared.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmailConfig {
+    pub host: String,
+    /// Defaults to the usual port for `security`.
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub security: EmailSecurity,
+    pub username: Option<String>,
+    pub password_file: Option<PathBuf>,
+    /// Who notifications come from, such as "MaxNines <alerts@example.com>".
+    pub from: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EmailSecurity {
+    /// Encrypted from the first byte, usually on port 465.
+    Tls,
+    /// Upgrades to encryption after connecting, usually on port 587.
+    #[default]
+    Starttls,
+    /// No encryption, which only suits a relay on the same machine.
+    None,
+}
+
+impl EmailConfig {
+    pub fn password(&self) -> Result<Option<String>> {
+        let Some(path) = &self.password_file else {
+            return Ok(None);
+        };
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading email password {}", path.display()))?;
+        Ok(Some(text.trim().to_string()))
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.username.is_some() == self.password_file.is_some(),
+            "set both username and password_file in the email block, or neither"
+        );
+        ensure!(
+            self.security != EmailSecurity::None || self.username.is_none(),
+            "email security can't be \"none\" with a password, which would be sent unencrypted"
+        );
+        Ok(())
+    }
 }
 
 /// One variant per database, selected by the `metrics "<name>"` block label.
@@ -163,6 +216,9 @@ impl Config {
             "heartbeat_timeout_secs must be longer than heartbeat_interval_secs"
         );
         config.trusted_networks()?;
+        if let Some(email) = &config.email {
+            email.validate().context("email block")?;
+        }
         for (name, rule) in &config.registration.rule {
             rule.validate().with_context(|| format!("rule {name:?}"))?;
         }

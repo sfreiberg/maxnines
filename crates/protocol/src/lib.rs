@@ -11,7 +11,13 @@ use serde_json::Value;
 
 /// Every collector the project knows about. An agent reports the ones it can
 /// run in its facts, because older agents may not have them all.
-pub const COLLECTORS: [&str; 5] = ["cpu", "disk", "host", "memory", "network"];
+pub const COLLECTORS: [&str; 6] = ["cpu", "disk", "host", "memory", "network", "processes"];
+
+/// How many process names one agent can be told to watch.
+const MAX_PROCESS_NAMES: usize = 64;
+
+/// Longer than any file name a supported system allows.
+const MAX_PROCESS_NAME_LEN: usize = 255;
 
 /// What git and the build tool report when they have no answer.
 const NO_BUILD_VALUE: &str = "VERGEN_IDEMPOTENT_OUTPUT";
@@ -79,6 +85,10 @@ pub struct CollectorSettings {
     /// Disk collector only: limit output to these mount points.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mount_points: Option<Vec<String>>,
+    /// Processes collector only: the process names to watch. Nothing else about
+    /// what's running on a machine is reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub names: Option<Vec<String>>,
 }
 
 fn default_interval_secs() -> u64 {
@@ -100,11 +110,12 @@ impl AgentConfig {
             self.facts_interval_secs > 0,
             "facts_interval_secs must be at least 1"
         );
-        for name in self.collectors.keys() {
+        for (name, settings) in &self.collectors {
             ensure!(
                 COLLECTORS.contains(&name.as_str()),
                 "unknown collector {name:?}"
             );
+            settings.validate()?;
         }
         Ok(())
     }
@@ -115,6 +126,24 @@ impl AgentConfig {
         let mut version = hex::encode(digest(&SHA256, text.as_bytes()));
         version.truncate(16);
         Ok(version)
+    }
+}
+
+impl CollectorSettings {
+    fn validate(&self) -> Result<()> {
+        let names = self.names.as_deref().unwrap_or_default();
+        ensure!(
+            names.len() <= MAX_PROCESS_NAMES,
+            "a collector can watch at most {MAX_PROCESS_NAMES} processes"
+        );
+        for name in names {
+            ensure!(!name.trim().is_empty(), "process names can't be empty");
+            ensure!(
+                name.len() <= MAX_PROCESS_NAME_LEN,
+                "the process name {name:?} is too long"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -192,6 +221,33 @@ mod tests {
             "collectors": { "cpu": {}, "disk": { "mount_points": ["/"] } },
         }))
         .unwrap()
+    }
+
+    fn watching(names: Value) -> AgentConfig {
+        serde_json::from_value(json!({ "collectors": { "processes": { "names": names } } }))
+            .unwrap()
+    }
+
+    #[test]
+    fn process_names_are_checked() {
+        watching(json!(["nginx", "postgres"])).validate().unwrap();
+
+        let too_many: Vec<String> = (0..=MAX_PROCESS_NAMES).map(|i| i.to_string()).collect();
+        for names in [
+            json!([""]),
+            json!(["  "]),
+            json!(["x".repeat(256)]),
+            json!(too_many),
+        ] {
+            assert!(watching(names.clone()).validate().is_err(), "{names}");
+        }
+    }
+
+    #[test]
+    fn a_config_without_process_names_keeps_its_version() {
+        let config: AgentConfig =
+            serde_json::from_value(json!({ "collectors": { "cpu": {} } })).unwrap();
+        assert!(!serde_json::to_string(&config).unwrap().contains("names"));
     }
 
     #[test]

@@ -11,11 +11,10 @@ use maxnines_protocol::COLLECTORS;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
+use super::condition_form::{ConditionForm, operators};
 use super::{CsrfForm, Page, server_error};
 use crate::app_state::AppState;
-use crate::condition_builder::{
-    Builder, Clause, MAX_CLAUSES, MatchMode, OPERATORS, Operator, ValueKind,
-};
+use crate::condition_builder::Builder;
 use crate::models::RuleInput;
 use crate::rule_engine;
 use crate::rule_preview::Preview;
@@ -34,61 +33,14 @@ pub fn routes() -> Router<AppState> {
 struct RuleForm {
     name: String,
     priority: String,
-    /// The expression, when it's being written by hand.
-    condition: String,
-    /// Whether the expression box is showing instead of the builder.
-    use_expression: bool,
-    /// Why the builder can't show this condition.
-    note: Option<String>,
-    match_any: bool,
-    clauses: Vec<ClauseRow>,
+    #[serde(flatten)]
+    applies_to: ConditionForm,
     enabled: bool,
     interval_secs: String,
     facts_interval_secs: String,
     mount_points: String,
+    process_names: String,
     collectors: Vec<CollectorChoice>,
-}
-
-/// One row of the builder.
-#[derive(Serialize, Clone)]
-struct ClauseRow {
-    fact: String,
-    operator: String,
-    value: String,
-    kind: String,
-}
-
-impl ClauseRow {
-    fn blank() -> Self {
-        Self {
-            fact: String::new(),
-            operator: Operator::Equals.form_name().to_string(),
-            value: String::new(),
-            kind: ValueKind::Text.form_name().to_string(),
-        }
-    }
-
-    fn from_clause(clause: Clause) -> Self {
-        Self {
-            fact: clause.fact,
-            operator: clause.operator.form_name().to_string(),
-            value: clause.value,
-            kind: clause.kind.form_name().to_string(),
-        }
-    }
-
-    fn is_blank(&self) -> bool {
-        self.fact.trim().is_empty() && self.value.trim().is_empty()
-    }
-
-    fn to_clause(&self) -> Result<Clause> {
-        Ok(Clause {
-            fact: self.fact.trim().to_string(),
-            operator: Operator::parse(&self.operator).context("unknown comparison")?,
-            value: self.value.clone(),
-            kind: ValueKind::parse(&self.kind),
-        })
-    }
 }
 
 /// A collector's setting. `inherit` leaves it to other rules.
@@ -103,55 +55,10 @@ impl RuleForm {
         Self {
             priority: "100".to_string(),
             enabled: true,
-            clauses: vec![ClauseRow::blank()],
+            applies_to: ConditionForm::blank(),
             collectors: choices(|_| "inherit".to_string()),
             ..Self::default()
         }
-    }
-
-    /// Shows a condition in the builder if it fits there, or as text if not.
-    fn set_condition(&mut self, condition: Option<&str>) {
-        self.condition = condition.unwrap_or_default().to_string();
-        match condition.map(Builder::from_expression) {
-            None => self.clauses = vec![ClauseRow::blank()],
-            Some(Some(builder)) => {
-                self.match_any = builder.mode == MatchMode::Any;
-                self.clauses = builder
-                    .clauses
-                    .into_iter()
-                    .map(ClauseRow::from_clause)
-                    .collect();
-                self.use_expression = false;
-                self.note = None;
-            }
-            Some(None) => {
-                self.use_expression = true;
-                self.note = Some(TOO_COMPLEX.to_string());
-            }
-        }
-    }
-
-    fn builder(&self) -> Result<Builder> {
-        let clauses = self
-            .clauses
-            .iter()
-            .filter(|row| !row.is_blank())
-            .map(ClauseRow::to_clause)
-            .collect::<Result<Vec<_>>>()?;
-        let mode = if self.match_any {
-            MatchMode::Any
-        } else {
-            MatchMode::All
-        };
-        Ok(Builder { mode, clauses })
-    }
-
-    fn expression(&self, known: &BTreeMap<String, String>) -> Result<Option<String>> {
-        if self.use_expression {
-            let condition = self.condition.trim();
-            return Ok((!condition.is_empty()).then(|| condition.to_string()));
-        }
-        self.builder()?.to_expression(known)
     }
 
     fn from_rule(rule: &RuleInput) -> Self {
@@ -159,21 +66,24 @@ impl RuleForm {
             Value::Null => String::new(),
             value => value.to_string(),
         };
-        let mounts = rule.settings["collectors"]["disk"]["mount_points"]
-            .as_array()
-            .map(|mounts| {
-                let lines: Vec<&str> = mounts.iter().filter_map(Value::as_str).collect();
-                lines.join("\n")
-            })
-            .unwrap_or_default();
+        let lines = |value: &Value| {
+            value
+                .as_array()
+                .map(|items| {
+                    let lines: Vec<&str> = items.iter().filter_map(Value::as_str).collect();
+                    lines.join("\n")
+                })
+                .unwrap_or_default()
+        };
 
-        let mut form = Self {
+        Self {
             name: rule.name.clone(),
             priority: rule.priority.to_string(),
             enabled: rule.enabled,
             interval_secs: number("interval_secs"),
             facts_interval_secs: number("facts_interval_secs"),
-            mount_points: mounts,
+            mount_points: lines(&rule.settings["collectors"]["disk"]["mount_points"]),
+            process_names: lines(&rule.settings["collectors"]["processes"]["names"]),
             collectors: choices(|name| {
                 match rule.settings["collectors"][name]["enabled"].as_bool() {
                     Some(true) => "on",
@@ -182,10 +92,8 @@ impl RuleForm {
                 }
                 .to_string()
             }),
-            ..Self::default()
-        };
-        form.set_condition(rule.condition.as_deref());
-        form
+            applies_to: ConditionForm::from_condition(rule.condition.as_deref()),
+        }
     }
 
     fn from_fields(fields: &BTreeMap<String, String>) -> Self {
@@ -193,25 +101,12 @@ impl RuleForm {
         Self {
             name: text("name"),
             priority: text("priority"),
-            condition: text("condition"),
-            use_expression: text("condition_mode") == "expression",
-            note: None,
-            match_any: text("match") == "any",
-            clauses: (0..MAX_CLAUSES)
-                .map_while(|index| {
-                    fields.get(&format!("clause_fact_{index}"))?;
-                    Some(ClauseRow {
-                        fact: text(&format!("clause_fact_{index}")),
-                        operator: text(&format!("clause_operator_{index}")),
-                        value: text(&format!("clause_value_{index}")),
-                        kind: text(&format!("clause_kind_{index}")),
-                    })
-                })
-                .collect(),
+            applies_to: ConditionForm::from_fields(fields),
             enabled: fields.contains_key("enabled"),
             interval_secs: text("interval_secs"),
             facts_interval_secs: text("facts_interval_secs"),
             mount_points: text("mount_points"),
+            process_names: text("process_names"),
             collectors: choices(|name| text(&format!("collector_{name}"))),
         }
     }
@@ -243,15 +138,19 @@ impl RuleForm {
             if let Some(enabled) = enabled {
                 fields.insert("enabled".to_string(), json!(enabled));
             }
-            if collector.name == "disk" {
-                let mounts: Vec<&str> = self
-                    .mount_points
+            let list = match collector.name {
+                "disk" => Some(("mount_points", &self.mount_points)),
+                "processes" => Some(("names", &self.process_names)),
+                _ => None,
+            };
+            if let Some((name, text)) = list {
+                let lines: Vec<&str> = text
                     .lines()
                     .map(str::trim)
                     .filter(|line| !line.is_empty())
                     .collect();
-                if !mounts.is_empty() {
-                    fields.insert("mount_points".to_string(), json!(mounts));
+                if !lines.is_empty() {
+                    fields.insert(name.to_string(), json!(lines));
                 }
             }
             if !fields.is_empty() {
@@ -269,15 +168,12 @@ impl RuleForm {
                 .trim()
                 .parse()
                 .context("priority must be a whole number")?,
-            condition: self.expression(known)?,
+            condition: self.applies_to.expression(known)?,
             enabled: self.enabled,
             settings: Value::Object(settings),
         })
     }
 }
-
-const TOO_COMPLEX: &str = "This condition is too complex for the builder, so it's shown as an \
-                          expression.";
 
 fn choices(mut choice: impl FnMut(&str) -> String) -> Vec<CollectorChoice> {
     COLLECTORS
@@ -357,12 +253,6 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
         .render()
 }
 
-#[derive(Serialize)]
-struct OperatorOption {
-    name: &'static str,
-    label: &'static str,
-}
-
 /// The rule form, ready to render.
 async fn form_view<'a>(
     state: &'a AppState,
@@ -370,16 +260,12 @@ async fn form_view<'a>(
     id: Option<i64>,
     form: &RuleForm,
 ) -> Page<'a> {
-    let operators: Vec<OperatorOption> = OPERATORS
-        .iter()
-        .map(|(_, name, label)| OperatorOption { name, label })
-        .collect();
     let known: Vec<String> = known_facts(state).await.into_keys().collect();
 
     Page::new(state, token, "rules/form.html")
         .with("id", &id)
         .with("rule", form)
-        .with("operators", &operators)
+        .with("operators", &operators())
         .with("known_facts", &known)
         .with("preview", &None::<Preview>)
 }
@@ -406,50 +292,6 @@ async fn known_facts(state: &AppState) -> BTreeMap<String, String> {
     state.database.known_facts().await.unwrap_or_default()
 }
 
-/// The builder's buttons change the form without saving it, so it works without
-/// any JavaScript. Returns true if one of them was pressed.
-fn apply_form_action(form: &mut RuleForm, action: &str, known: &BTreeMap<String, String>) -> bool {
-    if action == "add_clause" {
-        if form.clauses.len() < MAX_CLAUSES {
-            form.clauses.push(ClauseRow::blank());
-        }
-        return true;
-    }
-
-    if let Some(index) = action.strip_prefix("remove_clause_") {
-        if let Some(index) = index
-            .parse::<usize>()
-            .ok()
-            .filter(|i| *i < form.clauses.len())
-        {
-            form.clauses.remove(index);
-        }
-        if form.clauses.is_empty() {
-            form.clauses.push(ClauseRow::blank());
-        }
-        return true;
-    }
-
-    match action {
-        "use_expression" => {
-            // Keep what's been built, if it's complete enough to write out.
-            if let Ok(expression) = form.builder().and_then(|b| b.to_expression(known)) {
-                form.condition = expression.unwrap_or_default();
-            }
-            form.use_expression = true;
-            form.note = None;
-            true
-        }
-        "use_builder" => {
-            let condition = form.condition.trim().to_string();
-            form.use_expression = false;
-            form.set_condition((!condition.is_empty()).then_some(condition.as_str()));
-            true
-        }
-        _ => false,
-    }
-}
-
 /// Handles the buttons that show the form again without saving it, so a
 /// response means there's nothing left to do.
 async fn without_saving(
@@ -462,7 +304,10 @@ async fn without_saving(
     if action == "preview" {
         return Some(preview_page(state, &form.token, id, fields).await);
     }
-    if apply_form_action(fields, &action, &known_facts(state).await) {
+    if fields
+        .applies_to
+        .apply_action(&action, &known_facts(state).await)
+    {
         return Some(form_page(state, &form.token, id, fields, None).await);
     }
     None
@@ -596,6 +441,7 @@ async fn delete(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfFo
 
 #[cfg(test)]
 mod tests {
+    use super::super::condition_form::ClauseRow;
     use super::*;
 
     fn rule(settings: Value) -> RuleInput {
@@ -617,6 +463,7 @@ mod tests {
                 "cpu": { "enabled": true },
                 "memory": { "enabled": false },
                 "disk": { "enabled": true, "mount_points": ["/", "/data"] },
+                "processes": { "enabled": true, "names": ["nginx", "postgres"] },
             },
         }));
 
@@ -650,8 +497,8 @@ mod tests {
     #[test]
     fn an_empty_condition_means_every_agent() {
         let mut form = RuleForm::blank();
-        form.use_expression = true;
-        form.condition = "   ".to_string();
+        form.applies_to.use_expression = true;
+        form.applies_to.condition = "   ".to_string();
 
         assert_eq!(form.to_rule(&BTreeMap::new()).unwrap().condition, None);
     }
@@ -686,7 +533,7 @@ mod tests {
 
     fn built(rows: Vec<ClauseRow>) -> RuleForm {
         let mut form = RuleForm::blank();
-        form.clauses = rows;
+        form.applies_to.clauses = rows;
         form
     }
 
@@ -734,9 +581,9 @@ mod tests {
 
         let form = RuleForm::from_rule(&input);
 
-        assert!(!form.use_expression);
-        assert_eq!(form.clauses[0].fact, "os.family");
-        assert_eq!(form.clauses[0].value, "linux");
+        assert!(!form.applies_to.use_expression);
+        assert_eq!(form.applies_to.clauses[0].fact, "os.family");
+        assert_eq!(form.applies_to.clauses[0].value, "linux");
         assert_eq!(form.to_rule(&known()).unwrap(), input);
     }
 
@@ -747,8 +594,8 @@ mod tests {
 
         let form = RuleForm::from_rule(&input);
 
-        assert!(form.use_expression);
-        assert!(form.note.is_some());
+        assert!(form.applies_to.use_expression);
+        assert!(form.applies_to.note.is_some());
         assert_eq!(form.to_rule(&known()).unwrap(), input);
     }
 
@@ -756,58 +603,58 @@ mod tests {
     fn rows_can_be_added_and_removed() {
         let mut form = built(vec![fact("a", "equals", "1"), fact("b", "equals", "2")]);
 
-        assert!(apply_form_action(&mut form, "add_clause", &known()));
-        assert_eq!(form.clauses.len(), 3);
+        assert!(form.applies_to.apply_action("add_clause", &known()));
+        assert_eq!(form.applies_to.clauses.len(), 3);
 
-        assert!(apply_form_action(&mut form, "remove_clause_0", &known()));
-        assert_eq!(form.clauses[0].fact, "b");
+        assert!(form.applies_to.apply_action("remove_clause_0", &known()));
+        assert_eq!(form.applies_to.clauses[0].fact, "b");
 
         // An index past the end changes nothing.
-        assert!(apply_form_action(&mut form, "remove_clause_9", &known()));
-        assert_eq!(form.clauses.len(), 2);
+        assert!(form.applies_to.apply_action("remove_clause_9", &known()));
+        assert_eq!(form.applies_to.clauses.len(), 2);
     }
 
     #[test]
     fn removing_the_last_row_leaves_an_empty_one() {
         let mut form = built(vec![fact("a", "equals", "1")]);
 
-        apply_form_action(&mut form, "remove_clause_0", &known());
+        form.applies_to.apply_action("remove_clause_0", &known());
 
-        assert_eq!(form.clauses.len(), 1);
-        assert!(form.clauses[0].is_blank());
+        assert_eq!(form.applies_to.clauses.len(), 1);
+        assert!(form.applies_to.clauses[0].is_blank());
     }
 
     #[test]
     fn switching_to_the_expression_keeps_the_conditions() {
         let mut form = built(vec![fact("os.family", "equals", "linux")]);
 
-        apply_form_action(&mut form, "use_expression", &known());
+        form.applies_to.apply_action("use_expression", &known());
 
-        assert!(form.use_expression);
-        assert_eq!(form.condition, r#"facts.os.family == "linux""#);
+        assert!(form.applies_to.use_expression);
+        assert_eq!(form.applies_to.condition, r#"facts.os.family == "linux""#);
     }
 
     #[test]
     fn switching_back_reads_the_expression_or_explains_why_not() {
         let mut form = RuleForm::blank();
-        form.use_expression = true;
-        form.condition = r#"facts.os.family == "linux""#.to_string();
-        apply_form_action(&mut form, "use_builder", &known());
-        assert!(!form.use_expression);
-        assert_eq!(form.clauses[0].value, "linux");
+        form.applies_to.use_expression = true;
+        form.applies_to.condition = r#"facts.os.family == "linux""#.to_string();
+        form.applies_to.apply_action("use_builder", &known());
+        assert!(!form.applies_to.use_expression);
+        assert_eq!(form.applies_to.clauses[0].value, "linux");
 
         let mut form = RuleForm::blank();
-        form.use_expression = true;
-        form.condition = "1 + 1 == 2".to_string();
-        apply_form_action(&mut form, "use_builder", &known());
-        assert!(form.use_expression);
-        assert!(form.note.is_some());
-        assert_eq!(form.condition, "1 + 1 == 2");
+        form.applies_to.use_expression = true;
+        form.applies_to.condition = "1 + 1 == 2".to_string();
+        form.applies_to.apply_action("use_builder", &known());
+        assert!(form.applies_to.use_expression);
+        assert!(form.applies_to.note.is_some());
+        assert_eq!(form.applies_to.condition, "1 + 1 == 2");
     }
 
     #[test]
     fn saving_is_not_a_form_action() {
-        assert!(!apply_form_action(&mut RuleForm::blank(), "", &known()));
+        assert!(!RuleForm::blank().applies_to.apply_action("", &known()));
     }
 
     #[test]

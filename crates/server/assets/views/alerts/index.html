@@ -1,0 +1,76 @@
+{% extends "layouts/application.html" %}
+{% block title %}Alerts · MaxNines{% endblock title %}
+{% block head %}<meta http-equiv="refresh" content="60">{% endblock head %}
+{% block content %}
+<div class="title-row">
+  <h1>Alerts</h1>
+  <div class="actions">
+    <a class="button secondary" href="/alerts/rules">Alert rules</a>
+    <a class="button secondary" href="/alerts/channels">Notification channels</a>
+  </div>
+</div>
+
+<h2>Firing now</h2>
+{% if open %}
+<table>
+  <thead>
+    <tr><th>Severity</th><th>Alert</th><th>Agent</th><th>Rule</th><th>Started</th></tr>
+  </thead>
+  <tbody>
+    {% for alert in open %}
+    <tr>
+      <td>{% if alert.severity == "critical" %}<span class="badge bad">Critical</span>{% else %}<span class="badge warn">Warning</span>{% endif %}</td>
+      <td>{{ alert.summary }}</td>
+      <td><a href="/agents/{{ alert.agent_id }}">{{ alert.host }}</a></td>
+      <td>{{ alert.rule_name }}</td>
+      <td>{{ alert.started }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">Nothing is firing.</p>
+{% endif %}
+
+{% if problems %}
+<h2>Notifications that haven't arrived</h2>
+<table>
+  <thead>
+    <tr><th>Channel</th><th>Alert</th><th>Problem</th><th>Attempts</th><th>Status</th></tr>
+  </thead>
+  <tbody>
+    {% for problem in problems %}
+    <tr>
+      <td>{{ problem.channel }}</td>
+      <td>{{ problem.summary }}</td>
+      <td>{{ problem.error }}</td>
+      <td>{{ problem.attempts }}</td>
+      <td>{% if problem.gave_up %}<span class="badge bad">Gave up</span>{% else %}<span class="badge neutral">Retrying</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<h2>Recent</h2>
+{% if resolved %}
+<table>
+  <thead>
+    <tr><th>Alert</th><th>Agent</th><th>Started</th><th>Resolved</th><th>Why</th></tr>
+  </thead>
+  <tbody>
+    {% for alert in resolved %}
+    <tr>
+      <td>{{ alert.summary }}</td>
+      <td><a href="/agents/{{ alert.agent_id }}">{{ alert.host }}</a></td>
+      <td>{{ alert.started }}</td>
+      <td>{{ alert.resolved }}</td>
+      <td>{{ alert.reason }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">No alerts have ended yet.</p>
+{% endif %}
+{% endblock content %}
