@@ -15,6 +15,7 @@ mod notification;
 mod notification_channel;
 mod remote_check;
 mod remote_checks;
+mod server_secret;
 mod stats;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,6 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use maxnines_protocol::auth::new_nonce;
 use sea_orm::sea_query::Expr;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
@@ -297,6 +299,39 @@ impl Database {
             .await
             .context("loading facts history")?;
         rows.into_iter().map(to_fact_version).collect()
+    }
+}
+
+const ADMIN_TOKEN: &str = "admin_token";
+
+impl Database {
+    /// The token that protects the admin API, created the first time it's asked
+    /// for. Two servers starting at once can't end up with different tokens, as
+    /// only the first insert counts and both read the result.
+    pub async fn admin_token(&self) -> Result<String> {
+        let saved = server_secret::Entity::find_by_id(ADMIN_TOKEN)
+            .one(&self.connection)
+            .await
+            .context("reading the admin token")?;
+        if let Some(saved) = saved {
+            return Ok(saved.value);
+        }
+
+        let row = server_secret::ActiveModel {
+            name: Set(ADMIN_TOKEN.to_string()),
+            value: Set(new_nonce()?),
+        };
+        server_secret::Entity::insert(row)
+            .on_conflict_do_nothing_on([server_secret::Column::Name])
+            .exec_without_returning(&self.connection)
+            .await
+            .context("saving the admin token")?;
+
+        let saved = server_secret::Entity::find_by_id(ADMIN_TOKEN)
+            .one(&self.connection)
+            .await
+            .context("reading the admin token")?;
+        Ok(saved.context("the admin token wasn't saved")?.value)
     }
 }
 
@@ -607,6 +642,26 @@ mod tests {
     fn sorted(mut records: Vec<AgentRecord>) -> Vec<AgentRecord> {
         records.sort_by(|a, b| a.id.cmp(&b.id));
         records
+    }
+
+    #[tokio::test]
+    async fn the_admin_token_survives_a_restart() {
+        let folder = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", folder.path().join("db").display());
+
+        let first = Database::connect(&url).await.unwrap();
+        let token = first.admin_token().await.unwrap();
+        drop(first);
+
+        let reopened = Database::connect(&url).await.unwrap();
+        assert_eq!(reopened.admin_token().await.unwrap(), token);
+    }
+
+    #[tokio::test]
+    async fn each_database_gets_its_own_admin_token() {
+        let first = Database::in_memory().await.admin_token().await.unwrap();
+        let second = Database::in_memory().await.admin_token().await.unwrap();
+        assert_ne!(first, second);
     }
 
     /// Everything each database has to get right. It runs against SQLite
@@ -932,6 +987,10 @@ mod tests {
 
         exercise_alerting(database, agent).await;
         exercise_remote_checks(database).await;
+
+        let token = database.admin_token().await.unwrap();
+        assert!(token.len() >= 32);
+        assert_eq!(database.admin_token().await.unwrap(), token);
 
         let stats = database.stats().await.unwrap();
         assert!(stats.size_bytes.unwrap_or(0) > 0, "{stats:?}");

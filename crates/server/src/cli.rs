@@ -1,5 +1,5 @@
-//! The admin commands, which go through the running server because it holds the
-//! only database connection.
+//! The admin commands. They go through the running server, which holds the agent
+//! list and the metrics database, using the token kept in the main database.
 
 use std::net::SocketAddr;
 
@@ -7,9 +7,27 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use crate::config::Config;
-use crate::controllers::admin::{AgentView, read_token};
+use crate::controllers::admin::AgentView;
 use crate::fact_history::{describe_history, format_time};
-use crate::models::FactVersion;
+use crate::models::{Database, FactVersion};
+
+/// Reads the admin token from the main database.
+fn admin_token(config: &Config) -> Result<String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("reading the admin token")?;
+    runtime.block_on(async {
+        let database = Database::connect(&config.database.resolve_url()?).await?;
+        database.admin_token().await
+    })
+}
+
+/// Prints the admin token, for scripts that use the admin API.
+pub fn print_admin_token(config: &Config) -> Result<()> {
+    println!("{}", admin_token(config)?);
+    Ok(())
+}
 
 /// Where this machine reaches the server, even if it listens on all addresses.
 fn local_url(listen: SocketAddr) -> String {
@@ -37,7 +55,7 @@ fn explain(error: ureq::Error, url: &str) -> anyhow::Error {
 
 pub fn print_agents(config: &Config) -> Result<()> {
     let base = local_url(config.listen);
-    let token = read_token(&config.admin_token_file)?;
+    let token = admin_token(config)?;
 
     let mut response = ureq::get(format!("{base}/admin/agents"))
         .header("Authorization", format!("Bearer {token}"))
@@ -71,7 +89,7 @@ pub fn print_agents(config: &Config) -> Result<()> {
 
 fn get_json(config: &Config, path: &str) -> Result<String> {
     let base = local_url(config.listen);
-    let token = read_token(&config.admin_token_file)?;
+    let token = admin_token(config)?;
 
     let mut response = ureq::get(format!("{base}{path}"))
         .header("Authorization", format!("Bearer {token}"))
@@ -106,7 +124,7 @@ pub fn print_facts_history(config: &Config, id: &str) -> Result<()> {
 
 pub fn change_agent(config: &Config, id: &str, action: &str) -> Result<()> {
     let base = local_url(config.listen);
-    let token = read_token(&config.admin_token_file)?;
+    let token = admin_token(config)?;
 
     let result = ureq::post(format!("{base}/admin/agents/{id}/{action}"))
         .header("Authorization", format!("Bearer {token}"))

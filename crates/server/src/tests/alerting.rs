@@ -2943,7 +2943,11 @@ mod server_page {
             page.body.contains("SQLite"),
             "the other database still shows"
         );
-        assert!(!page.body.contains("secret"), "{}", page.body);
+        assert!(
+            !page.body.contains("deliberate test failure"),
+            "{}",
+            page.body
+        );
     }
 
     #[tokio::test]

@@ -1,22 +1,17 @@
-//! The admin API, which shares the server's port, and the commands that use it.
-//! The commands go through the server because it holds the only database
-//! connection. The API needs the admin token, because a proxy may expose it.
+//! The admin API, which shares the server's port. It needs the admin token,
+//! because a proxy may expose it.
 
-use std::fs;
 use std::net::IpAddr;
-use std::path::Path;
 
-use anyhow::{Context, Result, ensure};
 use axum::extract::{Path as UrlPath, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use maxnines_protocol::auth::{new_nonce, write_private_file};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tracing::{error, info};
+use tracing::error;
 
 use crate::alerting::{AlertRuleInput, ChannelInput, ChannelKind};
 use crate::app_state::AppState;
@@ -562,69 +557,5 @@ async fn decide(state: &AppState, id: &str, decision: AgentState) -> Response {
         Ok(Some(agent)) => Json(agent).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),
-    }
-}
-
-/// Reads the admin token, creating one on first start so there is nothing to
-/// set up. The file is what lets the admin commands in.
-pub fn load_or_create_token(path: &Path) -> Result<String> {
-    if !path.exists() {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating folder {}", parent.display()))?;
-        }
-        let token = new_nonce()?;
-        write_private_file(path, token.as_bytes())
-            .with_context(|| format!("writing {}", path.display()))?;
-        info!(file = %path.display(), "created admin token");
-        return Ok(token);
-    }
-    read_token(path)
-}
-
-pub fn read_token(path: &Path) -> Result<String> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("reading admin token {}", path.display()))?;
-    let token = text.trim();
-    ensure!(!token.is_empty(), "admin token {} is empty", path.display());
-    Ok(token.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn creates_a_token_once_then_keeps_it() {
-        let folder = tempfile::tempdir().unwrap();
-        let path = folder.path().join("nested/admin.token");
-
-        let first = load_or_create_token(&path).unwrap();
-        let second = load_or_create_token(&path).unwrap();
-
-        assert_eq!(first, second);
-        assert!(first.len() >= 32);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn only_the_owner_can_read_the_token() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let folder = tempfile::tempdir().unwrap();
-        let path = folder.path().join("admin.token");
-        load_or_create_token(&path).unwrap();
-
-        let mode = fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
-    }
-
-    #[test]
-    fn an_empty_token_file_is_an_error() {
-        let folder = tempfile::tempdir().unwrap();
-        let path = folder.path().join("admin.token");
-        fs::write(&path, "\n").unwrap();
-
-        assert!(load_or_create_token(&path).is_err());
     }
 }

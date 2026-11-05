@@ -68,6 +68,8 @@ enum Command {
     /// Manage registered agents on a running server
     #[command(subcommand)]
     Agents(AgentsCommand),
+    /// Print the token for the admin API
+    AdminToken,
 }
 
 #[derive(Debug, PartialEq, Subcommand)]
@@ -91,6 +93,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Run) {
         Command::Run => serve(&cli.config),
+        Command::AdminToken => cli::print_admin_token(&Config::load(&cli.config)?),
         Command::Agents(command) => {
             let config = Config::load(&cli.config)?;
             match command {
@@ -118,9 +121,9 @@ async fn serve(path: &Path) -> Result<()> {
 
     let config = Config::load(path)?;
     let rules = Rules::compile(&config.registration)?;
-    let admin_token = controllers::admin::load_or_create_token(&config.admin_token_file)?;
 
     let database = Database::connect(&config.database.resolve_url()?).await?;
+    let admin_token = database.admin_token().await?;
     let agents = database.load_agents().await.context("loading agents")?;
     let store = store::open(&config.metrics)?;
     let metrics = Metrics::new(store.reader()?);

@@ -13,6 +13,7 @@ impl MigratorTrait for Migrator {
             Box::new(CreateConfigRules),
             Box::new(CreateAlerting),
             Box::new(CreateRemoteChecks),
+            Box::new(CreateServerSecrets),
         ]
     }
 }
@@ -784,6 +785,49 @@ impl MigrationTrait for CreateRemoteChecks {
             .await?;
         manager
             .drop_table(Table::drop().table(RemoteChecks::Table).to_owned())
+            .await
+    }
+}
+
+struct CreateServerSecrets;
+
+impl MigrationName for CreateServerSecrets {
+    fn name(&self) -> &str {
+        "m20261105_000006_create_server_secrets"
+    }
+}
+
+#[derive(Iden)]
+enum ServerSecrets {
+    Table,
+    Name,
+    Value,
+}
+
+/// What the server generates for itself, such as the admin token. Keeping these
+/// here means the server writes to nothing but its databases.
+#[async_trait::async_trait]
+impl MigrationTrait for CreateServerSecrets {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(ServerSecrets::Table)
+                    .col(
+                        ColumnDef::new(ServerSecrets::Name)
+                            .string_len(64)
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(ServerSecrets::Value).text().not_null())
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(ServerSecrets::Table).to_owned())
             .await
     }
 }

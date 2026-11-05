@@ -1185,6 +1185,12 @@ async fn every_page_renders() {
     }
 }
 
+#[test]
+fn the_admin_token_has_a_command() {
+    let cli = Cli::parse_from(["maxnines-server", "admin-token"]);
+    assert_eq!(cli.command, Some(Command::AdminToken));
+}
+
 #[tokio::test]
 async fn the_home_page_is_the_overview() {
     let server = start().await;

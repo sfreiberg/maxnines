@@ -1,3 +1,14 @@
+# The server only ever reads this file. Anything it generates or changes is kept
+# in its databases.
+#
+# Any value can come from the environment, on its own or inside a longer value:
+#
+#   listen = env("LISTEN_ADDRESS")
+#   listen = env("LISTEN_ADDRESS", "127.0.0.1:9000")
+#   url    = "postgres://maxnines:${env("DB_PASSWORD")}@db:5432/maxnines"
+#
+# The server won't start if a variable with no default isn't set.
+
 # Address to listen on. Agents and the admin commands share this one port.
 listen = "127.0.0.1:9000"
 
@@ -8,9 +19,6 @@ public_url = "ws://127.0.0.1:9000/ws"
 
 # Proxies whose X-Forwarded-For header can be believed, as addresses or CIDRs.
 trusted_proxies = []
-
-# Protects the /admin endpoints. Created on first start if missing.
-admin_token_file = "data.nosync/admin.token"
 
 # The server pings each agent this often, and counts an agent as offline after
 # this long without hearing from it.
