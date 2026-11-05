@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::store::MetricsReader;
+use crate::store::{MetricsReader, StoreStats};
 
 /// The most points a series is split into. Charts can't show more than this
 /// anyway, so asking for more only costs time.
@@ -682,6 +682,13 @@ impl Metrics {
         })
         .await
         .context("reading metrics")?
+    }
+
+    pub async fn stats(&self, hour_ago_ms: i64) -> Result<StoreStats> {
+        let reader = self.reader.clone();
+        tokio::task::spawn_blocking(move || reader.stats(hour_ago_ms))
+            .await
+            .context("reading metrics")?
     }
 
     /// What one of an agent's collectors last sent, as it was sent.

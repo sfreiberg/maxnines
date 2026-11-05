@@ -1,0 +1,113 @@
+{% extends "layouts/application.html" %}
+{% block title %}Server · MaxNines{% endblock title %}
+{% block head %}<meta http-equiv="refresh" content="60">{% endblock head %}
+{% block content %}
+<p class="breadcrumb"><a href="/settings">Settings</a></p>
+<div>
+  <h1>Server</h1>
+  <p class="subtitle">Running for {{ server.uptime }}. This page updates every minute.</p>
+</div>
+
+{% if server.alert_rules_stalled %}
+<p class="error">Alert rules haven't run since {{ server.last_alert_pass }}, so nothing new will alert. Check the server's log.</p>
+{% endif %}
+{% if server.samples_failed > 0 %}
+<p class="error">{{ server.samples_failed }} sample{% if server.samples_failed != 1 %}s{% endif %} couldn't be saved since the server started. Check the server's log.</p>
+{% endif %}
+
+<div class="split">
+  <section class="card">
+    <h2>This server</h2>
+    <dl class="summary">
+      <dt>Version</dt><dd>{{ server.version }}</dd>
+      <dt>Commit</dt><dd><code>{{ server.commit }}</code></dd>
+      <dt>Built</dt><dd>{{ server.built_at }}</dd>
+      <dt>Started</dt><dd>{{ server.started }}</dd>
+      {% if server.os %}<dt>System</dt><dd>{{ server.os }}</dd>{% endif %}
+    </dl>
+  </section>
+
+  <section class="card">
+    <h2>Resources</h2>
+    <dl class="summary">
+      {% if server.process_memory %}<dt>Server memory</dt><dd>{{ server.process_memory }}</dd>{% endif %}
+      {% if server.process_cpu %}<dt>Server CPU</dt><dd>{{ server.process_cpu }} of this machine{% if server.cores %}, {{ server.cores }} cores{% endif %}</dd>{% endif %}
+      {% if server.open_files %}<dt>Open files</dt><dd>{{ server.open_files }}</dd>{% endif %}
+    </dl>
+    {% if server.machine_memory %}
+    <div class="stacked-field">
+      <span>Machine memory</span>
+      <svg class="meter" aria-hidden="true"><rect class="track" width="100%" height="7" rx="3.5"/><rect class="fill" width="{{ server.machine_memory.width }}%" height="7" rx="3.5"/></svg>
+      <span class="note">{{ server.machine_memory.text }}</span>
+    </div>
+    {% endif %}
+    {% if server.disk %}
+    <div class="stacked-field">
+      <span>Disk with the metrics database</span>
+      <svg class="meter" aria-hidden="true"><rect class="track" width="100%" height="7" rx="3.5"/><rect class="fill" width="{{ server.disk.width }}%" height="7" rx="3.5"/></svg>
+      <span class="note">{{ server.disk.text }} on {{ server.disk_mount_point }}</span>
+    </div>
+    {% endif %}
+  </section>
+</div>
+
+<section class="card">
+  <h2>Activity</h2>
+  <dl class="summary">
+    <dt>Agents</dt><dd>{{ server.agents_online }} of {{ server.agents_approved }} online{% if server.agents_waiting > 0 %}, {{ server.agents_waiting }} waiting for approval{% endif %}</dd>
+    <dt>Samples written</dt><dd>{{ server.samples_written }} since the server started</dd>
+    <dt>Write queue</dt><dd>{{ server.samples_queued }} of {{ server.queue_capacity }}</dd>
+    <dt>Alerts firing</dt><dd>{{ server.alerts_firing }}</dd>
+    <dt>Alert rules last ran</dt><dd>{% if server.last_alert_pass %}{{ server.last_alert_pass }}{% else %}Not yet{% endif %}</dd>
+    {% if server.has_database %}<dt>Notifications</dt><dd>{{ server.notifications_waiting }} waiting, {{ server.notifications_failed }} given up on</dd>{% endif %}
+  </dl>
+</section>
+
+<section class="card">
+  <h2>Metrics database</h2>
+  {% if server.metrics %}
+  <dl class="summary">
+    <dt>Engine</dt><dd>{{ server.metrics.engine }}</dd>
+    <dt>Size</dt><dd>{{ server.metrics.size }}</dd>
+    <dt>Write-ahead log</dt><dd>{{ server.metrics.write_ahead_log }}</dd>
+    <dt>Memory in use</dt><dd>{{ server.metrics.memory_used }}</dd>
+    <dt>Memory limit</dt><dd>{{ server.metrics.memory_limit }}</dd>
+    <dt>Rows</dt><dd>{{ server.total_rows }}</dd>
+  </dl>
+  {% if server.collectors %}
+  <div class="tablebox"><table>
+    <thead><tr><th>Collector</th><th class="number">Rows</th><th class="number">Last hour</th><th>Oldest</th><th>Newest</th></tr></thead>
+    <tbody>
+      {% for collector in server.collectors %}
+      <tr><td>{{ collector.name }}</td><td class="number">{{ collector.rows }}</td><td class="number">{{ collector.last_hour }}</td><td class="nowrap">{{ collector.oldest }}</td><td class="nowrap">{{ collector.newest }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+  {% else %}
+  <p class="error">The metrics database couldn't be read. Check the server's log.</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>Main database</h2>
+  {% if server.has_database %}
+  <dl class="summary">
+    <dt>Engine</dt><dd>{{ server.database_engine }}</dd>
+    {% if server.database_size %}<dt>Size</dt><dd>{{ server.database_size }}</dd>{% endif %}
+    <dt>Response time</dt><dd>{{ server.database_response }}</dd>
+    {% if server.latest_migration %}<dt>Schema</dt><dd><code>{{ server.latest_migration }}</code></dd>{% endif %}
+  </dl>
+  <div class="tablebox"><table>
+    <thead><tr><th>Table</th><th class="number">Rows</th></tr></thead>
+    <tbody>
+      {% for table in server.tables %}
+      <tr><td>{{ table.name }}</td><td class="number">{{ table.rows }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}
+  <p class="error">The main database couldn't be read. Check the server's log.</p>
+  {% endif %}
+</section>
+{% endblock content %}

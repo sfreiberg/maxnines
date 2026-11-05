@@ -100,6 +100,15 @@ pub enum MetricsConfig {
     },
 }
 
+impl MetricsConfig {
+    /// Where the metrics are kept.
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Duckdb { path, .. } => path,
+        }
+    }
+}
+
 /// SQLite, Postgres or MySQL, chosen by the URL. A URL can hold a password, so
 /// it can come from a file instead of the config.
 #[derive(Debug, Default, Deserialize)]

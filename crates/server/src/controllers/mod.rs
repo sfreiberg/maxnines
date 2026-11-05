@@ -106,7 +106,7 @@ impl<'a> Page<'a> {
         }
         context.insert("build", &maxnines_protocol::build_info!());
         context.insert("section", section_of(template));
-        context.insert("firing", &state.firing.load(Ordering::Relaxed));
+        context.insert("firing", &state.status.firing.load(Ordering::Relaxed));
         Self {
             state,
             token: token.clone(),

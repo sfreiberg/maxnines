@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -18,6 +17,7 @@ use crate::registration::{AgentState, Registry};
 use crate::remote_checks::{self, LatestResults, RemoteCheckInput};
 use crate::rule_engine::{self, ResolvedConfig};
 use crate::rule_preview::{self, Preview, PreviewAgent};
+use crate::server_stats::ServerStatus;
 use crate::store::WriterCommand;
 use crate::views::Views;
 
@@ -41,8 +41,7 @@ pub struct AppState {
     pub mailer: Option<Arc<Mailer>>,
     /// How the checks the server runs itself last went.
     pub check_results: Arc<LatestResults>,
-    /// How many alerts are firing, for the navigation on every page.
-    pub firing: Arc<AtomicUsize>,
+    pub status: Arc<ServerStatus>,
     pub heartbeat: Heartbeat,
     /// The URL agents must have signed.
     pub audience: Arc<str>,

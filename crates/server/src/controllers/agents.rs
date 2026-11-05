@@ -128,7 +128,7 @@ fn ago(ms: u64, now_ms: u64) -> String {
     }
 }
 
-fn format_uptime(secs: u64) -> String {
+pub fn format_uptime(secs: u64) -> String {
     let part = |count: u64, unit: &str| match count {
         1 => format!("1 {unit}"),
         _ => format!("{count} {unit}s"),

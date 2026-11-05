@@ -63,6 +63,10 @@ impl MetricsReader for Script {
         }
         Ok(self.readings.lock().unwrap().clone())
     }
+
+    fn stats(&self, _hour_ago_ms: i64) -> anyhow::Result<crate::store::StoreStats> {
+        Ok(Default::default())
+    }
 }
 
 /// A server with one connected agent, and an evaluator that started an hour ago.
@@ -145,7 +149,7 @@ fn evaluator(server: &TestServer, started_ms: i64) -> Evaluator {
         server.state.registry.clone(),
         server.state.presence.clone(),
         server.state.metrics.clone(),
-        server.state.firing.clone(),
+        server.state.status.clone(),
         started_ms,
     )
 }
@@ -718,7 +722,7 @@ async fn an_agent_never_seen_since_a_restart_counts_as_offline() {
         state.registry.clone(),
         state.presence.clone(),
         state.metrics.clone(),
-        state.firing.clone(),
+        state.status.clone(),
         started,
     );
     restarted.evaluate(started + 120_000).await.unwrap();
@@ -2891,5 +2895,124 @@ mod pages {
             assert_eq!(page.status, 200, "{path}");
             assert!(!page.body.contains("<script"), "{path}: {}", page.body);
         }
+    }
+}
+
+// ---- the server page
+
+mod server_page {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_server_page_reports_on_everything() {
+        let server = start_with_metrics().await;
+        let (_agent, _client) = report_samples(&server, "/").await;
+        evaluator(&server, now_ms())
+            .evaluate(now_ms())
+            .await
+            .unwrap();
+
+        let page = Browser::default().get(&server, "/settings/server").await;
+        assert_eq!(page.status, 200, "{}", page.body);
+        for text in [
+            env!("CARGO_PKG_VERSION"),
+            "DuckDB",
+            "SQLite",
+            "Memory limit",
+            "Write-ahead log",
+            "Samples written",
+            "Rows",
+            "cpu",
+            "Agents",
+            "Alert rules last ran",
+        ] {
+            assert!(page.body.contains(text), "{text}: {}", page.body);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_page_still_works_when_the_metrics_database_does_not() {
+        let saved = Saved::default();
+        let store = Box::new(crate::store::testing::MemoryStore(saved.clone()));
+        let server = start_on("", store, Arc::new(BrokenReader), saved, None).await;
+
+        let page = Browser::default().get(&server, "/settings/server").await;
+        assert_eq!(page.status, 200, "{}", page.body);
+        assert!(page.body.contains("couldn't be read"), "{}", page.body);
+        assert!(
+            page.body.contains("SQLite"),
+            "the other database still shows"
+        );
+        assert!(!page.body.contains("secret"), "{}", page.body);
+    }
+
+    #[tokio::test]
+    async fn the_page_still_works_when_the_main_database_does_not() {
+        let server = start().await;
+        server.state.database.break_for_test().await;
+
+        let page = Browser::default().get(&server, "/settings/server").await;
+        assert_eq!(page.status, 200, "{}", page.body);
+        assert!(page.body.contains("couldn't be read"), "{}", page.body);
+    }
+
+    #[tokio::test]
+    async fn the_page_warns_when_alert_rules_have_stopped_running() {
+        let server = start().await;
+        let late = now_ms() - 10 * MINUTE_MS;
+        evaluator(&server, late).evaluate(late).await.unwrap();
+
+        let page = Browser::default().get(&server, "/settings/server").await;
+        assert!(
+            page.body.contains("Alert rules haven't run"),
+            "{}",
+            page.body
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_writes_stand_out() {
+        let server = start().await;
+        let counts = &server.state.status.writes;
+        counts.failed.store(3, std::sync::atomic::Ordering::Relaxed);
+
+        let page = Browser::default().get(&server, "/settings/server").await;
+        assert!(
+            page.body.contains("3 samples couldn't be saved"),
+            "{}",
+            page.body
+        );
+    }
+
+    #[tokio::test]
+    async fn the_page_never_shows_a_database_url() {
+        let server = start().await;
+        let page = Browser::default().get(&server, "/settings/server").await;
+        assert!(!page.body.contains("sqlite:"), "{}", page.body);
+        assert!(!page.body.contains("://"), "{}", page.body);
+    }
+
+    #[tokio::test]
+    async fn the_api_gives_the_same_numbers_and_needs_the_token() {
+        let server = start().await;
+        let response = server.http("GET", "/admin/server", None).await;
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+
+        let (status, stats) = api(&server, "GET", "/admin/server", &Value::Null).await;
+        assert_eq!(status, 200);
+        assert_eq!(stats["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(stats["database"]["engine"], "SQLite");
+        assert!(stats["process"]["memory_bytes"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn settings_links_to_the_server_page() {
+        let server = start().await;
+        let page = Browser::default().get(&server, "/settings").await;
+        assert!(
+            page.body.contains(r#"href="/settings/server""#),
+            "{}",
+            page.body
+        );
     }
 }

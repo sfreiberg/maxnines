@@ -7,10 +7,12 @@ mod duckdb;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 
 use anyhow::Result;
 use maxnines_protocol::Sample;
+use serde::Serialize;
 use tokio::sync::mpsc;
 use tracing::error;
 
@@ -45,6 +47,38 @@ pub trait MetricsReader: Send + Sync {
     /// The newest value of each series of a metric, across every agent, between
     /// two times. Values that aren't usable numbers are skipped.
     fn newest(&self, metric: &Metric, since_ms: i64, until_ms: i64) -> Result<Vec<NewestReading>>;
+
+    /// How the database itself is doing. `hour_ago_ms` is the start of the last
+    /// hour, for how much is arriving now.
+    fn stats(&self, hour_ago_ms: i64) -> Result<StoreStats>;
+}
+
+/// How a metrics database is doing. Sizes are as the database words them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct StoreStats {
+    pub engine: &'static str,
+    pub size: String,
+    pub write_ahead_log: String,
+    pub memory_used: String,
+    pub memory_limit: String,
+    pub collectors: Vec<CollectorStats>,
+}
+
+/// What's stored from one collector.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CollectorStats {
+    pub name: String,
+    pub rows: i64,
+    pub rows_last_hour: i64,
+    pub oldest_ms: i64,
+    pub newest_ms: i64,
+}
+
+/// How many samples have been through the writer since the server started.
+#[derive(Debug, Default)]
+pub struct WriteCounts {
+    pub written: AtomicU64,
+    pub failed: AtomicU64,
 }
 
 pub fn open(config: &MetricsConfig) -> Result<Box<dyn Store>> {
@@ -67,14 +101,21 @@ pub enum WriterCommand {
 
 /// Runs the store on its own thread, so slow database calls can't hold up the
 /// async tasks that answer heartbeats.
-pub fn spawn_writer(store: Box<dyn Store>) -> (mpsc::Sender<WriterCommand>, JoinHandle<()>) {
+pub fn spawn_writer(
+    store: Box<dyn Store>,
+    counts: Arc<WriteCounts>,
+) -> (mpsc::Sender<WriterCommand>, JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel(WRITE_QUEUE_SIZE);
-    let handle = thread::spawn(move || run_writer(store, receiver));
+    let handle = thread::spawn(move || run_writer(store, receiver, &counts));
     (sender, handle)
 }
 
 /// A failed write or panic loses that one sample and the writer keeps going.
-fn run_writer(mut store: Box<dyn Store>, mut commands: mpsc::Receiver<WriterCommand>) {
+fn run_writer(
+    mut store: Box<dyn Store>,
+    mut commands: mpsc::Receiver<WriterCommand>,
+    counts: &WriteCounts,
+) {
     while let Some(command) = commands.blocking_recv() {
         match command {
             WriterCommand::Save {
@@ -82,11 +123,17 @@ fn run_writer(mut store: Box<dyn Store>, mut commands: mpsc::Receiver<WriterComm
                 host,
                 sample,
             } => match catch_unwind(AssertUnwindSafe(|| store.write(&agent_id, &host, &sample))) {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    counts.written.fetch_add(1, Ordering::Relaxed);
+                }
                 Ok(Err(error)) => {
+                    counts.failed.fetch_add(1, Ordering::Relaxed);
                     error!(error = format!("{error:#}"), "write failed, sample dropped");
                 }
-                Err(_) => error!("store panicked, sample dropped"),
+                Err(_) => {
+                    counts.failed.fetch_add(1, Ordering::Relaxed);
+                    error!("store panicked, sample dropped");
+                }
             },
             WriterCommand::Stop => break,
         }
@@ -135,6 +182,10 @@ pub mod testing {
             _until_ms: i64,
         ) -> Result<Vec<NewestReading>> {
             Ok(Vec::new())
+        }
+
+        fn stats(&self, _hour_ago_ms: i64) -> Result<StoreStats> {
+            Ok(StoreStats::default())
         }
     }
 
@@ -187,7 +238,7 @@ mod tests {
     #[test]
     fn keeps_writing_after_failures_and_panics() {
         let saved = Saved::default();
-        let (sender, handle) = spawn_writer(Box::new(MemoryStore(saved.clone())));
+        let (sender, handle) = spawn_writer(Box::new(MemoryStore(saved.clone())), Arc::default());
 
         for command in [
             save("a", 1),
@@ -207,7 +258,7 @@ mod tests {
     #[test]
     fn stopping_closes_the_store() {
         let saved = Saved::default();
-        let (sender, handle) = spawn_writer(Box::new(MemoryStore(saved.clone())));
+        let (sender, handle) = spawn_writer(Box::new(MemoryStore(saved.clone())), Arc::default());
 
         sender.blocking_send(WriterCommand::Stop).unwrap();
         handle.join().unwrap();

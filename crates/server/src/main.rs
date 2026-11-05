@@ -17,6 +17,7 @@ mod registration;
 mod remote_checks;
 mod rule_engine;
 mod rule_preview;
+mod server_stats;
 mod store;
 mod views;
 
@@ -45,6 +46,7 @@ use notifier::{Mailer, Notifier};
 use presence::Presence;
 use registration::{Registry, Rules, hash_token};
 use remote_checks::{LOCAL_AGENT_ID, LatestResults, Scheduler};
+use server_stats::ServerStatus;
 use store::WriterCommand;
 use views::Views;
 
@@ -122,7 +124,10 @@ async fn serve(path: &Path) -> Result<()> {
     let agents = database.load_agents().await.context("loading agents")?;
     let store = store::open(&config.metrics)?;
     let metrics = Metrics::new(store.reader()?);
-    let (writer, writer_thread) = store::spawn_writer(store);
+    let status = Arc::new(ServerStatus::new(Some(
+        config.metrics.path().to_path_buf(),
+    ))?);
+    let (writer, writer_thread) = store::spawn_writer(store, status.writes.clone());
     let mailer = config
         .email
         .as_ref()
@@ -145,7 +150,7 @@ async fn serve(path: &Path) -> Result<()> {
         metrics,
         mailer,
         check_results: Arc::new(LatestResults::default()),
-        firing: Arc::default(),
+        status,
         heartbeat: Heartbeat {
             interval: Duration::from_secs(config.heartbeat_interval_secs),
             timeout: Duration::from_secs(config.heartbeat_timeout_secs),
@@ -172,7 +177,7 @@ async fn serve(path: &Path) -> Result<()> {
         state.registry.clone(),
         state.presence.clone(),
         state.metrics.clone(),
-        state.firing.clone(),
+        state.status.clone(),
         now_ms(),
     )
     .spawn();

@@ -2411,6 +2411,7 @@ dependencies = [
  "sea-orm-migration",
  "serde",
  "serde_json",
+ "sysinfo",
  "tempfile",
  "tera",
  "tokio",

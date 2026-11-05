@@ -15,6 +15,7 @@ mod notification;
 mod notification_channel;
 mod remote_check;
 mod remote_checks;
+mod stats;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -33,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
+pub use self::stats::DatabaseStats;
 use crate::facts::{FlatFacts, decode, encode, flatten, unflatten};
 use crate::migrations::Migrator;
 use crate::registration::{AgentRecord, AgentState};
@@ -930,6 +932,12 @@ mod tests {
 
         exercise_alerting(database, agent).await;
         exercise_remote_checks(database).await;
+
+        let stats = database.stats().await.unwrap();
+        assert!(stats.size_bytes.unwrap_or(0) > 0, "{stats:?}");
+        assert!(stats.latest_migration.is_some());
+        assert_eq!(stats.tables[0].name, "Agents");
+        assert!(stats.tables[0].rows > 0);
     }
 
     async fn exercise_remote_checks(database: &Database) {

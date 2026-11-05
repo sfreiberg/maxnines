@@ -6,7 +6,7 @@ use duckdb::{Config, Connection, params};
 use maxnines_protocol::Sample;
 use tracing::debug;
 
-use super::{MetricsReader, Store};
+use super::{CollectorStats, MetricsReader, Store, StoreStats};
 use crate::metrics::{
     LatestSample, Metric, NewestReading, Point, Reading, Series, SeriesQuery, SeriesResult, Source,
 };
@@ -374,6 +374,41 @@ impl MetricsReader for DuckDbReader {
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    fn stats(&self, hour_ago_ms: i64) -> Result<StoreStats> {
+        let connection = self.connection()?;
+        let (size, write_ahead_log, memory_used, memory_limit) = connection.query_row(
+            "SELECT database_size, wal_size, memory_usage, memory_limit
+             FROM pragma_database_size()",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+
+        let mut statement = connection.prepare(
+            "SELECT collector, count(*),
+                    count(*) FILTER (WHERE time >= epoch_ms($1::BIGINT)),
+                    epoch_ms(min(time)), epoch_ms(max(time))
+             FROM metrics GROUP BY collector ORDER BY collector",
+        )?;
+        let rows = statement.query_map(params![hour_ago_ms], |row| {
+            Ok(CollectorStats {
+                name: row.get(0)?,
+                rows: row.get(1)?,
+                rows_last_hour: row.get(2)?,
+                oldest_ms: row.get(3)?,
+                newest_ms: row.get(4)?,
+            })
+        })?;
+
+        Ok(StoreStats {
+            engine: "DuckDB",
+            size,
+            write_ahead_log,
+            memory_used,
+            memory_limit,
+            collectors: rows.collect::<Result<_, _>>()?,
+        })
     }
 }
 
@@ -1062,6 +1097,45 @@ mod tests {
                 metric.name
             );
         }
+    }
+
+    #[test]
+    fn stats_count_what_each_collector_has_stored() {
+        let mut store = in_memory();
+        write_metric(&mut store, "a", 1000, "cpu", json!({}));
+        write_metric(&mut store, "a", 5000, "cpu", json!({}));
+        write_metric(&mut store, "b", 9000, "cpu", json!({}));
+        write_metric(&mut store, "a", 2000, "disk", json!([]));
+
+        let stats = store.reader().unwrap().stats(4000).unwrap();
+
+        assert_eq!(stats.engine, "DuckDB");
+        assert!(!stats.memory_limit.is_empty());
+        assert_eq!(
+            stats.collectors,
+            [
+                CollectorStats {
+                    name: "cpu".to_string(),
+                    rows: 3,
+                    rows_last_hour: 2,
+                    oldest_ms: 1000,
+                    newest_ms: 9000,
+                },
+                CollectorStats {
+                    name: "disk".to_string(),
+                    rows: 1,
+                    rows_last_hour: 0,
+                    oldest_ms: 2000,
+                    newest_ms: 2000,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn stats_work_on_an_empty_database() {
+        let stats = in_memory().reader().unwrap().stats(0).unwrap();
+        assert!(stats.collectors.is_empty());
     }
 
     #[test]

@@ -29,6 +29,7 @@ use crate::metrics::{Metrics, TimeRange, now_ms};
 use crate::models::{Database, FactVersion, RuleInput};
 use crate::presence::Presence;
 use crate::registration::{AgentState, Registry, Rules, hash_token};
+use crate::server_stats::ServerStatus;
 use crate::store::testing::{MemoryStore, Saved};
 use crate::store::{self, MetricsReader, Store, spawn_writer};
 use crate::views::Views;
@@ -83,7 +84,8 @@ async fn start_on(
     let config = Config::parse(&text).unwrap();
 
     let database = Database::in_memory().await;
-    let (writer, _thread) = spawn_writer(store);
+    let status = Arc::new(ServerStatus::new(None).unwrap());
+    let (writer, _thread) = spawn_writer(store, status.writes.clone());
     let state = AppState {
         presence: Arc::new(Presence::default()),
         registry: Arc::new(Registry::new(
@@ -98,7 +100,7 @@ async fn start_on(
         metrics: Metrics::new(reader),
         mailer: None,
         check_results: Arc::default(),
-        firing: Arc::default(),
+        status,
         heartbeat: Heartbeat {
             interval: Duration::from_millis(50),
             timeout: Duration::from_millis(200),
@@ -2638,6 +2640,10 @@ impl MetricsReader for BrokenReader {
         _since_ms: i64,
         _until_ms: i64,
     ) -> anyhow::Result<Vec<crate::metrics::NewestReading>> {
+        anyhow::bail!("deliberate test failure with a secret in it");
+    }
+
+    fn stats(&self, _hour_ago_ms: i64) -> anyhow::Result<crate::store::StoreStats> {
         anyhow::bail!("deliberate test failure with a secret in it");
     }
 }

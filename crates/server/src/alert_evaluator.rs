@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -24,6 +24,7 @@ use crate::models::Database;
 use crate::presence::Presence;
 use crate::registration::{AgentRecord, AgentState, Registry};
 use crate::rule_engine;
+use crate::server_stats::ServerStatus;
 
 /// How often rules are checked. Matches the default sample interval.
 const INTERVAL: Duration = Duration::from_secs(15);
@@ -149,8 +150,8 @@ pub struct Evaluator {
     registry: Arc<Registry>,
     presence: Arc<Presence>,
     metrics: Metrics,
-    /// Kept up to date for the navigation.
-    firing: Arc<AtomicUsize>,
+    /// Told how each pass went, for the navigation and the Server page.
+    status: Arc<ServerStatus>,
     started_ms: i64,
     trackers: HashMap<Key, Tracker>,
 }
@@ -161,7 +162,7 @@ impl Evaluator {
         registry: Arc<Registry>,
         presence: Arc<Presence>,
         metrics: Metrics,
-        firing: Arc<AtomicUsize>,
+        status: Arc<ServerStatus>,
         started_ms: i64,
     ) -> Self {
         Self {
@@ -169,7 +170,7 @@ impl Evaluator {
             registry,
             presence,
             metrics,
-            firing,
+            status,
             started_ms,
             trackers: HashMap::new(),
         }
@@ -313,7 +314,10 @@ impl Evaluator {
 
         self.trackers.retain(|key, _| checked.contains(key));
         let firing = self.database.open_alerts().await?.len();
-        self.firing.store(firing, Ordering::Relaxed);
+        self.status.firing.store(firing, Ordering::Relaxed);
+        self.status
+            .last_alert_pass_ms
+            .store(now_ms, Ordering::Relaxed);
         Ok(())
     }
 

@@ -71,6 +71,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
             "/admin/rules/{id}",
             get(show_rule).put(update_rule).delete(delete_rule),
         )
+        .route("/admin/server", get(server_stats))
         .route("/admin/alerts", get(list_alerts))
         .route(
             "/admin/alert-rules",
@@ -315,6 +316,10 @@ async fn delete_rule(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),
     }
+}
+
+async fn server_stats(State(state): State<AppState>) -> Json<crate::server_stats::ServerStats> {
+    Json(crate::server_stats::gather(&state).await)
 }
 
 /// How many ended alerts the API returns.

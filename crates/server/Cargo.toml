@@ -21,6 +21,7 @@ sea-orm = { version = "2.0.4", default-features = false, features = ["macros", "
 sea-orm-migration = { version = "2.0.4", default-features = false, features = ["runtime-tokio-rustls", "sqlx-mysql", "sqlx-postgres", "sqlx-sqlite"] }
 serde.workspace = true
 serde_json.workspace = true
+sysinfo = { version = "0.40.1", default-features = false, features = ["disk", "system"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
