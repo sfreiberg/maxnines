@@ -33,6 +33,9 @@ struct ChannelForm {
     target: String,
     /// What's saved, for a webhook that isn't being shown.
     preview: Option<String>,
+    /// Slack's bot token, which is only ever typed in and never shown again.
+    credential: String,
+    has_credential: bool,
 }
 
 impl ChannelForm {
@@ -42,11 +45,13 @@ impl ChannelForm {
             kind: ChannelKind::Webhook.as_str().to_string(),
             target: String::new(),
             preview: None,
+            credential: String::new(),
+            has_credential: false,
         }
     }
 
     fn from_channel(channel: &ChannelInput) -> Self {
-        let hidden = channel.kind != ChannelKind::Email;
+        let hidden = matches!(channel.kind, ChannelKind::Webhook | ChannelKind::Discord);
         Self {
             name: channel.name.clone(),
             kind: channel.kind.as_str().to_string(),
@@ -56,6 +61,8 @@ impl ChannelForm {
                 channel.target.clone()
             },
             preview: hidden.then(|| channel.target_preview()),
+            credential: String::new(),
+            has_credential: channel.credential.is_some(),
         }
     }
 
@@ -66,6 +73,8 @@ impl ChannelForm {
             kind: text("kind"),
             target: text("target"),
             preview: None,
+            credential: text("credential"),
+            has_credential: false,
         }
     }
 
@@ -78,10 +87,18 @@ impl ChannelForm {
             Some(saved) if typed.is_empty() && saved.kind == kind => saved.target.clone(),
             _ => typed.to_string(),
         };
+        let typed = self.credential.trim();
+        let credential = match saved {
+            _ if kind != ChannelKind::Slack => None,
+            _ if !typed.is_empty() => Some(typed.to_string()),
+            Some(saved) if saved.kind == kind => saved.credential.clone(),
+            _ => None,
+        };
         Ok(ChannelInput {
             name: self.name.trim().to_string(),
             kind,
             target,
+            credential,
         })
     }
 }
@@ -92,6 +109,8 @@ struct ChannelRow {
     name: String,
     kind: &'static str,
     target: String,
+    /// A plain webhook into Slack, which Slack is moving away from.
+    legacy_slack: bool,
 }
 
 impl From<Channel> for ChannelRow {
@@ -100,6 +119,8 @@ impl From<Channel> for ChannelRow {
             id: channel.id,
             kind: channel.channel.kind.as_str(),
             target: channel.channel.target_preview(),
+            legacy_slack: channel.channel.kind == ChannelKind::Webhook
+                && channel.channel.target.contains("hooks.slack.com"),
             name: channel.channel.name,
         }
     }
@@ -118,7 +139,7 @@ async fn index_page(
     let rows: Vec<ChannelRow> = channels.into_iter().map(ChannelRow::from).collect();
     Page::new(state, token, "notification_channels/index.html")
         .with("channels", &rows)
-        .with("email_ready", &state.mailer.is_some())
+        .with("email_ready", &state.senders.mailer.is_some())
         .with("notice", &notice)
         .with("error", &error)
         .render()
@@ -138,7 +159,7 @@ fn form_page(
     let page = Page::new(state, token, "notification_channels/form.html")
         .with("id", &id)
         .with("channel", form)
-        .with("email_ready", &state.mailer.is_some())
+        .with("email_ready", &state.senders.mailer.is_some())
         .with("error", &error);
     match error {
         Some(_) => page.with_status(StatusCode::UNPROCESSABLE_ENTITY).render(),
@@ -237,8 +258,8 @@ async fn test(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfForm
     };
 
     let name = channel.channel.name.clone();
-    match notifier::send(channel, Notice::test(), state.mailer.clone()).await {
-        Ok(()) => {
+    match notifier::send(channel, Notice::test(), None, state.senders.clone()).await {
+        Ok(_) => {
             let notice = format!("A test notification was sent to {name}.");
             index_page(&state, &form.token, Some(&notice), None).await
         }
@@ -258,6 +279,7 @@ mod tests {
             name: "Ops".to_string(),
             kind: ChannelKind::Webhook,
             target: "https://hooks.example.com/secret".to_string(),
+            credential: None,
         }
     }
 
@@ -271,6 +293,48 @@ mod tests {
         let form = ChannelForm::from_channel(&channel);
         assert_eq!(form.target, "");
         assert_eq!(form.preview.as_deref(), Some("https://discord.com/…"));
+    }
+
+    fn slack() -> ChannelInput {
+        ChannelInput {
+            kind: ChannelKind::Slack,
+            target: "#alerts".to_string(),
+            credential: Some("xoxb-secret".to_string()),
+            ..webhook()
+        }
+    }
+
+    #[test]
+    fn a_slack_token_never_reaches_the_form_but_its_channel_does() {
+        let form = ChannelForm::from_channel(&slack());
+        assert_eq!(form.credential, "");
+        assert!(form.has_credential);
+        assert_eq!(form.target, "#alerts");
+    }
+
+    #[test]
+    fn leaving_the_token_empty_keeps_it() {
+        let saved = slack();
+        let form = ChannelForm::from_channel(&saved);
+        assert_eq!(form.to_channel(Some(&saved)).unwrap(), saved);
+    }
+
+    #[test]
+    fn a_new_token_replaces_the_saved_one() {
+        let saved = slack();
+        let mut form = ChannelForm::from_channel(&saved);
+        form.credential = " xoxb-new ".to_string();
+        let channel = form.to_channel(Some(&saved)).unwrap();
+        assert_eq!(channel.credential.as_deref(), Some("xoxb-new"));
+    }
+
+    #[test]
+    fn leaving_slack_drops_its_token() {
+        let saved = slack();
+        let mut form = ChannelForm::from_channel(&saved);
+        form.kind = "webhook".to_string();
+        form.target = "https://example.com/x".to_string();
+        assert_eq!(form.to_channel(Some(&saved)).unwrap().credential, None);
     }
 
     #[test]

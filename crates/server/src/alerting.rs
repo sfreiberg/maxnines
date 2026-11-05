@@ -287,6 +287,7 @@ pub enum ChannelKind {
     Webhook,
     Email,
     Discord,
+    Slack,
 }
 
 impl ChannelKind {
@@ -295,6 +296,7 @@ impl ChannelKind {
             Self::Webhook => "webhook",
             Self::Email => "email",
             Self::Discord => "discord",
+            Self::Slack => "slack",
         }
     }
 
@@ -303,6 +305,7 @@ impl ChannelKind {
             "webhook" => Ok(Self::Webhook),
             "email" => Ok(Self::Email),
             "discord" => Ok(Self::Discord),
+            "slack" => Ok(Self::Slack),
             other => bail!("unknown channel kind {other:?}"),
         }
     }
@@ -320,8 +323,11 @@ pub struct Channel {
 pub struct ChannelInput {
     pub name: String,
     pub kind: ChannelKind,
-    /// A webhook's URL, or email addresses separated by commas.
+    /// A webhook's URL, email addresses separated by commas, or a Slack channel.
     pub target: String,
+    /// Slack's bot token. Like a webhook's URL, it can be set but not read back.
+    #[serde(default)]
+    pub credential: Option<String>,
 }
 
 pub fn check_channel(channel: &ChannelInput) -> Result<()> {
@@ -339,6 +345,7 @@ pub fn check_channel(channel: &ChannelInput) -> Result<()> {
             webhook_host(&channel.target)?;
         }
         ChannelKind::Discord => check_discord_url(&channel.target)?,
+        ChannelKind::Slack => check_slack(channel)?,
         ChannelKind::Email => {
             let recipients = recipients(&channel.target)?;
             ensure!(!recipients.is_empty(), "add at least one email address");
@@ -348,6 +355,25 @@ pub fn check_channel(channel: &ChannelInput) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// Slack's own limit on a channel name, plus its leading `#`.
+const MAX_SLACK_CHANNEL_LEN: usize = 81;
+
+fn check_slack(channel: &ChannelInput) -> Result<()> {
+    let target = channel.target.trim();
+    ensure!(
+        !target.is_empty()
+            && target.len() <= MAX_SLACK_CHANNEL_LEN
+            && !target.contains(char::is_whitespace),
+        "enter a Slack channel, such as #alerts or C0123456789"
+    );
+    let token = channel.credential.as_deref().unwrap_or_default();
+    ensure!(
+        token.starts_with("xoxb-"),
+        "enter the app's bot token, which starts with xoxb-"
+    );
     Ok(())
 }
 
@@ -404,7 +430,7 @@ impl ChannelInput {
         match self.kind {
             ChannelKind::Webhook | ChannelKind::Discord => webhook_host(&self.target)
                 .map_or_else(|_| "Unknown".to_string(), |host| format!("{host}/…")),
-            ChannelKind::Email => self.target.clone(),
+            ChannelKind::Email | ChannelKind::Slack => self.target.clone(),
         }
     }
 }
@@ -473,6 +499,8 @@ impl Event {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Delivery {
     pub id: i64,
+    /// What the service called the notification before this one for the alert.
+    pub reply_to: Option<String>,
     pub event: Event,
     pub attempts: i32,
     pub created_ms: i64,
@@ -528,6 +556,7 @@ mod tests {
             name: "Ops".to_string(),
             kind: ChannelKind::Webhook,
             target: target.to_string(),
+            credential: None,
         }
     }
 
@@ -736,6 +765,37 @@ mod tests {
             kind: ChannelKind::Discord,
             ..webhook(target)
         }
+    }
+
+    fn slack(target: &str, token: Option<&str>) -> ChannelInput {
+        ChannelInput {
+            kind: ChannelKind::Slack,
+            credential: token.map(String::from),
+            ..webhook(target)
+        }
+    }
+
+    #[test]
+    fn slack_channels_need_a_channel_and_a_bot_token() {
+        check_channel(&slack("#alerts", Some("xoxb-1"))).unwrap();
+        check_channel(&slack("C0123456789", Some("xoxb-1"))).unwrap();
+
+        for bad in [
+            slack("", Some("xoxb-1")),
+            slack("two words", Some("xoxb-1")),
+            slack(&"x".repeat(82), Some("xoxb-1")),
+            slack("#alerts", None),
+            slack("#alerts", Some("xoxp-user-token")),
+            slack("#alerts", Some("https://hooks.slack.com/services/x")),
+        ] {
+            assert!(check_channel(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_slack_channel_is_shown_but_its_token_is_not() {
+        let channel = slack("#alerts", Some("xoxb-secret"));
+        assert_eq!(channel.target_preview(), "#alerts");
     }
 
     #[test]

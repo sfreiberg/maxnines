@@ -98,7 +98,7 @@ async fn start_on(
         config_changes: Arc::new(watch::Sender::new(0)),
         writer,
         metrics: Metrics::new(reader),
-        mailer: None,
+        senders: Default::default(),
         check_results: Arc::default(),
         status,
         heartbeat: Heartbeat {

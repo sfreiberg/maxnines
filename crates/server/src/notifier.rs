@@ -5,17 +5,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use hyper_rustls::HttpsConnectorBuilder;
 use lettre::message::Mailbox;
 use lettre::message::header::ContentType;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use serde::Serialize;
 use serde_json::{Value, json};
+use slack_morphism::api::{SlackApiChatPostMessageRequest, SlackApiChatUpdateRequest};
+use slack_morphism::errors::SlackClientError;
+use slack_morphism::prelude::{SlackClientHyperConnector, SlackClientHyperHttpsConnector};
+use slack_morphism::{
+    SlackApiToken, SlackApiTokenValue, SlackChannelId, SlackClient, SlackClientHttpConnector,
+    SlackMessageAttachment, SlackMessageContent, SlackTs,
+};
 use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::MissedTickBehavior;
+use tokio::time::{MissedTickBehavior, timeout};
 use tracing::{error, info, warn};
 
-use crate::alerting::{Alert, Channel, ChannelKind, Delivery, Event, recipients};
+use crate::alerting::{Alert, Channel, ChannelKind, Delivery, Event, Severity, recipients};
 use crate::config::{EmailConfig, EmailSecurity};
 use crate::metrics::now_ms;
 use crate::models::Database;
@@ -239,6 +247,229 @@ fn post_json(url: &str, body: &Value) -> Result<()> {
     }
 }
 
+/// What sending needs beyond the channel itself.
+#[derive(Clone, Default)]
+pub struct Senders {
+    pub mailer: Option<Arc<Mailer>>,
+    /// Where people reach this server's pages, for links in messages.
+    pub web_url: Option<String>,
+    /// Where to find a stand-in for Slack.
+    #[cfg(test)]
+    pub slack_api_url: Option<String>,
+}
+
+impl Senders {
+    pub fn new(mailer: Option<Arc<Mailer>>, web_url: Option<String>) -> Self {
+        Self {
+            mailer,
+            web_url,
+            #[cfg(test)]
+            slack_api_url: None,
+        }
+    }
+}
+
+/// The address behind the one agents connect to, for links to the web pages.
+pub fn web_url(agent_url: impl AsRef<str>) -> Option<String> {
+    let agent_url = agent_url.as_ref();
+    let (scheme, rest) = agent_url.split_once("://")?;
+    let scheme = match scheme {
+        "wss" => "https",
+        "ws" => "http",
+        _ => return None,
+    };
+    let host = rest.split('/').next().filter(|host| !host.is_empty())?;
+    Some(format!("{scheme}://{host}"))
+}
+
+/// Slack reads `<...>` as commands, such as `<!everyone>`, and agents choose their
+/// own names. Slack asks for exactly these three to be escaped.
+fn escape_slack(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn slack_color(notice: &Notice) -> &'static str {
+    match (notice.event, &notice.alert) {
+        (Event::Firing, Some(alert)) if alert.severity == Severity::Critical => "#b3261e",
+        (Event::Firing, Some(_)) => "#b87a00",
+        (Event::Resolved, _) => "#0b6b4b",
+        _ => "#6b7280",
+    }
+}
+
+fn slack_text(notice: &Notice, web_url: Option<&str>) -> String {
+    let Some(alert) = &notice.alert else {
+        return escape_slack(&notice.text);
+    };
+    let mut lines = vec![format!(
+        "*{}* {}",
+        notice.label(),
+        escape_slack(&alert.summary)
+    )];
+    let mut details = vec![
+        format!("Rule: {}", escape_slack(&alert.rule_name)),
+        format!("Agent: {}", escape_slack(&alert.host)),
+        format!("Started: {}", format_ms(alert.started_ms)),
+    ];
+    if let Some(url) = web_url {
+        details.push(format!("<{url}/alerts|View alerts>"));
+    }
+    lines.push(details.join(" · "));
+    lines.join("\n")
+}
+
+fn slack_content(notice: &Notice, web_url: Option<&str>) -> SlackMessageContent {
+    let attachment = SlackMessageAttachment::new()
+        .with_color(slack_color(notice).to_string())
+        .with_text(slack_text(notice, web_url))
+        .with_mrkdwn_in(vec!["text".to_string()]);
+    SlackMessageContent::new()
+        .with_text(escape_slack(&notice.text))
+        .with_attachments(vec![attachment])
+}
+
+/// Slack would otherwise fetch any link in a message, and agents choose what's in
+/// these.
+fn slack_post(
+    channel: SlackChannelId,
+    content: SlackMessageContent,
+) -> SlackApiChatPostMessageRequest {
+    SlackApiChatPostMessageRequest::new(channel, content)
+        .with_unfurl_links(false)
+        .with_unfurl_media(false)
+}
+
+/// Uses the certificates built into this binary, as the rest of the server does,
+/// so that Slack works on machines without their own.
+fn slack_connector() -> Result<SlackClientHyperHttpsConnector> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let https = HttpsConnectorBuilder::new()
+        .with_provider_and_webpki_roots(provider)
+        .map_err(|_| anyhow!("couldn't set up TLS for Slack"))?
+        .https_only()
+        .enable_http2()
+        .build();
+    Ok(SlackClientHyperConnector::with_connector(https))
+}
+
+/// The channel and timestamp that together name a Slack message.
+fn slack_message_id(external_id: &str) -> Option<(SlackChannelId, SlackTs)> {
+    let (channel, ts) = external_id.split_once(':')?;
+    Some((SlackChannelId(channel.to_string()), SlackTs(ts.to_string())))
+}
+
+/// Slack's error codes are safe to keep and say what's wrong, but anything else
+/// could quote the request, which holds the token.
+fn explain_slack(error: &SlackClientError) -> anyhow::Error {
+    match error {
+        SlackClientError::ApiError(error) => explain_slack_code(&error.code),
+        SlackClientError::RateLimitError(_) => anyhow!("Slack asked us to slow down"),
+        _ => anyhow!("couldn't reach Slack"),
+    }
+}
+
+/// The problems people can fix themselves, in words that say how.
+fn explain_slack_code(code: &str) -> anyhow::Error {
+    let advice = match code {
+        "invalid_auth" | "not_authed" | "token_revoked" | "token_expired" | "account_inactive" => {
+            "Slack didn't accept the bot token"
+        }
+        "channel_not_found" => {
+            "Slack can't find that channel. For a private channel, invite the app first"
+        }
+        "not_in_channel" => "the app isn't in that channel, so invite it",
+        "is_archived" => "that Slack channel is archived",
+        "missing_scope" => "the Slack app is missing the permissions in the setup steps",
+        _ => return anyhow!("Slack said {code}"),
+    };
+    anyhow!("{advice} ({code})")
+}
+
+fn is_gone(error: &SlackClientError) -> bool {
+    matches!(error, SlackClientError::ApiError(error) if error.code == "message_not_found")
+}
+
+/// Posts a message, or when an alert resolves, turns the original green and adds
+/// a reply, so that a channel shows one message per alert. Gives what Slack called
+/// a new message.
+async fn post_to_slack<C>(
+    client: &SlackClient<C>,
+    channel: &Channel,
+    notice: &Notice,
+    reply_to: Option<&str>,
+    web_url: Option<&str>,
+) -> Result<Option<String>>
+where
+    C: SlackClientHttpConnector + Send + Sync,
+{
+    let token = channel
+        .channel
+        .credential
+        .clone()
+        .context("this channel has no bot token")?;
+    let token = SlackApiToken::new(SlackApiTokenValue(token));
+    let session = client.open_session(&token);
+    let content = slack_content(notice, web_url);
+
+    if let Some((message_channel, ts)) = reply_to
+        .filter(|_| notice.event == Event::Resolved)
+        .and_then(slack_message_id)
+    {
+        let update =
+            SlackApiChatUpdateRequest::new(message_channel.clone(), content.clone(), ts.clone());
+        match session.chat_update(&update).await {
+            Ok(_) => {
+                let reason = notice
+                    .alert
+                    .as_ref()
+                    .and_then(|a| a.resolve_reason.as_deref());
+                let reply = SlackMessageContent::new()
+                    .with_text(escape_slack(reason.unwrap_or("Resolved")));
+                let request = slack_post(message_channel, reply).with_thread_ts(ts);
+                session
+                    .chat_post_message(&request)
+                    .await
+                    .map_err(|error| explain_slack(&error))?;
+                return Ok(None);
+            }
+            // Someone deleted it, so this has to stand on its own.
+            Err(error) if is_gone(&error) => {}
+            Err(error) => return Err(explain_slack(&error)),
+        }
+    }
+
+    let target = SlackChannelId(channel.channel.target.trim().to_string());
+    let request = slack_post(target, content);
+    let response = session
+        .chat_post_message(&request)
+        .await
+        .map_err(|error| explain_slack(&error))?;
+    Ok(Some(format!("{}:{}", response.channel, response.ts)))
+}
+
+async fn send_to_slack(
+    channel: &Channel,
+    notice: &Notice,
+    reply_to: Option<&str>,
+    senders: &Senders,
+) -> Result<Option<String>> {
+    let web_url = senders.web_url.as_deref();
+
+    #[cfg(test)]
+    if let Some(url) = &senders.slack_api_url {
+        let connector = hyper_util::client::legacy::connect::HttpConnector::new();
+        let connector =
+            SlackClientHyperConnector::with_connector(connector).with_slack_api_url(url);
+        let client = SlackClient::new(connector);
+        return post_to_slack(&client, channel, notice, reply_to, web_url).await;
+    }
+
+    let client = SlackClient::new(slack_connector()?);
+    post_to_slack(&client, channel, notice, reply_to, web_url).await
+}
+
 /// Sends one notification. Blocks, so it can't run on an async thread.
 fn send_blocking(channel: &Channel, notice: &Notice, mailer: Option<&Mailer>) -> Result<()> {
     match channel.channel.kind {
@@ -247,25 +478,43 @@ fn send_blocking(channel: &Channel, notice: &Notice, mailer: Option<&Mailer>) ->
         ChannelKind::Email => mailer
             .context("email isn't set up in the server config")?
             .send(&channel.channel.target, notice),
+        ChannelKind::Slack => bail!("Slack doesn't send this way"),
     }
 }
 
-/// Sends one notification. A panic counts as a failed delivery.
-pub async fn send(channel: Channel, notice: Notice, mailer: Option<Arc<Mailer>>) -> Result<()> {
+/// Sends one notification, and gives what the service called it if that matters
+/// later. A panic counts as a failed delivery.
+pub async fn send(
+    channel: Channel,
+    notice: Notice,
+    reply_to: Option<String>,
+    senders: Senders,
+) -> Result<Option<String>> {
+    if channel.channel.kind == ChannelKind::Slack {
+        return timeout(
+            SEND_TIMEOUT,
+            send_to_slack(&channel, &notice, reply_to.as_deref(), &senders),
+        )
+        .await
+        .map_err(|_| anyhow!("Slack timed out"))?;
+    }
+
+    let mailer = senders.mailer;
     tokio::task::spawn_blocking(move || send_blocking(&channel, &notice, mailer.as_deref()))
         .await
-        .map_err(|_| anyhow!("sending failed unexpectedly"))?
+        .map_err(|_| anyhow!("sending failed unexpectedly"))??;
+    Ok(None)
 }
 
 #[derive(Clone)]
 pub struct Notifier {
     database: Database,
-    mailer: Option<Arc<Mailer>>,
+    senders: Senders,
 }
 
 impl Notifier {
-    pub fn new(database: Database, mailer: Option<Arc<Mailer>>) -> Self {
-        Self { database, mailer }
+    pub fn new(database: Database, senders: Senders) -> Self {
+        Self { database, senders }
     }
 
     /// Runs until the server stops. Each pass is its own task, so a panic costs
@@ -298,10 +547,11 @@ impl Notifier {
 
         let mut sends = JoinSet::new();
         for delivery in due {
-            let mailer = self.mailer.clone();
+            let senders = self.senders.clone();
             sends.spawn(async move {
                 let notice = Notice::for_delivery(&delivery);
-                let result = send(delivery.channel.clone(), notice, mailer).await;
+                let reply_to = delivery.reply_to.clone();
+                let result = send(delivery.channel.clone(), notice, reply_to, senders).await;
                 (delivery, result)
             });
         }
@@ -313,18 +563,23 @@ impl Notifier {
         Ok(())
     }
 
-    async fn record(&self, delivery: &Delivery, result: Result<()>, now_ms: i64) -> Result<()> {
+    async fn record(
+        &self,
+        delivery: &Delivery,
+        result: Result<Option<String>>,
+        now_ms: i64,
+    ) -> Result<()> {
         let attempts = delivery.attempts.saturating_add(1);
         let channel = &delivery.channel.channel.name;
         match result {
-            Ok(()) => {
+            Ok(external_id) => {
                 info!(
                     channel,
                     event = delivery.event.as_str(),
                     "notification sent"
                 );
                 self.database
-                    .delivery_sent(delivery.id, attempts, now_ms)
+                    .delivery_sent(delivery.id, attempts, now_ms, external_id.as_deref())
                     .await
             }
             Err(error) => {
@@ -349,7 +604,6 @@ impl Notifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alerting::Severity;
 
     fn alert() -> Alert {
         Alert {
@@ -386,6 +640,103 @@ mod tests {
         assert_eq!(retry_delay_ms(7), LONGEST_RETRY_MS);
         assert_eq!(retry_delay_ms(i32::MAX), LONGEST_RETRY_MS);
         assert_eq!(retry_delay_ms(0), 30_000);
+    }
+
+    #[test]
+    fn links_use_the_address_agents_connect_to() {
+        assert_eq!(
+            web_url("wss://monitor.example.com/ws").as_deref(),
+            Some("https://monitor.example.com")
+        );
+        assert_eq!(
+            web_url("ws://127.0.0.1:9000/ws").as_deref(),
+            Some("http://127.0.0.1:9000")
+        );
+        assert_eq!(web_url("nonsense"), None);
+        assert_eq!(web_url("ftp://x/y"), None);
+    }
+
+    #[test]
+    fn a_host_cannot_ping_a_slack_channel() {
+        let alert = Alert {
+            summary: "<!everyone> & <@U123> are <http://evil|offline>".to_string(),
+            host: "<!here>".to_string(),
+            rule_name: "<!channel>".to_string(),
+            ..alert()
+        };
+        let notice = notice(Event::Firing, alert);
+        let text = slack_text(&notice, None);
+        assert!(!text.contains('<'), "{text}");
+        assert!(
+            text.contains("&lt;!everyone&gt; &amp; &lt;@U123&gt;"),
+            "{text}"
+        );
+
+        let content = slack_content(&notice, None);
+        assert!(!content.text.unwrap().contains('<'));
+    }
+
+    #[test]
+    fn slack_messages_say_what_happened_and_where_to_look() {
+        let text = slack_text(
+            &notice(Event::Firing, alert()),
+            Some("https://m.example.com"),
+        );
+        assert!(text.starts_with("*CRITICAL* CPU usage on web-1"), "{text}");
+        assert!(text.contains("Rule: High CPU"), "{text}");
+        assert!(text.contains("Agent: web-1"), "{text}");
+        assert!(
+            text.contains("<https://m.example.com/alerts|View alerts>"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn slack_colors_follow_severity_and_state() {
+        let warning = Alert {
+            severity: Severity::Warning,
+            ..alert()
+        };
+        assert_eq!(slack_color(&notice(Event::Firing, alert())), "#b3261e");
+        assert_eq!(slack_color(&notice(Event::Firing, warning)), "#b87a00");
+        assert_eq!(slack_color(&notice(Event::Resolved, alert())), "#0b6b4b");
+        assert_eq!(slack_color(&Notice::test()), "#6b7280");
+    }
+
+    #[test]
+    fn common_slack_problems_say_what_to_do_and_keep_the_code() {
+        assert_eq!(
+            explain_slack_code("token_revoked").to_string(),
+            "Slack didn't accept the bot token (token_revoked)"
+        );
+        assert_eq!(
+            explain_slack_code("not_in_channel").to_string(),
+            "the app isn't in that channel, so invite it (not_in_channel)"
+        );
+        assert_eq!(
+            explain_slack_code("fatal_error").to_string(),
+            "Slack said fatal_error"
+        );
+    }
+
+    #[test]
+    fn slack_needs_no_certificates_or_tls_setup_from_the_machine() {
+        slack_connector().unwrap();
+    }
+
+    #[test]
+    fn slack_is_told_not_to_fetch_links() {
+        let request = slack_post(SlackChannelId("C1".to_string()), SlackMessageContent::new());
+        assert_eq!(request.unfurl_links, Some(false));
+        assert_eq!(request.unfurl_media, Some(false));
+    }
+
+    #[test]
+    fn a_message_id_needs_both_parts() {
+        let (channel, ts) = slack_message_id("C1:12.34").unwrap();
+        assert_eq!(channel.0, "C1");
+        assert_eq!(ts.0, "12.34");
+        assert!(slack_message_id("nonsense").is_none());
     }
 
     #[test]

@@ -210,7 +210,7 @@ form.stacked { display: flex; flex-direction: column; gap: 16px; }
 form.stacked label, .stacked-field { display: flex; flex-direction: column; gap: 5px; font-weight: 600; min-width: 0; }
 form.stacked label.checkbox { flex-direction: row; align-items: center; gap: 10px; min-height: 32px; font-weight: 500; }
 form.stacked small { color: var(--muted); font-size: 13px; font-weight: 400; }
-input[type="text"], input[type="number"], select, textarea {
+input[type="text"], input[type="password"], input[type="number"], select, textarea {
   width: 100%;
   min-height: 44px;
   padding: 8px 12px;
@@ -297,3 +297,6 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .remote-check:not(:has(option[value="dns"]:checked)) .for-dns { display: none; }
 .remote-check:not(:has(option[value="ping"]:checked)) .for-ping { display: none; }
 .remote-check:not(:has(option[value="http"]:checked)):not(:has(option[value="tls"]:checked)) .for-tls { display: none; }
+
+/* Only Slack has a token. Without :has() the section just stays. */
+.channel:not(:has(option[value="slack"]:checked)) .for-slack { display: none; }

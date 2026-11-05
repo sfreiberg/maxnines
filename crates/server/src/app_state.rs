@@ -11,7 +11,7 @@ use crate::alerting::{self, AlertRuleInput, ChannelInput};
 use crate::facts::{FlatFacts, unflatten};
 use crate::metrics::Metrics;
 use crate::models::{Database, RuleInput};
-use crate::notifier::Mailer;
+use crate::notifier::Senders;
 use crate::presence::Presence;
 use crate::registration::{AgentState, Registry};
 use crate::remote_checks::{self, LatestResults, RemoteCheckInput};
@@ -37,8 +37,8 @@ pub struct AppState {
     pub config_changes: Arc<watch::Sender<u64>>,
     pub writer: mpsc::Sender<WriterCommand>,
     pub metrics: Metrics,
-    /// Set when the config has a mail server.
-    pub mailer: Option<Arc<Mailer>>,
+    /// What sending notifications needs.
+    pub senders: Senders,
     /// How the checks the server runs itself last went.
     pub check_results: Arc<LatestResults>,
     pub status: Arc<ServerStatus>,

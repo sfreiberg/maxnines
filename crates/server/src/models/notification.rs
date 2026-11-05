@@ -14,6 +14,7 @@ pub struct Model {
     pub last_error: Option<String>,
     pub created_ms: i64,
     pub sent_ms: Option<i64>,
+    pub external_id: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

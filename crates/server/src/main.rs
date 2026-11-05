@@ -42,7 +42,7 @@ use app_state::{AppState, Heartbeat};
 use config::Config;
 use metrics::{Metrics, now_ms};
 use models::Database;
-use notifier::{Mailer, Notifier};
+use notifier::{Mailer, Notifier, Senders, web_url};
 use presence::Presence;
 use registration::{Registry, Rules, hash_token};
 use remote_checks::{LOCAL_AGENT_ID, LatestResults, Scheduler};
@@ -151,7 +151,7 @@ async fn serve(path: &Path) -> Result<()> {
         config_changes: Arc::new(watch::Sender::new(0)),
         writer: writer.clone(),
         metrics,
-        mailer,
+        senders: Senders::new(mailer, web_url(config.audience())),
         check_results: Arc::new(LatestResults::default()),
         status,
         heartbeat: Heartbeat {
@@ -184,7 +184,7 @@ async fn serve(path: &Path) -> Result<()> {
         now_ms(),
     )
     .spawn();
-    Notifier::new(state.database.clone(), state.mailer.clone()).spawn();
+    Notifier::new(state.database.clone(), state.senders.clone()).spawn();
     Scheduler::new(
         state.database.clone(),
         state.writer.clone(),

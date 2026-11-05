@@ -8,6 +8,7 @@ pub struct Model {
     pub name: String,
     pub kind: String,
     pub target: String,
+    pub credential: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

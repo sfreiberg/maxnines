@@ -14,6 +14,7 @@ impl MigratorTrait for Migrator {
             Box::new(CreateAlerting),
             Box::new(CreateRemoteChecks),
             Box::new(CreateServerSecrets),
+            Box::new(AddSlackChannels),
         ]
     }
 }
@@ -828,6 +829,67 @@ impl MigrationTrait for CreateServerSecrets {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
             .drop_table(Table::drop().table(ServerSecrets::Table).to_owned())
+            .await
+    }
+}
+
+struct AddSlackChannels;
+
+impl MigrationName for AddSlackChannels {
+    fn name(&self) -> &str {
+        "m20261105_000007_add_slack_channels"
+    }
+}
+
+#[derive(Iden)]
+enum ChannelCredential {
+    Credential,
+}
+
+#[derive(Iden)]
+enum NotificationExternalId {
+    ExternalId,
+}
+
+/// Slack needs a token as well as a destination. Its messages also get updated
+/// when an alert resolves, so each notification keeps what the service called it.
+#[async_trait::async_trait]
+impl MigrationTrait for AddSlackChannels {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(NotificationChannels::Table)
+                    .add_column(ColumnDef::new(ChannelCredential::Credential).text())
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Notifications::Table)
+                    .add_column(ColumnDef::new(NotificationExternalId::ExternalId).string_len(128))
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Notifications::Table)
+                    .drop_column(NotificationExternalId::ExternalId)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(NotificationChannels::Table)
+                    .drop_column(ChannelCredential::Credential)
+                    .to_owned(),
+            )
             .await
     }
 }

@@ -68,6 +68,7 @@ fn to_channel(row: notification_channel::Model) -> Result<Channel> {
             name: row.name,
             kind: ChannelKind::parse(&row.kind)?,
             target: row.target,
+            credential: row.credential,
         },
     })
 }
@@ -111,6 +112,7 @@ fn queued(alert_id: i64, channel_id: i64, event: Event, now_ms: i64) -> notifica
         last_error: Set(None),
         created_ms: Set(now_ms),
         sent_ms: Set(None),
+        external_id: Set(None),
         ..Default::default()
     }
 }
@@ -248,6 +250,7 @@ impl Database {
             name: Set(input.name.clone()),
             kind: Set(input.kind.as_str().to_string()),
             target: Set(input.target.clone()),
+            credential: Set(input.credential.clone()),
             ..Default::default()
         };
         let result = notification_channel::Entity::insert(row)
@@ -267,6 +270,7 @@ impl Database {
             name: Set(input.name.clone()),
             kind: Set(input.kind.as_str().to_string()),
             target: Set(input.target.clone()),
+            credential: Set(input.credential.clone()),
         };
         notification_channel::Entity::update(row)
             .exec(&self.connection)
@@ -426,9 +430,21 @@ impl Database {
             .map(|channel| (channel.id, channel))
             .collect();
 
+        // A resolved notification may need what its firing one was called.
+        let earlier: BTreeMap<(i64, i64), String> = notification::Entity::find()
+            .filter(notification::Column::AlertId.is_in(due.iter().map(|row| row.alert_id)))
+            .filter(notification::Column::Event.eq(Event::Firing.as_str()))
+            .all(&self.connection)
+            .await
+            .context("loading notifications")?
+            .into_iter()
+            .filter_map(|row| Some(((row.alert_id, row.channel_id), row.external_id?)))
+            .collect();
+
         due.into_iter()
             .map(|row| {
                 Ok(Delivery {
+                    reply_to: earlier.get(&(row.alert_id, row.channel_id)).cloned(),
                     id: row.id,
                     event: Event::parse(&row.event)?,
                     attempts: row.attempts,
@@ -443,11 +459,22 @@ impl Database {
             .collect()
     }
 
-    pub async fn delivery_sent(&self, id: i64, attempts: i32, now_ms: i64) -> Result<()> {
+    /// `external_id` is what the service called it, if that's needed later.
+    pub async fn delivery_sent(
+        &self,
+        id: i64,
+        attempts: i32,
+        now_ms: i64,
+        external_id: Option<&str>,
+    ) -> Result<()> {
         notification::Entity::update_many()
             .col_expr(notification::Column::State, Expr::value(SENT))
             .col_expr(notification::Column::Attempts, Expr::value(attempts))
             .col_expr(notification::Column::SentMs, Expr::value(now_ms))
+            .col_expr(
+                notification::Column::ExternalId,
+                Expr::value(external_id.map(String::from)),
+            )
             .col_expr(notification::Column::LastError, Expr::value(None::<String>))
             .filter(notification::Column::Id.eq(id))
             .exec(&self.connection)

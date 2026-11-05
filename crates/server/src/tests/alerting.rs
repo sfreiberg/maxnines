@@ -15,7 +15,7 @@ use crate::alerting::{
     AlertRuleInput, ChannelInput, ChannelKind, Comparison, Delivery, Event, RuleKind, Severity,
 };
 use crate::metrics::{Metric, NewestReading};
-use crate::notifier::{Mailer, Notifier};
+use crate::notifier::{Mailer, Notice, Notifier, Senders};
 
 const MINUTE_MS: i64 = 60_000;
 
@@ -1019,6 +1019,7 @@ fn webhook_channel(url: &str) -> ChannelInput {
         name: "Ops".to_string(),
         kind: ChannelKind::Webhook,
         target: url.to_string(),
+        credential: None,
     }
 }
 
@@ -1036,7 +1037,7 @@ async fn firing_with_channel(test: &mut Harness, url: &str) -> Notifier {
     };
     database.create_alert_rule(&rule).await.unwrap();
     test.cpu(0, 95.0).await;
-    Notifier::new(database, None)
+    Notifier::new(database, Senders::default())
 }
 
 async fn due(test: &Harness, at_ms: i64) -> Vec<Delivery> {
@@ -1083,6 +1084,7 @@ async fn a_discord_channel_gets_discords_message_format() {
         name: "Discord".to_string(),
         kind: ChannelKind::Discord,
         target: url,
+        credential: None,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -1093,7 +1095,7 @@ async fn a_discord_channel_gets_discords_message_format() {
     test.database().create_alert_rule(&rule).await.unwrap();
     test.cpu(0, 95.0).await;
 
-    Notifier::new(test.database().clone(), None)
+    Notifier::new(test.database().clone(), Senders::default())
         .deliver_due(test.now)
         .await
         .unwrap();
@@ -1150,6 +1152,300 @@ async fn a_wrong_url_for_discord_is_refused_on_the_form() {
         .await;
     assert_eq!(page.status, 422);
     assert!(page.body.contains("Discord webhook URL"), "{}", page.body);
+}
+
+/// A stand-in for Slack's API. It keeps what it's sent, and answers each call with
+/// the next error if there is one.
+#[derive(Clone, Default)]
+struct FakeSlack {
+    calls: Arc<Mutex<Vec<(String, String, Value)>>>,
+    errors: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl FakeSlack {
+    async fn start(&self) -> String {
+        let answer = |method: &'static str, slack: FakeSlack| {
+            move |headers: axum::http::HeaderMap, body: String| async move {
+                let auth = headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                let body: Value = serde_json::from_str(&body).unwrap();
+                slack
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .push((method.to_string(), auth, body));
+                let mut errors = slack.errors.lock().unwrap();
+                if errors.is_empty() {
+                    axum::Json(json!({
+                        "ok": true,
+                        "channel": "C123",
+                        "ts": "1700000000.000100",
+                        "message": { "ts": "1700000000.000100", "text": "sent" },
+                    }))
+                } else {
+                    axum::Json(json!({ "ok": false, "error": errors.remove(0) }))
+                }
+            }
+        };
+        let router = Router::new()
+            .route("/api/chat.postMessage", post(answer("post", self.clone())))
+            .route("/api/chat.update", post(answer("update", self.clone())));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        format!("http://{address}/api")
+    }
+
+    fn calls(&self) -> Vec<(String, String, Value)> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn methods(&self) -> Vec<String> {
+        self.calls().into_iter().map(|call| call.0).collect()
+    }
+}
+
+/// A firing alert with a Slack channel, ready to deliver.
+async fn firing_on_slack(test: &mut Harness, slack: &FakeSlack) -> Notifier {
+    let url = slack.start().await;
+    let channel = ChannelInput {
+        name: "Slack".to_string(),
+        kind: ChannelKind::Slack,
+        target: "#alerts".to_string(),
+        credential: Some("xoxb-secret-token".to_string()),
+    };
+    let channel = test.database().create_channel(&channel).await.unwrap();
+    let rule = AlertRuleInput {
+        for_secs: 0,
+        channels: vec![channel],
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    test.cpu(0, 95.0).await;
+    Notifier::new(
+        test.database().clone(),
+        Senders {
+            web_url: Some("https://monitor.example.com".to_string()),
+            slack_api_url: Some(url),
+            ..Senders::default()
+        },
+    )
+}
+
+#[tokio::test]
+async fn an_alert_posts_to_slack_with_the_bot_token() {
+    let mut test = Harness::start().await;
+    let slack = FakeSlack::default();
+    let notifier = firing_on_slack(&mut test, &slack).await;
+
+    notifier.deliver_due(test.now).await.unwrap();
+
+    let calls = slack.calls();
+    let (method, auth, body) = &calls[0];
+    assert_eq!(method, "post");
+    assert_eq!(auth, "Bearer xoxb-secret-token");
+    assert_eq!(body["channel"], "#alerts");
+    assert_eq!(body["text"], "CPU usage on web-1 is 95%, above 90%");
+    assert_eq!(body["attachments"][0]["color"], "#b3261e");
+    assert_eq!(body["unfurl_links"], false);
+    assert_eq!(body["unfurl_media"], false);
+    let text = body["attachments"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("<https://monitor.example.com/alerts|View alerts>"),
+        "{text}"
+    );
+    assert!(
+        test.database()
+            .delivery_problems(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn resolving_updates_the_slack_message_and_replies_in_its_thread() {
+    let mut test = Harness::start().await;
+    let slack = FakeSlack::default();
+    let notifier = firing_on_slack(&mut test, &slack).await;
+    notifier.deliver_due(test.now).await.unwrap();
+
+    test.cpu(MINUTE_MS, 10.0).await;
+    notifier.deliver_due(test.now + MINUTE_MS).await.unwrap();
+
+    assert_eq!(slack.methods(), ["post", "update", "post"]);
+    let calls = slack.calls();
+    let update = &calls[1].2;
+    assert_eq!(update["channel"], "C123");
+    assert_eq!(update["ts"], "1700000000.000100");
+    assert_eq!(update["attachments"][0]["color"], "#0b6b4b");
+    let reply = &calls[2].2;
+    assert_eq!(reply["thread_ts"], "1700000000.000100");
+    assert_eq!(reply["text"], "The problem cleared");
+}
+
+#[tokio::test]
+async fn a_deleted_slack_message_gets_a_new_one_when_resolving() {
+    let mut test = Harness::start().await;
+    let slack = FakeSlack::default();
+    let notifier = firing_on_slack(&mut test, &slack).await;
+    notifier.deliver_due(test.now).await.unwrap();
+
+    test.cpu(MINUTE_MS, 10.0).await;
+    slack.errors.lock().unwrap().push("message_not_found");
+    notifier.deliver_due(test.now + MINUTE_MS).await.unwrap();
+
+    assert_eq!(slack.methods(), ["post", "update", "post"]);
+    let calls = slack.calls();
+    assert_eq!(calls[2].2["channel"], "#alerts");
+    assert!(calls[2].2.get("thread_ts").is_none());
+    assert!(
+        test.database()
+            .delivery_problems(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_slack_error_is_retried_and_says_what_slack_said() {
+    let mut test = Harness::start().await;
+    let slack = FakeSlack::default();
+    slack.errors.lock().unwrap().push("not_in_channel");
+    let notifier = firing_on_slack(&mut test, &slack).await;
+
+    notifier.deliver_due(test.now).await.unwrap();
+
+    let problems = test.database().delivery_problems(10).await.unwrap();
+    assert_eq!(
+        problems[0].error,
+        "the app isn't in that channel, so invite it (not_in_channel)"
+    );
+    assert_eq!(problems[0].state, "pending");
+
+    notifier.deliver_due(test.now + 30_000).await.unwrap();
+    assert_eq!(slack.methods(), ["post", "post"]);
+    assert!(
+        test.database()
+            .delivery_problems(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn not_reaching_slack_says_so_without_any_detail() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let channel = crate::alerting::Channel {
+        id: 1,
+        channel: ChannelInput {
+            name: "Slack".to_string(),
+            kind: ChannelKind::Slack,
+            target: "#alerts".to_string(),
+            credential: Some("xoxb-secret-token".to_string()),
+        },
+    };
+    let senders = Senders {
+        slack_api_url: Some(format!("http://{address}/api")),
+        ..Senders::default()
+    };
+
+    let error = crate::notifier::send(channel, Notice::test(), None, senders)
+        .await
+        .unwrap_err();
+
+    assert_eq!(format!("{error:#}"), "couldn't reach Slack");
+}
+
+#[tokio::test]
+async fn a_slack_token_never_appears_in_a_saved_error() {
+    let mut test = Harness::start().await;
+    let slack = FakeSlack::default();
+    slack.errors.lock().unwrap().push("invalid_auth");
+    let notifier = firing_on_slack(&mut test, &slack).await;
+    notifier.deliver_due(test.now).await.unwrap();
+
+    let page = Browser::default().get(&test.server, "/alerts").await;
+    assert!(page.body.contains("(invalid_auth)"), "{}", page.body);
+    assert!(!page.body.contains("xoxb"), "{}", page.body);
+}
+
+#[tokio::test]
+async fn a_slack_channel_can_be_made_from_the_form_and_hides_its_token() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    let fields = [
+        ("name", "Team"),
+        ("kind", "slack"),
+        ("target", "#alerts"),
+        ("credential", "xoxb-secret-token"),
+    ];
+    let page = browser
+        .submit(&server, "/alerts/channels/new", "/alerts/channels", &fields)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+
+    let id = server.state.database.list_channels().await.unwrap()[0].id;
+    let edit = format!("/alerts/channels/{id}/edit");
+    for path in ["/alerts/channels", edit.as_str()] {
+        let page = browser.get(&server, path).await;
+        assert!(page.body.contains("#alerts"), "{path}");
+        assert!(!page.body.contains("xoxb-secret"), "{path}: {}", page.body);
+    }
+
+    let (status, shown) = api(
+        &server,
+        "GET",
+        &format!("/admin/notification-channels/{id}"),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(!shown.to_string().contains("xoxb"), "{shown}");
+
+    // Saving without retyping it keeps it.
+    let fields = [
+        ("name", "Renamed"),
+        ("kind", "slack"),
+        ("target", "#ops"),
+        ("credential", ""),
+    ];
+    let page = browser
+        .submit(&server, &edit, &format!("/alerts/channels/{id}"), &fields)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    let channel = server
+        .state
+        .database
+        .get_channel(id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        channel.channel.credential.as_deref(),
+        Some("xoxb-secret-token")
+    );
+    assert_eq!(channel.channel.target, "#ops");
+}
+
+#[tokio::test]
+async fn a_plain_webhook_into_slack_gets_a_warning() {
+    let server = start().await;
+    server
+        .state
+        .database
+        .create_channel(&webhook_channel("https://hooks.slack.com/services/x"))
+        .await
+        .unwrap();
+    let page = Browser::default().get(&server, "/alerts/channels").await;
+    assert!(page.body.contains("Slack is moving away"), "{}", page.body);
 }
 
 #[tokio::test]
@@ -1250,7 +1546,7 @@ async fn queued_notifications_survive_a_restart() {
     let url = format!("{}/secret-token", hook.start().await);
     firing_with_channel(&mut test, &url).await;
 
-    let restarted = Notifier::new(test.database().clone(), None);
+    let restarted = Notifier::new(test.database().clone(), Senders::default());
     restarted.deliver_due(test.now).await.unwrap();
     assert_eq!(hook.events(), ["firing"]);
 }
@@ -1397,6 +1693,7 @@ async fn email_channels_send_a_message_to_every_address() {
         name: "On call".to_string(),
         kind: ChannelKind::Email,
         target: "a@example.com, b@example.com".to_string(),
+        credential: None,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -1408,7 +1705,13 @@ async fn email_channels_send_a_message_to_every_address() {
     test.cpu(0, 95.0).await;
 
     let (port, heard) = start_mail_server().await;
-    let notifier = Notifier::new(test.database().clone(), Some(mailer(port)));
+    let notifier = Notifier::new(
+        test.database().clone(),
+        Senders {
+            mailer: Some(mailer(port)),
+            ..Senders::default()
+        },
+    );
     notifier.deliver_due(test.now).await.unwrap();
 
     let heard = heard.await.unwrap();
@@ -1430,6 +1733,7 @@ async fn an_email_channel_without_a_mail_server_says_so() {
         name: "On call".to_string(),
         kind: ChannelKind::Email,
         target: "a@example.com".to_string(),
+        credential: None,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -1440,7 +1744,7 @@ async fn an_email_channel_without_a_mail_server_says_so() {
     test.database().create_alert_rule(&rule).await.unwrap();
     test.cpu(0, 95.0).await;
 
-    Notifier::new(test.database().clone(), None)
+    Notifier::new(test.database().clone(), Senders::default())
         .deliver_due(test.now)
         .await
         .unwrap();

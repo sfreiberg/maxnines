@@ -1048,6 +1048,7 @@ mod tests {
                 name: format!("Ops {suffix}"),
                 kind: ChannelKind::Webhook,
                 target: "https://example.com/hook".to_string(),
+                credential: Some("secret".to_string()),
             })
             .await
             .unwrap();
@@ -1110,7 +1111,7 @@ mod tests {
         let problems = database.delivery_problems(10).await.unwrap();
         assert_eq!(problems[0].error, "the webhook returned status 500");
         database
-            .delivery_sent(firing.id, 2, started_ms + 5)
+            .delivery_sent(firing.id, 2, started_ms + 5, Some("C123:1.2"))
             .await
             .unwrap();
 
@@ -1121,6 +1122,11 @@ mod tests {
         let due = database.due_deliveries(started_ms + 10, 500).await.unwrap();
         let resolved = due.iter().find(|d| d.alert.id == alert).unwrap();
         assert_eq!(resolved.event, Event::Resolved);
+        assert_eq!(resolved.reply_to.as_deref(), Some("C123:1.2"));
+        assert_eq!(
+            resolved.channel.channel.credential.as_deref(),
+            Some("secret")
+        );
 
         // The alert outlives its rule, and its queue goes with its channel.
         assert!(database.delete_alert_rule(rule).await.unwrap());
