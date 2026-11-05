@@ -24,10 +24,15 @@ const STOP_CHECK: Duration = Duration::from_millis(100);
 /// this waits, so a dead network mount can't keep adding threads.
 const MAX_BLOCKING_THREADS: usize = 8;
 
+/// How long an idle blocking thread hangs around. Rounds are seconds apart, so
+/// keeping them longer only holds memory.
+const BLOCKING_THREAD_KEEP_ALIVE: Duration = Duration::from_secs(1);
+
 fn runtime() -> std::io::Result<Runtime> {
     Builder::new_current_thread()
         .enable_all()
         .max_blocking_threads(MAX_BLOCKING_THREADS)
+        .thread_keep_alive(BLOCKING_THREAD_KEEP_ALIVE)
         .build()
 }
 
