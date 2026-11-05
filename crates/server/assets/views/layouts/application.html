@@ -4,21 +4,23 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}MaxNines{% endblock title %}</title>
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/assets/css/application.css">
   {% block head %}{% endblock head %}
 </head>
 <body>
   <header class="site-header">
-    <a class="brand" href="/">MaxNines</a>
-    <nav>
-      <a href="/agents">Agents</a>
-      <a href="/metrics">Metrics</a>
-      <a href="/checks">Checks</a>
-      <a href="/alerts">Alerts</a>
-      <a href="/rules">Config rules</a>
+    <nav class="site-nav" aria-label="Main">
+      <a class="brand" href="/"><span class="mark">9</span>MaxNines</a>
+      <a class="pill{% if section == "overview" %} on{% endif %}" href="/">Overview</a>
+      <a class="pill{% if section == "agents" %} on{% endif %}" href="/agents">Agents</a>
+      <a class="pill{% if section == "metrics" %} on{% endif %}" href="/metrics">Metrics</a>
+      <a class="pill{% if section == "checks" %} on{% endif %}" href="/checks">Checks</a>
+      <a class="pill{% if section == "alerts" %} on{% endif %}" href="/alerts">Alerts{% if firing > 0 %} <span class="count">{{ firing }}</span>{% endif %}</a>
+      <a class="pill{% if section == "settings" %} on{% endif %}" href="/settings">Settings</a>
     </nav>
   </header>
-  <main>
+  <main{% block main_class %}{% endblock main_class %}>
     {% block content %}{% endblock content %}
   </main>
   <footer class="site-footer">MaxNines {{ build.version }} · {{ build.commit }} · built {{ build.built_at }}</footer>

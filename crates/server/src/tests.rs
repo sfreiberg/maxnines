@@ -98,6 +98,7 @@ async fn start_on(
         metrics: Metrics::new(reader),
         mailer: None,
         check_results: Arc::default(),
+        firing: Arc::default(),
         heartbeat: Heartbeat {
             interval: Duration::from_millis(50),
             timeout: Duration::from_millis(200),
@@ -1168,6 +1169,8 @@ async fn every_page_renders() {
     let mut browser = Browser::default();
 
     for path in [
+        "/".to_string(),
+        "/settings".to_string(),
         "/agents".to_string(),
         format!("/agents/{}", agent.id()),
         "/rules".to_string(),
@@ -1181,12 +1184,12 @@ async fn every_page_renders() {
 }
 
 #[tokio::test]
-async fn the_home_page_goes_to_agents() {
+async fn the_home_page_is_the_overview() {
     let server = start().await;
     let page = Browser::default().get(&server, "/").await;
 
-    assert_eq!(page.status, 303);
-    assert_eq!(page.header("location"), Some("/agents"));
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("All clear"), "{}", page.body);
 }
 
 #[tokio::test]
@@ -2411,8 +2414,8 @@ async fn metric_pages_need_nothing_the_security_policy_blocks() {
 
     assert_eq!(
         page.header("content-security-policy").unwrap(),
-        "default-src 'none'; style-src 'self'; img-src 'self'; form-action 'self'; \
-         base-uri 'none'; frame-ancestors 'none'"
+        "default-src 'none'; style-src 'self'; font-src 'self'; img-src 'self'; \
+         form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
     );
     assert!(!page.body.contains(" style="), "inline styles are blocked");
 }

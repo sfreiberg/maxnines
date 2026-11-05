@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -148,6 +149,8 @@ pub struct Evaluator {
     registry: Arc<Registry>,
     presence: Arc<Presence>,
     metrics: Metrics,
+    /// Kept up to date for the navigation.
+    firing: Arc<AtomicUsize>,
     started_ms: i64,
     trackers: HashMap<Key, Tracker>,
 }
@@ -158,6 +161,7 @@ impl Evaluator {
         registry: Arc<Registry>,
         presence: Arc<Presence>,
         metrics: Metrics,
+        firing: Arc<AtomicUsize>,
         started_ms: i64,
     ) -> Self {
         Self {
@@ -165,6 +169,7 @@ impl Evaluator {
             registry,
             presence,
             metrics,
+            firing,
             started_ms,
             trackers: HashMap::new(),
         }
@@ -307,6 +312,8 @@ impl Evaluator {
         }
 
         self.trackers.retain(|key, _| checked.contains(key));
+        let firing = self.database.open_alerts().await?.len();
+        self.firing.store(firing, Ordering::Relaxed);
         Ok(())
     }
 

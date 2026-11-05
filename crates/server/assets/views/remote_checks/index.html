@@ -10,8 +10,13 @@
   </div>
 </div>
 <p class="hint">The server runs these itself, against remote sites. To check something from where an agent is, add it to a config rule. Alert rules cover both.</p>
+<nav class="tabs" aria-label="Filter">
+  {% for tab in filters %}
+  <a href="/checks?filter={{ tab.key }}"{% if tab.selected %} class="selected" aria-current="true"{% endif %}>{{ tab.label }} {{ tab.count }}</a>
+  {% endfor %}
+</nav>
 {% if checks %}
-<table>
+<div class="tablebox"><table>
   <thead>
     <tr><th>Name</th><th>Kind</th><th>Target</th><th>Status</th><th class="number">Total</th><th class="number">First byte</th><th>Response</th><th class="number">Certificate days</th></tr>
   </thead>
@@ -22,7 +27,7 @@
       <td>{{ check.kind }}</td>
       <td>{{ check.target }}</td>
       {% if check.latest %}
-      <td>{% if check.latest.up %}<span class="badge good">Up</span>{% else %}<span class="badge bad">Down</span>{% endif %}{% if check.latest.error %} <small class="hint">{{ check.latest.error }}</small>{% endif %}</td>
+      <td>{% if check.latest.up %}<span class="badge good">Up</span>{% else %}<span class="badge bad">Down</span>{% endif %}{% if check.latest.error %} <span class="note">{{ check.latest.error }}</span>{% endif %}</td>
       <td class="number">{{ check.latest.response }}</td>
       <td class="number">{{ check.latest.first_byte }}</td>
       <td>{% if check.latest.status %}{{ check.latest.status }}{% endif %} {{ check.latest.protocol }}</td>
@@ -35,8 +40,8 @@
     </tr>
     {% endfor %}
   </tbody>
-</table>
+</table></div>
 {% else %}
-<p class="empty">There are no checks yet.</p>
+<p class="empty">No checks here yet.</p>
 {% endif %}
 {% endblock content %}

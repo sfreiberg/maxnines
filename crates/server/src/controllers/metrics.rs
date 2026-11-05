@@ -8,12 +8,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::task::JoinSet;
 
-use super::{Page, server_error};
+use super::{Page, fleet, server_error};
 use crate::app_state::AppState;
-use crate::fact_history::format_time;
 use crate::metric_charts::{self, Chart, MAX_SERIES};
 use crate::metrics::{self, METRICS, Metric, ShowChart, TimeRange, Unit, now_ms};
-use crate::registration::{AgentRecord, AgentState};
+use crate::registration::AgentRecord;
 
 const HOUR_MS: i64 = 3_600_000;
 
@@ -33,55 +32,13 @@ pub fn routes() -> Router<AppState> {
         .route("/agents/{id}/metrics/{metric}", get(data))
 }
 
-#[derive(Serialize)]
-struct FleetRow {
-    id: String,
-    host: String,
-    online: bool,
-    cpu: Option<String>,
-    memory: Option<String>,
-    disk: Option<String>,
-    disk_mount_point: Option<String>,
-    updated: Option<String>,
-}
-
-fn percent(value: Option<f64>) -> Option<String> {
-    value.map(|value| metric_charts::format_value(Unit::Percent, value))
-}
-
 async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
-    let mut current = match state.metrics.current(now_ms()).await {
-        Ok(current) => current,
-        Err(error) => return server_error(&error),
-    };
-
-    let agents: Vec<FleetRow> = state
-        .registry
-        .list()
-        .await
-        .into_iter()
-        .filter(|agent| agent.state == AgentState::Approved && !agent.is_local())
-        .map(|agent| {
-            let values = current.remove(&agent.id).unwrap_or_default();
-            FleetRow {
-                online: state.presence.get(&agent.id).is_some_and(|p| p.online),
-                cpu: percent(values.cpu_percent),
-                memory: percent(values.memory_percent),
-                disk: percent(values.disk_percent),
-                disk_mount_point: values.disk_mount_point,
-                updated: u64::try_from(values.time_ms)
-                    .ok()
-                    .filter(|time| *time > 0)
-                    .map(format_time),
-                id: agent.id,
-                host: agent.host,
-            }
-        })
-        .collect();
-
-    Page::new(&state, &token, "metrics/index.html")
-        .with("agents", &agents)
-        .render()
+    match fleet::rows(&state).await {
+        Ok(agents) => Page::new(&state, &token, "metrics/index.html")
+            .with("agents", &agents)
+            .render(),
+        Err(error) => server_error(&error),
+    }
 }
 
 /// A check's latest result. Agents send this, so nothing about it is trusted to
@@ -90,7 +47,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
 pub struct CheckRow {
     name: String,
     kind: String,
-    up: bool,
+    pub up: bool,
     error: Option<String>,
     response: Option<String>,
     first_byte: Option<String>,
@@ -217,7 +174,14 @@ async fn show(
     let latest = if agent.is_local() {
         Ok(state.check_results.all().into_values().collect())
     } else {
-        state.metrics.latest_checks(&agent.id, now_ms()).await
+        let output = state
+            .metrics
+            .latest_output(&agent.id, "checks", now_ms())
+            .await;
+        output.map(|output| match output {
+            Some(Value::Array(checks)) => checks,
+            _ => Vec::new(),
+        })
     };
     let checks: Vec<CheckRow> = match latest {
         Ok(checks) => checks.iter().filter_map(check_row).collect(),

@@ -1,5 +1,6 @@
 {% extends "layouts/application.html" %}
 {% block title %}{% if id %}Edit rule{% else %}New rule{% endif %} · MaxNines{% endblock title %}
+{% block main_class %} class="narrow"{% endblock main_class %}
 {% block content %}
 <p class="breadcrumb"><a href="/rules">Config rules</a></p>
 <h1>{% if id %}Edit rule{% else %}New rule{% endif %}</h1>
@@ -30,7 +31,7 @@
   </label>
 
   <fieldset>
-    <legend>Settings</legend>
+    <legend>Sampling</legend>
     <p class="hint">Anything left empty is decided by other rules.</p>
 
     <label>Sample interval (seconds)
@@ -41,6 +42,11 @@
       <input type="number" name="facts_interval_secs" value="{{ rule.facts_interval_secs }}" min="1">
     </label>
 
+  </fieldset>
+
+  <fieldset>
+    <legend>Collectors</legend>
+    <div class="field-row">
     {% for collector in rule.collectors %}
     <label>Collector: {{ collector.name }}
       <select name="collector_{{ collector.name }}">
@@ -50,33 +56,37 @@
       </select>
     </label>
     {% endfor %}
+    </div>
+  </fieldset>
 
+  <fieldset>
+    <legend>What to watch</legend>
+    <p class="hint">Filling in any of these turns its collector on, unless it's set to Off above.</p>
     <label>Disk mount points
       <textarea name="mount_points" rows="3" spellcheck="false">{{ rule.mount_points }}</textarea>
       <small>One per line. Leave empty for every disk.</small>
     </label>
 
-    <label>Processes to watch
+    <label>Processes
       <textarea name="process_names" rows="3" spellcheck="false">{{ rule.process_names }}</textarea>
       <small>One name per line, such as <code>nginx</code>. Only these are reported, and a name with nothing running reports 0.</small>
     </label>
 
-    <label>Services to watch
+    <label>Services
       <textarea name="service_names" rows="3" spellcheck="false">{{ rule.service_names }}</textarea>
       <small>One per line, as the system names them, such as <code>nginx.service</code> on Linux.</small>
     </label>
 
-    <label>Files and folders to watch
+    <label>Files and folders
       <textarea name="file_paths" rows="3" spellcheck="false">{{ rule.file_paths }}</textarea>
       <small>One path per line. This reports whether each exists, its size and how long since it changed. Contents are never read.</small>
     </label>
 
-    <label>Checks to run
+    <label>Checks
       <textarea name="checks" rows="4" spellcheck="false" placeholder="tcp db db1:5432">{{ rule.checks }}</textarea>
       <small>One per line, as a kind, a name and a target: <code>tcp db db1:5432</code>, <code>http site https://example.com/</code>, <code>tls site example.com:443</code>, <code>dns resolver example.com</code> or <code>ping gateway 10.0.0.1</code>. Options can follow: <code>timeout=5</code>, <code>insecure</code>, for http <code>method=POST</code>, <code>body=...</code> and <code>regex="Welcome back"</code>, for dns <code>server=8.8.8.8</code> and <code>record=MX</code>, and for ping <code>count=5</code>.</small>
     </label>
 
-    <p class="hint">Filling in any of these turns its collector on, unless it's set to Off above.</p>
   </fieldset>
 
   <div class="actions">
@@ -101,7 +111,7 @@
     <dt>Match this rule</dt><dd>{{ preview.matching }}</dd>
     <dt>Would change</dt><dd>{{ preview.changing }}</dd>
   </dl>
-  <table>
+  <div class="tablebox"><table>
     <thead>
       <tr><th>Agent</th><th>Status</th><th>Condition</th><th>What changes</th></tr>
     </thead>
@@ -124,7 +134,7 @@
       </tr>
       {% endfor %}
     </tbody>
-  </table>
+  </table></div>
   {% if preview.hidden > 0 %}<p class="hint">{{ preview.hidden }} more not shown. Agents that change are listed first.</p>{% endif %}
   {% endif %}
 </section>

@@ -145,6 +145,7 @@ fn evaluator(server: &TestServer, started_ms: i64) -> Evaluator {
         server.state.registry.clone(),
         server.state.presence.clone(),
         server.state.metrics.clone(),
+        server.state.firing.clone(),
         started_ms,
     )
 }
@@ -717,6 +718,7 @@ async fn an_agent_never_seen_since_a_restart_counts_as_offline() {
         state.registry.clone(),
         state.presence.clone(),
         state.metrics.clone(),
+        state.firing.clone(),
         started,
     );
     restarted.evaluate(started + 120_000).await.unwrap();
@@ -2449,6 +2451,366 @@ mod remote {
             assert!(policy.starts_with("default-src 'none'"), "{path}");
             assert!(!page.body.contains("<script"), "{path}");
             assert!(!page.body.contains(" style="), "{path}");
+        }
+    }
+}
+
+// ---- the redesigned pages
+
+mod pages {
+    use super::*;
+    use crate::alerting::NewAlert;
+
+    fn alert(agent: &Identity, severity: Severity, summary: &str) -> NewAlert {
+        NewAlert {
+            rule_id: 1,
+            rule_name: "Rule".to_string(),
+            severity,
+            agent_id: agent.id(),
+            host: "web-1".to_string(),
+            series: String::new(),
+            value: None,
+            summary: summary.to_string(),
+            started_ms: 1000,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_overview_leads_with_problems_most_serious_first() {
+        let test = Harness::start().await;
+        test.database()
+            .create_alert_rule(&cpu_rule())
+            .await
+            .unwrap();
+        let (warning, critical) = ("Disk is filling up", "Everything is on fire");
+        let new = alert(&test.agent, Severity::Warning, warning);
+        test.database().fire_alert(&new, &[]).await.unwrap();
+        let new = alert(&test.agent, Severity::Critical, critical);
+        test.database().fire_alert(&new, &[]).await.unwrap();
+
+        let page = Browser::default().get(&test.server, "/").await;
+        assert!(
+            page.body.contains("2 problems need attention"),
+            "{}",
+            page.body
+        );
+        let (first, second) = (page.body.find(critical), page.body.find(warning));
+        assert!(first.unwrap() < second.unwrap(), "{}", page.body);
+        assert!(!page.body.contains("All clear"));
+    }
+
+    #[tokio::test]
+    async fn one_problem_reads_as_one_problem() {
+        let test = Harness::start().await;
+        test.database()
+            .create_alert_rule(&cpu_rule())
+            .await
+            .unwrap();
+        let new = alert(&test.agent, Severity::Warning, "Disk is filling up");
+        test.database().fire_alert(&new, &[]).await.unwrap();
+
+        let page = Browser::default().get(&test.server, "/").await;
+        assert!(
+            page.body.contains("1 problem needs attention"),
+            "{}",
+            page.body
+        );
+    }
+
+    #[tokio::test]
+    async fn the_overview_shows_agents_checks_and_who_is_waiting() {
+        let test = Harness::start().await;
+        let input = crate::remote_checks::RemoteCheckInput {
+            check: maxnines_protocol::Check::new("site", maxnines_protocol::CheckKind::Tcp, "a:1"),
+            interval_secs: 60,
+            enabled: true,
+        };
+        test.database().create_remote_check(&input).await.unwrap();
+        let mut waiting = test.server.connect().await;
+        let newcomer = identity();
+        handshake(&mut waiting, &newcomer, "new-1", None).await;
+
+        let page = Browser::default().get(&test.server, "/").await;
+        assert!(page.body.contains("web-1"), "{}", page.body);
+        assert!(page.body.contains("site"), "{}", page.body);
+        assert!(page.body.contains("Waiting"), "{}", page.body);
+        assert!(
+            page.body.contains("1 agent is waiting for approval"),
+            "{}",
+            page.body
+        );
+    }
+
+    #[tokio::test]
+    async fn the_navigation_marks_the_current_section_and_counts_what_is_firing() {
+        let mut test = Harness::start().await;
+        let rule = AlertRuleInput {
+            for_secs: 0,
+            ..cpu_rule()
+        };
+        test.database().create_alert_rule(&rule).await.unwrap();
+        test.cpu(0, 95.0).await;
+        let mut browser = Browser::default();
+
+        for (path, link) in [
+            ("/", r#"class="pill on" href="/""#),
+            ("/agents", r#"class="pill on" href="/agents""#),
+            ("/metrics", r#"class="pill on" href="/metrics""#),
+            ("/checks", r#"class="pill on" href="/checks""#),
+            ("/alerts", r#"class="pill on" href="/alerts""#),
+            ("/settings", r#"class="pill on" href="/settings""#),
+            ("/rules", r#"class="pill on" href="/settings""#),
+            ("/alerts/rules", r#"class="pill on" href="/settings""#),
+            ("/alerts/channels", r#"class="pill on" href="/settings""#),
+        ] {
+            let page = browser.get(&test.server, path).await;
+            assert!(page.body.contains(link), "{path}: {}", page.body);
+            assert!(
+                page.body.contains(r#"<span class="count">1</span>"#),
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn nothing_firing_shows_no_count() {
+        let server = start().await;
+        let page = Browser::default().get(&server, "/").await;
+        assert!(!page.body.contains(r#"class="count""#));
+    }
+
+    #[tokio::test]
+    async fn agents_can_be_filtered_and_seen_as_a_table() {
+        let test = Harness::start().await;
+        let other = identity();
+        let client = test.server.connect_approved(&other, "db-1").await;
+        drop(client);
+        test.server.wait_for_online(&other.id(), false).await;
+        let mut browser = Browser::default();
+
+        let page = browser.get(&test.server, "/agents").await;
+        assert!(page.body.contains("1 of 2 online"), "{}", page.body);
+        assert!(page.body.contains("All 2"), "{}", page.body);
+        assert!(page.body.contains("class=\"tile"), "{}", page.body);
+
+        let page = browser.get(&test.server, "/agents?filter=offline").await;
+        assert!(page.body.contains("db-1"));
+        assert!(!page.body.contains("web-1"), "{}", page.body);
+
+        let page = browser.get(&test.server, "/agents?filter=online").await;
+        assert!(page.body.contains("web-1"));
+        assert!(!page.body.contains("db-1"), "{}", page.body);
+
+        let page = browser.get(&test.server, "/agents?view=table").await;
+        assert!(page.body.contains("<table"), "{}", page.body);
+        assert!(!page.body.contains("class=\"tile"));
+    }
+
+    #[tokio::test]
+    async fn a_waiting_agent_can_be_approved_or_rejected_from_the_list() {
+        let server = start().await;
+        let newcomer = identity();
+        let mut client = server.connect().await;
+        handshake(&mut client, &newcomer, "new-1", None).await;
+        let id = newcomer.id();
+
+        let mut browser = Browser::default();
+        let page = browser.get(&server, "/agents").await;
+        assert!(page.body.contains("Waiting for approval"), "{}", page.body);
+        assert!(page.body.contains(&format!("/agents/{id}/approve")));
+        assert!(page.body.contains(&format!("/agents/{id}/revoke")));
+
+        let page = browser
+            .submit(&server, "/agents", &format!("/agents/{id}/approve"), &[])
+            .await;
+        assert_eq!(page.status, 303, "{}", page.body);
+        assert!(server.state.registry.is_approved(&id).await);
+
+        let page = browser.get(&server, "/agents").await;
+        assert!(!page.body.contains("Waiting for approval"), "{}", page.body);
+    }
+
+    #[tokio::test]
+    async fn an_agents_page_shows_uptime_facts_and_firing_alerts() {
+        let server = start_with_metrics().await;
+        let agent = identity();
+        let mut client = server.connect_approved(&agent, "web-1").await;
+        let sample = AgentMessage::Sample(Sample {
+            timestamp_ms: now_ms() as u64 - 1000,
+            metrics: BTreeMap::from([(
+                "host".to_string(),
+                json!({ "uptime_secs": 4_603_242, "boot_time_secs": 1 }),
+            )]),
+        });
+        send(&mut client, &sample).await;
+        let facts = FlatFacts::from([
+            ("os.name".to_string(), json!("Ubuntu")),
+            ("os.version".to_string(), json!("24.04")),
+            ("cpu.logical_cores".to_string(), json!(16)),
+        ]);
+        server
+            .state
+            .database
+            .record_facts(&agent.id(), &facts, now_ms() as u64)
+            .await
+            .unwrap();
+        server
+            .state
+            .database
+            .create_alert_rule(&cpu_rule())
+            .await
+            .unwrap();
+        let new = alert(&agent, Severity::Warning, "Disk is filling up");
+        server.state.database.fire_alert(&new, &[]).await.unwrap();
+
+        let metric = crate::metrics::find("host.uptime").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while server
+            .state
+            .metrics
+            .newest(metric, now_ms())
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            assert!(Instant::now() < deadline, "the sample never arrived");
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let page = Browser::default()
+            .get(&server, &format!("/agents/{}", agent.id()))
+            .await;
+        for text in [
+            "53 days, 6 hours",
+            "Ubuntu 24.04",
+            "cpu.logical_cores",
+            "Disk is filling up",
+            "127.0.0.1",
+        ] {
+            assert!(page.body.contains(text), "{text}: {}", page.body);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reboot_can_be_alerted_on() {
+        let server = start_with_metrics().await;
+        let agent = identity();
+        let mut client = server.connect_approved(&agent, "web-1").await;
+        let rule = AlertRuleInput {
+            name: "Rebooted".to_string(),
+            metric: Some("host.uptime".to_string()),
+            comparison: Some(Comparison::Below),
+            threshold: Some(600.0),
+            for_secs: 0,
+            ..cpu_rule()
+        };
+        server
+            .state
+            .database
+            .create_alert_rule(&rule)
+            .await
+            .unwrap();
+        let sample = AgentMessage::Sample(Sample {
+            timestamp_ms: now_ms() as u64 - 1000,
+            metrics: BTreeMap::from([("host".to_string(), json!({ "uptime_secs": 90 }))]),
+        });
+        send(&mut client, &sample).await;
+
+        let metric = crate::metrics::find("host.uptime").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while server
+            .state
+            .metrics
+            .newest(metric, now_ms())
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            assert!(Instant::now() < deadline, "the sample never arrived");
+            sleep(Duration::from_millis(10)).await;
+        }
+        evaluator(&server, now_ms() - 60 * MINUTE_MS)
+            .evaluate(now_ms())
+            .await
+            .unwrap();
+
+        let open = server.state.database.open_alerts().await.unwrap();
+        assert_eq!(open[0].summary, "Uptime on web-1 is 1.5 m, below 10 m");
+    }
+
+    #[tokio::test]
+    async fn config_rules_say_how_many_agents_they_reach() {
+        let test = Harness::start().await;
+        let page = Browser::default().get(&test.server, "/rules").await;
+        assert!(
+            page.body.contains(r#"<td class="number">1</td>"#),
+            "{}",
+            page.body
+        );
+    }
+
+    #[tokio::test]
+    async fn checks_can_be_filtered() {
+        let server = start().await;
+        let input = |name: &str, enabled| crate::remote_checks::RemoteCheckInput {
+            check: maxnines_protocol::Check::new(name, maxnines_protocol::CheckKind::Tcp, "a:1"),
+            interval_secs: 60,
+            enabled,
+        };
+        let database = &server.state.database;
+        database
+            .create_remote_check(&input("on", true))
+            .await
+            .unwrap();
+        database
+            .create_remote_check(&input("paused", false))
+            .await
+            .unwrap();
+        let mut browser = Browser::default();
+
+        let page = browser.get(&server, "/checks?filter=disabled").await;
+        assert!(page.body.contains("paused"), "{}", page.body);
+        assert!(!page.body.contains(">on<"), "{}", page.body);
+        assert!(page.body.contains("All 2"), "{}", page.body);
+    }
+
+    #[tokio::test]
+    async fn the_font_is_served_from_the_binary_and_the_policy_allows_it() {
+        let server = start().await;
+        let mut browser = Browser::default();
+        let page = browser.get(&server, "/assets/fonts/figtree.woff2").await;
+        assert_eq!(page.status, 200);
+        assert_eq!(page.header("content-type"), Some("font/woff2"));
+
+        let policy = page.header("content-security-policy").unwrap();
+        assert!(policy.contains("font-src 'self'"), "{policy}");
+    }
+
+    #[tokio::test]
+    async fn names_from_agents_are_escaped_on_every_new_page() {
+        let server = start_with_metrics().await;
+        let agent = identity();
+        let host = "<script>alert(1)</script>";
+        let _client = server.connect_approved(&agent, host).await;
+        let facts = FlatFacts::from([("os.name".to_string(), json!(host))]);
+        server
+            .state
+            .database
+            .record_facts(&agent.id(), &facts, now_ms() as u64)
+            .await
+            .unwrap();
+        let mut browser = Browser::default();
+
+        for path in [
+            "/".to_string(),
+            "/agents".to_string(),
+            "/agents?view=table".to_string(),
+            format!("/agents/{}", agent.id()),
+            "/metrics".to_string(),
+        ] {
+            let page = browser.get(&server, &path).await;
+            assert_eq!(page.status, 200, "{path}");
+            assert!(!page.body.contains("<script"), "{path}: {}", page.body);
         }
     }
 }

@@ -1,5 +1,6 @@
 {% extends "layouts/application.html" %}
 {% block title %}{% if id %}Edit channel{% else %}New channel{% endif %} · MaxNines{% endblock title %}
+{% block main_class %} class="narrow"{% endblock main_class %}
 {% block content %}
 <p class="breadcrumb"><a href="/alerts/channels">Notification channels</a></p>
 <h1>{% if id %}Edit channel{% else %}New channel{% endif %}</h1>

@@ -1,0 +1,19 @@
+{% extends "layouts/application.html" %}
+{% block title %}Settings · MaxNines{% endblock title %}
+{% block content %}
+<h1>Settings</h1>
+<div class="wall">
+  <a class="tile" href="/rules">
+    <span class="tile-head">Config rules <span class="badge neutral">{{ rules }}</span></span>
+    <span class="note">What each agent monitors, chosen by its facts.</span>
+  </a>
+  <a class="tile" href="/alerts/rules">
+    <span class="tile-head">Alert rules <span class="badge neutral">{{ alert_rules }}</span></span>
+    <span class="note">What counts as a problem, and who to tell.</span>
+  </a>
+  <a class="tile" href="/alerts/channels">
+    <span class="tile-head">Notification channels <span class="badge neutral">{{ channels }}</span></span>
+    <span class="note">Webhooks and email addresses that alerts go to.</span>
+  </a>
+</div>
+{% endblock content %}

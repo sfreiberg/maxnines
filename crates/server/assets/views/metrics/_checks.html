@@ -1,5 +1,5 @@
 <h2>Latest checks</h2>
-<table>
+<div class="tablebox"><table>
   <thead>
     <tr><th>Check</th><th>Kind</th><th>Status</th><th class="number">Total</th><th class="number">First byte</th><th>Response</th><th>TLS</th><th class="number">Certificate days</th></tr>
   </thead>
@@ -8,7 +8,7 @@
     <tr>
       <td>{{ check.name }}</td>
       <td>{{ check.kind }}</td>
-      <td>{% if check.up %}<span class="badge good">Up</span>{% else %}<span class="badge bad">Down</span>{% endif %}{% if check.error %} <small class="hint">{{ check.error }}</small>{% endif %}</td>
+      <td>{% if check.up %}<span class="badge good">Up</span>{% else %}<span class="badge bad">Down</span>{% endif %}{% if check.error %} <span class="note">{{ check.error }}</span>{% endif %}</td>
       <td class="number">{{ check.response }}</td>
       <td class="number">{{ check.first_byte }}</td>
       <td>{% if check.status %}{{ check.status }}{% endif %} {{ check.protocol }}</td>
@@ -17,4 +17,4 @@
     </tr>
     {% endfor %}
   </tbody>
-</table>
+</table></div>

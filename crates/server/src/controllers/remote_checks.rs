@@ -2,13 +2,13 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context as _, Result, bail};
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
 use maxnines_protocol::{Check, CheckKind};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::metrics::{CheckRow, check_row};
 use super::{CsrfForm, Page, server_error};
@@ -152,13 +152,38 @@ struct ListRow {
     latest: Option<CheckRow>,
 }
 
-async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
+#[derive(Deserialize)]
+struct ListParams {
+    filter: Option<String>,
+}
+
+#[derive(Serialize)]
+struct FilterTab {
+    key: &'static str,
+    label: &'static str,
+    count: usize,
+    selected: bool,
+}
+
+fn matches(filter: &str, row: &ListRow) -> bool {
+    match filter {
+        "down" => row.latest.as_ref().is_some_and(|latest| !latest.up),
+        "disabled" => !row.enabled,
+        _ => true,
+    }
+}
+
+async fn index(
+    State(state): State<AppState>,
+    Query(params): Query<ListParams>,
+    token: CsrfToken,
+) -> Response {
     let checks = match state.database.list_remote_checks().await {
         Ok(checks) => checks,
         Err(error) => return server_error(&error),
     };
     let latest = state.check_results.all();
-    let rows: Vec<ListRow> = checks
+    let mut rows: Vec<ListRow> = checks
         .into_iter()
         .map(|check| {
             let input = check.input;
@@ -174,8 +199,21 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
         })
         .collect();
 
+    let selected = params.filter.as_deref().unwrap_or("all");
+    let filters: Vec<FilterTab> = [("all", "All"), ("down", "Down"), ("disabled", "Disabled")]
+        .into_iter()
+        .map(|(key, label)| FilterTab {
+            key,
+            label,
+            count: rows.iter().filter(|row| matches(key, row)).count(),
+            selected: key == selected,
+        })
+        .collect();
+    rows.retain(|row| matches(selected, row));
+
     Page::new(&state, &token, "remote_checks/index.html")
         .with("checks", &rows)
+        .with("filters", &filters)
         .with("agent_id", LOCAL_AGENT_ID)
         .render()
 }

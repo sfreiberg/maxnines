@@ -15,7 +15,9 @@ use super::condition_form::{ConditionForm, operators};
 use super::{CsrfForm, Page, server_error};
 use crate::app_state::AppState;
 use crate::condition_builder::Builder;
+use crate::facts::unflatten;
 use crate::models::RuleInput;
+use crate::registration::AgentState;
 use crate::rule_engine;
 use crate::rule_preview::Preview;
 
@@ -336,6 +338,8 @@ struct RuleRow {
     description: Option<String>,
     enabled: bool,
     summary: String,
+    /// How many approved agents it applies to.
+    agents: usize,
 }
 
 /// Describes what a rule sets in a few words.
@@ -371,10 +375,30 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
         Ok(rules) => rules,
         Err(error) => return server_error(&error),
     };
+    let facts = match state.database.all_current_facts().await {
+        Ok(facts) => facts,
+        Err(error) => return server_error(&error),
+    };
+    let agents: Vec<(String, Value)> = state
+        .registry
+        .list()
+        .await
+        .into_iter()
+        .filter(|agent| agent.state == AgentState::Approved && !agent.is_local())
+        .map(|agent| {
+            let shape = facts.get(&agent.id).map(unflatten).unwrap_or(Value::Null);
+            (agent.id, shape)
+        })
+        .collect();
+
     let rows: Vec<RuleRow> = rules
         .into_iter()
         .map(|rule| RuleRow {
             id: rule.id,
+            agents: agents
+                .iter()
+                .filter(|(id, facts)| rule_engine::matches(&rule.rule, facts, id))
+                .count(),
             summary: summarize(&rule.rule.settings),
             description: rule
                 .rule

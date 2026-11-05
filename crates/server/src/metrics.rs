@@ -471,6 +471,14 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
+    Metric {
+        name: "host.uptime",
+        title: "Uptime",
+        unit: Unit::Seconds,
+        collector: "host",
+        source: Source::Fields(&[("Uptime", Reading::Field("$.uptime_secs"))]),
+        chart: ShowChart::Never,
+    },
 ];
 
 pub fn now_ms() -> i64 {
@@ -676,8 +684,13 @@ impl Metrics {
         .context("reading metrics")?
     }
 
-    /// What an agent's checks last reported, as they were sent.
-    pub async fn latest_checks(&self, agent_id: &str, now_ms: i64) -> Result<Vec<Value>> {
+    /// What one of an agent's collectors last sent, as it was sent.
+    pub async fn latest_output(
+        &self,
+        agent_id: &str,
+        collector: &str,
+        now_ms: i64,
+    ) -> Result<Option<Value>> {
         let reader = self.reader.clone();
         let samples = tokio::task::spawn_blocking(move || {
             reader.latest(now_ms - CURRENT_WINDOW_MS, now_ms + CLOCK_SKEW_MS)
@@ -685,13 +698,10 @@ impl Metrics {
         .await
         .context("reading metrics")??;
 
-        let latest = samples
+        Ok(samples
             .into_iter()
-            .find(|sample| sample.agent_id == agent_id && sample.collector == "checks");
-        Ok(match latest.map(|sample| sample.data) {
-            Some(Value::Array(checks)) => checks,
-            _ => Vec::new(),
-        })
+            .find(|sample| sample.agent_id == agent_id && sample.collector == collector)
+            .map(|sample| sample.data))
     }
 
     pub async fn current(&self, now_ms: i64) -> Result<BTreeMap<String, CurrentValues>> {

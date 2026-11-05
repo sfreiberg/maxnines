@@ -10,51 +10,37 @@
   </div>
 </div>
 
-<h2>Firing now</h2>
-{% if open %}
-<table>
-  <thead>
-    <tr><th>Severity</th><th>Alert</th><th>Agent</th><th>Rule</th><th>Started</th></tr>
-  </thead>
-  <tbody>
-    {% for alert in open %}
-    <tr>
-      <td>{% if alert.severity == "critical" %}<span class="badge bad">Critical</span>{% else %}<span class="badge warn">Warning</span>{% endif %}</td>
-      <td>{{ alert.summary }}</td>
-      <td><a href="/agents/{{ alert.agent_id }}">{{ alert.host }}</a></td>
-      <td>{{ alert.rule_name }}</td>
-      <td>{{ alert.started }}</td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
-{% else %}
-<p class="empty">Nothing is firing.</p>
-{% endif %}
+<section class="card">
+  <h2>Firing now</h2>
+  {% if open %}
+  {% for alert in open %}
+  <div class="problem">
+    {% if alert.severity == "critical" %}<span class="badge bad">Critical</span>{% else %}<span class="badge warn">Warning</span>{% endif %}
+    <span class="text">{{ alert.summary }}<br><span class="note">{{ alert.rule_name }} · started {{ alert.started }}</span></span>
+    <a class="button secondary" href="/agents/{{ alert.agent_id }}{% if alert.agent_id == "server" %}/metrics{% endif %}">{{ alert.host }}</a>
+  </div>
+  {% endfor %}
+  {% else %}
+  <p class="empty">Nothing is firing.</p>
+  {% endif %}
+</section>
 
 {% if problems %}
-<h2>Notifications that haven't arrived</h2>
-<table>
-  <thead>
-    <tr><th>Channel</th><th>Alert</th><th>Problem</th><th>Attempts</th><th>Status</th></tr>
-  </thead>
-  <tbody>
-    {% for problem in problems %}
-    <tr>
-      <td>{{ problem.channel }}</td>
-      <td>{{ problem.summary }}</td>
-      <td>{{ problem.error }}</td>
-      <td>{{ problem.attempts }}</td>
-      <td>{% if problem.gave_up %}<span class="badge bad">Gave up</span>{% else %}<span class="badge neutral">Retrying</span>{% endif %}</td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
+<section class="card">
+  <h2>Notifications that haven't arrived</h2>
+  {% for problem in problems %}
+  <div class="problem">
+    {% if problem.gave_up %}<span class="badge bad">Gave up</span>{% else %}<span class="badge neutral">Retrying</span>{% endif %}
+    <span class="text">{{ problem.channel }}: {{ problem.error }}<br><span class="note">{{ problem.summary }} · {{ problem.attempts }} attempt{% if problem.attempts != 1 %}s{% endif %}</span></span>
+  </div>
+  {% endfor %}
+</section>
 {% endif %}
 
+<section>
 <h2>Recent</h2>
 {% if resolved %}
-<table>
+<div class="tablebox"><table>
   <thead>
     <tr><th>Alert</th><th>Agent</th><th>Started</th><th>Resolved</th><th>Why</th></tr>
   </thead>
@@ -62,15 +48,16 @@
     {% for alert in resolved %}
     <tr>
       <td>{{ alert.summary }}</td>
-      <td><a href="/agents/{{ alert.agent_id }}">{{ alert.host }}</a></td>
+      <td class="nowrap"><a href="/agents/{{ alert.agent_id }}{% if alert.agent_id == "server" %}/metrics{% endif %}">{{ alert.host }}</a></td>
       <td>{{ alert.started }}</td>
       <td>{{ alert.resolved }}</td>
       <td>{{ alert.reason }}</td>
     </tr>
     {% endfor %}
   </tbody>
-</table>
+</table></div>
 {% else %}
 <p class="empty">No alerts have ended yet.</p>
 {% endif %}
+</section>
 {% endblock content %}

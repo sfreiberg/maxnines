@@ -3,8 +3,13 @@
 {% block content %}
 <p class="breadcrumb"><a href="/agents">Agents</a></p>
 <div class="title-row">
-  <h1>{{ agent.host }}</h1>
+  <div>
+    <h1>{{ agent.host }}</h1>
+    {% if os %}<p class="subtitle">{{ os }}</p>{% endif %}
+  </div>
   <div class="actions">
+    {% include "agents/_health.html" %}
+    <a class="button secondary" href="/agents/{{ agent.id }}/metrics">View metrics</a>
     {% if agent.state != "approved" %}
     <form method="post" action="/agents/{{ agent.id }}/approve">
       <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
@@ -20,41 +25,70 @@
   </div>
 </div>
 
-<dl class="summary">
-  <dt>Agent ID</dt><dd><code>{{ agent.id }}</code></dd>
-  <dt>Status</dt><dd>{{ agent.state }}{% if decided_by %} by {{ decided_by }}{% endif %}</dd>
-  <dt>Online</dt><dd>{% if agent.online %}Yes{% else %}No{% endif %}</dd>
-</dl>
-
-<p><a href="/agents/{{ agent.id }}/metrics">View metrics</a></p>
-
-<h2>Config</h2>
-<p><span class="badge {{ agent.config.class }}">{{ agent.config.label }}</span>
-  {% if matched_rules %}from {{ matched_rules | join(sep=", ") }}{% else %}No rules match this agent.{% endif %}</p>
-{% if reported and reported.error %}
-<p class="error">The agent rejected its config: {{ reported.error }}</p>
+{% if alerts %}
+<section class="card">
+  {% for alert in alerts %}
+  <div class="problem">
+    {% if alert.severity == "critical" %}<span class="badge bad">Critical</span>{% else %}<span class="badge warn">Warning</span>{% endif %}
+    <span class="text">{{ alert.summary }}</span>
+    <a class="button secondary" href="/alerts">View</a>
+  </div>
+  {% endfor %}
+</section>
 {% endif %}
-{% if skipped_collectors %}
-<p class="notice">This agent can't run: {{ skipped_collectors | join(sep=", ") }}</p>
-{% endif %}
-<pre>{{ config }}</pre>
 
-<h2>Facts</h2>
-{% if has_facts %}
-<pre>{{ facts }}</pre>
-{% else %}
-<p class="empty">This agent hasn't reported any facts yet.</p>
-{% endif %}
+<div class="split">
+  <section class="card">
+    <h2>Status</h2>
+    <dl class="summary">
+      <dt>Status</dt><dd>{{ agent.state }}{% if decided_by %} by {{ decided_by }}{% endif %}</dd>
+      <dt>Online</dt><dd>{% if agent.online %}Yes{% else %}No{% endif %}{% if agent.seen %}, seen {{ agent.seen }}{% endif %}</dd>
+      {% if uptime %}<dt>Uptime</dt><dd>{{ uptime }}</dd>{% endif %}
+      {% if source %}<dt>Connected from</dt><dd><code>{{ source }}</code></dd>{% endif %}
+      {% if agent_version %}<dt>Agent version</dt><dd>{{ agent_version }}{% if agent_commit %}, commit <code>{{ agent_commit }}</code>{% endif %}</dd>{% endif %}
+      <dt>Agent ID</dt><dd><code>{{ agent.id }}</code></dd>
+    </dl>
+  </section>
+
+  <section class="card">
+    <h2>Config</h2>
+    <p class="hint"><span class="badge {{ agent.config.class }}">{{ agent.config.label }}</span>
+      {% if matched_rules %}from {{ matched_rules | join(sep=", ") }}{% else %}No rules match this agent.{% endif %}</p>
+    {% if reported and reported.error %}
+    <p class="error">The agent rejected its config: {{ reported.error }}</p>
+    {% endif %}
+    {% if skipped_collectors %}
+    <p class="notice">This agent can't run: {{ skipped_collectors | join(sep=", ") }}</p>
+    {% endif %}
+    <details>
+      <summary>Show the full config</summary>
+      <pre>{{ config }}</pre>
+    </details>
+  </section>
+</div>
+
+<section class="card">
+  <h2>Facts</h2>
+  {% if has_facts %}
+  <dl class="summary">
+    {% for fact in facts %}<dt>{{ fact.name }}</dt><dd>{{ fact.value }}</dd>{% endfor %}
+  </dl>
+  {% else %}
+  <p class="empty">This agent hasn't reported any facts yet.</p>
+  {% endif %}
+</section>
 
 {% if history %}
-<h2>Fact history</h2>
-<ul class="history">
-  {% for entry in history %}
-  <li>
-    <time>{{ entry.time }}</time>
-    <ul>{% for change in entry.changes %}<li><code>{{ change }}</code></li>{% endfor %}</ul>
-  </li>
-  {% endfor %}
-</ul>
+<section class="card">
+  <h2>Fact history</h2>
+  <ul class="history">
+    {% for entry in history %}
+    <li>
+      <time>{{ entry.time }}</time>
+      <ul>{% for change in entry.changes %}<li><code>{{ change }}</code></li>{% endfor %}</ul>
+    </li>
+    {% endfor %}
+  </ul>
+</section>
 {% endif %}
 {% endblock content %}

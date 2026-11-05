@@ -1,5 +1,6 @@
 {% extends "layouts/application.html" %}
 {% block title %}{% if id %}Edit check{% else %}New check{% endif %} · MaxNines{% endblock title %}
+{% block main_class %} class="narrow"{% endblock main_class %}
 {% block content %}
 <p class="breadcrumb"><a href="/checks">Checks</a></p>
 <h1>{% if id %}Edit check{% else %}New check{% endif %}</h1>
@@ -16,14 +17,14 @@
   <label>Kind
     <select name="kind">
       {% for kind in kinds %}
-      <option value="{{ kind }}"{% if kind == check.kind %} selected{% endif %}>{{ kind }}</option>
+      <option value="{{ kind }}"{% if kind == check.kind %} selected{% endif %}>{% if kind == "http" %}Website (http){% elif kind == "tcp" %}Port (tcp){% elif kind == "tls" %}Certificate (tls){% elif kind == "dns" %}DNS (dns){% else %}Ping (ping){% endif %}</option>
       {% endfor %}
     </select>
   </label>
 
   <label>Target
     <input type="text" name="target" value="{{ check.target }}" required maxlength="255" spellcheck="false">
-    <small>A URL for http, <code>host:port</code> for tcp and tls, and a host for dns and ping.</small>
+    <small>A web address for websites, <code>host:port</code> for ports and certificates, and a host name for DNS and ping.</small>
   </label>
 
   <label>Run every (seconds)
@@ -36,7 +37,7 @@
   </label>
 
   <fieldset class="for-http">
-    <legend>Web options</legend>
+    <legend>Website options</legend>
     <label>Method
       <input type="text" name="method" value="{{ check.method }}" spellcheck="false" placeholder="GET">
     </label>

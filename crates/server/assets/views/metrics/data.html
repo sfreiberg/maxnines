@@ -1,11 +1,12 @@
 {% extends "layouts/application.html" %}
 {% block title %}{{ chart.title }} on {{ host }} · MaxNines{% endblock title %}
+{% block main_class %} class="narrow"{% endblock main_class %}
 {% block content %}
 <p class="breadcrumb"><a href="/agents/{{ agent_id }}/metrics?range={{ range }}">{{ host }}</a></p>
 <h1>{{ chart.title }}</h1>
 <p class="hint">The last {{ range_label }}, as shown on the chart. Each value is an average for that period.</p>
 {% if chart.has_data %}
-<table>
+<div class="tablebox"><table>
   <thead>
     <tr><th>Time</th>{% for row in chart.summary %}<th class="number">{{ row.name }}</th>{% endfor %}</tr>
   </thead>
@@ -17,7 +18,7 @@
     </tr>
     {% endfor %}
   </tbody>
-</table>
+</table></div>
 {% else %}
 <p class="empty">No data in this range.</p>
 {% endif %}

@@ -1,7 +1,7 @@
 {% extends "layouts/application.html" %}
 {% block title %}Notification channels · MaxNines{% endblock title %}
 {% block content %}
-<p class="breadcrumb"><a href="/alerts">Alerts</a></p>
+<p class="breadcrumb"><a href="/settings">Settings</a></p>
 <div class="title-row">
   <h1>Notification channels</h1>
   <div class="actions"><a class="button" href="/alerts/channels/new">New channel</a></div>
@@ -11,7 +11,7 @@
 {% if notice %}<p class="notice">{{ notice }}</p>{% endif %}
 
 {% if channels %}
-<table>
+<div class="tablebox"><table>
   <thead>
     <tr><th>Name</th><th>Type</th><th>Sends to</th><th></th></tr>
   </thead>
@@ -30,7 +30,7 @@
     </tr>
     {% endfor %}
   </tbody>
-</table>
+</table></div>
 {% else %}
 <p class="empty">There are no channels, so alerts only show on the Alerts page.</p>
 {% endif %}

@@ -5,10 +5,10 @@
 <p class="breadcrumb">{% if is_local %}<a href="/checks">Checks</a>{% else %}<a href="/metrics">Metrics</a>{% endif %}</p>
 <div class="title-row">
   <h1>{{ host }}</h1>
-  {% if not is_local %}<a href="/agents/{{ agent_id }}">Agent details</a>{% endif %}
+  {% if not is_local %}<a class="button secondary" href="/agents/{{ agent_id }}">Agent details</a>{% endif %}
 </div>
 
-<nav class="ranges" aria-label="Time range">
+<nav class="tabs" aria-label="Time range">
   {% for option in ranges %}
   <a href="/agents/{{ agent_id }}/metrics?range={{ option.key }}"{% if option.selected %} class="selected" aria-current="true"{% endif %}>{{ option.label }}</a>
   {% endfor %}
@@ -16,7 +16,9 @@
 <p class="hint">Times are UTC. This page updates every minute.</p>
 
 {% if checks %}
+<section>
 {% include "metrics/_checks.html" %}
+</section>
 {% endif %}
 
 <div class="charts">

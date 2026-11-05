@@ -82,7 +82,7 @@ pub fn resolve(rules: &[ConfigRule], facts: &Value, agent_id: &str) -> Result<Re
 
 /// A condition that can't be evaluated doesn't match. That's the normal case
 /// for a rule about a fact this agent doesn't have.
-fn matches(rule: &RuleInput, facts: &Value, agent_id: &str) -> bool {
+pub fn matches(rule: &RuleInput, facts: &Value, agent_id: &str) -> bool {
     if !rule.enabled {
         return false;
     }

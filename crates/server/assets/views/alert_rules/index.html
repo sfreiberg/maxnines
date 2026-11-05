@@ -1,13 +1,13 @@
 {% extends "layouts/application.html" %}
 {% block title %}Alert rules · MaxNines{% endblock title %}
 {% block content %}
-<p class="breadcrumb"><a href="/alerts">Alerts</a></p>
+<p class="breadcrumb"><a href="/settings">Settings</a></p>
 <div class="title-row">
   <h1>Alert rules</h1>
   <div class="actions"><a class="button" href="/alerts/rules/new">New rule</a></div>
 </div>
 {% if rules %}
-<table>
+<div class="tablebox"><table>
   <thead>
     <tr><th>Name</th><th>Watches</th><th>Applies to</th><th>Severity</th><th>Notifies</th><th></th></tr>
   </thead>
@@ -23,7 +23,7 @@
     </tr>
     {% endfor %}
   </tbody>
-</table>
+</table></div>
 {% else %}
 <p class="empty">There are no alert rules, so nothing will alert.</p>
 {% endif %}

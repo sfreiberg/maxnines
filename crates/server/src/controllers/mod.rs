@@ -1,5 +1,6 @@
-//! Routes and request handling. Pages live in `agents`, `alerts`, `alert_rules`,
-//! `metrics`, `notification_channels`, `remote_checks` and `rules`, the token protected API in `admin`, and agent connections in `agent_socket`.
+//! Routes and request handling. Pages live in `overview`, `agents`, `alerts`,
+//! `alert_rules`, `metrics`, `notification_channels`, `remote_checks`, `rules` and
+//! `settings`, the token protected API in `admin`, and agent connections in `agent_socket`.
 
 pub mod admin;
 pub mod agent_socket;
@@ -8,18 +9,22 @@ mod alert_rules;
 mod alerts;
 mod assets;
 mod condition_form;
+mod fleet;
 mod metrics;
 mod notification_channels;
+mod overview;
 mod remote_checks;
 mod rules;
+mod settings;
 
 use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
 
 use anyhow::Error;
 use axum::extract::{FromRequest, FromRequestParts, Request};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Form, Router};
 use axum_csrf::CsrfToken;
@@ -28,13 +33,14 @@ use tracing::{error, warn};
 
 use crate::app_state::AppState;
 
-const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; style-src 'self'; img-src 'self'; \
-     form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; style-src 'self'; font-src 'self'; \
+     img-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 
 pub fn app(state: AppState) -> Router {
     Router::new()
-        .route("/", get(home))
         .route("/ws", get(agent_socket::upgrade))
+        .merge(overview::routes())
+        .merge(settings::routes())
         .merge(agents::routes())
         .merge(alerts::routes())
         .merge(alert_rules::routes())
@@ -47,10 +53,6 @@ pub fn app(state: AppState) -> Router {
         .fallback(not_found)
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
-}
-
-async fn home() -> Redirect {
-    Redirect::to("/agents")
 }
 
 async fn not_found(state: axum::extract::State<AppState>, token: CsrfToken) -> Response {
@@ -73,6 +75,19 @@ async fn security_headers(request: Request, next: Next) -> Response {
     response
 }
 
+/// Which item in the navigation a template belongs to.
+fn section_of(template: &str) -> &'static str {
+    match template.split('/').next().unwrap_or_default() {
+        "overview" => "overview",
+        "agents" => "agents",
+        "metrics" => "metrics",
+        "remote_checks" => "checks",
+        "alerts" => "alerts",
+        "settings" | "rules" | "alert_rules" | "notification_channels" => "settings",
+        _ => "",
+    }
+}
+
 /// A page to render, carrying the CSRF token every form on it needs.
 struct Page<'a> {
     state: &'a AppState,
@@ -90,6 +105,8 @@ impl<'a> Page<'a> {
             Err(error) => warn!(%error, "creating a CSRF token failed"),
         }
         context.insert("build", &maxnines_protocol::build_info!());
+        context.insert("section", section_of(template));
+        context.insert("firing", &state.firing.load(Ordering::Relaxed));
         Self {
             state,
             token: token.clone(),
