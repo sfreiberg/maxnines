@@ -9,15 +9,16 @@ use sysinfo::{
     Components, CpuRefreshKind, Disks, InterfaceOperationalState, MemoryRefreshKind, Networks,
     ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind,
 };
-use systemstat::{CPULoad, DelayedMeasurement, Platform};
+use systemstat::Platform;
 
 use crate::checks::CheckCollector;
+use crate::custom::{CustomCollector, Definitions};
 use crate::files::FileCollector;
 use crate::services::ServiceCollector;
-use crate::system::{self, Change, SystemCollector};
+use crate::system::{self, Change, CpuTime, SystemCollector};
 
 /// What this agent can run, reported to the server as a fact.
-pub const SUPPORTED: [&str; 11] = COLLECTORS;
+pub const SUPPORTED: [&str; 12] = COLLECTORS;
 
 /// How long to wait after building collectors before the first sample.
 /// CPU usage is measured between two refreshes, so it needs this gap.
@@ -36,16 +37,25 @@ pub fn host_name() -> String {
 }
 
 /// Builds everything a config turns on.
-pub fn build_all(config: &AgentConfig) -> Result<Vec<Box<dyn Collector>>> {
+pub fn build_all(
+    config: &AgentConfig,
+    definitions: &Definitions,
+) -> Result<Vec<Box<dyn Collector>>> {
+    let interval = Duration::from_secs(config.interval_secs);
     config
         .collectors
         .iter()
         .filter(|(_, settings)| settings.enabled)
-        .map(|(name, settings)| build(name, settings, Duration::from_secs(config.interval_secs)))
+        .map(|(name, settings)| build(name, settings, definitions, interval))
         .collect()
 }
 
-fn build(name: &str, config: &CollectorSettings, interval: Duration) -> Result<Box<dyn Collector>> {
+fn build(
+    name: &str,
+    config: &CollectorSettings,
+    definitions: &Definitions,
+    interval: Duration,
+) -> Result<Box<dyn Collector>> {
     Ok(match name {
         "host" => Box::new(HostCollector),
         "cpu" => Box::new(CpuCollector::new()?),
@@ -58,6 +68,10 @@ fn build(name: &str, config: &CollectorSettings, interval: Duration) -> Result<B
         "checks" => {
             let checks = config.checks.clone().unwrap_or_default();
             Box::new(CheckCollector::new(checks, interval))
+        }
+        "custom" => {
+            let names = config.names.clone().unwrap_or_default();
+            Box::new(CustomCollector::new(names, definitions, interval))
         }
         "services" => {
             let names = config.names.clone().unwrap_or_default();
@@ -88,9 +102,7 @@ impl Collector for HostCollector {
 
 struct CpuCollector {
     system: System,
-    stats: systemstat::System,
-    /// Started at the previous sample, and finished by the next one.
-    time: Option<DelayedMeasurement<CPULoad>>,
+    time: CpuTime,
     context_switches: Change,
     interrupts: Change,
 }
@@ -99,12 +111,9 @@ impl CpuCollector {
     fn new() -> Result<Self> {
         let mut system = System::new()?;
         system.refresh_cpu_usage();
-        let stats = systemstat::System::new();
-        let time = stats.cpu_load_aggregate().ok();
         let mut collector = Self {
             system,
-            stats,
-            time,
+            time: CpuTime::new(),
             context_switches: Change::default(),
             interrupts: Change::default(),
         };
@@ -120,31 +129,6 @@ impl CpuCollector {
             self.interrupts.update(counters.interrupts),
         )
     }
-
-    /// How the time since the last call was spent, and starts measuring again.
-    fn time_percent(&mut self) -> Option<Value> {
-        let load = self.time.as_ref()?.done().ok();
-        self.time = self.stats.cpu_load_aggregate().ok();
-        load.as_ref().map(describe_cpu_time)
-    }
-}
-
-/// Fractions of the time, as percentages. Only Linux reports waiting on disks.
-fn describe_cpu_time(load: &CPULoad) -> Value {
-    let percent = |fraction: f32| fraction * 100.0;
-    #[allow(unused_mut)]
-    let mut time = json!({
-        "user": percent(load.user),
-        "nice": percent(load.nice),
-        "system": percent(load.system),
-        "interrupt": percent(load.interrupt),
-        "idle": percent(load.idle),
-    });
-    #[cfg(target_os = "linux")]
-    {
-        time["iowait"] = json!(percent(load.platform.iowait));
-    }
-    time
 }
 
 impl Collector for CpuCollector {
@@ -161,7 +145,7 @@ impl Collector for CpuCollector {
         Ok(json!({
             "usage_percent": self.system.global_cpu_usage(),
             "per_core_percent": per_core,
-            "time_percent": self.time_percent(),
+            "time_percent": self.time.measure(),
             "context_switches": context_switches,
             "interrupts": interrupts,
             "load_average": load.map(|l| json!({
@@ -538,7 +522,9 @@ mod tests {
         );
 
         assert_eq!(
-            build_all(&config(collectors)).unwrap().len(),
+            build_all(&config(collectors), &Definitions::new())
+                .unwrap()
+                .len(),
             SUPPORTED.len()
         );
     }
@@ -558,11 +544,11 @@ mod tests {
 
     #[test]
     fn each_sample_measures_cpu_time_from_the_one_before() {
-        let mut collector = CpuCollector::new().unwrap();
+        let mut time = CpuTime::new();
         std::thread::sleep(Duration::from_millis(50));
-        let first = collector.time_percent();
-        assert!(first.is_some());
-        assert!(collector.time.is_some());
+        assert!(time.measure().is_some());
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(time.measure().is_some());
     }
 
     #[test]
@@ -577,7 +563,7 @@ mod tests {
     #[test]
     fn disabled_collectors_are_left_out() {
         let collectors = json!({ "cpu": {}, "memory": { "enabled": false } });
-        let built = build_all(&config(collectors)).unwrap();
+        let built = build_all(&config(collectors), &Definitions::new()).unwrap();
 
         assert_eq!(built.len(), 1);
         assert_eq!(built[0].name(), "cpu");
@@ -748,6 +734,6 @@ mod tests {
 
     #[test]
     fn an_unknown_collector_is_an_error() {
-        assert!(build_all(&config(json!({ "gpu": {} }))).is_err());
+        assert!(build_all(&config(json!({ "gpu": {} })), &Definitions::new()).is_err());
     }
 }

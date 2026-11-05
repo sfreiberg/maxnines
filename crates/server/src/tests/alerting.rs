@@ -947,6 +947,70 @@ async fn an_agents_page_shows_how_its_checks_last_went() {
 }
 
 #[tokio::test]
+async fn an_agents_page_shows_its_custom_metrics_without_trusting_them() {
+    let server = start_with_metrics().await;
+    let agent = identity();
+    let mut client = server.connect_approved(&agent, "web-1").await;
+    let sample = AgentMessage::Sample(Sample {
+        timestamp_ms: (now_ms() - 1000) as u64,
+        metrics: BTreeMap::from([(
+            "custom".to_string(),
+            json!([
+                { "name": "queue", "ok": 1, "value": 12.5 },
+                { "name": "many", "ok": 1 },
+                { "name": "many.depth", "value": 3 },
+                { "name": "<script>alert(1)</script>", "ok": 0, "error": "<b>timed out</b>" },
+                { "ok": 1, "value": 9 },
+                "nonsense",
+            ]),
+        )]),
+    });
+    send(&mut client, &sample).await;
+
+    let metric = crate::metrics::find("custom.ok").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while server
+        .state
+        .metrics
+        .newest(metric, now_ms())
+        .await
+        .unwrap()
+        .is_empty()
+    {
+        assert!(Instant::now() < deadline, "the sample never arrived");
+        sleep(Duration::from_millis(10)).await;
+    }
+
+    let page = Browser::default()
+        .get(&server, &format!("/agents/{}/metrics", agent.id()))
+        .await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("Latest custom metrics"));
+    assert_eq!(page.body.matches("badge good").count(), 3, "{}", page.body);
+    assert_eq!(page.body.matches("badge bad").count(), 1, "{}", page.body);
+    assert!(page.body.contains(">12.5<"), "{}", page.body);
+    assert!(!page.body.contains("<script>alert"), "{}", page.body);
+    assert!(!page.body.contains("<b>timed"), "{}", page.body);
+}
+
+#[tokio::test]
+async fn a_rule_can_choose_custom_metrics_by_name_but_not_commands() {
+    let server = start().await;
+    for settings in [
+        json!({ "names": ["/bin/sh -c id"] }),
+        json!({ "command": ["/bin/sh"] }),
+    ] {
+        let rule = json!({
+            "name": "Bad",
+            "priority": 100,
+            "settings": { "collectors": { "custom": settings } },
+        });
+        let (status, body) = api(&server, "POST", "/admin/rules", &rule).await;
+        assert!((400..500).contains(&status), "{status}: {body}");
+    }
+}
+
+#[tokio::test]
 async fn charts_keep_the_catalog_order_however_their_queries_finish() {
     let server = start_with_metrics().await;
     let (agent, _client) = report_samples(&server, "/").await;

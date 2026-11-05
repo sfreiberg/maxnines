@@ -2,6 +2,7 @@ mod background;
 mod checks;
 mod collector;
 mod config;
+mod custom;
 mod facts;
 mod files;
 mod identity;
@@ -25,6 +26,7 @@ use tracing_subscriber::EnvFilter;
 
 use collector::Collector;
 use config::Config;
+use custom::Definitions;
 use websocket::{ConfigUpdate, ServerLink};
 
 #[derive(Debug, Parser)]
@@ -67,7 +69,7 @@ fn main() -> Result<()> {
         Command::Run => run(cli.config),
         Command::Facts => {
             let config = Config::load(&cli.config)?;
-            let facts = facts::gather(&config.facts)?;
+            let facts = facts::gather(&config.facts, &config.custom_metrics)?;
             println!("{}", serde_json::to_string_pretty(&facts)?);
             Ok(())
         }
@@ -99,10 +101,10 @@ struct Monitoring {
 
 impl Monitoring {
     /// Fails without side effects, so a bad config leaves the old one running.
-    fn start(update: &ConfigUpdate) -> Result<Self> {
+    fn start(update: &ConfigUpdate, definitions: &Definitions) -> Result<Self> {
         let collectors = catch_unwind(AssertUnwindSafe(|| {
             update.config.validate()?;
-            collector::build_all(&update.config)
+            collector::build_all(&update.config, definitions)
         }))
         .map_err(|_| anyhow!("building collectors panicked"))??;
 
@@ -137,7 +139,7 @@ async fn run(path: PathBuf) -> Result<()> {
     let saved_file = config.saved_config_file();
     let mut monitoring = None;
     if let Some(update) = saved_config::load(&saved_file) {
-        match Monitoring::start(&update) {
+        match Monitoring::start(&update, &config.custom_metrics) {
             Ok(started) => {
                 info!(version = update.version, "using the saved config");
                 link.set_facts_interval(Duration::from_secs(update.config.facts_interval_secs));
@@ -155,7 +157,7 @@ async fn run(path: PathBuf) -> Result<()> {
                 }
             }
             Some(update) = link.next_config() => {
-                apply(update, &mut monitoring, &link, &saved_file)?;
+                apply(update, &config.custom_metrics, &mut monitoring, &link, &saved_file)?;
             }
             result = tokio::signal::ctrl_c() => {
                 result?;
@@ -179,6 +181,7 @@ async fn next_tick(monitoring: &mut Option<Monitoring>) {
 /// Swaps in a new config, or keeps the current one and tells the server why not.
 fn apply(
     update: ConfigUpdate,
+    definitions: &Definitions,
     monitoring: &mut Option<Monitoring>,
     link: &ServerLink,
     saved_file: &Path,
@@ -190,7 +193,7 @@ fn apply(
         return link.report_config(&update.version, None);
     }
 
-    match Monitoring::start(&update) {
+    match Monitoring::start(&update, definitions) {
         Ok(started) => {
             info!(
                 version = update.version,
@@ -331,7 +334,7 @@ mod tests {
     #[tokio::test]
     async fn a_good_config_starts_its_collectors() {
         let config = json!({ "collectors": { "cpu": {} } });
-        let started = Monitoring::start(&update("v1", config)).unwrap();
+        let started = Monitoring::start(&update("v1", config), &Definitions::new()).unwrap();
 
         assert_eq!(started.version, "v1");
         assert_eq!(started.collectors.len(), 1);
@@ -343,7 +346,7 @@ mod tests {
             json!({ "interval_secs": 0 }),
             json!({ "collectors": { "gpu": {} } }),
         ] {
-            assert!(Monitoring::start(&update("v1", config)).is_err());
+            assert!(Monitoring::start(&update("v1", config), &Definitions::new()).is_err());
         }
     }
 }

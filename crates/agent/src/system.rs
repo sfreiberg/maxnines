@@ -1,6 +1,7 @@
 //! What only the operating system can say about itself, which differs by
-//! platform. `systemstat` covers CPU time and memory, and the rest comes from
-//! `/proc` on Linux and `sysctl` on macOS and FreeBSD.
+//! platform. `systemstat` covers memory, and CPU time everywhere but Linux, where
+//! `/proc/stat` also gives steal time. The rest comes from `/proc` on Linux and
+//! `sysctl` on macOS and FreeBSD.
 //!
 //! Anything a platform doesn't have is left out rather than reported as zero.
 
@@ -48,6 +49,130 @@ struct Limits {
     max_open_files: Option<u64>,
     open_files: Option<u64>,
     max_processes: Option<u64>,
+    processes: Option<u64>,
+}
+
+/// Measures how CPU time is spent between one call and the next.
+#[cfg(not(target_os = "linux"))]
+pub struct CpuTime {
+    stats: System,
+    /// Has a fixed start, so each sample needs a new one.
+    started: Option<systemstat::DelayedMeasurement<systemstat::CPULoad>>,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl CpuTime {
+    pub fn new() -> Self {
+        let stats = System::new();
+        let started = stats.cpu_load_aggregate().ok();
+        Self { stats, started }
+    }
+
+    pub fn measure(&mut self) -> Option<Value> {
+        let load = self.started.as_ref()?.done().ok();
+        self.started = self.stats.cpu_load_aggregate().ok();
+        let percent = |fraction: f32| fraction * 100.0;
+        load.map(|load| {
+            json!({
+                "user": percent(load.user),
+                "nice": percent(load.nice),
+                "system": percent(load.system),
+                "interrupt": percent(load.interrupt),
+                "idle": percent(load.idle),
+            })
+        })
+    }
+}
+
+/// `/proc/stat`'s first line, in clock ticks since boot.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CpuTicks {
+    user: u64,
+    nice: u64,
+    system: u64,
+    idle: u64,
+    iowait: u64,
+    interrupt: u64,
+    steal: u64,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl CpuTicks {
+    fn parse(text: &str) -> Option<Self> {
+        let line = text.lines().find(|line| line.starts_with("cpu "))?;
+        let mut numbers = line.split_whitespace().skip(1).map(str::parse::<u64>);
+        let mut next = || numbers.next()?.ok();
+        let (user, nice, system, idle) = (next()?, next()?, next()?, next()?);
+        let (iowait, irq, softirq) = (next()?, next()?, next()?);
+        Some(Self {
+            user,
+            nice,
+            system,
+            idle,
+            iowait,
+            interrupt: irq + softirq,
+            // Kernels before 2.6.11 don't have it, and neither do some containers.
+            steal: next().unwrap_or(0),
+        })
+    }
+
+    /// Percentages of the time between two readings. Nothing can be said if no
+    /// time passed, or if the counters went backwards.
+    fn percent_since(&self, old: &Self) -> Option<Value> {
+        let spent = |new: u64, old: u64| new.checked_sub(old);
+        let parts = [
+            spent(self.user, old.user)?,
+            spent(self.nice, old.nice)?,
+            spent(self.system, old.system)?,
+            spent(self.idle, old.idle)?,
+            spent(self.iowait, old.iowait)?,
+            spent(self.interrupt, old.interrupt)?,
+            spent(self.steal, old.steal)?,
+        ];
+        let total: u64 = parts.iter().sum();
+        if total == 0 {
+            return None;
+        }
+        let percent = |part: u64| part as f64 * 100.0 / total as f64;
+        Some(json!({
+            "user": percent(parts[0]),
+            "nice": percent(parts[1]),
+            "system": percent(parts[2]),
+            "idle": percent(parts[3]),
+            "iowait": percent(parts[4]),
+            "interrupt": percent(parts[5]),
+            "steal": percent(parts[6]),
+        }))
+    }
+}
+
+/// Measures how CPU time is spent between one call and the next.
+#[cfg(target_os = "linux")]
+pub struct CpuTime {
+    previous: Option<CpuTicks>,
+}
+
+#[cfg(target_os = "linux")]
+impl CpuTime {
+    pub fn new() -> Self {
+        Self {
+            previous: Self::read(),
+        }
+    }
+
+    fn read() -> Option<CpuTicks> {
+        CpuTicks::parse(&std::fs::read_to_string("/proc/stat").ok()?)
+    }
+
+    pub fn measure(&mut self) -> Option<Value> {
+        let now = Self::read();
+        let time = now
+            .zip(self.previous)
+            .and_then(|(new, old)| new.percent_since(&old));
+        self.previous = now;
+        time
+    }
 }
 
 /// Reads `/proc/stat`'s `ctxt` and `intr` lines. The first number on `intr` is
@@ -73,6 +198,18 @@ fn parse_vmstat(text: &str) -> (Option<u64>, Option<u64>) {
         })
     };
     (total("pswpin"), total("pswpout"))
+}
+
+/// Reads `/proc/loadavg`, whose fourth field is `running/total`. Linux counts every
+/// thread here, and it's threads that its limits apply to.
+#[cfg(any(target_os = "linux", test))]
+fn parse_task_count(text: &str) -> Option<u64> {
+    text.split_whitespace()
+        .nth(3)?
+        .split_once('/')?
+        .1
+        .parse()
+        .ok()
 }
 
 /// Reads `/proc/sys/fs/file-nr`, which holds what's allocated, how much of that
@@ -106,8 +243,27 @@ fn limits() -> Limits {
         open_files: std::fs::read_to_string("/proc/sys/fs/file-nr")
             .ok()
             .and_then(|text| parse_file_nr(&text)),
-        max_processes: number("/proc/sys/kernel/pid_max"),
+        // Whichever runs out first.
+        max_processes: [
+            number("/proc/sys/kernel/pid_max"),
+            number("/proc/sys/kernel/threads-max"),
+        ]
+        .into_iter()
+        .flatten()
+        .min(),
+        processes: std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|text| parse_task_count(&text)),
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_count() -> Option<u64> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
+
+    let mut system = sysinfo::System::new().ok()?;
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    Some(system.processes().len() as u64)
 }
 
 /// Reads a whole number, whichever size the kernel declares it as.
@@ -140,6 +296,7 @@ fn limits() -> Limits {
         max_open_files: sysctl_number("kern.maxfiles"),
         open_files: sysctl_number("kern.openfiles"),
         max_processes: sysctl_number("kern.maxproc"),
+        processes: process_count(),
     }
 }
 
@@ -149,6 +306,7 @@ fn limits() -> Limits {
         max_open_files: sysctl_number("kern.maxfiles"),
         open_files: sysctl_number("kern.num_files"),
         max_processes: sysctl_number("kern.maxproc"),
+        processes: process_count(),
     }
 }
 
@@ -162,7 +320,10 @@ pub fn counters() -> Counters {
 /// Windows has no system-wide limits like these.
 #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
 fn limits() -> Limits {
-    Limits::default()
+    Limits {
+        processes: process_count(),
+        ..Limits::default()
+    }
 }
 
 /// What memory is being used for, in the categories each system keeps.
@@ -270,6 +431,7 @@ fn report(limits: &Limits, sessions: Option<u64>) -> Value {
         "max_open_files": limits.max_open_files,
         "open_files": limits.open_files,
         "max_processes": limits.max_processes,
+        "processes": limits.processes,
         "login_sessions": sessions,
     })
 }
@@ -345,6 +507,60 @@ pgpgin 900
     }
 
     #[test]
+    fn cpu_ticks_are_read_from_the_whole_machine_line() {
+        let ticks = CpuTicks::parse(PROC_STAT).unwrap();
+        assert_eq!(ticks.user, 6168);
+        assert_eq!(ticks.idle, 217_451);
+        assert_eq!(ticks.iowait, 351);
+        assert_eq!(ticks.interrupt, 96);
+        assert_eq!(ticks.steal, 0);
+        assert_eq!(CpuTicks::parse("cpu0 1 2 3 4 5 6 7 8"), None);
+        assert_eq!(CpuTicks::parse("cpu  1 2 x"), None);
+    }
+
+    #[test]
+    fn older_kernels_without_steal_still_work() {
+        let ticks = CpuTicks::parse("cpu  1 2 3 4 5 6 7\n").unwrap();
+        assert_eq!(ticks.interrupt, 13);
+        assert_eq!(ticks.steal, 0);
+    }
+
+    #[test]
+    fn cpu_time_includes_what_a_hypervisor_took() {
+        let old = CpuTicks::default();
+        let new = CpuTicks {
+            user: 40,
+            system: 10,
+            idle: 20,
+            iowait: 5,
+            interrupt: 5,
+            steal: 20,
+            nice: 0,
+        };
+        let time = new.percent_since(&old).unwrap();
+        assert_eq!(time["steal"], 20.0);
+        assert_eq!(time["user"], 40.0);
+        assert_eq!(time["iowait"], 5.0);
+    }
+
+    #[test]
+    fn cpu_time_needs_time_to_have_passed_forwards() {
+        let ticks = CpuTicks {
+            user: 10,
+            ..CpuTicks::default()
+        };
+        assert_eq!(ticks.percent_since(&ticks), None);
+        assert_eq!(CpuTicks::default().percent_since(&ticks), None);
+    }
+
+    #[test]
+    fn loadavg_gives_the_number_of_tasks() {
+        assert_eq!(parse_task_count("0.20 0.18 0.12 1/80 11206\n"), Some(80));
+        assert_eq!(parse_task_count("0.20 0.18 0.12"), None);
+        assert_eq!(parse_task_count(""), None);
+    }
+
+    #[test]
     fn open_files_are_those_allocated_and_in_use() {
         assert_eq!(parse_file_nr("3168\t100\t1620200\n"), Some(3068));
         assert_eq!(parse_file_nr("5\t9\t100"), Some(0));
@@ -406,7 +622,11 @@ pgpgin 900
             open > 0 && open < limits.max_open_files.unwrap(),
             "{limits:?}"
         );
-        assert!(limits.max_processes.unwrap() > 0, "{limits:?}");
+        let processes = limits.processes.unwrap();
+        assert!(
+            processes > 1 && processes < limits.max_processes.unwrap(),
+            "{limits:?}"
+        );
     }
 
     #[cfg(target_os = "macos")]

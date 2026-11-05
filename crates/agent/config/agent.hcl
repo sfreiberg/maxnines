@@ -38,3 +38,18 @@ state_dir = "data.nosync"
 # facts "disk" {
 #   size = 500
 # }
+
+# Your own metrics, from commands. A command prints one number to standard output,
+# or a JSON object of up to 32 numbers such as {"depth": 12, "oldest_secs": 40},
+# which report as queue_depth.depth and queue_depth.oldest_secs. It runs as the
+# agent's user, directly rather than through a shell. For pipes, use
+# ["/bin/sh", "-c", "..."].
+#
+# The server chooses which of these to collect and how often, by name, but it can
+# only pick from this list. Only the numbers are reported, never other output. Keep
+# this file writable only by its owner, because what's here gets run.
+#
+# custom_metric "queue_depth" {
+#   command      = ["/usr/local/bin/queue-depth", "--name", "mail"]
+#   timeout_secs = 5   # from 1 to 60, 10 if left out
+# }

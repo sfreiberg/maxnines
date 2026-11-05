@@ -23,6 +23,7 @@ use tokio_tungstenite::{
 use tracing::{error, info, warn};
 
 use crate::config::Config;
+use crate::custom::Definitions;
 use crate::facts;
 
 /// Samples kept while the server is unreachable. Newer ones are dropped once
@@ -63,6 +64,7 @@ struct Connection {
     token: Option<String>,
     connector: Connector,
     custom_facts: BTreeMap<String, Value>,
+    custom_metrics: Definitions,
     facts_every: watch::Receiver<Duration>,
     configs: mpsc::Sender<ConfigUpdate>,
 }
@@ -92,6 +94,7 @@ impl ServerLink {
                 .transpose()?,
             connector: tls_connector(config.server.ca_file.as_deref())?,
             custom_facts: config.facts.clone(),
+            custom_metrics: config.custom_metrics.clone(),
             facts_every: facts_every_receiver,
             configs: config_sender,
         };
@@ -252,7 +255,7 @@ async fn receive(text: &str, connection: &Connection) {
 /// Sends everything each time and lets the server work out what changed, so a
 /// change can't be lost if the server couldn't save it the first time.
 async fn send_facts(socket: &mut Socket, connection: &Connection) -> Result<()> {
-    let facts = match facts::gather(&connection.custom_facts) {
+    let facts = match facts::gather(&connection.custom_facts, &connection.custom_metrics) {
         Ok(facts) => facts,
         Err(error) => {
             warn!(error = format!("{error:#}"), "gathering facts failed");
@@ -328,6 +331,7 @@ mod tests {
             },
             state_dir: "state".into(),
             facts: BTreeMap::from([("role".to_string(), json!("web"))]),
+            custom_metrics: Definitions::new(),
         }
     }
 

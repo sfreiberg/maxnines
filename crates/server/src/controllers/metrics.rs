@@ -57,6 +57,28 @@ pub struct CheckRow {
     cert_days_left: Option<i64>,
 }
 
+/// A custom metric's latest result. Agents send this, so it's treated the same
+/// way as a check's.
+#[derive(Serialize)]
+struct CustomRow {
+    name: String,
+    working: bool,
+    error: Option<String>,
+    value: Option<String>,
+}
+
+fn custom_row(metric: &Value) -> Option<CustomRow> {
+    Some(CustomRow {
+        name: metric["name"].as_str()?.to_string(),
+        // Only the command's own item says, and values from one that ran did work.
+        working: metric["ok"].as_u64() != Some(0),
+        error: metric["error"].as_str().map(String::from),
+        value: metric["value"]
+            .as_f64()
+            .map(|value| metric_charts::format_value(Unit::Number, value)),
+    })
+}
+
 pub fn check_row(check: &Value) -> Option<CheckRow> {
     let text = |name: &str| check[name].as_str().map(String::from);
     let time = |name: &str| {
@@ -188,8 +210,19 @@ async fn show(
         Err(error) => return server_error(&error),
     };
 
+    let custom_metrics: Vec<CustomRow> = match state
+        .metrics
+        .latest_output(&agent.id, "custom", now_ms())
+        .await
+    {
+        Ok(Some(Value::Array(metrics))) => metrics.iter().filter_map(custom_row).collect(),
+        Ok(_) => Vec::new(),
+        Err(error) => return server_error(&error),
+    };
+
     Page::new(&state, &token, "metrics/show.html")
         .with("checks", &checks)
+        .with("custom_metrics", &custom_metrics)
         .with("is_local", &agent.is_local())
         .with("agent_id", &agent.id)
         .with("host", &agent.host)

@@ -7,6 +7,8 @@ use maxnines_protocol::hcl_env::config_context;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::custom::{Definitions, check_definitions};
+
 const FACTS: &str = "facts";
 
 /// What the server's database columns hold. Names also get a `custom.` prefix.
@@ -15,6 +17,7 @@ const MAX_FACT_NAME_LEN: usize = 255 - "custom.".len();
 
 /// Only what's needed to reach the server. What to monitor comes from the
 /// server, and custom facts stay here because the server's rules match on them.
+/// Custom metrics stay here so that the server can't choose what a machine runs.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -26,6 +29,10 @@ pub struct Config {
     /// by [`take_facts`] rather than deserialized.
     #[serde(skip)]
     pub facts: BTreeMap<String, Value>,
+    /// Commands that give your own metrics, by name. The server chooses which of
+    /// these to collect, but can't add to them.
+    #[serde(default, rename = "custom_metric")]
+    pub custom_metrics: Definitions,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,6 +69,7 @@ impl Config {
         let (body, facts) = take_facts(body)?;
         let mut config: Config = hcl::from_body(body)?;
         config.facts = facts;
+        check_definitions(&config.custom_metrics)?;
         Ok(config)
     }
 }
@@ -201,6 +209,56 @@ mod env_tests {
         let error = Config::parse(&with_url("env(\"MAXNINES_TEST_UNSET\")")).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("MAXNINES_TEST_UNSET"), "{message}");
+    }
+
+    fn reachable() -> String {
+        with_url("\"ws://127.0.0.1:9000/ws\"")
+    }
+
+    #[test]
+    fn custom_metrics_are_read_from_their_blocks() {
+        let server = reachable();
+        let text = format!(
+            r#"{server}
+            custom_metric "queue" {{
+              command = ["/usr/local/bin/queue", "--name", "mail"]
+              timeout_secs = 5
+            }}
+            custom_metric "disk.temp" {{
+              command = ["/bin/true"]
+            }}
+            "#
+        );
+        let config = Config::parse(&text).unwrap();
+
+        assert_eq!(config.custom_metrics.len(), 2);
+        let queue = &config.custom_metrics["queue"];
+        assert_eq!(queue.command[2], "mail");
+        assert_eq!(queue.timeout_secs, Some(5));
+        assert_eq!(config.custom_metrics["disk.temp"].timeout_secs, None);
+    }
+
+    #[test]
+    fn no_custom_metrics_is_fine() {
+        assert!(
+            Config::parse(&reachable())
+                .unwrap()
+                .custom_metrics
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn broken_custom_metrics_stop_the_agent_starting() {
+        for block in [
+            "custom_metric \"a\" {\n  command = []\n}\n",
+            "custom_metric \"a\" {\n  command = [\"/bin/true\"]\n  timeout_secs = 0\n}\n",
+            "custom_metric \"a b\" {\n  command = [\"/bin/true\"]\n}\n",
+            "custom_metric \"a\" {\n  command = [\"/bin/true\"]\n  shell = true\n}\n",
+        ] {
+            let text = format!("{}{block}", reachable());
+            assert!(Config::parse(&text).is_err(), "{block}");
+        }
     }
 
     #[test]

@@ -1,0 +1,15 @@
+<h2>Latest custom metrics</h2>
+<div class="tablebox"><table>
+  <thead>
+    <tr><th>Metric</th><th>Status</th><th class="number">Value</th></tr>
+  </thead>
+  <tbody>
+    {% for metric in custom_metrics %}
+    <tr>
+      <td>{{ metric.name }}</td>
+      <td>{% if metric.working %}<span class="badge good">Working</span>{% else %}<span class="badge bad">Failing</span>{% endif %}{% if metric.error %} <span class="note">{{ metric.error }}</span>{% endif %}</td>
+      <td class="number">{{ metric.value }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table></div>

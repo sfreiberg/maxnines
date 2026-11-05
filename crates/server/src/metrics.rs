@@ -133,6 +133,7 @@ pub const METRICS: &[Metric] = &[
             ("Nice", Reading::Field("$.time_percent.nice")),
             ("Interrupt", Reading::Field("$.time_percent.interrupt")),
             ("I/O wait", Reading::Field("$.time_percent.iowait")),
+            ("Steal", Reading::Field("$.time_percent.steal")),
             ("Idle", Reading::Field("$.time_percent.idle")),
         ]),
         chart: ShowChart::WithData,
@@ -528,12 +529,29 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::WithData,
     },
     Metric {
-        name: "system.max_processes",
-        title: "Process limit",
+        name: "system.processes",
+        title: "Processes",
         unit: Unit::Number,
         collector: "system",
-        source: Source::Fields(&[("Limit", Reading::Field("$.max_processes"))]),
-        chart: ShowChart::Never,
+        source: Source::Fields(&[
+            ("Running", Reading::Field("$.processes")),
+            ("Limit", Reading::Field("$.max_processes")),
+        ]),
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "system.processes_used",
+        title: "Process limit used",
+        unit: Unit::Percent,
+        collector: "system",
+        source: Source::Fields(&[(
+            "Used",
+            Reading::Percent {
+                part: "$.processes",
+                whole: "$.max_processes",
+            },
+        )]),
+        chart: ShowChart::WithData,
     },
     Metric {
         name: "system.sessions",
@@ -542,6 +560,28 @@ pub const METRICS: &[Metric] = &[
         collector: "system",
         source: Source::Fields(&[("Sessions", Reading::Field("$.login_sessions"))]),
         chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "custom.value",
+        title: "Custom metrics",
+        unit: Unit::Number,
+        collector: "custom",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.value"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "custom.ok",
+        title: "Custom metric working",
+        unit: Unit::Number,
+        collector: "custom",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.ok"),
+        },
+        chart: ShowChart::Never,
     },
     Metric {
         name: "file.exists",

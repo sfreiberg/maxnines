@@ -21,6 +21,12 @@
 </section>
 {% endif %}
 
+{% if custom_metrics %}
+<section>
+{% include "metrics/_custom.html" %}
+</section>
+{% endif %}
+
 <div class="charts">
   {% for chart in charts %}
   <section class="chart-card">

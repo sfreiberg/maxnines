@@ -16,14 +16,14 @@ serde.workspace = true
 serde_json.workspace = true
 sysinfo = "0.40.1"
 systemstat = "0.2.7"
-tokio = { version = "1.54.1", features = ["rt", "macros", "process", "time", "signal", "sync"] }
+tokio = { version = "1.54.1", features = ["io-util", "rt", "macros", "process", "time", "signal", "sync"] }
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 webpki-roots = "0.26"
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", default-features = false, features = ["fs", "std"] }
+rustix = { version = "1", default-features = false, features = ["fs", "process", "std"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "freebsd"))'.dependencies]
 sysctl = "0.7"

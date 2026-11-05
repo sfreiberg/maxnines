@@ -6,11 +6,12 @@ use serde_json::{Value, json};
 use sysinfo::{CpuRefreshKind, Motherboard, Product, System};
 
 use crate::collector;
+use crate::custom::Definitions;
 
 /// Gathers what this machine is, as opposed to what it's doing. Everything here
 /// should rarely change, because each change is kept as history. That's why
 /// swap size, which some systems resize on demand, isn't included.
-pub fn gather(custom: &BTreeMap<String, Value>) -> Result<Value> {
+pub fn gather(custom: &BTreeMap<String, Value>, metrics: &Definitions) -> Result<Value> {
     let build = build_info!();
     let mut system = System::new()?;
     system.refresh_memory();
@@ -51,6 +52,8 @@ pub fn gather(custom: &BTreeMap<String, Value>) -> Result<Value> {
             "commit": build.commit,
             "built_at": build.built_at,
             "collectors": collector::SUPPORTED,
+            // Only the names. What they run stays on this machine.
+            "custom_metrics": metrics.keys().collect::<Vec<_>>(),
         },
         "custom": custom,
     }))
@@ -59,10 +62,11 @@ pub fn gather(custom: &BTreeMap<String, Value>) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::custom::CustomMetric;
 
     #[test]
     fn reports_the_built_in_facts() {
-        let facts = gather(&BTreeMap::new()).unwrap();
+        let facts = gather(&BTreeMap::new(), &Definitions::new()).unwrap();
 
         assert_eq!(facts["os"]["family"], std::env::consts::OS);
         assert!(facts["host"]["arch"].is_string());
@@ -74,7 +78,7 @@ mod tests {
 
     #[test]
     fn reports_which_build_this_is() {
-        let facts = gather(&BTreeMap::new()).unwrap();
+        let facts = gather(&BTreeMap::new(), &Definitions::new()).unwrap();
         let agent = &facts["agent"];
 
         let commit = agent["commit"].as_str().unwrap();
@@ -90,13 +94,35 @@ mod tests {
     fn reports_custom_facts() {
         let custom = BTreeMap::from([("role".to_string(), json!("web"))]);
 
-        assert_eq!(gather(&custom).unwrap()["custom"]["role"], "web");
+        assert_eq!(
+            gather(&custom, &Definitions::new()).unwrap()["custom"]["role"],
+            "web"
+        );
     }
 
     #[test]
     fn gathering_twice_gives_the_same_facts() {
         // A difference here would fill the history with false changes.
         let custom = BTreeMap::new();
-        assert_eq!(gather(&custom).unwrap(), gather(&custom).unwrap());
+        let none = Definitions::new();
+        assert_eq!(
+            gather(&custom, &none).unwrap(),
+            gather(&custom, &none).unwrap()
+        );
+    }
+
+    #[test]
+    fn custom_metrics_are_listed_by_name_without_their_commands() {
+        let metrics = Definitions::from([(
+            "queue".to_string(),
+            CustomMetric {
+                command: vec!["/usr/local/bin/secret-tool".to_string()],
+                timeout_secs: None,
+            },
+        )]);
+        let facts = gather(&BTreeMap::new(), &metrics).unwrap();
+
+        assert_eq!(facts["agent"]["custom_metrics"], json!(["queue"]));
+        assert!(!facts.to_string().contains("secret-tool"));
     }
 }

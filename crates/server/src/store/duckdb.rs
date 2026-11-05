@@ -1042,7 +1042,7 @@ mod tests {
         let mut store = in_memory();
         let data = json!({
             "open_files": 250, "max_open_files": 1000,
-            "max_processes": 4096, "login_sessions": 2,
+            "processes": 1024, "max_processes": 4096, "login_sessions": 2,
         });
         write_metric(&mut store, "a", 1000, "system", data);
 
@@ -1051,13 +1051,32 @@ mod tests {
             25.0
         );
         assert_eq!(
-            newest(&store, "system.max_processes", 0, HOUR_MS)[0].value,
-            4096.0
+            newest(&store, "system.processes_used", 0, HOUR_MS)[0].value,
+            25.0
         );
         assert_eq!(newest(&store, "system.sessions", 0, HOUR_MS)[0].value, 2.0);
         assert_eq!(
             names(&query(&store, "a", "system.open_files", 10)),
             ["Limit", "Open"]
+        );
+    }
+
+    #[test]
+    fn a_broken_custom_metric_has_no_value_but_can_be_alerted_on() {
+        let mut store = in_memory();
+        let data = json!([
+            { "name": "queue", "ok": 1, "value": 12.5 },
+            { "name": "broken", "ok": 0, "error": "timed out" },
+        ]);
+        write_metric(&mut store, "a", 1000, "custom", data);
+
+        assert_eq!(
+            values(&newest(&store, "custom.value", 0, HOUR_MS)),
+            [("a", "queue", 1000, 12.5)]
+        );
+        assert_eq!(
+            values(&newest(&store, "custom.ok", 0, HOUR_MS)),
+            [("a", "broken", 1000, 0.0), ("a", "queue", 1000, 1.0)]
         );
     }
 

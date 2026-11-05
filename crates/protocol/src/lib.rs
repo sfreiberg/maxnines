@@ -12,9 +12,10 @@ use serde_json::Value;
 
 /// Every collector the project knows about. An agent reports the ones it can
 /// run in its facts, because older agents may not have them all.
-pub const COLLECTORS: [&str; 11] = [
+pub const COLLECTORS: [&str; 12] = [
     "checks",
     "cpu",
+    "custom",
     "disk",
     "files",
     "host",
@@ -109,8 +110,9 @@ pub struct CollectorSettings {
     /// Disk collector only: limit output to these mount points.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mount_points: Option<Vec<String>>,
-    /// Processes and services collectors only: the names to watch. Nothing else
-    /// about what's running on a machine is reported.
+    /// Processes, services and custom collectors only: the names to watch. Nothing
+    /// else about what's running on a machine is reported. For custom metrics these
+    /// pick from what the agent's own config defines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub names: Option<Vec<String>>,
     /// Files collector only: the files and folders to watch.
@@ -191,6 +193,11 @@ impl CheckKind {
 }
 
 /// Goes on a command line, so it can't be anything an option could look like.
+/// A custom metric's name is a series name, so it has to fit in chart labels.
+pub fn is_custom_metric_name(name: &str) -> bool {
+    name.len() <= MAX_CHECK_NAME_LEN && is_plain_name(name, "")
+}
+
 fn is_plain_name(name: &str, extra: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('-')
@@ -385,6 +392,10 @@ impl CollectorSettings {
                 collector != "services" || is_plain_name(name, "@:"),
                 "{name:?} isn't a valid service name"
             );
+            ensure!(
+                collector != "custom" || is_custom_metric_name(name),
+                "{name:?} isn't a valid custom metric name"
+            );
         }
 
         let paths = self.paths.as_deref().unwrap_or_default();
@@ -496,6 +507,18 @@ mod tests {
     fn watching(names: Value) -> AgentConfig {
         serde_json::from_value(json!({ "collectors": { "processes": { "names": names } } }))
             .unwrap()
+    }
+
+    #[test]
+    fn custom_metric_names_are_checked() {
+        let custom = |name: &str| -> AgentConfig {
+            serde_json::from_value(json!({ "collectors": { "custom": { "names": [name] } } }))
+                .unwrap()
+        };
+        custom("queue.depth-1_a").validate().unwrap();
+        for bad in ["/bin/sh", "a b", "-x", "a;b", &"x".repeat(65)] {
+            assert!(custom(bad).validate().is_err(), "{bad}");
+        }
     }
 
     #[test]
