@@ -19,7 +19,7 @@
     {% for channel in channels %}
     <tr>
       <td><a href="/alerts/channels/{{ channel.id }}/edit">{{ channel.name }}</a></td>
-      <td>{% if channel.kind == "email" %}Email{% else %}Webhook{% endif %}</td>
+      <td>{% if channel.kind == "email" %}Email{% elif channel.kind == "discord" %}Discord{% else %}Webhook{% endif %}</td>
       <td>{{ channel.target }}</td>
       <td>
         <form method="post" action="/alerts/channels/{{ channel.id }}/test">

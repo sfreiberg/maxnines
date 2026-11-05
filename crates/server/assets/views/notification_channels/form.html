@@ -18,13 +18,14 @@
     <select name="kind">
       <option value="webhook"{% if channel.kind == "webhook" %} selected{% endif %}>Webhook</option>
       <option value="email"{% if channel.kind == "email" %} selected{% endif %}>Email</option>
+      <option value="discord"{% if channel.kind == "discord" %} selected{% endif %}>Discord</option>
     </select>
     {% if not email_ready %}<small>Email needs an <code>email</code> block in the server config.</small>{% endif %}
   </label>
 
   <label>Sends to
     <input type="text" name="target" value="{{ channel.target }}" spellcheck="false" autocomplete="off"{% if channel.preview %} placeholder="{{ channel.preview }}"{% endif %}>
-    <small>{% if channel.preview %}Leave empty to keep the saved URL, which isn't shown because it can work like a password.{% else %}A webhook's URL, or email addresses separated by commas.{% endif %}</small>
+    <small>{% if channel.preview %}Leave empty to keep the saved URL, which isn't shown because it can work like a password.{% else %}A webhook's URL, a Discord webhook URL, or email addresses separated by commas.{% endif %}</small>
   </label>
 
   <div class="actions">

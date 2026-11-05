@@ -22,6 +22,14 @@ const MAX_FOR_SECS: u64 = 7 * 86_400;
 
 const MAX_RECIPIENTS: usize = 20;
 
+/// Where Discord's webhooks live, including its test builds and older domain.
+const DISCORD_HOSTS: [&str; 4] = [
+    "discord.com",
+    "discordapp.com",
+    "ptb.discord.com",
+    "canary.discord.com",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuleKind {
@@ -278,6 +286,7 @@ pub fn format_duration(secs: u64) -> String {
 pub enum ChannelKind {
     Webhook,
     Email,
+    Discord,
 }
 
 impl ChannelKind {
@@ -285,6 +294,7 @@ impl ChannelKind {
         match self {
             Self::Webhook => "webhook",
             Self::Email => "email",
+            Self::Discord => "discord",
         }
     }
 
@@ -292,6 +302,7 @@ impl ChannelKind {
         match text {
             "webhook" => Ok(Self::Webhook),
             "email" => Ok(Self::Email),
+            "discord" => Ok(Self::Discord),
             other => bail!("unknown channel kind {other:?}"),
         }
     }
@@ -327,6 +338,7 @@ pub fn check_channel(channel: &ChannelInput) -> Result<()> {
         ChannelKind::Webhook => {
             webhook_host(&channel.target)?;
         }
+        ChannelKind::Discord => check_discord_url(&channel.target)?,
         ChannelKind::Email => {
             let recipients = recipients(&channel.target)?;
             ensure!(!recipients.is_empty(), "add at least one email address");
@@ -336,6 +348,24 @@ pub fn check_channel(channel: &ChannelInput) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// Catches pasting the wrong thing here, which would otherwise only show up when
+/// the first alert failed to arrive. Errors don't repeat the URL.
+fn check_discord_url(url: &str) -> Result<()> {
+    let uri: Uri = url
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("the Discord webhook URL isn't valid"))?;
+    let host = uri.host().unwrap_or_default();
+    ensure!(
+        uri.scheme_str() == Some("https")
+            && DISCORD_HOSTS.contains(&host)
+            && uri.path().starts_with("/api/webhooks/"),
+        "that doesn't look like a Discord webhook URL, which starts with \
+         https://discord.com/api/webhooks/"
+    );
     Ok(())
 }
 
@@ -372,7 +402,7 @@ impl ChannelInput {
     /// Enough to recognize a channel, without giving away a webhook's secret.
     pub fn target_preview(&self) -> String {
         match self.kind {
-            ChannelKind::Webhook => webhook_host(&self.target)
+            ChannelKind::Webhook | ChannelKind::Discord => webhook_host(&self.target)
                 .map_or_else(|_| "Unknown".to_string(), |host| format!("{host}/…")),
             ChannelKind::Email => self.target.clone(),
         }
@@ -699,6 +729,42 @@ mod tests {
         for target in ["", "hooks.example.com", "ftp://x/y", "file:///etc/passwd"] {
             assert!(check_channel(&webhook(target)).is_err(), "{target}");
         }
+    }
+
+    fn discord(target: &str) -> ChannelInput {
+        ChannelInput {
+            kind: ChannelKind::Discord,
+            ..webhook(target)
+        }
+    }
+
+    #[test]
+    fn discord_channels_need_a_discord_webhook_url() {
+        for good in [
+            "https://discord.com/api/webhooks/123/token",
+            "https://discordapp.com/api/webhooks/123/token",
+            "https://canary.discord.com/api/webhooks/123/token",
+        ] {
+            check_channel(&discord(good)).unwrap();
+        }
+        for bad in [
+            "",
+            "http://discord.com/api/webhooks/123/token",
+            "https://discord.com/channels/123",
+            "https://evil.example.com/api/webhooks/123/token",
+            "https://discord.com.evil.example/api/webhooks/1/t",
+        ] {
+            assert!(check_channel(&discord(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_discord_url_is_treated_as_a_secret() {
+        let channel = discord("https://discord.com/api/webhooks/123/secret-token");
+        assert_eq!(channel.target_preview(), "https://discord.com/…");
+
+        let error = check_channel(&discord("https://exa mple/secret-token")).unwrap_err();
+        assert!(!format!("{error:#}").contains("secret-token"));
     }
 
     #[test]

@@ -29,6 +29,9 @@ const BATCH_SIZE: usize = 16;
 /// How long one delivery can take.
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The longest message Discord accepts.
+const DISCORD_MAX_CHARS: usize = 2000;
+
 const FIRST_RETRY_MS: i64 = 30_000;
 const LONGEST_RETRY_MS: i64 = 30 * 60_000;
 
@@ -90,12 +93,30 @@ impl Notice {
         })
     }
 
-    fn subject(&self) -> String {
-        let label = match (self.event, &self.alert) {
+    fn label(&self) -> String {
+        match (self.event, &self.alert) {
             (Event::Firing, Some(alert)) => alert.severity.as_str().to_uppercase(),
             (Event::Resolved, _) => "RESOLVED".to_string(),
             _ => "TEST".to_string(),
-        };
+        }
+    }
+
+    /// Mentions are turned off, as agents choose their own names and one called
+    /// `@everyone` would otherwise ping a whole server.
+    fn discord_body(&self) -> Value {
+        let summary = self
+            .alert
+            .as_ref()
+            .map_or(self.text.as_str(), |a| &a.summary);
+        let content: String = format!("**{}** {summary}", self.label())
+            .chars()
+            .take(DISCORD_MAX_CHARS)
+            .collect();
+        json!({ "content": content, "allowed_mentions": { "parse": [] } })
+    }
+
+    fn subject(&self) -> String {
+        let label = self.label();
         let summary = self
             .alert
             .as_ref()
@@ -189,7 +210,7 @@ impl Mailer {
 
 /// Errors are saved and shown, and a webhook's URL is often its password, so
 /// they only ever say what kind of failure it was.
-fn post_webhook(url: &str, notice: &Notice) -> Result<()> {
+fn post_json(url: &str, body: &Value) -> Result<()> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(SEND_TIMEOUT))
         .max_redirects(0)
@@ -198,7 +219,7 @@ fn post_webhook(url: &str, notice: &Notice) -> Result<()> {
         .build()
         .new_agent();
 
-    let body = notice.webhook_body().to_string();
+    let body = body.to_string();
     let result = agent
         .post(url.trim())
         .header("content-type", "application/json")
@@ -221,7 +242,8 @@ fn post_webhook(url: &str, notice: &Notice) -> Result<()> {
 /// Sends one notification. Blocks, so it can't run on an async thread.
 fn send_blocking(channel: &Channel, notice: &Notice, mailer: Option<&Mailer>) -> Result<()> {
     match channel.channel.kind {
-        ChannelKind::Webhook => post_webhook(&channel.channel.target, notice),
+        ChannelKind::Webhook => post_json(&channel.channel.target, &notice.webhook_body()),
+        ChannelKind::Discord => post_json(&channel.channel.target, &notice.discord_body()),
         ChannelKind::Email => mailer
             .context("email isn't set up in the server config")?
             .send(&channel.channel.target, notice),
@@ -364,6 +386,40 @@ mod tests {
         assert_eq!(retry_delay_ms(7), LONGEST_RETRY_MS);
         assert_eq!(retry_delay_ms(i32::MAX), LONGEST_RETRY_MS);
         assert_eq!(retry_delay_ms(0), 30_000);
+    }
+
+    #[test]
+    fn discord_messages_lead_with_what_happened() {
+        let body = notice(Event::Firing, alert()).discord_body();
+        assert_eq!(
+            body["content"],
+            "**CRITICAL** CPU usage on web-1 is 97%, above 90%"
+        );
+        assert_eq!(
+            notice(Event::Resolved, alert()).discord_body()["content"],
+            "**RESOLVED** CPU usage on web-1 is 97%, above 90%"
+        );
+    }
+
+    #[test]
+    fn a_host_cannot_ping_a_discord_server() {
+        let alert = Alert {
+            summary: "@everyone is offline".to_string(),
+            ..alert()
+        };
+        let body = notice(Event::Firing, alert).discord_body();
+        assert_eq!(body["allowed_mentions"]["parse"], json!([]));
+    }
+
+    #[test]
+    fn a_long_discord_message_fits_the_limit() {
+        let alert = Alert {
+            summary: "é".repeat(3000),
+            ..alert()
+        };
+        let body = notice(Event::Firing, alert).discord_body();
+        let content = body["content"].as_str().unwrap();
+        assert_eq!(content.chars().count(), DISCORD_MAX_CHARS);
     }
 
     #[test]

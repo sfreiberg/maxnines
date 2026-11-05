@@ -46,7 +46,7 @@ impl ChannelForm {
     }
 
     fn from_channel(channel: &ChannelInput) -> Self {
-        let hidden = channel.kind == ChannelKind::Webhook;
+        let hidden = channel.kind != ChannelKind::Email;
         Self {
             name: channel.name.clone(),
             kind: channel.kind.as_str().to_string(),
@@ -205,7 +205,7 @@ async fn update(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfFo
         Err(error) => {
             let message = format!("{error:#}");
             if saved.channel.kind.as_str() == fields.kind
-                && saved.channel.kind == ChannelKind::Webhook
+                && saved.channel.kind != ChannelKind::Email
             {
                 fields.preview = Some(saved.channel.target_preview());
             }
@@ -259,6 +259,18 @@ mod tests {
             kind: ChannelKind::Webhook,
             target: "https://hooks.example.com/secret".to_string(),
         }
+    }
+
+    #[test]
+    fn a_discord_url_never_reaches_the_form() {
+        let channel = ChannelInput {
+            kind: ChannelKind::Discord,
+            target: "https://discord.com/api/webhooks/1/secret".to_string(),
+            ..webhook()
+        };
+        let form = ChannelForm::from_channel(&channel);
+        assert_eq!(form.target, "");
+        assert_eq!(form.preview.as_deref(), Some("https://discord.com/…"));
     }
 
     #[test]

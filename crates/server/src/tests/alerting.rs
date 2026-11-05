@@ -1071,6 +1071,84 @@ async fn a_webhook_hears_about_an_alert_starting_and_ending_once_each() {
 }
 
 #[tokio::test]
+async fn a_discord_channel_gets_discords_message_format() {
+    let mut test = Harness::start().await;
+    let hook = Hook::default();
+    let url = format!("{}/secret-token", hook.start().await);
+    let channel = ChannelInput {
+        name: "Discord".to_string(),
+        kind: ChannelKind::Discord,
+        target: url,
+    };
+    let channel = test.database().create_channel(&channel).await.unwrap();
+    let rule = AlertRuleInput {
+        for_secs: 0,
+        channels: vec![channel],
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    test.cpu(0, 95.0).await;
+
+    Notifier::new(test.database().clone(), None)
+        .deliver_due(test.now)
+        .await
+        .unwrap();
+
+    let received = hook.received.lock().unwrap();
+    assert_eq!(
+        received[0],
+        json!({
+            "content": "**CRITICAL** CPU usage on web-1 is 95%, above 90%",
+            "allowed_mentions": { "parse": [] },
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_discord_channel_can_be_made_from_the_form_and_keeps_its_url_hidden() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    let url = "https://discord.com/api/webhooks/123/secret-token";
+    let fields = [("name", "Team"), ("kind", "discord"), ("target", url)];
+
+    let page = browser
+        .submit(&server, "/alerts/channels/new", "/alerts/channels", &fields)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+
+    let page = browser.get(&server, "/alerts/channels").await;
+    assert!(page.body.contains("Discord"), "{}", page.body);
+    assert!(page.body.contains("https://discord.com/…"));
+    assert!(!page.body.contains("secret-token"));
+
+    let id = server.state.database.list_channels().await.unwrap()[0].id;
+    let page = browser
+        .get(&server, &format!("/alerts/channels/{id}/edit"))
+        .await;
+    assert!(!page.body.contains("secret-token"), "{}", page.body);
+    assert!(
+        page.body.contains(r#"value="discord" selected"#),
+        "{}",
+        page.body
+    );
+}
+
+#[tokio::test]
+async fn a_wrong_url_for_discord_is_refused_on_the_form() {
+    let server = start().await;
+    let fields = [
+        ("name", "Team"),
+        ("kind", "discord"),
+        ("target", "https://hooks.slack.com/services/x"),
+    ];
+    let page = Browser::default()
+        .submit(&server, "/alerts/channels/new", "/alerts/channels", &fields)
+        .await;
+    assert_eq!(page.status, 422);
+    assert!(page.body.contains("Discord webhook URL"), "{}", page.body);
+}
+
+#[tokio::test]
 async fn an_alert_with_no_channels_sends_nothing() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
@@ -2483,9 +2561,10 @@ mod pages {
             .await
             .unwrap();
         let (warning, critical) = ("Disk is filling up", "Everything is on fire");
-        let new = alert(&test.agent, Severity::Warning, warning);
-        test.database().fire_alert(&new, &[]).await.unwrap();
+        // Newest comes first otherwise, so this has to be sorted to pass.
         let new = alert(&test.agent, Severity::Critical, critical);
+        test.database().fire_alert(&new, &[]).await.unwrap();
+        let new = alert(&test.agent, Severity::Warning, warning);
         test.database().fire_alert(&new, &[]).await.unwrap();
 
         let page = Browser::default().get(&test.server, "/").await;
