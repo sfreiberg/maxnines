@@ -1004,6 +1004,72 @@ mod tests {
     }
 
     #[test]
+    fn cpu_and_memory_detail_read_what_the_agent_sends() {
+        let mut store = in_memory();
+        let cpu = |switches: u64| {
+            json!({
+                "time_percent": { "user": 20.0, "system": 5.0, "iowait": 7.5, "idle": 67.5 },
+                "context_switches": switches,
+            })
+        };
+        write_metric(&mut store, "a", 1000, "cpu", cpu(100));
+        write_metric(&mut store, "a", 11_000, "cpu", cpu(500));
+        let memory = json!({
+            "detail": { "active_bytes": 2048, "free_bytes": 1024 },
+            "swap_in_pages": 30,
+        });
+        write_metric(&mut store, "a", 1000, "memory", memory);
+
+        let time = newest(&store, "cpu.time", 0, HOUR_MS);
+        let reading = |name: &str| time.iter().find(|r| r.series == name).map(|r| r.value);
+        assert_eq!(reading("User"), Some(20.0));
+        assert_eq!(reading("I/O wait"), Some(7.5));
+        assert_eq!(reading("Interrupt"), None);
+
+        let rate = query(&store, "a", "cpu.context_switches", 10);
+        assert_eq!(rate.series[0].points.last().unwrap().avg, 50.0);
+
+        let detail = newest(&store, "memory.detail", 0, HOUR_MS);
+        assert_eq!(
+            values(&detail),
+            [("a", "Active", 1000, 2048.0), ("a", "Free", 1000, 1024.0)]
+        );
+        assert_eq!(names(&query(&store, "a", "memory.detail", 10)).len(), 2);
+    }
+
+    #[test]
+    fn limits_and_sessions_read_what_the_agent_sends() {
+        let mut store = in_memory();
+        let data = json!({
+            "open_files": 250, "max_open_files": 1000,
+            "max_processes": 4096, "login_sessions": 2,
+        });
+        write_metric(&mut store, "a", 1000, "system", data);
+
+        assert_eq!(
+            newest(&store, "system.open_files_used", 0, HOUR_MS)[0].value,
+            25.0
+        );
+        assert_eq!(
+            newest(&store, "system.max_processes", 0, HOUR_MS)[0].value,
+            4096.0
+        );
+        assert_eq!(newest(&store, "system.sessions", 0, HOUR_MS)[0].value, 2.0);
+        assert_eq!(
+            names(&query(&store, "a", "system.open_files", 10)),
+            ["Limit", "Open"]
+        );
+    }
+
+    #[test]
+    fn a_platform_without_a_limit_reports_no_percentage() {
+        let mut store = in_memory();
+        let data = json!({ "open_files": null, "max_open_files": null, "login_sessions": 1 });
+        write_metric(&mut store, "a", 1000, "system", data);
+        assert!(newest(&store, "system.open_files_used", 0, HOUR_MS).is_empty());
+    }
+
+    #[test]
     fn new_metrics_read_what_the_agent_sends() {
         let mut store = in_memory();
         let disk = |read: u64| {

@@ -9,13 +9,15 @@ use sysinfo::{
     Components, CpuRefreshKind, Disks, InterfaceOperationalState, MemoryRefreshKind, Networks,
     ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind,
 };
+use systemstat::{CPULoad, DelayedMeasurement, Platform};
 
 use crate::checks::CheckCollector;
 use crate::files::FileCollector;
 use crate::services::ServiceCollector;
+use crate::system::{self, Change, SystemCollector};
 
 /// What this agent can run, reported to the server as a fact.
-pub const SUPPORTED: [&str; 10] = COLLECTORS;
+pub const SUPPORTED: [&str; 11] = COLLECTORS;
 
 /// How long to wait after building collectors before the first sample.
 /// CPU usage is measured between two refreshes, so it needs this gap.
@@ -52,6 +54,7 @@ fn build(name: &str, config: &CollectorSettings, interval: Duration) -> Result<B
         "network" => Box::new(NetworkCollector::new()?),
         "processes" => Box::new(ProcessCollector::new(config.names.clone())?),
         "sensors" => Box::new(SensorCollector::new()?),
+        "system" => Box::new(SystemCollector::new(interval)),
         "checks" => {
             let checks = config.checks.clone().unwrap_or_default();
             Box::new(CheckCollector::new(checks, interval))
@@ -85,14 +88,63 @@ impl Collector for HostCollector {
 
 struct CpuCollector {
     system: System,
+    stats: systemstat::System,
+    /// Started at the previous sample, and finished by the next one.
+    time: Option<DelayedMeasurement<CPULoad>>,
+    context_switches: Change,
+    interrupts: Change,
 }
 
 impl CpuCollector {
     fn new() -> Result<Self> {
         let mut system = System::new()?;
         system.refresh_cpu_usage();
-        Ok(Self { system })
+        let stats = systemstat::System::new();
+        let time = stats.cpu_load_aggregate().ok();
+        let mut collector = Self {
+            system,
+            stats,
+            time,
+            context_switches: Change::default(),
+            interrupts: Change::default(),
+        };
+        collector.count();
+        Ok(collector)
     }
+
+    /// Gives the changes since the last call, in the same order as the fields.
+    fn count(&mut self) -> (Option<u64>, Option<u64>) {
+        let counters = system::counters();
+        (
+            self.context_switches.update(counters.context_switches),
+            self.interrupts.update(counters.interrupts),
+        )
+    }
+
+    /// How the time since the last call was spent, and starts measuring again.
+    fn time_percent(&mut self) -> Option<Value> {
+        let load = self.time.as_ref()?.done().ok();
+        self.time = self.stats.cpu_load_aggregate().ok();
+        load.as_ref().map(describe_cpu_time)
+    }
+}
+
+/// Fractions of the time, as percentages. Only Linux reports waiting on disks.
+fn describe_cpu_time(load: &CPULoad) -> Value {
+    let percent = |fraction: f32| fraction * 100.0;
+    #[allow(unused_mut)]
+    let mut time = json!({
+        "user": percent(load.user),
+        "nice": percent(load.nice),
+        "system": percent(load.system),
+        "interrupt": percent(load.interrupt),
+        "idle": percent(load.idle),
+    });
+    #[cfg(target_os = "linux")]
+    {
+        time["iowait"] = json!(percent(load.platform.iowait));
+    }
+    time
 }
 
 impl Collector for CpuCollector {
@@ -104,10 +156,14 @@ impl Collector for CpuCollector {
         self.system.refresh_cpu_usage();
         let per_core: Vec<f32> = self.system.cpus().iter().map(|c| c.usage()).collect();
         let load = System::load_average().ok();
+        let (context_switches, interrupts) = self.count();
 
         Ok(json!({
             "usage_percent": self.system.global_cpu_usage(),
             "per_core_percent": per_core,
+            "time_percent": self.time_percent(),
+            "context_switches": context_switches,
+            "interrupts": interrupts,
             "load_average": load.map(|l| json!({
                 "one": l.one,
                 "five": l.five,
@@ -119,13 +175,30 @@ impl Collector for CpuCollector {
 
 struct MemoryCollector {
     system: System,
+    stats: systemstat::System,
+    swap_in: Change,
+    swap_out: Change,
 }
 
 impl MemoryCollector {
     fn new() -> Result<Self> {
-        Ok(Self {
+        let mut collector = Self {
             system: System::new()?,
-        })
+            stats: systemstat::System::new(),
+            swap_in: Change::default(),
+            swap_out: Change::default(),
+        };
+        collector.count();
+        Ok(collector)
+    }
+
+    /// Gives the changes since the last call, as pages swapped in and out.
+    fn count(&mut self) -> (Option<u64>, Option<u64>) {
+        let counters = system::counters();
+        (
+            self.swap_in.update(counters.swap_in_pages),
+            self.swap_out.update(counters.swap_out_pages),
+        )
     }
 }
 
@@ -136,7 +209,11 @@ impl Collector for MemoryCollector {
 
     fn collect(&mut self) -> Result<Value> {
         self.system.refresh_memory();
+        let (swap_in, swap_out) = self.count();
         Ok(json!({
+            "detail": system::memory_detail(&self.stats),
+            "swap_in_pages": swap_in,
+            "swap_out_pages": swap_out,
             "total_bytes": self.system.total_memory(),
             "used_bytes": self.system.used_memory(),
             "available_bytes": self.system.available_memory(),
@@ -463,6 +540,37 @@ mod tests {
         assert_eq!(
             build_all(&config(collectors)).unwrap().len(),
             SUPPORTED.len()
+        );
+    }
+
+    #[test]
+    fn cpu_time_adds_up_to_the_whole_of_the_time_measured() {
+        let mut collector = CpuCollector::new().unwrap();
+        std::thread::sleep(Duration::from_millis(250));
+        let output = collector.collect().unwrap();
+        let time = &output["time_percent"];
+        let total: f64 = ["user", "nice", "system", "interrupt", "idle"]
+            .iter()
+            .map(|name| time[name].as_f64().unwrap())
+            .sum();
+        assert!((99.0..=101.0).contains(&total), "{time}");
+    }
+
+    #[test]
+    fn each_sample_measures_cpu_time_from_the_one_before() {
+        let mut collector = CpuCollector::new().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let first = collector.time_percent();
+        assert!(first.is_some());
+        assert!(collector.time.is_some());
+    }
+
+    #[test]
+    fn memory_reports_what_it_is_used_for() {
+        let output = MemoryCollector::new().unwrap().collect().unwrap();
+        assert!(
+            output["detail"]["free_bytes"].as_u64().is_some(),
+            "{output}"
         );
     }
 
