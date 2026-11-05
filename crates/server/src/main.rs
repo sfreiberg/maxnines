@@ -14,6 +14,7 @@ mod models;
 mod notifier;
 mod presence;
 mod registration;
+mod remote_checks;
 mod rule_engine;
 mod rule_preview;
 mod store;
@@ -22,7 +23,7 @@ mod views;
 #[cfg(test)]
 mod tests;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,6 +44,7 @@ use models::Database;
 use notifier::{Mailer, Notifier};
 use presence::Presence;
 use registration::{Registry, Rules, hash_token};
+use remote_checks::{LOCAL_AGENT_ID, LatestResults, Scheduler};
 use store::WriterCommand;
 use views::Views;
 
@@ -142,6 +144,7 @@ async fn serve(path: &Path) -> Result<()> {
         writer: writer.clone(),
         metrics,
         mailer,
+        check_results: Arc::new(LatestResults::default()),
         heartbeat: Heartbeat {
             interval: Duration::from_secs(config.heartbeat_interval_secs),
             timeout: Duration::from_secs(config.heartbeat_timeout_secs),
@@ -172,6 +175,16 @@ async fn serve(path: &Path) -> Result<()> {
     )
     .spawn();
     Notifier::new(state.database.clone(), state.mailer.clone()).spawn();
+    Scheduler::new(
+        state.database.clone(),
+        state.writer.clone(),
+        state.check_results.clone(),
+    )
+    .spawn();
+    // The server is always online to itself, so nothing reads it as missing.
+    state
+        .presence
+        .connected(LOCAL_AGENT_ID, IpAddr::from([127, 0, 0, 1]));
 
     let service = controllers::app(state).into_make_service_with_connect_info::<SocketAddr>();
     tokio::select! {

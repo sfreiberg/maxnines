@@ -12,6 +12,7 @@ impl MigratorTrait for Migrator {
             Box::new(CreateAgentFacts),
             Box::new(CreateConfigRules),
             Box::new(CreateAlerting),
+            Box::new(CreateRemoteChecks),
         ]
     }
 }
@@ -686,5 +687,103 @@ impl MigrationTrait for CreateAlerting {
                 .await?;
         }
         Ok(())
+    }
+}
+
+struct CreateRemoteChecks;
+
+impl MigrationName for CreateRemoteChecks {
+    fn name(&self) -> &str {
+        "m20261105_000005_create_remote_checks"
+    }
+}
+
+#[derive(Iden)]
+enum RemoteChecks {
+    Table,
+    Id,
+    Name,
+    Kind,
+    Target,
+    TimeoutSecs,
+    Method,
+    Body,
+    Regex,
+    Insecure,
+    Server,
+    Record,
+    Count,
+    IntervalSecs,
+    Enabled,
+}
+
+/// Checks the server runs itself. Their results are stored under a built-in agent
+/// row, so that charts and alert rules work on them like any other metric. No
+/// key hashes to this ID, as real ones are 32 hex characters, so nothing can
+/// connect as it.
+const LOCAL_AGENT: &str = "
+    INSERT INTO agents (id, public_key, host, state, decided_by, first_seen_ms)
+    VALUES ('server', '', 'MaxNines server', 'approved', 'built-in', 0)
+";
+
+#[async_trait::async_trait]
+impl MigrationTrait for CreateRemoteChecks {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(RemoteChecks::Table)
+                    .col(
+                        ColumnDef::new(RemoteChecks::Id)
+                            .big_integer()
+                            .not_null()
+                            .auto_increment()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(RemoteChecks::Name)
+                            .string_len(64)
+                            .not_null()
+                            .unique_key(),
+                    )
+                    .col(ColumnDef::new(RemoteChecks::Kind).string_len(16).not_null())
+                    .col(
+                        ColumnDef::new(RemoteChecks::Target)
+                            .string_len(255)
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(RemoteChecks::TimeoutSecs).big_integer())
+                    .col(ColumnDef::new(RemoteChecks::Method).string_len(16))
+                    .col(ColumnDef::new(RemoteChecks::Body).text())
+                    .col(ColumnDef::new(RemoteChecks::Regex).text())
+                    .col(ColumnDef::new(RemoteChecks::Insecure).boolean())
+                    .col(ColumnDef::new(RemoteChecks::Server).string_len(255))
+                    .col(ColumnDef::new(RemoteChecks::Record).string_len(16))
+                    .col(ColumnDef::new(RemoteChecks::Count).integer())
+                    .col(
+                        ColumnDef::new(RemoteChecks::IntervalSecs)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(RemoteChecks::Enabled).boolean().not_null())
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .get_connection()
+            .execute_unprepared(LOCAL_AGENT)
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared("DELETE FROM agents WHERE id = 'server'")
+            .await?;
+        manager
+            .drop_table(Table::drop().table(RemoteChecks::Table).to_owned())
+            .await
     }
 }

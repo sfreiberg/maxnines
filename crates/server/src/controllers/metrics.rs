@@ -60,7 +60,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
         .list()
         .await
         .into_iter()
-        .filter(|agent| agent.state == AgentState::Approved)
+        .filter(|agent| agent.state == AgentState::Approved && !agent.is_local())
         .map(|agent| {
             let values = current.remove(&agent.id).unwrap_or_default();
             FleetRow {
@@ -87,7 +87,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
 /// A check's latest result. Agents send this, so nothing about it is trusted to
 /// be the right shape: anything unusable is just left blank.
 #[derive(Serialize)]
-struct CheckRow {
+pub struct CheckRow {
     name: String,
     kind: String,
     up: bool,
@@ -100,7 +100,7 @@ struct CheckRow {
     cert_days_left: Option<i64>,
 }
 
-fn check_row(check: &Value) -> Option<CheckRow> {
+pub fn check_row(check: &Value) -> Option<CheckRow> {
     let text = |name: &str| check[name].as_str().map(String::from);
     let time = |name: &str| {
         let value = check[name].as_f64()?;
@@ -213,13 +213,20 @@ async fn show(
         })
         .collect();
 
-    let checks: Vec<CheckRow> = match state.metrics.latest_checks(&agent.id, now_ms()).await {
+    // The server saves its checks one at a time, so no one sample has them all.
+    let latest = if agent.is_local() {
+        Ok(state.check_results.all().into_values().collect())
+    } else {
+        state.metrics.latest_checks(&agent.id, now_ms()).await
+    };
+    let checks: Vec<CheckRow> = match latest {
         Ok(checks) => checks.iter().filter_map(check_row).collect(),
         Err(error) => return server_error(&error),
     };
 
     Page::new(&state, &token, "metrics/show.html")
         .with("checks", &checks)
+        .with("is_local", &agent.is_local())
         .with("agent_id", &agent.id)
         .with("host", &agent.host)
         .with("charts", &charts)

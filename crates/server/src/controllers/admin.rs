@@ -25,6 +25,7 @@ use crate::metrics::{self, METRICS, Metric, SeriesResult, TimeRange, Unit, now_m
 use crate::models::{ConfigStatus, RuleInput};
 use crate::presence::AgentPresence;
 use crate::registration::{AgentRecord, AgentState, hash_token};
+use crate::remote_checks::{RemoteCheck, RemoteCheckInput};
 use crate::rule_engine::{self, ResolvedConfig};
 
 /// An agent as admins see it.
@@ -89,6 +90,16 @@ pub fn routes(state: AppState) -> Router<AppState> {
             "/admin/notification-channels/{id}",
             get(show_channel).put(update_channel).delete(delete_channel),
         )
+        .route(
+            "/admin/remote-checks",
+            get(list_remote_checks).post(create_remote_check),
+        )
+        .route(
+            "/admin/remote-checks/{id}",
+            get(show_remote_check)
+                .put(update_remote_check)
+                .delete(delete_remote_check),
+        )
         .route("/admin/agents/{id}/approve", post(approve))
         .route("/admin/agents/{id}/revoke", post(revoke))
         .route_layer(middleware::from_fn_with_state(state, require_token))
@@ -111,6 +122,7 @@ async fn list(State(state): State<AppState>) -> Json<Vec<AgentView>> {
     let agents = state.registry.list().await;
     let views = agents
         .into_iter()
+        .filter(|agent| !agent.is_local())
         .map(|agent| {
             let presence: Option<AgentPresence> = state.presence.get(&agent.id);
             AgentView {
@@ -370,6 +382,57 @@ async fn update_alert_rule(
 
 async fn delete_alert_rule(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
     match state.database.delete_alert_rule(id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn list_remote_checks(State(state): State<AppState>) -> Response {
+    match state.database.list_remote_checks().await {
+        Ok(checks) => Json::<Vec<RemoteCheck>>(checks).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn show_remote_check(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.get_remote_check(id).await {
+        Ok(Some(check)) => Json(check).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn create_remote_check(
+    State(state): State<AppState>,
+    Json(input): Json<RemoteCheckInput>,
+) -> Response {
+    if let Err(error) = state.check_remote_check(&input, None).await {
+        return refused(&error);
+    }
+    match state.database.create_remote_check(&input).await {
+        Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn update_remote_check(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<i64>,
+    Json(input): Json<RemoteCheckInput>,
+) -> Response {
+    if let Err(error) = state.check_remote_check(&input, Some(id)).await {
+        return refused(&error);
+    }
+    match state.database.update_remote_check(id, &input).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn delete_remote_check(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.delete_remote_check(id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),

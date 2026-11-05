@@ -17,6 +17,7 @@ use wildmatch::WildMatch;
 
 use crate::config::{RegistrationConfig, RuleAction, RuleConfig, parse_network};
 use crate::models::Database;
+use crate::remote_checks::LOCAL_AGENT_ID;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -24,6 +25,14 @@ pub enum AgentState {
     Pending,
     Approved,
     Revoked,
+}
+
+impl AgentRecord {
+    /// Whether this is the server's own built-in agent, which isn't a machine
+    /// anyone registered, so it stays out of lists and can't be changed.
+    pub fn is_local(&self) -> bool {
+        self.id == LOCAL_AGENT_ID
+    }
 }
 
 impl AgentState {
@@ -45,7 +54,8 @@ impl AgentState {
     }
 }
 
-/// An agent the server has heard from.
+/// An agent the server has heard from, or the built-in one that holds the results
+/// of checks the server runs itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentRecord {
     pub id: String,
@@ -254,6 +264,9 @@ impl Registry {
 
     /// An admin decision. Returns `None` for an unknown agent.
     pub async fn decide(&self, id: &str, state: AgentState) -> Result<Option<AgentRecord>> {
+        if id == LOCAL_AGENT_ID {
+            return Ok(None);
+        }
         let mut agents = self.agents.lock().await;
         let Some(mut agent) = agents.get(id).cloned() else {
             return Ok(None);
@@ -268,6 +281,12 @@ impl Registry {
         info!(agent = id, state = state.as_str(), "admin decision");
         self.revisions.send_modify(|revision| *revision += 1);
         Ok(Some(agent))
+    }
+
+    /// Adds an agent as if it had been loaded at startup.
+    #[cfg(test)]
+    pub async fn insert_for_test(&self, agent: AgentRecord) {
+        self.agents.lock().await.insert(agent.id.clone(), agent);
     }
 
     pub async fn list(&self) -> Vec<AgentRecord> {
@@ -325,7 +344,8 @@ mod tests {
     }
 
     async fn registry_with(body: &str, database: Database) -> Registry {
-        let agents = database.load_agents().await.unwrap();
+        let mut agents = database.load_agents().await.unwrap();
+        agents.retain(|agent| !agent.is_local());
         let (rules, max_pending) = rules(body);
         Registry::new(agents, rules, max_pending, database)
     }

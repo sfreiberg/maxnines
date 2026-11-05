@@ -8,24 +8,17 @@ anyhow.workspace = true
 clap.workspace = true
 futures-util.workspace = true
 hcl-rs.workspace = true
+maxnines-checks.workspace = true
 maxnines-protocol.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde.workspace = true
 serde_json.workspace = true
 sysinfo = "0.40.1"
-flate2 = "1"
-hickory-proto = { version = "0.25", default-features = false, features = ["std"] }
-http-body-util = "0.1"
-hyper = { version = "1", features = ["client", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-regex-lite = "0.1"
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-tokio = { version = "1.54.1", features = ["rt", "macros", "net", "time", "signal", "sync"] }
+tokio = { version = "1.54.1", features = ["rt", "macros", "time", "signal", "sync"] }
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 webpki-roots = "0.26"
-x509-parser = { version = "0.18", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = ["fs", "std"] }
@@ -34,7 +27,6 @@ rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 windows-service = "0.8"
 
 [dev-dependencies]
-rcgen = "0.14"
 tempfile = "3"
 
 [build-dependencies]

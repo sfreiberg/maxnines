@@ -97,6 +97,7 @@ async fn start_on(
         writer,
         metrics: Metrics::new(reader),
         mailer: None,
+        check_results: Arc::default(),
         heartbeat: Heartbeat {
             interval: Duration::from_millis(50),
             timeout: Duration::from_millis(200),

@@ -66,7 +66,9 @@ async fn row(state: &AppState, agent: AgentRecord) -> AgentRow {
 async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
     let mut agents = Vec::new();
     for agent in state.registry.list().await {
-        agents.push(row(&state, agent).await);
+        if !agent.is_local() {
+            agents.push(row(&state, agent).await);
+        }
     }
     Page::new(&state, &token, "agents/index.html")
         .with("agents", &agents)
@@ -80,7 +82,8 @@ struct HistoryEntry {
 }
 
 async fn show(State(state): State<AppState>, Path(id): Path<String>, token: CsrfToken) -> Response {
-    let Some(agent) = state.registry.get(&id).await else {
+    let found = state.registry.get(&id).await;
+    let Some(agent) = found.filter(|agent| !agent.is_local()) else {
         let page = Page::new(&state, &token, "errors/not_found.html");
         return page.with_status(StatusCode::NOT_FOUND).render();
     };

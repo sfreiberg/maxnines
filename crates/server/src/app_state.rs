@@ -14,6 +14,7 @@ use crate::models::{Database, RuleInput};
 use crate::notifier::Mailer;
 use crate::presence::Presence;
 use crate::registration::{AgentState, Registry};
+use crate::remote_checks::{self, LatestResults, RemoteCheckInput};
 use crate::rule_engine::{self, ResolvedConfig};
 use crate::rule_preview::{self, Preview, PreviewAgent};
 use crate::store::WriterCommand;
@@ -37,6 +38,8 @@ pub struct AppState {
     pub metrics: Metrics,
     /// Set when the config has a mail server.
     pub mailer: Option<Arc<Mailer>>,
+    /// How the checks the server runs itself last went.
+    pub check_results: Arc<LatestResults>,
     pub heartbeat: Heartbeat,
     /// The URL agents must have signed.
     pub audience: Arc<str>,
@@ -76,7 +79,7 @@ impl AppState {
             .list()
             .await
             .into_iter()
-            .filter(|agent| agent.state == AgentState::Approved)
+            .filter(|agent| agent.state == AgentState::Approved && !agent.is_local())
             .map(|agent| PreviewAgent {
                 online: self.presence.get(&agent.id).is_some_and(|p| p.online),
                 facts: unflatten(&facts.remove(&agent.id).unwrap_or_default()),
@@ -124,6 +127,23 @@ impl AppState {
             .iter()
             .any(|channel| channel.channel.name == input.name && Some(channel.id) != id);
         ensure!(!taken, "a channel named {:?} already exists", input.name);
+        Ok(())
+    }
+
+    /// Everything that has to be true for a server check to be saved. `id` is the
+    /// saved check it would replace.
+    pub async fn check_remote_check(
+        &self,
+        input: &RemoteCheckInput,
+        id: Option<i64>,
+    ) -> Result<()> {
+        remote_checks::check_input(input)?;
+        let checks = self.database.list_remote_checks().await?;
+        let name = &input.check.name;
+        let taken = checks
+            .iter()
+            .any(|check| check.input.check.name == *name && Some(check.id) != id);
+        ensure!(!taken, "a check named {name:?} already exists");
         Ok(())
     }
 

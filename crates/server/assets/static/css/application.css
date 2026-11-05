@@ -230,3 +230,9 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 /* An offline rule has no metric to choose. Without :has() the fields just stay. */
 .alert-rule:has(select[name="kind"] option[value="offline"]:checked) .metric-fields { display: none; }
 .metric-fields { display: contents; }
+
+/* Only the options a kind of check uses. Without :has() they all stay. */
+.remote-check:not(:has(option[value="http"]:checked)) .for-http { display: none; }
+.remote-check:not(:has(option[value="dns"]:checked)) .for-dns { display: none; }
+.remote-check:not(:has(option[value="ping"]:checked)) .for-ping { display: none; }
+.remote-check:not(:has(option[value="http"]:checked)):not(:has(option[value="tls"]:checked)) .for-tls { display: none; }

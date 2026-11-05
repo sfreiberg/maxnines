@@ -2,10 +2,10 @@
 {% block title %}{{ host }} metrics · MaxNines{% endblock title %}
 {% block head %}<meta http-equiv="refresh" content="60">{% endblock head %}
 {% block content %}
-<p class="breadcrumb"><a href="/metrics">Metrics</a></p>
+<p class="breadcrumb">{% if is_local %}<a href="/checks">Checks</a>{% else %}<a href="/metrics">Metrics</a>{% endif %}</p>
 <div class="title-row">
   <h1>{{ host }}</h1>
-  <a href="/agents/{{ agent_id }}">Agent details</a>
+  {% if not is_local %}<a href="/agents/{{ agent_id }}">Agent details</a>{% endif %}
 </div>
 
 <nav class="ranges" aria-label="Time range">

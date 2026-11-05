@@ -13,6 +13,8 @@ mod config_rule;
 mod config_rule_setting;
 mod notification;
 mod notification_channel;
+mod remote_check;
+mod remote_checks;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -568,7 +570,7 @@ impl Database {
             .await
             .unwrap();
         self.connection
-            .execute_unprepared("DELETE FROM agents")
+            .execute_unprepared("DELETE FROM agents WHERE id <> 'server'")
             .await
             .unwrap();
     }
@@ -593,6 +595,13 @@ mod tests {
         }
     }
 
+    /// Everything but the built-in agent, which every database starts with.
+    async fn machines(database: &Database) -> Vec<AgentRecord> {
+        let mut agents = database.load_agents().await.unwrap();
+        agents.retain(|agent| !agent.is_local());
+        agents
+    }
+
     fn sorted(mut records: Vec<AgentRecord>) -> Vec<AgentRecord> {
         records.sort_by(|a, b| a.id.cmp(&b.id));
         records
@@ -603,16 +612,16 @@ mod tests {
     async fn exercise(url: &str) {
         let database = Database::connect(url).await.unwrap();
         database.clear_for_test().await;
-        assert!(database.load_agents().await.unwrap().is_empty());
+        assert!(machines(&database).await.is_empty());
 
         // Creating.
         let pending = record("agent-1");
         database.save_agent(&pending).await.unwrap();
-        assert_eq!(database.load_agents().await.unwrap(), vec![pending.clone()]);
+        assert_eq!(machines(&database).await, vec![pending.clone()]);
 
         // Saving identical data, which MySQL reports as zero rows changed.
         database.save_agent(&pending).await.unwrap();
-        assert_eq!(database.load_agents().await.unwrap(), vec![pending.clone()]);
+        assert_eq!(machines(&database).await, vec![pending.clone()]);
 
         // Replacing, including going from NULL to a value.
         let approved = AgentRecord {
@@ -622,10 +631,7 @@ mod tests {
             ..pending.clone()
         };
         database.save_agent(&approved).await.unwrap();
-        assert_eq!(
-            database.load_agents().await.unwrap(),
-            vec![approved.clone()]
-        );
+        assert_eq!(machines(&database).await, vec![approved.clone()]);
 
         // The largest hostname allowed, non-ASCII text, and a long rule name.
         let unusual = AgentRecord {
@@ -640,7 +646,7 @@ mod tests {
         };
         database.save_agent(&unicode).await.unwrap();
         assert_eq!(
-            sorted(database.load_agents().await.unwrap()),
+            sorted(machines(&database).await),
             [approved.clone(), unusual.clone(), unicode.clone()]
         );
 
@@ -651,7 +657,7 @@ mod tests {
         // A second connection sees it all, and migrating again changes nothing.
         let reopened = Database::connect(url).await.unwrap();
         assert_eq!(
-            sorted(reopened.load_agents().await.unwrap()),
+            sorted(machines(&reopened).await),
             [approved, unusual, unicode]
         );
 
@@ -923,6 +929,43 @@ mod tests {
         assert_eq!(database.current_facts(agent).await.unwrap().len(), 5);
 
         exercise_alerting(database, agent).await;
+        exercise_remote_checks(database).await;
+    }
+
+    async fn exercise_remote_checks(database: &Database) {
+        use maxnines_protocol::{Check, CheckKind};
+
+        use crate::remote_checks::{LOCAL_AGENT_ID, RemoteCheckInput};
+
+        let agents = database.load_agents().await.unwrap();
+        assert!(agents.iter().any(|agent| agent.id == LOCAL_AGENT_ID));
+
+        let name = format!("site {}", crate::metrics::now_ms());
+        let mut check = Check::new(&name, CheckKind::Http, "https://example.com/");
+        check.timeout_secs = Some(5);
+        check.method = Some("POST".to_string());
+        check.body = Some("é".repeat(100));
+        check.regex = Some("Welcome".to_string());
+        check.insecure = Some(true);
+        let mut input = RemoteCheckInput {
+            check,
+            interval_secs: 60,
+            enabled: true,
+        };
+
+        let id = database.create_remote_check(&input).await.unwrap();
+        let saved = database.get_remote_check(id).await.unwrap().unwrap();
+        assert_eq!(saved.input, input);
+
+        input.interval_secs = 120;
+        input.check.count = None;
+        assert!(database.update_remote_check(id, &input).await.unwrap());
+        let list = database.list_remote_checks().await.unwrap();
+        let saved = list.iter().find(|check| check.id == id).unwrap();
+        assert_eq!(saved.input.interval_secs, 120);
+
+        assert!(database.delete_remote_check(id).await.unwrap());
+        assert!(database.get_remote_check(id).await.unwrap().is_none());
     }
 
     /// Names are unique per run, because real databases keep their rows.

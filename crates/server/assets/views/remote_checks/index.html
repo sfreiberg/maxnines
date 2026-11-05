@@ -1,0 +1,42 @@
+{% extends "layouts/application.html" %}
+{% block title %}Checks · MaxNines{% endblock title %}
+{% block head %}<meta http-equiv="refresh" content="60">{% endblock head %}
+{% block content %}
+<div class="title-row">
+  <h1>Checks</h1>
+  <div class="actions">
+    <a class="button secondary" href="/agents/{{ agent_id }}/metrics">Charts</a>
+    <a class="button" href="/checks/new">New check</a>
+  </div>
+</div>
+<p class="hint">The server runs these itself, against remote sites. To check something from where an agent is, add it to a config rule. Alert rules cover both.</p>
+{% if checks %}
+<table>
+  <thead>
+    <tr><th>Name</th><th>Kind</th><th>Target</th><th>Status</th><th class="number">Total</th><th class="number">First byte</th><th>Response</th><th class="number">Certificate days</th></tr>
+  </thead>
+  <tbody>
+    {% for check in checks %}
+    <tr{% if not check.enabled %} class="disabled"{% endif %}>
+      <td><a href="/checks/{{ check.id }}/edit">{{ check.name }}</a></td>
+      <td>{{ check.kind }}</td>
+      <td>{{ check.target }}</td>
+      {% if check.latest %}
+      <td>{% if check.latest.up %}<span class="badge good">Up</span>{% else %}<span class="badge bad">Down</span>{% endif %}{% if check.latest.error %} <small class="hint">{{ check.latest.error }}</small>{% endif %}</td>
+      <td class="number">{{ check.latest.response }}</td>
+      <td class="number">{{ check.latest.first_byte }}</td>
+      <td>{% if check.latest.status %}{{ check.latest.status }}{% endif %} {{ check.latest.protocol }}</td>
+      <td class="number">{% if check.latest.cert_days_left is defined and check.latest.cert_days_left is not none %}{{ check.latest.cert_days_left }}{% endif %}</td>
+      {% elif check.enabled %}
+      <td><span class="badge neutral">Waiting</span></td><td></td><td></td><td></td><td></td>
+      {% else %}
+      <td><span class="badge neutral">Disabled</span></td><td></td><td></td><td></td><td></td>
+      {% endif %}
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">There are no checks yet.</p>
+{% endif %}
+{% endblock content %}

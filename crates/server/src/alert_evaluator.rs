@@ -281,7 +281,7 @@ impl Evaluator {
                     continue;
                 }
                 match rule.rule.kind {
-                    RuleKind::Offline if snapshot.in_grace => {}
+                    RuleKind::Offline if snapshot.in_grace || agent.is_local() => {}
                     RuleKind::Offline => {
                         self.check_offline(rule, agent, &snapshot, &mut open, &mut checked)
                             .await?;

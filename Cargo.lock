@@ -2334,16 +2334,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "flate2",
  "futures-util",
  "hcl-rs",
- "hickory-proto",
- "http-body-util",
- "hyper",
- "hyper-util",
+ "maxnines-checks",
  "maxnines-protocol",
- "rcgen",
- "regex-lite",
  "rustix 1.1.6",
  "rustls",
  "serde",
@@ -2351,13 +2345,33 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "tokio",
- "tokio-rustls",
  "tokio-tungstenite 0.30.0",
  "tracing",
  "tracing-subscriber",
  "vergen-gitcl",
  "webpki-roots 0.26.11",
  "windows-service",
+]
+
+[[package]]
+name = "maxnines-checks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "hickory-proto",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "maxnines-protocol",
+ "rcgen",
+ "regex-lite",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "webpki-roots 0.26.11",
  "x509-parser",
 ]
 
@@ -2389,6 +2403,7 @@ dependencies = [
  "indexmap",
  "ipnet",
  "lettre",
+ "maxnines-checks",
  "maxnines-protocol",
  "ring",
  "rust-embed",

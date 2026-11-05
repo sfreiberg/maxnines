@@ -2050,3 +2050,405 @@ fn events_read_back_as_written() {
     );
     assert!(Event::parse("test").is_err(), "tests are never queued");
 }
+
+// ---- checks the server runs itself
+
+mod remote {
+    use super::*;
+    use crate::remote_checks::{LOCAL_AGENT_ID, RemoteCheckInput, Scheduler};
+    use maxnines_protocol::{Check, CheckKind};
+
+    /// A server that knows about its built-in agent, as a real one does.
+    async fn server() -> TestServer {
+        let server = start_with_metrics().await;
+        let local = server.state.database.load_agents().await.unwrap();
+        let local = local.into_iter().find(|a| a.is_local()).unwrap();
+        server.state.registry.insert_for_test(local).await;
+        server
+    }
+
+    fn scheduler(server: &TestServer) -> Scheduler {
+        Scheduler::new(
+            server.state.database.clone(),
+            server.state.writer.clone(),
+            server.state.check_results.clone(),
+        )
+    }
+
+    fn tcp_input(name: &str, target: &str) -> RemoteCheckInput {
+        RemoteCheckInput {
+            check: Check::new(name, CheckKind::Tcp, target),
+            interval_secs: 60,
+            enabled: true,
+        }
+    }
+
+    async fn run_due(scheduler: &mut Scheduler, now: i64) -> usize {
+        let started = scheduler.start_due(now).await.unwrap();
+        let count = started.len();
+        for task in started {
+            task.await.unwrap();
+        }
+        count
+    }
+
+    fn open_port() -> (std::net::TcpListener, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap().to_string();
+        (listener, target)
+    }
+
+    #[tokio::test]
+    async fn a_check_runs_when_due_and_waits_for_its_interval() {
+        let server = server().await;
+        let (_listener, target) = open_port();
+        let input = tcp_input("db", &target);
+        server
+            .state
+            .database
+            .create_remote_check(&input)
+            .await
+            .unwrap();
+        let mut scheduler = scheduler(&server);
+
+        let now = now_ms();
+        assert_eq!(run_due(&mut scheduler, now).await, 1);
+        assert_eq!(run_due(&mut scheduler, now + 59_000).await, 0);
+        assert_eq!(run_due(&mut scheduler, now + 60_000).await, 1);
+        assert_eq!(server.state.check_results.all()["db"]["up"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_check_does_not_run() {
+        let server = server().await;
+        let (_listener, target) = open_port();
+        let input = RemoteCheckInput {
+            enabled: false,
+            ..tcp_input("db", &target)
+        };
+        server
+            .state
+            .database
+            .create_remote_check(&input)
+            .await
+            .unwrap();
+
+        assert_eq!(run_due(&mut scheduler(&server), now_ms()).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_checks_result_is_forgotten() {
+        let server = server().await;
+        let (_listener, target) = open_port();
+        let input = tcp_input("db", &target);
+        let id = server
+            .state
+            .database
+            .create_remote_check(&input)
+            .await
+            .unwrap();
+        let mut scheduler = scheduler(&server);
+        run_due(&mut scheduler, now_ms()).await;
+
+        server.state.database.delete_remote_check(id).await.unwrap();
+        run_due(&mut scheduler, now_ms()).await;
+        assert!(server.state.check_results.all().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failing_server_check_can_alert_like_anything_else() {
+        let server = server().await;
+        let (listener, target) = open_port();
+        drop(listener);
+        let input = tcp_input("db", &target);
+        server
+            .state
+            .database
+            .create_remote_check(&input)
+            .await
+            .unwrap();
+        let rule = AlertRuleInput {
+            name: "Check failing".to_string(),
+            metric: Some("check.up".to_string()),
+            comparison: Some(Comparison::Below),
+            threshold: Some(1.0),
+            for_secs: 0,
+            ..cpu_rule()
+        };
+        server
+            .state
+            .database
+            .create_alert_rule(&rule)
+            .await
+            .unwrap();
+
+        run_due(&mut scheduler(&server), now_ms()).await;
+
+        let metric = crate::metrics::find("check.up").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while server
+            .state
+            .metrics
+            .newest(metric, now_ms())
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            assert!(Instant::now() < deadline, "the result was never saved");
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let mut evaluator = evaluator(&server, now_ms() - 60 * MINUTE_MS);
+        evaluator.evaluate(now_ms()).await.unwrap();
+        let open = server.state.database.open_alerts().await.unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].agent_id, LOCAL_AGENT_ID);
+        assert_eq!(
+            open[0].summary,
+            "Checks passing (db) on MaxNines server is 0, below 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_built_in_agent_never_counts_as_offline() {
+        let server = server().await;
+        server
+            .state
+            .database
+            .create_alert_rule(&offline_rule())
+            .await
+            .unwrap();
+
+        let mut evaluator = evaluator(&server, now_ms() - 60 * MINUTE_MS);
+        evaluator.evaluate(now_ms()).await.unwrap();
+        assert!(
+            server
+                .state
+                .database
+                .open_alerts()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_built_in_agent_stays_out_of_lists_and_cannot_be_changed() {
+        let server = server().await;
+        let mut browser = Browser::default();
+
+        for path in ["/agents", "/metrics"] {
+            let page = browser.get(&server, path).await;
+            assert!(!page.body.contains("MaxNines server"), "{path}");
+        }
+        let page = browser.get(&server, "/agents/server").await;
+        assert_eq!(page.status, 404);
+        let page = browser.get(&server, "/agents/server/metrics").await;
+        assert_eq!(page.status, 200, "{}", page.body);
+        assert!(!page.body.contains("Agent details"));
+
+        let response = server.http("GET", "/admin/agents", Some(ADMIN_TOKEN)).await;
+        assert!(!response.contains("MaxNines server"));
+
+        let revoked = server
+            .state
+            .registry
+            .decide(LOCAL_AGENT_ID, AgentState::Revoked)
+            .await;
+        assert_eq!(revoked.unwrap(), None);
+        assert!(server.state.registry.is_approved(LOCAL_AGENT_ID).await);
+    }
+
+    const FIELDS: [(&str, &str); 6] = [
+        ("name", "Site"),
+        ("kind", "http"),
+        ("target", "https://example.com/"),
+        ("interval_secs", "120"),
+        ("regex", "Welcome back"),
+        ("enabled", "on"),
+    ];
+
+    #[tokio::test]
+    async fn a_check_can_be_managed_from_its_form() {
+        let server = server().await;
+        let mut browser = Browser::default();
+
+        let page = browser
+            .submit(&server, "/checks/new", "/checks", &FIELDS)
+            .await;
+        assert_eq!(page.status, 303, "{}", page.body);
+        let saved = server.state.database.list_remote_checks().await.unwrap();
+        assert_eq!(saved[0].input.check.regex.as_deref(), Some("Welcome back"));
+        assert_eq!(saved[0].input.interval_secs, 120);
+        let id = saved[0].id;
+
+        let page = browser.get(&server, "/checks").await;
+        assert!(page.body.contains("Site"));
+        assert!(page.body.contains("Waiting"), "{}", page.body);
+
+        let edit = format!("/checks/{id}/edit");
+        let page = browser.get(&server, &edit).await;
+        assert!(
+            page.body.contains(r#"value="Welcome back""#),
+            "{}",
+            page.body
+        );
+
+        let mut fields = FIELDS.to_vec();
+        fields[3] = ("interval_secs", "300");
+        let page = browser
+            .submit(&server, &edit, &format!("/checks/{id}"), &fields)
+            .await;
+        assert_eq!(page.status, 303, "{}", page.body);
+        let saved = server.state.database.get_remote_check(id).await.unwrap();
+        assert_eq!(saved.unwrap().input.interval_secs, 300);
+
+        let delete = format!("/checks/{id}/delete");
+        let page = browser.submit(&server, &edit, &delete, &[]).await;
+        assert_eq!(page.status, 303);
+        assert!(
+            server
+                .state
+                .database
+                .list_remote_checks()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bad_check_keeps_what_was_typed_and_says_why() {
+        let server = server().await;
+        let mut fields = FIELDS.to_vec();
+        fields[2] = ("target", "example.com");
+
+        let page = Browser::default()
+            .submit(&server, "/checks/new", "/checks", &fields)
+            .await;
+        assert_eq!(page.status, 422);
+        assert!(page.body.contains("starting with http"), "{}", page.body);
+        assert!(page.body.contains(r#"value="Site""#));
+    }
+
+    #[tokio::test]
+    async fn two_checks_cannot_share_a_name() {
+        let server = server().await;
+        let mut browser = Browser::default();
+        browser
+            .submit(&server, "/checks/new", "/checks", &FIELDS)
+            .await;
+        let page = browser
+            .submit(&server, "/checks/new", "/checks", &FIELDS)
+            .await;
+        assert_eq!(page.status, 422);
+        assert!(page.body.contains("already exists"), "{}", page.body);
+    }
+
+    #[tokio::test]
+    async fn check_forms_refuse_a_bad_csrf_token() {
+        let server = server().await;
+        let input = tcp_input("db", "example.com:80");
+        let id = server
+            .state
+            .database
+            .create_remote_check(&input)
+            .await
+            .unwrap();
+        let mut browser = Browser::default();
+        browser.get(&server, "/checks/new").await;
+
+        for path in [
+            "/checks".to_string(),
+            format!("/checks/{id}"),
+            format!("/checks/{id}/delete"),
+        ] {
+            let page = browser
+                .post(&server, &path, &[("authenticity_token", "wrong")])
+                .await;
+            assert_eq!(page.status, 403, "{path}");
+        }
+        assert_eq!(
+            server
+                .state
+                .database
+                .list_remote_checks()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn results_show_on_the_checks_page_and_agent_page() {
+        let server = server().await;
+        let (listener, target) = open_port();
+        drop(listener);
+        let input = tcp_input("<b>db</b>", &target);
+        server
+            .state
+            .database
+            .create_remote_check(&input)
+            .await
+            .unwrap();
+        run_due(&mut scheduler(&server), now_ms()).await;
+
+        let mut browser = Browser::default();
+        for path in ["/checks", "/agents/server/metrics"] {
+            let page = browser.get(&server, path).await;
+            assert_eq!(page.status, 200, "{path}");
+            assert!(page.body.contains("Down"), "{path}: {}", page.body);
+            assert!(page.body.contains("connect"), "{path}");
+            assert!(!page.body.contains("<b>db"), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_api_manages_checks_and_needs_the_token() {
+        let server = server().await;
+        let response = server.http("GET", "/admin/remote-checks", None).await;
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+
+        let body = json!({
+            "check": { "name": "db", "kind": "tcp", "target": "example.com:80" },
+            "interval_secs": 60,
+        });
+        let (status, created) = api(&server, "POST", "/admin/remote-checks", &body).await;
+        assert_eq!(status, 201, "{created}");
+        let path = format!("/admin/remote-checks/{}", created["id"]);
+
+        let (status, shown) = api(&server, "GET", &path, &Value::Null).await;
+        assert_eq!(status, 200);
+        assert_eq!(shown["check"]["target"], "example.com:80");
+        assert_eq!(shown["enabled"], true);
+
+        let mut changed = body.clone();
+        changed["interval_secs"] = json!(120);
+        assert_eq!(api(&server, "PUT", &path, &changed).await.0, 204);
+
+        changed["interval_secs"] = json!(1);
+        let (status, refused) = api(&server, "PUT", &path, &changed).await;
+        assert_eq!(status, 422);
+        assert!(
+            refused["error"].as_str().unwrap().contains("interval"),
+            "{refused}"
+        );
+
+        assert_eq!(api(&server, "DELETE", &path, &Value::Null).await.0, 204);
+        assert_eq!(api(&server, "GET", &path, &Value::Null).await.0, 404);
+    }
+
+    #[tokio::test]
+    async fn check_pages_keep_the_strict_security_policy() {
+        let server = server().await;
+        let mut browser = Browser::default();
+        for path in ["/checks", "/checks/new"] {
+            let page = browser.get(&server, path).await;
+            let policy = page.header("content-security-policy").unwrap();
+            assert!(policy.starts_with("default-src 'none'"), "{path}");
+            assert!(!page.body.contains("<script"), "{path}");
+            assert!(!page.body.contains(" style="), "{path}");
+        }
+    }
+}
