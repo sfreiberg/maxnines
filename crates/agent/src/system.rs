@@ -519,6 +519,12 @@ pgpgin 900
     }
 
     #[test]
+    fn steal_is_the_eighth_number() {
+        let ticks = CpuTicks::parse("cpu  1 2 3 4 5 6 7 8 9 10\n").unwrap();
+        assert_eq!(ticks.steal, 8);
+    }
+
+    #[test]
     fn older_kernels_without_steal_still_work() {
         let ticks = CpuTicks::parse("cpu  1 2 3 4 5 6 7\n").unwrap();
         assert_eq!(ticks.interrupt, 13);
