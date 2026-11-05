@@ -4,12 +4,14 @@
 
 use std::fs::{self, Metadata};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::background::{Background, Prober};
+use crate::background::{Background, Busy, probe_all};
 use crate::collector::Collector;
 
 /// Network drives can hang, which shows as this much delay and then a failure.
@@ -23,12 +25,40 @@ pub struct FileCollector {
     background: Background,
 }
 
+struct WatchedPath {
+    path: String,
+    busy: Arc<AtomicBool>,
+}
+
+/// There's no async way to ask about a file, so this uses the blocking pool. A
+/// time limit can stop waiting but can't stop the call, so a path that's still
+/// stuck from before isn't queued again.
+async fn check_path(watched: Arc<WatchedPath>) -> Value {
+    let Some(busy) = Busy::try_start(&watched.busy) else {
+        return timed_out(&watched);
+    };
+    let path = watched.path.clone();
+    let inspected = tokio::task::spawn_blocking(move || {
+        let _busy = busy;
+        inspect(&path, SystemTime::now())
+    });
+    inspected.await.unwrap_or_else(|_| timed_out(&watched))
+}
+
 impl FileCollector {
     pub fn new(paths: Vec<String>, interval: Duration) -> Self {
-        let prober = Prober::new(paths, TIMEOUT);
+        let watched: Vec<Arc<WatchedPath>> = paths
+            .into_iter()
+            .map(|path| {
+                Arc::new(WatchedPath {
+                    path,
+                    busy: Arc::default(),
+                })
+            })
+            .collect();
         let background = Background::start(interval, move || {
-            let results = prober.round(|path| inspect(path, SystemTime::now()), timed_out);
-            Value::Array(results)
+            let watched = watched.clone();
+            async move { Value::Array(probe_all(&watched, TIMEOUT, check_path, timed_out).await) }
         });
         Self { background }
     }
@@ -46,8 +76,8 @@ impl Collector for FileCollector {
 
 /// A path that can't be reached in time says nothing about whether it exists,
 /// so it has no `exists` value, and an alert on it holds its state.
-fn timed_out(path: &String) -> Value {
-    json!({ "path": path, "error": "timed out" })
+fn timed_out(watched: &WatchedPath) -> Value {
+    json!({ "path": watched.path, "error": "timed out" })
 }
 
 fn age_secs(metadata: &Metadata, now: SystemTime) -> Option<f64> {
@@ -185,8 +215,28 @@ mod tests {
 
     #[test]
     fn a_path_that_times_out_says_nothing_about_existing() {
-        let output = timed_out(&"/mnt/nfs".to_string());
+        let watched = WatchedPath {
+            path: "/mnt/nfs".to_string(),
+            busy: Arc::default(),
+        };
+        let output = timed_out(&watched);
         assert!(output.get("exists").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_path_still_stuck_from_before_is_not_tried_again() {
+        let folder = tempfile::tempdir().unwrap();
+        let watched = Arc::new(WatchedPath {
+            path: path_of(folder.path()),
+            busy: Arc::new(AtomicBool::new(true)),
+        });
+
+        assert_eq!(check_path(watched.clone()).await["error"], "timed out");
+
+        watched
+            .busy
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(check_path(watched).await["exists"], 1);
     }
 
     #[test]

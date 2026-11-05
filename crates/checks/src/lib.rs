@@ -7,7 +7,7 @@
 
 use std::io::Read;
 use std::net::SocketAddr;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -36,6 +36,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UdpSocket, lookup_host};
+use tokio::process::Command;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
@@ -124,46 +125,27 @@ pub fn timed_out_report(check: &Check) -> Value {
     report(check, Findings::default(), Err(timed_out()))
 }
 
-/// Runs a check, blocking until it's done or out of time. Always gives a result.
-pub fn run(check: &Check) -> Value {
+/// Runs a check, until it's done or out of time. Always gives a result, and
+/// whatever was learned before running out of time is kept.
+pub async fn run(check: &Check) -> Value {
     let started = Instant::now();
     let mut findings = Findings::default();
-    let result = match check.kind {
-        CheckKind::Ping => check_ping(check, &mut findings),
-        _ => run_async(check, &mut findings),
+    let work = async {
+        match check.kind {
+            CheckKind::Tcp => check_tcp(check, &mut findings).await,
+            CheckKind::Http => check_http(check, &mut findings).await,
+            CheckKind::Tls => check_tls(check, &mut findings).await,
+            CheckKind::Dns => check_dns(check, &mut findings).await,
+            CheckKind::Ping => check_ping(check, &mut findings).await,
+        }
     };
+    let result = timeout(limit(check), work)
+        .await
+        .unwrap_or_else(|_| Err(timed_out()));
     if result.is_ok() {
         findings.response_ms = Some(elapsed_ms(started));
     }
     report(check, findings, result)
-}
-
-/// Each check runs on its own small runtime, on its own thread. Being async is
-/// what lets a time limit cut one off cleanly, partway through.
-fn run_async(check: &Check, findings: &mut Findings) -> Result<()> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("starting the check")?;
-
-    let result = runtime.block_on(async {
-        let work = async {
-            match check.kind {
-                CheckKind::Tcp => check_tcp(check, findings).await,
-                CheckKind::Http => check_http(check, findings).await,
-                CheckKind::Tls => check_tls(check, findings).await,
-                CheckKind::Dns => check_dns(check, findings).await,
-                CheckKind::Ping => unreachable!("ping doesn't run here"),
-            }
-        };
-        timeout(limit(check), work)
-            .await
-            .unwrap_or_else(|_| Err(timed_out()))
-    });
-
-    // A lookup stuck in the system's resolver mustn't hold this thread.
-    runtime.shutdown_background();
-    result
 }
 
 fn host_and_port(target: &str) -> Result<(String, u16)> {
@@ -459,6 +441,26 @@ fn decompress(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(unpacked)
 }
 
+/// Gives a page's size and, if asked, whether it matches.
+fn examine(
+    body: Vec<u8>,
+    compressed: bool,
+    pattern: Option<String>,
+) -> Result<(usize, Option<bool>)> {
+    let body = if compressed {
+        decompress(&body).context("the page couldn't be unpacked")?
+    } else {
+        body
+    };
+    let matched = pattern
+        .map(|pattern| {
+            let regex = Regex::new(&pattern).map_err(|_| anyhow!("invalid regex"))?;
+            anyhow::Ok(regex.is_match(&String::from_utf8_lossy(&body)))
+        })
+        .transpose()?;
+    Ok((body.len(), matched))
+}
+
 /// Redirects aren't followed, as a second request would muddle every timing. A
 /// redirect is an answer from a working site, so anything below 400 is up.
 async fn check_http(check: &Check, findings: &mut Findings) -> Result<()> {
@@ -504,17 +506,17 @@ async fn check_http(check: &Check, findings: &mut Findings) -> Result<()> {
         .is_some_and(|encoding| encoding.as_bytes().eq_ignore_ascii_case(b"gzip"));
     findings.compressed = Some(compressed);
 
-    let mut body = read_body(&mut response).await?;
+    let body = read_body(&mut response).await?;
     findings.download_ms = Some(elapsed_ms(downloading));
-    if compressed {
-        body = decompress(&body).context("the page couldn't be unpacked")?;
-    }
-    findings.content_length = Some(body.len());
 
-    if let Some(pattern) = &check.regex {
-        let regex = Regex::new(pattern).map_err(|_| anyhow!("invalid regex"))?;
-        findings.regex_matched = Some(regex.is_match(&String::from_utf8_lossy(&body)));
-    }
+    // Unpacking and searching a big page takes real time, so it can't run on a
+    // task, where it would hold up everything else on the thread.
+    let pattern = check.regex.clone();
+    let (length, matched) = tokio::task::spawn_blocking(move || examine(body, compressed, pattern))
+        .await
+        .map_err(|_| anyhow!("the request failed"))??;
+    findings.content_length = Some(length);
+    findings.regex_matched = matched;
 
     certificate_verdict(check, problem)?;
     ensure!(status < 400, "the server returned status {status}");
@@ -663,13 +665,15 @@ fn read_ping_summary(output: &str, findings: &mut Findings) {
     }
 }
 
-fn check_ping(check: &Check, findings: &mut Findings) -> Result<()> {
+async fn check_ping(check: &Check, findings: &mut Findings) -> Result<()> {
     let count = check.count.unwrap_or(1);
     let arguments = ping_arguments(std::env::consts::OS, &check.target, count, limit(check));
     let output = Command::new("ping")
         .args(arguments)
         .stdin(Stdio::null())
+        .kill_on_drop(true)
         .output()
+        .await
         .map_err(|_| anyhow!("couldn't run ping"))?;
     read_ping_summary(&String::from_utf8_lossy(&output.stdout), findings);
     ensure!(output.status.success(), "no reply");
@@ -686,6 +690,15 @@ mod tests {
 
     fn check(kind: CheckKind, target: &str) -> Check {
         Check::new("a", kind, target)
+    }
+
+    /// Runs a check the way a collector does.
+    fn run(check: &Check) -> Value {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::run(check))
     }
 
     /// Answers one request with `response`, and hands back what was asked.

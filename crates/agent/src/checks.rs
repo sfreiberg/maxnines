@@ -1,6 +1,7 @@
 //! The checks collector. The checks themselves are in `maxnines_checks`, as the
 //! server runs them too.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -8,7 +9,7 @@ use maxnines_checks::{limit, run, timed_out_report};
 use maxnines_protocol::Check;
 use serde_json::Value;
 
-use crate::background::{Background, Prober};
+use crate::background::{Background, probe_all};
 use crate::collector::Collector;
 
 /// How long a check gets to report once its own time limit is up.
@@ -21,9 +22,14 @@ pub struct CheckCollector {
 impl CheckCollector {
     pub fn new(checks: Vec<Check>, interval: Duration) -> Self {
         let longest = checks.iter().map(limit).max().unwrap_or_default();
-        let prober = Prober::new(checks, longest + GRACE);
+        let checks: Vec<Arc<Check>> = checks.into_iter().map(Arc::new).collect();
         let background = Background::start(interval, move || {
-            Value::Array(prober.round(run, timed_out_report))
+            let checks = checks.clone();
+            async move {
+                let probe = |check: Arc<Check>| async move { run(&check).await };
+                let results = probe_all(&checks, longest + GRACE, probe, timed_out_report).await;
+                Value::Array(results)
+            }
         });
         Self { background }
     }

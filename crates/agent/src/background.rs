@@ -1,17 +1,35 @@
 //! Runs slow or unreliable work away from the agent's main loop, which also
 //! answers the server and can't wait on a dead host or a stuck network drive.
+//!
+//! Each background collector gets one thread running its own small tokio
+//! runtime, and the things it watches are tasks on it. Work that can only block,
+//! like asking the system about a file, goes to that runtime's blocking pool.
 
+use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use tokio::runtime::{Builder, Runtime};
+use tokio::time::timeout;
 use tracing::error;
 
 /// How quickly a stopped collector's thread notices.
 const STOP_CHECK: Duration = Duration::from_millis(100);
+
+/// How many blocking calls a collector can have stuck at once. Anything beyond
+/// this waits, so a dead network mount can't keep adding threads.
+const MAX_BLOCKING_THREADS: usize = 8;
+
+fn runtime() -> std::io::Result<Runtime> {
+    Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(MAX_BLOCKING_THREADS)
+        .build()
+}
 
 /// Repeats some work on its own thread and keeps the newest result. It stops
 /// when dropped, which happens whenever the agent's config changes.
@@ -21,15 +39,26 @@ pub struct Background {
 }
 
 impl Background {
-    pub fn start(interval: Duration, mut round: impl FnMut() -> Value + Send + 'static) -> Self {
+    pub fn start<Round, Work>(interval: Duration, mut round: Round) -> Self
+    where
+        Round: FnMut() -> Work + Send + 'static,
+        Work: Future<Output = Value>,
+    {
         let latest = Arc::new(Mutex::new(Value::Array(Vec::new())));
         let stop = Arc::new(AtomicBool::new(false));
 
         let (saved, stopped) = (latest.clone(), stop.clone());
         thread::spawn(move || {
+            let runtime = match runtime() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    error!(%error, "starting a background collector failed");
+                    return;
+                }
+            };
             while !stopped.load(Ordering::Relaxed) {
                 let started = Instant::now();
-                match catch_unwind(AssertUnwindSafe(&mut round)) {
+                match catch_unwind(AssertUnwindSafe(|| runtime.block_on(round()))) {
                     Ok(value) => *saved.lock().unwrap_or_else(PoisonError::into_inner) = value,
                     Err(_) => error!("a background collector panicked"),
                 }
@@ -37,6 +66,8 @@ impl Background {
                     thread::sleep(STOP_CHECK.min(interval));
                 }
             }
+            // Something stuck in the blocking pool mustn't hold this thread.
+            runtime.shutdown_background();
         });
 
         Self { latest, stop }
@@ -56,68 +87,53 @@ impl Drop for Background {
     }
 }
 
-/// Clears an item's busy flag however its thread ends.
-struct Finished(Arc<AtomicBool>);
+/// Probes a list of things at once, as tasks with a time limit. Gives one result
+/// per item, in order. `failed` stands in for anything that ran out of time or
+/// panicked, and running out of time cancels the task.
+pub async fn probe_all<T, O, Probe, Work>(
+    items: &[Arc<T>],
+    limit: Duration,
+    probe: Probe,
+    failed: impl Fn(&T) -> O,
+) -> Vec<O>
+where
+    Probe: Fn(Arc<T>) -> Work,
+    Work: Future<Output = O> + Send + 'static,
+    O: Send + 'static,
+{
+    let tasks: Vec<_> = items
+        .iter()
+        .map(|item| {
+            let work = probe(item.clone());
+            tokio::spawn(async move { timeout(limit, work).await.ok() })
+        })
+        .collect();
 
-impl Drop for Finished {
+    let mut results = Vec::with_capacity(items.len());
+    for (task, item) in tasks.into_iter().zip(items) {
+        results.push(match task.await {
+            Ok(Some(result)) => result,
+            _ => failed(item),
+        });
+    }
+    results
+}
+
+/// Marks something as busy until dropped. Blocking work can't be cancelled the
+/// way a task can, so this is held by the blocking call itself, and stops a stuck
+/// item from being queued again on every round.
+pub struct Busy(Arc<AtomicBool>);
+
+impl Busy {
+    /// `None` means it's still busy from before.
+    pub fn try_start(flag: &Arc<AtomicBool>) -> Option<Self> {
+        (!flag.swap(true, Ordering::Relaxed)).then(|| Self(flag.clone()))
+    }
+}
+
+impl Drop for Busy {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Relaxed);
-    }
-}
-
-/// Probes a list of things at once, each on its own thread with a time limit.
-/// Rust can't stop a thread stuck in a system call, so a stuck item is left to
-/// finish and isn't started again until it has. That's what stops a dead network
-/// mount from using up a new thread on every round.
-pub struct Prober<T> {
-    items: Vec<(Arc<T>, Arc<AtomicBool>)>,
-    timeout: Duration,
-}
-
-impl<T: Send + Sync + 'static> Prober<T> {
-    pub fn new(items: Vec<T>, timeout: Duration) -> Self {
-        let items = items
-            .into_iter()
-            .map(|item| (Arc::new(item), Arc::new(AtomicBool::new(false))))
-            .collect();
-        Self { items, timeout }
-    }
-
-    /// Gives one result per item, in order. `failed` stands in for anything that
-    /// ran out of time, panicked or is still stuck from before.
-    pub fn round<O: Send + 'static>(&self, probe: fn(&T) -> O, failed: impl Fn(&T) -> O) -> Vec<O> {
-        let (sender, receiver) = mpsc::channel();
-        let mut waiting = 0;
-        for (index, (item, busy)) in self.items.iter().enumerate() {
-            if busy.swap(true, Ordering::Relaxed) {
-                continue;
-            }
-            let (item, finished) = (item.clone(), Finished(busy.clone()));
-            let sender = sender.clone();
-            waiting += 1;
-            thread::spawn(move || {
-                let _finished = finished;
-                let result = catch_unwind(AssertUnwindSafe(|| probe(&item))).ok();
-                let _ = sender.send((index, result));
-            });
-        }
-
-        let mut results: Vec<Option<O>> = self.items.iter().map(|_| None).collect();
-        let deadline = Instant::now() + self.timeout;
-        while waiting > 0 {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let Ok((index, result)) = receiver.recv_timeout(left) else {
-                break;
-            };
-            results[index] = result;
-            waiting -= 1;
-        }
-
-        results
-            .into_iter()
-            .zip(&self.items)
-            .map(|(result, (item, _))| result.unwrap_or_else(|| failed(item)))
-            .collect()
     }
 }
 
@@ -139,12 +155,17 @@ mod tests {
         }
     }
 
+    fn items(values: &[u64]) -> Vec<Arc<u64>> {
+        values.iter().copied().map(Arc::new).collect()
+    }
+
     #[test]
     fn background_work_repeats_and_keeps_the_newest_result() {
         let mut count = 0;
         let background = Background::start(Duration::from_millis(5), move || {
             count += 1;
-            json!(count)
+            let value = count;
+            async move { json!(value) }
         });
 
         wait_until(|| background.latest().as_u64().is_some_and(|count| count >= 3));
@@ -152,8 +173,8 @@ mod tests {
 
     #[test]
     fn nothing_is_reported_until_the_first_round_finishes() {
-        let background = Background::start(SHORT, || {
-            thread::sleep(Duration::from_secs(1));
+        let background = Background::start(SHORT, || async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
             json!("late")
         });
         assert_eq!(background.latest(), json!([]));
@@ -164,7 +185,8 @@ mod tests {
         let rounds = Arc::new(AtomicUsize::new(0));
         let counted = rounds.clone();
         let background = Background::start(Duration::from_millis(5), move || {
-            json!(counted.fetch_add(1, Ordering::Relaxed))
+            let count = counted.fetch_add(1, Ordering::Relaxed);
+            async move { json!(count) }
         });
         wait_until(|| rounds.load(Ordering::Relaxed) > 0);
 
@@ -176,78 +198,113 @@ mod tests {
     }
 
     #[test]
-    fn a_panic_costs_one_round_and_keeps_the_last_result() {
+    fn a_panic_costs_one_round_and_keeps_going() {
         let mut count = 0;
         let background = Background::start(Duration::from_millis(5), move || {
             count += 1;
-            assert!(count != 2, "deliberate test panic");
-            json!(count)
+            let value = count;
+            async move {
+                assert!(value != 2, "deliberate test panic");
+                json!(value)
+            }
         });
 
         wait_until(|| background.latest().as_u64().is_some_and(|count| count >= 3));
     }
 
-    #[test]
-    fn results_come_back_in_order() {
-        let prober = Prober::new(vec![30_u64, 1, 15], Duration::from_secs(5));
-        let results = prober.round(
-            |delay| {
-                thread::sleep(Duration::from_millis(*delay));
+    #[tokio::test]
+    async fn results_come_back_in_order() {
+        let results = probe_all(
+            &items(&[30, 1, 15]),
+            Duration::from_secs(5),
+            |delay| async move {
+                tokio::time::sleep(Duration::from_millis(*delay)).await;
                 *delay
             },
             |_| 0,
-        );
+        )
+        .await;
         assert_eq!(results, [30, 1, 15]);
     }
 
-    #[test]
-    fn items_run_at_the_same_time() {
-        let prober = Prober::new(vec![200_u64; 10], Duration::from_secs(5));
+    #[tokio::test]
+    async fn items_run_at_the_same_time() {
         let started = Instant::now();
-        prober.round(|delay| thread::sleep(Duration::from_millis(*delay)), |_| ());
+        probe_all(
+            &items(&[200; 10]),
+            Duration::from_secs(5),
+            |delay| async move { tokio::time::sleep(Duration::from_millis(*delay)).await },
+            |_| (),
+        )
+        .await;
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
-    #[test]
-    fn a_stuck_item_times_out_without_holding_up_the_rest() {
-        let prober = Prober::new(vec![600_u64, 1], SHORT);
-        let results = prober.round(
-            |delay| {
-                thread::sleep(Duration::from_millis(*delay));
+    #[tokio::test]
+    async fn a_slow_item_times_out_without_holding_up_the_rest() {
+        let started = Instant::now();
+        let results = probe_all(
+            &items(&[5000, 1]),
+            SHORT,
+            |delay| async move {
+                tokio::time::sleep(Duration::from_millis(*delay)).await;
                 "done"
             },
             |_| "timed out",
-        );
+        )
+        .await;
         assert_eq!(results, ["timed out", "done"]);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
-    static STARTED: AtomicUsize = AtomicUsize::new(0);
-
-    #[test]
-    fn a_stuck_item_is_not_started_again_until_it_finishes() {
-        let prober = Prober::new(vec![400_u64], Duration::from_millis(20));
-        let probe = |delay: &u64| {
-            STARTED.fetch_add(1, Ordering::Relaxed);
-            thread::sleep(Duration::from_millis(*delay));
-            "done"
-        };
-
-        for _ in 0..4 {
-            assert_eq!(prober.round(probe, |_| "timed out"), ["timed out"]);
-        }
-        assert_eq!(STARTED.load(Ordering::Relaxed), 1);
-
-        wait_until(|| !prober.items[0].1.load(Ordering::Relaxed));
-        prober.round(probe, |_| "timed out");
-        assert_eq!(STARTED.load(Ordering::Relaxed), 2);
+    #[tokio::test]
+    async fn a_panicking_item_counts_as_failed() {
+        let results = probe_all(
+            &items(&[1, 2]),
+            Duration::from_secs(5),
+            |value| async move {
+                assert!(*value != 1, "deliberate test panic");
+                "ok"
+            },
+            |_| "failed",
+        )
+        .await;
+        assert_eq!(results, ["failed", "ok"]);
     }
 
     #[test]
-    fn a_panicking_item_counts_as_failed_and_can_run_again() {
-        let prober = Prober::new(vec![1_u64], Duration::from_secs(5));
-        let probe = |_: &u64| -> &str { panic!("deliberate test panic") };
-        assert_eq!(prober.round(probe, |_| "failed"), ["failed"]);
-        wait_until(|| !prober.items[0].1.load(Ordering::Relaxed));
-        assert_eq!(prober.round(|_| "ok", |_| "failed"), ["ok"]);
+    fn busy_items_cannot_start_twice_and_free_up_when_dropped() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let first = Busy::try_start(&flag);
+        assert!(first.is_some());
+        assert!(Busy::try_start(&flag).is_none());
+
+        drop(first);
+        assert!(Busy::try_start(&flag).is_some());
+    }
+
+    #[test]
+    fn the_blocking_pool_cannot_grow_past_its_limit() {
+        let running = Arc::new(AtomicUsize::new(0));
+        let most = Arc::new(AtomicUsize::new(0));
+        let runtime = runtime().unwrap();
+
+        runtime.block_on(async {
+            let mut tasks = Vec::new();
+            for _ in 0..(MAX_BLOCKING_THREADS * 3) {
+                let (running, most) = (running.clone(), most.clone());
+                tasks.push(tokio::task::spawn_blocking(move || {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(now, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(20));
+                    running.fetch_sub(1, Ordering::SeqCst);
+                }));
+            }
+            for task in tasks {
+                task.await.unwrap();
+            }
+        });
+
+        assert!(most.load(Ordering::SeqCst) <= MAX_BLOCKING_THREADS);
     }
 }

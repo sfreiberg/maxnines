@@ -30,7 +30,7 @@ const TICK: Duration = Duration::from_secs(5);
 const MIN_INTERVAL_SECS: u64 = 10;
 const MAX_INTERVAL_SECS: u64 = 86_400;
 
-/// How many checks run at once. Each holds a thread, and anything over this waits.
+/// How many checks run at once. Anything over this waits its turn.
 const MAX_RUNNING: usize = 32;
 
 /// A check the server runs, as stored.
@@ -160,13 +160,8 @@ impl Scheduler {
             let Ok(_slot) = slots.acquire_owned().await else {
                 return;
             };
-            let name = check.name.clone();
-            let finished = tokio::task::spawn_blocking(move || maxnines_checks::run(&check)).await;
-            let Ok(result) = finished else {
-                error!(check = name, "a check panicked");
-                return;
-            };
-            results.set(&name, result.clone());
+            let result = maxnines_checks::run(&check).await;
+            results.set(&check.name, result.clone());
             save(&writer, result).await;
         })
     }

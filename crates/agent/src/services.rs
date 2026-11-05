@@ -2,12 +2,13 @@
 //! own service manager, so this is the one place that differs by platform. Names
 //! are checked by the protocol crate and are never passed through a shell.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::background::{Background, Prober};
+use crate::background::{Background, probe_all};
 use crate::collector::Collector;
 
 /// A service manager can stall, but it answers quickly when it's healthy.
@@ -21,13 +22,14 @@ pub struct ServiceCollector {
 
 impl ServiceCollector {
     pub fn new(names: Vec<String>, interval: Duration) -> Self {
-        let prober = Prober::new(names, TIMEOUT);
+        let names: Vec<Arc<String>> = names.into_iter().map(Arc::new).collect();
         let background = Background::start(interval, move || {
-            let results = prober.round(
-                |name| report(name, query(name)),
-                |name| report(name, Status::stopped(UNKNOWN)),
-            );
-            Value::Array(results)
+            let names = names.clone();
+            async move {
+                let probe = |name: Arc<String>| async move { report(&name, query(&name).await) };
+                let failed = |name: &String| report(name, Status::stopped(UNKNOWN));
+                Value::Array(probe_all(&names, TIMEOUT, probe, failed).await)
+            }
         });
         Self { background }
     }
@@ -120,11 +122,20 @@ fn parse_rc(success: bool, errors: &str) -> Status {
     }
 }
 
+/// Runs a service manager's command. Dropping this, as a timeout does, kills it.
+#[cfg(unix)]
+async fn run_command(program: &str, arguments: &[&str]) -> std::io::Result<std::process::Output> {
+    tokio::process::Command::new(program)
+        .args(arguments)
+        .kill_on_drop(true)
+        .output()
+        .await
+}
+
 #[cfg(target_os = "linux")]
-fn query(name: &str) -> Status {
-    let output = std::process::Command::new("systemctl")
-        .args(["show", "--property=LoadState,ActiveState", "--", name])
-        .output();
+async fn query(name: &str) -> Status {
+    let arguments = ["show", "--property=LoadState,ActiveState", "--", name];
+    let output = run_command("systemctl", &arguments).await;
     match output {
         Ok(output) => parse_systemd(&String::from_utf8_lossy(&output.stdout)),
         Err(_) => Status::stopped(UNKNOWN),
@@ -132,10 +143,8 @@ fn query(name: &str) -> Status {
 }
 
 #[cfg(target_os = "macos")]
-fn query(name: &str) -> Status {
-    let output = std::process::Command::new("launchctl")
-        .args(["list", name])
-        .output();
+async fn query(name: &str) -> Status {
+    let output = run_command("launchctl", &["list", name]).await;
     match output {
         Ok(output) if output.status.success() => {
             parse_launchd(&String::from_utf8_lossy(&output.stdout))
@@ -146,10 +155,8 @@ fn query(name: &str) -> Status {
 }
 
 #[cfg(target_os = "freebsd")]
-fn query(name: &str) -> Status {
-    let output = std::process::Command::new("service")
-        .args([name, "status"])
-        .output();
+async fn query(name: &str) -> Status {
+    let output = run_command("service", &[name, "status"]).await;
     match output {
         Ok(output) => parse_rc(
             output.status.success(),
@@ -159,8 +166,17 @@ fn query(name: &str) -> Status {
     }
 }
 
+/// Windows only offers a blocking call for this.
 #[cfg(windows)]
-fn query(name: &str) -> Status {
+async fn query(name: &str) -> Status {
+    let name = name.to_string();
+    tokio::task::spawn_blocking(move || query_blocking(&name))
+        .await
+        .unwrap_or_else(|_| Status::stopped(UNKNOWN))
+}
+
+#[cfg(windows)]
+fn query_blocking(name: &str) -> Status {
     use windows_service::service::{ServiceAccess, ServiceState};
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
@@ -186,7 +202,7 @@ fn query(name: &str) -> Status {
     target_os = "freebsd",
     windows
 )))]
-fn query(_name: &str) -> Status {
+async fn query(_name: &str) -> Status {
     Status::stopped(UNKNOWN)
 }
 
@@ -258,9 +274,9 @@ mod tests {
         assert_eq!(report("nginx", Status::stopped("failed"))["running"], 0);
     }
 
-    #[test]
-    fn a_service_that_does_not_exist_is_not_running() {
-        let status = query("maxnines-no-such-service");
+    #[tokio::test]
+    async fn a_service_that_does_not_exist_is_not_running() {
+        let status = query("maxnines-no-such-service").await;
         assert!(!status.running, "{status:?}");
     }
 }
