@@ -1133,6 +1133,15 @@ impl Browser {
         self.send(server, request).await
     }
 
+    async fn get_gzipped(&mut self, server: &TestServer, path: &str) -> Page {
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: x\r\nCookie: {}\r\nAccept-Encoding: gzip\r\n\
+             Connection: close\r\n\r\n",
+            self.cookie
+        );
+        self.send(server, request).await
+    }
+
     /// Opens a page and submits its form, as a person would.
     async fn submit(
         &mut self,
@@ -2317,6 +2326,46 @@ async fn pages_of_data_update_in_place() {
             "pages still update without scripts: {path}"
         );
         assert_eq!(page.body.matches("http-equiv").count(), 1, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn metric_pages_and_assets_are_gzipped_for_browsers_that_accept_it() {
+    let server = start_with_metrics().await;
+    let (agent, _client) = report_samples(&server, "/").await;
+    let mut browser = Browser::default();
+
+    for path in [
+        format!("/agents/{}/metrics", agent.id()),
+        "/metrics".to_string(),
+        "/assets/js/htmx.min.js".to_string(),
+        "/assets/css/application.css".to_string(),
+    ] {
+        let gzipped = browser.get_gzipped(&server, &path).await;
+        assert_eq!(gzipped.status, 200, "{path}");
+        assert_eq!(gzipped.header("content-encoding"), Some("gzip"), "{path}");
+
+        let plain = browser.get(&server, &path).await;
+        assert_eq!(plain.header("content-encoding"), None, "{path}");
+        assert!(gzipped.body.len() < plain.body.len(), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn pages_with_a_csrf_token_and_fonts_are_never_gzipped() {
+    let server = start().await;
+    let mut browser = Browser::default();
+
+    for path in [
+        "/agents",
+        "/rules/new",
+        "/checks/new",
+        "/settings",
+        "/assets/fonts/figtree.woff2",
+    ] {
+        let page = browser.get_gzipped(&server, path).await;
+        assert_eq!(page.status, 200, "{path}");
+        assert_eq!(page.header("content-encoding"), None, "{path}");
     }
 }
 

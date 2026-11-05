@@ -31,6 +31,8 @@ use axum::routing::get;
 use axum::{Form, Router};
 use axum_csrf::CsrfToken;
 use tera::Context;
+use tower_http::compression::CompressionLayer;
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tracing::{error, warn};
 
 use crate::app_state::AppState;
@@ -49,14 +51,22 @@ pub fn app(state: AppState) -> Router {
         .merge(alert_rules::routes())
         .merge(notification_channels::routes())
         .merge(remote_checks::routes())
-        .merge(metrics::routes())
+        .merge(compressed(metrics::routes()))
         .merge(rules::routes())
-        .merge(assets::routes())
+        .merge(compressed(assets::routes()))
         .merge(update_notice::routes())
         .merge(admin::routes(state.clone()))
         .fallback(not_found)
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
+}
+
+/// Gzips responses for routes with no forms on them. A page holding a CSRF token
+/// stays uncompressed, because its compressed size could give the token away to
+/// someone watching encrypted traffic. Fonts are compressed already.
+fn compressed(routes: Router<AppState>) -> Router<AppState> {
+    let worthwhile = DefaultPredicate::new().and(NotForContentType::const_new("font/"));
+    routes.layer(CompressionLayer::new().compress_when(worthwhile))
 }
 
 async fn not_found(state: axum::extract::State<AppState>, token: CsrfToken) -> Response {
