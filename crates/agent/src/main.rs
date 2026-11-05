@@ -1,8 +1,12 @@
+mod background;
+mod checks;
 mod collector;
 mod config;
 mod facts;
+mod files;
 mod identity;
 mod saved_config;
+mod services;
 mod websocket;
 
 use std::collections::BTreeMap;

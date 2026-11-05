@@ -809,16 +809,13 @@ async fn a_stopped_process_alerts_from_what_an_agent_really_sends() {
 #[tokio::test]
 async fn process_charts_only_appear_for_agents_that_report_processes() {
     let server = start_with_metrics().await;
-    let (agent, mut client) = report_samples(&server, "/").await;
-    let path = format!("/agents/{}/metrics", agent.id());
-    let mut browser = Browser::default();
+    let (plain, _plain_client) = report_samples(&server, "/").await;
 
-    let page = browser.get(&server, &path).await;
-    assert!(page.body.contains("CPU usage"));
-    assert!(!page.body.contains("Running processes"), "{}", page.body);
-
+    let watching = identity();
+    let mut client = server.connect_approved(&watching, "web-2").await;
+    let time = now_ms() - 1000;
     let sample = AgentMessage::Sample(Sample {
-        timestamp_ms: now_ms() as u64 - 1000,
+        timestamp_ms: time as u64,
         metrics: BTreeMap::from([(
             "processes".to_string(),
             json!([{ "name": "nginx", "count": 2, "cpu_percent": 1.0, "memory_percent": 1.0 }]),
@@ -826,17 +823,84 @@ async fn process_charts_only_appear_for_agents_that_report_processes() {
     });
     send(&mut client, &sample).await;
 
+    let metric = crate::metrics::find("process.count").unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let page = browser.get(&server, &path).await;
-        if page.body.contains("Running processes") {
-            assert!(page.body.contains("nginx"));
-            assert!(page.body.contains("Process CPU usage"));
-            break;
-        }
-        assert!(Instant::now() < deadline, "the chart never appeared");
-        sleep(Duration::from_millis(20)).await;
+    while server
+        .state
+        .metrics
+        .newest(metric, now_ms())
+        .await
+        .unwrap()
+        .is_empty()
+    {
+        assert!(Instant::now() < deadline, "the sample never arrived");
+        sleep(Duration::from_millis(10)).await;
     }
+
+    let mut browser = Browser::default();
+    let page = browser
+        .get(&server, &format!("/agents/{}/metrics", plain.id()))
+        .await;
+    assert!(page.body.contains("CPU usage"));
+    assert!(!page.body.contains("Running processes"), "{}", page.body);
+
+    let page = browser
+        .get(&server, &format!("/agents/{}/metrics", watching.id()))
+        .await;
+    assert!(page.body.contains("Running processes"), "{}", page.body);
+    assert!(page.body.contains("Process CPU usage"));
+    assert!(page.body.contains("nginx"));
+}
+
+#[tokio::test]
+async fn a_metric_for_alerts_only_gets_no_chart_but_can_still_be_read() {
+    let server = start_with_metrics().await;
+    let agent = identity();
+    let mut client = server.connect_approved(&agent, "web-1").await;
+    let time = now_ms() - 1000;
+    let sample = AgentMessage::Sample(Sample {
+        timestamp_ms: time as u64,
+        metrics: BTreeMap::from([(
+            "network".to_string(),
+            json!({ "en0": { "received_bytes": 0, "transmitted_bytes": 0, "link_up": 1 } }),
+        )]),
+    });
+    send(&mut client, &sample).await;
+
+    let metric = crate::metrics::find("network.link").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while server
+        .state
+        .metrics
+        .newest(metric, now_ms())
+        .await
+        .unwrap()
+        .is_empty()
+    {
+        assert!(Instant::now() < deadline, "the sample never arrived");
+        sleep(Duration::from_millis(10)).await;
+    }
+
+    let page = Browser::default()
+        .get(&server, &format!("/agents/{}/metrics", agent.id()))
+        .await;
+    assert!(!page.body.contains("Network link up"), "{}", page.body);
+}
+
+#[tokio::test]
+async fn charts_keep_the_catalog_order_however_their_queries_finish() {
+    let server = start_with_metrics().await;
+    let (agent, _client) = report_samples(&server, "/").await;
+
+    let page = Browser::default()
+        .get(&server, &format!("/agents/{}/metrics", agent.id()))
+        .await;
+    let position = |title: &str| page.body.find(&format!("<h2>{title}</h2>")).unwrap();
+    assert!(position("CPU usage") < position("Load average"));
+    assert!(position("Load average") < position("Memory usage"));
+    assert!(position("Memory usage") < position("Disk usage"));
+    assert!(position("Disk usage") < position("Network received"));
+    assert!(position("Network received") < position("Network sent"));
 }
 
 // ---- delivery

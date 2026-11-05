@@ -44,6 +44,11 @@ pub enum Unit {
     Percent,
     Number,
     BytesPerSecond,
+    PerSecond,
+    Bytes,
+    Seconds,
+    Milliseconds,
+    Celsius,
 }
 
 /// How a number is read from a collector's output.
@@ -81,6 +86,19 @@ pub struct Metric {
     pub collector: &'static str,
     #[serde(skip)]
     pub source: Source,
+    #[serde(skip)]
+    pub chart: ShowChart,
+}
+
+/// Whether an agent's page shows a chart for a metric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShowChart {
+    Always,
+    /// Most agents won't report this, and a page of empty charts says nothing.
+    WithData,
+    /// Good to alert on, but not to look at, such as a line per interface that
+    /// sits at 1 all day. It can still be queried.
+    Never,
 }
 
 pub const METRICS: &[Metric] = &[
@@ -90,6 +108,7 @@ pub const METRICS: &[Metric] = &[
         unit: Unit::Percent,
         collector: "cpu",
         source: Source::Fields(&[("CPU", Reading::Field("$.usage_percent"))]),
+        chart: ShowChart::Always,
     },
     Metric {
         name: "cpu.load",
@@ -101,6 +120,7 @@ pub const METRICS: &[Metric] = &[
             ("5 minutes", Reading::Field("$.load_average.five")),
             ("15 minutes", Reading::Field("$.load_average.fifteen")),
         ]),
+        chart: ShowChart::Always,
     },
     Metric {
         name: "memory.usage",
@@ -123,6 +143,7 @@ pub const METRICS: &[Metric] = &[
                 },
             ),
         ]),
+        chart: ShowChart::Always,
     },
     Metric {
         name: "disk.usage",
@@ -136,6 +157,7 @@ pub const METRICS: &[Metric] = &[
                 whole: "$.total_bytes",
             },
         },
+        chart: ShowChart::Always,
     },
     Metric {
         name: "network.received",
@@ -143,6 +165,7 @@ pub const METRICS: &[Metric] = &[
         unit: Unit::BytesPerSecond,
         collector: "network",
         source: Source::Entries(Reading::Rate("$.received_bytes")),
+        chart: ShowChart::Always,
     },
     Metric {
         name: "network.transmitted",
@@ -150,6 +173,7 @@ pub const METRICS: &[Metric] = &[
         unit: Unit::BytesPerSecond,
         collector: "network",
         source: Source::Entries(Reading::Rate("$.transmitted_bytes")),
+        chart: ShowChart::Always,
     },
     Metric {
         name: "process.count",
@@ -160,6 +184,7 @@ pub const METRICS: &[Metric] = &[
             name: "$.name",
             reading: Reading::Field("$.count"),
         },
+        chart: ShowChart::WithData,
     },
     Metric {
         name: "process.cpu",
@@ -170,6 +195,7 @@ pub const METRICS: &[Metric] = &[
             name: "$.name",
             reading: Reading::Field("$.cpu_percent"),
         },
+        chart: ShowChart::WithData,
     },
     Metric {
         name: "process.memory",
@@ -180,6 +206,171 @@ pub const METRICS: &[Metric] = &[
             name: "$.name",
             reading: Reading::Field("$.memory_percent"),
         },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "disk.read",
+        title: "Disk reads",
+        unit: Unit::BytesPerSecond,
+        collector: "disk",
+        source: Source::Items {
+            name: "$.mount_point",
+            reading: Reading::Rate("$.read_bytes"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "disk.written",
+        title: "Disk writes",
+        unit: Unit::BytesPerSecond,
+        collector: "disk",
+        source: Source::Items {
+            name: "$.mount_point",
+            reading: Reading::Rate("$.written_bytes"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "disk.inodes",
+        title: "Inode usage",
+        unit: Unit::Percent,
+        collector: "disk",
+        source: Source::Items {
+            name: "$.mount_point",
+            reading: Reading::Percent {
+                part: "$.inodes_used",
+                whole: "$.inodes_total",
+            },
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "network.packets.received",
+        title: "Packets received",
+        unit: Unit::PerSecond,
+        collector: "network",
+        source: Source::Entries(Reading::Rate("$.packets_received")),
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "network.packets.transmitted",
+        title: "Packets sent",
+        unit: Unit::PerSecond,
+        collector: "network",
+        source: Source::Entries(Reading::Rate("$.packets_transmitted")),
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "network.errors.received",
+        title: "Receive errors",
+        unit: Unit::PerSecond,
+        collector: "network",
+        source: Source::Entries(Reading::Rate("$.receive_errors")),
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "network.errors.transmitted",
+        title: "Send errors",
+        unit: Unit::PerSecond,
+        collector: "network",
+        source: Source::Entries(Reading::Rate("$.transmit_errors")),
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "network.link",
+        title: "Network link up",
+        unit: Unit::Number,
+        collector: "network",
+        source: Source::Entries(Reading::Field("$.link_up")),
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "sensor.temperature",
+        title: "Temperature",
+        unit: Unit::Celsius,
+        collector: "sensors",
+        source: Source::Items {
+            name: "$.label",
+            reading: Reading::Field("$.celsius"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "check.up",
+        title: "Checks passing",
+        unit: Unit::Number,
+        collector: "checks",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.up"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "check.response",
+        title: "Check response time",
+        unit: Unit::Milliseconds,
+        collector: "checks",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.response_ms"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "check.cert_days",
+        title: "Certificate days left",
+        unit: Unit::Number,
+        collector: "checks",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.cert_days_left"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "service.running",
+        title: "Services running",
+        unit: Unit::Number,
+        collector: "services",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.running"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "file.exists",
+        title: "File exists",
+        unit: Unit::Number,
+        collector: "files",
+        source: Source::Items {
+            name: "$.path",
+            reading: Reading::Field("$.exists"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "file.size",
+        title: "File size",
+        unit: Unit::Bytes,
+        collector: "files",
+        source: Source::Items {
+            name: "$.path",
+            reading: Reading::Field("$.size_bytes"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "file.age",
+        title: "Time since file changed",
+        unit: Unit::Seconds,
+        collector: "files",
+        source: Source::Items {
+            name: "$.path",
+            reading: Reading::Field("$.age_secs"),
+        },
+        chart: ShowChart::WithData,
     },
 ];
 
@@ -196,12 +387,6 @@ pub fn find(name: &str) -> Option<&'static Metric> {
 }
 
 impl Metric {
-    /// Most agents aren't set up to watch processes, and a page of empty charts
-    /// about them says nothing.
-    pub fn is_optional(&self) -> bool {
-        self.collector == "processes"
-    }
-
     /// Where a series sits in the catalog, for metrics with fixed series.
     pub fn position(&self, series: &str) -> Option<usize> {
         match self.source {

@@ -209,7 +209,9 @@ impl Axis {
         let (floor, ceiling) = match unit {
             Unit::Percent => (0.0, 100.0),
             Unit::Number => (0.0, 1.0),
-            Unit::BytesPerSecond => (0.0, 1000.0),
+            Unit::BytesPerSecond | Unit::Bytes => (0.0, 1000.0),
+            Unit::PerSecond | Unit::Seconds | Unit::Milliseconds => (0.0, 10.0),
+            Unit::Celsius => (0.0, 100.0),
         };
         // A percentage reads best on its whole scale, and anything else on its
         // own values. Agents can still report beyond 100%.
@@ -466,6 +468,17 @@ fn trimmed(value: f64, decimals: usize) -> String {
     }
 }
 
+fn format_size(value: f64, decimals: usize) -> String {
+    let (divisor, label) = match value.abs() {
+        size if size >= 1e12 => (1e12, "TB"),
+        size if size >= 1e9 => (1e9, "GB"),
+        size if size >= 1e6 => (1e6, "MB"),
+        size if size >= 1e3 => (1e3, "KB"),
+        _ => (1.0, "B"),
+    };
+    format!("{} {label}", trimmed(value / divisor, decimals))
+}
+
 fn format_rate(value: f64, decimals: usize) -> String {
     let (divisor, label) = match value.abs() {
         size if size >= 1e9 => (1e9, "GB/s"),
@@ -476,11 +489,33 @@ fn format_rate(value: f64, decimals: usize) -> String {
     format!("{} {label}", trimmed(value / divisor, decimals))
 }
 
+fn format_age(value: f64, decimals: usize) -> String {
+    let (divisor, label) = match value.abs() {
+        age if age >= 86_400.0 => (86_400.0, "d"),
+        age if age >= 3600.0 => (3600.0, "h"),
+        age if age >= 60.0 => (60.0, "m"),
+        _ => (1.0, "s"),
+    };
+    format!("{} {label}", trimmed(value / divisor, decimals))
+}
+
 pub fn format_value(unit: Unit, value: f64) -> String {
     match unit {
         Unit::Percent => format!("{}%", trimmed(value, 1)),
         Unit::Number => trimmed(value, 2),
         Unit::BytesPerSecond => format_rate(value, 1),
+        other => format_other(other, value, 1),
+    }
+}
+
+fn format_other(unit: Unit, value: f64, decimals: usize) -> String {
+    match unit {
+        Unit::PerSecond => format!("{}/s", trimmed(value, decimals)),
+        Unit::Bytes => format_size(value, decimals),
+        Unit::Seconds => format_age(value, decimals),
+        Unit::Milliseconds => format!("{} ms", trimmed(value, decimals)),
+        Unit::Celsius => format!("{}°C", trimmed(value, decimals)),
+        Unit::Percent | Unit::Number | Unit::BytesPerSecond => trimmed(value, decimals),
     }
 }
 
@@ -490,6 +525,7 @@ fn format_tick(unit: Unit, value: f64) -> String {
         Unit::Percent => format!("{}%", trimmed(value, 2)),
         Unit::Number => trimmed(value, 2),
         Unit::BytesPerSecond => format_rate(value, 2),
+        other => format_other(other, value, 2),
     }
 }
 
@@ -824,6 +860,16 @@ mod tests {
             (Unit::BytesPerSecond, 2_500_000.0, "2.5 MB/s"),
             (Unit::BytesPerSecond, 3e9, "3 GB/s"),
             (Unit::Number, 2e20, "2.00e20"),
+            (Unit::PerSecond, 12.5, "12.5/s"),
+            (Unit::Bytes, 512.0, "512 B"),
+            (Unit::Bytes, 2_500_000.0, "2.5 MB"),
+            (Unit::Bytes, 4e12, "4 TB"),
+            (Unit::Seconds, 45.0, "45 s"),
+            (Unit::Seconds, 90.0, "1.5 m"),
+            (Unit::Seconds, 7200.0, "2 h"),
+            (Unit::Seconds, 172_800.0, "2 d"),
+            (Unit::Milliseconds, 12.34, "12.3 ms"),
+            (Unit::Celsius, 54.5, "54.5°C"),
         ] {
             assert_eq!(format_value(unit, value), text);
         }

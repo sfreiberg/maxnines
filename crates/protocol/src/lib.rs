@@ -11,13 +11,30 @@ use serde_json::Value;
 
 /// Every collector the project knows about. An agent reports the ones it can
 /// run in its facts, because older agents may not have them all.
-pub const COLLECTORS: [&str; 6] = ["cpu", "disk", "host", "memory", "network", "processes"];
+pub const COLLECTORS: [&str; 10] = [
+    "checks",
+    "cpu",
+    "disk",
+    "files",
+    "host",
+    "memory",
+    "network",
+    "processes",
+    "sensors",
+    "services",
+];
 
-/// How many process names one agent can be told to watch.
-const MAX_PROCESS_NAMES: usize = 64;
+/// How many things one collector can be told to watch.
+const MAX_WATCHED: usize = 64;
 
-/// Longer than any file name a supported system allows.
-const MAX_PROCESS_NAME_LEN: usize = 255;
+/// What the server can store for one setting.
+const MAX_SETTING_LEN: usize = 255;
+
+/// Checks each use a thread and reach out over the network, so fewer of them.
+const MAX_CHECKS: usize = 32;
+
+/// A check's name is a series name, which has to fit in chart labels.
+const MAX_CHECK_NAME_LEN: usize = 64;
 
 /// What git and the build tool report when they have no answer.
 const NO_BUILD_VALUE: &str = "VERGEN_IDEMPOTENT_OUTPUT";
@@ -85,12 +102,111 @@ pub struct CollectorSettings {
     /// Disk collector only: limit output to these mount points.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mount_points: Option<Vec<String>>,
-    /// Processes collector only: the process names to watch. Nothing else about
-    /// what's running on a machine is reported.
+    /// Processes and services collectors only: the names to watch. Nothing else
+    /// about what's running on a machine is reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub names: Option<Vec<String>>,
+    /// Files collector only: the files and folders to watch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
+    /// Checks collector only: what to try reaching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<Vec<Check>>,
 }
 
+/// Something an agent tries reaching, to see if it's up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Check {
+    /// What it's called on charts and in alerts.
+    pub name: String,
+    pub kind: CheckKind,
+    /// `host:port` for tcp and tls, a URL for http, and a host for dns and ping.
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckKind {
+    Tcp,
+    Http,
+    Tls,
+    Dns,
+    Ping,
+}
+
+impl CheckKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Http => "http",
+            Self::Tls => "tls",
+            Self::Dns => "dns",
+            Self::Ping => "ping",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "tcp" => Some(Self::Tcp),
+            "http" => Some(Self::Http),
+            "tls" => Some(Self::Tls),
+            "dns" => Some(Self::Dns),
+            "ping" => Some(Self::Ping),
+            _ => None,
+        }
+    }
+}
+
+/// Goes on a command line, so it can't be anything an option could look like.
+fn is_plain_name(name: &str, extra: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c) || extra.contains(c))
+}
+
+fn has_port(target: &str) -> bool {
+    target
+        .rsplit_once(':')
+        .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0))
+}
+
+impl Check {
+    fn validate(&self) -> Result<()> {
+        let name = &self.name;
+        ensure!(!name.trim().is_empty(), "a check needs a name");
+        ensure!(
+            name.len() <= MAX_CHECK_NAME_LEN,
+            "the check name {name:?} is too long"
+        );
+        let target = &self.target;
+        ensure!(
+            !target.is_empty() && target.len() <= MAX_SETTING_LEN,
+            "check {name:?} needs a target of at most {MAX_SETTING_LEN} characters"
+        );
+        ensure!(
+            !target.chars().any(|c| c.is_whitespace() || c.is_control()),
+            "check {name:?} has spaces in its target"
+        );
+        match self.kind {
+            CheckKind::Tcp | CheckKind::Tls => ensure!(
+                has_port(target),
+                "check {name:?} needs a target like host:port"
+            ),
+            CheckKind::Http => ensure!(
+                target.starts_with("http://") || target.starts_with("https://"),
+                "check {name:?} needs a target starting with http:// or https://"
+            ),
+            CheckKind::Dns | CheckKind::Ping => ensure!(
+                is_plain_name(target, ":"),
+                "check {name:?} needs a host name as its target"
+            ),
+        }
+        Ok(())
+    }
+}
 fn default_interval_secs() -> u64 {
     15
 }
@@ -115,7 +231,7 @@ impl AgentConfig {
                 COLLECTORS.contains(&name.as_str()),
                 "unknown collector {name:?}"
             );
-            settings.validate()?;
+            settings.validate(name)?;
         }
         Ok(())
     }
@@ -130,17 +246,49 @@ impl AgentConfig {
 }
 
 impl CollectorSettings {
-    fn validate(&self) -> Result<()> {
+    fn validate(&self, collector: &str) -> Result<()> {
         let names = self.names.as_deref().unwrap_or_default();
         ensure!(
-            names.len() <= MAX_PROCESS_NAMES,
-            "a collector can watch at most {MAX_PROCESS_NAMES} processes"
+            names.len() <= MAX_WATCHED,
+            "a collector can watch at most {MAX_WATCHED} names"
         );
         for name in names {
-            ensure!(!name.trim().is_empty(), "process names can't be empty");
+            ensure!(!name.trim().is_empty(), "names can't be empty");
             ensure!(
-                name.len() <= MAX_PROCESS_NAME_LEN,
-                "the process name {name:?} is too long"
+                name.len() <= MAX_SETTING_LEN,
+                "the name {name:?} is too long"
+            );
+            // Service names reach a command line. `@` and `:` appear in real ones.
+            ensure!(
+                collector != "services" || is_plain_name(name, "@:"),
+                "{name:?} isn't a valid service name"
+            );
+        }
+
+        let paths = self.paths.as_deref().unwrap_or_default();
+        ensure!(
+            paths.len() <= MAX_WATCHED,
+            "a collector can watch at most {MAX_WATCHED} paths"
+        );
+        for path in paths {
+            ensure!(!path.trim().is_empty(), "paths can't be empty");
+            ensure!(
+                path.len() <= MAX_SETTING_LEN,
+                "the path {path:?} is too long"
+            );
+        }
+
+        let checks = self.checks.as_deref().unwrap_or_default();
+        ensure!(
+            checks.len() <= MAX_CHECKS,
+            "a collector can run at most {MAX_CHECKS} checks"
+        );
+        for (index, check) in checks.iter().enumerate() {
+            check.validate()?;
+            ensure!(
+                !checks[..index].iter().any(|other| other.name == check.name),
+                "two checks are named {:?}",
+                check.name
             );
         }
         Ok(())
@@ -232,7 +380,7 @@ mod tests {
     fn process_names_are_checked() {
         watching(json!(["nginx", "postgres"])).validate().unwrap();
 
-        let too_many: Vec<String> = (0..=MAX_PROCESS_NAMES).map(|i| i.to_string()).collect();
+        let too_many: Vec<String> = (0..=MAX_WATCHED).map(|i| i.to_string()).collect();
         for names in [
             json!([""]),
             json!(["  "]),
@@ -241,6 +389,110 @@ mod tests {
         ] {
             assert!(watching(names.clone()).validate().is_err(), "{names}");
         }
+    }
+
+    fn with(collector: &str, settings: Value) -> AgentConfig {
+        serde_json::from_value(json!({ "collectors": { collector: settings } })).unwrap()
+    }
+
+    #[test]
+    fn service_names_cannot_look_like_options() {
+        let services = |name: &str| with("services", json!({ "names": [name] }));
+        for good in [
+            "nginx",
+            "nginx.service",
+            "getty@tty1",
+            "com.apple.Finder",
+            "MSSQL$SQL",
+        ] {
+            let result = services(good).validate();
+            assert_eq!(result.is_ok(), good != "MSSQL$SQL", "{good}");
+        }
+        for bad in ["-H", "--root=/", "a b", "../x", "a;b", ""] {
+            assert!(services(bad).validate().is_err(), "{bad}");
+        }
+        // The same characters are fine as process names, which never reach a command.
+        with("processes", json!({ "names": ["a b"] }))
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn paths_are_limited() {
+        let files = |paths: Value| with("files", json!({ "paths": paths }));
+        files(json!(["/var/log/x", "C:\\backup"]))
+            .validate()
+            .unwrap();
+        assert!(files(json!([""])).validate().is_err());
+        assert!(files(json!(["x".repeat(256)])).validate().is_err());
+        let too_many: Vec<String> = (0..=MAX_WATCHED).map(|i| i.to_string()).collect();
+        assert!(files(json!(too_many)).validate().is_err());
+    }
+
+    fn check(kind: &str, target: &str) -> AgentConfig {
+        let checks = json!([{ "name": "a", "kind": kind, "target": target }]);
+        with("checks", json!({ "checks": checks }))
+    }
+
+    #[test]
+    fn check_targets_have_to_suit_their_kind() {
+        for (kind, target) in [
+            ("tcp", "db.internal:5432"),
+            ("tcp", "[::1]:5432"),
+            ("tls", "example.com:443"),
+            ("http", "https://example.com/health?x=1"),
+            ("http", "http://10.0.0.1:8080/"),
+            ("dns", "example.com"),
+            ("ping", "10.0.0.1"),
+            ("ping", "::1"),
+        ] {
+            check(kind, target).validate().unwrap();
+        }
+        for (kind, target) in [
+            ("tcp", "db.internal"),
+            ("tcp", ":5432"),
+            ("tcp", "db:0"),
+            ("tcp", "db:99999"),
+            ("tls", "example.com"),
+            ("http", "example.com"),
+            ("http", "ftp://example.com"),
+            ("http", "https://exa mple.com"),
+            ("dns", "-x"),
+            ("ping", "-f"),
+            ("ping", "a;b"),
+            ("ping", ""),
+        ] {
+            assert!(check(kind, target).validate().is_err(), "{kind} {target}");
+        }
+    }
+
+    #[test]
+    fn checks_need_their_own_short_names() {
+        let target = "example.com:80";
+        let one = |name: &str| json!({ "name": name, "kind": "tcp", "target": target });
+        let checks = |list: Value| with("checks", json!({ "checks": list }));
+
+        assert!(checks(json!([one(""),])).validate().is_err());
+        assert!(checks(json!([one(&"x".repeat(65))])).validate().is_err());
+        assert!(checks(json!([one("a"), one("a")])).validate().is_err());
+        checks(json!([one("a"), one("b")])).validate().unwrap();
+
+        let many: Vec<Value> = (0..=MAX_CHECKS).map(|i| one(&i.to_string())).collect();
+        assert!(checks(json!(many)).validate().is_err());
+    }
+
+    #[test]
+    fn check_kinds_read_back_as_written() {
+        for kind in [
+            CheckKind::Tcp,
+            CheckKind::Http,
+            CheckKind::Tls,
+            CheckKind::Dns,
+            CheckKind::Ping,
+        ] {
+            assert_eq!(CheckKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(CheckKind::parse("carrier-pigeon"), None);
     }
 
     #[test]

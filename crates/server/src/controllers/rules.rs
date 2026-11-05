@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
-use maxnines_protocol::COLLECTORS;
+use maxnines_protocol::{COLLECTORS, Check, CheckKind};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
@@ -40,6 +40,9 @@ struct RuleForm {
     facts_interval_secs: String,
     mount_points: String,
     process_names: String,
+    service_names: String,
+    file_paths: String,
+    checks: String,
     collectors: Vec<CollectorChoice>,
 }
 
@@ -84,6 +87,9 @@ impl RuleForm {
             facts_interval_secs: number("facts_interval_secs"),
             mount_points: lines(&rule.settings["collectors"]["disk"]["mount_points"]),
             process_names: lines(&rule.settings["collectors"]["processes"]["names"]),
+            service_names: lines(&rule.settings["collectors"]["services"]["names"]),
+            file_paths: lines(&rule.settings["collectors"]["files"]["paths"]),
+            checks: check_lines(&rule.settings["collectors"]["checks"]["checks"]),
             collectors: choices(|name| {
                 match rule.settings["collectors"][name]["enabled"].as_bool() {
                     Some(true) => "on",
@@ -107,6 +113,9 @@ impl RuleForm {
             facts_interval_secs: text("facts_interval_secs"),
             mount_points: text("mount_points"),
             process_names: text("process_names"),
+            service_names: text("service_names"),
+            file_paths: text("file_paths"),
+            checks: text("checks"),
             collectors: choices(|name| text(&format!("collector_{name}"))),
         }
     }
@@ -141,6 +150,8 @@ impl RuleForm {
             let list = match collector.name {
                 "disk" => Some(("mount_points", &self.mount_points)),
                 "processes" => Some(("names", &self.process_names)),
+                "services" => Some(("names", &self.service_names)),
+                "files" => Some(("paths", &self.file_paths)),
                 _ => None,
             };
             if let Some((name, text)) = list {
@@ -151,6 +162,12 @@ impl RuleForm {
                     .collect();
                 if !lines.is_empty() {
                     fields.insert(name.to_string(), json!(lines));
+                }
+            }
+            if collector.name == "checks" {
+                let checks = parse_checks(&self.checks)?;
+                if !checks.is_empty() {
+                    fields.insert("checks".to_string(), json!(checks));
                 }
             }
             if !fields.is_empty() {
@@ -173,6 +190,36 @@ impl RuleForm {
             settings: Value::Object(settings),
         })
     }
+}
+
+/// Checks are typed one per line, as `kind name target`.
+fn parse_checks(text: &str) -> Result<Vec<Check>> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let [kind, name, target] = words[..] else {
+                bail!("{line:?} should be a kind, a name and a target, such as: tcp db db1:5432");
+            };
+            let kind = CheckKind::parse(kind)
+                .with_context(|| format!("{kind:?} isn't a kind of check, in {line:?}"))?;
+            Ok(Check {
+                name: name.to_string(),
+                kind,
+                target: target.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn check_lines(value: &Value) -> String {
+    let checks: Vec<Check> = serde_json::from_value(value.clone()).unwrap_or_default();
+    let lines: Vec<String> = checks
+        .iter()
+        .map(|check| format!("{} {} {}", check.kind.as_str(), check.name, check.target))
+        .collect();
+    lines.join("\n")
 }
 
 fn choices(mut choice: impl FnMut(&str) -> String) -> Vec<CollectorChoice> {
@@ -455,6 +502,27 @@ mod tests {
     }
 
     #[test]
+    fn checks_are_typed_one_per_line() {
+        let checks = parse_checks("tcp db db1:5432\n\n  ping gw 10.0.0.1  \n").unwrap();
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[0].kind, CheckKind::Tcp);
+        assert_eq!(checks[0].name, "db");
+        assert_eq!(checks[1].target, "10.0.0.1");
+    }
+
+    #[test]
+    fn a_badly_typed_check_is_explained() {
+        for (line, expected) in [
+            ("tcp db", "should be a kind"),
+            ("tcp db a:1 extra", "should be a kind"),
+            ("gopher db a:1", "isn't a kind of check"),
+        ] {
+            let error = format!("{:#}", parse_checks(line).unwrap_err());
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
     fn a_rule_survives_the_trip_through_its_form() {
         let original = rule(json!({
             "interval_secs": 5,
@@ -464,6 +532,12 @@ mod tests {
                 "memory": { "enabled": false },
                 "disk": { "enabled": true, "mount_points": ["/", "/data"] },
                 "processes": { "enabled": true, "names": ["nginx", "postgres"] },
+                "services": { "enabled": true, "names": ["nginx.service"] },
+                "files": { "enabled": true, "paths": ["/var/backup/latest.tar"] },
+                "checks": { "enabled": true, "checks": [
+                    { "name": "db", "kind": "tcp", "target": "db1:5432" },
+                    { "name": "site", "kind": "http", "target": "https://example.com/" },
+                ] },
             },
         }));
 

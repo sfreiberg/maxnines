@@ -2514,7 +2514,10 @@ async fn the_metrics_api_lists_what_can_be_asked_for() {
         .await;
 
     let catalog = json_body(&response);
-    assert_eq!(catalog.as_array().unwrap().len(), 9);
+    assert_eq!(
+        catalog.as_array().unwrap().len(),
+        crate::metrics::METRICS.len()
+    );
     assert_eq!(
         catalog[0],
         json!({ "name": "cpu.usage", "title": "CPU usage", "unit": "percent", "collector": "cpu" })

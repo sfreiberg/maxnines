@@ -969,6 +969,76 @@ mod tests {
     }
 
     #[test]
+    fn new_metrics_read_what_the_agent_sends() {
+        let mut store = in_memory();
+        let disk = |read: u64| {
+            json!([{
+                "mount_point": "/", "read_bytes": read, "written_bytes": 500,
+                "inodes_total": 1000, "inodes_used": 250,
+            }])
+        };
+        write_metric(&mut store, "a", 10_000, "disk", disk(0));
+        write_metric(&mut store, "a", 20_000, "disk", disk(1000));
+        let network = |packets: u64| {
+            json!({ "en0": {
+                "packets_received": packets, "packets_transmitted": 20, "receive_errors": 5,
+                "transmit_errors": 0, "link_up": 1,
+            } })
+        };
+        write_metric(&mut store, "a", 10_000, "network", network(0));
+        write_metric(&mut store, "a", 20_000, "network", network(50));
+        let sensors = json!([{ "label": "CPU die", "celsius": 54.5 }]);
+        write_metric(&mut store, "a", 20_000, "sensors", sensors);
+        let checks = json!([
+            { "name": "site", "up": 1, "response_ms": 12.5, "cert_days_left": 30 },
+            { "name": "db", "up": 0, "error": "couldn't connect" },
+        ]);
+        write_metric(&mut store, "a", 20_000, "checks", checks);
+        let services = json!([{ "name": "nginx", "running": 1, "state": "active" }]);
+        write_metric(&mut store, "a", 20_000, "services", services);
+        let files = json!([
+            { "path": "/b", "exists": 1, "size_bytes": 2048, "age_secs": 60.0 },
+            { "path": "/gone", "exists": 0 },
+            { "path": "/nfs", "error": "timed out" },
+        ]);
+        write_metric(&mut store, "a", 20_000, "files", files);
+
+        let value = |metric: &str, series: &str| {
+            let readings = newest(&store, metric, 0, HOUR_MS);
+            let found = readings.iter().find(|r| r.series == series);
+            found.map(|r| r.value)
+        };
+        assert_eq!(value("disk.read", "/"), Some(100.0));
+        assert_eq!(value("disk.written", "/"), Some(50.0));
+        assert_eq!(value("disk.inodes", "/"), Some(25.0));
+        assert_eq!(value("network.packets.received", "en0"), Some(5.0));
+        assert_eq!(value("network.packets.transmitted", "en0"), Some(2.0));
+        assert_eq!(value("network.errors.received", "en0"), Some(0.5));
+        assert_eq!(value("network.errors.transmitted", "en0"), Some(0.0));
+        assert_eq!(value("network.link", "en0"), Some(1.0));
+        assert_eq!(value("sensor.temperature", "CPU die"), Some(54.5));
+        assert_eq!(value("check.up", "site"), Some(1.0));
+        assert_eq!(value("check.up", "db"), Some(0.0));
+        assert_eq!(value("check.response", "site"), Some(12.5));
+        assert_eq!(
+            value("check.response", "db"),
+            None,
+            "a failed check has no time"
+        );
+        assert_eq!(value("check.cert_days", "site"), Some(30.0));
+        assert_eq!(value("service.running", "nginx"), Some(1.0));
+        assert_eq!(value("file.exists", "/b"), Some(1.0));
+        assert_eq!(value("file.exists", "/gone"), Some(0.0));
+        assert_eq!(
+            value("file.exists", "/nfs"),
+            None,
+            "a timeout isn't an answer"
+        );
+        assert_eq!(value("file.size", "/b"), Some(2048.0));
+        assert_eq!(value("file.age", "/b"), Some(60.0));
+    }
+
+    #[test]
     fn every_metric_can_be_read_across_agents() {
         let store = in_memory();
         for metric in METRICS {

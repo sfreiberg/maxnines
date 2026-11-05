@@ -5,12 +5,13 @@ use axum::response::Response;
 use axum::routing::get;
 use axum_csrf::CsrfToken;
 use serde::{Deserialize, Serialize};
+use tokio::task::JoinSet;
 
 use super::{Page, server_error};
 use crate::app_state::AppState;
 use crate::fact_history::format_time;
 use crate::metric_charts::{self, Chart, MAX_SERIES};
-use crate::metrics::{self, METRICS, Metric, TimeRange, Unit, now_ms};
+use crate::metrics::{self, METRICS, Metric, ShowChart, TimeRange, Unit, now_ms};
 use crate::registration::{AgentRecord, AgentState};
 
 const HOUR_MS: i64 = 3_600_000;
@@ -139,14 +140,32 @@ async fn show(
         return not_found(&state, &token);
     };
 
+    // Each chart is its own query, so they run together rather than in turn.
+    let mut queries = JoinSet::new();
+    let shown = METRICS.iter().enumerate();
+    for (position, metric) in shown.filter(|(_, m)| m.chart != ShowChart::Never) {
+        let (state, agent) = (state.clone(), agent.clone());
+        queries.spawn(async move {
+            let result = chart(&state, &agent, metric, range).await;
+            (position, metric, result)
+        });
+    }
+
     let mut charts = Vec::new();
-    for metric in METRICS {
-        match chart(&state, &agent, metric, range).await {
-            Ok(chart) if chart.has_data || !metric.is_optional() => charts.push(chart),
-            Ok(_) => {}
-            Err(error) => return server_error(&error),
+    while let Some(finished) = queries.join_next().await {
+        match finished {
+            Ok((position, metric, Ok(chart)))
+                if chart.has_data || metric.chart == ShowChart::Always =>
+            {
+                charts.push((position, chart));
+            }
+            Ok((_, _, Ok(_))) => {}
+            Ok((_, _, Err(error))) => return server_error(&error),
+            Err(error) => return server_error(&error.into()),
         }
     }
+    charts.sort_by_key(|(position, _)| *position);
+    let charts: Vec<Chart> = charts.into_iter().map(|(_, chart)| chart).collect();
 
     let ranges: Vec<RangeLink> = RANGES
         .into_iter()

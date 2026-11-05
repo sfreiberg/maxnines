@@ -2,7 +2,7 @@
 //! `resolve` that agents get their config from, once with the saved rules and
 //! once with the rule as it stands in the form, and compares the results.
 
-use maxnines_protocol::{AgentConfig, CollectorSettings};
+use maxnines_protocol::{AgentConfig, Check, CollectorSettings};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -173,8 +173,24 @@ fn describe_changes(before: &ResolvedConfig, after: &ResolvedConfig) -> Vec<Stri
             if old_names != now.names.as_ref() {
                 changes.push(format!(
                     "{name} watches: {} → {}",
-                    describe_names(old_names),
-                    describe_names(now.names.as_ref())
+                    describe_list(old_names),
+                    describe_list(now.names.as_ref())
+                ));
+            }
+            let old_paths = was.and_then(|settings| settings.paths.as_ref());
+            if old_paths != now.paths.as_ref() {
+                changes.push(format!(
+                    "{name} watches: {} → {}",
+                    describe_list(old_paths),
+                    describe_list(now.paths.as_ref())
+                ));
+            }
+            let old_checks = was.and_then(|settings| settings.checks.as_ref());
+            if old_checks != now.checks.as_ref() {
+                changes.push(format!(
+                    "{name} runs: {} → {}",
+                    describe_checks(old_checks),
+                    describe_checks(now.checks.as_ref())
                 ));
             }
         }
@@ -197,8 +213,16 @@ fn describe_mounts(mounts: Option<&Vec<String>>) -> String {
     mounts.map_or("every disk".to_string(), |mounts| mounts.join(", "))
 }
 
-fn describe_names(names: Option<&Vec<String>>) -> String {
-    names.map_or("nothing".to_string(), |names| names.join(", "))
+fn describe_list(items: Option<&Vec<String>>) -> String {
+    items.map_or("nothing".to_string(), |items| items.join(", "))
+}
+
+fn describe_checks(checks: Option<&Vec<Check>>) -> String {
+    let Some(checks) = checks else {
+        return "nothing".to_string();
+    };
+    let names: Vec<&str> = checks.iter().map(|check| check.name.as_str()).collect();
+    names.join(", ")
 }
 
 #[cfg(test)]
@@ -224,6 +248,26 @@ mod tests {
             &resolved(config(json!(["nginx", "postgres"]))),
         );
         assert_eq!(changes, ["processes watches: nginx → nginx, postgres"]);
+    }
+
+    #[test]
+    fn watched_paths_and_checks_are_part_of_what_changes() {
+        let resolved = |collectors: Value| ResolvedConfig {
+            version: String::new(),
+            config: serde_json::from_value(json!({ "collectors": collectors })).unwrap(),
+            matched_rules: Vec::new(),
+            skipped_collectors: Vec::new(),
+        };
+        let web = json!({ "name": "web", "kind": "tcp", "target": "a:80" });
+
+        let changes = describe_changes(
+            &resolved(json!({ "files": { "paths": ["/a"] }, "checks": {} })),
+            &resolved(json!({ "files": { "paths": ["/b"] }, "checks": { "checks": [web] } })),
+        );
+        assert_eq!(
+            changes,
+            ["checks runs: nothing → web", "files watches: /a → /b"]
+        );
     }
 
     fn saved(

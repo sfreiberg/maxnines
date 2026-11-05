@@ -6,12 +6,16 @@ use anyhow::{Result, bail};
 use maxnines_protocol::{AgentConfig, COLLECTORS, CollectorSettings};
 use serde_json::{Value, json};
 use sysinfo::{
-    CpuRefreshKind, Disks, MemoryRefreshKind, Networks, ProcessRefreshKind, ProcessStatus,
-    ProcessesToUpdate, System, UpdateKind,
+    Components, CpuRefreshKind, Disks, InterfaceOperationalState, MemoryRefreshKind, Networks,
+    ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind,
 };
 
+use crate::checks::CheckCollector;
+use crate::files::FileCollector;
+use crate::services::ServiceCollector;
+
 /// What this agent can run, reported to the server as a fact.
-pub const SUPPORTED: [&str; 6] = COLLECTORS;
+pub const SUPPORTED: [&str; 10] = COLLECTORS;
 
 /// How long to wait after building collectors before the first sample.
 /// CPU usage is measured between two refreshes, so it needs this gap.
@@ -35,11 +39,11 @@ pub fn build_all(config: &AgentConfig) -> Result<Vec<Box<dyn Collector>>> {
         .collectors
         .iter()
         .filter(|(_, settings)| settings.enabled)
-        .map(|(name, settings)| build(name, settings))
+        .map(|(name, settings)| build(name, settings, Duration::from_secs(config.interval_secs)))
         .collect()
 }
 
-fn build(name: &str, config: &CollectorSettings) -> Result<Box<dyn Collector>> {
+fn build(name: &str, config: &CollectorSettings, interval: Duration) -> Result<Box<dyn Collector>> {
     Ok(match name {
         "host" => Box::new(HostCollector),
         "cpu" => Box::new(CpuCollector::new()?),
@@ -47,6 +51,19 @@ fn build(name: &str, config: &CollectorSettings) -> Result<Box<dyn Collector>> {
         "disk" => Box::new(DiskCollector::new(config.mount_points.clone())?),
         "network" => Box::new(NetworkCollector::new()?),
         "processes" => Box::new(ProcessCollector::new(config.names.clone())?),
+        "sensors" => Box::new(SensorCollector::new()?),
+        "checks" => {
+            let checks = config.checks.clone().unwrap_or_default();
+            Box::new(CheckCollector::new(checks, interval))
+        }
+        "services" => {
+            let names = config.names.clone().unwrap_or_default();
+            Box::new(ServiceCollector::new(names, interval))
+        }
+        "files" => {
+            let paths = config.paths.clone().unwrap_or_default();
+            Box::new(FileCollector::new(paths, interval))
+        }
         other => bail!("unknown collector {other:?}"),
     })
 }
@@ -165,7 +182,8 @@ impl Collector for DiskCollector {
                 self.wanted(&mount_point).then(|| {
                     let total = disk.total_space();
                     let available = disk.available_space();
-                    json!({
+                    let usage = disk.usage();
+                    let mut output = json!({
                         "name": disk.name().to_string_lossy(),
                         "mount_point": mount_point,
                         "file_system": disk.file_system().to_string_lossy(),
@@ -173,13 +191,35 @@ impl Collector for DiskCollector {
                         "available_bytes": available,
                         "used_bytes": total.saturating_sub(available),
                         "removable": disk.is_removable(),
-                    })
+                        "read_only": disk.is_read_only(),
+                        "kind": disk.kind().to_string(),
+                        "read_bytes": usage.read_bytes,
+                        "written_bytes": usage.written_bytes,
+                    });
+                    if let Some((total, free)) = inodes(disk.mount_point()) {
+                        output["inodes_total"] = json!(total);
+                        output["inodes_used"] = json!(total.saturating_sub(free));
+                    }
+                    output
                 })
             })
             .collect();
 
         Ok(Value::Array(disks))
     }
+}
+
+/// Total and free inodes. A disk can run out of these with plenty of space left.
+/// Windows file systems don't have them, and some Unix ones report none.
+#[cfg(unix)]
+fn inodes(mount_point: &Path) -> Option<(u64, u64)> {
+    let stats = rustix::fs::statvfs(mount_point).ok()?;
+    (stats.f_files > 0).then_some((stats.f_files, stats.f_ffree))
+}
+
+#[cfg(not(unix))]
+fn inodes(_mount_point: &Path) -> Option<(u64, u64)> {
+    None
 }
 
 struct NetworkCollector {
@@ -209,16 +249,70 @@ impl Collector for NetworkCollector {
                 let stats = json!({
                     "received_bytes": data.received(),
                     "transmitted_bytes": data.transmitted(),
+                    "packets_received": data.packets_received(),
+                    "packets_transmitted": data.packets_transmitted(),
+                    "receive_errors": data.errors_on_received(),
+                    "transmit_errors": data.errors_on_transmitted(),
                     "total_received_bytes": data.total_received(),
                     "total_transmitted_bytes": data.total_transmitted(),
                     "total_receive_errors": data.total_errors_on_received(),
                     "total_transmit_errors": data.total_errors_on_transmitted(),
+                    "link_up": link_up(data.operational_state()),
                 });
                 (name.to_string_lossy().into_owned(), stats)
             })
             .collect();
 
         Ok(Value::Object(interfaces))
+    }
+}
+
+/// 1 or 0 where the system says, and nothing where it doesn't, so that an
+/// interface with no known state can't set off an alert.
+fn link_up(state: InterfaceOperationalState) -> Option<u8> {
+    match state {
+        InterfaceOperationalState::Up => Some(1),
+        InterfaceOperationalState::Down | InterfaceOperationalState::LowerLayerDown => Some(0),
+        _ => None,
+    }
+}
+
+/// Some sensors report raw values that aren't temperatures, such as -9200 on
+/// Apple hardware. Nothing a machine can survive falls outside this.
+fn is_plausible(celsius: f32) -> bool {
+    (-60.0..=200.0).contains(&celsius)
+}
+
+/// Reads temperatures. What's available depends heavily on the machine: virtual
+/// machines usually have none, and some readings need extra rights.
+struct SensorCollector {
+    components: Components,
+}
+
+impl SensorCollector {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            components: Components::new_with_refreshed_list()?,
+        })
+    }
+}
+
+impl Collector for SensorCollector {
+    fn name(&self) -> &'static str {
+        "sensors"
+    }
+
+    fn collect(&mut self) -> Result<Value> {
+        self.components.refresh(true);
+        let sensors: Vec<Value> = self
+            .components
+            .iter()
+            .filter_map(|component| {
+                let celsius = component.temperature().filter(|c| is_plausible(*c))?;
+                Some(json!({ "label": component.label(), "celsius": celsius }))
+            })
+            .collect();
+        Ok(Value::Array(sensors))
     }
 }
 
@@ -491,6 +585,57 @@ mod tests {
             "{output}"
         );
         assert_eq!(output[1]["count"], 0);
+    }
+
+    #[test]
+    fn link_state_is_only_reported_when_known() {
+        assert_eq!(link_up(InterfaceOperationalState::Up), Some(1));
+        assert_eq!(link_up(InterfaceOperationalState::Down), Some(0));
+        assert_eq!(link_up(InterfaceOperationalState::Unknown), None);
+    }
+
+    #[test]
+    fn disks_report_their_activity_and_inodes() {
+        let mut collector = DiskCollector::new(None).unwrap();
+        let output = collector.collect().unwrap();
+        let disks = output.as_array().unwrap();
+
+        assert!(!disks.is_empty());
+        assert!(disks.iter().all(|disk| disk["read_bytes"].is_u64()));
+        if cfg!(unix) {
+            assert!(
+                disks.iter().any(|disk| disk["inodes_total"].is_u64()),
+                "{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn interfaces_report_packets_and_errors() {
+        let mut collector = NetworkCollector::new().unwrap();
+        let output = collector.collect().unwrap();
+        let interfaces = output.as_object().unwrap();
+
+        assert!(!interfaces.is_empty());
+        for stats in interfaces.values() {
+            assert!(stats["packets_received"].is_u64(), "{stats}");
+            assert!(stats["receive_errors"].is_u64(), "{stats}");
+        }
+    }
+
+    #[test]
+    fn impossible_temperatures_are_left_out() {
+        assert!(is_plausible(45.0));
+        assert!(is_plausible(-20.0));
+        assert!(!is_plausible(-9200.5));
+        assert!(!is_plausible(1500.0));
+        assert!(!is_plausible(f32::NAN));
+    }
+
+    #[test]
+    fn sensors_give_a_list_even_when_there_are_none() {
+        let mut collector = SensorCollector::new().unwrap();
+        assert!(collector.collect().unwrap().is_array());
     }
 
     #[test]

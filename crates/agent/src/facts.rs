@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use maxnines_protocol::build_info;
 use serde_json::{Value, json};
-use sysinfo::{CpuRefreshKind, System};
+use sysinfo::{CpuRefreshKind, Motherboard, Product, System};
 
 use crate::collector;
 
@@ -15,6 +15,7 @@ pub fn gather(custom: &BTreeMap<String, Value>) -> Result<Value> {
     let mut system = System::new()?;
     system.refresh_memory();
     system.refresh_cpu_list(CpuRefreshKind::nothing());
+    let board = Motherboard::new().ok();
 
     Ok(json!({
         "os": {
@@ -35,6 +36,15 @@ pub fn gather(custom: &BTreeMap<String, Value>) -> Result<Value> {
         },
         "memory": {
             "total_bytes": system.total_memory(),
+        },
+        // Virtual machines and missing rights leave some of these out.
+        "hardware": {
+            "vendor": Product::vendor_name().ok(),
+            "product": Product::name().ok(),
+            "serial_number": Product::serial_number().ok(),
+            "uuid": Product::uuid().ok(),
+            "board_vendor": board.as_ref().and_then(Motherboard::vendor_name),
+            "board_name": board.as_ref().and_then(Motherboard::name),
         },
         "agent": {
             "version": build.version,

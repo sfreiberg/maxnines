@@ -58,8 +58,25 @@
 
     <label>Processes to watch
       <textarea name="process_names" rows="3" spellcheck="false">{{ rule.process_names }}</textarea>
-      <small>One name per line, such as <code>nginx</code>. The processes collector has to be on. Only these are reported, and a name with nothing running reports 0.</small>
+      <small>One name per line, such as <code>nginx</code>. Only these are reported, and a name with nothing running reports 0.</small>
     </label>
+
+    <label>Services to watch
+      <textarea name="service_names" rows="3" spellcheck="false">{{ rule.service_names }}</textarea>
+      <small>One per line, as the system names them, such as <code>nginx.service</code> on Linux.</small>
+    </label>
+
+    <label>Files and folders to watch
+      <textarea name="file_paths" rows="3" spellcheck="false">{{ rule.file_paths }}</textarea>
+      <small>One path per line. This reports whether each exists, its size and how long since it changed. Contents are never read.</small>
+    </label>
+
+    <label>Checks to run
+      <textarea name="checks" rows="4" spellcheck="false" placeholder="tcp db db1:5432">{{ rule.checks }}</textarea>
+      <small>One per line, as a kind, a name and a target: <code>tcp db db1:5432</code>, <code>http site https://example.com/</code>, <code>tls site example.com:443</code>, <code>dns resolver example.com</code> or <code>ping gateway 10.0.0.1</code>.</small>
+    </label>
+
+    <p class="hint">Filling in any of these turns its collector on, unless it's set to Off above.</p>
   </fieldset>
 
   <div class="actions">

@@ -17,7 +17,15 @@ tokio = { version = "1.54.1", features = ["rt", "macros", "time", "signal", "syn
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
 webpki-roots = "0.26"
+x509-parser = { version = "0.18", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
