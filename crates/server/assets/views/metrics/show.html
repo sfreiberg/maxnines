@@ -15,6 +15,10 @@
 </nav>
 <p class="hint">Times are UTC. This page updates every minute.</p>
 
+{% if checks %}
+{% include "metrics/_checks.html" %}
+{% endif %}
+
 <div class="charts">
   {% for chart in charts %}
   <section class="chart-card">

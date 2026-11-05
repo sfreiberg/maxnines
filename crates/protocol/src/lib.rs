@@ -33,6 +33,11 @@ const MAX_SETTING_LEN: usize = 255;
 /// Checks each use a thread and reach out over the network, so fewer of them.
 const MAX_CHECKS: usize = 32;
 
+/// A check runs inside a sampling round, so it can't take forever.
+const MAX_CHECK_TIMEOUT_SECS: u64 = 60;
+
+const MAX_PING_COUNT: u32 = 20;
+
 /// A check's name is a series name, which has to fit in chart labels.
 const MAX_CHECK_NAME_LEN: usize = 64;
 
@@ -123,6 +128,31 @@ pub struct Check {
     pub kind: CheckKind,
     /// `host:port` for tcp and tls, a URL for http, and a host for dns and ping.
     pub target: String,
+    /// How long it gets, up to a minute. A slower answer counts as down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// http: the method to use. Defaults to GET.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// http: what to send, for methods like POST.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// http: a regular expression the page has to match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
+    /// http and tls: measure a site whose certificate can't be verified, such as
+    /// one from a private authority, without counting that as down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insecure: Option<bool>,
+    /// dns: ask this server directly, instead of the system's resolver.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    /// dns: the record type to ask for, with `server`. Defaults to A.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<String>,
+    /// ping: how many packets to send. Defaults to 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,7 +204,23 @@ fn has_port(target: &str) -> bool {
 }
 
 impl Check {
-    fn validate(&self) -> Result<()> {
+    pub fn new(name: &str, kind: CheckKind, target: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            kind,
+            target: target.to_string(),
+            timeout_secs: None,
+            method: None,
+            body: None,
+            regex: None,
+            insecure: None,
+            server: None,
+            record: None,
+            count: None,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
         let name = &self.name;
         ensure!(!name.trim().is_empty(), "a check needs a name");
         ensure!(
@@ -203,6 +249,80 @@ impl Check {
                 is_plain_name(target, ":"),
                 "check {name:?} needs a host name as its target"
             ),
+        }
+        self.validate_options()
+    }
+
+    fn validate_options(&self) -> Result<()> {
+        let name = &self.name;
+        let only_for = |set: bool, option: &str, kinds: &[CheckKind]| {
+            ensure!(
+                !set || kinds.contains(&self.kind),
+                "check {name:?} can't use {option}"
+            );
+            Ok(())
+        };
+        only_for(self.method.is_some(), "method", &[CheckKind::Http])?;
+        only_for(self.body.is_some(), "body", &[CheckKind::Http])?;
+        only_for(self.regex.is_some(), "regex", &[CheckKind::Http])?;
+        only_for(
+            self.insecure.is_some(),
+            "insecure",
+            &[CheckKind::Http, CheckKind::Tls],
+        )?;
+        only_for(self.server.is_some(), "server", &[CheckKind::Dns])?;
+        only_for(self.record.is_some(), "record", &[CheckKind::Dns])?;
+        only_for(self.count.is_some(), "count", &[CheckKind::Ping])?;
+
+        if let Some(seconds) = self.timeout_secs {
+            ensure!(
+                (1..=MAX_CHECK_TIMEOUT_SECS).contains(&seconds),
+                "check {name:?} needs a timeout from 1 to {MAX_CHECK_TIMEOUT_SECS} seconds"
+            );
+        }
+        if let Some(method) = &self.method {
+            ensure!(
+                !method.is_empty()
+                    && method.len() <= 16
+                    && method.chars().all(|c| c.is_ascii_uppercase()),
+                "check {name:?} has an invalid method"
+            );
+        }
+        for (option, text) in [("body", &self.body), ("regex", &self.regex)] {
+            if let Some(text) = text {
+                ensure!(
+                    text.len() <= MAX_SETTING_LEN,
+                    "check {name:?} has too long a {option}"
+                );
+            }
+        }
+        if let Some(pattern) = &self.regex {
+            regex_lite::Regex::new(pattern)
+                .map_err(|_| anyhow::anyhow!("check {name:?} has an invalid regex"))?;
+        }
+        if let Some(server) = &self.server {
+            ensure!(
+                has_port(server) || is_plain_name(server, ":"),
+                "check {name:?} has an invalid server"
+            );
+        }
+        if let Some(record) = &self.record {
+            ensure!(
+                self.server.is_some(),
+                "check {name:?} needs a server to ask for a record type"
+            );
+            ensure!(
+                !record.is_empty()
+                    && record.len() <= 10
+                    && record.chars().all(|c| c.is_ascii_alphanumeric()),
+                "check {name:?} has an invalid record type"
+            );
+        }
+        if let Some(count) = self.count {
+            ensure!(
+                (1..=MAX_PING_COUNT).contains(&count),
+                "check {name:?} needs a count from 1 to {MAX_PING_COUNT}"
+            );
         }
         Ok(())
     }
@@ -479,6 +599,68 @@ mod tests {
 
         let many: Vec<Value> = (0..=MAX_CHECKS).map(|i| one(&i.to_string())).collect();
         assert!(checks(json!(many)).validate().is_err());
+    }
+
+    fn option(kind: &str, target: &str, options: Value) -> AgentConfig {
+        let mut check = json!({ "name": "a", "kind": kind, "target": target });
+        check
+            .as_object_mut()
+            .unwrap()
+            .extend(options.as_object().unwrap().clone());
+        with("checks", json!({ "checks": [check] }))
+    }
+
+    #[test]
+    fn check_options_are_checked() {
+        let url = "https://example.com/";
+        for (kind, target, good) in [
+            (
+                "http",
+                url,
+                json!({ "method": "POST", "body": "{}", "timeout_secs": 30 }),
+            ),
+            (
+                "http",
+                url,
+                json!({ "regex": "^Welcome", "insecure": true }),
+            ),
+            ("tls", "example.com:443", json!({ "insecure": true })),
+            (
+                "dns",
+                "example.com",
+                json!({ "server": "8.8.8.8", "record": "MX" }),
+            ),
+            ("dns", "example.com", json!({ "server": "10.0.0.1:5353" })),
+            ("ping", "example.com", json!({ "count": 5 })),
+        ] {
+            option(kind, target, good).validate().unwrap();
+        }
+        for (kind, target, bad) in [
+            ("http", url, json!({ "method": "post" })),
+            ("http", url, json!({ "method": "GET /" })),
+            ("http", url, json!({ "regex": "(" })),
+            ("http", url, json!({ "regex": "x".repeat(256) })),
+            ("http", url, json!({ "body": "x".repeat(256) })),
+            ("http", url, json!({ "timeout_secs": 0 })),
+            ("http", url, json!({ "timeout_secs": 61 })),
+            ("http", url, json!({ "count": 2 })),
+            ("tcp", "a:1", json!({ "regex": "x" })),
+            ("tcp", "a:1", json!({ "insecure": true })),
+            ("dns", "example.com", json!({ "record": "A" })),
+            ("dns", "example.com", json!({ "server": "-x" })),
+            (
+                "dns",
+                "example.com",
+                json!({ "server": "8.8.8.8", "record": "A;B" }),
+            ),
+            ("ping", "example.com", json!({ "count": 0 })),
+            ("ping", "example.com", json!({ "count": 21 })),
+        ] {
+            assert!(
+                option(kind, target, bad.clone()).validate().is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

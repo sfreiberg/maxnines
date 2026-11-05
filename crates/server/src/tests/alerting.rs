@@ -888,6 +888,59 @@ async fn a_metric_for_alerts_only_gets_no_chart_but_can_still_be_read() {
 }
 
 #[tokio::test]
+async fn an_agents_page_shows_how_its_checks_last_went() {
+    let server = start_with_metrics().await;
+    let agent = identity();
+    let mut client = server.connect_approved(&agent, "web-1").await;
+    let time = now_ms() - 1000;
+    let sample = AgentMessage::Sample(Sample {
+        timestamp_ms: time as u64,
+        metrics: BTreeMap::from([(
+            "checks".to_string(),
+            json!([
+                {
+                    "name": "site", "kind": "http", "up": 1, "response_ms": 120.5,
+                    "first_byte_ms": 80.25, "status": 200, "protocol": "HTTP/2.0",
+                    "tls_version": "TLS 1.3", "cert_days_left": 42,
+                },
+                {
+                    "name": "<script>alert(1)</script>", "kind": "tcp", "up": 0,
+                    "error": "<b>couldn't connect</b>",
+                },
+                { "kind": "tcp", "up": "not a name, so this row is skipped" },
+                7,
+            ]),
+        )]),
+    });
+    send(&mut client, &sample).await;
+
+    let metric = crate::metrics::find("check.up").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while server
+        .state
+        .metrics
+        .newest(metric, now_ms())
+        .await
+        .unwrap()
+        .is_empty()
+    {
+        assert!(Instant::now() < deadline, "the sample never arrived");
+        sleep(Duration::from_millis(10)).await;
+    }
+
+    let page = Browser::default()
+        .get(&server, &format!("/agents/{}/metrics", agent.id()))
+        .await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("Latest checks"));
+    for text in ["120.5 ms", "80.2 ms", "HTTP/2.0", "TLS 1.3", ">42<", "Down"] {
+        assert!(page.body.contains(text), "{text}: {}", page.body);
+    }
+    assert!(!page.body.contains("<script>alert"), "{}", page.body);
+    assert!(!page.body.contains("<b>couldn"), "{}", page.body);
+}
+
+#[tokio::test]
 async fn charts_keep_the_catalog_order_however_their_queries_finish() {
     let server = start_with_metrics().await;
     let (agent, _client) = report_samples(&server, "/").await;

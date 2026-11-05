@@ -990,7 +990,12 @@ mod tests {
         let sensors = json!([{ "label": "CPU die", "celsius": 54.5 }]);
         write_metric(&mut store, "a", 20_000, "sensors", sensors);
         let checks = json!([
-            { "name": "site", "up": 1, "response_ms": 12.5, "cert_days_left": 30 },
+            {
+                "name": "site", "up": 1, "response_ms": 12.5, "cert_days_left": 30,
+                "first_byte_ms": 8.0, "dns_ms": 1.0, "connect_ms": 2.0, "tls_ms": 3.0,
+                "download_ms": 4.0, "content_length": 512, "status": 200,
+                "records": 2, "packet_loss_percent": 20.0,
+            },
             { "name": "db", "up": 0, "error": "couldn't connect" },
         ]);
         write_metric(&mut store, "a", 20_000, "checks", checks);
@@ -1026,6 +1031,15 @@ mod tests {
             "a failed check has no time"
         );
         assert_eq!(value("check.cert_days", "site"), Some(30.0));
+        assert_eq!(value("check.first_byte", "site"), Some(8.0));
+        assert_eq!(value("check.dns", "site"), Some(1.0));
+        assert_eq!(value("check.connect", "site"), Some(2.0));
+        assert_eq!(value("check.tls", "site"), Some(3.0));
+        assert_eq!(value("check.download", "site"), Some(4.0));
+        assert_eq!(value("check.size", "site"), Some(512.0));
+        assert_eq!(value("check.status", "site"), Some(200.0));
+        assert_eq!(value("check.records", "site"), Some(2.0));
+        assert_eq!(value("check.packet_loss", "site"), Some(20.0));
         assert_eq!(value("service.running", "nginx"), Some(1.0));
         assert_eq!(value("file.exists", "/b"), Some(1.0));
         assert_eq!(value("file.exists", "/gone"), Some(0.0));

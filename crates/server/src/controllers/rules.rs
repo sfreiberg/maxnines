@@ -192,33 +192,127 @@ impl RuleForm {
     }
 }
 
-/// Checks are typed one per line, as `kind name target`.
+/// Splits a line on spaces, except inside double quotes, where `\"` and `\\`
+/// stand for themselves.
+fn split_words(line: &str) -> Result<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let (mut in_word, mut quoted) = (false, false);
+    let mut characters = line.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '"' => {
+                quoted = !quoted;
+                in_word = true;
+            }
+            '\\' if quoted => word.extend(characters.next()),
+            ' ' | '\t' if !quoted => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            other => {
+                word.push(other);
+                in_word = true;
+            }
+        }
+    }
+    if quoted {
+        bail!("{line:?} has an opening quote with no closing quote");
+    }
+    if in_word {
+        words.push(word);
+    }
+    Ok(words)
+}
+
+fn quote(text: &str) -> String {
+    if text.is_empty() || text.contains([' ', '\t', '"', '\\']) {
+        let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{escaped}\"")
+    } else {
+        text.to_string()
+    }
+}
+
+fn set_option(check: &mut Check, option: &str, line: &str) -> Result<()> {
+    if option == "insecure" {
+        check.insecure = Some(true);
+        return Ok(());
+    }
+    let Some((name, value)) = option.split_once('=') else {
+        bail!("{option:?} isn't an option, in {line:?}");
+    };
+    let number = || {
+        value
+            .parse()
+            .with_context(|| format!("{name} has to be a number, in {line:?}"))
+    };
+    match name {
+        "timeout" => check.timeout_secs = Some(number()?),
+        "count" => check.count = Some(u32::try_from(number()?)?),
+        "method" => check.method = Some(value.to_string()),
+        "body" => check.body = Some(value.to_string()),
+        "regex" => check.regex = Some(value.to_string()),
+        "server" => check.server = Some(value.to_string()),
+        "record" => check.record = Some(value.to_string()),
+        other => bail!("{other:?} isn't an option, in {line:?}"),
+    }
+    Ok(())
+}
+
+/// Checks are typed one per line, as `kind name target` and then any options,
+/// such as `timeout=5` or `regex="Welcome back"`.
 fn parse_checks(text: &str) -> Result<Vec<Check>> {
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(|line| {
-            let words: Vec<&str> = line.split_whitespace().collect();
-            let [kind, name, target] = words[..] else {
+            let words = split_words(line)?;
+            let [kind, name, target, options @ ..] = &words[..] else {
                 bail!("{line:?} should be a kind, a name and a target, such as: tcp db db1:5432");
             };
             let kind = CheckKind::parse(kind)
                 .with_context(|| format!("{kind:?} isn't a kind of check, in {line:?}"))?;
-            Ok(Check {
-                name: name.to_string(),
-                kind,
-                target: target.to_string(),
-            })
+            let mut check = Check::new(name, kind, target);
+            for option in options {
+                set_option(&mut check, option, line)?;
+            }
+            Ok(check)
         })
         .collect()
 }
 
+fn check_line(check: &Check) -> String {
+    let mut words = vec![
+        check.kind.as_str().to_string(),
+        quote(&check.name),
+        quote(&check.target),
+    ];
+    let options = [
+        ("timeout", check.timeout_secs.map(|value| value.to_string())),
+        ("method", check.method.clone()),
+        ("body", check.body.clone()),
+        ("regex", check.regex.clone()),
+        ("server", check.server.clone()),
+        ("record", check.record.clone()),
+        ("count", check.count.map(|value| value.to_string())),
+    ];
+    for (name, value) in options {
+        if let Some(value) = value {
+            words.push(format!("{name}={}", quote(&value)));
+        }
+    }
+    if check.insecure == Some(true) {
+        words.push("insecure".to_string());
+    }
+    words.join(" ")
+}
+
 fn check_lines(value: &Value) -> String {
     let checks: Vec<Check> = serde_json::from_value(value.clone()).unwrap_or_default();
-    let lines: Vec<String> = checks
-        .iter()
-        .map(|check| format!("{} {} {}", check.kind.as_str(), check.name, check.target))
-        .collect();
+    let lines: Vec<String> = checks.iter().map(check_line).collect();
     lines.join("\n")
 }
 
@@ -511,10 +605,31 @@ mod tests {
     }
 
     #[test]
+    fn check_options_can_follow_the_target() {
+        let line = r#"http site https://example.com/ timeout=5 regex="Welcome \"back\"" insecure"#;
+        let checks = parse_checks(line).unwrap();
+        assert_eq!(checks[0].timeout_secs, Some(5));
+        assert_eq!(checks[0].regex.as_deref(), Some(r#"Welcome "back""#));
+        assert_eq!(checks[0].insecure, Some(true));
+    }
+
+    #[test]
+    fn a_badly_typed_option_is_explained() {
+        for (line, expected) in [
+            ("tcp a b:1 nonsense", "isn't an option"),
+            ("tcp a b:1 color=red", "isn't an option"),
+            ("tcp a b:1 timeout=soon", "has to be a number"),
+            (r#"http a http://b regex="open"#, "no closing quote"),
+        ] {
+            let error = format!("{:#}", parse_checks(line).unwrap_err());
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
     fn a_badly_typed_check_is_explained() {
         for (line, expected) in [
             ("tcp db", "should be a kind"),
-            ("tcp db a:1 extra", "should be a kind"),
             ("gopher db a:1", "isn't a kind of check"),
         ] {
             let error = format!("{:#}", parse_checks(line).unwrap_err());
@@ -536,7 +651,12 @@ mod tests {
                 "files": { "enabled": true, "paths": ["/var/backup/latest.tar"] },
                 "checks": { "enabled": true, "checks": [
                     { "name": "db", "kind": "tcp", "target": "db1:5432" },
-                    { "name": "site", "kind": "http", "target": "https://example.com/" },
+                    { "name": "site", "kind": "http", "target": "https://example.com/",
+                      "timeout_secs": 5, "method": "POST", "body": "a b",
+                      "regex": "Hello \\\"you\\\"\\d", "insecure": true },
+                    { "name": "ns", "kind": "dns", "target": "example.com",
+                      "server": "8.8.8.8", "record": "MX" },
+                    { "name": "gw", "kind": "ping", "target": "10.0.0.1", "count": 3 },
                 ] },
             },
         }));

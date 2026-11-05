@@ -1,31 +1,70 @@
-//! Tries reaching things, to see if they're up. Errors only ever say what kind
-//! of failure it was, as a URL can hold a password.
+//! Tries reaching things, to see if they're up and how quickly. Each stage of a
+//! web request is timed separately, so a slow site can be told apart from slow
+//! DNS, and whatever was learned before a failure is still reported.
+//!
+//! Errors only ever say what kind of failure it was, as a URL can hold a password.
 
-use std::io::Write;
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::io::Read;
+use std::net::SocketAddr;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use flate2::read::GzDecoder;
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_proto::rr::{Name, RecordType};
+use http_body_util::{BodyExt, Full};
+use hyper::body::{Bytes, Incoming};
+use hyper::client::conn::{http1, http2};
+use hyper::header::{ACCEPT_ENCODING, CONTENT_ENCODING, HOST, USER_AGENT};
+use hyper::{Method, Request, Response, Uri};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use maxnines_protocol::{Check, CheckKind};
-use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, ClientConnection, RootCertStore, Stream};
+use regex_lite::Regex;
+use rustls::client::WebPkiServerVerifier;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::server::ParsedCertificate;
+use rustls::{
+    CertificateError, ClientConfig, DigitallySignedStruct, Error as TlsError, ProtocolVersion,
+    RootCertStore, SignatureScheme,
+};
+use serde::Serialize;
 use serde_json::{Value, json};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpStream, UdpSocket, lookup_host};
+use tokio::time::timeout;
+use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
 use x509_parser::parse_x509_certificate;
 
 use crate::background::{Background, Prober};
 use crate::collector::Collector;
 
-/// How long one check gets. A slower answer counts as down.
-const TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a check gets unless it says otherwise. A slower answer counts as down.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Who to say is asking.
-const USER_AGENT: &str = concat!("MaxNines-Agent/", env!("CARGO_PKG_VERSION"));
+/// The longest a check can ask for, plus a moment to report it.
+const LONGEST_ROUND: Duration = Duration::from_secs(61);
 
-const REDIRECTS_TO_FOLLOW: u32 = 5;
+/// A name can have several addresses, and one that's gone shouldn't use up the
+/// whole time limit before the others are tried.
+const CONNECT_ATTEMPT: Duration = Duration::from_secs(5);
+
+/// How much of a page is read. It's only measured and searched, never kept.
+const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// What's put in the logs of sites being checked.
+const AGENT_NAME: &str = concat!("MaxNines-Agent/", env!("CARGO_PKG_VERSION"));
 
 const SECS_PER_DAY: i64 = 86_400;
+
+const DNS_PORT: u16 = 53;
+
+/// The largest answer a plain UDP lookup returns.
+const DNS_BUFFER_BYTES: usize = 4096;
 
 pub struct CheckCollector {
     background: Background,
@@ -33,10 +72,16 @@ pub struct CheckCollector {
 
 impl CheckCollector {
     pub fn new(checks: Vec<Check>, interval: Duration) -> Self {
-        let prober = Prober::new(checks, TIMEOUT + Duration::from_secs(1));
+        let longest = checks
+            .iter()
+            .map(limit)
+            .max()
+            .unwrap_or(DEFAULT_TIMEOUT)
+            .min(LONGEST_ROUND);
+        let prober = Prober::new(checks, longest + Duration::from_secs(1));
         let background = Background::start(interval, move || {
-            let results = prober.round(run, |check| report(check, None, Err(timed_out())));
-            Value::Array(results)
+            let failed = |check: &Check| report(check, Findings::default(), Err(timed_out()));
+            Value::Array(prober.round(run, failed))
         });
         Self { background }
     }
@@ -52,150 +97,224 @@ impl Collector for CheckCollector {
     }
 }
 
+fn limit(check: &Check) -> Duration {
+    check
+        .timeout_secs
+        .map_or(DEFAULT_TIMEOUT, Duration::from_secs)
+}
+
 fn timed_out() -> anyhow::Error {
     anyhow!("timed out")
 }
 
-/// What a successful check found out, beyond being up.
-#[derive(Default)]
+/// What a check found out. Stage times are how long each stage took on its own,
+/// so together they add up to about `response_ms`.
+#[derive(Debug, Default, Serialize)]
 struct Findings {
+    response_ms: Option<f64>,
+    dns_ms: Option<f64>,
+    connect_ms: Option<f64>,
+    tls_ms: Option<f64>,
+    first_byte_ms: Option<f64>,
+    download_ms: Option<f64>,
     status: Option<u16>,
+    protocol: Option<String>,
+    content_length: Option<usize>,
+    compressed: Option<bool>,
+    regex_matched: Option<bool>,
+    tls_version: Option<String>,
+    cert_valid: Option<bool>,
+    hostname_valid: Option<bool>,
+    cert_not_before: Option<i64>,
+    cert_not_after: Option<i64>,
     cert_days_left: Option<i64>,
+    records: Option<usize>,
+    packet_loss_percent: Option<f64>,
+    rtt_min_ms: Option<f64>,
+    rtt_max_ms: Option<f64>,
+    rtt_stddev_ms: Option<f64>,
 }
 
-fn report(check: &Check, elapsed: Option<Duration>, result: Result<Findings>) -> Value {
-    let mut output = json!({
-        "name": check.name,
-        "kind": check.kind.as_str(),
-        "up": u8::from(result.is_ok()),
-    });
-    match result {
-        Ok(findings) => {
-            if let Some(elapsed) = elapsed {
-                output["response_ms"] = json!(elapsed.as_secs_f64() * 1000.0);
-            }
-            if let Some(status) = findings.status {
-                output["status"] = json!(status);
-            }
-            if let Some(days) = findings.cert_days_left {
-                output["cert_days_left"] = json!(days);
-            }
+fn elapsed_ms(since: Instant) -> f64 {
+    since.elapsed().as_secs_f64() * 1000.0
+}
+
+fn report(check: &Check, findings: Findings, result: Result<()>) -> Value {
+    let mut output = serde_json::to_value(&findings).unwrap_or_else(|_| json!({}));
+    if let Some(fields) = output.as_object_mut() {
+        fields.retain(|_, value| !value.is_null());
+        fields.insert("name".to_string(), json!(check.name));
+        fields.insert("kind".to_string(), json!(check.kind.as_str()));
+        fields.insert("up".to_string(), json!(u8::from(result.is_ok())));
+        if let Err(error) = result {
+            fields.insert("error".to_string(), json!(format!("{error:#}")));
         }
-        Err(error) => output["error"] = json!(format!("{error:#}")),
     }
     output
 }
 
 fn run(check: &Check) -> Value {
     let started = Instant::now();
+    let mut findings = Findings::default();
     let result = match check.kind {
-        CheckKind::Tcp => check_tcp(&check.target),
-        CheckKind::Http => check_http(&check.target),
-        CheckKind::Tls => check_tls(&check.target),
-        CheckKind::Dns => check_dns(&check.target),
-        CheckKind::Ping => check_ping(&check.target),
+        CheckKind::Ping => check_ping(check, &mut findings),
+        _ => run_async(check, &mut findings),
     };
-    report(check, Some(started.elapsed()), result)
+    if result.is_ok() {
+        findings.response_ms = Some(elapsed_ms(started));
+    }
+    report(check, findings, result)
 }
 
-fn resolve(target: &str) -> Result<Vec<SocketAddr>> {
-    let addresses: Vec<SocketAddr> = target
-        .to_socket_addrs()
+/// Each check runs on its own small runtime, on its own thread. Being async is
+/// what lets a time limit cut one off cleanly, partway through.
+fn run_async(check: &Check, findings: &mut Findings) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("starting the check")?;
+
+    let result = runtime.block_on(async {
+        let work = async {
+            match check.kind {
+                CheckKind::Tcp => check_tcp(check, findings).await,
+                CheckKind::Http => check_http(check, findings).await,
+                CheckKind::Tls => check_tls(check, findings).await,
+                CheckKind::Dns => check_dns(check, findings).await,
+                CheckKind::Ping => unreachable!("ping doesn't run here"),
+            }
+        };
+        timeout(limit(check), work)
+            .await
+            .unwrap_or_else(|_| Err(timed_out()))
+    });
+
+    // A lookup stuck in the system's resolver mustn't hold this thread.
+    runtime.shutdown_background();
+    result
+}
+
+fn host_and_port(target: &str) -> Result<(String, u16)> {
+    let (host, port) = target.rsplit_once(':').context("no port")?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    Ok((host.to_string(), port.parse().context("invalid port")?))
+}
+
+async fn resolve(host: &str, port: u16, findings: &mut Findings) -> Result<Vec<SocketAddr>> {
+    let started = Instant::now();
+    let addresses: Vec<SocketAddr> = lookup_host((host, port))
+        .await
         .map_err(|_| anyhow!("the name wasn't found"))?
         .collect();
+    findings.dns_ms = Some(elapsed_ms(started));
     ensure!(!addresses.is_empty(), "the name wasn't found");
     Ok(addresses)
 }
 
-/// Tries each address, as a name can have several and only some may answer.
-fn connect(target: &str) -> Result<TcpStream> {
-    for address in resolve(target)? {
-        if let Ok(stream) = TcpStream::connect_timeout(&address, TIMEOUT) {
+/// Tries each address, as only some of a name's may answer.
+async fn connect(addresses: &[SocketAddr], findings: &mut Findings) -> Result<TcpStream> {
+    let started = Instant::now();
+    for address in addresses {
+        if let Ok(Ok(stream)) = timeout(CONNECT_ATTEMPT, TcpStream::connect(address)).await {
+            findings.connect_ms = Some(elapsed_ms(started));
             return Ok(stream);
         }
     }
     bail!("couldn't connect")
 }
 
-fn check_tcp(target: &str) -> Result<Findings> {
-    connect(target)?;
-    Ok(Findings::default())
+async fn check_tcp(check: &Check, findings: &mut Findings) -> Result<()> {
+    let (host, port) = host_and_port(&check.target)?;
+    let addresses = resolve(&host, port, findings).await?;
+    connect(&addresses, findings).await?;
+    Ok(())
 }
 
-fn check_dns(target: &str) -> Result<Findings> {
-    resolve(&format!("{target}:0"))?;
-    Ok(Findings::default())
+/// Lets a handshake finish whatever the certificate's like, so that a site with
+/// a bad one can still be measured, and remembers what the real check said.
+#[derive(Debug)]
+struct RecordingVerifier {
+    real: Arc<WebPkiServerVerifier>,
+    outcome: Arc<Mutex<Option<TlsError>>>,
 }
 
-/// Anything below 400 is up. Redirects are followed, as sites commonly send
-/// plain HTTP on to HTTPS.
-fn check_http(url: &str) -> Result<Findings> {
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(TIMEOUT))
-        .max_redirects(REDIRECTS_TO_FOLLOW)
-        .http_status_as_error(false)
-        .user_agent(USER_AGENT)
-        .build()
-        .new_agent();
+impl ServerCertVerifier for RecordingVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, TlsError> {
+        let result = self.real.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        );
+        *self.outcome.lock().unwrap_or_else(PoisonError::into_inner) = result.err();
+        Ok(ServerCertVerified::assertion())
+    }
 
-    match agent.get(url).call() {
-        Ok(response) => {
-            let status = response.status().as_u16();
-            ensure!(status < 400, "the server returned status {status}");
-            Ok(Findings {
-                status: Some(status),
-                ..Findings::default()
-            })
-        }
-        Err(ureq::Error::Timeout(_)) => Err(timed_out()),
-        Err(ureq::Error::HostNotFound) => bail!("the name wasn't found"),
-        Err(ureq::Error::ConnectionFailed | ureq::Error::Io(_)) => bail!("couldn't connect"),
-        Err(ureq::Error::Tls(_) | ureq::Error::Rustls(_)) => {
-            bail!("the certificate wasn't accepted")
-        }
-        Err(_) => bail!("the request failed"),
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        self.real.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        self.real.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.real.supported_verify_schemes()
     }
 }
 
-fn tls_config() -> Result<Arc<ClientConfig>> {
-    let roots = RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    Ok(Arc::new(config))
+fn version_name(version: Option<ProtocolVersion>) -> Option<String> {
+    match version? {
+        ProtocolVersion::TLSv1_2 => Some("TLS 1.2".to_string()),
+        ProtocolVersion::TLSv1_3 => Some("TLS 1.3".to_string()),
+        other => Some(format!("{other:?}")),
+    }
 }
 
-/// Connects and reads how long the certificate has left. One that's expired or
-/// untrusted fails the handshake, so it counts as down.
-fn check_tls(target: &str) -> Result<Findings> {
-    let (host, _) = target.rsplit_once(':').context("no port")?;
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    let name = ServerName::try_from(host.to_string()).map_err(|_| anyhow!("invalid host name"))?;
+fn describe_certificate_problem(error: &TlsError) -> &'static str {
+    match error {
+        TlsError::InvalidCertificate(
+            CertificateError::Expired | CertificateError::ExpiredContext { .. },
+        ) => "the certificate has expired",
+        TlsError::InvalidCertificate(
+            CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. },
+        ) => "the certificate is for a different name",
+        _ => "the certificate isn't trusted",
+    }
+}
 
-    let mut socket = connect(target)?;
-    socket.set_read_timeout(Some(TIMEOUT))?;
-    socket.set_write_timeout(Some(TIMEOUT))?;
-    let mut connection = ClientConnection::new(tls_config()?, name)?;
-    let mut stream = Stream::new(&mut connection, &mut socket);
-    stream
-        .flush()
-        .map_err(|_| anyhow!("the certificate wasn't accepted"))?;
-
-    let certificate = connection
-        .peer_certificates()
-        .and_then(|chain| chain.first())
-        .context("the server sent no certificate")?;
-    let (_, parsed) =
-        parse_x509_certificate(certificate).map_err(|_| anyhow!("unreadable certificate"))?;
-    let expires = parsed.validity().not_after.timestamp();
-    Ok(Findings {
-        cert_days_left: Some(days_left(expires, now_secs())),
-        ..Findings::default()
-    })
+/// Reads the dates across the whole chain, as any certificate in it expiring
+/// breaks the site. So the start is the latest and the end is the earliest.
+fn read_dates(chain: &[CertificateDer<'_>], now_secs: i64, findings: &mut Findings) {
+    for certificate in chain {
+        if let Ok((_, parsed)) = parse_x509_certificate(certificate) {
+            let (start, end) = (
+                parsed.validity().not_before.timestamp(),
+                parsed.validity().not_after.timestamp(),
+            );
+            findings.cert_not_before = findings.cert_not_before.max(Some(start));
+            findings.cert_not_after = Some(findings.cert_not_after.map_or(end, |e| e.min(end)));
+        }
+    }
+    findings.cert_days_left = findings.cert_not_after.map(|end| days_left(end, now_secs));
 }
 
 fn now_secs() -> i64 {
@@ -208,15 +327,331 @@ fn days_left(expires_secs: i64, now_secs: i64) -> i64 {
     (expires_secs - now_secs).div_euclid(SECS_PER_DAY)
 }
 
+fn tls_config(verifier: Arc<RecordingVerifier>) -> Result<ClientConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    Ok(config)
+}
+
+fn trusted_roots() -> RootCertStore {
+    RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    }
+}
+
+/// A connection, and what's wrong with its certificate if anything is.
+struct Secured {
+    stream: TlsStream<TcpStream>,
+    problem: Option<&'static str>,
+}
+
+async fn secure(
+    host: &str,
+    socket: TcpStream,
+    alpn: &[&[u8]],
+    findings: &mut Findings,
+) -> Result<Secured> {
+    let name = ServerName::try_from(host.to_string()).map_err(|_| anyhow!("invalid host name"))?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let real = WebPkiServerVerifier::builder_with_provider(Arc::new(trusted_roots()), provider)
+        .build()
+        .context("setting up TLS")?;
+    let outcome = Arc::new(Mutex::new(None));
+    let verifier = Arc::new(RecordingVerifier {
+        real,
+        outcome: outcome.clone(),
+    });
+    let mut config = tls_config(verifier)?;
+    config.alpn_protocols = alpn.iter().map(|protocol| protocol.to_vec()).collect();
+
+    let started = Instant::now();
+    let stream = TlsConnector::from(Arc::new(config))
+        .connect(name.clone(), socket)
+        .await
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::TimedOut => timed_out(),
+            _ => anyhow!("the TLS handshake failed"),
+        })?;
+    findings.tls_ms = Some(elapsed_ms(started));
+
+    let (_, connection) = stream.get_ref();
+    findings.tls_version = version_name(connection.protocol_version());
+    let chain = connection.peer_certificates().unwrap_or_default();
+    read_dates(chain, now_secs(), findings);
+    findings.hostname_valid = chain.first().and_then(|certificate| {
+        let parsed = ParsedCertificate::try_from(certificate).ok()?;
+        Some(rustls::client::verify_server_name(&parsed, &name).is_ok())
+    });
+
+    let error = outcome
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    findings.cert_valid = Some(error.is_none());
+    let problem = error.as_ref().map(describe_certificate_problem);
+    Ok(Secured { stream, problem })
+}
+
+/// Fails a check over its certificate, unless it's been told not to mind.
+fn certificate_verdict(check: &Check, problem: Option<&'static str>) -> Result<()> {
+    match problem {
+        Some(problem) if check.insecure != Some(true) => bail!(problem),
+        _ => Ok(()),
+    }
+}
+
+async fn check_tls(check: &Check, findings: &mut Findings) -> Result<()> {
+    let (host, port) = host_and_port(&check.target)?;
+    let addresses = resolve(&host, port, findings).await?;
+    let socket = connect(&addresses, findings).await?;
+    let secured = secure(&host, socket, &[], findings).await?;
+    certificate_verdict(check, secured.problem)
+}
+
+/// Sends the request and waits for the response to start.
+async fn exchange<S>(
+    stream: S,
+    use_http2: bool,
+    request: Request<Full<Bytes>>,
+) -> Result<Response<Incoming>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let io = TokioIo::new(stream);
+    let failed = |_| anyhow!("the request failed");
+    if use_http2 {
+        let (mut sender, connection) = http2::handshake(TokioExecutor::new(), io)
+            .await
+            .map_err(failed)?;
+        tokio::spawn(connection);
+        sender.send_request(request).await.map_err(failed)
+    } else {
+        let (mut sender, connection) = http1::handshake(io).await.map_err(failed)?;
+        tokio::spawn(connection);
+        sender.send_request(request).await.map_err(failed)
+    }
+}
+
+fn build_request(check: &Check, uri: &Uri, use_http2: bool) -> Result<Request<Full<Bytes>>> {
+    let method = check.method.as_deref().unwrap_or("GET");
+    let method = Method::from_str(method).map_err(|_| anyhow!("invalid method"))?;
+    let host = uri.host().context("no host")?;
+    let host_header = match uri.port_u16() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    let path = uri.path_and_query().map_or("/", |path| path.as_str());
+    let target = if use_http2 {
+        let scheme = uri.scheme_str().unwrap_or("https");
+        format!("{scheme}://{host_header}{path}")
+    } else {
+        path.to_string()
+    };
+
+    let body = check.body.clone().unwrap_or_default();
+    Request::builder()
+        .method(method)
+        .uri(target)
+        .header(HOST, host_header)
+        .header(USER_AGENT, AGENT_NAME)
+        .header(ACCEPT_ENCODING, "gzip")
+        .body(Full::new(Bytes::from(body)))
+        .map_err(|_| anyhow!("invalid request"))
+}
+
+async fn read_body(response: &mut Response<Incoming>) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    while bytes.len() < MAX_BODY_BYTES {
+        let Some(frame) = response.body_mut().frame().await else {
+            break;
+        };
+        let frame = frame.map_err(|_| anyhow!("the response was cut off"))?;
+        if let Some(data) = frame.data_ref() {
+            bytes.extend_from_slice(data);
+        }
+    }
+    Ok(bytes)
+}
+
+/// A small file can unpack to something enormous, so this stops at the limit.
+fn decompress(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut unpacked = Vec::new();
+    GzDecoder::new(bytes)
+        .take(MAX_BODY_BYTES as u64)
+        .read_to_end(&mut unpacked)
+        .ok()?;
+    Some(unpacked)
+}
+
+/// Redirects aren't followed, as a second request would muddle every timing. A
+/// redirect is an answer from a working site, so anything below 400 is up.
+async fn check_http(check: &Check, findings: &mut Findings) -> Result<()> {
+    let uri: Uri = check
+        .target
+        .parse()
+        .map_err(|_| anyhow!("the request failed"))?;
+    let secure_site = uri.scheme_str() == Some("https");
+    let host = uri.host().context("the request failed")?.to_string();
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    let port = uri.port_u16().unwrap_or(if secure_site { 443 } else { 80 });
+
+    let addresses = resolve(&host, port, findings).await?;
+    let socket = connect(&addresses, findings).await?;
+
+    let mut problem = None;
+    let (sent, mut response) = if secure_site {
+        let alpn: [&[u8]; 2] = [b"h2", b"http/1.1"];
+        let secured = secure(&host, socket, &alpn, findings).await?;
+        problem = secured.problem;
+        let (_, connection) = secured.stream.get_ref();
+        let use_http2 = connection.alpn_protocol() == Some(b"h2");
+        let request = build_request(check, &uri, use_http2)?;
+        let sent = Instant::now();
+        (sent, exchange(secured.stream, use_http2, request).await?)
+    } else {
+        let request = build_request(check, &uri, false)?;
+        let sent = Instant::now();
+        (sent, exchange(socket, false, request).await?)
+    };
+    findings.first_byte_ms = Some(elapsed_ms(sent));
+
+    let downloading = Instant::now();
+    findings.protocol = Some(format!("{:?}", response.version()));
+    let status = response.status().as_u16();
+    findings.status = Some(status);
+    let compressed = response
+        .headers()
+        .get(CONTENT_ENCODING)
+        .is_some_and(|encoding| encoding.as_bytes().eq_ignore_ascii_case(b"gzip"));
+    findings.compressed = Some(compressed);
+
+    let mut body = read_body(&mut response).await?;
+    findings.download_ms = Some(elapsed_ms(downloading));
+    if compressed {
+        body = decompress(&body).context("the page couldn't be unpacked")?;
+    }
+    findings.content_length = Some(body.len());
+
+    if let Some(pattern) = &check.regex {
+        let regex = Regex::new(pattern).map_err(|_| anyhow!("invalid regex"))?;
+        findings.regex_matched = Some(regex.is_match(&String::from_utf8_lossy(&body)));
+    }
+
+    certificate_verdict(check, problem)?;
+    ensure!(status < 400, "the server returned status {status}");
+    ensure!(
+        findings.regex_matched != Some(false),
+        "the page didn't match"
+    );
+    Ok(())
+}
+
+/// Without a server, this asks the system, as anything on the machine would.
+async fn check_dns(check: &Check, findings: &mut Findings) -> Result<()> {
+    let Some(server) = &check.server else {
+        let addresses = resolve(&check.target, 0, findings).await?;
+        findings.records = Some(addresses.len());
+        return Ok(());
+    };
+    let answers = query_server(check, server, findings).await?;
+    findings.records = Some(answers);
+    ensure!(answers > 0, "no records were returned");
+    Ok(())
+}
+
+fn dns_query(check: &Check, id: u16) -> Result<Vec<u8>> {
+    let record = check.record.as_deref().unwrap_or("A");
+    let record = RecordType::from_str(record).map_err(|_| anyhow!("unknown record type"))?;
+    let name = Name::from_utf8(format!("{}.", check.target.trim_end_matches('.')))
+        .map_err(|_| anyhow!("invalid name"))?;
+
+    let mut message = Message::new();
+    message
+        .set_id(id)
+        .set_message_type(MessageType::Query)
+        .set_op_code(OpCode::Query)
+        .set_recursion_desired(true)
+        .add_query(Query::query(name, record));
+    message.to_vec().map_err(|_| anyhow!("invalid query"))
+}
+
+fn dns_answers(bytes: &[u8], id: u16) -> Result<usize> {
+    let message = Message::from_vec(bytes).map_err(|_| anyhow!("unreadable DNS answer"))?;
+    ensure!(
+        message.id() == id,
+        "the DNS answer didn't match the question"
+    );
+    match message.response_code() {
+        ResponseCode::NoError => Ok(message.answers().len()),
+        ResponseCode::NXDomain => bail!("the name wasn't found"),
+        _ => bail!("the DNS server refused"),
+    }
+}
+
+async fn query_server(check: &Check, server: &str, findings: &mut Findings) -> Result<usize> {
+    let (host, port) = if server.contains('.') && server.contains(':') {
+        host_and_port(server)?
+    } else {
+        (server.to_string(), DNS_PORT)
+    };
+    let addresses = lookup_host((host.as_str(), port))
+        .await
+        .map_err(|_| anyhow!("the DNS server wasn't found"))?
+        .collect::<Vec<_>>();
+    let address = *addresses.first().context("the DNS server wasn't found")?;
+
+    let local: SocketAddr = if address.is_ipv4() {
+        ([0, 0, 0, 0], 0).into()
+    } else {
+        ([0_u16; 8], 0).into()
+    };
+    let socket = UdpSocket::bind(local)
+        .await
+        .map_err(|_| anyhow!("couldn't connect"))?;
+    socket
+        .connect(address)
+        .await
+        .map_err(|_| anyhow!("couldn't connect"))?;
+
+    // Not for secrecy: this only has to tell one answer from another.
+    let id = (now_nanos() & 0xffff) as u16;
+    let started = Instant::now();
+    socket
+        .send(&dns_query(check, id)?)
+        .await
+        .map_err(|_| anyhow!("couldn't connect"))?;
+    let mut buffer = vec![0; DNS_BUFFER_BYTES];
+    let size = socket
+        .recv(&mut buffer)
+        .await
+        .map_err(|_| anyhow!("couldn't connect"))?;
+    findings.dns_ms = Some(elapsed_ms(started));
+    dns_answers(&buffer[..size], id)
+}
+
+fn now_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |time| time.as_nanos())
+}
+
 /// Sending ICMP directly needs special rights, so this uses the system's own
 /// `ping`, which every platform ships with those rights. Their options differ.
-fn ping_arguments(os: &str, host: &str) -> Vec<String> {
-    let seconds = TIMEOUT.as_secs().to_string();
-    let millis = TIMEOUT.as_millis().to_string();
+fn ping_arguments(os: &str, host: &str, count: u32, limit: Duration) -> Vec<String> {
+    let count = count.to_string();
+    let seconds = limit.as_secs().to_string();
+    let millis = limit.as_millis().to_string();
     let options: Vec<&str> = match os {
-        "windows" => vec!["-n", "1", "-w", &millis],
-        "linux" => vec!["-c", "1", "-W", &seconds],
-        _ => vec!["-c", "1", "-t", &seconds],
+        "windows" => vec!["-n", &count, "-w", &millis],
+        "linux" => vec!["-c", &count, "-W", &seconds],
+        _ => vec!["-c", &count, "-t", &seconds],
     };
     options
         .into_iter()
@@ -225,50 +660,83 @@ fn ping_arguments(os: &str, host: &str) -> Vec<String> {
         .collect()
 }
 
-fn check_ping(host: &str) -> Result<Findings> {
-    let status = Command::new("ping")
-        .args(ping_arguments(std::env::consts::OS, host))
+/// Reads the summary Unix pings end with. Windows words its own by language, so
+/// there only the exit code is used.
+fn read_ping_summary(output: &str, findings: &mut Findings) {
+    for line in output.lines() {
+        if let Some(before) = line
+            .split("% packet loss")
+            .next()
+            .filter(|_| line.contains('%'))
+        {
+            let number = before.rsplit([' ', ',']).next().unwrap_or_default();
+            if let Ok(loss) = number.parse() {
+                findings.packet_loss_percent = Some(loss);
+            }
+        }
+        if let Some((names, values)) = line.split_once(" = ")
+            && names.contains("min/avg/max")
+        {
+            let numbers: Vec<f64> = values
+                .trim_end_matches(" ms")
+                .split('/')
+                .filter_map(|value| value.trim().parse().ok())
+                .collect();
+            if let [min, _, max, stddev] = numbers[..] {
+                findings.rtt_min_ms = Some(min);
+                findings.rtt_max_ms = Some(max);
+                findings.rtt_stddev_ms = Some(stddev);
+            }
+        }
+    }
+}
+
+fn check_ping(check: &Check, findings: &mut Findings) -> Result<()> {
+    let count = check.count.unwrap_or(1);
+    let arguments = ping_arguments(std::env::consts::OS, &check.target, count, limit(check));
+    let output = Command::new("ping")
+        .args(arguments)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .output()
         .map_err(|_| anyhow!("couldn't run ping"))?;
-    ensure!(status.success(), "no reply");
-    Ok(Findings::default())
+    read_ping_summary(&String::from_utf8_lossy(&output.stdout), findings);
+    ensure!(output.status.success(), "no reply");
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::io::Write;
+    use std::net::{TcpListener, UdpSocket as StdUdpSocket};
     use std::thread;
 
     use super::*;
 
     fn check(kind: CheckKind, target: &str) -> Check {
-        Check {
-            name: "a".to_string(),
-            kind,
-            target: target.to_string(),
-        }
+        Check::new("a", kind, target)
     }
 
-    /// Answers one request with `response`, then closes.
-    fn serve_once(response: &'static str) -> String {
+    /// Answers one request with `response`, and hands back what was asked.
+    fn serve_once(response: &'static [u8]) -> (String, thread::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap().to_string();
-        thread::spawn(move || {
+        let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0; 2048];
-            let _ = stream.read(&mut request);
-            stream.write_all(response.as_bytes()).unwrap();
+            let size = stream.read(&mut request).unwrap_or(0);
+            let _ = stream.write_all(response);
+            String::from_utf8_lossy(&request[..size]).to_string()
         });
-        address
+        (address, handle)
     }
 
     fn closed_port() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap().to_string()
+    }
+
+    fn http_check(address: &str) -> Check {
+        check(CheckKind::Http, &format!("http://{address}/health"))
     }
 
     #[test]
@@ -281,6 +749,8 @@ mod tests {
         assert_eq!(output["name"], "a");
         assert_eq!(output["kind"], "tcp");
         assert!(output["response_ms"].as_f64().unwrap() >= 0.0);
+        assert!(output["connect_ms"].as_f64().unwrap() >= 0.0);
+        assert!(output["dns_ms"].as_f64().unwrap() >= 0.0);
     }
 
     #[test]
@@ -292,6 +762,12 @@ mod tests {
     }
 
     #[test]
+    fn a_failure_keeps_what_was_learned_before_it() {
+        let output = run(&check(CheckKind::Tcp, &closed_port()));
+        assert!(output["dns_ms"].is_f64(), "{output}");
+    }
+
+    #[test]
     fn an_unknown_name_is_down() {
         let output = run(&check(CheckKind::Tcp, "no-such-host.invalid:80"));
         assert_eq!(output["up"], 0);
@@ -299,25 +775,128 @@ mod tests {
     }
 
     #[test]
-    fn dns_checks_resolve_a_name() {
-        assert_eq!(run(&check(CheckKind::Dns, "localhost"))["up"], 1);
-        assert_eq!(run(&check(CheckKind::Dns, "no-such-host.invalid"))["up"], 0);
+    fn a_good_web_response_is_up_with_each_stage_timed() {
+        let (address, _) = serve_once(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+        let output = run(&http_check(&address));
+
+        assert_eq!(output["up"], 1, "{output}");
+        assert_eq!(output["status"], 200);
+        assert_eq!(output["protocol"], "HTTP/1.1");
+        assert_eq!(output["content_length"], 5);
+        assert_eq!(output["compressed"], false);
+        for stage in [
+            "dns_ms",
+            "connect_ms",
+            "first_byte_ms",
+            "download_ms",
+            "response_ms",
+        ] {
+            assert!(output[stage].is_f64(), "{stage}: {output}");
+        }
+        assert!(output.get("tls_ms").is_none());
     }
 
     #[test]
-    fn a_good_web_response_is_up() {
-        let address = serve_once("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
-        let output = run(&check(CheckKind::Http, &format!("http://{address}/health")));
+    fn the_request_says_who_is_asking_and_what_it_accepts() {
+        let (address, request) = serve_once(b"HTTP/1.1 204 No Content\r\n\r\n");
+        run(&http_check(&address));
+
+        let request = request.join().unwrap().to_lowercase();
+        assert!(request.starts_with("get /health http/1.1\r\n"), "{request}");
+        assert!(request.contains("user-agent: maxnines-agent/"), "{request}");
+        assert!(request.contains("accept-encoding: gzip"), "{request}");
+        assert!(
+            request.contains(&format!("host: {}", address.to_lowercase())),
+            "{request}"
+        );
+    }
+
+    #[test]
+    fn a_check_can_choose_its_method_and_body() {
+        let (address, request) = serve_once(b"HTTP/1.1 204 No Content\r\n\r\n");
+        let output = run(&Check {
+            method: Some("POST".to_string()),
+            body: Some("hello=world".to_string()),
+            ..http_check(&address)
+        });
+
         assert_eq!(output["up"], 1, "{output}");
-        assert_eq!(output["status"], 204);
+        let request = request.join().unwrap();
+        assert!(request.starts_with("POST /health"), "{request}");
+        assert!(request.ends_with("hello=world"), "{request}");
     }
 
     #[test]
     fn a_web_error_is_down_and_gives_the_status() {
-        let address = serve_once("HTTP/1.1 503 Busy\r\nContent-Length: 0\r\n\r\n");
-        let output = run(&check(CheckKind::Http, &format!("http://{address}/")));
+        let (address, _) = serve_once(b"HTTP/1.1 503 Busy\r\nContent-Length: 0\r\n\r\n");
+        let output = run(&http_check(&address));
         assert_eq!(output["up"], 0);
+        assert_eq!(output["status"], 503);
         assert_eq!(output["error"], "the server returned status 503");
+    }
+
+    #[test]
+    fn redirects_are_reported_rather_than_followed() {
+        let (address, _) =
+            serve_once(b"HTTP/1.1 301 Moved\r\nLocation: /next\r\nContent-Length: 0\r\n\r\n");
+        let output = run(&http_check(&address));
+        assert_eq!(output["up"], 1, "{output}");
+        assert_eq!(output["status"], 301);
+    }
+
+    #[test]
+    fn a_page_has_to_match_its_regex() {
+        let page: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\n\r\nWelcome, user!";
+
+        let (address, _) = serve_once(page);
+        let output = run(&Check {
+            regex: Some("^Welcome".to_string()),
+            ..http_check(&address)
+        });
+        assert_eq!(output["up"], 1, "{output}");
+        assert_eq!(output["regex_matched"], true);
+
+        let (address, _) = serve_once(page);
+        let output = run(&Check {
+            regex: Some("Goodbye".to_string()),
+            ..http_check(&address)
+        });
+        assert_eq!(output["up"], 0);
+        assert_eq!(output["regex_matched"], false);
+        assert_eq!(output["error"], "the page didn't match");
+    }
+
+    fn gzipped(text: &str) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(text.as_bytes()).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn a_compressed_page_is_measured_and_searched_unpacked() {
+        let packed = gzipped("Welcome, user!");
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+            packed.len()
+        )
+        .into_bytes();
+        response.extend(packed);
+
+        let (address, _) = serve_once(Box::leak(response.into_boxed_slice()));
+        let output = run(&Check {
+            regex: Some("Welcome".to_string()),
+            ..http_check(&address)
+        });
+        assert_eq!(output["up"], 1, "{output}");
+        assert_eq!(output["compressed"], true);
+        assert_eq!(output["content_length"], 14);
+        assert_eq!(output["regex_matched"], true);
+    }
+
+    #[test]
+    fn a_huge_unpacked_page_stops_at_the_limit() {
+        let packed = gzipped(&"x".repeat(MAX_BODY_BYTES + 1000));
+        assert_eq!(decompress(&packed).unwrap().len(), MAX_BODY_BYTES);
     }
 
     #[test]
@@ -337,11 +916,134 @@ mod tests {
     }
 
     #[test]
+    fn a_server_that_goes_silent_runs_out_of_time() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let started = Instant::now();
+        let output = run(&Check {
+            timeout_secs: Some(1),
+            ..http_check(&address)
+        });
+
+        assert_eq!(output["up"], 0);
+        assert_eq!(output["error"], "timed out");
+        assert!(output["connect_ms"].is_f64(), "{output}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        drop(listener);
+    }
+
+    #[test]
     fn a_server_that_will_not_speak_tls_is_down() {
-        let address = serve_once("this isn't TLS\r\n");
+        let (address, _) = serve_once(b"this isn't TLS\r\n");
         let output = run(&check(CheckKind::Tls, &address));
         assert_eq!(output["up"], 0);
-        assert_eq!(output["error"], "the certificate wasn't accepted");
+        assert_eq!(output["error"], "the TLS handshake failed");
+    }
+
+    /// A TLS server for one connection, with a certificate nothing trusts.
+    fn serve_tls(names: &[&str]) -> String {
+        let certified = rcgen::generate_simple_self_signed(
+            names.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let chain = vec![certified.cert.der().clone()];
+        let key = rustls::pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der())
+            .unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(chain, key)
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut connection = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+            let mut stream = rustls::Stream::new(&mut connection, &mut socket);
+            let mut request = [0; 1024];
+            if stream.read(&mut request).is_ok() {
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                let _ = stream.flush();
+            }
+            thread::sleep(Duration::from_millis(200));
+        });
+        format!("localhost:{}", address.port())
+    }
+
+    #[test]
+    fn an_untrusted_certificate_is_down_but_still_measured() {
+        let output = run(&check(CheckKind::Tls, &serve_tls(&["localhost"])));
+
+        assert_eq!(output["up"], 0, "{output}");
+        assert_eq!(output["error"], "the certificate isn't trusted");
+        assert_eq!(output["cert_valid"], false);
+        assert_eq!(output["hostname_valid"], true);
+        assert!(output["tls_ms"].is_f64(), "{output}");
+        assert!(
+            output["tls_version"]
+                .as_str()
+                .unwrap()
+                .starts_with("TLS 1.")
+        );
+        assert!(output["cert_days_left"].as_i64().unwrap() > 300);
+    }
+
+    #[test]
+    fn a_certificate_for_another_name_is_noticed() {
+        let output = run(&check(CheckKind::Tls, &serve_tls(&["example.org"])));
+        assert_eq!(output["hostname_valid"], false, "{output}");
+    }
+
+    #[test]
+    fn insecure_measures_a_site_without_failing_it() {
+        let output = run(&Check {
+            insecure: Some(true),
+            ..check(CheckKind::Tls, &serve_tls(&["localhost"]))
+        });
+        assert_eq!(output["up"], 1, "{output}");
+        assert_eq!(output["cert_valid"], false);
+    }
+
+    #[test]
+    fn a_secure_page_with_a_bad_certificate_is_measured_all_the_way() {
+        let target = format!("https://{}/", serve_tls(&["localhost"]));
+        let output = run(&check(CheckKind::Http, &target));
+
+        assert_eq!(output["up"], 0, "{output}");
+        assert_eq!(output["error"], "the certificate isn't trusted");
+        assert_eq!(output["status"], 200);
+        assert!(output["first_byte_ms"].is_f64(), "{output}");
+    }
+
+    #[test]
+    fn insecure_lets_a_secure_page_pass() {
+        let target = format!("https://{}/", serve_tls(&["localhost"]));
+        let output = run(&Check {
+            insecure: Some(true),
+            ..check(CheckKind::Http, &target)
+        });
+        assert_eq!(output["up"], 1, "{output}");
+        assert_eq!(output["status"], 200);
+    }
+
+    #[test]
+    fn certificate_problems_are_named() {
+        let error = |kind| TlsError::InvalidCertificate(kind);
+        assert_eq!(
+            describe_certificate_problem(&error(CertificateError::Expired)),
+            "the certificate has expired"
+        );
+        assert_eq!(
+            describe_certificate_problem(&error(CertificateError::NotValidForName)),
+            "the certificate is for a different name"
+        );
+        assert_eq!(
+            describe_certificate_problem(&error(CertificateError::UnknownIssuer)),
+            "the certificate isn't trusted"
+        );
     }
 
     #[test]
@@ -352,20 +1054,140 @@ mod tests {
     }
 
     #[test]
+    fn dns_checks_can_use_the_system_resolver() {
+        let output = run(&check(CheckKind::Dns, "localhost"));
+        assert_eq!(output["up"], 1, "{output}");
+        assert!(output["records"].as_u64().unwrap() >= 1);
+        assert_eq!(run(&check(CheckKind::Dns, "no-such-host.invalid"))["up"], 0);
+    }
+
+    /// A DNS server for one question, answering with an A record or `code`.
+    fn serve_dns(code: ResponseCode, answers: usize) -> String {
+        let socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap().to_string();
+        thread::spawn(move || {
+            let mut buffer = [0; 512];
+            let (size, from) = socket.recv_from(&mut buffer).unwrap();
+            let question = Message::from_vec(&buffer[..size]).unwrap();
+            let mut answer = Message::new();
+            answer
+                .set_id(question.id())
+                .set_message_type(MessageType::Response)
+                .set_response_code(code);
+            for query in question.queries() {
+                answer.add_query(query.clone());
+                for index in 0..answers {
+                    answer.add_answer(hickory_proto::rr::Record::from_rdata(
+                        query.name().clone(),
+                        60,
+                        hickory_proto::rr::RData::A(hickory_proto::rr::rdata::A::new(
+                            10,
+                            0,
+                            0,
+                            index as u8,
+                        )),
+                    ));
+                }
+            }
+            socket.send_to(&answer.to_vec().unwrap(), from).unwrap();
+        });
+        address
+    }
+
+    fn dns_check(server: String) -> Check {
+        Check {
+            server: Some(server),
+            ..check(CheckKind::Dns, "example.com")
+        }
+    }
+
+    #[test]
+    fn a_dns_server_can_be_asked_directly() {
+        let output = run(&dns_check(serve_dns(ResponseCode::NoError, 2)));
+        assert_eq!(output["up"], 1, "{output}");
+        assert_eq!(output["records"], 2);
+        assert!(output["dns_ms"].is_f64());
+    }
+
+    #[test]
+    fn a_dns_server_with_no_answer_is_down() {
+        let output = run(&dns_check(serve_dns(ResponseCode::NoError, 0)));
+        assert_eq!(output["up"], 0);
+        assert_eq!(output["error"], "no records were returned");
+    }
+
+    #[test]
+    fn an_unknown_name_from_a_dns_server_is_down() {
+        let output = run(&dns_check(serve_dns(ResponseCode::NXDomain, 0)));
+        assert_eq!(output["error"], "the name wasn't found");
+    }
+
+    #[test]
+    fn a_dns_answer_to_another_question_is_refused() {
+        let bytes = dns_query(&check(CheckKind::Dns, "example.com"), 1).unwrap();
+        assert!(dns_answers(&bytes, 2).is_err());
+    }
+
+    #[test]
     fn ping_options_suit_each_system() {
-        assert_eq!(ping_arguments("linux", "a"), ["-c", "1", "-W", "10", "a"]);
-        assert_eq!(ping_arguments("macos", "a"), ["-c", "1", "-t", "10", "a"]);
-        assert_eq!(ping_arguments("freebsd", "a"), ["-c", "1", "-t", "10", "a"]);
+        let limit = Duration::from_secs(10);
         assert_eq!(
-            ping_arguments("windows", "a"),
-            ["-n", "1", "-w", "10000", "a"]
+            ping_arguments("linux", "a", 5, limit),
+            ["-c", "5", "-W", "10", "a"]
+        );
+        assert_eq!(
+            ping_arguments("macos", "a", 5, limit),
+            ["-c", "5", "-t", "10", "a"]
+        );
+        assert_eq!(
+            ping_arguments("freebsd", "a", 1, limit),
+            ["-c", "1", "-t", "10", "a"]
+        );
+        assert_eq!(
+            ping_arguments("windows", "a", 5, limit),
+            ["-n", "5", "-w", "10000", "a"]
         );
     }
 
     #[test]
-    fn ping_reaches_this_machine() {
-        let output = run(&check(CheckKind::Ping, "127.0.0.1"));
+    fn ping_summaries_are_read_on_each_system() {
+        let linux = "5 packets transmitted, 4 received, 20% packet loss, time 4005ms\n\
+                     rtt min/avg/max/mdev = 1.100/2.200/3.300/0.400 ms\n";
+        let mut findings = Findings::default();
+        read_ping_summary(linux, &mut findings);
+        assert_eq!(findings.packet_loss_percent, Some(20.0));
+        assert_eq!(findings.rtt_min_ms, Some(1.1));
+        assert_eq!(findings.rtt_max_ms, Some(3.3));
+        assert_eq!(findings.rtt_stddev_ms, Some(0.4));
+
+        let bsd = "5 packets transmitted, 5 packets received, 0.0% packet loss\n\
+                   round-trip min/avg/max/stddev = 0.1/0.2/0.3/0.05 ms\n";
+        let mut findings = Findings::default();
+        read_ping_summary(bsd, &mut findings);
+        assert_eq!(findings.packet_loss_percent, Some(0.0));
+        assert_eq!(findings.rtt_min_ms, Some(0.1));
+    }
+
+    #[test]
+    fn an_unreadable_ping_summary_is_left_out() {
+        let mut findings = Findings::default();
+        read_ping_summary(
+            "Antwort von 10.0.0.1: Zeit<1ms\n100% something",
+            &mut findings,
+        );
+        assert_eq!(findings.packet_loss_percent, None);
+        assert_eq!(findings.rtt_min_ms, None);
+    }
+
+    #[test]
+    fn ping_reaches_this_machine_and_reports_loss() {
+        let output = run(&Check {
+            count: Some(2),
+            ..check(CheckKind::Ping, "127.0.0.1")
+        });
         assert_eq!(output["up"], 1, "{output}");
+        assert_eq!(output["packet_loss_percent"], 0.0);
+        assert!(output["rtt_max_ms"].is_f64(), "{output}");
     }
 
     #[test]

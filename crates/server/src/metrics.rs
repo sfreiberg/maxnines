@@ -329,6 +329,105 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::WithData,
     },
     Metric {
+        name: "check.first_byte",
+        title: "Time to first byte",
+        unit: Unit::Milliseconds,
+        collector: "checks",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.first_byte_ms"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "check.dns",
+        title: "DNS lookup time",
+        unit: Unit::Milliseconds,
+        collector: "checks",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.dns_ms"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "check.connect",
+        title: "Connection time",
+        unit: Unit::Milliseconds,
+        collector: "checks",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.connect_ms"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "check.tls",
+        title: "TLS handshake time",
+        unit: Unit::Milliseconds,
+        collector: "checks",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.tls_ms"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "check.download",
+        title: "Download time",
+        unit: Unit::Milliseconds,
+        collector: "checks",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.download_ms"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "check.size",
+        title: "Page size",
+        unit: Unit::Bytes,
+        collector: "checks",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.content_length"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "check.status",
+        title: "HTTP status",
+        unit: Unit::Number,
+        collector: "checks",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.status"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "check.records",
+        title: "DNS records returned",
+        unit: Unit::Number,
+        collector: "checks",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.records"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "check.packet_loss",
+        title: "Packet loss",
+        unit: Unit::Percent,
+        collector: "checks",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.packet_loss_percent"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
         name: "service.running",
         title: "Services running",
         unit: Unit::Number,
@@ -575,6 +674,24 @@ impl Metrics {
         })
         .await
         .context("reading metrics")?
+    }
+
+    /// What an agent's checks last reported, as they were sent.
+    pub async fn latest_checks(&self, agent_id: &str, now_ms: i64) -> Result<Vec<Value>> {
+        let reader = self.reader.clone();
+        let samples = tokio::task::spawn_blocking(move || {
+            reader.latest(now_ms - CURRENT_WINDOW_MS, now_ms + CLOCK_SKEW_MS)
+        })
+        .await
+        .context("reading metrics")??;
+
+        let latest = samples
+            .into_iter()
+            .find(|sample| sample.agent_id == agent_id && sample.collector == "checks");
+        Ok(match latest.map(|sample| sample.data) {
+            Some(Value::Array(checks)) => checks,
+            _ => Vec::new(),
+        })
     }
 
     pub async fn current(&self, now_ms: i64) -> Result<BTreeMap<String, CurrentValues>> {

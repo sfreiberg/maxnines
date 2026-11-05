@@ -5,6 +5,7 @@ use axum::response::Response;
 use axum::routing::get;
 use axum_csrf::CsrfToken;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::task::JoinSet;
 
 use super::{Page, server_error};
@@ -81,6 +82,42 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
     Page::new(&state, &token, "metrics/index.html")
         .with("agents", &agents)
         .render()
+}
+
+/// A check's latest result. Agents send this, so nothing about it is trusted to
+/// be the right shape: anything unusable is just left blank.
+#[derive(Serialize)]
+struct CheckRow {
+    name: String,
+    kind: String,
+    up: bool,
+    error: Option<String>,
+    response: Option<String>,
+    first_byte: Option<String>,
+    status: Option<u64>,
+    protocol: Option<String>,
+    tls_version: Option<String>,
+    cert_days_left: Option<i64>,
+}
+
+fn check_row(check: &Value) -> Option<CheckRow> {
+    let text = |name: &str| check[name].as_str().map(String::from);
+    let time = |name: &str| {
+        let value = check[name].as_f64()?;
+        Some(metric_charts::format_value(Unit::Milliseconds, value))
+    };
+    Some(CheckRow {
+        name: text("name")?,
+        kind: text("kind").unwrap_or_default(),
+        up: check["up"].as_u64() == Some(1),
+        error: text("error"),
+        response: time("response_ms"),
+        first_byte: time("first_byte_ms"),
+        status: check["status"].as_u64(),
+        protocol: text("protocol"),
+        tls_version: text("tls_version"),
+        cert_days_left: check["cert_days_left"].as_i64(),
+    })
 }
 
 #[derive(Deserialize)]
@@ -176,7 +213,13 @@ async fn show(
         })
         .collect();
 
+    let checks: Vec<CheckRow> = match state.metrics.latest_checks(&agent.id, now_ms()).await {
+        Ok(checks) => checks.iter().filter_map(check_row).collect(),
+        Err(error) => return server_error(&error),
+    };
+
     Page::new(&state, &token, "metrics/show.html")
+        .with("checks", &checks)
         .with("agent_id", &agent.id)
         .with("host", &agent.host)
         .with("charts", &charts)
