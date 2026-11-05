@@ -2380,6 +2380,7 @@ name = "maxnines-protocol"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hcl-rs",
  "hex",
  "regex-lite",
  "ring",

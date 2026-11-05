@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 regex-lite = "0.1"
 anyhow.workspace = true
+hcl-rs.workspace = true
 hex.workspace = true
 ring.workspace = true
 serde.workspace = true

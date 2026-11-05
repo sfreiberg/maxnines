@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use hcl::{Body, Structure};
+use maxnines_protocol::hcl_env::config_context;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -57,7 +58,7 @@ impl Config {
     }
 
     fn parse(text: &str) -> Result<Self> {
-        let body: Body = hcl::from_str(text)?;
+        let body: Body = hcl::eval::from_str(text, &config_context())?;
         let (body, facts) = take_facts(body)?;
         let mut config: Config = hcl::from_body(body)?;
         config.facts = facts;
@@ -171,6 +172,48 @@ fn is_valid_fact_name(name: &str) -> bool {
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     };
     name.len() <= MAX_FACT_NAME_LEN && name.split('.').all(is_valid_part)
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+
+    fn with_url(url: &str) -> String {
+        format!("server {{\n  url = {url}\n}}\n")
+    }
+
+    #[test]
+    fn a_setting_can_come_from_the_environment() {
+        let path = std::env::var("PATH").unwrap();
+        let config = Config::parse(&with_url("env(\"PATH\")")).unwrap();
+        assert_eq!(config.server.url, path);
+    }
+
+    #[test]
+    fn a_variable_can_be_part_of_a_longer_value() {
+        let text = with_url(r#""wss://${env("MAXNINES_TEST_UNSET", "monitor")}.example.com/ws""#);
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(config.server.url, "wss://monitor.example.com/ws");
+    }
+
+    #[test]
+    fn an_unset_variable_stops_the_agent_and_says_which() {
+        let error = Config::parse(&with_url("env(\"MAXNINES_TEST_UNSET\")")).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("MAXNINES_TEST_UNSET"), "{message}");
+    }
+
+    #[test]
+    fn custom_facts_can_come_from_the_environment_in_every_form() {
+        let text = format!(
+            "{}facts = {{\n  role = env(\"MAXNINES_TEST_UNSET\", \"web\")\n}}\n\
+             facts \"disk\" {{\n  kind = env(\"MAXNINES_TEST_UNSET\", \"ssd\")\n}}\n",
+            with_url("\"ws://x/ws\"")
+        );
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(config.facts["role"], "web");
+        assert_eq!(config.facts["disk.kind"], "ssd");
+    }
 }
 
 #[cfg(test)]
@@ -467,13 +510,18 @@ mod tests {
             "[null]",
             "null",
             "var.role",
-            "1 + 2",
             "\"${var.role}\"",
             "\"web-${var.id}\"",
         ] {
             let text = format!("facts = {{\n  role = {value}\n}}\n");
             assert!(parse(&text).is_err(), "{value}");
         }
+    }
+
+    #[test]
+    fn an_expression_in_a_fact_becomes_its_value() {
+        let config = parse("facts = {\n  total = 1 + 2\n}\n").unwrap();
+        assert_eq!(config.facts["total"], 3);
     }
 
     #[test]

@@ -2,10 +2,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail, ensure};
-use hcl::Value;
-use hcl::eval::{Context, FuncArgs, FuncDef, ParamType};
 use indexmap::IndexMap;
 use ipnet::IpNet;
+use maxnines_protocol::hcl_env::config_context;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -85,33 +84,6 @@ impl EmailConfig {
         );
         Ok(())
     }
-}
-
-/// `env("NAME")` in the config, or `env("NAME", "default")`. An unset variable with
-/// no default is an error, so that a typo can't quietly leave something empty.
-fn env(args: FuncArgs) -> Result<Value, String> {
-    let name = args
-        .positional_args()
-        .next()
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    match (std::env::var(name), args.variadic_args().next()) {
-        (Ok(value), _) => Ok(Value::from(value)),
-        (Err(_), Some(default)) => Ok(default.clone()),
-        (Err(_), None) => Err(format!("environment variable {name} isn't set")),
-    }
-}
-
-fn context() -> Context<'static> {
-    let mut context = Context::new();
-    context.declare_func(
-        "env",
-        FuncDef::builder()
-            .param(ParamType::String)
-            .variadic_param(ParamType::String)
-            .build(env),
-    );
-    context
 }
 
 /// One variant per database, selected by the `metrics "<name>"` block label.
@@ -237,7 +209,7 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Self> {
-        let config: Config = hcl::eval::from_str(text, &context())?;
+        let config: Config = hcl::eval::from_str(text, &config_context())?;
         ensure!(
             config.heartbeat_interval_secs > 0,
             "heartbeat_interval_secs must be at least 1"

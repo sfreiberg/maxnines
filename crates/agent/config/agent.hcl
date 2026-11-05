@@ -1,4 +1,12 @@
 # Only what's needed to reach the server. What to monitor is set on the server.
+#
+# Any value can come from the environment, on its own or inside a longer value:
+#
+#   url = env("MAXNINES_SERVER_URL")
+#   url = env("MAXNINES_SERVER_URL", "ws://127.0.0.1:9000/ws")
+#   url = "wss://${env("MONITOR_HOST")}/ws"
+#
+# The agent won't start if a variable with no default isn't set.
 
 server {
   # Use wss:// for anything beyond this machine.

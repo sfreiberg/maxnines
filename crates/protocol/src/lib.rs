@@ -1,6 +1,7 @@
 //! Types shared by the agent and the server.
 
 pub mod auth;
+pub mod hcl_env;
 
 use std::collections::BTreeMap;
 
