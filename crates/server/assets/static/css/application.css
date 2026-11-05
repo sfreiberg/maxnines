@@ -105,6 +105,9 @@ code, pre, .mono { font-family: var(--mono); font-size: 0.8125rem; }
 .count { display: inline-flex; align-items: center; justify-content: center; min-width: 20px; height: 20px; padding: 0 6px; border-radius: 999px; background: #b3261e; color: #fff; font-size: 12px; font-weight: 700; }
 
 /* Page structure */
+.page-notices { max-width: 1320px; margin: 0 auto; padding: 0 24px; }
+.page-notices > * { margin-top: 16px; }
+#update-notice:empty { display: none; }
 main { display: flex; flex-direction: column; gap: 24px; max-width: 1320px; margin: 0 auto; padding: 24px; }
 main.narrow { max-width: 820px; }
 .site-footer { max-width: 1320px; margin: 0 auto; padding: 8px 24px 24px; color: var(--muted); font-size: 0.8125rem; overflow-wrap: anywhere; }
@@ -128,6 +131,7 @@ h2 { margin: 0 0 12px; font-size: 18px; font-weight: 700; }
 .error, .notice { margin: 0; padding: 12px 14px; border-radius: 12px; overflow-wrap: anywhere; }
 .error { background: var(--bad-surface); color: var(--bad); }
 .notice { background: var(--accent-surface); color: var(--accent-ink); }
+.notice a { color: inherit; font-weight: 600; text-decoration: underline; }
 
 /* Status */
 .badge { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; font-size: 13px; font-weight: 600; white-space: nowrap; }

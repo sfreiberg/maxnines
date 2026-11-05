@@ -1,6 +1,6 @@
-{% extends "layouts/application.html" %}
+{% extends "layouts/live.html" %}
 {% block title %}{{ host }} metrics · MaxNines{% endblock title %}
-{% block head %}<meta http-equiv="refresh" content="60">{% endblock head %}
+{% block refresh_every %}60s{% endblock refresh_every %}
 {% block content %}
 <p class="breadcrumb">{% if is_local %}<a href="/checks">Checks</a>{% else %}<a href="/metrics">Metrics</a>{% endif %}</p>
 <div class="title-row">
@@ -13,7 +13,7 @@
   <a href="/agents/{{ agent_id }}/metrics?range={{ option.key }}"{% if option.selected %} class="selected" aria-current="true"{% endif %}>{{ option.label }}</a>
   {% endfor %}
 </nav>
-<p class="hint">Times are UTC. This page updates every minute.</p>
+<p class="hint">Times are UTC. The charts update every minute.</p>
 
 {% if checks %}
 <section>

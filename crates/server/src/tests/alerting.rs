@@ -2336,7 +2336,7 @@ async fn alert_pages_keep_the_strict_security_policy() {
         let page = browser.get(&server, path).await;
         let policy = page.header("content-security-policy").unwrap();
         assert!(policy.starts_with("default-src 'none'"), "{path}");
-        assert!(!page.body.contains("<script"), "{path}");
+        assert!(page.has_only_our_scripts(), "{path}");
         assert!(!page.body.contains(" style="), "{path}");
     }
 }
@@ -2899,7 +2899,7 @@ mod remote {
             let page = browser.get(&server, path).await;
             let policy = page.header("content-security-policy").unwrap();
             assert!(policy.starts_with("default-src 'none'"), "{path}");
-            assert!(!page.body.contains("<script"), "{path}");
+            assert!(page.has_only_our_scripts(), "{path}");
             assert!(!page.body.contains(" style="), "{path}");
         }
     }
@@ -3261,7 +3261,7 @@ mod pages {
         ] {
             let page = browser.get(&server, &path).await;
             assert_eq!(page.status, 200, "{path}");
-            assert!(!page.body.contains("<script"), "{path}: {}", page.body);
+            assert!(page.has_only_our_scripts(), "{path}: {}", page.body);
         }
     }
 }

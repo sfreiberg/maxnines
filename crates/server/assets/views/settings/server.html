@@ -1,11 +1,10 @@
-{% extends "layouts/application.html" %}
+{% extends "layouts/live.html" %}
 {% block title %}Server · MaxNines{% endblock title %}
-{% block head %}<meta http-equiv="refresh" content="60">{% endblock head %}
 {% block content %}
 <p class="breadcrumb"><a href="/settings">Settings</a></p>
 <div>
   <h1>Server</h1>
-  <p class="subtitle">Running for {{ server.uptime }}. This page updates every minute.</p>
+  <p class="subtitle">Running for {{ server.uptime }}. This page updates by itself.</p>
 </div>
 
 {% if server.alert_rules_stalled %}

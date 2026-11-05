@@ -1062,6 +1062,14 @@ struct Page {
 }
 
 impl Page {
+    /// Whether the only scripts here are the ones embedded in the binary, so nothing
+    /// an agent or a person typed has become a script.
+    fn has_only_our_scripts(&self) -> bool {
+        self.body
+            .match_indices("<script")
+            .all(|(at, _)| self.body[at..].starts_with(r#"<script src="/assets/js/"#))
+    }
+
     fn token(&self) -> String {
         let marker = r#"name="authenticity_token" value=""#;
         let start = self.body.find(marker).expect("no form on this page") + marker.len();
@@ -1220,6 +1228,20 @@ async fn embedded_assets_are_served_and_nothing_else_is() {
     let css = browser.get(&server, "/assets/css/application.css").await;
     assert_eq!(css.status, 200);
     assert_eq!(css.header("content-type"), Some("text/css"));
+
+    for path in [
+        "/assets/js/htmx.min.js",
+        "/assets/js/idiomorph-ext.min.js",
+        "/assets/js/application.js",
+    ] {
+        let script = browser.get(&server, path).await;
+        assert_eq!(script.status, 200, "{path}");
+        assert_eq!(
+            script.header("content-type"),
+            Some("text/javascript"),
+            "{path}"
+        );
+    }
 
     for path in [
         "/assets/nope.css",
@@ -1493,7 +1515,7 @@ async fn agent_reported_text_can_not_inject_html() {
     for path in ["/agents".to_string(), format!("/agents/{id}")] {
         let page = browser.get(&server, &path).await;
         assert_eq!(page.status, 200, "{path}");
-        assert!(!page.body.contains("<script"), "{path}: {}", page.body);
+        assert!(page.has_only_our_scripts(), "{path}: {}", page.body);
         assert!(page.body.contains("&lt;script"), "{path}: {}", page.body);
     }
 }
@@ -1517,7 +1539,7 @@ async fn text_in_a_rule_can_not_inject_html() {
     for path in ["/rules".to_string(), format!("/rules/{id}/edit")] {
         let page = browser.get(&server, &path).await;
         assert_eq!(page.status, 200, "{path}");
-        assert!(!page.body.contains("<script"), "{path}: {}", page.body);
+        assert!(page.has_only_our_scripts(), "{path}: {}", page.body);
     }
 }
 
@@ -2093,7 +2115,7 @@ async fn text_from_an_agent_can_not_inject_html_into_a_preview() {
         "{}",
         page.body
     );
-    assert!(!page.body.contains("<script"), "{}", page.body);
+    assert!(page.has_only_our_scripts(), "{}", page.body);
 }
 
 // ---- build details
@@ -2263,22 +2285,113 @@ async fn the_range_links_change_what_is_shown() {
 }
 
 #[tokio::test]
-async fn metric_pages_keep_themselves_up_to_date() {
+async fn pages_of_data_update_in_place() {
     let server = start_with_metrics().await;
     let (agent, _client) = report_samples(&server, "/").await;
     let mut browser = Browser::default();
 
-    for path in [
-        "/metrics".to_string(),
-        format!("/agents/{}/metrics", agent.id()),
+    for (path, every) in [
+        ("/".to_string(), "15s"),
+        ("/agents".to_string(), "15s"),
+        (format!("/agents/{}", agent.id()), "15s"),
+        ("/alerts".to_string(), "15s"),
+        ("/checks".to_string(), "15s"),
+        ("/metrics".to_string(), "15s"),
+        ("/settings/server".to_string(), "15s"),
+        (format!("/agents/{}/metrics", agent.id()), "60s"),
+        (format!("/agents/{}/metrics/cpu.usage", agent.id()), "60s"),
     ] {
         let page = browser.get(&server, &path).await;
+        assert_eq!(page.status, 200, "{path}");
+        assert!(page.body.contains(r#"<main id="page""#), "{path}");
+        assert!(page.body.contains(r##"hx-select="#page""##), "{path}");
+        let (_, rest) = page.body.split_once("<main").unwrap();
+        let (main, _) = rest.split_once('>').unwrap();
+        assert!(
+            main.contains(&format!(r#"hx-trigger="every {every}""#)),
+            "{path}: {main}"
+        );
         assert!(
             page.body
-                .contains("<meta http-equiv=\"refresh\" content=\"60\">"),
-            "{path}"
+                .contains(r#"<noscript><meta http-equiv="refresh" content="60"></noscript>"#),
+            "pages still update without scripts: {path}"
         );
+        assert_eq!(page.body.matches("http-equiv").count(), 1, "{path}");
     }
+}
+
+#[tokio::test]
+async fn pages_being_filled_in_never_update_themselves() {
+    let server = start().await;
+    let mut browser = Browser::default();
+
+    for path in ["/rules/new", "/checks/new", "/settings"] {
+        let page = browser.get(&server, path).await;
+        assert_eq!(page.status, 200, "{path}");
+        assert!(!page.body.contains(r##"hx-select="#page""##), "{path}");
+        assert!(!page.body.contains("http-equiv"), "{path}");
+    }
+}
+
+/// What a page says about the build it came from.
+fn build_of(page: &Page) -> String {
+    let (_, rest) = page.body.split_once("/update-notice?build=").unwrap();
+    rest.split('"').next().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn every_page_asks_whether_the_server_has_been_updated() {
+    let server = start().await;
+    let mut browser = Browser::default();
+
+    for path in ["/", "/rules/new", "/settings", "/no-such-page"] {
+        let page = browser.get(&server, path).await;
+        let build = build_of(&page);
+        assert!(!build.is_empty(), "{path}");
+        assert!(page.body.contains(r#"hx-trigger="every 60s""#), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn a_page_from_this_build_is_told_nothing() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    let page = browser.get(&server, "/").await;
+
+    let path = format!("/update-notice?build={}", build_of(&page));
+    let answer = browser.get(&server, &path).await;
+
+    assert_eq!(answer.status, 204);
+    assert_eq!(answer.body, "");
+}
+
+#[tokio::test]
+async fn a_page_from_another_build_is_told_to_refresh() {
+    let server = start().await;
+    let mut browser = Browser::default();
+
+    let answer = browser.get(&server, "/update-notice?build=older").await;
+
+    assert_eq!(answer.status, 200);
+    assert!(answer.body.contains("MaxNines has been updated."));
+    assert!(answer.body.contains(r#"<a href="">Refresh this page</a>"#));
+}
+
+#[tokio::test]
+async fn a_form_still_works_after_the_page_has_updated_around_it() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    let opened = browser.get(&server, "/rules/new").await;
+    let token = opened.token();
+
+    for _ in 0..3 {
+        browser.get(&server, "/agents").await;
+    }
+
+    let mut fields = vec![("authenticity_token", token.as_str())];
+    fields.extend(RULE_FIELDS);
+    let saved = browser.post(&server, "/rules", &fields).await;
+    assert_eq!(saved.status, 303, "{}", saved.body);
 }
 
 /// How many samples of `metric` are stored in a range around now.
@@ -2366,7 +2479,7 @@ async fn names_from_agents_are_escaped_on_metric_pages() {
             "{path}: {}",
             page.body
         );
-        assert!(!page.body.contains("<script"), "{path}: {}", page.body);
+        assert!(page.has_only_our_scripts(), "{path}: {}", page.body);
     }
 }
 
@@ -2391,7 +2504,7 @@ async fn host_names_from_agents_are_escaped_on_metric_pages() {
             "{path}: {}",
             page.body
         );
-        assert!(!page.body.contains("<script"), "{path}: {}", page.body);
+        assert!(page.has_only_our_scripts(), "{path}: {}", page.body);
     }
 }
 
@@ -2422,10 +2535,19 @@ async fn metric_pages_need_nothing_the_security_policy_blocks() {
 
     assert_eq!(
         page.header("content-security-policy").unwrap(),
-        "default-src 'none'; style-src 'self'; font-src 'self'; img-src 'self'; \
-         form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+        "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'self'; \
+         font-src 'self'; img-src 'self'; form-action 'self'; base-uri 'none'; \
+         frame-ancestors 'none'"
     );
     assert!(!page.body.contains(" style="), "inline styles are blocked");
+    assert!(
+        !page.body.contains("<script>"),
+        "inline scripts are blocked"
+    );
+    assert!(
+        page.body.contains(r#""allowEval":false"#),
+        "eval is blocked, and agent data must never be able to reach it"
+    );
 }
 
 #[tokio::test]

@@ -1,6 +1,7 @@
 //! Routes and request handling. Pages live in `overview`, `agents`, `alerts`,
 //! `alert_rules`, `metrics`, `notification_channels`, `remote_checks`, `rules` and
-//! `settings`, the token protected API in `admin`, and agent connections in `agent_socket`.
+//! `settings`, the token protected API in `admin`, agent connections in `agent_socket`,
+//! and how an open page learns of a new build in `update_notice`.
 
 pub mod admin;
 pub mod agent_socket;
@@ -16,6 +17,7 @@ mod overview;
 mod remote_checks;
 mod rules;
 mod settings;
+mod update_notice;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
@@ -33,8 +35,9 @@ use tracing::{error, warn};
 
 use crate::app_state::AppState;
 
-const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; style-src 'self'; font-src 'self'; \
-     img-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; connect-src 'self'; \
+     style-src 'self'; font-src 'self'; img-src 'self'; form-action 'self'; base-uri 'none'; \
+     frame-ancestors 'none'";
 
 pub fn app(state: AppState) -> Router {
     Router::new()
@@ -49,6 +52,7 @@ pub fn app(state: AppState) -> Router {
         .merge(metrics::routes())
         .merge(rules::routes())
         .merge(assets::routes())
+        .merge(update_notice::routes())
         .merge(admin::routes(state.clone()))
         .fallback(not_found)
         .layer(middleware::from_fn(security_headers))
@@ -88,6 +92,12 @@ fn section_of(template: &str) -> &'static str {
     }
 }
 
+/// Identifies this exact build, so an open page can tell the server has changed.
+fn build_id() -> String {
+    let build = maxnines_protocol::build_info!();
+    format!("{}-{}", build.commit, build.built_at)
+}
+
 /// A page to render, carrying the CSRF token every form on it needs.
 struct Page<'a> {
     state: &'a AppState,
@@ -105,6 +115,7 @@ impl<'a> Page<'a> {
             Err(error) => warn!(%error, "creating a CSRF token failed"),
         }
         context.insert("build", &maxnines_protocol::build_info!());
+        context.insert("build_id", &build_id());
         context.insert("section", section_of(template));
         context.insert("firing", &state.status.firing.load(Ordering::Relaxed));
         Self {

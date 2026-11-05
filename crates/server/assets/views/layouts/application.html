@@ -6,9 +6,13 @@
   <title>{% block title %}MaxNines{% endblock title %}</title>
   <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/assets/css/application.css">
+  <meta name="htmx-config" content='{"allowEval":false,"allowScriptTags":false,"includeIndicatorStyles":false}'>
+  <script src="/assets/js/htmx.min.js" defer></script>
+  <script src="/assets/js/idiomorph-ext.min.js" defer></script>
+  <script src="/assets/js/application.js" defer></script>
   {% block head %}{% endblock head %}
 </head>
-<body>
+<body hx-ext="morph">
   <header class="site-header">
     <nav class="site-nav" aria-label="Main">
       <a class="brand" href="/"><span class="mark">9</span>MaxNines</a>
@@ -16,11 +20,15 @@
       <a class="pill{% if section == "agents" %} on{% endif %}" href="/agents">Agents</a>
       <a class="pill{% if section == "metrics" %} on{% endif %}" href="/metrics">Metrics</a>
       <a class="pill{% if section == "checks" %} on{% endif %}" href="/checks">Checks</a>
-      <a class="pill{% if section == "alerts" %} on{% endif %}" href="/alerts">Alerts{% if firing > 0 %} <span class="count">{{ firing }}</span>{% endif %}</a>
+      <a id="alerts-link" class="pill{% if section == "alerts" %} on{% endif %}" href="/alerts">Alerts{% if firing > 0 %} <span class="count">{{ firing }}</span>{% endif %}</a>
       <a class="pill{% if section == "settings" %} on{% endif %}" href="/settings">Settings</a>
     </nav>
   </header>
-  <main{% block main_class %}{% endblock main_class %}>
+  <div class="page-notices">
+    <div id="update-notice" role="status" hx-get="/update-notice?build={{ build_id }}" hx-trigger="every 60s"></div>
+    <p id="stale-notice" class="error" role="status" hidden>This page couldn't update, so what it shows may be out of date.</p>
+  </div>
+  <main id="page"{% block main_class %}{% endblock main_class %}{% block main_attributes %}{% endblock main_attributes %}>
     {% block content %}{% endblock content %}
   </main>
   <footer class="site-footer">MaxNines {{ build.version }} · {{ build.commit }} · built {{ build.built_at }}</footer>
