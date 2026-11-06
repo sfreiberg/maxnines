@@ -1,10 +1,12 @@
 mod alert_evaluator;
 mod alerting;
 mod app_state;
+mod calculations;
 mod cli;
 mod condition_builder;
 mod config;
 mod controllers;
+mod dashboards;
 mod fact_history;
 mod facts;
 mod host_filter;

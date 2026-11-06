@@ -1,6 +1,7 @@
 //! Tests that run the real router over real sockets.
 
 mod alerting;
+mod dashboards;
 mod users;
 
 use std::collections::{BTreeMap, HashMap};
@@ -3145,6 +3146,13 @@ impl MetricsReader for BrokenReader {
 
     fn series_count(&self) -> anyhow::Result<u64> {
         Ok(0)
+    }
+
+    fn calculate(
+        &self,
+        _query: &crate::calculations::CalculationQuery,
+    ) -> anyhow::Result<crate::metrics::SeriesResult> {
+        anyhow::bail!("deliberate test failure");
     }
 }
 

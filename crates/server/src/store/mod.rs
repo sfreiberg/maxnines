@@ -20,6 +20,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::error;
 
+use crate::calculations::CalculationQuery;
 use crate::config::MetricsConfig;
 use crate::metrics::{LastSample, Metric, NewestReading, SeriesQuery, SeriesResult, now_ms};
 use crate::remote_checks::LOCAL_AGENT_ID;
@@ -86,6 +87,10 @@ pub trait MetricsReader: Send + Sync {
 
     /// How many separate series have been stored, which is what storage grows with.
     fn series_count(&self) -> Result<u64>;
+
+    /// Combines a metric across machines. Lines are sorted by name, and each point's
+    /// `avg`, `min` and `max` are all the calculated value.
+    fn calculate(&self, query: &CalculationQuery) -> Result<SeriesResult>;
 }
 
 /// How a metrics database is doing. Sizes are as the database words them.
@@ -375,6 +380,10 @@ pub mod testing {
 
         fn series_count(&self) -> Result<u64> {
             Ok(0)
+        }
+
+        fn calculate(&self, _query: &CalculationQuery) -> Result<SeriesResult> {
+            Ok(SeriesResult::default())
         }
     }
 

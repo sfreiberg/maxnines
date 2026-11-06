@@ -1,0 +1,57 @@
+{% extends "layouts/application.html" %}
+{% block title %}{{ dashboard.name }} · MaxNines{% endblock title %}
+{% block head %}
+  <link rel="stylesheet" href="/assets/css/gridstack.min.css">
+  <script src="/assets/js/gridstack-all.js" defer></script>
+  <script src="/assets/js/dashboards.js" defer></script>
+{% endblock head %}
+{% block content %}
+<p class="breadcrumb"><a href="/dashboards">Dashboards</a></p>
+<div class="title-row">
+  <h1>{{ dashboard.name }}</h1>
+  {% if editing %}
+  <a class="button" href="/dashboards/{{ dashboard.id }}">Done</a>
+  {% else %}
+  <a class="button secondary" href="/dashboards/{{ dashboard.id }}/edit">Edit</a>
+  {% endif %}
+</div>
+
+{% if editing %}
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+<div class="dashboard-tools">
+  <a class="button" href="/dashboards/{{ dashboard.id }}/widgets/new">Add widget</a>
+  <form method="post" action="/dashboards/{{ dashboard.id }}">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <input type="text" name="name" value="{{ dashboard.name }}" required maxlength="100" aria-label="Dashboard name">
+    <button type="submit" class="secondary">Rename</button>
+  </form>
+  <form method="post" action="/dashboards/{{ dashboard.id }}/delete">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <button type="submit" class="danger">Delete dashboard</button>
+  </form>
+  <span id="layout-status" class="note" role="status">Drag widgets to move them, and their corners to resize them.</span>
+</div>
+{% else %}
+<nav class="tabs" aria-label="Time range">
+  {% for option in ranges %}
+  <a href="/dashboards/{{ dashboard.id }}?range={{ option.key }}"{% if option.selected %} class="selected" aria-current="true"{% endif %}>{{ option.label }}</a>
+  {% endfor %}
+</nav>
+{% endif %}
+
+{% if dashboard.widgets %}
+<div id="dashboard-grid" class="grid-stack"{% if editing %} data-layout-url="/dashboards/{{ dashboard.id }}/layout" data-token="{{ csrf_token }}"{% endif %}>
+  {% for widget in dashboard.widgets %}
+  <div class="grid-stack-item" gs-id="{{ widget.id }}" gs-x="{{ widget.x }}" gs-y="{{ widget.y }}" gs-w="{{ widget.w }}" gs-h="{{ widget.h }}">
+    <div class="grid-stack-item-content">
+      <section class="widget" hx-get="/dashboards/{{ dashboard.id }}/widgets/{{ widget.id }}?range={{ range }}{% if editing %}&amp;edit=1{% endif %}" hx-trigger="load{% if not editing %}, every 30s{% endif %}" hx-swap="morph:innerHTML">
+        <p class="note">Loading…</p>
+      </section>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% elif not editing %}
+<p class="empty">Nothing here yet. <a href="/dashboards/{{ dashboard.id }}/edit">Add a widget</a>.</p>
+{% endif %}
+{% endblock content %}

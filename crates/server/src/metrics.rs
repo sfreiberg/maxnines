@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::calculations::CalculationQuery;
 use crate::store::{MetricsReader, StoreStats};
 
 /// The most points a series is split into. Charts can't show more than this
@@ -963,6 +964,11 @@ impl Metrics {
         })
         .await
         .context("reading metrics")?
+    }
+
+    pub async fn calculate(&self, query: CalculationQuery) -> Result<SeriesResult> {
+        let reader = self.reader.clone();
+        tokio::task::spawn_blocking(move || reader.calculate(&query)).await?
     }
 
     pub async fn series_count(&self) -> Result<u64> {

@@ -8,7 +8,7 @@ use axum::extract::{Path as UrlPath, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -20,6 +20,8 @@ use super::host_list::HostSearch;
 use super::users::{refusal, setup_url};
 use crate::alerting::{Alert, AlertRuleInput, ChannelInput, ChannelKind};
 use crate::app_state::AppState;
+use crate::calculations::{self, Calculation, Question};
+use crate::dashboards::{Placed, WidgetInput, check_layout, check_name};
 use crate::facts::unflatten;
 use crate::metrics::{self, METRICS, Metric, SeriesResult, TimeRange, Unit, now_ms};
 use crate::models::{
@@ -74,6 +76,20 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/agents/{id}/metrics/{metric}", get(agent_metric))
         .route("/metrics", get(metric_catalog))
         .route("/metrics/current", get(current_metrics))
+        .route("/query", get(query))
+        .route("/dashboards", get(list_dashboards).post(create_dashboard))
+        .route(
+            "/dashboards/{id}",
+            get(show_dashboard)
+                .put(rename_dashboard)
+                .delete(delete_dashboard),
+        )
+        .route("/dashboards/{id}/layout", put(place_widgets))
+        .route("/dashboards/{id}/widgets", post(create_widget))
+        .route(
+            "/dashboards/{id}/widgets/{widget}",
+            put(update_widget).delete(delete_widget),
+        )
         .route("/rules", get(list_rules).post(create_rule))
         .route(
             "/rules/{id}",
@@ -595,6 +611,183 @@ async fn list_alerts(State(state): State<AppState>) -> Response {
     };
     match alerts.await {
         Ok(alerts) => Json(alerts).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct QueryParams {
+    metric: String,
+    #[serde(default = "default_calculation")]
+    calculation: String,
+    #[serde(default)]
+    group_by: String,
+    #[serde(default)]
+    filter: String,
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+}
+
+fn default_calculation() -> String {
+    Calculation::Avg.as_str().to_string()
+}
+
+async fn query(State(state): State<AppState>, Query(params): Query<QueryParams>) -> Response {
+    let question = Question::new(
+        &params.metric,
+        &params.calculation,
+        &params.group_by,
+        &params.filter,
+    );
+    let question = match question {
+        Ok(question) => question,
+        Err(error) => return refused(&anyhow::anyhow!(error)),
+    };
+    let to_ms = params.to_ms.unwrap_or_else(now_ms);
+    let from_ms = params
+        .from_ms
+        .unwrap_or_else(|| to_ms.saturating_sub(DEFAULT_RANGE_MS));
+    let Some(range) = TimeRange::new(from_ms, to_ms) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+
+    match calculations::answer(&state, &question, range, MAX_SERIES).await {
+        Ok(result) => Json(MetricView {
+            metric: question.metric.name,
+            unit: question.unit(),
+            from_ms,
+            to_ms,
+            step_ms: range.step_ms,
+            result,
+        })
+        .into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn list_dashboards(State(state): State<AppState>) -> Response {
+    match state.database.list_dashboards().await {
+        Ok(dashboards) => Json(dashboards).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn show_dashboard(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.get_dashboard(id).await {
+        Ok(Some(dashboard)) => Json(dashboard).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DashboardInput {
+    name: String,
+}
+
+async fn create_dashboard(
+    State(state): State<AppState>,
+    Json(input): Json<DashboardInput>,
+) -> Response {
+    let name = match check_name(&input.name) {
+        Ok(name) => name,
+        Err(error) => return refused(&anyhow::anyhow!(error)),
+    };
+    match state.database.create_dashboard(&name, now_ms()).await {
+        Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn rename_dashboard(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<i64>,
+    Json(input): Json<DashboardInput>,
+) -> Response {
+    let name = match check_name(&input.name) {
+        Ok(name) => name,
+        Err(error) => return refused(&anyhow::anyhow!(error)),
+    };
+    match state.database.rename_dashboard(id, &name).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn delete_dashboard(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.delete_dashboard(id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn place_widgets(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<i64>,
+    Json(widgets): Json<Vec<Placed>>,
+) -> Response {
+    if let Err(error) = check_layout(&widgets) {
+        return refused(&anyhow::anyhow!(error));
+    }
+    match state.database.get_dashboard(id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return server_error(&error),
+    }
+    match state.database.place_widgets(id, &widgets).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn create_widget(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<i64>,
+    Json(input): Json<WidgetInput>,
+) -> Response {
+    if let Err(error) = input.check() {
+        return refused(&anyhow::anyhow!(error));
+    }
+    let dashboard = match state.database.get_dashboard(id).await {
+        Ok(Some(dashboard)) => dashboard,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return server_error(&error),
+    };
+    if dashboard.is_full() {
+        return refused(&anyhow::anyhow!(
+            "This dashboard has as many widgets as it can."
+        ));
+    }
+    match state.database.create_widget(id, &input).await {
+        Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn update_widget(
+    State(state): State<AppState>,
+    UrlPath((id, widget)): UrlPath<(i64, i64)>,
+    Json(input): Json<WidgetInput>,
+) -> Response {
+    if let Err(error) = input.check() {
+        return refused(&anyhow::anyhow!(error));
+    }
+    match state.database.update_widget(id, widget, &input).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn delete_widget(
+    State(state): State<AppState>,
+    UrlPath((id, widget)): UrlPath<(i64, i64)>,
+) -> Response {
+    match state.database.delete_widget(id, widget).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),
     }
 }

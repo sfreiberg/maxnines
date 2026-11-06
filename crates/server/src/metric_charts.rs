@@ -16,9 +16,33 @@ pub const MAX_SERIES: usize = 8;
 const WIDTH: f64 = 480.0;
 const HEIGHT: f64 = 200.0;
 const LEFT: f64 = 74.0;
-const RIGHT: f64 = 472.0;
 const TOP: f64 = 10.0;
-const BOTTOM: f64 = 176.0;
+/// What's left of the plot's right and bottom edges, for the last label and the times.
+const RIGHT_MARGIN: f64 = 8.0;
+const BOTTOM_MARGIN: f64 = 24.0;
+
+/// The space a chart is drawn in. Text stays the same size whatever this is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Frame {
+    pub width: f64,
+    pub height: f64,
+}
+
+impl Frame {
+    /// What charts are on the pages that show them in a grid of their own.
+    pub const STANDARD: Self = Self {
+        width: WIDTH,
+        height: HEIGHT,
+    };
+
+    fn right(self) -> f64 {
+        self.width - RIGHT_MARGIN
+    }
+
+    fn bottom(self) -> f64 {
+        self.height - BOTTOM_MARGIN
+    }
+}
 
 const MINUTE_MS: i64 = 60_000;
 const DAY_MS: i64 = 1440 * MINUTE_MS;
@@ -122,7 +146,7 @@ pub struct Summary {
 #[derive(Debug, Serialize)]
 pub struct Chart {
     pub name: &'static str,
-    pub title: &'static str,
+    pub title: String,
     pub has_data: bool,
     /// Series left out because a chart only shows so many.
     pub hidden: usize,
@@ -143,7 +167,27 @@ pub struct Chart {
 }
 
 pub fn build(metric: &Metric, result: &SeriesResult, range: TimeRange) -> Chart {
-    let axis = Axis::new(metric.unit, &result.series);
+    build_as(
+        metric,
+        metric.unit,
+        metric.title,
+        Frame::STANDARD,
+        result,
+        range,
+    )
+}
+
+/// A chart of something worked out from a metric, which can have its own unit and
+/// title.
+pub fn build_as(
+    metric: &Metric,
+    unit: Unit,
+    title: &str,
+    frame: Frame,
+    result: &SeriesResult,
+    range: TimeRange,
+) -> Chart {
+    let axis = Axis::new(unit, &result.series, frame);
     let slots: Vec<usize> = result
         .series
         .iter()
@@ -153,31 +197,31 @@ pub fn build(metric: &Metric, result: &SeriesResult, range: TimeRange) -> Chart 
 
     Chart {
         name: metric.name,
-        title: metric.title,
+        title: title.to_string(),
         has_data: !result.series.is_empty(),
         hidden: result.hidden,
         left: LEFT,
-        right: RIGHT,
+        right: frame.right(),
         top: TOP,
-        bottom: BOTTOM,
-        width: WIDTH,
-        height: HEIGHT,
+        bottom: frame.bottom(),
+        width: frame.width,
+        height: frame.height,
         y_ticks: axis
             .ticks
             .iter()
             .map(|tick| Tick {
                 position: axis.y(*tick),
-                label: format_tick(metric.unit, *tick),
+                label: format_tick(unit, *tick),
             })
             .collect(),
-        x_ticks: time_ticks(range),
+        x_ticks: time_ticks(range, frame),
         lines: result
             .series
             .iter()
             .zip(&slots)
             .map(|(series, slot)| line(series, *slot, &axis, range))
             .collect(),
-        columns: columns(metric.unit, &result.series, &slots, &axis, range),
+        columns: columns(unit, &result.series, &slots, &axis, range),
         reach_ms: result
             .series
             .iter()
@@ -188,14 +232,14 @@ pub fn build(metric: &Metric, result: &SeriesResult, range: TimeRange) -> Chart 
             .series
             .iter()
             .zip(&slots)
-            .map(|(series, slot)| summary(metric.unit, series, *slot))
+            .map(|(series, slot)| summary(unit, series, *slot))
             .collect(),
     }
 }
 
-fn x_for(time_ms: i64, range: TimeRange) -> f64 {
+fn x_for(time_ms: i64, range: TimeRange, frame: Frame) -> f64 {
     let share = (time_ms - range.from_ms) as f64 / (range.to_ms - range.from_ms) as f64;
-    LEFT + share.clamp(0.0, 1.0) * (RIGHT - LEFT)
+    LEFT + share.clamp(0.0, 1.0) * (frame.right() - LEFT)
 }
 
 /// The vertical scale. It always includes zero, so a small change doesn't look
@@ -204,10 +248,11 @@ struct Axis {
     low: f64,
     high: f64,
     ticks: Vec<f64>,
+    frame: Frame,
 }
 
 impl Axis {
-    fn new(unit: Unit, series: &[Series]) -> Self {
+    fn new(unit: Unit, series: &[Series], frame: Frame) -> Self {
         let values = || {
             series
                 .iter()
@@ -240,13 +285,19 @@ impl Axis {
         let count = ((highest - low) / step).ceil().clamp(1.0, 12.0) as usize;
         let ticks: Vec<f64> = (0..=count).map(|index| low + index as f64 * step).collect();
         let high = ticks.last().copied().unwrap_or(highest);
-        Self { low, high, ticks }
+        Self {
+            low,
+            high,
+            ticks,
+            frame,
+        }
     }
 
     fn y(&self, value: f64) -> f64 {
         let value = value.clamp(-LARGEST_VALUE, LARGEST_VALUE);
         let share = (value - self.low) / (self.high - self.low);
-        BOTTOM - share.clamp(0.0, 1.0) * (BOTTOM - TOP)
+        let bottom = self.frame.bottom();
+        bottom - share.clamp(0.0, 1.0) * (bottom - TOP)
     }
 }
 
@@ -261,7 +312,7 @@ fn nice_step(span: f64) -> f64 {
     step * magnitude
 }
 
-fn time_ticks(range: TimeRange) -> Vec<Tick> {
+fn time_ticks(range: TimeRange, frame: Frame) -> Vec<Tick> {
     let span = range.to_ms - range.from_ms;
     let step = TIME_LABEL_STEPS_MS
         .into_iter()
@@ -274,8 +325,8 @@ fn time_ticks(range: TimeRange) -> Vec<Tick> {
     (0..=MAX_TIME_LABELS)
         .map(|index| first + index * step)
         .take_while(|time| *time < range.to_ms)
-        .map(|time| (time, x_for(time, range)))
-        .filter(|(_, x)| *x - TIME_LABEL_MARGIN >= 0.0 && *x + TIME_LABEL_MARGIN <= WIDTH)
+        .map(|time| (time, x_for(time, range, frame)))
+        .filter(|(_, x)| *x - TIME_LABEL_MARGIN >= 0.0 && *x + TIME_LABEL_MARGIN <= frame.width)
         .filter_map(|(time, x)| {
             let label = DateTime::from_timestamp_millis(time)?.format(format);
             Some(Tick {
@@ -306,7 +357,7 @@ fn line(series: &Series, slot: usize, axis: &Axis, range: TimeRange) -> Line {
     let mut previous = None;
     for point in &series.points {
         let dot = Dot {
-            x: x_for(point.time_ms, range),
+            x: x_for(point.time_ms, range, axis.frame),
             y: axis.y(point.avg),
         };
         match (previous, runs.last_mut()) {
@@ -358,7 +409,10 @@ fn columns(
         }
     }
 
-    let xs: Vec<f64> = moments.keys().map(|time| x_for(*time, range)).collect();
+    let xs: Vec<f64> = moments
+        .keys()
+        .map(|time| x_for(*time, range, axis.frame))
+        .collect();
     moments
         .iter()
         .enumerate()
@@ -369,7 +423,7 @@ fn columns(
                 .map_or(LEFT, |before| f64::midpoint(xs[before], xs[index]));
             let end = xs
                 .get(index + 1)
-                .map_or(RIGHT, |after| f64::midpoint(xs[index], *after));
+                .map_or(axis.frame.right(), |after| f64::midpoint(xs[index], *after));
             column(
                 unit,
                 series,
@@ -420,7 +474,7 @@ fn column(
     let tooltip_width = (longest as f64 * TOOLTIP_CHAR_WIDTH + TOOLTIP_PADDING)
         .clamp(TOOLTIP_MIN_WIDTH, TOOLTIP_MAX_WIDTH);
     // Opens toward the middle, so it never runs off the chart.
-    let tooltip_x = if x > f64::midpoint(LEFT, RIGHT) {
+    let tooltip_x = if x > f64::midpoint(LEFT, axis.frame.right()) {
         x - TOOLTIP_GAP - tooltip_width
     } else {
         x + TOOLTIP_GAP
@@ -594,7 +648,7 @@ mod tests {
 
         assert_eq!(chart.y_ticks.last().unwrap().label, "600%");
         let y = chart.columns[0].rows[0].dot.y;
-        assert!(y > TOP && y < BOTTOM, "{y}");
+        assert!(y > TOP && y < Frame::STANDARD.bottom(), "{y}");
     }
 
     #[test]
@@ -605,7 +659,7 @@ mod tests {
         );
 
         let lowest = chart.columns[0].rows[0].dot.y;
-        assert!(lowest <= BOTTOM, "{lowest}");
+        assert!(lowest <= Frame::STANDARD.bottom(), "{lowest}");
         assert!(chart.y_ticks[0].label.starts_with('-'));
     }
 
@@ -630,7 +684,7 @@ mod tests {
 
         assert_eq!(chart.y_ticks.first().unwrap().label, "0");
         assert_eq!(chart.y_ticks.last().unwrap().label, "1");
-        assert_eq!(chart.columns[0].rows[0].dot.y, BOTTOM);
+        assert_eq!(chart.columns[0].rows[0].dot.y, Frame::STANDARD.bottom());
     }
 
     #[test]
@@ -647,7 +701,10 @@ mod tests {
             }
             for column in &chart.columns {
                 let y = column.rows[0].dot.y;
-                assert!((TOP..=BOTTOM).contains(&y), "{value} gave {y}");
+                assert!(
+                    (TOP..=Frame::STANDARD.bottom()).contains(&y),
+                    "{value} gave {y}"
+                );
             }
         }
     }
@@ -739,7 +796,36 @@ mod tests {
             assert!((end - pair[1].hit_x).abs() < 1e-9);
         }
         let last = columns.last().unwrap();
-        assert!((last.hit_x + last.hit_width - RIGHT).abs() < 1e-9);
+        assert!((last.hit_x + last.hit_width - Frame::STANDARD.right()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_bigger_frame_gives_a_bigger_plot_with_everything_inside_it() {
+        let frame = Frame {
+            width: 1000.0,
+            height: 400.0,
+        };
+        let result = SeriesResult {
+            series: vec![series("CPU", &[(0, 0.0), (HOUR_MS - 1, 100.0)])],
+            hidden: 0,
+        };
+
+        let chart = build_as(
+            find("cpu.usage").unwrap(),
+            Unit::Percent,
+            "Busy machines",
+            frame,
+            &result,
+            range(),
+        );
+
+        assert_eq!(chart.title, "Busy machines");
+        assert_eq!((chart.width, chart.height), (1000.0, 400.0));
+        assert_eq!(chart.bottom, 376.0);
+        assert_eq!(chart.columns[0].rows[0].dot.y, 376.0);
+        let last = chart.columns.last().unwrap();
+        assert!(last.x > 900.0 && last.x <= chart.right, "{}", last.x);
+        assert!(last.tooltip_x >= 0.0);
     }
 
     #[test]
@@ -845,7 +931,7 @@ mod tests {
         let start = 1_700_000_000_000;
         let ticks = |hours: i64| {
             let range = TimeRange::new(start, start + hours * HOUR_MS).unwrap();
-            time_ticks(range)
+            time_ticks(range, Frame::STANDARD)
         };
 
         assert_eq!(labels(&ticks(1)), ["22:15", "22:30", "22:45", "23:00"]);
@@ -859,7 +945,7 @@ mod tests {
             let from = 1_700_000_123_456;
             let range = TimeRange::new(from, from + hours * HOUR_MS).unwrap();
 
-            let ticks = time_ticks(range);
+            let ticks = time_ticks(range, Frame::STANDARD);
 
             assert!(!ticks.is_empty(), "{hours}");
             assert!(ticks.len() <= 6, "{hours}");

@@ -904,6 +904,101 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "$MAXNINES_URL/api/v1/agents/server/metrics/server.memory"
 ```
 
+## Calculations
+
+### Ask about many machines at once
+
+`GET /api/v1/query`
+
+Combines a metric across machines, the same way dashboards do. Each series is averaged
+within a moment first, so a machine reporting more often doesn't count for more. Only
+approved machines count, and the server itself isn't one of them.
+
+| Parameter | Meaning |
+| --- | --- |
+| `metric` | Required. A name from `GET /api/v1/metrics`. |
+| `calculation` | `avg`, `sum`, `min`, `max` or `count`, which is how many series are reporting. Defaults to `avg`. |
+| `group_by` | What gets a line of its own: `nothing`, `host`, `series` or `fact:<name>`. Defaults to `nothing`. |
+| `filter` | Which machines, in the same form as the host list, such as `os=linux hostname=web*`. Defaults to all of them. |
+| `from_ms`, `to_ms` | The time range. Defaults to the last hour. |
+
+The result has the same shape as an agent's metric. The highest 100 lines are kept, and
+`hidden` says how many more there were. A question that makes no sense gets a `422`.
+
+```sh
+curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  "$MAXNINES_URL/api/v1/query?metric=cpu.usage&calculation=avg&group_by=fact:role"
+```
+
+## Dashboards
+
+Everyone signed in shares dashboards. A widget sits on a grid 12 columns wide, and
+asks one question, using the same `metric`, `calculation`, `group_by` and `filter` as
+`GET /api/v1/query`.
+
+| Widget field | Meaning |
+| --- | --- |
+| `title` | What it's called. Empty uses the metric's name. |
+| `kind` | `chart`, `number` or `table`. Defaults to `chart`. A number always combines everything. |
+| `x`, `y`, `w`, `h` | Where it sits, in grid cells. Defaults to the top left, 6 wide and 4 high. |
+
+### List dashboards
+
+`GET /api/v1/dashboards`
+
+Each dashboard's `id`, `name` and how many `widgets` it has, sorted by name.
+
+### Create a dashboard
+
+`POST /api/v1/dashboards`
+
+```sh
+curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  -d '{"name": "Fleet"}' "$MAXNINES_URL/api/v1/dashboards"
+```
+
+### Get a dashboard
+
+`GET /api/v1/dashboards/{id}`
+
+The dashboard with its `widgets`, from the top of the page down.
+
+### Rename a dashboard
+
+`PUT /api/v1/dashboards/{id}`
+
+Takes a `name`.
+
+### Delete a dashboard
+
+`DELETE /api/v1/dashboards/{id}`
+
+Deletes its widgets too.
+
+### Add a widget
+
+`POST /api/v1/dashboards/{id}/widgets`
+
+```sh
+curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  -d '{"metric": "cpu.usage", "calculation": "avg", "group_by": "host", "filter": "os=linux"}' \
+  "$MAXNINES_URL/api/v1/dashboards/1/widgets"
+```
+
+### Change or remove a widget
+
+`PUT /api/v1/dashboards/{id}/widgets/{widget}`
+
+`DELETE /api/v1/dashboards/{id}/widgets/{widget}`
+
+Changing a widget replaces all of it, including where it sits.
+
+### Move widgets
+
+`PUT /api/v1/dashboards/{id}/layout`
+
+Takes a list of widgets' `id`, `x`, `y`, `w` and `h`, and saves them together.
+
 ## API keys
 
 Keys can also be managed on the Settings page, and with `maxnines-server api-keys`.

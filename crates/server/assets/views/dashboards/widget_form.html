@@ -1,0 +1,71 @@
+{% extends "layouts/application.html" %}
+{% block title %}{% if id %}Edit widget{% else %}New widget{% endif %} · MaxNines{% endblock title %}
+{% block main_class %} class="narrow"{% endblock main_class %}
+{% block content %}
+<p class="breadcrumb"><a href="/dashboards/{{ dashboard_id }}/edit">{{ dashboard_name }}</a></p>
+<h1>{% if id %}Edit widget{% else %}New widget{% endif %}</h1>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<form method="post" action="/dashboards/{{ dashboard_id }}/widgets{% if id %}/{{ id }}{% endif %}" class="stacked">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+
+  <label>Show as
+    <select name="kind">
+      <option value="chart"{% if widget.kind == "chart" %} selected{% endif %}>Chart</option>
+      <option value="number"{% if widget.kind == "number" %} selected{% endif %}>Single number</option>
+      <option value="table"{% if widget.kind == "table" %} selected{% endif %}>Table, highest first</option>
+    </select>
+  </label>
+
+  <label>Metric
+    <select name="metric">
+      {% for metric in metrics %}
+      <option value="{{ metric.value }}"{% if metric.value == widget.metric %} selected{% endif %}>{{ metric.label }}</option>
+      {% endfor %}
+    </select>
+  </label>
+
+  <label>Combine values using
+    <select name="calculation">
+      {% for calculation in calculations %}
+      <option value="{{ calculation.value }}"{% if calculation.value == widget.calculation %} selected{% endif %}>{{ calculation.label }}</option>
+      {% endfor %}
+    </select>
+  </label>
+
+  <label>A line for each
+    <select name="group_by">
+      <option value="nothing"{% if widget.group_by == "nothing" %} selected{% endif %}>Nothing, combine everything</option>
+      <option value="host"{% if widget.group_by == "host" %} selected{% endif %}>Machine</option>
+      <option value="series"{% if widget.group_by == "series" %} selected{% endif %}>Series, such as each disk</option>
+      <option value="fact"{% if widget.group_by == "fact" %} selected{% endif %}>Value of a fact</option>
+    </select>
+    <span class="note">A single number always combines everything.</span>
+  </label>
+
+  <label>Fact
+    <input type="text" name="fact" value="{{ widget.fact }}" maxlength="200" placeholder="os.name">
+    <span class="note">Only used for a line for each value of a fact.</span>
+  </label>
+
+  <label>Machines
+    <input type="text" name="filter" value="{{ widget.filter }}" maxlength="500" placeholder="os=linux">
+    <span class="note">The same filter as the host list. Leave it empty for every machine.</span>
+  </label>
+
+  <label>Title
+    <input type="text" name="title" value="{{ widget.title }}" maxlength="100">
+    <span class="note">Leave it empty to use the metric's name.</span>
+  </label>
+
+  <button type="submit">{% if id %}Save{% else %}Add widget{% endif %}</button>
+</form>
+
+{% if id %}
+<form method="post" action="/dashboards/{{ dashboard_id }}/widgets/{{ id }}/delete">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  <button type="submit" class="danger">Delete widget</button>
+</form>
+{% endif %}
+{% endblock content %}

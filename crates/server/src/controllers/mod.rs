@@ -12,6 +12,7 @@ pub mod api;
 mod api_keys;
 mod assets;
 mod condition_form;
+mod dashboards;
 mod fleet;
 pub mod host_list;
 mod metrics;
@@ -66,6 +67,7 @@ pub fn app(state: AppState) -> Router {
         .merge(overview::routes())
         .merge(settings::routes())
         .merge(compressed(server::routes()))
+        .merge(dashboards::routes())
         .merge(api_keys::routes())
         .merge(users::routes())
         .merge(agents::routes())
@@ -135,6 +137,7 @@ fn section_of(template: &str) -> &'static str {
         "remote_checks" => "checks",
         "alerts" => "alerts",
         "server" => "server",
+        "dashboards" => "dashboards",
         "settings" | "rules" | "alert_rules" | "notification_channels" => "settings",
         "profile" => "profile",
         _ => "",

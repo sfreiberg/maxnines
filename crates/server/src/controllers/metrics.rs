@@ -128,9 +128,9 @@ pub fn check_row(check: &Value) -> Option<CheckRow> {
     })
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub(super) struct RangeParams {
-    range: Option<String>,
+    pub(super) range: Option<String>,
 }
 
 #[derive(Serialize)]

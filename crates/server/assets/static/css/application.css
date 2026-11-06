@@ -266,6 +266,19 @@ legend { padding: 0 8px; color: var(--muted); font-size: 12px; font-weight: 500;
 
 /* Charts */
 .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(520px, 100%), 1fr)); gap: 16px; }
+#dashboard-grid { margin: 0 -6px; }
+.grid-stack-item-content { display: flex; padding: 14px 18px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
+.grid-stack-placeholder > .placeholder-content { background: var(--raised); border: 1px dashed var(--border-strong); border-radius: var(--radius); }
+.widget { display: flex; flex: 1; flex-direction: column; gap: 6px; min-width: 0; min-height: 0; }
+.widget-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; font-size: 14px; font-weight: 500; }
+.widget-heading h2 { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.widget svg.chart { flex: 1; min-height: 0; margin: 0; }
+.widget-legend { display: flex; flex-wrap: wrap; gap: 2px 14px; margin: 0; padding: 0; color: var(--muted); font-size: 12px; list-style: none; }
+.widget-legend strong { color: var(--text); font-weight: 600; }
+.widget-number { display: flex; flex: 1; align-items: center; color: var(--text); font-size: clamp(28px, 4vw, 44px); font-weight: 600; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+.widget-table { flex: 1; min-height: 0; overflow-y: auto; }
+.dashboard-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.dashboard-tools form { display: flex; gap: 8px; margin: 0; }
 .chart-section { display: flex; flex-direction: column; gap: 12px; }
 .chart-card { display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 20px 24px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
 .chart-card .empty, .chart-card .hint { font-size: 14px; }
@@ -308,7 +321,7 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
   .shell { display: block; }
   .rail { position: fixed; top: auto; right: 0; bottom: 0; left: 0; flex-direction: row; justify-content: space-around; gap: 0; height: auto; padding: 4px calc(4px + env(safe-area-inset-right)) calc(4px + env(safe-area-inset-bottom)) calc(4px + env(safe-area-inset-left)); border-top: 1px solid var(--border); border-right: 0; }
   .brand { display: none; }
-  .rail-link { flex: 1 1 0; width: auto; min-width: 0; font-size: 10px; }
+  .rail-link { flex: 1 0 58px; width: auto; min-width: 0; font-size: 10px; }
   .rail-link.profile { margin-top: 0; }
   .avatar { width: 22px; height: 22px; font-size: 11px; box-shadow: none; }
   .count { right: calc(50% - 22px); }

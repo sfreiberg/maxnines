@@ -11,6 +11,7 @@ use tracing::warn;
 
 use super::flatten::{DataType, ENTRY_LABEL, Reported, Top, flatten};
 use super::{CollectorStats, MetricsReader, NewSample, Store, StoreStats};
+use crate::calculations::{Calculation, CalculationQuery, numbered};
 use crate::metrics::{
     LastSample, METRICS, Metric, NewestReading, Point, Reading, Series, SeriesQuery, SeriesResult,
     Source,
@@ -742,6 +743,78 @@ fn series_sql(connection: &Connection, metric: &Metric, agent: i32) -> Result<St
     ))
 }
 
+/// Parameters: from, to, step, and how many lines to keep. `members` is pairs of an
+/// agent's number and the number of its group, so nothing here comes from a request.
+fn calculation_sql(
+    connection: &Connection,
+    query: &CalculationQuery,
+    members: &[(i32, usize)],
+) -> Result<String> {
+    let values = if is_rate(query.metric.source) {
+        "SELECT agent_id, t, series,
+                v * 1000.0 / NULLIF(
+                    t - lag(t) OVER (PARTITION BY agent_id, series ORDER BY t), 0
+                ) AS v
+         FROM readings"
+    } else {
+        "SELECT agent_id, t, series, v FROM readings"
+    };
+    let scope = Scope {
+        agent: None,
+        time: "s.time >= epoch_ms($1::BIGINT) AND s.time < epoch_ms($2::BIGINT)",
+    };
+    let members: Vec<String> = members
+        .iter()
+        .map(|(agent, group)| format!("({agent}, {group})"))
+        .collect();
+    let line = if query.by_series {
+        "series"
+    } else {
+        "grp::VARCHAR"
+    };
+    let combined = match query.calculation {
+        Calculation::Avg => "avg(v)",
+        Calculation::Sum => "sum(v)",
+        Calculation::Min => "min(v)",
+        Calculation::Max => "max(v)",
+        Calculation::Count => "count(*)::DOUBLE",
+    };
+
+    Ok(format!(
+        "WITH members(agent, grp) AS (VALUES {members}),
+         readings AS ({readings}),
+         computed AS ({values}),
+         usable AS (
+             SELECT agent_id, t, series, v FROM computed
+             WHERE series IS NOT NULL AND abs(v) <= {LARGEST_VALUE}
+         ),
+         per_series AS (
+             SELECT m.grp, u.agent_id, u.series,
+                    u.t // $3::BIGINT * $3::BIGINT AS bucket, avg(u.v) AS v
+             FROM usable u
+             JOIN agents a ON a.agent_id = u.agent_id
+             JOIN members m ON m.agent = a.id
+             GROUP BY m.grp, u.agent_id, u.series, bucket
+         ),
+         combined AS (
+             SELECT {line} AS line, bucket, {combined} AS v
+             FROM per_series GROUP BY line, bucket
+         ),
+         ranked AS (
+             SELECT line,
+                    row_number() OVER (ORDER BY avg(v) DESC, line) AS position,
+                    count(*) OVER () AS total
+             FROM combined GROUP BY line
+         )
+         SELECT line, bucket, v, total
+         FROM combined JOIN ranked USING (line)
+         WHERE position <= $4::BIGINT
+         ORDER BY line, bucket",
+        members = members.join(", "),
+        readings = readings(connection, query.metric, &scope)?,
+    ))
+}
+
 /// Parameters: from and to.
 fn newest_sql(connection: &Connection, metric: &Metric) -> Result<String> {
     let values = if is_rate(metric.source) {
@@ -1015,6 +1088,72 @@ impl MetricsReader for DuckDbReader {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    fn calculate(&self, query: &CalculationQuery) -> Result<SeriesResult> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare("SELECT agent_id, id FROM agents")?;
+        let numbers: HashMap<String, i32> = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<duckdb::Result<_>>()?;
+
+        let (groups, places) = numbered(&query.members);
+        let members: Vec<(i32, usize)> = query
+            .members
+            .iter()
+            .zip(places)
+            .filter_map(|(member, place)| Some((*numbers.get(&member.agent_id)?, place)))
+            .collect();
+        if members.is_empty() {
+            return Ok(SeriesResult::default());
+        }
+
+        let mut statement = connection.prepare(&calculation_sql(&connection, query, &members)?)?;
+        let range = query.range;
+        let rows = statement.query_map(
+            params![
+                range.from_ms,
+                range.to_ms,
+                range.step_ms,
+                query.max_lines as i64
+            ],
+            |row| {
+                let line: String = row.get(0)?;
+                let time_ms: i64 = row.get(1)?;
+                let value: f64 = row.get(2)?;
+                let total: i64 = row.get(3)?;
+                Ok((line, time_ms, value, total))
+            },
+        )?;
+
+        let name_of = |line: &str| match line.parse::<usize>() {
+            Ok(place) if !query.by_series => groups.get(place).map(ToString::to_string),
+            _ => Some(line.to_string()),
+        };
+        let mut result = SeriesResult::default();
+        let mut shown_of_total = 0;
+        for row in rows {
+            let (line, time_ms, value, total) = row?;
+            shown_of_total = total;
+            let point = Point {
+                time_ms,
+                avg: value,
+                min: value,
+                max: value,
+            };
+            let name = name_of(&line).unwrap_or_default();
+            match result.series.last_mut() {
+                Some(series) if series.name == name => series.points.push(point),
+                _ => result.series.push(Series {
+                    name,
+                    points: vec![point],
+                }),
+            }
+        }
+        result.series.sort_by(|a, b| a.name.cmp(&b.name));
+        let total = usize::try_from(shown_of_total)?;
+        result.hidden = total.saturating_sub(result.series.len());
+        Ok(result)
+    }
+
     fn series_count(&self) -> Result<u64> {
         let connection = self.connection()?;
         let count: i64 =
@@ -1072,6 +1211,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::calculations::Member;
     use crate::metrics::{METRICS, TimeRange, find};
 
     fn sample() -> Sample {
@@ -1938,6 +2078,186 @@ mod tests {
                 },
             ]
         );
+    }
+
+    fn calculate(
+        store: &DuckDbStore,
+        metric: &str,
+        calculation: Calculation,
+        members: &[(&str, &str)],
+        by_series: bool,
+    ) -> SeriesResult {
+        let query = CalculationQuery {
+            metric: find(metric).unwrap(),
+            range: TimeRange::new(0, 3_600_000).unwrap(),
+            calculation,
+            members: members
+                .iter()
+                .map(|(agent_id, group)| Member {
+                    agent_id: agent_id.to_string(),
+                    group: group.to_string(),
+                })
+                .collect(),
+            by_series,
+            max_lines: 8,
+        };
+        store.reader().unwrap().calculate(&query).unwrap()
+    }
+
+    fn line(series: &Series) -> Vec<f64> {
+        series.points.iter().map(|point| point.avg).collect()
+    }
+
+    /// Two machines at 10% and 30%, and a third at 80% on its own.
+    fn three_machines() -> DuckDbStore {
+        let mut store = in_memory();
+        for (agent, usage) in [("a", 10.0), ("b", 30.0), ("c", 80.0)] {
+            write_metric(
+                &mut store,
+                agent,
+                1000,
+                "cpu",
+                json!({ "usage_percent": usage }),
+            );
+        }
+        store
+    }
+
+    #[test]
+    fn machines_are_combined_into_one_line() {
+        let store = three_machines();
+        let everyone = [("a", "All"), ("b", "All"), ("c", "All")];
+
+        for (calculation, expected) in [
+            (Calculation::Avg, 40.0),
+            (Calculation::Sum, 120.0),
+            (Calculation::Min, 10.0),
+            (Calculation::Max, 80.0),
+            (Calculation::Count, 3.0),
+        ] {
+            let result = calculate(&store, "cpu.usage", calculation, &everyone, false);
+            assert_eq!(result.series.len(), 1);
+            assert_eq!(result.series[0].name, "All");
+            assert_eq!(line(&result.series[0]), [expected], "{calculation:?}");
+        }
+    }
+
+    #[test]
+    fn machines_can_be_grouped_into_a_line_each() {
+        let store = three_machines();
+        let members = [("a", "web"), ("b", "web"), ("c", "db")];
+
+        let result = calculate(&store, "cpu.usage", Calculation::Avg, &members, false);
+
+        assert_eq!(result.series[0].name, "db");
+        assert_eq!(line(&result.series[0]), [80.0]);
+        assert_eq!(result.series[1].name, "web");
+        assert_eq!(line(&result.series[1]), [20.0]);
+    }
+
+    #[test]
+    fn only_the_machines_asked_for_count() {
+        let store = three_machines();
+        let result = calculate(&store, "cpu.usage", Calculation::Sum, &[("a", "x")], false);
+        assert_eq!(line(&result.series[0]), [10.0]);
+    }
+
+    #[test]
+    fn a_machine_nothing_has_been_heard_from_is_left_out() {
+        let store = three_machines();
+        let result = calculate(
+            &store,
+            "cpu.usage",
+            Calculation::Sum,
+            &[("nobody", "x")],
+            false,
+        );
+        assert!(result.series.is_empty());
+    }
+
+    #[test]
+    fn a_metrics_own_series_can_each_have_a_line() {
+        let mut store = in_memory();
+        let disks = |used: f64| {
+            json!([
+                { "mount_point": "/", "used_bytes": used, "total_bytes": 100.0 },
+                { "mount_point": "/data", "used_bytes": 50.0, "total_bytes": 100.0 },
+            ])
+        };
+        write_metric(&mut store, "a", 1000, "disk", disks(10.0));
+        write_metric(&mut store, "b", 1000, "disk", disks(30.0));
+
+        let members = [("a", "All"), ("b", "All")];
+        let result = calculate(&store, "disk.usage", Calculation::Avg, &members, true);
+
+        assert_eq!(result.series[0].name, "/");
+        assert_eq!(line(&result.series[0]), [20.0]);
+        assert_eq!(result.series[1].name, "/data");
+        assert_eq!(line(&result.series[1]), [50.0]);
+    }
+
+    #[test]
+    fn a_sample_stored_twice_does_not_change_a_sum() {
+        let mut store = three_machines();
+        write_metric(
+            &mut store,
+            "a",
+            1000,
+            "cpu",
+            json!({ "usage_percent": 10.0 }),
+        );
+
+        let everyone = [("a", "All"), ("b", "All"), ("c", "All")];
+        let result = calculate(&store, "cpu.usage", Calculation::Sum, &everyone, false);
+
+        assert_eq!(line(&result.series[0]), [120.0]);
+    }
+
+    #[test]
+    fn the_highest_lines_are_kept_when_there_are_too_many() {
+        let mut store = in_memory();
+        let mut members = Vec::new();
+        for number in 0..10 {
+            let (agent, usage) = (format!("agent-{number}"), f64::from(number));
+            write_metric(
+                &mut store,
+                &agent,
+                1000,
+                "cpu",
+                json!({ "usage_percent": usage }),
+            );
+            members.push(agent);
+        }
+
+        let members: Vec<(&str, &str)> = members.iter().map(|a| (a.as_str(), a.as_str())).collect();
+        let result = calculate(&store, "cpu.usage", Calculation::Avg, &members, false);
+
+        assert_eq!(result.series.len(), 8);
+        assert_eq!(result.hidden, 2);
+        assert!(!result.series.iter().any(|series| series.name == "agent-0"));
+    }
+
+    #[test]
+    fn rates_are_worked_out_per_machine_before_being_combined() {
+        let mut store = in_memory();
+        for (agent, per_sample) in [("a", 10.0), ("b", 30.0)] {
+            for time in [10_000, 20_000] {
+                let eth = json!({ "eth0": { "received_bytes": per_sample } });
+                write_metric(&mut store, agent, time, "network", eth);
+            }
+        }
+
+        let everyone = [("a", "All"), ("b", "All")];
+        let result = calculate(
+            &store,
+            "network.received",
+            Calculation::Sum,
+            &everyone,
+            false,
+        );
+
+        // 10 and 30 bytes over 10 seconds.
+        assert_eq!(line(&result.series[0]), [4.0]);
     }
 
     #[test]

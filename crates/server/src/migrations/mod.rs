@@ -17,6 +17,7 @@ impl MigratorTrait for Migrator {
             Box::new(AddSlackChannels),
             Box::new(CreateApiKeys),
             Box::new(CreateUsers),
+            Box::new(CreateDashboards),
         ]
     }
 }
@@ -1089,6 +1090,144 @@ impl MigrationTrait for CreateUsers {
             .await?;
         manager
             .drop_table(Table::drop().table(Users::Table).to_owned())
+            .await
+    }
+}
+
+struct CreateDashboards;
+
+impl MigrationName for CreateDashboards {
+    fn name(&self) -> &str {
+        "m20261106_000010_create_dashboards"
+    }
+}
+
+#[derive(Iden)]
+enum Dashboards {
+    Table,
+    Id,
+    Name,
+    CreatedMs,
+}
+
+#[derive(Iden)]
+enum DashboardWidgets {
+    Table,
+    Id,
+    DashboardId,
+    Title,
+    Kind,
+    Metric,
+    Calculation,
+    GroupBy,
+    Filter,
+    X,
+    Y,
+    W,
+    H,
+}
+
+/// Dashboards everyone signed in shares, and what's on them. A widget keeps its
+/// question as what was chosen, and where it sits on a grid of 12 columns.
+#[async_trait::async_trait]
+impl MigrationTrait for CreateDashboards {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(Dashboards::Table)
+                    .col(
+                        ColumnDef::new(Dashboards::Id)
+                            .big_integer()
+                            .not_null()
+                            .auto_increment()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(Dashboards::Name).string_len(100).not_null())
+                    .col(
+                        ColumnDef::new(Dashboards::CreatedMs)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(DashboardWidgets::Table)
+                    .col(
+                        ColumnDef::new(DashboardWidgets::Id)
+                            .big_integer()
+                            .not_null()
+                            .auto_increment()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(DashboardWidgets::DashboardId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(DashboardWidgets::Title)
+                            .string_len(100)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(DashboardWidgets::Kind)
+                            .string_len(16)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(DashboardWidgets::Metric)
+                            .string_len(64)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(DashboardWidgets::Calculation)
+                            .string_len(16)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(DashboardWidgets::GroupBy)
+                            .string_len(255)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(DashboardWidgets::Filter)
+                            .string_len(500)
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(DashboardWidgets::X).integer().not_null())
+                    .col(ColumnDef::new(DashboardWidgets::Y).integer().not_null())
+                    .col(ColumnDef::new(DashboardWidgets::W).integer().not_null())
+                    .col(ColumnDef::new(DashboardWidgets::H).integer().not_null())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(DashboardWidgets::Table, DashboardWidgets::DashboardId)
+                            .to(Dashboards::Table, Dashboards::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_dashboard_widgets_dashboard")
+                    .table(DashboardWidgets::Table)
+                    .col(DashboardWidgets::DashboardId)
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(DashboardWidgets::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(Dashboards::Table).to_owned())
             .await
     }
 }

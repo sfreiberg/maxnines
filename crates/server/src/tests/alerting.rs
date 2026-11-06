@@ -81,6 +81,13 @@ impl MetricsReader for Script {
     fn series_count(&self) -> anyhow::Result<u64> {
         Ok(0)
     }
+
+    fn calculate(
+        &self,
+        _query: &crate::calculations::CalculationQuery,
+    ) -> anyhow::Result<crate::metrics::SeriesResult> {
+        anyhow::bail!("deliberate test failure");
+    }
 }
 
 /// A server with one connected agent, and an evaluator that started an hour ago.
@@ -3487,8 +3494,15 @@ mod server_page {
         let mut recorded = Recorded::default();
         record_once(&server.state, &mut recorded).await;
         // A rate needs something to have arrived between two records.
+        let writes = server.state.status.writes.clone();
+        let before = writes.written.load(std::sync::atomic::Ordering::Relaxed);
         send(&mut client, &full_sample(now_ms() as u64, "/")).await;
-        sleep(Duration::from_millis(200)).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while writes.written.load(std::sync::atomic::Ordering::Relaxed) == before {
+            assert!(Instant::now() < deadline, "the sample wasn't written");
+            sleep(Duration::from_millis(5)).await;
+        }
+        sleep(Duration::from_millis(50)).await;
         record_once(&server.state, &mut recorded).await;
 
         let metric = crate::metrics::find("server.metrics").unwrap();

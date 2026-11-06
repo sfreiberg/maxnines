@@ -1,0 +1,557 @@
+//! Dashboards, and asking about many machines at once.
+
+use super::*;
+
+/// Calls the API with the admin token, giving back the status and any JSON.
+async fn api(server: &TestServer, method: &str, path: &str, body: &Value) -> (u16, Value) {
+    let response = server.request(method, path, &body.to_string()).await;
+    let (head, text) = response.split_once("\r\n\r\n").unwrap();
+    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    (status, serde_json::from_str(text).unwrap_or(Value::Null))
+}
+
+/// An approved machine reporting a CPU reading, with these facts.
+async fn machine(server: &TestServer, host: &str, usage: f64, facts: Value) -> (Identity, Client) {
+    let agent = identity();
+    let mut client = server.connect_approved(&agent, host).await;
+    send(&mut client, &AgentMessage::Facts { facts }).await;
+    let sample = AgentMessage::Sample(Sample {
+        timestamp_ms: now_ms() as u64 - 5_000,
+        metrics: BTreeMap::from([("cpu".to_string(), json!({ "usage_percent": usage }))]),
+    });
+    send(&mut client, &sample).await;
+    server.wait_for_facts(&agent.id(), 1).await;
+    (agent, client)
+}
+
+/// Asks until the samples have been written, which happens in the background.
+async fn query(server: &TestServer, path: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (status, result) = api(server, "GET", path, &Value::Null).await;
+        assert_eq!(status, 200, "{result}");
+        if result["series"].as_array().is_some_and(|s| !s.is_empty()) {
+            return result;
+        }
+        assert!(Instant::now() < deadline, "nothing came back: {result}");
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn newest(series: &Value) -> f64 {
+    let points = series["points"].as_array().unwrap();
+    points.last().unwrap()["avg"].as_f64().unwrap()
+}
+
+async fn three_machines(server: &TestServer) -> Vec<(Identity, Client)> {
+    vec![
+        machine(server, "web-1", 10.0, json!({ "role": "web" })).await,
+        machine(server, "web-2", 30.0, json!({ "role": "web" })).await,
+        machine(server, "db-1", 80.0, json!({ "role": "db" })).await,
+    ]
+}
+
+async fn wait_for_all_three(server: &TestServer) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let path = "/api/v1/query?metric=cpu.usage&calculation=count";
+        let result = query(server, path).await;
+        if newest(&result["series"][0]) == 3.0 {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{result}");
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+mod query_api {
+    use super::*;
+
+    #[tokio::test]
+    async fn machines_can_be_combined() {
+        let server = start_with_metrics().await;
+        let _machines = three_machines(&server).await;
+        wait_for_all_three(&server).await;
+
+        let result = query(&server, "/api/v1/query?metric=cpu.usage&calculation=avg").await;
+
+        assert_eq!(result["unit"], "percent");
+        assert_eq!(newest(&result["series"][0]), 40.0);
+    }
+
+    #[tokio::test]
+    async fn machines_can_be_grouped_by_a_fact() {
+        let server = start_with_metrics().await;
+        let _machines = three_machines(&server).await;
+        wait_for_all_three(&server).await;
+
+        let path = "/api/v1/query?metric=cpu.usage&calculation=sum&group_by=fact:role";
+        let result = query(&server, path).await;
+
+        assert_eq!(result["series"][0]["name"], "db");
+        assert_eq!(newest(&result["series"][0]), 80.0);
+        assert_eq!(result["series"][1]["name"], "web");
+        assert_eq!(newest(&result["series"][1]), 40.0);
+    }
+
+    #[tokio::test]
+    async fn a_filter_picks_the_machines() {
+        let server = start_with_metrics().await;
+        let _machines = three_machines(&server).await;
+        wait_for_all_three(&server).await;
+
+        let path = "/api/v1/query?metric=cpu.usage&calculation=sum&filter=role%3Dweb";
+        let result = query(&server, path).await;
+
+        assert_eq!(newest(&result["series"][0]), 40.0);
+    }
+
+    #[tokio::test]
+    async fn a_line_can_be_given_to_each_machine() {
+        let server = start_with_metrics().await;
+        let _machines = three_machines(&server).await;
+        wait_for_all_three(&server).await;
+
+        let path = "/api/v1/query?metric=cpu.usage&group_by=host";
+        let result = query(&server, path).await;
+
+        let names: Vec<&str> = result["series"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|series| series["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["db-1", "web-1", "web-2"]);
+    }
+
+    #[tokio::test]
+    async fn the_server_is_not_part_of_the_fleet() {
+        let server = start_with_metrics().await;
+        let facts = json!({ "role": "web" });
+        let (_agent, _client) = machine(&server, "web-1", 10.0, facts).await;
+        let mut recorded = crate::server_stats::Recorded::with_machine();
+        crate::server_stats::record_once(&server.state, &mut recorded).await;
+        sleep(Duration::from_millis(300)).await;
+        crate::server_stats::record_once(&server.state, &mut recorded).await;
+
+        let result = query(&server, "/api/v1/query?metric=cpu.usage&calculation=count").await;
+
+        assert_eq!(newest(&result["series"][0]), 1.0);
+    }
+
+    #[tokio::test]
+    async fn a_question_that_makes_no_sense_is_refused() {
+        let server = start_with_metrics().await;
+        for path in [
+            "/api/v1/query?metric=nope",
+            "/api/v1/query?metric=cpu.usage&calculation=median",
+            "/api/v1/query?metric=cpu.usage&group_by=colour",
+            "/api/v1/query?metric=cpu.usage&filter=%22unfinished",
+        ] {
+            let (status, body) = api(&server, "GET", path, &Value::Null).await;
+            assert_eq!(status, 422, "{path}: {body}");
+            assert!(body["error"].is_string(), "{path}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn nobody_gets_in_without_a_key() {
+        let server = start_with_metrics().await;
+        let response = server
+            .http("GET", "/api/v1/query?metric=cpu.usage", None)
+            .await;
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+    }
+}
+
+mod dashboards_api {
+    use super::*;
+
+    const WIDGET: &str = r#"{ "metric": "cpu.usage", "calculation": "avg", "group_by": "host" }"#;
+
+    async fn dashboard(server: &TestServer, name: &str) -> i64 {
+        let body = json!({ "name": name });
+        let (status, created) = api(server, "POST", "/api/v1/dashboards", &body).await;
+        assert_eq!(status, 201, "{created}");
+        created["id"].as_i64().unwrap()
+    }
+
+    async fn widget(server: &TestServer, dashboard: i64) -> i64 {
+        let path = format!("/api/v1/dashboards/{dashboard}/widgets");
+        let body: Value = serde_json::from_str(WIDGET).unwrap();
+        let (status, created) = api(server, "POST", &path, &body).await;
+        assert_eq!(status, 201, "{created}");
+        created["id"].as_i64().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_keeps_its_widgets() {
+        let server = start().await;
+        let id = dashboard(&server, "Fleet").await;
+        let widget_id = widget(&server, id).await;
+
+        let path = format!("/api/v1/dashboards/{id}");
+        let (status, shown) = api(&server, "GET", &path, &Value::Null).await;
+
+        assert_eq!(status, 200);
+        assert_eq!(shown["name"], "Fleet");
+        assert_eq!(shown["widgets"][0]["id"], widget_id);
+        assert_eq!(shown["widgets"][0]["metric"], "cpu.usage");
+        assert_eq!(shown["widgets"][0]["kind"], "chart");
+        assert_eq!(shown["widgets"][0]["w"], 6);
+
+        let (_, list) = api(&server, "GET", "/api/v1/dashboards", &Value::Null).await;
+        assert_eq!(list[0]["name"], "Fleet");
+        assert_eq!(list[0]["widgets"], 1);
+    }
+
+    #[tokio::test]
+    async fn widgets_can_be_changed_moved_and_removed() {
+        let server = start().await;
+        let id = dashboard(&server, "Fleet").await;
+        let widget_id = widget(&server, id).await;
+        let path = format!("/api/v1/dashboards/{id}/widgets/{widget_id}");
+
+        let change = json!({ "metric": "memory.usage", "title": "Memory", "kind": "table" });
+        assert_eq!(api(&server, "PUT", &path, &change).await.0, 204);
+
+        let layout = format!("/api/v1/dashboards/{id}/layout");
+        let moved = json!([{ "id": widget_id, "x": 6, "y": 2, "w": 3, "h": 5 }]);
+        assert_eq!(api(&server, "PUT", &layout, &moved).await.0, 204);
+
+        let shown = format!("/api/v1/dashboards/{id}");
+        let (_, shown_now) = api(&server, "GET", &shown, &Value::Null).await;
+        let saved = &shown_now["widgets"][0];
+        assert_eq!(saved["title"], "Memory");
+        assert_eq!((&saved["x"], &saved["w"]), (&json!(6), &json!(3)));
+
+        assert_eq!(api(&server, "DELETE", &path, &Value::Null).await.0, 204);
+        assert_eq!(api(&server, "DELETE", &path, &Value::Null).await.0, 404);
+    }
+
+    #[tokio::test]
+    async fn a_widget_can_not_be_reached_through_another_dashboard() {
+        let server = start().await;
+        let first = dashboard(&server, "First").await;
+        let second = dashboard(&server, "Second").await;
+        let widget_id = widget(&server, first).await;
+
+        let wrong = format!("/api/v1/dashboards/{second}/widgets/{widget_id}");
+        let change = json!({ "metric": "memory.usage" });
+        assert_eq!(api(&server, "PUT", &wrong, &change).await.0, 404);
+        assert_eq!(api(&server, "DELETE", &wrong, &Value::Null).await.0, 404);
+
+        let layout = format!("/api/v1/dashboards/{second}/layout");
+        let moved = json!([{ "id": widget_id, "x": 6, "y": 2, "w": 3, "h": 5 }]);
+        api(&server, "PUT", &layout, &moved).await;
+        let shown = format!("/api/v1/dashboards/{first}");
+        let (_, kept) = api(&server, "GET", &shown, &Value::Null).await;
+        assert_eq!(
+            kept["widgets"][0]["x"], 0,
+            "moved through the wrong dashboard"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_widget_that_makes_no_sense_is_refused() {
+        let server = start().await;
+        let id = dashboard(&server, "Fleet").await;
+        let path = format!("/api/v1/dashboards/{id}/widgets");
+
+        for body in [
+            json!({ "metric": "nope" }),
+            json!({ "metric": "cpu.usage", "kind": "pie" }),
+            json!({ "metric": "cpu.usage", "calculation": "median" }),
+            json!({ "metric": "cpu.usage", "x": 10, "w": 6 }),
+        ] {
+            let (status, answer) = api(&server, "POST", &path, &body).await;
+            assert_eq!(status, 422, "{body}: {answer}");
+        }
+
+        let layout = format!("/api/v1/dashboards/{id}/layout");
+        let moved = json!([{ "id": 1, "x": 11, "y": 0, "w": 6, "h": 4 }]);
+        assert_eq!(api(&server, "PUT", &layout, &moved).await.0, 422);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_dashboard_takes_its_widgets_with_it() {
+        let server = start().await;
+        let id = dashboard(&server, "Fleet").await;
+        let widget_id = widget(&server, id).await;
+
+        let path = format!("/api/v1/dashboards/{id}");
+        assert_eq!(api(&server, "DELETE", &path, &Value::Null).await.0, 204);
+
+        assert_eq!(api(&server, "GET", &path, &Value::Null).await.0, 404);
+        let gone = server.state.database.get_widget(id, widget_id).await;
+        assert!(gone.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_needs_a_name() {
+        let server = start().await;
+        let body = json!({ "name": "   " });
+        let (status, _) = api(&server, "POST", "/api/v1/dashboards", &body).await;
+        assert_eq!(status, 422);
+    }
+}
+
+mod dashboard_pages {
+    use super::*;
+
+    async fn built(server: &TestServer, browser: &mut Browser) -> i64 {
+        let page = browser
+            .submit(server, "/dashboards", "/dashboards", &[("name", "Fleet")])
+            .await;
+        assert_eq!(page.status, 303, "{}", page.body);
+        server.state.database.list_dashboards().await.unwrap()[0].id
+    }
+
+    async fn add_widget(
+        server: &TestServer,
+        browser: &mut Browser,
+        id: i64,
+        fields: &[(&str, &str)],
+    ) -> Page {
+        let form = format!("/dashboards/{id}/widgets/new");
+        let action = format!("/dashboards/{id}/widgets");
+        browser.submit(server, &form, &action, fields).await
+    }
+
+    const CHART: [(&str, &str); 6] = [
+        ("kind", "chart"),
+        ("metric", "cpu.usage"),
+        ("calculation", "avg"),
+        ("group_by", "host"),
+        ("filter", ""),
+        ("title", "Busy machines"),
+    ];
+
+    #[tokio::test]
+    async fn a_dashboard_can_be_built_on_the_pages() {
+        let server = start_with_metrics().await;
+        let _machines = three_machines(&server).await;
+        wait_for_all_three(&server).await;
+        let mut browser = Browser::default();
+        let id = built(&server, &mut browser).await;
+
+        let page = add_widget(&server, &mut browser, id, &CHART).await;
+        assert_eq!(page.status, 303, "{}", page.body);
+
+        let shown = browser.get(&server, &format!("/dashboards/{id}")).await;
+        assert_eq!(shown.status, 200);
+        assert!(
+            shown.body.contains(r#"class="grid-stack""#),
+            "{}",
+            shown.body
+        );
+        assert!(shown.body.contains("every 30s"), "views refresh themselves");
+
+        let widget = server
+            .state
+            .database
+            .get_dashboard(id)
+            .await
+            .unwrap()
+            .unwrap();
+        let path = format!("/dashboards/{id}/widgets/{}", widget.widgets[0].id);
+        let drawn = browser.get(&server, &path).await;
+        assert_eq!(drawn.status, 200);
+        assert!(drawn.body.contains("Busy machines"), "{}", drawn.body);
+        assert!(
+            drawn.body.contains(r#"<svg class="chart""#),
+            "{}",
+            drawn.body
+        );
+        assert!(drawn.body.contains("web-2"), "{}", drawn.body);
+        assert!(!drawn.body.contains("<html"), "just the widget");
+    }
+
+    #[tokio::test]
+    async fn a_page_with_forms_does_not_refresh_itself() {
+        let server = start().await;
+        let mut browser = Browser::default();
+        let id = built(&server, &mut browser).await;
+        add_widget(&server, &mut browser, id, &CHART).await;
+
+        let page = browser
+            .get(&server, &format!("/dashboards/{id}/edit"))
+            .await;
+
+        assert!(page.body.contains("Add widget"));
+        assert!(!page.body.contains("every 30s"), "{}", page.body);
+    }
+
+    #[tokio::test]
+    async fn dragging_a_widget_saves_where_it_went() {
+        let server = start().await;
+        let mut browser = Browser::default();
+        let id = built(&server, &mut browser).await;
+        add_widget(&server, &mut browser, id, &CHART).await;
+        let database = &server.state.database;
+        let widget = database.get_dashboard(id).await.unwrap().unwrap().widgets[0].id;
+
+        let layout = format!(r#"[{{"id":{widget},"x":6,"y":1,"w":6,"h":5}}]"#);
+        let page = browser
+            .submit(
+                &server,
+                &format!("/dashboards/{id}/edit"),
+                &format!("/dashboards/{id}/layout"),
+                &[("layout", &layout)],
+            )
+            .await;
+
+        assert_eq!(page.status, 204, "{}", page.body);
+        let saved = database.get_widget(id, widget).await.unwrap().unwrap();
+        assert_eq!(saved.input.placement.x, 6);
+        assert_eq!(saved.input.placement.h, 5);
+    }
+
+    #[tokio::test]
+    async fn a_mistake_on_the_form_keeps_what_was_typed() {
+        let server = start().await;
+        let mut browser = Browser::default();
+        let id = built(&server, &mut browser).await;
+
+        let mut fields = CHART;
+        fields[4] = ("filter", "\"unfinished");
+        let page = add_widget(&server, &mut browser, id, &fields).await;
+
+        assert_eq!(page.status, 200);
+        assert!(page.body.contains(r#"class="error""#), "{}", page.body);
+        assert!(page.body.contains("Busy machines"), "{}", page.body);
+    }
+
+    #[tokio::test]
+    async fn what_agents_report_is_never_treated_as_html() {
+        let server = start_with_metrics().await;
+        let hostile = "<script>alert(1)</script>";
+        let (_agent, _client) = machine(&server, "web-1", 10.0, json!({ "role": hostile })).await;
+        query(&server, "/api/v1/query?metric=cpu.usage&calculation=count").await;
+        let mut browser = Browser::default();
+        let id = built(&server, &mut browser).await;
+        let mut fields = CHART.to_vec();
+        fields[3] = ("group_by", "fact");
+        fields.push(("fact", "role"));
+        add_widget(&server, &mut browser, id, &fields).await;
+
+        let dashboard = server
+            .state
+            .database
+            .get_dashboard(id)
+            .await
+            .unwrap()
+            .unwrap();
+        let path = format!("/dashboards/{id}/widgets/{}", dashboard.widgets[0].id);
+        let page = browser.get(&server, &path).await;
+
+        assert!(!page.body.contains(hostile), "{}", page.body);
+        assert!(page.body.contains("&lt;script"), "{}", page.body);
+    }
+
+    #[tokio::test]
+    async fn one_broken_widget_says_so_without_stopping_the_page() {
+        let saved = Saved::default();
+        let store = Box::new(MemoryStore(saved.clone()));
+        let server = start_on("", store, Arc::new(FailingReader), saved, None).await;
+        let (agent, _client) = (identity(), ());
+        server.connect_approved(&agent, "web-1").await;
+        let mut browser = Browser::default();
+        let id = built(&server, &mut browser).await;
+        add_widget(&server, &mut browser, id, &CHART).await;
+
+        let dashboard = server
+            .state
+            .database
+            .get_dashboard(id)
+            .await
+            .unwrap()
+            .unwrap();
+        let path = format!("/dashboards/{id}/widgets/{}", dashboard.widgets[0].id);
+        let page = browser.get(&server, &path).await;
+
+        assert_eq!(page.status, 200);
+        assert!(page.body.contains("couldn't be read"), "{}", page.body);
+        assert!(!page.body.contains("secret"), "{}", page.body);
+    }
+
+    #[tokio::test]
+    async fn dashboards_need_someone_signed_in() {
+        let server = start().await;
+        let mut stranger = Browser::anonymous();
+        for path in ["/dashboards", "/dashboards/1", "/dashboards/1/widgets/1"] {
+            let page = stranger.get(&server, path).await;
+            assert_eq!(page.status, 303, "{path}");
+            assert!(page.header("location").unwrap().starts_with("/login"));
+        }
+    }
+
+    #[tokio::test]
+    async fn something_that_does_not_exist_is_not_found() {
+        let server = start().await;
+        let mut browser = Browser::default();
+        for path in [
+            "/dashboards/99",
+            "/dashboards/99/edit",
+            "/dashboards/99/widgets/new",
+            "/dashboards/99/widgets/1",
+            "/dashboards/99/widgets/1/edit",
+        ] {
+            assert_eq!(browser.get(&server, path).await.status, 404, "{path}");
+        }
+    }
+}
+
+/// Fails with a secret in the error, which must never reach a page.
+struct FailingReader;
+
+impl MetricsReader for FailingReader {
+    fn series(
+        &self,
+        _query: &crate::metrics::SeriesQuery,
+    ) -> anyhow::Result<crate::metrics::SeriesResult> {
+        anyhow::bail!("a secret");
+    }
+
+    fn last_samples(
+        &self,
+        _since_ms: i64,
+        _until_ms: i64,
+    ) -> anyhow::Result<Vec<crate::metrics::LastSample>> {
+        Ok(Vec::new())
+    }
+
+    fn latest_output(
+        &self,
+        _agent_id: &str,
+        _collector: &str,
+        _since_ms: i64,
+        _until_ms: i64,
+    ) -> anyhow::Result<Option<Value>> {
+        Ok(None)
+    }
+
+    fn newest(
+        &self,
+        _metric: &crate::metrics::Metric,
+        _since_ms: i64,
+        _until_ms: i64,
+    ) -> anyhow::Result<Vec<crate::metrics::NewestReading>> {
+        Ok(Vec::new())
+    }
+
+    fn stats(&self, _hour_ago_ms: i64) -> anyhow::Result<crate::store::StoreStats> {
+        Ok(Default::default())
+    }
+
+    fn series_count(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    fn calculate(
+        &self,
+        _query: &crate::calculations::CalculationQuery,
+    ) -> anyhow::Result<crate::metrics::SeriesResult> {
+        anyhow::bail!("a secret");
+    }
+}
