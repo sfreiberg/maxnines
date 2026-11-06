@@ -61,6 +61,23 @@ code, pre, .mono { font-family: var(--mono); font-size: 0.8125rem; }
 .live-pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
 .live-pill.stale { border-color: var(--warn); background: var(--warn-surface); color: var(--warn); }
 
+/* Theme menu. It needs scripts, so theme.js reveals it. */
+.theme-menu { position: relative; margin-left: auto; }
+.theme-menu[hidden] { display: none; }
+.theme-menu summary { display: flex; align-items: center; gap: 8px; min-height: 40px; padding: 0 12px; border: 1px solid var(--border-strong); border-radius: var(--radius-small); color: var(--text); font-size: 14px; font-weight: 500; list-style: none; cursor: pointer; }
+.theme-menu summary::-webkit-details-marker { display: none; }
+.theme-menu summary:hover { background: var(--surface); }
+.theme-menu summary svg { width: 18px; height: 18px; }
+.theme-menu summary circle { fill: none; stroke: currentColor; stroke-width: 1.7; }
+.theme-menu summary path { fill: currentColor; }
+.theme-options { position: absolute; z-index: 30; top: calc(100% + 8px); right: 0; display: flex; flex-direction: column; gap: 2px; width: 210px; padding: 6px; background: var(--surface); border: 1px solid var(--border-strong); border-radius: 14px; }
+.theme-options button { justify-content: flex-start; gap: 10px; min-height: 40px; padding: 0 8px; border: 0; border-radius: 9px; background: transparent; color: var(--text); font-weight: 500; }
+.theme-options button:hover { background: var(--raised); color: var(--text); }
+.theme-options button[aria-pressed="true"] { background: var(--accent-surface); color: var(--accent-ink); }
+.swatch { position: relative; display: flex; flex: none; width: 26px; height: 26px; overflow: hidden; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--surface); }
+.swatch[data-theme]::after { content: ""; position: absolute; top: 7px; left: 7px; width: 10px; height: 10px; border-radius: 50%; background: var(--accent); }
+.swatch span { flex: 1; background: var(--surface); }
+
 /* Page structure */
 .page-notices { width: 100%; max-width: 1520px; margin: 0 auto; padding: 0 32px; }
 .page-notices > * { margin-top: 16px; }
@@ -281,6 +298,7 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
   .topbar { gap: 10px; min-height: 56px; padding: 8px 16px; }
   .crumbs { font-size: 11px; letter-spacing: 0.1em; }
   .crumbs .home { display: none; }
+  .theme-menu summary span { display: none; }
   .page-notices { padding: 0 16px; }
   main { gap: 16px; padding: 20px 16px 16px; }
   .card, fieldset { padding: 18px; }

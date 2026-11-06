@@ -2,7 +2,7 @@
 
 mod alerting;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1262,6 +1262,134 @@ async fn embedded_assets_are_served_and_nothing_else_is() {
         let page = browser.get(&server, path).await;
         assert_eq!(page.status, 404, "{path}");
         assert!(!page.body.contains("[package]"), "{path}");
+    }
+}
+
+const THEMES_CSS: &str = include_str!("../assets/static/css/themes.css");
+const LAYOUT: &str = include_str!("../assets/views/layouts/application.html");
+
+/// Each theme's name with its colours, as they're written in themes.css.
+fn themes() -> Vec<(&'static str, HashMap<&'static str, &'static str>)> {
+    THEMES_CSS
+        .split(r#"[data-theme=""#)
+        .skip(1)
+        .map(|block| {
+            let (name, rest) = block.split_once('"').unwrap();
+            let colours = rest
+                .split_once('{')
+                .unwrap()
+                .1
+                .split_once('}')
+                .unwrap()
+                .0
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("--")?.strip_suffix(';'))
+                .filter_map(|line| line.split_once(": "))
+                .collect();
+            (name, colours)
+        })
+        .collect()
+}
+
+/// How bright a colour like #0f1114 looks, as WCAG defines it.
+fn luminance(colour: &str) -> f64 {
+    let channel = |at: usize| {
+        let value = f64::from(u8::from_str_radix(&colour[at..at + 2], 16).unwrap()) / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(1) + 0.7152 * channel(3) + 0.0722 * channel(5)
+}
+
+fn contrast(first: &str, second: &str) -> f64 {
+    let (first, second) = (luminance(first), luminance(second));
+    (first.max(second) + 0.05) / (first.min(second) + 0.05)
+}
+
+#[test]
+fn every_theme_is_readable() {
+    const TEXT: f64 = 4.5;
+    const GRAPHIC: f64 = 3.0;
+    let pairs = [
+        ("text", "background", TEXT),
+        ("text", "surface", TEXT),
+        ("text", "sunken", TEXT),
+        ("text", "raised", TEXT),
+        ("muted", "background", TEXT),
+        ("muted", "surface", TEXT),
+        ("muted", "sunken", TEXT),
+        ("muted", "raised", TEXT),
+        ("muted", "neutral-surface", TEXT),
+        ("accent-text", "accent", TEXT),
+        ("accent-text", "accent-hover", TEXT),
+        ("accent-ink", "background", TEXT),
+        ("accent-ink", "surface", TEXT),
+        ("accent-ink", "accent-surface", TEXT),
+        ("good", "good-surface", TEXT),
+        ("good", "surface", TEXT),
+        ("bad", "bad-surface", TEXT),
+        ("bad", "surface", TEXT),
+        ("bad-text", "bad", TEXT),
+        ("warn", "warn-surface", TEXT),
+        ("warn", "surface", TEXT),
+        ("meter", "surface", GRAPHIC),
+        ("meter-hot", "surface", GRAPHIC),
+    ];
+
+    let themes = themes();
+    assert!(themes.len() >= 5);
+    for (theme, colours) in &themes {
+        for (foreground, background, least) in pairs {
+            let ratio = contrast(colours[foreground], colours[background]);
+            assert!(
+                ratio >= least,
+                "{theme}: {foreground} on {background} is only {ratio:.2}:1"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_theme_sets_the_same_colours() {
+    let themes = themes();
+    let (_, first) = &themes[0];
+    for (theme, colours) in &themes {
+        let mut names: Vec<_> = colours.keys().collect();
+        let mut expected: Vec<_> = first.keys().collect();
+        names.sort();
+        expected.sort();
+        assert_eq!(names, expected, "{theme}");
+    }
+}
+
+#[test]
+fn the_theme_menu_offers_every_theme() {
+    for (theme, _) in themes() {
+        assert!(
+            LAYOUT.contains(&format!(r#"data-choice="{theme}""#)),
+            "{theme}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pages_load_the_theme_before_they_draw() {
+    let server = start().await;
+    let page = Browser::default().get(&server, "/agents").await;
+
+    let theme = page.body.find(r#"<script src="/assets/js/theme.js">"#);
+    assert!(theme.unwrap() < page.body.find("<body").unwrap());
+    let mut browser = Browser::default();
+    for path in [
+        "/assets/js/theme.js",
+        "/assets/css/themes.css",
+        "/assets/fonts/inter.woff2",
+        "/assets/fonts/jetbrains-mono.woff2",
+    ] {
+        assert_eq!(browser.get(&server, path).await.status, 200, "{path}");
     }
 }
 

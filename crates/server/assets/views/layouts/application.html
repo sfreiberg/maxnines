@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="/assets/css/themes.css">
   <link rel="stylesheet" href="/assets/css/application.css">
   <meta name="htmx-config" content='{"allowEval":false,"allowScriptTags":false,"includeIndicatorStyles":false}'>
+  <script src="/assets/js/theme.js"></script>
   <script src="/assets/js/htmx.min.js" defer></script>
   <script src="/assets/js/idiomorph-ext.min.js" defer></script>
   <script src="/assets/js/application.js" defer></script>
@@ -29,6 +30,17 @@
       <header class="topbar">
         <p class="crumbs"><span class="home">MaxNines</span>{% if section %}<span class="home">/</span><strong>{{ section }}</strong>{% endif %}</p>
         {% block status %}{% endblock status %}
+        <details id="theme-menu" class="theme-menu" hidden>
+          <summary aria-label="Choose a theme"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 3.5a8.5 8.5 0 0 1 0 17Z"/></svg><span>Theme</span></summary>
+          <div class="theme-options">
+            <button type="button" data-choice="carbon"><span class="swatch" data-theme="carbon"></span>Carbon</button>
+            <button type="button" data-choice="midnight"><span class="swatch" data-theme="midnight"></span>Midnight</button>
+            <button type="button" data-choice="dusk"><span class="swatch" data-theme="dusk"></span>Dusk</button>
+            <button type="button" data-choice="paper"><span class="swatch" data-theme="paper"></span>Paper</button>
+            <button type="button" data-choice="contrast"><span class="swatch" data-theme="contrast"></span>High contrast</button>
+            <button type="button" data-choice="system"><span class="swatch"><span data-theme="carbon"></span><span data-theme="paper"></span></span>Match system</button>
+          </div>
+        </details>
       </header>
       <div class="page-notices">
         <div id="update-notice" role="status" hx-get="/update-notice?build={{ build_id }}" hx-trigger="every 60s"></div>
