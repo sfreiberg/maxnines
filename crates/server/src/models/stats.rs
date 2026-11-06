@@ -59,6 +59,12 @@ fn size_query(backend: DatabaseBackend) -> Option<&'static str> {
 impl Database {
     /// Only for what's reported about this database. A size that can't be read
     /// isn't worth losing the rest over, as some hosts restrict these views.
+    /// How big the database is, for databases that can say.
+    pub async fn size(&self) -> Option<i64> {
+        self.size_bytes(self.connection.get_database_backend())
+            .await
+    }
+
     async fn size_bytes(&self, backend: DatabaseBackend) -> Option<i64> {
         let sql = size_query(backend)?;
         let statement = Statement::from_string(backend, sql);

@@ -22,7 +22,7 @@ use crate::store::{NewSample, WriterCommand};
 /// The built-in agent's ID. See the migration that creates it.
 pub const LOCAL_AGENT_ID: &str = "server";
 
-const LOCAL_HOST: &str = "MaxNines server";
+pub const LOCAL_HOST: &str = "MaxNines server";
 
 /// How often to look for checks that are due.
 const TICK: Duration = Duration::from_secs(5);

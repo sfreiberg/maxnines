@@ -21,6 +21,7 @@ use tracing::error;
 
 use crate::config::MetricsConfig;
 use crate::metrics::{LastSample, Metric, NewestReading, SeriesQuery, SeriesResult, now_ms};
+use crate::remote_checks::LOCAL_AGENT_ID;
 
 /// Samples waiting to be written. When this fills up, connections stop reading
 /// from their agents until the database catches up.
@@ -28,6 +29,8 @@ const WRITE_QUEUE_SIZE: usize = 1024;
 
 /// How often to look for upkeep when there's none going on.
 const TIDY_CHECK_EVERY: Duration = Duration::from_secs(60);
+/// The pause between pieces of upkeep, so samples don't queue up behind it.
+const TIDY_PAUSE: Duration = Duration::from_millis(250);
 
 /// Somewhere samples are saved.
 pub trait Store: Send {
@@ -163,12 +166,7 @@ fn run_writer(
         }
         if Instant::now() >= next_tidy {
             let more = tidy(store.as_mut());
-            next_tidy = Instant::now()
-                + if more {
-                    Duration::ZERO
-                } else {
-                    TIDY_CHECK_EVERY
-                };
+            next_tidy = Instant::now() + if more { TIDY_PAUSE } else { TIDY_CHECK_EVERY };
         }
     }
 
@@ -199,9 +197,11 @@ fn tidy(store: &mut dyn Store) -> bool {
 fn save(store: &mut dyn Store, samples: &[NewSample], counts: &WriteCounts) {
     let error = match catch_unwind(AssertUnwindSafe(|| store.write(samples))) {
         Ok(Ok(())) => {
+            // From agents, as the server recording itself isn't ingesting anything.
+            let from_agents = samples.iter().filter(|new| new.agent_id != LOCAL_AGENT_ID);
             counts
                 .written
-                .fetch_add(samples.len() as u64, Ordering::Relaxed);
+                .fetch_add(from_agents.count() as u64, Ordering::Relaxed);
             return;
         }
         Ok(Err(error)) => format!("{error:#}"),

@@ -253,6 +253,7 @@ async fn serve(path: &Path) -> Result<()> {
         state.check_results.clone(),
     )
     .spawn();
+    server_stats::spawn_recorder(state.clone());
     // The server is always online to itself, so nothing reads it as missing.
     state
         .presence

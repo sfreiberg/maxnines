@@ -2,9 +2,12 @@
 {% block title %}Server · MaxNines{% endblock title %}
 {% block content %}
 <p class="breadcrumb"><a href="/settings">Settings</a></p>
-<div>
-  <h1>Server</h1>
-  <p class="subtitle">Running for {{ server.uptime }}. This page updates by itself.</p>
+<div class="title-row">
+  <div>
+    <h1>Server</h1>
+    <p class="subtitle">Running for {{ server.uptime }}. This page updates by itself.</p>
+  </div>
+  <a class="button secondary" href="/agents/server/metrics">History</a>
 </div>
 
 {% if server.alert_rules_stalled %}

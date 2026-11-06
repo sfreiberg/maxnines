@@ -3298,6 +3298,77 @@ mod server_page {
     use super::*;
 
     #[tokio::test]
+    async fn the_server_keeps_a_history_of_its_own_numbers() {
+        use crate::server_stats::{Recorded, record_once};
+
+        let server = start_with_metrics().await;
+        let local = server.state.database.load_agents().await.unwrap();
+        let local = local.into_iter().find(|agent| agent.is_local()).unwrap();
+        server.state.registry.insert_for_test(local).await;
+        let (_agent, _client) = report_samples(&server, "/").await;
+        let mut recorded = Recorded::default();
+        record_once(&server.state, &mut recorded).await;
+        sleep(Duration::from_millis(50)).await;
+        record_once(&server.state, &mut recorded).await;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let page = loop {
+            let page = Browser::default()
+                .get(&server, "/agents/server/metrics")
+                .await;
+            if page.body.contains("Server memory") || Instant::now() > deadline {
+                break page;
+            }
+            sleep(Duration::from_millis(20)).await;
+        };
+
+        assert_eq!(page.status, 200);
+        assert!(page.body.contains("Server memory"), "{}", page.body);
+        assert!(page.body.contains("Agents"), "{}", page.body);
+        // Charts for what the server doesn't report would only be empty.
+        assert!(!page.body.contains("CPU usage"), "{}", page.body);
+        assert!(page.body.contains(r#"href="/settings/server""#));
+
+        let metric = crate::metrics::find("server.agents").unwrap();
+        let range = TimeRange::new(now_ms() - 60_000, now_ms() + 60_000).unwrap();
+        let agents = server
+            .state
+            .metrics
+            .series("server", metric, range, 8)
+            .await;
+        let online = agents
+            .unwrap()
+            .series
+            .into_iter()
+            .find(|s| s.name == "Online");
+        assert_eq!(
+            online.unwrap().points[0].max,
+            1.0,
+            "the server isn't counted"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_server_page_links_to_its_history() {
+        let server = start().await;
+        let page = Browser::default().get(&server, "/settings/server").await;
+        assert!(page.body.contains(r#"href="/agents/server/metrics""#));
+    }
+
+    #[tokio::test]
+    async fn the_servers_own_samples_are_not_counted_as_ingested() {
+        use crate::server_stats::{Recorded, record_once};
+
+        let server = start_with_metrics().await;
+        record_once(&server.state, &mut Recorded::default()).await;
+        sleep(Duration::from_millis(100)).await;
+
+        let writes = &server.state.status.writes;
+        let written = writes.written.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(written, 0);
+    }
+
+    #[tokio::test]
     async fn the_server_page_reports_on_everything() {
         let server = start_with_metrics().await;
         let (_agent, _client) = report_samples(&server, "/").await;

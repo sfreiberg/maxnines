@@ -1,22 +1,27 @@
 //! How the server itself is doing: what the Server page and admin API report.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use maxnines_protocol::Sample;
 use serde::Serialize;
+use serde_json::{Value, json};
 use sysinfo::{
     CpuRefreshKind, Disks, MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System,
 };
-use tracing::error;
+use tokio::time::MissedTickBehavior;
+use tracing::{error, warn};
 
 use crate::app_state::AppState;
 use crate::metrics::now_ms;
 use crate::models::DatabaseStats;
-use crate::registration::AgentState;
-use crate::store::{StoreStats, WriteCounts};
+use crate::registration::{AgentRecord, AgentState};
+use crate::remote_checks::{LOCAL_AGENT_ID, LOCAL_HOST};
+use crate::store::{NewSample, StoreStats, WriteCounts, WriterCommand};
 
 const HOUR_MS: i64 = 3_600_000;
 
@@ -51,6 +56,102 @@ impl ServerStatus {
             system: Mutex::new((system, None)),
         })
     }
+}
+
+/// How often the server records its own numbers, as agents do by default.
+const RECORD_EVERY: Duration = Duration::from_secs(15);
+
+fn file_size(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|file| file.len())
+}
+
+impl ServerStatus {
+    /// The size of the metrics database and its write-ahead log, read from the files
+    /// because asking the database what it holds is far slower.
+    fn metrics_files(&self) -> (Option<u64>, Option<u64>) {
+        let Some(path) = &self.data_path else {
+            return (None, None);
+        };
+        let mut wal = path.clone().into_os_string();
+        wal.push(".wal");
+        (file_size(path), file_size(Path::new(&wal)))
+    }
+}
+
+/// Samples counted so far, so each record can say how many are new.
+#[derive(Default)]
+pub struct Recorded {
+    written: u64,
+    failed: u64,
+}
+
+/// What the server reports about itself, in the shape an agent would. These are the
+/// numbers that are cheap to read, so that watching the server adds little to it.
+async fn own_numbers(state: &AppState, recorded: &mut Recorded) -> Value {
+    let status = state.status.clone();
+    let (process, (metrics_bytes, wal_bytes)) =
+        tokio::task::spawn_blocking(move || (process_stats(&status), status.metrics_files()))
+            .await
+            .unwrap_or((None, (None, None)));
+
+    let status = &state.status;
+    let written = status.writes.written.load(Ordering::Relaxed);
+    let failed = status.writes.failed.load(Ordering::Relaxed);
+    let new_written = written - recorded.written;
+    let new_failed = failed - recorded.failed;
+    *recorded = Recorded { written, failed };
+
+    let agents = state.registry.list().await;
+    let real = || agents.iter().filter(|agent| !agent.is_local());
+    let online = |agent: &&AgentRecord| state.presence.get(&agent.id).is_some_and(|p| p.online);
+    json!({
+        "memory_bytes": process.as_ref().map(|process| process.memory_bytes),
+        "cpu_percent": process.as_ref().and_then(|process| process.cpu_percent),
+        "open_files": process.as_ref().and_then(|process| process.open_files),
+        "samples_written": new_written,
+        "samples_failed": new_failed,
+        "write_queue": state.writer.max_capacity() - state.writer.capacity(),
+        "agents_online": real().filter(online).count(),
+        "agents_approved": real()
+            .filter(|agent| agent.state == AgentState::Approved)
+            .count(),
+        "agents_waiting": real()
+            .filter(|agent| agent.state == AgentState::Pending)
+            .count(),
+        "alerts_firing": status.firing.load(Ordering::Relaxed),
+        "metrics_database_bytes": metrics_bytes,
+        "metrics_wal_bytes": wal_bytes,
+        "main_database_bytes": state.database.size().await,
+    })
+}
+
+pub async fn record_once(state: &AppState, recorded: &mut Recorded) {
+    let sample = Sample {
+        timestamp_ms: now_ms() as u64,
+        metrics: BTreeMap::from([("server".to_string(), own_numbers(state, recorded).await)]),
+    };
+    let command = WriterCommand::Save(NewSample {
+        agent_id: LOCAL_AGENT_ID.to_string(),
+        host: LOCAL_HOST.to_string(),
+        sample,
+    });
+    if state.writer.send(command).await.is_err() {
+        warn!("the metrics writer has stopped, so the server's own numbers were dropped");
+    }
+}
+
+/// Records the server's own numbers the same way an agent's are, so they get history,
+/// charts and alert rules like everything else.
+pub fn spawn_recorder(state: AppState) {
+    tokio::spawn(async move {
+        let mut recorded = Recorded::default();
+        let mut every = tokio::time::interval(RECORD_EVERY);
+        every.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            every.tick().await;
+            record_once(&state, &mut recorded).await;
+        }
+    });
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

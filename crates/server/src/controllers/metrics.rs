@@ -201,7 +201,7 @@ async fn show(
     while let Some(finished) = queries.join_next().await {
         match finished {
             Ok((position, metric, Ok(chart)))
-                if chart.has_data || metric.chart == ShowChart::Always =>
+                if chart.has_data || (metric.chart == ShowChart::Always && !agent.is_local()) =>
             {
                 charts.push((position, chart));
             }

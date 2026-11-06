@@ -2,7 +2,7 @@
 {% block title %}{{ host }} metrics · MaxNines{% endblock title %}
 {% block refresh_every %}60s{% endblock refresh_every %}
 {% block content %}
-<p class="breadcrumb">{% if is_local %}<a href="/checks">Checks</a>{% else %}<a href="/metrics">Metrics</a>{% endif %}</p>
+<p class="breadcrumb">{% if is_local %}<a href="/settings/server">Server</a>{% else %}<a href="/metrics">Metrics</a>{% endif %}</p>
 <div class="title-row">
   <h1>{{ host }}</h1>
   {% if not is_local %}<a class="button secondary" href="/agents/{{ agent_id }}">Agent details</a>{% endif %}
