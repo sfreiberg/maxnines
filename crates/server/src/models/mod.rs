@@ -28,6 +28,7 @@ use anyhow::{Context, Result};
 use maxnines_protocol::auth::new_nonce;
 use sea_orm::sea_query::Expr;
 use sea_orm::sea_query::OnConflict;
+use sea_orm::sqlx::sqlite::{SqliteJournalMode, SqliteSynchronous};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectOptions, ConnectionTrait, DatabaseConnection,
     EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
@@ -112,6 +113,16 @@ impl Database {
             .connect_timeout(CONNECT_TIMEOUT)
             .acquire_timeout(CONNECT_TIMEOUT)
             .sqlx_logging(false);
+        // The default journal waits on the disk several times for every write, which
+        // a fleet reporting at once can't get through on a slow disk. In this mode a
+        // power cut can lose the last few writes, but can't damage the database.
+        if is_sqlite {
+            options.map_sqlx_sqlite_opts(|sqlite| {
+                sqlite
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .synchronous(SqliteSynchronous::Normal)
+            });
+        }
 
         let connection = sea_orm::Database::connect(options)
             .await
@@ -964,6 +975,33 @@ mod tests {
         assert!(check_api_key_name("backup").is_ok());
         assert!(check_api_key_name("  ").is_err());
         assert!(check_api_key_name(&"x".repeat(101)).is_err());
+    }
+
+    #[tokio::test]
+    async fn sqlite_does_not_wait_on_the_disk_for_every_write() {
+        let folder = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}/app.db?mode=rwc", folder.path().display());
+        let database = Database::connect(&url).await.unwrap();
+
+        let pragma = async |name: &str| {
+            let statement = sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                format!("PRAGMA {name}"),
+            );
+            let row = database.connection.query_one_raw(statement).await.unwrap();
+            row.unwrap()
+        };
+
+        let mode: String = pragma("journal_mode")
+            .await
+            .try_get("", "journal_mode")
+            .unwrap();
+        let synchronous: i32 = pragma("synchronous")
+            .await
+            .try_get("", "synchronous")
+            .unwrap();
+        assert_eq!(mode, "wal");
+        assert_eq!(synchronous, 1, "NORMAL");
     }
 
     #[tokio::test]
