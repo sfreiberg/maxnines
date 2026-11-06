@@ -962,3 +962,133 @@ Stops a key working straight away. It stays in the list, to show what existed.
 curl -X DELETE -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "$MAXNINES_URL/api/v1/api-keys/2"
 ```
+
+## Users
+
+Everyone who can sign in to the web pages. Nobody can sign up, so people are only
+added here, on the Settings page, or with `maxnines-server users`. Passwords can't
+be read or set through the API: someone new gets a link to set their own.
+
+### List users
+
+`GET /api/v1/users`
+
+```sh
+curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/users"
+```
+
+```json
+[
+  {
+    "id": 1,
+    "email": "sam@example.com",
+    "name": "Sam",
+    "theme": "carbon",
+    "has_password": true,
+    "created_ms": 1793977895109,
+    "last_sign_in_ms": 1793978000000,
+    "disabled_ms": null
+  }
+]
+```
+
+### Add a user
+
+`POST /api/v1/users`
+
+The answer holds a link for them to set a password. It works once, lasts 7 days and
+can't be seen again, so pass it on.
+
+```sh
+curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"email": "alex@example.com", "name": "Alex"}' \
+  "$MAXNINES_URL/api/v1/users"
+```
+
+```json
+{
+  "user": {
+    "id": 2,
+    "email": "alex@example.com",
+    "name": "Alex",
+    "theme": "carbon",
+    "has_password": false,
+    "created_ms": 1793977895109,
+    "last_sign_in_ms": null,
+    "disabled_ms": null
+  },
+  "setup_url": "http://localhost:9000/setup/8f3a…"
+}
+```
+
+An address that's already in use gives `409`.
+
+### Get a user
+
+`GET /api/v1/users/{id}`
+
+```sh
+curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/users/2"
+```
+
+### Change a user's theme
+
+`PUT /api/v1/users/{id}`
+
+`theme` can be `carbon`, `midnight`, `dusk`, `paper`, `contrast` or `system`.
+
+```sh
+curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"theme": "paper"}' \
+  "$MAXNINES_URL/api/v1/users/2"
+```
+
+### Make a new setup link
+
+`POST /api/v1/users/{id}/setup-link`
+
+This is how a forgotten password is reset. It replaces any earlier link, and their
+current password keeps working until the new link is used.
+
+```sh
+curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  "$MAXNINES_URL/api/v1/users/2/setup-link"
+```
+
+```json
+{ "setup_url": "http://localhost:9000/setup/2c91…" }
+```
+
+### Enable a user
+
+`POST /api/v1/users/{id}/enable`
+
+```sh
+curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  "$MAXNINES_URL/api/v1/users/2/enable"
+```
+
+### Disable a user
+
+`POST /api/v1/users/{id}/disable`
+
+This stops them signing in and signs them out straight away. Disabling the last
+enabled user gives `409`, so someone can always sign in.
+
+```sh
+curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  "$MAXNINES_URL/api/v1/users/2/disable"
+```
+
+### Delete a user
+
+`DELETE /api/v1/users/{id}`
+
+Only a disabled user can be deleted. Anyone else gives `409`.
+
+```sh
+curl -X DELETE -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  "$MAXNINES_URL/api/v1/users/2"
+```

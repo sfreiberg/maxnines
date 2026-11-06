@@ -1,6 +1,7 @@
 //! Tests that run the real router over real sockets.
 
 mod alerting;
+mod users;
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -43,6 +44,8 @@ type Client = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 struct TestServer {
     address: SocketAddr,
+    /// A signed in user's session, which browsers use unless they're anonymous.
+    session: String,
     state: AppState,
     saved: Saved,
     /// Holds the metrics database, for tests that use a real one.
@@ -85,6 +88,12 @@ async fn start_on(
     let config = Config::parse(&text).unwrap();
 
     let database = Database::in_memory().await;
+    let (user, _) = database
+        .create_user("test@example.com", "Tester", now_ms())
+        .await
+        .unwrap()
+        .unwrap();
+    let session = database.start_session(user.id, now_ms()).await.unwrap();
     let status = Arc::new(ServerStatus::new(None).unwrap());
     let (writer, _thread) = spawn_writer(store, status.writes.clone());
     let state = AppState {
@@ -111,6 +120,8 @@ async fn start_on(
         admin_token_hash: hash_token(ADMIN_TOKEN).into(),
         views: Arc::new(Views::load().unwrap()),
         csrf: CsrfConfig::default(),
+        web_url: "http://site.test".into(),
+        sign_ins: Arc::default(),
     };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -120,6 +131,7 @@ async fn start_on(
 
     TestServer {
         address,
+        session,
         state,
         saved,
         _folder: folder,
@@ -1053,7 +1065,9 @@ async fn the_rules_api_needs_the_token() {
 /// A browser: keeps the CSRF cookie and reads tokens out of forms.
 #[derive(Default)]
 struct Browser {
-    cookie: String,
+    cookies: BTreeMap<String, String>,
+    /// Stays signed out until it signs in, unlike other browsers in these tests.
+    anonymous: bool,
 }
 
 struct Page {
@@ -1089,6 +1103,26 @@ impl Page {
 }
 
 impl Browser {
+    fn anonymous() -> Self {
+        Self {
+            anonymous: true,
+            ..Self::default()
+        }
+    }
+
+    fn cookie_header(&self, server: &TestServer) -> String {
+        let mut cookies = self.cookies.clone();
+        if !self.anonymous {
+            cookies
+                .entry("maxnines_session".to_string())
+                .or_insert_with(|| server.session.clone());
+        }
+        let pairs = cookies
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"));
+        pairs.collect::<Vec<_>>().join("; ")
+    }
+
     async fn send(&mut self, server: &TestServer, request: String) -> Page {
         let mut stream = TcpStream::connect(server.address).await.unwrap();
         stream.write_all(request.as_bytes()).await.unwrap();
@@ -1099,8 +1133,9 @@ impl Browser {
         let (headers, body) = response.split_once("\r\n\r\n").unwrap();
         for line in headers.lines() {
             if line.to_lowercase().starts_with("set-cookie: ") {
-                let cookie = &line["set-cookie: ".len()..];
-                self.cookie = cookie.split(';').next().unwrap().to_string();
+                let cookie = line["set-cookie: ".len()..].split(';').next().unwrap();
+                let (name, value) = cookie.split_once('=').unwrap();
+                self.cookies.insert(name.to_string(), value.to_string());
             }
         }
         Page {
@@ -1113,7 +1148,7 @@ impl Browser {
     async fn get(&mut self, server: &TestServer, path: &str) -> Page {
         let request = format!(
             "GET {path} HTTP/1.1\r\nHost: x\r\nCookie: {}\r\nConnection: close\r\n\r\n",
-            self.cookie
+            self.cookie_header(server)
         );
         self.send(server, request).await
     }
@@ -1128,7 +1163,7 @@ impl Browser {
             "POST {path} HTTP/1.1\r\nHost: x\r\nCookie: {}\r\n\
              Content-Type: application/x-www-form-urlencoded\r\n\
              Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            self.cookie,
+            self.cookie_header(server),
             body.len()
         );
         self.send(server, request).await
@@ -1138,7 +1173,7 @@ impl Browser {
         let request = format!(
             "GET {path} HTTP/1.1\r\nHost: x\r\nCookie: {}\r\nAccept-Encoding: gzip\r\n\
              Connection: close\r\n\r\n",
-            self.cookie
+            self.cookie_header(server)
         );
         self.send(server, request).await
     }
@@ -1266,7 +1301,6 @@ async fn embedded_assets_are_served_and_nothing_else_is() {
 }
 
 const THEMES_CSS: &str = include_str!("../assets/static/css/themes.css");
-const LAYOUT: &str = include_str!("../assets/views/layouts/application.html");
 
 /// Each theme's name with its colours, as they're written in themes.css.
 fn themes() -> Vec<(&'static str, HashMap<&'static str, &'static str>)> {
@@ -1366,12 +1400,9 @@ fn every_theme_sets_the_same_colours() {
 }
 
 #[test]
-fn the_theme_menu_offers_every_theme() {
+fn everyone_can_choose_every_theme() {
     for (theme, _) in themes() {
-        assert!(
-            LAYOUT.contains(&format!(r#"data-choice="{theme}""#)),
-            "{theme}"
-        );
+        assert!(crate::models::is_theme(theme), "{theme}");
     }
 }
 
@@ -2592,7 +2623,7 @@ async fn every_page_asks_whether_the_server_has_been_updated() {
         let page = browser.get(&server, path).await;
         let build = build_of(&page);
         assert!(!build.is_empty(), "{path}");
-        assert!(page.body.contains(r#"hx-trigger="every 60s""#), "{path}");
+        assert!(page.body.contains(r#"hx-trigger="every 60s,"#), "{path}");
     }
 }
 

@@ -1,0 +1,45 @@
+{% extends "layouts/application.html" %}
+{% block title %}Profile · MaxNines{% endblock title %}
+{% block main_class %} class="narrow"{% endblock main_class %}
+{% block content %}
+<div class="title-row">
+  <div>
+    <p class="eyebrow">{{ person.email }}</p>
+    <h1>{{ person.name }}</h1>
+  </div>
+  <form method="post" action="/logout">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <button type="submit" class="secondary">Sign out</button>
+  </form>
+</div>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+{% if saved %}<p class="notice">Your password has been changed, and you've been signed out everywhere else.</p>{% endif %}
+
+<section class="card">
+  <h2>Theme</h2>
+  <form method="post" action="/profile/theme" class="theme-choices">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    {% for choice in themes %}
+    <button type="submit" name="theme" value="{{ choice.value }}" class="theme-choice" aria-pressed="{% if choice.chosen %}true{% else %}false{% endif %}">
+      {% if choice.value == "system" %}<span class="swatch"><span data-theme="carbon"></span><span data-theme="paper"></span></span>{% else %}<span class="swatch" data-theme="{{ choice.value }}"></span>{% endif %}
+      {{ choice.label }}
+    </button>
+    {% endfor %}
+  </form>
+</section>
+
+{% if person.has_password %}
+<section class="card">
+  <h2>Password</h2>
+  <form method="post" action="/profile/password" class="stacked">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <input type="text" name="username" value="{{ person.email }}" autocomplete="username" hidden>
+    <label>Current password <input type="password" name="current" autocomplete="current-password" required></label>
+    <label>New password <input type="password" name="password" autocomplete="new-password" minlength="12" required><small>At least 12 characters. A few random words work well.</small></label>
+    <label>Confirm new password <input type="password" name="confirm" autocomplete="new-password" required></label>
+    <div class="actions"><button type="submit">Change password</button></div>
+  </form>
+</section>
+{% endif %}
+{% endblock content %}

@@ -1,7 +1,8 @@
 //! Routes and request handling. Pages live in `overview`, `agents`, `alerts`,
 //! `alert_rules`, `metrics`, `notification_channels`, `remote_checks`, `rules` and
 //! `settings`, the token protected API in `api`, agent connections in `agent_socket`,
-//! and how an open page learns of a new build in `update_notice`.
+//! signing in in `sessions`, people in `users`, and how an open page learns of a new
+//! build in `update_notice`.
 
 pub mod agent_socket;
 mod agents;
@@ -18,10 +19,13 @@ mod notification_channels;
 mod overview;
 mod remote_checks;
 mod rules;
+mod sessions;
 mod settings;
 mod update_notice;
+mod users;
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::Error;
@@ -38,17 +42,30 @@ use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Pr
 use tracing::{error, warn};
 
 use crate::app_state::AppState;
+use crate::models::{DEFAULT_THEME, User};
 
 const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; connect-src 'self'; \
      style-src 'self'; font-src 'self'; img-src 'self'; manifest-src 'self'; form-action 'self'; \
      base-uri 'none'; frame-ancestors 'none'";
 
+tokio::task_local! {
+    /// Who this request is from, for the page's frame and anything they do.
+    static SIGNED_IN: Arc<User>;
+}
+
+/// Who's signed in, which is nobody on the sign in pages or for an API key.
+fn signed_in_user() -> Option<Arc<User>> {
+    SIGNED_IN.try_with(Arc::clone).ok()
+}
+
 pub fn app(state: AppState) -> Router {
-    Router::new()
-        .route("/ws", get(agent_socket::upgrade))
+    // Everything here needs someone signed in, including what isn't found, so a
+    // stranger can't tell which addresses exist.
+    let pages = Router::new()
         .merge(overview::routes())
         .merge(settings::routes())
         .merge(api_keys::routes())
+        .merge(users::routes())
         .merge(agents::routes())
         .merge(alerts::routes())
         .merge(alert_rules::routes())
@@ -56,10 +73,20 @@ pub fn app(state: AppState) -> Router {
         .merge(remote_checks::routes())
         .merge(compressed(metrics::routes()))
         .merge(rules::routes())
+        .fallback(not_found)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            sessions::require_login,
+        ));
+
+    Router::new()
+        .route("/ws", get(agent_socket::upgrade))
+        .merge(pages)
+        .merge(sessions::routes())
         .merge(compressed(assets::routes()))
+        // Open to all, so a form being filled in isn't lost to a login that ran out.
         .merge(update_notice::routes())
         .nest(api::BASE_PATH, api::routes(state.clone()))
-        .fallback(not_found)
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
 }
@@ -85,6 +112,11 @@ async fn security_headers(request: Request, next: Next) -> Response {
         HeaderValue::from_static(CONTENT_SECURITY_POLICY),
     );
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    // Setup links are secrets, and a referrer would hand them to anything linked to.
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -101,6 +133,7 @@ fn section_of(template: &str) -> &'static str {
         "remote_checks" => "checks",
         "alerts" => "alerts",
         "settings" | "rules" | "alert_rules" | "notification_channels" => "settings",
+        "profile" => "profile",
         _ => "",
     }
 }
@@ -109,6 +142,21 @@ fn section_of(template: &str) -> &'static str {
 fn build_id() -> String {
     let build = maxnines_protocol::build_info!();
     format!("{}-{}", build.commit, build.built_at)
+}
+
+/// What the frame around a page shows of whoever's signed in.
+#[derive(serde::Serialize)]
+struct Badge {
+    name: String,
+    initial: String,
+}
+
+fn badge(user: &User) -> Badge {
+    let initial = user.name.chars().next().map(char::to_uppercase);
+    Badge {
+        name: user.name.clone(),
+        initial: initial.map(|letters| letters.collect()).unwrap_or_default(),
+    }
 }
 
 /// A page to render, carrying the CSRF token every form on it needs.
@@ -131,6 +179,10 @@ impl<'a> Page<'a> {
         context.insert("build_id", &build_id());
         context.insert("section", section_of(template));
         context.insert("firing", &state.status.firing.load(Ordering::Relaxed));
+        let user = signed_in_user();
+        context.insert("user", &user.as_deref().map(badge));
+        let theme = user.as_deref().map_or(DEFAULT_THEME, |user| &user.theme);
+        context.insert("theme", theme);
         Self {
             state,
             token: token.clone(),

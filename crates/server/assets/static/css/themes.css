@@ -1,7 +1,7 @@
-/* Every colour on the site, one block per theme. Carbon is the default. theme.js
-   sets data-theme on the page, and the theme menu sets it on each swatch so a
-   swatch shows its own theme's colours. Add a theme here and to the theme menu in
-   layouts/application.html. A test checks that each one is readable. */
+/* Every colour on the site, one block per theme. Carbon is the default. The page
+   carries data-theme, and so does each swatch on the profile page, to show its own
+   theme's colours. Add a theme here and to THEMES in models/users.rs. A test checks
+   that each one is readable. */
 
 :root,
 [data-theme="carbon"] {

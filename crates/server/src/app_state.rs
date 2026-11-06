@@ -12,6 +12,7 @@ use crate::facts::{FlatFacts, unflatten};
 use crate::metrics::Metrics;
 use crate::models::{Database, RuleInput};
 use crate::notifier::Senders;
+use crate::passwords::SignInThrottle;
 use crate::presence::Presence;
 use crate::registration::{AgentState, Registry};
 use crate::remote_checks::{self, LatestResults, RemoteCheckInput};
@@ -49,6 +50,9 @@ pub struct AppState {
     pub admin_token_hash: Arc<[u8]>,
     pub views: Arc<Views>,
     pub csrf: CsrfConfig,
+    /// Where people reach the site, for links they're given.
+    pub web_url: Arc<str>,
+    pub sign_ins: Arc<SignInThrottle>,
 }
 
 impl FromRef<AppState> for CsrfConfig {

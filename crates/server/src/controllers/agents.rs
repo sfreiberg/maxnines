@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use super::fleet::Health;
 use super::host_list::{HostSearch, address, page_number, paginate};
-use super::{CsrfForm, Page, server_error};
+use super::{CsrfForm, Page, server_error, signed_in_user};
 use crate::alerting::Alert;
 use crate::app_state::AppState;
 use crate::fact_history::{describe_history, format_time};
@@ -500,7 +500,8 @@ async fn decide(
     form: CsrfForm,
     decision: AgentState,
 ) -> Response {
-    match state.registry.decide(&id, decision).await {
+    let by = signed_in_user().map_or_else(|| "admin".to_string(), |user| user.email.clone());
+    match state.registry.decide_as(&id, decision, &by).await {
         Ok(Some(_)) => (form.token, Redirect::to(&format!("/agents/{id}"))).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),

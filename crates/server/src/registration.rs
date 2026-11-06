@@ -62,7 +62,7 @@ pub struct AgentRecord {
     pub public_key: String,
     pub host: String,
     pub state: AgentState,
-    /// "admin", or "rule:<name>", for the audit trail.
+    /// Who approved it: "admin", someone's address, or "rule:<name>".
     pub decided_by: Option<String>,
     pub first_seen_ms: u64,
     pub decided_at_ms: Option<u64>,
@@ -262,8 +262,18 @@ impl Registry {
         Ok(status)
     }
 
-    /// An admin decision. Returns `None` for an unknown agent.
+    /// A decision made through the API or the command line.
     pub async fn decide(&self, id: &str, state: AgentState) -> Result<Option<AgentRecord>> {
+        self.decide_as(id, state, "admin").await
+    }
+
+    /// A decision someone made, to show who it was. Returns `None` for an unknown agent.
+    pub async fn decide_as(
+        &self,
+        id: &str,
+        state: AgentState,
+        by: &str,
+    ) -> Result<Option<AgentRecord>> {
         if id == LOCAL_AGENT_ID {
             return Ok(None);
         }
@@ -273,7 +283,7 @@ impl Registry {
         };
 
         agent.state = state;
-        agent.decided_by = Some("admin".to_string());
+        agent.decided_by = Some(by.to_string());
         agent.decided_at_ms = Some(now_ms());
         self.save(&mut agents, agent.clone()).await?;
         drop(agents);

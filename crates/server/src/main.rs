@@ -13,6 +13,7 @@ mod metrics;
 mod migrations;
 mod models;
 mod notifier;
+mod passwords;
 mod presence;
 mod registration;
 mod remote_checks;
@@ -72,8 +73,27 @@ enum Command {
     /// Manage keys for the API on a running server
     #[command(subcommand)]
     ApiKeys(ApiKeysCommand),
+    /// Manage who can sign in on a running server
+    #[command(subcommand)]
+    Users(UsersCommand),
     /// Print the server's own token, which works like an API key and can't be revoked
     AdminToken,
+}
+
+#[derive(Debug, PartialEq, Subcommand)]
+enum UsersCommand {
+    /// List everyone who can sign in
+    List,
+    /// Add someone and print the link for them to set a password
+    Create { email: String, name: String },
+    /// Print a new link for someone to set a password, as when they've forgotten it
+    SetupLink { id: i64 },
+    /// Stop someone signing in, and sign them out
+    Disable { id: i64 },
+    /// Let someone sign in again
+    Enable { id: i64 },
+    /// Remove someone who's been disabled
+    Delete { id: i64 },
 }
 
 #[derive(Debug, PartialEq, Subcommand)]
@@ -112,6 +132,17 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Run) {
         Command::Run => serve(&cli.config),
+        Command::Users(command) => {
+            let config = Config::load(&cli.config)?;
+            match command {
+                UsersCommand::List => cli::print_users(&config),
+                UsersCommand::Create { email, name } => cli::create_user(&config, &email, &name),
+                UsersCommand::SetupLink { id } => cli::print_setup_link(&config, id),
+                UsersCommand::Disable { id } => cli::change_user(&config, id, "disable"),
+                UsersCommand::Enable { id } => cli::change_user(&config, id, "enable"),
+                UsersCommand::Delete { id } => cli::delete_user(&config, id),
+            }
+        }
         Command::AdminToken => cli::print_admin_token(&Config::load(&cli.config)?),
         Command::ApiKeys(command) => {
             let config = Config::load(&cli.config)?;
@@ -192,6 +223,8 @@ async fn serve(path: &Path) -> Result<()> {
         admin_token_hash: hash_token(&admin_token).into(),
         views: Arc::new(Views::load()?),
         csrf: CsrfConfig::default().with_secure(config.audience().starts_with("wss://")),
+        web_url: web_url(config.audience()).unwrap_or_default().into(),
+        sign_ins: Arc::default(),
     };
 
     let listener = TcpListener::bind(config.listen)

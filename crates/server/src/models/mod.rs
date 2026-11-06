@@ -18,6 +18,9 @@ mod remote_check;
 mod remote_checks;
 mod server_secret;
 mod stats;
+mod user;
+mod user_session;
+mod users;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -39,6 +42,10 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 pub use self::stats::DatabaseStats;
+pub use self::users::{
+    DEFAULT_THEME, SESSION_LIFETIME_MS, THEMES, User, UserChange, check_new_password,
+    check_new_user, is_theme,
+};
 use crate::facts::{FlatFacts, decode, encode, flatten, unflatten};
 use crate::migrations::Migrator;
 use crate::registration::hash_token;

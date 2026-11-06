@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-choice="{{ theme }}"{% if theme != "system" %} data-theme="{{ theme }}"{% endif %}>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -22,6 +22,7 @@
   {% block head %}{% endblock head %}
 </head>
 <body hx-ext="morph">
+  {% block frame %}
   <div class="shell">
     <nav class="rail" aria-label="Main">
       <a class="brand" href="/" aria-label="MaxNines"><span class="mark">9</span></a>
@@ -31,25 +32,15 @@
       <a class="rail-link{% if section == "checks" %} on{% endif %}" href="/checks"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="m8.5 12.5 2.5 2.5 4.5-5.5"/></svg>Checks</a>
       <a id="alerts-link" class="rail-link{% if section == "alerts" %} on{% endif %}" href="/alerts"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 10a6 6 0 1 1 12 0c0 5 2 6.5 2 6.5H4S6 15 6 10Z"/><path d="M10 20a2.2 2.2 0 0 0 4 0"/></svg>Alerts{% if firing > 0 %} <span class="count">{{ firing }}</span>{% endif %}</a>
       <a class="rail-link{% if section == "settings" %} on{% endif %}" href="/settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h9M18 7h2M4 17h2M11 17h9"/><circle cx="15.5" cy="7" r="2.5"/><circle cx="8.5" cy="17" r="2.5"/></svg>Settings</a>
+      {% if user %}<a id="profile-link" class="rail-link profile{% if section == "profile" %} on{% endif %}" href="/profile" title="Connected to the server" aria-label="{{ user.name }}, connected to the server"><span class="avatar">{{ user.initial }}</span><span id="connection-label">Profile</span></a>{% endif %}
     </nav>
     <div class="workspace">
       <header class="topbar">
         <p class="crumbs"><span class="home">MaxNines</span>{% if section %}<span class="home">/</span><strong>{{ section }}</strong>{% endif %}</p>
         {% block status %}{% endblock status %}
-        <details id="theme-menu" class="theme-menu" hidden>
-          <summary aria-label="Choose a theme"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 3.5a8.5 8.5 0 0 1 0 17Z"/></svg><span>Theme</span></summary>
-          <div class="theme-options">
-            <button type="button" data-choice="carbon"><span class="swatch" data-theme="carbon"></span>Carbon</button>
-            <button type="button" data-choice="midnight"><span class="swatch" data-theme="midnight"></span>Midnight</button>
-            <button type="button" data-choice="dusk"><span class="swatch" data-theme="dusk"></span>Dusk</button>
-            <button type="button" data-choice="paper"><span class="swatch" data-theme="paper"></span>Paper</button>
-            <button type="button" data-choice="contrast"><span class="swatch" data-theme="contrast"></span>High contrast</button>
-            <button type="button" data-choice="system"><span class="swatch"><span data-theme="carbon"></span><span data-theme="paper"></span></span>Match system</button>
-          </div>
-        </details>
       </header>
       <div class="page-notices">
-        <div id="update-notice" role="status" hx-get="/update-notice?build={{ build_id }}" hx-trigger="every 60s"></div>
+        <div id="update-notice" role="status" hx-get="/update-notice?build={{ build_id }}" hx-trigger="every 60s, online from:window, visibilitychange from:document"></div>
         <p id="stale-notice" class="error" role="status" hidden>This page couldn't update, so what it shows may be out of date.</p>
       </div>
       <main id="page"{% block main_class %}{% endblock main_class %}{% block main_attributes %}{% endblock main_attributes %}>
@@ -58,5 +49,6 @@
       <footer class="site-footer">MaxNines {{ build.version }} · {{ build.commit }} · built {{ build.built_at }}</footer>
     </div>
   </div>
+  {% endblock frame %}
 </body>
 </html>

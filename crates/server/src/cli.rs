@@ -216,6 +216,112 @@ pub fn revoke_api_key(config: &Config, id: i64) -> Result<()> {
     }
 }
 
+/// What the server said was wrong, or a plain explanation if it didn't say.
+fn users_error(error: ureq::Error, url: &str) -> anyhow::Error {
+    match error {
+        ureq::Error::StatusCode(404) => anyhow::anyhow!("no user with that ID"),
+        ureq::Error::StatusCode(409) => {
+            anyhow::anyhow!(
+                "refused: this would leave nobody able to sign in, or they aren't disabled"
+            )
+        }
+        ureq::Error::StatusCode(422) => anyhow::anyhow!("that isn't a valid address and name"),
+        other => explain(other, url),
+    }
+}
+
+pub fn print_users(config: &Config) -> Result<()> {
+    let base = local_url(config.listen);
+    let token = admin_token(config)?;
+
+    let mut response = ureq::get(format!("{base}{BASE_PATH}/users"))
+        .header("Authorization", format!("Bearer {token}"))
+        .call()
+        .map_err(|error| explain(error, &base))?;
+    let body = response.body_mut().read_to_string()?;
+    let users: Vec<Value> = serde_json::from_str(&body).context("invalid server response")?;
+
+    for user in users {
+        let status = if !user["disabled_ms"].is_null() {
+            "disabled"
+        } else if user["has_password"] == true {
+            "active"
+        } else {
+            "invited"
+        };
+        println!(
+            "{}  {status:<8}  {}  {}",
+            user["id"],
+            user["email"].as_str().unwrap_or_default(),
+            user["name"].as_str().unwrap_or_default(),
+        );
+    }
+    Ok(())
+}
+
+/// Prints the link, the only time it can be seen.
+fn print_link(body: &str) -> Result<()> {
+    let answer: Value = serde_json::from_str(body).context("invalid server response")?;
+    let url = answer["setup_url"]
+        .as_str()
+        .context("invalid server response")?;
+    println!("{url}");
+    eprintln!("Open this to set a password. It works once and lasts 7 days.");
+    Ok(())
+}
+
+pub fn create_user(config: &Config, email: &str, name: &str) -> Result<()> {
+    let base = local_url(config.listen);
+    let token = admin_token(config)?;
+
+    let result = ureq::post(format!("{base}{BASE_PATH}/users"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .send(serde_json::json!({ "email": email, "name": name }).to_string());
+    let mut response = match result {
+        Ok(response) => response,
+        Err(ureq::Error::StatusCode(409)) => bail!("there's already a user with that address"),
+        Err(error) => bail!(users_error(error, &base)),
+    };
+    print_link(&response.body_mut().read_to_string()?)
+}
+
+pub fn print_setup_link(config: &Config, id: i64) -> Result<()> {
+    let base = local_url(config.listen);
+    let token = admin_token(config)?;
+
+    let mut response = ureq::post(format!("{base}{BASE_PATH}/users/{id}/setup-link"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send_empty()
+        .map_err(|error| users_error(error, &base))?;
+    print_link(&response.body_mut().read_to_string()?)
+}
+
+/// `action` is the last part of the API's address for it.
+pub fn change_user(config: &Config, id: i64, action: &str) -> Result<()> {
+    let base = local_url(config.listen);
+    let token = admin_token(config)?;
+
+    ureq::post(format!("{base}{BASE_PATH}/users/{id}/{action}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send_empty()
+        .map_err(|error| users_error(error, &base))?;
+    println!("{action}d: {id}");
+    Ok(())
+}
+
+pub fn delete_user(config: &Config, id: i64) -> Result<()> {
+    let base = local_url(config.listen);
+    let token = admin_token(config)?;
+
+    ureq::delete(format!("{base}{BASE_PATH}/users/{id}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .call()
+        .map_err(|error| users_error(error, &base))?;
+    println!("deleted: {id}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

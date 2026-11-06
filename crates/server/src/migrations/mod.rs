@@ -16,6 +16,7 @@ impl MigratorTrait for Migrator {
             Box::new(CreateServerSecrets),
             Box::new(AddSlackChannels),
             Box::new(CreateApiKeys),
+            Box::new(CreateUsers),
         ]
     }
 }
@@ -951,6 +952,143 @@ impl MigrationTrait for CreateApiKeys {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
             .drop_table(Table::drop().table(ApiKeys::Table).to_owned())
+            .await
+    }
+}
+
+struct CreateUsers;
+
+impl MigrationName for CreateUsers {
+    fn name(&self) -> &str {
+        "m20261106_000009_create_users"
+    }
+}
+
+#[derive(Iden)]
+enum Users {
+    Table,
+    Id,
+    Email,
+    Name,
+    PasswordHash,
+    Theme,
+    SetupTokenHash,
+    SetupExpiresMs,
+    CreatedMs,
+    LastSignInMs,
+    DisabledMs,
+}
+
+#[derive(Iden)]
+enum UserSessions {
+    Table,
+    Id,
+    UserId,
+    TokenHash,
+    CreatedMs,
+    ExpiresMs,
+}
+
+/// People who can sign in. A password is optional, for ways of signing in that
+/// don't use one.
+#[async_trait::async_trait]
+impl MigrationTrait for CreateUsers {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(Users::Table)
+                    .col(
+                        ColumnDef::new(Users::Id)
+                            .big_integer()
+                            .not_null()
+                            .auto_increment()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(Users::Email)
+                            .string_len(254)
+                            .not_null()
+                            .unique_key(),
+                    )
+                    .col(ColumnDef::new(Users::Name).string_len(100).not_null())
+                    .col(ColumnDef::new(Users::PasswordHash).string_len(255))
+                    .col(
+                        ColumnDef::new(Users::Theme)
+                            .string_len(20)
+                            .not_null()
+                            .default("carbon"),
+                    )
+                    .col(
+                        ColumnDef::new(Users::SetupTokenHash)
+                            .string_len(64)
+                            .unique_key(),
+                    )
+                    .col(ColumnDef::new(Users::SetupExpiresMs).big_integer())
+                    .col(ColumnDef::new(Users::CreatedMs).big_integer().not_null())
+                    .col(ColumnDef::new(Users::LastSignInMs).big_integer())
+                    .col(ColumnDef::new(Users::DisabledMs).big_integer())
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(UserSessions::Table)
+                    .col(
+                        ColumnDef::new(UserSessions::Id)
+                            .big_integer()
+                            .not_null()
+                            .auto_increment()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(UserSessions::UserId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(UserSessions::TokenHash)
+                            .string_len(64)
+                            .not_null()
+                            .unique_key(),
+                    )
+                    .col(
+                        ColumnDef::new(UserSessions::CreatedMs)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(UserSessions::ExpiresMs)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(UserSessions::Table, UserSessions::UserId)
+                            .to(Users::Table, Users::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_user_sessions_user_id")
+                    .table(UserSessions::Table)
+                    .col(UserSessions::UserId)
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(UserSessions::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(Users::Table).to_owned())
             .await
     }
 }

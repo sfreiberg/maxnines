@@ -28,6 +28,22 @@ If you'd like to help guide the project, we'd love to hear from you. What you ne
 from monitoring, what gets in your way today, and what you'd leave out are all
 welcome and genuinely useful. Open an issue or start a discussion here on GitHub.
 
+## Users
+
+Nobody can sign up. Every page needs someone signed in, and people are only added by
+someone already here, so a new server starts with the command line:
+
+```sh
+maxnines-server users create you@example.com "Your Name"
+```
+
+That prints a link for setting a password. It works once and lasts 7 days. After
+that, add people on the Settings page, which gives you a link to send them. The same
+command line can recover from a forgotten password with `users setup-link`.
+
+Over plain `http://`, passwords cross the network unencrypted, so put anything beyond
+a trusted network behind HTTPS.
+
 ## API
 
 Everything the web pages can see and do is available as JSON under `/api/v1`, on the

@@ -1,0 +1,56 @@
+{% extends "layouts/application.html" %}
+{% block title %}Users · MaxNines{% endblock title %}
+{% block content %}
+<p class="breadcrumb"><a href="/settings">Settings</a></p>
+<div>
+  <h1>Users</h1>
+  <p class="subtitle">Everyone who can sign in. There's no way to sign up, so people are only ever added here. Everyone can do everything for now.</p>
+</div>
+
+{% if new_link %}
+<section class="card">
+  <h2>Link for {{ new_link.name }}</h2>
+  <p class="hint">Send them this. It sets their password, works once and lasts 7 days. It can't be shown again.</p>
+  <p><code class="secret">{{ new_link.url }}</code></p>
+</section>
+{% endif %}
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<section class="card">
+  <h2>Add a user</h2>
+  <form method="post" action="/settings/users" class="host-filter">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <div class="host-filter-box"><input type="text" name="name" aria-label="Name" placeholder="Name" maxlength="100" required></div>
+    <div class="host-filter-box"><input type="email" name="email" aria-label="Email" placeholder="Email" maxlength="254" autocapitalize="none" spellcheck="false" required></div>
+    <button type="submit">Add user</button>
+  </form>
+</section>
+
+<div class="tablebox"><table>
+  <thead>
+    <tr><th>Name</th><th>Email</th><th>Last sign in</th><th>Status</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for person in users %}
+    <tr{% if person.disabled %} class="disabled"{% endif %}>
+      <td>{{ person.name }}{% if person.is_you %} <span class="note">You</span>{% endif %}</td>
+      <td>{{ person.email }}</td>
+      <td class="nowrap">{% if person.last_sign_in %}{{ person.last_sign_in }}{% else %}Never{% endif %}</td>
+      <td><span class="badge {% if person.disabled %}neutral{% elif person.status == "Active" %}good{% else %}warn{% endif %}">{{ person.status }}</span></td>
+      <td>
+        <div class="actions row-actions">
+          {% if person.disabled %}
+          <form method="post" action="/settings/users/{{ person.id }}/enable"><input type="hidden" name="authenticity_token" value="{{ csrf_token }}"><button type="submit" class="secondary">Enable</button></form>
+          <form method="post" action="/settings/users/{{ person.id }}/delete"><input type="hidden" name="authenticity_token" value="{{ csrf_token }}"><button type="submit" class="danger">Delete</button></form>
+          {% else %}
+          <form method="post" action="/settings/users/{{ person.id }}/setup-link"><input type="hidden" name="authenticity_token" value="{{ csrf_token }}"><button type="submit" class="secondary">New password link</button></form>
+          {% if not person.is_you %}<form method="post" action="/settings/users/{{ person.id }}/disable"><input type="hidden" name="authenticity_token" value="{{ csrf_token }}"><button type="submit" class="danger">Disable</button></form>{% endif %}
+          {% endif %}
+        </div>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table></div>
+{% endblock content %}

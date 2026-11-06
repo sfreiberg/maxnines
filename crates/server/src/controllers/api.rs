@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 use axum::extract::{Path as UrlPath, Query, Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -17,11 +17,14 @@ use tracing::error;
 use super::agents::suggestions;
 use super::fleet::Health;
 use super::host_list::HostSearch;
+use super::users::{refusal, setup_url};
 use crate::alerting::{Alert, AlertRuleInput, ChannelInput, ChannelKind};
 use crate::app_state::AppState;
 use crate::facts::unflatten;
 use crate::metrics::{self, METRICS, Metric, SeriesResult, TimeRange, Unit, now_ms};
-use crate::models::{ConfigStatus, RuleInput, check_api_key_name, expiry_after};
+use crate::models::{
+    ConfigStatus, RuleInput, UserChange, check_api_key_name, check_new_user, expiry_after, is_theme,
+};
 use crate::notifier::{self, Notice};
 use crate::presence::AgentPresence;
 use crate::registration::{AgentRecord, AgentState, hash_token};
@@ -113,6 +116,14 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/agents/{id}/revoke", post(revoke))
         .route("/rules/preview", post(preview_rule))
         .route("/notification-channels/{id}/test", post(test_channel))
+        .route("/users", get(list_users).post(create_user))
+        .route(
+            "/users/{id}",
+            get(get_user).put(update_user).delete(delete_user),
+        )
+        .route("/users/{id}/disable", post(disable_user))
+        .route("/users/{id}/enable", post(enable_user))
+        .route("/users/{id}/setup-link", post(new_setup_link))
         .route_layer(middleware::from_fn_with_state(state, require_token))
         .fallback(no_such_route)
 }
@@ -127,25 +138,118 @@ fn failed(status: StatusCode, error: &str) -> Response {
     (status, Json(json!({ "error": error }))).into_response()
 }
 
-async fn require_token(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    let presented = request
-        .headers()
+/// Whether a request carries the admin token or a working API key.
+pub async fn token_accepted(state: &AppState, headers: &HeaderMap) -> anyhow::Result<bool> {
+    let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
+    match presented {
+        Some(token) if hash_token(token) == *state.admin_token_hash => Ok(true),
+        Some(key) => state.database.accept_api_key(key, now_ms()).await,
+        None => Ok(false),
+    }
+}
 
-    let accepted = match presented {
-        Some(token) if hash_token(token) == *state.admin_token_hash => true,
-        Some(key) => match state.database.accept_api_key(key, now_ms()).await {
-            Ok(accepted) => accepted,
-            Err(error) => return server_error(&error),
-        },
-        None => false,
+async fn require_token(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    match token_accepted(&state, request.headers()).await {
+        Ok(true) => next.run(request).await,
+        Ok(false) => StatusCode::UNAUTHORIZED.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn list_users(State(state): State<AppState>) -> Response {
+    match state.database.list_users().await {
+        Ok(users) => Json(users).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn get_user(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.user(id).await {
+        Ok(Some(user)) => Json(user).into_response(),
+        Ok(None) => no_such_user(),
+        Err(error) => server_error(&error),
+    }
+}
+
+fn no_such_user() -> Response {
+    failed(StatusCode::NOT_FOUND, "There's no user with that ID")
+}
+
+#[derive(Deserialize)]
+struct NewUser {
+    email: String,
+    name: String,
+}
+
+/// Gives back the link for them to set a password, the only time it can be seen.
+async fn create_user(State(state): State<AppState>, Json(input): Json<NewUser>) -> Response {
+    let (email, name) = match check_new_user(&input.email, &input.name) {
+        Ok(checked) => checked,
+        Err(error) => return refused(&error),
     };
-    if accepted {
-        next.run(request).await
-    } else {
-        StatusCode::UNAUTHORIZED.into_response()
+    match state.database.create_user(&email, &name, now_ms()).await {
+        Ok(Some((user, link))) => {
+            let body = json!({ "user": user, "setup_url": setup_url(&state, &link) });
+            (StatusCode::CREATED, Json(body)).into_response()
+        }
+        Ok(None) => failed(
+            StatusCode::CONFLICT,
+            "There's already a user with that address",
+        ),
+        Err(error) => server_error(&error),
+    }
+}
+
+#[derive(Deserialize)]
+struct UserChanges {
+    theme: String,
+}
+
+async fn update_user(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<i64>,
+    Json(input): Json<UserChanges>,
+) -> Response {
+    if !is_theme(&input.theme) {
+        return failed(StatusCode::UNPROCESSABLE_ENTITY, "There's no such theme");
+    }
+    match state.database.set_theme(id, &input.theme).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => no_such_user(),
+        Err(error) => server_error(&error),
+    }
+}
+
+fn after_user_change(change: anyhow::Result<UserChange>) -> Response {
+    match change {
+        Ok(UserChange::Done) => StatusCode::NO_CONTENT.into_response(),
+        Ok(UserChange::NoSuchUser) => no_such_user(),
+        Ok(other) => failed(StatusCode::CONFLICT, refusal(other).unwrap_or_default()),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn disable_user(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    after_user_change(state.database.disable_user(id, now_ms()).await)
+}
+
+async fn enable_user(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    after_user_change(state.database.enable_user(id).await)
+}
+
+async fn delete_user(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    after_user_change(state.database.delete_user(id).await)
+}
+
+/// Replaces a user's setup link, which is also how a forgotten password is reset.
+async fn new_setup_link(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.new_setup_link(id, now_ms()).await {
+        Ok(Some(link)) => Json(json!({ "setup_url": setup_url(&state, &link) })).into_response(),
+        Ok(None) => no_such_user(),
+        Err(error) => server_error(&error),
     }
 }
 
