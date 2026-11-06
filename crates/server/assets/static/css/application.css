@@ -236,6 +236,17 @@ input[type="text"], input[type="password"], input[type="number"], select, textar
   font-weight: 400;
 }
 input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
+/* Browsers keep their own look for a select unless told not to. The arrow is drawn
+   here because the site doesn't allow inline images, which also lets it follow the theme. */
+select {
+  padding-right: 36px;
+  appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: calc(100% - 20px) 50%, calc(100% - 15px) 50%;
+  background-repeat: no-repeat;
+  background-size: 5px 5px;
+  cursor: pointer;
+}
 textarea { font-family: var(--mono); font-size: 0.8125rem; }
 input[type="checkbox"] { width: 18px; height: 18px; margin: 0; accent-color: var(--accent); }
 legend { padding: 0 8px; color: var(--muted); font-size: 12px; font-weight: 500; letter-spacing: 0.14em; text-transform: uppercase; }
