@@ -1,0 +1,30 @@
+[package]
+name = "maxnines-loadtest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "maxnines-loadtest"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true, features = ["env"] }
+futures-util.workspace = true
+hex.workspace = true
+humantime = "2.3"
+maxnines-protocol.workspace = true
+rand = "0.10"
+serde.workspace = true
+serde_json.workspace = true
+sysinfo = { version = "0.40.1", default-features = false, features = ["system"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["process", "std"] }
+
+[dev-dependencies]
+tempfile = "3"
