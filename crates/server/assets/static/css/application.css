@@ -277,7 +277,7 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .chart .line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
 .chart .hit { fill: transparent; }
 .chart .reading { visibility: hidden; pointer-events: none; }
-.chart .column:hover .reading { visibility: visible; }
+.chart .column:hover .reading, .chart .column.linked .reading { visibility: visible; }
 .chart .crosshair { stroke: var(--muted); stroke-width: 1; }
 .chart .marker { stroke: var(--surface); stroke-width: 2; }
 .chart .tooltip { fill: var(--raised); stroke: var(--border-strong); }

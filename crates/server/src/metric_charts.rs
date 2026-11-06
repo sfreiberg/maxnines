@@ -98,6 +98,8 @@ pub struct Column {
     pub x: f64,
     pub hit_x: f64,
     pub hit_width: f64,
+    /// For finding the same moment on the page's other charts.
+    pub time_ms: i64,
     pub time: String,
     pub tooltip_x: f64,
     pub tooltip_width: f64,
@@ -134,6 +136,9 @@ pub struct Chart {
     pub x_ticks: Vec<Tick>,
     pub lines: Vec<Line>,
     pub columns: Vec<Column>,
+    /// How far from a moment this chart's data still counts as being at that moment.
+    /// Further than this is a gap in its lines, so it has nothing to show for it.
+    pub reach_ms: i64,
     pub summary: Vec<Summary>,
 }
 
@@ -173,6 +178,12 @@ pub fn build(metric: &Metric, result: &SeriesResult, range: TimeRange) -> Chart 
             .map(|(series, slot)| line(series, *slot, &axis, range))
             .collect(),
         columns: columns(metric.unit, &result.series, &slots, &axis, range),
+        reach_ms: result
+            .series
+            .iter()
+            .map(|series| (gap_limit_ms(series, range) / 2.0) as i64)
+            .max()
+            .unwrap_or(0),
         summary: result
             .series
             .iter()
@@ -419,6 +430,7 @@ fn column(
         x,
         hit_x: start,
         hit_width: end - start,
+        time_ms,
         time: format_time(u64::try_from(time_ms).unwrap_or(0)),
         tooltip_x,
         tooltip_width,
@@ -728,6 +740,15 @@ mod tests {
         }
         let last = columns.last().unwrap();
         assert!((last.hit_x + last.hit_width - RIGHT).abs() < 1e-9);
+    }
+
+    #[test]
+    fn columns_say_when_they_are_and_how_far_the_chart_reaches() {
+        let chart = chart("cpu.usage", vec![series("CPU", &[(0, 1.0), (60_000, 2.0)])]);
+
+        let times: Vec<i64> = chart.columns.iter().map(|column| column.time_ms).collect();
+        assert_eq!(times, [0, 60_000]);
+        assert_eq!(chart.reach_ms, 75_000);
     }
 
     #[test]

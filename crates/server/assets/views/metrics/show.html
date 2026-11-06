@@ -34,7 +34,7 @@
       <h2>{{ chart.title }}</h2>
       {% if chart.has_data %}<a href="/agents/{{ agent_id }}/metrics/{{ chart.name }}?range={{ range }}">View data</a>{% endif %}
     </div>
-    <svg class="chart" viewBox="0 0 {{ chart.width }} {{ chart.height }}" role="img" aria-label="{{ chart.title }} over time. The table below gives the numbers.">
+    <svg class="chart" data-reach="{{ chart.reach_ms }}" viewBox="0 0 {{ chart.width }} {{ chart.height }}" role="img" aria-label="{{ chart.title }} over time. The table below gives the numbers.">
       {% for tick in chart.y_ticks %}
       <line class="grid" x1="{{ chart.left }}" x2="{{ chart.right }}" y1="{{ tick.position }}" y2="{{ tick.position }}"/>
       <text class="tick" x="{{ chart.left - 6 }}" y="{{ tick.position + 4 }}" text-anchor="end">{{ tick.label }}</text>
@@ -47,7 +47,7 @@
       {% for dot in line.dots %}<circle class="dot s{{ line.slot }}" cx="{{ dot.x }}" cy="{{ dot.y }}" r="2.5"/>{% endfor %}
       {% endfor %}
       {% for column in chart.columns %}
-      <g class="column">
+      <g class="column" data-time="{{ column.time_ms }}">
         <rect class="hit" x="{{ column.hit_x }}" y="{{ chart.top }}" width="{{ column.hit_width }}" height="{{ chart.bottom - chart.top }}"/>
         <g class="reading">
           <line class="crosshair" x1="{{ column.x }}" x2="{{ column.x }}" y1="{{ chart.top }}" y2="{{ chart.bottom }}"/>

@@ -1278,6 +1278,7 @@ async fn embedded_assets_are_served_and_nothing_else_is() {
         "/assets/js/htmx.min.js",
         "/assets/js/idiomorph-ext.min.js",
         "/assets/js/application.js",
+        "/assets/js/charts.js",
     ] {
         let script = browser.get(&server, path).await;
         assert_eq!(script.status, 200, "{path}");
