@@ -10,6 +10,8 @@ use axum::response::Response;
 use ipnet::IpNet;
 use maxnines_protocol::{AgentMessage, RegistrationStatus, ServerMessage, auth};
 use serde_json::Value;
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{Instant, interval, timeout};
 use tracing::{info, warn};
 
@@ -31,6 +33,9 @@ const MAX_ERROR_LEN: usize = 1000;
 /// Bigger than most messages, and they can still be larger than this. A busy server
 /// holds thousands of these, and the default of 128 KB each way adds up to gigabytes.
 const SOCKET_BUFFER_SIZE: usize = 8 * 1024;
+/// Facts and config results waiting on the database, for one agent. It sends few of
+/// them, so this only fills up if the database has stalled or an agent misbehaves.
+const JOB_QUEUE_SIZE: usize = 8;
 
 pub async fn upgrade(
     socket: WebSocketUpgrade,
@@ -198,51 +203,62 @@ async fn send(socket: &mut WebSocket, message: &ServerMessage) -> Result<()> {
         .map_err(|error| anyhow!("sending to agent: {error}"))
 }
 
+/// Work for the main database, which has to wait its turn without holding up samples.
+enum Job {
+    Facts(Value),
+    ConfigResult {
+        version: String,
+        error: Option<String>,
+    },
+}
+
 /// Reads from the agent and pings it until the connection ends, returning why.
 /// Any message counts as a sign of life, not just pongs.
+///
+/// This loop never waits on a database. Samples go straight to the writer, and
+/// everything else goes to [`do_jobs`], which runs alongside it. When the writer's
+/// queue is full reading stops, so that agents slow down, but heartbeats carry on.
 async fn serve(socket: &mut WebSocket, agent: &Agent, state: &AppState) -> &'static str {
     let mut ping = interval(state.heartbeat.interval);
-    let mut changes = state.registry.subscribe();
-    let mut config_changes = state.config_changes.subscribe();
     let mut last_heard = Instant::now();
-    let mut sent_version = None;
+    let mut waiting_sample = None;
 
-    if !send_config(socket, agent, state, &mut sent_version).await {
-        return "send failed";
-    }
+    let (jobs, job_queue) = mpsc::channel(JOB_QUEUE_SIZE);
+    let (config_sender, mut configs) = mpsc::channel(1);
+    let work = do_jobs(job_queue, config_sender, agent, state);
+    tokio::pin!(work);
 
     loop {
         tokio::select! {
+            reason = &mut work => return reason,
             _ = ping.tick() => {
-                if last_heard.elapsed() >= state.heartbeat.timeout {
+                // Nothing is being read while a sample waits, so silence means nothing.
+                if waiting_sample.is_none() && last_heard.elapsed() >= state.heartbeat.timeout {
                     return "heartbeat timeout";
                 }
                 if socket.send(Message::Ping(Bytes::new())).await.is_err() {
                     return "send failed";
                 }
             }
-            Ok(()) = changes.changed() => {
-                if !state.registry.is_approved(&agent.id).await {
-                    return "revoked";
-                }
-            }
-            Ok(()) = config_changes.changed() => {
-                if !send_config(socket, agent, state, &mut sent_version).await {
+            Some(text) = configs.recv() => {
+                if socket.send(Message::text(text)).await.is_err() {
                     return "send failed";
                 }
             }
-            message = socket.recv() => {
+            reserved = state.writer.reserve(), if waiting_sample.is_some() => {
+                last_heard = Instant::now();
+                match (reserved, waiting_sample.take()) {
+                    (Ok(permit), Some(command)) => permit.send(command),
+                    _ => warn!(id = agent.id, "writer stopped, sample dropped"),
+                }
+            }
+            message = socket.recv(), if waiting_sample.is_none() => {
                 last_heard = Instant::now();
                 state.presence.seen(&agent.id);
 
                 match message {
                     Some(Ok(Message::Text(text))) => {
-                        let facts_changed = receive(&text, agent, state).await;
-                        if facts_changed
-                            && !send_config(socket, agent, state, &mut sent_version).await
-                        {
-                            return "send failed";
-                        }
+                        waiting_sample = receive(&text, agent, state, &jobs);
                     }
                     Some(Ok(Message::Close(_))) | None => return "connection closed",
                     Some(Ok(_)) => {}
@@ -253,15 +269,54 @@ async fn serve(socket: &mut WebSocket, agent: &Agent, state: &AppState) -> &'sta
     }
 }
 
-/// Sends the agent its config if it's different from what it was last sent.
-/// Returns false only if the connection failed. If the config can't be worked
-/// out, the agent keeps what it has, and it's tried again on the next change.
+/// Everything about a connection that waits on the main database, one job at a time,
+/// which keeps a config from being worked out before the facts it depends on are in.
+/// Returns why the connection should end.
+async fn do_jobs(
+    mut jobs: mpsc::Receiver<Job>,
+    configs: mpsc::Sender<String>,
+    agent: &Agent,
+    state: &AppState,
+) -> &'static str {
+    let mut changes = state.registry.subscribe();
+    let mut config_changes = state.config_changes.subscribe();
+    let mut sent_version = None;
+
+    send_config(&configs, agent, state, &mut sent_version).await;
+    loop {
+        tokio::select! {
+            Ok(()) = changes.changed() => {
+                if !state.registry.is_approved(&agent.id).await {
+                    return "revoked";
+                }
+            }
+            Ok(()) = config_changes.changed() => {
+                send_config(&configs, agent, state, &mut sent_version).await;
+            }
+            job = jobs.recv() => match job {
+                Some(Job::Facts(facts)) => {
+                    if save_facts(facts, agent, state).await {
+                        send_config(&configs, agent, state, &mut sent_version).await;
+                    }
+                }
+                Some(Job::ConfigResult { version, error }) => {
+                    save_config_result(version, error, agent, state).await;
+                }
+                None => return "connection closed",
+            }
+        }
+    }
+}
+
+/// Sends the agent its config if it's different from what it was last sent. If it
+/// can't be worked out, the agent keeps what it has, and it's tried again on the next
+/// change.
 async fn send_config(
-    socket: &mut WebSocket,
+    configs: &mpsc::Sender<String>,
     agent: &Agent,
     state: &AppState,
     sent_version: &mut Option<String>,
-) -> bool {
+) {
     let resolved = match state.config_for(&agent.id).await {
         Ok(resolved) => resolved,
         Err(error) => {
@@ -270,12 +325,12 @@ async fn send_config(
                 error = format!("{error:#}"),
                 "working out config failed"
             );
-            return true;
+            return;
         }
     };
 
     if sent_version.as_ref() == Some(&resolved.version) {
-        return true;
+        return;
     }
     if !resolved.skipped_collectors.is_empty() {
         warn!(
@@ -289,42 +344,63 @@ async fn send_config(
         version: resolved.version.clone(),
         config: resolved.config,
     };
-    if send(socket, &message).await.is_err() {
-        return false;
+    match serde_json::to_string(&message) {
+        Ok(text) => {
+            if configs.send(text).await.is_ok() {
+                *sent_version = Some(resolved.version);
+            }
+        }
+        Err(error) => warn!(id = agent.id, %error, "encoding config failed"),
     }
-    *sent_version = Some(resolved.version);
-    true
 }
 
-/// A bad message is logged and skipped rather than ending the connection.
-/// Returns whether the agent's facts changed, which can change its config.
-async fn receive(text: &str, agent: &Agent, state: &AppState) -> bool {
-    match serde_json::from_str(text) {
+/// A bad message is logged and skipped rather than ending the connection. Returns a
+/// sample the writer has no room for yet.
+fn receive(
+    text: &str,
+    agent: &Agent,
+    state: &AppState,
+    jobs: &mpsc::Sender<Job>,
+) -> Option<WriterCommand> {
+    let job = match serde_json::from_str(text) {
         Ok(AgentMessage::Sample(sample)) => {
             let command = WriterCommand::Save(NewSample {
                 agent_id: agent.id.clone(),
                 host: agent.host.clone(),
                 sample,
             });
-            if state.writer.send(command).await.is_err() {
-                warn!(id = agent.id, "writer stopped, sample dropped");
-            }
-            false
+            return match state.writer.try_send(command) {
+                Ok(()) => None,
+                Err(TrySendError::Full(command)) => Some(command),
+                Err(TrySendError::Closed(_)) => {
+                    warn!(id = agent.id, "writer stopped, sample dropped");
+                    None
+                }
+            };
         }
-        Ok(AgentMessage::Facts { facts }) => save_facts(text.len(), facts, agent, state).await,
-        Ok(AgentMessage::ConfigResult { version, error }) => {
-            save_config_result(version, error, agent, state).await;
-            false
+        Ok(AgentMessage::Facts { .. }) if text.len() > MAX_FACTS_LEN => {
+            warn!(id = agent.id, size = text.len(), "skipping oversized facts");
+            return None;
         }
+        Ok(AgentMessage::Facts { facts }) => Job::Facts(facts),
+        Ok(AgentMessage::ConfigResult { version, error }) => Job::ConfigResult { version, error },
         Ok(AgentMessage::Hello { .. }) => {
             warn!(id = agent.id, "ignoring repeated hello");
-            false
+            return None;
         }
         Err(error) => {
             warn!(id = agent.id, %error, "skipping invalid message");
-            false
+            return None;
         }
+    };
+    // Agents report facts again later, and a config result again with the next config.
+    if jobs.try_send(job).is_err() {
+        warn!(
+            id = agent.id,
+            "too much waiting on the database, skipping a report"
+        );
     }
+    None
 }
 
 async fn save_config_result(
@@ -364,11 +440,7 @@ fn now_ms() -> u64 {
 
 /// Failing to save loses nothing, because the agent reports again later.
 /// Returns whether anything changed.
-async fn save_facts(size: usize, facts: Value, agent: &Agent, state: &AppState) -> bool {
-    if size > MAX_FACTS_LEN {
-        warn!(id = agent.id, size, "skipping oversized facts");
-        return false;
-    }
+async fn save_facts(facts: Value, agent: &Agent, state: &AppState) -> bool {
     let facts = match flatten(&facts) {
         Ok(facts) => facts,
         Err(error) => {

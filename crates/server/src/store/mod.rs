@@ -25,7 +25,7 @@ use crate::remote_checks::LOCAL_AGENT_ID;
 
 /// Samples waiting to be written. When this fills up, connections stop reading
 /// from their agents until the database catches up.
-const WRITE_QUEUE_SIZE: usize = 1024;
+pub const WRITE_QUEUE_SIZE: usize = 1024;
 
 /// How often to look for upkeep when there's none going on.
 const TIDY_CHECK_EVERY: Duration = Duration::from_secs(60);
@@ -220,6 +220,7 @@ fn save(store: &mut dyn Store, samples: &[NewSample], counts: &WriteCounts) {
 #[cfg(test)]
 pub mod testing {
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
 
     use anyhow::bail;
 
@@ -234,6 +235,8 @@ pub mod testing {
         /// How many samples each successful write held.
         pub writes: Arc<Mutex<Vec<usize>>>,
         pub closed: Arc<Mutex<bool>>,
+        /// Holds up writes while it's set, as a slow disk does.
+        pub paused: Arc<AtomicBool>,
     }
 
     /// Has nothing to report, for tests that aren't about metrics.
@@ -277,6 +280,9 @@ pub mod testing {
 
     impl Store for MemoryStore {
         fn write(&mut self, samples: &[NewSample]) -> Result<()> {
+            while self.0.paused.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(1));
+            }
             for new in samples {
                 match new.host.as_str() {
                     "fail" => bail!("deliberate test failure"),

@@ -6,6 +6,7 @@ mod users;
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum_csrf::CsrfConfig;
@@ -33,7 +34,7 @@ use crate::presence::Presence;
 use crate::registration::{AgentState, Registry, Rules, hash_token};
 use crate::server_stats::ServerStatus;
 use crate::store::testing::{MemoryStore, Saved};
-use crate::store::{self, MetricsReader, Store, spawn_writer};
+use crate::store::{self, MetricsReader, Store, WRITE_QUEUE_SIZE, spawn_writer};
 use crate::views::Views;
 use crate::{AgentsCommand, Cli, Command};
 
@@ -518,6 +519,79 @@ async fn a_clean_close_marks_the_agent_offline() {
     client.close(None).await.unwrap();
 
     server.wait_for_online(&agent.id(), false).await;
+}
+
+/// Reads in the background as an agent would, counting the server's pings.
+fn count_pings(receiver: futures_util::stream::SplitStream<Client>) -> Arc<AtomicU64> {
+    let pings = Arc::new(AtomicU64::new(0));
+    let counted = pings.clone();
+    tokio::spawn(async move {
+        let mut receiver = receiver;
+        while let Some(Ok(message)) = receiver.next().await {
+            if matches!(message, Message::Ping(_)) {
+                counted.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+    pings
+}
+
+#[tokio::test]
+async fn a_stalled_database_does_not_hold_up_samples_or_heartbeats() {
+    let server = start().await;
+    let agent = identity();
+    let client = server.connect_approved(&agent, "web-1").await;
+    let (mut sender, receiver) = client.split();
+    let pings = count_pings(receiver);
+    let stalled = server.state.database.stall_for_test().await;
+
+    let facts = AgentMessage::Facts {
+        facts: json!({ "os": "linux" }),
+    };
+    for message in [&facts, &sample(1)] {
+        let text = serde_json::to_string(message).unwrap();
+        sender.send(Message::text(text)).await.unwrap();
+    }
+
+    assert_eq!(server.wait_for_sample().await.2, 1);
+    let before = pings.load(Ordering::Relaxed);
+    sleep(Duration::from_millis(300)).await;
+    assert!(pings.load(Ordering::Relaxed) > before, "pings stopped");
+
+    drop(stalled);
+    let facts = server.wait_for_facts(&agent.id(), 1).await;
+    assert_eq!(facts[0].name, "os");
+}
+
+#[tokio::test]
+async fn a_full_write_queue_stops_reading_but_not_the_heartbeat() {
+    let server = start().await;
+    let agent = identity();
+    let client = server.connect_approved(&agent, "web-1").await;
+    let (mut sender, receiver) = client.split();
+    let pings = count_pings(receiver);
+    server.saved.paused.store(true, Ordering::Relaxed);
+
+    // One lot being written, a full queue, and more waiting behind them.
+    let count = 2 * WRITE_QUEUE_SIZE as u64 + 100;
+    for time in 0..count {
+        let text = serde_json::to_string(&sample(time)).unwrap();
+        sender.send(Message::text(text)).await.unwrap();
+    }
+
+    // Long enough to be taken for dead, had the wait counted as silence.
+    sleep(Duration::from_millis(400)).await;
+    let before = pings.load(Ordering::Relaxed);
+    sleep(Duration::from_millis(300)).await;
+    assert!(pings.load(Ordering::Relaxed) > before, "pings stopped");
+    assert!(server.state.presence.get(&agent.id()).unwrap().online);
+
+    server.saved.paused.store(false, Ordering::Relaxed);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (server.saved.samples.lock().unwrap().len() as u64) < count {
+        assert!(Instant::now() < deadline, "samples went missing");
+        sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]

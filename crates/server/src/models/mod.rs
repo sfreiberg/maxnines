@@ -800,6 +800,16 @@ impl Database {
         Self::connect("sqlite::memory:").await.unwrap()
     }
 
+    /// Takes the only connection, so that queries wait until it's dropped, as they do
+    /// on a database that's stalled.
+    pub async fn stall_for_test(&self) -> impl Sized {
+        self.connection
+            .get_sqlite_connection_pool()
+            .acquire()
+            .await
+            .unwrap()
+    }
+
     /// Makes every later query fail, as if the database had gone away.
     pub async fn break_for_test(&self) {
         use sea_orm::ConnectionTrait;
