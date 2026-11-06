@@ -9,7 +9,7 @@ mod identity;
 mod saved_config;
 mod services;
 mod spool;
-mod system;
+mod system_collector;
 mod websocket;
 
 use std::collections::BTreeMap;

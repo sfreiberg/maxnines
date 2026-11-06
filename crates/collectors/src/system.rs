@@ -8,14 +8,10 @@
 use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::Result;
 use serde_json::{Value, json};
 use systemstat::{Platform, System};
 use tokio::process::Command;
 use tokio::time::timeout;
-
-use crate::background::Background;
-use crate::collector::Collector;
 
 /// Listing logins is quick when the machine is healthy.
 const SESSIONS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -45,7 +41,7 @@ impl Change {
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-struct Limits {
+pub struct Limits {
     max_open_files: Option<u64>,
     open_files: Option<u64>,
     max_processes: Option<u64>,
@@ -177,6 +173,12 @@ impl CpuTime {
 
 /// Reads `/proc/stat`'s `ctxt` and `intr` lines. The first number on `intr` is
 /// the total, and the rest are per interrupt.
+impl Default for CpuTime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn parse_proc_stat(text: &str) -> (Option<u64>, Option<u64>) {
     let total = |wanted: &str| {
@@ -236,7 +238,7 @@ pub fn counters() -> Counters {
 }
 
 #[cfg(target_os = "linux")]
-fn limits() -> Limits {
+pub fn limits() -> Limits {
     let number = |path: &str| std::fs::read_to_string(path).ok()?.trim().parse().ok();
     Limits {
         max_open_files: number("/proc/sys/fs/file-max"),
@@ -291,7 +293,7 @@ pub fn counters() -> Counters {
 }
 
 #[cfg(target_os = "freebsd")]
-fn limits() -> Limits {
+pub fn limits() -> Limits {
     Limits {
         max_open_files: sysctl_number("kern.maxfiles"),
         open_files: sysctl_number("kern.openfiles"),
@@ -301,7 +303,7 @@ fn limits() -> Limits {
 }
 
 #[cfg(target_os = "macos")]
-fn limits() -> Limits {
+pub fn limits() -> Limits {
     Limits {
         max_open_files: sysctl_number("kern.maxfiles"),
         open_files: sysctl_number("kern.num_files"),
@@ -319,7 +321,7 @@ pub fn counters() -> Counters {
 
 /// Windows has no system-wide limits like these.
 #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
-fn limits() -> Limits {
+pub fn limits() -> Limits {
     Limits {
         processes: process_count(),
         ..Limits::default()
@@ -410,7 +412,7 @@ async fn run_quietly(program: &str) -> Option<std::process::Output> {
 }
 
 #[cfg(unix)]
-async fn login_sessions() -> Option<u64> {
+pub async fn login_sessions() -> Option<u64> {
     let output = run_quietly("who").await?;
     output
         .status
@@ -421,12 +423,12 @@ async fn login_sessions() -> Option<u64> {
 /// Home editions don't have `quser`, which leaves this out. It also exits with
 /// an error when nobody is logged in, so its exit code says nothing.
 #[cfg(windows)]
-async fn login_sessions() -> Option<u64> {
+pub async fn login_sessions() -> Option<u64> {
     let output = run_quietly("quser").await?;
     Some(count_quser(&String::from_utf8_lossy(&output.stdout)))
 }
 
-fn report(limits: &Limits, sessions: Option<u64>) -> Value {
+pub fn report(limits: &Limits, sessions: Option<u64>) -> Value {
     json!({
         "max_open_files": limits.max_open_files,
         "open_files": limits.open_files,
@@ -434,30 +436,6 @@ fn report(limits: &Limits, sessions: Option<u64>) -> Value {
         "processes": limits.processes,
         "login_sessions": sessions,
     })
-}
-
-/// How close the machine is to its limits, and how many people are on it.
-pub struct SystemCollector {
-    background: Background,
-}
-
-impl SystemCollector {
-    pub fn new(interval: Duration) -> Self {
-        let background = Background::start(interval, || async {
-            report(&limits(), login_sessions().await)
-        });
-        Self { background }
-    }
-}
-
-impl Collector for SystemCollector {
-    fn name(&self) -> &'static str {
-        "system"
-    }
-
-    fn collect(&mut self) -> Result<Value> {
-        Ok(self.background.latest())
-    }
 }
 
 #[cfg(test)]

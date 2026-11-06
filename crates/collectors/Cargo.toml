@@ -1,0 +1,21 @@
+[package]
+name = "maxnines-collectors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+sysinfo = "0.40.1"
+systemstat = "0.2.7"
+tokio = { version = "1.54.1", features = ["process", "time"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "freebsd"))'.dependencies]
+sysctl = "0.7"
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["macros", "rt"] }

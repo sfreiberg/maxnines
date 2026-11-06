@@ -14,6 +14,7 @@ futures-util = { version = "0.3.34", default-features = false, features = ["sink
 hcl-rs = "0.20.0"
 hex = "0.4.3"
 maxnines-checks = { path = "crates/checks" }
+maxnines-collectors = { path = "crates/collectors" }
 maxnines-protocol = { path = "crates/protocol" }
 ring = "0.17.14"
 serde = { version = "1.0.229", features = ["derive"] }
