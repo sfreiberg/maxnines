@@ -2619,6 +2619,7 @@ dependencies = [
  "sea-orm-migration",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "slack-morphism",
  "sysinfo",
  "tempfile",

@@ -11,6 +11,7 @@ mod alerts;
 mod assets;
 mod condition_form;
 mod fleet;
+pub mod host_list;
 mod metrics;
 mod notification_channels;
 mod overview;

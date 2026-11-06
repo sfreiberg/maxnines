@@ -24,6 +24,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use crate::app_state::{AppState, Heartbeat};
 use crate::config::Config;
 use crate::controllers::app;
+use crate::controllers::host_list::PAGE_SIZE;
 use crate::facts::FlatFacts;
 use crate::metrics::{Metrics, TimeRange, now_ms};
 use crate::models::{Database, FactVersion, RuleInput};
@@ -2842,4 +2843,198 @@ async fn a_failing_metrics_query_only_fails_that_request() {
     assert!(!page.body.contains("secret"), "{}", page.body);
 
     assert_eq!(browser.get(&server, "/agents").await.status, 200);
+}
+
+// ---- finding hosts
+
+async fn report_facts(server: &TestServer, host: &str, facts: Value) -> (Identity, Client) {
+    let agent = identity();
+    let mut client = server.connect_approved(&agent, host).await;
+    let count = crate::facts::flatten(&facts).unwrap().len();
+    send(&mut client, &AgentMessage::Facts { facts }).await;
+    server.wait_for_facts(&agent.id(), count).await;
+    (agent, client)
+}
+
+/// One Linux web server and one macOS database server.
+async fn two_hosts(server: &TestServer) -> [(Identity, Client); 2] {
+    let web = json!({ "os": { "family": "linux", "name": "Ubuntu Linux" }, "custom": { "tags": ["web", "eu"] } });
+    let db = json!({ "os": { "family": "macos", "name": "Darwin" }, "custom": { "tags": ["db"] } });
+    [
+        report_facts(server, "web-1", web).await,
+        report_facts(server, "db-1", db).await,
+    ]
+}
+
+async fn hosts_on(server: &TestServer, path: &str) -> (bool, bool) {
+    let page = Browser::default().get(server, path).await;
+    assert_eq!(page.status, 200, "{path}: {}", page.body);
+    (page.body.contains(">web-1"), page.body.contains(">db-1"))
+}
+
+#[tokio::test]
+async fn hosts_can_be_filtered_by_their_facts() {
+    let server = start().await;
+    let _hosts = two_hosts(&server).await;
+
+    for (query, web, db) in [
+        ("", true, true),
+        ("?q=os%3Dlinux", true, false),
+        ("?q=os.family%3Dmacos", false, true),
+        ("?q=os%21%3Dlinux", false, true),
+        ("?q=hostname%3Dweb%2A", true, false),
+        ("?q=db", false, true),
+        ("?q=custom.tags%3Deu", true, false),
+        ("?q=os.name%3D%22Ubuntu+Linux%22", true, false),
+        ("?q=os%3Dlinux+hostname%3Ddb%2A", false, false),
+        ("?q=custom.rack%3Da1", false, false),
+    ] {
+        let found = hosts_on(&server, &format!("/agents{query}")).await;
+        assert_eq!(found, (web, db), "{query}");
+    }
+}
+
+#[tokio::test]
+async fn the_fleet_metrics_page_filters_the_same_way() {
+    let server = start_with_metrics().await;
+    let _hosts = two_hosts(&server).await;
+
+    assert_eq!(
+        hosts_on(&server, "/metrics?q=os%3Dlinux").await,
+        (true, false)
+    );
+    let page = Browser::default().get(&server, "/metrics?q=nothing").await;
+    assert!(page.body.contains("No agents match this filter."));
+}
+
+#[tokio::test]
+async fn a_filter_that_cannot_be_read_says_why_and_shows_nothing() {
+    let server = start().await;
+    let _hosts = two_hosts(&server).await;
+
+    let page = Browser::default().get(&server, "/agents?q=os%3D").await;
+
+    assert!(page.body.contains("os needs a value"), "{}", page.body);
+    assert!(!page.body.contains(">web-1"));
+}
+
+#[tokio::test]
+async fn links_on_the_agents_page_keep_the_filter() {
+    let server = start().await;
+    let _hosts = two_hosts(&server).await;
+
+    let page = Browser::default()
+        .get(&server, "/agents?filter=online&view=table&q=os%3Dlinux")
+        .await;
+
+    assert!(page.body.contains(r#"value="os=linux""#), "{}", page.body);
+    assert!(page.body.contains(r#"name="filter" value="online""#));
+    assert!(page.body.contains(r#"name="view" value="table""#));
+    for tab in ["Online 1", "All 1", "Offline 0"] {
+        assert!(page.body.contains(tab), "{tab}: {}", page.body);
+    }
+    // Encoded for the address, then again for the page.
+    assert!(page.body.contains("q=os%3Dlinux"), "{}", page.body);
+}
+
+#[tokio::test]
+async fn a_table_shows_each_hosts_config_state() {
+    let server = start().await;
+    let _hosts = two_hosts(&server).await;
+
+    let page = Browser::default().get(&server, "/agents?view=table").await;
+
+    assert!(page.body.contains("Not reported"), "{}", page.body);
+}
+
+#[tokio::test]
+async fn what_is_typed_into_a_filter_is_never_markup() {
+    let server = start().await;
+    let hostile = "%22%3E%3Cscript%3Ealert(1)%3C%2Fscript%3E";
+
+    for path in ["/agents", "/metrics"] {
+        let page = Browser::default()
+            .get(&server, &format!("{path}?q={hostile}"))
+            .await;
+        assert!(page.has_only_our_scripts(), "{}", page.body);
+    }
+}
+
+#[tokio::test]
+async fn long_lists_are_split_into_pages() {
+    let server = start().await;
+    for number in 0..PAGE_SIZE + 1 {
+        let agent = identity();
+        server
+            .connect_approved(&agent, &format!("host-{number:03}"))
+            .await;
+    }
+
+    let first = Browser::default().get(&server, "/agents").await;
+    let second = Browser::default().get(&server, "/agents?page=2").await;
+
+    assert!(first.body.contains("host-000"));
+    assert!(!first.body.contains(&format!("host-{PAGE_SIZE:03}")));
+    assert!(
+        first
+            .body
+            .contains(&format!("1 to {PAGE_SIZE} of {}", PAGE_SIZE + 1))
+    );
+    assert!(first.body.contains("page=2"), "{}", first.body);
+    assert!(second.body.contains(&format!("host-{PAGE_SIZE:03}")));
+    assert!(!second.body.contains("host-000"));
+    assert!(second.body.contains(r#"rel="prev""#));
+}
+
+async fn options(server: &TestServer, term: &str) -> Vec<Value> {
+    let path = format!("/agents/filter-options?term={term}");
+    let page = Browser::default().get(server, &path).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    serde_json::from_str(&page.body).unwrap()
+}
+
+fn option_texts(options: &[Value]) -> Vec<&str> {
+    options.iter().filter_map(|o| o["text"].as_str()).collect()
+}
+
+#[tokio::test]
+async fn the_filter_suggests_fact_names() {
+    let server = start().await;
+    let _hosts = two_hosts(&server).await;
+
+    let found = options(&server, "os").await;
+    assert_eq!(
+        option_texts(&found),
+        ["os=", "os.family=", "os.name=", "hostname="]
+    );
+
+    let found = options(&server, "cust").await;
+    assert_eq!(option_texts(&found), ["custom.tags="]);
+}
+
+#[tokio::test]
+async fn the_filter_suggests_values() {
+    let server = start().await;
+    let _hosts = two_hosts(&server).await;
+
+    assert_eq!(
+        option_texts(&options(&server, "os%3D").await),
+        ["os=linux", "os=macos"]
+    );
+    assert_eq!(
+        option_texts(&options(&server, "os%3Dmac").await),
+        ["os=macos"]
+    );
+    assert_eq!(
+        option_texts(&options(&server, "custom.tags%3D").await),
+        ["custom.tags=db", "custom.tags=eu", "custom.tags=web"]
+    );
+    assert_eq!(
+        option_texts(&options(&server, "hostname%3Dweb").await),
+        ["hostname=web-1"]
+    );
+    assert_eq!(
+        option_texts(&options(&server, "os.name%3DUbu").await),
+        [r#"os.name="Ubuntu Linux""#]
+    );
 }

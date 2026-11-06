@@ -5,6 +5,9 @@ document.addEventListener("htmx:afterRequest", (event) => {
   }
 });
 
+// Leaves what someone is typing alone when the page's data updates.
+Idiomorph.defaults.callbacks.beforeNodeMorphed = (node) => node.id !== "host-filter";
+
 // Leaves anything someone has opened on the page open when its data updates.
 Idiomorph.defaults.callbacks.beforeAttributeUpdated = (name, element) =>
   !(name === "open" && element.tagName === "DETAILS");

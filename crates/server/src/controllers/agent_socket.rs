@@ -28,6 +28,9 @@ const MAX_FACTS_LEN: usize = 64 * 1024;
 const MAX_VERSION_LEN: usize = 32;
 /// Plenty to explain a problem, without letting an agent store anything it likes.
 const MAX_ERROR_LEN: usize = 1000;
+/// Bigger than most messages, and they can still be larger than this. A busy server
+/// holds thousands of these, and the default of 128 KB each way adds up to gigabytes.
+const SOCKET_BUFFER_SIZE: usize = 8 * 1024;
 
 pub async fn upgrade(
     socket: WebSocketUpgrade,
@@ -41,7 +44,10 @@ pub async fn upgrade(
         .filter_map(|value| value.to_str().ok())
         .collect();
     let source = client_ip(peer.ip(), &forwarded.join(","), &state.trusted_proxies);
-    socket.on_upgrade(move |socket| handle(socket, source, state))
+    socket
+        .read_buffer_size(SOCKET_BUFFER_SIZE)
+        .write_buffer_size(SOCKET_BUFFER_SIZE)
+        .on_upgrade(move |socket| handle(socket, source, state))
 }
 
 /// Finds the real client address. `X-Forwarded-For` can be forged by anyone, so

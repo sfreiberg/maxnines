@@ -28,8 +28,8 @@ use maxnines_protocol::auth::new_nonce;
 use sea_orm::sea_query::Expr;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectOptions, ConnectionTrait, DatabaseConnection,
-    EntityTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectOptions, ConnectionTrait, DatabaseConnection,
+    EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use sea_orm_migration::MigratorTrait;
 use serde::{Deserialize, Serialize};
@@ -253,17 +253,61 @@ impl Database {
             .all(&self.connection)
             .await
             .context("loading facts")?;
+        by_agent(rows)
+    }
 
-        let mut agents: BTreeMap<String, FlatFacts> = BTreeMap::new();
-        for row in rows {
-            let agent = row.agent_id.clone();
-            let fact = to_fact_version(row)?;
-            agents
-                .entry(agent)
-                .or_default()
-                .insert(fact.name, fact.value);
-        }
-        Ok(agents)
+    /// The current facts of some agents, for when a page only shows those.
+    pub async fn facts_of(&self, agent_ids: &[&str]) -> Result<BTreeMap<String, FlatFacts>> {
+        let rows = agent_fact::Entity::find()
+            .filter(agent_fact::Column::ValidToMs.is_null())
+            .filter(agent_fact::Column::AgentId.is_in(agent_ids.iter().copied()))
+            .all(&self.connection)
+            .await
+            .context("loading facts")?;
+        by_agent(rows)
+    }
+
+    /// Every agent's current values of some facts, including the items of lists.
+    pub async fn facts_named(&self, names: &[&str]) -> Result<BTreeMap<String, FlatFacts>> {
+        let rows = agent_fact::Entity::find()
+            .filter(agent_fact::Column::ValidToMs.is_null())
+            .filter(fact_or_its_items(names))
+            .all(&self.connection)
+            .await
+            .context("loading facts")?;
+        by_agent(rows)
+    }
+
+    /// The names facts are reported under, with a list appearing under its own name.
+    pub async fn fact_names(&self) -> Result<Vec<String>> {
+        let names: Vec<String> = agent_fact::Entity::find()
+            .select_only()
+            .column(agent_fact::Column::Name)
+            .distinct()
+            .filter(agent_fact::Column::ValidToMs.is_null())
+            .into_tuple()
+            .all(&self.connection)
+            .await
+            .context("loading fact names")?;
+        let names: BTreeSet<String> = names.into_iter().filter_map(simple_fact_name).collect();
+        Ok(names.into_iter().collect())
+    }
+
+    /// Different values a fact has containing some text, in order.
+    pub async fn fact_values(&self, name: &str, text: &str, limit: u64) -> Result<Vec<String>> {
+        agent_fact::Entity::find()
+            .select_only()
+            .column(agent_fact::Column::Value)
+            .distinct()
+            .filter(agent_fact::Column::ValidToMs.is_null())
+            .filter(fact_or_its_items(&[name]))
+            .filter(agent_fact::Column::Value.contains(text))
+            .order_by_asc(agent_fact::Column::Value)
+            .limit(limit)
+            .into_tuple()
+            .all(&self.connection)
+            .await
+            .context("loading fact values")
     }
 
     /// Every fact name in use and how its values are written, for offering in
@@ -277,12 +321,7 @@ impl Database {
 
         let mut known = BTreeMap::new();
         for row in rows {
-            let name = match row.name.strip_suffix(']').and_then(|n| n.rsplit_once('[')) {
-                Some((list, _)) => list.to_string(),
-                None => row.name,
-            };
-            // Items inside lists of maps can't be reached by a simple condition.
-            if !name.contains('[') {
+            if let Some(name) = simple_fact_name(row.name) {
                 known.insert(name, row.value_type);
             }
         }
@@ -524,6 +563,37 @@ fn to_rule<'a>(
             settings: unflatten(&flat),
         },
     })
+}
+
+/// A list's own name for an item of it. Items inside lists of maps can't be reached
+/// by a simple name, so they have none.
+fn simple_fact_name(name: String) -> Option<String> {
+    let name = match name.strip_suffix(']').and_then(|n| n.rsplit_once('[')) {
+        Some((list, _)) => list.to_string(),
+        None => name,
+    };
+    (!name.contains('[')).then_some(name)
+}
+
+fn fact_or_its_items(names: &[&str]) -> Condition {
+    names.iter().fold(Condition::any(), |wanted, name| {
+        wanted
+            .add(agent_fact::Column::Name.eq(*name))
+            .add(agent_fact::Column::Name.starts_with(format!("{name}[")))
+    })
+}
+
+fn by_agent(rows: Vec<agent_fact::Model>) -> Result<BTreeMap<String, FlatFacts>> {
+    let mut agents: BTreeMap<String, FlatFacts> = BTreeMap::new();
+    for row in rows {
+        let agent = row.agent_id.clone();
+        let fact = to_fact_version(row)?;
+        agents
+            .entry(agent)
+            .or_default()
+            .insert(fact.name, fact.value);
+    }
+    Ok(agents)
 }
 
 fn to_fact_version(row: agent_fact::Model) -> Result<FactVersion> {

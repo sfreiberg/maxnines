@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::task::JoinSet;
 
+use super::host_list::{HostSearch, address, page_number, paginate};
 use super::{Page, fleet, server_error};
 use crate::app_state::AppState;
 use crate::metric_charts::{self, Chart, MAX_SERIES};
@@ -32,13 +33,42 @@ pub fn routes() -> Router<AppState> {
         .route("/agents/{id}/metrics/{metric}", get(data))
 }
 
-async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
-    match fleet::rows(&state).await {
-        Ok(agents) => Page::new(&state, &token, "metrics/index.html")
-            .with("agents", &agents)
-            .render(),
-        Err(error) => server_error(&error),
-    }
+#[derive(Deserialize)]
+struct FleetParams {
+    q: Option<String>,
+    page: Option<String>,
+}
+
+async fn index(
+    State(state): State<AppState>,
+    Query(params): Query<FleetParams>,
+    token: CsrfToken,
+) -> Response {
+    let data = async {
+        let search = HostSearch::load(&state, params.q.as_deref()).await?;
+        let agents = fleet::rows(&state).await?;
+        anyhow::Ok((search, agents))
+    };
+    let (search, mut agents) = match data.await {
+        Ok(data) => data,
+        Err(error) => return server_error(&error),
+    };
+
+    agents.retain(|agent| search.includes(&agent.id, &agent.host));
+    let pages = paginate(&mut agents, page_number(params.page.as_deref()), |page| {
+        address(
+            "/metrics",
+            &[("q", &search.text), ("page", &page.to_string())],
+        )
+    });
+    Page::new(&state, &token, "metrics/index.html")
+        .with("agents", &agents)
+        .with("pages", &pages)
+        .with("search", &search)
+        .with("search_path", "/metrics")
+        .with("keep_tab", "")
+        .with("as_table", &false)
+        .render()
 }
 
 /// A check's latest result. Agents send this, so nothing about it is trusted to

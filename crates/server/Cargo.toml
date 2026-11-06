@@ -23,6 +23,7 @@ sea-orm-migration = { version = "2.0.4", default-features = false, features = ["
 hyper-rustls = { version = "0.27", default-features = false, features = ["http2", "ring", "tls12", "webpki-tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde.workspace = true
+serde_urlencoded = "0.7"
 slack-morphism = { version = "2.31", default-features = false, features = ["hyper-base"] }
 serde_json.workspace = true
 sysinfo = { version = "0.40.1", default-features = false, features = ["disk", "system"] }

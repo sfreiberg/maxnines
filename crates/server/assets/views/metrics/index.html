@@ -5,6 +5,7 @@
   <h1>Metrics</h1>
   <p class="subtitle">Current values from each agent. Choose one to see its charts.</p>
 </div>
+{% include "agents/_filter.html" %}
 {% if agents %}
 <div class="tablebox"><table>
   <thead>
@@ -23,6 +24,9 @@
     {% endfor %}
   </tbody>
 </table></div>
+{% include "agents/_pages.html" %}
+{% elif search.text %}
+<p class="empty">No agents match this filter.</p>
 {% else %}
 <p class="empty">There are no approved agents yet.</p>
 {% endif %}

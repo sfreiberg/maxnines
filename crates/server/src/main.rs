@@ -7,6 +7,7 @@ mod config;
 mod controllers;
 mod fact_history;
 mod facts;
+mod host_filter;
 mod metric_charts;
 mod metrics;
 mod migrations;

@@ -168,6 +168,13 @@ button.danger { border-color: var(--bad); background: var(--surface); color: var
 .tabs a.selected { border-color: var(--accent-surface); background: var(--accent-surface); color: var(--accent-ink); font-weight: 600; }
 
 /* Tiles */
+.host-filter { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.host-filter-box { position: relative; flex: 1 1 260px; min-width: 0; }
+.host-filter input[type="text"] { width: 100%; font-family: var(--mono); font-size: 14px; }
+.host-filter ul { position: absolute; z-index: 10; top: calc(100% + 4px); right: 0; left: 0; max-height: 320px; margin: 0; padding: 4px; overflow-y: auto; border: 1px solid var(--border-strong); border-radius: 10px; background: var(--surface); list-style: none; }
+.host-filter li { padding: 8px 10px; border-radius: 7px; font-family: var(--mono); font-size: 14px; overflow-wrap: anywhere; cursor: pointer; }
+.host-filter li.active, .host-filter li:hover { background: var(--accent-surface); color: var(--accent-ink); }
+.pages { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 12px; }
 .wall { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(230px, 100%), 1fr)); gap: 12px; }
 .tile { display: flex; flex-direction: column; gap: 10px; min-width: 0; padding: 14px; background: var(--surface); border: 1px solid var(--border); border-radius: 14px; color: var(--text); }
 .tile:hover { border-color: var(--border-strong); color: var(--text); }

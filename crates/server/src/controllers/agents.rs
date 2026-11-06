@@ -1,25 +1,32 @@
-use axum::Router;
+use std::collections::BTreeMap;
+
+use anyhow::Result;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
+use axum::{Json, Router};
 use axum_csrf::CsrfToken;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::fleet::Health;
+use super::host_list::{HostSearch, address, page_number, paginate};
 use super::{CsrfForm, Page, server_error};
 use crate::alerting::Alert;
 use crate::app_state::AppState;
 use crate::fact_history::{describe_history, format_time};
-use crate::facts::{FlatFacts, unflatten};
+use crate::facts::{FlatFacts, fact_text, unflatten};
+use crate::host_filter::{MAX_SUGGESTIONS, PartialValue, Suggestion, suggest_names};
 use crate::metrics::now_ms;
 use crate::models::ConfigStatus;
 use crate::registration::{AgentRecord, AgentState};
+use crate::rule_engine;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/agents", get(index))
+        .route("/agents/filter-options", get(filter_options))
         .route("/agents/{id}", get(show))
         .route("/agents/{id}/approve", post(approve))
         .route("/agents/{id}/revoke", post(revoke))
@@ -34,7 +41,7 @@ struct AgentRow {
     health: Health,
     os: Option<String>,
     seen: Option<String>,
-    config: ConfigState,
+    config: Option<ConfigState>,
 }
 
 /// How an agent's running config compares with what it should be running.
@@ -66,13 +73,6 @@ fn os_of(facts: &FlatFacts) -> Option<String> {
             (name, _) => name,
         }
     })
-}
-
-fn fact_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
-    }
 }
 
 /// Facts in their natural shape: maps give dotted names, and a list of plain
@@ -143,26 +143,20 @@ pub fn format_uptime(secs: u64) -> String {
     }
 }
 
-async fn row(
+/// Everything shown about an agent except its config, which takes more working out.
+fn row(
     state: &AppState,
     agent: AgentRecord,
     facts: Option<&FlatFacts>,
-    alerts: &[&Alert],
+    health: Health,
 ) -> AgentRow {
-    let desired = state.config_for(&agent.id).await.ok();
-    let reported = state.database.config_status(&agent.id).await.ok().flatten();
     let presence = state.presence.get(&agent.id);
-    let online = presence.is_some_and(|p| p.online);
-
     AgentRow {
-        online,
-        health: Health::of(online, alerts),
+        online: presence.as_ref().is_some_and(|p| p.online),
+        health,
         os: facts.and_then(os_of),
         seen: presence.map(|p| ago(p.last_seen_ms, now_ms() as u64)),
-        config: config_state(
-            desired.as_ref().map(|d| d.version.as_str()),
-            reported.as_ref(),
-        ),
+        config: None,
         state: agent.state.as_str(),
         id: agent.id,
         host: agent.host,
@@ -173,24 +167,69 @@ async fn row(
 struct ListParams {
     view: Option<String>,
     filter: Option<String>,
+    q: Option<String>,
+    page: Option<String>,
 }
 
 #[derive(Serialize)]
 struct FilterTab {
-    key: &'static str,
     label: &'static str,
     count: usize,
     selected: bool,
+    href: String,
+}
+
+#[derive(Serialize)]
+struct WaitingAgent {
+    id: String,
+    host: String,
+    seen: Option<String>,
+}
+
+/// An agent in the list, with only what it takes to sort and count them all.
+struct Listed {
+    agent: AgentRecord,
+    online: bool,
+    health: Health,
 }
 
 /// Whether an agent belongs under a filter on the list.
-fn matches(filter: &str, agent: &AgentRow) -> bool {
+fn matches(filter: &str, listed: &Listed) -> bool {
     match filter {
-        "online" => agent.online,
-        "offline" => !agent.online && agent.state == "approved",
-        "revoked" => agent.state == "revoked",
+        "online" => listed.online,
+        "offline" => !listed.online && listed.agent.state == AgentState::Approved,
+        "revoked" => listed.agent.state == AgentState::Revoked,
         _ => true,
     }
+}
+
+/// Works out the rows being shown, which is far fewer than the agents there can be.
+async fn page_rows(state: &AppState, listed: Vec<Listed>, as_table: bool) -> Result<Vec<AgentRow>> {
+    let ids: Vec<&str> = listed.iter().map(|item| item.agent.id.as_str()).collect();
+    let facts = state.database.facts_of(&ids).await?;
+    let rules = if as_table {
+        state.database.list_rules().await?
+    } else {
+        Vec::new()
+    };
+
+    let mut rows = Vec::with_capacity(listed.len());
+    for item in listed {
+        let id = item.agent.id.clone();
+        let mine = facts.get(&id);
+        let mut row = row(state, item.agent, mine, item.health);
+        if as_table {
+            let flat = mine.cloned().unwrap_or_default();
+            let desired = rule_engine::resolve(&rules, &unflatten(&flat), &id).ok();
+            let reported = state.database.config_status(&id).await.ok().flatten();
+            row.config = Some(config_state(
+                desired.as_ref().map(|d| d.version.as_str()),
+                reported.as_ref(),
+            ));
+        }
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 async fn index(
@@ -199,33 +238,54 @@ async fn index(
     token: CsrfToken,
 ) -> Response {
     let data = async {
-        let facts = state.database.all_current_facts().await?;
+        let search = HostSearch::load(&state, params.q.as_deref()).await?;
         let alerts = state.database.open_alerts().await?;
-        anyhow::Ok((facts, alerts))
+        anyhow::Ok((search, alerts))
     };
-    let (facts, open) = match data.await {
+    let (search, open) = match data.await {
         Ok(data) => data,
         Err(error) => return server_error(&error),
     };
+    let mut alerts: BTreeMap<&str, Vec<&Alert>> = BTreeMap::new();
+    for alert in &open {
+        alerts.entry(&alert.agent_id).or_default().push(alert);
+    }
 
     let mut waiting = Vec::new();
-    let mut agents = Vec::new();
+    let mut listed = Vec::new();
     for agent in state.registry.list().await {
         if agent.is_local() {
             continue;
         }
-        let mine: Vec<&Alert> = open.iter().filter(|a| a.agent_id == agent.id).collect();
-        let pending = agent.state == AgentState::Pending;
-        let row = row(&state, agent.clone(), facts.get(&agent.id), &mine).await;
-        if pending {
-            waiting.push(row);
-        } else {
-            agents.push(row);
+        let presence = state.presence.get(&agent.id);
+        if agent.state == AgentState::Pending {
+            waiting.push(WaitingAgent {
+                seen: presence.map(|p| ago(p.last_seen_ms, now_ms() as u64)),
+                id: agent.id,
+                host: agent.host,
+            });
+        } else if search.includes(&agent.id, &agent.host) {
+            let online = presence.is_some_and(|p| p.online);
+            let mine = alerts.get(agent.id.as_str()).map_or(&[][..], Vec::as_slice);
+            let health = Health::of(online, mine);
+            listed.push(Listed {
+                agent,
+                online,
+                health,
+            });
         }
     }
-    agents.sort_by(|a, b| a.health.cmp(&b.health).then_with(|| a.host.cmp(&b.host)));
+    listed.sort_by(|a, b| {
+        a.health
+            .cmp(&b.health)
+            .then_with(|| a.agent.host.cmp(&b.agent.host))
+    });
 
+    let as_table = params.view.as_deref() == Some("table");
+    let view = if as_table { "table" } else { "" };
     let selected = params.filter.as_deref().unwrap_or("all");
+    let tab = if selected == "all" { "" } else { selected };
+    let text = search.text.as_str();
     let filters: Vec<FilterTab> = [
         ("all", "All"),
         ("online", "Online"),
@@ -234,26 +294,106 @@ async fn index(
     ]
     .into_iter()
     .map(|(key, label)| FilterTab {
-        key,
         label,
-        count: agents.iter().filter(|agent| matches(key, agent)).count(),
+        count: listed.iter().filter(|item| matches(key, item)).count(),
         selected: key == selected,
+        href: address(
+            "/agents",
+            &[
+                ("filter", if key == "all" { "" } else { key }),
+                ("view", view),
+                ("q", text),
+            ],
+        ),
     })
     .collect();
 
-    let online = agents.iter().filter(|agent| agent.online).count();
-    let total = agents.len();
-    agents.retain(|agent| matches(selected, agent));
+    let online = listed.iter().filter(|item| item.online).count();
+    let total = listed.len();
+    listed.retain(|item| matches(selected, item));
+
+    let pages = paginate(&mut listed, page_number(params.page.as_deref()), |page| {
+        address(
+            "/agents",
+            &[
+                ("filter", tab),
+                ("view", view),
+                ("q", text),
+                ("page", &page.to_string()),
+            ],
+        )
+    });
+    let agents = match page_rows(&state, listed, as_table).await {
+        Ok(agents) => agents,
+        Err(error) => return server_error(&error),
+    };
 
     Page::new(&state, &token, "agents/index.html")
         .with("agents", &agents)
         .with("waiting", &waiting)
         .with("filters", &filters)
-        .with("filter", selected)
         .with("online_count", &online)
         .with("total", &total)
-        .with("as_table", &(params.view.as_deref() == Some("table")))
+        .with("as_table", &as_table)
+        .with("pages", &pages)
+        .with("search", &search)
+        .with("search_path", "/agents")
+        .with("keep_tab", tab)
+        .with(
+            "tiles_href",
+            &address("/agents", &[("filter", tab), ("q", text)]),
+        )
+        .with(
+            "table_href",
+            &address(
+                "/agents",
+                &[("filter", tab), ("view", "table"), ("q", text)],
+            ),
+        )
         .render()
+}
+
+#[derive(Deserialize)]
+struct OptionParams {
+    term: Option<String>,
+}
+
+/// What the filter box can offer for the word being typed.
+async fn filter_options(
+    State(state): State<AppState>,
+    Query(params): Query<OptionParams>,
+) -> Response {
+    let term = params.term.unwrap_or_default();
+    match suggestions(&state, &term).await {
+        Ok(suggestions) => Json(suggestions).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn suggestions(state: &AppState, term: &str) -> anyhow::Result<Vec<Suggestion>> {
+    let Some(value) = PartialValue::of(term) else {
+        return Ok(suggest_names(term, state.database.fact_names().await?));
+    };
+    let values = if value.is_host() {
+        let wanted = value.partial.to_lowercase();
+        let mut hosts: Vec<String> = state
+            .registry
+            .list()
+            .await
+            .into_iter()
+            .filter(|agent| !agent.is_local() && agent.host.to_lowercase().contains(&wanted))
+            .map(|agent| agent.host)
+            .collect();
+        hosts.sort();
+        hosts.truncate(MAX_SUGGESTIONS);
+        hosts
+    } else {
+        state
+            .database
+            .fact_values(value.fact(), value.partial, MAX_SUGGESTIONS as u64)
+            .await?
+    };
+    Ok(values.iter().map(|text| value.suggestion(text)).collect())
 }
 
 #[derive(Serialize)]
@@ -315,7 +455,17 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         })
         .collect();
 
-    let row = row(&state, agent.clone(), Some(&flat), &alerts).await;
+    let online = state.presence.get(&id).is_some_and(|p| p.online);
+    let mut row = row(
+        &state,
+        agent.clone(),
+        Some(&flat),
+        Health::of(online, &alerts),
+    );
+    row.config = Some(config_state(
+        Some(desired.version.as_str()),
+        reported.as_ref(),
+    ));
     Page::new(&state, &token, "agents/show.html")
         .with("agent", &row)
         .with("decided_by", &agent.decided_by)

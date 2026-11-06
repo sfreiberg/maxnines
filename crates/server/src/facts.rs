@@ -15,6 +15,14 @@ const MAX_LEN: usize = 255;
 /// Fact names and their values, which are always strings, numbers or booleans.
 pub type FlatFacts = BTreeMap<String, Value>;
 
+/// A value as it reads to a person.
+pub fn fact_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// Flattens a report. A fact with no value (null) counts as not being reported,
 /// and so does an empty list, which has no items to store.
 /// Anything that can't be stored rejects the whole report, because keeping part

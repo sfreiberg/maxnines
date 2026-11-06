@@ -7,8 +7,8 @@
     <p class="subtitle">{{ online_count }} of {{ total }} online</p>
   </div>
   <nav class="tabs" aria-label="View">
-    <a href="/agents?filter={{ filter }}"{% if not as_table %} class="selected" aria-current="true"{% endif %}>Tiles</a>
-    <a href="/agents?view=table&amp;filter={{ filter }}"{% if as_table %} class="selected" aria-current="true"{% endif %}>Table</a>
+    <a href="{{ tiles_href }}"{% if not as_table %} class="selected" aria-current="true"{% endif %}>Tiles</a>
+    <a href="{{ table_href }}"{% if as_table %} class="selected" aria-current="true"{% endif %}>Table</a>
   </nav>
 </div>
 
@@ -33,9 +33,11 @@
 </section>
 {% endif %}
 
+{% include "agents/_filter.html" %}
+
 <nav class="tabs" aria-label="Filter">
   {% for tab in filters %}
-  <a href="/agents?filter={{ tab.key }}{% if as_table %}&amp;view=table{% endif %}"{% if tab.selected %} class="selected" aria-current="true"{% endif %}>{{ tab.label }} {{ tab.count }}</a>
+  <a href="{{ tab.href }}"{% if tab.selected %} class="selected" aria-current="true"{% endif %}>{{ tab.label }} {{ tab.count }}</a>
   {% endfor %}
 </nav>
 
@@ -66,9 +68,10 @@
   </a>
   {% endfor %}
 </div>
+{% elif search.text or total > 0 %}
+<p class="empty">No agents match this filter.</p>
 {% elif not waiting %}
 <p class="empty">No agents have connected yet.</p>
-{% else %}
-<p class="empty">No agents match this filter.</p>
 {% endif %}
+{% include "agents/_pages.html" %}
 {% endblock content %}
