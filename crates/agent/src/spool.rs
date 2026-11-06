@@ -1,33 +1,35 @@
 //! Samples waiting for the server. While connected they pass through memory, so a
-//! healthy agent doesn't write to disk. While disconnected they're saved to a file,
+//! healthy agent doesn't write to disk. While disconnected they're saved to files,
 //! which keeps them through a restart. Either way the newest samples win when space
 //! runs out, because recent data is what people want after an outage.
 
 use std::collections::VecDeque;
-use std::path::Path;
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use anyhow::{Context, Result, bail};
-use redb::{Database, DatabaseError, Durability, ReadableDatabase, ReadableTable, TableDefinition};
+use serde::de::IgnoredAny;
 use tokio::sync::Notify;
 use tracing::warn;
 
-const SAMPLES: TableDefinition<u64, &str> = TableDefinition::new("samples");
+const EXTENSION: &str = "jsonl";
 
 /// Samples kept in memory. This only fills up if the disk can't be used.
 const MAX_IN_MEMORY: usize = 64;
-/// How much to keep on disk, which takes about twice this in the file. A sample is
-/// usually a few KB, so this covers at least a day at the default interval.
+/// How much to keep on disk. A sample is usually a few KB, so this covers at least
+/// a day at the default interval.
 const MAX_SAVED_BYTES: u64 = 64 * 1024 * 1024;
-/// Removing a sent sample is only forced to disk this often, to send a backlog
-/// quickly. Being killed part way through can send up to this many samples twice.
-const REMOVALS_PER_SYNC: u32 = 32;
+/// The limit is shared between about this many files, and reaching it deletes the
+/// oldest, so this much of the backlog goes at once.
+const FILES_KEPT: u64 = 16;
 
 /// Where a sample came from, to remove it once it's been sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Place {
     Memory,
-    Saved(u64),
+    Saved { file: u64, end: u64 },
 }
 
 pub struct Spool {
@@ -44,14 +46,14 @@ struct State {
 }
 
 impl Spool {
-    /// Carries on in memory if the file can't be used, because a full or read-only
+    /// Carries on in memory if the folder can't be used, because a full or read-only
     /// disk must not stop an agent reporting while it's connected.
-    pub fn open(path: &Path) -> Self {
-        Self::with_limit(path, MAX_SAVED_BYTES)
+    pub fn open(folder: &Path) -> Self {
+        Self::with_limit(folder, MAX_SAVED_BYTES)
     }
 
-    fn with_limit(path: &Path, max_bytes: u64) -> Self {
-        let saved = Saved::open(path, max_bytes)
+    fn with_limit(folder: &Path, max_bytes: u64) -> Self {
+        let saved = Saved::open(folder, max_bytes)
             .inspect_err(|error| {
                 let error = format!("{error:#}");
                 warn!(error, "can't save samples to disk, keeping them in memory");
@@ -81,7 +83,7 @@ impl Spool {
         }
         if state.memory.len() > MAX_IN_MEMORY {
             state.memory.pop_front();
-            state.note_drops(1);
+            state.note_drops();
         }
         drop(state);
         self.arrived.notify_one();
@@ -101,9 +103,9 @@ impl Spool {
     /// The oldest sample, which stays queued until [`Spool::sent`] says it went.
     pub fn next(&self) -> Option<(String, Place)> {
         let mut state = self.state();
-        if let Some(saved) = &state.saved {
+        if let Some(saved) = &mut state.saved {
             match saved.oldest() {
-                Ok(Some((id, text))) => return Some((text, Place::Saved(id))),
+                Ok(Some(oldest)) => return Some(oldest),
                 Ok(None) => {}
                 Err(error) => state.give_up_on_disk(&error),
             }
@@ -118,9 +120,9 @@ impl Spool {
             Place::Memory => {
                 state.memory.pop_front();
             }
-            Place::Saved(id) => {
+            Place::Saved { file, end } => {
                 if let Some(saved) = &mut state.saved
-                    && let Err(error) = saved.remove(id)
+                    && let Err(error) = saved.remove_through(file, end)
                 {
                     state.give_up_on_disk(&error);
                 }
@@ -157,7 +159,9 @@ impl State {
         match saved.append(self.memory.make_contiguous()) {
             Ok(dropped) => {
                 self.memory.clear();
-                self.note_drops(dropped);
+                if dropped {
+                    self.note_drops();
+                }
             }
             Err(error) if !self.warned_of_saving => {
                 self.warned_of_saving = true;
@@ -168,14 +172,14 @@ impl State {
         }
     }
 
-    fn note_drops(&mut self, dropped: u64) {
-        if dropped > 0 && !self.warned_of_drops {
+    fn note_drops(&mut self) {
+        if !self.warned_of_drops {
             self.warned_of_drops = true;
             warn!("the sample queue is full, dropping the oldest samples");
         }
     }
 
-    /// A file that can't be read or updated would send the same sample forever.
+    /// Files that can't be read or updated would send the same sample forever.
     fn give_up_on_disk(&mut self, error: &anyhow::Error) {
         let error = format!("{error:#}");
         warn!(
@@ -186,118 +190,233 @@ impl State {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SavedFile {
+    number: u64,
+    size: u64,
+}
+
+/// Samples as JSON Lines, one sample per line, spread over numbered files so the
+/// oldest can be dropped by deleting a file. Only the newest file is written to, and
+/// a restart always starts a new one, so a line cut short by a crash stays at the
+/// end of a file where it's skipped.
 struct Saved {
-    database: Database,
-    next_id: u64,
+    folder: PathBuf,
+    /// The file and offset of the oldest unsent sample. Being locked, it also keeps
+    /// a second agent out of the folder.
+    position: File,
+    files: VecDeque<SavedFile>,
+    /// How far into the oldest file has been sent.
+    offset: u64,
+    writer: Option<File>,
+    next_number: u64,
     bytes: u64,
     max_bytes: u64,
-    removals: u32,
 }
 
 impl Saved {
-    fn open(path: &Path, max_bytes: u64) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        let database = open_or_replace(path)?;
-
-        let transaction = database.begin_write()?;
-        let (next_id, bytes) = {
-            let table = transaction.open_table(SAMPLES)?;
-            let next_id = table.last()?.map_or(0, |(id, _)| id.value() + 1);
-            let mut bytes = 0;
-            for entry in table.iter()? {
-                bytes += entry?.1.value().len() as u64;
+    fn open(folder: &Path, max_bytes: u64) -> Result<Self> {
+        fs::create_dir_all(folder).with_context(|| format!("creating {}", folder.display()))?;
+        let position_path = folder.join("position");
+        let mut position = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&position_path)
+            .with_context(|| format!("opening {}", position_path.display()))?;
+        match position.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                bail!("{} is in use by another agent", folder.display())
             }
-            (next_id, bytes)
-        };
-        transaction.commit()?;
+            Err(TryLockError::Error(error)) => {
+                return Err(error).with_context(|| format!("locking {}", folder.display()));
+            }
+        }
+
+        let (position_file, position_offset) = read_position(&mut position).unwrap_or((0, 0));
+        let files = saved_files(folder)?;
+        let offset = files
+            .front()
+            .filter(|oldest| oldest.number == position_file && position_offset <= oldest.size)
+            .map_or(0, |_| position_offset);
+        let total: u64 = files.iter().map(|file| file.size).sum();
+        // A number the position still names can't be reused, or its offset would
+        // apply to a new file.
+        let newest = files.back().map_or(0, |file| file.number);
 
         Ok(Self {
-            database,
-            next_id,
-            bytes,
+            folder: folder.to_path_buf(),
+            position,
+            offset,
+            writer: None,
+            next_number: newest.max(position_file) + 1,
+            bytes: total - offset,
             max_bytes,
-            removals: 0,
+            files,
         })
     }
 
-    /// Saves samples, removing the oldest to stay in the limit, and returns how
-    /// many were removed.
-    fn append(&mut self, samples: &[String]) -> Result<u64> {
-        let mut next_id = self.next_id;
-        let mut bytes = self.bytes;
-        let mut dropped = 0;
+    fn path_of(&self, number: u64) -> PathBuf {
+        self.folder.join(format!("{number}.{EXTENSION}"))
+    }
 
-        let transaction = self.database.begin_write()?;
+    /// Saves samples, deleting the oldest file to stay in the limit, and returns
+    /// whether it did.
+    fn append(&mut self, samples: &[String]) -> Result<bool> {
+        let lines: String = samples.iter().map(|text| format!("{text}\n")).collect();
+
+        let full = self
+            .files
+            .back()
+            .is_none_or(|newest| newest.size >= self.max_bytes / FILES_KEPT);
+        let mut writer = match self.writer.take() {
+            Some(writer) if !full => writer,
+            _ => self.start_file()?,
+        };
+        let start = writer.stream_position()?;
+        if let Err(error) = writer
+            .write_all(lines.as_bytes())
+            .and_then(|()| writer.sync_data())
         {
-            let mut table = transaction.open_table(SAMPLES)?;
-            for text in samples {
-                table.insert(next_id, text.as_str())?;
-                next_id += 1;
-                bytes += text.len() as u64;
-            }
-            while bytes > self.max_bytes {
-                let Some((_, oldest)) = table.pop_first()? else {
-                    break;
-                };
-                bytes -= oldest.value().len() as u64;
-                dropped += 1;
-            }
+            // The samples stay in memory to be saved again, so they mustn't stay
+            // here too. If this fails as well, the next write goes to a new file.
+            writer.set_len(start).ok();
+            return Err(error).context("writing saved samples");
         }
-        transaction.commit()?;
+        self.writer = Some(writer);
+        if let Some(newest) = self.files.back_mut() {
+            newest.size += lines.len() as u64;
+        }
+        self.bytes += lines.len() as u64;
 
-        self.next_id = next_id;
-        self.bytes = bytes;
+        let mut dropped = false;
+        while self.bytes > self.max_bytes && self.files.len() > 1 {
+            self.remove_oldest()?;
+            dropped = true;
+        }
         Ok(dropped)
     }
 
-    fn oldest(&self) -> Result<Option<(u64, String)>> {
-        if self.bytes == 0 {
-            return Ok(None);
-        }
-        let transaction = self.database.begin_read()?;
-        let table = transaction.open_table(SAMPLES)?;
-        let oldest = table.first()?;
-        Ok(oldest.map(|(id, text)| (id.value(), text.value().to_string())))
+    fn start_file(&mut self) -> Result<File> {
+        let number = self.next_number;
+        let path = self.path_of(number);
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        self.next_number += 1;
+        self.files.push_back(SavedFile { number, size: 0 });
+        Ok(file)
     }
 
-    fn remove(&mut self, id: u64) -> Result<()> {
-        self.removals += 1;
-        let mut transaction = self.database.begin_write()?;
-        let bytes = {
-            let mut table = transaction.open_table(SAMPLES)?;
-            let removed = table.remove(id)?;
-            let removed = removed.map_or(0, |text| text.value().len() as u64);
-            self.bytes.saturating_sub(removed)
-        };
-        if bytes > 0 && !self.removals.is_multiple_of(REMOVALS_PER_SYNC) {
-            transaction.set_durability(Durability::None)?;
+    /// The oldest sample that can be read. Lines damaged by a crash are skipped,
+    /// because the server would reject them and they'd be sent forever.
+    fn oldest(&mut self) -> Result<Option<(String, Place)>> {
+        while let Some(oldest) = self.files.front().copied() {
+            let path = self.path_of(oldest.number);
+            let file = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+            let mut reader = BufReader::new(file);
+            reader.seek(SeekFrom::Start(self.offset))?;
+            let mut line = Vec::new();
+            reader.read_until(b'\n', &mut line)?;
+
+            let end = self.offset + line.len() as u64;
+            if line.pop() != Some(b'\n') {
+                self.remove_oldest()?;
+            } else if let Some(text) = whole_sample(line) {
+                let place = Place::Saved {
+                    file: oldest.number,
+                    end,
+                };
+                return Ok(Some((text, place)));
+            } else {
+                warn!("skipping a damaged saved sample");
+                self.remove_through(oldest.number, end)?;
+            }
         }
-        transaction.commit()?;
-        self.bytes = bytes;
-        if bytes == 0 {
-            self.database.compact()?;
+        Ok(None)
+    }
+
+    /// Moves past a sample that ends at `end`, deleting its file if that was the last.
+    fn remove_through(&mut self, number: u64, end: u64) -> Result<()> {
+        let Some(oldest) = self.files.front().copied() else {
+            return Ok(());
+        };
+        if oldest.number != number {
+            return Ok(());
+        }
+        self.bytes = self.bytes.saturating_sub(end - self.offset);
+        self.offset = end;
+        self.save_position(number)?;
+        if end >= oldest.size {
+            self.remove_oldest()?;
         }
         Ok(())
     }
+
+    /// Not forced to disk: losing this in a power cut sends samples twice, and
+    /// never loses them.
+    fn save_position(&mut self, number: u64) -> Result<()> {
+        let text = format!("{number:020} {:020}\n", self.offset);
+        self.position.seek(SeekFrom::Start(0))?;
+        self.position.write_all(text.as_bytes())?;
+        Ok(())
+    }
+
+    fn remove_oldest(&mut self) -> Result<()> {
+        let Some(oldest) = self.files.pop_front() else {
+            return Ok(());
+        };
+        if self.files.is_empty() {
+            self.writer = None;
+        }
+        self.bytes = self
+            .bytes
+            .saturating_sub(oldest.size.saturating_sub(self.offset));
+        self.offset = 0;
+        let path = self.path_of(oldest.number);
+        fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))
+    }
 }
 
-/// A damaged file only holds samples that can't be read, so it's started afresh.
-fn open_or_replace(path: &Path) -> Result<Database> {
-    match Database::create(path) {
-        Ok(database) => Ok(database),
-        Err(DatabaseError::DatabaseAlreadyOpen) => {
-            bail!("{} is in use by another agent", path.display())
+/// `None` if the file is new or damaged, which starts from the oldest file's beginning.
+fn read_position(file: &mut File) -> Option<(u64, u64)> {
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    let (number, offset) = text.trim().split_once(' ')?;
+    Some((number.parse().ok()?, offset.parse().ok()?))
+}
+
+/// The folder's sample files, oldest first.
+fn saved_files(folder: &Path) -> Result<VecDeque<SavedFile>> {
+    let mut files = Vec::new();
+    let entries = fs::read_dir(folder).with_context(|| format!("reading {}", folder.display()))?;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let number = name.to_str().and_then(|name| {
+            name.strip_suffix(EXTENSION)?
+                .strip_suffix('.')?
+                .parse()
+                .ok()
+        });
+        if let Some(number) = number {
+            let size = entry.metadata()?.len();
+            files.push(SavedFile { number, size });
         }
-        Err(error) if path.is_file() => {
-            warn!(%error, "replacing a damaged file of saved samples");
-            std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
-            Database::create(path).with_context(|| format!("creating {}", path.display()))
-        }
-        Err(error) => Err(error).with_context(|| format!("opening {}", path.display())),
     }
+    files.sort_by_key(|file| file.number);
+    Ok(files.into())
+}
+
+fn whole_sample(line: Vec<u8>) -> Option<String> {
+    let text = String::from_utf8(line).ok()?;
+    serde_json::from_str::<IgnoredAny>(&text)
+        .is_ok()
+        .then_some(text)
 }
 
 #[cfg(test)]
@@ -310,10 +429,22 @@ mod tests {
 
     use super::*;
 
-    fn file() -> (TempDir, PathBuf) {
-        let folder = tempdir().unwrap();
-        let path = folder.path().join("samples.redb");
-        (folder, path)
+    fn folder() -> (TempDir, PathBuf) {
+        let parent = tempdir().unwrap();
+        let path = parent.path().join("samples");
+        (parent, path)
+    }
+
+    /// The sample files in a folder, oldest first.
+    fn files_in(path: &Path) -> Vec<PathBuf> {
+        let files = saved_files(path).unwrap();
+        let path_of = |file: &SavedFile| path.join(format!("{}.{EXTENSION}", file.number));
+        files.iter().map(path_of).collect()
+    }
+
+    fn add_to_file(path: &Path, text: &[u8]) {
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(text).unwrap();
     }
 
     /// Everything queued, oldest first, marking each one as sent.
@@ -326,80 +457,73 @@ mod tests {
         texts
     }
 
-    fn saved_count(spool: &Spool) -> u64 {
-        let state = spool.state();
-        let transaction = state.saved.as_ref().unwrap().database.begin_read().unwrap();
-        let table = transaction.open_table(SAMPLES).unwrap();
-        redb::ReadableTableMetadata::len(&table).unwrap()
-    }
-
     #[test]
     fn samples_come_out_oldest_first() {
-        let (_folder, path) = file();
+        let (_parent, path) = folder();
         let spool = Spool::open(&path);
-        for text in ["a", "b", "c"] {
+        for text in ["1", "2", "3"] {
             spool.push(text.to_string());
         }
 
-        assert_eq!(drain(&spool), ["a", "b", "c"]);
+        assert_eq!(drain(&spool), ["1", "2", "3"]);
         assert!(spool.next().is_none());
     }
 
     #[test]
     fn samples_saved_while_disconnected_survive_a_restart() {
-        let (_folder, path) = file();
+        let (_parent, path) = folder();
         let spool = Spool::open(&path);
-        spool.push("a".to_string());
-        spool.push("b".to_string());
+        spool.push("1".to_string());
+        spool.push("2".to_string());
         drop(spool);
 
         let spool = Spool::open(&path);
-        spool.push("c".to_string());
+        spool.push("3".to_string());
 
-        assert_eq!(drain(&spool), ["a", "b", "c"]);
+        assert_eq!(drain(&spool), ["1", "2", "3"]);
     }
 
     #[test]
     fn a_connected_agent_does_not_write_samples_to_disk() {
-        let (_folder, path) = file();
+        let (_parent, path) = folder();
         let spool = Spool::open(&path);
         spool.set_online(true);
 
-        spool.push("a".to_string());
+        spool.push("1".to_string());
 
-        assert_eq!(saved_count(&spool), 0);
-        assert_eq!(drain(&spool), ["a"]);
+        assert!(files_in(&path).is_empty());
+        assert_eq!(drain(&spool), ["1"]);
     }
 
     #[test]
     fn losing_the_connection_saves_what_had_not_been_sent() {
-        let (_folder, path) = file();
+        let (_parent, path) = folder();
         let spool = Spool::open(&path);
         spool.set_online(true);
-        spool.push("a".to_string());
+        spool.push("1".to_string());
 
         spool.set_online(false);
         drop(spool);
 
-        assert_eq!(drain(&Spool::open(&path)), ["a"]);
+        assert_eq!(drain(&Spool::open(&path)), ["1"]);
     }
 
     #[test]
     fn saved_samples_go_before_newer_ones_in_memory() {
-        let (_folder, path) = file();
+        let (_parent, path) = folder();
         let spool = Spool::open(&path);
-        spool.push("offline".to_string());
+        spool.push("1".to_string());
         spool.set_online(true);
-        spool.push("online".to_string());
+        spool.push("2".to_string());
 
-        assert_eq!(drain(&spool), ["offline", "online"]);
+        assert_eq!(drain(&spool), ["1", "2"]);
     }
 
     #[test]
     fn a_sample_stays_queued_until_it_has_been_sent() {
-        let (_folder, path) = file();
+        let (_parent, path) = folder();
         let spool = Spool::open(&path);
-        spool.push("a".to_string());
+        spool.push("1".to_string());
 
         let (first, _) = spool.next().unwrap();
         let (again, place) = spool.next().unwrap();
@@ -411,60 +535,59 @@ mod tests {
 
     #[test]
     fn the_oldest_saved_samples_go_first_when_the_limit_is_reached() {
-        let (_folder, path) = file();
+        let (_parent, path) = folder();
         let spool = Spool::with_limit(&path, 20);
         for number in 0..10 {
-            spool.push(format!("sample-{number}"));
+            spool.push((10_000_000 + number).to_string());
         }
 
-        assert_eq!(drain(&spool), ["sample-8", "sample-9"]);
+        assert_eq!(drain(&spool), ["10000008", "10000009"]);
     }
 
     #[test]
     fn the_limit_counts_samples_saved_before_a_restart() {
-        let (_folder, path) = file();
+        let (_parent, path) = folder();
         let spool = Spool::with_limit(&path, 20);
-        spool.push("sample-0".to_string());
-        spool.push("sample-1".to_string());
+        spool.push("10000000".to_string());
+        spool.push("10000001".to_string());
         drop(spool);
 
         let spool = Spool::with_limit(&path, 20);
-        spool.push("sample-2".to_string());
+        spool.push("10000002".to_string());
 
-        assert_eq!(drain(&spool), ["sample-1", "sample-2"]);
+        assert_eq!(drain(&spool), ["10000001", "10000002"]);
     }
 
     #[test]
     fn sending_a_backlog_frees_its_space() {
-        let (_folder, path) = file();
+        let (_parent, path) = folder();
         let spool = Spool::with_limit(&path, 20);
-        spool.push("sample-0".to_string());
+        spool.push("10000000".to_string());
         drain(&spool);
 
-        spool.push("sample-1".to_string());
-        spool.push("sample-2".to_string());
+        spool.push("10000001".to_string());
+        spool.push("10000002".to_string());
 
-        assert_eq!(drain(&spool), ["sample-1", "sample-2"]);
+        assert_eq!(drain(&spool), ["10000001", "10000002"]);
     }
 
     #[test]
     fn sending_a_whole_backlog_gives_the_disk_space_back() {
-        let (_folder, path) = file();
-        let spool = Spool::open(&path);
-        let size = || std::fs::metadata(&path).unwrap().len();
-        for _ in 0..100 {
-            spool.push("x".repeat(100_000));
+        let (_parent, path) = folder();
+        let spool = Spool::with_limit(&path, 1_000_000);
+        for _ in 0..5 {
+            spool.push(format!("\"{}\"", "x".repeat(100_000)));
         }
-        let full = size();
+        assert!(files_in(&path).len() > 1);
 
         drain(&spool);
 
-        assert!(size() < full / 4, "{} of {full}", size());
+        assert!(files_in(&path).is_empty());
     }
 
     #[test]
     fn samples_sent_before_a_restart_are_not_sent_again() {
-        let (_folder, path) = file();
+        let (_parent, path) = folder();
         let spool = Spool::open(&path);
         for number in 0..100 {
             spool.push(number.to_string());
@@ -476,38 +599,41 @@ mod tests {
         drop(spool);
 
         let left = drain(&Spool::open(&path));
-        assert!(left.len() <= 50 + REMOVALS_PER_SYNC as usize, "{left:?}");
+        assert_eq!(left.len(), 50);
+        assert_eq!(left[0], "50");
         assert_eq!(left.last().unwrap(), "99");
     }
 
     #[test]
     fn an_unusable_location_falls_back_to_memory() {
-        let folder = tempdir().unwrap();
-        let spool = Spool::open(folder.path());
+        let (_parent, path) = folder();
+        std::fs::write(&path, "a file where the folder should be").unwrap();
+        let spool = Spool::open(&path);
         assert!(spool.state().saved.is_none());
 
-        spool.push("a".to_string());
+        spool.push("1".to_string());
         spool.set_online(false);
 
-        assert_eq!(drain(&spool), ["a"]);
+        assert_eq!(drain(&spool), ["1"]);
     }
 
     #[test]
     fn a_file_another_agent_has_open_falls_back_to_memory() {
-        let (_folder, path) = file();
+        let (_parent, path) = folder();
         let first = Spool::open(&path);
-        first.push("a".to_string());
+        first.push("1".to_string());
 
         let second = Spool::open(&path);
 
         assert!(second.state().saved.is_none());
-        assert_eq!(drain(&first), ["a"]);
+        assert_eq!(drain(&first), ["1"]);
     }
 
     #[test]
     fn memory_keeps_the_newest_samples_when_the_disk_can_not_be_used() {
-        let folder = tempdir().unwrap();
-        let spool = Spool::open(folder.path());
+        let (_parent, path) = folder();
+        std::fs::write(&path, "a file where the folder should be").unwrap();
+        let spool = Spool::open(&path);
         for number in 0..MAX_IN_MEMORY + 3 {
             spool.push(number.to_string());
         }
@@ -519,20 +645,121 @@ mod tests {
     }
 
     #[test]
-    fn a_damaged_file_is_replaced() {
-        let (_folder, path) = file();
-        std::fs::write(&path, b"this is not a database").unwrap();
+    fn a_line_cut_short_by_a_crash_is_skipped() {
+        let (_parent, path) = folder();
+        let spool = Spool::open(&path);
+        spool.push("1".to_string());
+        drop(spool);
+        add_to_file(&files_in(&path)[0], b"{\"cut sho");
 
         let spool = Spool::open(&path);
-        assert!(spool.state().saved.is_some());
-        spool.push("a".to_string());
+        spool.push("2".to_string());
 
-        assert_eq!(drain(&spool), ["a"]);
+        assert_eq!(drain(&spool), ["1", "2"]);
+        assert!(files_in(&path).is_empty());
+    }
+
+    #[test]
+    fn damaged_lines_are_skipped() {
+        let (_parent, path) = folder();
+        let spool = Spool::open(&path);
+        spool.push("1".to_string());
+        drop(spool);
+        add_to_file(&files_in(&path)[0], b"{\"cut\n\0\0\0\n\xff\xfe\n2\n");
+
+        assert_eq!(drain(&Spool::open(&path)), ["1", "2"]);
+    }
+
+    #[test]
+    fn nothing_is_left_waiting_when_only_damage_remains() {
+        let (_parent, path) = folder();
+        let spool = Spool::open(&path);
+        spool.push("1".to_string());
+        drop(spool);
+        std::fs::write(&files_in(&path)[0], b"{\"cut\n{\"short").unwrap();
+
+        let spool = Spool::open(&path);
+
+        assert!(spool.next().is_none());
+        assert_eq!(spool.saved_bytes(), 0);
+        assert!(files_in(&path).is_empty());
+    }
+
+    #[test]
+    fn a_damaged_position_sends_the_oldest_file_again() {
+        let (_parent, path) = folder();
+        let spool = Spool::open(&path);
+        spool.push("1".to_string());
+        spool.push("2".to_string());
+        let (_, place) = spool.next().unwrap();
+        spool.sent(place);
+        drop(spool);
+        std::fs::write(path.join("position"), "not a position").unwrap();
+
+        assert_eq!(drain(&Spool::open(&path)), ["1", "2"]);
+    }
+
+    #[test]
+    fn an_old_position_does_not_apply_to_a_new_file() {
+        let (_parent, path) = folder();
+        let spool = Spool::open(&path);
+        spool.push("1000".to_string());
+        drain(&spool);
+        drop(spool);
+
+        let spool = Spool::open(&path);
+        spool.push("2000".to_string());
+        spool.push("3000".to_string());
+        drop(spool);
+
+        assert_eq!(drain(&Spool::open(&path)), ["2000", "3000"]);
+    }
+
+    #[test]
+    fn a_restart_keeps_the_order_across_files() {
+        let (_parent, path) = folder();
+        let spool = Spool::with_limit(&path, 1000);
+        for number in 0..30 {
+            spool.push(format!("{}", 1000 + number));
+        }
+        drop(spool);
+        let spool = Spool::with_limit(&path, 1000);
+        spool.push("2000".to_string());
+
+        let expected: Vec<String> = (1000..1030).chain([2000]).map(|n| n.to_string()).collect();
+        assert!(files_in(&path).len() > 2);
+        assert_eq!(drain(&spool), expected);
+    }
+
+    #[test]
+    fn samples_saved_part_way_through_a_backlog_are_kept() {
+        let (_parent, path) = folder();
+        let spool = Spool::open(&path);
+        spool.push("1".to_string());
+        spool.push("2".to_string());
+        let (_, place) = spool.next().unwrap();
+        spool.sent(place);
+
+        spool.push("3".to_string());
+
+        assert_eq!(drain(&spool), ["2", "3"]);
+    }
+
+    #[test]
+    fn samples_are_saved_one_per_line() {
+        let (_parent, path) = folder();
+        let spool = Spool::open(&path);
+        spool.push(r#"{"a":1}"#.to_string());
+        spool.push(r#"{"a":2}"#.to_string());
+
+        let text = std::fs::read_to_string(&files_in(&path)[0]).unwrap();
+
+        assert_eq!(text, "{\"a\":1}\n{\"a\":2}\n");
     }
 
     #[tokio::test]
     async fn waiting_ends_when_a_sample_arrives() {
-        let (_folder, path) = file();
+        let (_parent, path) = folder();
         let spool = std::sync::Arc::new(Spool::open(&path));
         let waiting = tokio::spawn({
             let spool = spool.clone();
@@ -540,7 +767,7 @@ mod tests {
         });
 
         tokio::task::yield_now().await;
-        spool.push("a".to_string());
+        spool.push("1".to_string());
 
         timeout(Duration::from_secs(5), waiting)
             .await
@@ -550,8 +777,8 @@ mod tests {
 
     #[tokio::test]
     async fn waiting_ends_at_once_for_samples_saved_earlier() {
-        let (_folder, path) = file();
-        Spool::open(&path).push("a".to_string());
+        let (_parent, path) = folder();
+        Spool::open(&path).push("1".to_string());
 
         let spool = Spool::open(&path);
 

@@ -82,7 +82,7 @@ impl ServerLink {
 
         let (facts_every, facts_every_receiver) = watch::channel(DEFAULT_FACTS_INTERVAL);
         let (config_sender, configs) = mpsc::channel(CONFIG_QUEUE_SIZE);
-        let spool = Arc::new(Spool::open(&config.sample_queue_file()));
+        let spool = Arc::new(Spool::open(&config.sample_queue_folder()));
         let connection = Connection {
             url,
             host: host.to_string(),
@@ -573,8 +573,8 @@ mod tests {
     #[tokio::test]
     async fn a_sample_that_fails_to_send_stays_queued() {
         let folder = tempfile::tempdir().unwrap();
-        let spool = Spool::open(&folder.path().join("samples.redb"));
-        spool.push("a".to_string());
+        let spool = Spool::open(&folder.path().join("samples"));
+        spool.push("1".to_string());
         let broken = futures_util::sink::unfold((), |(), _: Message| async {
             Err::<(), &str>("connection lost")
         });
@@ -582,7 +582,7 @@ mod tests {
 
         assert!(send_next(&mut broken, &spool).await.is_err());
 
-        assert_eq!(spool.next().unwrap().0, "a");
+        assert_eq!(spool.next().unwrap().0, "1");
     }
 
     #[tokio::test]
@@ -592,7 +592,7 @@ mod tests {
         let listener = TcpListener::bind(address).await.unwrap();
         let settings = config(&url);
         let saved = serde_json::to_string(&AgentMessage::Sample(sample())).unwrap();
-        Spool::open(&settings.sample_queue_file()).push(saved);
+        Spool::open(&settings.sample_queue_folder()).push(saved);
 
         let _link = ServerLink::start(&settings, "web-1", identity()).unwrap();
 

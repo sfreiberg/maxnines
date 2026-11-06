@@ -20,7 +20,7 @@ server {
 }
 
 # Where the agent keeps its key, the last config it received, and samples while
-# the server can't be reached, up to about 120 MB. Keep it out of synced folders.
+# the server can't be reached, up to 64 MB. Keep it out of synced folders.
 state_dir = "data.nosync"
 
 # Your own facts, which server rules can match on. Reported under "custom".

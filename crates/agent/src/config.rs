@@ -58,8 +58,8 @@ impl Config {
         self.state_dir.join("config.json")
     }
 
-    pub fn sample_queue_file(&self) -> PathBuf {
-        self.state_dir.join("samples.redb")
+    pub fn sample_queue_folder(&self) -> PathBuf {
+        self.state_dir.join("samples")
     }
 
     pub fn load(path: &Path) -> Result<Self> {
