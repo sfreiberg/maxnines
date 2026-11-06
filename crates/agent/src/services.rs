@@ -28,7 +28,7 @@ impl ServiceCollector {
             async move {
                 let probe = |name: Arc<String>| async move { report(&name, query(&name).await) };
                 let failed = |name: &String| report(name, Status::stopped(UNKNOWN));
-                Value::Array(probe_all(&names, TIMEOUT, probe, failed).await)
+                Value::Array(probe_all(&names, interval, TIMEOUT, probe, failed).await)
             }
         });
         Self { background }

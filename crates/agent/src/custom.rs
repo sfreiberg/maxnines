@@ -125,7 +125,7 @@ impl CustomCollector {
                     report(&item.name, result)
                 };
                 let failed = |item: &Wanted| report(&item.name, Err(TIMED_OUT.to_string()));
-                let results = probe_all(&wanted, longest + GRACE, probe, failed).await;
+                let results = probe_all(&wanted, interval, longest + GRACE, probe, failed).await;
                 Value::Array(results.into_iter().flatten().collect())
             }
         });
@@ -572,7 +572,7 @@ mod tests {
             ]);
 
             let names = vec!["wanted".to_string()];
-            let mut collector = CustomCollector::new(names, &defined, LIMIT);
+            let mut collector = CustomCollector::new(names, &defined, Duration::from_millis(20));
             wait_until(|| collector.background_has_results());
 
             assert_eq!(
@@ -586,7 +586,8 @@ mod tests {
         #[test]
         fn a_name_the_agent_does_not_define_is_never_run() {
             let names = vec!["/bin/sh".to_string()];
-            let mut collector = CustomCollector::new(names, &Definitions::new(), LIMIT);
+            let mut collector =
+                CustomCollector::new(names, &Definitions::new(), Duration::from_millis(20));
             wait_until(|| collector.background_has_results());
             assert_eq!(
                 latest(&mut collector, "/bin/sh").unwrap()["error"],

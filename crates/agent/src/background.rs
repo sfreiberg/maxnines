@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::runtime::{Builder, Runtime};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tracing::error;
 
 /// How quickly a stopped collector's thread notices.
@@ -28,6 +28,30 @@ const MAX_BLOCKING_THREADS: usize = 8;
 /// keeping them longer only holds memory.
 const BLOCKING_THREAD_KEEP_ALIVE: Duration = Duration::from_secs(1);
 
+/// A random time up to `limit`, which keeps work on the same schedule from all
+/// starting at once, whether that's in one agent or across a fleet.
+pub fn jitter(limit: Duration) -> Duration {
+    limit.mul_f64(rand::random())
+}
+
+/// Sleeps until a time, or until stopped.
+fn pause(until: Instant, stopped: &AtomicBool) {
+    while !stopped.load(Ordering::Relaxed) {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        thread::sleep(STOP_CHECK.min(left));
+    }
+}
+
+/// Finishes when stopped.
+async fn stopping(stopped: &AtomicBool) {
+    while !stopped.load(Ordering::Relaxed) {
+        sleep(STOP_CHECK).await;
+    }
+}
+
 fn runtime() -> std::io::Result<Runtime> {
     Builder::new_current_thread()
         .enable_all()
@@ -36,8 +60,9 @@ fn runtime() -> std::io::Result<Runtime> {
         .build()
 }
 
-/// Repeats some work on its own thread and keeps the newest result. It stops
-/// when dropped, which happens whenever the agent's config changes.
+/// Repeats some work on its own thread and keeps the newest result, starting at a
+/// random point in the interval. It stops when dropped, which happens whenever the
+/// agent's config changes.
 pub struct Background {
     latest: Arc<Mutex<Value>>,
     stop: Arc<AtomicBool>,
@@ -49,7 +74,7 @@ impl Background {
         Round: FnMut() -> Work + Send + 'static,
         Work: Future<Output = Value>,
     {
-        let latest = Arc::new(Mutex::new(Value::Array(Vec::new())));
+        let latest = Arc::new(Mutex::new(Value::Null));
         let stop = Arc::new(AtomicBool::new(false));
 
         let (saved, stopped) = (latest.clone(), stop.clone());
@@ -61,15 +86,25 @@ impl Background {
                     return;
                 }
             };
+            pause(Instant::now() + jitter(interval), &stopped);
             while !stopped.load(Ordering::Relaxed) {
                 let started = Instant::now();
-                match catch_unwind(AssertUnwindSafe(|| runtime.block_on(round()))) {
-                    Ok(value) => *saved.lock().unwrap_or_else(PoisonError::into_inner) = value,
+                let finished = catch_unwind(AssertUnwindSafe(|| {
+                    runtime.block_on(async {
+                        tokio::select! {
+                            value = round() => Some(value),
+                            () = stopping(&stopped) => None,
+                        }
+                    })
+                }));
+                match finished {
+                    Ok(Some(value)) => {
+                        *saved.lock().unwrap_or_else(PoisonError::into_inner) = value;
+                    }
+                    Ok(None) => {}
                     Err(_) => error!("a background collector panicked"),
                 }
-                while started.elapsed() < interval && !stopped.load(Ordering::Relaxed) {
-                    thread::sleep(STOP_CHECK.min(interval));
-                }
+                pause(started + interval, &stopped);
             }
             // Something stuck in the blocking pool mustn't hold this thread.
             runtime.shutdown_background();
@@ -78,6 +113,7 @@ impl Background {
         Self { latest, stop }
     }
 
+    /// Null until the first round has finished.
     pub fn latest(&self) -> Value {
         self.latest
             .lock()
@@ -92,11 +128,14 @@ impl Drop for Background {
     }
 }
 
-/// Probes a list of things at once, as tasks with a time limit. Gives one result
-/// per item, in order. `failed` stands in for anything that ran out of time or
-/// panicked, and running out of time cancels the task.
+/// Probes a list of things as tasks with a time limit, each starting at a random
+/// point in the first half of the interval. That leaves the second half for them to
+/// finish before the next round. Gives one result per item, in order. `failed`
+/// stands in for anything that ran out of time or panicked, and running out of time
+/// cancels the task.
 pub async fn probe_all<T, O, Probe, Work>(
     items: &[Arc<T>],
+    interval: Duration,
     limit: Duration,
     probe: Probe,
     failed: impl Fn(&T) -> O,
@@ -110,7 +149,11 @@ where
         .iter()
         .map(|item| {
             let work = probe(item.clone());
-            tokio::spawn(async move { timeout(limit, work).await.ok() })
+            let wait = jitter(interval / 2);
+            tokio::spawn(async move {
+                sleep(wait).await;
+                timeout(limit, work).await.ok()
+            })
         })
         .collect();
 
@@ -182,7 +225,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(1)).await;
             json!("late")
         });
-        assert_eq!(background.latest(), json!([]));
+        assert_eq!(background.latest(), Value::Null);
     }
 
     #[test]
@@ -217,10 +260,98 @@ mod tests {
         wait_until(|| background.latest().as_u64().is_some_and(|count| count >= 3));
     }
 
+    #[test]
+    fn jitter_varies_and_stays_within_its_limit() {
+        let limit = Duration::from_secs(10);
+        let times: Vec<Duration> = (0..100).map(|_| jitter(limit)).collect();
+
+        assert!(times.iter().all(|time| *time < limit));
+        assert!(times.iter().any(|time| *time != times[0]));
+        assert_eq!(jitter(Duration::ZERO), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_first_round_waits_for_a_random_part_of_the_interval() {
+        let rounds = Arc::new(AtomicUsize::new(0));
+        let counted = rounds.clone();
+        let background = Background::start(Duration::from_secs(36_000), move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+            async { json!(1) }
+        });
+
+        thread::sleep(Duration::from_millis(100));
+
+        assert_eq!(rounds.load(Ordering::Relaxed), 0);
+        assert_eq!(background.latest(), Value::Null);
+    }
+
+    #[test]
+    fn stopping_does_not_wait_for_a_round_to_finish() {
+        struct Flag(Arc<AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let (ended, flag) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (started, dropped) = (ended.clone(), flag.clone());
+        let background = Background::start(Duration::ZERO, move || {
+            let (started, guard) = (started.clone(), Flag(dropped.clone()));
+            async move {
+                started.store(true, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                drop(guard);
+                json!(1)
+            }
+        });
+        wait_until(|| ended.load(Ordering::Relaxed));
+
+        drop(background);
+
+        wait_until(|| flag.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn items_start_at_different_times_in_the_first_half_of_the_interval() {
+        let interval = Duration::from_secs(1);
+        let started = Instant::now();
+        let waits = probe_all(
+            &items(&[0; 20]),
+            interval,
+            Duration::from_secs(5),
+            |_| async move { started.elapsed() },
+            |_| Duration::MAX,
+        )
+        .await;
+
+        let (first, last) = (waits.iter().min().unwrap(), waits.iter().max().unwrap());
+        assert!(*last - *first > interval / 10, "{waits:?}");
+        assert!(*last < interval / 2 + SHORT, "{waits:?}");
+    }
+
+    #[tokio::test]
+    async fn waiting_to_start_does_not_use_up_the_time_limit() {
+        let results = probe_all(
+            &items(&[0; 20]),
+            Duration::from_secs(1),
+            SHORT,
+            |_| async move { "done" },
+            |_| "timed out",
+        )
+        .await;
+
+        assert_eq!(results, ["done"; 20]);
+    }
+
     #[tokio::test]
     async fn results_come_back_in_order() {
         let results = probe_all(
             &items(&[30, 1, 15]),
+            Duration::ZERO,
             Duration::from_secs(5),
             |delay| async move {
                 tokio::time::sleep(Duration::from_millis(*delay)).await;
@@ -237,6 +368,7 @@ mod tests {
         let started = Instant::now();
         probe_all(
             &items(&[200; 10]),
+            Duration::ZERO,
             Duration::from_secs(5),
             |delay| async move { tokio::time::sleep(Duration::from_millis(*delay)).await },
             |_| (),
@@ -250,6 +382,7 @@ mod tests {
         let started = Instant::now();
         let results = probe_all(
             &items(&[5000, 1]),
+            Duration::ZERO,
             SHORT,
             |delay| async move {
                 tokio::time::sleep(Duration::from_millis(*delay)).await;
@@ -266,6 +399,7 @@ mod tests {
     async fn a_panicking_item_counts_as_failed() {
         let results = probe_all(
             &items(&[1, 2]),
+            Duration::ZERO,
             Duration::from_secs(5),
             |value| async move {
                 assert!(*value != 1, "deliberate test panic");

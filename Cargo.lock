@@ -2539,6 +2539,7 @@ dependencies = [
  "hcl-rs",
  "maxnines-checks",
  "maxnines-protocol",
+ "rand 0.10.3",
  "rustix 1.1.6",
  "rustls",
  "serde",

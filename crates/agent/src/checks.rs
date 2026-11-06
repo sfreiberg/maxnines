@@ -27,7 +27,8 @@ impl CheckCollector {
             let checks = checks.clone();
             async move {
                 let probe = |check: Arc<Check>| async move { run(&check).await };
-                let results = probe_all(&checks, longest + GRACE, probe, timed_out_report).await;
+                let results =
+                    probe_all(&checks, interval, longest + GRACE, probe, timed_out_report).await;
                 Value::Array(results)
             }
         });
@@ -60,7 +61,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let target = listener.local_addr().unwrap().to_string();
         let check = Check::new("a", CheckKind::Tcp, &target);
-        let mut collector = CheckCollector::new(vec![check], Duration::from_secs(60));
+        let mut collector = CheckCollector::new(vec![check], Duration::from_millis(20));
 
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

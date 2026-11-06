@@ -58,7 +58,9 @@ impl FileCollector {
             .collect();
         let background = Background::start(interval, move || {
             let watched = watched.clone();
-            async move { Value::Array(probe_all(&watched, TIMEOUT, check_path, timed_out).await) }
+            async move {
+                Value::Array(probe_all(&watched, interval, TIMEOUT, check_path, timed_out).await)
+            }
         });
         Self { background }
     }
@@ -244,7 +246,7 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         let mut collector = FileCollector::new(
             vec![path_of(folder.path()), path_of(&folder.path().join("nope"))],
-            Duration::from_secs(60),
+            Duration::from_millis(20),
         );
 
         let deadline = Instant::now() + Duration::from_secs(5);

@@ -21,10 +21,12 @@ use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 use maxnines_protocol::Sample;
 use maxnines_protocol::auth::Identity;
+use serde_json::Value;
 use tokio::time::{Instant, Interval, MissedTickBehavior, interval_at};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use background::jitter;
 use collector::Collector;
 use config::Config;
 use custom::Definitions;
@@ -109,9 +111,12 @@ impl Monitoring {
         }))
         .map_err(|_| anyhow!("building collectors panicked"))??;
 
-        // CPU usage is measured between refreshes, so the first sample waits.
+        // CPU usage is measured between refreshes, so the first sample waits. The
+        // random part is because a config can reach every agent at the same moment,
+        // and they would then all collect together from then on.
         let period = Duration::from_secs(update.config.interval_secs);
-        let mut ticker = interval_at(Instant::now() + collector::WARMUP, period);
+        let first = Instant::now() + collector::WARMUP + jitter(period);
+        let mut ticker = interval_at(first, period);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         Ok(Self {
@@ -224,6 +229,8 @@ fn collect(collectors: &mut [Box<dyn Collector>]) -> Sample {
     let mut metrics = BTreeMap::new();
     for collector in collectors {
         match catch_unwind(AssertUnwindSafe(|| collector.collect())) {
+            // Nothing yet, which isn't the same as finding nothing.
+            Ok(Ok(Value::Null)) => {}
             Ok(Ok(value)) => {
                 metrics.insert(collector.name().to_string(), value);
             }
@@ -246,7 +253,8 @@ fn collect(collectors: &mut [Box<dyn Collector>]) -> Sample {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{Value, json};
+    use serde_json::json;
+    use tokio::time::timeout;
 
     struct Working;
 
@@ -257,6 +265,18 @@ mod tests {
 
         fn collect(&mut self) -> Result<Value> {
             Ok(json!(1))
+        }
+    }
+
+    struct NothingYet;
+
+    impl Collector for NothingYet {
+        fn name(&self) -> &'static str {
+            "nothing-yet"
+        }
+
+        fn collect(&mut self) -> Result<Value> {
+            Ok(Value::Null)
         }
     }
 
@@ -330,6 +350,26 @@ mod tests {
             assert_eq!(sample.metrics.get("working"), Some(&json!(1)));
             assert!(!sample.metrics.contains_key("panicking"));
         }
+    }
+
+    #[test]
+    fn a_collector_with_no_result_yet_is_left_out() {
+        let mut collectors: Vec<Box<dyn Collector>> = vec![Box::new(NothingYet), Box::new(Working)];
+
+        let sample = collect(&mut collectors);
+
+        assert_eq!(sample.metrics.get("working"), Some(&json!(1)));
+        assert!(!sample.metrics.contains_key("nothing-yet"));
+    }
+
+    #[tokio::test]
+    async fn the_first_sample_waits_for_a_random_part_of_the_interval() {
+        let config = json!({ "interval_secs": 36_000, "collectors": { "cpu": {} } });
+        let mut started = Monitoring::start(&update("v1", config), &Definitions::new()).unwrap();
+
+        let first = timeout(Duration::from_secs(1), started.ticker.tick()).await;
+
+        assert!(first.is_err());
     }
 
     #[tokio::test]
