@@ -40,8 +40,8 @@ use tracing::{error, warn};
 use crate::app_state::AppState;
 
 const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; connect-src 'self'; \
-     style-src 'self'; font-src 'self'; img-src 'self'; form-action 'self'; base-uri 'none'; \
-     frame-ancestors 'none'";
+     style-src 'self'; font-src 'self'; img-src 'self'; manifest-src 'self'; form-action 'self'; \
+     base-uri 'none'; frame-ancestors 'none'";
 
 pub fn app(state: AppState) -> Router {
     Router::new()

@@ -1394,6 +1394,54 @@ async fn pages_load_the_theme_before_they_draw() {
 }
 
 #[tokio::test]
+async fn the_site_can_be_installed_as_an_app() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    let page = browser.get(&server, "/").await;
+    for tag in [
+        r#"<link rel="manifest" href="/assets/manifest.webmanifest">"#,
+        r#"<link rel="apple-touch-icon" href="/assets/icons/apple-touch-icon.png">"#,
+        r#"<meta name="apple-mobile-web-app-capable" content="yes">"#,
+    ] {
+        assert!(page.body.contains(tag), "{tag}");
+    }
+    // theme.js fills this in, so it has to come first.
+    let colour = page.body.find(r#"<meta name="theme-color""#).unwrap();
+    assert!(colour < page.body.find("/assets/js/theme.js").unwrap());
+
+    let response = browser.get(&server, "/assets/manifest.webmanifest").await;
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        response.header("content-type"),
+        Some("application/manifest+json")
+    );
+    let manifest: Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(manifest["display"], "standalone");
+    assert_eq!(manifest["start_url"], "/");
+
+    let mut icons: Vec<(String, u32)> = manifest["icons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|icon| {
+            let size = icon["sizes"].as_str().unwrap().split('x').next().unwrap();
+            let path = icon["src"].as_str().unwrap().to_string();
+            (path, size.parse().unwrap())
+        })
+        .collect();
+    assert!(icons.iter().any(|(_, size)| *size == 192));
+    assert!(icons.iter().any(|(_, size)| *size == 512));
+    icons.push(("/assets/icons/apple-touch-icon.png".to_string(), 180));
+    for (path, size) in icons {
+        let file = crate::views::StaticFiles::get(path.strip_prefix("/assets/").unwrap());
+        let data = file.unwrap_or_else(|| panic!("{path} is missing")).data;
+        let width = u32::from_be_bytes(data[16..20].try_into().unwrap());
+        assert!(data.starts_with(b"\x89PNG"), "{path}");
+        assert_eq!(width, size, "{path}");
+    }
+}
+
+#[tokio::test]
 async fn only_pages_that_update_themselves_say_they_are_live() {
     let server = start().await;
     let mut browser = Browser::default();
@@ -2732,8 +2780,8 @@ async fn metric_pages_need_nothing_the_security_policy_blocks() {
     assert_eq!(
         page.header("content-security-policy").unwrap(),
         "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'self'; \
-         font-src 'self'; img-src 'self'; form-action 'self'; base-uri 'none'; \
-         frame-ancestors 'none'"
+         font-src 'self'; img-src 'self'; manifest-src 'self'; form-action 'self'; \
+         base-uri 'none'; frame-ancestors 'none'"
     );
     assert!(!page.body.contains(" style="), "inline styles are blocked");
     assert!(

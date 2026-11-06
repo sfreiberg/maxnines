@@ -27,6 +27,10 @@
   function apply() {
     const system = prefersLight.matches ? "paper" : "carbon";
     document.documentElement.dataset.theme = choice === "system" ? system : choice;
+    // Colours the bar around the page when it's installed as an app.
+    document.querySelector('meta[name="theme-color"]').content = getComputedStyle(
+      document.documentElement,
+    ).getPropertyValue("--background");
     document.querySelectorAll("[data-choice]").forEach((button) => {
       button.setAttribute("aria-pressed", String(button.dataset.choice === choice));
     });
