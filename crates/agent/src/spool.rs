@@ -35,6 +35,8 @@ const FILES_KEPT: u64 = 16;
 /// about an hour and a half to send, and a thousand agents catching up add about
 /// 1,000 samples a second.
 const BACKLOG_GAP: Duration = Duration::from_secs(1);
+const LOCK_WAIT: Duration = Duration::from_millis(500);
+const LOCK_RETRY_EVERY: Duration = Duration::from_millis(10);
 
 /// Where a sample came from, to remove it once it's been sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,15 +261,7 @@ impl Saved {
             .truncate(false)
             .open(&position_path)
             .with_context(|| format!("opening {}", position_path.display()))?;
-        match position.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
-                bail!("{} is in use by another agent", folder.display())
-            }
-            Err(TryLockError::Error(error)) => {
-                return Err(error).with_context(|| format!("locking {}", folder.display()));
-            }
-        }
+        lock_folder(&position, folder)?;
 
         let (position_file, position_offset) = read_position(&mut position).unwrap_or((0, 0));
         let files = saved_files(folder)?;
@@ -413,6 +407,27 @@ impl Saved {
         self.offset = 0;
         let path = self.path_of(oldest.number);
         fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))
+    }
+}
+
+/// Waits a moment for the lock, as it can take that long to be let go. An agent being
+/// restarted can overlap with the one before it, and a process being started holds
+/// onto this one's files until it's running.
+fn lock_folder(position: &File, folder: &Path) -> Result<()> {
+    let began = std::time::Instant::now();
+    loop {
+        match position.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::WouldBlock) if began.elapsed() < LOCK_WAIT => {
+                std::thread::sleep(LOCK_RETRY_EVERY);
+            }
+            Err(TryLockError::WouldBlock) => {
+                bail!("{} is in use by another agent", folder.display())
+            }
+            Err(TryLockError::Error(error)) => {
+                return Err(error).with_context(|| format!("locking {}", folder.display()));
+            }
+        }
     }
 }
 
@@ -718,6 +733,23 @@ mod tests {
 
         assert!(second.state().saved.is_none());
         assert_eq!(drain(&first), ["1"]);
+    }
+
+    #[test]
+    fn a_lock_let_go_a_moment_later_is_still_taken() {
+        let (_parent, path) = folder();
+        let first = unpaced(&path);
+        first.push("1".to_string());
+
+        let handover = std::thread::spawn(move || {
+            std::thread::sleep(LOCK_WAIT / 5);
+            drop(first);
+        });
+        let second = unpaced(&path);
+        handover.join().unwrap();
+
+        assert!(second.state().saved.is_some());
+        assert_eq!(drain(&second), ["1"]);
     }
 
     #[test]
