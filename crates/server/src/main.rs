@@ -69,8 +69,26 @@ enum Command {
     /// Manage registered agents on a running server
     #[command(subcommand)]
     Agents(AgentsCommand),
-    /// Print the token for the admin API
+    /// Manage keys for the API on a running server
+    #[command(subcommand)]
+    ApiKeys(ApiKeysCommand),
+    /// Print the server's own token, which works like an API key and can't be revoked
     AdminToken,
+}
+
+#[derive(Debug, PartialEq, Subcommand)]
+enum ApiKeysCommand {
+    /// List keys, without the keys themselves
+    List,
+    /// Make a key and print it, which is the only time it can be seen
+    Create {
+        name: String,
+        /// How long it lasts, like 1h or 30d. Without this it never expires
+        #[arg(long, value_name = "TIME", value_parser = humantime::parse_duration)]
+        expires_in: Option<std::time::Duration>,
+    },
+    /// Stop a key working
+    Revoke { id: i64 },
 }
 
 #[derive(Debug, PartialEq, Subcommand)]
@@ -95,6 +113,16 @@ fn main() -> Result<()> {
     match cli.command.unwrap_or(Command::Run) {
         Command::Run => serve(&cli.config),
         Command::AdminToken => cli::print_admin_token(&Config::load(&cli.config)?),
+        Command::ApiKeys(command) => {
+            let config = Config::load(&cli.config)?;
+            match command {
+                ApiKeysCommand::List => cli::print_api_keys(&config),
+                ApiKeysCommand::Create { name, expires_in } => {
+                    cli::create_api_key(&config, &name, expires_in)
+                }
+                ApiKeysCommand::Revoke { id } => cli::revoke_api_key(&config, id),
+            }
+        }
         Command::Agents(command) => {
             let config = Config::load(&cli.config)?;
             match command {

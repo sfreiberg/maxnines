@@ -1,0 +1,55 @@
+{% extends "layouts/application.html" %}
+{% block title %}API keys · MaxNines{% endblock title %}
+{% block content %}
+<div>
+  <h1>API keys</h1>
+  <p class="subtitle">For scripts and tools that use the API. Each key can do everything the API can, so give each tool its own and revoke any you stop using.</p>
+</div>
+
+{% if new_key %}
+<section class="card">
+  <h2>Your new key</h2>
+  <p class="hint">Copy it now. Only a hash of it is kept, so it can't be shown again.</p>
+  <p><code class="secret">{{ new_key }}</code></p>
+</section>
+{% endif %}
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<section class="card">
+  <h2>New key</h2>
+  <form method="post" action="/settings/api-keys" class="host-filter">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <div class="host-filter-box">
+      <input type="text" name="name" aria-label="What this key is for" placeholder="What it's for, like backup script" maxlength="100" required>
+    </div>
+    <select name="lifetime" aria-label="How long the key lasts">
+      {% for lifetime in lifetimes %}<option value="{{ lifetime.value }}">{{ lifetime.label }}</option>{% endfor %}
+    </select>
+    <button type="submit">Create key</button>
+  </form>
+</section>
+
+{% if keys %}
+<div class="tablebox"><table>
+  <thead>
+    <tr><th>Name</th><th>Key</th><th>Created</th><th>Expires</th><th>Last used</th><th>Status</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for key in keys %}
+    <tr{% if not key.usable %} class="disabled"{% endif %}>
+      <td>{{ key.name }}</td>
+      <td><code>{{ key.hint }}…</code></td>
+      <td class="nowrap">{{ key.created }}</td>
+      <td class="nowrap">{% if key.expires %}{{ key.expires }}{% else %}Never{% endif %}</td>
+      <td class="nowrap">{% if key.last_used %}{{ key.last_used }}{% else %}Never{% endif %}</td>
+      <td><span class="badge {% if key.usable %}good{% else %}neutral{% endif %}">{{ key.status }}</span></td>
+      <td>{% if key.usable %}<form method="post" action="/settings/api-keys/{{ key.id }}/revoke"><input type="hidden" name="authenticity_token" value="{{ csrf_token }}"><button type="submit" class="danger">Revoke</button></form>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table></div>
+{% else %}
+<p class="empty">There are no API keys yet.</p>
+{% endif %}
+{% endblock content %}

@@ -200,6 +200,7 @@ table { width: 100%; border-collapse: collapse; }
 th, td { padding: 11px 14px; text-align: left; border-bottom: 1px solid var(--border); }
 th { color: var(--muted); font-size: 13px; font-weight: 600; white-space: nowrap; }
 td code { overflow-wrap: anywhere; }
+.secret { display: block; padding: 10px 12px; border-radius: 8px; background: var(--sunken); overflow-wrap: anywhere; user-select: all; }
 tbody tr:last-child td { border-bottom: 0; }
 tr.disabled td { color: var(--muted); }
 td.number, th.number { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }

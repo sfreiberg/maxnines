@@ -2,6 +2,7 @@
 //! list and the metrics database, using the token kept in the main database.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -134,6 +135,83 @@ pub fn change_agent(config: &Config, id: &str, action: &str) -> Result<()> {
             println!("{action}: {id}");
             Ok(())
         }
+        Err(error) => bail!(explain(error, &base)),
+    }
+}
+
+pub fn print_api_keys(config: &Config) -> Result<()> {
+    let body = get_json(config, &format!("{BASE_PATH}/api-keys"))?;
+    let keys: Vec<Value> = serde_json::from_str(&body).context("invalid server response")?;
+    if keys.is_empty() {
+        println!("no API keys yet");
+        return Ok(());
+    }
+
+    let now = crate::metrics::now_ms();
+    println!(
+        "{:<6} {:<16} {:<8} {:<20} NAME",
+        "ID", "KEY", "STATE", "EXPIRES"
+    );
+    for key in keys {
+        let expires = key["expires_ms"].as_i64();
+        let state = if !key["revoked_ms"].is_null() {
+            "revoked"
+        } else if expires.is_some_and(|time| now >= time) {
+            "expired"
+        } else {
+            "active"
+        };
+        println!(
+            "{:<6} {:<16} {:<8} {:<20} {}",
+            key["id"],
+            format!("{}...", key["hint"].as_str().unwrap_or_default()),
+            state,
+            expires
+                .and_then(|time| u64::try_from(time).ok())
+                .map_or_else(|| "never".to_string(), format_time),
+            key["name"].as_str().unwrap_or_default(),
+        );
+    }
+    Ok(())
+}
+
+pub fn create_api_key(config: &Config, name: &str, expires_in: Option<Duration>) -> Result<()> {
+    let base = local_url(config.listen);
+    let token = admin_token(config)?;
+
+    let mut response = ureq::post(format!("{base}{BASE_PATH}/api-keys"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .send(
+            serde_json::json!({
+                "name": name,
+                "expires_in_secs": expires_in.map(|time| time.as_secs()),
+            })
+            .to_string(),
+        )
+        .map_err(|error| explain(error, &base))?;
+    let body = response.body_mut().read_to_string()?;
+    let created: Value = serde_json::from_str(&body).context("invalid server response")?;
+    let key = created["key"].as_str().context("invalid server response")?;
+
+    println!("{key}");
+    eprintln!("Save this now. It can't be shown again.");
+    Ok(())
+}
+
+pub fn revoke_api_key(config: &Config, id: i64) -> Result<()> {
+    let base = local_url(config.listen);
+    let token = admin_token(config)?;
+
+    let result = ureq::delete(format!("{base}{BASE_PATH}/api-keys/{id}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .call();
+    match result {
+        Ok(_) => {
+            println!("revoked: {id}");
+            Ok(())
+        }
+        Err(ureq::Error::StatusCode(404)) => bail!("no API key with that ID"),
         Err(error) => bail!(explain(error, &base)),
     }
 }

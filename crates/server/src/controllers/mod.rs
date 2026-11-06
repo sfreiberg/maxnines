@@ -8,6 +8,7 @@ mod agents;
 mod alert_rules;
 mod alerts;
 pub mod api;
+mod api_keys;
 mod assets;
 mod condition_form;
 mod fleet;
@@ -47,6 +48,7 @@ pub fn app(state: AppState) -> Router {
         .route("/ws", get(agent_socket::upgrade))
         .merge(overview::routes())
         .merge(settings::routes())
+        .merge(api_keys::routes())
         .merge(agents::routes())
         .merge(alerts::routes())
         .merge(alert_rules::routes())

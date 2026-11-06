@@ -15,6 +15,7 @@ impl MigratorTrait for Migrator {
             Box::new(CreateRemoteChecks),
             Box::new(CreateServerSecrets),
             Box::new(AddSlackChannels),
+            Box::new(CreateApiKeys),
         ]
     }
 }
@@ -890,6 +891,66 @@ impl MigrationTrait for AddSlackChannels {
                     .drop_column(ChannelCredential::Credential)
                     .to_owned(),
             )
+            .await
+    }
+}
+
+struct CreateApiKeys;
+
+impl MigrationName for CreateApiKeys {
+    fn name(&self) -> &str {
+        "m20261105_000008_create_api_keys"
+    }
+}
+
+#[derive(Iden)]
+enum ApiKeys {
+    Table,
+    Id,
+    Name,
+    Hint,
+    TokenHash,
+    CreatedMs,
+    ExpiresMs,
+    LastUsedMs,
+    RevokedMs,
+}
+
+/// Keys for the API. Revoked ones stay, to show what existed and when it stopped.
+#[async_trait::async_trait]
+impl MigrationTrait for CreateApiKeys {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(ApiKeys::Table)
+                    .col(
+                        ColumnDef::new(ApiKeys::Id)
+                            .big_integer()
+                            .not_null()
+                            .auto_increment()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(ApiKeys::Name).string_len(100).not_null())
+                    .col(ColumnDef::new(ApiKeys::Hint).string_len(16).not_null())
+                    .col(
+                        ColumnDef::new(ApiKeys::TokenHash)
+                            .string_len(64)
+                            .not_null()
+                            .unique_key(),
+                    )
+                    .col(ColumnDef::new(ApiKeys::CreatedMs).big_integer().not_null())
+                    .col(ColumnDef::new(ApiKeys::ExpiresMs).big_integer())
+                    .col(ColumnDef::new(ApiKeys::LastUsedMs).big_integer())
+                    .col(ColumnDef::new(ApiKeys::RevokedMs).big_integer())
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(ApiKeys::Table).to_owned())
             .await
     }
 }

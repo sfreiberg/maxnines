@@ -11,7 +11,7 @@ use serde::Serialize;
 /// Simulates a fleet of agents against a MaxNines server and reports how it held up.
 ///
 /// Run it against a test server: simulated agents are approved and their samples are
-/// saved like any others. Get the admin token with `maxnines-server admin-token`.
+/// saved like any others. Make a key with `maxnines-server api-keys create`.
 #[derive(Parser)]
 #[command(version)]
 pub struct Options {
@@ -23,15 +23,15 @@ pub struct Options {
     #[arg(long, value_name = "URL", help_heading = "Server")]
     pub admin_url: Option<String>,
 
-    /// The server's admin token
+    /// A key for the server's API
     #[arg(
         long,
-        env = "MAXNINES_ADMIN_TOKEN",
+        env = "MAXNINES_API_KEY",
         hide_env_values = true,
-        value_name = "TOKEN",
+        value_name = "KEY",
         help_heading = "Server"
     )]
-    pub admin_token: String,
+    pub api_key: String,
 
     /// Allow a server that isn't on this machine
     #[arg(long, help_heading = "Server")]
@@ -219,7 +219,7 @@ impl Options {
         address.trim_end_matches('/').to_string()
     }
 
-    /// Everything that shaped the load. The admin token is deliberately not here.
+    /// Everything that shaped the load. The API key is deliberately not here.
     pub fn settings(&self) -> Vec<Setting> {
         let mut settings = vec![
             ("Server", self.url.clone()),
@@ -277,7 +277,7 @@ mod tests {
     use super::*;
 
     fn options(arguments: &str) -> Options {
-        let line = format!("loadtest --admin-token t {arguments}");
+        let line = format!("loadtest --api-key t {arguments}");
         Options::try_parse_from(line.split_whitespace()).unwrap()
     }
 
@@ -337,17 +337,18 @@ mod tests {
             "--churn 101",
             "--hot-agents -1",
         ] {
-            let line = format!("loadtest --admin-token t --url ws://localhost/ws {bad}");
+            let line = format!("loadtest --api-key t --url ws://localhost/ws {bad}");
             let parsed = Options::try_parse_from(line.split_whitespace());
             assert!(parsed.is_err() || parsed.unwrap().check().is_err(), "{bad}");
         }
     }
 
     #[test]
-    fn the_settings_never_include_the_admin_token() {
-        let options = options("--url ws://localhost/ws");
+    fn the_settings_never_include_the_api_key() {
+        let line = "loadtest --api-key secret-key --url ws://localhost/ws";
+        let options = Options::try_parse_from(line.split_whitespace()).unwrap();
         let text = serde_json::to_string(&options.settings()).unwrap();
-        assert!(!text.contains("admin"), "{text}");
+        assert!(!text.contains("secret-key"), "{text}");
     }
 
     #[test]

@@ -9,6 +9,7 @@ mod alert;
 mod alert_rule;
 mod alert_rule_channel;
 mod alerting;
+mod api_key;
 mod config_rule;
 mod config_rule_setting;
 mod notification;
@@ -39,6 +40,7 @@ use tokio::sync::Mutex;
 pub use self::stats::DatabaseStats;
 use crate::facts::{FlatFacts, decode, encode, flatten, unflatten};
 use crate::migrations::Migrator;
+use crate::registration::hash_token;
 use crate::registration::{AgentRecord, AgentState};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -343,10 +345,149 @@ impl Database {
 
 const ADMIN_TOKEN: &str = "admin_token";
 
+/// What the database column holds.
+const MAX_API_KEY_NAME_LEN: usize = 100;
+/// How much of a key is kept to tell it apart, which is `mxn_` and 8 of its 64 digits.
+const API_KEY_HINT_LEN: usize = 12;
+/// How current "last used" stays, so using a key doesn't write on every request.
+const API_KEY_USE_ACCURACY_MS: i64 = 60_000;
+
+/// A key for the API, without the key itself, which only exists when it's created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ApiKey {
+    pub id: i64,
+    pub name: String,
+    pub hint: String,
+    pub created_ms: i64,
+    /// Empty means it never expires.
+    pub expires_ms: Option<i64>,
+    pub last_used_ms: Option<i64>,
+    pub revoked_ms: Option<i64>,
+}
+
+impl ApiKey {
+    pub fn has_expired(&self, now_ms: i64) -> bool {
+        self.expires_ms.is_some_and(|expires| now_ms >= expires)
+    }
+}
+
+impl From<api_key::Model> for ApiKey {
+    fn from(row: api_key::Model) -> Self {
+        Self {
+            id: row.id,
+            name: row.name,
+            hint: row.hint,
+            created_ms: row.created_ms,
+            expires_ms: row.expires_ms,
+            last_used_ms: row.last_used_ms,
+            revoked_ms: row.revoked_ms,
+        }
+    }
+}
+
+pub fn check_api_key_name(name: &str) -> Result<()> {
+    anyhow::ensure!(!name.trim().is_empty(), "A key needs a name.");
+    anyhow::ensure!(
+        name.len() <= MAX_API_KEY_NAME_LEN,
+        "A key's name can be up to {MAX_API_KEY_NAME_LEN} characters."
+    );
+    Ok(())
+}
+
+/// When a key lasting this long from now runs out.
+pub fn expiry_after(secs: u64, now_ms: i64) -> Result<i64> {
+    anyhow::ensure!(secs > 0, "A key has to last longer than that.");
+    i64::try_from(secs)
+        .ok()
+        .and_then(|secs| secs.checked_mul(1000))
+        .and_then(|ms| now_ms.checked_add(ms))
+        .context("That's too long for a key to last. Leave it out for a key that never expires.")
+}
+
+fn api_key_hash(key: &str) -> String {
+    hex::encode(hash_token(key))
+}
+
 impl Database {
     /// The token that protects the admin API, created the first time it's asked
     /// for. Two servers starting at once can't end up with different tokens, as
     /// only the first insert counts and both read the result.
+    /// Makes a key, and gives back the only copy of it there'll ever be.
+    pub async fn create_api_key(
+        &self,
+        name: &str,
+        expires_ms: Option<i64>,
+        now_ms: i64,
+    ) -> Result<(ApiKey, String)> {
+        let key = format!("mxn_{}", new_nonce()?);
+        let row = api_key::ActiveModel {
+            name: Set(name.to_string()),
+            hint: Set(key[..API_KEY_HINT_LEN].to_string()),
+            token_hash: Set(api_key_hash(&key)),
+            created_ms: Set(now_ms),
+            expires_ms: Set(expires_ms),
+            ..Default::default()
+        }
+        .insert(&self.connection)
+        .await
+        .context("saving an API key")?;
+        Ok((row.into(), key))
+    }
+
+    /// Every key, newest first, including revoked ones.
+    pub async fn list_api_keys(&self) -> Result<Vec<ApiKey>> {
+        let rows = api_key::Entity::find()
+            .order_by_desc(api_key::Column::Id)
+            .all(&self.connection)
+            .await
+            .context("loading API keys")?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Stops a key working. Returns false if there's no such key.
+    pub async fn revoke_api_key(&self, id: i64, now_ms: i64) -> Result<bool> {
+        let Some(row) = api_key::Entity::find_by_id(id)
+            .one(&self.connection)
+            .await
+            .context("loading an API key")?
+        else {
+            return Ok(false);
+        };
+        if row.revoked_ms.is_none() {
+            let mut row: api_key::ActiveModel = row.into();
+            row.revoked_ms = Set(Some(now_ms));
+            row.update(&self.connection)
+                .await
+                .context("revoking an API key")?;
+        }
+        Ok(true)
+    }
+
+    /// Whether this is a key that still works, noting that it's been used.
+    pub async fn accept_api_key(&self, key: &str, now_ms: i64) -> Result<bool> {
+        let row = api_key::Entity::find()
+            .filter(api_key::Column::TokenHash.eq(api_key_hash(key)))
+            .filter(api_key::Column::RevokedMs.is_null())
+            .one(&self.connection)
+            .await
+            .context("checking an API key")?;
+        let Some(row) = row.filter(|row| row.expires_ms.is_none_or(|expires| now_ms < expires))
+        else {
+            return Ok(false);
+        };
+        let stale = row
+            .last_used_ms
+            .is_none_or(|used| now_ms - used >= API_KEY_USE_ACCURACY_MS);
+        if stale {
+            let mut row: api_key::ActiveModel = row.into();
+            row.last_used_ms = Set(Some(now_ms));
+            row.update(&self.connection)
+                .await
+                .context("noting an API key's use")?;
+        }
+        Ok(true)
+    }
+
     pub async fn admin_token(&self) -> Result<String> {
         let saved = server_secret::Entity::find_by_id(ADMIN_TOKEN)
             .one(&self.connection)
@@ -712,6 +853,117 @@ mod tests {
     fn sorted(mut records: Vec<AgentRecord>) -> Vec<AgentRecord> {
         records.sort_by(|a, b| a.id.cmp(&b.id));
         records
+    }
+
+    #[tokio::test]
+    async fn an_api_key_works_until_it_is_revoked() {
+        let database = Database::in_memory().await;
+        let (key, secret) = database.create_api_key("backup", None, 1000).await.unwrap();
+
+        assert!(database.accept_api_key(&secret, 2000).await.unwrap());
+        assert!(database.revoke_api_key(key.id, 3000).await.unwrap());
+        assert!(!database.accept_api_key(&secret, 4000).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn only_a_real_key_is_accepted() {
+        let database = Database::in_memory().await;
+        database.create_api_key("backup", None, 1000).await.unwrap();
+
+        assert!(!database.accept_api_key("mxn_guess", 2000).await.unwrap());
+        assert!(!database.accept_api_key("", 2000).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_key_itself_is_never_stored() {
+        let database = Database::in_memory().await;
+        let (_, secret) = database.create_api_key("backup", None, 1000).await.unwrap();
+
+        let rows = api_key::Entity::find()
+            .all(&database.connection)
+            .await
+            .unwrap();
+
+        assert_ne!(rows[0].token_hash, secret);
+        assert!(!format!("{rows:?}").contains(&secret));
+        assert!(secret.starts_with(&rows[0].hint));
+        assert!(rows[0].hint.len() < secret.len() / 4);
+    }
+
+    #[tokio::test]
+    async fn each_key_is_different() {
+        let database = Database::in_memory().await;
+        let (_, first) = database.create_api_key("a", None, 1).await.unwrap();
+        let (_, second) = database.create_api_key("a", None, 1).await.unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    async fn using_a_key_is_noted_without_writing_every_time() {
+        let database = Database::in_memory().await;
+        let (_, secret) = database.create_api_key("backup", None, 0).await.unwrap();
+        let used = async || database.list_api_keys().await.unwrap()[0].last_used_ms;
+        assert_eq!(used().await, None);
+
+        database.accept_api_key(&secret, 100_000).await.unwrap();
+        assert_eq!(used().await, Some(100_000));
+
+        database.accept_api_key(&secret, 100_500).await.unwrap();
+        assert_eq!(used().await, Some(100_000));
+
+        database.accept_api_key(&secret, 170_000).await.unwrap();
+        assert_eq!(used().await, Some(170_000));
+    }
+
+    #[tokio::test]
+    async fn revoking_twice_keeps_the_first_time() {
+        let database = Database::in_memory().await;
+        let (key, _) = database.create_api_key("backup", None, 0).await.unwrap();
+
+        database.revoke_api_key(key.id, 100).await.unwrap();
+        database.revoke_api_key(key.id, 200).await.unwrap();
+
+        let keys = database.list_api_keys().await.unwrap();
+        assert_eq!(keys[0].revoked_ms, Some(100));
+        assert!(!database.revoke_api_key(999, 300).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_key_stops_working_when_it_expires() {
+        let database = Database::in_memory().await;
+        let (key, secret) = database
+            .create_api_key("deploy", Some(5000), 1000)
+            .await
+            .unwrap();
+
+        assert!(database.accept_api_key(&secret, 4999).await.unwrap());
+        assert!(!database.accept_api_key(&secret, 5000).await.unwrap());
+        assert!(!database.accept_api_key(&secret, 9000).await.unwrap());
+        assert!(!key.has_expired(4999));
+        assert!(key.has_expired(5000));
+    }
+
+    #[tokio::test]
+    async fn a_key_with_no_expiry_lasts() {
+        let database = Database::in_memory().await;
+        let (key, secret) = database.create_api_key("a", None, 0).await.unwrap();
+
+        assert!(database.accept_api_key(&secret, i64::MAX).await.unwrap());
+        assert!(!key.has_expired(i64::MAX));
+    }
+
+    #[test]
+    fn expiry_is_counted_from_now() {
+        assert_eq!(expiry_after(60, 1000).unwrap(), 61_000);
+        assert!(expiry_after(0, 1000).is_err());
+        assert!(expiry_after(u64::MAX, 1000).is_err());
+    }
+
+    #[test]
+    fn keys_need_a_sensible_name() {
+        assert!(check_api_key_name("backup").is_ok());
+        assert!(check_api_key_name("  ").is_err());
+        assert!(check_api_key_name(&"x".repeat(101)).is_err());
     }
 
     #[tokio::test]

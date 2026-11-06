@@ -49,7 +49,7 @@ impl Server {
             .with_context(|| format!("asking the server for {path}"))?;
         let status = response.status();
         if status == 401 {
-            bail!("the server didn't accept the admin token");
+            bail!("the server didn't accept the API key");
         }
         if !status.is_success() {
             bail!("{path} gave {status}");

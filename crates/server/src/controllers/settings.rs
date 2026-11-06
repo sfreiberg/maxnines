@@ -205,15 +205,19 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
     let counts = async {
         let rules = state.database.list_rules().await?.len();
         let alert_rules = state.database.list_alert_rules().await?.len();
+        let api_keys = state.database.list_api_keys().await?.len();
         let channels = state.database.list_channels().await?.len();
-        anyhow::Ok((rules, alert_rules, channels))
+        anyhow::Ok((rules, alert_rules, channels, api_keys))
     };
     match counts.await {
-        Ok((rules, alert_rules, channels)) => Page::new(&state, &token, "settings/index.html")
-            .with("rules", &rules)
-            .with("alert_rules", &alert_rules)
-            .with("channels", &channels)
-            .render(),
+        Ok((rules, alert_rules, channels, api_keys)) => {
+            Page::new(&state, &token, "settings/index.html")
+                .with("rules", &rules)
+                .with("alert_rules", &alert_rules)
+                .with("api_keys", &api_keys)
+                .with("channels", &channels)
+                .render()
+        }
         Err(error) => server_error(&error),
     }
 }

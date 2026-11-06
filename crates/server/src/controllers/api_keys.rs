@@ -1,0 +1,194 @@
+//! The page for creating and revoking API keys.
+
+use axum::Router;
+use axum::extract::{Path, State};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Redirect, Response};
+use axum::routing::{get, post};
+use axum_csrf::CsrfToken;
+use serde::Serialize;
+
+use super::{CsrfForm, Page, server_error};
+use crate::app_state::AppState;
+use crate::fact_history::format_time;
+use crate::metrics::now_ms;
+use crate::models::{ApiKey, check_api_key_name, expiry_after};
+
+pub fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/settings/api-keys", get(index).post(create))
+        .route("/settings/api-keys/{id}/revoke", post(revoke))
+}
+
+/// What the form offers, in seconds. Anything else can be asked for through the API.
+const LIFETIMES: [(&str, Option<u64>); 7] = [
+    ("Never expires", None),
+    ("1 hour", Some(3600)),
+    ("1 day", Some(86_400)),
+    ("7 days", Some(604_800)),
+    ("30 days", Some(2_592_000)),
+    ("90 days", Some(7_776_000)),
+    ("1 year", Some(31_536_000)),
+];
+
+#[derive(Serialize)]
+struct KeyRow {
+    id: i64,
+    name: String,
+    hint: String,
+    created: String,
+    expires: Option<String>,
+    last_used: Option<String>,
+    status: &'static str,
+    usable: bool,
+}
+
+#[derive(Serialize)]
+struct Lifetime {
+    label: &'static str,
+    value: String,
+}
+
+fn lifetimes() -> Vec<Lifetime> {
+    LIFETIMES
+        .iter()
+        .map(|(label, secs)| Lifetime {
+            label,
+            value: secs.map_or_else(String::new, |secs| secs.to_string()),
+        })
+        .collect()
+}
+
+/// A lifetime from the form, which only ever offers those above.
+fn chosen_lifetime(value: &str) -> Option<Option<u64>> {
+    if value.is_empty() {
+        return Some(None);
+    }
+    let secs: u64 = value.parse().ok()?;
+    LIFETIMES
+        .iter()
+        .any(|(_, offered)| *offered == Some(secs))
+        .then_some(Some(secs))
+}
+
+fn time(ms: i64) -> String {
+    u64::try_from(ms).map_or_else(|_| String::new(), format_time)
+}
+
+fn row(key: ApiKey, now_ms: i64) -> KeyRow {
+    let status = if key.revoked_ms.is_some() {
+        "Revoked"
+    } else if key.has_expired(now_ms) {
+        "Expired"
+    } else {
+        "Active"
+    };
+    KeyRow {
+        created: time(key.created_ms),
+        expires: key.expires_ms.map(time),
+        last_used: key.last_used_ms.map(time),
+        status,
+        usable: status == "Active",
+        id: key.id,
+        name: key.name,
+        hint: key.hint,
+    }
+}
+
+/// `new_key` is only ever on the page right after creating it.
+async fn page(
+    state: &AppState,
+    token: &CsrfToken,
+    new_key: Option<&str>,
+    error: Option<&str>,
+) -> Response {
+    let keys = match state.database.list_api_keys().await {
+        Ok(keys) => keys,
+        Err(error) => return server_error(&error),
+    };
+    let now = now_ms();
+    let rows: Vec<KeyRow> = keys.into_iter().map(|key| row(key, now)).collect();
+    let page = Page::new(state, token, "settings/api_keys.html")
+        .with("keys", &rows)
+        .with("lifetimes", &lifetimes())
+        .with("new_key", &new_key)
+        .with("error", &error);
+    if error.is_some() {
+        page.with_status(StatusCode::UNPROCESSABLE_ENTITY).render()
+    } else {
+        page.render()
+    }
+}
+
+async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
+    page(&state, &token, None, None).await
+}
+
+async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
+    let name = form.fields.get("name").map_or("", |name| name.trim());
+    if let Err(error) = check_api_key_name(name) {
+        return page(&state, &form.token, None, Some(&format!("{error:#}"))).await;
+    }
+    let lifetime = form.fields.get("lifetime").map_or("", String::as_str);
+    let Some(lifetime) = chosen_lifetime(lifetime) else {
+        let error = "Choose how long the key should last.";
+        return page(&state, &form.token, None, Some(error)).await;
+    };
+    let now = now_ms();
+    let expires_ms = match lifetime.map(|secs| expiry_after(secs, now)).transpose() {
+        Ok(expires) => expires,
+        Err(error) => return server_error(&error),
+    };
+    match state.database.create_api_key(name, expires_ms, now).await {
+        Ok((_, key)) => {
+            let mut response = page(&state, &form.token, Some(&key), None).await;
+            // The key is on this page, and nowhere else from now on.
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        }
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn revoke(State(state): State<AppState>, Path(id): Path<i64>, _form: CsrfForm) -> Response {
+    match state.database.revoke_api_key(id, now_ms()).await {
+        Ok(_) => Redirect::to("/settings/api-keys").into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_form_can_only_choose_what_it_offers() {
+        assert_eq!(chosen_lifetime(""), Some(None));
+        assert_eq!(chosen_lifetime("3600"), Some(Some(3600)));
+        assert_eq!(chosen_lifetime("12345"), None);
+        assert_eq!(chosen_lifetime("soon"), None);
+    }
+
+    fn key(expires_ms: Option<i64>, revoked_ms: Option<i64>) -> ApiKey {
+        ApiKey {
+            id: 1,
+            name: "a".to_string(),
+            hint: "mxn_".to_string(),
+            created_ms: 0,
+            expires_ms,
+            last_used_ms: None,
+            revoked_ms,
+        }
+    }
+
+    #[test]
+    fn keys_say_whether_they_still_work() {
+        assert_eq!(row(key(None, None), 100).status, "Active");
+        assert_eq!(row(key(Some(200), None), 100).status, "Active");
+        assert_eq!(row(key(Some(50), None), 100).status, "Expired");
+        assert_eq!(row(key(Some(50), Some(10)), 100).status, "Revoked");
+        assert!(!row(key(Some(50), None), 100).usable);
+    }
+}

@@ -8,7 +8,7 @@ use axum::extract::{Path as UrlPath, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -21,7 +21,7 @@ use crate::alerting::{Alert, AlertRuleInput, ChannelInput, ChannelKind};
 use crate::app_state::AppState;
 use crate::facts::unflatten;
 use crate::metrics::{self, METRICS, Metric, SeriesResult, TimeRange, Unit, now_ms};
-use crate::models::{ConfigStatus, RuleInput};
+use crate::models::{ConfigStatus, RuleInput, check_api_key_name, expiry_after};
 use crate::notifier::{self, Notice};
 use crate::presence::AgentPresence;
 use crate::registration::{AgentRecord, AgentState, hash_token};
@@ -105,6 +105,8 @@ pub fn routes(state: AppState) -> Router<AppState> {
                 .put(update_remote_check)
                 .delete(delete_remote_check),
         )
+        .route("/api-keys", get(list_api_keys).post(create_api_key))
+        .route("/api-keys/{id}", delete(revoke_api_key))
         .route("/agents/filter-options", get(filter_options))
         .route("/agents/{id}/approve", post(approve))
         .route("/agents/{id}/revoke", post(revoke))
@@ -131,9 +133,62 @@ async fn require_token(State(state): State<AppState>, request: Request, next: Ne
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
 
-    match presented {
-        Some(token) if hash_token(token) == *state.admin_token_hash => next.run(request).await,
-        _ => StatusCode::UNAUTHORIZED.into_response(),
+    let accepted = match presented {
+        Some(token) if hash_token(token) == *state.admin_token_hash => true,
+        Some(key) => match state.database.accept_api_key(key, now_ms()).await {
+            Ok(accepted) => accepted,
+            Err(error) => return server_error(&error),
+        },
+        None => false,
+    };
+    if accepted {
+        next.run(request).await
+    } else {
+        StatusCode::UNAUTHORIZED.into_response()
+    }
+}
+
+async fn list_api_keys(State(state): State<AppState>) -> Response {
+    match state.database.list_api_keys().await {
+        Ok(keys) => Json(keys).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+#[derive(Deserialize)]
+struct NewApiKey {
+    name: String,
+    /// How long it lasts. Leaving this out makes a key that doesn't expire.
+    expires_in_secs: Option<u64>,
+}
+
+/// The only time a key can be seen.
+async fn create_api_key(State(state): State<AppState>, Json(input): Json<NewApiKey>) -> Response {
+    let name = input.name.trim();
+    if let Err(error) = check_api_key_name(name) {
+        return refused(&error);
+    }
+    let now = now_ms();
+    let expires_ms = match input.expires_in_secs.map(|secs| expiry_after(secs, now)) {
+        Some(Ok(expires)) => Some(expires),
+        Some(Err(error)) => return refused(&error),
+        None => None,
+    };
+    match state.database.create_api_key(name, expires_ms, now).await {
+        Ok((details, key)) => {
+            let mut body = json!(details);
+            body["key"] = json!(key);
+            (StatusCode::CREATED, Json(body)).into_response()
+        }
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn revoke_api_key(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.revoke_api_key(id, now_ms()).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
     }
 }
 

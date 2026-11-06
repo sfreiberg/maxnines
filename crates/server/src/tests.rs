@@ -3186,3 +3186,206 @@ async fn testing_a_channel_that_does_not_exist_is_not_found() {
 
     assert_eq!(status_of(&response), "404", "{response}");
 }
+
+// ---- API keys
+
+async fn request_with_key(server: &TestServer, key: &str, path: &str) -> String {
+    let mut stream = TcpStream::connect(server.address).await.unwrap();
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {key}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    response
+}
+
+async fn new_key(server: &TestServer, details: Value) -> Value {
+    let response = server
+        .request("POST", "/api/v1/api-keys", &details.to_string())
+        .await;
+    assert_eq!(status_of(&response), "201", "{response}");
+    body_of(&response)
+}
+
+#[tokio::test]
+async fn a_key_from_the_api_opens_the_api_until_it_is_revoked() {
+    let server = start().await;
+    let created = new_key(&server, json!({ "name": "backup" })).await;
+    let key = created["key"].as_str().unwrap();
+    assert!(key.starts_with("mxn_"));
+
+    let using = request_with_key(&server, key, "/api/v1/agents").await;
+    assert_eq!(status_of(&using), "200", "{using}");
+
+    let path = format!("/api/v1/api-keys/{}", created["id"]);
+    let revoked = server.request("DELETE", &path, "").await;
+    assert_eq!(status_of(&revoked), "204", "{revoked}");
+
+    let refused = request_with_key(&server, key, "/api/v1/agents").await;
+    assert_eq!(status_of(&refused), "401", "{refused}");
+}
+
+#[tokio::test]
+async fn a_made_up_key_is_refused() {
+    let server = start().await;
+
+    let response = request_with_key(&server, "mxn_nope", "/api/v1/agents").await;
+
+    assert_eq!(status_of(&response), "401", "{response}");
+}
+
+#[tokio::test]
+async fn listing_keys_never_shows_them() {
+    let server = start().await;
+    let created = new_key(&server, json!({ "name": "backup" })).await;
+    let key = created["key"].as_str().unwrap();
+
+    let list = server.request("GET", "/api/v1/api-keys", "").await;
+
+    assert!(!list.contains(key), "{list}");
+    assert!(!list.contains("token_hash"), "{list}");
+    assert_eq!(body_of(&list)[0]["name"], "backup");
+}
+
+#[tokio::test]
+async fn a_key_can_be_short_lived() {
+    let server = start().await;
+    let created = new_key(
+        &server,
+        json!({ "name": "deploy", "expires_in_secs": 3600 }),
+    )
+    .await;
+
+    let expires = created["expires_ms"].as_i64().unwrap();
+    let hour = 3_600_000;
+    assert!((expires - now_ms() - hour).abs() < 5000, "{created}");
+
+    let forever = new_key(&server, json!({ "name": "ci" })).await;
+    assert!(forever["expires_ms"].is_null(), "{forever}");
+}
+
+#[tokio::test]
+async fn a_key_that_has_run_out_is_refused() {
+    let server = start().await;
+    let (_, key) = server
+        .state
+        .database
+        .create_api_key("old", Some(now_ms() - 1000), now_ms() - 5000)
+        .await
+        .unwrap();
+
+    let response = request_with_key(&server, &key, "/api/v1/agents").await;
+
+    assert_eq!(status_of(&response), "401", "{response}");
+}
+
+#[tokio::test]
+async fn impossible_key_lifetimes_are_refused() {
+    let server = start().await;
+    for details in [
+        json!({ "name": "a", "expires_in_secs": 0 }),
+        json!({ "name": "a", "expires_in_secs": u64::MAX }),
+        json!({ "name": "  " }),
+    ] {
+        let response = server
+            .request("POST", "/api/v1/api-keys", &details.to_string())
+            .await;
+        assert_eq!(status_of(&response), "422", "{response}");
+    }
+}
+
+#[tokio::test]
+async fn the_keys_page_shows_a_new_key_once() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    let page = browser.get(&server, "/settings/api-keys").await;
+    let token = page.token();
+
+    let created = browser
+        .post(
+            &server,
+            "/settings/api-keys",
+            &[
+                ("authenticity_token", token.as_str()),
+                ("name", "Backup script"),
+                ("lifetime", "3600"),
+            ],
+        )
+        .await;
+
+    assert_eq!(created.status, 200, "{}", created.body);
+    assert!(created.body.contains("Your new key"));
+    assert!(created.headers.to_lowercase().contains("no-store"));
+    let start = created.body.find("mxn_").unwrap();
+    let key: String = created.body[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    assert_eq!(key.len(), 68, "{key}");
+
+    let again = browser.get(&server, "/settings/api-keys").await;
+    assert!(again.body.contains("Backup script"));
+    assert!(!again.body.contains(&key), "{}", again.body);
+    assert!(!again.body.contains("Your new key"));
+}
+
+#[tokio::test]
+async fn the_keys_page_needs_a_valid_form() {
+    let server = start().await;
+    let mut browser = Browser::default();
+
+    let page = browser
+        .post(
+            &server,
+            "/settings/api-keys",
+            &[("authenticity_token", "wrong"), ("name", "x")],
+        )
+        .await;
+
+    assert_eq!(page.status, 403, "{}", page.body);
+}
+
+#[tokio::test]
+async fn the_keys_page_offers_only_set_lifetimes() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    let token = browser.get(&server, "/settings/api-keys").await.token();
+
+    let page = browser
+        .post(
+            &server,
+            "/settings/api-keys",
+            &[
+                ("authenticity_token", token.as_str()),
+                ("name", "a"),
+                ("lifetime", "5"),
+            ],
+        )
+        .await;
+
+    assert_eq!(page.status, 422, "{}", page.body);
+    assert!(!page.body.contains("mxn_"), "{}", page.body);
+}
+
+#[tokio::test]
+async fn a_key_can_be_revoked_from_its_page() {
+    let server = start().await;
+    let created = new_key(&server, json!({ "name": "old" })).await;
+    let key = created["key"].as_str().unwrap();
+    let mut browser = Browser::default();
+    let token = browser.get(&server, "/settings/api-keys").await.token();
+
+    browser
+        .post(
+            &server,
+            &format!("/settings/api-keys/{}/revoke", created["id"]),
+            &[("authenticity_token", token.as_str())],
+        )
+        .await;
+
+    let response = request_with_key(&server, key, "/api/v1/agents").await;
+    assert_eq!(status_of(&response), "401", "{response}");
+    let page = browser.get(&server, "/settings/api-keys").await;
+    assert!(page.body.contains("Revoked"), "{}", page.body);
+}

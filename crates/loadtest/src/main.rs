@@ -460,7 +460,7 @@ async fn run(options: Options) -> Result<Outcome> {
     options.check()?;
     raise_open_file_limit(options.agents);
 
-    let server = Server::new(options.admin_address(), options.admin_token.clone());
+    let server = Server::new(options.admin_address(), options.api_key.clone());
     let client = server.clone();
     let stats = tokio::task::spawn_blocking(move || client.stats())
         .await

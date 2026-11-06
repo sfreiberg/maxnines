@@ -2632,6 +2632,8 @@ dependencies = [
  "duckdb",
  "futures-util",
  "hcl-rs",
+ "hex",
+ "humantime",
  "hyper-rustls",
  "hyper-util",
  "indexmap",
