@@ -1,4 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -131,7 +132,7 @@ async fn handle(mut socket: WebSocket, source: IpAddr, state: AppState) {
     };
     info!(id = agent.id, host = agent.host, %source, "agent online");
 
-    let reason = serve(&mut socket, &agent, &state).await;
+    let reason = serve(&mut socket, agent.clone(), &state).await;
     info!(id = agent.id, host = agent.host, reason, "agent offline");
 }
 
@@ -141,7 +142,7 @@ async fn authenticate(
     socket: &mut WebSocket,
     source: IpAddr,
     state: &AppState,
-) -> Result<Option<Agent>> {
+) -> Result<Option<Arc<Agent>>> {
     let nonce = auth::new_nonce()?;
     let challenge = ServerMessage::Challenge {
         nonce: nonce.clone(),
@@ -188,7 +189,7 @@ async fn authenticate(
         .await?;
     send_status(socket, status).await?;
 
-    Ok((status == RegistrationStatus::Approved).then_some(Agent { id, host }))
+    Ok((status == RegistrationStatus::Approved).then(|| Arc::new(Agent { id, host })))
 }
 
 async fn send_status(socket: &mut WebSocket, status: RegistrationStatus) -> Result<()> {
@@ -216,21 +217,26 @@ enum Job {
 /// Any message counts as a sign of life, not just pongs.
 ///
 /// This loop never waits on a database. Samples go straight to the writer, and
-/// everything else goes to [`do_jobs`], which runs alongside it. When the writer's
-/// queue is full reading stops, so that agents slow down, but heartbeats carry on.
-async fn serve(socket: &mut WebSocket, agent: &Agent, state: &AppState) -> &'static str {
+/// everything else goes to [`do_jobs`], which is its own task so that a query is never
+/// abandoned half way when the connection ends. When the writer's queue is full
+/// reading stops, so that agents slow down, but heartbeats carry on.
+async fn serve(socket: &mut WebSocket, agent: Arc<Agent>, state: &AppState) -> &'static str {
     let mut ping = interval(state.heartbeat.interval);
     let mut last_heard = Instant::now();
     let mut waiting_sample = None;
 
     let (jobs, job_queue) = mpsc::channel(JOB_QUEUE_SIZE);
     let (config_sender, mut configs) = mpsc::channel(1);
-    let work = do_jobs(job_queue, config_sender, agent, state);
-    tokio::pin!(work);
+    let mut work = tokio::spawn(do_jobs(
+        job_queue,
+        config_sender,
+        agent.clone(),
+        state.clone(),
+    ));
 
     loop {
         tokio::select! {
-            reason = &mut work => return reason,
+            reason = &mut work => return reason.unwrap_or("database work failed"),
             _ = ping.tick() => {
                 // Nothing is being read while a sample waits, so silence means nothing.
                 if waiting_sample.is_none() && last_heard.elapsed() >= state.heartbeat.timeout {
@@ -258,7 +264,7 @@ async fn serve(socket: &mut WebSocket, agent: &Agent, state: &AppState) -> &'sta
 
                 match message {
                     Some(Ok(Message::Text(text))) => {
-                        waiting_sample = receive(&text, agent, state, &jobs);
+                        waiting_sample = receive(&text, &agent, state, &jobs);
                     }
                     Some(Ok(Message::Close(_))) | None => return "connection closed",
                     Some(Ok(_)) => {}
@@ -275,9 +281,10 @@ async fn serve(socket: &mut WebSocket, agent: &Agent, state: &AppState) -> &'sta
 async fn do_jobs(
     mut jobs: mpsc::Receiver<Job>,
     configs: mpsc::Sender<String>,
-    agent: &Agent,
-    state: &AppState,
+    agent: Arc<Agent>,
+    state: AppState,
 ) -> &'static str {
+    let (agent, state) = (agent.as_ref(), &state);
     let mut changes = state.registry.subscribe();
     let mut config_changes = state.config_changes.subscribe();
     let mut sent_version = None;
