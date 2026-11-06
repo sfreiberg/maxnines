@@ -51,7 +51,6 @@ code, pre, .mono { font-family: var(--mono); font-size: 0.8125rem; }
 .rail-link:hover { background: var(--surface); color: var(--text); }
 .rail-link.on { background: var(--surface); border-color: var(--border-strong); color: var(--text); }
 .rail-link.on svg { color: var(--accent); }
-.rail-link:last-child { margin-top: auto; }
 .count { position: absolute; top: 3px; right: 10px; display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px; background: var(--bad); color: var(--bad-text); font-size: 11px; font-weight: 700; }
 
 .workspace { display: flex; flex-direction: column; min-width: 0; padding-right: env(safe-area-inset-right); }
@@ -293,7 +292,6 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
   .rail { position: fixed; top: auto; right: 0; bottom: 0; left: 0; flex-direction: row; justify-content: space-around; gap: 0; height: auto; padding: 4px calc(4px + env(safe-area-inset-right)) calc(4px + env(safe-area-inset-bottom)) calc(4px + env(safe-area-inset-left)); border-top: 1px solid var(--border); border-right: 0; }
   .brand { display: none; }
   .rail-link { flex: 1 1 0; width: auto; min-width: 0; font-size: 10.5px; }
-  .rail-link:last-child { margin-top: 0; }
   .count { right: calc(50% - 22px); }
   .workspace { min-height: 100dvh; padding-bottom: calc(76px + env(safe-area-inset-bottom)); }
   .topbar { gap: 10px; min-height: 56px; padding: calc(8px + env(safe-area-inset-top)) 16px 8px; }
