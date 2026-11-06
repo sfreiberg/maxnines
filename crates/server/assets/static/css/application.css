@@ -269,13 +269,17 @@ legend { padding: 0 8px; color: var(--muted); font-size: 12px; font-weight: 500;
 #dashboard-grid { margin: 0 -6px; }
 .grid-stack-item-content { display: flex; padding: 14px 18px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
 .grid-stack-placeholder > .placeholder-content { background: var(--raised); border: 1px dashed var(--border-strong); border-radius: var(--radius); }
+/* GridStack's handle is a data: image, which the content security policy rightly blocks. */
+.grid-stack > .grid-stack-item > .ui-resizable-handle { background-image: none; }
+.grid-stack > .grid-stack-item > .ui-resizable-se { right: 6px; bottom: 6px; width: 18px; height: 18px; transform: none; }
+.grid-stack > .grid-stack-item > .ui-resizable-se::after { position: absolute; right: 5px; bottom: 5px; width: 9px; height: 9px; border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted); border-bottom-right-radius: 3px; content: ""; }
 .widget { display: flex; flex: 1; flex-direction: column; gap: 6px; min-width: 0; min-height: 0; }
 .widget-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; font-size: 14px; font-weight: 500; }
 .widget-heading h2 { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .widget svg.chart { flex: 1; min-height: 0; margin: 0; }
 .widget-legend { display: flex; flex-wrap: wrap; gap: 2px 14px; margin: 0; padding: 0; color: var(--muted); font-size: 12px; list-style: none; }
 .widget-legend strong { color: var(--text); font-weight: 600; }
-.widget-number { display: flex; flex: 1; align-items: center; color: var(--text); font-size: clamp(28px, 4vw, 44px); font-weight: 600; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+.widget-number { display: flex; flex: 1; align-items: center; min-height: 0; margin: 0; line-height: 1; color: var(--text); font-size: clamp(28px, 4vw, 44px); font-weight: 600; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
 .widget-table { flex: 1; min-height: 0; overflow-y: auto; }
 .dashboard-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 .dashboard-tools form { display: flex; gap: 8px; margin: 0; }
