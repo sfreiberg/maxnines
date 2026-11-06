@@ -64,6 +64,7 @@ pub const BASE_PATH: &str = "/api/v1";
 pub fn routes(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/agents", get(list))
+        .route("/agents/{id}", get(show_agent))
         .route("/agents/{id}/facts", get(facts))
         .route("/agents/{id}/facts/history", get(facts_history))
         .route("/agents/{id}/config", get(agent_config))
@@ -235,6 +236,26 @@ async fn list(State(state): State<AppState>, Query(params): Query<ListParams>) -
         })
         .collect();
     Json(views).into_response()
+}
+
+async fn show_agent(State(state): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
+    let Some(agent) = state.registry.get(&id).await.filter(|a| !a.is_local()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let open = match state.database.open_alerts().await {
+        Ok(open) => open,
+        Err(error) => return server_error(&error),
+    };
+    let mine: Vec<&Alert> = open.iter().filter(|alert| alert.agent_id == id).collect();
+    let presence = state.presence.get(&id);
+    let online = presence.as_ref().is_some_and(|p| p.online);
+    Json(AgentView {
+        online,
+        health: Health::of(online, &mine),
+        last_seen_ms: presence.map(|p| p.last_seen_ms),
+        agent,
+    })
+    .into_response()
 }
 
 #[derive(Deserialize)]

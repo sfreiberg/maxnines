@@ -3109,6 +3109,22 @@ async fn the_api_filters_hosts_the_same_way_as_the_pages() {
 }
 
 #[tokio::test]
+async fn the_api_shows_one_agent() {
+    let server = start().await;
+    let hosts = two_hosts(&server).await;
+    let id = hosts[0].0.id();
+
+    let found = server
+        .request("GET", &format!("/api/v1/agents/{id}"), "")
+        .await;
+    let missing = server.request("GET", "/api/v1/agents/nope", "").await;
+
+    assert_eq!(body_of(&found)["host"], "web-1", "{found}");
+    assert_eq!(body_of(&found)["health"], "online");
+    assert_eq!(status_of(&missing), "404", "{missing}");
+}
+
+#[tokio::test]
 async fn the_api_explains_a_filter_it_cannot_read() {
     let server = start().await;
 
