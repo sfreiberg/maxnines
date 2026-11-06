@@ -47,6 +47,9 @@ const MAX_SERIES_PER_AGENT: usize = 100_000;
 
 const HOUR_MS: i64 = 3_600_000;
 
+/// The most rows sorted at once, so that sorting fits in memory on any size of fleet.
+const MAX_TIDY_ROWS: i64 = 1_000_000;
+
 /// What identifies a series: its metric, its agent and its labels in one string.
 type SeriesKey = (i32, i32, String);
 
@@ -62,9 +65,9 @@ struct Names {
     next_series: i64,
     /// Text that's current, so that only a change is written.
     texts: HashMap<i64, String>,
-    /// Which series have current text, by agent and collector, for noticing when
-    /// one stops being reported.
-    text_series: HashMap<(i32, i32), HashSet<i64>>,
+    /// Which series have current text, with the labels of what each describes, by
+    /// agent and collector, for noticing when one stops being reported.
+    text_series: HashMap<(i32, i32), HashMap<i64, String>>,
     /// Agents already warned about, so a noisy one doesn't fill the log.
     over_limit: HashSet<i32>,
 }
@@ -123,7 +126,7 @@ impl Names {
             .iter()
             .map(|((collector, _), (metric, _))| (*metric, *collector))
             .collect();
-        let mut owners: HashMap<i64, (i32, i32)> = HashMap::new();
+        let mut owners: HashMap<i64, ((i32, i32), String)> = HashMap::new();
         let mut statement = connection.prepare("SELECT id, metric_id, agent FROM series")?;
         let rows = statement.query_map([], |row| {
             Ok((row.get::<_, i64>(0)?, row.get(1)?, row.get(2)?))
@@ -133,12 +136,12 @@ impl Names {
             let key = labels
                 .get(&id)
                 .map_or_else(String::new, |labels| labels_key(labels));
+            if let Some(collector) = collector_of.get(&metric) {
+                owners.insert(id, ((agent, *collector), key.clone()));
+            }
             names.series.insert((metric, agent, key), id);
             *names.series_per_agent.entry(agent).or_default() += 1;
             names.next_series = names.next_series.max(id + 1);
-            if let Some(collector) = collector_of.get(&metric) {
-                owners.insert(id, (agent, *collector));
-            }
         }
 
         let mut statement = connection.prepare(
@@ -150,8 +153,9 @@ impl Names {
         })?;
         for row in rows {
             let (id, text) = row?;
-            if let Some(owner) = owners.get(&id) {
-                names.text_series.entry(*owner).or_default().insert(id);
+            if let Some((owner, item)) = owners.get(&id) {
+                let current = names.text_series.entry(*owner).or_default();
+                current.insert(id, item.clone());
             }
             names.texts.insert(id, text);
         }
@@ -252,6 +256,7 @@ impl Names {
             }
             let collector = self.collector(name, rows);
             let mut reported = HashSet::new();
+            let mut items = HashSet::new();
             for reading in flatten(output, top_of(name)) {
                 let too_long = reading.metric.len() > MAX_NAME_BYTES
                     || reading.labels.iter().any(|(name, value)| {
@@ -260,6 +265,8 @@ impl Names {
                 if too_long {
                     continue;
                 }
+                let item = labels_key(&reading.labels);
+                items.insert(item.clone());
                 let kind = match reading.value {
                     Reported::Number(_, kind) => kind,
                     Reported::Text(_) => DataType::Text,
@@ -276,22 +283,24 @@ impl Names {
                         if self.texts.get(&series).is_none_or(|known| known != text) {
                             self.texts.insert(series, text.to_string());
                             rows.texts.push((time, series, Some(text.to_string())));
-                            self.text_series
-                                .entry((agent, collector))
-                                .or_default()
-                                .insert(series);
+                            let current = self.text_series.entry((agent, collector)).or_default();
+                            current.insert(series, item);
                         }
                     }
                 }
             }
 
-            // Something that was reported and isn't any more, like a check's error.
+            // Something that was reported and isn't any more, like a check's error. A
+            // sample may only cover some items, so only the ones in it can have changed.
             if let Some(current) = self.text_series.get_mut(&(agent, collector)) {
-                for series in current.iter().filter(|id| !reported.contains(id)) {
-                    self.texts.remove(series);
-                    rows.texts.push((time, *series, None));
-                }
-                current.retain(|id| reported.contains(id));
+                current.retain(|series, item| {
+                    let gone = items.contains(item) && !reported.contains(series);
+                    if gone {
+                        self.texts.remove(series);
+                        rows.texts.push((time, *series, None));
+                    }
+                    !gone
+                });
             }
         }
         Ok(())
@@ -425,6 +434,50 @@ impl DuckDbStore {
         Ok(Self { connection, names })
     }
 
+    /// Moves part of a finished hour into the sorted table, in one transaction, so
+    /// nothing can be lost or seen twice. A piece at a time, so that writes aren't kept
+    /// waiting and a bigger fleet doesn't need more memory. Series are moved in order,
+    /// so each one's rows stay together however many pieces its metric takes.
+    fn tidy_up_to(&mut self, now_ms: i64, max_rows: i64) -> Result<bool> {
+        let hour_start = now_ms / HOUR_MS * HOUR_MS;
+        let found = self.connection.query_row(
+            "SELECT metric_id, epoch_ms(date_trunc('hour', time)) FROM samples_recent
+             WHERE time < epoch_ms($1::BIGINT) LIMIT 1",
+            params![hour_start],
+            |row| Ok((row.get::<_, i32>(0)?, row.get::<_, i64>(1)?)),
+        );
+        let (metric, hour) = match found {
+            Ok(found) => found,
+            Err(duckdb::Error::QueryReturnedNoRows) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+
+        let chosen = "WHERE metric_id = $1
+                        AND time >= epoch_ms($2::BIGINT) AND time < epoch_ms($3::BIGINT)";
+        let (rows, first, last): (i64, i64, i64) = self.connection.query_row(
+            &format!(
+                "SELECT count(*), min(series_id), max(series_id) FROM samples_recent {chosen}"
+            ),
+            params![metric, hour, hour + HOUR_MS],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let pieces = (rows + max_rows - 1) / max_rows;
+        let up_to = first + (last - first) / pieces.max(1);
+
+        let piece = format!("{chosen} AND series_id <= $4");
+        let values = params![metric, hour, hour + HOUR_MS, up_to];
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            &format!(
+                "INSERT INTO samples SELECT * FROM samples_recent {piece} ORDER BY series_id, time"
+            ),
+            values,
+        )?;
+        transaction.execute(&format!("DELETE FROM samples_recent {piece}"), values)?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     fn write_samples(&mut self, samples: &[NewSample]) -> Result<()> {
         let mut rows = Rows::default();
         for new in samples {
@@ -483,38 +536,8 @@ impl Store for DuckDbStore {
         }))
     }
 
-    /// Moves one metric's hour into the sorted table, in one transaction, so nothing
-    /// can be lost or seen twice. A piece at a time, so that writes aren't kept waiting.
     fn tidy(&mut self, now_ms: i64) -> Result<bool> {
-        let hour_start = now_ms / HOUR_MS * HOUR_MS;
-        let found = self.connection.query_row(
-            "SELECT metric_id, epoch_ms(date_trunc('hour', time)) FROM samples_recent
-             WHERE time < epoch_ms($1::BIGINT) LIMIT 1",
-            params![hour_start],
-            |row| Ok((row.get::<_, i32>(0)?, row.get::<_, i64>(1)?)),
-        );
-        let (metric, hour) = match found {
-            Ok(found) => found,
-            Err(duckdb::Error::QueryReturnedNoRows) => return Ok(false),
-            Err(error) => return Err(error.into()),
-        };
-
-        let chosen = "WHERE metric_id = $1
-                        AND time >= epoch_ms($2::BIGINT) AND time < epoch_ms($3::BIGINT)";
-        let transaction = self.connection.transaction()?;
-        transaction.execute(
-            &format!(
-                "INSERT INTO samples SELECT * FROM samples_recent {chosen}
-                 ORDER BY series_id, time"
-            ),
-            params![metric, hour, hour + HOUR_MS],
-        )?;
-        transaction.execute(
-            &format!("DELETE FROM samples_recent {chosen}"),
-            params![metric, hour, hour + HOUR_MS],
-        )?;
-        transaction.commit()?;
-        Ok(true)
+        self.tidy_up_to(now_ms, MAX_TIDY_ROWS)
     }
 
     /// Readers can outlive this connection, which would otherwise leave recent
@@ -790,8 +813,16 @@ fn rebuilt_output(
     numbers: &HashMap<i64, f64>,
     texts: &HashMap<i64, String>,
 ) -> Option<Value> {
+    // An item with no number in the latest sample wasn't in it.
+    let current: HashSet<&Option<(String, String)>> = series
+        .iter()
+        .filter(|(id, ..)| numbers.contains_key(id))
+        .map(|(_, _, _, label)| label)
+        .collect();
+
     let mut items: BTreeMap<String, (i64, Item)> = BTreeMap::new();
-    for (id, field, data_type, label) in series {
+    let current_series = series.iter().filter(|(.., label)| current.contains(label));
+    for (id, field, data_type, label) in current_series {
         let value = match (numbers.get(id), texts.get(id)) {
             (Some(number), _) => stored_number(*number, *data_type),
             (None, Some(text)) => Value::from(text.clone()),
@@ -2063,6 +2094,55 @@ mod tests {
     }
 
     #[test]
+    fn a_sample_covering_some_items_leaves_the_others_alone() {
+        let mut store = in_memory();
+        let check = |name, error| json!([{ "name": name, "up": 0, "error": error }]);
+        // The server saves its own checks one at a time.
+        for time_ms in [1000, 2000, 3000] {
+            write_metric(
+                &mut store,
+                "server",
+                time_ms,
+                "checks",
+                check("a", "refused"),
+            );
+            write_metric(
+                &mut store,
+                "server",
+                time_ms + 1,
+                "checks",
+                check("b", "timed out"),
+            );
+        }
+
+        assert_eq!(
+            text_rows(&store),
+            [Some("refused".to_string()), Some("timed out".to_string())]
+        );
+    }
+
+    #[test]
+    fn something_no_longer_reported_is_left_out_of_the_latest_output() {
+        let mut store = in_memory();
+        let failing = json!([
+            { "name": "a", "up": 0, "error": "refused" },
+            { "name": "b", "up": 1 },
+        ]);
+        write_metric(&mut store, "a", 1000, "checks", failing);
+        write_metric(
+            &mut store,
+            "a",
+            2000,
+            "checks",
+            json!([{ "name": "b", "up": 1 }]),
+        );
+
+        let output = latest_output(&store, "a", "checks").unwrap();
+
+        assert_eq!(output, json!([{ "name": "b", "up": 1 }]));
+    }
+
+    #[test]
     fn text_that_cleared_stays_cleared_across_a_restart() {
         let folder = tempfile::tempdir().unwrap();
         let path = folder.path().join("m.duckdb");
@@ -2170,6 +2250,36 @@ mod tests {
         // Two metrics of memory and one of cpu, for the two finished hours.
         assert_eq!(sorted_count(&store), 120 * 3);
         assert_eq!(query(&store, "a", "cpu.usage", 8), before);
+    }
+
+    #[test]
+    fn a_big_hour_is_tidied_in_pieces_that_keep_each_series_together() {
+        let mut store = in_memory();
+        for minute in 0..20 {
+            for agent in ["a", "b", "c", "d", "e"] {
+                let usage = json!({ "usage_percent": 1.0 });
+                write_metric(&mut store, agent, minute * 60_000, "cpu", usage);
+            }
+        }
+        let before = query(&store, "c", "cpu.usage", 8);
+
+        let mut moves = 0;
+        while store.tidy_up_to(2 * HOUR_MS, 30).unwrap() {
+            moves += 1;
+        }
+
+        assert!(moves >= 3, "{moves}");
+        assert_eq!(sorted_count(&store), 100);
+        assert_eq!(query(&store, "c", "cpu.usage", 8), before);
+        let order: Vec<i64> = store
+            .connection
+            .prepare("SELECT series_id FROM samples ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(order.is_sorted(), "{order:?}");
     }
 
     #[test]
