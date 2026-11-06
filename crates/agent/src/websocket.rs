@@ -7,7 +7,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use futures_util::{FutureExt, Sink, SinkExt, StreamExt};
 use maxnines_protocol::auth::Identity;
-use maxnines_protocol::{AgentConfig, AgentMessage, RegistrationStatus, Sample, ServerMessage};
+use maxnines_protocol::{
+    AgentConfig, AgentMessage, Backoff, RegistrationStatus, Sample, ServerMessage,
+};
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
 use rustls::{ClientConfig, RootCertStore};
@@ -27,8 +29,6 @@ use crate::custom::Definitions;
 use crate::facts;
 use crate::spool::Spool;
 
-const MIN_RETRY_DELAY: Duration = Duration::from_secs(1);
-const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 /// The server pings regularly, so this much silence means the connection died.
 const SERVER_SILENCE_LIMIT: Duration = Duration::from_secs(30);
 const HANDSHAKE_LIMIT: Duration = Duration::from_secs(15);
@@ -173,7 +173,7 @@ fn tls_connector(ca_file: Option<&Path>) -> Result<Connector> {
 /// also how a pending agent checks for approval. A panic in a session is
 /// treated like any other lost connection.
 async fn stay_connected(connection: Connection, mut pending: mpsc::Receiver<String>) {
-    let mut delay = MIN_RETRY_DELAY;
+    let mut backoff = Backoff::new();
 
     loop {
         let started = Instant::now();
@@ -188,11 +188,10 @@ async fn stay_connected(connection: Connection, mut pending: mpsc::Receiver<Stri
             Err(_) => error!("websocket session panicked"),
         }
 
-        if started.elapsed() > MAX_RETRY_DELAY {
-            delay = MIN_RETRY_DELAY;
+        if started.elapsed() > Backoff::MAX {
+            backoff.reset();
         }
-        sleep(delay).await;
-        delay = (delay * 2).min(MAX_RETRY_DELAY);
+        sleep(backoff.next_wait(rand::random())).await;
     }
 }
 

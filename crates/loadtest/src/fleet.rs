@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use maxnines_protocol::auth::Identity;
-use maxnines_protocol::{AgentMessage, RegistrationStatus, Sample, ServerMessage};
+use maxnines_protocol::{AgentMessage, Backoff, RegistrationStatus, Sample, ServerMessage};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::time::{
@@ -23,9 +23,6 @@ use crate::sample::{Readings, Shape, facts};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// The same as real agents use.
-const MIN_RETRY_DELAY: Duration = Duration::from_secs(1);
-const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const HANDSHAKE_LIMIT: Duration = Duration::from_secs(30);
 
 /// What every agent adds to.
@@ -320,22 +317,22 @@ impl SimulatedAgent {
             _ = stop.changed() => return,
         }
 
-        let mut delay = MIN_RETRY_DELAY;
+        let mut backoff = Backoff::new();
         loop {
             let tried = Instant::now();
             if !*outage.borrow() {
                 match self.session(&plan, &mut stop, &mut outage).await {
                     End::Stopped => return,
                     End::Outage => {}
-                    End::Churn => delay = MIN_RETRY_DELAY,
+                    End::Churn => backoff.reset(),
                     End::Failed(error) => plan.counters.failed(error),
                 }
             }
-            if tried.elapsed() > MAX_RETRY_DELAY {
-                delay = MIN_RETRY_DELAY;
+            if tried.elapsed() > Backoff::MAX {
+                backoff.reset();
             }
 
-            let retry = Instant::now() + delay;
+            let retry = Instant::now() + backoff.next_wait(rand::random());
             loop {
                 tokio::select! {
                     () = sleep_until(retry) => break,
@@ -343,7 +340,6 @@ impl SimulatedAgent {
                     _ = stop.changed() => return,
                 }
             }
-            delay = (delay * 2).min(MAX_RETRY_DELAY);
         }
     }
 }

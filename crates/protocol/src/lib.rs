@@ -4,6 +4,7 @@ pub mod auth;
 pub mod hcl_env;
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use anyhow::{Result, ensure};
 use ring::digest::{SHA256, digest};
@@ -46,6 +47,42 @@ const MAX_CHECK_NAME_LEN: usize = 64;
 
 /// What git and the build tool report when they have no answer.
 const NO_BUILD_VALUE: &str = "VERGEN_IDEMPOTENT_OUTPUT";
+
+/// How long an agent waits before trying the server again. The limit on the wait
+/// doubles with each try, and the wait itself is anywhere up to the limit, so that
+/// agents cut off together don't all come back together.
+#[derive(Debug, Clone)]
+pub struct Backoff {
+    limit: Duration,
+}
+
+impl Backoff {
+    /// The longest an agent ever waits, and how long a connection has to last for it
+    /// to count as having worked.
+    pub const MAX: Duration = Duration::from_secs(30);
+    const MIN: Duration = Duration::from_secs(1);
+
+    pub fn new() -> Self {
+        Self { limit: Self::MIN }
+    }
+
+    /// The next wait, given a random number from 0 to 1.
+    pub fn next_wait(&mut self, random: f64) -> Duration {
+        let wait = self.limit.mul_f64(random.clamp(0.0, 1.0));
+        self.limit = (self.limit * 2).min(Self::MAX);
+        wait
+    }
+
+    pub fn reset(&mut self) {
+        self.limit = Self::MIN;
+    }
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Exactly which build of a program is running.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -495,6 +532,30 @@ pub enum RegistrationStatus {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_longest_wait_doubles_until_it_reaches_the_limit() {
+        let mut backoff = Backoff::new();
+        let waits: Vec<u64> = (0..7).map(|_| backoff.next_wait(1.0).as_secs()).collect();
+        assert_eq!(waits, [1, 2, 4, 8, 16, 30, 30]);
+    }
+
+    #[test]
+    fn a_wait_is_spread_over_the_whole_of_the_limit() {
+        let mut backoff = Backoff::new();
+        assert_eq!(backoff.next_wait(0.0), Duration::ZERO);
+        assert_eq!(backoff.next_wait(0.5), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_reset_goes_back_to_short_waits() {
+        let mut backoff = Backoff::new();
+        for _ in 0..4 {
+            backoff.next_wait(1.0);
+        }
+        backoff.reset();
+        assert_eq!(backoff.next_wait(1.0), Duration::from_secs(1));
+    }
 
     fn config() -> AgentConfig {
         serde_json::from_value(json!({
