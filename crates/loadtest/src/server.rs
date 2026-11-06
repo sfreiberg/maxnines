@@ -117,7 +117,12 @@ impl Server {
         let response = self
             .client
             .get(format!("{}{path}", self.base))
+            .header("Authorization", self.bearer())
             .header("Accept-Encoding", "gzip")
+            // Being sent to sign in is a failure, not a very fast page.
+            .config()
+            .max_redirects(0)
+            .build()
             .call();
         let (bytes, ok) = match response {
             Ok(mut response) => {
