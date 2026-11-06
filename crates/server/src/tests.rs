@@ -2695,20 +2695,28 @@ async fn wait_for_points(server: &TestServer, agent: &Identity, count: usize) {
 async fn only_recent_samples_count_as_current() {
     let server = start_with_metrics().await;
     let agent = identity();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let client = server.connect_approved(&agent, "web-1").await;
+    // Reading in the background answers heartbeats, as an agent would, however long
+    // the checks below take. The server would drop a client that went quiet.
+    let (mut sender, mut receiver) = client.split();
+    tokio::spawn(async move { while receiver.next().await.is_some() {} });
     let now = now_ms() as u64;
+    let mut report = async |time_ms| {
+        let text = serde_json::to_string(&full_sample(time_ms, "/")).unwrap();
+        sender.send(Message::text(text)).await.unwrap();
+    };
 
-    send(&mut client, &full_sample(now - 600_000, "/")).await;
+    report(now - 600_000).await;
     wait_for_points(&server, &agent, 1).await;
     let current = server.state.metrics.current(now_ms()).await.unwrap();
     assert!(!current.contains_key(&agent.id()), "ten minutes old");
 
-    send(&mut client, &full_sample(now + 1_800_000, "/")).await;
+    report(now + 1_800_000).await;
     wait_for_points(&server, &agent, 2).await;
     let current = server.state.metrics.current(now_ms()).await.unwrap();
     assert!(!current.contains_key(&agent.id()), "from the future");
 
-    send(&mut client, &full_sample(now - 240_000, "/")).await;
+    report(now - 240_000).await;
     wait_for_points(&server, &agent, 3).await;
     let current = server.state.metrics.current(now_ms()).await.unwrap();
     assert!(current.contains_key(&agent.id()), "four minutes old");
@@ -3029,11 +3037,21 @@ impl MetricsReader for BrokenReader {
         panic!("deliberate test panic");
     }
 
-    fn latest(
+    fn last_samples(
         &self,
         _since_ms: i64,
         _until_ms: i64,
-    ) -> anyhow::Result<Vec<crate::metrics::LatestSample>> {
+    ) -> anyhow::Result<Vec<crate::metrics::LastSample>> {
+        anyhow::bail!("deliberate test failure with a secret in it");
+    }
+
+    fn latest_output(
+        &self,
+        _agent_id: &str,
+        _collector: &str,
+        _since_ms: i64,
+        _until_ms: i64,
+    ) -> anyhow::Result<Option<Value>> {
         anyhow::bail!("deliberate test failure with a secret in it");
     }
 

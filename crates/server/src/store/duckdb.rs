@@ -1,15 +1,19 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, Result};
-use duckdb::types::{TimeUnit, Value};
-use duckdb::{Config, Connection, params};
+use duckdb::types::{TimeUnit, ToSqlOutput, ValueRef};
+use duckdb::{Config, Connection, Transaction, appender_params_from_iter, params};
 use maxnines_protocol::Sample;
-use tracing::debug;
+use serde_json::Value;
+use tracing::warn;
 
+use super::flatten::{DataType, ENTRY_LABEL, Reported, Top, flatten};
 use super::{CollectorStats, MetricsReader, NewSample, Store, StoreStats};
 use crate::metrics::{
-    LatestSample, Metric, NewestReading, Point, Reading, Series, SeriesQuery, SeriesResult, Source,
+    LastSample, METRICS, Metric, NewestReading, Point, Reading, Series, SeriesQuery, SeriesResult,
+    Source,
 };
 
 /// A schema change. SeaORM doesn't support DuckDB, so this mirrors how its
@@ -22,18 +26,8 @@ struct Migration {
 /// Every schema change, in order. Applied ones are recorded in the database, so
 /// never edit one that has shipped: add a new one instead.
 const MIGRATIONS: &[Migration] = &[Migration {
-    name: "0001_create_metrics",
-    // One row per collector per sample. `data` holds the collector's output, so
-    // new collectors and fields need no schema change.
-    sql: "
-        CREATE TABLE metrics (
-            time      TIMESTAMP NOT NULL,
-            agent_id  VARCHAR   NOT NULL,
-            host      VARCHAR   NOT NULL,
-            collector VARCHAR   NOT NULL,
-            data      JSON      NOT NULL
-        );
-    ",
+    name: "0001_create_tables",
+    sql: include_str!("migrations/0001_create_tables.sql"),
 }];
 
 /// Only the bookkeeping table is created outside a migration, because it is
@@ -45,8 +39,370 @@ const CREATE_MIGRATIONS_TABLE: &str = "
     );
 ";
 
+/// Agents choose these names and how many series they have, so each is limited to
+/// stop one agent filling the database or the server's memory.
+const MAX_NAME_BYTES: usize = 512;
+const MAX_TEXT_BYTES: usize = 2048;
+const MAX_SERIES_PER_AGENT: usize = 100_000;
+
+const HOUR_MS: i64 = 3_600_000;
+
+/// What identifies a series: its metric, its agent and its labels in one string.
+type SeriesKey = (i32, i32, String);
+
+/// Everything needed to turn a value into rows without asking the database. The
+/// writer is the only thing that adds to these tables, so it can keep the whole list.
+#[derive(Default)]
+struct Names {
+    collectors: HashMap<String, i32>,
+    metrics: HashMap<(i32, String), (i32, DataType)>,
+    agents: HashMap<String, i32>,
+    series: HashMap<SeriesKey, i64>,
+    series_per_agent: HashMap<i32, usize>,
+    next_series: i64,
+    /// Text that's current, so that only a change is written.
+    texts: HashMap<i64, String>,
+    /// Which series have current text, by agent and collector, for noticing when
+    /// one stops being reported.
+    text_series: HashMap<(i32, i32), HashSet<i64>>,
+    /// Agents already warned about, so a noisy one doesn't fill the log.
+    over_limit: HashSet<i32>,
+}
+
+fn labels_key(labels: &[(String, String)]) -> String {
+    let mut key = String::new();
+    for (name, value) in labels {
+        key.push_str(name);
+        key.push('\0');
+        key.push_str(value);
+        key.push('\0');
+    }
+    key
+}
+
+impl Names {
+    fn load(connection: &Connection) -> Result<Self> {
+        let mut names = Self::default();
+        let mut statement = connection.prepare("SELECT id, name FROM collectors")?;
+        for row in statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))? {
+            let (id, name): (i32, String) = row?;
+            names.collectors.insert(name, id);
+        }
+
+        let mut statement =
+            connection.prepare("SELECT id, collector_id, name, data_type FROM metrics")?;
+        let rows = statement.query_map([], |row| {
+            let (id, collector, name, data_type): (i32, i32, String, String) =
+                (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?);
+            Ok(((collector, name), (id, DataType::parse(&data_type))))
+        })?;
+        for row in rows {
+            let (key, value) = row?;
+            names.metrics.insert(key, value);
+        }
+
+        let mut statement = connection.prepare("SELECT id, agent_id FROM agents")?;
+        for row in statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))? {
+            let (id, agent_id): (i32, String) = row?;
+            names.agents.insert(agent_id, id);
+        }
+
+        let mut labels: HashMap<i64, Vec<(String, String)>> = HashMap::new();
+        let mut statement = connection
+            .prepare("SELECT series_id, name, value FROM series_labels ORDER BY rowid")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        for row in rows {
+            let (id, name, value) = row?;
+            labels.entry(id).or_default().push((name, value));
+        }
+
+        let collector_of: HashMap<i32, i32> = names
+            .metrics
+            .iter()
+            .map(|((collector, _), (metric, _))| (*metric, *collector))
+            .collect();
+        let mut owners: HashMap<i64, (i32, i32)> = HashMap::new();
+        let mut statement = connection.prepare("SELECT id, metric_id, agent FROM series")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        for row in rows {
+            let (id, metric, agent): (i64, i32, i32) = row?;
+            let key = labels
+                .get(&id)
+                .map_or_else(String::new, |labels| labels_key(labels));
+            names.series.insert((metric, agent, key), id);
+            *names.series_per_agent.entry(agent).or_default() += 1;
+            names.next_series = names.next_series.max(id + 1);
+            if let Some(collector) = collector_of.get(&metric) {
+                owners.insert(id, (agent, *collector));
+            }
+        }
+
+        let mut statement = connection.prepare(
+            "SELECT series_id, arg_max_null(value, time) FROM texts GROUP BY series_id
+             HAVING arg_max_null(value, time) IS NOT NULL",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, text) = row?;
+            if let Some(owner) = owners.get(&id) {
+                names.text_series.entry(*owner).or_default().insert(id);
+            }
+            names.texts.insert(id, text);
+        }
+        Ok(names)
+    }
+}
+
+/// What a batch of samples adds, gathered first so it can be written in one go.
+#[derive(Default)]
+struct Rows {
+    collectors: Vec<(i32, String)>,
+    metrics: Vec<(i32, i32, String, DataType)>,
+    now_float: Vec<i32>,
+    agents: Vec<(i32, String)>,
+    series: Vec<(i64, i32, i32)>,
+    labels: Vec<(i64, String, String)>,
+    numbers: Vec<(i64, i32, i64, f64)>,
+    texts: Vec<(i64, i64, Option<String>)>,
+}
+
+impl Names {
+    fn collector(&mut self, name: &str, rows: &mut Rows) -> i32 {
+        if let Some(id) = self.collectors.get(name) {
+            return *id;
+        }
+        let id = i32::try_from(self.collectors.len()).unwrap_or(i32::MAX) + 1;
+        self.collectors.insert(name.to_string(), id);
+        rows.collectors.push((id, name.to_string()));
+        id
+    }
+
+    fn agent(&mut self, agent_id: &str, rows: &mut Rows) -> i32 {
+        if let Some(id) = self.agents.get(agent_id) {
+            return *id;
+        }
+        let id = i32::try_from(self.agents.len()).unwrap_or(i32::MAX) + 1;
+        self.agents.insert(agent_id.to_string(), id);
+        rows.agents.push((id, agent_id.to_string()));
+        id
+    }
+
+    /// JSON can't always tell `5` from `5.0`, so a metric that's ever had a fraction
+    /// stays a float. Types other than that are whatever it first was.
+    fn metric(&mut self, collector: i32, name: &str, kind: DataType, rows: &mut Rows) -> i32 {
+        let next = i32::try_from(self.metrics.len()).unwrap_or(i32::MAX) + 1;
+        let key = (collector, name.to_string());
+        if let Some((id, known)) = self.metrics.get_mut(&key) {
+            if *known == DataType::Int && kind == DataType::Float {
+                *known = DataType::Float;
+                rows.now_float.push(*id);
+            }
+            return *id;
+        }
+        self.metrics.insert(key, (next, kind));
+        rows.metrics.push((next, collector, name.to_string(), kind));
+        next
+    }
+
+    /// `None` once an agent has as many series as it's allowed.
+    fn series(
+        &mut self,
+        metric: i32,
+        agent: i32,
+        labels: &[(String, String)],
+        rows: &mut Rows,
+    ) -> Option<i64> {
+        let key = (metric, agent, labels_key(labels));
+        if let Some(id) = self.series.get(&key) {
+            return Some(*id);
+        }
+        let count = self.series_per_agent.entry(agent).or_default();
+        if *count >= MAX_SERIES_PER_AGENT {
+            if self.over_limit.insert(agent) {
+                warn!(
+                    agent,
+                    "an agent reached the limit on series, ignoring new ones"
+                );
+            }
+            return None;
+        }
+        *count += 1;
+        let id = self.next_series.max(1);
+        self.next_series = id + 1;
+        self.series.insert(key, id);
+        rows.series.push((id, metric, agent));
+        for (name, value) in labels {
+            rows.labels.push((id, name.clone(), value.clone()));
+        }
+        Some(id)
+    }
+
+    fn add_sample(&mut self, new: &NewSample, rows: &mut Rows) -> Result<()> {
+        let time = microseconds(&new.sample)?;
+        let agent = self.agent(&new.agent_id, rows);
+        for (name, output) in &new.sample.metrics {
+            if name.len() > MAX_NAME_BYTES {
+                continue;
+            }
+            let collector = self.collector(name, rows);
+            let mut reported = HashSet::new();
+            for reading in flatten(output, top_of(name)) {
+                let too_long = reading.metric.len() > MAX_NAME_BYTES
+                    || reading.labels.iter().any(|(name, value)| {
+                        name.len() > MAX_NAME_BYTES || value.len() > MAX_NAME_BYTES
+                    });
+                if too_long {
+                    continue;
+                }
+                let kind = match reading.value {
+                    Reported::Number(_, kind) => kind,
+                    Reported::Text(_) => DataType::Text,
+                };
+                let metric = self.metric(collector, &reading.metric, kind, rows);
+                let Some(series) = self.series(metric, agent, &reading.labels, rows) else {
+                    continue;
+                };
+                match reading.value {
+                    Reported::Number(value, _) => rows.numbers.push((time, metric, series, value)),
+                    Reported::Text(text) => {
+                        let text = shortened(text);
+                        reported.insert(series);
+                        if self.texts.get(&series).is_none_or(|known| known != text) {
+                            self.texts.insert(series, text.to_string());
+                            rows.texts.push((time, series, Some(text.to_string())));
+                            self.text_series
+                                .entry((agent, collector))
+                                .or_default()
+                                .insert(series);
+                        }
+                    }
+                }
+            }
+
+            // Something that was reported and isn't any more, like a check's error.
+            if let Some(current) = self.text_series.get_mut(&(agent, collector)) {
+                for series in current.iter().filter(|id| !reported.contains(id)) {
+                    self.texts.remove(series);
+                    rows.texts.push((time, *series, None));
+                }
+                current.retain(|id| reported.contains(id));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The catalog knows which collectors report a map of things.
+fn top_of(collector: &str) -> Top {
+    let has_entries = METRICS
+        .iter()
+        .any(|metric| metric.collector == collector && matches!(metric.source, Source::Entries(_)));
+    if has_entries {
+        Top::Entries
+    } else {
+        Top::Fields
+    }
+}
+
+/// Cut at a character boundary, as text can be anything.
+fn shortened(text: &str) -> &str {
+    if text.len() <= MAX_TEXT_BYTES {
+        return text;
+    }
+    let mut end = MAX_TEXT_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn timestamp(microseconds: i64) -> ToSqlOutput<'static> {
+    ToSqlOutput::Borrowed(ValueRef::Timestamp(TimeUnit::Microsecond, microseconds))
+}
+
+/// Each appender is flushed by hand, because dropping one hides any failure.
+fn write_rows(transaction: &Transaction<'_>, rows: &Rows) -> Result<()> {
+    if !rows.collectors.is_empty() {
+        let mut appender = transaction.appender("collectors")?;
+        for (id, name) in &rows.collectors {
+            appender.append_row(params![id, name])?;
+        }
+        appender.flush()?;
+    }
+    if !rows.metrics.is_empty() {
+        let mut appender = transaction.appender("metrics")?;
+        for (id, collector, name, kind) in &rows.metrics {
+            appender.append_row(params![id, collector, name, kind.as_str()])?;
+        }
+        appender.flush()?;
+    }
+    if !rows.agents.is_empty() {
+        let mut appender = transaction.appender("agents")?;
+        for (id, agent_id) in &rows.agents {
+            appender.append_row(params![id, agent_id])?;
+        }
+        appender.flush()?;
+    }
+    if !rows.series.is_empty() {
+        let mut appender = transaction.appender("series")?;
+        for (id, metric, agent) in &rows.series {
+            appender.append_row(params![id, metric, agent])?;
+        }
+        appender.flush()?;
+    }
+    if !rows.labels.is_empty() {
+        let mut appender = transaction.appender("series_labels")?;
+        for (series, name, value) in &rows.labels {
+            appender.append_row(params![series, name, value])?;
+        }
+        appender.flush()?;
+    }
+    for metric in &rows.now_float {
+        transaction.execute(
+            "UPDATE metrics SET data_type = ? WHERE id = ?",
+            params![DataType::Float.as_str(), metric],
+        )?;
+    }
+    if !rows.numbers.is_empty() {
+        let mut appender = transaction.appender("samples_recent")?;
+        for (time, metric, series, value) in &rows.numbers {
+            let row = [
+                timestamp(*time),
+                ToSqlOutput::Borrowed(ValueRef::Int(*metric)),
+                ToSqlOutput::Borrowed(ValueRef::BigInt(*series)),
+                ToSqlOutput::Borrowed(ValueRef::Double(*value)),
+            ];
+            appender.append_row(appender_params_from_iter(row))?;
+        }
+        appender.flush()?;
+    }
+    if !rows.texts.is_empty() {
+        let mut appender = transaction.appender("texts")?;
+        for (time, series, text) in &rows.texts {
+            let value = text
+                .as_deref()
+                .map_or(ValueRef::Null, |text| ValueRef::Text(text.as_bytes()));
+            let row = [
+                timestamp(*time),
+                ToSqlOutput::Borrowed(ValueRef::BigInt(*series)),
+                ToSqlOutput::Borrowed(value),
+            ];
+            appender.append_row(appender_params_from_iter(row))?;
+        }
+        appender.flush()?;
+    }
+    Ok(())
+}
+
 pub struct DuckDbStore {
     connection: Connection,
+    names: Names,
 }
 
 impl DuckDbStore {
@@ -65,7 +421,19 @@ impl DuckDbStore {
 
     fn with_connection(mut connection: Connection) -> Result<Self> {
         migrate(&mut connection, MIGRATIONS)?;
-        Ok(Self { connection })
+        let names = Names::load(&connection).context("loading metric names")?;
+        Ok(Self { connection, names })
+    }
+
+    fn write_samples(&mut self, samples: &[NewSample]) -> Result<()> {
+        let mut rows = Rows::default();
+        for new in samples {
+            self.names.add_sample(new, &mut rows)?;
+        }
+        let transaction = self.connection.transaction()?;
+        write_rows(&transaction, &rows)?;
+        transaction.commit()?;
+        Ok(())
     }
 }
 
@@ -101,31 +469,52 @@ fn migrate(connection: &mut Connection, migrations: &[Migration]) -> Result<()> 
 
 impl Store for DuckDbStore {
     fn write(&mut self, samples: &[NewSample]) -> Result<()> {
-        let transaction = self.connection.transaction()?;
-        {
-            let mut appender = transaction.appender("metrics")?;
-            for new in samples {
-                let time = Value::Timestamp(TimeUnit::Microsecond, microseconds(&new.sample)?);
-                for (collector, data) in &new.sample.metrics {
-                    appender.append_row(params![
-                        time,
-                        new.agent_id,
-                        new.host,
-                        collector,
-                        data.to_string()
-                    ])?;
-                }
-            }
-            appender.flush()?;
+        let result = self.write_samples(samples);
+        if result.is_err() {
+            // What was remembered for this batch never reached the database.
+            self.names = Names::load(&self.connection).context("reloading metric names")?;
         }
-        transaction.commit()?;
-        Ok(())
+        result
     }
 
     fn reader(&self) -> Result<Arc<dyn MetricsReader>> {
         Ok(Arc::new(DuckDbReader {
             connection: Mutex::new(self.connection.try_clone()?),
         }))
+    }
+
+    /// Moves one metric's hour into the sorted table, in one transaction, so nothing
+    /// can be lost or seen twice. A piece at a time, so that writes aren't kept waiting.
+    fn tidy(&mut self, now_ms: i64) -> Result<bool> {
+        let hour_start = now_ms / HOUR_MS * HOUR_MS;
+        let found = self.connection.query_row(
+            "SELECT metric_id, epoch_ms(date_trunc('hour', time)) FROM samples_recent
+             WHERE time < epoch_ms($1::BIGINT) LIMIT 1",
+            params![hour_start],
+            |row| Ok((row.get::<_, i32>(0)?, row.get::<_, i64>(1)?)),
+        );
+        let (metric, hour) = match found {
+            Ok(found) => found,
+            Err(duckdb::Error::QueryReturnedNoRows) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+
+        let chosen = "WHERE metric_id = $1
+                        AND time >= epoch_ms($2::BIGINT) AND time < epoch_ms($3::BIGINT)";
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            &format!(
+                "INSERT INTO samples SELECT * FROM samples_recent {chosen}
+                 ORDER BY series_id, time"
+            ),
+            params![metric, hour, hour + HOUR_MS],
+        )?;
+        transaction.execute(
+            &format!("DELETE FROM samples_recent {chosen}"),
+            params![metric, hour, hour + HOUR_MS],
+        )?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     /// Readers can outlive this connection, which would otherwise leave recent
@@ -166,47 +555,114 @@ impl DuckDbReader {
 /// values that overflow when added up, which fails the whole query.
 const LARGEST_VALUE: &str = "1e300";
 
-/// The SQL for a number at `path`. `TRY_CAST` leaves anything else as NULL, as
-/// agents can send any JSON.
-fn number(json: &str, path: &str) -> String {
-    format!("TRY_CAST({json}->>'{path}' AS DOUBLE)")
+/// Which rows a reading of a metric covers. `agent` is `None` for every agent.
+struct Scope {
+    agent: Option<i32>,
+    time: &'static str,
 }
 
-fn reading(json: &str, reading: Reading) -> String {
-    match reading {
-        Reading::Field(path) | Reading::Rate(path) => number(json, path),
-        Reading::Percent { part, whole } => format!(
-            "{} / NULLIF({}, 0) * 100",
-            number(json, part),
-            number(json, whole)
-        ),
+/// The number of a stored metric, which is what the sorted samples are found by.
+fn metric_id(connection: &Connection, collector: &str, path: &str) -> Result<Option<i32>> {
+    let found = connection.query_row(
+        "SELECT m.id FROM metrics m JOIN collectors c ON c.id = m.collector_id
+         WHERE c.name = ? AND m.name = ?",
+        params![collector, path.trim_start_matches("$.")],
+        |row| row.get(0),
+    );
+    match found {
+        Ok(id) => Ok(Some(id)),
+        Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 
-/// One row per value, as `agent_id`, `t`, `series` and `v`. Everything here comes from the
-/// metric catalog. `json_each` is used for keys because agents choose them, and
-/// a name like `eth0.100` would be misread as a path.
-fn readings(source: Source) -> String {
-    match source {
-        Source::Fields(fields) => fields
-            .iter()
-            .map(|(name, field)| {
-                format!(
-                    "SELECT agent_id, t, '{name}' AS series, {} AS v FROM samples",
-                    self::reading("data", *field)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" UNION ALL "),
-        Source::Items { name, reading } => format!(
-            "SELECT agent_id, t, item.value->>'{name}' AS series, {} AS v
-             FROM samples, json_each(samples.data) AS item",
-            self::reading("item.value", reading)
+/// What a series is called in a result.
+enum Naming<'a> {
+    Fixed(&'a str),
+    Label(&'a str),
+}
+
+/// One stored metric as rows of `agent_id`, `t`, `series` and `v`. Metric and agent
+/// numbers and the names here come from the catalog, never from a request or an agent.
+fn stored_values(
+    connection: &Connection,
+    metric: &Metric,
+    path: &str,
+    naming: &Naming<'_>,
+    scope: &Scope,
+) -> Result<String> {
+    let Some(id) = metric_id(connection, metric.collector, path)? else {
+        // Nothing has reported it yet. This still takes the query's parameters.
+        return Ok(format!(
+            "SELECT NULL::VARCHAR AS agent_id, 0::BIGINT AS t,
+                    NULL::VARCHAR AS series, NULL::DOUBLE AS v
+             FROM all_samples s WHERE false AND {}",
+            scope.time
+        ));
+    };
+    let (name, label) = match naming {
+        Naming::Fixed(name) => (format!("'{name}'"), String::new()),
+        Naming::Label(label) => (
+            "l.value".to_string(),
+            format!("JOIN series_labels l ON l.series_id = se.id AND l.name = '{label}'"),
         ),
-        Source::Entries(reading) => format!(
-            "SELECT agent_id, t, item.key AS series, {} AS v
-             FROM samples, json_each(samples.data) AS item",
-            self::reading("item.value", reading)
+    };
+    let agent = scope
+        .agent
+        .map_or_else(String::new, |agent| format!("AND se.agent = {agent}"));
+    Ok(format!(
+        "SELECT a.agent_id, epoch_ms(s.time) AS t, {name} AS series, s.value AS v
+         FROM all_samples s
+         JOIN series se ON se.id = s.series_id
+         JOIN agents a ON a.id = se.agent
+         {label}
+         WHERE s.metric_id = {id} {agent} AND {time}",
+        time = scope.time,
+    ))
+}
+
+fn reading_values(
+    connection: &Connection,
+    metric: &Metric,
+    reading: Reading,
+    naming: &Naming<'_>,
+    scope: &Scope,
+) -> Result<String> {
+    match reading {
+        Reading::Field(path) | Reading::Rate(path) => {
+            stored_values(connection, metric, path, naming, scope)
+        }
+        Reading::Percent { part, whole } => Ok(format!(
+            "SELECT p.agent_id, p.t, p.series, p.v / NULLIF(w.v, 0) * 100 AS v
+             FROM ({}) p JOIN ({}) w USING (agent_id, t, series)",
+            stored_values(connection, metric, part, naming, scope)?,
+            stored_values(connection, metric, whole, naming, scope)?,
+        )),
+    }
+}
+
+/// One row per value, as `agent_id`, `t`, `series` and `v`.
+fn readings(connection: &Connection, metric: &Metric, scope: &Scope) -> Result<String> {
+    match metric.source {
+        Source::Fields(fields) => {
+            let selects = fields
+                .iter()
+                .map(|(name, field)| {
+                    reading_values(connection, metric, *field, &Naming::Fixed(name), scope)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(selects.join(" UNION ALL "))
+        }
+        Source::Items { name, reading } => {
+            let label = Naming::Label(name.trim_start_matches("$."));
+            reading_values(connection, metric, reading, &label, scope)
+        }
+        Source::Entries(reading) => reading_values(
+            connection,
+            metric,
+            reading,
+            &Naming::Label(ENTRY_LABEL),
+            scope,
         ),
     }
 }
@@ -222,8 +678,8 @@ fn is_rate(source: Source) -> bool {
     }
 }
 
-/// Parameters: agent, collector, from, to, step, and how many series to keep.
-fn series_sql(metric: &Metric) -> String {
+/// Parameters: from, to, step, and how many series to keep.
+fn series_sql(connection: &Connection, metric: &Metric, agent: i32) -> Result<String> {
     let rate = is_rate(metric.source);
     // Each value covers the time since the sample before it. The first in the
     // range has nothing to compare with, so it's dropped.
@@ -236,14 +692,13 @@ fn series_sql(metric: &Metric) -> String {
     };
     // An idle interface says nothing, but a CPU at 0% does.
     let having = if rate { "HAVING max(v) > 0" } else { "" };
+    let scope = Scope {
+        agent: Some(agent),
+        time: "s.time >= epoch_ms($1::BIGINT) AND s.time < epoch_ms($2::BIGINT)",
+    };
 
-    format!(
-        "WITH samples AS (
-             SELECT agent_id, epoch_ms(time) AS t, data FROM metrics
-             WHERE agent_id = $1 AND collector = $2
-               AND time >= epoch_ms($3::BIGINT) AND time < epoch_ms($4::BIGINT)
-         ),
-         readings AS ({readings}),
+    Ok(format!(
+        "WITH readings AS ({readings}),
          computed AS ({values}),
          usable AS (
              SELECT t, series, v FROM computed
@@ -255,17 +710,17 @@ fn series_sql(metric: &Metric) -> String {
                     count(*) OVER () AS total
              FROM usable GROUP BY series {having}
          )
-         SELECT series, t // $5::BIGINT * $5::BIGINT AS bucket, avg(v), min(v), max(v), total
+         SELECT series, t // $3::BIGINT * $3::BIGINT AS bucket, avg(v), min(v), max(v), total
          FROM usable JOIN ranked USING (series)
-         WHERE position <= $6::BIGINT
+         WHERE position <= $4::BIGINT
          GROUP BY series, bucket, total
          ORDER BY series, bucket",
-        readings = readings(metric.source),
-    )
+        readings = readings(connection, metric, &scope)?,
+    ))
 }
 
-/// Parameters: collector, from and to.
-fn newest_sql(metric: &Metric) -> String {
+/// Parameters: from and to.
+fn newest_sql(connection: &Connection, metric: &Metric) -> Result<String> {
     let values = if is_rate(metric.source) {
         "SELECT agent_id, t, series,
                 v * 1000.0 / NULLIF(
@@ -275,33 +730,114 @@ fn newest_sql(metric: &Metric) -> String {
     } else {
         "SELECT agent_id, t, series, v FROM readings"
     };
+    let scope = Scope {
+        agent: None,
+        time: "s.time >= epoch_ms($1::BIGINT) AND s.time <= epoch_ms($2::BIGINT)",
+    };
 
-    format!(
-        "WITH samples AS (
-             SELECT agent_id, epoch_ms(time) AS t, data FROM metrics
-             WHERE collector = $1
-               AND time >= epoch_ms($2::BIGINT) AND time <= epoch_ms($3::BIGINT)
-         ),
-         readings AS ({readings}),
+    Ok(format!(
+        "WITH readings AS ({readings}),
          computed AS ({values})
          SELECT agent_id, series, max(t), arg_max(v, t)
          FROM computed
          WHERE series IS NOT NULL AND abs(v) <= {LARGEST_VALUE}
          GROUP BY agent_id, series
          ORDER BY agent_id, series",
-        readings = readings(metric.source),
-    )
+        readings = readings(connection, metric, &scope)?,
+    ))
+}
+
+/// The number of an agent the store has heard from.
+fn agent_number(connection: &Connection, agent_id: &str) -> Result<Option<i32>> {
+    let found = connection.query_row(
+        "SELECT id FROM agents WHERE agent_id = ?",
+        params![agent_id],
+        |row| row.get(0),
+    );
+    match found {
+        Ok(id) => Ok(Some(id)),
+        Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Whole numbers come back as whole numbers, as agents sent them.
+fn stored_number(number: f64, data_type: DataType) -> Value {
+    const LARGEST_EXACT: f64 = 9_007_199_254_740_992.0;
+    if data_type == DataType::Bool {
+        Value::from(number != 0.0)
+    } else if number.fract() == 0.0 && number.abs() < LARGEST_EXACT {
+        Value::from(number as i64)
+    } else {
+        Value::from(number)
+    }
+}
+
+/// A series of a collector, as its ID, field name, data type and label.
+type StoredSeries = (i64, String, DataType, Option<(String, String)>);
+
+/// One thing a collector reported on, as its label and its fields.
+#[derive(Default)]
+struct Item {
+    label: Option<(String, String)>,
+    fields: serde_json::Map<String, Value>,
+}
+
+/// Puts a collector's latest values back together, keeping items in the order they
+/// were first seen.
+fn rebuilt_output(
+    series: &[StoredSeries],
+    numbers: &HashMap<i64, f64>,
+    texts: &HashMap<i64, String>,
+) -> Option<Value> {
+    let mut items: BTreeMap<String, (i64, Item)> = BTreeMap::new();
+    for (id, field, data_type, label) in series {
+        let value = match (numbers.get(id), texts.get(id)) {
+            (Some(number), _) => stored_number(*number, *data_type),
+            (None, Some(text)) => Value::from(text.clone()),
+            (None, None) => continue,
+        };
+        let key = label
+            .as_ref()
+            .map_or_else(String::new, |(_, value)| value.clone());
+        let (first, item) = items.entry(key).or_insert_with(|| {
+            let item = Item {
+                label: label.clone(),
+                ..Item::default()
+            };
+            (*id, item)
+        });
+        *first = (*first).min(*id);
+        item.fields.insert(field.clone(), value);
+    }
+    if items.is_empty() {
+        return None;
+    }
+
+    let mut items: Vec<(i64, Item)> = items.into_values().collect();
+    items.sort_by_key(|(first, _)| *first);
+    if items.len() == 1 && items[0].1.label.is_none() {
+        return items.pop().map(|(_, item)| Value::Object(item.fields));
+    }
+    let rebuilt = items.into_iter().map(|(_, mut item)| {
+        if let Some((name, value)) = item.label {
+            item.fields.insert(name, Value::from(value));
+        }
+        Value::Object(item.fields)
+    });
+    Some(Value::Array(rebuilt.collect()))
 }
 
 impl MetricsReader for DuckDbReader {
     fn series(&self, query: &SeriesQuery) -> Result<SeriesResult> {
         let connection = self.connection()?;
-        let mut statement = connection.prepare(&series_sql(query.metric))?;
+        let Some(agent) = agent_number(&connection, query.agent_id)? else {
+            return Ok(SeriesResult::default());
+        };
+        let mut statement = connection.prepare(&series_sql(&connection, query.metric, agent)?)?;
         let range = query.range;
         let rows = statement.query_map(
             params![
-                query.agent_id,
-                query.metric.collector,
                 range.from_ms,
                 range.to_ms,
                 range.step_ms,
@@ -335,43 +871,109 @@ impl MetricsReader for DuckDbReader {
         Ok(result)
     }
 
-    fn latest(&self, since_ms: i64, until_ms: i64) -> Result<Vec<LatestSample>> {
+    fn last_samples(&self, since_ms: i64, until_ms: i64) -> Result<Vec<LastSample>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT agent_id, collector, epoch_ms(max(time)), arg_max(data, time)::VARCHAR
-             FROM metrics
-             WHERE time >= epoch_ms($1::BIGINT) AND time <= epoch_ms($2::BIGINT)
-             GROUP BY agent_id, collector",
+            "SELECT a.agent_id, epoch_ms(newest.time)
+             FROM (
+                 SELECT se.agent, max(s.time) AS time
+                 FROM all_samples s JOIN series se ON se.id = s.series_id
+                 WHERE s.time >= epoch_ms($1::BIGINT) AND s.time <= epoch_ms($2::BIGINT)
+                 GROUP BY se.agent
+             ) newest JOIN agents a ON a.id = newest.agent",
         )?;
         let rows = statement.query_map(params![since_ms, until_ms], |row| {
+            Ok(LastSample {
+                agent_id: row.get(0)?,
+                time_ms: row.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    fn latest_output(
+        &self,
+        agent_id: &str,
+        collector: &str,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> Result<Option<Value>> {
+        let connection = self.connection()?;
+        let Some(agent) = agent_number(&connection, agent_id)? else {
+            return Ok(None);
+        };
+
+        let mut statement = connection.prepare(
+            "SELECT se.id, m.name, m.data_type, l.name, l.value
+             FROM series se
+             JOIN metrics m ON m.id = se.metric_id
+             JOIN collectors c ON c.id = m.collector_id
+             LEFT JOIN series_labels l ON l.series_id = se.id
+             WHERE se.agent = ? AND c.name = ?
+             ORDER BY se.id",
+        )?;
+        let rows = statement.query_map(params![agent, collector], |row| {
+            let label: Option<(String, String)> = match (row.get(3)?, row.get(4)?) {
+                (Some(name), Some(value)) => Some((name, value)),
+                _ => None,
+            };
+            let data_type: String = row.get(2)?;
             Ok((
-                row.get::<_, String>(0)?,
+                row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
+                DataType::parse(&data_type),
+                label,
             ))
         })?;
+        let series: Vec<_> = rows.collect::<Result<_, _>>()?;
+        let Some(ids) = series
+            .iter()
+            .map(|(id, ..)| id.to_string())
+            .reduce(|ids, id| format!("{ids}, {id}"))
+        else {
+            return Ok(None);
+        };
 
-        let mut samples = Vec::new();
+        // Series numbers come from the database itself.
+        let mut statement = connection.prepare(&format!(
+            "WITH chosen AS (
+                 SELECT time, series_id, value FROM all_samples
+                 WHERE series_id IN ({ids})
+                   AND time >= epoch_ms($1::BIGINT) AND time <= epoch_ms($2::BIGINT)
+             )
+             SELECT series_id, value FROM chosen
+             WHERE time = (SELECT max(time) FROM chosen)"
+        ))?;
+        let rows = statement.query_map(params![since_ms, until_ms], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+        })?;
+        let numbers: HashMap<i64, f64> = rows.collect::<Result<_, _>>()?;
+
+        let mut statement = connection.prepare(&format!(
+            "SELECT series_id, arg_max_null(value, time) FROM texts
+             WHERE series_id IN ({ids}) AND time <= epoch_ms($1::BIGINT)
+             GROUP BY series_id"
+        ))?;
+        let rows = statement.query_map(params![until_ms], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        let mut texts = HashMap::new();
         for row in rows {
-            let (agent_id, collector, time_ms, data) = row?;
-            match serde_json::from_str(&data) {
-                Ok(data) => samples.push(LatestSample {
-                    agent_id,
-                    collector,
-                    time_ms,
-                    data,
-                }),
-                Err(error) => debug!(%error, agent_id, collector, "skipped an unreadable sample"),
+            let (id, text) = row?;
+            if let Some(text) = text {
+                texts.insert(id, text);
             }
         }
-        Ok(samples)
+        if numbers.is_empty() {
+            return Ok(None);
+        }
+        Ok(rebuilt_output(&series, &numbers, &texts))
     }
 
     fn newest(&self, metric: &Metric, since_ms: i64, until_ms: i64) -> Result<Vec<NewestReading>> {
         let connection = self.connection()?;
-        let mut statement = connection.prepare(&newest_sql(metric))?;
-        let rows = statement.query_map(params![metric.collector, since_ms, until_ms], |row| {
+        let mut statement = connection.prepare(&newest_sql(&connection, metric)?)?;
+        let rows = statement.query_map(params![since_ms, until_ms], |row| {
             Ok(NewestReading {
                 agent_id: row.get(0)?,
                 series: row.get(1)?,
@@ -392,10 +994,17 @@ impl MetricsReader for DuckDbReader {
         )?;
 
         let mut statement = connection.prepare(
-            "SELECT collector, count(*),
-                    count(*) FILTER (WHERE time >= epoch_ms($1::BIGINT)),
-                    epoch_ms(min(time)), epoch_ms(max(time))
-             FROM metrics GROUP BY collector ORDER BY collector",
+            "SELECT c.name, sum(total)::BIGINT, sum(recent)::BIGINT,
+                    epoch_ms(min(oldest)), epoch_ms(max(newest))
+             FROM (
+                 SELECT metric_id, count(*) AS total,
+                        count(*) FILTER (WHERE time >= epoch_ms($1::BIGINT)) AS recent,
+                        min(time) AS oldest, max(time) AS newest
+                 FROM all_samples GROUP BY metric_id
+             ) counted
+             JOIN metrics m ON m.id = counted.metric_id
+             JOIN collectors c ON c.id = m.collector_id
+             GROUP BY c.name ORDER BY c.name",
         )?;
         let rows = statement.query_map(params![hour_ago_ms], |row| {
             Ok(CollectorStats {
@@ -457,8 +1066,6 @@ mod tests {
     ) -> Result<()> {
         store.write(&[new_sample(agent_id, host, sample)])
     }
-
-    const HOUR_MS: i64 = 3_600_000;
 
     fn write_metric(
         store: &mut DuckDbStore,
@@ -746,53 +1353,105 @@ mod tests {
     }
 
     #[test]
-    fn latest_gives_the_newest_sample_of_each_collector() {
+    fn last_samples_give_each_agents_newest_time_from_any_collector() {
         let mut store = in_memory();
-        write_metric(
-            &mut store,
-            "a",
-            1000,
-            "cpu",
-            json!({ "usage_percent": 1.0 }),
-        );
-        write_metric(
-            &mut store,
-            "a",
-            2000,
-            "cpu",
-            json!({ "usage_percent": 2.0 }),
-        );
-        write_metric(&mut store, "a", 1500, "memory", json!({ "used_bytes": 1 }));
-        write_metric(
-            &mut store,
-            "b",
-            1000,
-            "cpu",
-            json!({ "usage_percent": 3.0 }),
-        );
+        let cpu = || json!({ "usage_percent": 1.0 });
+        write_metric(&mut store, "a", 1000, "cpu", cpu());
+        write_metric(&mut store, "a", 2000, "memory", json!({ "used_bytes": 1 }));
+        write_metric(&mut store, "b", 1500, "cpu", cpu());
 
-        let mut latest = store.reader().unwrap().latest(0, 5000).unwrap();
-        latest.sort_by_key(|sample| (sample.agent_id.clone(), sample.collector.clone()));
+        let mut last = store.reader().unwrap().last_samples(0, 5000).unwrap();
+        last.sort_by_key(|sample| sample.agent_id.clone());
 
-        assert_eq!(latest.len(), 3);
-        assert_eq!(latest[0].time_ms, 2000);
-        assert_eq!(latest[0].data, json!({ "usage_percent": 2.0 }));
-        assert_eq!(latest[1].collector, "memory");
-        assert_eq!(latest[2].agent_id, "b");
+        assert_eq!(
+            last,
+            [
+                LastSample {
+                    agent_id: "a".to_string(),
+                    time_ms: 2000
+                },
+                LastSample {
+                    agent_id: "b".to_string(),
+                    time_ms: 1500
+                },
+            ]
+        );
     }
 
     #[test]
-    fn latest_ignores_samples_outside_its_window() {
+    fn last_samples_ignore_what_is_outside_their_window() {
         let mut store = in_memory();
         let cpu = || json!({ "usage_percent": 1.0 });
         write_metric(&mut store, "old", 1000, "cpu", cpu());
         write_metric(&mut store, "now", 5000, "cpu", cpu());
         write_metric(&mut store, "future", 9000, "cpu", cpu());
 
-        let latest = store.reader().unwrap().latest(2000, 8000).unwrap();
+        let last = store.reader().unwrap().last_samples(2000, 8000).unwrap();
 
-        assert_eq!(latest.len(), 1);
-        assert_eq!(latest[0].agent_id, "now");
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0].agent_id, "now");
+    }
+
+    fn latest_output(store: &DuckDbStore, agent: &str, collector: &str) -> Option<Value> {
+        let reader = store.reader().unwrap();
+        reader.latest_output(agent, collector, 0, 9000).unwrap()
+    }
+
+    #[test]
+    fn the_latest_output_keeps_text_and_whole_numbers_as_they_were_sent() {
+        let mut store = in_memory();
+        let old = json!([{ "name": "site", "kind": "http", "up": 1 }]);
+        write_metric(&mut store, "a", 1000, "checks", old);
+        let checks = json!([
+            {
+                "name": "site", "kind": "http", "up": 0, "error": "<refused>",
+                "status": 503, "cert_days_left": -2, "response_ms": 12.5,
+                "protocol": "HTTP/2", "cert_valid": false,
+            },
+            { "name": "dns", "kind": "dns", "up": 1 },
+        ]);
+        write_metric(&mut store, "a", 2000, "checks", checks);
+
+        let output = latest_output(&store, "a", "checks").unwrap();
+
+        assert_eq!(
+            output,
+            json!([
+                {
+                    "name": "site", "kind": "http", "up": 0, "error": "<refused>",
+                    "status": 503, "cert_days_left": -2, "response_ms": 12.5,
+                    "protocol": "HTTP/2", "cert_valid": false,
+                },
+                { "name": "dns", "kind": "dns", "up": 1 },
+            ])
+        );
+        assert_eq!(output[0]["status"].as_u64(), Some(503));
+    }
+
+    #[test]
+    fn the_latest_output_of_one_thing_is_an_object() {
+        let mut store = in_memory();
+        write_metric(&mut store, "a", 1000, "host", json!({ "uptime_secs": 90 }));
+
+        let output = latest_output(&store, "a", "host").unwrap();
+
+        assert_eq!(output, json!({ "uptime_secs": 90 }));
+    }
+
+    #[test]
+    fn the_latest_output_is_only_ever_this_agents_and_recent() {
+        let mut store = in_memory();
+        let custom = |name| json!([{ "name": name, "ok": 1, "value": 1.5 }]);
+        write_metric(&mut store, "a", 1000, "custom", custom("mine"));
+        write_metric(&mut store, "b", 2000, "custom", custom("theirs"));
+        write_metric(&mut store, "a", 20_000, "custom", custom("too new"));
+
+        let output = latest_output(&store, "a", "custom").unwrap();
+
+        assert_eq!(output[0]["name"], "mine");
+        assert_eq!(output[0]["value"], 1.5);
+        assert_eq!(latest_output(&store, "c", "custom"), None);
+        assert_eq!(latest_output(&store, "a", "nonsense"), None);
     }
 
     #[test]
@@ -802,7 +1461,7 @@ mod tests {
 
         let reads = std::thread::spawn(move || {
             for _ in 0..200 {
-                reader.latest(0, HOUR_MS).unwrap();
+                reader.last_samples(0, HOUR_MS).unwrap();
             }
             reader
         });
@@ -817,7 +1476,7 @@ mod tests {
         }
         let reader = reads.join().unwrap();
 
-        assert_eq!(reader.latest(0, HOUR_MS).unwrap()[0].time_ms, 199);
+        assert_eq!(reader.last_samples(0, HOUR_MS).unwrap()[0].time_ms, 199);
     }
 
     #[test]
@@ -832,13 +1491,14 @@ mod tests {
         store.close().unwrap();
 
         assert!(!path.with_extension("duckdb.wal").exists());
-        assert_eq!(reader.latest(0, 2_000_000_000_000).unwrap().len(), 2);
+        assert_eq!(reader.last_samples(0, 2_000_000_000_000).unwrap().len(), 1);
     }
 
+    /// How many numbers are saved, sorted or not.
     fn row_count(store: &DuckDbStore) -> i64 {
         store
             .connection
-            .query_row("SELECT count(*) FROM metrics", [], |row| row.get(0))
+            .query_row("SELECT count(*) FROM all_samples", [], |row| row.get(0))
             .unwrap()
     }
 
@@ -1210,10 +1870,12 @@ mod tests {
     #[test]
     fn stats_count_what_each_collector_has_stored() {
         let mut store = in_memory();
-        write_metric(&mut store, "a", 1000, "cpu", json!({}));
-        write_metric(&mut store, "a", 5000, "cpu", json!({}));
-        write_metric(&mut store, "b", 9000, "cpu", json!({}));
-        write_metric(&mut store, "a", 2000, "disk", json!([]));
+        let cpu = || json!({ "usage_percent": 1.0 });
+        write_metric(&mut store, "a", 1000, "cpu", cpu());
+        write_metric(&mut store, "a", 5000, "cpu", cpu());
+        write_metric(&mut store, "b", 9000, "cpu", cpu());
+        let disks = json!([{ "mount_point": "/", "used_bytes": 1 }]);
+        write_metric(&mut store, "a", 2000, "disk", disks);
 
         let stats = store.reader().unwrap().stats(4000).unwrap();
 
@@ -1247,10 +1909,316 @@ mod tests {
     }
 
     #[test]
-    fn stores_one_row_per_collector() {
+    fn stores_a_row_for_each_number_a_sample_holds() {
         let mut store = in_memory();
         write_one(&mut store, "agent-1", "web-1", &sample()).unwrap();
+        // The usage from cpu. The disk has a mount point and nothing else.
+        assert_eq!(row_count(&store), 1);
+    }
+
+    #[test]
+    fn a_collector_nobody_has_heard_of_needs_no_schema_change() {
+        let mut store = in_memory();
+        let output = json!({
+            "connections": 12, "cache": { "hit_rate": 0.95 }, "healthy": true,
+            "version": "16.2",
+        });
+
+        write_metric(&mut store, "a", 1000, "postgres_plugin", output);
+
+        let known: Vec<(String, String)> = store
+            .connection
+            .prepare(
+                "SELECT m.name, m.data_type FROM metrics m
+                 JOIN collectors c ON c.id = m.collector_id
+                 WHERE c.name = 'postgres_plugin' ORDER BY m.name",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            known,
+            [
+                ("cache.hit_rate".to_string(), "float".to_string()),
+                ("connections".to_string(), "int".to_string()),
+                ("healthy".to_string(), "bool".to_string()),
+                ("version".to_string(), "text".to_string()),
+            ]
+        );
+        assert_eq!(row_count(&store), 3);
+    }
+
+    #[test]
+    fn a_metric_that_shows_a_fraction_is_a_float_from_then_on() {
+        let mut store = in_memory();
+        write_metric(&mut store, "a", 1000, "cpu", json!({ "usage_percent": 5 }));
+        write_metric(
+            &mut store,
+            "a",
+            2000,
+            "cpu",
+            json!({ "usage_percent": 5.5 }),
+        );
+        write_metric(&mut store, "a", 3000, "cpu", json!({ "usage_percent": 6 }));
+
+        let kind: String = store
+            .connection
+            .query_row("SELECT data_type FROM metrics", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(kind, "float");
+        assert_eq!(
+            averages(&query(&store, "a", "cpu.usage", 8).series[0]).len(),
+            1
+        );
+    }
+
+    fn text_rows(store: &DuckDbStore) -> Vec<Option<String>> {
+        store
+            .connection
+            .prepare("SELECT value FROM texts ORDER BY time")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn text_is_only_saved_when_it_changes() {
+        let mut store = in_memory();
+        let service = |state| json!([{ "name": "nginx", "running": 1, "state": state }]);
+        for (time_ms, state) in [(1000, "active"), (2000, "active"), (3000, "failed")] {
+            write_metric(&mut store, "a", time_ms, "services", service(state));
+        }
+
+        assert_eq!(
+            text_rows(&store),
+            [Some("active".to_string()), Some("failed".to_string())]
+        );
+    }
+
+    #[test]
+    fn text_that_stops_being_reported_is_gone_rather_than_stuck() {
+        let mut store = in_memory();
+        let failing = json!([{ "name": "site", "up": 0, "error": "refused" }]);
+        let working = json!([{ "name": "site", "up": 1 }]);
+        write_metric(&mut store, "a", 1000, "checks", failing.clone());
+        write_metric(&mut store, "a", 2000, "checks", working.clone());
+
+        assert_eq!(
+            latest_output(&store, "a", "checks").unwrap(),
+            json!([{ "name": "site", "up": 1 }])
+        );
+        assert_eq!(text_rows(&store), [Some("refused".to_string()), None]);
+
+        write_metric(&mut store, "a", 3000, "checks", failing.clone());
+        assert_eq!(
+            latest_output(&store, "a", "checks").unwrap()[0]["error"],
+            "refused"
+        );
+    }
+
+    #[test]
+    fn one_agent_cannot_flood_the_store() {
+        let mut store = in_memory();
+        store.names.series_per_agent.insert(1, MAX_SERIES_PER_AGENT);
+        store.names.agents.insert("noisy".to_string(), 1);
+
+        write_metric(
+            &mut store,
+            "noisy",
+            1000,
+            "cpu",
+            json!({ "usage_percent": 1.0 }),
+        );
+        write_metric(
+            &mut store,
+            "calm",
+            1000,
+            "cpu",
+            json!({ "usage_percent": 1.0 }),
+        );
+
+        assert_eq!(row_count(&store), 1, "only the calm agent's");
+    }
+
+    #[test]
+    fn names_and_text_that_are_too_long_are_limited() {
+        let mut store = in_memory();
+        let long = "x".repeat(MAX_NAME_BYTES + 1);
+        write_metric(&mut store, "a", 1000, "cpu", json!({ long.clone(): 1 }));
+        let disks = json!([{ "mount_point": long, "used_bytes": 1 }]);
+        write_metric(&mut store, "a", 1000, "disk", disks);
+        assert_eq!(row_count(&store), 0);
+
+        let error = "é".repeat(MAX_TEXT_BYTES);
+        let check = json!([{ "name": "site", "up": 0, "error": error }]);
+        write_metric(&mut store, "a", 1000, "checks", check);
+
+        let saved = text_rows(&store)[0].clone().unwrap();
+        assert!(saved.len() <= MAX_TEXT_BYTES);
+    }
+
+    #[test]
+    fn text_that_cleared_stays_cleared_across_a_restart() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("m.duckdb");
+        let failing = json!([{ "name": "site", "up": 0, "error": "refused" }]);
+        let working = json!([{ "name": "site", "up": 1 }]);
+
+        let mut store = DuckDbStore::open(&path, "1GB").unwrap();
+        write_metric(&mut store, "a", 1000, "checks", failing.clone());
+        write_metric(&mut store, "a", 2000, "checks", working.clone());
+        store.close().unwrap();
+        drop(store);
+
+        let mut store = DuckDbStore::open(&path, "1GB").unwrap();
+        write_metric(&mut store, "a", 3000, "checks", working);
+        assert_eq!(text_rows(&store).len(), 2, "nothing new to say");
+        write_metric(&mut store, "a", 4000, "checks", failing);
+
+        assert_eq!(text_rows(&store).len(), 3, "the same error again is news");
+    }
+
+    #[test]
+    fn nothing_is_forgotten_across_a_restart() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("m.duckdb");
+        let service = |state| json!([{ "name": "nginx", "running": 1, "state": state }]);
+
+        let mut store = DuckDbStore::open(&path, "1GB").unwrap();
+        write_metric(&mut store, "a", 1000, "services", service("active"));
+        store.close().unwrap();
+        drop(store);
+
+        let mut store = DuckDbStore::open(&path, "1GB").unwrap();
+        write_metric(&mut store, "a", 2000, "services", service("active"));
+        write_metric(&mut store, "b", 2000, "services", service("active"));
+
+        let series: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM series", [], |row| row.get(0))
+            .unwrap();
+        let ids: i64 = store
+            .connection
+            .query_row("SELECT count(DISTINCT id) FROM series", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(series, ids, "no series was added twice");
+        assert_eq!(series, 4, "two agents, each with a number and a text");
+        assert_eq!(
+            text_rows(&store).len(),
+            2,
+            "unchanged text isn't saved again"
+        );
+    }
+
+    #[test]
+    fn a_failed_write_forgets_what_it_learned() {
+        let mut store = in_memory();
+        store
+            .connection
+            .execute_batch("DROP TABLE samples_recent CASCADE")
+            .unwrap_or_default();
+        let result = write_one(&mut store, "a", "h", &sample());
+        assert!(result.is_err());
+        assert!(store.names.agents.is_empty());
+    }
+
+    fn sorted_count(store: &DuckDbStore) -> i64 {
+        store
+            .connection
+            .query_row("SELECT count(*) FROM samples", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn tidy_all(store: &mut DuckDbStore, now_ms: i64) {
+        while store.tidy(now_ms).unwrap() {}
+    }
+
+    #[test]
+    fn tidying_moves_finished_hours_and_loses_nothing() {
+        let mut store = in_memory();
+        for minute in 0..150u32 {
+            let usage = json!({ "usage_percent": f64::from(minute) });
+            let memory = json!({ "used_bytes": 1, "total_bytes": 4 });
+            write_metric(
+                &mut store,
+                "a",
+                u64::from(minute) * 60_000,
+                "cpu",
+                usage.clone(),
+            );
+            write_metric(
+                &mut store,
+                "b",
+                u64::from(minute) * 60_000,
+                "memory",
+                memory,
+            );
+        }
+        let before = query(&store, "a", "cpu.usage", 8);
+        let total = row_count(&store);
+
+        tidy_all(&mut store, 150 * 60_000);
+
+        assert_eq!(row_count(&store), total);
+        // Two metrics of memory and one of cpu, for the two finished hours.
+        assert_eq!(sorted_count(&store), 120 * 3);
+        assert_eq!(query(&store, "a", "cpu.usage", 8), before);
+    }
+
+    #[test]
+    fn tidying_leaves_the_current_hour_and_future_samples_alone() {
+        let mut store = in_memory();
+        let cpu = json!({ "usage_percent": 1.0 });
+        write_metric(&mut store, "a", 3_700_000, "cpu", cpu.clone());
+        write_metric(&mut store, "a", 99_000_000, "cpu", cpu);
+
+        assert!(!store.tidy(3_800_000).unwrap());
+
+        assert_eq!(sorted_count(&store), 0);
         assert_eq!(row_count(&store), 2);
+    }
+
+    #[test]
+    fn a_late_sample_is_tidied_when_it_arrives() {
+        let mut store = in_memory();
+        let cpu = json!({ "usage_percent": 1.0 });
+        write_metric(&mut store, "a", 1000, "cpu", cpu.clone());
+        tidy_all(&mut store, 2 * HOUR_MS);
+        // An agent coming back with samples it kept while it was offline.
+        write_metric(&mut store, "a", 2000, "cpu", cpu);
+
+        tidy_all(&mut store, 2 * HOUR_MS);
+
+        assert_eq!(sorted_count(&store), 2);
+        assert_eq!(row_count(&store), 2);
+    }
+
+    #[test]
+    fn a_tidy_that_fails_changes_nothing() {
+        let mut store = in_memory();
+        let cpu = json!({ "usage_percent": 1.0 });
+        write_metric(&mut store, "a", 1000, "cpu", cpu);
+        store
+            .connection
+            .execute_batch(
+                "DROP VIEW all_samples; DROP TABLE samples;
+                 CREATE TABLE samples (time TIMESTAMP, metric_id INTEGER, series_id BIGINT,
+                                       value DOUBLE CHECK (value > 5));
+                 CREATE VIEW all_samples AS
+                     SELECT * FROM samples UNION ALL SELECT * FROM samples_recent;",
+            )
+            .unwrap();
+
+        assert!(store.tidy(2 * HOUR_MS).is_err());
+
+        assert_eq!(row_count(&store), 1);
     }
 
     #[test]
@@ -1258,11 +2226,13 @@ mod tests {
         let mut store = in_memory();
         write_one(&mut store, "agent-1", "web-1", &sample()).unwrap();
 
-        let (time, agent_id, host, usage): (String, String, String, String) = store
+        let (time, agent_id, metric, value): (String, String, String, f64) = store
             .connection
             .query_row(
-                "SELECT time::VARCHAR, agent_id, host, data->>'$.usage_percent'
-                 FROM metrics WHERE collector = 'cpu'",
+                "SELECT s.time::VARCHAR, a.agent_id, m.name, s.value FROM all_samples s
+                 JOIN series se ON se.id = s.series_id
+                 JOIN agents a ON a.id = se.agent
+                 JOIN metrics m ON m.id = s.metric_id",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
@@ -1270,8 +2240,8 @@ mod tests {
 
         assert_eq!(time, "2023-11-14 22:13:20.123");
         assert_eq!(agent_id, "agent-1");
-        assert_eq!(host, "web-1");
-        assert_eq!(usage, "12.5");
+        assert_eq!(metric, "usage_percent");
+        assert_eq!(value, 12.5);
     }
 
     #[test]
@@ -1309,7 +2279,11 @@ mod tests {
 
         let saved: Vec<(i64, String)> = store
             .connection
-            .prepare("SELECT DISTINCT epoch_ms(time), agent_id FROM metrics ORDER BY 1")
+            .prepare(
+                "SELECT epoch_ms(s.time), a.agent_id FROM all_samples s
+                 JOIN series se ON se.id = s.series_id JOIN agents a ON a.id = se.agent
+                 ORDER BY 1",
+            )
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap()
@@ -1342,23 +2316,142 @@ mod tests {
     #[test]
     fn a_failure_partway_through_a_sample_stores_none_of_it() {
         let mut store = in_memory();
-        // "cpu" inserts first, then this rejects "disk".
+        // Names are written first, then this rejects the numbers.
         store
             .connection
             .execute_batch(
-                "DROP TABLE metrics;
-                 CREATE TABLE metrics (
-                     time      TIMESTAMP NOT NULL,
-                     agent_id  VARCHAR   NOT NULL,
-                     host      VARCHAR   NOT NULL,
-                     collector VARCHAR   NOT NULL CHECK (collector <> 'disk'),
-                     data      JSON      NOT NULL
-                 );",
+                "DROP VIEW all_samples; DROP TABLE samples_recent;
+                 CREATE TABLE samples_recent (time TIMESTAMP, metric_id INTEGER,
+                                              series_id BIGINT, value DOUBLE CHECK (value > 99));
+                 CREATE VIEW all_samples AS
+                     SELECT * FROM samples UNION ALL SELECT * FROM samples_recent;",
             )
             .unwrap();
 
         assert!(write_one(&mut store, "agent-1", "web-1", &sample()).is_err());
+
+        let series: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM series", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(series, 0);
         assert_eq!(row_count(&store), 0);
+    }
+
+    /// Something from every collector, with every kind of value.
+    fn every_collector() -> BTreeMap<String, Value> {
+        BTreeMap::from([
+            (
+                "cpu".to_string(),
+                json!({
+                    "usage_percent": 12.5,
+                    "per_core_percent": [10.0, 15.0],
+                    "time_percent": { "user": 8.0, "system": 4.5, "idle": 87.5, "iowait": 0.0 },
+                    "load_average": { "one": 1.5, "five": 1.25, "fifteen": 1.0 },
+                    "context_switches": 5000,
+                    "interrupts": 700,
+                }),
+            ),
+            (
+                "memory".to_string(),
+                json!({
+                    "total_bytes": 400, "used_bytes": 100, "available_bytes": 300,
+                    "swap_total_bytes": 50, "swap_used_bytes": 5,
+                    "swap_in_pages": 1, "swap_out_pages": 2,
+                    "detail": { "active_bytes": 40, "free_bytes": 60 },
+                }),
+            ),
+            (
+                "host".to_string(),
+                json!({ "uptime_secs": 90, "boot_time_secs": 10 }),
+            ),
+            (
+                "system".to_string(),
+                json!({
+                    "open_files": 10, "max_open_files": 100, "processes": 20,
+                    "max_processes": 200, "login_sessions": 2,
+                }),
+            ),
+            (
+                "disk".to_string(),
+                json!([{
+                    "name": "sda", "mount_point": "/", "file_system": "ext4", "kind": "SSD",
+                    "total_bytes": 100, "used_bytes": 25, "available_bytes": 75,
+                    "inodes_total": 10, "inodes_used": 1, "read_bytes": 500,
+                    "written_bytes": 600, "read_only": false, "removable": true,
+                }]),
+            ),
+            (
+                "network".to_string(),
+                json!({ "eth0.100": {
+                    "received_bytes": 100, "transmitted_bytes": 200, "packets_received": 3,
+                    "packets_transmitted": 4, "receive_errors": 5, "transmit_errors": 6,
+                    "link_up": 1, "total_received_bytes": 1000,
+                } }),
+            ),
+            (
+                "processes".to_string(),
+                json!([{ "name": "nginx", "count": 2, "cpu_percent": 5.0, "memory_percent": 1.5 }]),
+            ),
+            (
+                "sensors".to_string(),
+                json!([{ "label": "CPU die", "celsius": 55.5 }]),
+            ),
+            (
+                "services".to_string(),
+                json!([{ "name": "sshd", "running": 1, "state": "active" }]),
+            ),
+            (
+                "files".to_string(),
+                json!([
+                    {
+                        "path": "/var/log", "exists": 1, "is_folder": true, "age_secs": 30,
+                        "size_bytes": 500, "entries": 4,
+                    },
+                    { "path": "/gone", "error": "not allowed" },
+                ]),
+            ),
+            (
+                "custom".to_string(),
+                json!([
+                    { "name": "queue", "ok": 1, "value": 7.5 },
+                    { "name": "broken", "ok": 0, "error": "exit 1" },
+                ]),
+            ),
+            (
+                "checks".to_string(),
+                json!([{
+                    "name": "site", "kind": "http", "up": 1, "response_ms": 12.5, "dns_ms": 1.0,
+                    "connect_ms": 2.0, "tls_ms": 3.0, "first_byte_ms": 4.0, "download_ms": 2.5,
+                    "status": 200, "protocol": "HTTP/2", "content_length": 512,
+                    "compressed": true, "regex_matched": true, "tls_version": "TLS 1.3",
+                    "cert_valid": true, "hostname_valid": true, "cert_not_before": 100,
+                    "cert_not_after": 900, "cert_days_left": 30, "records": 2,
+                    "packet_loss_percent": 0.0, "rtt_min_ms": 1.0, "rtt_max_ms": 2.0,
+                    "rtt_stddev_ms": 0.5,
+                }]),
+            ),
+        ])
+    }
+
+    #[test]
+    fn every_collector_can_be_read_back() {
+        let mut store = in_memory();
+        let sample = Sample {
+            timestamp_ms: 1000,
+            metrics: every_collector(),
+        };
+
+        write_one(&mut store, "a", "h", &sample).unwrap();
+
+        let readable = METRICS
+            .iter()
+            .filter(|metric| !is_rate(metric.source))
+            .filter(|metric| !query(&store, "a", metric.name, 8).series.is_empty())
+            .count();
+        assert!(readable > 25, "{readable}");
+        let host = latest_output(&store, "a", "host").unwrap();
+        assert_eq!(host, json!({ "uptime_secs": 90, "boot_time_secs": 10 }));
     }
 
     #[test]
@@ -1372,7 +2465,7 @@ mod tests {
 
         let mut reopened = DuckDbStore::open(&path, "1GB").unwrap();
         write_one(&mut reopened, "agent-1", "web-1", &sample()).unwrap();
-        assert_eq!(row_count(&reopened), 4);
+        assert_eq!(row_count(&reopened), 2);
     }
 
     fn applied_migrations(connection: &Connection) -> i64 {

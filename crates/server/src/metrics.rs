@@ -1,5 +1,5 @@
-//! What can be asked of stored metrics. The web pages and the admin API both
-//! read through here, and alerting will too.
+//! What can be asked of stored metrics. The web pages, the API and alerting all
+//! read through here.
 //!
 //! The catalog is a fixed list, so what's queried never comes from a request or
 //! an agent. Only agent IDs and times do, and those are bound as parameters.
@@ -711,13 +711,11 @@ pub struct SeriesResult {
     pub hidden: usize,
 }
 
-/// The newest sample from one collector on one agent.
-#[derive(Debug, Clone, PartialEq)]
-pub struct LatestSample {
+/// When an agent last sent anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastSample {
     pub agent_id: String,
-    pub collector: String,
     pub time_ms: i64,
-    pub data: Value,
 }
 
 /// An agent's headline numbers.
@@ -731,22 +729,6 @@ pub struct CurrentValues {
     pub disk_mount_point: Option<String>,
 }
 
-fn percent(part: &Value, whole: &Value) -> Option<f64> {
-    let (part, whole) = (part.as_f64()?, whole.as_f64()?);
-    (whole > 0.0).then(|| part / whole * 100.0)
-}
-
-/// Agents send what they like, so anything unusable is left as unknown.
-fn fullest_disk(data: &Value) -> Option<(f64, String)> {
-    data.as_array()?
-        .iter()
-        .filter_map(|disk| {
-            let used = percent(&disk["used_bytes"], &disk["total_bytes"])?;
-            Some((used, disk["mount_point"].as_str()?.to_string()))
-        })
-        .max_by(|a, b| a.0.total_cmp(&b.0))
-}
-
 /// A series' newest value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewestReading {
@@ -756,25 +738,52 @@ pub struct NewestReading {
     pub value: f64,
 }
 
-fn current_values(samples: Vec<LatestSample>) -> BTreeMap<String, CurrentValues> {
-    let mut agents: BTreeMap<String, CurrentValues> = BTreeMap::new();
-    for sample in samples {
-        let values = agents.entry(sample.agent_id).or_default();
-        values.time_ms = values.time_ms.max(sample.time_ms);
+/// What the headline numbers come from.
+const CPU_USAGE: &str = "cpu.usage";
+const MEMORY_USAGE: &str = "memory.usage";
+const DISK_USAGE: &str = "disk.usage";
+const CPU_SERIES: &str = "CPU";
+const MEMORY_SERIES: &str = "Memory";
 
-        match sample.collector.as_str() {
-            "cpu" => values.cpu_percent = sample.data["usage_percent"].as_f64(),
-            "memory" => {
-                values.memory_percent =
-                    percent(&sample.data["used_bytes"], &sample.data["total_bytes"]);
-            }
-            "disk" => {
-                if let Some((used, mount_point)) = fullest_disk(&sample.data) {
-                    values.disk_percent = Some(used);
-                    values.disk_mount_point = Some(mount_point);
-                }
-            }
-            _ => {}
+/// Only agents that have sent something have values.
+fn current_values(
+    last_samples: Vec<LastSample>,
+    cpu: Vec<NewestReading>,
+    memory: Vec<NewestReading>,
+    disks: Vec<NewestReading>,
+) -> BTreeMap<String, CurrentValues> {
+    let mut agents: BTreeMap<String, CurrentValues> = last_samples
+        .into_iter()
+        .map(|sample| {
+            let values = CurrentValues {
+                time_ms: sample.time_ms,
+                ..CurrentValues::default()
+            };
+            (sample.agent_id, values)
+        })
+        .collect();
+
+    for reading in cpu.into_iter().filter(|cpu| cpu.series == CPU_SERIES) {
+        if let Some(values) = agents.get_mut(&reading.agent_id) {
+            values.cpu_percent = Some(reading.value);
+        }
+    }
+    for reading in memory
+        .into_iter()
+        .filter(|memory| memory.series == MEMORY_SERIES)
+    {
+        if let Some(values) = agents.get_mut(&reading.agent_id) {
+            values.memory_percent = Some(reading.value);
+        }
+    }
+    for disk in disks {
+        if let Some(values) = agents.get_mut(&disk.agent_id)
+            && values
+                .disk_percent
+                .is_none_or(|fullest| disk.value > fullest)
+        {
+            values.disk_percent = Some(disk.value);
+            values.disk_mount_point = Some(disk.series);
         }
     }
     agents
@@ -836,7 +845,7 @@ impl Metrics {
             .context("reading metrics")?
     }
 
-    /// What one of an agent's collectors last sent, as it was sent.
+    /// What one of an agent's collectors last sent.
     pub async fn latest_output(
         &self,
         agent_id: &str,
@@ -844,46 +853,44 @@ impl Metrics {
         now_ms: i64,
     ) -> Result<Option<Value>> {
         let reader = self.reader.clone();
-        let samples = tokio::task::spawn_blocking(move || {
-            reader.latest(now_ms - CURRENT_WINDOW_MS, now_ms + CLOCK_SKEW_MS)
+        let (agent_id, collector) = (agent_id.to_string(), collector.to_string());
+        tokio::task::spawn_blocking(move || {
+            reader.latest_output(
+                &agent_id,
+                &collector,
+                now_ms - CURRENT_WINDOW_MS,
+                now_ms + CLOCK_SKEW_MS,
+            )
         })
         .await
-        .context("reading metrics")??;
-
-        Ok(samples
-            .into_iter()
-            .find(|sample| sample.agent_id == agent_id && sample.collector == collector)
-            .map(|sample| sample.data))
+        .context("reading metrics")?
     }
 
     pub async fn current(&self, now_ms: i64) -> Result<BTreeMap<String, CurrentValues>> {
         let reader = self.reader.clone();
-        let samples = tokio::task::spawn_blocking(move || {
-            reader.latest(now_ms - CURRENT_WINDOW_MS, now_ms + CLOCK_SKEW_MS)
+        tokio::task::spawn_blocking(move || {
+            let (since_ms, until_ms) = (now_ms - CURRENT_WINDOW_MS, now_ms + CLOCK_SKEW_MS);
+            let newest = |name| {
+                let metric = find(name).context("unknown metric")?;
+                reader.newest(metric, since_ms, until_ms)
+            };
+            Ok(current_values(
+                reader.last_samples(since_ms, until_ms)?,
+                newest(CPU_USAGE)?,
+                newest(MEMORY_USAGE)?,
+                newest(DISK_USAGE)?,
+            ))
         })
         .await
-        .context("reading metrics")??;
-
-        Ok(current_values(samples))
+        .context("reading metrics")?
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
     use super::*;
 
     const HOUR_MS: i64 = 3_600_000;
-
-    fn sample(agent_id: &str, collector: &str, time_ms: i64, data: Value) -> LatestSample {
-        LatestSample {
-            agent_id: agent_id.to_string(),
-            collector: collector.to_string(),
-            time_ms,
-            data,
-        }
-    }
 
     #[test]
     fn every_metric_has_a_unique_name_and_can_be_found() {
@@ -931,28 +938,30 @@ mod tests {
         assert_eq!(find("disk.usage").unwrap().position("/"), None);
     }
 
+    fn reading(agent_id: &str, series: &str, value: f64) -> NewestReading {
+        NewestReading {
+            agent_id: agent_id.to_string(),
+            series: series.to_string(),
+            time_ms: 1,
+            value,
+        }
+    }
+
+    fn last(agent_id: &str, time_ms: i64) -> LastSample {
+        LastSample {
+            agent_id: agent_id.to_string(),
+            time_ms,
+        }
+    }
+
     #[test]
-    fn current_values_combine_an_agents_collectors() {
-        let values = current_values(vec![
-            sample("a", "cpu", 10, json!({ "usage_percent": 12.5 })),
-            sample(
-                "a",
-                "memory",
-                30,
-                json!({ "used_bytes": 1, "total_bytes": 4 }),
-            ),
-            sample(
-                "a",
-                "disk",
-                20,
-                json!([
-                    { "mount_point": "/", "used_bytes": 1, "total_bytes": 10 },
-                    { "mount_point": "/data", "used_bytes": 9, "total_bytes": 10 },
-                ]),
-            ),
-            sample("a", "network", 40, json!({})),
-            sample("a", "host", 5, json!({})),
-        ]);
+    fn current_values_combine_an_agents_headline_numbers() {
+        let values = current_values(
+            vec![last("a", 40)],
+            vec![reading("a", "CPU", 12.5)],
+            vec![reading("a", "Memory", 25.0), reading("a", "Swap", 80.0)],
+            vec![reading("a", "/", 10.0), reading("a", "/data", 90.0)],
+        );
 
         assert_eq!(
             values["a"],
@@ -967,23 +976,8 @@ mod tests {
     }
 
     #[test]
-    fn output_of_the_wrong_shape_is_left_as_unknown() {
-        let values = current_values(vec![
-            sample("a", "cpu", 1, json!({ "usage_percent": "lots" })),
-            sample(
-                "a",
-                "memory",
-                1,
-                json!({ "used_bytes": 1, "total_bytes": 0 }),
-            ),
-            sample(
-                "a",
-                "disk",
-                1,
-                json!([7, { "mount_point": 3, "used_bytes": 1, "total_bytes": 2 }]),
-            ),
-            sample("b", "disk", 1, json!({ "mount_point": "/" })),
-        ]);
+    fn an_agent_with_nothing_to_show_still_has_a_time() {
+        let values = current_values(vec![last("a", 1)], Vec::new(), Vec::new(), Vec::new());
 
         assert_eq!(
             values["a"],
@@ -992,6 +986,13 @@ mod tests {
                 ..CurrentValues::default()
             }
         );
-        assert_eq!(values["b"].disk_percent, None);
+    }
+
+    #[test]
+    fn readings_for_agents_that_sent_nothing_lately_are_left_out() {
+        let cpu = vec![reading("gone", "CPU", 5.0)];
+        let values = current_values(Vec::new(), cpu, Vec::new(), Vec::new());
+
+        assert!(values.is_empty());
     }
 }

@@ -4,24 +4,30 @@
 //! Everything else the server keeps lives in [`crate::models`].
 
 mod duckdb;
+mod flatten;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use maxnines_protocol::Sample;
 use serde::Serialize;
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::error;
 
 use crate::config::MetricsConfig;
-use crate::metrics::{LatestSample, Metric, NewestReading, SeriesQuery, SeriesResult};
+use crate::metrics::{LastSample, Metric, NewestReading, SeriesQuery, SeriesResult, now_ms};
 
 /// Samples waiting to be written. When this fills up, connections stop reading
 /// from their agents until the database catches up.
 const WRITE_QUEUE_SIZE: usize = 1024;
+
+/// How often to look for upkeep when there's none going on.
+const TIDY_CHECK_EVERY: Duration = Duration::from_secs(60);
 
 /// Somewhere samples are saved.
 pub trait Store: Send {
@@ -31,6 +37,12 @@ pub trait Store: Send {
 
     /// Something to read with, which can run alongside writes.
     fn reader(&self) -> Result<Arc<dyn MetricsReader>>;
+
+    /// Does a piece of whatever upkeep the store needs, on the writer's thread between
+    /// writes. Returns whether there's more to do.
+    fn tidy(&mut self, _now_ms: i64) -> Result<bool> {
+        Ok(false)
+    }
 
     /// Called once at shutdown, after the last write.
     fn close(&mut self) -> Result<()>;
@@ -42,8 +54,19 @@ pub trait MetricsReader: Send + Sync {
     /// that aren't usable numbers are skipped.
     fn series(&self, query: &SeriesQuery) -> Result<SeriesResult>;
 
-    /// The newest sample from each agent's collectors, between two times.
-    fn latest(&self, since_ms: i64, until_ms: i64) -> Result<Vec<LatestSample>>;
+    /// When each agent last sent anything, between two times.
+    fn last_samples(&self, since_ms: i64, until_ms: i64) -> Result<Vec<LastSample>>;
+
+    /// What one of an agent's collectors last sent between two times, including
+    /// text like an error. It's an object, or a list for what repeats. Nothing is
+    /// `None`, and so is a collector the store doesn't know.
+    fn latest_output(
+        &self,
+        agent_id: &str,
+        collector: &str,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> Result<Option<Value>>;
 
     /// The newest value of each series of a metric, across every agent, between
     /// two times. Values that aren't usable numbers are skipped.
@@ -123,6 +146,7 @@ fn run_writer(
 ) {
     let mut queued = Vec::with_capacity(WRITE_QUEUE_SIZE);
     let mut stopping = false;
+    let mut next_tidy = Instant::now();
     while !stopping && commands.blocking_recv_many(&mut queued, WRITE_QUEUE_SIZE) > 0 {
         let mut samples = Vec::with_capacity(queued.len());
         for command in queued.drain(..) {
@@ -137,12 +161,36 @@ fn run_writer(
         if !samples.is_empty() {
             save(store.as_mut(), &samples, counts);
         }
+        if Instant::now() >= next_tidy {
+            let more = tidy(store.as_mut());
+            next_tidy = Instant::now()
+                + if more {
+                    Duration::ZERO
+                } else {
+                    TIDY_CHECK_EVERY
+                };
+        }
     }
 
     match catch_unwind(AssertUnwindSafe(|| store.close())) {
         Ok(Ok(())) => {}
         Ok(Err(error)) => error!(error = format!("{error:#}"), "closing the store failed"),
         Err(_) => error!("store panicked while closing"),
+    }
+}
+
+/// Upkeep failing leaves everything readable, so it's only worth saying so.
+fn tidy(store: &mut dyn Store) -> bool {
+    match catch_unwind(AssertUnwindSafe(|| store.tidy(now_ms()))) {
+        Ok(Ok(more)) => more,
+        Ok(Err(error)) => {
+            error!(error = format!("{error:#}"), "tidying the store failed");
+            false
+        }
+        Err(_) => {
+            error!("the store panicked while tidying");
+            false
+        }
     }
 }
 
@@ -196,8 +244,18 @@ pub mod testing {
             Ok(SeriesResult::default())
         }
 
-        fn latest(&self, _since_ms: i64, _until_ms: i64) -> Result<Vec<LatestSample>> {
+        fn last_samples(&self, _since_ms: i64, _until_ms: i64) -> Result<Vec<LastSample>> {
             Ok(Vec::new())
+        }
+
+        fn latest_output(
+            &self,
+            _agent_id: &str,
+            _collector: &str,
+            _since_ms: i64,
+            _until_ms: i64,
+        ) -> Result<Option<Value>> {
+            Ok(None)
         }
 
         fn newest(

@@ -44,12 +44,22 @@ impl MetricsReader for Script {
         Ok(Default::default())
     }
 
-    fn latest(
+    fn last_samples(
         &self,
         _since_ms: i64,
         _until_ms: i64,
-    ) -> anyhow::Result<Vec<crate::metrics::LatestSample>> {
+    ) -> anyhow::Result<Vec<crate::metrics::LastSample>> {
         Ok(Vec::new())
+    }
+
+    fn latest_output(
+        &self,
+        _agent_id: &str,
+        _collector: &str,
+        _since_ms: i64,
+        _until_ms: i64,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        Ok(None)
     }
 
     fn newest(
