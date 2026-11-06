@@ -6,6 +6,7 @@
 mod duckdb;
 mod flatten;
 
+use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,6 +32,10 @@ pub const WRITE_QUEUE_SIZE: usize = 1024;
 const TIDY_CHECK_EVERY: Duration = Duration::from_secs(60);
 /// The pause between pieces of upkeep, so samples don't queue up behind it.
 const TIDY_PAUSE: Duration = Duration::from_millis(250);
+
+/// Enough to cover what an agent can have waiting to hear about: it keeps 64 samples
+/// in memory, and sends its backlog one at a time.
+const RECENT_SAMPLES_PER_AGENT: usize = 80;
 
 /// Somewhere samples are saved.
 pub trait Store: Send {
@@ -123,9 +128,49 @@ pub struct NewSample {
 }
 
 pub enum WriterCommand {
+    /// Something the server recorded itself.
     Save(NewSample),
+    /// A sample from an agent, which keeps it until told on `acks` that it's stored.
+    SaveAndAck {
+        sample: NewSample,
+        acks: mpsc::Sender<u64>,
+    },
     /// Finish queued work and close the database cleanly.
     Stop,
+}
+
+/// The samples each agent sent last. An agent sends a sample again if it never heard
+/// that it was stored, which happens when a connection ends at the wrong moment, and
+/// those shouldn't be stored twice. A server restart forgets these, so the odd sample
+/// can still be stored twice then.
+#[derive(Default)]
+struct RecentSamples(HashMap<String, VecDeque<u64>>);
+
+impl RecentSamples {
+    /// Notes a sample, and returns whether it's already been seen.
+    fn seen(&mut self, agent_id: &str, timestamp_ms: u64) -> bool {
+        if !self.0.contains_key(agent_id) {
+            self.0.insert(agent_id.to_string(), VecDeque::new());
+        }
+        let Some(recent) = self.0.get_mut(agent_id) else {
+            return false;
+        };
+        if recent.contains(&timestamp_ms) {
+            return true;
+        }
+        if recent.len() == RECENT_SAMPLES_PER_AGENT {
+            recent.pop_front();
+        }
+        recent.push_back(timestamp_ms);
+        false
+    }
+
+    /// For a sample that couldn't be stored, which needs to be let in next time.
+    fn forget(&mut self, agent_id: &str, timestamp_ms: u64) {
+        if let Some(recent) = self.0.get_mut(agent_id) {
+            recent.retain(|time| *time != timestamp_ms);
+        }
+    }
 }
 
 /// Runs the store on its own thread, so slow database calls can't hold up the
@@ -148,13 +193,28 @@ fn run_writer(
     counts: &WriteCounts,
 ) {
     let mut queued = Vec::with_capacity(WRITE_QUEUE_SIZE);
+    let mut recent = RecentSamples::default();
     let mut stopping = false;
     let mut next_tidy = Instant::now();
     while !stopping && commands.blocking_recv_many(&mut queued, WRITE_QUEUE_SIZE) > 0 {
         let mut samples = Vec::with_capacity(queued.len());
+        let mut acks = Vec::with_capacity(queued.len());
+        let mut repeats = Vec::new();
         for command in queued.drain(..) {
             match command {
-                WriterCommand::Save(sample) => samples.push(sample),
+                WriterCommand::Save(sample) => {
+                    samples.push(sample);
+                    acks.push(None);
+                }
+                WriterCommand::SaveAndAck { sample, acks: ack } => {
+                    let time = sample.sample.timestamp_ms;
+                    if recent.seen(&sample.agent_id, time) {
+                        repeats.push((ack, time));
+                    } else {
+                        samples.push(sample);
+                        acks.push(Some(ack));
+                    }
+                }
                 WriterCommand::Stop => {
                     stopping = true;
                     break;
@@ -162,7 +222,19 @@ fn run_writer(
             }
         }
         if !samples.is_empty() {
-            save(store.as_mut(), &samples, counts);
+            let saved = save(store.as_mut(), &samples, counts);
+            for ((new, ack), saved) in samples.iter().zip(acks).zip(saved) {
+                let time = new.sample.timestamp_ms;
+                match ack {
+                    Some(ack) if saved => repeats.push((ack, time)),
+                    Some(_) => recent.forget(&new.agent_id, time),
+                    None => {}
+                }
+            }
+        }
+        // An agent that's gone will send the sample again, and hear back then.
+        for (ack, time) in repeats {
+            ack.try_send(time).ok();
         }
         if Instant::now() >= next_tidy {
             let more = tidy(store.as_mut());
@@ -192,9 +264,9 @@ fn tidy(store: &mut dyn Store) -> bool {
     }
 }
 
-/// A failed write or panic loses only the sample that caused it, by trying the rest
-/// again one at a time.
-fn save(store: &mut dyn Store, samples: &[NewSample], counts: &WriteCounts) {
+/// A failed write or panic only affects the sample that caused it, by trying the rest
+/// again one at a time. Returns which were saved.
+fn save(store: &mut dyn Store, samples: &[NewSample], counts: &WriteCounts) -> Vec<bool> {
     let error = match catch_unwind(AssertUnwindSafe(|| store.write(samples))) {
         Ok(Ok(())) => {
             // From agents, as the server recording itself isn't ingesting anything.
@@ -202,18 +274,20 @@ fn save(store: &mut dyn Store, samples: &[NewSample], counts: &WriteCounts) {
             counts
                 .written
                 .fetch_add(from_agents.count() as u64, Ordering::Relaxed);
-            return;
+            return vec![true; samples.len()];
         }
         Ok(Err(error)) => format!("{error:#}"),
         Err(_) => "the store panicked".to_string(),
     };
     if samples.len() > 1 {
-        for sample in samples {
-            save(store, std::slice::from_ref(sample), counts);
-        }
+        samples
+            .iter()
+            .flat_map(|sample| save(store, std::slice::from_ref(sample), counts))
+            .collect()
     } else {
         counts.failed.fetch_add(1, Ordering::Relaxed);
-        error!(error, "write failed, sample dropped");
+        error!(error, "write failed, sample not saved");
+        vec![false]
     }
 }
 
@@ -322,6 +396,106 @@ mod tests {
 
     use super::testing::{MemoryStore, Saved};
     use super::*;
+
+    fn from_agent(host: &str, timestamp_ms: u64, acks: &mpsc::Sender<u64>) -> WriterCommand {
+        WriterCommand::SaveAndAck {
+            sample: NewSample {
+                agent_id: "agent-1".to_string(),
+                host: host.to_string(),
+                sample: Sample {
+                    timestamp_ms,
+                    metrics: BTreeMap::new(),
+                },
+            },
+            acks: acks.clone(),
+        }
+    }
+
+    /// Runs commands through a writer, and returns what it stored and acknowledged.
+    fn run(
+        commands: impl FnOnce(&mpsc::Sender<u64>) -> Vec<WriterCommand>,
+    ) -> (Vec<u64>, Vec<u64>) {
+        let saved = Saved::default();
+        let store = Box::new(MemoryStore(saved.clone()));
+        let (writer, thread) = spawn_writer(store, Arc::default());
+        let (acks, mut acked) = mpsc::channel(16);
+        for command in commands(&acks) {
+            writer.blocking_send(command).unwrap();
+        }
+        writer.blocking_send(WriterCommand::Stop).unwrap();
+        thread.join().unwrap();
+        drop(acks);
+
+        let mut times = Vec::new();
+        while let Some(time) = acked.blocking_recv() {
+            times.push(time);
+        }
+        let stored = saved.samples.lock().unwrap();
+        (stored.iter().map(|sample| sample.2).collect(), times)
+    }
+
+    #[test]
+    fn a_sample_is_acknowledged_once_it_is_stored() {
+        let (stored, acked) =
+            run(|acks| vec![from_agent("web", 1, acks), from_agent("web", 2, acks)]);
+        assert_eq!(stored, [1, 2]);
+        assert_eq!(acked, [1, 2]);
+    }
+
+    #[test]
+    fn a_sample_that_could_not_be_stored_is_not_acknowledged() {
+        let (stored, acked) =
+            run(|acks| vec![from_agent("fail", 1, acks), from_agent("web", 2, acks)]);
+        assert_eq!(stored, [2]);
+        assert_eq!(acked, [2]);
+    }
+
+    #[test]
+    fn a_sample_sent_again_is_acknowledged_without_being_stored_twice() {
+        let saved = Saved::default();
+        let store = Box::new(MemoryStore(saved.clone()));
+        let (writer, thread) = spawn_writer(store, Arc::default());
+        let (acks, mut acked) = mpsc::channel(16);
+
+        writer.blocking_send(from_agent("web", 1, &acks)).unwrap();
+        assert_eq!(acked.blocking_recv(), Some(1));
+        writer.blocking_send(from_agent("web", 1, &acks)).unwrap();
+        assert_eq!(acked.blocking_recv(), Some(1));
+
+        writer.blocking_send(WriterCommand::Stop).unwrap();
+        thread.join().unwrap();
+        assert_eq!(saved.samples.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_sample_that_failed_can_be_stored_when_it_is_sent_again() {
+        let saved = Saved::default();
+        let store = Box::new(MemoryStore(saved.clone()));
+        let (writer, thread) = spawn_writer(store, Arc::default());
+        let (acks, mut acked) = mpsc::channel(16);
+
+        writer.blocking_send(from_agent("fail", 1, &acks)).unwrap();
+        writer.blocking_send(from_agent("web", 2, &acks)).unwrap();
+        assert_eq!(acked.blocking_recv(), Some(2));
+        writer.blocking_send(from_agent("web", 1, &acks)).unwrap();
+        assert_eq!(acked.blocking_recv(), Some(1));
+
+        writer.blocking_send(WriterCommand::Stop).unwrap();
+        thread.join().unwrap();
+        assert_eq!(saved.samples.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn only_the_latest_samples_are_remembered() {
+        let mut recent = RecentSamples::default();
+        for time in 0..RECENT_SAMPLES_PER_AGENT as u64 + 1 {
+            assert!(!recent.seen("a", time));
+        }
+
+        assert!(recent.seen("a", 1));
+        assert!(!recent.seen("a", 0), "pushed out by newer samples");
+        assert!(!recent.seen("b", 1), "each agent has its own");
+    }
 
     fn save(host: &str, timestamp_ms: u64) -> WriterCommand {
         WriterCommand::Save(NewSample {

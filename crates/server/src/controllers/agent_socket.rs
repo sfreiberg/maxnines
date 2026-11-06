@@ -37,6 +37,9 @@ const SOCKET_BUFFER_SIZE: usize = 8 * 1024;
 /// Facts and config results waiting on the database, for one agent. It sends few of
 /// them, so this only fills up if the database has stalled or an agent misbehaves.
 const JOB_QUEUE_SIZE: usize = 8;
+/// More than an agent has waiting at once. A missed one only means a sample is sent
+/// twice.
+const ACK_QUEUE_SIZE: usize = 128;
 
 pub async fn upgrade(
     socket: WebSocketUpgrade,
@@ -227,6 +230,7 @@ async fn serve(socket: &mut WebSocket, agent: Arc<Agent>, state: &AppState) -> &
 
     let (jobs, job_queue) = mpsc::channel(JOB_QUEUE_SIZE);
     let (config_sender, mut configs) = mpsc::channel(1);
+    let (ack_sender, mut acks) = mpsc::channel(ACK_QUEUE_SIZE);
     let mut work = tokio::spawn(do_jobs(
         job_queue,
         config_sender,
@@ -251,6 +255,11 @@ async fn serve(socket: &mut WebSocket, agent: Arc<Agent>, state: &AppState) -> &
                     return "send failed";
                 }
             }
+            Some(timestamp_ms) = acks.recv() => {
+                if send(socket, &ServerMessage::Ack { timestamp_ms }).await.is_err() {
+                    return "send failed";
+                }
+            }
             reserved = state.writer.reserve(), if waiting_sample.is_some() => {
                 last_heard = Instant::now();
                 match (reserved, waiting_sample.take()) {
@@ -264,7 +273,7 @@ async fn serve(socket: &mut WebSocket, agent: Arc<Agent>, state: &AppState) -> &
 
                 match message {
                     Some(Ok(Message::Text(text))) => {
-                        waiting_sample = receive(&text, &agent, state, &jobs);
+                        waiting_sample = receive(&text, &agent, state, &jobs, &ack_sender);
                     }
                     Some(Ok(Message::Close(_))) | None => return "connection closed",
                     Some(Ok(_)) => {}
@@ -368,14 +377,18 @@ fn receive(
     agent: &Agent,
     state: &AppState,
     jobs: &mpsc::Sender<Job>,
+    acks: &mpsc::Sender<u64>,
 ) -> Option<WriterCommand> {
     let job = match serde_json::from_str(text) {
         Ok(AgentMessage::Sample(sample)) => {
-            let command = WriterCommand::Save(NewSample {
-                agent_id: agent.id.clone(),
-                host: agent.host.clone(),
-                sample,
-            });
+            let command = WriterCommand::SaveAndAck {
+                sample: NewSample {
+                    agent_id: agent.id.clone(),
+                    host: agent.host.clone(),
+                    sample,
+                },
+                acks: acks.clone(),
+            };
             return match state.writer.try_send(command) {
                 Ok(()) => None,
                 Err(TrySendError::Full(command)) => Some(command),

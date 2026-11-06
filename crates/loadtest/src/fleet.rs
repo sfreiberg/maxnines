@@ -139,6 +139,24 @@ pub async fn register(url: &str, identity: &Identity, host: &str) -> Result<Regi
         .context("the server didn't finish the handshake")?
 }
 
+/// A sample that's yet to reach the server.
+#[derive(Clone, Copy)]
+struct Waiting {
+    taken_at: u64,
+    /// Going again because the connection ended before it was confirmed, so it's
+    /// already been counted.
+    resend: bool,
+}
+
+impl Waiting {
+    fn new(taken_at: u64) -> Self {
+        Self {
+            taken_at,
+            resend: false,
+        }
+    }
+}
+
 pub struct SimulatedAgent {
     index: usize,
     identity: Identity,
@@ -146,9 +164,13 @@ pub struct SimulatedAgent {
     readings: Readings,
     ticker: Interval,
     last_sample: Instant,
-    /// When saved samples were taken, oldest first.
-    saved: VecDeque<u64>,
+    /// Samples to send from before, oldest first.
+    saved: VecDeque<Waiting>,
     next_saved: Instant,
+    /// When samples the server hasn't confirmed yet were taken.
+    unconfirmed: Vec<u64>,
+    /// The saved one on its way, as they go one at a time.
+    saved_unconfirmed: Option<u64>,
     next_churn: Option<Instant>,
     build: u64,
 }
@@ -170,9 +192,11 @@ impl SimulatedAgent {
             last_sample: Instant::now(),
             saved: (0..plan.backlog as u64)
                 .rev()
-                .map(|age| started.saturating_sub((age + 1) * interval_ms))
+                .map(|age| Waiting::new(started.saturating_sub((age + 1) * interval_ms)))
                 .collect(),
             next_saved: Instant::now(),
+            unconfirmed: Vec::new(),
+            saved_unconfirmed: None,
             next_churn: next_churn(plan.churn_percent),
             build: 0,
         }
@@ -194,6 +218,18 @@ impl SimulatedAgent {
         Ok(serde_json::to_string(&AgentMessage::Facts { facts })?)
     }
 
+    /// What a real agent does on losing a connection.
+    fn requeue_unconfirmed(&mut self) {
+        let saved = self.saved_unconfirmed.take();
+        let live = self.unconfirmed.drain(..);
+        for taken_at in saved.into_iter().chain(live) {
+            self.saved.push_back(Waiting {
+                taken_at,
+                resend: true,
+            });
+        }
+    }
+
     async fn serve(
         &mut self,
         socket: &mut Socket,
@@ -208,7 +244,7 @@ impl SimulatedAgent {
         let mut facts_timer = interval_at(Instant::now() + plan.facts_every, plan.facts_every);
 
         loop {
-            let saved_due = !self.saved.is_empty();
+            let saved_due = !self.saved.is_empty() && self.saved_unconfirmed.is_none();
             let churn = self.next_churn;
             tokio::select! {
                 _ = stop.changed() => return Ok(End::Stopped),
@@ -222,19 +258,23 @@ impl SimulatedAgent {
                     return Ok(End::Churn);
                 }
                 _ = self.ticker.tick() => {
-                    let text = self.sample_text(now_ms())?;
+                    let taken_at = now_ms();
+                    let text = self.sample_text(taken_at)?;
                     counters.bytes.fetch_add(text.len() as u64, Relaxed);
-                    socket.send(Message::text(text)).await?;
+                    self.unconfirmed.push(taken_at);
                     counters.live_samples.fetch_add(1, Relaxed);
+                    socket.send(Message::text(text)).await?;
                 }
                 () = sleep_until(self.next_saved), if saved_due => {
-                    if let Some(time) = self.saved.pop_front() {
-                        let text = self.sample_text(time)?;
+                    if let Some(waiting) = self.saved.pop_front() {
+                        let text = self.sample_text(waiting.taken_at)?;
                         counters.bytes.fetch_add(text.len() as u64, Relaxed);
+                        self.saved_unconfirmed = Some(waiting.taken_at);
+                        if !waiting.resend {
+                            counters.saved_samples.fetch_add(1, Relaxed);
+                        }
                         socket.send(Message::text(text)).await?;
-                        counters.saved_samples.fetch_add(1, Relaxed);
                     }
-                    self.next_saved = Instant::now() + plan.backlog_gap;
                 }
                 _ = facts_timer.tick() => {
                     if chance(plan.fact_change_percent) {
@@ -243,8 +283,16 @@ impl SimulatedAgent {
                     socket.send(Message::text(self.facts_text()?)).await?;
                 }
                 message = socket.next() => match message {
-                    Some(Ok(Message::Text(text))) => {
-                        if let Ok(ServerMessage::Config { version, .. }) = serde_json::from_str(&text) {
+                    Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
+                        Ok(ServerMessage::Ack { timestamp_ms }) => {
+                            if self.saved_unconfirmed == Some(timestamp_ms) {
+                                self.saved_unconfirmed = None;
+                                self.next_saved = Instant::now() + plan.backlog_gap;
+                            } else {
+                                self.unconfirmed.retain(|time| *time != timestamp_ms);
+                            }
+                        }
+                        Ok(ServerMessage::Config { version, .. }) => {
                             if !timed {
                                 timed = true;
                                 counters
@@ -259,6 +307,7 @@ impl SimulatedAgent {
                                 .send(Message::text(serde_json::to_string(&result)?))
                                 .await?;
                         }
+                        _ => {}
                     }
                     Some(Ok(Message::Close(_))) | None => bail!("the server closed the connection"),
                     Some(Err(error)) => bail!("the connection failed: {error}"),
@@ -295,6 +344,7 @@ impl SimulatedAgent {
         counters.online.fetch_add(1, Relaxed);
         let end = self.serve(&mut socket, plan, began, stop, outage).await;
         counters.online.fetch_sub(1, Relaxed);
+        self.requeue_unconfirmed();
         match end {
             Ok(end) => end,
             Err(error) => {
@@ -336,7 +386,7 @@ impl SimulatedAgent {
             loop {
                 tokio::select! {
                     () = sleep_until(retry) => break,
-                    _ = self.ticker.tick() => self.saved.push_back(now_ms()),
+                    _ = self.ticker.tick() => self.saved.push_back(Waiting::new(now_ms())),
                     _ = stop.changed() => return,
                 }
             }
@@ -394,7 +444,7 @@ mod tests {
 
         let agent = SimulatedAgent::new(0, identity, "h".to_string(), &plan);
 
-        let saved: Vec<u64> = agent.saved.iter().copied().collect();
+        let saved: Vec<u64> = agent.saved.iter().map(|sample| sample.taken_at).collect();
         assert_eq!(saved.len(), 3);
         assert_eq!(saved[1] - saved[0], 15_000);
         assert!(saved[2] < now_ms());

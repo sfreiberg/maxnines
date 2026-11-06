@@ -168,6 +168,7 @@ async fn run(path: PathBuf) -> Result<()> {
             result = tokio::signal::ctrl_c() => {
                 result?;
                 info!("shutting down");
+                link.save_unconfirmed();
                 return Ok(());
             }
         }

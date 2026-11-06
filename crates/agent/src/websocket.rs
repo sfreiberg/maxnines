@@ -135,6 +135,11 @@ impl ServerLink {
         self.facts_every.send_replace(every);
     }
 
+    /// Saves what the server hasn't confirmed, for when the agent stops.
+    pub fn save_unconfirmed(&self) {
+        self.spool.set_online(false);
+    }
+
     /// Waits for the next config from the server.
     pub async fn next_config(&mut self) -> Option<ConfigUpdate> {
         self.configs.recv().await
@@ -240,14 +245,13 @@ async fn session(connection: &Connection, pending: &mut mpsc::Receiver<String>) 
     }
 }
 
-/// A sample only leaves the queue once it's been sent, so a failed send keeps it.
+/// A failed send ends the connection, which puts the sample back in line.
 async fn send_next<S>(socket: &mut S, spool: &Spool) -> Result<(), S::Error>
 where
     S: Sink<Message> + Unpin,
 {
-    if let Some((text, place)) = spool.next() {
+    if let Some(text) = spool.next() {
         socket.send(Message::text(text)).await?;
-        spool.sent(place);
     }
     Ok(())
 }
@@ -262,6 +266,7 @@ async fn receive(text: &str, connection: &Connection) {
                 error!("config dropped, the agent has stopped");
             }
         }
+        Ok(ServerMessage::Ack { timestamp_ms }) => connection.spool.acked(timestamp_ms),
         Ok(_) => warn!("ignoring an unexpected message from the server"),
         Err(error) => warn!(%error, "ignoring an invalid message from the server"),
     }
@@ -573,15 +578,67 @@ mod tests {
     async fn a_sample_that_fails_to_send_stays_queued() {
         let folder = tempfile::tempdir().unwrap();
         let spool = Spool::open(&folder.path().join("samples"));
-        spool.push("1".to_string());
+        spool.push(r#"{"timestamp_ms":1}"#.to_string());
         let broken = futures_util::sink::unfold((), |(), _: Message| async {
             Err::<(), &str>("connection lost")
         });
         let mut broken = std::pin::pin!(broken);
 
         assert!(send_next(&mut broken, &spool).await.is_err());
+        spool.set_online(false);
 
-        assert_eq!(spool.next().unwrap().0, "1");
+        assert_eq!(spool.next().unwrap(), r#"{"timestamp_ms":1}"#);
+    }
+
+    /// Waits for a new connection from the agent, and gets past its first facts.
+    async fn reconnected(listener: &TcpListener, url: &str) -> WebSocketStream<TcpStream> {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        accept_agent(&mut socket, url).await;
+        next_message(&mut socket).await;
+        socket
+    }
+
+    #[tokio::test]
+    async fn a_sample_the_server_never_confirmed_is_sent_again() {
+        let address = free_address().await;
+        let url = format!("ws://{address}/ws");
+        let listener = TcpListener::bind(address).await.unwrap();
+        let link = ServerLink::start(&config(&url), "web-1", identity()).unwrap();
+        let mut socket = reconnected(&listener, &url).await;
+
+        link.send_sample(&sample()).unwrap();
+        assert_eq!(
+            next_message(&mut socket).await,
+            AgentMessage::Sample(sample())
+        );
+        drop(socket);
+
+        let mut socket = reconnected(&listener, &url).await;
+        assert_eq!(
+            next_message(&mut socket).await,
+            AgentMessage::Sample(sample())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_sample_is_not_sent_again() {
+        let address = free_address().await;
+        let url = format!("ws://{address}/ws");
+        let listener = TcpListener::bind(address).await.unwrap();
+        let link = ServerLink::start(&config(&url), "web-1", identity()).unwrap();
+        let mut socket = reconnected(&listener, &url).await;
+
+        link.send_sample(&sample()).unwrap();
+        next_message(&mut socket).await;
+        let ack = ServerMessage::Ack { timestamp_ms: 7 };
+        send_to_agent(&mut socket, &ack).await;
+        sleep(Duration::from_millis(100)).await;
+        drop(socket);
+
+        let mut socket = reconnected(&listener, &url).await;
+        let nothing = timeout(Duration::from_millis(300), next_message(&mut socket)).await;
+        assert!(nothing.is_err(), "{nothing:?}");
     }
 
     #[tokio::test]

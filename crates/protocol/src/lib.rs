@@ -504,7 +504,7 @@ pub enum AgentMessage {
     },
 }
 
-/// What the server sends to an agent during the handshake.
+/// What the server sends to an agent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
@@ -517,6 +517,10 @@ pub enum ServerMessage {
         version: String,
         config: AgentConfig,
     },
+    /// The sample taken at this time is safely stored, so the agent can forget it.
+    /// Until then it keeps the sample and sends it again if the connection ends, so
+    /// the server ignores one it's already stored.
+    Ack { timestamp_ms: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
