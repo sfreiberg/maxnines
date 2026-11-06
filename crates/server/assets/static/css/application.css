@@ -308,7 +308,7 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
   .shell { display: block; }
   .rail { position: fixed; top: auto; right: 0; bottom: 0; left: 0; flex-direction: row; justify-content: space-around; gap: 0; height: auto; padding: 4px calc(4px + env(safe-area-inset-right)) calc(4px + env(safe-area-inset-bottom)) calc(4px + env(safe-area-inset-left)); border-top: 1px solid var(--border); border-right: 0; }
   .brand { display: none; }
-  .rail-link { flex: 1 1 0; width: auto; min-width: 0; font-size: 10.5px; }
+  .rail-link { flex: 1 1 0; width: auto; min-width: 0; font-size: 10px; }
   .rail-link.profile { margin-top: 0; }
   .avatar { width: 22px; height: 22px; font-size: 11px; box-shadow: none; }
   .count { right: calc(50% - 22px); }
