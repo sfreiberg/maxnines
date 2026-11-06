@@ -44,6 +44,57 @@ command line can recover from a forgotten password with `users setup-link`.
 Over plain `http://`, passwords cross the network unencrypted, so put anything beyond
 a trusted network behind HTTPS.
 
+## Running an agent by hand
+
+There are no installers yet, so an agent is one file you copy to a machine and start
+yourself. Build it with `cargo build --release -p maxnines-agent`, or for an Intel Mac
+from an Apple Silicon one, add `--target x86_64-apple-darwin`.
+
+Put `maxnines-agent` in a folder of its own, with an `agent.hcl` beside it that says
+where the server is:
+
+```hcl
+server {
+  url = "ws://your-server:9000/ws"
+}
+
+state_dir = "state"
+```
+
+The URL has to match the server's `public_url`. Use `wss://` for anything beyond a
+trusted network. Everything else about what to monitor comes from the server, and
+[`crates/agent/config/agent.hcl`](crates/agent/config/agent.hcl) explains the settings
+an agent can have of its own.
+
+Then start it:
+
+```sh
+./maxnines-agent
+```
+
+It creates a key in `state`, logs its agent ID, and waits to be approved. Approve it
+on the Agents page, or on the server with:
+
+```sh
+maxnines-server agents approve <agent-id>
+```
+
+It starts reporting within a few seconds, and from then on it reconnects by itself.
+It stops with Ctrl+C or when the terminal closes, so use `nohup` or `tmux` to keep it
+running after you log out. Samples are kept in `state` while the server can't be
+reached, and sent when it's back.
+
+- **One key per machine.** Copy the program and `agent.hcl` to another machine, but
+  never `state`. The key inside it is the agent's identity, so a copy looks like the
+  same machine.
+- **Upgrade the server first.** Older agents work with a newer server, but a newer
+  agent may need things an older server doesn't have.
+- **macOS and downloads:** a file that came through a browser or AirDrop is blocked
+  until you run `xattr -d com.apple.quarantine maxnines-agent`.
+- **Other commands:** `./maxnines-agent facts` prints what it reports about the
+  machine, and `./maxnines-agent identity show` prints its ID once it's been started.
+  Use `-c` to point any of them at a config file somewhere else.
+
 ## API
 
 Everything the web pages can see and do is available as JSON under `/api/v1`, on the
