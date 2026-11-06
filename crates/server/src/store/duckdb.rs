@@ -2,11 +2,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, Result};
+use duckdb::types::{TimeUnit, Value};
 use duckdb::{Config, Connection, params};
 use maxnines_protocol::Sample;
 use tracing::debug;
 
-use super::{CollectorStats, MetricsReader, Store, StoreStats};
+use super::{CollectorStats, MetricsReader, NewSample, Store, StoreStats};
 use crate::metrics::{
     LatestSample, Metric, NewestReading, Point, Reading, Series, SeriesQuery, SeriesResult, Source,
 };
@@ -42,11 +43,6 @@ const CREATE_MIGRATIONS_TABLE: &str = "
         name       VARCHAR   PRIMARY KEY,
         applied_at TIMESTAMP NOT NULL
     );
-";
-
-const INSERT_METRIC: &str = "
-    INSERT INTO metrics (time, agent_id, host, collector, data)
-    VALUES (epoch_ms(?::BIGINT), ?, ?, ?, ?::JSON)
 ";
 
 pub struct DuckDbStore {
@@ -104,21 +100,23 @@ fn migrate(connection: &mut Connection, migrations: &[Migration]) -> Result<()> 
 }
 
 impl Store for DuckDbStore {
-    fn write(&mut self, agent_id: &str, host: &str, sample: &Sample) -> Result<()> {
-        let timestamp_ms = i64::try_from(sample.timestamp_ms).context("timestamp out of range")?;
-
+    fn write(&mut self, samples: &[NewSample]) -> Result<()> {
         let transaction = self.connection.transaction()?;
         {
-            let mut insert = transaction.prepare(INSERT_METRIC)?;
-            for (collector, data) in &sample.metrics {
-                insert.execute(params![
-                    timestamp_ms,
-                    agent_id,
-                    host,
-                    collector,
-                    data.to_string()
-                ])?;
+            let mut appender = transaction.appender("metrics")?;
+            for new in samples {
+                let time = Value::Timestamp(TimeUnit::Microsecond, microseconds(&new.sample)?);
+                for (collector, data) in &new.sample.metrics {
+                    appender.append_row(params![
+                        time,
+                        new.agent_id,
+                        new.host,
+                        collector,
+                        data.to_string()
+                    ])?;
+                }
             }
+            appender.flush()?;
         }
         transaction.commit()?;
         Ok(())
@@ -137,6 +135,14 @@ impl Store for DuckDbStore {
             .execute_batch("FORCE CHECKPOINT")
             .context("saving recent writes")
     }
+}
+
+/// Agents send this, so it can be anything.
+fn microseconds(sample: &Sample) -> Result<i64> {
+    i64::try_from(sample.timestamp_ms)
+        .ok()
+        .and_then(|milliseconds| milliseconds.checked_mul(1000))
+        .context("timestamp out of range")
 }
 
 /// Reads on connections of its own, so a slow query doesn't hold up writes and
@@ -435,6 +441,23 @@ mod tests {
         DuckDbStore::with_connection(Connection::open_in_memory().unwrap()).unwrap()
     }
 
+    fn new_sample(agent_id: &str, host: &str, sample: &Sample) -> NewSample {
+        NewSample {
+            agent_id: agent_id.to_string(),
+            host: host.to_string(),
+            sample: sample.clone(),
+        }
+    }
+
+    fn write_one(
+        store: &mut DuckDbStore,
+        agent_id: &str,
+        host: &str,
+        sample: &Sample,
+    ) -> Result<()> {
+        store.write(&[new_sample(agent_id, host, sample)])
+    }
+
     const HOUR_MS: i64 = 3_600_000;
 
     fn write_metric(
@@ -448,7 +471,7 @@ mod tests {
             timestamp_ms: time_ms,
             metrics: BTreeMap::from([(collector.to_string(), data)]),
         };
-        store.write(agent, "host", &sample).unwrap();
+        write_one(store, agent, "host", &sample).unwrap();
     }
 
     fn query(store: &DuckDbStore, agent_id: &str, metric: &str, max_series: usize) -> SeriesResult {
@@ -803,7 +826,7 @@ mod tests {
         let path = folder.path().join("m.duckdb");
         let mut store = DuckDbStore::open(&path, "1GB").unwrap();
         let reader = store.reader().unwrap();
-        store.write("a", "h", &sample()).unwrap();
+        write_one(&mut store, "a", "h", &sample()).unwrap();
         assert!(path.with_extension("duckdb.wal").exists());
 
         store.close().unwrap();
@@ -1226,14 +1249,14 @@ mod tests {
     #[test]
     fn stores_one_row_per_collector() {
         let mut store = in_memory();
-        store.write("agent-1", "web-1", &sample()).unwrap();
+        write_one(&mut store, "agent-1", "web-1", &sample()).unwrap();
         assert_eq!(row_count(&store), 2);
     }
 
     #[test]
     fn stored_values_can_be_queried() {
         let mut store = in_memory();
-        store.write("agent-1", "web-1", &sample()).unwrap();
+        write_one(&mut store, "agent-1", "web-1", &sample()).unwrap();
 
         let (time, agent_id, host, usage): (String, String, String, String) = store
             .connection
@@ -1257,7 +1280,62 @@ mod tests {
         let mut bad = sample();
         bad.timestamp_ms = u64::MAX;
 
-        assert!(store.write("agent-1", "web-1", &bad).is_err());
+        assert!(write_one(&mut store, "agent-1", "web-1", &bad).is_err());
+        assert_eq!(row_count(&store), 0);
+    }
+
+    #[test]
+    fn rejects_timestamps_too_large_to_store() {
+        let mut store = in_memory();
+        let mut bad = sample();
+        bad.timestamp_ms = i64::MAX as u64;
+
+        assert!(write_one(&mut store, "agent-1", "web-1", &bad).is_err());
+        assert_eq!(row_count(&store), 0);
+    }
+
+    #[test]
+    fn writes_several_samples_at_once() {
+        let mut store = in_memory();
+        let mut second = sample();
+        second.timestamp_ms += 1000;
+
+        store
+            .write(&[
+                new_sample("agent-1", "web-1", &sample()),
+                new_sample("agent-2", "web-2", &second),
+            ])
+            .unwrap();
+
+        let saved: Vec<(i64, String)> = store
+            .connection
+            .prepare("SELECT DISTINCT epoch_ms(time), agent_id FROM metrics ORDER BY 1")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            saved,
+            [
+                (1_700_000_000_123, "agent-1".to_string()),
+                (1_700_000_001_123, "agent-2".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bad_sample_stores_none_of_its_batch() {
+        let mut store = in_memory();
+        let mut bad = sample();
+        bad.timestamp_ms = u64::MAX;
+
+        let result = store.write(&[
+            new_sample("agent-1", "web-1", &sample()),
+            new_sample("agent-1", "web-1", &bad),
+        ]);
+
+        assert!(result.is_err());
         assert_eq!(row_count(&store), 0);
     }
 
@@ -1279,7 +1357,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(store.write("agent-1", "web-1", &sample()).is_err());
+        assert!(write_one(&mut store, "agent-1", "web-1", &sample()).is_err());
         assert_eq!(row_count(&store), 0);
     }
 
@@ -1288,13 +1366,12 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         let path = folder.path().join("nested/maxnines.duckdb");
 
-        DuckDbStore::open(&path, "1GB")
-            .unwrap()
-            .write("agent-1", "web-1", &sample())
-            .unwrap();
+        let mut store = DuckDbStore::open(&path, "1GB").unwrap();
+        write_one(&mut store, "agent-1", "web-1", &sample()).unwrap();
+        drop(store);
 
         let mut reopened = DuckDbStore::open(&path, "1GB").unwrap();
-        reopened.write("agent-1", "web-1", &sample()).unwrap();
+        write_one(&mut reopened, "agent-1", "web-1", &sample()).unwrap();
         assert_eq!(row_count(&reopened), 4);
     }
 

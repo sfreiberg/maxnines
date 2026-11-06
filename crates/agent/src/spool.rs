@@ -31,8 +31,9 @@ const MAX_SAVED_BYTES: u64 = 64 * 1024 * 1024;
 /// The limit is shared between about this many files, and reaching it deletes the
 /// oldest, so this much of the backlog goes at once.
 const FILES_KEPT: u64 = 16;
-/// The time between saved samples. A day of samples every 30 seconds takes under an
-/// hour to send, and a thousand agents catching up add about 1,000 samples a second.
+/// The time between saved samples. A day of samples at the default interval takes
+/// about an hour and a half to send, and a thousand agents catching up add about
+/// 1,000 samples a second.
 const BACKLOG_GAP: Duration = Duration::from_secs(1);
 
 /// Where a sample came from, to remove it once it's been sent.

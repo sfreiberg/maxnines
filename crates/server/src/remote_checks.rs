@@ -17,7 +17,7 @@ use tracing::{error, warn};
 
 use crate::metrics::now_ms;
 use crate::models::Database;
-use crate::store::WriterCommand;
+use crate::store::{NewSample, WriterCommand};
 
 /// The built-in agent's ID. See the migration that creates it.
 pub const LOCAL_AGENT_ID: &str = "server";
@@ -172,11 +172,11 @@ async fn save(writer: &mpsc::Sender<WriterCommand>, result: Value) {
         timestamp_ms: now_ms() as u64,
         metrics: BTreeMap::from([("checks".to_string(), json!([result]))]),
     };
-    let command = WriterCommand::Save {
+    let command = WriterCommand::Save(NewSample {
         agent_id: LOCAL_AGENT_ID.to_string(),
         host: LOCAL_HOST.to_string(),
         sample,
-    };
+    });
     if writer.send(command).await.is_err() {
         warn!("the metrics writer has stopped, so a check result was dropped");
     }

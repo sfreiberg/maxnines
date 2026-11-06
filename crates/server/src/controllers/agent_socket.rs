@@ -18,7 +18,7 @@ use crate::facts::flatten;
 use crate::models::ConfigStatus;
 use crate::presence::Presence;
 use crate::registration::Admission;
-use crate::store::WriterCommand;
+use crate::store::{NewSample, WriterCommand};
 
 /// The longest hostname DNS allows, and what the database column holds.
 const MAX_HOST_LEN: usize = 255;
@@ -295,11 +295,11 @@ async fn send_config(
 async fn receive(text: &str, agent: &Agent, state: &AppState) -> bool {
     match serde_json::from_str(text) {
         Ok(AgentMessage::Sample(sample)) => {
-            let command = WriterCommand::Save {
+            let command = WriterCommand::Save(NewSample {
                 agent_id: agent.id.clone(),
                 host: agent.host.clone(),
                 sample,
-            };
+            });
             if state.writer.send(command).await.is_err() {
                 warn!(id = agent.id, "writer stopped, sample dropped");
             }

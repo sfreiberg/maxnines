@@ -25,8 +25,9 @@ const WRITE_QUEUE_SIZE: usize = 1024;
 
 /// Somewhere samples are saved.
 pub trait Store: Send {
-    /// Saves a whole sample: either all of it is stored or none of it is.
-    fn write(&mut self, agent_id: &str, host: &str, sample: &Sample) -> Result<()>;
+    /// Saves samples together, as waiting on the disk once is what makes this quick:
+    /// either all of them are stored or none of them are.
+    fn write(&mut self, samples: &[NewSample]) -> Result<()>;
 
     /// Something to read with, which can run alongside writes.
     fn reader(&self) -> Result<Arc<dyn MetricsReader>>;
@@ -89,12 +90,14 @@ pub fn open(config: &MetricsConfig) -> Result<Box<dyn Store>> {
     })
 }
 
+pub struct NewSample {
+    pub agent_id: String,
+    pub host: String,
+    pub sample: Sample,
+}
+
 pub enum WriterCommand {
-    Save {
-        agent_id: String,
-        host: String,
-        sample: Sample,
-    },
+    Save(NewSample),
     /// Finish queued work and close the database cleanly.
     Stop,
 }
@@ -110,32 +113,29 @@ pub fn spawn_writer(
     (sender, handle)
 }
 
-/// A failed write or panic loses that one sample and the writer keeps going.
+/// Saves whatever has queued up since the last write in one go, so writes grow to
+/// keep up with a slow disk or a busy moment, and a quiet server saves each sample
+/// as it arrives.
 fn run_writer(
     mut store: Box<dyn Store>,
     mut commands: mpsc::Receiver<WriterCommand>,
     counts: &WriteCounts,
 ) {
-    while let Some(command) = commands.blocking_recv() {
-        match command {
-            WriterCommand::Save {
-                agent_id,
-                host,
-                sample,
-            } => match catch_unwind(AssertUnwindSafe(|| store.write(&agent_id, &host, &sample))) {
-                Ok(Ok(())) => {
-                    counts.written.fetch_add(1, Ordering::Relaxed);
+    let mut queued = Vec::with_capacity(WRITE_QUEUE_SIZE);
+    let mut stopping = false;
+    while !stopping && commands.blocking_recv_many(&mut queued, WRITE_QUEUE_SIZE) > 0 {
+        let mut samples = Vec::with_capacity(queued.len());
+        for command in queued.drain(..) {
+            match command {
+                WriterCommand::Save(sample) => samples.push(sample),
+                WriterCommand::Stop => {
+                    stopping = true;
+                    break;
                 }
-                Ok(Err(error)) => {
-                    counts.failed.fetch_add(1, Ordering::Relaxed);
-                    error!(error = format!("{error:#}"), "write failed, sample dropped");
-                }
-                Err(_) => {
-                    counts.failed.fetch_add(1, Ordering::Relaxed);
-                    error!("store panicked, sample dropped");
-                }
-            },
-            WriterCommand::Stop => break,
+            }
+        }
+        if !samples.is_empty() {
+            save(store.as_mut(), &samples, counts);
         }
     }
 
@@ -143,6 +143,29 @@ fn run_writer(
         Ok(Ok(())) => {}
         Ok(Err(error)) => error!(error = format!("{error:#}"), "closing the store failed"),
         Err(_) => error!("store panicked while closing"),
+    }
+}
+
+/// A failed write or panic loses only the sample that caused it, by trying the rest
+/// again one at a time.
+fn save(store: &mut dyn Store, samples: &[NewSample], counts: &WriteCounts) {
+    let error = match catch_unwind(AssertUnwindSafe(|| store.write(samples))) {
+        Ok(Ok(())) => {
+            counts
+                .written
+                .fetch_add(samples.len() as u64, Ordering::Relaxed);
+            return;
+        }
+        Ok(Err(error)) => format!("{error:#}"),
+        Err(_) => "the store panicked".to_string(),
+    };
+    if samples.len() > 1 {
+        for sample in samples {
+            save(store, std::slice::from_ref(sample), counts);
+        }
+    } else {
+        counts.failed.fetch_add(1, Ordering::Relaxed);
+        error!(error, "write failed, sample dropped");
     }
 }
 
@@ -160,6 +183,8 @@ pub mod testing {
     pub struct Saved {
         /// (agent ID, host, timestamp)
         pub samples: Arc<Mutex<Vec<(String, String, u64)>>>,
+        /// How many samples each successful write held.
+        pub writes: Arc<Mutex<Vec<usize>>>,
         pub closed: Arc<Mutex<bool>>,
     }
 
@@ -193,16 +218,26 @@ pub mod testing {
     pub struct MemoryStore(pub Saved);
 
     impl Store for MemoryStore {
-        fn write(&mut self, agent_id: &str, host: &str, sample: &Sample) -> Result<()> {
-            match host {
-                "fail" => bail!("deliberate test failure"),
-                "panic" => panic!("deliberate test panic"),
-                _ => self.0.samples.lock().unwrap().push((
-                    agent_id.to_string(),
-                    host.to_string(),
-                    sample.timestamp_ms,
-                )),
+        fn write(&mut self, samples: &[NewSample]) -> Result<()> {
+            for new in samples {
+                match new.host.as_str() {
+                    "fail" => bail!("deliberate test failure"),
+                    "panic" => panic!("deliberate test panic"),
+                    _ => {}
+                }
             }
+            self.0.writes.lock().unwrap().push(samples.len());
+            self.0
+                .samples
+                .lock()
+                .unwrap()
+                .extend(samples.iter().map(|new| {
+                    (
+                        new.agent_id.clone(),
+                        new.host.clone(),
+                        new.sample.timestamp_ms,
+                    )
+                }));
             Ok(())
         }
 
@@ -225,14 +260,30 @@ mod tests {
     use super::*;
 
     fn save(host: &str, timestamp_ms: u64) -> WriterCommand {
-        WriterCommand::Save {
+        WriterCommand::Save(NewSample {
             agent_id: "agent-1".to_string(),
             host: host.to_string(),
             sample: Sample {
                 timestamp_ms,
                 metrics: BTreeMap::new(),
             },
+        })
+    }
+
+    /// Queues everything before the writer starts, so it all arrives together.
+    fn run_with(commands: Vec<WriterCommand>) -> (Saved, WriteCounts) {
+        let saved = Saved::default();
+        let counts = WriteCounts::default();
+        let (sender, receiver) = mpsc::channel(WRITE_QUEUE_SIZE);
+        for command in commands {
+            sender.try_send(command).unwrap();
         }
+        run_writer(Box::new(MemoryStore(saved.clone())), receiver, &counts);
+        (saved, counts)
+    }
+
+    fn timestamps(saved: &Saved) -> Vec<u64> {
+        saved.samples.lock().unwrap().iter().map(|s| s.2).collect()
     }
 
     #[test]
@@ -251,8 +302,44 @@ mod tests {
         sender.blocking_send(WriterCommand::Stop).unwrap();
         handle.join().unwrap();
 
-        let timestamps: Vec<u64> = saved.samples.lock().unwrap().iter().map(|s| s.2).collect();
-        assert_eq!(timestamps, [1, 4]);
+        assert_eq!(timestamps(&saved), [1, 4]);
+    }
+
+    #[test]
+    fn samples_that_queue_up_are_written_together() {
+        let (saved, counts) = run_with(vec![
+            save("a", 1),
+            save("a", 2),
+            save("a", 3),
+            WriterCommand::Stop,
+        ]);
+
+        assert_eq!(*saved.writes.lock().unwrap(), [3]);
+        assert_eq!(timestamps(&saved), [1, 2, 3]);
+        assert_eq!(counts.written.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn a_bad_sample_only_loses_itself_from_a_batch() {
+        let (saved, counts) = run_with(vec![
+            save("a", 1),
+            save("fail", 2),
+            save("panic", 3),
+            save("a", 4),
+            WriterCommand::Stop,
+        ]);
+
+        assert_eq!(timestamps(&saved), [1, 4]);
+        assert_eq!(counts.written.load(Ordering::Relaxed), 2);
+        assert_eq!(counts.failed.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn stopping_saves_what_was_queued_first() {
+        let (saved, _) = run_with(vec![save("a", 1), WriterCommand::Stop, save("a", 2)]);
+
+        assert_eq!(timestamps(&saved), [1]);
+        assert!(*saved.closed.lock().unwrap());
     }
 
     #[test]
