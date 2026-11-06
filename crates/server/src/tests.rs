@@ -614,7 +614,7 @@ async fn custom_fact_names_with_dots_are_shown_nested() {
     let response = server
         .http(
             "GET",
-            &format!("/admin/agents/{id}/facts"),
+            &format!("/api/v1/agents/{id}/facts"),
             Some(ADMIN_TOKEN),
         )
         .await;
@@ -641,7 +641,7 @@ async fn list_items_are_stored_under_indexed_names() {
     let response = server
         .http(
             "GET",
-            &format!("/admin/agents/{id}/facts"),
+            &format!("/api/v1/agents/{id}/facts"),
             Some(ADMIN_TOKEN),
         )
         .await;
@@ -685,7 +685,7 @@ async fn values_come_back_with_the_type_they_went_in_with() {
     let response = server
         .http(
             "GET",
-            &format!("/admin/agents/{id}/facts"),
+            &format!("/api/v1/agents/{id}/facts"),
             Some(ADMIN_TOKEN),
         )
         .await;
@@ -755,7 +755,7 @@ async fn the_admin_api_separates_trusted_and_reported_facts() {
     let response = server
         .http(
             "GET",
-            &format!("/admin/agents/{id}/facts"),
+            &format!("/api/v1/agents/{id}/facts"),
             Some(ADMIN_TOKEN),
         )
         .await;
@@ -779,15 +779,15 @@ async fn the_facts_api_needs_the_token_and_a_known_agent() {
     let id = agent.id();
 
     for path in [
-        format!("/admin/agents/{id}/facts"),
-        format!("/admin/agents/{id}/facts/history"),
+        format!("/api/v1/agents/{id}/facts"),
+        format!("/api/v1/agents/{id}/facts/history"),
     ] {
         let response = server.http("GET", &path, None).await;
         assert!(response.starts_with("HTTP/1.1 401"), "{response}");
     }
     for path in [
-        "/admin/agents/nope/facts",
-        "/admin/agents/nope/facts/history",
+        "/api/v1/agents/nope/facts",
+        "/api/v1/agents/nope/facts/history",
     ] {
         let response = server.http("GET", path, Some(ADMIN_TOKEN)).await;
         assert!(response.starts_with("HTTP/1.1 404"), "{response}");
@@ -804,7 +804,7 @@ async fn the_history_api_returns_every_change_in_order() {
     send(&mut client, &facts("24.10")).await;
     server.wait_for_facts(&id, 3).await;
 
-    let path = format!("/admin/agents/{id}/facts/history");
+    let path = format!("/api/v1/agents/{id}/facts/history");
     let response = server.http("GET", &path, Some(ADMIN_TOKEN)).await;
     let body = response.split("\r\n\r\n").nth(1).unwrap();
     let history: Vec<FactVersion> = serde_json::from_str(body).unwrap();
@@ -965,7 +965,7 @@ async fn an_agents_config_result_is_recorded_and_shown() {
     assert_eq!(status.version, version);
     assert_eq!(status.error.unwrap().len(), 1000);
 
-    let path = format!("/admin/agents/{id}/config");
+    let path = format!("/api/v1/agents/{id}/config");
     let response = server.request("GET", &path, "").await;
     let body = response.split("\r\n\r\n").nth(1).unwrap();
     let view: Value = serde_json::from_str(body).unwrap();
@@ -981,10 +981,10 @@ async fn rules_can_be_managed_through_the_api() {
     let server = start().await;
 
     let body = r#"{"name":"web","priority":100,"condition":"facts.custom.role == \"web\"","settings":{"interval_secs":5}}"#;
-    let created = server.request("POST", "/admin/rules", body).await;
+    let created = server.request("POST", "/api/v1/rules", body).await;
     assert!(created.starts_with("HTTP/1.1 201"), "{created}");
     let id: Value = serde_json::from_str(created.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-    let path = format!("/admin/rules/{}", id["id"]);
+    let path = format!("/api/v1/rules/{}", id["id"]);
 
     let shown = server.request("GET", &path, "").await;
     assert!(shown.contains(r#""interval_secs":5"#), "{shown}");
@@ -993,7 +993,7 @@ async fn rules_can_be_managed_through_the_api() {
     let updated = server.request("PUT", &path, changed).await;
     assert!(updated.starts_with("HTTP/1.1 204"), "{updated}");
 
-    let listed = server.request("GET", "/admin/rules", "").await;
+    let listed = server.request("GET", "/api/v1/rules", "").await;
     assert!(listed.contains(r#""enabled":false"#), "{listed}");
 
     let deleted = server.request("DELETE", &path, "").await;
@@ -1034,7 +1034,7 @@ async fn invalid_rules_are_refused_with_a_reason() {
     ];
 
     for (body, reason) in cases {
-        let response = server.request("POST", "/admin/rules", body).await;
+        let response = server.request("POST", "/api/v1/rules", body).await;
         assert!(response.starts_with("HTTP/1.1 422"), "{body}: {response}");
         assert!(response.contains(reason), "{body}: {response}");
     }
@@ -1044,7 +1044,7 @@ async fn invalid_rules_are_refused_with_a_reason() {
 #[tokio::test]
 async fn the_rules_api_needs_the_token() {
     let server = start().await;
-    let response = server.http("GET", "/admin/rules", None).await;
+    let response = server.http("GET", "/api/v1/rules", None).await;
     assert!(response.starts_with("HTTP/1.1 401"), "{response}");
 }
 
@@ -1832,10 +1832,10 @@ async fn the_admin_api_needs_the_token() {
     let agent = identity();
     let mut client = server.connect().await;
     handshake(&mut client, &agent, "web-1", None).await;
-    let approve = format!("/admin/agents/{}/approve", agent.id());
+    let approve = format!("/api/v1/agents/{}/approve", agent.id());
 
     for token in [None, Some("wrong")] {
-        let list = server.http("GET", "/admin/agents", token).await;
+        let list = server.http("GET", "/api/v1/agents", token).await;
         assert!(list.starts_with("HTTP/1.1 401"), "{list}");
 
         let change = server.http("POST", &approve, token).await;
@@ -1856,18 +1856,20 @@ async fn the_admin_api_lists_approves_and_revokes() {
     let mut client = server.connect().await;
     handshake(&mut client, &agent, "web-1", None).await;
 
-    let list = server.http("GET", "/admin/agents", Some(ADMIN_TOKEN)).await;
+    let list = server
+        .http("GET", "/api/v1/agents", Some(ADMIN_TOKEN))
+        .await;
     assert!(list.starts_with("HTTP/1.1 200"), "{list}");
     assert!(list.contains(&id), "{list}");
     assert!(list.contains(r#""state":"pending""#), "{list}");
     assert!(list.contains(r#""online":false"#), "{list}");
 
-    let path = format!("/admin/agents/{id}/approve");
+    let path = format!("/api/v1/agents/{id}/approve");
     let response = server.http("POST", &path, Some(ADMIN_TOKEN)).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert!(server.state.registry.is_approved(&id).await);
 
-    let path = format!("/admin/agents/{id}/revoke");
+    let path = format!("/api/v1/agents/{id}/revoke");
     let response = server.http("POST", &path, Some(ADMIN_TOKEN)).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert!(!server.state.registry.is_approved(&id).await);
@@ -1877,7 +1879,7 @@ async fn the_admin_api_lists_approves_and_revokes() {
 async fn approving_an_unknown_agent_is_not_found() {
     let server = start().await;
     let response = server
-        .http("POST", "/admin/agents/nope/approve", Some(ADMIN_TOKEN))
+        .http("POST", "/api/v1/agents/nope/approve", Some(ADMIN_TOKEN))
         .await;
     assert!(response.starts_with("HTTP/1.1 404"), "{response}");
 }
@@ -2675,9 +2677,9 @@ async fn the_agent_and_metric_pages_link_to_each_other() {
 async fn the_metrics_api_needs_the_admin_token() {
     let server = start().await;
     for path in [
-        "/admin/metrics",
-        "/admin/metrics/current",
-        "/admin/agents/x/metrics/cpu.usage",
+        "/api/v1/metrics",
+        "/api/v1/metrics/current",
+        "/api/v1/agents/x/metrics/cpu.usage",
     ] {
         let response = server.http("GET", path, None).await;
         assert!(response.starts_with("HTTP/1.1 401"), "{path}: {response}");
@@ -2694,7 +2696,7 @@ async fn the_metrics_api_lists_what_can_be_asked_for() {
     let server = start().await;
 
     let response = server
-        .http("GET", "/admin/metrics", Some(ADMIN_TOKEN))
+        .http("GET", "/api/v1/metrics", Some(ADMIN_TOKEN))
         .await;
 
     let catalog = json_body(&response);
@@ -2714,7 +2716,7 @@ async fn the_metrics_api_returns_series_and_current_values() {
     let (agent, _client) = report_samples(&server, "/data").await;
     let id = agent.id();
 
-    let path = format!("/admin/agents/{id}/metrics/cpu.usage");
+    let path = format!("/api/v1/agents/{id}/metrics/cpu.usage");
     let body = json_body(&server.http("GET", &path, Some(ADMIN_TOKEN)).await);
 
     assert_eq!(body["metric"], "cpu.usage");
@@ -2729,7 +2731,7 @@ async fn the_metrics_api_returns_series_and_current_values() {
 
     let body = json_body(
         &server
-            .http("GET", "/admin/metrics/current", Some(ADMIN_TOKEN))
+            .http("GET", "/api/v1/metrics/current", Some(ADMIN_TOKEN))
             .await,
     );
     assert_eq!(body[&id]["cpu_percent"], 42.5);
@@ -2741,7 +2743,7 @@ async fn the_metrics_api_can_be_given_a_time_range() {
     let server = start_with_metrics().await;
     let (agent, _client) = report_samples(&server, "/").await;
     let now = now_ms();
-    let base = format!("/admin/agents/{}/metrics/cpu.usage", agent.id());
+    let base = format!("/api/v1/agents/{}/metrics/cpu.usage", agent.id());
 
     let path = format!(
         "{base}?from_ms={}&to_ms={}",
@@ -2765,7 +2767,7 @@ async fn the_metrics_api_refuses_what_it_can_not_answer() {
     let id = agent.id();
     let token = Some(ADMIN_TOKEN);
 
-    let metric = format!("/admin/agents/{id}/metrics/cpu.usage");
+    let metric = format!("/api/v1/agents/{id}/metrics/cpu.usage");
     for query in [
         "from_ms=5&to_ms=1",
         "from_ms=-1&to_ms=5",
@@ -2785,8 +2787,8 @@ async fn the_metrics_api_refuses_what_it_can_not_answer() {
     );
 
     for path in [
-        format!("/admin/agents/{id}/metrics/nonsense"),
-        "/admin/agents/nope/metrics/cpu.usage".to_string(),
+        format!("/api/v1/agents/{id}/metrics/nonsense"),
+        "/api/v1/agents/nope/metrics/cpu.usage".to_string(),
     ] {
         let response = server.http("GET", &path, token).await;
         assert!(response.starts_with("HTTP/1.1 404"), "{path}: {response}");
@@ -3037,4 +3039,150 @@ async fn the_filter_suggests_values() {
         option_texts(&options(&server, "os.name%3DUbu").await),
         [r#"os.name="Ubuntu Linux""#]
     );
+}
+
+// ---- the versioned API
+
+fn status_of(response: &str) -> &str {
+    response.split_whitespace().nth(1).unwrap_or_default()
+}
+
+fn body_of(response: &str) -> Value {
+    let body = response.split_once("\r\n\r\n").map_or("", |(_, body)| body);
+    serde_json::from_str(body).unwrap_or(Value::Null)
+}
+
+fn hosts_in(response: &str) -> Vec<String> {
+    let mut hosts: Vec<String> = body_of(response)
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|agent| agent["host"].as_str().unwrap().to_string())
+        .collect();
+    hosts.sort();
+    hosts
+}
+
+#[tokio::test]
+async fn the_api_lives_under_its_version() {
+    let server = start().await;
+
+    let versioned = server.request("GET", "/api/v1/agents", "").await;
+    let old = server.request("GET", "/admin/agents", "").await;
+
+    assert_eq!(status_of(&versioned), "200", "{versioned}");
+    assert_eq!(status_of(&old), "404", "{old}");
+}
+
+#[tokio::test]
+async fn an_unknown_api_address_answers_in_json() {
+    let server = start().await;
+
+    let response = server.request("GET", "/api/v1/nope", "").await;
+
+    assert_eq!(status_of(&response), "404", "{response}");
+    assert!(body_of(&response)["error"].is_string(), "{response}");
+}
+
+#[tokio::test]
+async fn the_api_still_needs_the_token() {
+    let server = start().await;
+
+    let page = Browser::default().get(&server, "/api/v1/agents").await;
+
+    assert_eq!(page.status, 401, "{}", page.body);
+}
+
+#[tokio::test]
+async fn the_api_filters_hosts_the_same_way_as_the_pages() {
+    let server = start().await;
+    let _hosts = two_hosts(&server).await;
+
+    let all = server.request("GET", "/api/v1/agents", "").await;
+    let linux = server
+        .request("GET", "/api/v1/agents?q=os%3Dlinux", "")
+        .await;
+
+    assert_eq!(hosts_in(&all), ["db-1", "web-1"]);
+    assert_eq!(hosts_in(&linux), ["web-1"]);
+    assert_eq!(body_of(&linux)[0]["health"], "online");
+}
+
+#[tokio::test]
+async fn the_api_explains_a_filter_it_cannot_read() {
+    let server = start().await;
+
+    let response = server.request("GET", "/api/v1/agents?q=os%3D", "").await;
+
+    assert_eq!(status_of(&response), "400", "{response}");
+    assert!(
+        body_of(&response)["error"]
+            .as_str()
+            .unwrap()
+            .contains("needs a value")
+    );
+}
+
+#[tokio::test]
+async fn the_api_suggests_what_the_filter_box_does() {
+    let server = start().await;
+    let _hosts = two_hosts(&server).await;
+
+    let response = server
+        .request("GET", "/api/v1/agents/filter-options?term=os%3D", "")
+        .await;
+
+    assert_eq!(body_of(&response)[0]["text"], "os=linux", "{response}");
+}
+
+#[tokio::test]
+async fn the_api_can_preview_a_rule_without_saving_it() {
+    let server = start().await;
+    let _hosts = two_hosts(&server).await;
+    let rule = json!({
+        "name": "Linux only",
+        "priority": 100,
+        "condition": "facts.os.family == \"linux\"",
+        "settings": { "interval_secs": 60 },
+    });
+
+    let response = server
+        .request("POST", "/api/v1/rules/preview", &rule.to_string())
+        .await;
+
+    assert_eq!(status_of(&response), "200", "{response}");
+    let preview = body_of(&response);
+    assert_eq!(preview["total"], 2);
+    assert_eq!(preview["matching"], 1);
+
+    let rules = server.request("GET", "/api/v1/rules", "").await;
+    assert!(!rules.contains("Linux only"), "{rules}");
+}
+
+#[tokio::test]
+async fn the_api_refuses_to_preview_a_bad_rule() {
+    let server = start().await;
+    let rule = json!({
+        "name": "Broken",
+        "priority": 100,
+        "condition": "facts.os.family ==",
+        "settings": {},
+    });
+
+    let response = server
+        .request("POST", "/api/v1/rules/preview", &rule.to_string())
+        .await;
+
+    assert!(status_of(&response).starts_with('4'), "{response}");
+}
+
+#[tokio::test]
+async fn testing_a_channel_that_does_not_exist_is_not_found() {
+    let server = start().await;
+
+    let response = server
+        .request("POST", "/api/v1/notification-channels/999/test", "")
+        .await;
+
+    assert_eq!(status_of(&response), "404", "{response}");
 }

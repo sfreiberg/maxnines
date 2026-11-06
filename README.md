@@ -28,6 +28,28 @@ If you'd like to help guide the project, we'd love to hear from you. What you ne
 from monitoring, what gets in your way today, and what you'd leave out are all
 welcome and genuinely useful. Open an issue or start a discussion here on GitHub.
 
+## API
+
+Everything the web pages can see and do is available as JSON under `/api/v1`, on the
+same port as everything else. Send the admin token as a bearer token:
+
+```sh
+curl -H "Authorization: Bearer $(maxnines-server admin-token)" \
+  "http://localhost:9000/api/v1/agents?q=os%3Dlinux"
+```
+
+| Address | What it covers |
+| --- | --- |
+| `/agents`, `/agents/{id}/approve`, `/agents/{id}/revoke` | Agents, filtered with `q` as on the agents page |
+| `/agents/filter-options` | What the filter box suggests |
+| `/agents/{id}/facts`, `/agents/{id}/facts/history`, `/agents/{id}/config` | What's known about an agent |
+| `/agents/{id}/metrics/{metric}`, `/metrics`, `/metrics/current` | Metrics |
+| `/rules`, `/rules/{id}`, `/rules/preview` | Config rules, and what a change would do |
+| `/alerts`, `/alert-rules`, `/alert-rules/{id}` | Alerts and their rules |
+| `/notification-channels`, `/notification-channels/{id}`, `/notification-channels/{id}/test` | Where alerts go |
+| `/remote-checks`, `/remote-checks/{id}` | Checks the server runs itself |
+| `/server` | How the server is doing, including its CPU, memory and databases |
+
 ## Load testing
 
 `maxnines-loadtest` simulates a fleet of agents against a server and reports how it

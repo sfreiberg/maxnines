@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::alerting::{Alert, Severity};
 use crate::app_state::AppState;
@@ -32,7 +32,7 @@ impl Meter {
 }
 
 /// How an agent is, as a word and a class. Problems outrank being online.
-#[derive(Serialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum Health {
     Critical,

@@ -1,13 +1,13 @@
 //! Routes and request handling. Pages live in `overview`, `agents`, `alerts`,
 //! `alert_rules`, `metrics`, `notification_channels`, `remote_checks`, `rules` and
-//! `settings`, the token protected API in `admin`, agent connections in `agent_socket`,
+//! `settings`, the token protected API in `api`, agent connections in `agent_socket`,
 //! and how an open page learns of a new build in `update_notice`.
 
-pub mod admin;
 pub mod agent_socket;
 mod agents;
 mod alert_rules;
 mod alerts;
+pub mod api;
 mod assets;
 mod condition_form;
 mod fleet;
@@ -56,7 +56,7 @@ pub fn app(state: AppState) -> Router {
         .merge(rules::routes())
         .merge(compressed(assets::routes()))
         .merge(update_notice::routes())
-        .merge(admin::routes(state.clone()))
+        .nest(api::BASE_PATH, api::routes(state.clone()))
         .fallback(not_found)
         .layer(middleware::from_fn(security_headers))
         .with_state(state)

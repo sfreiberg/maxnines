@@ -1,4 +1,4 @@
-//! Talking to the server's admin API and pages.
+//! Talking to the server's API and pages.
 
 use std::time::{Duration, Instant};
 
@@ -72,24 +72,24 @@ impl Server {
     }
 
     pub fn stats(&self) -> Result<Value> {
-        self.get_json("/admin/server")
+        self.get_json("/api/v1/server")
     }
 
     pub fn approve(&self, id: &str) -> Result<()> {
-        self.post(&format!("/admin/agents/{id}/approve"))
+        self.post(&format!("/api/v1/agents/{id}/approve"))
     }
 
     pub fn revoke(&self, id: &str) -> Result<()> {
-        self.post(&format!("/admin/agents/{id}/revoke"))
+        self.post(&format!("/api/v1/agents/{id}/revoke"))
     }
 
     /// The first config rule, for changing and putting back.
     pub fn first_rule(&self) -> Result<(i64, Value)> {
-        let rules = self.get_json("/admin/rules")?;
+        let rules = self.get_json("/api/v1/rules")?;
         let id = rules[0]["id"]
             .as_i64()
             .context("the server has no config rules")?;
-        let mut rule = self.get_json(&format!("/admin/rules/{id}"))?;
+        let mut rule = self.get_json(&format!("/api/v1/rules/{id}"))?;
         if let Some(fields) = rule.as_object_mut() {
             fields.remove("id");
         }
@@ -97,7 +97,7 @@ impl Server {
     }
 
     pub fn save_rule(&self, id: i64, rule: &Value) -> Result<()> {
-        let path = format!("/admin/rules/{id}");
+        let path = format!("/api/v1/rules/{id}");
         let response = self
             .client
             .put(format!("{}{path}", self.base))

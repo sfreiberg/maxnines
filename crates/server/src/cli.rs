@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use crate::config::Config;
-use crate::controllers::admin::AgentView;
+use crate::controllers::api::{AgentView, BASE_PATH};
 use crate::fact_history::{describe_history, format_time};
 use crate::models::{Database, FactVersion};
 
@@ -57,7 +57,7 @@ pub fn print_agents(config: &Config) -> Result<()> {
     let base = local_url(config.listen);
     let token = admin_token(config)?;
 
-    let mut response = ureq::get(format!("{base}/admin/agents"))
+    let mut response = ureq::get(format!("{base}{BASE_PATH}/agents"))
         .header("Authorization", format!("Bearer {token}"))
         .call()
         .map_err(|error| explain(error, &base))?;
@@ -99,14 +99,14 @@ fn get_json(config: &Config, path: &str) -> Result<String> {
 }
 
 pub fn print_facts(config: &Config, id: &str) -> Result<()> {
-    let body = get_json(config, &format!("/admin/agents/{id}/facts"))?;
+    let body = get_json(config, &format!("{BASE_PATH}/agents/{id}/facts"))?;
     let view: Value = serde_json::from_str(&body).context("invalid server response")?;
     println!("{}", serde_json::to_string_pretty(&view)?);
     Ok(())
 }
 
 pub fn print_facts_history(config: &Config, id: &str) -> Result<()> {
-    let body = get_json(config, &format!("/admin/agents/{id}/facts/history"))?;
+    let body = get_json(config, &format!("{BASE_PATH}/agents/{id}/facts/history"))?;
     let history: Vec<FactVersion> =
         serde_json::from_str(&body).context("invalid server response")?;
 
@@ -126,7 +126,7 @@ pub fn change_agent(config: &Config, id: &str, action: &str) -> Result<()> {
     let base = local_url(config.listen);
     let token = admin_token(config)?;
 
-    let result = ureq::post(format!("{base}/admin/agents/{id}/{action}"))
+    let result = ureq::post(format!("{base}{BASE_PATH}/agents/{id}/{action}"))
         .header("Authorization", format!("Bearer {token}"))
         .send_empty();
     match result {

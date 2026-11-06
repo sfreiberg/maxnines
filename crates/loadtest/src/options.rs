@@ -19,7 +19,7 @@ pub struct Options {
     #[arg(long, value_name = "URL", help_heading = "Server")]
     pub url: String,
 
-    /// Where to reach the admin API and pages [default: worked out from --url]
+    /// Where to reach the API and pages [default: worked out from --url]
     #[arg(long, value_name = "URL", help_heading = "Server")]
     pub admin_url: Option<String>,
 

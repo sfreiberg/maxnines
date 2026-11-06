@@ -1005,7 +1005,7 @@ async fn a_rule_can_choose_custom_metrics_by_name_but_not_commands() {
             "priority": 100,
             "settings": { "collectors": { "custom": settings } },
         });
-        let (status, body) = api(&server, "POST", "/admin/rules", &rule).await;
+        let (status, body) = api(&server, "POST", "/api/v1/rules", &rule).await;
         assert!((400..500).contains(&status), "{status}: {body}");
     }
 }
@@ -1467,7 +1467,7 @@ async fn a_slack_channel_can_be_made_from_the_form_and_hides_its_token() {
     let (status, shown) = api(
         &server,
         "GET",
-        &format!("/admin/notification-channels/{id}"),
+        &format!("/api/v1/notification-channels/{id}"),
         &Value::Null,
     )
     .await;
@@ -2362,11 +2362,11 @@ async fn api(server: &TestServer, method: &str, path: &str, body: &Value) -> (u1
 async fn the_alert_api_needs_the_admin_token() {
     let server = start().await;
     for path in [
-        "/admin/alerts",
-        "/admin/alert-rules",
-        "/admin/alert-rules/1",
-        "/admin/notification-channels",
-        "/admin/notification-channels/1",
+        "/api/v1/alerts",
+        "/api/v1/alert-rules",
+        "/api/v1/alert-rules/1",
+        "/api/v1/notification-channels",
+        "/api/v1/notification-channels/1",
     ] {
         let response = server.http("GET", path, None).await;
         assert!(response.starts_with("HTTP/1.1 401"), "{path}: {response}");
@@ -2386,9 +2386,9 @@ async fn alert_rules_can_be_managed_through_the_api() {
         "severity": "critical",
     });
 
-    let (status, created) = api(&server, "POST", "/admin/alert-rules", &rule).await;
+    let (status, created) = api(&server, "POST", "/api/v1/alert-rules", &rule).await;
     assert_eq!(status, 201, "{created}");
-    let path = format!("/admin/alert-rules/{}", created["id"]);
+    let path = format!("/api/v1/alert-rules/{}", created["id"]);
 
     let (status, shown) = api(&server, "GET", &path, &Value::Null).await;
     assert_eq!(status, 200);
@@ -2401,7 +2401,7 @@ async fn alert_rules_can_be_managed_through_the_api() {
     let (_, shown) = api(&server, "GET", &path, &Value::Null).await;
     assert_eq!(shown["threshold"], 50.0);
 
-    let (status, list) = api(&server, "GET", "/admin/alert-rules", &Value::Null).await;
+    let (status, list) = api(&server, "GET", "/api/v1/alert-rules", &Value::Null).await;
     assert_eq!(status, 200);
     assert_eq!(list.as_array().unwrap().len(), 1);
 
@@ -2423,7 +2423,7 @@ async fn the_api_refuses_bad_rules_and_says_why() {
         "for_secs": 0,
         "severity": "warning",
     });
-    let (status, body) = api(&server, "POST", "/admin/alert-rules", &rule).await;
+    let (status, body) = api(&server, "POST", "/api/v1/alert-rules", &rule).await;
     assert_eq!(status, 422);
     assert!(
         body["error"].as_str().unwrap().contains("unknown metric"),
@@ -2433,7 +2433,7 @@ async fn the_api_refuses_bad_rules_and_says_why() {
     let mut rule = rule;
     rule["metric"] = json!("cpu.usage");
     rule["channels"] = json!([42]);
-    let (status, body) = api(&server, "POST", "/admin/alert-rules", &rule).await;
+    let (status, body) = api(&server, "POST", "/api/v1/alert-rules", &rule).await;
     assert_eq!(status, 422);
     assert!(
         body["error"].as_str().unwrap().contains("channel 42"),
@@ -2450,16 +2450,22 @@ async fn the_api_takes_a_webhook_url_but_never_gives_it_back() {
         "target": "https://hooks.example.com/secret-token",
     });
 
-    let (status, created) = api(&server, "POST", "/admin/notification-channels", &channel).await;
+    let (status, created) = api(&server, "POST", "/api/v1/notification-channels", &channel).await;
     assert_eq!(status, 201, "{created}");
-    let path = format!("/admin/notification-channels/{}", created["id"]);
+    let path = format!("/api/v1/notification-channels/{}", created["id"]);
 
     let (status, shown) = api(&server, "GET", &path, &Value::Null).await;
     assert_eq!(status, 200);
     assert_eq!(shown["target_preview"], "https://hooks.example.com/…");
     assert!(!shown.to_string().contains("secret-token"));
 
-    let (_, list) = api(&server, "GET", "/admin/notification-channels", &Value::Null).await;
+    let (_, list) = api(
+        &server,
+        "GET",
+        "/api/v1/notification-channels",
+        &Value::Null,
+    )
+    .await;
     assert!(!list.to_string().contains("secret-token"));
 
     let mut changed = channel.clone();
@@ -2479,13 +2485,13 @@ async fn the_api_lists_open_and_resolved_alerts() {
     test.database().create_alert_rule(&rule).await.unwrap();
     test.cpu(0, 95.0).await;
 
-    let (status, alerts) = api(&test.server, "GET", "/admin/alerts", &Value::Null).await;
+    let (status, alerts) = api(&test.server, "GET", "/api/v1/alerts", &Value::Null).await;
     assert_eq!(status, 200);
     assert_eq!(alerts["open"][0]["rule_name"], "High CPU");
     assert_eq!(alerts["resolved"].as_array().unwrap().len(), 0);
 
     test.cpu(MINUTE_MS, 10.0).await;
-    let (_, alerts) = api(&test.server, "GET", "/admin/alerts", &Value::Null).await;
+    let (_, alerts) = api(&test.server, "GET", "/api/v1/alerts", &Value::Null).await;
     assert_eq!(alerts["open"].as_array().unwrap().len(), 0);
     assert_eq!(
         alerts["resolved"][0]["resolve_reason"],
@@ -2699,7 +2705,9 @@ mod remote {
         assert_eq!(page.status, 200, "{}", page.body);
         assert!(!page.body.contains("Agent details"));
 
-        let response = server.http("GET", "/admin/agents", Some(ADMIN_TOKEN)).await;
+        let response = server
+            .http("GET", "/api/v1/agents", Some(ADMIN_TOKEN))
+            .await;
         assert!(!response.contains("MaxNines server"));
 
         let revoked = server
@@ -2859,16 +2867,16 @@ mod remote {
     #[tokio::test]
     async fn the_api_manages_checks_and_needs_the_token() {
         let server = server().await;
-        let response = server.http("GET", "/admin/remote-checks", None).await;
+        let response = server.http("GET", "/api/v1/remote-checks", None).await;
         assert!(response.starts_with("HTTP/1.1 401"), "{response}");
 
         let body = json!({
             "check": { "name": "db", "kind": "tcp", "target": "example.com:80" },
             "interval_secs": 60,
         });
-        let (status, created) = api(&server, "POST", "/admin/remote-checks", &body).await;
+        let (status, created) = api(&server, "POST", "/api/v1/remote-checks", &body).await;
         assert_eq!(status, 201, "{created}");
-        let path = format!("/admin/remote-checks/{}", created["id"]);
+        let path = format!("/api/v1/remote-checks/{}", created["id"]);
 
         let (status, shown) = api(&server, "GET", &path, &Value::Null).await;
         assert_eq!(status, 200);
@@ -3367,10 +3375,10 @@ mod server_page {
     #[tokio::test]
     async fn the_api_gives_the_same_numbers_and_needs_the_token() {
         let server = start().await;
-        let response = server.http("GET", "/admin/server", None).await;
+        let response = server.http("GET", "/api/v1/server", None).await;
         assert!(response.starts_with("HTTP/1.1 401"), "{response}");
 
-        let (status, stats) = api(&server, "GET", "/admin/server", &Value::Null).await;
+        let (status, stats) = api(&server, "GET", "/api/v1/server", &Value::Null).await;
         assert_eq!(status, 200);
         assert_eq!(stats["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(stats["database"]["engine"], "SQLite");

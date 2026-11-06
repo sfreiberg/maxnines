@@ -1,6 +1,7 @@
-//! The admin API, which shares the server's port. It needs the admin token,
-//! because a proxy may expose it.
+//! The versioned API, which shares the server's port. Everything the web pages can
+//! see and do is here too. It needs the admin token, because a proxy may expose it.
 
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 use axum::extract::{Path as UrlPath, Query, Request, State};
@@ -13,11 +14,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::error;
 
-use crate::alerting::{AlertRuleInput, ChannelInput, ChannelKind};
+use super::agents::suggestions;
+use super::fleet::Health;
+use super::host_list::HostSearch;
+use crate::alerting::{Alert, AlertRuleInput, ChannelInput, ChannelKind};
 use crate::app_state::AppState;
 use crate::facts::unflatten;
 use crate::metrics::{self, METRICS, Metric, SeriesResult, TimeRange, Unit, now_ms};
 use crate::models::{ConfigStatus, RuleInput};
+use crate::notifier::{self, Notice};
 use crate::presence::AgentPresence;
 use crate::registration::{AgentRecord, AgentState, hash_token};
 use crate::remote_checks::{RemoteCheck, RemoteCheckInput};
@@ -29,6 +34,7 @@ pub struct AgentView {
     #[serde(flatten)]
     pub agent: AgentRecord,
     pub online: bool,
+    pub health: Health,
     pub last_seen_ms: Option<u64>,
 }
 
@@ -52,53 +58,70 @@ pub struct TrustedFacts {
     source_address: Option<IpAddr>,
 }
 
+/// Where the API lives. A change that would break a client goes in a new version.
+pub const BASE_PATH: &str = "/api/v1";
+
 pub fn routes(state: AppState) -> Router<AppState> {
     Router::new()
-        .route("/admin/agents", get(list))
-        .route("/admin/agents/{id}/facts", get(facts))
-        .route("/admin/agents/{id}/facts/history", get(facts_history))
-        .route("/admin/agents/{id}/config", get(agent_config))
-        .route("/admin/agents/{id}/metrics/{metric}", get(agent_metric))
-        .route("/admin/metrics", get(metric_catalog))
-        .route("/admin/metrics/current", get(current_metrics))
-        .route("/admin/rules", get(list_rules).post(create_rule))
+        .route("/agents", get(list))
+        .route("/agents/{id}/facts", get(facts))
+        .route("/agents/{id}/facts/history", get(facts_history))
+        .route("/agents/{id}/config", get(agent_config))
+        .route("/agents/{id}/metrics/{metric}", get(agent_metric))
+        .route("/metrics", get(metric_catalog))
+        .route("/metrics/current", get(current_metrics))
+        .route("/rules", get(list_rules).post(create_rule))
         .route(
-            "/admin/rules/{id}",
+            "/rules/{id}",
             get(show_rule).put(update_rule).delete(delete_rule),
         )
-        .route("/admin/server", get(server_stats))
-        .route("/admin/alerts", get(list_alerts))
+        .route("/server", get(server_stats))
+        .route("/alerts", get(list_alerts))
         .route(
-            "/admin/alert-rules",
+            "/alert-rules",
             get(list_alert_rules).post(create_alert_rule),
         )
         .route(
-            "/admin/alert-rules/{id}",
+            "/alert-rules/{id}",
             get(show_alert_rule)
                 .put(update_alert_rule)
                 .delete(delete_alert_rule),
         )
         .route(
-            "/admin/notification-channels",
+            "/notification-channels",
             get(list_channels).post(create_channel),
         )
         .route(
-            "/admin/notification-channels/{id}",
+            "/notification-channels/{id}",
             get(show_channel).put(update_channel).delete(delete_channel),
         )
         .route(
-            "/admin/remote-checks",
+            "/remote-checks",
             get(list_remote_checks).post(create_remote_check),
         )
         .route(
-            "/admin/remote-checks/{id}",
+            "/remote-checks/{id}",
             get(show_remote_check)
                 .put(update_remote_check)
                 .delete(delete_remote_check),
         )
-        .route("/admin/agents/{id}/approve", post(approve))
-        .route("/admin/agents/{id}/revoke", post(revoke))
+        .route("/agents/filter-options", get(filter_options))
+        .route("/agents/{id}/approve", post(approve))
+        .route("/agents/{id}/revoke", post(revoke))
+        .route("/rules/preview", post(preview_rule))
+        .route("/notification-channels/{id}/test", post(test_channel))
         .route_layer(middleware::from_fn_with_state(state, require_token))
+        .fallback(no_such_route)
+}
+
+/// Clients expect an answer they can read, rather than the web pages' not found page.
+async fn no_such_route() -> Response {
+    let body = Json(json!({ "error": "There's nothing at this address" }));
+    (StatusCode::NOT_FOUND, body).into_response()
+}
+
+fn failed(status: StatusCode, error: &str) -> Response {
+    (status, Json(json!({ "error": error }))).into_response()
 }
 
 async fn require_token(State(state): State<AppState>, request: Request, next: Next) -> Response {
@@ -114,21 +137,64 @@ async fn require_token(State(state): State<AppState>, request: Request, next: Ne
     }
 }
 
-async fn list(State(state): State<AppState>) -> Json<Vec<AgentView>> {
-    let agents = state.registry.list().await;
-    let views = agents
+#[derive(Deserialize)]
+struct ListParams {
+    /// A filter, written as in the box on the agents page.
+    q: Option<String>,
+}
+
+async fn list(State(state): State<AppState>, Query(params): Query<ListParams>) -> Response {
+    let data = async {
+        let search = HostSearch::load(&state, params.q.as_deref()).await?;
+        let alerts = state.database.open_alerts().await?;
+        anyhow::Ok((search, alerts))
+    };
+    let (search, open) = match data.await {
+        Ok(data) => data,
+        Err(error) => return server_error(&error),
+    };
+    if let Some(error) = &search.error {
+        return failed(StatusCode::BAD_REQUEST, error);
+    }
+    let mut alerts: BTreeMap<&str, Vec<&Alert>> = BTreeMap::new();
+    for alert in &open {
+        alerts.entry(&alert.agent_id).or_default().push(alert);
+    }
+
+    let views: Vec<AgentView> = state
+        .registry
+        .list()
+        .await
         .into_iter()
-        .filter(|agent| !agent.is_local())
+        .filter(|agent| !agent.is_local() && search.includes(&agent.id, &agent.host))
         .map(|agent| {
             let presence: Option<AgentPresence> = state.presence.get(&agent.id);
+            let online = presence.as_ref().is_some_and(|p| p.online);
+            let mine = alerts.get(agent.id.as_str()).map_or(&[][..], Vec::as_slice);
             AgentView {
-                online: presence.is_some_and(|p| p.online),
+                online,
+                health: Health::of(online, mine),
                 last_seen_ms: presence.map(|p| p.last_seen_ms),
                 agent,
             }
         })
         .collect();
-    Json(views)
+    Json(views).into_response()
+}
+
+#[derive(Deserialize)]
+struct FilterOptionParams {
+    term: Option<String>,
+}
+
+async fn filter_options(
+    State(state): State<AppState>,
+    Query(params): Query<FilterOptionParams>,
+) -> Response {
+    match suggestions(&state, &params.term.unwrap_or_default()).await {
+        Ok(found) => Json(found).into_response(),
+        Err(error) => server_error(&error),
+    }
 }
 
 async fn facts(State(state): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
@@ -259,6 +325,27 @@ async fn agent_metric(
 async fn list_rules(State(state): State<AppState>) -> Response {
     match state.database.list_rules().await {
         Ok(rules) => Json(rules).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+#[derive(Deserialize)]
+struct PreviewParams {
+    /// The saved rule this would replace, if any.
+    id: Option<i64>,
+}
+
+/// What saving a rule would do, without saving it.
+async fn preview_rule(
+    State(state): State<AppState>,
+    Query(params): Query<PreviewParams>,
+    Json(input): Json<RuleInput>,
+) -> Response {
+    if let Some(response) = refuse_rule(&state, &input, params.id).await {
+        return response;
+    }
+    match state.preview_rule(params.id, input).await {
+        Ok(preview) => Json(preview).into_response(),
         Err(error) => server_error(&error),
     }
 }
@@ -557,5 +644,18 @@ async fn decide(state: &AppState, id: &str, decision: AgentState) -> Response {
         Ok(Some(agent)) => Json(agent).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),
+    }
+}
+
+/// Sends a test notification. The error is the same one the channels page shows.
+async fn test_channel(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    let channel = match state.database.get_channel(id).await {
+        Ok(Some(channel)) => channel,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return server_error(&error),
+    };
+    match notifier::send(channel, Notice::test(), None, state.senders.clone()).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => failed(StatusCode::BAD_GATEWAY, &format!("{error:#}")),
     }
 }

@@ -370,7 +370,7 @@ async fn filter_options(
     }
 }
 
-async fn suggestions(state: &AppState, term: &str) -> anyhow::Result<Vec<Suggestion>> {
+pub async fn suggestions(state: &AppState, term: &str) -> anyhow::Result<Vec<Suggestion>> {
     let Some(value) = PartialValue::of(term) else {
         return Ok(suggest_names(term, state.database.fact_names().await?));
     };
