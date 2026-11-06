@@ -3063,6 +3063,30 @@ fn hosts_in(response: &str) -> Vec<String> {
     hosts
 }
 
+/// The addresses in the API's routes, read from its source so a new one can't be
+/// missed.
+fn api_routes() -> Vec<&'static str> {
+    let source = include_str!("controllers/api.rs");
+    let start = source.find("pub fn routes").unwrap();
+    let end = source.find(".route_layer(").unwrap();
+    source[start..end]
+        .split('"')
+        .filter(|text| text.starts_with('/'))
+        .collect()
+}
+
+#[test]
+fn every_api_route_is_documented() {
+    let docs = include_str!("../../../docs/api.md");
+    let routes = api_routes();
+
+    assert!(routes.len() > 20, "{routes:?}");
+    for route in routes {
+        let heading = format!(" /api/v1{route}`");
+        assert!(docs.contains(&heading), "{route} isn't in docs/api.md");
+    }
+}
+
 #[tokio::test]
 async fn the_api_lives_under_its_version() {
     let server = start().await;
