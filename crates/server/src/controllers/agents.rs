@@ -18,6 +18,8 @@ use crate::app_state::AppState;
 use crate::fact_history::{describe_history, format_time};
 use crate::facts::{FlatFacts, fact_text, unflatten};
 use crate::host_filter::{MAX_SUGGESTIONS, PartialValue, Suggestion, suggest_names};
+use crate::metric_charts::format_value;
+use crate::metrics::Unit;
 use crate::metrics::now_ms;
 use crate::models::ConfigStatus;
 use crate::registration::{AgentRecord, AgentState};
@@ -440,6 +442,10 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
     let flat: FlatFacts = current.into_iter().map(|f| (f.name, f.value)).collect();
     let mut facts = Vec::new();
     fact_rows("", &unflatten(&flat), &mut facts);
+    let own_memory = match state.metrics.latest_output(&id, "agent", now_ms()).await {
+        Ok(output) => output.and_then(|agent| agent["memory_bytes"].as_f64()),
+        Err(error) => return server_error(&error),
+    };
     let uptime = match state.metrics.latest_output(&id, "host", now_ms()).await {
         Ok(output) => output.and_then(|host| host["uptime_secs"].as_u64()),
         Err(error) => return server_error(&error),
@@ -472,6 +478,10 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         .with("has_facts", &!flat.is_empty())
         .with("alerts", &alerts)
         .with("uptime", &uptime.map(format_uptime))
+        .with(
+            "own_memory",
+            &own_memory.map(|bytes| format_value(Unit::Bytes, bytes)),
+        )
         .with("os", &os_of(&flat))
         .with("source", &presence.map(|p| p.source.to_string()))
         .with("agent_version", &text_fact(&flat, "agent.version"))

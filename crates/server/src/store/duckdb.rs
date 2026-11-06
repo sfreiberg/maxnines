@@ -467,10 +467,26 @@ impl DuckDbStore {
 
         let piece = format!("{chosen} AND series_id <= $4");
         let values = params![metric, hour, hour + HOUR_MS, up_to];
+        // A series can only have one value at a moment, so anything more is a sample
+        // sent twice, which the writer can't catch after a restart. That covers rows
+        // that arrived late for an hour already sorted too.
+        let already_sorted = format!(
+            "SELECT series_id, time FROM samples
+             WHERE metric_id = {metric}
+               AND time >= epoch_ms({hour}::BIGINT)
+               AND time < epoch_ms({next_hour}::BIGINT)
+               AND series_id BETWEEN {first} AND {up_to}",
+            next_hour = hour + HOUR_MS,
+        );
         let transaction = self.connection.transaction()?;
         transaction.execute(
             &format!(
-                "INSERT INTO samples SELECT * FROM samples_recent {piece} ORDER BY series_id, time"
+                "INSERT INTO samples
+                 SELECT DISTINCT ON (series_id, time) r.*
+                 FROM samples_recent r
+                 ANTI JOIN ({already_sorted}) sorted USING (series_id, time)
+                 {piece}
+                 ORDER BY series_id, time"
             ),
             values,
         )?;
@@ -2258,6 +2274,78 @@ mod tests {
 
         // 10 and 30 bytes over 10 seconds.
         assert_eq!(line(&result.series[0]), [4.0]);
+    }
+
+    fn stored_rows(store: &DuckDbStore) -> i64 {
+        store
+            .connection
+            .query_row("SELECT count(*) FROM all_samples", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_sample_sent_twice_is_stored_once_after_tidying() {
+        let mut store = in_memory();
+        for agent in ["a", "a", "b"] {
+            write_metric(
+                &mut store,
+                agent,
+                1000,
+                "cpu",
+                json!({ "usage_percent": 5.0 }),
+            );
+        }
+        write_metric(
+            &mut store,
+            "a",
+            2000,
+            "cpu",
+            json!({ "usage_percent": 6.0 }),
+        );
+        assert_eq!(stored_rows(&store), 4);
+
+        while store.tidy(HOUR_MS * 2).unwrap() {}
+
+        assert_eq!(
+            stored_rows(&store),
+            3,
+            "a's repeat is gone, and nothing else"
+        );
+    }
+
+    #[test]
+    fn a_repeat_arriving_after_its_hour_was_tidied_is_dropped_too() {
+        let mut store = in_memory();
+        write_metric(
+            &mut store,
+            "a",
+            1000,
+            "cpu",
+            json!({ "usage_percent": 5.0 }),
+        );
+        while store.tidy(HOUR_MS * 2).unwrap() {}
+
+        write_metric(
+            &mut store,
+            "a",
+            1000,
+            "cpu",
+            json!({ "usage_percent": 5.0 }),
+        );
+        write_metric(
+            &mut store,
+            "a",
+            3000,
+            "cpu",
+            json!({ "usage_percent": 7.0 }),
+        );
+        while store.tidy(HOUR_MS * 2).unwrap() {}
+
+        assert_eq!(
+            stored_rows(&store),
+            2,
+            "the late sample stays, the repeat doesn't"
+        );
     }
 
     #[test]

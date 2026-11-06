@@ -153,8 +153,8 @@ pub enum WriterCommand {
 
 /// The samples each agent sent last. An agent sends a sample again if it never heard
 /// that it was stored, which happens when a connection ends at the wrong moment, and
-/// those shouldn't be stored twice. A server restart forgets these, so the odd sample
-/// can still be stored twice then.
+/// those shouldn't be stored twice. This catches them straight away. A server restart
+/// forgets these, so the store also drops repeats when it tidies.
 #[derive(Default)]
 struct RecentSamples(HashMap<String, VecDeque<u64>>);
 

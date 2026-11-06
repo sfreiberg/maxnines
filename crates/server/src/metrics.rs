@@ -717,6 +717,22 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::WithData,
     },
     Metric {
+        name: "agent.memory",
+        title: "Agent memory",
+        unit: Unit::Bytes,
+        collector: "agent",
+        source: Source::Fields(&[("Memory", Reading::Field("$.memory_bytes"))]),
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "agent.cpu",
+        title: "Agent CPU",
+        unit: Unit::Percent,
+        collector: "agent",
+        source: Source::Fields(&[("CPU", Reading::Field("$.cpu_percent"))]),
+        chart: ShowChart::WithData,
+    },
+    Metric {
         name: "host.uptime",
         title: "Uptime",
         unit: Unit::Seconds,

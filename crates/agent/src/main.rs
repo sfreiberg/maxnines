@@ -6,6 +6,7 @@ mod custom;
 mod facts;
 mod files;
 mod identity;
+mod own_usage;
 mod saved_config;
 mod services;
 mod spool;
@@ -30,6 +31,7 @@ use background::jitter;
 use collector::Collector;
 use config::Config;
 use custom::Definitions;
+use own_usage::OwnUsageCollector;
 use websocket::{ConfigUpdate, ServerLink};
 
 #[derive(Debug, Parser)]
@@ -107,7 +109,9 @@ impl Monitoring {
     fn start(update: &ConfigUpdate, definitions: &Definitions) -> Result<Self> {
         let collectors = catch_unwind(AssertUnwindSafe(|| {
             update.config.validate()?;
-            collector::build_all(&update.config, definitions)
+            let mut collectors = collector::build_all(&update.config, definitions)?;
+            collectors.push(Box::new(OwnUsageCollector::new()?));
+            anyhow::Ok(collectors)
         }))
         .map_err(|_| anyhow!("building collectors panicked"))??;
 
@@ -379,7 +383,8 @@ mod tests {
         let started = Monitoring::start(&update("v1", config), &Definitions::new()).unwrap();
 
         assert_eq!(started.version, "v1");
-        assert_eq!(started.collectors.len(), 1);
+        // What was asked for, and the agent reporting on itself.
+        assert_eq!(started.collectors.len(), 2);
     }
 
     #[tokio::test]
