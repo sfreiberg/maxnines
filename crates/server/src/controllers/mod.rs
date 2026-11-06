@@ -19,6 +19,7 @@ mod notification_channels;
 mod overview;
 mod remote_checks;
 mod rules;
+mod server;
 mod sessions;
 mod settings;
 mod update_notice;
@@ -64,6 +65,7 @@ pub fn app(state: AppState) -> Router {
     let pages = Router::new()
         .merge(overview::routes())
         .merge(settings::routes())
+        .merge(compressed(server::routes()))
         .merge(api_keys::routes())
         .merge(users::routes())
         .merge(agents::routes())
@@ -132,6 +134,7 @@ fn section_of(template: &str) -> &'static str {
         "metrics" => "metrics",
         "remote_checks" => "checks",
         "alerts" => "alerts",
+        "server" => "server",
         "settings" | "rules" | "alert_rules" | "notification_channels" => "settings",
         "profile" => "profile",
         _ => "",

@@ -65,7 +65,7 @@ async fn every_page_needs_someone_signed_in() {
         "/alerts",
         "/rules",
         "/settings",
-        "/settings/server",
+        "/server",
         "/settings/users",
         "/settings/api-keys",
         "/profile",

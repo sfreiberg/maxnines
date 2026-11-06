@@ -892,10 +892,12 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/server"
 ### The server's own history
 
 The server records its own numbers every 15 seconds as the built-in agent `server`,
-so they work like any agent's metrics, including in alert rules. Read them with the
-same route, using metrics such as `server.memory`, `server.cpu`, `server.samples`,
-`server.write_queue`, `server.agents`, `server.alerts`, `server.database_size` and
-`server.open_files`:
+along with `cpu`, `memory`, `disk` and `network` for the machine it's on. Nothing has
+to be installed for this. They work like any agent's metrics, including in alert
+rules. Read them with the same route, using metrics such as `server.metrics` (metrics
+stored per second), `server.samples`, `server.write_queue`, `server.write_time`,
+`server.agents`, `server.alerts`, `server.database_size`, `server.series`,
+`server.memory`, `server.cpu`, `server.open_files` and `cpu.usage`:
 
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" \

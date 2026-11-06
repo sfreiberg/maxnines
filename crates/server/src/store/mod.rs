@@ -83,6 +83,9 @@ pub trait MetricsReader: Send + Sync {
     /// How the database itself is doing. `hour_ago_ms` is the start of the last
     /// hour, for how much is arriving now.
     fn stats(&self, hour_ago_ms: i64) -> Result<StoreStats>;
+
+    /// How many separate series have been stored, which is what storage grows with.
+    fn series_count(&self) -> Result<u64>;
 }
 
 /// How a metrics database is doing. Sizes are as the database words them.
@@ -111,6 +114,10 @@ pub struct CollectorStats {
 pub struct WriteCounts {
     pub written: AtomicU64,
     pub failed: AtomicU64,
+    /// How many readings those samples held.
+    pub values: AtomicU64,
+    /// The longest write since this was last reset, as a sign of a struggling disk.
+    pub slowest_write_ms: AtomicU64,
 }
 
 pub fn open(config: &MetricsConfig) -> Result<Box<dyn Store>> {
@@ -267,13 +274,21 @@ fn tidy(store: &mut dyn Store) -> bool {
 /// A failed write or panic only affects the sample that caused it, by trying the rest
 /// again one at a time. Returns which were saved.
 fn save(store: &mut dyn Store, samples: &[NewSample], counts: &WriteCounts) -> Vec<bool> {
+    let started = Instant::now();
     let error = match catch_unwind(AssertUnwindSafe(|| store.write(samples))) {
         Ok(Ok(())) => {
             // From agents, as the server recording itself isn't ingesting anything.
-            let from_agents = samples.iter().filter(|new| new.agent_id != LOCAL_AGENT_ID);
+            let from_agents = || samples.iter().filter(|new| new.agent_id != LOCAL_AGENT_ID);
             counts
                 .written
-                .fetch_add(from_agents.count() as u64, Ordering::Relaxed);
+                .fetch_add(from_agents().count() as u64, Ordering::Relaxed);
+            let values = from_agents().flat_map(|new| new.sample.metrics.values());
+            counts
+                .values
+                .fetch_add(values.map(count_values).sum(), Ordering::Relaxed);
+            counts
+                .slowest_write_ms
+                .fetch_max(started.elapsed().as_millis() as u64, Ordering::Relaxed);
             return vec![true; samples.len()];
         }
         Ok(Err(error)) => format!("{error:#}"),
@@ -288,6 +303,16 @@ fn save(store: &mut dyn Store, samples: &[NewSample], counts: &WriteCounts) -> V
         counts.failed.fetch_add(1, Ordering::Relaxed);
         error!(error, "write failed, sample not saved");
         vec![false]
+    }
+}
+
+/// How many readings a collector's output holds.
+fn count_values(value: &Value) -> u64 {
+    match value {
+        Value::Null => 0,
+        Value::Array(items) => items.iter().map(count_values).sum(),
+        Value::Object(fields) => fields.values().map(count_values).sum(),
+        _ => 1,
     }
 }
 
@@ -346,6 +371,10 @@ pub mod testing {
 
         fn stats(&self, _hour_ago_ms: i64) -> Result<StoreStats> {
             Ok(StoreStats::default())
+        }
+
+        fn series_count(&self) -> Result<u64> {
+            Ok(0)
         }
     }
 
@@ -483,6 +512,18 @@ mod tests {
         writer.blocking_send(WriterCommand::Stop).unwrap();
         thread.join().unwrap();
         assert_eq!(saved.samples.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn every_reading_in_a_collectors_output_is_counted() {
+        let output = serde_json::json!({
+            "usage": 1.5,
+            "name": "text",
+            "missing": null,
+            "per_core": [1, 2],
+            "load": { "one": 1, "five": { "deep": 2 } },
+        });
+        assert_eq!(count_values(&output), 6);
     }
 
     #[test]

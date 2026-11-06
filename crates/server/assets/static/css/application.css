@@ -266,6 +266,7 @@ legend { padding: 0 8px; color: var(--muted); font-size: 12px; font-weight: 500;
 
 /* Charts */
 .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(520px, 100%), 1fr)); gap: 16px; }
+.chart-section { display: flex; flex-direction: column; gap: 12px; }
 .chart-card { display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 20px 24px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
 .chart-card .empty, .chart-card .hint { font-size: 14px; }
 .chart-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; font-size: 14px; font-weight: 500; }

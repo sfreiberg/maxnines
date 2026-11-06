@@ -202,7 +202,7 @@ fn pages_to_view(agent_id: &str) -> Vec<(String, String)> {
         "/agents?q=os%3Dlinux",
         "/metrics",
         "/alerts",
-        "/settings/server",
+        "/server",
     ]
     .iter()
     .map(|path| ((*path).to_string(), (*path).to_string()))

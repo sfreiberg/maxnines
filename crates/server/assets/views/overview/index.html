@@ -27,7 +27,7 @@
     <span class="stats-value{% if checks_down > 0 %} bad{% endif %}">{{ checks_up }} / {{ check_count }}</span>
     <span class="stats-note">{% if checks_down > 0 %}{{ checks_down }} down{% elif check_count == 0 %}None yet{% elif checks_up < check_count %}Waiting for results{% else %}All up{% endif %}</span>
   </a>
-  <a class="stats-cell" href="/settings/server">
+  <a class="stats-cell" href="/server">
     <span class="label">Samples saved</span>
     <span class="stats-value">{{ samples_written }}</span>
     <span class="stats-note">Since the server started</span>

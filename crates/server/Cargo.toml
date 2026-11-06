@@ -18,6 +18,7 @@ hex.workspace = true
 humantime = "2.3"
 ipnet = "2.12.2"
 maxnines-checks.workspace = true
+maxnines-collectors.workspace = true
 maxnines-protocol.workspace = true
 ring.workspace = true
 sea-orm = { version = "2.0.4", default-features = false, features = ["macros", "runtime-tokio-rustls", "sqlx-mysql", "sqlx-postgres", "sqlx-sqlite"] }

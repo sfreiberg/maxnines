@@ -562,6 +562,14 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::WithData,
     },
     Metric {
+        name: "server.metrics",
+        title: "Metrics per second",
+        unit: Unit::PerSecond,
+        collector: "server",
+        source: Source::Fields(&[("Metrics", Reading::Rate("$.values_written"))]),
+        chart: ShowChart::WithData,
+    },
+    Metric {
         name: "server.memory",
         title: "Server memory",
         unit: Unit::Bytes,
@@ -579,7 +587,7 @@ pub const METRICS: &[Metric] = &[
     },
     Metric {
         name: "server.samples",
-        title: "Samples saved",
+        title: "Samples per second",
         unit: Unit::PerSecond,
         collector: "server",
         source: Source::Fields(&[
@@ -594,6 +602,22 @@ pub const METRICS: &[Metric] = &[
         unit: Unit::Number,
         collector: "server",
         source: Source::Fields(&[("Waiting", Reading::Field("$.write_queue"))]),
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "server.write_time",
+        title: "Slowest write",
+        unit: Unit::Milliseconds,
+        collector: "server",
+        source: Source::Fields(&[("Slowest", Reading::Field("$.slowest_write_ms"))]),
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "server.series",
+        title: "Series stored",
+        unit: Unit::Number,
+        collector: "server",
+        source: Source::Fields(&[("Series", Reading::Field("$.series"))]),
         chart: ShowChart::WithData,
     },
     Metric {
@@ -939,6 +963,11 @@ impl Metrics {
         })
         .await
         .context("reading metrics")?
+    }
+
+    pub async fn series_count(&self) -> Result<u64> {
+        let reader = self.reader.clone();
+        tokio::task::spawn_blocking(move || reader.series_count()).await?
     }
 
     pub async fn current(&self, now_ms: i64) -> Result<BTreeMap<String, CurrentValues>> {

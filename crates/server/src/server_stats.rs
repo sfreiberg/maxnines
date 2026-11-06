@@ -1,12 +1,14 @@
 //! How the server itself is doing: what the Server page and admin API report.
 
 use std::collections::BTreeMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use maxnines_collectors::{Collector, WARMUP, machine};
 use maxnines_protocol::Sample;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -83,6 +85,57 @@ impl ServerStatus {
 pub struct Recorded {
     written: u64,
     failed: u64,
+    values: u64,
+    /// What's read about the machine, as an agent would. Nothing needs installing, as
+    /// that makes no sense everywhere a server can run, and each keeps state between
+    /// reads, which is why these stay here.
+    collectors: Vec<Box<dyn Collector + Send>>,
+}
+
+impl Recorded {
+    /// Also reads the machine, rather than only the server.
+    pub fn with_machine() -> Self {
+        match machine::all() {
+            Ok(collectors) => Self {
+                collectors,
+                ..Self::default()
+            },
+            Err(error) => {
+                let error = format!("{error:#}");
+                warn!(
+                    error,
+                    "can't read the server's machine, so its charts will be empty"
+                );
+                Self::default()
+            }
+        }
+    }
+}
+
+/// Reads the machine, off the async threads as it can be slow. One failing only
+/// leaves that one out.
+async fn read_machine(recorded: &mut Recorded) -> BTreeMap<String, Value> {
+    let mut collectors = std::mem::take(&mut recorded.collectors);
+    let read = tokio::task::spawn_blocking(move || {
+        let mut readings = BTreeMap::new();
+        for collector in &mut collectors {
+            match catch_unwind(AssertUnwindSafe(|| collector.collect())) {
+                Ok(Ok(value)) => {
+                    readings.insert(collector.name().to_string(), value);
+                }
+                Ok(Err(error)) => warn!(
+                    collector = collector.name(),
+                    error = format!("{error:#}"),
+                    "reading the server's machine failed"
+                ),
+                Err(_) => error!(collector = collector.name(), "collector panicked"),
+            }
+        }
+        (collectors, readings)
+    });
+    let (collectors, readings) = read.await.unwrap_or_default();
+    recorded.collectors = collectors;
+    readings
 }
 
 /// What the server reports about itself, in the shape an agent would. These are the
@@ -99,7 +152,11 @@ async fn own_numbers(state: &AppState, recorded: &mut Recorded) -> Value {
     let failed = status.writes.failed.load(Ordering::Relaxed);
     let new_written = written - recorded.written;
     let new_failed = failed - recorded.failed;
-    *recorded = Recorded { written, failed };
+    let values = status.writes.values.load(Ordering::Relaxed);
+    let new_values = values - recorded.values;
+    recorded.written = written;
+    recorded.failed = failed;
+    recorded.values = values;
 
     let agents = state.registry.list().await;
     let real = || agents.iter().filter(|agent| !agent.is_local());
@@ -110,6 +167,9 @@ async fn own_numbers(state: &AppState, recorded: &mut Recorded) -> Value {
         "open_files": process.as_ref().and_then(|process| process.open_files),
         "samples_written": new_written,
         "samples_failed": new_failed,
+        "values_written": new_values,
+        "slowest_write_ms": status.writes.slowest_write_ms.swap(0, Ordering::Relaxed),
+        "series": state.metrics.series_count().await.ok(),
         "write_queue": state.writer.max_capacity() - state.writer.capacity(),
         "agents_online": real().filter(online).count(),
         "agents_approved": real()
@@ -126,9 +186,11 @@ async fn own_numbers(state: &AppState, recorded: &mut Recorded) -> Value {
 }
 
 pub async fn record_once(state: &AppState, recorded: &mut Recorded) {
+    let mut metrics = read_machine(recorded).await;
+    metrics.insert("server".to_string(), own_numbers(state, recorded).await);
     let sample = Sample {
         timestamp_ms: now_ms() as u64,
-        metrics: BTreeMap::from([("server".to_string(), own_numbers(state, recorded).await)]),
+        metrics,
     };
     let command = WriterCommand::Save(NewSample {
         agent_id: LOCAL_AGENT_ID.to_string(),
@@ -144,7 +206,11 @@ pub async fn record_once(state: &AppState, recorded: &mut Recorded) {
 /// charts and alert rules like everything else.
 pub fn spawn_recorder(state: AppState) {
     tokio::spawn(async move {
-        let mut recorded = Recorded::default();
+        let mut recorded = tokio::task::spawn_blocking(Recorded::with_machine)
+            .await
+            .unwrap_or_default();
+        tokio::time::sleep(WARMUP).await;
+
         let mut every = tokio::time::interval(RECORD_EVERY);
         every.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {

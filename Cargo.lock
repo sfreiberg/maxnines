@@ -2727,6 +2727,7 @@ dependencies = [
  "ipnet",
  "lettre",
  "maxnines-checks",
+ "maxnines-collectors",
  "maxnines-protocol",
  "ring",
  "rust-embed",

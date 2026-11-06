@@ -1015,6 +1015,13 @@ impl MetricsReader for DuckDbReader {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    fn series_count(&self) -> Result<u64> {
+        let connection = self.connection()?;
+        let count: i64 =
+            connection.query_row("SELECT count(*) FROM series", [], |row| row.get(0))?;
+        Ok(count.try_into()?)
+    }
+
     fn stats(&self, hour_ago_ms: i64) -> Result<StoreStats> {
         let connection = self.connection()?;
         let (size, write_ahead_log, memory_used, memory_limit) = connection.query_row(
@@ -1931,6 +1938,20 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn series_are_counted_once_however_often_they_report() {
+        let mut store = in_memory();
+        let reader = store.reader().unwrap();
+        assert_eq!(reader.series_count().unwrap(), 0);
+
+        for time in [1000, 2000] {
+            let cpu = json!({ "usage_percent": 1.0, "load": 2.0 });
+            write_metric(&mut store, "a", time, "cpu", cpu);
+        }
+
+        assert_eq!(reader.series_count().unwrap(), 2);
     }
 
     #[test]

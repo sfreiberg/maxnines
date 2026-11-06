@@ -1552,7 +1552,7 @@ async fn only_pages_that_update_themselves_say_they_are_live() {
     let server = start().await;
     let mut browser = Browser::default();
 
-    for path in ["/", "/agents", "/alerts", "/settings/server"] {
+    for path in ["/", "/agents", "/alerts", "/server"] {
         let page = browser.get(&server, path).await;
         assert!(page.body.contains(r#"id="live-status""#), "{path}");
     }
@@ -2607,7 +2607,7 @@ async fn pages_of_data_update_in_place() {
         ("/alerts".to_string(), "15s"),
         ("/checks".to_string(), "15s"),
         ("/metrics".to_string(), "15s"),
-        ("/settings/server".to_string(), "15s"),
+        ("/server".to_string(), "15s"),
         (format!("/agents/{}/metrics", agent.id()), "60s"),
         (format!("/agents/{}/metrics/cpu.usage", agent.id()), "60s"),
     ] {
@@ -3141,6 +3141,10 @@ impl MetricsReader for BrokenReader {
 
     fn stats(&self, _hour_ago_ms: i64) -> anyhow::Result<crate::store::StoreStats> {
         anyhow::bail!("deliberate test failure with a secret in it");
+    }
+
+    fn series_count(&self) -> anyhow::Result<u64> {
+        Ok(0)
     }
 }
 

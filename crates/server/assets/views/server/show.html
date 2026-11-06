@@ -1,13 +1,12 @@
 {% extends "layouts/live.html" %}
 {% block title %}Server · MaxNines{% endblock title %}
 {% block content %}
-<p class="breadcrumb"><a href="/settings">Settings</a></p>
 <div class="title-row">
   <div>
     <h1>Server</h1>
     <p class="subtitle">Running for {{ server.uptime }}. This page updates by itself.</p>
   </div>
-  <a class="button secondary" href="/agents/server/metrics">History</a>
+  <a class="button secondary" href="/agents/{{ agent_id }}/metrics?range={{ range }}">All charts</a>
 </div>
 
 {% if server.alert_rules_stalled %}
@@ -17,6 +16,51 @@
 <p class="error">{{ server.samples_failed }} sample{% if server.samples_failed != 1 %}s{% endif %} couldn't be saved since the server started. Check the server's log.</p>
 {% endif %}
 
+<section class="stats" aria-label="At a glance">
+  <div class="stats-cell">
+    <span class="label">Metrics per second</span>
+    <span class="stats-value">{{ metrics_per_second }}</span>
+    <span class="stats-note">{{ samples_per_second }} samples a second</span>
+  </div>
+  <a class="stats-cell" href="/agents">
+    <span class="label">Machines checking in</span>
+    <span class="stats-value{% if server.agents_online < server.agents_approved %} warn{% endif %}">{{ server.agents_online }} / {{ server.agents_approved }}</span>
+    <span class="stats-note">{% if server.agents_waiting > 0 %}{{ server.agents_waiting }} waiting for approval{% elif server.agents_online < server.agents_approved %}{{ server.agents_approved - server.agents_online }} offline{% else %}All online{% endif %}</span>
+  </a>
+  <div class="stats-cell">
+    <span class="label">Metrics database</span>
+    <span class="stats-value">{% if server.metrics %}{{ server.metrics.size }}{% else %}–{% endif %}</span>
+    <span class="stats-note">{{ series }} series</span>
+  </div>
+  <a class="stats-cell" href="/alerts">
+    <span class="label">Alerts firing</span>
+    <span class="stats-value{% if server.alerts_firing > 0 %} bad{% endif %}">{{ server.alerts_firing }}</span>
+    <span class="stats-note">{% if server.last_alert_pass %}Last checked {{ server.last_alert_pass }}{% else %}Not checked yet{% endif %}</span>
+  </a>
+</section>
+
+<nav class="tabs" aria-label="Time range">
+  {% for option in ranges %}
+  <a href="/server?range={{ option.key }}"{% if option.selected %} class="selected" aria-current="true"{% endif %}>{{ option.label }}</a>
+  {% endfor %}
+</nav>
+<p class="hint">Times are UTC. Hover over a chart to see that moment on all of them.</p>
+
+{% if charts_failed %}
+<p class="error">The charts couldn't be read. Check the server's log.</p>
+{% endif %}
+{% for section in sections %}
+<section class="chart-section">
+  <h2>{{ section.title }}</h2>
+  <div class="charts">
+    {% for chart in section.charts %}
+    {% include "metrics/_chart.html" %}
+    {% endfor %}
+  </div>
+</section>
+{% endfor %}
+
+<h2>Details</h2>
 <div class="split">
   <section class="card">
     <h2>This server</h2>

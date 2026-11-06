@@ -13,7 +13,6 @@ use super::{Page, fleet, server_error};
 use crate::app_state::AppState;
 use crate::metric_charts::{self, Chart, MAX_SERIES};
 use crate::metrics::{self, METRICS, Metric, ShowChart, TimeRange, Unit, now_ms};
-use crate::registration::AgentRecord;
 
 const HOUR_MS: i64 = 3_600_000;
 
@@ -130,44 +129,79 @@ pub fn check_row(check: &Value) -> Option<CheckRow> {
 }
 
 #[derive(Deserialize)]
-struct RangeParams {
+pub(super) struct RangeParams {
     range: Option<String>,
 }
 
 #[derive(Serialize)]
-struct RangeLink {
+pub(super) struct RangeLink {
     key: &'static str,
     label: &'static str,
     selected: bool,
 }
 
 /// A range nobody offered falls back to the shortest.
-fn selected_range(params: &RangeParams) -> (&'static str, &'static str, i64) {
+pub(super) fn selected_range(params: &RangeParams) -> (&'static str, &'static str, i64) {
     RANGES
         .into_iter()
         .find(|(key, _, _)| params.range.as_deref() == Some(*key))
         .unwrap_or(RANGES[0])
 }
 
-fn time_range(length_ms: i64) -> Option<TimeRange> {
+pub(super) fn time_range(length_ms: i64) -> Option<TimeRange> {
     let now = now_ms();
     TimeRange::new(now - length_ms, now)
 }
 
 async fn chart(
     state: &AppState,
-    agent: &AgentRecord,
+    agent_id: &str,
     metric: &'static Metric,
     range: TimeRange,
 ) -> anyhow::Result<Chart> {
     let result = state
         .metrics
-        .series(&agent.id, metric, range, MAX_SERIES)
+        .series(agent_id, metric, range, MAX_SERIES)
         .await?;
     Ok(metric_charts::build(metric, &result, range))
 }
 
-fn not_found(state: &AppState, token: &CsrfToken) -> Response {
+/// The links for choosing a range, with `selected` marked.
+pub(super) fn range_links(selected: &str) -> Vec<RangeLink> {
+    RANGES
+        .into_iter()
+        .map(|(key, label, _)| RangeLink {
+            key,
+            label,
+            selected: key == selected,
+        })
+        .collect()
+}
+
+/// Charts for these metrics, in this order. Each is its own query, so they run
+/// together rather than in turn.
+pub(super) async fn charts_for(
+    state: &AppState,
+    agent_id: &str,
+    metrics: &[&'static Metric],
+    range: TimeRange,
+) -> anyhow::Result<Vec<Chart>> {
+    let mut queries = JoinSet::new();
+    for (position, metric) in metrics.iter().copied().enumerate() {
+        let (state, agent_id) = (state.clone(), agent_id.to_string());
+        queries.spawn(async move { (position, chart(&state, &agent_id, metric, range).await) });
+    }
+
+    let mut charts = Vec::with_capacity(metrics.len());
+    while let Some(finished) = queries.join_next().await {
+        let (position, chart) = finished?;
+        charts.push((position, chart?));
+    }
+    charts.sort_by_key(|(position, _)| *position);
+    Ok(charts.into_iter().map(|(_, chart)| chart).collect())
+}
+
+pub(super) fn not_found(state: &AppState, token: &CsrfToken) -> Response {
     let page = Page::new(state, token, "errors/not_found.html");
     page.with_status(StatusCode::NOT_FOUND).render()
 }
@@ -186,41 +220,24 @@ async fn show(
         return not_found(&state, &token);
     };
 
-    // Each chart is its own query, so they run together rather than in turn.
-    let mut queries = JoinSet::new();
-    let shown = METRICS.iter().enumerate();
-    for (position, metric) in shown.filter(|(_, m)| m.chart != ShowChart::Never) {
-        let (state, agent) = (state.clone(), agent.clone());
-        queries.spawn(async move {
-            let result = chart(&state, &agent, metric, range).await;
-            (position, metric, result)
-        });
-    }
-
-    let mut charts = Vec::new();
-    while let Some(finished) = queries.join_next().await {
-        match finished {
-            Ok((position, metric, Ok(chart)))
-                if chart.has_data || (metric.chart == ShowChart::Always && !agent.is_local()) =>
-            {
-                charts.push((position, chart));
-            }
-            Ok((_, _, Ok(_))) => {}
-            Ok((_, _, Err(error))) => return server_error(&error),
-            Err(error) => return server_error(&error.into()),
-        }
-    }
-    charts.sort_by_key(|(position, _)| *position);
-    let charts: Vec<Chart> = charts.into_iter().map(|(_, chart)| chart).collect();
-
-    let ranges: Vec<RangeLink> = RANGES
-        .into_iter()
-        .map(|(key, label, _)| RangeLink {
-            key,
-            label,
-            selected: key == selected,
-        })
+    let shown: Vec<&'static Metric> = METRICS
+        .iter()
+        .filter(|metric| metric.chart != ShowChart::Never)
         .collect();
+    let charts = match charts_for(&state, &agent.id, &shown, range).await {
+        Ok(charts) => charts,
+        Err(error) => return server_error(&error),
+    };
+    let charts: Vec<Chart> = charts
+        .into_iter()
+        .zip(shown)
+        .filter(|(chart, metric)| {
+            chart.has_data || (metric.chart == ShowChart::Always && !agent.is_local())
+        })
+        .map(|(chart, _)| chart)
+        .collect();
+
+    let ranges = range_links(selected);
 
     // The server saves its checks one at a time, so no one sample has them all.
     let latest = if agent.is_local() {
@@ -277,7 +294,7 @@ async fn data(
         return not_found(&state, &token);
     };
 
-    match chart(&state, &agent, metric, range).await {
+    match chart(&state, &agent.id, metric, range).await {
         Ok(chart) => Page::new(&state, &token, "metrics/data.html")
             .with("agent_id", &agent.id)
             .with("host", &agent.host)

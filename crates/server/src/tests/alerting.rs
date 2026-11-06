@@ -77,6 +77,10 @@ impl MetricsReader for Script {
     fn stats(&self, _hour_ago_ms: i64) -> anyhow::Result<crate::store::StoreStats> {
         Ok(Default::default())
     }
+
+    fn series_count(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
 }
 
 /// A server with one connected agent, and an evaluator that started an hour ago.
@@ -3296,11 +3300,10 @@ mod pages {
 
 mod server_page {
     use super::*;
+    use crate::server_stats::{Recorded, record_once};
 
     #[tokio::test]
     async fn the_server_keeps_a_history_of_its_own_numbers() {
-        use crate::server_stats::{Recorded, record_once};
-
         let server = start_with_metrics().await;
         let local = server.state.database.load_agents().await.unwrap();
         let local = local.into_iter().find(|agent| agent.is_local()).unwrap();
@@ -3327,7 +3330,7 @@ mod server_page {
         assert!(page.body.contains("Agents"), "{}", page.body);
         // Charts for what the server doesn't report would only be empty.
         assert!(!page.body.contains("CPU usage"), "{}", page.body);
-        assert!(page.body.contains(r#"href="/settings/server""#));
+        assert!(page.body.contains(r#"href="/server""#));
 
         let metric = crate::metrics::find("server.agents").unwrap();
         let range = TimeRange::new(now_ms() - 60_000, now_ms() + 60_000).unwrap();
@@ -3351,8 +3354,11 @@ mod server_page {
     #[tokio::test]
     async fn the_server_page_links_to_its_history() {
         let server = start().await;
-        let page = Browser::default().get(&server, "/settings/server").await;
-        assert!(page.body.contains(r#"href="/agents/server/metrics""#));
+        let page = Browser::default().get(&server, "/server").await;
+        assert!(
+            page.body
+                .contains(r#"href="/agents/server/metrics?range=1h""#)
+        );
     }
 
     #[tokio::test]
@@ -3377,7 +3383,7 @@ mod server_page {
             .await
             .unwrap();
 
-        let page = Browser::default().get(&server, "/settings/server").await;
+        let page = Browser::default().get(&server, "/server").await;
         assert_eq!(page.status, 200, "{}", page.body);
         for text in [
             env!("CARGO_PKG_VERSION"),
@@ -3401,7 +3407,7 @@ mod server_page {
         let store = Box::new(crate::store::testing::MemoryStore(saved.clone()));
         let server = start_on("", store, Arc::new(BrokenReader), saved, None).await;
 
-        let page = Browser::default().get(&server, "/settings/server").await;
+        let page = Browser::default().get(&server, "/server").await;
         assert_eq!(page.status, 200, "{}", page.body);
         assert!(page.body.contains("couldn't be read"), "{}", page.body);
         assert!(
@@ -3420,7 +3426,7 @@ mod server_page {
         let server = start().await;
         server.state.database.break_for_test().await;
 
-        let page = Browser::default().get(&server, "/settings/server").await;
+        let page = Browser::default().get(&server, "/server").await;
         assert_eq!(page.status, 200, "{}", page.body);
         assert!(page.body.contains("couldn't be read"), "{}", page.body);
     }
@@ -3431,7 +3437,7 @@ mod server_page {
         let late = now_ms() - 10 * MINUTE_MS;
         evaluator(&server, late).evaluate(late).await.unwrap();
 
-        let page = Browser::default().get(&server, "/settings/server").await;
+        let page = Browser::default().get(&server, "/server").await;
         assert!(
             page.body.contains("Alert rules haven't run"),
             "{}",
@@ -3445,7 +3451,7 @@ mod server_page {
         let counts = &server.state.status.writes;
         counts.failed.store(3, std::sync::atomic::Ordering::Relaxed);
 
-        let page = Browser::default().get(&server, "/settings/server").await;
+        let page = Browser::default().get(&server, "/server").await;
         assert!(
             page.body.contains("3 samples couldn't be saved"),
             "{}",
@@ -3456,7 +3462,7 @@ mod server_page {
     #[tokio::test]
     async fn the_page_never_shows_a_database_url() {
         let server = start().await;
-        let page = Browser::default().get(&server, "/settings/server").await;
+        let page = Browser::default().get(&server, "/server").await;
         assert!(!page.body.contains("sqlite:"), "{}", page.body);
         assert!(!page.body.contains("://"), "{}", page.body);
     }
@@ -3475,13 +3481,82 @@ mod server_page {
     }
 
     #[tokio::test]
+    async fn the_dashboard_graphs_what_the_server_takes_in() {
+        let server = start_with_metrics().await;
+        let (_agent, mut client) = report_samples(&server, "/").await;
+        let mut recorded = Recorded::default();
+        record_once(&server.state, &mut recorded).await;
+        // A rate needs something to have arrived between two records.
+        send(&mut client, &full_sample(now_ms() as u64, "/")).await;
+        sleep(Duration::from_millis(200)).await;
+        record_once(&server.state, &mut recorded).await;
+
+        let metric = crate::metrics::find("server.metrics").unwrap();
+        let range = TimeRange::new(now_ms() - 60_000, now_ms() + 60_000).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let page = loop {
+            let found = server.state.metrics.series("server", metric, range, 8);
+            if !found.await.unwrap().series.is_empty() {
+                break Browser::default().get(&server, "/server").await;
+            }
+            assert!(Instant::now() < deadline, "no rate was recorded");
+            sleep(Duration::from_millis(20)).await;
+        };
+
+        assert_eq!(page.status, 200);
+        for heading in [
+            "Metrics per second",
+            "Samples per second",
+            "Slowest write",
+            "Series stored",
+            "Database size",
+            "Agents",
+            "CPU usage",
+        ] {
+            assert!(page.body.contains(heading), "{heading}: {}", page.body);
+        }
+        assert!(page.body.contains(r#"<svg class="chart""#));
+        assert!(page.body.contains(r#"href="/server?range=7d""#));
+    }
+
+    #[tokio::test]
+    async fn the_server_reports_on_its_own_machine() {
+        let server = start_with_metrics().await;
+        let mut recorded = Recorded::with_machine();
+        record_once(&server.state, &mut recorded).await;
+        sleep(Duration::from_millis(300)).await;
+        record_once(&server.state, &mut recorded).await;
+
+        let metric = crate::metrics::find("memory.usage").unwrap();
+        let range = TimeRange::new(now_ms() - 60_000, now_ms() + 60_000).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let found = server.state.metrics.series("server", metric, range, 8);
+            if !found.await.unwrap().series.is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "nothing about the machine");
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_old_address_of_the_server_page_still_works() {
+        let server = start().await;
+        let response = server
+            .http("GET", "/settings/server", Some(ADMIN_TOKEN))
+            .await;
+        assert!(response.starts_with("HTTP/1.1 308"), "{response}");
+        assert!(
+            response.to_lowercase().contains("location: /server"),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
     async fn settings_links_to_the_server_page() {
         let server = start().await;
         let page = Browser::default().get(&server, "/settings").await;
-        assert!(
-            page.body.contains(r#"href="/settings/server""#),
-            "{}",
-            page.body
-        );
+        assert!(page.body.contains(r#"href="/server""#), "{}", page.body);
     }
 }

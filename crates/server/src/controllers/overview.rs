@@ -8,7 +8,7 @@ use axum_csrf::CsrfToken;
 use serde::Serialize;
 
 use super::metrics::{CheckRow, check_row};
-use super::settings::count;
+use super::server::count;
 use super::{Page, fleet, server_error};
 use crate::alerting::Severity;
 use crate::app_state::AppState;

@@ -2,7 +2,7 @@
 {% block title %}{{ host }} metrics · MaxNines{% endblock title %}
 {% block refresh_every %}60s{% endblock refresh_every %}
 {% block content %}
-<p class="breadcrumb">{% if is_local %}<a href="/settings/server">Server</a>{% else %}<a href="/metrics">Metrics</a>{% endif %}</p>
+<p class="breadcrumb">{% if is_local %}<a href="/server">Server</a>{% else %}<a href="/metrics">Metrics</a>{% endif %}</p>
 <div class="title-row">
   <h1>{{ host }}</h1>
   {% if not is_local %}<a class="button secondary" href="/agents/{{ agent_id }}">Agent details</a>{% endif %}
@@ -29,58 +29,7 @@
 
 <div class="charts">
   {% for chart in charts %}
-  <section class="chart-card">
-    <div class="chart-heading">
-      <h2>{{ chart.title }}</h2>
-      {% if chart.has_data %}<a href="/agents/{{ agent_id }}/metrics/{{ chart.name }}?range={{ range }}">View data</a>{% endif %}
-    </div>
-    <svg class="chart" data-reach="{{ chart.reach_ms }}" viewBox="0 0 {{ chart.width }} {{ chart.height }}" role="img" aria-label="{{ chart.title }} over time. The table below gives the numbers.">
-      {% for tick in chart.y_ticks %}
-      <line class="grid" x1="{{ chart.left }}" x2="{{ chart.right }}" y1="{{ tick.position }}" y2="{{ tick.position }}"/>
-      <text class="tick" x="{{ chart.left - 6 }}" y="{{ tick.position + 4 }}" text-anchor="end">{{ tick.label }}</text>
-      {% endfor %}
-      {% for tick in chart.x_ticks %}
-      <text class="tick" x="{{ tick.position }}" y="{{ chart.bottom + 18 }}" text-anchor="middle">{{ tick.label }}</text>
-      {% endfor %}
-      {% for line in chart.lines %}
-      {% for segment in line.segments %}<polyline class="line s{{ line.slot }}" points="{{ segment }}"/>{% endfor %}
-      {% for dot in line.dots %}<circle class="dot s{{ line.slot }}" cx="{{ dot.x }}" cy="{{ dot.y }}" r="2.5"/>{% endfor %}
-      {% endfor %}
-      {% for column in chart.columns %}
-      <g class="column" data-time="{{ column.time_ms }}">
-        <rect class="hit" x="{{ column.hit_x }}" y="{{ chart.top }}" width="{{ column.hit_width }}" height="{{ chart.bottom - chart.top }}"/>
-        <g class="reading">
-          <line class="crosshair" x1="{{ column.x }}" x2="{{ column.x }}" y1="{{ chart.top }}" y2="{{ chart.bottom }}"/>
-          {% for row in column.rows %}<circle class="marker s{{ row.slot }}" cx="{{ row.dot.x }}" cy="{{ row.dot.y }}" r="4"/>{% endfor %}
-          <rect class="tooltip" x="{{ column.tooltip_x }}" y="{{ chart.top }}" width="{{ column.tooltip_width }}" height="{{ column.tooltip_height }}" rx="4"/>
-          <text class="tooltip-time" x="{{ column.tooltip_x + 8 }}" y="{{ chart.top + 15 }}">{{ column.time }}</text>
-          {% for row in column.rows %}
-          <line class="key s{{ row.slot }}" x1="{{ column.tooltip_x + 8 }}" x2="{{ column.tooltip_x + 18 }}" y1="{{ row.text_y - 4 }}" y2="{{ row.text_y - 4 }}"/>
-          <text class="tooltip-row" x="{{ column.tooltip_x + 22 }}" y="{{ row.text_y }}"><tspan class="tooltip-value">{{ row.value }}</tspan> {{ row.name }}</text>
-          {% endfor %}
-        </g>
-      </g>
-      {% endfor %}
-    </svg>
-    {% if chart.has_data %}
-    <table class="chart-summary">
-      <thead><tr><th>Series</th><th class="number">Latest</th><th class="number">Average</th><th class="number">Peak</th></tr></thead>
-      <tbody>
-        {% for row in chart.summary %}
-        <tr>
-          <td><span class="key-swatch s{{ row.slot }}"></span>{{ row.name }}</td>
-          <td class="number">{{ row.latest }}</td>
-          <td class="number">{{ row.average }}</td>
-          <td class="number">{{ row.peak }}</td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-    {% if chart.hidden > 0 %}<p class="hint">{{ chart.hidden }} more not shown. The highest are listed.</p>{% endif %}
-    {% else %}
-    <p class="empty">No data in this range.</p>
-    {% endif %}
-  </section>
+  {% include "metrics/_chart.html" %}
   {% endfor %}
 </div>
 {% endblock content %}
