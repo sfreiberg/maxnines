@@ -3,8 +3,8 @@
 {% block content %}
 <div class="title-row">
   <div>
+    <p class="eyebrow">{{ online_count }} of {{ total }} online</p>
     <h1>Agents</h1>
-    <p class="subtitle">{{ online_count }} of {{ total }} online</p>
   </div>
   <nav class="tabs" aria-label="View">
     <a href="{{ tiles_href }}"{% if not as_table %} class="selected" aria-current="true"{% endif %}>Tiles</a>

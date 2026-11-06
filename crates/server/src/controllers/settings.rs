@@ -33,7 +33,7 @@ fn time(ms: i64) -> String {
 }
 
 /// Thousands separated, as these get large.
-fn count(value: u64) -> String {
+pub(super) fn count(value: u64) -> String {
     let digits = value.to_string();
     let mut text = String::new();
     for (index, digit) in digits.chars().enumerate() {

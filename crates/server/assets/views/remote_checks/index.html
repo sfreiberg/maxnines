@@ -2,7 +2,10 @@
 {% block title %}Checks · MaxNines{% endblock title %}
 {% block content %}
 <div class="title-row">
-  <h1>Checks</h1>
+  <div>
+    <p class="eyebrow">Run by this server</p>
+    <h1>Checks</h1>
+  </div>
   <div class="actions">
     <a class="button secondary" href="/agents/{{ agent_id }}/metrics">Charts</a>
     <a class="button" href="/checks/new">New check</a>

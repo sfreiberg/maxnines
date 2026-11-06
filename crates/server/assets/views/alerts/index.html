@@ -2,7 +2,10 @@
 {% block title %}Alerts · MaxNines{% endblock title %}
 {% block content %}
 <div class="title-row">
-  <h1>Alerts</h1>
+  <div>
+    <p class="eyebrow">{{ firing }} firing</p>
+    <h1>Alerts</h1>
+  </div>
   <div class="actions">
     <a class="button secondary" href="/alerts/rules">Alert rules</a>
     <a class="button secondary" href="/alerts/channels">Notification channels</a>

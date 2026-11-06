@@ -2956,6 +2956,7 @@ mod pages {
         let (first, second) = (page.body.find(critical), page.body.find(warning));
         assert!(first.unwrap() < second.unwrap(), "{}", page.body);
         assert!(!page.body.contains("All clear"));
+        assert!(page.body.contains("1 critical"), "{}", page.body);
     }
 
     #[tokio::test]
@@ -2974,6 +2975,7 @@ mod pages {
             "{}",
             page.body
         );
+        assert!(page.body.contains("Warnings only"), "{}", page.body);
     }
 
     #[tokio::test]
@@ -2998,6 +3000,9 @@ mod pages {
             "{}",
             page.body
         );
+        assert!(page.body.contains("1 / 1"), "{}", page.body);
+        assert!(page.body.contains("0 / 1"), "{}", page.body);
+        assert!(page.body.contains("Waiting for results"), "{}", page.body);
     }
 
     #[tokio::test]
@@ -3012,15 +3017,18 @@ mod pages {
         let mut browser = Browser::default();
 
         for (path, link) in [
-            ("/", r#"class="pill on" href="/""#),
-            ("/agents", r#"class="pill on" href="/agents""#),
-            ("/metrics", r#"class="pill on" href="/metrics""#),
-            ("/checks", r#"class="pill on" href="/checks""#),
-            ("/alerts", r#"class="pill on" href="/alerts""#),
-            ("/settings", r#"class="pill on" href="/settings""#),
-            ("/rules", r#"class="pill on" href="/settings""#),
-            ("/alerts/rules", r#"class="pill on" href="/settings""#),
-            ("/alerts/channels", r#"class="pill on" href="/settings""#),
+            ("/", r#"class="rail-link on" href="/""#),
+            ("/agents", r#"class="rail-link on" href="/agents""#),
+            ("/metrics", r#"class="rail-link on" href="/metrics""#),
+            ("/checks", r#"class="rail-link on" href="/checks""#),
+            ("/alerts", r#"class="rail-link on" href="/alerts""#),
+            ("/settings", r#"class="rail-link on" href="/settings""#),
+            ("/rules", r#"class="rail-link on" href="/settings""#),
+            ("/alerts/rules", r#"class="rail-link on" href="/settings""#),
+            (
+                "/alerts/channels",
+                r#"class="rail-link on" href="/settings""#,
+            ),
         ] {
             let page = browser.get(&test.server, path).await;
             assert!(page.body.contains(link), "{path}: {}", page.body);
@@ -3237,7 +3245,7 @@ mod pages {
     async fn the_font_is_served_from_the_binary_and_the_policy_allows_it() {
         let server = start().await;
         let mut browser = Browser::default();
-        let page = browser.get(&server, "/assets/fonts/figtree.woff2").await;
+        let page = browser.get(&server, "/assets/fonts/inter.woff2").await;
         assert_eq!(page.status, 200);
         assert_eq!(page.header("content-type"), Some("font/woff2"));
 

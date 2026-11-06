@@ -1,0 +1,38 @@
+/* Every colour on the site. */
+
+:root {
+  color-scheme: dark;
+  --background: #08090b;
+  --surface: #0f1114;
+  --sunken: #0a0b0e;
+  --raised: #1b1e24;
+  --text: #f3f5f4;
+  --muted: #9ea5ab;
+  --border: #1e2227;
+  --border-strong: #30353c;
+  --accent: #6fdc8c;
+  --accent-hover: #8ce8a4;
+  --accent-text: #06200f;
+  --accent-surface: #12291a;
+  --accent-ink: #8ce8a4;
+  --meter: #6fdc8c;
+  --meter-hot: #f0b64e;
+  --track: #22262c;
+  --good: #6fdc8c;
+  --good-surface: #102a1a;
+  --bad: #ff7b7d;
+  --bad-surface: #33161a;
+  --bad-text: #2b0507;
+  --warn: #f0b64e;
+  --warn-surface: #2f2310;
+  --neutral-surface: #1b1e24;
+  --grid: #1a1d22;
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --series-4: #c98500;
+  --series-5: #d55181;
+  --series-6: #008300;
+  --series-7: #9085e9;
+  --series-8: #e66767;
+}

@@ -1266,6 +1266,21 @@ async fn embedded_assets_are_served_and_nothing_else_is() {
 }
 
 #[tokio::test]
+async fn only_pages_that_update_themselves_say_they_are_live() {
+    let server = start().await;
+    let mut browser = Browser::default();
+
+    for path in ["/", "/agents", "/alerts", "/settings/server"] {
+        let page = browser.get(&server, path).await;
+        assert!(page.body.contains(r#"id="live-status""#), "{path}");
+    }
+    for path in ["/settings", "/rules/new", "/settings/api-keys"] {
+        let page = browser.get(&server, path).await;
+        assert!(!page.body.contains(r#"id="live-status""#), "{path}");
+    }
+}
+
+#[tokio::test]
 async fn pages_carry_security_headers() {
     let server = start().await;
     let page = Browser::default().get(&server, "/agents").await;
@@ -1643,7 +1658,8 @@ async fn enter_saves_the_rule_instead_of_pressing_a_builder_button() {
     let server = start().await;
     let page = Browser::default().get(&server, "/rules/new").await;
 
-    let first_button = page.body.find("<button").unwrap();
+    let form = page.body.find("<form").unwrap();
+    let first_button = form + page.body[form..].find("<button").unwrap();
     assert!(
         page.body[first_button..].starts_with(r#"<button type="submit" class="default-submit""#),
         "{}",
@@ -2364,7 +2380,7 @@ async fn pages_with_a_csrf_token_and_fonts_are_never_gzipped() {
         "/rules/new",
         "/checks/new",
         "/settings",
-        "/assets/fonts/figtree.woff2",
+        "/assets/fonts/inter.woff2",
     ] {
         let page = browser.get_gzipped(&server, path).await;
         assert_eq!(page.status, 200, "{path}");
