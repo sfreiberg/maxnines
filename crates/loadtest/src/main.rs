@@ -509,6 +509,14 @@ async fn run(options: Options) -> Result<Outcome> {
         began: Instant::now(),
     });
 
+    // Before any load, so everything the test sends is counted. The first reading in
+    // the background comes too late for that once the server is busy.
+    let client = server.clone();
+    let before = tokio::task::spawn_blocking(move || client.stats())
+        .await
+        .context("reaching the server")??;
+    measurements.record(Snapshot::read(&before, now_ms()), &plan.counters);
+
     let (stop, stopped) = watch::channel(false);
     let (outage, outage_watch) = watch::channel(false);
     let finished = Arc::new(AtomicBool::new(false));
