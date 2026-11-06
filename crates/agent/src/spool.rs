@@ -2,16 +2,23 @@
 //! healthy agent doesn't write to disk. While disconnected they're saved to files,
 //! which keeps them through a restart. Either way the newest samples win when space
 //! runs out, because recent data is what people want after an outage.
+//!
+//! After an outage every agent has a backlog at once, so saved samples go at a slow,
+//! steady pace behind live ones. That keeps dashboards and alerts current, and keeps
+//! the server from being flooded. The server goes by each sample's own time, so it
+//! doesn't matter that they arrive out of order.
 
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::de::IgnoredAny;
 use tokio::sync::Notify;
+use tokio::time::{Instant, sleep_until};
 use tracing::warn;
 
 const EXTENSION: &str = "jsonl";
@@ -24,6 +31,9 @@ const MAX_SAVED_BYTES: u64 = 64 * 1024 * 1024;
 /// The limit is shared between about this many files, and reaching it deletes the
 /// oldest, so this much of the backlog goes at once.
 const FILES_KEPT: u64 = 16;
+/// The time between saved samples. A day of samples every 30 seconds takes under an
+/// hour to send, and a thousand agents catching up add about 1,000 samples a second.
+const BACKLOG_GAP: Duration = Duration::from_secs(1);
 
 /// Where a sample came from, to remove it once it's been sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,12 +45,14 @@ pub enum Place {
 pub struct Spool {
     state: Mutex<State>,
     arrived: Notify,
+    backlog_gap: Duration,
 }
 
 struct State {
     memory: VecDeque<String>,
     saved: Option<Saved>,
     online: bool,
+    backlog_due: Instant,
     warned_of_drops: bool,
     warned_of_saving: bool,
 }
@@ -49,10 +61,10 @@ impl Spool {
     /// Carries on in memory if the folder can't be used, because a full or read-only
     /// disk must not stop an agent reporting while it's connected.
     pub fn open(folder: &Path) -> Self {
-        Self::with_limit(folder, MAX_SAVED_BYTES)
+        Self::with_limits(folder, MAX_SAVED_BYTES, BACKLOG_GAP)
     }
 
-    fn with_limit(folder: &Path, max_bytes: u64) -> Self {
+    fn with_limits(folder: &Path, max_bytes: u64, backlog_gap: Duration) -> Self {
         let saved = Saved::open(folder, max_bytes)
             .inspect_err(|error| {
                 let error = format!("{error:#}");
@@ -64,10 +76,12 @@ impl Spool {
                 memory: VecDeque::new(),
                 saved,
                 online: false,
+                backlog_due: Instant::now(),
                 warned_of_drops: false,
                 warned_of_saving: false,
             }),
             arrived: Notify::new(),
+            backlog_gap,
         }
     }
 
@@ -100,18 +114,23 @@ impl Spool {
         }
     }
 
-    /// The oldest sample, which stays queued until [`Spool::sent`] says it went.
+    /// The next sample to send, which stays queued until [`Spool::sent`] says it
+    /// went. Live samples come first, then saved ones when one is due.
     pub fn next(&self) -> Option<(String, Place)> {
         let mut state = self.state();
-        if let Some(saved) = &mut state.saved {
-            match saved.oldest() {
-                Ok(Some(oldest)) => return Some(oldest),
-                Ok(None) => {}
-                Err(error) => state.give_up_on_disk(&error),
+        if let Some(text) = state.memory.front() {
+            return Some((text.clone(), Place::Memory));
+        }
+        if Instant::now() < state.backlog_due {
+            return None;
+        }
+        match state.saved.as_mut()?.oldest() {
+            Ok(oldest) => oldest,
+            Err(error) => {
+                state.give_up_on_disk(&error);
+                None
             }
         }
-        let text = state.memory.front()?.clone();
-        Some((text, Place::Memory))
     }
 
     pub fn sent(&self, place: Place) {
@@ -121,6 +140,7 @@ impl Spool {
                 state.memory.pop_front();
             }
             Place::Saved { file, end } => {
+                state.backlog_due = Instant::now() + self.backlog_gap;
                 if let Some(saved) = &mut state.saved
                     && let Err(error) = saved.remove_through(file, end)
                 {
@@ -137,15 +157,28 @@ impl Spool {
 
     /// Waits until there's something to send. Only one task may wait.
     pub async fn wait(&self) {
-        while !self.state().has_samples() {
-            self.arrived.notified().await;
+        loop {
+            let backlog_due = {
+                let state = self.state();
+                if !state.memory.is_empty() {
+                    return;
+                }
+                state.has_backlog().then_some(state.backlog_due)
+            };
+            match backlog_due {
+                Some(due) => tokio::select! {
+                    () = sleep_until(due) => return,
+                    () = self.arrived.notified() => {}
+                },
+                None => self.arrived.notified().await,
+            }
         }
     }
 }
 
 impl State {
-    fn has_samples(&self) -> bool {
-        !self.memory.is_empty() || self.saved.as_ref().is_some_and(|saved| saved.bytes > 0)
+    fn has_backlog(&self) -> bool {
+        self.saved.as_ref().is_some_and(|saved| saved.bytes > 0)
     }
 
     /// Anything that can't be saved stays in memory.
@@ -435,6 +468,18 @@ mod tests {
         (parent, path)
     }
 
+    fn unpaced(folder: &Path) -> Spool {
+        limited(folder, MAX_SAVED_BYTES)
+    }
+
+    fn limited(folder: &Path, max_bytes: u64) -> Spool {
+        Spool::with_limits(folder, max_bytes, Duration::ZERO)
+    }
+
+    fn paced(folder: &Path, gap: Duration) -> Spool {
+        Spool::with_limits(folder, MAX_SAVED_BYTES, gap)
+    }
+
     /// The sample files in a folder, oldest first.
     fn files_in(path: &Path) -> Vec<PathBuf> {
         let files = saved_files(path).unwrap();
@@ -460,7 +505,7 @@ mod tests {
     #[test]
     fn samples_come_out_oldest_first() {
         let (_parent, path) = folder();
-        let spool = Spool::open(&path);
+        let spool = unpaced(&path);
         for text in ["1", "2", "3"] {
             spool.push(text.to_string());
         }
@@ -472,12 +517,12 @@ mod tests {
     #[test]
     fn samples_saved_while_disconnected_survive_a_restart() {
         let (_parent, path) = folder();
-        let spool = Spool::open(&path);
+        let spool = unpaced(&path);
         spool.push("1".to_string());
         spool.push("2".to_string());
         drop(spool);
 
-        let spool = Spool::open(&path);
+        let spool = unpaced(&path);
         spool.push("3".to_string());
 
         assert_eq!(drain(&spool), ["1", "2", "3"]);
@@ -486,7 +531,7 @@ mod tests {
     #[test]
     fn a_connected_agent_does_not_write_samples_to_disk() {
         let (_parent, path) = folder();
-        let spool = Spool::open(&path);
+        let spool = unpaced(&path);
         spool.set_online(true);
 
         spool.push("1".to_string());
@@ -498,31 +543,76 @@ mod tests {
     #[test]
     fn losing_the_connection_saves_what_had_not_been_sent() {
         let (_parent, path) = folder();
-        let spool = Spool::open(&path);
+        let spool = unpaced(&path);
         spool.set_online(true);
         spool.push("1".to_string());
 
         spool.set_online(false);
         drop(spool);
 
-        assert_eq!(drain(&Spool::open(&path)), ["1"]);
+        assert_eq!(drain(&unpaced(&path)), ["1"]);
     }
 
     #[test]
-    fn saved_samples_go_before_newer_ones_in_memory() {
+    fn live_samples_go_before_the_backlog() {
         let (_parent, path) = folder();
-        let spool = Spool::open(&path);
+        let spool = unpaced(&path);
         spool.push("1".to_string());
         spool.set_online(true);
         spool.push("2".to_string());
 
-        assert_eq!(drain(&spool), ["1", "2"]);
+        assert_eq!(drain(&spool), ["2", "1"]);
+    }
+
+    #[tokio::test]
+    async fn the_backlog_goes_at_a_steady_pace() {
+        let (_parent, path) = folder();
+        let gap = Duration::from_millis(200);
+        let spool = paced(&path, gap);
+        spool.push("1".to_string());
+        spool.push("2".to_string());
+        spool.set_online(true);
+
+        let (first, place) = spool.next().unwrap();
+        assert_eq!(first, "1");
+        spool.sent(place);
+        let sent = Instant::now();
+        assert!(spool.next().is_none(), "the next one isn't due yet");
+
+        spool.wait().await;
+
+        assert!(sent.elapsed() >= gap - Duration::from_millis(20));
+        assert_eq!(spool.next().unwrap().0, "2");
+    }
+
+    #[tokio::test]
+    async fn live_samples_do_not_wait_for_the_backlog_pace() {
+        let (_parent, path) = folder();
+        let spool = std::sync::Arc::new(paced(&path, Duration::from_secs(3600)));
+        spool.push("1".to_string());
+        spool.push("2".to_string());
+        spool.set_online(true);
+        let (_, place) = spool.next().unwrap();
+        spool.sent(place);
+        let waiting = tokio::spawn({
+            let spool = spool.clone();
+            async move { spool.wait().await }
+        });
+
+        tokio::task::yield_now().await;
+        spool.push("3".to_string());
+
+        timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(spool.next().unwrap().0, "3");
     }
 
     #[test]
     fn a_sample_stays_queued_until_it_has_been_sent() {
         let (_parent, path) = folder();
-        let spool = Spool::open(&path);
+        let spool = unpaced(&path);
         spool.push("1".to_string());
 
         let (first, _) = spool.next().unwrap();
@@ -536,7 +626,7 @@ mod tests {
     #[test]
     fn the_oldest_saved_samples_go_first_when_the_limit_is_reached() {
         let (_parent, path) = folder();
-        let spool = Spool::with_limit(&path, 20);
+        let spool = limited(&path, 20);
         for number in 0..10 {
             spool.push((10_000_000 + number).to_string());
         }
@@ -547,12 +637,12 @@ mod tests {
     #[test]
     fn the_limit_counts_samples_saved_before_a_restart() {
         let (_parent, path) = folder();
-        let spool = Spool::with_limit(&path, 20);
+        let spool = limited(&path, 20);
         spool.push("10000000".to_string());
         spool.push("10000001".to_string());
         drop(spool);
 
-        let spool = Spool::with_limit(&path, 20);
+        let spool = limited(&path, 20);
         spool.push("10000002".to_string());
 
         assert_eq!(drain(&spool), ["10000001", "10000002"]);
@@ -561,7 +651,7 @@ mod tests {
     #[test]
     fn sending_a_backlog_frees_its_space() {
         let (_parent, path) = folder();
-        let spool = Spool::with_limit(&path, 20);
+        let spool = limited(&path, 20);
         spool.push("10000000".to_string());
         drain(&spool);
 
@@ -574,7 +664,7 @@ mod tests {
     #[test]
     fn sending_a_whole_backlog_gives_the_disk_space_back() {
         let (_parent, path) = folder();
-        let spool = Spool::with_limit(&path, 1_000_000);
+        let spool = limited(&path, 1_000_000);
         for _ in 0..5 {
             spool.push(format!("\"{}\"", "x".repeat(100_000)));
         }
@@ -588,7 +678,7 @@ mod tests {
     #[test]
     fn samples_sent_before_a_restart_are_not_sent_again() {
         let (_parent, path) = folder();
-        let spool = Spool::open(&path);
+        let spool = unpaced(&path);
         for number in 0..100 {
             spool.push(number.to_string());
         }
@@ -598,7 +688,7 @@ mod tests {
         }
         drop(spool);
 
-        let left = drain(&Spool::open(&path));
+        let left = drain(&unpaced(&path));
         assert_eq!(left.len(), 50);
         assert_eq!(left[0], "50");
         assert_eq!(left.last().unwrap(), "99");
@@ -608,7 +698,7 @@ mod tests {
     fn an_unusable_location_falls_back_to_memory() {
         let (_parent, path) = folder();
         std::fs::write(&path, "a file where the folder should be").unwrap();
-        let spool = Spool::open(&path);
+        let spool = unpaced(&path);
         assert!(spool.state().saved.is_none());
 
         spool.push("1".to_string());
@@ -620,10 +710,10 @@ mod tests {
     #[test]
     fn a_file_another_agent_has_open_falls_back_to_memory() {
         let (_parent, path) = folder();
-        let first = Spool::open(&path);
+        let first = unpaced(&path);
         first.push("1".to_string());
 
-        let second = Spool::open(&path);
+        let second = unpaced(&path);
 
         assert!(second.state().saved.is_none());
         assert_eq!(drain(&first), ["1"]);
@@ -633,7 +723,7 @@ mod tests {
     fn memory_keeps_the_newest_samples_when_the_disk_can_not_be_used() {
         let (_parent, path) = folder();
         std::fs::write(&path, "a file where the folder should be").unwrap();
-        let spool = Spool::open(&path);
+        let spool = unpaced(&path);
         for number in 0..MAX_IN_MEMORY + 3 {
             spool.push(number.to_string());
         }
@@ -647,12 +737,12 @@ mod tests {
     #[test]
     fn a_line_cut_short_by_a_crash_is_skipped() {
         let (_parent, path) = folder();
-        let spool = Spool::open(&path);
+        let spool = unpaced(&path);
         spool.push("1".to_string());
         drop(spool);
         add_to_file(&files_in(&path)[0], b"{\"cut sho");
 
-        let spool = Spool::open(&path);
+        let spool = unpaced(&path);
         spool.push("2".to_string());
 
         assert_eq!(drain(&spool), ["1", "2"]);
@@ -662,23 +752,23 @@ mod tests {
     #[test]
     fn damaged_lines_are_skipped() {
         let (_parent, path) = folder();
-        let spool = Spool::open(&path);
+        let spool = unpaced(&path);
         spool.push("1".to_string());
         drop(spool);
         add_to_file(&files_in(&path)[0], b"{\"cut\n\0\0\0\n\xff\xfe\n2\n");
 
-        assert_eq!(drain(&Spool::open(&path)), ["1", "2"]);
+        assert_eq!(drain(&unpaced(&path)), ["1", "2"]);
     }
 
     #[test]
     fn nothing_is_left_waiting_when_only_damage_remains() {
         let (_parent, path) = folder();
-        let spool = Spool::open(&path);
+        let spool = unpaced(&path);
         spool.push("1".to_string());
         drop(spool);
         std::fs::write(&files_in(&path)[0], b"{\"cut\n{\"short").unwrap();
 
-        let spool = Spool::open(&path);
+        let spool = unpaced(&path);
 
         assert!(spool.next().is_none());
         assert_eq!(spool.saved_bytes(), 0);
@@ -688,7 +778,7 @@ mod tests {
     #[test]
     fn a_damaged_position_sends_the_oldest_file_again() {
         let (_parent, path) = folder();
-        let spool = Spool::open(&path);
+        let spool = unpaced(&path);
         spool.push("1".to_string());
         spool.push("2".to_string());
         let (_, place) = spool.next().unwrap();
@@ -696,34 +786,34 @@ mod tests {
         drop(spool);
         std::fs::write(path.join("position"), "not a position").unwrap();
 
-        assert_eq!(drain(&Spool::open(&path)), ["1", "2"]);
+        assert_eq!(drain(&unpaced(&path)), ["1", "2"]);
     }
 
     #[test]
     fn an_old_position_does_not_apply_to_a_new_file() {
         let (_parent, path) = folder();
-        let spool = Spool::open(&path);
+        let spool = unpaced(&path);
         spool.push("1000".to_string());
         drain(&spool);
         drop(spool);
 
-        let spool = Spool::open(&path);
+        let spool = unpaced(&path);
         spool.push("2000".to_string());
         spool.push("3000".to_string());
         drop(spool);
 
-        assert_eq!(drain(&Spool::open(&path)), ["2000", "3000"]);
+        assert_eq!(drain(&unpaced(&path)), ["2000", "3000"]);
     }
 
     #[test]
     fn a_restart_keeps_the_order_across_files() {
         let (_parent, path) = folder();
-        let spool = Spool::with_limit(&path, 1000);
+        let spool = limited(&path, 1000);
         for number in 0..30 {
             spool.push(format!("{}", 1000 + number));
         }
         drop(spool);
-        let spool = Spool::with_limit(&path, 1000);
+        let spool = limited(&path, 1000);
         spool.push("2000".to_string());
 
         let expected: Vec<String> = (1000..1030).chain([2000]).map(|n| n.to_string()).collect();
@@ -734,7 +824,7 @@ mod tests {
     #[test]
     fn samples_saved_part_way_through_a_backlog_are_kept() {
         let (_parent, path) = folder();
-        let spool = Spool::open(&path);
+        let spool = unpaced(&path);
         spool.push("1".to_string());
         spool.push("2".to_string());
         let (_, place) = spool.next().unwrap();
@@ -748,7 +838,7 @@ mod tests {
     #[test]
     fn samples_are_saved_one_per_line() {
         let (_parent, path) = folder();
-        let spool = Spool::open(&path);
+        let spool = unpaced(&path);
         spool.push(r#"{"a":1}"#.to_string());
         spool.push(r#"{"a":2}"#.to_string());
 
@@ -760,7 +850,7 @@ mod tests {
     #[tokio::test]
     async fn waiting_ends_when_a_sample_arrives() {
         let (_parent, path) = folder();
-        let spool = std::sync::Arc::new(Spool::open(&path));
+        let spool = std::sync::Arc::new(unpaced(&path));
         let waiting = tokio::spawn({
             let spool = spool.clone();
             async move { spool.wait().await }
@@ -778,9 +868,9 @@ mod tests {
     #[tokio::test]
     async fn waiting_ends_at_once_for_samples_saved_earlier() {
         let (_parent, path) = folder();
-        Spool::open(&path).push("1".to_string());
+        unpaced(&path).push("1".to_string());
 
-        let spool = Spool::open(&path);
+        let spool = unpaced(&path);
 
         timeout(Duration::from_secs(5), spool.wait()).await.unwrap();
     }
