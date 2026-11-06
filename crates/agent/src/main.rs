@@ -8,6 +8,7 @@ mod files;
 mod identity;
 mod saved_config;
 mod services;
+mod spool;
 mod system;
 mod websocket;
 

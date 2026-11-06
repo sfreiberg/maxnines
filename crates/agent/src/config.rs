@@ -58,6 +58,10 @@ impl Config {
         self.state_dir.join("config.json")
     }
 
+    pub fn sample_queue_file(&self) -> PathBuf {
+        self.state_dir.join("samples.redb")
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config file {}", path.display()))?;

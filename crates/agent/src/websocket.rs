@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use futures_util::{FutureExt, SinkExt, StreamExt};
+use futures_util::{FutureExt, Sink, SinkExt, StreamExt};
 use maxnines_protocol::auth::Identity;
 use maxnines_protocol::{AgentConfig, AgentMessage, RegistrationStatus, Sample, ServerMessage};
 use rustls::pki_types::CertificateDer;
@@ -25,10 +25,8 @@ use tracing::{error, info, warn};
 use crate::config::Config;
 use crate::custom::Definitions;
 use crate::facts;
+use crate::spool::Spool;
 
-/// Samples kept while the server is unreachable. Newer ones are dropped once
-/// this is full. At the default 15 second interval this covers 16 minutes.
-const OUTBOX_SIZE: usize = 64;
 const MIN_RETRY_DELAY: Duration = Duration::from_secs(1);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 /// The server pings regularly, so this much silence means the connection died.
@@ -52,7 +50,8 @@ pub struct ConfigUpdate {
 /// Talks to a background task that owns the connection, so a slow or missing
 /// server never holds up collection.
 pub struct ServerLink {
-    outbox: mpsc::Sender<String>,
+    spool: Arc<Spool>,
+    config_results: mpsc::Sender<String>,
     configs: mpsc::Receiver<ConfigUpdate>,
     facts_every: watch::Sender<Duration>,
 }
@@ -63,6 +62,7 @@ struct Connection {
     identity: Identity,
     token: Option<String>,
     connector: Connector,
+    spool: Arc<Spool>,
     custom_facts: BTreeMap<String, Value>,
     custom_metrics: Definitions,
     facts_every: watch::Receiver<Duration>,
@@ -82,6 +82,7 @@ impl ServerLink {
 
         let (facts_every, facts_every_receiver) = watch::channel(DEFAULT_FACTS_INTERVAL);
         let (config_sender, configs) = mpsc::channel(CONFIG_QUEUE_SIZE);
+        let spool = Arc::new(Spool::open(&config.sample_queue_file()));
         let connection = Connection {
             url,
             host: host.to_string(),
@@ -93,23 +94,27 @@ impl ServerLink {
                 .map(read_token)
                 .transpose()?,
             connector: tls_connector(config.server.ca_file.as_deref())?,
+            spool: spool.clone(),
             custom_facts: config.facts.clone(),
             custom_metrics: config.custom_metrics.clone(),
             facts_every: facts_every_receiver,
             configs: config_sender,
         };
 
-        let (outbox, pending) = mpsc::channel(OUTBOX_SIZE);
+        let (config_results, pending) = mpsc::channel(CONFIG_QUEUE_SIZE);
         tokio::spawn(stay_connected(connection, pending));
         Ok(Self {
-            outbox,
+            spool,
+            config_results,
             configs,
             facts_every,
         })
     }
 
     pub fn send_sample(&self, sample: &Sample) -> Result<()> {
-        self.send(&AgentMessage::Sample(sample.clone()), "sample")
+        let text = serde_json::to_string(&AgentMessage::Sample(sample.clone()))?;
+        self.spool.push(text);
+        Ok(())
     }
 
     pub fn report_config(&self, version: &str, error: Option<String>) -> Result<()> {
@@ -117,7 +122,13 @@ impl ServerLink {
             version: version.to_string(),
             error,
         };
-        self.send(&message, "config result")
+        let text = serde_json::to_string(&message)?;
+        match self.config_results.try_send(text) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => warn!("too many config results, one was dropped"),
+            Err(TrySendError::Closed(_)) => error!("connection task gone, config result dropped"),
+        }
+        Ok(())
     }
 
     pub fn set_facts_interval(&self, every: Duration) {
@@ -127,16 +138,6 @@ impl ServerLink {
     /// Waits for the next config from the server.
     pub async fn next_config(&mut self) -> Option<ConfigUpdate> {
         self.configs.recv().await
-    }
-
-    fn send(&self, message: &AgentMessage, what: &str) -> Result<()> {
-        let text = serde_json::to_string(message)?;
-        match self.outbox.try_send(text) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => warn!(what, "outbox full, message dropped"),
-            Err(TrySendError::Closed(_)) => error!(what, "connection task gone, message dropped"),
-        }
-        Ok(())
     }
 }
 
@@ -179,6 +180,7 @@ async fn stay_connected(connection: Connection, mut pending: mpsc::Receiver<Stri
         let outcome = AssertUnwindSafe(session(&connection, &mut pending))
             .catch_unwind()
             .await;
+        connection.spool.set_online(false);
 
         match outcome {
             Ok(Ok(())) => {}
@@ -206,6 +208,7 @@ async fn session(connection: &Connection, pending: &mut mpsc::Receiver<String>) 
         .await
         .context("server did not finish the handshake")??;
     info!(url, "connected to server");
+    connection.spool.set_online(true);
 
     send_facts(&mut socket, connection).await?;
     let mut facts_every = connection.facts_every.clone();
@@ -218,6 +221,7 @@ async fn session(connection: &Connection, pending: &mut mpsc::Receiver<String>) 
     loop {
         tokio::select! {
             Some(text) = pending.recv() => socket.send(Message::text(text)).await?,
+            () = connection.spool.wait() => send_next(&mut socket, &connection.spool).await?,
             _ = facts_timer.tick() => send_facts(&mut socket, connection).await?,
             Ok(()) = facts_every.changed() => {
                 let every = *facts_every.borrow_and_update();
@@ -235,6 +239,18 @@ async fn session(connection: &Connection, pending: &mut mpsc::Receiver<String>) 
             () = &mut silence => bail!("no heartbeat from server"),
         }
     }
+}
+
+/// A sample only leaves the queue once it's been sent, so a failed send keeps it.
+async fn send_next<S>(socket: &mut S, spool: &Spool) -> Result<(), S::Error>
+where
+    S: Sink<Message> + Unpin,
+{
+    if let Some((text, place)) = spool.next() {
+        socket.send(Message::text(text)).await?;
+        spool.sent(place);
+    }
+    Ok(())
 }
 
 /// Anything unexpected is logged and ignored, so a newer server can't take down
@@ -329,7 +345,7 @@ mod tests {
                 token_file: None,
                 ca_file: None,
             },
-            state_dir: "state".into(),
+            state_dir: tempfile::tempdir().unwrap().keep(),
             facts: BTreeMap::from([("role".to_string(), json!("web"))]),
             custom_metrics: Definitions::new(),
         }
@@ -515,18 +531,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drops_samples_instead_of_blocking_when_the_outbox_is_full() {
-        let (outbox, _pending) = mpsc::channel(1);
-        let (_config_sender, configs) = mpsc::channel(1);
-        let (facts_every, _) = watch::channel(DEFAULT_FACTS_INTERVAL);
-        let link = ServerLink {
-            outbox,
-            configs,
-            facts_every,
-        };
+    async fn sends_again_a_sample_the_connection_lost() {
+        let address = free_address().await;
+        let url = format!("ws://{address}/ws");
+        let listener = TcpListener::bind(address).await.unwrap();
+        let link = ServerLink::start(&config(&url), "web-1", identity()).unwrap();
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        accept_agent(&mut socket, &url).await;
+        next_message(&mut socket).await;
+        drop(socket);
+        sleep(Duration::from_millis(100)).await;
 
         link.send_sample(&sample()).unwrap();
+        assert!(link.spool.saved_bytes() > 0, "offline samples go to disk");
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        accept_agent(&mut socket, &url).await;
+        next_message(&mut socket).await;
+        assert_eq!(
+            next_message(&mut socket).await,
+            AgentMessage::Sample(sample())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connected_agent_sends_samples_without_saving_them() {
+        let (link, mut socket) = connected().await;
+
         link.send_sample(&sample()).unwrap();
+
+        assert_eq!(link.spool.saved_bytes(), 0);
+        assert_eq!(
+            next_message(&mut socket).await,
+            AgentMessage::Sample(sample())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sample_that_fails_to_send_stays_queued() {
+        let folder = tempfile::tempdir().unwrap();
+        let spool = Spool::open(&folder.path().join("samples.redb"));
+        spool.push("a".to_string());
+        let broken = futures_util::sink::unfold((), |(), _: Message| async {
+            Err::<(), &str>("connection lost")
+        });
+        let mut broken = std::pin::pin!(broken);
+
+        assert!(send_next(&mut broken, &spool).await.is_err());
+
+        assert_eq!(spool.next().unwrap().0, "a");
+    }
+
+    #[tokio::test]
+    async fn delivers_samples_saved_before_a_restart() {
+        let address = free_address().await;
+        let url = format!("ws://{address}/ws");
+        let listener = TcpListener::bind(address).await.unwrap();
+        let settings = config(&url);
+        let saved = serde_json::to_string(&AgentMessage::Sample(sample())).unwrap();
+        Spool::open(&settings.sample_queue_file()).push(saved);
+
+        let _link = ServerLink::start(&settings, "web-1", identity()).unwrap();
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        accept_agent(&mut socket, &url).await;
+        next_message(&mut socket).await;
+        assert_eq!(
+            next_message(&mut socket).await,
+            AgentMessage::Sample(sample())
+        );
     }
 
     #[test]
