@@ -173,7 +173,8 @@ tls {
 - **Port 443 has to reach this server from the internet.** Let's Encrypt proves you
   control the name by connecting to it there, on the same port as everything else, so
   port 80 isn't needed. A firewall or router can forward 443 to another `listen` port.
-- The first start takes a moment while the certificate is issued. Renewal is automatic.
+- The first start takes a moment while the certificate is issued, and renewal is
+  automatic.
 - `cache_dir` has to survive restarts and stay private, because it holds the account key
   and Let's Encrypt limits how many certificates it will issue. Keep it out of synced
   folders.
@@ -183,9 +184,6 @@ tls {
   ```hcl
   directory = "https://acme-staging-v02.api.letsencrypt.org/directory"
   ```
-
-Proving control through DNS instead, for servers the internet can't reach, isn't
-available yet.
 
 ### Agents
 
