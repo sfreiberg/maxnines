@@ -523,6 +523,8 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/alerts"
       "started_ms": 1793940279545,
       "resolved_ms": null,
       "resolve_reason": null,
+      "acknowledged_by": null,
+      "acknowledged_ms": null,
       "silenced_by": null
     }
   ],
@@ -531,6 +533,20 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/alerts"
 ```
 
 `silenced_by` is the ID of the silence keeping an open alert's notifications back.
+
+### Acknowledge an alert
+
+`POST /api/v1/alerts/{id}/acknowledge`
+
+Says someone is dealing with it, which shows on the Alerts page and stops its reminders.
+The first to acknowledge stays on it. Through the API, `acknowledged_by` is `api`. Returns
+`204`, or `404` if it isn't firing.
+
+### Undo acknowledging an alert
+
+`POST /api/v1/alerts/{id}/unacknowledge`
+
+Returns `204`, or `404` if it isn't firing.
 
 ## Silences
 
@@ -617,6 +633,7 @@ isn't running.
 | `group_by` | For calculation rules, what's watched separately: `nothing`, `host`, `series` or `fact:<name>` |
 | `filter` | For calculation rules, which machines, as on the host list. It takes the place of `condition` |
 | `window_secs` | For calculation rules, how far back to look, from 60 to 86400. Defaults to 300 |
+| `remind_every_secs` | How often to say the alert is still firing, until someone acknowledges it, at most every 300 seconds. Leave it out for no reminders. On-call services are left out, as they repeat for themselves. |
 
 A calculation rule watches something across machines, such as the average CPU of every
 Linux host, and gives one alert for the group rather than one per machine. `min` and

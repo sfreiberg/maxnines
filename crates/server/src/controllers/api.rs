@@ -98,6 +98,8 @@ pub fn routes(state: AppState) -> Router<AppState> {
         )
         .route("/server", get(server_stats))
         .route("/alerts", get(list_alerts))
+        .route("/alerts/{id}/acknowledge", post(acknowledge_alert))
+        .route("/alerts/{id}/unacknowledge", post(unacknowledge_alert))
         .route("/silences", get(list_silences).post(create_silence))
         .route("/silences/{id}", get(show_silence))
         .route("/silences/{id}/end", post(end_silence))
@@ -633,6 +635,22 @@ async fn list_alerts(State(state): State<AppState>) -> Response {
     };
     match alerts.await {
         Ok(alerts) => Json(alerts).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn acknowledge_alert(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.acknowledge_alert(id, "api", now_ms()).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn unacknowledge_alert(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.unacknowledge_alert(id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),
     }
 }

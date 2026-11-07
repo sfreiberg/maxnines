@@ -85,6 +85,7 @@ impl Notice {
     pub fn for_delivery(delivery: &Delivery) -> Self {
         let alert = &delivery.alert;
         let text = match delivery.event {
+            Event::Reminder => format!("Still firing: {}", alert.summary),
             Event::Resolved => format!("Resolved: {}", alert.summary),
             _ => alert.summary.clone(),
         };
@@ -120,6 +121,7 @@ impl Notice {
     fn label(&self) -> String {
         match (self.event, &self.alert) {
             (Event::Firing, Some(alert)) => alert.severity.as_str().to_uppercase(),
+            (Event::Reminder, _) => "STILL FIRING".to_string(),
             (Event::Resolved, _) => "RESOLVED".to_string(),
             _ => "TEST".to_string(),
         }
@@ -146,6 +148,8 @@ impl Notice {
             Event::Firing => &[Incident::Open],
             Event::Resolved => &[Incident::Close],
             Event::Test => &[Incident::Open, Incident::Close],
+            // They repeat for themselves, so they're never sent these.
+            Event::Reminder => &[],
         }
     }
 
@@ -452,8 +456,10 @@ fn escape_slack(text: &str) -> String {
 
 fn slack_color(notice: &Notice) -> &'static str {
     match (notice.event, &notice.alert) {
-        (Event::Firing, Some(alert)) if alert.severity == Severity::Critical => "#b3261e",
-        (Event::Firing, Some(_)) => "#b87a00",
+        (Event::Firing | Event::Reminder, Some(alert)) if alert.severity == Severity::Critical => {
+            "#b3261e"
+        }
+        (Event::Firing | Event::Reminder, Some(_)) => "#b87a00",
         (Event::Resolved, _) => "#0b6b4b",
         _ => "#6b7280",
     }
@@ -739,17 +745,42 @@ impl Notifier {
         Ok(())
     }
 
+    /// Whether a reminder queued a moment ago still has a point.
+    fn reminder_is_stale(delivery: &Delivery, silences: &ActiveSilences) -> bool {
+        let alert = &delivery.alert;
+        alert.resolved_ms.is_some()
+            || alert.acknowledged_ms.is_some()
+            || silences.covering(alert).is_some()
+    }
+
+    async fn queue_reminders(&self, silences: &ActiveSilences, now_ms: i64) -> Result<()> {
+        let alerts: Vec<(i64, i64)> = self
+            .database
+            .alerts_to_remind()
+            .await?
+            .into_iter()
+            .filter(|(alert, _)| silences.covering(alert).is_none())
+            .map(|(alert, every_secs)| (alert.id, every_secs))
+            .collect();
+        self.database.queue_reminders(&alerts, now_ms).await
+    }
+
     /// Sends what's due, and saves how each one went. Someone who was told an alert
     /// started always hears that it ended, or an on-call incident would stay open.
     pub async fn deliver_due(&self, now_ms: i64) -> Result<()> {
         let silences = ActiveSilences::load(&self.database, now_ms).await?;
         self.release_held(&silences, now_ms).await?;
+        self.queue_reminders(&silences, now_ms).await?;
         let due = self.database.due_deliveries(now_ms, BATCH_SIZE).await?;
 
         let mut sends = JoinSet::new();
         for delivery in due {
             if delivery.event == Event::Firing && silences.covering(&delivery.alert).is_some() {
                 self.database.hold_delivery(&delivery).await?;
+                continue;
+            }
+            if delivery.event == Event::Reminder && Self::reminder_is_stale(&delivery, &silences) {
+                self.database.drop_delivery(delivery.id).await?;
                 continue;
             }
             let senders = self.senders.clone();
@@ -824,6 +855,8 @@ mod tests {
             started_ms: 1_000,
             resolved_ms: None,
             resolve_reason: None,
+            acknowledged_by: None,
+            acknowledged_ms: None,
         }
     }
 

@@ -52,6 +52,11 @@ fn to_alert_rule(row: alert_rule::Model, channels: Vec<i64>) -> Result<AlertRule
                 .map(u64::try_from)
                 .transpose()
                 .context("invalid window")?,
+            remind_every_secs: row
+                .remind_every_secs
+                .map(u64::try_from)
+                .transpose()
+                .context("invalid reminder")?,
         },
     })
 }
@@ -76,6 +81,11 @@ fn alert_rule_row(input: &AlertRuleInput) -> Result<alert_rule::ActiveModel> {
             .map(i64::try_from)
             .transpose()
             .context("invalid window")?),
+        remind_every_secs: Set(input
+            .remind_every_secs
+            .map(i64::try_from)
+            .transpose()
+            .context("invalid reminder")?),
         ..Default::default()
     })
 }
@@ -106,6 +116,8 @@ fn to_alert(row: alert::Model) -> Result<Alert> {
         started_ms: row.started_ms,
         resolved_ms: row.resolved_ms,
         resolve_reason: row.resolve_reason,
+        acknowledged_by: row.acknowledged_by,
+        acknowledged_ms: row.acknowledged_ms,
     })
 }
 
@@ -350,6 +362,8 @@ impl Database {
             started_ms: Set(new.started_ms),
             resolved_ms: Set(None),
             resolve_reason: Set(None),
+            acknowledged_by: Set(None),
+            acknowledged_ms: Set(None),
             ..Default::default()
         };
 
@@ -482,6 +496,136 @@ impl Database {
                 })
             })
             .collect()
+    }
+
+    /// Says someone is dealing with an alert. The first person to say so stays on it.
+    /// Returns false if there's no such alert firing.
+    pub async fn acknowledge_alert(&self, id: i64, by: &str, now_ms: i64) -> Result<bool> {
+        let firing = alert::Entity::find_by_id(id)
+            .filter(alert::Column::ResolvedMs.is_null())
+            .one(&self.connection)
+            .await
+            .context("loading alert")?;
+        if firing.is_none() {
+            return Ok(false);
+        }
+        alert::Entity::update_many()
+            .col_expr(alert::Column::AcknowledgedBy, Expr::value(by))
+            .col_expr(alert::Column::AcknowledgedMs, Expr::value(now_ms))
+            .filter(alert::Column::Id.eq(id))
+            .filter(alert::Column::AcknowledgedMs.is_null())
+            .exec(&self.connection)
+            .await
+            .context("saving alert")?;
+        Ok(true)
+    }
+
+    /// Returns false if there's no such alert firing.
+    pub async fn unacknowledge_alert(&self, id: i64) -> Result<bool> {
+        let result = alert::Entity::update_many()
+            .col_expr(alert::Column::AcknowledgedBy, Expr::value(None::<String>))
+            .col_expr(alert::Column::AcknowledgedMs, Expr::value(None::<i64>))
+            .filter(alert::Column::Id.eq(id))
+            .filter(alert::Column::ResolvedMs.is_null())
+            .exec(&self.connection)
+            .await
+            .context("saving alert")?;
+        Ok(result.rows_affected > 0)
+    }
+
+    /// Alerts that nobody has acknowledged, on rules that send reminders, with how often.
+    pub async fn alerts_to_remind(&self) -> Result<Vec<(Alert, i64)>> {
+        let rules: BTreeMap<i64, i64> = alert_rule::Entity::find()
+            .filter(alert_rule::Column::RemindEverySecs.is_not_null())
+            .all(&self.connection)
+            .await
+            .context("loading alert rules")?
+            .into_iter()
+            .filter_map(|row| Some((row.id, row.remind_every_secs?)))
+            .collect();
+        if rules.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = alert::Entity::find()
+            .filter(alert::Column::RuleId.is_in(rules.keys().copied()))
+            .filter(alert::Column::ResolvedMs.is_null())
+            .filter(alert::Column::AcknowledgedMs.is_null())
+            .all(&self.connection)
+            .await
+            .context("loading alerts")?;
+        rows.into_iter()
+            .filter_map(|row| Some((rules.get(&row.rule_id?).copied()?, row)))
+            .map(|(every, row)| Ok((to_alert(row)?, every)))
+            .collect()
+    }
+
+    /// Queues a reminder for each channel that was told an alert started and hasn't heard
+    /// about it for as long as the alert's rule says. Each alert comes with that time, in
+    /// seconds. On-call services are left out.
+    pub async fn queue_reminders(&self, alerts: &[(i64, i64)], now_ms: i64) -> Result<()> {
+        if alerts.is_empty() {
+            return Ok(());
+        }
+        let rows = notification::Entity::find()
+            .filter(notification::Column::AlertId.is_in(alerts.iter().map(|(id, _)| *id)))
+            .all(&self.connection)
+            .await
+            .context("loading notifications")?;
+
+        let mut last_told: BTreeMap<(i64, i64), i64> = BTreeMap::new();
+        let mut waiting = BTreeSet::new();
+        for row in rows {
+            let key = (row.alert_id, row.channel_id);
+            match row.sent_ms {
+                Some(sent) => {
+                    let last = last_told.entry(key).or_default();
+                    *last = sent.max(*last);
+                }
+                None if row.state != FAILED => {
+                    waiting.insert(key);
+                }
+                None => {}
+            }
+        }
+
+        let every_ms: BTreeMap<i64, i64> = alerts
+            .iter()
+            .map(|(id, secs)| (*id, secs.saturating_mul(1000)))
+            .collect();
+        let on_call: BTreeSet<i64> = self
+            .list_channels()
+            .await?
+            .into_iter()
+            .filter(|channel| channel.channel.kind.is_on_call())
+            .map(|channel| channel.id)
+            .collect();
+        let rows: Vec<_> = last_told
+            .into_iter()
+            .filter(|(key, _)| !waiting.contains(key) && !on_call.contains(&key.1))
+            .filter(|((alert, _), told)| {
+                every_ms
+                    .get(alert)
+                    .is_some_and(|every| now_ms - told >= *every)
+            })
+            .map(|((alert, channel), _)| queued(alert, channel, Event::Reminder, now_ms))
+            .collect();
+        if !rows.is_empty() {
+            notification::Entity::insert_many(rows)
+                .exec_without_returning(&self.connection)
+                .await
+                .context("queueing notifications")?;
+        }
+        Ok(())
+    }
+
+    /// Forgets a notification that no longer has anything to say.
+    pub async fn drop_delivery(&self, id: i64) -> Result<()> {
+        notification::Entity::delete_by_id(id)
+            .exec(&self.connection)
+            .await
+            .context("dropping notification")?;
+        Ok(())
     }
 
     /// Keeps a notification back because of a silence. An alert that's already over

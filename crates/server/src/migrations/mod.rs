@@ -20,6 +20,7 @@ impl MigratorTrait for Migrator {
             Box::new(CreateDashboards),
             Box::new(AddCalculationRules),
             Box::new(CreateSilences),
+            Box::new(AddRemindersAndAcknowledging),
         ]
     }
 }
@@ -1394,6 +1395,80 @@ impl MigrationTrait for CreateSilences {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
             .drop_table(Table::drop().table(Silences::Table).to_owned())
+            .await
+    }
+}
+
+struct AddRemindersAndAcknowledging;
+
+impl MigrationName for AddRemindersAndAcknowledging {
+    fn name(&self) -> &str {
+        "m20261107_000013_add_reminders_and_acknowledging"
+    }
+}
+
+#[derive(Iden)]
+enum ReminderColumns {
+    RemindEverySecs,
+}
+
+#[derive(Iden)]
+enum AcknowledgedColumns {
+    AcknowledgedBy,
+    AcknowledgedMs,
+}
+
+/// One column at a time, as SQLite can only add them that way.
+#[async_trait::async_trait]
+impl MigrationTrait for AddRemindersAndAcknowledging {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(AlertRulesTable::Table)
+                    .add_column(ColumnDef::new(ReminderColumns::RemindEverySecs).big_integer())
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alerts::Table)
+                    .add_column(ColumnDef::new(AcknowledgedColumns::AcknowledgedBy).string_len(255))
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alerts::Table)
+                    .add_column(ColumnDef::new(AcknowledgedColumns::AcknowledgedMs).big_integer())
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for column in [
+            AcknowledgedColumns::AcknowledgedBy,
+            AcknowledgedColumns::AcknowledgedMs,
+        ] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(Alerts::Table)
+                        .drop_column(column)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(AlertRulesTable::Table)
+                    .drop_column(ReminderColumns::RemindEverySecs)
+                    .to_owned(),
+            )
             .await
     }
 }

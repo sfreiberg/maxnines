@@ -46,6 +46,7 @@ struct AlertRuleForm {
     fact: String,
     filter: String,
     window_secs: String,
+    remind_every_minutes: String,
     #[serde(flatten)]
     applies_to: ConditionForm,
 }
@@ -68,6 +69,7 @@ impl AlertRuleForm {
             fact: String::new(),
             filter: String::new(),
             window_secs: "300".to_string(),
+            remind_every_minutes: String::new(),
             applies_to: ConditionForm::blank(),
         }
     }
@@ -83,6 +85,10 @@ impl AlertRuleForm {
             fact,
             filter: rule.filter.clone().unwrap_or_default(),
             window_secs: rule.window().to_string(),
+            remind_every_minutes: rule
+                .remind_every_secs
+                .map(|secs| (secs / 60).to_string())
+                .unwrap_or_default(),
             name: rule.name.clone(),
             kind: rule.kind.as_str().to_string(),
             metric: rule.metric.clone().unwrap_or(blank.metric),
@@ -107,6 +113,7 @@ impl AlertRuleForm {
             fact: text("fact").trim().to_string(),
             filter: text("filter").trim().to_string(),
             window_secs: text("window_secs"),
+            remind_every_minutes: text("remind_every_minutes").trim().to_string(),
             name: text("name"),
             kind: text("kind"),
             metric: text("metric"),
@@ -131,6 +138,15 @@ impl AlertRuleForm {
             .trim()
             .parse()
             .context("the duration must be a whole number of seconds")?;
+        let remind_every_secs = match self.remind_every_minutes.as_str() {
+            "" => None,
+            text => {
+                let minutes: u64 = text
+                    .parse()
+                    .context("reminders must be a whole number of minutes")?;
+                Some(minutes.saturating_mul(60))
+            }
+        };
 
         // The form always sends these, and they only mean something for metrics.
         let (metric, series, comparison, threshold) = match kind {
@@ -192,6 +208,7 @@ impl AlertRuleForm {
             group_by: only_for_calculations(group_by),
             filter: only_for_calculations(self.filter.clone()).filter(|text| !text.is_empty()),
             window_secs,
+            remind_every_secs,
             name: self.name.trim().to_string(),
             kind,
             metric,
@@ -466,6 +483,7 @@ mod tests {
             group_by: None,
             filter: None,
             window_secs: None,
+            remind_every_secs: None,
         }
     }
 

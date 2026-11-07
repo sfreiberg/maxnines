@@ -167,6 +167,10 @@ pub struct AlertRuleInput {
     /// How far back a calculation rule looks, so one busy moment isn't a problem.
     #[serde(default)]
     pub window_secs: Option<u64>,
+    /// How often to say an alert is still firing, until someone acknowledges it. Never,
+    /// if empty. On-call services are left out, as repeating is their job.
+    #[serde(default)]
+    pub remind_every_secs: Option<u64>,
 }
 
 fn default_enabled() -> bool {
@@ -175,12 +179,20 @@ fn default_enabled() -> bool {
 
 /// Checks a rule before it's saved. Whether its channels exist is up to the
 /// caller, which can see them.
+/// Any more often and people stop reading them.
+const MIN_REMINDER_SECS: u64 = 300;
+
 pub fn check_rule(rule: &AlertRuleInput) -> Result<()> {
     ensure!(!rule.name.trim().is_empty(), "a rule needs a name");
     ensure!(rule.name.len() <= MAX_NAME_LEN, "the rule name is too long");
     ensure!(
         rule.for_secs <= MAX_FOR_SECS,
         "the duration can't be longer than 7 days"
+    );
+    ensure!(
+        rule.remind_every_secs
+            .is_none_or(|secs| secs >= MIN_REMINDER_SECS),
+        "reminders can't be more often than every 5 minutes"
     );
 
     if let Some(condition) = &rule.condition {
@@ -393,6 +405,11 @@ pub enum ChannelKind {
 }
 
 impl ChannelKind {
+    /// Whether the service keeps after people itself until someone responds.
+    pub fn is_on_call(self) -> bool {
+        matches!(self, Self::PagerDuty | Self::AlertOps | Self::Signl4)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Webhook => "webhook",
@@ -614,6 +631,9 @@ pub struct Alert {
     pub started_ms: i64,
     pub resolved_ms: Option<i64>,
     pub resolve_reason: Option<String>,
+    /// Who said they're dealing with it.
+    pub acknowledged_by: Option<String>,
+    pub acknowledged_ms: Option<i64>,
 }
 
 /// What's needed to start an alert.
@@ -634,6 +654,7 @@ pub struct NewAlert {
 #[serde(rename_all = "snake_case")]
 pub enum Event {
     Firing,
+    Reminder,
     Resolved,
     Test,
 }
@@ -642,6 +663,7 @@ impl Event {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Firing => "firing",
+            Self::Reminder => "reminder",
             Self::Resolved => "resolved",
             Self::Test => "test",
         }
@@ -650,6 +672,7 @@ impl Event {
     pub fn parse(text: &str) -> Result<Self> {
         match text {
             "firing" => Ok(Self::Firing),
+            "reminder" => Ok(Self::Reminder),
             "resolved" => Ok(Self::Resolved),
             other => bail!("unknown event {other:?}"),
         }
@@ -702,6 +725,7 @@ mod tests {
             group_by: None,
             filter: None,
             window_secs: None,
+            remind_every_secs: None,
         }
     }
 
@@ -754,6 +778,13 @@ mod tests {
                     ..metric_rule()
                 },
                 "too long",
+            ),
+            (
+                AlertRuleInput {
+                    remind_every_secs: Some(MIN_REMINDER_SECS - 1),
+                    ..metric_rule()
+                },
+                "every 5 minutes",
             ),
             (
                 AlertRuleInput {

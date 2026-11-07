@@ -16,6 +16,8 @@ pub struct Model {
     pub started_ms: i64,
     pub resolved_ms: Option<i64>,
     pub resolve_reason: Option<String>,
+    pub acknowledged_by: Option<String>,
+    pub acknowledged_ms: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

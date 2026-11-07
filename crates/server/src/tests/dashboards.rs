@@ -528,6 +528,7 @@ mod calculation_alerts {
             group_by: None,
             filter: None,
             window_secs: Some(300),
+            remind_every_secs: None,
         }
     }
 

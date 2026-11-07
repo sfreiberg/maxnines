@@ -301,6 +301,16 @@ silence ends, the notifications go out then, and if it ends first, nobody hears 
 Anyone who had already been told about an alert still hears when it ends, which keeps
 on-call services from leaving an incident open.
 
+## Reminders and acknowledging
+
+Set **Remind every** on an alert rule to hear again while it's still firing, at most
+every 5 minutes. Reminders go to the channels that were told it started, except on-call
+services, which repeat for themselves.
+
+Press **Acknowledge** on a firing alert to say you're dealing with it. That shows your
+name on the Alerts page and stops the reminders. It only applies inside MaxNines, so
+acknowledging an alert here doesn't acknowledge it in PagerDuty, or the other way round.
+
 ## On-call services
 
 Alerts can open incidents in PagerDuty, AlertOps and SIGNL4, and close them again when

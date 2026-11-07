@@ -1,11 +1,12 @@
 use axum::Router;
-use axum::extract::State;
-use axum::response::Response;
-use axum::routing::get;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Redirect, Response};
+use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
 use serde::Serialize;
 
-use super::{Page, server_error};
+use super::{CsrfForm, Page, server_error, signed_in_user};
 use crate::alerting::{Alert, DeliveryProblem};
 use crate::app_state::AppState;
 use crate::fact_history::format_time;
@@ -21,7 +22,10 @@ const HISTORY: u64 = 50;
 const PROBLEMS: u64 = 20;
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/alerts", get(index))
+    Router::new()
+        .route("/alerts", get(index))
+        .route("/alerts/{id}/acknowledge", post(acknowledge))
+        .route("/alerts/{id}/unacknowledge", post(unacknowledge))
 }
 
 fn time(ms: i64) -> String {
@@ -30,6 +34,8 @@ fn time(ms: i64) -> String {
 
 #[derive(Serialize)]
 struct AlertRow {
+    id: i64,
+    acknowledged_by: Option<String>,
     agent_id: String,
     host: String,
     rule_name: String,
@@ -62,6 +68,8 @@ impl From<Alert> for AlertRow {
         Self {
             silence_link: silence_link(&alert),
             silenced_until: None,
+            id: alert.id,
+            acknowledged_by: alert.acknowledged_by,
             severity: alert.severity.as_str(),
             started: time(alert.started_ms),
             resolved: alert.resolved_ms.map(time),
@@ -136,4 +144,29 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
         .with("resolved", &resolved)
         .with("problems", &problems)
         .render()
+}
+
+async fn acknowledge(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    form: CsrfForm,
+) -> Response {
+    let by = signed_in_user().map_or_else(|| "admin".to_string(), |user| user.email.clone());
+    match state.database.acknowledge_alert(id, &by, now_ms()).await {
+        Ok(true) => (form.token, Redirect::to("/alerts")).into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn unacknowledge(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    form: CsrfForm,
+) -> Response {
+    match state.database.unacknowledge_alert(id).await {
+        Ok(true) => (form.token, Redirect::to("/alerts")).into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
 }

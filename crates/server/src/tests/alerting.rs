@@ -193,6 +193,7 @@ fn cpu_rule() -> AlertRuleInput {
         group_by: None,
         filter: None,
         window_secs: None,
+        remind_every_secs: None,
     }
 }
 
@@ -3704,6 +3705,337 @@ mod silences {
 
         assert_eq!(alerts["open"][0]["silenced_by"], id);
         assert_eq!(alerts["open"][0]["rule_name"], "High CPU");
+    }
+}
+
+mod reminders {
+    use super::*;
+    use crate::silences::SilenceInput;
+
+    const HOUR_MS: i64 = 3_600_000;
+
+    /// A firing alert that's been delivered to a channel, on a rule with hourly reminders.
+    async fn firing(
+        test: &mut Harness,
+        hook: &FakeOnCall,
+        kind: ChannelKind,
+        target: &str,
+    ) -> Notifier {
+        let url = hook.start().await;
+        let target = if target.is_empty() {
+            url.as_str()
+        } else {
+            target
+        };
+        let channel = ChannelInput {
+            name: "Ops".to_string(),
+            kind,
+            target: target.to_string(),
+            credential: None,
+        };
+        let channel = test.database().create_channel(&channel).await.unwrap();
+        let rule = AlertRuleInput {
+            for_secs: 0,
+            channels: vec![channel],
+            remind_every_secs: Some(3600),
+            ..cpu_rule()
+        };
+        test.database().create_alert_rule(&rule).await.unwrap();
+        test.cpu(0, 95.0).await;
+        let senders = Senders {
+            pagerduty_url: Some(url),
+            ..Senders::default()
+        };
+        let notifier = Notifier::new(test.database().clone(), senders);
+        notifier.deliver_due(test.now).await.unwrap();
+        notifier
+    }
+
+    async fn at(test: &Harness, notifier: &Notifier, offset_ms: i64) {
+        notifier.deliver_due(test.now + offset_ms).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reminder_goes_out_each_time_the_wait_passes() {
+        let mut test = Harness::start().await;
+        let hook = FakeOnCall::default();
+        let notifier = firing(&mut test, &hook, ChannelKind::Webhook, "").await;
+        assert_eq!(hook.events().len(), 1);
+
+        at(&test, &notifier, HOUR_MS - 1000).await;
+        assert_eq!(hook.events().len(), 1, "it's too soon");
+
+        at(&test, &notifier, HOUR_MS).await;
+        let events = hook.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1]["event"], "reminder");
+        assert!(
+            events[1]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Still firing: ")
+        );
+
+        at(&test, &notifier, HOUR_MS + 1000).await;
+        assert_eq!(hook.events().len(), 2, "the wait starts again");
+
+        at(&test, &notifier, 2 * HOUR_MS).await;
+        assert_eq!(hook.events().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn no_reminders_without_the_setting_on_the_rule() {
+        let mut test = Harness::start().await;
+        let hook = FakeOnCall::default();
+        let url = hook.start().await;
+        let notifier = firing_on(&mut test, ChannelKind::Webhook, &url, Senders::default()).await;
+        notifier.deliver_due(test.now).await.unwrap();
+
+        at(&test, &notifier, 100 * HOUR_MS).await;
+
+        assert_eq!(hook.events().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn acknowledging_stops_reminders_and_undoing_it_starts_them_again() {
+        let mut test = Harness::start().await;
+        let hook = FakeOnCall::default();
+        let notifier = firing(&mut test, &hook, ChannelKind::Webhook, "").await;
+        let id = test.open().await[0].id;
+
+        assert!(
+            test.database()
+                .acknowledge_alert(id, "sam", test.now)
+                .await
+                .unwrap()
+        );
+        at(&test, &notifier, 2 * HOUR_MS).await;
+        assert_eq!(hook.events().len(), 1);
+
+        assert!(test.database().unacknowledge_alert(id).await.unwrap());
+        at(&test, &notifier, 3 * HOUR_MS).await;
+        assert_eq!(hook.events().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_first_to_acknowledge_stays_on_it() {
+        let mut test = Harness::start().await;
+        let hook = FakeOnCall::default();
+        firing(&mut test, &hook, ChannelKind::Webhook, "").await;
+        let id = test.open().await[0].id;
+
+        test.database()
+            .acknowledge_alert(id, "sam", test.now)
+            .await
+            .unwrap();
+        test.database()
+            .acknowledge_alert(id, "alex", test.now)
+            .await
+            .unwrap();
+
+        let open = test.open().await;
+        assert_eq!(open[0].acknowledged_by.as_deref(), Some("sam"));
+        assert_eq!(open[0].acknowledged_ms, Some(test.now));
+    }
+
+    #[tokio::test]
+    async fn an_alert_that_has_ended_can_not_be_acknowledged() {
+        let mut test = Harness::start().await;
+        let hook = FakeOnCall::default();
+        firing(&mut test, &hook, ChannelKind::Webhook, "").await;
+        let id = test.open().await[0].id;
+        test.database()
+            .resolve_alert(id, test.now, "Fixed")
+            .await
+            .unwrap();
+
+        assert!(
+            !test
+                .database()
+                .acknowledge_alert(id, "sam", test.now)
+                .await
+                .unwrap()
+        );
+        assert!(!test.database().unacknowledge_alert(id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn on_call_services_are_left_to_repeat_for_themselves() {
+        let mut test = Harness::start().await;
+        let hook = FakeOnCall::default();
+        let notifier = firing(&mut test, &hook, ChannelKind::PagerDuty, PAGERDUTY_KEY).await;
+        assert_eq!(hook.events().len(), 1);
+
+        at(&test, &notifier, 5 * HOUR_MS).await;
+
+        assert_eq!(hook.events().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_silence_stops_reminders() {
+        let mut test = Harness::start().await;
+        let hook = FakeOnCall::default();
+        let notifier = firing(&mut test, &hook, ChannelKind::Webhook, "").await;
+        let input = SilenceInput {
+            rule_id: None,
+            filter: String::new(),
+            reason: "Upgrading".to_string(),
+            duration_secs: 3 * 3600,
+        };
+        test.database()
+            .create_silence(&input, "sam", test.now)
+            .await
+            .unwrap();
+
+        at(&test, &notifier, 2 * HOUR_MS).await;
+        assert_eq!(hook.events().len(), 1);
+
+        at(&test, &notifier, 3 * HOUR_MS).await;
+        assert_eq!(
+            hook.events().len(),
+            2,
+            "it's still firing once the silence is over"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reminder_still_waiting_when_the_alert_ends_is_dropped() {
+        let mut test = Harness::start().await;
+        let hook = FakeOnCall::default();
+        let notifier = firing(&mut test, &hook, ChannelKind::Webhook, "").await;
+        hook.statuses.lock().unwrap().push(500);
+        at(&test, &notifier, HOUR_MS).await;
+        assert_eq!(
+            hook.events().len(),
+            2,
+            "the reminder failed and waits to retry"
+        );
+
+        let id = test.open().await[0].id;
+        test.database()
+            .resolve_alert(id, test.now + HOUR_MS, "Fixed")
+            .await
+            .unwrap();
+        at(&test, &notifier, 2 * HOUR_MS).await;
+        at(&test, &notifier, 2 * HOUR_MS + 1000).await;
+
+        let events = hook.events();
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert_eq!(events[2]["event"], "resolved");
+    }
+
+    #[tokio::test]
+    async fn someone_can_acknowledge_from_the_alerts_page() {
+        let mut test = Harness::start().await;
+        let hook = FakeOnCall::default();
+        firing(&mut test, &hook, ChannelKind::Webhook, "").await;
+        let id = test.open().await[0].id;
+        let mut browser = Browser::default();
+
+        let path = format!("/alerts/{id}/acknowledge");
+        let page = browser.submit(&test.server, "/alerts", &path, &[]).await;
+        assert_eq!(page.status, 303, "{}", page.body);
+
+        let page = browser.get(&test.server, "/alerts").await;
+        assert!(page.body.contains("acknowledged by"), "{}", page.body);
+        assert!(page.body.contains("Undo"), "{}", page.body);
+
+        let path = format!("/alerts/{id}/unacknowledge");
+        browser.submit(&test.server, "/alerts", &path, &[]).await;
+        assert_eq!(test.open().await[0].acknowledged_by, None);
+    }
+
+    #[tokio::test]
+    async fn the_api_acknowledges_as_the_api() {
+        let mut test = Harness::start().await;
+        let hook = FakeOnCall::default();
+        firing(&mut test, &hook, ChannelKind::Webhook, "").await;
+        let id = test.open().await[0].id;
+        let path = format!("/api/v1/alerts/{id}");
+
+        let (status, _) = api(
+            &test.server,
+            "POST",
+            &format!("{path}/acknowledge"),
+            &Value::Null,
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (_, alerts) = api(&test.server, "GET", "/api/v1/alerts", &Value::Null).await;
+        assert_eq!(alerts["open"][0]["acknowledged_by"], "api");
+
+        let (status, _) = api(
+            &test.server,
+            "POST",
+            &format!("{path}/unacknowledge"),
+            &Value::Null,
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (status, _) = api(
+            &test.server,
+            "POST",
+            "/api/v1/alerts/99/acknowledge",
+            &Value::Null,
+        )
+        .await;
+        assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
+    async fn the_rule_form_sets_reminders_in_minutes() {
+        let test = Harness::start().await;
+        let mut browser = Browser::default();
+        let fields = [
+            ("name", "Busy"),
+            ("kind", "metric"),
+            ("metric", "cpu.usage"),
+            ("comparison", "above"),
+            ("threshold", "90"),
+            ("for_secs", "60"),
+            ("severity", "warning"),
+            ("enabled", "on"),
+            ("remind_every_minutes", "30"),
+        ];
+        let form = "/alerts/rules/new";
+
+        let page = browser
+            .submit(&test.server, form, "/alerts/rules", &fields)
+            .await;
+        assert_eq!(page.status, 303, "{}", page.body);
+
+        let rules = test.database().list_alert_rules().await.unwrap();
+        assert_eq!(rules[0].rule.remind_every_secs, Some(1800));
+        let edit = format!("/alerts/rules/{}/edit", rules[0].id);
+        let page = browser.get(&test.server, &edit).await;
+        assert!(
+            page.body
+                .contains("name=\"remind_every_minutes\" value=\"30\""),
+            "{}",
+            page.body
+        );
+    }
+
+    #[tokio::test]
+    async fn the_rule_form_refuses_reminders_that_are_too_often() {
+        let test = Harness::start().await;
+        let mut browser = Browser::default();
+        let fields = [
+            ("name", "Busy"),
+            ("kind", "metric"),
+            ("metric", "cpu.usage"),
+            ("comparison", "above"),
+            ("threshold", "90"),
+            ("for_secs", "60"),
+            ("severity", "warning"),
+            ("remind_every_minutes", "1"),
+        ];
+
+        let page = browser
+            .submit(&test.server, "/alerts/rules/new", "/alerts/rules", &fields)
+            .await;
+
+        assert!(page.body.contains("every 5 minutes"), "{}", page.body);
     }
 }
 
