@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
 
 use anyhow::Result;
 use maxnines_protocol::build_info;
@@ -8,9 +9,19 @@ use sysinfo::{CpuRefreshKind, IpNetwork, MacAddr, Motherboard, Networks, Product
 use crate::collector;
 use crate::custom::Definitions;
 
+/// Loopback is the same everywhere. Link-local addresses are plentiful, can change with
+/// each reboot or VPN connection, and every change would be kept as history.
+fn reachable(address: IpAddr) -> bool {
+    let link_local = match address {
+        IpAddr::V4(address) => address.is_link_local(),
+        IpAddr::V6(address) => address.is_unicast_link_local(),
+    };
+    !address.is_loopback() && !link_local
+}
+
 /// Every address this machine has, and where each one is. `addresses` is a plain list so
-/// that a host filter can match any of them. The loopback address is the same everywhere,
-/// so it's left out, along with any interface that has nothing else.
+/// that a host filter can match any of them. Addresses that only mean something on the
+/// machine or its own link are left out, along with any interface that has nothing else.
 fn network_facts<'a>(
     interfaces: impl Iterator<Item = (String, MacAddr, &'a [IpNetwork])>,
 ) -> Value {
@@ -19,7 +30,7 @@ fn network_facts<'a>(
     for (name, mac, networks) in interfaces {
         let networks: BTreeSet<String> = networks
             .iter()
-            .filter(|network| !network.addr.is_loopback())
+            .filter(|network| reachable(network.addr))
             .inspect(|network| {
                 addresses.insert(network.addr.to_string());
             })
@@ -159,6 +170,25 @@ mod tests {
         let facts = network_facts(interfaces.into_iter());
 
         assert_eq!(facts, json!({ "addresses": [], "interfaces": [] }));
+    }
+
+    #[test]
+    fn link_local_addresses_are_left_out() {
+        let tunnel = [network("fe80::1/64"), network("169.254.3.4/16")];
+        let wired = [network("fe80::2/64"), network("192.168.0.5/24")];
+        let interfaces: [(String, MacAddr, &[IpNetwork]); 2] = [
+            ("utun0".to_string(), MacAddr::UNSPECIFIED, &tunnel),
+            ("eth0".to_string(), MacAddr::UNSPECIFIED, &wired),
+        ];
+
+        let facts = network_facts(interfaces.into_iter());
+
+        assert_eq!(facts["addresses"], json!(["192.168.0.5"]));
+        assert_eq!(facts["interfaces"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            facts["interfaces"][0]["addresses"],
+            json!(["192.168.0.5/24"])
+        );
     }
 
     #[test]
