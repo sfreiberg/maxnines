@@ -8,6 +8,7 @@ use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clickhouse::{Client, Row};
@@ -29,6 +30,8 @@ use crate::metrics::{
 
 /// Anything beyond this is skipped, as in the other stores.
 const LARGEST_VALUE: &str = "1e300";
+
+const BATCH_EVERY: Duration = Duration::from_secs(1);
 
 /// Picking machines lists them all, which can be longer than ClickHouse's default.
 const MAX_QUERY_BYTES: &str = "67108864";
@@ -521,15 +524,7 @@ impl ClickHouseStore {
         if rows.is_empty() {
             return Ok(());
         }
-        // ClickHouse wants few, large inserts. It gathers ours up, and waiting for it
-        // means a sample really is stored by the time the agent hears so.
-        let mut insert = self
-            .client
-            .clone()
-            .with_setting("async_insert", "1")
-            .with_setting("wait_for_async_insert", "1")
-            .insert::<T>(table)
-            .await?;
+        let mut insert = self.client.insert::<T>(table).await?;
         for row in rows {
             insert.write(row).await?;
         }
@@ -546,6 +541,11 @@ impl ClickHouseStore {
 }
 
 impl Store for ClickHouseStore {
+    /// ClickHouse wants few, large inserts, about one a second.
+    fn batch_every(&self) -> Duration {
+        BATCH_EVERY
+    }
+
     fn write(&mut self, samples: &[NewSample]) -> Result<()> {
         let mut rows = Rows::default();
         for new in samples {

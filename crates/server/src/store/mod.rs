@@ -19,7 +19,7 @@ use anyhow::Result;
 use maxnines_protocol::Sample;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, error::TryRecvError};
 use tracing::{error, warn};
 
 use crate::calculations::CalculationQuery;
@@ -40,22 +40,20 @@ const TIDY_PAUSE: Duration = Duration::from_millis(250);
 /// send any time at all, so anything later is turned away before it gets this far.
 pub const LATEST_SAMPLE_MS: u64 = 10_413_791_999_000;
 
-/// How long to wait before each new try at a batch the store couldn't take. It adds up
-/// to about two minutes, which is plenty for a database to restart. Agents keep what
-/// isn't confirmed, so nothing's lost by giving up after that.
+/// How often to try a batch the store couldn't take, and how many times. That's about
+/// two minutes, which is plenty for a database to restart. Agents keep what isn't
+/// confirmed, so nothing's lost by giving up after that.
 #[cfg(not(test))]
-const RETRY_WAITS: [Duration; 8] = [
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-    Duration::from_secs(4),
-    Duration::from_secs(8),
-    Duration::from_secs(16),
-    Duration::from_secs(30),
-    Duration::from_secs(30),
-    Duration::from_secs(30),
-];
+const RETRY_WAIT: Duration = Duration::from_secs(1);
 #[cfg(test)]
-const RETRY_WAITS: [Duration; 3] = [Duration::from_millis(1); 3];
+const RETRY_WAIT: Duration = Duration::from_millis(1);
+#[cfg(not(test))]
+const RETRIES: usize = 120;
+#[cfg(test)]
+const RETRIES: usize = 3;
+
+/// How often to look for more samples while waiting for a batch to be due.
+const GATHER_EVERY: Duration = Duration::from_millis(10);
 
 /// Enough to cover what an agent can have waiting to hear about: it keeps 64 samples
 /// in memory, and sends its backlog one at a time.
@@ -67,11 +65,10 @@ pub trait Store: Send {
     /// either all of them are stored or none of them are.
     fn write(&mut self, samples: &[NewSample]) -> Result<()>;
 
-    /// Whether a batch that failed is worth trying a sample at a time. Otherwise a
-    /// failure means the database can't be reached, and the whole batch waits to go
-    /// again, as trying each sample would only take far longer.
-    fn retries_samples_singly(&self) -> bool {
-        false
+    /// The least time between writes, for a database that wants few, large batches.
+    /// With none, samples are written as soon as the last write is done.
+    fn batch_every(&self) -> Duration {
+        Duration::ZERO
     }
 
     /// Something to read with, which can run alongside writes.
@@ -251,7 +248,10 @@ fn run_writer(
     let mut recent = RecentSamples::default();
     let mut stopping = false;
     let mut next_tidy = Instant::now();
+    let every = store.batch_every();
+    let mut next_write = Instant::now();
     while !stopping && commands.blocking_recv_many(&mut queued, WRITE_QUEUE_SIZE) > 0 {
+        gather_until(next_write, &mut commands, &mut queued);
         let mut samples = Vec::with_capacity(queued.len());
         let mut acks = Vec::with_capacity(queued.len());
         let mut repeats = Vec::new();
@@ -276,9 +276,10 @@ fn run_writer(
                 }
             }
         }
+        next_write = Instant::now() + every;
         if !samples.is_empty() {
             let saved = save(store.as_mut(), &samples, counts);
-            for ((new, ack), saved) in samples.iter().zip(acks).zip(saved) {
+            for (new, ack) in samples.iter().zip(acks) {
                 let time = new.sample.timestamp_ms;
                 match ack {
                     Some(ack) if saved => repeats.push((ack, time)),
@@ -301,6 +302,25 @@ fn run_writer(
         Ok(Ok(())) => {}
         Ok(Err(error)) => error!(error = format!("{error:#}"), "closing the store failed"),
         Err(_) => error!("store panicked while closing"),
+    }
+}
+
+/// Collects what arrives until a batch is due. A full batch doesn't wait, so a busy
+/// server isn't limited by the timer, and stopping doesn't wait either.
+fn gather_until(
+    due: Instant,
+    commands: &mut mpsc::Receiver<WriterCommand>,
+    queued: &mut Vec<WriterCommand>,
+) {
+    while Instant::now() < due
+        && queued.len() < WRITE_QUEUE_SIZE
+        && !matches!(queued.last(), Some(WriterCommand::Stop))
+    {
+        match commands.try_recv() {
+            Ok(command) => queued.push(command),
+            Err(TryRecvError::Empty) => thread::sleep(GATHER_EVERY),
+            Err(TryRecvError::Disconnected) => return,
+        }
     }
 }
 
@@ -347,34 +367,27 @@ fn write_batch(
     }
 }
 
-/// Saves a batch, and returns which samples were saved. What wasn't stays with the
-/// agents that sent it, as they only let go of a sample once they hear it's stored.
-fn save(store: &mut dyn Store, samples: &[NewSample], counts: &WriteCounts) -> Vec<bool> {
+/// Saves a batch, and returns whether it was. A batch stays together: samples are
+/// checked before they get here, so a failure means the database itself has a problem.
+/// What isn't saved stays with the agents that sent it, as they only let go of a sample
+/// once they hear it's stored.
+fn save(store: &mut dyn Store, samples: &[NewSample], counts: &WriteCounts) -> bool {
     let Err(mut error) = write_batch(store, samples, counts) else {
-        return vec![true; samples.len()];
+        return true;
     };
-    if store.retries_samples_singly() {
-        if samples.len() > 1 {
-            return samples
-                .iter()
-                .flat_map(|sample| save(store, std::slice::from_ref(sample), counts))
-                .collect();
-        }
-    } else {
-        for wait in RETRY_WAITS {
-            warn!(error, samples = samples.len(), "write failed, trying again");
-            thread::sleep(wait);
-            match write_batch(store, samples, counts) {
-                Ok(()) => return vec![true; samples.len()],
-                Err(failure) => error = failure,
-            }
+    warn!(error, samples = samples.len(), "write failed, trying again");
+    for _ in 0..RETRIES {
+        thread::sleep(RETRY_WAIT);
+        match write_batch(store, samples, counts) {
+            Ok(()) => return true,
+            Err(failure) => error = failure,
         }
     }
     counts
         .failed
         .fetch_add(samples.len() as u64, Ordering::Relaxed);
     error!(error, samples = samples.len(), "write failed, not saved");
-    vec![false; samples.len()]
+    false
 }
 
 /// How many readings a collector's output holds.
@@ -457,10 +470,6 @@ pub mod testing {
     pub struct MemoryStore(pub Saved);
 
     impl Store for MemoryStore {
-        fn retries_samples_singly(&self) -> bool {
-            true
-        }
-
         fn write(&mut self, samples: &[NewSample]) -> Result<()> {
             while self.0.paused.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(1));
@@ -552,10 +561,9 @@ mod tests {
 
     #[test]
     fn a_sample_that_could_not_be_stored_is_not_acknowledged() {
-        let (stored, acked) =
-            run(|acks| vec![from_agent("fail", 1, acks), from_agent("web", 2, acks)]);
-        assert_eq!(stored, [2]);
-        assert_eq!(acked, [2]);
+        let (stored, acked) = run(|acks| vec![from_agent("fail", 1, acks)]);
+        assert!(stored.is_empty());
+        assert!(acked.is_empty());
     }
 
     #[test]
@@ -579,18 +587,18 @@ mod tests {
     fn a_sample_that_failed_can_be_stored_when_it_is_sent_again() {
         let saved = Saved::default();
         let store = Box::new(MemoryStore(saved.clone()));
-        let (writer, thread) = spawn_writer(store, Arc::default());
+        let counts = Arc::new(WriteCounts::default());
+        let (writer, thread) = spawn_writer(store, counts.clone());
         let (acks, mut acked) = mpsc::channel(16);
 
         writer.blocking_send(from_agent("fail", 1, &acks)).unwrap();
-        writer.blocking_send(from_agent("web", 2, &acks)).unwrap();
-        assert_eq!(acked.blocking_recv(), Some(2));
+        wait_for_failures(&counts, 1);
         writer.blocking_send(from_agent("web", 1, &acks)).unwrap();
         assert_eq!(acked.blocking_recv(), Some(1));
 
         writer.blocking_send(WriterCommand::Stop).unwrap();
         thread.join().unwrap();
-        assert_eq!(saved.samples.lock().unwrap().len(), 2);
+        assert_eq!(saved.samples.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -643,18 +651,86 @@ mod tests {
             .collect()
     }
 
+    fn wait_for_failures(counts: &WriteCounts, failures: u64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while counts.failed.load(Ordering::Relaxed) < failures {
+            assert!(Instant::now() < deadline, "the write never failed");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Wants a gap between writes, and says how big each was.
+    struct Timed(Arc<std::sync::Mutex<Vec<usize>>>);
+
+    impl Store for Timed {
+        fn batch_every(&self) -> Duration {
+            Duration::from_millis(100)
+        }
+
+        fn write(&mut self, samples: &[NewSample]) -> Result<()> {
+            self.0.lock().unwrap().push(samples.len());
+            Ok(())
+        }
+
+        fn reader(&self) -> Result<Arc<dyn MetricsReader>> {
+            Ok(Arc::new(super::testing::EmptyReader))
+        }
+
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
-    fn a_batch_that_fails_goes_again_whole_and_never_a_sample_at_a_time() {
+    fn a_store_can_ask_for_samples_to_be_gathered_into_a_batch() {
+        let writes = Arc::default();
+        let store = Box::new(Timed(Arc::clone(&writes)));
+        let (writer, thread) = spawn_writer(store, Arc::default());
+
+        for time in 0..20 {
+            writer.blocking_send(save("web", time)).unwrap();
+            thread::sleep(Duration::from_millis(2));
+        }
+        thread::sleep(Duration::from_millis(250));
+        writer.blocking_send(WriterCommand::Stop).unwrap();
+        thread.join().unwrap();
+
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.iter().sum::<usize>(), 20);
+        assert!(writes.len() <= 3, "{writes:?}");
+    }
+
+    #[test]
+    fn a_full_batch_does_not_wait_for_the_timer() {
+        let writes = Arc::default();
+        let store = Box::new(Timed(Arc::clone(&writes)));
+        let (writer, thread) = spawn_writer(store, Arc::default());
+
+        let started = Instant::now();
+        for time in 0..2 * WRITE_QUEUE_SIZE as u64 {
+            writer.blocking_send(save("web", time)).unwrap();
+        }
+        writer.blocking_send(WriterCommand::Stop).unwrap();
+        thread.join().unwrap();
+
+        assert_eq!(
+            writes.lock().unwrap().iter().sum::<usize>(),
+            2 * WRITE_QUEUE_SIZE
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_batch_that_fails_goes_again_whole() {
         let mut store = Unreachable {
             failures: 2,
             writes: Vec::new(),
         };
         let counts = WriteCounts::default();
 
-        let saved = super::save(&mut store, &batch(100), &counts);
+        assert!(super::save(&mut store, &batch(100), &counts));
 
         assert_eq!(store.writes, [100, 100, 100]);
-        assert_eq!(saved, vec![true; 100]);
         assert_eq!(counts.written.load(Ordering::Relaxed), 100);
         assert_eq!(counts.failed.load(Ordering::Relaxed), 0);
     }
@@ -667,11 +743,10 @@ mod tests {
         };
         let counts = WriteCounts::default();
 
-        let saved = super::save(&mut store, &batch(100), &counts);
+        assert!(!super::save(&mut store, &batch(100), &counts));
 
-        assert_eq!(store.writes.len(), 1 + RETRY_WAITS.len());
+        assert_eq!(store.writes.len(), 1 + RETRIES);
         assert!(store.writes.iter().all(|size| *size == 100));
-        assert_eq!(saved, vec![false; 100], "so nothing gets acknowledged");
         assert_eq!(counts.failed.load(Ordering::Relaxed), 100);
     }
 
@@ -717,20 +792,19 @@ mod tests {
     #[test]
     fn keeps_writing_after_failures_and_panics() {
         let saved = Saved::default();
-        let (sender, handle) = spawn_writer(Box::new(MemoryStore(saved.clone())), Arc::default());
+        let counts = Arc::new(WriteCounts::default());
+        let store = Box::new(MemoryStore(saved.clone()));
+        let (sender, handle) = spawn_writer(store, counts.clone());
 
-        for command in [
-            save("a", 1),
-            save("fail", 2),
-            save("panic", 3),
-            save("a", 4),
-        ] {
-            sender.blocking_send(command).unwrap();
-        }
+        sender.blocking_send(save("fail", 1)).unwrap();
+        wait_for_failures(&counts, 1);
+        sender.blocking_send(save("panic", 2)).unwrap();
+        wait_for_failures(&counts, 2);
+        sender.blocking_send(save("a", 3)).unwrap();
         sender.blocking_send(WriterCommand::Stop).unwrap();
         handle.join().unwrap();
 
-        assert_eq!(timestamps(&saved), [1, 4]);
+        assert_eq!(timestamps(&saved), [3]);
     }
 
     #[test]
@@ -748,18 +822,17 @@ mod tests {
     }
 
     #[test]
-    fn a_bad_sample_only_loses_itself_from_a_batch() {
+    fn a_batch_is_never_split_up() {
         let (saved, counts) = run_with(vec![
             save("a", 1),
             save("fail", 2),
-            save("panic", 3),
-            save("a", 4),
+            save("a", 3),
             WriterCommand::Stop,
         ]);
 
-        assert_eq!(timestamps(&saved), [1, 4]);
-        assert_eq!(counts.written.load(Ordering::Relaxed), 2);
-        assert_eq!(counts.failed.load(Ordering::Relaxed), 2);
+        assert!(timestamps(&saved).is_empty());
+        assert_eq!(counts.written.load(Ordering::Relaxed), 0);
+        assert_eq!(counts.failed.load(Ordering::Relaxed), 3);
     }
 
     #[test]
