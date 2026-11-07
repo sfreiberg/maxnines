@@ -23,13 +23,14 @@
       <option value="pagerduty"{% if channel.kind == "pagerduty" %} selected{% endif %}>PagerDuty</option>
       <option value="alertops"{% if channel.kind == "alertops" %} selected{% endif %}>AlertOps</option>
       <option value="signl4"{% if channel.kind == "signl4" %} selected{% endif %}>SIGNL4</option>
+      <option value="telegram"{% if channel.kind == "telegram" %} selected{% endif %}>Telegram</option>
     </select>
     {% if not email_ready %}<small>Email needs an <code>email</code> block in the server config.</small>{% endif %}
   </label>
 
   <label>Sends to
     <input type="text" name="target" value="{{ channel.target }}" spellcheck="false" autocomplete="off"{% if channel.preview %} placeholder="{{ channel.preview }}"{% endif %}>
-    <small>{% if channel.preview %}Leave empty to keep what's saved, which isn't shown because it can work like a password.{% else %}A webhook's URL, a Discord webhook URL, email addresses separated by commas, for Slack a channel such as <code>#alerts</code>, for PagerDuty an integration key, or the URL from AlertOps or SIGNL4.{% endif %}</small>
+    <small>{% if channel.preview %}Leave empty to keep what's saved, which isn't shown because it can work like a password.{% else %}A webhook's URL, a Discord webhook URL, email addresses separated by commas, for Slack a channel such as <code>#alerts</code>, for PagerDuty an integration key, the URL from AlertOps or SIGNL4, or for Telegram a chat ID.{% endif %}</small>
   </label>
 
   <details class="for-pagerduty">
@@ -63,12 +64,23 @@
     <p class="note">Sending a test opens an alert and resolves it straight away, which can notify whoever is on call.</p>
   </details>
 
+  <label class="for-token">Bot token
+    <input type="password" name="credential" autocomplete="off" spellcheck="false"{% if channel.has_credential %} placeholder="Saved"{% endif %}>
+    <small>{% if channel.has_credential %}Leave empty to keep the saved token, which isn't shown.{% else %}<span class="for-slack">It starts with <code>xoxb-</code>.</span><span class="for-telegram">BotFather gives it out, as a number, a colon, then a long code.</span>{% endif %}</small>
+  </label>
+
+  <details class="for-telegram">
+    <summary>How to set up a Telegram bot</summary>
+    <ol>
+      <li>In Telegram, message <a href="https://t.me/BotFather">@BotFather</a>, send <code>/newbot</code>, and follow its steps. Copy the token it gives you into the box above.</li>
+      <li>Add the bot to the group that should get alerts, or send the bot a message yourself for alerts in a private chat. For a channel, make the bot an admin that can post.</li>
+      <li>To find the chat ID, open <code>https://api.telegram.org/bot</code> followed by the token and <code>/getUpdates</code> in a browser, and look for <code>"chat":{"id":</code>. Group IDs start with a minus sign. A public channel can use its <code>@username</code> instead.</li>
+    </ol>
+    <p class="note">When an alert resolves, the message replies to the one that said it started.</p>
+  </details>
+
   <fieldset class="for-slack">
     <legend>Slack</legend>
-    <label>Bot token
-      <input type="password" name="credential" autocomplete="off" spellcheck="false"{% if channel.has_credential %} placeholder="Saved"{% endif %}>
-      <small>{% if channel.has_credential %}Leave empty to keep the saved token, which isn't shown.{% else %}It starts with <code>xoxb-</code>.{% endif %}</small>
-    </label>
     <details>
       <summary>How to create the Slack app</summary>
       <ol>

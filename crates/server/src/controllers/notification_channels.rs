@@ -33,7 +33,8 @@ struct ChannelForm {
     target: String,
     /// What's saved, for a webhook that isn't being shown.
     preview: Option<String>,
-    /// Slack's bot token, which is only ever typed in and never shown again.
+    /// Slack's or Telegram's bot token, which is only ever typed in and never
+    /// shown again.
     credential: String,
     has_credential: bool,
 }
@@ -96,7 +97,7 @@ impl ChannelForm {
         };
         let typed = self.credential.trim();
         let credential = match saved {
-            _ if kind != ChannelKind::Slack => None,
+            _ if !kind.has_credential() => None,
             _ if !typed.is_empty() => Some(typed.to_string()),
             Some(saved) if saved.kind == kind => saved.credential.clone(),
             _ => None,
@@ -343,6 +344,29 @@ mod tests {
         form.kind = "webhook".to_string();
         form.target = "https://example.com/x".to_string();
         assert_eq!(form.to_channel(Some(&saved)).unwrap().credential, None);
+    }
+
+    #[test]
+    fn a_slack_token_does_not_carry_over_to_telegram() {
+        let saved = slack();
+        let mut form = ChannelForm::from_channel(&saved);
+        form.kind = "telegram".to_string();
+        form.target = "-100123".to_string();
+        assert_eq!(form.to_channel(Some(&saved)).unwrap().credential, None);
+    }
+
+    #[test]
+    fn a_telegram_token_is_kept_when_left_empty() {
+        let saved = ChannelInput {
+            kind: ChannelKind::Telegram,
+            target: "-100123".to_string(),
+            credential: Some("123:secret".to_string()),
+            ..webhook()
+        };
+        let form = ChannelForm::from_channel(&saved);
+        assert_eq!(form.credential, "");
+        assert_eq!(form.target, "-100123");
+        assert_eq!(form.to_channel(Some(&saved)).unwrap(), saved);
     }
 
     #[test]

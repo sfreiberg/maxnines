@@ -402,9 +402,15 @@ pub enum ChannelKind {
     #[serde(rename = "alertops")]
     AlertOps,
     Signl4,
+    Telegram,
 }
 
 impl ChannelKind {
+    /// Whether it needs a token beside its destination.
+    pub fn has_credential(self) -> bool {
+        matches!(self, Self::Slack | Self::Telegram)
+    }
+
     /// Whether the service keeps after people itself until someone responds.
     pub fn is_on_call(self) -> bool {
         matches!(self, Self::PagerDuty | Self::AlertOps | Self::Signl4)
@@ -419,6 +425,7 @@ impl ChannelKind {
             Self::PagerDuty => "pagerduty",
             Self::AlertOps => "alertops",
             Self::Signl4 => "signl4",
+            Self::Telegram => "telegram",
         }
     }
 
@@ -431,6 +438,7 @@ impl ChannelKind {
             "pagerduty" => Ok(Self::PagerDuty),
             "alertops" => Ok(Self::AlertOps),
             "signl4" => Ok(Self::Signl4),
+            "telegram" => Ok(Self::Telegram),
             other => bail!("unknown channel kind {other:?}"),
         }
     }
@@ -449,9 +457,11 @@ pub struct ChannelInput {
     pub name: String,
     pub kind: ChannelKind,
     /// A webhook's URL, email addresses separated by commas, a Slack channel, a
-    /// PagerDuty integration key, or the URL AlertOps or SIGNL4 gave out.
+    /// PagerDuty integration key, the URL AlertOps or SIGNL4 gave out, or a
+    /// Telegram chat.
     pub target: String,
-    /// Slack's bot token. Like a webhook's URL, it can be set but not read back.
+    /// Slack's or Telegram's bot token. Like a webhook's URL, it can be set but
+    /// not read back.
     #[serde(default)]
     pub credential: Option<String>,
 }
@@ -472,6 +482,7 @@ pub fn check_channel(channel: &ChannelInput) -> Result<()> {
         }
         ChannelKind::Discord => check_discord_url(&channel.target)?,
         ChannelKind::Slack => check_slack(channel)?,
+        ChannelKind::Telegram => check_telegram(channel)?,
         ChannelKind::PagerDuty => check_pagerduty_key(&channel.target)?,
         ChannelKind::AlertOps => check_service_url(
             &channel.target,
@@ -527,6 +538,47 @@ fn check_slack(channel: &ChannelInput) -> Result<()> {
     ensure!(
         token.starts_with("xoxb-"),
         "enter the app's bot token, which starts with xoxb-"
+    );
+    Ok(())
+}
+
+/// Telegram's limits on a public channel's or group's username.
+const TELEGRAM_USERNAME_LEN: std::ops::RangeInclusive<usize> = 5..=32;
+
+/// A chat's number, which is negative for groups and channels, or the `@username`
+/// of a public one.
+fn is_telegram_chat(target: &str) -> bool {
+    match target.strip_prefix('@') {
+        Some(name) => {
+            TELEGRAM_USERNAME_LEN.contains(&name.len())
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => target.parse::<i64>().is_ok_and(|id| id != 0),
+    }
+}
+
+/// The bot's number, a colon, and its secret. Errors don't repeat the token.
+fn is_telegram_token(token: &str) -> bool {
+    let Some((bot, secret)) = token.split_once(':') else {
+        return false;
+    };
+    !bot.is_empty()
+        && bot.chars().all(|c| c.is_ascii_digit())
+        && secret.len() >= 30
+        && secret
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn check_telegram(channel: &ChannelInput) -> Result<()> {
+    ensure!(
+        is_telegram_chat(channel.target.trim()),
+        "enter a Telegram chat ID, such as -1001234567890, or a public channel such as \
+         @alerts"
+    );
+    ensure!(
+        is_telegram_token(channel.credential.as_deref().unwrap_or_default().trim()),
+        "enter the bot token from BotFather, which is a number, a colon, then a long code"
     );
     Ok(())
 }
@@ -601,7 +653,7 @@ impl ChannelInput {
             | ChannelKind::AlertOps
             | ChannelKind::Signl4 => webhook_host(&self.target)
                 .map_or_else(|_| "Unknown".to_string(), |host| format!("{host}/…")),
-            ChannelKind::Email | ChannelKind::Slack => self.target.clone(),
+            ChannelKind::Email | ChannelKind::Slack | ChannelKind::Telegram => self.target.clone(),
             ChannelKind::PagerDuty => {
                 let start = self.target.len().saturating_sub(4);
                 format!(
@@ -1055,6 +1107,48 @@ mod tests {
     fn a_slack_channel_is_shown_but_its_token_is_not() {
         let channel = slack("#alerts", Some("xoxb-secret"));
         assert_eq!(channel.target_preview(), "#alerts");
+    }
+
+    fn telegram(target: &str, token: Option<&str>) -> ChannelInput {
+        ChannelInput {
+            name: "Telegram".to_string(),
+            kind: ChannelKind::Telegram,
+            target: target.to_string(),
+            credential: token.map(str::to_string),
+        }
+    }
+
+    const TELEGRAM_TOKEN: &str = "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw";
+
+    #[test]
+    fn telegram_channels_need_a_chat_and_a_bot_token() {
+        for chat in ["-1001234567890", "123456789", "@alerts_room"] {
+            check_channel(&telegram(chat, Some(TELEGRAM_TOKEN))).unwrap();
+        }
+        for bad in [
+            telegram("", Some(TELEGRAM_TOKEN)),
+            telegram("0", Some(TELEGRAM_TOKEN)),
+            telegram("#alerts", Some(TELEGRAM_TOKEN)),
+            telegram("@abc", Some(TELEGRAM_TOKEN)),
+            telegram("@has space", Some(TELEGRAM_TOKEN)),
+            telegram("https://t.me/alerts", Some(TELEGRAM_TOKEN)),
+            telegram("-100123", None),
+            telegram("-100123", Some("xoxb-1")),
+            telegram("-100123", Some("123456789:short")),
+            telegram("-100123", Some("bot:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw")),
+        ] {
+            assert!(check_channel(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_telegram_chat_is_shown_but_its_token_is_not() {
+        let channel = telegram("-1001234567890", Some(TELEGRAM_TOKEN));
+        assert_eq!(channel.target_preview(), "-1001234567890");
+        let error = check_channel(&telegram("-100123", Some("123:wrong-secret")))
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("wrong-secret"), "{error}");
     }
 
     #[test]

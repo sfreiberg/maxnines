@@ -315,6 +315,23 @@ Press **Acknowledge** on a firing alert to say you're dealing with it. That show
 name on the Alerts page and stops the reminders. It only applies inside MaxNines, so
 acknowledging an alert here doesn't acknowledge it in PagerDuty, or the other way round.
 
+## Telegram
+
+Alerts can go to a Telegram group, channel or private chat through a bot of your own.
+When an alert resolves, the message replies to the one that said it started.
+
+1. Message [@BotFather](https://t.me/BotFather), send `/newbot` and follow its steps. It
+   gives you the bot's token.
+2. Add the bot to the group that should get alerts. For a channel, make the bot an admin
+   that can post. For a private chat, send the bot a message yourself.
+3. Find the chat's ID by opening `https://api.telegram.org/bot<token>/getUpdates` in a
+   browser and looking for `"chat":{"id":`. Group IDs start with a minus sign. A public
+   channel can use its `@username` instead.
+4. In MaxNines, go to Settings, then notification channels, and add a Telegram channel
+   with that chat ID and the token.
+
+The token works like a password, so it can't be read back once saved.
+
 ## On-call services
 
 Alerts can open incidents in PagerDuty, AlertOps and SIGNL4, and close them again when

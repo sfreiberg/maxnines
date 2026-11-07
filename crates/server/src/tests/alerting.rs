@@ -1690,6 +1690,229 @@ async fn a_pagerduty_key_has_to_look_like_one() {
     }
 }
 
+const TELEGRAM_TOKEN: &str = "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw";
+
+/// A stand-in for Telegram's bot API. It keeps the path and body of each call,
+/// and answers with the next queued status and body, or else a sent message.
+#[derive(Clone, Default)]
+struct FakeTelegram {
+    calls: Arc<Mutex<Vec<(String, Value)>>>,
+    answers: Arc<Mutex<Vec<(u16, Value)>>>,
+}
+
+impl FakeTelegram {
+    async fn start(&self) -> String {
+        let fake = self.clone();
+        let router = Router::new().fallback(post(
+            move |uri: axum::http::Uri, axum::Json(body): axum::Json<Value>| {
+                let fake = fake.clone();
+                async move {
+                    let mut calls = fake.calls.lock().unwrap();
+                    calls.push((uri.path().to_string(), body));
+                    let mut answers = fake.answers.lock().unwrap();
+                    let (status, answer) = if answers.is_empty() {
+                        let id = 100 + calls.len();
+                        (200, json!({ "ok": true, "result": { "message_id": id } }))
+                    } else {
+                        answers.remove(0)
+                    };
+                    (StatusCode::from_u16(status).unwrap(), axum::Json(answer))
+                }
+            },
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        format!("http://{address}")
+    }
+
+    fn calls(&self) -> Vec<(String, Value)> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+/// A firing alert with a Telegram channel, ready to deliver.
+async fn firing_on_telegram(test: &mut Harness, telegram: &FakeTelegram) -> Notifier {
+    let url = telegram.start().await;
+    let channel = ChannelInput {
+        name: "Telegram".to_string(),
+        kind: ChannelKind::Telegram,
+        target: "-1001234567890".to_string(),
+        credential: Some(TELEGRAM_TOKEN.to_string()),
+    };
+    let channel = test.database().create_channel(&channel).await.unwrap();
+    let rule = AlertRuleInput {
+        for_secs: 0,
+        channels: vec![channel],
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    test.cpu(0, 95.0).await;
+    Notifier::new(
+        test.database().clone(),
+        Senders {
+            web_url: Some("https://monitor.example.com".to_string()),
+            telegram_api_url: Some(url),
+            ..Senders::default()
+        },
+    )
+}
+
+#[tokio::test]
+async fn an_alert_posts_to_telegram_and_resolving_replies_to_it() {
+    let mut test = Harness::start().await;
+    let telegram = FakeTelegram::default();
+    let notifier = firing_on_telegram(&mut test, &telegram).await;
+    notifier.deliver_due(test.now).await.unwrap();
+    test.cpu(MINUTE_MS, 10.0).await;
+    notifier.deliver_due(test.now + MINUTE_MS).await.unwrap();
+
+    let calls = telegram.calls();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    let (path, firing) = &calls[0];
+    assert_eq!(path, &format!("/bot{TELEGRAM_TOKEN}/sendMessage"));
+    assert_eq!(firing["chat_id"], "-1001234567890");
+    assert_eq!(firing["parse_mode"], "HTML");
+    let text = firing["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("<b>CRITICAL</b> CPU usage on web-1 is 95%, above 90%"),
+        "{text}"
+    );
+    assert!(firing.get("reply_parameters").is_none());
+
+    let resolved = &calls[1].1;
+    assert!(
+        resolved["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("<b>RESOLVED</b>"),
+        "{resolved}"
+    );
+    assert_eq!(resolved["reply_parameters"]["message_id"], 101);
+    assert!(
+        test.database()
+            .delivery_problems(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_telegram_error_is_retried_and_never_shows_the_token() {
+    let mut test = Harness::start().await;
+    let telegram = FakeTelegram::default();
+    telegram.answers.lock().unwrap().push((
+        400,
+        json!({ "ok": false, "error_code": 400, "description": "Bad Request: chat not found" }),
+    ));
+    let notifier = firing_on_telegram(&mut test, &telegram).await;
+
+    notifier.deliver_due(test.now).await.unwrap();
+
+    let problems = test.database().delivery_problems(10).await.unwrap();
+    assert!(
+        problems[0]
+            .error
+            .starts_with("Telegram can't find that chat"),
+        "{}",
+        problems[0].error
+    );
+    assert_eq!(problems[0].state, "pending");
+    let page = Browser::default().get(&test.server, "/alerts").await;
+    assert!(page.body.contains("find that chat"), "{}", page.body);
+    assert!(!page.body.contains("AAHdqTcv"), "{}", page.body);
+
+    notifier.deliver_due(test.now + 30_000).await.unwrap();
+    assert_eq!(telegram.calls().len(), 2);
+    assert!(
+        test.database()
+            .delivery_problems(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn not_reaching_telegram_says_so_without_the_token() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let channel = Channel {
+        id: 1,
+        channel: ChannelInput {
+            name: "Telegram".to_string(),
+            kind: ChannelKind::Telegram,
+            target: "-100123".to_string(),
+            credential: Some(TELEGRAM_TOKEN.to_string()),
+        },
+    };
+    let senders = Senders {
+        telegram_api_url: Some(format!("http://{address}")),
+        ..Senders::default()
+    };
+
+    let error = crate::notifier::send(channel, Notice::test(), None, senders)
+        .await
+        .unwrap_err();
+
+    assert_eq!(format!("{error:#}"), "couldn't connect to Telegram");
+}
+
+#[tokio::test]
+async fn a_telegram_channel_can_be_made_from_the_form_and_keeps_its_token_hidden() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    let fields = [
+        ("name", "Team"),
+        ("kind", "telegram"),
+        ("target", "-1001234567890"),
+        ("credential", TELEGRAM_TOKEN),
+    ];
+
+    let page = browser
+        .submit(&server, "/alerts/channels/new", "/alerts/channels", &fields)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+
+    let saved = server.state.database.list_channels().await.unwrap();
+    assert_eq!(saved[0].channel.credential.as_deref(), Some(TELEGRAM_TOKEN));
+
+    let page = browser.get(&server, "/alerts/channels").await;
+    assert!(page.body.contains("-1001234567890"), "{}", page.body);
+    assert!(!page.body.contains("AAHdqTcv"));
+
+    let page = browser
+        .get(&server, &format!("/alerts/channels/{}/edit", saved[0].id))
+        .await;
+    assert!(!page.body.contains("AAHdqTcv"), "{}", page.body);
+    assert!(
+        page.body.contains(r#"value="telegram" selected"#),
+        "{}",
+        page.body
+    );
+}
+
+#[tokio::test]
+async fn a_telegram_channel_needs_its_token_on_the_form() {
+    let server = start().await;
+    let fields = [
+        ("name", "Team"),
+        ("kind", "telegram"),
+        ("target", "-1001234567890"),
+    ];
+    let page = Browser::default()
+        .submit(&server, "/alerts/channels/new", "/alerts/channels", &fields)
+        .await;
+    assert_eq!(page.status, 422);
+    assert!(
+        page.body.contains("bot token from BotFather"),
+        "{}",
+        page.body
+    );
+}
+
 /// A firing alert with a Slack channel, ready to deliver.
 async fn firing_on_slack(test: &mut Harness, slack: &FakeSlack) -> Notifier {
     let url = slack.start().await;

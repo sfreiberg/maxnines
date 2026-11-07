@@ -807,15 +807,15 @@ curl -X DELETE -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 ## Notification channels
 
-Where alerts go. Webhook addresses, PagerDuty keys, AlertOps and SIGNL4 URLs and Slack
-tokens can be set but never read back, so `target_preview` only shows enough to recognize a channel.
+Where alerts go. Webhook addresses, PagerDuty keys, AlertOps and SIGNL4 URLs, and Slack
+and Telegram tokens can be set but never read back, so `target_preview` only shows enough to recognize a channel.
 
 | Field | Description |
 | --- | --- |
 | `name` | Required |
-| `kind` | Required. `webhook`, `email`, `discord`, `slack`, `pagerduty`, `alertops` or `signl4` |
-| `target` | Required. A webhook's address, email addresses separated by commas, a Slack channel, a PagerDuty integration key, or the URL from AlertOps or SIGNL4 |
-| `credential` | Slack's bot token |
+| `kind` | Required. `webhook`, `email`, `discord`, `slack`, `pagerduty`, `alertops`, `signl4` or `telegram` |
+| `target` | Required. A webhook's address, email addresses separated by commas, a Slack channel, a PagerDuty integration key, the URL from AlertOps or SIGNL4, or a Telegram chat ID such as `-1001234567890` or `@channel` |
+| `credential` | Slack's or Telegram's bot token |
 
 ### List notification channels
 

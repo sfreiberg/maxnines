@@ -365,8 +365,10 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .remote-check:not(:has(option[value="ping"]:checked)) .for-ping { display: none; }
 .remote-check:not(:has(option[value="http"]:checked)):not(:has(option[value="tls"]:checked)) .for-tls { display: none; }
 
-/* Only Slack has a token. Without :has() the section just stays. */
+/* Only Slack and Telegram have a token. Without :has() the sections just stay. */
 .channel:not(:has(option[value="slack"]:checked)) .for-slack { display: none; }
+.channel:not(:has(option[value="telegram"]:checked)) .for-telegram { display: none; }
+.channel:not(:has(option[value="slack"]:checked)):not(:has(option[value="telegram"]:checked)) .for-token { display: none; }
 .channel:not(:has(option[value="pagerduty"]:checked)) .for-pagerduty { display: none; }
 .channel:not(:has(option[value="alertops"]:checked)) .for-alertops { display: none; }
 .channel:not(:has(option[value="signl4"]:checked)) .for-signl4 { display: none; }
