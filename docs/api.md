@@ -264,6 +264,7 @@ becomes `os%3Dlinux`. With curl, `-G --data-urlencode` does this for you.
 | `web` | Host names containing "web" |
 | `hostname=web*` | Host names starting with "web" |
 | `os=linux` | That operating system family. `os` is short for `os.family` |
+| `network.addresses=10.0.*` | Any of the machine's IP addresses. The loopback address isn't listed |
 | `os!=windows` | Everything else, including hosts that haven't said |
 | `cpu.logical_cores=8` | Any fact by its full name |
 | `custom.tags=eu` | A list containing that value |

@@ -1,12 +1,41 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
 use maxnines_protocol::build_info;
 use serde_json::{Value, json};
-use sysinfo::{CpuRefreshKind, Motherboard, Product, System};
+use sysinfo::{CpuRefreshKind, IpNetwork, MacAddr, Motherboard, Networks, Product, System};
 
 use crate::collector;
 use crate::custom::Definitions;
+
+/// Every address this machine has, and where each one is. `addresses` is a plain list so
+/// that a host filter can match any of them. The loopback address is the same everywhere,
+/// so it's left out, along with any interface that has nothing else.
+fn network_facts<'a>(
+    interfaces: impl Iterator<Item = (String, MacAddr, &'a [IpNetwork])>,
+) -> Value {
+    let mut addresses = BTreeSet::new();
+    let mut described = BTreeMap::new();
+    for (name, mac, networks) in interfaces {
+        let networks: BTreeSet<String> = networks
+            .iter()
+            .filter(|network| !network.addr.is_loopback())
+            .inspect(|network| {
+                addresses.insert(network.addr.to_string());
+            })
+            .map(ToString::to_string)
+            .collect();
+        if !networks.is_empty() {
+            let mac = (!mac.is_unspecified()).then(|| mac.to_string());
+            let interface = json!({ "name": name, "mac": mac, "addresses": networks });
+            described.insert(name, interface);
+        }
+    }
+    json!({
+        "addresses": addresses,
+        "interfaces": described.into_values().collect::<Vec<_>>(),
+    })
+}
 
 /// Gathers what this machine is, as opposed to what it's doing. Everything here
 /// should rarely change, because each change is kept as history. That's why
@@ -17,6 +46,11 @@ pub fn gather(custom: &BTreeMap<String, Value>, metrics: &Definitions) -> Result
     system.refresh_memory();
     system.refresh_cpu_list(CpuRefreshKind::nothing());
     let board = Motherboard::new().ok();
+    let networks = Networks::new_with_refreshed_list()?;
+    let interfaces = networks.iter().map(|(name, data)| {
+        let name = name.to_string_lossy().into_owned();
+        (name, data.mac_address(), data.ip_networks())
+    });
 
     Ok(json!({
         "os": {
@@ -38,6 +72,7 @@ pub fn gather(custom: &BTreeMap<String, Value>, metrics: &Definitions) -> Result
         "memory": {
             "total_bytes": system.total_memory(),
         },
+        "network": network_facts(interfaces),
         // Virtual machines and missing rights leave some of these out.
         "hardware": {
             "vendor": Product::vendor_name().ok(),
@@ -72,8 +107,71 @@ mod tests {
         assert!(facts["host"]["arch"].is_string());
         assert!(facts["cpu"]["logical_cores"].as_u64().unwrap() > 0);
         assert!(facts["memory"]["total_bytes"].as_u64().unwrap() > 0);
+        assert!(facts["network"]["addresses"].is_array());
         assert_eq!(facts["agent"]["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(facts["agent"]["collectors"], json!(collector::SUPPORTED));
+    }
+
+    fn network(text: &str) -> IpNetwork {
+        let (addr, prefix) = text.split_once('/').unwrap();
+        IpNetwork {
+            addr: addr.parse().unwrap(),
+            prefix: prefix.parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn lists_every_address_and_where_it_is() {
+        let mac: MacAddr = "aa:bb:cc:dd:ee:ff".parse().unwrap();
+        let wired = [network("192.168.0.5/24"), network("fd00::5/64")];
+        let wifi = [network("10.0.0.9/16")];
+        let interfaces: [(String, MacAddr, &[IpNetwork]); 2] = [
+            ("wifi0".to_string(), MacAddr::UNSPECIFIED, &wifi),
+            ("eth0".to_string(), mac, &wired),
+        ];
+
+        let facts = network_facts(interfaces.into_iter());
+
+        assert_eq!(
+            facts,
+            json!({
+                "addresses": ["10.0.0.9", "192.168.0.5", "fd00::5"],
+                "interfaces": [
+                    {
+                        "name": "eth0",
+                        "mac": "aa:bb:cc:dd:ee:ff",
+                        "addresses": ["192.168.0.5/24", "fd00::5/64"],
+                    },
+                    { "name": "wifi0", "mac": null, "addresses": ["10.0.0.9/16"] },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn loopback_and_interfaces_with_no_address_are_left_out() {
+        let loopback = [network("127.0.0.1/8"), network("::1/128")];
+        let interfaces: [(String, MacAddr, &[IpNetwork]); 2] = [
+            ("lo".to_string(), MacAddr::UNSPECIFIED, &loopback),
+            ("eth1".to_string(), MacAddr::UNSPECIFIED, &[]),
+        ];
+
+        let facts = network_facts(interfaces.into_iter());
+
+        assert_eq!(facts, json!({ "addresses": [], "interfaces": [] }));
+    }
+
+    #[test]
+    fn an_address_on_two_interfaces_is_listed_once() {
+        let shared = [network("10.0.0.1/24")];
+        let interfaces: [(String, MacAddr, &[IpNetwork]); 2] = [
+            ("eth0".to_string(), MacAddr::UNSPECIFIED, &shared),
+            ("eth1".to_string(), MacAddr::UNSPECIFIED, &shared),
+        ];
+
+        let facts = network_facts(interfaces.into_iter());
+
+        assert_eq!(facts["addresses"], json!(["10.0.0.1"]));
     }
 
     #[test]
