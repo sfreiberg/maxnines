@@ -58,6 +58,15 @@ fn identity() -> Identity {
     Identity::from_pkcs8(&Identity::generate().unwrap()).unwrap()
 }
 
+/// What the pages call the database these tests are running against.
+pub fn main_database_engine() -> &'static str {
+    match std::env::var("MAXNINES_TEST_DATABASE_URL") {
+        Ok(url) if url.starts_with("postgres") => "PostgreSQL",
+        Ok(_) => "MySQL",
+        Err(_) => "SQLite",
+    }
+}
+
 async fn start() -> TestServer {
     start_with("").await
 }
@@ -89,7 +98,7 @@ async fn start_on(
     let text = format!("{config}\nmetrics \"duckdb\" {{\n  path = \"x\"\n}}\n");
     let config = Config::parse(&text).unwrap();
 
-    let database = Database::in_memory().await;
+    let database = Database::for_test().await;
     let (user, _) = database
         .create_user("test@example.com", "Tester", now_ms())
         .await

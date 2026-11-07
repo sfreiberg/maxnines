@@ -2937,7 +2937,7 @@ mod remote {
     async fn server() -> TestServer {
         let server = start_with_metrics().await;
         let local = server.state.database.load_agents().await.unwrap();
-        let local = local.into_iter().find(|a| a.is_local()).unwrap();
+        let local = local.into_iter().find(|a| a.id == LOCAL_AGENT_ID).unwrap();
         server.state.registry.insert_for_test(local).await;
         server
     }
@@ -3709,7 +3709,10 @@ mod server_page {
     async fn the_server_keeps_a_history_of_its_own_numbers() {
         let server = start_with_metrics().await;
         let local = server.state.database.load_agents().await.unwrap();
-        let local = local.into_iter().find(|agent| agent.is_local()).unwrap();
+        let local = local
+            .into_iter()
+            .find(|agent| agent.id == crate::remote_checks::LOCAL_AGENT_ID)
+            .unwrap();
         server.state.registry.insert_for_test(local).await;
         let (_agent, client) = report_samples(&server, "/").await;
         // Reading answers heartbeats, as an agent would, however long this takes.
@@ -3794,7 +3797,7 @@ mod server_page {
         for text in [
             env!("CARGO_PKG_VERSION"),
             "DuckDB",
-            "SQLite",
+            crate::tests::main_database_engine(),
             "Memory limit",
             "Write-ahead log",
             "Samples written",
@@ -3817,7 +3820,7 @@ mod server_page {
         assert_eq!(page.status, 200, "{}", page.body);
         assert!(page.body.contains("couldn't be read"), "{}", page.body);
         assert!(
-            page.body.contains("SQLite"),
+            page.body.contains(crate::tests::main_database_engine()),
             "the other database still shows"
         );
         assert!(
@@ -3882,7 +3885,10 @@ mod server_page {
         let (status, stats) = api(&server, "GET", "/api/v1/server", &Value::Null).await;
         assert_eq!(status, 200);
         assert_eq!(stats["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(stats["database"]["engine"], "SQLite");
+        assert_eq!(
+            stats["database"]["engine"],
+            crate::tests::main_database_engine()
+        );
         assert!(stats["process"]["memory_bytes"].as_u64().unwrap() > 0);
     }
 

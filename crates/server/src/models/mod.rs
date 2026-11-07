@@ -798,36 +798,75 @@ fn create_sqlite_folder(url: &str) -> Result<()> {
 }
 
 #[cfg(test)]
+async fn hold_all<DB: sea_orm::sqlx::Database>(
+    pool: &sea_orm::sqlx::Pool<DB>,
+) -> Vec<sea_orm::sqlx::pool::PoolConnection<DB>> {
+    let mut held = Vec::new();
+    for _ in 0..pool.options().get_max_connections() {
+        held.push(pool.acquire().await.unwrap());
+    }
+    held
+}
+
+/// Makes a new database on a test server, and returns the URL to reach it.
+#[cfg(test)]
+async fn fresh_test_database(server: &str) -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use sea_orm::ConnectionTrait;
+
+    static MADE: AtomicU32 = AtomicU32::new(0);
+    let name = format!(
+        "maxnines_test_{}_{}",
+        std::process::id(),
+        MADE.fetch_add(1, Ordering::Relaxed)
+    );
+    let connection = sea_orm::Database::connect(server).await.unwrap();
+    connection
+        .execute_unprepared(&format!("CREATE DATABASE {name}"))
+        .await
+        .unwrap();
+    connection.close().await.unwrap();
+    let (host, _) = server.rsplit_once('/').unwrap();
+    format!("{host}/{name}")
+}
+
+#[cfg(test)]
 impl Database {
-    pub async fn in_memory() -> Self {
-        Self::connect("sqlite::memory:").await.unwrap()
+    /// An empty database of its own. SQLite in memory, unless `MAXNINES_TEST_DATABASE_URL`
+    /// names a Postgres or MySQL server to run the tests against instead.
+    pub async fn for_test() -> Self {
+        let url = match std::env::var("MAXNINES_TEST_DATABASE_URL") {
+            Ok(server) => fresh_test_database(&server).await,
+            Err(_) => "sqlite::memory:".to_string(),
+        };
+        Self::connect(&url).await.unwrap()
     }
 
-    /// Takes the only connection, so that queries wait until it's dropped, as they do
-    /// on a database that's stalled.
-    pub async fn stall_for_test(&self) -> impl Sized {
-        self.connection
-            .get_sqlite_connection_pool()
-            .acquire()
-            .await
-            .unwrap()
+    /// Takes every connection, so that queries wait until it's dropped, as they do on a
+    /// database that's stalled.
+    pub async fn stall_for_test(&self) -> Box<dyn std::any::Any + Send> {
+        use sea_orm::DatabaseBackend;
+        match self.connection.get_database_backend() {
+            DatabaseBackend::Postgres => {
+                Box::new(hold_all(self.connection.get_postgres_connection_pool()).await)
+            }
+            DatabaseBackend::MySql => {
+                Box::new(hold_all(self.connection.get_mysql_connection_pool()).await)
+            }
+            _ => Box::new(hold_all(self.connection.get_sqlite_connection_pool()).await),
+        }
     }
 
-    /// Makes every later query fail, as if the database had gone away.
+    /// Makes every later query about agents fail, while signing in still works.
     pub async fn break_for_test(&self) {
         use sea_orm::ConnectionTrait;
-        self.connection
-            .execute_unprepared("DROP TABLE agent_config_status")
-            .await
-            .unwrap();
-        self.connection
-            .execute_unprepared("DROP TABLE agent_facts")
-            .await
-            .unwrap();
-        self.connection
-            .execute_unprepared("DROP TABLE agents")
-            .await
-            .unwrap();
+        for table in ["agent_config_status", "agent_facts", "agents"] {
+            self.connection
+                .execute_unprepared(&format!("ALTER TABLE {table} RENAME TO {table}_gone"))
+                .await
+                .unwrap();
+        }
     }
 
     async fn clear_for_test(&self) {
@@ -888,7 +927,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_api_key_works_until_it_is_revoked() {
-        let database = Database::in_memory().await;
+        let database = Database::for_test().await;
         let (key, secret) = database.create_api_key("backup", None, 1000).await.unwrap();
 
         assert!(database.accept_api_key(&secret, 2000).await.unwrap());
@@ -898,7 +937,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_a_real_key_is_accepted() {
-        let database = Database::in_memory().await;
+        let database = Database::for_test().await;
         database.create_api_key("backup", None, 1000).await.unwrap();
 
         assert!(!database.accept_api_key("mxn_guess", 2000).await.unwrap());
@@ -907,7 +946,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_key_itself_is_never_stored() {
-        let database = Database::in_memory().await;
+        let database = Database::for_test().await;
         let (_, secret) = database.create_api_key("backup", None, 1000).await.unwrap();
 
         let rows = api_key::Entity::find()
@@ -923,7 +962,7 @@ mod tests {
 
     #[tokio::test]
     async fn each_key_is_different() {
-        let database = Database::in_memory().await;
+        let database = Database::for_test().await;
         let (_, first) = database.create_api_key("a", None, 1).await.unwrap();
         let (_, second) = database.create_api_key("a", None, 1).await.unwrap();
         assert_ne!(first, second);
@@ -931,7 +970,7 @@ mod tests {
 
     #[tokio::test]
     async fn using_a_key_is_noted_without_writing_every_time() {
-        let database = Database::in_memory().await;
+        let database = Database::for_test().await;
         let (_, secret) = database.create_api_key("backup", None, 0).await.unwrap();
         let used = async || database.list_api_keys().await.unwrap()[0].last_used_ms;
         assert_eq!(used().await, None);
@@ -948,7 +987,7 @@ mod tests {
 
     #[tokio::test]
     async fn revoking_twice_keeps_the_first_time() {
-        let database = Database::in_memory().await;
+        let database = Database::for_test().await;
         let (key, _) = database.create_api_key("backup", None, 0).await.unwrap();
 
         database.revoke_api_key(key.id, 100).await.unwrap();
@@ -961,7 +1000,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_key_stops_working_when_it_expires() {
-        let database = Database::in_memory().await;
+        let database = Database::for_test().await;
         let (key, secret) = database
             .create_api_key("deploy", Some(5000), 1000)
             .await
@@ -976,7 +1015,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_key_with_no_expiry_lasts() {
-        let database = Database::in_memory().await;
+        let database = Database::for_test().await;
         let (key, secret) = database.create_api_key("a", None, 0).await.unwrap();
 
         assert!(database.accept_api_key(&secret, i64::MAX).await.unwrap());
@@ -1039,8 +1078,8 @@ mod tests {
 
     #[tokio::test]
     async fn each_database_gets_its_own_admin_token() {
-        let first = Database::in_memory().await.admin_token().await.unwrap();
-        let second = Database::in_memory().await.admin_token().await.unwrap();
+        let first = Database::for_test().await.admin_token().await.unwrap();
+        let second = Database::for_test().await.admin_token().await.unwrap();
         assert_ne!(first, second);
     }
 
@@ -1133,7 +1172,7 @@ mod tests {
 
     #[tokio::test]
     async fn known_facts_lists_each_name_once_with_its_type() {
-        let database = Database::in_memory().await;
+        let database = Database::for_test().await;
         database.save_agent(&record("agent-1")).await.unwrap();
         database.save_agent(&record("agent-2")).await.unwrap();
         let facts = flatten(&json!({
@@ -1524,7 +1563,7 @@ mod tests {
 
     #[tokio::test]
     async fn facts_need_a_registered_agent() {
-        let database = Database::in_memory().await;
+        let database = Database::for_test().await;
         let result = database
             .record_facts("nobody", &flat(&[("a", json!(1))]), 1)
             .await;
@@ -1535,7 +1574,7 @@ mod tests {
     async fn a_failed_update_leaves_the_previous_facts_in_place() {
         use sea_orm::ConnectionTrait;
 
-        let database = Database::in_memory().await;
+        let database = Database::for_test().await;
         database.save_agent(&record("agent-1")).await.unwrap();
         let before = flat(&[("os.version", json!("24.04"))]);
         database
@@ -1544,12 +1583,25 @@ mod tests {
             .unwrap();
 
         // The old value is closed first, then adding the new one fails.
+        let trigger = match database.connection.get_database_backend() {
+            sea_orm::DatabaseBackend::Postgres => {
+                "CREATE FUNCTION block_new_version() RETURNS trigger AS
+                 $$ BEGIN RAISE EXCEPTION 'blocked'; END $$ LANGUAGE plpgsql;
+                 CREATE TRIGGER block_new_version BEFORE INSERT ON agent_facts
+                 FOR EACH ROW EXECUTE FUNCTION block_new_version()"
+            }
+            sea_orm::DatabaseBackend::MySql => {
+                "CREATE TRIGGER block_new_version BEFORE INSERT ON agent_facts
+                 FOR EACH ROW SIGNAL SQLSTATE '45000'"
+            }
+            _ => {
+                "CREATE TRIGGER block_new_version BEFORE INSERT ON agent_facts
+                 BEGIN SELECT RAISE(ABORT, 'blocked'); END"
+            }
+        };
         database
             .connection
-            .execute_unprepared(
-                "CREATE TRIGGER block_new_version BEFORE INSERT ON agent_facts
-                 BEGIN SELECT RAISE(ABORT, 'blocked'); END",
-            )
+            .execute_unprepared(trigger)
             .await
             .unwrap();
 
@@ -1563,7 +1615,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_reports_never_leave_two_current_values() {
-        let database = Database::in_memory().await;
+        let database = Database::for_test().await;
         database.save_agent(&record("agent-1")).await.unwrap();
 
         let reports = (0..20).map(|n| {
@@ -1603,7 +1655,7 @@ mod tests {
     async fn a_corrupt_state_is_an_error_not_a_guess() {
         use sea_orm::ConnectionTrait;
 
-        let database = Database::in_memory().await;
+        let database = Database::for_test().await;
         database
             .connection
             .execute_unprepared(
@@ -1614,6 +1666,40 @@ mod tests {
             .unwrap();
 
         assert!(database.load_agents().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn every_migration_can_be_undone_and_applied_again() {
+        let database = Database::for_test().await;
+        let connection = &database.connection;
+        let count = u32::try_from(Migrator::migrations().len()).unwrap();
+
+        for _ in 0..count {
+            Migrator::down(connection, Some(1)).await.unwrap();
+            Migrator::up(connection, Some(1)).await.unwrap();
+        }
+        Migrator::down(connection, None).await.unwrap();
+        assert!(
+            Migrator::get_applied_migrations(connection)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        Migrator::up(connection, None).await.unwrap();
+        let agents = database.load_agents().await.unwrap();
+        assert_eq!(agents.len(), 2, "both built-in agents are back: {agents:?}");
+    }
+
+    #[tokio::test]
+    async fn starting_again_changes_nothing_and_keeps_what_was_saved() {
+        let database = Database::for_test().await;
+        database.save_agent(&record("agent-1")).await.unwrap();
+
+        Migrator::up(&database.connection, None).await.unwrap();
+
+        let agents = database.load_agents().await.unwrap();
+        assert!(agents.iter().any(|agent| agent.id == "agent-1"));
     }
 
     #[tokio::test]

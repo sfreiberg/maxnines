@@ -212,6 +212,37 @@ certificate is from a private authority and the `tls` block needs its `ca_file`.
 curl https://maxnines.example.com/health
 ```
 
+## Main database
+
+Users, agents, alert rules, dashboards and settings are kept in the main database, which
+is separate from metrics. `server.hcl` chooses it with a URL:
+
+```hcl
+# SQLite, the default. There's nothing else to run.
+database {
+  url = "sqlite://data/maxnines.sqlite?mode=rwc"
+}
+
+# PostgreSQL
+database {
+  url = "postgres://maxnines:${env("DB_PASSWORD")}@db.example.com:5432/maxnines"
+}
+
+# MySQL or MariaDB
+database {
+  url = "mysql://maxnines:${env("DB_PASSWORD")}@db.example.com:3306/maxnines"
+}
+```
+
+To keep the password out of `server.hcl`, use `env()` as above, or put the whole URL in a
+file and use `url_file = "/path/to/file"` instead of `url`.
+
+For PostgreSQL, MySQL and MariaDB, create an empty database and a user who can create
+tables in it. The server sets up its tables when it starts, and updates them after an
+upgrade. PostgreSQL 16, MySQL 8.4 and MariaDB 12 are tested.
+
+Nothing moves between databases, so changing later starts this data afresh.
+
 ## Metrics databases
 
 `server.hcl` chooses where metrics are kept, and everything else works the same on

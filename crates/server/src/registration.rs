@@ -365,7 +365,7 @@ mod tests {
     }
 
     async fn registry(body: &str) -> Registry {
-        registry_with(body, Database::in_memory().await).await
+        registry_with(body, Database::for_test().await).await
     }
 
     fn request<'a>(id: &'a str, host: &'a str, source: &str) -> Admission<'a> {
@@ -664,7 +664,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_save_refuses_the_agent() {
-        let database = Database::in_memory().await;
+        let database = Database::for_test().await;
         let registry = registry_with(SUBNET_RULE, database.clone()).await;
         database.break_for_test().await;
 
@@ -677,7 +677,7 @@ mod tests {
 
     #[tokio::test]
     async fn approved_agents_can_connect_while_the_database_is_down() {
-        let database = Database::in_memory().await;
+        let database = Database::for_test().await;
         let registry = registry_with(SUBNET_RULE, database.clone()).await;
         let agent = request("a", "web-1", "10.0.0.1");
         registry.admit(&agent).await.unwrap();
