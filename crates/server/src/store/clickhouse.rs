@@ -149,6 +149,26 @@ struct Rows {
     texts: Vec<TextRow>,
     series: Vec<SeriesRow>,
     reports: Vec<ReportRow>,
+    /// How to take back what was remembered, if writing these fails.
+    undo: Vec<Undo>,
+}
+
+/// Something remembered for a batch that may never reach the database.
+enum Undo {
+    Series {
+        agent: String,
+        print: u64,
+    },
+    Text {
+        print: u64,
+        previous: Option<String>,
+    },
+    Cleared {
+        print: u64,
+        text: Option<String>,
+        owner: (String, String),
+        series: TextSeries,
+    },
 }
 
 /// A series, as a number for this server's own bookkeeping. It's never stored.
@@ -205,6 +225,10 @@ impl Memory {
             return false;
         }
         known.insert(print);
+        rows.undo.push(Undo::Series {
+            agent: agent.to_string(),
+            print,
+        });
         rows.series.push(SeriesRow {
             agent: agent.to_string(),
             metric: metric.to_string(),
@@ -258,7 +282,8 @@ impl Memory {
                         let print = fingerprint(agent, &metric, &item);
                         reported.insert(print);
                         if self.texts.get(&print).is_none_or(|known| known != text) {
-                            self.texts.insert(print, text.to_string());
+                            let previous = self.texts.insert(print, text.to_string());
+                            rows.undo.push(Undo::Text { print, previous });
                             let labels = labelled(&reading.labels);
                             rows.texts.push(TextRow {
                                 metric: metric.clone(),
@@ -290,7 +315,12 @@ impl Memory {
                 current.retain(|print, series| {
                     let gone = items.contains(&series.item) && !reported.contains(print);
                     if gone {
-                        self.texts.remove(print);
+                        rows.undo.push(Undo::Cleared {
+                            print: *print,
+                            text: self.texts.remove(print),
+                            owner: key.clone(),
+                            series: series.clone(),
+                        });
                         rows.texts.push(TextRow {
                             metric: series.metric.clone(),
                             agent: agent.to_string(),
@@ -304,6 +334,43 @@ impl Memory {
             }
         }
         Ok(())
+    }
+}
+
+impl Memory {
+    /// Latest first, so that things end up as they started.
+    fn take_back(&mut self, undo: Vec<Undo>) {
+        for step in undo.into_iter().rev() {
+            match step {
+                Undo::Series { agent, print } => {
+                    if let Some(known) = self.series.get_mut(&agent) {
+                        known.remove(&print);
+                    }
+                }
+                Undo::Text { print, previous } => match previous {
+                    Some(text) => {
+                        self.texts.insert(print, text);
+                    }
+                    None => {
+                        self.texts.remove(&print);
+                    }
+                },
+                Undo::Cleared {
+                    print,
+                    text,
+                    owner,
+                    series,
+                } => {
+                    if let Some(text) = text {
+                        self.texts.insert(print, text);
+                    }
+                    self.text_series
+                        .entry(owner)
+                        .or_default()
+                        .insert(print, series);
+                }
+            }
+        }
     }
 }
 
@@ -485,12 +552,15 @@ impl Store for ClickHouseStore {
     fn write(&mut self, samples: &[NewSample]) -> Result<()> {
         let mut rows = Rows::default();
         for new in samples {
-            self.memory.add_sample(new, &mut rows)?;
+            if let Err(error) = self.memory.add_sample(new, &mut rows) {
+                self.memory.take_back(rows.undo);
+                return Err(error);
+            }
         }
         let result = wait(self.write_rows(&rows));
         if result.is_err() {
-            // What was remembered for this batch may never have reached the database.
-            self.memory = wait(load_memory(&self.client)).context("reloading metric names")?;
+            // None of it may have reached the database, so it all has to go again.
+            self.memory.take_back(rows.undo);
         }
         result
     }
@@ -884,8 +954,11 @@ impl MetricsReader for ClickHouseReader {
             "agent IN ({agents}) AND {}",
             time_between(range.from_ms, range.to_ms, "<")
         );
+        // Listing every machine again is slow to read, so it's only done if needed.
         let line = if query.by_series {
             "series".to_string()
+        } else if groups.len() == 1 {
+            "'0'".to_string()
         } else {
             format!("toString(transform(agent, [{agents}], [{places}], 0))")
         };
@@ -1110,6 +1183,46 @@ mod tests {
         }
 
         assert_eq!(count(&store, "SELECT count() FROM samples"), 1);
+    }
+
+    #[test]
+    fn a_write_that_fails_leaves_everything_to_go_again() {
+        let mut store = in_memory();
+        let good = store.client.clone();
+        let failing = json!([{ "name": "site", "up": 0, "error": "refused" }]);
+        let working = json!([{ "name": "site", "up": 1 }]);
+        write_metric(&mut store, "a", 1000, "checks", failing);
+
+        store.client = good.clone().with_url("http://127.0.0.1:1");
+        let sample = Sample {
+            timestamp_ms: 2000,
+            metrics: BTreeMap::from([
+                ("checks".to_string(), working.clone()),
+                ("cpu".to_string(), json!({ "usage_percent": 1.0 })),
+            ]),
+        };
+        assert!(write_one(&mut store, "a", "host", &sample).is_err());
+
+        store.client = good;
+        write_one(&mut store, "a", "host", &sample).unwrap();
+
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count() FROM series WHERE metric = 'cpu.usage_percent'"
+            ),
+            1
+        );
+        let reader = store.reader().unwrap();
+        let output = reader
+            .latest_output("a", "checks", 0, 5000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            output,
+            json!([{ "name": "site", "up": 1 }]),
+            "the error cleared"
+        );
     }
 
     #[test]
