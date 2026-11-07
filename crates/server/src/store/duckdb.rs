@@ -49,7 +49,7 @@ const MAX_SERIES_PER_AGENT: usize = 100_000;
 const HOUR_MS: i64 = 3_600_000;
 
 /// The most rows sorted at once, so that sorting fits in memory on any size of fleet.
-const MAX_TIDY_ROWS: i64 = 1_000_000;
+const MAX_TIDY_ROWS: i64 = 250_000;
 
 /// What identifies a series: its metric, its agent and its labels in one string.
 type SeriesKey = (i32, i32, String);
