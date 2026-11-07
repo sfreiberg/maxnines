@@ -84,6 +84,12 @@ impl Database {
             .context("reading the schema version")
     }
 
+    /// Whether the database answers a real question, as a closed connection pool or a
+    /// missing table can still answer a ping.
+    pub async fn is_reachable(&self) -> bool {
+        agent::Entity::find().one(&self.connection).await.is_ok()
+    }
+
     pub async fn stats(&self) -> Result<DatabaseStats> {
         let backend = self.connection.get_database_backend();
 

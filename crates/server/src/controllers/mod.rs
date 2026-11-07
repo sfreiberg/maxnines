@@ -14,6 +14,7 @@ mod assets;
 mod condition_form;
 mod dashboards;
 mod fleet;
+mod health;
 pub mod host_list;
 mod metrics;
 mod notification_channels;
@@ -90,6 +91,7 @@ pub fn app(state: AppState) -> Router {
         .merge(compressed(assets::routes()))
         // Open to all, so a form being filled in isn't lost to a login that ran out.
         .merge(update_notice::routes())
+        .merge(health::routes())
         .nest(api::BASE_PATH, api::routes(state.clone()))
         .layer(middleware::from_fn(security_headers))
         .with_state(state)

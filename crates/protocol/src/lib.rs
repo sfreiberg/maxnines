@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod hcl_env;
+pub mod stopping;
 
 use std::collections::BTreeMap;
 use std::time::Duration;

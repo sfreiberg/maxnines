@@ -934,6 +934,29 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "$MAXNINES_URL/api/v1/agents/server/metrics/server.memory"
 ```
 
+## Health
+
+`GET /health`
+
+For load balancers and uptime monitors. It's at the top of the site rather than under
+`/api/v1`, and needs no key. It answers `200` when everything works and `503` when
+something doesn't, and says which part without giving any detail. Each check has two
+seconds to answer.
+
+| Check | What it means |
+| --- | --- |
+| `database` | The main database answers |
+| `metrics` | The metrics database answers |
+| `writer` | Samples can still be saved |
+| `alerts` | Alert rules have run in the last minute |
+
+```json
+{
+  "status": "ok",
+  "checks": { "database": "ok", "metrics": "ok", "writer": "ok", "alerts": "ok" }
+}
+```
+
 ## Calculations
 
 ### Ask about many machines at once

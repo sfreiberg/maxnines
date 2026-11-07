@@ -18,7 +18,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use maxnines_protocol::Sample;
 use maxnines_protocol::auth::Identity;
@@ -31,6 +31,7 @@ use background::jitter;
 use collector::Collector;
 use config::Config;
 use custom::Definitions;
+use maxnines_protocol::stopping::StopSignal;
 use own_usage::OwnUsageCollector;
 use websocket::{ConfigUpdate, ServerLink};
 
@@ -159,6 +160,7 @@ async fn run(path: PathBuf) -> Result<()> {
         }
     }
 
+    let mut stop = StopSignal::listen().context("listening for being asked to stop")?;
     loop {
         tokio::select! {
             () = next_tick(&mut monitoring) => {
@@ -169,7 +171,7 @@ async fn run(path: PathBuf) -> Result<()> {
             Some(update) = link.next_config() => {
                 apply(update, &config.custom_metrics, &mut monitoring, &link, &saved_file)?;
             }
-            result = tokio::signal::ctrl_c() => {
+            result = stop.wait() => {
                 result?;
                 info!("shutting down");
                 link.save_unconfirmed();

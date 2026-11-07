@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tokio = { version = "1.54.1", features = ["signal"] }
 regex-lite = "0.1"
 anyhow.workspace = true
 hcl-rs.workspace = true
@@ -12,3 +13,6 @@ hex.workspace = true
 ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["macros", "rt", "time"] }

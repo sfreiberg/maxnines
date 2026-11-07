@@ -44,6 +44,7 @@ use tracing_subscriber::EnvFilter;
 use alert_evaluator::Evaluator;
 use app_state::{AppState, Heartbeat};
 use config::Config;
+use maxnines_protocol::stopping::StopSignal;
 use metrics::{Metrics, now_ms};
 use models::Database;
 use notifier::{Mailer, Notifier, Senders, web_url};
@@ -261,10 +262,11 @@ async fn serve(path: &Path) -> Result<()> {
         .presence
         .connected(LOCAL_AGENT_ID, IpAddr::from([127, 0, 0, 1]));
 
+    let mut stop = StopSignal::listen().context("listening for being asked to stop")?;
     let service = controllers::app(state).into_make_service_with_connect_info::<SocketAddr>();
     tokio::select! {
         result = axum::serve(listener, service).into_future() => result?,
-        result = tokio::signal::ctrl_c() => result?,
+        result = stop.wait() => result?,
     }
 
     info!("shutting down");

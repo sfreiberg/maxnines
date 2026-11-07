@@ -539,6 +539,96 @@ fn count_pings(receiver: futures_util::stream::SplitStream<Client>) -> Arc<Atomi
     pings
 }
 
+mod health {
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+
+    async fn health(server: &TestServer) -> (u16, Value) {
+        let page = Browser::anonymous().get(server, "/health").await;
+        (page.status, serde_json::from_str(&page.body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_working_server_says_so_to_anyone() {
+        let server = start().await;
+
+        let (status, body) = health(&server).await;
+
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            body,
+            json!({
+                "status": "ok",
+                "checks": {
+                    "database": "ok",
+                    "metrics": "ok",
+                    "writer": "ok",
+                    "alerts": "ok",
+                },
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_database_that_is_down_fails_the_check_without_saying_why() {
+        let server = start().await;
+        server.state.database.break_for_test().await;
+
+        let (status, body) = health(&server).await;
+
+        assert_eq!(status, 503);
+        assert_eq!(body["status"], "failing");
+        assert_eq!(body["checks"]["database"], "failing");
+        assert_eq!(body["checks"]["metrics"], "ok");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_database_counts_as_failing_rather_than_hanging() {
+        let server = start().await;
+        let _stalled = server.state.database.stall_for_test().await;
+
+        let (status, body) = health(&server).await;
+
+        assert_eq!(status, 503);
+        assert_eq!(body["checks"]["database"], "failing");
+    }
+
+    #[tokio::test]
+    async fn alert_rules_that_have_stopped_fail_the_check() {
+        let server = start().await;
+        let long_ago = now_ms() - 120_000;
+        let mut stale = ServerStatus::new(None).unwrap();
+        stale.started_ms = long_ago;
+        let mut state = server.state.clone();
+        state.status = Arc::new(stale);
+        state
+            .status
+            .last_alert_pass_ms
+            .store(long_ago, Ordering::Relaxed);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = app(state).into_make_service_with_connect_info::<SocketAddr>();
+        tokio::spawn(async move { axum::serve(listener, service).await });
+
+        let response = get_health(address).await;
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(response.contains(r#""alerts":"failing""#), "{response}");
+    }
+
+    async fn get_health(address: SocketAddr) -> String {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    }
+}
+
 #[tokio::test]
 async fn a_sample_with_an_impossible_time_is_answered_but_never_stored() {
     let server = start().await;
