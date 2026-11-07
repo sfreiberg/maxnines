@@ -570,6 +570,30 @@ mod health {
         );
     }
 
+    /// Some uptime monitors can only send `HEAD`, so the status has to tell them.
+    #[tokio::test]
+    async fn a_head_request_gets_the_status_with_no_body() {
+        let server = start().await;
+
+        let response = server.http("HEAD", "/health", None).await;
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        assert!(body.is_empty(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_head_request_hears_about_a_failure_too() {
+        let server = start().await;
+        server.state.database.break_for_test().await;
+
+        let response = server.http("HEAD", "/health", None).await;
+
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        assert!(body.is_empty(), "{body}");
+    }
+
     #[tokio::test]
     async fn a_database_that_is_down_fails_the_check_without_saying_why() {
         let server = start().await;
