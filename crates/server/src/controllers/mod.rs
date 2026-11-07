@@ -24,6 +24,7 @@ mod rules;
 mod server;
 mod sessions;
 mod settings;
+mod silences;
 mod update_notice;
 mod users;
 
@@ -73,6 +74,7 @@ pub fn app(state: AppState) -> Router {
         .merge(users::routes())
         .merge(agents::routes())
         .merge(alerts::routes())
+        .merge(silences::routes())
         .merge(alert_rules::routes())
         .merge(notification_channels::routes())
         .merge(remote_checks::routes())
@@ -137,7 +139,7 @@ fn section_of(template: &str) -> &'static str {
         "agents" => "agents",
         "metrics" => "metrics",
         "remote_checks" => "checks",
-        "alerts" => "alerts",
+        "alerts" | "silences" => "alerts",
         "server" => "server",
         "dashboards" => "dashboards",
         "settings" | "rules" | "alert_rules" | "notification_channels" => "settings",

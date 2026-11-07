@@ -289,6 +289,18 @@ either.
 
 Nothing moves between them, so changing later starts metrics afresh.
 
+## Silences
+
+A silence stops notifications for a while, as during planned work. Press **Silence** on
+a firing alert, or start one from **Alerts > Silences**. It needs a reason and a length,
+and it can cover one rule or all of them, and some hosts or all of them, using the same
+filter as the host list.
+
+Alerts still fire and show while they're silenced. If one is still firing when the
+silence ends, the notifications go out then, and if it ends first, nobody hears about it.
+Anyone who had already been told about an alert still hears when it ends, which keeps
+on-call services from leaving an incident open.
+
 ## On-call services
 
 Alerts can open incidents in PagerDuty, AlertOps and SIGNL4, and close them again when

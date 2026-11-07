@@ -28,6 +28,7 @@ use crate::config::{EmailConfig, EmailSecurity};
 use crate::metrics::now_ms;
 use crate::models::Database;
 use crate::remote_checks::FLEET_AGENT_ID;
+use crate::silences::ActiveSilences;
 
 /// How often the queue is checked.
 const INTERVAL: Duration = Duration::from_secs(5);
@@ -722,12 +723,35 @@ impl Notifier {
         })
     }
 
-    /// Sends what's due, and saves how each one went.
+    /// Lets go of what no silence covers any more.
+    async fn release_held(&self, silences: &ActiveSilences, now_ms: i64) -> Result<()> {
+        let ids: Vec<i64> = self
+            .database
+            .held_deliveries()
+            .await?
+            .into_iter()
+            .filter(|(alert, _)| silences.covering(alert).is_none())
+            .flat_map(|(_, ids)| ids)
+            .collect();
+        if !ids.is_empty() {
+            self.database.release_deliveries(&ids, now_ms).await?;
+        }
+        Ok(())
+    }
+
+    /// Sends what's due, and saves how each one went. Someone who was told an alert
+    /// started always hears that it ended, or an on-call incident would stay open.
     pub async fn deliver_due(&self, now_ms: i64) -> Result<()> {
+        let silences = ActiveSilences::load(&self.database, now_ms).await?;
+        self.release_held(&silences, now_ms).await?;
         let due = self.database.due_deliveries(now_ms, BATCH_SIZE).await?;
 
         let mut sends = JoinSet::new();
         for delivery in due {
+            if delivery.event == Event::Firing && silences.covering(&delivery.alert).is_some() {
+                self.database.hold_delivery(&delivery).await?;
+                continue;
+            }
             let senders = self.senders.clone();
             sends.spawn(async move {
                 let notice = Notice::for_delivery(&delivery);

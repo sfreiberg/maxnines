@@ -3332,6 +3332,381 @@ mod remote {
 
 // ---- the redesigned pages
 
+mod silences {
+    use super::*;
+    use crate::silences::SilenceInput;
+
+    const HOUR_SECS: u64 = 3600;
+    const HOUR_MS: i64 = 3_600_000;
+
+    fn silence(filter: &str) -> SilenceInput {
+        SilenceInput {
+            rule_id: None,
+            filter: filter.to_string(),
+            reason: "Upgrading".to_string(),
+            duration_secs: HOUR_SECS,
+        }
+    }
+
+    /// Delivers notifications at `offset_ms`, and says how many have arrived in all.
+    async fn deliver(
+        test: &Harness,
+        notifier: &Notifier,
+        hook: &FakeOnCall,
+        offset_ms: i64,
+    ) -> usize {
+        notifier.deliver_due(test.now + offset_ms).await.unwrap();
+        hook.events().len()
+    }
+
+    async fn on_a_webhook(test: &mut Harness, hook: &FakeOnCall) -> Notifier {
+        let url = hook.start().await;
+        firing_on(test, ChannelKind::Webhook, &url, Senders::default()).await
+    }
+
+    #[tokio::test]
+    async fn a_silenced_alert_still_fires_but_nobody_is_told() {
+        let mut test = Harness::start().await;
+        test.database()
+            .create_silence(&silence(""), "sam", test.now)
+            .await
+            .unwrap();
+        let hook = FakeOnCall::default();
+        let notifier = on_a_webhook(&mut test, &hook).await;
+
+        assert_eq!(deliver(&test, &notifier, &hook, 1000).await, 0);
+        assert_eq!(test.open().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn notifications_go_out_when_the_silence_ends_if_it_is_still_firing() {
+        let mut test = Harness::start().await;
+        test.database()
+            .create_silence(&silence(""), "sam", test.now)
+            .await
+            .unwrap();
+        let hook = FakeOnCall::default();
+        let notifier = on_a_webhook(&mut test, &hook).await;
+        assert_eq!(deliver(&test, &notifier, &hook, 1000).await, 0);
+
+        assert_eq!(deliver(&test, &notifier, &hook, HOUR_MS + 1000).await, 1);
+        assert_eq!(deliver(&test, &notifier, &hook, HOUR_MS + 2000).await, 1);
+    }
+
+    #[tokio::test]
+    async fn ending_a_silence_early_lets_notifications_go() {
+        let mut test = Harness::start().await;
+        let id = test
+            .database()
+            .create_silence(&silence(""), "sam", test.now)
+            .await
+            .unwrap();
+        let hook = FakeOnCall::default();
+        let notifier = on_a_webhook(&mut test, &hook).await;
+        assert_eq!(deliver(&test, &notifier, &hook, 1000).await, 0);
+
+        let ended = test.database().end_silence(id, test.now + 2000).await;
+        assert!(ended.unwrap());
+
+        assert_eq!(deliver(&test, &notifier, &hook, 3000).await, 1);
+    }
+
+    #[tokio::test]
+    async fn an_alert_that_ends_during_a_silence_is_never_mentioned() {
+        let mut test = Harness::start().await;
+        test.database()
+            .create_silence(&silence(""), "sam", test.now)
+            .await
+            .unwrap();
+        let hook = FakeOnCall::default();
+        let notifier = on_a_webhook(&mut test, &hook).await;
+        assert_eq!(deliver(&test, &notifier, &hook, 1000).await, 0);
+
+        let open = test.open().await;
+        let resolved = test
+            .database()
+            .resolve_alert(open[0].id, test.now + 2000, "Fixed");
+        resolved.await.unwrap();
+
+        assert_eq!(deliver(&test, &notifier, &hook, 3000).await, 0);
+        assert_eq!(deliver(&test, &notifier, &hook, HOUR_MS + 1000).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_alert_that_starts_and_ends_between_passes_is_never_mentioned() {
+        let mut test = Harness::start().await;
+        test.database()
+            .create_silence(&silence(""), "sam", test.now)
+            .await
+            .unwrap();
+        let hook = FakeOnCall::default();
+        let notifier = on_a_webhook(&mut test, &hook).await;
+
+        let open = test.open().await;
+        let resolved = test
+            .database()
+            .resolve_alert(open[0].id, test.now + 500, "Fixed");
+        resolved.await.unwrap();
+
+        assert_eq!(deliver(&test, &notifier, &hook, 1000).await, 0);
+        assert_eq!(deliver(&test, &notifier, &hook, 2000).await, 0);
+        assert_eq!(deliver(&test, &notifier, &hook, HOUR_MS + 1000).await, 0);
+    }
+
+    #[tokio::test]
+    async fn whoever_was_told_it_started_hears_it_ended_even_during_a_silence() {
+        let mut test = Harness::start().await;
+        let hook = FakeOnCall::default();
+        let notifier = on_a_webhook(&mut test, &hook).await;
+        assert_eq!(deliver(&test, &notifier, &hook, 1000).await, 1);
+
+        test.database()
+            .create_silence(&silence(""), "sam", test.now + 2000)
+            .await
+            .unwrap();
+        let open = test.open().await;
+        let resolved = test
+            .database()
+            .resolve_alert(open[0].id, test.now + 3000, "Fixed");
+        resolved.await.unwrap();
+
+        assert_eq!(deliver(&test, &notifier, &hook, 4000).await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_silence_only_covers_the_hosts_in_its_filter() {
+        let mut test = Harness::start().await;
+        test.database()
+            .create_silence(&silence("hostname=db*"), "sam", test.now)
+            .await
+            .unwrap();
+        let hook = FakeOnCall::default();
+        let notifier = on_a_webhook(&mut test, &hook).await;
+
+        assert_eq!(deliver(&test, &notifier, &hook, 1000).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_silence_can_follow_a_fact() {
+        let mut test = Harness::start().await;
+        let facts = BTreeMap::from([("os.family".to_string(), json!("linux"))]);
+        test.database()
+            .record_facts(&test.id(), &facts, test.now as u64)
+            .await
+            .unwrap();
+        test.database()
+            .create_silence(&silence("os=linux"), "sam", test.now)
+            .await
+            .unwrap();
+        let hook = FakeOnCall::default();
+        let notifier = on_a_webhook(&mut test, &hook).await;
+
+        assert_eq!(deliver(&test, &notifier, &hook, 1000).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_silence_for_one_rule_leaves_the_others_alone() {
+        let mut test = Harness::start().await;
+        let other = AlertRuleInput {
+            name: "Something else".to_string(),
+            ..cpu_rule()
+        };
+        let other = test.database().create_alert_rule(&other).await.unwrap();
+        let input = SilenceInput {
+            rule_id: Some(other),
+            ..silence("")
+        };
+        test.database()
+            .create_silence(&input, "sam", test.now)
+            .await
+            .unwrap();
+        let hook = FakeOnCall::default();
+        let notifier = on_a_webhook(&mut test, &hook).await;
+
+        assert_eq!(deliver(&test, &notifier, &hook, 1000).await, 1);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_rule_ends_its_silences_rather_than_widening_them() {
+        let test = Harness::start().await;
+        let rule = test.database().create_alert_rule(&cpu_rule()).await;
+        let rule = rule.unwrap();
+        let input = SilenceInput {
+            rule_id: Some(rule),
+            ..silence("")
+        };
+        let id = test
+            .database()
+            .create_silence(&input, "sam", test.now)
+            .await;
+        let id = id.unwrap();
+
+        test.database().delete_alert_rule(rule).await.unwrap();
+
+        assert_eq!(test.database().get_silence(id).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn the_alerts_page_offers_a_silence_for_the_alert_and_shows_one_running() {
+        let mut test = Harness::start().await;
+        let hook = FakeOnCall::default();
+        on_a_webhook(&mut test, &hook).await;
+
+        let page = Browser::default().get(&test.server, "/alerts").await;
+        assert!(
+            page.body.contains("/alerts/silences/new?rule_id=1"),
+            "{}",
+            page.body
+        );
+
+        test.database()
+            .create_silence(&silence(""), "sam", now_ms())
+            .await
+            .unwrap();
+        let page = Browser::default().get(&test.server, "/alerts").await;
+        assert!(page.body.contains("silenced until"), "{}", page.body);
+    }
+
+    #[tokio::test]
+    async fn the_form_starts_from_the_alert_and_saves_who_asked() {
+        let test = Harness::start().await;
+        test.database()
+            .create_alert_rule(&cpu_rule())
+            .await
+            .unwrap();
+        let mut browser = Browser::default();
+        let form = "/alerts/silences/new?rule_id=1&filter=hostname%3Dweb-1";
+
+        let page = browser.get(&test.server, form).await;
+        assert!(
+            page.body.contains("value=\"hostname=web-1\""),
+            "{}",
+            page.body
+        );
+        assert!(page.body.contains("value=\"1\" selected"), "{}", page.body);
+
+        let fields = [
+            ("reason", "Upgrading"),
+            ("rule_id", "1"),
+            ("filter", "hostname=web-1"),
+            ("duration_secs", "3600"),
+        ];
+        let page = browser
+            .submit(&test.server, form, "/alerts/silences", &fields)
+            .await;
+        assert_eq!(page.status, 303, "{}", page.body);
+
+        let silences = test.database().active_silences(now_ms()).await.unwrap();
+        assert_eq!(silences.len(), 1);
+        assert_eq!(silences[0].rule_id, Some(1));
+        assert!(!silences[0].created_by.is_empty());
+
+        let page = browser.get(&test.server, "/alerts/silences").await;
+        assert!(page.body.contains("Upgrading"), "{}", page.body);
+    }
+
+    #[tokio::test]
+    async fn the_form_explains_what_is_wrong_and_keeps_what_was_typed() {
+        let test = Harness::start().await;
+        let mut browser = Browser::default();
+        let form = "/alerts/silences/new";
+        let fields = [
+            ("reason", "  "),
+            ("rule_id", ""),
+            ("filter", "hostname=db*"),
+            ("duration_secs", "3600"),
+        ];
+
+        let page = browser
+            .submit(&test.server, form, "/alerts/silences", &fields)
+            .await;
+
+        assert_eq!(page.status, 422);
+        assert!(page.body.contains("needs a reason"), "{}", page.body);
+        assert!(page.body.contains("hostname=db*"), "{}", page.body);
+    }
+
+    #[tokio::test]
+    async fn a_silence_can_be_ended_from_its_page() {
+        let test = Harness::start().await;
+        let id = test
+            .database()
+            .create_silence(&silence(""), "sam", now_ms())
+            .await;
+        let id = id.unwrap();
+        let mut browser = Browser::default();
+        let path = format!("/alerts/silences/{id}/end");
+
+        let page = browser
+            .submit(&test.server, "/alerts/silences", &path, &[])
+            .await;
+
+        assert_eq!(page.status, 303, "{}", page.body);
+        let active = test.database().active_silences(now_ms() + 1).await.unwrap();
+        assert!(active.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_api_starts_lists_and_ends_silences() {
+        let test = Harness::start().await;
+        let server = &test.server;
+
+        let body =
+            json!({ "filter": "hostname=web*", "reason": "Upgrading", "duration_secs": 3600 });
+        let (status, created) = api(server, "POST", "/api/v1/silences", &body).await;
+        assert_eq!(status, 201, "{created}");
+        let id = created["id"].as_i64().unwrap();
+
+        let (status, listed) = api(server, "GET", "/api/v1/silences", &Value::Null).await;
+        assert_eq!(status, 200);
+        assert_eq!(listed["active"][0]["id"], id);
+        assert_eq!(listed["active"][0]["created_by"], "api");
+
+        let path = format!("/api/v1/silences/{id}");
+        let (status, shown) = api(server, "GET", &path, &Value::Null).await;
+        assert_eq!(status, 200);
+        assert_eq!(shown["reason"], "Upgrading");
+
+        let (status, _) = api(server, "POST", &format!("{path}/end"), &Value::Null).await;
+        assert_eq!(status, 204);
+        let (status, _) = api(server, "POST", &format!("{path}/end"), &Value::Null).await;
+        assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
+    async fn the_api_refuses_a_silence_for_a_rule_that_does_not_exist() {
+        let test = Harness::start().await;
+        let body = json!({ "rule_id": 99, "reason": "Upgrading", "duration_secs": 3600 });
+
+        let (status, refused) = api(&test.server, "POST", "/api/v1/silences", &body).await;
+
+        assert_eq!(status, 422);
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap()
+                .contains("no alert rule 99")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_api_says_which_silence_covers_an_alert() {
+        let mut test = Harness::start().await;
+        let hook = FakeOnCall::default();
+        on_a_webhook(&mut test, &hook).await;
+        let id = test
+            .database()
+            .create_silence(&silence(""), "sam", now_ms())
+            .await;
+        let id = id.unwrap();
+
+        let (_, alerts) = api(&test.server, "GET", "/api/v1/alerts", &Value::Null).await;
+
+        assert_eq!(alerts["open"][0]["silenced_by"], id);
+        assert_eq!(alerts["open"][0]["rule_name"], "High CPU");
+    }
+}
+
 mod pages {
     use super::*;
     use crate::alerting::NewAlert;

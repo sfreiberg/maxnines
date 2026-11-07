@@ -1,0 +1,60 @@
+{% extends "layouts/application.html" %}
+{% block title %}Silences · MaxNines{% endblock title %}
+{% block content %}
+<p class="breadcrumb"><a href="/alerts">Alerts</a></p>
+<div class="title-row">
+  <h1>Silences</h1>
+  <div class="actions"><a class="button" href="/alerts/silences/new">New silence</a></div>
+</div>
+<p class="hint">Alerts still fire and show while they're silenced, but nobody is notified. If one is still firing when its silence ends, the notifications go out then.</p>
+
+{% if active %}
+<div class="tablebox"><table>
+  <thead>
+    <tr><th>Reason</th><th>Rule</th><th>Hosts</th><th>Until</th><th>Added by</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for silence in active %}
+    <tr>
+      <td>{{ silence.reason }}</td>
+      <td>{{ silence.rule }}</td>
+      <td>{{ silence.hosts }}</td>
+      <td class="nowrap">{{ silence.ends }}</td>
+      <td>{{ silence.created_by }}</td>
+      <td>
+        <form method="post" action="/alerts/silences/{{ silence.id }}/end">
+          <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+          <button type="submit" class="secondary">End now</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table></div>
+{% else %}
+<p class="empty">Nothing is silenced.</p>
+{% endif %}
+
+{% if ended %}
+<section>
+<h2>Ended</h2>
+<div class="tablebox"><table>
+  <thead>
+    <tr><th>Reason</th><th>Rule</th><th>Hosts</th><th>From</th><th>Until</th><th>Added by</th></tr>
+  </thead>
+  <tbody>
+    {% for silence in ended %}
+    <tr>
+      <td>{{ silence.reason }}</td>
+      <td>{{ silence.rule }}</td>
+      <td>{{ silence.hosts }}</td>
+      <td class="nowrap">{{ silence.starts }}</td>
+      <td class="nowrap">{{ silence.ends }}</td>
+      <td>{{ silence.created_by }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table></div>
+</section>
+{% endif %}
+{% endblock content %}

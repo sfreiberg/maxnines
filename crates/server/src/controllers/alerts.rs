@@ -9,6 +9,10 @@ use super::{Page, server_error};
 use crate::alerting::{Alert, DeliveryProblem};
 use crate::app_state::AppState;
 use crate::fact_history::format_time;
+use crate::host_filter::PartialValue;
+use crate::metrics::now_ms;
+use crate::remote_checks::FLEET_AGENT_ID;
+use crate::silences::ActiveSilences;
 
 /// How many ended alerts the page shows.
 const HISTORY: u64 = 50;
@@ -34,11 +38,30 @@ struct AlertRow {
     started: String,
     resolved: Option<String>,
     reason: Option<String>,
+    silence_link: String,
+    silenced_until: Option<String>,
+}
+
+/// Where to start a silence for just this alert. Agents choose their own names, which
+/// is fine here because it only fills in a form for someone to read.
+fn silence_link(alert: &Alert) -> String {
+    let mut fields = Vec::new();
+    if let Some(id) = alert.rule_id {
+        fields.push(("rule_id", id.to_string()));
+    }
+    if alert.agent_id != FLEET_AGENT_ID {
+        let host = PartialValue::of("hostname=").map(|term| term.suggestion(&alert.host).text);
+        fields.extend(host.map(|filter| ("filter", filter)));
+    }
+    let query = serde_urlencoded::to_string(fields).unwrap_or_default();
+    format!("/alerts/silences/new?{query}")
 }
 
 impl From<Alert> for AlertRow {
     fn from(alert: Alert) -> Self {
         Self {
+            silence_link: silence_link(&alert),
+            silenced_until: None,
             severity: alert.severity.as_str(),
             started: time(alert.started_ms),
             resolved: alert.resolved_ms.map(time),
@@ -81,14 +104,26 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
         let open = state.database.open_alerts().await?;
         let resolved = state.database.resolved_alerts(HISTORY).await?;
         let problems = state.database.delivery_problems(PROBLEMS).await?;
-        anyhow::Ok((open, resolved, problems))
+        let silences = ActiveSilences::load(&state.database, now_ms()).await?;
+        anyhow::Ok((open, resolved, problems, silences))
     };
-    let (open, resolved, problems) = match rows.await {
+    let (open, resolved, problems, silences) = match rows.await {
         Ok(rows) => rows,
         Err(error) => return server_error(&error),
     };
 
-    let open: Vec<AlertRow> = open.into_iter().map(AlertRow::from).collect();
+    let open: Vec<AlertRow> = open
+        .into_iter()
+        .map(|alert| {
+            let silence = silences
+                .covering(&alert)
+                .map(|silence| time(silence.ends_ms));
+            AlertRow {
+                silenced_until: silence,
+                ..AlertRow::from(alert)
+            }
+        })
+        .collect();
     let resolved: Vec<AlertRow> = resolved.into_iter().map(AlertRow::from).collect();
     let problems: Vec<ProblemRow> = problems
         .into_iter()

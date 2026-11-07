@@ -7,6 +7,7 @@
     <h1>Alerts</h1>
   </div>
   <div class="actions">
+    <a class="button secondary" href="/alerts/silences">Silences</a>
     <a class="button secondary" href="/alerts/rules">Alert rules</a>
     <a class="button secondary" href="/alerts/channels">Notification channels</a>
   </div>
@@ -18,8 +19,9 @@
   {% for alert in open %}
   <div class="problem">
     {% if alert.severity == "critical" %}<span class="badge bad">Critical</span>{% else %}<span class="badge warn">Warning</span>{% endif %}
-    <span class="text">{{ alert.summary }}<br><span class="note">{{ alert.rule_name }} · started {{ alert.started }}</span></span>
+    <span class="text">{{ alert.summary }}<br><span class="note">{{ alert.rule_name }} · started {{ alert.started }}{% if alert.silenced_until %} · silenced until {{ alert.silenced_until }}{% endif %}</span></span>
     {% if alert.agent_id != "fleet" %}<a class="button secondary" href="/agents/{{ alert.agent_id }}{% if alert.agent_id == "server" %}/metrics{% endif %}">{{ alert.host }}</a>{% else %}<span class="badge">{{ alert.host }}</span>{% endif %}
+    {% if alert.silenced_until %}<span class="badge neutral">Silenced</span>{% else %}<a class="button secondary" href="{{ alert.silence_link }}">Silence</a>{% endif %}
   </div>
   {% endfor %}
   {% else %}

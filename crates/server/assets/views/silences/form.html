@@ -1,0 +1,44 @@
+{% extends "layouts/application.html" %}
+{% block title %}New silence · MaxNines{% endblock title %}
+{% block main_class %} class="narrow"{% endblock main_class %}
+{% block content %}
+<p class="breadcrumb"><a href="/alerts/silences">Silences</a></p>
+<h1>New silence</h1>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<form method="post" action="/alerts/silences" class="stacked">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+
+  <label>Reason
+    <input type="text" name="reason" value="{{ silence.reason }}" required maxlength="255" placeholder="Upgrading Postgres">
+  </label>
+
+  <label>Rule
+    <select name="rule_id">
+      <option value="">Every rule</option>
+      {% for rule in rules %}
+      <option value="{{ rule.id }}"{% if rule.id ~ "" == silence.rule_id %} selected{% endif %}>{{ rule.name }}</option>
+      {% endfor %}
+    </select>
+  </label>
+
+  <label>Hosts
+    <input type="text" name="filter" value="{{ silence.filter }}" maxlength="500" spellcheck="false" placeholder="hostname=db*">
+    <small>The same filter as the host list. Leave empty for every host. Alerts about a group of machines only follow the rule above, so a silence with a filter leaves them out.</small>
+  </label>
+
+  <label>For
+    <select name="duration_secs">
+      {% for duration in durations %}
+      <option value="{{ duration.secs }}"{% if duration.secs == silence.duration_secs %} selected{% endif %}>{{ duration.label }}</option>
+      {% endfor %}
+    </select>
+  </label>
+
+  <div class="actions">
+    <button type="submit">Start silence</button>
+    <a class="button secondary" href="/alerts/silences">Cancel</a>
+  </div>
+</form>
+{% endblock content %}

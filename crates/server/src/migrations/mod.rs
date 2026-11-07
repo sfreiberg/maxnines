@@ -19,6 +19,7 @@ impl MigratorTrait for Migrator {
             Box::new(CreateUsers),
             Box::new(CreateDashboards),
             Box::new(AddCalculationRules),
+            Box::new(CreateSilences),
         ]
     }
 }
@@ -1319,5 +1320,80 @@ impl MigrationTrait for AddCalculationRules {
                 .await?;
         }
         Ok(())
+    }
+}
+
+struct CreateSilences;
+
+impl MigrationName for CreateSilences {
+    fn name(&self) -> &str {
+        "m20261107_000012_create_silences"
+    }
+}
+
+#[derive(Iden)]
+enum Silences {
+    Table,
+    Id,
+    RuleId,
+    Filter,
+    Reason,
+    CreatedBy,
+    StartsMs,
+    EndsMs,
+}
+
+/// A silence goes with its rule. Leaving the rule empty would mean every rule, so it
+/// would quietly silence far more than anyone asked for.
+#[async_trait::async_trait]
+impl MigrationTrait for CreateSilences {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(Silences::Table)
+                    .col(
+                        ColumnDef::new(Silences::Id)
+                            .big_integer()
+                            .not_null()
+                            .auto_increment()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(Silences::RuleId).big_integer())
+                    .col(ColumnDef::new(Silences::Filter).string_len(500).not_null())
+                    .col(ColumnDef::new(Silences::Reason).string_len(255).not_null())
+                    .col(
+                        ColumnDef::new(Silences::CreatedBy)
+                            .string_len(255)
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(Silences::StartsMs).big_integer().not_null())
+                    .col(ColumnDef::new(Silences::EndsMs).big_integer().not_null())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(Silences::Table, Silences::RuleId)
+                            .to(AlertRules::Table, AlertRules::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        // Finding what's running, which happens every few seconds.
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_silences_ends")
+                    .table(Silences::Table)
+                    .col(Silences::EndsMs)
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(Silences::Table).to_owned())
+            .await
     }
 }

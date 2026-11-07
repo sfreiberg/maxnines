@@ -18,6 +18,8 @@ use crate::calculations::Calculation;
 const PENDING: &str = "pending";
 const SENT: &str = "sent";
 const FAILED: &str = "failed";
+/// Kept back by a silence.
+const HELD: &str = "held";
 
 /// How much of the queue is looked at each time. Anything beyond this waits for
 /// the rows in front of it to be sent or given up on.
@@ -374,7 +376,7 @@ impl Database {
     }
 
     /// Ends an alert and tells whoever was told it started, even if the rule
-    /// has since changed or gone.
+    /// has since changed or gone. Anyone a silence kept it from never hears of it.
     pub async fn resolve_alert(&self, id: i64, now_ms: i64, reason: &str) -> Result<()> {
         let transaction = self.connection.begin().await.context("resolving alert")?;
         let result = alert::Entity::update_many()
@@ -387,6 +389,12 @@ impl Database {
             .context("resolving alert")?;
 
         if result.rows_affected > 0 {
+            notification::Entity::delete_many()
+                .filter(notification::Column::AlertId.eq(id))
+                .filter(notification::Column::State.eq(HELD))
+                .exec(&transaction)
+                .await
+                .context("dropping notifications")?;
             let told = notification::Entity::find()
                 .filter(notification::Column::AlertId.eq(id))
                 .filter(notification::Column::Event.eq(Event::Firing.as_str()))
@@ -474,6 +482,74 @@ impl Database {
                 })
             })
             .collect()
+    }
+
+    /// Keeps a notification back because of a silence. An alert that's already over
+    /// has nothing to wait for, so nobody hears about it starting or ending.
+    pub async fn hold_delivery(&self, delivery: &Delivery) -> Result<()> {
+        if delivery.alert.resolved_ms.is_some() {
+            notification::Entity::delete_many()
+                .filter(notification::Column::AlertId.eq(delivery.alert.id))
+                .filter(notification::Column::ChannelId.eq(delivery.channel.id))
+                .filter(notification::Column::State.eq(PENDING))
+                .exec(&self.connection)
+                .await
+                .context("dropping notifications")?;
+            return Ok(());
+        }
+
+        notification::Entity::update_many()
+            .col_expr(notification::Column::State, Expr::value(HELD))
+            .col_expr(notification::Column::Attempts, Expr::value(0))
+            .col_expr(notification::Column::LastError, Expr::value(None::<String>))
+            .filter(notification::Column::Id.eq(delivery.id))
+            .exec(&self.connection)
+            .await
+            .context("saving notification")?;
+        Ok(())
+    }
+
+    /// The alerts behind what silences are keeping back, with what's kept back for each.
+    pub async fn held_deliveries(&self) -> Result<Vec<(Alert, Vec<i64>)>> {
+        let rows = notification::Entity::find()
+            .filter(notification::Column::State.eq(HELD))
+            .all(&self.connection)
+            .await
+            .context("loading notifications")?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut held: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+        for row in rows {
+            held.entry(row.alert_id).or_default().push(row.id);
+        }
+        let alerts = alert::Entity::find()
+            .filter(alert::Column::Id.is_in(held.keys().copied()))
+            .all(&self.connection)
+            .await
+            .context("loading alerts")?;
+        alerts
+            .into_iter()
+            .map(|row| {
+                let ids = held.remove(&row.id).unwrap_or_default();
+                Ok((to_alert(row)?, ids))
+            })
+            .collect()
+    }
+
+    /// Lets held notifications go. The day they get to arrive starts now, however long
+    /// they waited.
+    pub async fn release_deliveries(&self, ids: &[i64], now_ms: i64) -> Result<()> {
+        notification::Entity::update_many()
+            .col_expr(notification::Column::State, Expr::value(PENDING))
+            .col_expr(notification::Column::NextAttemptMs, Expr::value(now_ms))
+            .col_expr(notification::Column::CreatedMs, Expr::value(now_ms))
+            .filter(notification::Column::Id.is_in(ids.iter().copied()))
+            .exec(&self.connection)
+            .await
+            .context("saving notifications")?;
+        Ok(())
     }
 
     /// `external_id` is what the service called it, if that's needed later.

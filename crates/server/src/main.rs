@@ -22,6 +22,7 @@ mod remote_checks;
 mod rule_engine;
 mod rule_preview;
 mod server_stats;
+mod silences;
 mod store;
 mod tls;
 mod views;

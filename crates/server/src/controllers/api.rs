@@ -32,6 +32,7 @@ use crate::presence::AgentPresence;
 use crate::registration::{AgentRecord, AgentState, hash_token};
 use crate::remote_checks::{RemoteCheck, RemoteCheckInput};
 use crate::rule_engine::{self, ResolvedConfig};
+use crate::silences::{ActiveSilences, SilenceInput};
 
 /// An agent as admins see it.
 #[derive(Debug, Serialize, Deserialize)]
@@ -97,6 +98,9 @@ pub fn routes(state: AppState) -> Router<AppState> {
         )
         .route("/server", get(server_stats))
         .route("/alerts", get(list_alerts))
+        .route("/silences", get(list_silences).post(create_silence))
+        .route("/silences/{id}", get(show_silence))
+        .route("/silences/{id}/end", post(end_silence))
         .route(
             "/alert-rules",
             get(list_alert_rules).post(create_alert_rule),
@@ -603,14 +607,77 @@ async fn server_stats(State(state): State<AppState>) -> Json<crate::server_stats
 /// How many ended alerts the API returns.
 const RESOLVED_ALERTS: u64 = 200;
 
+#[derive(Serialize)]
+struct OpenAlert {
+    #[serde(flatten)]
+    alert: Alert,
+    /// The silence keeping its notifications back, if there is one.
+    silenced_by: Option<i64>,
+}
+
 async fn list_alerts(State(state): State<AppState>) -> Response {
     let alerts = async {
-        let open = state.database.open_alerts().await?;
+        let silences = ActiveSilences::load(&state.database, now_ms()).await?;
+        let open: Vec<OpenAlert> = state
+            .database
+            .open_alerts()
+            .await?
+            .into_iter()
+            .map(|alert| OpenAlert {
+                silenced_by: silences.covering(&alert).map(|silence| silence.id),
+                alert,
+            })
+            .collect();
         let resolved = state.database.resolved_alerts(RESOLVED_ALERTS).await?;
         anyhow::Ok(json!({ "open": open, "resolved": resolved }))
     };
     match alerts.await {
         Ok(alerts) => Json(alerts).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// How many ended silences the API returns.
+const ENDED_SILENCES: u64 = 200;
+
+async fn list_silences(State(state): State<AppState>) -> Response {
+    let now = now_ms();
+    let silences = async {
+        let active = state.database.active_silences(now).await?;
+        let ended = state.database.ended_silences(now, ENDED_SILENCES).await?;
+        anyhow::Ok(json!({ "active": active, "ended": ended }))
+    };
+    match silences.await {
+        Ok(silences) => Json(silences).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn show_silence(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.get_silence(id).await {
+        Ok(Some(silence)) => Json(silence).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn create_silence(
+    State(state): State<AppState>,
+    Json(input): Json<SilenceInput>,
+) -> Response {
+    if let Err(error) = state.check_silence(&input).await {
+        return refused(&error);
+    }
+    match state.database.create_silence(&input, "api", now_ms()).await {
+        Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn end_silence(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.end_silence(id, now_ms()).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),
     }
 }

@@ -20,6 +20,8 @@ mod notification_channel;
 mod remote_check;
 mod remote_checks;
 mod server_secret;
+mod silence;
+mod silences;
 mod stats;
 mod user;
 mod user_session;

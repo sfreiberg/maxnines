@@ -20,6 +20,7 @@ use crate::remote_checks::{self, LatestResults, RemoteCheckInput};
 use crate::rule_engine::{self, ResolvedConfig};
 use crate::rule_preview::{self, Preview, PreviewAgent};
 use crate::server_stats::ServerStatus;
+use crate::silences::{self, SilenceInput};
 use crate::store::WriterCommand;
 use crate::views::Views;
 
@@ -130,6 +131,18 @@ impl AppState {
             if !channels.iter().any(|channel| channel.id == *wanted) {
                 bail!("there's no notification channel {wanted}");
             }
+        }
+        Ok(())
+    }
+
+    /// Everything that has to be true for a silence to start.
+    pub async fn check_silence(&self, input: &SilenceInput) -> Result<()> {
+        silences::check_silence(input)?;
+        if let Some(id) = input.rule_id {
+            ensure!(
+                self.database.get_alert_rule(id).await?.is_some(),
+                "there's no alert rule {id}"
+            );
         }
         Ok(())
     }
