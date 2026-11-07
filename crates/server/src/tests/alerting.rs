@@ -3315,7 +3315,10 @@ mod server_page {
         let local = server.state.database.load_agents().await.unwrap();
         let local = local.into_iter().find(|agent| agent.is_local()).unwrap();
         server.state.registry.insert_for_test(local).await;
-        let (_agent, _client) = report_samples(&server, "/").await;
+        let (_agent, client) = report_samples(&server, "/").await;
+        // Reading answers heartbeats, as an agent would, however long this takes.
+        let (_sender, receiver) = client.split();
+        tokio::spawn(receiver.for_each(|_| async {}));
         let mut recorded = Recorded::default();
         record_once(&server.state, &mut recorded).await;
         sleep(Duration::from_millis(50)).await;
@@ -3490,13 +3493,17 @@ mod server_page {
     #[tokio::test]
     async fn the_dashboard_graphs_what_the_server_takes_in() {
         let server = start_with_metrics().await;
-        let (_agent, mut client) = report_samples(&server, "/").await;
+        let (_agent, client) = report_samples(&server, "/").await;
+        // Reading answers heartbeats, as an agent would, however long this takes.
+        let (mut sender, receiver) = client.split();
+        tokio::spawn(receiver.for_each(|_| async {}));
         let mut recorded = Recorded::default();
         record_once(&server.state, &mut recorded).await;
         // A rate needs something to have arrived between two records.
         let writes = server.state.status.writes.clone();
         let before = writes.written.load(std::sync::atomic::Ordering::Relaxed);
-        send(&mut client, &full_sample(now_ms() as u64, "/")).await;
+        let text = serde_json::to_string(&full_sample(now_ms() as u64, "/")).unwrap();
+        sender.send(Message::text(text)).await.unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while writes.written.load(std::sync::atomic::Ordering::Relaxed) == before {
             assert!(Instant::now() < deadline, "the sample wasn't written");

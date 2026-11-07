@@ -115,7 +115,9 @@ async fn start_on(
         status,
         heartbeat: Heartbeat {
             interval: Duration::from_millis(50),
-            timeout: Duration::from_millis(200),
+            // Short to keep tests quick, but long enough that a busy machine running
+            // every test at once doesn't look like a client gone quiet.
+            timeout: Duration::from_secs(1),
         },
         audience: AUDIENCE.into(),
         trusted_proxies: config.trusted_networks().unwrap().into(),
@@ -581,7 +583,7 @@ async fn a_full_write_queue_stops_reading_but_not_the_heartbeat() {
     }
 
     // Long enough to be taken for dead, had the wait counted as silence.
-    sleep(Duration::from_millis(400)).await;
+    sleep(Duration::from_millis(1200)).await;
     let before = pings.load(Ordering::Relaxed);
     sleep(Duration::from_millis(300)).await;
     assert!(pings.load(Ordering::Relaxed) > before, "pings stopped");
@@ -2503,7 +2505,10 @@ async fn report_samples(server: &TestServer, mount_point: &str) -> (Identity, Cl
         {
             return (agent, client);
         }
-        sleep(Duration::from_millis(10)).await;
+        // Reading answers heartbeats, or the server would drop a client this quiet.
+        tokio::time::timeout(Duration::from_millis(10), client.next())
+            .await
+            .ok();
     }
     panic!("the samples never arrived");
 }
