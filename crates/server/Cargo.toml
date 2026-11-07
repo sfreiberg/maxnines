@@ -34,6 +34,7 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "s
 tower-http = { version = "0.6", features = ["compression-gzip"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+clickhouse = { version = "0.15", default-features = false, features = ["lz4", "rustls-tls-ring", "rustls-tls-webpki-roots"] }
 ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "rustls", "ring", "webpki-roots"] }
 wildmatch = "2.7.0"
@@ -53,3 +54,7 @@ tokio-tungstenite.workspace = true
 
 [build-dependencies]
 vergen-gitcl = { version = "10", features = ["build"] }
+
+[features]
+# Runs the metrics store tests against a ClickHouse server as well.
+clickhouse-tests = []

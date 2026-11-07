@@ -96,13 +96,30 @@ pub enum MetricsConfig {
         #[serde(default = "default_duckdb_memory_limit")]
         memory_limit: String,
     },
+    /// For bigger fleets. Takes a server of its own.
+    Clickhouse {
+        /// Such as "http://127.0.0.1:8123".
+        url: String,
+        #[serde(default = "default_clickhouse_database")]
+        database: String,
+        #[serde(default)]
+        user: Option<String>,
+        /// A file holding the password, so it stays out of the config.
+        #[serde(default)]
+        password_file: Option<PathBuf>,
+    },
+}
+
+fn default_clickhouse_database() -> String {
+    "maxnines".to_string()
 }
 
 impl MetricsConfig {
-    /// Where the metrics are kept.
-    pub fn path(&self) -> &Path {
+    /// Where the metrics are kept, if it's on this machine.
+    pub fn path(&self) -> Option<&Path> {
         match self {
-            Self::Duckdb { path, .. } => path,
+            Self::Duckdb { path, .. } => Some(path),
+            Self::Clickhouse { .. } => None,
         }
     }
 }
@@ -314,6 +331,48 @@ mod env_tests {
                     source_cidrs = [env(\"MAXNINES_TEST_UNSET\", \"10.0.0.0/8\")]\n  }\n}";
         let config = parse_with(line).unwrap();
         assert_eq!(config.registration.rule["a"].source_cidrs, ["10.0.0.0/8"]);
+    }
+}
+
+#[cfg(test)]
+mod clickhouse_config {
+    use super::*;
+
+    #[test]
+    fn clickhouse_can_be_chosen_with_only_a_url() {
+        let text = r#"
+            metrics "clickhouse" {
+              url = "http://127.0.0.1:8123"
+            }
+        "#;
+        let config = Config::parse(text).unwrap();
+        assert_eq!(config.metrics.path(), None);
+        assert_eq!(
+            config.metrics,
+            MetricsConfig::Clickhouse {
+                url: "http://127.0.0.1:8123".to_string(),
+                database: "maxnines".to_string(),
+                user: None,
+                password_file: None,
+            }
+        );
+    }
+
+    #[test]
+    fn clickhouse_can_have_its_own_database_and_login() {
+        let text = r#"
+            metrics "clickhouse" {
+              url           = "https://clickhouse.internal:8443"
+              database      = "metrics"
+              user          = "maxnines"
+              password_file = "/etc/maxnines/clickhouse.password"
+            }
+        "#;
+        let config = Config::parse(text).unwrap();
+        assert!(matches!(
+            config.metrics,
+            MetricsConfig::Clickhouse { ref database, .. } if database == "metrics"
+        ));
     }
 }
 

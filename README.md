@@ -95,6 +95,18 @@ reached, and sent when it's back.
   machine, and `./maxnines-agent identity show` prints its ID once it's been started.
   Use `-c` to point any of them at a config file somewhere else.
 
+## Metrics databases
+
+`server.hcl` chooses where metrics are kept, and everything else works the same on
+either.
+
+- **DuckDB** is the default. It's built into the server, so there's nothing else to run.
+  Use it for smaller installations.
+- **ClickHouse** runs as a server of its own. Use it for bigger fleets. Point the
+  `metrics "clickhouse"` block at it, and the database and tables are created for you.
+
+Nothing moves between them, so changing later starts metrics afresh.
+
 ## API
 
 Everything the web pages can see and do is available as JSON under `/api/v1`, on the

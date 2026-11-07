@@ -185,7 +185,11 @@ fn server_page(stats: ServerStats, now_ms: i64) -> ServerPage {
         .metrics
         .as_ref()
         .map_or(&[][..], |m| m.collectors.as_slice());
-    let total_rows: i64 = collectors.iter().map(|collector| collector.rows).sum();
+    let total_rows: i64 = stats
+        .metrics
+        .as_ref()
+        .and_then(|metrics| metrics.total_rows)
+        .unwrap_or_else(|| collectors.iter().map(|collector| collector.rows).sum());
     let activity = &stats.activity;
     let last_pass = activity.last_alert_pass_ms;
 

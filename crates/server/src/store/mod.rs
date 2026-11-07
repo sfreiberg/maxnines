@@ -3,8 +3,10 @@
 //! a match arm to [`open`].
 //! Everything else the server keeps lives in [`crate::models`].
 
+mod clickhouse;
 mod duckdb;
 mod flatten;
+mod shared;
 
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -102,6 +104,8 @@ pub struct StoreStats {
     pub memory_used: String,
     pub memory_limit: String,
     pub collectors: Vec<CollectorStats>,
+    /// Everything stored, where that's more than `collectors` adds up to.
+    pub total_rows: Option<i64>,
 }
 
 /// What's stored from one collector.
@@ -130,6 +134,17 @@ pub fn open(config: &MetricsConfig) -> Result<Box<dyn Store>> {
         MetricsConfig::Duckdb { path, memory_limit } => {
             Box::new(duckdb::DuckDbStore::open(path, memory_limit)?)
         }
+        MetricsConfig::Clickhouse {
+            url,
+            database,
+            user,
+            password_file,
+        } => Box::new(clickhouse::ClickHouseStore::open(
+            url,
+            database,
+            user.as_deref(),
+            password_file.as_deref(),
+        )?),
     })
 }
 

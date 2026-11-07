@@ -35,6 +35,18 @@ metrics "duckdb" {
   memory_limit = "1GB"
 }
 
+# For bigger fleets, use ClickHouse instead. It runs as a server of its own, and the
+# database and its tables are created for you.
+#
+# metrics "clickhouse" {
+#   url      = "http://127.0.0.1:8123"
+#   database = "maxnines"
+#
+#   # Only if ClickHouse needs a login. The password stays out of this file.
+#   user          = "maxnines"
+#   password_file = "/etc/maxnines/clickhouse.password"
+# }
+
 # Where everything else is saved, such as registered agents. The URL picks the
 # database. Use url_file instead of url to keep a password out of this file.
 #

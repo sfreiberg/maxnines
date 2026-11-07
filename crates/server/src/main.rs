@@ -189,9 +189,9 @@ async fn serve(path: &Path) -> Result<()> {
     let agents = database.load_agents().await.context("loading agents")?;
     let store = store::open(&config.metrics)?;
     let metrics = Metrics::new(store.reader()?);
-    let status = Arc::new(ServerStatus::new(Some(
-        config.metrics.path().to_path_buf(),
-    ))?);
+    let status = Arc::new(ServerStatus::new(
+        config.metrics.path().map(Path::to_path_buf),
+    )?);
     let (writer, writer_thread) = store::spawn_writer(store, status.writes.clone());
     let mailer = config
         .email
