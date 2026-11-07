@@ -234,7 +234,7 @@ pub async fn view(state: &AppState, widget: &Widget, range: TimeRange) -> Widget
         "number" => 1,
         _ => MAX_SERIES,
     };
-    match calculations::answer(state, &question, range, max_lines).await {
+    match calculations::answer(&state.sources(), &question, range, max_lines).await {
         Ok(result) => {
             let title = input.title(&question);
             let chart = metric_charts::build_as(

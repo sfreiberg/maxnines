@@ -1444,6 +1444,10 @@ mod tests {
             condition: Some("true".to_string()),
             enabled: true,
             channels: vec![channel],
+            calculation: None,
+            group_by: None,
+            filter: None,
+            window_secs: None,
         };
         let rule = database.create_alert_rule(&input).await.unwrap();
         assert_eq!(

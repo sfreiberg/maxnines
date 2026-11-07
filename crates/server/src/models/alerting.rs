@@ -13,6 +13,7 @@ use crate::alerting::{
     Alert, AlertRule, AlertRuleInput, Channel, ChannelInput, ChannelKind, Comparison, Delivery,
     DeliveryProblem, Event, NewAlert, RuleKind, Severity,
 };
+use crate::calculations::Calculation;
 
 const PENDING: &str = "pending";
 const SENT: &str = "sent";
@@ -41,6 +42,14 @@ fn to_alert_rule(row: alert_rule::Model, channels: Vec<i64>) -> Result<AlertRule
             condition: row.condition_expr,
             enabled: row.enabled,
             channels,
+            calculation: row.calculation.as_deref().and_then(Calculation::parse),
+            group_by: row.group_by,
+            filter: row.filter,
+            window_secs: row
+                .window_secs
+                .map(u64::try_from)
+                .transpose()
+                .context("invalid window")?,
         },
     })
 }
@@ -57,6 +66,14 @@ fn alert_rule_row(input: &AlertRuleInput) -> Result<alert_rule::ActiveModel> {
         severity: Set(input.severity.as_str().to_string()),
         condition_expr: Set(input.condition.clone()),
         enabled: Set(input.enabled),
+        calculation: Set(input.calculation.map(|c| c.as_str().to_string())),
+        group_by: Set(input.group_by.clone()),
+        filter: Set(input.filter.clone()),
+        window_secs: Set(input
+            .window_secs
+            .map(i64::try_from)
+            .transpose()
+            .context("invalid window")?),
         ..Default::default()
     })
 }

@@ -23,6 +23,9 @@ use crate::store::{NewSample, WriterCommand};
 pub const LOCAL_AGENT_ID: &str = "server";
 
 pub const LOCAL_HOST: &str = "MaxNines server";
+/// The built-in agent alerts about a group of machines belong to.
+pub const FLEET_AGENT_ID: &str = "fleet";
+pub const FLEET_HOST: &str = "Fleet";
 
 /// How often to look for checks that are due.
 const TICK: Duration = Duration::from_secs(5);

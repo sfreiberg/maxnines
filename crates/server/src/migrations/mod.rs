@@ -18,6 +18,7 @@ impl MigratorTrait for Migrator {
             Box::new(CreateApiKeys),
             Box::new(CreateUsers),
             Box::new(CreateDashboards),
+            Box::new(AddCalculationRules),
         ]
     }
 }
@@ -1229,5 +1230,94 @@ impl MigrationTrait for CreateDashboards {
         manager
             .drop_table(Table::drop().table(Dashboards::Table).to_owned())
             .await
+    }
+}
+
+struct AddCalculationRules;
+
+impl MigrationName for AddCalculationRules {
+    fn name(&self) -> &str {
+        "m20261107_000011_add_calculation_rules"
+    }
+}
+
+#[derive(Iden)]
+enum CalculationRuleColumns {
+    Calculation,
+    GroupBy,
+    Filter,
+    WindowSecs,
+}
+
+#[derive(Iden)]
+enum AlertRulesTable {
+    #[iden = "alert_rules"]
+    Table,
+}
+
+/// Stands for the machines as a whole, so an alert about a group has an agent to
+/// belong to, as every alert has to.
+const FLEET_AGENT: &str = "
+    INSERT INTO agents (id, public_key, host, state, decided_by, first_seen_ms)
+    VALUES ('fleet', '', 'Fleet', 'approved', 'built-in', 0)
+";
+
+/// Rules can watch something worked out across machines. One column at a time, as
+/// SQLite can only add them that way.
+#[async_trait::async_trait]
+impl MigrationTrait for AddCalculationRules {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let columns = [
+            ColumnDef::new(CalculationRuleColumns::Calculation)
+                .string_len(16)
+                .to_owned(),
+            ColumnDef::new(CalculationRuleColumns::GroupBy)
+                .string_len(255)
+                .to_owned(),
+            ColumnDef::new(CalculationRuleColumns::Filter)
+                .string_len(500)
+                .to_owned(),
+            ColumnDef::new(CalculationRuleColumns::WindowSecs)
+                .big_integer()
+                .to_owned(),
+        ];
+        for mut column in columns {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(AlertRulesTable::Table)
+                        .add_column(&mut column)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        manager
+            .get_connection()
+            .execute_unprepared(FLEET_AGENT)
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared("DELETE FROM agents WHERE id = 'fleet'")
+            .await?;
+        for column in [
+            CalculationRuleColumns::Calculation,
+            CalculationRuleColumns::GroupBy,
+            CalculationRuleColumns::Filter,
+            CalculationRuleColumns::WindowSecs,
+        ] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(AlertRulesTable::Table)
+                        .drop_column(column)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
     }
 }

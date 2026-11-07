@@ -651,7 +651,7 @@ async fn query(State(state): State<AppState>, Query(params): Query<QueryParams>)
         return StatusCode::BAD_REQUEST.into_response();
     };
 
-    match calculations::answer(&state, &question, range, MAX_SERIES).await {
+    match calculations::answer(&state.sources(), &question, range, MAX_SERIES).await {
         Ok(result) => Json(MetricView {
             metric: question.metric.name,
             unit: question.unit(),

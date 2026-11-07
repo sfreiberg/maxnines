@@ -27,6 +27,7 @@ use crate::alerting::{Alert, Channel, ChannelKind, Delivery, Event, Severity, re
 use crate::config::{EmailConfig, EmailSecurity};
 use crate::metrics::now_ms;
 use crate::models::Database;
+use crate::remote_checks::FLEET_AGENT_ID;
 
 /// How often the queue is checked.
 const INTERVAL: Duration = Duration::from_secs(5);
@@ -141,7 +142,11 @@ impl Notice {
             String::new(),
             format!("Rule: {}", alert.rule_name),
             format!("Severity: {}", alert.severity.as_str()),
-            format!("Agent: {} ({})", alert.host, alert.agent_id),
+            if alert.agent_id == FLEET_AGENT_ID {
+                format!("Machines: {}", alert.host)
+            } else {
+                format!("Agent: {} ({})", alert.host, alert.agent_id)
+            },
             format!("Started: {}", format_ms(alert.started_ms)),
         ];
         if let Some(resolved) = alert.resolved_ms {
@@ -310,7 +315,15 @@ fn slack_text(notice: &Notice, web_url: Option<&str>) -> String {
     )];
     let mut details = vec![
         format!("Rule: {}", escape_slack(&alert.rule_name)),
-        format!("Agent: {}", escape_slack(&alert.host)),
+        format!(
+            "{}: {}",
+            if alert.agent_id == FLEET_AGENT_ID {
+                "Machines"
+            } else {
+                "Agent"
+            },
+            escape_slack(&alert.host)
+        ),
         format!("Started: {}", format_ms(alert.started_ms)),
     ];
     if let Some(url) = web_url {

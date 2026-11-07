@@ -19,7 +19,7 @@
   <div class="problem">
     {% if alert.severity == "critical" %}<span class="badge bad">Critical</span>{% else %}<span class="badge warn">Warning</span>{% endif %}
     <span class="text">{{ alert.summary }}<br><span class="note">{{ alert.rule_name }} · started {{ alert.started }}</span></span>
-    <a class="button secondary" href="/agents/{{ alert.agent_id }}{% if alert.agent_id == "server" %}/metrics{% endif %}">{{ alert.host }}</a>
+    {% if alert.agent_id != "fleet" %}<a class="button secondary" href="/agents/{{ alert.agent_id }}{% if alert.agent_id == "server" %}/metrics{% endif %}">{{ alert.host }}</a>{% else %}<span class="badge">{{ alert.host }}</span>{% endif %}
   </div>
   {% endfor %}
   {% else %}
@@ -50,7 +50,7 @@
     {% for alert in resolved %}
     <tr>
       <td>{{ alert.summary }}</td>
-      <td class="nowrap"><a href="/agents/{{ alert.agent_id }}{% if alert.agent_id == "server" %}/metrics{% endif %}">{{ alert.host }}</a></td>
+      <td class="nowrap">{% if alert.agent_id != "fleet" %}<a href="/agents/{{ alert.agent_id }}{% if alert.agent_id == "server" %}/metrics{% endif %}">{{ alert.host }}</a>{% else %}{{ alert.host }}{% endif %}</td>
       <td>{{ alert.started }}</td>
       <td>{{ alert.resolved }}</td>
       <td>{{ alert.reason }}</td>

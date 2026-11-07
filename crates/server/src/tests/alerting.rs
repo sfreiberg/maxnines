@@ -188,6 +188,10 @@ fn cpu_rule() -> AlertRuleInput {
         condition: None,
         enabled: true,
         channels: Vec::new(),
+        calculation: None,
+        group_by: None,
+        filter: None,
+        window_secs: None,
     }
 }
 

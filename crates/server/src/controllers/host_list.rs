@@ -9,6 +9,7 @@ use serde::Serialize;
 use crate::app_state::AppState;
 use crate::facts::FlatFacts;
 use crate::host_filter::HostFilter;
+use crate::models::Database;
 
 pub const PAGE_SIZE: usize = 100;
 
@@ -25,6 +26,10 @@ pub struct HostSearch {
 
 impl HostSearch {
     pub async fn load(state: &AppState, text: Option<&str>) -> Result<Self> {
+        Self::from_database(&state.database, text).await
+    }
+
+    pub async fn from_database(database: &Database, text: Option<&str>) -> Result<Self> {
         let text = text.unwrap_or_default().trim().to_string();
         let (filter, error) = match HostFilter::parse(&text) {
             Ok(filter) => (Some(filter), None),
@@ -37,7 +42,7 @@ impl HostSearch {
         let facts = if names.is_empty() {
             BTreeMap::new()
         } else {
-            state.database.facts_named(&names).await?
+            database.facts_named(&names).await?
         };
         Ok(Self {
             text,

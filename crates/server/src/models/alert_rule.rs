@@ -15,6 +15,10 @@ pub struct Model {
     pub severity: String,
     pub condition_expr: Option<String>,
     pub enabled: bool,
+    pub calculation: Option<String>,
+    pub group_by: Option<String>,
+    pub filter: Option<String>,
+    pub window_secs: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

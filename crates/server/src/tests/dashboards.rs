@@ -2,6 +2,8 @@
 
 use super::*;
 
+const MINUTE_MS: i64 = 60_000;
+
 /// Calls the API with the admin token, giving back the status and any JSON.
 async fn api(server: &TestServer, method: &str, path: &str, body: &Value) -> (u16, Value) {
     let response = server.request(method, path, &body.to_string()).await;
@@ -16,7 +18,8 @@ async fn machine(server: &TestServer, host: &str, usage: f64, facts: Value) -> (
     let mut client = server.connect_approved(&agent, host).await;
     send(&mut client, &AgentMessage::Facts { facts }).await;
     let sample = AgentMessage::Sample(Sample {
-        timestamp_ms: now_ms() as u64 - 5_000,
+        // In a minute that's over, as the one still filling up isn't counted.
+        timestamp_ms: now_ms() as u64 - 90_000,
         metrics: BTreeMap::from([("cpu".to_string(), json!({ "usage_percent": usage }))]),
     });
     send(&mut client, &sample).await;
@@ -499,6 +502,327 @@ mod dashboard_pages {
         ] {
             assert_eq!(browser.get(&server, path).await.status, 404, "{path}");
         }
+    }
+}
+
+mod calculation_alerts {
+    use super::*;
+    use crate::alert_evaluator::Evaluator;
+    use crate::alerting::{AlertRuleInput, Comparison, RuleKind, Severity};
+    use crate::calculations::Calculation;
+
+    fn rule(calculation: Calculation, comparison: Comparison, threshold: f64) -> AlertRuleInput {
+        AlertRuleInput {
+            name: "Fleet".to_string(),
+            kind: RuleKind::Calculation,
+            metric: Some("cpu.usage".to_string()),
+            series: None,
+            comparison: Some(comparison),
+            threshold: Some(threshold),
+            for_secs: 0,
+            severity: Severity::Warning,
+            condition: None,
+            enabled: true,
+            channels: Vec::new(),
+            calculation: Some(calculation),
+            group_by: None,
+            filter: None,
+            window_secs: Some(300),
+        }
+    }
+
+    fn evaluator(server: &TestServer, started_ms: i64) -> Evaluator {
+        let state = &server.state;
+        Evaluator::new(
+            state.database.clone(),
+            state.registry.clone(),
+            state.presence.clone(),
+            state.metrics.clone(),
+            state.status.clone(),
+            started_ms,
+        )
+    }
+
+    /// Well after the start, so the wait for agents to come back is over.
+    fn past_grace() -> i64 {
+        now_ms() - 600_000
+    }
+
+    async fn open_alerts(server: &TestServer) -> Vec<crate::alerting::Alert> {
+        server.state.database.open_alerts().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_average_across_machines_fires_one_alert() {
+        let server = start_with_metrics().await;
+        let _machines = three_machines(&server).await;
+        wait_for_all_three(&server).await;
+        let database = &server.state.database;
+        let firing = rule(Calculation::Avg, Comparison::Above, 35.0);
+        database.create_alert_rule(&firing).await.unwrap();
+
+        evaluator(&server, past_grace())
+            .evaluate(now_ms())
+            .await
+            .unwrap();
+
+        let alerts = open_alerts(&server).await;
+        assert_eq!(
+            alerts.len(),
+            1,
+            "one alert for the group, not one per machine"
+        );
+        assert_eq!(alerts[0].agent_id, "fleet");
+        assert_eq!(alerts[0].host, "Fleet");
+        assert_eq!(alerts[0].value, Some(40.0));
+        assert!(
+            alerts[0].summary.contains("Average of CPU usage is 40%"),
+            "{}",
+            alerts[0].summary
+        );
+    }
+
+    #[tokio::test]
+    async fn staying_under_the_threshold_fires_nothing() {
+        let server = start_with_metrics().await;
+        let _machines = three_machines(&server).await;
+        wait_for_all_three(&server).await;
+        let quiet = rule(Calculation::Avg, Comparison::Above, 90.0);
+        server
+            .state
+            .database
+            .create_alert_rule(&quiet)
+            .await
+            .unwrap();
+
+        evaluator(&server, past_grace())
+            .evaluate(now_ms())
+            .await
+            .unwrap();
+
+        assert!(open_alerts(&server).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn each_group_can_have_its_own_alert() {
+        let server = start_with_metrics().await;
+        let _machines = three_machines(&server).await;
+        wait_for_all_three(&server).await;
+        let mut grouped = rule(Calculation::Avg, Comparison::Above, 50.0);
+        grouped.group_by = Some("fact:role".to_string());
+        server
+            .state
+            .database
+            .create_alert_rule(&grouped)
+            .await
+            .unwrap();
+
+        evaluator(&server, past_grace())
+            .evaluate(now_ms())
+            .await
+            .unwrap();
+
+        let alerts = open_alerts(&server).await;
+        assert_eq!(alerts.len(), 1, "web averages 20%, and db 80%");
+        assert_eq!(alerts[0].series, "db");
+    }
+
+    #[tokio::test]
+    async fn a_filter_limits_the_machines_a_rule_watches() {
+        let server = start_with_metrics().await;
+        let _machines = three_machines(&server).await;
+        wait_for_all_three(&server).await;
+        let mut filtered = rule(Calculation::Max, Comparison::Above, 50.0);
+        filtered.filter = Some("role=web".to_string());
+        server
+            .state
+            .database
+            .create_alert_rule(&filtered)
+            .await
+            .unwrap();
+
+        evaluator(&server, past_grace())
+            .evaluate(now_ms())
+            .await
+            .unwrap();
+
+        assert!(
+            open_alerts(&server).await.is_empty(),
+            "db-1 isn't being watched"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_machines_reporting_at_all_is_caught_by_a_count() {
+        let server = start_with_metrics().await;
+        let (agent, _client) = (identity(), ());
+        server.connect_approved(&agent, "web-1").await;
+        let counting = rule(Calculation::Count, Comparison::Below, 1.0);
+        server
+            .state
+            .database
+            .create_alert_rule(&counting)
+            .await
+            .unwrap();
+
+        evaluator(&server, past_grace())
+            .evaluate(now_ms())
+            .await
+            .unwrap();
+
+        let alerts = open_alerts(&server).await;
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].value, Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn a_restart_does_not_look_like_the_fleet_disappearing() {
+        let server = start_with_metrics().await;
+        let counting = rule(Calculation::Count, Comparison::Below, 1.0);
+        server
+            .state
+            .database
+            .create_alert_rule(&counting)
+            .await
+            .unwrap();
+
+        evaluator(&server, now_ms())
+            .evaluate(now_ms())
+            .await
+            .unwrap();
+
+        assert!(open_alerts(&server).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_alert_resolves_when_the_calculation_recovers() {
+        let server = start_with_metrics().await;
+        let _machines = three_machines(&server).await;
+        wait_for_all_three(&server).await;
+        let database = &server.state.database;
+        let id = database
+            .create_alert_rule(&rule(Calculation::Avg, Comparison::Above, 35.0))
+            .await
+            .unwrap();
+        let mut evaluator = evaluator(&server, past_grace());
+        evaluator.evaluate(now_ms()).await.unwrap();
+        assert_eq!(open_alerts(&server).await.len(), 1);
+
+        // Raising the threshold has the same effect as the number coming down.
+        let raised = rule(Calculation::Avg, Comparison::Above, 90.0);
+        database.update_alert_rule(id, &raised).await.unwrap();
+        evaluator.evaluate(now_ms() + MINUTE_MS).await.unwrap();
+
+        assert!(open_alerts(&server).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_calculation_that_can_not_be_read_changes_nothing() {
+        let saved = Saved::default();
+        let store = Box::new(MemoryStore(saved.clone()));
+        let server = start_on("", store, Arc::new(FailingReader), saved, None).await;
+        let agent = identity();
+        server.connect_approved(&agent, "web-1").await;
+        let counting = rule(Calculation::Count, Comparison::Below, 1.0);
+        server
+            .state
+            .database
+            .create_alert_rule(&counting)
+            .await
+            .unwrap();
+
+        evaluator(&server, past_grace())
+            .evaluate(now_ms())
+            .await
+            .unwrap();
+
+        assert!(
+            open_alerts(&server).await.is_empty(),
+            "not knowing isn't zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_fleet_is_not_a_machine_anyone_can_see_or_change() {
+        let server = start().await;
+        let database = &server.state.database;
+        let agents = database.load_agents().await.unwrap();
+        let fleet = agents
+            .into_iter()
+            .find(|agent| agent.id == "fleet")
+            .unwrap();
+        server.state.registry.insert_for_test(fleet).await;
+
+        let list = Browser::default().get(&server, "/agents").await;
+        assert!(!list.body.contains("/agents/fleet"), "{}", list.body);
+
+        let revoked = server
+            .state
+            .registry
+            .decide("fleet", AgentState::Revoked)
+            .await
+            .unwrap();
+        assert!(revoked.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_rule_can_be_made_through_the_api_and_the_pages() {
+        let server = start().await;
+        let body = json!({
+            "name": "Busy fleet", "kind": "calculation", "metric": "cpu.usage",
+            "calculation": "avg", "comparison": "above", "threshold": 80.0,
+            "filter": "os=linux", "group_by": "fact:role", "window_secs": 600,
+            "for_secs": 60, "severity": "warning",
+        });
+        let (status, made) = api(&server, "POST", "/api/v1/alert-rules", &body).await;
+        assert_eq!(status, 201, "{made}");
+
+        let mut browser = Browser::default();
+        let page = browser.get(&server, "/alerts/rules").await;
+        assert!(
+            page.body.contains("Average of CPU usage above 80%"),
+            "{}",
+            page.body
+        );
+
+        let id = made["id"].as_i64().unwrap();
+        let form = browser
+            .get(&server, &format!("/alerts/rules/{id}/edit"))
+            .await;
+        assert!(form.body.contains(r#"value="os=linux""#), "{}", form.body);
+        assert!(form.body.contains(r#"value="role""#), "{}", form.body);
+        assert!(form.body.contains(r#"value="600""#), "{}", form.body);
+    }
+
+    #[tokio::test]
+    async fn a_rule_that_makes_no_sense_is_refused() {
+        let server = start().await;
+        let good = json!({
+            "name": "x", "kind": "calculation", "metric": "cpu.usage", "calculation": "avg",
+            "comparison": "above", "threshold": 80.0, "for_secs": 0, "severity": "warning",
+        });
+        for (field, value) in [
+            ("metric", json!("nope")),
+            ("calculation", Value::Null),
+            ("filter", json!("\"unfinished")),
+            ("group_by", json!("colour")),
+            ("window_secs", json!(5)),
+            ("comparison", Value::Null),
+            ("threshold", Value::Null),
+            ("condition", json!("true")),
+        ] {
+            let mut body = good.clone();
+            body[field] = value;
+            let (status, answer) = api(&server, "POST", "/api/v1/alert-rules", &body).await;
+            assert_eq!(status, 422, "{field}: {answer}");
+        }
+
+        let mut offline = json!({
+            "name": "x", "kind": "offline", "for_secs": 0, "severity": "warning",
+        });
+        offline["filter"] = json!("os=linux");
+        let (status, _) = api(&server, "POST", "/api/v1/alert-rules", &offline).await;
+        assert_eq!(status, 422, "only calculations have filters");
     }
 }
 

@@ -534,16 +534,46 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/alerts"
 | Field | Description |
 | --- | --- |
 | `name` | Required |
-| `kind` | Required. `metric` or `offline` |
-| `metric` | For metric rules, a name from the [catalog](#list-metrics) |
+| `kind` | Required. `metric`, `offline` or `calculation` |
+| `metric` | For metric and calculation rules, a name from the [catalog](#list-metrics) |
 | `series` | Limits a metric rule to matching series, with `*` and `?` wildcards |
-| `comparison` | For metric rules, `above` or `below` |
-| `threshold` | For metric rules, the value to compare with |
+| `comparison` | For metric and calculation rules, `above` or `below` |
+| `threshold` | For metric and calculation rules, the value to compare with |
 | `for_secs` | Required. How long a problem lasts before firing, and how long it has to stay gone before resolving |
 | `severity` | Required. `warning` or `critical` |
 | `condition` | A CEL expression limiting which agents this covers |
 | `enabled` | Defaults to `true` |
 | `channels` | IDs of the [channels](#notification-channels) to tell. With none, an alert only shows in the web interface |
+| `calculation` | For calculation rules, `avg`, `sum`, `min`, `max` or `count`, as in [a query](#ask-about-many-machines-at-once) |
+| `group_by` | For calculation rules, what's watched separately: `nothing`, `host`, `series` or `fact:<name>` |
+| `filter` | For calculation rules, which machines, as on the host list. It takes the place of `condition` |
+| `window_secs` | For calculation rules, how far back to look, from 60 to 86400. Defaults to 300 |
+
+A calculation rule watches something across machines, such as the average CPU of every
+Linux host, and gives one alert for the group rather than one per machine. `min` and
+`max` use the lowest or highest moment in the window, and the rest use the average over
+it. An alert about a group has the `agent_id` `fleet`, and its `series` says which group.
+A `count` that finds nothing reporting counts as 0, so a rule can catch machines going
+quiet. Rules wait out the first two minutes after a server starts, while agents
+reconnect.
+
+```sh
+curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Busy web servers",
+    "kind": "calculation",
+    "metric": "cpu.usage",
+    "calculation": "avg",
+    "filter": "role=web",
+    "comparison": "above",
+    "threshold": 80,
+    "window_secs": 600,
+    "for_secs": 300,
+    "severity": "warning"
+  }' \
+  "$MAXNINES_URL/api/v1/alert-rules"
+```
 
 ### List alert rules
 

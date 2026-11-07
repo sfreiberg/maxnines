@@ -17,7 +17,7 @@ use wildmatch::WildMatch;
 
 use crate::config::{RegistrationConfig, RuleAction, RuleConfig, parse_network};
 use crate::models::Database;
-use crate::remote_checks::LOCAL_AGENT_ID;
+use crate::remote_checks::{FLEET_AGENT_ID, LOCAL_AGENT_ID};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -27,11 +27,15 @@ pub enum AgentState {
     Revoked,
 }
 
+fn is_built_in(id: &str) -> bool {
+    id == LOCAL_AGENT_ID || id == FLEET_AGENT_ID
+}
+
 impl AgentRecord {
-    /// Whether this is the server's own built-in agent, which isn't a machine
-    /// anyone registered, so it stays out of lists and can't be changed.
+    /// Whether this is a built-in agent, which isn't a machine anyone registered, so
+    /// it stays out of lists and can't be changed.
     pub fn is_local(&self) -> bool {
-        self.id == LOCAL_AGENT_ID
+        is_built_in(&self.id)
     }
 }
 
@@ -274,7 +278,7 @@ impl Registry {
         state: AgentState,
         by: &str,
     ) -> Result<Option<AgentRecord>> {
-        if id == LOCAL_AGENT_ID {
+        if is_built_in(id) {
             return Ok(None);
         }
         let mut agents = self.agents.lock().await;

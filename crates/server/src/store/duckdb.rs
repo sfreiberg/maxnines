@@ -11,7 +11,7 @@ use tracing::warn;
 
 use super::flatten::{DataType, ENTRY_LABEL, Reported, Top, flatten};
 use super::{CollectorStats, MetricsReader, NewSample, Store, StoreStats};
-use crate::calculations::{Calculation, CalculationQuery, numbered};
+use crate::calculations::{Calculation, CalculationQuery, SMALLEST_STEP_MS, numbered};
 use crate::metrics::{
     LastSample, METRICS, Metric, NewestReading, Point, Reading, Series, SeriesQuery, SeriesResult,
     Source,
@@ -759,7 +759,8 @@ fn series_sql(connection: &Connection, metric: &Metric, agent: i32) -> Result<St
     ))
 }
 
-/// Parameters: from, to, step, and how many lines to keep. `members` is pairs of an
+/// Parameters: from, to, step, and how many lines to keep. A moment still filling up
+/// is left out, as it would look like machines disappearing. `members` is pairs of an
 /// agent's number and the number of its group, so nothing here comes from a request.
 fn calculation_sql(
     connection: &Connection,
@@ -814,7 +815,9 @@ fn calculation_sql(
          ),
          combined AS (
              SELECT {line} AS line, bucket, {combined} AS v
-             FROM per_series GROUP BY line, bucket
+             FROM per_series
+             WHERE bucket + $3::BIGINT <= $2::BIGINT
+             GROUP BY line, bucket
          ),
          ranked AS (
              SELECT line,
@@ -1128,7 +1131,7 @@ impl MetricsReader for DuckDbReader {
             params![
                 range.from_ms,
                 range.to_ms,
-                range.step_ms,
+                range.step_ms.max(SMALLEST_STEP_MS),
                 query.max_lines as i64
             ],
             |row| {
@@ -2210,6 +2213,67 @@ mod tests {
         assert_eq!(line(&result.series[0]), [20.0]);
         assert_eq!(result.series[1].name, "/data");
         assert_eq!(line(&result.series[1]), [50.0]);
+    }
+
+    #[test]
+    fn machines_reporting_at_different_moments_still_add_up() {
+        let mut store = in_memory();
+        for (agent, time, usage) in [("a", 10_000, 10.0), ("b", 40_000, 30.0)] {
+            write_metric(
+                &mut store,
+                agent,
+                time,
+                "cpu",
+                json!({ "usage_percent": usage }),
+            );
+        }
+
+        let everyone = [("a", "All"), ("b", "All")];
+        let sum = calculate(&store, "cpu.usage", Calculation::Sum, &everyone, false);
+        let count = calculate(&store, "cpu.usage", Calculation::Count, &everyone, false);
+
+        assert_eq!(line(&sum.series[0]), [40.0]);
+        assert_eq!(line(&count.series[0]), [2.0]);
+    }
+
+    #[test]
+    fn a_moment_still_filling_up_is_left_out() {
+        let mut store = in_memory();
+        for agent in ["a", "b"] {
+            write_metric(
+                &mut store,
+                agent,
+                10_000,
+                "cpu",
+                json!({ "usage_percent": 10.0 }),
+            );
+        }
+        write_metric(
+            &mut store,
+            "a",
+            70_000,
+            "cpu",
+            json!({ "usage_percent": 10.0 }),
+        );
+
+        let query = CalculationQuery {
+            metric: find("cpu.usage").unwrap(),
+            range: TimeRange::new(0, 90_000).unwrap(),
+            calculation: Calculation::Sum,
+            members: ["a", "b"]
+                .iter()
+                .map(|agent_id| Member {
+                    agent_id: agent_id.to_string(),
+                    group: "All".to_string(),
+                })
+                .collect(),
+            by_series: false,
+            max_lines: 8,
+        };
+        let result = store.reader().unwrap().calculate(&query).unwrap();
+
+        // Only "a" has reported in the second minute so far, which isn't a fall by half.
+        assert_eq!(line(&result.series[0]), [20.0]);
     }
 
     #[test]

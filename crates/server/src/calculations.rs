@@ -7,14 +7,17 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::app_state::AppState;
 use crate::controllers::host_list::HostSearch;
 use crate::host_filter::HostFilter;
-use crate::metrics::{Metric, SeriesResult, TimeRange, Unit, find};
-use crate::registration::AgentState;
+use crate::metrics::{Metric, Metrics, Point, SeriesResult, TimeRange, Unit, find};
+use crate::models::Database;
+use crate::registration::{AgentState, Registry};
 
 /// What a line stands for when a machine hasn't reported the fact it's grouped by.
 const NO_VALUE: &str = "(none)";
+/// The shortest moment machines are combined over. Agents report at their own times,
+/// so a shorter one would only hold some of them, and a sum or count would jump around.
+pub const SMALLEST_STEP_MS: i64 = 60_000;
 const FACT_PREFIX: &str = "fact:";
 const MAX_FACT_NAME_LEN: usize = 200;
 const MAX_FILTER_LEN: usize = 500;
@@ -170,17 +173,17 @@ fn fact_text(value: &Value) -> String {
 
 /// The approved machines a filter picks, each with its line. The server itself isn't
 /// one of them, as it isn't part of the fleet.
-async fn members(state: &AppState, question: &Question) -> Result<Vec<Member>> {
-    let search = HostSearch::load(state, Some(&question.filter)).await?;
+async fn members(sources: &Sources<'_>, question: &Question) -> Result<Vec<Member>> {
+    let search = HostSearch::from_database(sources.database, Some(&question.filter)).await?;
     if let Some(error) = &search.error {
         bail!("{error}");
     }
     let facts = match &question.grouping {
-        Grouping::Fact(name) => Some((name, state.database.facts_named(&[name]).await?)),
+        Grouping::Fact(name) => Some((name, sources.database.facts_named(&[name]).await?)),
         _ => None,
     };
 
-    let agents = state.registry.list().await;
+    let agents = sources.registry.list().await;
     let chosen = agents.into_iter().filter(|agent| {
         agent.state == AgentState::Approved
             && !agent.is_local()
@@ -204,18 +207,38 @@ async fn members(state: &AppState, question: &Question) -> Result<Vec<Member>> {
         .collect())
 }
 
+/// Where answers come from.
+#[derive(Clone, Copy)]
+pub struct Sources<'a> {
+    pub database: &'a Database,
+    pub registry: &'a Registry,
+    pub metrics: &'a Metrics,
+}
+
+/// One number for a whole window. A low or high stands for the worst moment, and
+/// anything else for how it went on the whole.
+pub fn over_window(calculation: Calculation, points: &[Point]) -> Option<f64> {
+    let values = || points.iter().map(|point| point.avg);
+    match calculation {
+        Calculation::Min => values().reduce(f64::min),
+        Calculation::Max => values().reduce(f64::max),
+        _ if points.is_empty() => None,
+        _ => Some(values().sum::<f64>() / points.len() as f64),
+    }
+}
+
 /// Answers a question over a range of time.
 pub async fn answer(
-    state: &AppState,
+    sources: &Sources<'_>,
     question: &Question,
     range: TimeRange,
     max_lines: usize,
 ) -> Result<SeriesResult> {
-    let members = members(state, question).await?;
+    let members = members(sources, question).await?;
     if members.is_empty() {
         return Ok(SeriesResult::default());
     }
-    state
+    sources
         .metrics
         .calculate(CalculationQuery {
             metric: question.metric,
@@ -246,6 +269,29 @@ pub fn numbered(members: &[Member]) -> (Vec<&str>, Vec<usize>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn points(values: &[f64]) -> Vec<Point> {
+        values
+            .iter()
+            .map(|value| Point {
+                time_ms: 0,
+                avg: *value,
+                min: *value,
+                max: *value,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_window_comes_down_to_one_number() {
+        let values = points(&[10.0, 20.0, 60.0]);
+        assert_eq!(over_window(Calculation::Avg, &values), Some(30.0));
+        assert_eq!(over_window(Calculation::Sum, &values), Some(30.0));
+        assert_eq!(over_window(Calculation::Count, &values), Some(30.0));
+        assert_eq!(over_window(Calculation::Min, &values), Some(10.0));
+        assert_eq!(over_window(Calculation::Max, &values), Some(60.0));
+        assert_eq!(over_window(Calculation::Avg, &[]), None);
+    }
 
     #[test]
     fn calculations_survive_being_saved() {

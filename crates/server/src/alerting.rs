@@ -9,6 +9,7 @@ use lettre::Address;
 use serde::{Deserialize, Serialize};
 use wildmatch::WildMatch;
 
+use crate::calculations::{Calculation, Grouping, Question};
 use crate::metric_charts::format_value;
 use crate::metrics::{self, Metric, Source};
 
@@ -21,6 +22,11 @@ const MAX_TARGET_LEN: usize = 2048;
 const MAX_FOR_SECS: u64 = 7 * 86_400;
 
 const MAX_RECIPIENTS: usize = 20;
+
+/// A calculation needs a finished minute to look at.
+const MIN_WINDOW_SECS: u64 = 60;
+const MAX_WINDOW_SECS: u64 = 86_400;
+const DEFAULT_WINDOW_SECS: u64 = 300;
 
 /// Where Discord's webhooks live, including its test builds and older domain.
 const DISCORD_HOSTS: [&str; 4] = [
@@ -35,6 +41,8 @@ const DISCORD_HOSTS: [&str; 4] = [
 pub enum RuleKind {
     Metric,
     Offline,
+    /// Something worked out across a group of machines, such as their average CPU.
+    Calculation,
 }
 
 impl RuleKind {
@@ -42,6 +50,7 @@ impl RuleKind {
         match self {
             Self::Metric => "metric",
             Self::Offline => "offline",
+            Self::Calculation => "calculation",
         }
     }
 
@@ -49,6 +58,7 @@ impl RuleKind {
         match text {
             "metric" => Ok(Self::Metric),
             "offline" => Ok(Self::Offline),
+            "calculation" => Ok(Self::Calculation),
             other => bail!("unknown rule kind {other:?}"),
         }
     }
@@ -145,6 +155,18 @@ pub struct AlertRuleInput {
     /// Who to tell. With none, the alert only shows in the web interface.
     #[serde(default)]
     pub channels: Vec<i64>,
+    /// How to combine machines, for calculation rules.
+    #[serde(default)]
+    pub calculation: Option<Calculation>,
+    /// What's watched separately, for calculation rules, as in a dashboard widget.
+    #[serde(default)]
+    pub group_by: Option<String>,
+    /// Which machines, for calculation rules, as on the host list. Empty is all.
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// How far back a calculation rule looks, so one busy moment isn't a problem.
+    #[serde(default)]
+    pub window_secs: Option<u64>,
 }
 
 fn default_enabled() -> bool {
@@ -176,6 +198,20 @@ pub fn check_rule(rule: &AlertRuleInput) -> Result<()> {
                 ensure!(series.len() <= MAX_NAME_LEN, "the series name is too long");
             }
         }
+        RuleKind::Calculation => {
+            rule.question().map_err(|error| anyhow!("{error}"))?;
+            ensure!(rule.comparison.is_some(), "choose above or below");
+            let threshold = rule.threshold.context("a rule needs a threshold")?;
+            ensure!(threshold.is_finite(), "the threshold must be a number");
+            ensure!(
+                (MIN_WINDOW_SECS..=MAX_WINDOW_SECS).contains(&rule.window()),
+                "the window has to be between a minute and a day"
+            );
+            ensure!(
+                rule.condition.is_none() && rule.series.is_none(),
+                "a calculation picks its machines with a filter"
+            );
+        }
         RuleKind::Offline => {
             ensure!(
                 rule.metric.is_none()
@@ -186,10 +222,33 @@ pub fn check_rule(rule: &AlertRuleInput) -> Result<()> {
             );
         }
     }
+    if rule.kind != RuleKind::Calculation {
+        ensure!(
+            rule.calculation.is_none()
+                && rule.group_by.is_none()
+                && rule.filter.is_none()
+                && rule.window_secs.is_none(),
+            "only a calculation rule takes a calculation, grouping, filter or window"
+        );
+    }
     Ok(())
 }
 
 impl AlertRuleInput {
+    /// What a calculation rule asks. The error says what's wrong, to show whoever chose it.
+    pub fn question(&self) -> Result<Question, String> {
+        Question::new(
+            self.metric.as_deref().unwrap_or_default(),
+            self.calculation.map_or("", Calculation::as_str),
+            self.group_by.as_deref().unwrap_or_default(),
+            self.filter.as_deref().unwrap_or_default(),
+        )
+    }
+
+    pub fn window(&self) -> u64 {
+        self.window_secs.unwrap_or(DEFAULT_WINDOW_SECS)
+    }
+
     pub fn metric(&self) -> Option<&'static Metric> {
         metrics::find(self.metric.as_deref()?)
     }
@@ -211,6 +270,16 @@ impl AlertRuleInput {
         else {
             return wait("Offline".to_string());
         };
+        if let Ok(question) = self.question() {
+            return wait(format!(
+                "{} of {} {} {} over {}",
+                question.calculation.label(),
+                metric.title,
+                comparison.as_str(),
+                format_value(question.unit(), threshold),
+                format_duration(self.window())
+            ));
+        }
         let series = match &self.series {
             Some(series) => format!(" ({series})"),
             None => String::new(),
@@ -242,6 +311,34 @@ impl AlertRuleInput {
             format_value(metric.unit, value),
             comparison.as_str(),
             format_value(metric.unit, threshold)
+        );
+        if self.for_secs > 0 {
+            summary.push_str(&format!(" for {}", format_duration(self.for_secs)));
+        }
+        Ok(summary)
+    }
+
+    /// What a calculation alert says when it fires. `line` is what's being watched.
+    pub fn calculation_summary(
+        &self,
+        question: &Question,
+        line: &str,
+        value: f64,
+    ) -> Result<String> {
+        let comparison = self.comparison.context("no comparison")?;
+        let threshold = self.threshold.context("no threshold")?;
+        let unit = question.unit();
+        let mut summary = format!(
+            "{} of {}{} is {}, {} {}",
+            question.calculation.label(),
+            question.metric.title,
+            match question.grouping {
+                Grouping::Nothing => String::new(),
+                _ => format!(" for {line}"),
+            },
+            format_value(unit, value),
+            comparison.as_str(),
+            format_value(unit, threshold)
         );
         if self.for_secs > 0 {
             summary.push_str(&format!(" for {}", format_duration(self.for_secs)));
@@ -537,6 +634,10 @@ mod tests {
             condition: None,
             enabled: true,
             channels: Vec::new(),
+            calculation: None,
+            group_by: None,
+            filter: None,
+            window_secs: None,
         }
     }
 

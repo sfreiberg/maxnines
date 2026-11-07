@@ -18,11 +18,15 @@ use tokio::time::MissedTickBehavior;
 use tracing::{error, info};
 
 use crate::alerting::{Alert, AlertRule, NewAlert, RuleKind, clean};
+use crate::calculations::{
+    self, Calculation, Grouping, Question, SMALLEST_STEP_MS, Sources, over_window,
+};
 use crate::facts::unflatten;
-use crate::metrics::{self, Metrics, NewestReading, now_ms};
+use crate::metrics::{self, Metrics, NewestReading, TimeRange, now_ms};
 use crate::models::Database;
 use crate::presence::Presence;
 use crate::registration::{AgentRecord, AgentState, Registry};
+use crate::remote_checks::{FLEET_AGENT_ID, FLEET_HOST};
 use crate::rule_engine;
 use crate::server_stats::ServerStatus;
 
@@ -36,6 +40,9 @@ const STARTUP_GRACE_MS: i64 = 120_000;
 /// An agent can report as many disks or interfaces as it likes, and each series
 /// can be its own alert. No real machine needs more than this.
 const MAX_SERIES_PER_AGENT: usize = 64;
+
+/// A calculation can have a line for every machine, and each can be its own alert.
+const MAX_CALCULATION_LINES: usize = 500;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Key {
@@ -125,6 +132,11 @@ impl Snapshot {
         else {
             return Some("The rule was deleted or disabled");
         };
+        // Checking a calculation deals with its own alerts. Getting here means it
+        // couldn't be read, which says nothing about whether anything is wrong.
+        if rule.rule.kind == RuleKind::Calculation {
+            return None;
+        }
         if !self.agents.contains_key(&alert.agent_id) {
             return Some("The agent is no longer approved");
         }
@@ -134,6 +146,7 @@ impl Snapshot {
         match rule.rule.kind {
             RuleKind::Offline if self.in_grace => None,
             RuleKind::Offline => Some("The rule changed"),
+            RuleKind::Calculation => None,
             RuleKind::Metric => {
                 let metric = rule.rule.metric()?;
                 let readings = self.readings.get(metric.name)?;
@@ -230,6 +243,7 @@ impl Evaluator {
         };
 
         let wanted: BTreeSet<&'static str> = active()
+            .filter(|rule| rule.rule.kind == RuleKind::Metric)
             .filter_map(|rule| rule.rule.metric())
             .map(|metric| metric.name)
             .collect();
@@ -282,6 +296,13 @@ impl Evaluator {
 
         let mut checked = HashSet::new();
         for rule in snapshot.rules.values().filter(|rule| rule.rule.enabled) {
+            if rule.rule.kind == RuleKind::Calculation {
+                if !snapshot.in_grace {
+                    self.check_calculation(rule, &snapshot, &mut open, &mut checked)
+                        .await?;
+                }
+                continue;
+            }
             for agent in snapshot.agents.values() {
                 if !snapshot.rule_applies(rule, &agent.id) {
                     continue;
@@ -296,6 +317,7 @@ impl Evaluator {
                         self.check_metric(rule, agent, &snapshot, &mut open, &mut checked)
                             .await?;
                     }
+                    RuleKind::Calculation => {}
                 }
             }
         }
@@ -352,8 +374,126 @@ impl Evaluator {
         let change = tracker.observe(!online, snapshot.now_ms, hold_ms, open.contains_key(&key));
 
         let summary = rule.rule.offline_summary(&clean(&agent.host));
-        self.apply(change, rule, agent, key, None, summary, snapshot, open)
+        let host = clean(&agent.host);
+        self.apply(change, rule, &host, key, None, summary, snapshot, open)
             .await
+    }
+
+    /// The lines of a calculation with a number for each, or nothing if it couldn't
+    /// be read, which says nothing about whether anything is wrong.
+    async fn calculated_lines(
+        &self,
+        rule: &AlertRule,
+        question: &Question,
+        now_ms: i64,
+    ) -> Option<Vec<(String, f64)>> {
+        let window_ms = i64::try_from(rule.rule.window()).unwrap_or(i64::MAX / 1000) * 1000;
+        let range = TimeRange::new(now_ms - window_ms - SMALLEST_STEP_MS, now_ms)?;
+        let sources = Sources {
+            database: &self.database,
+            registry: &self.registry,
+            metrics: &self.metrics,
+        };
+        let result =
+            match calculations::answer(&sources, question, range, MAX_CALCULATION_LINES).await {
+                Ok(result) => result,
+                Err(error) => {
+                    let error = format!("{error:#}");
+                    error!(rule = rule.rule.name, error, "reading a calculation failed");
+                    return None;
+                }
+            };
+
+        let mut lines: Vec<(String, f64)> = result
+            .series
+            .iter()
+            .filter_map(|series| {
+                let value = over_window(question.calculation, &series.points)?;
+                Some((clean(&series.name), value))
+            })
+            .collect();
+        // Nothing reporting is exactly what a rule counting machines is there to catch.
+        if lines.is_empty()
+            && question.calculation == Calculation::Count
+            && question.grouping == Grouping::Nothing
+        {
+            lines.push((question.metric.title.to_string(), 0.0));
+        }
+        Some(lines)
+    }
+
+    async fn check_calculation(
+        &mut self,
+        rule: &AlertRule,
+        snapshot: &Snapshot,
+        open: &mut HashMap<Key, Alert>,
+        checked: &mut HashSet<Key>,
+    ) -> Result<()> {
+        let (Some(comparison), Some(threshold)) = (rule.rule.comparison, rule.rule.threshold)
+        else {
+            return Ok(());
+        };
+        let question = match rule.rule.question() {
+            Ok(question) => question,
+            Err(error) => {
+                error!(
+                    rule = rule.rule.name,
+                    error, "a saved rule doesn't make sense"
+                );
+                return Ok(());
+            }
+        };
+        let Some(lines) = self
+            .calculated_lines(rule, &question, snapshot.now_ms)
+            .await
+        else {
+            return Ok(());
+        };
+
+        let key_of = |line: &str| Key {
+            rule_id: rule.id,
+            agent_id: FLEET_AGENT_ID.to_string(),
+            series: line.to_string(),
+        };
+        for (line, value) in &lines {
+            let key = key_of(line);
+            checked.insert(key.clone());
+
+            let tracker = self.trackers.entry(key.clone()).or_default();
+            let firing = open.contains_key(&key);
+            let breached = comparison.is_breached(*value, threshold);
+            let change = tracker.observe(breached, snapshot.now_ms, hold_ms(rule), firing);
+
+            let summary = rule.rule.calculation_summary(&question, line, *value)?;
+            self.apply(
+                change,
+                rule,
+                FLEET_HOST,
+                key,
+                Some(*value),
+                summary,
+                snapshot,
+                open,
+            )
+            .await?;
+        }
+
+        // A line that's gone while others carry on has stopped being reported. With
+        // nothing at all, the alert stays open, as it does for an agent that's gone.
+        if !lines.is_empty() {
+            let gone: Vec<Key> = open
+                .keys()
+                .filter(|key| key.rule_id == rule.id && !checked.contains(*key))
+                .cloned()
+                .collect();
+            for key in gone {
+                if let Some(alert) = open.remove(&key) {
+                    self.close(&alert, snapshot.now_ms, "This line is no longer reported")
+                        .await?;
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn check_metric(
@@ -407,7 +547,7 @@ impl Evaluator {
             self.apply(
                 change,
                 rule,
-                agent,
+                &host,
                 key,
                 Some(reading.value),
                 summary,
@@ -424,7 +564,7 @@ impl Evaluator {
         &self,
         change: Option<Change>,
         rule: &AlertRule,
-        agent: &AgentRecord,
+        host: &str,
         key: Key,
         value: Option<f64>,
         summary: String,
@@ -445,15 +585,15 @@ impl Evaluator {
                     rule_id: rule.id,
                     rule_name: rule.rule.name.clone(),
                     severity: rule.rule.severity,
-                    agent_id: agent.id.clone(),
-                    host: clean(&agent.host),
+                    agent_id: key.agent_id,
+                    host: host.to_string(),
                     series: key.series,
                     value,
                     summary,
                     started_ms: snapshot.now_ms,
                 };
                 self.database.fire_alert(&new, &rule.rule.channels).await?;
-                info!(rule = rule.rule.name, agent = agent.id, "alert fired");
+                info!(rule = rule.rule.name, host, "alert fired");
                 Ok(())
             }
         }

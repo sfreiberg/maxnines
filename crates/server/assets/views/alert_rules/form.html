@@ -22,6 +22,7 @@
       <select name="kind">
         <option value="metric"{% if rule.kind == "metric" %} selected{% endif %}>A metric crosses a threshold</option>
         <option value="offline"{% if rule.kind == "offline" %} selected{% endif %}>An agent goes offline</option>
+        <option value="calculation"{% if rule.kind == "calculation" %} selected{% endif %}>A calculation across machines crosses a threshold</option>
       </select>
     </label>
 
@@ -43,6 +44,40 @@
 
       <label>Threshold
         <input type="text" name="threshold" value="{{ rule.threshold }}" inputmode="decimal" spellcheck="false">
+      </label>
+
+      <label>Combine machines using
+        <select name="calculation">
+          {% for calculation in calculations %}
+          <option value="{{ calculation.value }}"{% if calculation.value == rule.calculation %} selected{% endif %}>{{ calculation.label }}</option>
+          {% endfor %}
+        </select>
+        <small>Only for a calculation across machines.</small>
+      </label>
+
+      <label>Watch separately
+        <select name="group_by">
+          <option value="nothing"{% if rule.group_by == "nothing" %} selected{% endif %}>Nothing, combine everything</option>
+          <option value="host"{% if rule.group_by == "host" %} selected{% endif %}>Each machine</option>
+          <option value="series"{% if rule.group_by == "series" %} selected{% endif %}>Each series, such as each disk</option>
+          <option value="fact"{% if rule.group_by == "fact" %} selected{% endif %}>Each value of a fact</option>
+        </select>
+        <small>Only for a calculation across machines.</small>
+      </label>
+
+      <label>Fact
+        <input type="text" name="fact" value="{{ rule.fact }}" maxlength="200" spellcheck="false" placeholder="os.name">
+        <small>Only for watching each value of a fact.</small>
+      </label>
+
+      <label>Machines
+        <input type="text" name="filter" value="{{ rule.filter }}" maxlength="500" spellcheck="false" placeholder="os=linux">
+        <small>Only for a calculation. The same filter as the host list. Leave empty for every machine.</small>
+      </label>
+
+      <label>Looking back (seconds)
+        <input type="number" name="window_secs" value="{{ rule.window_secs }}" min="60" max="86400">
+        <small>Only for a calculation. How far back to look, so one busy moment isn't a problem.</small>
       </label>
 
       <label>Series

@@ -13,7 +13,9 @@ use super::condition_form::{ConditionForm, operators};
 use super::{CsrfForm, Page, server_error};
 use crate::alerting::{AlertRuleInput, Comparison, RuleKind, Severity};
 use crate::app_state::AppState;
+use crate::calculations::Calculation;
 use crate::condition_builder::Builder;
+use crate::dashboards::grouping_fields;
 use crate::metrics::{METRICS, Unit};
 
 pub fn routes() -> Router<AppState> {
@@ -39,6 +41,11 @@ struct AlertRuleForm {
     severity: String,
     enabled: bool,
     channels: BTreeSet<i64>,
+    calculation: String,
+    group_by: String,
+    fact: String,
+    filter: String,
+    window_secs: String,
     #[serde(flatten)]
     applies_to: ConditionForm,
 }
@@ -56,13 +63,26 @@ impl AlertRuleForm {
             severity: Severity::Warning.as_str().to_string(),
             enabled: true,
             channels: BTreeSet::new(),
+            calculation: Calculation::Avg.as_str().to_string(),
+            group_by: "nothing".to_string(),
+            fact: String::new(),
+            filter: String::new(),
+            window_secs: "300".to_string(),
             applies_to: ConditionForm::blank(),
         }
     }
 
     fn from_rule(rule: &AlertRuleInput) -> Self {
         let blank = Self::blank();
+        let (group_by, fact) = grouping_fields(rule.group_by.as_deref().unwrap_or_default());
         Self {
+            calculation: rule
+                .calculation
+                .map_or(blank.calculation, |c| c.as_str().to_string()),
+            group_by,
+            fact,
+            filter: rule.filter.clone().unwrap_or_default(),
+            window_secs: rule.window().to_string(),
             name: rule.name.clone(),
             kind: rule.kind.as_str().to_string(),
             metric: rule.metric.clone().unwrap_or(blank.metric),
@@ -82,6 +102,11 @@ impl AlertRuleForm {
     fn from_fields(fields: &BTreeMap<String, String>) -> Self {
         let text = |name: &str| fields.get(name).cloned().unwrap_or_default();
         Self {
+            calculation: text("calculation"),
+            group_by: text("group_by"),
+            fact: text("fact").trim().to_string(),
+            filter: text("filter").trim().to_string(),
+            window_secs: text("window_secs"),
             name: text("name"),
             kind: text("kind"),
             metric: text("metric"),
@@ -110,6 +135,19 @@ impl AlertRuleForm {
         // The form always sends these, and they only mean something for metrics.
         let (metric, series, comparison, threshold) = match kind {
             RuleKind::Offline => (None, None, None, None),
+            RuleKind::Calculation => {
+                let threshold = self
+                    .threshold
+                    .trim()
+                    .parse()
+                    .context("the threshold must be a number")?;
+                (
+                    Some(self.metric.clone()),
+                    None,
+                    Some(Comparison::parse(&self.comparison)?),
+                    Some(threshold),
+                )
+            }
             RuleKind::Metric => {
                 let threshold = self.threshold.trim();
                 if threshold.is_empty() {
@@ -128,7 +166,32 @@ impl AlertRuleForm {
             }
         };
 
+        let is_calculation = kind == RuleKind::Calculation;
+        let only_for_calculations = |value: String| is_calculation.then_some(value);
+        let group_by = if self.group_by == "fact" {
+            format!("fact:{}", self.fact)
+        } else {
+            self.group_by.clone()
+        };
+        let window_secs = if is_calculation {
+            let secs = self.window_secs.trim().parse();
+            Some(secs.context("how far back has to be a whole number of seconds")?)
+        } else {
+            None
+        };
+        let condition = if is_calculation {
+            None
+        } else {
+            self.applies_to.expression(known)?
+        };
+
         Ok(AlertRuleInput {
+            calculation: is_calculation
+                .then(|| Calculation::parse(&self.calculation))
+                .flatten(),
+            group_by: only_for_calculations(group_by),
+            filter: only_for_calculations(self.filter.clone()).filter(|text| !text.is_empty()),
+            window_secs,
             name: self.name.trim().to_string(),
             kind,
             metric,
@@ -137,11 +200,27 @@ impl AlertRuleForm {
             threshold,
             for_secs,
             severity: Severity::parse(&self.severity)?,
-            condition: self.applies_to.expression(known)?,
+            condition,
             enabled: self.enabled,
             channels: self.channels.iter().copied().collect(),
         })
     }
+}
+
+#[derive(Serialize)]
+struct CalculationOption {
+    value: &'static str,
+    label: &'static str,
+}
+
+fn calculation_options() -> Vec<CalculationOption> {
+    Calculation::ALL
+        .into_iter()
+        .map(|calculation| CalculationOption {
+            value: calculation.as_str(),
+            label: calculation.label(),
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -208,6 +287,7 @@ async fn form_page(
         .with("id", &id)
         .with("rule", form)
         .with("metrics", &metric_options())
+        .with("calculations", &calculation_options())
         .with("channels", &channels)
         .with("operators", &operators())
         .with("known_facts", &known)
@@ -382,6 +462,10 @@ mod tests {
             condition: Some("true".to_string()),
             enabled: false,
             channels: vec![2, 5],
+            calculation: None,
+            group_by: None,
+            filter: None,
+            window_secs: None,
         }
     }
 

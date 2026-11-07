@@ -8,6 +8,7 @@ use ipnet::IpNet;
 use tokio::sync::{mpsc, watch};
 
 use crate::alerting::{self, AlertRuleInput, ChannelInput};
+use crate::calculations::Sources;
 use crate::facts::{FlatFacts, unflatten};
 use crate::metrics::Metrics;
 use crate::models::{Database, RuleInput};
@@ -63,6 +64,15 @@ impl FromRef<AppState> for CsrfConfig {
 
 impl AppState {
     /// Works out what an agent should be running right now.
+    /// Where calculations get their answers.
+    pub fn sources(&self) -> Sources<'_> {
+        Sources {
+            database: &self.database,
+            registry: &self.registry,
+            metrics: &self.metrics,
+        }
+    }
+
     pub async fn config_for(&self, agent_id: &str) -> Result<ResolvedConfig> {
         let rules = self.database.list_rules().await?;
         let facts: FlatFacts = self
