@@ -22,10 +22,12 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use maxnines_protocol::Sample;
 use maxnines_protocol::auth::Identity;
+use maxnines_protocol::logging;
+#[cfg(windows)]
+use maxnines_protocol::service::{self, Service, ServiceCommand};
 use serde_json::Value;
 use tokio::time::{Instant, Interval, MissedTickBehavior, interval_at};
 use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
 
 use background::jitter;
 use collector::Collector;
@@ -34,6 +36,14 @@ use custom::Definitions;
 use maxnines_protocol::stopping::StopSignal;
 use own_usage::OwnUsageCollector;
 use websocket::{ConfigUpdate, ServerLink};
+
+#[cfg(windows)]
+static SERVICE: Service = Service {
+    name: "MaxNinesAgent",
+    display_name: "MaxNines Agent",
+    description: "Reports system metrics to a MaxNines server.",
+    log_name: "agent",
+};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Reports system metrics to a MaxNines server")]
@@ -55,6 +65,10 @@ enum Command {
     Identity(IdentityCommand),
     /// Print the facts this agent reports
     Facts,
+    /// Run the agent as a Windows service
+    #[cfg(windows)]
+    #[command(subcommand)]
+    Service(ServiceCommand),
 }
 
 #[derive(Debug, PartialEq, Subcommand)]
@@ -72,7 +86,19 @@ enum IdentityCommand {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Run) {
-        Command::Run => run(cli.config),
+        Command::Run => {
+            logging::to_stderr();
+            run(cli.config)
+        }
+        #[cfg(windows)]
+        Command::Service(ServiceCommand::Install) => {
+            Config::load(&cli.config)?;
+            service::install(&SERVICE, &cli.config)
+        }
+        #[cfg(windows)]
+        Command::Service(ServiceCommand::Uninstall) => service::uninstall(&SERVICE),
+        #[cfg(windows)]
+        Command::Service(ServiceCommand::Run) => service::run(&SERVICE, &cli.config, run),
         Command::Facts => {
             let config = Config::load(&cli.config)?;
             let facts = facts::gather(&config.facts, &config.custom_metrics)?;
@@ -134,13 +160,6 @@ impl Monitoring {
 
 #[tokio::main(flavor = "current_thread")]
 async fn run(path: PathBuf) -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     let config = Config::load(&path)?;
     let identity = identity::load_or_create(&config.key_file())?;
     let mut link = ServerLink::start(&config, &collector::host_name(), identity)?;
@@ -338,6 +357,14 @@ mod tests {
         let cli = parse("-c my.hcl identity show").unwrap();
         assert_eq!(cli.command, Some(Command::Identity(IdentityCommand::Show)));
         assert_eq!(cli.config, PathBuf::from("my.hcl"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parses_what_windows_starts_a_service_with() {
+        let cli = parse(r"--config C:\agent.hcl service run").unwrap();
+        assert_eq!(cli.command, Some(Command::Service(ServiceCommand::Run)));
+        assert_eq!(cli.config, PathBuf::from(r"C:\agent.hcl"));
     }
 
     #[test]

@@ -265,6 +265,7 @@ fn stop_group(_id: Option<u32>) {}
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::time::Instant;
 
     use super::*;

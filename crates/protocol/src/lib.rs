@@ -2,6 +2,9 @@
 
 pub mod auth;
 pub mod hcl_env;
+pub mod logging;
+#[cfg(windows)]
+pub mod service;
 pub mod stopping;
 
 use std::collections::BTreeMap;

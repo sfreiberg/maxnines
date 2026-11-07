@@ -40,11 +40,13 @@ use clap::{Parser, Subcommand};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 use alert_evaluator::Evaluator;
 use app_state::{AppState, Heartbeat};
 use config::Config;
+use maxnines_protocol::logging;
+#[cfg(windows)]
+use maxnines_protocol::service::{self, Service, ServiceCommand};
 use maxnines_protocol::stopping::StopSignal;
 use metrics::{Metrics, now_ms};
 use models::Database;
@@ -55,6 +57,14 @@ use remote_checks::{LOCAL_AGENT_ID, LatestResults, Scheduler};
 use server_stats::ServerStatus;
 use store::WriterCommand;
 use views::Views;
+
+#[cfg(windows)]
+static SERVICE: Service = Service {
+    name: "MaxNinesServer",
+    display_name: "MaxNines Server",
+    description: "Receives and stores metrics from MaxNines agents.",
+    log_name: "server",
+};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Receives and stores metrics from MaxNines agents")]
@@ -82,6 +92,10 @@ enum Command {
     Users(UsersCommand),
     /// Print the server's own token, which works like an API key and can't be revoked
     AdminToken,
+    /// Run the server as a Windows service
+    #[cfg(windows)]
+    #[command(subcommand)]
+    Service(ServiceCommand),
 }
 
 #[derive(Debug, PartialEq, Subcommand)]
@@ -135,7 +149,21 @@ enum AgentsCommand {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Run) {
-        Command::Run => serve(&cli.config),
+        Command::Run => {
+            logging::to_stderr();
+            serve(&cli.config)
+        }
+        #[cfg(windows)]
+        Command::Service(ServiceCommand::Install) => {
+            Config::load(&cli.config)?;
+            service::install(&SERVICE, &cli.config)
+        }
+        #[cfg(windows)]
+        Command::Service(ServiceCommand::Uninstall) => service::uninstall(&SERVICE),
+        #[cfg(windows)]
+        Command::Service(ServiceCommand::Run) => {
+            service::run(&SERVICE, &cli.config, |path| serve(&path))
+        }
         Command::Users(command) => {
             let config = Config::load(&cli.config)?;
             match command {
@@ -175,14 +203,6 @@ fn main() -> Result<()> {
 
 #[tokio::main]
 async fn serve(path: &Path) -> Result<()> {
-    // Logs go to stderr, matching the agent.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     let config = Config::load(path)?;
     let rules = Rules::compile(&config.registration)?;
 

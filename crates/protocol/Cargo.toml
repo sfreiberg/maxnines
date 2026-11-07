@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-tokio = { version = "1.54.1", features = ["signal"] }
+tokio = { version = "1.54.1", features = ["macros", "signal", "sync"] }
 regex-lite = "0.1"
 anyhow.workspace = true
 hcl-rs.workspace = true
@@ -13,6 +13,14 @@ hex.workspace = true
 ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
+tracing-appender = "0.2"
+tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+clap.workspace = true
+windows-service = "0.8"
 
 [dev-dependencies]
+tempfile = "3"
 tokio = { version = "1.54.1", features = ["macros", "rt", "time"] }
