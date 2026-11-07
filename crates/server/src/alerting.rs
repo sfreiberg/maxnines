@@ -387,6 +387,9 @@ pub enum ChannelKind {
     Slack,
     #[serde(rename = "pagerduty")]
     PagerDuty,
+    #[serde(rename = "alertops")]
+    AlertOps,
+    Signl4,
 }
 
 impl ChannelKind {
@@ -397,6 +400,8 @@ impl ChannelKind {
             Self::Discord => "discord",
             Self::Slack => "slack",
             Self::PagerDuty => "pagerduty",
+            Self::AlertOps => "alertops",
+            Self::Signl4 => "signl4",
         }
     }
 
@@ -407,6 +412,8 @@ impl ChannelKind {
             "discord" => Ok(Self::Discord),
             "slack" => Ok(Self::Slack),
             "pagerduty" => Ok(Self::PagerDuty),
+            "alertops" => Ok(Self::AlertOps),
+            "signl4" => Ok(Self::Signl4),
             other => bail!("unknown channel kind {other:?}"),
         }
     }
@@ -424,8 +431,8 @@ pub struct Channel {
 pub struct ChannelInput {
     pub name: String,
     pub kind: ChannelKind,
-    /// A webhook's URL, email addresses separated by commas, a Slack channel, or a
-    /// PagerDuty integration key.
+    /// A webhook's URL, email addresses separated by commas, a Slack channel, a
+    /// PagerDuty integration key, or the URL AlertOps or SIGNL4 gave out.
     pub target: String,
     /// Slack's bot token. Like a webhook's URL, it can be set but not read back.
     #[serde(default)]
@@ -449,6 +456,20 @@ pub fn check_channel(channel: &ChannelInput) -> Result<()> {
         ChannelKind::Discord => check_discord_url(&channel.target)?,
         ChannelKind::Slack => check_slack(channel)?,
         ChannelKind::PagerDuty => check_pagerduty_key(&channel.target)?,
+        ChannelKind::AlertOps => check_service_url(
+            &channel.target,
+            ".alertops.com",
+            "/POSTAlert/",
+            "that doesn't look like an AlertOps integration URL, which looks like \
+             https://notify.alertops.com/POSTAlert/ followed by its token",
+        )?,
+        ChannelKind::Signl4 => check_service_url(
+            &channel.target,
+            ".signl4.com",
+            "/webhook/",
+            "that doesn't look like a SIGNL4 webhook URL, which is \
+             https://connect.signl4.com/webhook/ followed by your secret",
+        )?,
         ChannelKind::Email => {
             let recipients = recipients(&channel.target)?;
             ensure!(!recipients.is_empty(), "add at least one email address");
@@ -511,6 +532,20 @@ fn check_discord_url(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// A URL from an on-call service, which has a secret after `path`. `complaint` is
+/// fixed text, as the URL itself mustn't end up on the page.
+fn check_service_url(url: &str, domain: &str, path: &str, complaint: &str) -> Result<()> {
+    let uri: Uri = url.trim().parse().map_err(|_| anyhow!("{complaint}"))?;
+    let secret = uri.path().strip_prefix(path).unwrap_or_default();
+    ensure!(
+        uri.scheme_str() == Some("https")
+            && uri.host().unwrap_or_default().ends_with(domain)
+            && !secret.is_empty(),
+        "{complaint}"
+    );
+    Ok(())
+}
+
 /// The part of a webhook's URL that's safe to show. Errors don't repeat the URL.
 fn webhook_host(url: &str) -> Result<String> {
     let uri: Uri = url
@@ -544,7 +579,10 @@ impl ChannelInput {
     /// Enough to recognize a channel, without giving away a webhook's secret.
     pub fn target_preview(&self) -> String {
         match self.kind {
-            ChannelKind::Webhook | ChannelKind::Discord => webhook_host(&self.target)
+            ChannelKind::Webhook
+            | ChannelKind::Discord
+            | ChannelKind::AlertOps
+            | ChannelKind::Signl4 => webhook_host(&self.target)
                 .map_or_else(|_| "Unknown".to_string(), |host| format!("{host}/…")),
             ChannelKind::Email | ChannelKind::Slack => self.target.clone(),
             ChannelKind::PagerDuty => {
@@ -891,6 +929,69 @@ mod tests {
         ChannelInput {
             kind: ChannelKind::Discord,
             ..webhook(target)
+        }
+    }
+
+    fn of_kind(kind: ChannelKind, target: &str) -> ChannelInput {
+        ChannelInput {
+            kind,
+            ..webhook(target)
+        }
+    }
+
+    #[test]
+    fn an_alertops_url_has_to_look_like_one() {
+        for good in [
+            "https://notify.alertops.com/POSTAlert/8f14e45f/Custom",
+            "https://acme.alertops.com/POSTAlert/8f14e45f/Custom",
+        ] {
+            check_channel(&of_kind(ChannelKind::AlertOps, good)).unwrap();
+        }
+        for bad in [
+            "http://notify.alertops.com/POSTAlert/8f14e45f/Custom",
+            "https://notify.alertops.com/POSTAlert/",
+            "https://notify.alertops.com/other/8f14e45f",
+            "https://alertops.com.example.org/POSTAlert/8f14e45f",
+            "8f14e45f",
+        ] {
+            assert!(
+                check_channel(&of_kind(ChannelKind::AlertOps, bad)).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_signl4_url_has_to_look_like_one() {
+        check_channel(&of_kind(
+            ChannelKind::Signl4,
+            "https://connect.signl4.com/webhook/abc123",
+        ))
+        .unwrap();
+        for bad in [
+            "http://connect.signl4.com/webhook/abc123",
+            "https://connect.signl4.com/webhook/",
+            "https://connect.signl4.com/api/abc123",
+            "https://signl4.com.example.org/webhook/abc123",
+            "abc123",
+        ] {
+            assert!(
+                check_channel(&of_kind(ChannelKind::Signl4, bad)).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_service_url_is_not_repeated() {
+        for kind in [ChannelKind::AlertOps, ChannelKind::Signl4] {
+            for bad in [
+                "https://exa mple/secret-token",
+                "https://example.com/secret-token",
+            ] {
+                let error = check_channel(&of_kind(kind, bad)).unwrap_err();
+                assert!(!error.to_string().contains("secret-token"), "{error}");
+            }
         }
     }
 

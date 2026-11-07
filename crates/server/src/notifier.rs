@@ -45,8 +45,8 @@ const DISCORD_MAX_CHARS: usize = 2000;
 const PAGERDUTY_EVENTS_URL: &str = "https://events.pagerduty.com/v2/enqueue";
 /// The longest summary PagerDuty accepts.
 const PAGERDUTY_MAX_SUMMARY_CHARS: usize = 1024;
-/// Ties a test's two events together.
-const PAGERDUTY_TEST_KEY: &str = "maxnines-test";
+/// Ties a test's two steps together.
+const TEST_INCIDENT_ID: &str = "maxnines-test";
 
 const FIRST_RETRY_MS: i64 = 30_000;
 const LONGEST_RETRY_MS: i64 = 30 * 60_000;
@@ -60,6 +60,13 @@ fn retry_delay_ms(attempts: i32) -> i64 {
         .unwrap_or(0)
         .min(16);
     (FIRST_RETRY_MS << doublings).min(LONGEST_RETRY_MS)
+}
+
+/// What a notification does to an incident in an on-call service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Incident {
+    Open,
+    Close,
 }
 
 /// What a notification says, in the form every channel starts from.
@@ -131,54 +138,117 @@ impl Notice {
         json!({ "content": content, "allowed_mentions": { "parse": [] } })
     }
 
-    /// What to send PagerDuty. An alert's ID is what ties resolving it to the incident
-    /// it opened, and makes a repeat delivery land on that incident too. A test has to
-    /// open an incident to prove anything, so it closes it again straight away.
-    fn pagerduty_events(&self, key: &str, web_url: Option<&str>) -> Vec<Value> {
-        let closing = |dedup_key: &str| json!({ "routing_key": key, "event_action": "resolve", "dedup_key": dedup_key });
-        let opening = |dedup_key: &str, severity: &str, source: &str, details: Value| {
-            let summary: String = self
-                .alert
-                .as_ref()
-                .map_or(self.text.as_str(), |alert| &alert.summary)
-                .chars()
-                .take(PAGERDUTY_MAX_SUMMARY_CHARS)
-                .collect();
-            let mut event = json!({
-                "routing_key": key,
-                "event_action": "trigger",
-                "dedup_key": dedup_key,
-                "client": "MaxNines",
-                "payload": {
-                    "summary": summary,
-                    "source": source,
-                    "severity": severity,
-                    "custom_details": details,
-                },
-            });
-            if let Some(url) = web_url {
-                event["client_url"] = json!(format!("{url}/alerts"));
-            }
-            event
-        };
+    /// What this means for an on-call service. A test has to open an incident to prove
+    /// anything, so it closes it again rather than leave someone paged.
+    fn incident_steps(&self) -> &'static [Incident] {
+        match self.event {
+            Event::Firing => &[Incident::Open],
+            Event::Resolved => &[Incident::Close],
+            Event::Test => &[Incident::Open, Incident::Close],
+        }
+    }
 
-        match (self.event, &self.alert) {
-            (Event::Firing, Some(alert)) => {
-                let details = json!({
+    /// Ties closing an incident to the one that was opened, and makes a repeat delivery
+    /// land on that incident too.
+    fn incident_id(&self) -> String {
+        self.alert.as_ref().map_or_else(
+            || TEST_INCIDENT_ID.to_string(),
+            |alert| format!("maxnines-alert-{}", alert.id),
+        )
+    }
+
+    fn incident_title(&self) -> &str {
+        self.alert.as_ref().map_or("Test", |a| &a.rule_name)
+    }
+
+    fn incident_severity(&self) -> &'static str {
+        self.alert.as_ref().map_or("info", |a| a.severity.as_str())
+    }
+
+    fn incident_host(&self) -> &str {
+        self.alert.as_ref().map_or("MaxNines", |a| &a.host)
+    }
+
+    fn pagerduty_event(&self, step: Incident, key: &str, web_url: Option<&str>) -> Value {
+        let dedup_key = self.incident_id();
+        if step == Incident::Close {
+            return json!({
+                "routing_key": key,
+                "event_action": "resolve",
+                "dedup_key": dedup_key,
+            });
+        }
+
+        let summary: String = self
+            .text
+            .chars()
+            .take(PAGERDUTY_MAX_SUMMARY_CHARS)
+            .collect();
+        let details = self.alert.as_ref().map_or_else(
+            || json!({}),
+            |alert| {
+                json!({
                     "rule": alert.rule_name,
                     "series": alert.series,
                     "value": alert.value,
-                });
-                let dedup_key = pagerduty_key(alert);
-                let severity = alert.severity.as_str();
-                vec![opening(&dedup_key, severity, &alert.host, details)]
-            }
-            (Event::Resolved, Some(alert)) => vec![closing(&pagerduty_key(alert))],
-            _ => vec![
-                opening(PAGERDUTY_TEST_KEY, "info", "MaxNines", json!({})),
-                closing(PAGERDUTY_TEST_KEY),
-            ],
+                })
+            },
+        );
+        let mut event = json!({
+            "routing_key": key,
+            "event_action": "trigger",
+            "dedup_key": dedup_key,
+            "client": "MaxNines",
+            "payload": {
+                "summary": summary,
+                "source": self.incident_host(),
+                "severity": self.incident_severity(),
+                "custom_details": details,
+            },
+        });
+        if let Some(url) = web_url {
+            event["client_url"] = json!(alerts_link(url));
         }
+        event
+    }
+
+    /// Fixed names only, as AlertOps leaves it to whoever sets up the integration to
+    /// say which of them means what. The form shows this as the sample to map from.
+    fn alertops_event(&self, step: Incident, web_url: Option<&str>) -> Value {
+        let mut event = json!({
+            "alert_id": self.incident_id(),
+            "status": if step == Incident::Open { "open" } else { "closed" },
+            "subject": self.incident_title(),
+            "message": self.text,
+            "severity": self.incident_severity(),
+            "host": self.incident_host(),
+        });
+        if let Some(url) = web_url {
+            event["link"] = json!(alerts_link(url));
+        }
+        event
+    }
+
+    /// Names starting `X-S4-` mean something to SIGNL4. It shows the others in the alert.
+    fn signl4_event(&self, step: Incident, web_url: Option<&str>) -> Value {
+        let id = self.incident_id();
+        if step == Incident::Close {
+            return json!({ "X-S4-ExternalID": id, "X-S4-Status": "resolved" });
+        }
+
+        let mut event = json!({
+            "Title": self.incident_title(),
+            "Message": self.text,
+            "Severity": self.incident_severity(),
+            "Host": self.incident_host(),
+            "X-S4-ExternalID": id,
+            "X-S4-Status": "new",
+            "X-S4-SourceSystem": "MaxNines",
+        });
+        if let Some(url) = web_url {
+            event["Link"] = json!(alerts_link(url));
+        }
+        event
     }
 
     fn subject(&self) -> String {
@@ -278,8 +348,14 @@ impl Mailer {
     }
 }
 
-fn pagerduty_key(alert: &Alert) -> String {
-    format!("maxnines-alert-{}", alert.id)
+fn alerts_link(web_url: &str) -> String {
+    format!("{web_url}/alerts")
+}
+
+/// What AlertOps' sample data box needs, to map its fields from.
+pub fn alertops_sample() -> String {
+    let event = Notice::test().alertops_event(Incident::Open, Some("https://maxnines.example.com"));
+    serde_json::to_string_pretty(&event).unwrap_or_default()
 }
 
 /// Errors are saved and shown, and a webhook's URL is often its password, so
@@ -564,6 +640,7 @@ async fn send_to_slack(
 /// Sends one notification. Blocks, so it can't run on an async thread.
 fn send_blocking(channel: &Channel, notice: &Notice, senders: &Senders) -> Result<()> {
     let target = &channel.channel.target;
+    let web_url = senders.web_url.as_deref();
     match channel.channel.kind {
         ChannelKind::Webhook => post_json("the webhook", target, &notice.webhook_body()),
         ChannelKind::Discord => post_json("the webhook", target, &notice.discord_body()),
@@ -572,10 +649,17 @@ fn send_blocking(channel: &Channel, notice: &Notice, senders: &Senders) -> Resul
             .as_deref()
             .context("email isn't set up in the server config")?
             .send(target, notice),
-        ChannelKind::PagerDuty => notice
-            .pagerduty_events(target, senders.web_url.as_deref())
+        ChannelKind::PagerDuty => notice.incident_steps().iter().try_for_each(|step| {
+            let event = notice.pagerduty_event(*step, target, web_url);
+            post_json("PagerDuty", senders.pagerduty_url(), &event)
+        }),
+        ChannelKind::AlertOps => notice.incident_steps().iter().try_for_each(|step| {
+            post_json("AlertOps", target, &notice.alertops_event(*step, web_url))
+        }),
+        ChannelKind::Signl4 => notice
+            .incident_steps()
             .iter()
-            .try_for_each(|event| post_json("PagerDuty", senders.pagerduty_url(), event)),
+            .try_for_each(|step| post_json("SIGNL4", target, &notice.signl4_event(*step, web_url))),
         ChannelKind::Slack => bail!("Slack doesn't send this way"),
     }
 }

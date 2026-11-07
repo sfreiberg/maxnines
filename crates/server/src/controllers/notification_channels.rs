@@ -53,7 +53,11 @@ impl ChannelForm {
     fn from_channel(channel: &ChannelInput) -> Self {
         let hidden = matches!(
             channel.kind,
-            ChannelKind::Webhook | ChannelKind::Discord | ChannelKind::PagerDuty
+            ChannelKind::Webhook
+                | ChannelKind::Discord
+                | ChannelKind::PagerDuty
+                | ChannelKind::AlertOps
+                | ChannelKind::Signl4
         );
         Self {
             name: channel.name.clone(),
@@ -162,6 +166,7 @@ fn form_page(
     let page = Page::new(state, token, "notification_channels/form.html")
         .with("id", &id)
         .with("channel", form)
+        .with("alertops_sample", &notifier::alertops_sample())
         .with("email_ready", &state.senders.mailer.is_some())
         .with("error", &error);
     match error {

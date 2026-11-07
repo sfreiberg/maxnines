@@ -21,13 +21,15 @@
       <option value="discord"{% if channel.kind == "discord" %} selected{% endif %}>Discord</option>
       <option value="slack"{% if channel.kind == "slack" %} selected{% endif %}>Slack</option>
       <option value="pagerduty"{% if channel.kind == "pagerduty" %} selected{% endif %}>PagerDuty</option>
+      <option value="alertops"{% if channel.kind == "alertops" %} selected{% endif %}>AlertOps</option>
+      <option value="signl4"{% if channel.kind == "signl4" %} selected{% endif %}>SIGNL4</option>
     </select>
     {% if not email_ready %}<small>Email needs an <code>email</code> block in the server config.</small>{% endif %}
   </label>
 
   <label>Sends to
     <input type="text" name="target" value="{{ channel.target }}" spellcheck="false" autocomplete="off"{% if channel.preview %} placeholder="{{ channel.preview }}"{% endif %}>
-    <small>{% if channel.preview %}Leave empty to keep what's saved, which isn't shown because it can work like a password.{% else %}A webhook's URL, a Discord webhook URL, email addresses separated by commas, for Slack a channel such as <code>#alerts</code>, or for PagerDuty an integration key.{% endif %}</small>
+    <small>{% if channel.preview %}Leave empty to keep what's saved, which isn't shown because it can work like a password.{% else %}A webhook's URL, a Discord webhook URL, email addresses separated by commas, for Slack a channel such as <code>#alerts</code>, for PagerDuty an integration key, or the URL from AlertOps or SIGNL4.{% endif %}</small>
   </label>
 
   <details class="for-pagerduty">
@@ -38,6 +40,27 @@
       <li>Copy its Integration Key into the box above.</li>
     </ol>
     <p class="note">Sending a test opens an incident on that service and resolves it straight away, which can notify whoever is on call.</p>
+  </details>
+
+  <details class="for-alertops">
+    <summary>How to set up AlertOps</summary>
+    <ol>
+      <li>In AlertOps, go to Configuration, then Integrations. Under Inbound Integrations, choose API and add one using the Custom card, with the escalation policy you want.</li>
+      <li>Open its rules for opening and closing an alert. Keep the method as POST and the content as JSON.</li>
+      <li>Paste this in as the sample data:
+<pre>{{ alertops_sample }}</pre></li>
+      <li>Map <code>alert_id</code> to both Source Name and Source Id, so each alert stays separate. A fixed Source Name would merge them into one.</li>
+      <li>Map <code>status</code> as the status field. Open an alert when it contains <code>open</code>, and close it when it contains <code>closed</code>.</li>
+      <li>Map <code>subject</code> and <code>message</code> to the text fields you want, and <code>link</code> to Source URL.</li>
+      <li>Leave the authorization header off, then copy the integration's URL into the box above. Do this last, as changing its source changes the URL.</li>
+    </ol>
+    <p class="note">Sending a test opens an alert and closes it straight away, which can notify whoever is on call.</p>
+  </details>
+
+  <details class="for-signl4">
+    <summary>How to get a SIGNL4 webhook URL</summary>
+    <p>Put <code>https://connect.signl4.com/webhook/</code> followed by your SIGNL4 team or integration secret in the box above.</p>
+    <p class="note">Sending a test opens an alert and resolves it straight away, which can notify whoever is on call.</p>
   </details>
 
   <fieldset class="for-slack">

@@ -1298,31 +1298,28 @@ impl FakeSlack {
     }
 }
 
-/// Stands in for PagerDuty, and answers with these statuses in turn, then 202.
+/// Stands in for an on-call service, and answers with these statuses in turn, then 202.
 #[derive(Clone, Default)]
-struct FakePagerDuty {
+struct FakeOnCall {
     events: Arc<Mutex<Vec<Value>>>,
     statuses: Arc<Mutex<Vec<u16>>>,
 }
 
-impl FakePagerDuty {
+impl FakeOnCall {
     async fn start(&self) -> String {
         let fake = self.clone();
-        let router = Router::new().route(
-            "/v2/enqueue",
-            post(move |axum::Json(event): axum::Json<Value>| {
-                let fake = fake.clone();
-                async move {
-                    fake.events.lock().unwrap().push(event);
-                    let mut statuses = fake.statuses.lock().unwrap();
-                    if statuses.is_empty() {
-                        StatusCode::ACCEPTED
-                    } else {
-                        StatusCode::from_u16(statuses.remove(0)).unwrap()
-                    }
+        let router = Router::new().fallback(post(move |axum::Json(event): axum::Json<Value>| {
+            let fake = fake.clone();
+            async move {
+                fake.events.lock().unwrap().push(event);
+                let mut statuses = fake.statuses.lock().unwrap();
+                if statuses.is_empty() {
+                    StatusCode::ACCEPTED
+                } else {
+                    StatusCode::from_u16(statuses.remove(0)).unwrap()
                 }
-            }),
-        );
+            }
+        }));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router).await });
@@ -1336,12 +1333,26 @@ impl FakePagerDuty {
 
 const PAGERDUTY_KEY: &str = "abcdefghijklmnopqrstuvwxyz012345";
 
-async fn firing_on_pagerduty(test: &mut Harness, pagerduty: &FakePagerDuty) -> Notifier {
+async fn firing_on_pagerduty(test: &mut Harness, pagerduty: &FakeOnCall) -> Notifier {
     let url = pagerduty.start().await;
+    let senders = Senders {
+        web_url: Some("https://monitor.example.com".to_string()),
+        pagerduty_url: Some(url),
+        ..Senders::default()
+    };
+    firing_on(test, ChannelKind::PagerDuty, PAGERDUTY_KEY, senders).await
+}
+
+async fn firing_on(
+    test: &mut Harness,
+    kind: ChannelKind,
+    target: &str,
+    senders: Senders,
+) -> Notifier {
     let channel = ChannelInput {
         name: "On call".to_string(),
-        kind: ChannelKind::PagerDuty,
-        target: PAGERDUTY_KEY.to_string(),
+        kind,
+        target: target.to_string(),
         credential: None,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
@@ -1352,20 +1363,185 @@ async fn firing_on_pagerduty(test: &mut Harness, pagerduty: &FakePagerDuty) -> N
     };
     test.database().create_alert_rule(&rule).await.unwrap();
     test.cpu(0, 95.0).await;
-    Notifier::new(
-        test.database().clone(),
-        Senders {
-            web_url: Some("https://monitor.example.com".to_string()),
-            pagerduty_url: Some(url),
-            ..Senders::default()
-        },
-    )
+    Notifier::new(test.database().clone(), senders)
+}
+
+fn with_web_url() -> Senders {
+    Senders {
+        web_url: Some("https://monitor.example.com".to_string()),
+        ..Senders::default()
+    }
+}
+
+#[tokio::test]
+async fn an_alert_opens_and_closes_in_alertops() {
+    let mut test = Harness::start().await;
+    let alertops = FakeOnCall::default();
+    let url = alertops.start().await;
+    let notifier = firing_on(&mut test, ChannelKind::AlertOps, &url, with_web_url()).await;
+
+    notifier.deliver_due(test.now).await.unwrap();
+    test.cpu(MINUTE_MS, 10.0).await;
+    notifier.deliver_due(test.now + MINUTE_MS).await.unwrap();
+
+    let events = alertops.events();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0]["status"], "open");
+    assert_eq!(events[0]["subject"], "High CPU");
+    assert_eq!(events[0]["message"], "CPU usage on web-1 is 95%, above 90%");
+    assert_eq!(events[0]["severity"], "critical");
+    assert_eq!(events[0]["host"], "web-1");
+    assert_eq!(events[0]["link"], "https://monitor.example.com/alerts");
+    assert_eq!(events[1]["status"], "closed");
+    assert_eq!(events[1]["alert_id"], events[0]["alert_id"]);
+}
+
+#[tokio::test]
+async fn an_alert_opens_and_closes_in_signl4() {
+    let mut test = Harness::start().await;
+    let signl4 = FakeOnCall::default();
+    let url = signl4.start().await;
+    let notifier = firing_on(&mut test, ChannelKind::Signl4, &url, with_web_url()).await;
+
+    notifier.deliver_due(test.now).await.unwrap();
+    test.cpu(MINUTE_MS, 10.0).await;
+    notifier.deliver_due(test.now + MINUTE_MS).await.unwrap();
+
+    let events = signl4.events();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0]["X-S4-Status"], "new");
+    assert_eq!(events[0]["Title"], "High CPU");
+    assert_eq!(events[0]["Message"], "CPU usage on web-1 is 95%, above 90%");
+    assert_eq!(events[0]["Severity"], "critical");
+    assert_eq!(events[0]["Link"], "https://monitor.example.com/alerts");
+    assert_eq!(events[1]["X-S4-Status"], "resolved");
+    assert_eq!(events[1]["X-S4-ExternalID"], events[0]["X-S4-ExternalID"]);
+}
+
+#[tokio::test]
+async fn a_failure_names_the_service_without_its_secret_url() {
+    for (kind, name) in [
+        (ChannelKind::AlertOps, "AlertOps"),
+        (ChannelKind::Signl4, "SIGNL4"),
+    ] {
+        let mut test = Harness::start().await;
+        let service = FakeOnCall::default();
+        service.statuses.lock().unwrap().push(404);
+        let url = format!("{}/secret-token", service.start().await);
+        let notifier = firing_on(&mut test, kind, &url, Senders::default()).await;
+
+        notifier.deliver_due(test.now).await.unwrap();
+
+        let problems = test.database().delivery_problems(10).await.unwrap();
+        assert_eq!(problems[0].error, format!("{name} returned status 404"));
+    }
+}
+
+#[tokio::test]
+async fn a_test_opens_an_incident_and_closes_it_again_on_every_service() {
+    for (kind, status, id) in [
+        (ChannelKind::AlertOps, "status", "alert_id"),
+        (ChannelKind::Signl4, "X-S4-Status", "X-S4-ExternalID"),
+    ] {
+        let service = FakeOnCall::default();
+        let channel = Channel {
+            id: 1,
+            channel: ChannelInput {
+                name: "On call".to_string(),
+                kind,
+                target: service.start().await,
+                credential: None,
+            },
+        };
+
+        crate::notifier::send(channel, Notice::test(), None, Senders::default())
+            .await
+            .unwrap();
+
+        let events = service.events();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(["open", "new"].contains(&events[0][status].as_str().unwrap()));
+        assert!(["closed", "resolved"].contains(&events[1][status].as_str().unwrap()));
+        assert_eq!(events[0][id], events[1][id]);
+    }
+}
+
+#[tokio::test]
+async fn a_service_url_is_set_but_never_shown_again() {
+    let server = start().await;
+    for (kind, name, target, preview) in [
+        (
+            "alertops",
+            "AlertOps",
+            "https://notify.alertops.com/POSTAlert/secret-token/Custom",
+            "https://notify.alertops.com/…",
+        ),
+        (
+            "signl4",
+            "SIGNL4",
+            "https://connect.signl4.com/webhook/secret-token",
+            "https://connect.signl4.com/…",
+        ),
+    ] {
+        let body = json!({ "name": name, "kind": kind, "target": target });
+        let (status, made) = api(&server, "POST", "/api/v1/notification-channels", &body).await;
+        assert_eq!(status, 201, "{made}");
+        assert!(!made.to_string().contains("secret-token"), "{made}");
+
+        let id = made["id"].as_i64().unwrap();
+        let (_, listed) = api(
+            &server,
+            "GET",
+            "/api/v1/notification-channels",
+            &Value::Null,
+        )
+        .await;
+        assert!(!listed.to_string().contains("secret-token"), "{listed}");
+        let saved = listed.as_array().unwrap().iter().find(|c| c["id"] == id);
+        assert_eq!(saved.unwrap()["target_preview"], preview);
+
+        let mut browser = Browser::default();
+        let edit = browser
+            .get(&server, &format!("/alerts/channels/{id}/edit"))
+            .await;
+        assert!(!edit.body.contains("secret-token"), "{}", edit.body);
+        let list = browser.get(&server, "/alerts/channels").await;
+        assert!(!list.body.contains("secret-token"), "{}", list.body);
+        assert!(list.body.contains(name), "{}", list.body);
+    }
+}
+
+#[tokio::test]
+async fn the_channel_form_offers_what_alertops_needs_to_map_from() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    let form = browser.get(&server, "/alerts/channels/new").await;
+
+    for choice in ["pagerduty", "alertops", "signl4"] {
+        assert!(
+            form.body.contains(&format!("value=\"{choice}\"")),
+            "{choice}"
+        );
+    }
+    let sample = crate::notifier::alertops_sample();
+    let readme = include_str!("../../../../README.md");
+    for line in sample.lines() {
+        assert!(
+            readme.contains(line),
+            "the README's sample is out of date: {line}"
+        );
+    }
+    let sample: Value = serde_json::from_str(&sample).unwrap();
+    for key in ["alert_id", "status", "subject", "message", "link"] {
+        assert!(!sample[key].is_null(), "{key}");
+        assert!(form.body.contains(key), "{key}");
+    }
 }
 
 #[tokio::test]
 async fn an_alert_opens_a_pagerduty_incident() {
     let mut test = Harness::start().await;
-    let pagerduty = FakePagerDuty::default();
+    let pagerduty = FakeOnCall::default();
     let notifier = firing_on_pagerduty(&mut test, &pagerduty).await;
 
     notifier.deliver_due(test.now).await.unwrap();
@@ -1393,7 +1569,7 @@ async fn an_alert_opens_a_pagerduty_incident() {
 #[tokio::test]
 async fn resolving_closes_the_same_pagerduty_incident() {
     let mut test = Harness::start().await;
-    let pagerduty = FakePagerDuty::default();
+    let pagerduty = FakeOnCall::default();
     let notifier = firing_on_pagerduty(&mut test, &pagerduty).await;
     notifier.deliver_due(test.now).await.unwrap();
 
@@ -1410,7 +1586,7 @@ async fn resolving_closes_the_same_pagerduty_incident() {
 #[tokio::test]
 async fn pagerduty_being_busy_is_tried_again_with_the_same_incident() {
     let mut test = Harness::start().await;
-    let pagerduty = FakePagerDuty::default();
+    let pagerduty = FakeOnCall::default();
     pagerduty.statuses.lock().unwrap().push(429);
     let notifier = firing_on_pagerduty(&mut test, &pagerduty).await;
 
@@ -1428,7 +1604,7 @@ async fn pagerduty_being_busy_is_tried_again_with_the_same_incident() {
 #[tokio::test]
 async fn a_pagerduty_key_never_appears_in_a_saved_error() {
     let mut test = Harness::start().await;
-    let pagerduty = FakePagerDuty::default();
+    let pagerduty = FakeOnCall::default();
     pagerduty.statuses.lock().unwrap().push(400);
     let notifier = firing_on_pagerduty(&mut test, &pagerduty).await;
 
@@ -1444,7 +1620,7 @@ async fn a_pagerduty_key_never_appears_in_a_saved_error() {
 
 #[tokio::test]
 async fn a_pagerduty_test_opens_an_incident_and_closes_it_again() {
-    let pagerduty = FakePagerDuty::default();
+    let pagerduty = FakeOnCall::default();
     let url = pagerduty.start().await;
     let channel = Channel {
         id: 1,

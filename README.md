@@ -224,19 +224,62 @@ either.
 
 Nothing moves between them, so changing later starts metrics afresh.
 
-## PagerDuty
+## On-call services
 
-Alerts can open incidents in PagerDuty, and close them again when they resolve.
+Alerts can open incidents in PagerDuty, AlertOps and SIGNL4, and close them again when
+they resolve. Each alert is one incident.
+
+Set them up in the web interface: go to Settings, then notification channels, add a
+channel of that type, then add the channel to the alert rules that should use it. The
+form has these steps too.
+
+Sending a test opens an incident and closes it straight away, which can notify whoever
+is on call. Keys and URLs work like passwords, so they can't be read back once saved.
+
+### PagerDuty
 
 1. In PagerDuty, open the service that should get the alerts, then its Integrations tab.
 2. Add an integration, choose Events API V2, and copy its Integration Key.
-3. In MaxNines, go to Settings, then notification channels, and add a channel of type
-   PagerDuty with that key.
-4. Add the channel to the alert rules that should use it.
+3. Use that key as the channel's destination.
 
-Each alert is one incident, and a rule's severity carries over. Sending a test opens an
-incident and resolves it straight away, which can notify whoever is on call. The key
-works like a password, so it can't be read back once it's saved.
+A rule's severity carries over.
+
+### AlertOps
+
+AlertOps lets you choose what each field in an incoming alert means, so there's a little
+mapping to do. Custom integrations may depend on your AlertOps plan.
+
+1. In AlertOps, go to Configuration, then Integrations. Under Inbound Integrations,
+   choose API and add one using the Custom card, with the escalation policy you want.
+2. Open its rules for opening and closing an alert. Keep the method as POST and the
+   content as JSON.
+3. Paste this in as the sample data:
+
+   ```json
+   {
+     "alert_id": "maxnines-test",
+     "host": "MaxNines",
+     "link": "https://maxnines.example.com/alerts",
+     "message": "This is a test notification from MaxNines.",
+     "severity": "info",
+     "status": "open",
+     "subject": "Test"
+   }
+   ```
+
+4. Map `alert_id` to both Source Name and Source Id, so each alert stays separate. A
+   fixed Source Name would merge them into one.
+5. Map `status` as the status field. Open an alert when it contains `open`, and close it
+   when it contains `closed`.
+6. Map `subject` and `message` to the text fields you want, and `link` to Source URL.
+7. Leave the authorization header off, then copy the integration's URL. Do this last, as
+   changing its source changes the URL.
+8. Use that URL as the channel's destination.
+
+### SIGNL4
+
+Use `https://connect.signl4.com/webhook/` followed by your SIGNL4 team or integration
+secret as the channel's destination.
 
 ## API
 
