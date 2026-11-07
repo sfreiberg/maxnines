@@ -12,7 +12,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use super::*;
 use crate::alert_evaluator::Evaluator;
 use crate::alerting::{
-    AlertRuleInput, ChannelInput, ChannelKind, Comparison, Delivery, Event, RuleKind, Severity,
+    AlertRuleInput, Channel, ChannelInput, ChannelKind, Comparison, Delivery, Event, RuleKind,
+    Severity,
 };
 use crate::metrics::{Metric, NewestReading};
 use crate::notifier::{Mailer, Notice, Notifier, Senders};
@@ -1294,6 +1295,221 @@ impl FakeSlack {
 
     fn methods(&self) -> Vec<String> {
         self.calls().into_iter().map(|call| call.0).collect()
+    }
+}
+
+/// Stands in for PagerDuty, and answers with these statuses in turn, then 202.
+#[derive(Clone, Default)]
+struct FakePagerDuty {
+    events: Arc<Mutex<Vec<Value>>>,
+    statuses: Arc<Mutex<Vec<u16>>>,
+}
+
+impl FakePagerDuty {
+    async fn start(&self) -> String {
+        let fake = self.clone();
+        let router = Router::new().route(
+            "/v2/enqueue",
+            post(move |axum::Json(event): axum::Json<Value>| {
+                let fake = fake.clone();
+                async move {
+                    fake.events.lock().unwrap().push(event);
+                    let mut statuses = fake.statuses.lock().unwrap();
+                    if statuses.is_empty() {
+                        StatusCode::ACCEPTED
+                    } else {
+                        StatusCode::from_u16(statuses.remove(0)).unwrap()
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        format!("http://{address}/v2/enqueue")
+    }
+
+    fn events(&self) -> Vec<Value> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+const PAGERDUTY_KEY: &str = "abcdefghijklmnopqrstuvwxyz012345";
+
+async fn firing_on_pagerduty(test: &mut Harness, pagerduty: &FakePagerDuty) -> Notifier {
+    let url = pagerduty.start().await;
+    let channel = ChannelInput {
+        name: "On call".to_string(),
+        kind: ChannelKind::PagerDuty,
+        target: PAGERDUTY_KEY.to_string(),
+        credential: None,
+    };
+    let channel = test.database().create_channel(&channel).await.unwrap();
+    let rule = AlertRuleInput {
+        for_secs: 0,
+        channels: vec![channel],
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    test.cpu(0, 95.0).await;
+    Notifier::new(
+        test.database().clone(),
+        Senders {
+            web_url: Some("https://monitor.example.com".to_string()),
+            pagerduty_url: Some(url),
+            ..Senders::default()
+        },
+    )
+}
+
+#[tokio::test]
+async fn an_alert_opens_a_pagerduty_incident() {
+    let mut test = Harness::start().await;
+    let pagerduty = FakePagerDuty::default();
+    let notifier = firing_on_pagerduty(&mut test, &pagerduty).await;
+
+    notifier.deliver_due(test.now).await.unwrap();
+
+    let events = pagerduty.events();
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event["routing_key"], PAGERDUTY_KEY);
+    assert_eq!(event["event_action"], "trigger");
+    assert_eq!(
+        event["payload"]["summary"],
+        "CPU usage on web-1 is 95%, above 90%"
+    );
+    assert_eq!(event["payload"]["source"], "web-1");
+    assert_eq!(event["payload"]["severity"], "critical");
+    assert_eq!(event["client_url"], "https://monitor.example.com/alerts");
+    assert!(
+        event["dedup_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("maxnines-alert-")
+    );
+}
+
+#[tokio::test]
+async fn resolving_closes_the_same_pagerduty_incident() {
+    let mut test = Harness::start().await;
+    let pagerduty = FakePagerDuty::default();
+    let notifier = firing_on_pagerduty(&mut test, &pagerduty).await;
+    notifier.deliver_due(test.now).await.unwrap();
+
+    test.cpu(MINUTE_MS, 10.0).await;
+    notifier.deliver_due(test.now + MINUTE_MS).await.unwrap();
+
+    let events = pagerduty.events();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[1]["event_action"], "resolve");
+    assert_eq!(events[1]["dedup_key"], events[0]["dedup_key"]);
+    assert_eq!(events[1]["routing_key"], PAGERDUTY_KEY);
+}
+
+#[tokio::test]
+async fn pagerduty_being_busy_is_tried_again_with_the_same_incident() {
+    let mut test = Harness::start().await;
+    let pagerduty = FakePagerDuty::default();
+    pagerduty.statuses.lock().unwrap().push(429);
+    let notifier = firing_on_pagerduty(&mut test, &pagerduty).await;
+
+    notifier.deliver_due(test.now).await.unwrap();
+    let problems = test.database().delivery_problems(10).await.unwrap();
+    assert_eq!(problems[0].error, "PagerDuty returned status 429");
+
+    notifier.deliver_due(test.now + 60_000).await.unwrap();
+
+    let events = pagerduty.events();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["dedup_key"], events[1]["dedup_key"]);
+}
+
+#[tokio::test]
+async fn a_pagerduty_key_never_appears_in_a_saved_error() {
+    let mut test = Harness::start().await;
+    let pagerduty = FakePagerDuty::default();
+    pagerduty.statuses.lock().unwrap().push(400);
+    let notifier = firing_on_pagerduty(&mut test, &pagerduty).await;
+
+    notifier.deliver_due(test.now).await.unwrap();
+
+    let problems = test.database().delivery_problems(10).await.unwrap();
+    assert!(
+        !problems[0].error.contains(PAGERDUTY_KEY),
+        "{}",
+        problems[0].error
+    );
+}
+
+#[tokio::test]
+async fn a_pagerduty_test_opens_an_incident_and_closes_it_again() {
+    let pagerduty = FakePagerDuty::default();
+    let url = pagerduty.start().await;
+    let channel = Channel {
+        id: 1,
+        channel: ChannelInput {
+            name: "On call".to_string(),
+            kind: ChannelKind::PagerDuty,
+            target: PAGERDUTY_KEY.to_string(),
+            credential: None,
+        },
+    };
+    let senders = Senders {
+        pagerduty_url: Some(url),
+        ..Senders::default()
+    };
+
+    crate::notifier::send(channel, Notice::test(), None, senders)
+        .await
+        .unwrap();
+
+    let events = pagerduty.events();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["event_action"], "trigger");
+    assert_eq!(events[0]["payload"]["severity"], "info");
+    assert_eq!(events[1]["event_action"], "resolve");
+    assert_eq!(events[0]["dedup_key"], events[1]["dedup_key"]);
+}
+
+#[tokio::test]
+async fn a_pagerduty_key_is_set_but_never_shown_again() {
+    let server = start().await;
+    let body = json!({
+        "name": "On call", "kind": "pagerduty", "target": PAGERDUTY_KEY,
+    });
+    let (status, made) = api(&server, "POST", "/api/v1/notification-channels", &body).await;
+    assert_eq!(status, 201, "{made}");
+
+    let (_, listed) = api(
+        &server,
+        "GET",
+        "/api/v1/notification-channels",
+        &Value::Null,
+    )
+    .await;
+    assert!(!listed.to_string().contains(PAGERDUTY_KEY), "{listed}");
+    assert_eq!(listed[0]["target_preview"], "Key ending 2345");
+
+    let id = made["id"].as_i64().unwrap();
+    let mut browser = Browser::default();
+    let edit = browser
+        .get(&server, &format!("/alerts/channels/{id}/edit"))
+        .await;
+    assert!(!edit.body.contains(PAGERDUTY_KEY), "{}", edit.body);
+    let list = browser.get(&server, "/alerts/channels").await;
+    assert!(!list.body.contains(PAGERDUTY_KEY), "{}", list.body);
+    assert!(list.body.contains("PagerDuty"), "{}", list.body);
+}
+
+#[tokio::test]
+async fn a_pagerduty_key_has_to_look_like_one() {
+    let server = start().await;
+    for target in ["too-short", "has spaces in it and is 32 long..", ""] {
+        let body = json!({ "name": "x", "kind": "pagerduty", "target": target });
+        let (status, answer) = api(&server, "POST", "/api/v1/notification-channels", &body).await;
+        assert_eq!(status, 422, "{target}: {answer}");
+        assert!(!answer.to_string().contains("too-short"), "{answer}");
     }
 }
 

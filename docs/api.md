@@ -664,14 +664,14 @@ curl -X DELETE -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 ## Notification channels
 
-Where alerts go. Webhook addresses and Slack tokens can be set but never read back, so
-`target_preview` only shows enough to recognize a channel.
+Where alerts go. Webhook addresses, PagerDuty keys and Slack tokens can be set but never
+read back, so `target_preview` only shows enough to recognize a channel.
 
 | Field | Description |
 | --- | --- |
 | `name` | Required |
-| `kind` | Required. `webhook`, `email`, `discord` or `slack` |
-| `target` | Required. A webhook's address, email addresses separated by commas, or a Slack channel |
+| `kind` | Required. `webhook`, `email`, `discord`, `slack` or `pagerduty` |
+| `target` | Required. A webhook's address, email addresses separated by commas, a Slack channel, or a PagerDuty integration key |
 | `credential` | Slack's bot token |
 
 ### List notification channels

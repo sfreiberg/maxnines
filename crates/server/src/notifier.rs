@@ -41,6 +41,13 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// The longest message Discord accepts.
 const DISCORD_MAX_CHARS: usize = 2000;
 
+/// Where PagerDuty takes events.
+const PAGERDUTY_EVENTS_URL: &str = "https://events.pagerduty.com/v2/enqueue";
+/// The longest summary PagerDuty accepts.
+const PAGERDUTY_MAX_SUMMARY_CHARS: usize = 1024;
+/// Ties a test's two events together.
+const PAGERDUTY_TEST_KEY: &str = "maxnines-test";
+
 const FIRST_RETRY_MS: i64 = 30_000;
 const LONGEST_RETRY_MS: i64 = 30 * 60_000;
 
@@ -122,6 +129,56 @@ impl Notice {
             .take(DISCORD_MAX_CHARS)
             .collect();
         json!({ "content": content, "allowed_mentions": { "parse": [] } })
+    }
+
+    /// What to send PagerDuty. An alert's ID is what ties resolving it to the incident
+    /// it opened, and makes a repeat delivery land on that incident too. A test has to
+    /// open an incident to prove anything, so it closes it again straight away.
+    fn pagerduty_events(&self, key: &str, web_url: Option<&str>) -> Vec<Value> {
+        let closing = |dedup_key: &str| json!({ "routing_key": key, "event_action": "resolve", "dedup_key": dedup_key });
+        let opening = |dedup_key: &str, severity: &str, source: &str, details: Value| {
+            let summary: String = self
+                .alert
+                .as_ref()
+                .map_or(self.text.as_str(), |alert| &alert.summary)
+                .chars()
+                .take(PAGERDUTY_MAX_SUMMARY_CHARS)
+                .collect();
+            let mut event = json!({
+                "routing_key": key,
+                "event_action": "trigger",
+                "dedup_key": dedup_key,
+                "client": "MaxNines",
+                "payload": {
+                    "summary": summary,
+                    "source": source,
+                    "severity": severity,
+                    "custom_details": details,
+                },
+            });
+            if let Some(url) = web_url {
+                event["client_url"] = json!(format!("{url}/alerts"));
+            }
+            event
+        };
+
+        match (self.event, &self.alert) {
+            (Event::Firing, Some(alert)) => {
+                let details = json!({
+                    "rule": alert.rule_name,
+                    "series": alert.series,
+                    "value": alert.value,
+                });
+                let dedup_key = pagerduty_key(alert);
+                let severity = alert.severity.as_str();
+                vec![opening(&dedup_key, severity, &alert.host, details)]
+            }
+            (Event::Resolved, Some(alert)) => vec![closing(&pagerduty_key(alert))],
+            _ => vec![
+                opening(PAGERDUTY_TEST_KEY, "info", "MaxNines", json!({})),
+                closing(PAGERDUTY_TEST_KEY),
+            ],
+        }
     }
 
     fn subject(&self) -> String {
@@ -221,9 +278,13 @@ impl Mailer {
     }
 }
 
+fn pagerduty_key(alert: &Alert) -> String {
+    format!("maxnines-alert-{}", alert.id)
+}
+
 /// Errors are saved and shown, and a webhook's URL is often its password, so
-/// they only ever say what kind of failure it was.
-fn post_json(url: &str, body: &Value) -> Result<()> {
+/// they only ever say what kind of failure it was. `who` is what to call the receiver.
+fn post_json(who: &str, url: &str, body: &Value) -> Result<()> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(SEND_TIMEOUT))
         .max_redirects(0)
@@ -239,16 +300,16 @@ fn post_json(url: &str, body: &Value) -> Result<()> {
         .send(body.as_bytes());
     match result {
         Ok(response) if response.status().is_success() => Ok(()),
-        Ok(response) => bail!("the webhook returned status {}", response.status().as_u16()),
-        Err(ureq::Error::Timeout(_)) => bail!("the webhook timed out"),
-        Err(ureq::Error::HostNotFound) => bail!("the webhook's host wasn't found"),
+        Ok(response) => bail!("{who} returned status {}", response.status().as_u16()),
+        Err(ureq::Error::Timeout(_)) => bail!("{who} timed out"),
+        Err(ureq::Error::HostNotFound) => bail!("{who}'s host wasn't found"),
         Err(ureq::Error::ConnectionFailed | ureq::Error::Io(_)) => {
-            bail!("couldn't connect to the webhook")
+            bail!("couldn't connect to {who}")
         }
         Err(ureq::Error::Tls(_) | ureq::Error::Rustls(_)) => {
-            bail!("the webhook's certificate wasn't accepted")
+            bail!("{who}'s certificate wasn't accepted")
         }
-        Err(_) => bail!("the webhook request failed"),
+        Err(_) => bail!("the request to {who} failed"),
     }
 }
 
@@ -261,6 +322,9 @@ pub struct Senders {
     /// Where to find a stand-in for Slack.
     #[cfg(test)]
     pub slack_api_url: Option<String>,
+    /// Where to find a stand-in for PagerDuty.
+    #[cfg(test)]
+    pub pagerduty_url: Option<String>,
 }
 
 impl Senders {
@@ -270,7 +334,21 @@ impl Senders {
             web_url,
             #[cfg(test)]
             slack_api_url: None,
+            #[cfg(test)]
+            pagerduty_url: None,
         }
+    }
+
+    #[cfg(not(test))]
+    fn pagerduty_url(&self) -> &str {
+        PAGERDUTY_EVENTS_URL
+    }
+
+    #[cfg(test)]
+    fn pagerduty_url(&self) -> &str {
+        self.pagerduty_url
+            .as_deref()
+            .unwrap_or(PAGERDUTY_EVENTS_URL)
     }
 }
 
@@ -484,13 +562,20 @@ async fn send_to_slack(
 }
 
 /// Sends one notification. Blocks, so it can't run on an async thread.
-fn send_blocking(channel: &Channel, notice: &Notice, mailer: Option<&Mailer>) -> Result<()> {
+fn send_blocking(channel: &Channel, notice: &Notice, senders: &Senders) -> Result<()> {
+    let target = &channel.channel.target;
     match channel.channel.kind {
-        ChannelKind::Webhook => post_json(&channel.channel.target, &notice.webhook_body()),
-        ChannelKind::Discord => post_json(&channel.channel.target, &notice.discord_body()),
-        ChannelKind::Email => mailer
+        ChannelKind::Webhook => post_json("the webhook", target, &notice.webhook_body()),
+        ChannelKind::Discord => post_json("the webhook", target, &notice.discord_body()),
+        ChannelKind::Email => senders
+            .mailer
+            .as_deref()
             .context("email isn't set up in the server config")?
-            .send(&channel.channel.target, notice),
+            .send(target, notice),
+        ChannelKind::PagerDuty => notice
+            .pagerduty_events(target, senders.web_url.as_deref())
+            .iter()
+            .try_for_each(|event| post_json("PagerDuty", senders.pagerduty_url(), event)),
         ChannelKind::Slack => bail!("Slack doesn't send this way"),
     }
 }
@@ -512,8 +597,7 @@ pub async fn send(
         .map_err(|_| anyhow!("Slack timed out"))?;
     }
 
-    let mailer = senders.mailer;
-    tokio::task::spawn_blocking(move || send_blocking(&channel, &notice, mailer.as_deref()))
+    tokio::task::spawn_blocking(move || send_blocking(&channel, &notice, &senders))
         .await
         .map_err(|_| anyhow!("sending failed unexpectedly"))??;
     Ok(None)

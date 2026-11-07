@@ -385,6 +385,8 @@ pub enum ChannelKind {
     Email,
     Discord,
     Slack,
+    #[serde(rename = "pagerduty")]
+    PagerDuty,
 }
 
 impl ChannelKind {
@@ -394,6 +396,7 @@ impl ChannelKind {
             Self::Email => "email",
             Self::Discord => "discord",
             Self::Slack => "slack",
+            Self::PagerDuty => "pagerduty",
         }
     }
 
@@ -403,6 +406,7 @@ impl ChannelKind {
             "email" => Ok(Self::Email),
             "discord" => Ok(Self::Discord),
             "slack" => Ok(Self::Slack),
+            "pagerduty" => Ok(Self::PagerDuty),
             other => bail!("unknown channel kind {other:?}"),
         }
     }
@@ -420,7 +424,8 @@ pub struct Channel {
 pub struct ChannelInput {
     pub name: String,
     pub kind: ChannelKind,
-    /// A webhook's URL, email addresses separated by commas, or a Slack channel.
+    /// A webhook's URL, email addresses separated by commas, a Slack channel, or a
+    /// PagerDuty integration key.
     pub target: String,
     /// Slack's bot token. Like a webhook's URL, it can be set but not read back.
     #[serde(default)]
@@ -443,6 +448,7 @@ pub fn check_channel(channel: &ChannelInput) -> Result<()> {
         }
         ChannelKind::Discord => check_discord_url(&channel.target)?,
         ChannelKind::Slack => check_slack(channel)?,
+        ChannelKind::PagerDuty => check_pagerduty_key(&channel.target)?,
         ChannelKind::Email => {
             let recipients = recipients(&channel.target)?;
             ensure!(!recipients.is_empty(), "add at least one email address");
@@ -452,6 +458,19 @@ pub fn check_channel(channel: &ChannelInput) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// How long PagerDuty's integration keys are.
+const PAGERDUTY_KEY_LEN: usize = 32;
+
+/// Says what's wrong without repeating the key, as this ends up on the page.
+fn check_pagerduty_key(key: &str) -> Result<()> {
+    ensure!(
+        key.len() == PAGERDUTY_KEY_LEN && key.chars().all(|c| c.is_ascii_alphanumeric()),
+        "that doesn't look like a PagerDuty integration key, which is \
+         {PAGERDUTY_KEY_LEN} letters and numbers"
+    );
     Ok(())
 }
 
@@ -528,6 +547,13 @@ impl ChannelInput {
             ChannelKind::Webhook | ChannelKind::Discord => webhook_host(&self.target)
                 .map_or_else(|_| "Unknown".to_string(), |host| format!("{host}/…")),
             ChannelKind::Email | ChannelKind::Slack => self.target.clone(),
+            ChannelKind::PagerDuty => {
+                let start = self.target.len().saturating_sub(4);
+                format!(
+                    "Key ending {}",
+                    self.target.get(start..).unwrap_or_default()
+                )
+            }
         }
     }
 }

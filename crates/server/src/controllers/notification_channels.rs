@@ -51,7 +51,10 @@ impl ChannelForm {
     }
 
     fn from_channel(channel: &ChannelInput) -> Self {
-        let hidden = matches!(channel.kind, ChannelKind::Webhook | ChannelKind::Discord);
+        let hidden = matches!(
+            channel.kind,
+            ChannelKind::Webhook | ChannelKind::Discord | ChannelKind::PagerDuty
+        );
         Self {
             name: channel.name.clone(),
             kind: channel.kind.as_str().to_string(),

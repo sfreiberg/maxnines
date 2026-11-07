@@ -224,6 +224,20 @@ either.
 
 Nothing moves between them, so changing later starts metrics afresh.
 
+## PagerDuty
+
+Alerts can open incidents in PagerDuty, and close them again when they resolve.
+
+1. In PagerDuty, open the service that should get the alerts, then its Integrations tab.
+2. Add an integration, choose Events API V2, and copy its Integration Key.
+3. In MaxNines, go to Settings, then notification channels, and add a channel of type
+   PagerDuty with that key.
+4. Add the channel to the alert rules that should use it.
+
+Each alert is one incident, and a rule's severity carries over. Sending a test opens an
+incident and resolves it straight away, which can notify whoever is on call. The key
+works like a password, so it can't be read back once it's saved.
+
 ## API
 
 Everything the web pages can see and do is available as JSON under `/api/v1`, on the

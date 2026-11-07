@@ -20,14 +20,25 @@
       <option value="email"{% if channel.kind == "email" %} selected{% endif %}>Email</option>
       <option value="discord"{% if channel.kind == "discord" %} selected{% endif %}>Discord</option>
       <option value="slack"{% if channel.kind == "slack" %} selected{% endif %}>Slack</option>
+      <option value="pagerduty"{% if channel.kind == "pagerduty" %} selected{% endif %}>PagerDuty</option>
     </select>
     {% if not email_ready %}<small>Email needs an <code>email</code> block in the server config.</small>{% endif %}
   </label>
 
   <label>Sends to
     <input type="text" name="target" value="{{ channel.target }}" spellcheck="false" autocomplete="off"{% if channel.preview %} placeholder="{{ channel.preview }}"{% endif %}>
-    <small>{% if channel.preview %}Leave empty to keep the saved URL, which isn't shown because it can work like a password.{% else %}A webhook's URL, a Discord webhook URL, email addresses separated by commas, or for Slack a channel such as <code>#alerts</code>.{% endif %}</small>
+    <small>{% if channel.preview %}Leave empty to keep what's saved, which isn't shown because it can work like a password.{% else %}A webhook's URL, a Discord webhook URL, email addresses separated by commas, for Slack a channel such as <code>#alerts</code>, or for PagerDuty an integration key.{% endif %}</small>
   </label>
+
+  <details class="for-pagerduty">
+    <summary>How to get a PagerDuty integration key</summary>
+    <ol>
+      <li>In PagerDuty, open the service that should get these alerts, then its Integrations tab.</li>
+      <li>Add an integration, and choose Events API V2.</li>
+      <li>Copy its Integration Key into the box above.</li>
+    </ol>
+    <p class="note">Sending a test opens an incident on that service and resolves it straight away, which can notify whoever is on call.</p>
+  </details>
 
   <fieldset class="for-slack">
     <legend>Slack</legend>

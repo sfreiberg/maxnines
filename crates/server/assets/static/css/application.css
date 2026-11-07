@@ -367,3 +367,4 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 
 /* Only Slack has a token. Without :has() the section just stays. */
 .channel:not(:has(option[value="slack"]:checked)) .for-slack { display: none; }
+.channel:not(:has(option[value="pagerduty"]:checked)) .for-pagerduty { display: none; }
