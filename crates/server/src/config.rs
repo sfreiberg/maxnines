@@ -33,6 +33,58 @@ pub struct Config {
     pub registration: RegistrationConfig,
     /// The mail server for email notifications. Without it, they can't be sent.
     pub email: Option<EmailConfig>,
+    /// Serves HTTPS. Leave it out behind a proxy, or on a trusted network.
+    pub tls: Option<TlsConfig>,
+}
+
+/// Where a certificate comes from: files, or an ACME service.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    pub certificate_file: Option<PathBuf>,
+    pub key_file: Option<PathBuf>,
+    /// Who signed a private certificate, for this server's own command line tools.
+    /// A certificate from a public authority doesn't need it.
+    pub ca_file: Option<PathBuf>,
+    pub acme: Option<AcmeSettings>,
+}
+
+/// Getting certificates automatically, from Let's Encrypt unless told otherwise.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcmeSettings {
+    pub domains: Vec<String>,
+    /// Who the service can contact about the certificates.
+    pub email: Option<String>,
+    /// Keeps the certificate and account key. It has to survive restarts, because
+    /// services limit how many certificates can be issued.
+    pub cache_dir: PathBuf,
+    #[serde(default = "default_acme_directory")]
+    pub directory: String,
+    /// Who to trust for a private ACME service.
+    pub ca_file: Option<PathBuf>,
+}
+
+fn default_acme_directory() -> String {
+    "https://acme-v02.api.letsencrypt.org/directory".to_string()
+}
+
+impl TlsConfig {
+    fn validate(&self) -> Result<()> {
+        let files = self.certificate_file.is_some() || self.key_file.is_some();
+        ensure!(
+            self.certificate_file.is_some() == self.key_file.is_some(),
+            "set both certificate_file and key_file"
+        );
+        match &self.acme {
+            Some(acme) => {
+                ensure!(!files, "use certificate files or acme, not both");
+                ensure!(!acme.domains.is_empty(), "acme needs at least one domain");
+            }
+            None => ensure!(files, "set certificate_file and key_file, or an acme block"),
+        }
+        Ok(())
+    }
 }
 
 /// How to reach a mail server. The password lives in a file, so this one can be
@@ -239,6 +291,13 @@ impl Config {
         if let Some(email) = &config.email {
             email.validate().context("email block")?;
         }
+        if let Some(tls) = &config.tls {
+            tls.validate().context("tls block")?;
+            ensure!(
+                config.audience().starts_with("wss://"),
+                "with a tls block, public_url has to start with wss://"
+            );
+        }
         for (name, rule) in &config.registration.rule {
             rule.validate().with_context(|| format!("rule {name:?}"))?;
         }
@@ -331,6 +390,102 @@ mod env_tests {
                     source_cidrs = [env(\"MAXNINES_TEST_UNSET\", \"10.0.0.0/8\")]\n  }\n}";
         let config = parse_with(line).unwrap();
         assert_eq!(config.registration.rule["a"].source_cidrs, ["10.0.0.0/8"]);
+    }
+}
+
+#[cfg(test)]
+mod tls_config {
+    use super::*;
+
+    fn parsed(tls: &str, public_url: &str) -> Result<Config> {
+        Config::parse(&format!(
+            "public_url = \"{public_url}\"\n{tls}\nmetrics \"duckdb\" {{\n  path = \"x\"\n}}\n"
+        ))
+    }
+
+    const FILES: &str = r#"tls {
+      certificate_file = "a.crt"
+      key_file = "a.key"
+    }"#;
+
+    const ACME: &str = r#"tls {
+      acme {
+        domains = ["maxnines.example.com"]
+        email = "you@example.com"
+        cache_dir = "acme"
+      }
+    }"#;
+
+    #[test]
+    fn https_is_off_unless_asked_for() {
+        assert!(parsed("", "ws://x/ws").unwrap().tls.is_none());
+    }
+
+    #[test]
+    fn certificate_files_can_be_used() {
+        let config = parsed(FILES, "wss://x/ws").unwrap();
+        assert!(config.tls.unwrap().certificate_file.is_some());
+    }
+
+    #[test]
+    fn acme_uses_lets_encrypt_unless_told_otherwise() {
+        let config = parsed(ACME, "wss://x/ws").unwrap();
+        let acme = config.tls.unwrap().acme.unwrap();
+        assert!(acme.directory.contains("letsencrypt.org"));
+    }
+
+    #[test]
+    fn half_a_certificate_is_refused() {
+        let tls = r#"tls {
+          certificate_file = "a.crt"
+        }"#;
+        assert!(parsed(tls, "wss://x/ws").is_err());
+    }
+
+    #[test]
+    fn a_tls_block_has_to_say_something() {
+        assert!(parsed("tls {}", "wss://x/ws").is_err());
+    }
+
+    #[test]
+    fn files_and_acme_can_not_both_be_used() {
+        let tls = r#"tls {
+          certificate_file = "a.crt"
+          key_file = "a.key"
+          acme {
+            domains = ["x"]
+            cache_dir = "acme"
+          }
+        }"#;
+        assert!(parsed(tls, "wss://x/ws").is_err());
+    }
+
+    #[test]
+    fn acme_needs_a_domain() {
+        let tls = r#"tls {
+          acme {
+            domains = []
+            cache_dir = "acme"
+          }
+        }"#;
+        assert!(parsed(tls, "wss://x/ws").is_err());
+    }
+
+    #[test]
+    fn a_private_authority_can_be_named() {
+        let tls = r#"tls {
+          certificate_file = "a.crt"
+          key_file = "a.key"
+          ca_file = "ca.pem"
+        }"#;
+        let config = parsed(tls, "wss://x/ws").unwrap();
+        assert!(config.tls.unwrap().ca_file.is_some());
+    }
+
+    #[test]
+    fn agents_have_to_be_told_to_use_it() {
+        let error = parsed(FILES, "ws://x/ws").unwrap_err();
+        assert!(format!("{error:#}").contains("wss://"), "{error:#}");
     }
 }
 

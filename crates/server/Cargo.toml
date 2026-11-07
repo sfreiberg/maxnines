@@ -31,6 +31,9 @@ slack-morphism = { version = "2.31", default-features = false, features = ["hype
 serde_json.workspace = true
 sysinfo = { version = "0.40.1", default-features = false, features = ["disk", "system"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+futures-util.workspace = true
+rustls-acme = { version = "0.15", default-features = false, features = ["axum", "ring", "tls12", "webpki-roots"] }
 tower-http = { version = "0.6", features = ["compression-gzip"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -47,7 +50,7 @@ governor = "0.10.4"
 cookie = "0.18"
 
 [dev-dependencies]
-futures-util.workspace = true
+rcgen = "0.14"
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 tempfile = "3"
 tokio-tungstenite.workspace = true

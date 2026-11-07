@@ -23,6 +23,7 @@ mod rule_engine;
 mod rule_preview;
 mod server_stats;
 mod store;
+mod tls;
 mod views;
 
 #[cfg(test)]
@@ -264,8 +265,14 @@ async fn serve(path: &Path) -> Result<()> {
 
     let mut stop = StopSignal::listen().context("listening for being asked to stop")?;
     let service = controllers::app(state).into_make_service_with_connect_info::<SocketAddr>();
+    let serving = async {
+        match &config.tls {
+            Some(tls) => tls::serve(listener, tls, service).await,
+            None => Ok(axum::serve(listener, service).await?),
+        }
+    };
     tokio::select! {
-        result = axum::serve(listener, service).into_future() => result?,
+        result = serving => result?,
         result = stop.wait() => result?,
     }
 

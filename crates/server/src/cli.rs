@@ -1,10 +1,12 @@
 //! The admin commands. They go through the running server, which holds the agent
 //! list and the metrics database, using the token kept in the main database.
 
-use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use serde_json::Value;
 
 use crate::config::Config;
@@ -30,8 +32,16 @@ pub fn print_admin_token(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Where this machine reaches the server, even if it listens on all addresses.
-fn local_url(listen: SocketAddr) -> String {
+/// Where this machine reaches the server, even if it listens on all addresses. With
+/// HTTPS that's its public name, as that's what its certificate says.
+fn server_url(config: &Config) -> String {
+    if config.tls.is_some() {
+        let audience = config.audience();
+        let host = audience.strip_prefix("wss://").unwrap_or(&audience);
+        let host = host.split('/').next().unwrap_or(host);
+        return format!("https://{host}");
+    }
+    let listen = config.listen;
     let mut address = listen;
     if address.ip().is_unspecified() {
         address.set_ip(if listen.is_ipv4() {
@@ -41,6 +51,27 @@ fn local_url(listen: SocketAddr) -> String {
         });
     }
     format!("http://{address}")
+}
+
+/// Checks the server's certificate as anything else would: against the public
+/// authorities, or the one named in the config for a private certificate.
+fn client(config: &Config) -> Result<ureq::Agent> {
+    let ca_file = config.tls.as_ref().and_then(|tls| tls.ca_file.as_deref());
+    let mut tls = ureq::tls::TlsConfig::builder();
+    if let Some(path) = ca_file {
+        let roots = CertificateDer::pem_file_iter(path)
+            .and_then(Iterator::collect::<Result<Vec<_>, _>>)
+            .with_context(|| format!("reading CA file {}", path.display()))?;
+        let roots = roots
+            .iter()
+            .map(|root| ureq::tls::Certificate::from_der(root.as_ref()).to_owned())
+            .collect();
+        tls = tls.root_certs(ureq::tls::RootCerts::Specific(Arc::new(roots)));
+    }
+    let config = ureq::Agent::config_builder()
+        .tls_config(tls.build())
+        .build();
+    Ok(ureq::Agent::new_with_config(config))
 }
 
 fn explain(error: ureq::Error, url: &str) -> anyhow::Error {
@@ -55,10 +86,11 @@ fn explain(error: ureq::Error, url: &str) -> anyhow::Error {
 }
 
 pub fn print_agents(config: &Config) -> Result<()> {
-    let base = local_url(config.listen);
+    let base = server_url(config);
     let token = admin_token(config)?;
 
-    let mut response = ureq::get(format!("{base}{BASE_PATH}/agents"))
+    let mut response = client(config)?
+        .get(format!("{base}{BASE_PATH}/agents"))
         .header("Authorization", format!("Bearer {token}"))
         .call()
         .map_err(|error| explain(error, &base))?;
@@ -89,10 +121,11 @@ pub fn print_agents(config: &Config) -> Result<()> {
 }
 
 fn get_json(config: &Config, path: &str) -> Result<String> {
-    let base = local_url(config.listen);
+    let base = server_url(config);
     let token = admin_token(config)?;
 
-    let mut response = ureq::get(format!("{base}{path}"))
+    let mut response = client(config)?
+        .get(format!("{base}{path}"))
         .header("Authorization", format!("Bearer {token}"))
         .call()
         .map_err(|error| explain(error, &base))?;
@@ -124,10 +157,11 @@ pub fn print_facts_history(config: &Config, id: &str) -> Result<()> {
 }
 
 pub fn change_agent(config: &Config, id: &str, action: &str) -> Result<()> {
-    let base = local_url(config.listen);
+    let base = server_url(config);
     let token = admin_token(config)?;
 
-    let result = ureq::post(format!("{base}{BASE_PATH}/agents/{id}/{action}"))
+    let result = client(config)?
+        .post(format!("{base}{BASE_PATH}/agents/{id}/{action}"))
         .header("Authorization", format!("Bearer {token}"))
         .send_empty();
     match result {
@@ -176,10 +210,11 @@ pub fn print_api_keys(config: &Config) -> Result<()> {
 }
 
 pub fn create_api_key(config: &Config, name: &str, expires_in: Option<Duration>) -> Result<()> {
-    let base = local_url(config.listen);
+    let base = server_url(config);
     let token = admin_token(config)?;
 
-    let mut response = ureq::post(format!("{base}{BASE_PATH}/api-keys"))
+    let mut response = client(config)?
+        .post(format!("{base}{BASE_PATH}/api-keys"))
         .header("Authorization", format!("Bearer {token}"))
         .header("Content-Type", "application/json")
         .send(
@@ -200,10 +235,11 @@ pub fn create_api_key(config: &Config, name: &str, expires_in: Option<Duration>)
 }
 
 pub fn revoke_api_key(config: &Config, id: i64) -> Result<()> {
-    let base = local_url(config.listen);
+    let base = server_url(config);
     let token = admin_token(config)?;
 
-    let result = ureq::delete(format!("{base}{BASE_PATH}/api-keys/{id}"))
+    let result = client(config)?
+        .delete(format!("{base}{BASE_PATH}/api-keys/{id}"))
         .header("Authorization", format!("Bearer {token}"))
         .call();
     match result {
@@ -231,10 +267,11 @@ fn users_error(error: ureq::Error, url: &str) -> anyhow::Error {
 }
 
 pub fn print_users(config: &Config) -> Result<()> {
-    let base = local_url(config.listen);
+    let base = server_url(config);
     let token = admin_token(config)?;
 
-    let mut response = ureq::get(format!("{base}{BASE_PATH}/users"))
+    let mut response = client(config)?
+        .get(format!("{base}{BASE_PATH}/users"))
         .header("Authorization", format!("Bearer {token}"))
         .call()
         .map_err(|error| explain(error, &base))?;
@@ -271,10 +308,11 @@ fn print_link(body: &str) -> Result<()> {
 }
 
 pub fn create_user(config: &Config, email: &str, name: &str) -> Result<()> {
-    let base = local_url(config.listen);
+    let base = server_url(config);
     let token = admin_token(config)?;
 
-    let result = ureq::post(format!("{base}{BASE_PATH}/users"))
+    let result = client(config)?
+        .post(format!("{base}{BASE_PATH}/users"))
         .header("Authorization", format!("Bearer {token}"))
         .header("Content-Type", "application/json")
         .send(serde_json::json!({ "email": email, "name": name }).to_string());
@@ -287,10 +325,11 @@ pub fn create_user(config: &Config, email: &str, name: &str) -> Result<()> {
 }
 
 pub fn print_setup_link(config: &Config, id: i64) -> Result<()> {
-    let base = local_url(config.listen);
+    let base = server_url(config);
     let token = admin_token(config)?;
 
-    let mut response = ureq::post(format!("{base}{BASE_PATH}/users/{id}/setup-link"))
+    let mut response = client(config)?
+        .post(format!("{base}{BASE_PATH}/users/{id}/setup-link"))
         .header("Authorization", format!("Bearer {token}"))
         .send_empty()
         .map_err(|error| users_error(error, &base))?;
@@ -299,10 +338,11 @@ pub fn print_setup_link(config: &Config, id: i64) -> Result<()> {
 
 /// `action` is the last part of the API's address for it.
 pub fn change_user(config: &Config, id: i64, action: &str) -> Result<()> {
-    let base = local_url(config.listen);
+    let base = server_url(config);
     let token = admin_token(config)?;
 
-    ureq::post(format!("{base}{BASE_PATH}/users/{id}/{action}"))
+    client(config)?
+        .post(format!("{base}{BASE_PATH}/users/{id}/{action}"))
         .header("Authorization", format!("Bearer {token}"))
         .send_empty()
         .map_err(|error| users_error(error, &base))?;
@@ -311,10 +351,11 @@ pub fn change_user(config: &Config, id: i64, action: &str) -> Result<()> {
 }
 
 pub fn delete_user(config: &Config, id: i64) -> Result<()> {
-    let base = local_url(config.listen);
+    let base = server_url(config);
     let token = admin_token(config)?;
 
-    ureq::delete(format!("{base}{BASE_PATH}/users/{id}"))
+    client(config)?
+        .delete(format!("{base}{BASE_PATH}/users/{id}"))
         .header("Authorization", format!("Bearer {token}"))
         .call()
         .map_err(|error| users_error(error, &base))?;
@@ -326,16 +367,46 @@ pub fn delete_user(config: &Config, id: i64) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn url_for(settings: &str) -> String {
+        let text = format!("{settings}\nmetrics \"duckdb\" {{\n  path = \"x\"\n}}\n");
+        server_url(&Config::parse(&text).unwrap())
+    }
+
     #[test]
-    fn local_commands_reach_a_server_listening_on_all_addresses() {
+    fn a_server_on_every_address_is_reached_on_this_machine() {
         assert_eq!(
-            local_url("0.0.0.0:9000".parse().unwrap()),
+            url_for(r#"listen = "0.0.0.0:9000""#),
             "http://127.0.0.1:9000"
         );
-        assert_eq!(local_url("[::]:9000".parse().unwrap()), "http://[::1]:9000");
+        assert_eq!(url_for(r#"listen = "[::]:9000""#), "http://[::1]:9000");
         assert_eq!(
-            local_url("10.0.0.1:9000".parse().unwrap()),
+            url_for(r#"listen = "10.0.0.1:9000""#),
             "http://10.0.0.1:9000"
         );
+    }
+
+    #[test]
+    fn a_server_with_https_is_reached_by_the_name_on_its_certificate() {
+        let settings = r#"
+            listen = "0.0.0.0:443"
+            public_url = "wss://maxnines.example.com/ws"
+            tls {
+              certificate_file = "a.crt"
+              key_file = "a.key"
+            }
+        "#;
+        assert_eq!(url_for(settings), "https://maxnines.example.com");
+    }
+
+    #[test]
+    fn a_port_in_the_public_address_is_kept() {
+        let settings = r#"
+            public_url = "wss://maxnines.example.com:8443/ws"
+            tls {
+              certificate_file = "a.crt"
+              key_file = "a.key"
+            }
+        "#;
+        assert_eq!(url_for(settings), "https://maxnines.example.com:8443");
     }
 }

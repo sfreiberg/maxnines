@@ -25,6 +25,32 @@ trusted_proxies = []
 heartbeat_interval_secs = 5
 heartbeat_timeout_secs  = 15
 
+# HTTPS. Leave this out behind a proxy that handles it, or on a trusted network. With
+# it, public_url has to start with wss://. Certificates are picked up as they change,
+# with no restart.
+#
+# Your own certificate:
+#
+# tls {
+#   certificate_file = "/etc/maxnines/server.crt"
+#   key_file         = "/etc/maxnines/server.key"
+# }
+#
+# Or automatic certificates from Let's Encrypt. The service checks who you are by
+# connecting to this server on port 443, so that has to reach it from the internet.
+#
+# tls {
+#   acme {
+#     domains   = ["maxnines.example.com"]
+#     email     = "you@example.com"
+#     cache_dir = "/var/lib/maxnines/acme"
+#
+#     # Another ACME service, and who to trust for a private one.
+#     # directory = "https://acme-staging-v02.api.letsencrypt.org/directory"
+#     # ca_file   = "/etc/maxnines/acme-ca.pem"
+#   }
+# }
+
 # Where samples are saved.
 metrics "duckdb" {
   # Parent folders are created if needed. The .nosync folder keeps the live
