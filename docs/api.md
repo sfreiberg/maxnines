@@ -525,14 +525,16 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/alerts"
       "resolve_reason": null,
       "acknowledged_by": null,
       "acknowledged_ms": null,
-      "silenced_by": null
+      "silenced_by": null,
+      "maintenance_window": null
     }
   ],
   "resolved": []
 }
 ```
 
-`silenced_by` is the ID of the silence keeping an open alert's notifications back.
+`silenced_by` is the ID of the silence keeping an open alert's notifications back, and
+`maintenance_window` is the ID of the [window](#maintenance-windows) doing so.
 
 ### Acknowledge an alert
 
@@ -613,6 +615,60 @@ Returns `201` with the new `id`.
 
 Ends it now, and keeps it in the list of ended silences. Returns `204`, or `404` if it
 isn't running.
+
+## Maintenance windows
+
+A maintenance window is a silence that comes round on a schedule. Times are wall clock
+times in the window's time zone, so it keeps its place in the day when the clocks change.
+
+| Field | Meaning |
+|---|---|
+| `name` | Required. |
+| `rule_id` | The alert rule it covers. Leave it out for every rule. |
+| `filter` | Which hosts it covers, as for a [silence](#silences). |
+| `days` | Required. The days it starts on: `mon`, `tue`, `wed`, `thu`, `fri`, `sat` or `sun`. |
+| `start_time` | Required. When it starts, like `02:00`. |
+| `duration_minutes` | Required. How long it lasts, up to 7 days. |
+| `time_zone` | Required. A time zone database name, like `Europe/London` or `UTC`. |
+
+Deleting a rule deletes its windows too.
+
+### List maintenance windows
+
+`GET /api/v1/maintenance-windows`
+
+```sh
+curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/maintenance-windows"
+```
+
+### Create a maintenance window
+
+`POST /api/v1/maintenance-windows`
+
+```sh
+curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Weekly patching", "filter": "env=staging", "days": ["sun"], "start_time": "02:00", "duration_minutes": 120, "time_zone": "Europe/London"}' \
+  "$MAXNINES_URL/api/v1/maintenance-windows"
+```
+
+Returns `201` with the new `id`.
+
+### Get a maintenance window
+
+`GET /api/v1/maintenance-windows/{id}`
+
+### Update a maintenance window
+
+`PUT /api/v1/maintenance-windows/{id}`
+
+Takes the same fields as creating one, and returns `204`.
+
+### Delete a maintenance window
+
+`DELETE /api/v1/maintenance-windows/{id}`
+
+Returns `204`.
 
 ## Alert rules
 

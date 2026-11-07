@@ -1,6 +1,7 @@
 //! Silences: being told nothing about some alerts for a while, as during planned work.
 //! An alert that's silenced still fires and still shows, and only its notifications
-//! wait. If it's still firing when the silence ends, they're sent then.
+//! wait. If it's still firing when the silence ends, they're sent then. Maintenance
+//! windows work the same way, on a schedule.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -11,6 +12,7 @@ use tracing::warn;
 use crate::alerting::Alert;
 use crate::facts::FlatFacts;
 use crate::host_filter::HostFilter;
+use crate::maintenance::MaintenanceWindow;
 use crate::models::Database;
 use crate::remote_checks::FLEET_AGENT_ID;
 
@@ -49,38 +51,105 @@ pub fn check_silence(input: &SilenceInput) -> Result<()> {
     if input.reason.chars().count() > MAX_REASON_CHARS {
         bail!("The reason is too long. It can be up to {MAX_REASON_CHARS} characters.");
     }
-    if input.filter.chars().count() > MAX_FILTER_CHARS {
-        bail!("The filter is too long. It can be up to {MAX_FILTER_CHARS} characters.");
-    }
-    if let Err(error) = HostFilter::parse(&input.filter) {
-        bail!("{error}");
-    }
+    check_filter(&input.filter)?;
     if input.duration_secs == 0 || input.duration_secs > MAX_DURATION_SECS {
         bail!("A silence can last up to 30 days.");
     }
     Ok(())
 }
 
-/// The silences running at one moment, ready to compare with alerts.
+/// Whether a filter can be saved for a silence or a maintenance window.
+pub fn check_filter(filter: &str) -> Result<()> {
+    if filter.chars().count() > MAX_FILTER_CHARS {
+        bail!("The filter is too long. It can be up to {MAX_FILTER_CHARS} characters.");
+    }
+    if let Err(error) = HostFilter::parse(filter) {
+        bail!("{error}");
+    }
+    Ok(())
+}
+
+/// What's keeping an alert's notifications back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cover {
+    Silence { id: i64, ends_ms: i64 },
+    Window { id: i64, ends_ms: i64 },
+}
+
+impl Cover {
+    pub fn ends_ms(self) -> i64 {
+        match self {
+            Self::Silence { ends_ms, .. } | Self::Window { ends_ms, .. } => ends_ms,
+        }
+    }
+}
+
+struct Quiet {
+    cover: Cover,
+    rule_id: Option<i64>,
+    /// Empty if it covers every host.
+    filter: Option<HostFilter>,
+}
+
+impl Quiet {
+    fn new(cover: Cover, rule_id: Option<i64>, filter: &str) -> Option<Self> {
+        let parsed = match HostFilter::parse(filter) {
+            Ok(parsed) => parsed,
+            // Filters are checked when saved, so only a change to filters gets here.
+            Err(error) => {
+                warn!(?cover, error, "ignoring something with a bad filter");
+                return None;
+            }
+        };
+        Some(Self {
+            cover,
+            rule_id,
+            filter: (!filter.is_empty()).then_some(parsed),
+        })
+    }
+}
+
+/// The silences and maintenance windows running at one moment, ready to compare with
+/// alerts.
 pub struct ActiveSilences {
-    silences: Vec<(Silence, HostFilter)>,
+    quiet: Vec<Quiet>,
     facts: BTreeMap<String, FlatFacts>,
 }
 
 impl ActiveSilences {
     pub async fn load(database: &Database, now_ms: i64) -> Result<Self> {
-        let mut silences = Vec::new();
-        for silence in database.active_silences(now_ms).await? {
-            match HostFilter::parse(&silence.filter) {
-                Ok(filter) => silences.push((silence, filter)),
-                // Filters are checked when saved, so only a change to filters gets here.
-                Err(error) => warn!(id = silence.id, error, "ignoring a silence's filter"),
-            }
-        }
+        let silences = database.active_silences(now_ms).await?;
+        let windows = database.list_maintenance_windows().await?;
+        Self::load_from(database, silences, windows, now_ms).await
+    }
 
-        let names: BTreeSet<&str> = silences
+    async fn load_from(
+        database: &Database,
+        silences: Vec<Silence>,
+        windows: Vec<MaintenanceWindow>,
+        now_ms: i64,
+    ) -> Result<Self> {
+        let silences = silences.into_iter().filter_map(|silence| {
+            let cover = Cover::Silence {
+                id: silence.id,
+                ends_ms: silence.ends_ms,
+            };
+            Quiet::new(cover, silence.rule_id, &silence.filter)
+        });
+        let windows = windows.into_iter().filter_map(|window| {
+            let cover = Cover::Window {
+                id: window.id,
+                ends_ms: window.ends_at(now_ms)?,
+            };
+            Quiet::new(cover, window.window.rule_id, &window.window.filter)
+        });
+        let mut quiet: Vec<Quiet> = silences.chain(windows).collect();
+        quiet.sort_by_key(|entry| std::cmp::Reverse(entry.cover.ends_ms()));
+
+        let names: BTreeSet<&str> = quiet
             .iter()
-            .flat_map(|(_, filter)| filter.fact_names())
+            .filter_map(|entry| entry.filter.as_ref())
+            .flat_map(HostFilter::fact_names)
             .collect();
         let facts = if names.is_empty() {
             BTreeMap::new()
@@ -88,23 +157,21 @@ impl ActiveSilences {
             let names: Vec<&str> = names.into_iter().collect();
             database.facts_named(&names).await?
         };
-        Ok(Self { silences, facts })
+        Ok(Self { quiet, facts })
     }
 
-    /// The longest lasting silence that covers an alert. A group's alert has no host to
-    /// compare, so a filter never covers one.
-    pub fn covering(&self, alert: &Alert) -> Option<&Silence> {
-        let covers = |silence: &Silence, filter: &HostFilter| {
-            let rule = silence.rule_id.is_none_or(|id| alert.rule_id == Some(id));
-            let host = silence.filter.is_empty()
-                || (alert.agent_id != FLEET_AGENT_ID
-                    && filter.matches(&alert.host, self.facts.get(&alert.agent_id)));
+    /// Whatever covers an alert for longest. A group's alert has no host to compare, so
+    /// a filter never covers one.
+    pub fn covering(&self, alert: &Alert) -> Option<Cover> {
+        let covers = |entry: &&Quiet| {
+            let rule = entry.rule_id.is_none_or(|id| alert.rule_id == Some(id));
+            let host = entry.filter.as_ref().is_none_or(|filter| {
+                alert.agent_id != FLEET_AGENT_ID
+                    && filter.matches(&alert.host, self.facts.get(&alert.agent_id))
+            });
             rule && host
         };
-        self.silences
-            .iter()
-            .find(|(silence, filter)| covers(silence, filter))
-            .map(|(silence, _)| silence)
+        self.quiet.iter().find(covers).map(|entry| entry.cover)
     }
 }
 

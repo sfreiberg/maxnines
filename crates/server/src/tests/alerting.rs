@@ -3708,6 +3708,227 @@ mod silences {
     }
 }
 
+mod maintenance_windows {
+    use super::*;
+    use crate::maintenance::MaintenanceWindowInput;
+
+    /// Every day from midnight UTC, so `test.now` falls inside it unless a test runs
+    /// right at the end of the day.
+    fn all_day() -> MaintenanceWindowInput {
+        MaintenanceWindowInput {
+            name: "Patching".to_string(),
+            rule_id: None,
+            filter: String::new(),
+            days: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+                .map(String::from)
+                .to_vec(),
+            start_time: "00:00".to_string(),
+            duration_minutes: 24 * 60,
+            time_zone: "UTC".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_window_keeps_notifications_back_until_it_is_gone() {
+        let mut test = Harness::start().await;
+        let window = test.database().create_maintenance_window(&all_day()).await;
+        let window = window.unwrap();
+        let hook = FakeOnCall::default();
+        let url = hook.start().await;
+        let notifier = firing_on(&mut test, ChannelKind::Webhook, &url, Senders::default()).await;
+
+        notifier.deliver_due(test.now).await.unwrap();
+        assert!(hook.events().is_empty());
+        assert_eq!(test.open().await.len(), 1);
+
+        test.database()
+            .delete_maintenance_window(window)
+            .await
+            .unwrap();
+        notifier.deliver_due(test.now + 1000).await.unwrap();
+        notifier.deliver_due(test.now + 2000).await.unwrap();
+        assert_eq!(hook.events().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_window_only_covers_its_hosts() {
+        let mut test = Harness::start().await;
+        let input = MaintenanceWindowInput {
+            filter: "hostname=db*".to_string(),
+            ..all_day()
+        };
+        test.database()
+            .create_maintenance_window(&input)
+            .await
+            .unwrap();
+        let hook = FakeOnCall::default();
+        let url = hook.start().await;
+        let notifier = firing_on(&mut test, ChannelKind::Webhook, &url, Senders::default()).await;
+
+        notifier.deliver_due(test.now).await.unwrap();
+
+        assert_eq!(hook.events().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_rule_deletes_its_windows() {
+        let test = Harness::start().await;
+        let rule = test
+            .database()
+            .create_alert_rule(&cpu_rule())
+            .await
+            .unwrap();
+        let input = MaintenanceWindowInput {
+            rule_id: Some(rule),
+            ..all_day()
+        };
+        let id = test
+            .database()
+            .create_maintenance_window(&input)
+            .await
+            .unwrap();
+
+        test.database().delete_alert_rule(rule).await.unwrap();
+
+        let found = test.database().get_maintenance_window(id).await.unwrap();
+        assert_eq!(found, None);
+    }
+
+    #[tokio::test]
+    async fn the_api_manages_windows_and_says_which_covers_an_alert() {
+        let mut test = Harness::start().await;
+        let hook = FakeOnCall::default();
+        let url = hook.start().await;
+        firing_on(&mut test, ChannelKind::Webhook, &url, Senders::default()).await;
+        let server = &test.server;
+
+        let mut body = serde_json::to_value(all_day()).unwrap();
+        let (status, created) = api(server, "POST", "/api/v1/maintenance-windows", &body).await;
+        assert_eq!(status, 201, "{created}");
+        let id = created["id"].as_i64().unwrap();
+        let path = format!("/api/v1/maintenance-windows/{id}");
+
+        let (_, alerts) = api(server, "GET", "/api/v1/alerts", &Value::Null).await;
+        assert_eq!(alerts["open"][0]["maintenance_window"], id);
+        assert_eq!(alerts["open"][0]["silenced_by"], Value::Null);
+
+        body["name"] = json!("Renamed");
+        let (status, _) = api(server, "PUT", &path, &body).await;
+        assert_eq!(status, 204);
+        let (status, shown) = api(server, "GET", &path, &Value::Null).await;
+        assert_eq!(status, 200);
+        assert_eq!(shown["name"], "Renamed");
+        let (_, listed) = api(server, "GET", "/api/v1/maintenance-windows", &Value::Null).await;
+        assert_eq!(listed[0]["id"], id);
+
+        body["time_zone"] = json!("Mars/Olympus");
+        let (status, _) = api(server, "PUT", &path, &body).await;
+        assert_eq!(status, 422);
+
+        let (status, _) = api(server, "DELETE", &path, &Value::Null).await;
+        assert_eq!(status, 204);
+        let (status, _) = api(server, "GET", &path, &Value::Null).await;
+        assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
+    async fn windows_are_added_changed_and_deleted_on_the_pages() {
+        let test = Harness::start().await;
+        let mut browser = Browser::default();
+        let fields = [
+            ("name", "Weekly patching"),
+            ("rule_id", ""),
+            ("filter", "env=staging"),
+            ("day_sun", "on"),
+            ("day_sat", "on"),
+            ("start_time", "02:00"),
+            ("duration_minutes", "120"),
+            ("time_zone", "Europe/London"),
+        ];
+
+        let form = "/alerts/maintenance/new";
+        let page = browser
+            .submit(&test.server, form, "/alerts/maintenance", &fields)
+            .await;
+        assert_eq!(page.status, 303, "{}", page.body);
+
+        let windows = test.database().list_maintenance_windows().await.unwrap();
+        assert_eq!(windows[0].window.days, ["sat", "sun"]);
+        let id = windows[0].id;
+
+        let page = browser.get(&test.server, "/alerts/silences").await;
+        assert!(page.body.contains("Weekly patching"), "{}", page.body);
+        assert!(
+            page.body.contains("Saturday, Sunday at 02:00"),
+            "{}",
+            page.body
+        );
+
+        let edit = format!("/alerts/maintenance/{id}/edit");
+        let page = browser.get(&test.server, &edit).await;
+        assert!(
+            page.body.contains("value=\"Europe/London\""),
+            "{}",
+            page.body
+        );
+        assert!(
+            page.body.contains("name=\"day_sun\" checked"),
+            "{}",
+            page.body
+        );
+
+        let changed = [
+            ("name", "Monthly"),
+            ("day_mon", "on"),
+            ("start_time", "03:00"),
+            ("duration_minutes", "60"),
+            ("time_zone", "UTC"),
+        ];
+        let path = format!("/alerts/maintenance/{id}");
+        let page = browser.submit(&test.server, &edit, &path, &changed).await;
+        assert_eq!(page.status, 303, "{}", page.body);
+        let found = test
+            .database()
+            .get_maintenance_window(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.window.name, "Monthly");
+
+        let path = format!("/alerts/maintenance/{id}/delete");
+        let page = browser.submit(&test.server, &edit, &path, &[]).await;
+        assert_eq!(page.status, 303, "{}", page.body);
+        assert!(
+            test.database()
+                .list_maintenance_windows()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_form_explains_what_is_wrong_and_keeps_what_was_typed() {
+        let test = Harness::start().await;
+        let mut browser = Browser::default();
+        let fields = [
+            ("name", "Weekly patching"),
+            ("start_time", "02:00"),
+            ("duration_minutes", "120"),
+            ("time_zone", "UTC"),
+        ];
+        let form = "/alerts/maintenance/new";
+
+        let page = browser
+            .submit(&test.server, form, "/alerts/maintenance", &fields)
+            .await;
+
+        assert_eq!(page.status, 422);
+        assert!(page.body.contains("at least one day"), "{}", page.body);
+        assert!(page.body.contains("Weekly patching"), "{}", page.body);
+    }
+}
+
 mod reminders {
     use super::*;
     use crate::silences::SilenceInput;

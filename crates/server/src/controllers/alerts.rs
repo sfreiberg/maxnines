@@ -123,9 +123,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
     let open: Vec<AlertRow> = open
         .into_iter()
         .map(|alert| {
-            let silence = silences
-                .covering(&alert)
-                .map(|silence| time(silence.ends_ms));
+            let silence = silences.covering(&alert).map(|cover| time(cover.ends_ms()));
             AlertRow {
                 silenced_until: silence,
                 ..AlertRow::from(alert)

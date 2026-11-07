@@ -23,6 +23,7 @@ use crate::app_state::AppState;
 use crate::calculations::{self, Calculation, Question};
 use crate::dashboards::{Placed, WidgetInput, check_layout, check_name};
 use crate::facts::unflatten;
+use crate::maintenance::MaintenanceWindowInput;
 use crate::metrics::{self, METRICS, Metric, SeriesResult, TimeRange, Unit, now_ms};
 use crate::models::{
     ConfigStatus, RuleInput, UserChange, check_api_key_name, check_new_user, expiry_after, is_theme,
@@ -32,7 +33,7 @@ use crate::presence::AgentPresence;
 use crate::registration::{AgentRecord, AgentState, hash_token};
 use crate::remote_checks::{RemoteCheck, RemoteCheckInput};
 use crate::rule_engine::{self, ResolvedConfig};
-use crate::silences::{ActiveSilences, SilenceInput};
+use crate::silences::{ActiveSilences, Cover, SilenceInput};
 
 /// An agent as admins see it.
 #[derive(Debug, Serialize, Deserialize)]
@@ -103,6 +104,16 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/silences", get(list_silences).post(create_silence))
         .route("/silences/{id}", get(show_silence))
         .route("/silences/{id}/end", post(end_silence))
+        .route(
+            "/maintenance-windows",
+            get(list_maintenance_windows).post(create_maintenance_window),
+        )
+        .route(
+            "/maintenance-windows/{id}",
+            get(show_maintenance_window)
+                .put(update_maintenance_window)
+                .delete(delete_maintenance_window),
+        )
         .route(
             "/alert-rules",
             get(list_alert_rules).post(create_alert_rule),
@@ -615,6 +626,23 @@ struct OpenAlert {
     alert: Alert,
     /// The silence keeping its notifications back, if there is one.
     silenced_by: Option<i64>,
+    /// The maintenance window keeping them back, if there is one.
+    maintenance_window: Option<i64>,
+}
+
+impl OpenAlert {
+    fn new(alert: Alert, cover: Option<Cover>) -> Self {
+        let (silenced_by, maintenance_window) = match cover {
+            Some(Cover::Silence { id, .. }) => (Some(id), None),
+            Some(Cover::Window { id, .. }) => (None, Some(id)),
+            None => (None, None),
+        };
+        Self {
+            alert,
+            silenced_by,
+            maintenance_window,
+        }
+    }
 }
 
 async fn list_alerts(State(state): State<AppState>) -> Response {
@@ -625,9 +653,9 @@ async fn list_alerts(State(state): State<AppState>) -> Response {
             .open_alerts()
             .await?
             .into_iter()
-            .map(|alert| OpenAlert {
-                silenced_by: silences.covering(&alert).map(|silence| silence.id),
-                alert,
+            .map(|alert| {
+                let cover = silences.covering(&alert);
+                OpenAlert::new(alert, cover)
             })
             .collect();
         let resolved = state.database.resolved_alerts(RESOLVED_ALERTS).await?;
@@ -880,6 +908,63 @@ async fn delete_widget(
 fn refused(error: &anyhow::Error) -> Response {
     let body = Json(json!({ "error": format!("{error:#}") }));
     (StatusCode::UNPROCESSABLE_ENTITY, body).into_response()
+}
+
+async fn list_maintenance_windows(State(state): State<AppState>) -> Response {
+    match state.database.list_maintenance_windows().await {
+        Ok(windows) => Json(windows).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn show_maintenance_window(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<i64>,
+) -> Response {
+    match state.database.get_maintenance_window(id).await {
+        Ok(Some(window)) => Json(window).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn create_maintenance_window(
+    State(state): State<AppState>,
+    Json(input): Json<MaintenanceWindowInput>,
+) -> Response {
+    if let Err(error) = state.check_maintenance_window(&input).await {
+        return refused(&error);
+    }
+    match state.database.create_maintenance_window(&input).await {
+        Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn update_maintenance_window(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<i64>,
+    Json(input): Json<MaintenanceWindowInput>,
+) -> Response {
+    if let Err(error) = state.check_maintenance_window(&input).await {
+        return refused(&error);
+    }
+    match state.database.update_maintenance_window(id, &input).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn delete_maintenance_window(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<i64>,
+) -> Response {
+    match state.database.delete_maintenance_window(id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
 }
 
 async fn list_alert_rules(State(state): State<AppState>) -> Response {

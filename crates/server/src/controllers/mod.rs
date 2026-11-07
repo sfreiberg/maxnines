@@ -16,6 +16,7 @@ mod dashboards;
 mod fleet;
 mod health;
 pub mod host_list;
+mod maintenance_windows;
 mod metrics;
 mod notification_channels;
 mod overview;
@@ -75,6 +76,7 @@ pub fn app(state: AppState) -> Router {
         .merge(agents::routes())
         .merge(alerts::routes())
         .merge(silences::routes())
+        .merge(maintenance_windows::routes())
         .merge(alert_rules::routes())
         .merge(notification_channels::routes())
         .merge(remote_checks::routes())
@@ -139,7 +141,7 @@ fn section_of(template: &str) -> &'static str {
         "agents" => "agents",
         "metrics" => "metrics",
         "remote_checks" => "checks",
-        "alerts" | "silences" => "alerts",
+        "alerts" | "silences" | "maintenance_windows" => "alerts",
         "server" => "server",
         "dashboards" => "dashboards",
         "settings" | "rules" | "alert_rules" | "notification_channels" => "settings",

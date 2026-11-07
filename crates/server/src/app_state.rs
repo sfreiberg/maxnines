@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, watch};
 use crate::alerting::{self, AlertRuleInput, ChannelInput};
 use crate::calculations::Sources;
 use crate::facts::{FlatFacts, unflatten};
+use crate::maintenance::{self, MaintenanceWindowInput};
 use crate::metrics::Metrics;
 use crate::models::{Database, RuleInput};
 use crate::notifier::Senders;
@@ -131,6 +132,18 @@ impl AppState {
             if !channels.iter().any(|channel| channel.id == *wanted) {
                 bail!("there's no notification channel {wanted}");
             }
+        }
+        Ok(())
+    }
+
+    /// Everything that has to be true for a maintenance window to be saved.
+    pub async fn check_maintenance_window(&self, input: &MaintenanceWindowInput) -> Result<()> {
+        maintenance::check_window(input)?;
+        if let Some(id) = input.rule_id {
+            ensure!(
+                self.database.get_alert_rule(id).await?.is_some(),
+                "there's no alert rule {id}"
+            );
         }
         Ok(())
     }

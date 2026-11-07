@@ -21,6 +21,7 @@ impl MigratorTrait for Migrator {
             Box::new(AddCalculationRules),
             Box::new(CreateSilences),
             Box::new(AddRemindersAndAcknowledging),
+            Box::new(CreateMaintenanceWindows),
         ]
     }
 }
@@ -1469,6 +1470,91 @@ impl MigrationTrait for AddRemindersAndAcknowledging {
                     .drop_column(ReminderColumns::RemindEverySecs)
                     .to_owned(),
             )
+            .await
+    }
+}
+
+struct CreateMaintenanceWindows;
+
+impl MigrationName for CreateMaintenanceWindows {
+    fn name(&self) -> &str {
+        "m20261107_000014_create_maintenance_windows"
+    }
+}
+
+#[derive(Iden)]
+enum MaintenanceWindows {
+    Table,
+    Id,
+    Name,
+    RuleId,
+    Filter,
+    Days,
+    StartTime,
+    DurationMinutes,
+    TimeZone,
+}
+
+/// A window goes with its rule, for the same reason a silence does.
+#[async_trait::async_trait]
+impl MigrationTrait for CreateMaintenanceWindows {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(MaintenanceWindows::Table)
+                    .col(
+                        ColumnDef::new(MaintenanceWindows::Id)
+                            .big_integer()
+                            .not_null()
+                            .auto_increment()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(MaintenanceWindows::Name)
+                            .string_len(255)
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(MaintenanceWindows::RuleId).big_integer())
+                    .col(
+                        ColumnDef::new(MaintenanceWindows::Filter)
+                            .string_len(500)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(MaintenanceWindows::Days)
+                            .string_len(32)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(MaintenanceWindows::StartTime)
+                            .string_len(5)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(MaintenanceWindows::DurationMinutes)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(MaintenanceWindows::TimeZone)
+                            .string_len(64)
+                            .not_null(),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(MaintenanceWindows::Table, MaintenanceWindows::RuleId)
+                            .to(AlertRules::Table, AlertRules::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(MaintenanceWindows::Table).to_owned())
             .await
     }
 }

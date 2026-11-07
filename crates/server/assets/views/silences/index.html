@@ -35,6 +35,33 @@
 <p class="empty">Nothing is silenced.</p>
 {% endif %}
 
+<section>
+<div class="title-row">
+  <h2>Maintenance windows</h2>
+  <div class="actions"><a class="button secondary" href="/alerts/maintenance/new">New window</a></div>
+</div>
+{% if windows %}
+<div class="tablebox"><table>
+  <thead>
+    <tr><th>Name</th><th>When</th><th>Rule</th><th>Hosts</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for window in windows %}
+    <tr>
+      <td><a href="/alerts/maintenance/{{ window.id }}/edit">{{ window.name }}</a></td>
+      <td>{{ window.schedule }}</td>
+      <td>{{ window.rule }}</td>
+      <td>{{ window.hosts }}</td>
+      <td>{% if window.running %}<span class="badge neutral">Running</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table></div>
+{% else %}
+<p class="empty">No maintenance windows. They work like a silence that comes round on a schedule.</p>
+{% endif %}
+</section>
+
 {% if ended %}
 <section>
 <h2>Ended</h2>

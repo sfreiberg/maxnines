@@ -301,6 +301,10 @@ silence ends, the notifications go out then, and if it ends first, nobody hears 
 Anyone who had already been told about an alert still hears when it ends, which keeps
 on-call services from leaving an incident open.
 
+A maintenance window is a silence that comes round on a schedule, like Sundays from 02:00
+for two hours. Add one under **Alerts > Silences**, with a time zone so it keeps its place
+in the day when the clocks change.
+
 ## Reminders and acknowledging
 
 Set **Remind every** on an alert rule to hear again while it's still firing, at most

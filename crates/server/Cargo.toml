@@ -9,6 +9,7 @@ anyhow.workspace = true
 clap.workspace = true
 axum = { version = "0.8.9", features = ["ws"] }
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
 # Stay on DuckDB 1.5: 1.20000.x bundles a pre-release 2.0 with a development
 # storage format. Tilde because a minor bump changes the bundled DuckDB.
 duckdb = { version = "~1.10506.1", features = ["bundled", "json"] }

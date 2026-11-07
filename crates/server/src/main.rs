@@ -10,6 +10,7 @@ mod dashboards;
 mod fact_history;
 mod facts;
 mod host_filter;
+mod maintenance;
 mod metric_charts;
 mod metrics;
 mod migrations;

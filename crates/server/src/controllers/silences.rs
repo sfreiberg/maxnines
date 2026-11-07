@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use super::{CsrfForm, Page, server_error, signed_in_user};
 use crate::app_state::AppState;
 use crate::fact_history::format_time;
+use crate::maintenance::MaintenanceWindow;
 use crate::metrics::now_ms;
 use crate::silences::{Silence, SilenceInput};
 
@@ -79,17 +80,63 @@ async fn rows(state: &AppState, silences: Vec<Silence>) -> anyhow::Result<Vec<Si
         .collect())
 }
 
+#[derive(Serialize)]
+struct WindowRow {
+    id: i64,
+    name: String,
+    schedule: String,
+    hosts: String,
+    rule: String,
+    running: bool,
+}
+
+async fn window_rows(
+    state: &AppState,
+    windows: Vec<MaintenanceWindow>,
+    now: i64,
+) -> anyhow::Result<Vec<WindowRow>> {
+    let rules = state.database.list_alert_rules().await?;
+    let rule_name = |id: i64| {
+        let rule = rules.iter().find(|rule| rule.id == id);
+        rule.map(|rule| rule.rule.name.clone()).unwrap_or_default()
+    };
+    Ok(windows
+        .into_iter()
+        .map(|window| WindowRow {
+            schedule: window.schedule(),
+            running: window.ends_at(now).is_some(),
+            id: window.id,
+            rule: window
+                .window
+                .rule_id
+                .map_or("Every rule".to_string(), rule_name),
+            hosts: if window.window.filter.is_empty() {
+                "Every host".to_string()
+            } else {
+                window.window.filter
+            },
+            name: window.window.name,
+        })
+        .collect())
+}
+
 async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
     let now = now_ms();
     let lists = async {
         let active = state.database.active_silences(now).await?;
         let ended = state.database.ended_silences(now, HISTORY).await?;
-        anyhow::Ok((rows(&state, active).await?, rows(&state, ended).await?))
+        let windows = state.database.list_maintenance_windows().await?;
+        anyhow::Ok((
+            rows(&state, active).await?,
+            rows(&state, ended).await?,
+            window_rows(&state, windows, now).await?,
+        ))
     };
     match lists.await {
-        Ok((active, ended)) => Page::new(&state, &token, "silences/index.html")
+        Ok((active, ended, windows)) => Page::new(&state, &token, "silences/index.html")
             .with("active", &active)
             .with("ended", &ended)
+            .with("windows", &windows)
             .render(),
         Err(error) => server_error(&error),
     }

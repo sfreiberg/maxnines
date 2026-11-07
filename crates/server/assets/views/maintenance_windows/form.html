@@ -1,0 +1,65 @@
+{% extends "layouts/application.html" %}
+{% block title %}{% if id %}Edit maintenance window{% else %}New maintenance window{% endif %} · MaxNines{% endblock title %}
+{% block main_class %} class="narrow"{% endblock main_class %}
+{% block content %}
+<p class="breadcrumb"><a href="/alerts/silences">Silences</a></p>
+<h1>{% if id %}Edit maintenance window{% else %}New maintenance window{% endif %}</h1>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<form method="post" action="{% if id %}/alerts/maintenance/{{ id }}{% else %}/alerts/maintenance{% endif %}" class="stacked">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+
+  <label>Name
+    <input type="text" name="name" value="{{ window.name }}" required maxlength="255" placeholder="Weekly patching">
+  </label>
+
+  <fieldset>
+    <legend>Every</legend>
+    {% for day in days %}
+    <label class="check"><input type="checkbox" name="day_{{ day.value }}"{% if day.chosen %} checked{% endif %}> {{ day.label }}</label>
+    {% endfor %}
+  </fieldset>
+
+  <label>Starting at
+    <input type="time" name="start_time" value="{{ window.start_time }}" required>
+  </label>
+
+  <label>For (minutes)
+    <input type="number" name="duration_minutes" value="{{ window.duration_minutes }}" min="1" max="10080" required>
+  </label>
+
+  <label>Time zone
+    <input type="text" name="time_zone" value="{{ window.time_zone }}" list="time-zones" required spellcheck="false">
+    <datalist id="time-zones">
+      {% for zone in zones %}<option value="{{ zone }}"></option>{% endfor %}
+    </datalist>
+    <small>It keeps its place in the day when the clocks change.</small>
+  </label>
+
+  <label>Rule
+    <select name="rule_id">
+      <option value="">Every rule</option>
+      {% for rule in rules %}
+      <option value="{{ rule.id }}"{% if rule.id == window.rule_id %} selected{% endif %}>{{ rule.name }}</option>
+      {% endfor %}
+    </select>
+  </label>
+
+  <label>Hosts
+    <input type="text" name="filter" value="{{ window.filter }}" maxlength="500" spellcheck="false" placeholder="env=staging">
+    <small>The same filter as the host list. Leave empty for every host. Alerts about a group of machines only follow the rule above, so a window with a filter leaves them out.</small>
+  </label>
+
+  <div class="actions">
+    <button type="submit">Save window</button>
+    <a class="button secondary" href="/alerts/silences">Cancel</a>
+  </div>
+</form>
+{% if id %}
+<form method="post" action="/alerts/maintenance/{{ id }}/delete">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  <button type="submit" class="secondary">Delete window</button>
+</form>
+{% endif %}
+{% endblock content %}
