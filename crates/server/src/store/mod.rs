@@ -20,7 +20,7 @@ use maxnines_protocol::Sample;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::calculations::CalculationQuery;
 use crate::config::MetricsConfig;
@@ -36,6 +36,27 @@ const TIDY_CHECK_EVERY: Duration = Duration::from_secs(60);
 /// The pause between pieces of upkeep, so samples don't queue up behind it.
 const TIDY_PAUSE: Duration = Duration::from_millis(250);
 
+/// The end of what every store can hold, a little before the year 2300. Agents can
+/// send any time at all, so anything later is turned away before it gets this far.
+pub const LATEST_SAMPLE_MS: u64 = 10_413_791_999_000;
+
+/// How long to wait before each new try at a batch the store couldn't take. It adds up
+/// to about two minutes, which is plenty for a database to restart. Agents keep what
+/// isn't confirmed, so nothing's lost by giving up after that.
+#[cfg(not(test))]
+const RETRY_WAITS: [Duration; 8] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+    Duration::from_secs(30),
+    Duration::from_secs(30),
+    Duration::from_secs(30),
+];
+#[cfg(test)]
+const RETRY_WAITS: [Duration; 3] = [Duration::from_millis(1); 3];
+
 /// Enough to cover what an agent can have waiting to hear about: it keeps 64 samples
 /// in memory, and sends its backlog one at a time.
 const RECENT_SAMPLES_PER_AGENT: usize = 80;
@@ -45,6 +66,13 @@ pub trait Store: Send {
     /// Saves samples together, as waiting on the disk once is what makes this quick:
     /// either all of them are stored or none of them are.
     fn write(&mut self, samples: &[NewSample]) -> Result<()>;
+
+    /// Whether a batch that failed is worth trying a sample at a time. Otherwise a
+    /// failure means the database can't be reached, and the whole batch waits to go
+    /// again, as trying each sample would only take far longer.
+    fn retries_samples_singly(&self) -> bool {
+        false
+    }
 
     /// Something to read with, which can run alongside writes.
     fn reader(&self) -> Result<Arc<dyn MetricsReader>>;
@@ -291,11 +319,14 @@ fn tidy(store: &mut dyn Store) -> bool {
     }
 }
 
-/// A failed write or panic only affects the sample that caused it, by trying the rest
-/// again one at a time. Returns which were saved.
-fn save(store: &mut dyn Store, samples: &[NewSample], counts: &WriteCounts) -> Vec<bool> {
+/// Writes a batch once, counting it if that works.
+fn write_batch(
+    store: &mut dyn Store,
+    samples: &[NewSample],
+    counts: &WriteCounts,
+) -> Result<(), String> {
     let started = Instant::now();
-    let error = match catch_unwind(AssertUnwindSafe(|| store.write(samples))) {
+    match catch_unwind(AssertUnwindSafe(|| store.write(samples))) {
         Ok(Ok(())) => {
             // From agents, as the server recording itself isn't ingesting anything.
             let from_agents = || samples.iter().filter(|new| new.agent_id != LOCAL_AGENT_ID);
@@ -309,21 +340,41 @@ fn save(store: &mut dyn Store, samples: &[NewSample], counts: &WriteCounts) -> V
             counts
                 .slowest_write_ms
                 .fetch_max(started.elapsed().as_millis() as u64, Ordering::Relaxed);
-            return vec![true; samples.len()];
+            Ok(())
         }
-        Ok(Err(error)) => format!("{error:#}"),
-        Err(_) => "the store panicked".to_string(),
-    };
-    if samples.len() > 1 {
-        samples
-            .iter()
-            .flat_map(|sample| save(store, std::slice::from_ref(sample), counts))
-            .collect()
-    } else {
-        counts.failed.fetch_add(1, Ordering::Relaxed);
-        error!(error, "write failed, sample not saved");
-        vec![false]
+        Ok(Err(error)) => Err(format!("{error:#}")),
+        Err(_) => Err("the store panicked".to_string()),
     }
+}
+
+/// Saves a batch, and returns which samples were saved. What wasn't stays with the
+/// agents that sent it, as they only let go of a sample once they hear it's stored.
+fn save(store: &mut dyn Store, samples: &[NewSample], counts: &WriteCounts) -> Vec<bool> {
+    let Err(mut error) = write_batch(store, samples, counts) else {
+        return vec![true; samples.len()];
+    };
+    if store.retries_samples_singly() {
+        if samples.len() > 1 {
+            return samples
+                .iter()
+                .flat_map(|sample| save(store, std::slice::from_ref(sample), counts))
+                .collect();
+        }
+    } else {
+        for wait in RETRY_WAITS {
+            warn!(error, samples = samples.len(), "write failed, trying again");
+            thread::sleep(wait);
+            match write_batch(store, samples, counts) {
+                Ok(()) => return vec![true; samples.len()],
+                Err(failure) => error = failure,
+            }
+        }
+    }
+    counts
+        .failed
+        .fetch_add(samples.len() as u64, Ordering::Relaxed);
+    error!(error, samples = samples.len(), "write failed, not saved");
+    vec![false; samples.len()]
 }
 
 /// How many readings a collector's output holds.
@@ -406,6 +457,10 @@ pub mod testing {
     pub struct MemoryStore(pub Saved);
 
     impl Store for MemoryStore {
+        fn retries_samples_singly(&self) -> bool {
+            true
+        }
+
         fn write(&mut self, samples: &[NewSample]) -> Result<()> {
             while self.0.paused.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(1));
@@ -548,6 +603,76 @@ mod tests {
             "load": { "one": 1, "five": { "deep": 2 } },
         });
         assert_eq!(count_values(&output), 6);
+    }
+
+    /// Fails a set number of times, as a database does while it's out of reach.
+    struct Unreachable {
+        failures: usize,
+        writes: Vec<usize>,
+    }
+
+    impl Store for Unreachable {
+        fn write(&mut self, samples: &[NewSample]) -> Result<()> {
+            self.writes.push(samples.len());
+            if self.failures > 0 {
+                self.failures -= 1;
+                anyhow::bail!("can't reach the database");
+            }
+            Ok(())
+        }
+
+        fn reader(&self) -> Result<Arc<dyn MetricsReader>> {
+            Ok(Arc::new(super::testing::EmptyReader))
+        }
+
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn batch(size: u64) -> Vec<NewSample> {
+        (0..size)
+            .map(|time| NewSample {
+                agent_id: "agent-1".to_string(),
+                host: "web".to_string(),
+                sample: Sample {
+                    timestamp_ms: time,
+                    metrics: BTreeMap::new(),
+                },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_batch_that_fails_goes_again_whole_and_never_a_sample_at_a_time() {
+        let mut store = Unreachable {
+            failures: 2,
+            writes: Vec::new(),
+        };
+        let counts = WriteCounts::default();
+
+        let saved = super::save(&mut store, &batch(100), &counts);
+
+        assert_eq!(store.writes, [100, 100, 100]);
+        assert_eq!(saved, vec![true; 100]);
+        assert_eq!(counts.written.load(Ordering::Relaxed), 100);
+        assert_eq!(counts.failed.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_database_that_stays_away_is_given_up_on_for_agents_to_send_again() {
+        let mut store = Unreachable {
+            failures: usize::MAX,
+            writes: Vec::new(),
+        };
+        let counts = WriteCounts::default();
+
+        let saved = super::save(&mut store, &batch(100), &counts);
+
+        assert_eq!(store.writes.len(), 1 + RETRY_WAITS.len());
+        assert!(store.writes.iter().all(|size| *size == 100));
+        assert_eq!(saved, vec![false; 100], "so nothing gets acknowledged");
+        assert_eq!(counts.failed.load(Ordering::Relaxed), 100);
     }
 
     #[test]

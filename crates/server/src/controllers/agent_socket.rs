@@ -21,7 +21,7 @@ use crate::facts::flatten;
 use crate::models::ConfigStatus;
 use crate::presence::Presence;
 use crate::registration::Admission;
-use crate::store::{NewSample, WriterCommand};
+use crate::store::{LATEST_SAMPLE_MS, NewSample, WriterCommand};
 
 /// The longest hostname DNS allows, and what the database column holds.
 const MAX_HOST_LEN: usize = 255;
@@ -380,6 +380,12 @@ fn receive(
     acks: &mpsc::Sender<u64>,
 ) -> Option<WriterCommand> {
     let job = match serde_json::from_str(text) {
+        Ok(AgentMessage::Sample(sample)) if sample.timestamp_ms > LATEST_SAMPLE_MS => {
+            // Answered, so the agent lets go of something that can never be stored.
+            warn!(id = agent.id, "skipping a sample with an impossible time");
+            acks.try_send(sample.timestamp_ms).ok();
+            return None;
+        }
         Ok(AgentMessage::Sample(sample)) => {
             let command = WriterCommand::SaveAndAck {
                 sample: NewSample {

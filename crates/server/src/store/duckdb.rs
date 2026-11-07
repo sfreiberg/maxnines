@@ -499,6 +499,10 @@ fn migrate(connection: &mut Connection, migrations: &[Migration]) -> Result<()> 
 }
 
 impl Store for DuckDbStore {
+    fn retries_samples_singly(&self) -> bool {
+        true
+    }
+
     fn write(&mut self, samples: &[NewSample]) -> Result<()> {
         let result = self.write_samples(samples);
         if result.is_err() {

@@ -21,7 +21,7 @@ use super::shared::{
     MAX_NAME_BYTES, MAX_SERIES_PER_AGENT, StoredSeries, labels_key, rebuilt_output, shortened,
     top_of,
 };
-use super::{CollectorStats, MetricsReader, NewSample, Store, StoreStats};
+use super::{CollectorStats, LATEST_SAMPLE_MS, MetricsReader, NewSample, Store, StoreStats};
 use crate::calculations::{Calculation, CalculationQuery, SMALLEST_STEP_MS, numbered};
 use crate::metrics::{
     LastSample, Metric, NewestReading, Point, Reading, Series, SeriesQuery, SeriesResult, Source,
@@ -29,9 +29,6 @@ use crate::metrics::{
 
 /// Anything beyond this is skipped, as in the other stores.
 const LARGEST_VALUE: &str = "1e300";
-
-/// The end of what a `DateTime64` can hold. Agents can send any time at all.
-const LATEST_TIME_MS: i64 = 10_413_791_999_000;
 
 /// Picking machines lists them all, which can be longer than ClickHouse's default.
 const MAX_QUERY_BYTES: &str = "67108864";
@@ -240,7 +237,7 @@ impl Memory {
     fn add_sample(&mut self, new: &NewSample, rows: &mut Rows) -> Result<()> {
         let time = i64::try_from(new.sample.timestamp_ms)
             .ok()
-            .filter(|time| *time <= LATEST_TIME_MS)
+            .filter(|_| new.sample.timestamp_ms <= LATEST_SAMPLE_MS)
             .context("timestamp out of range")?;
         let agent = new.agent_id.as_str();
         rows.reports.push(ReportRow {

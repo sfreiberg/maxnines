@@ -540,6 +540,28 @@ fn count_pings(receiver: futures_util::stream::SplitStream<Client>) -> Arc<Atomi
 }
 
 #[tokio::test]
+async fn a_sample_with_an_impossible_time_is_answered_but_never_stored() {
+    let server = start().await;
+    let agent = identity();
+    let mut client = server.connect_approved(&agent, "web-1").await;
+
+    send(&mut client, &sample(u64::MAX)).await;
+    loop {
+        if let ServerMessage::Ack { timestamp_ms } = read_server_message(&mut client).await {
+            assert_eq!(timestamp_ms, u64::MAX);
+            break;
+        }
+    }
+
+    send(&mut client, &sample(5)).await;
+    assert_eq!(
+        server.wait_for_sample().await.2,
+        5,
+        "and it blocked nothing"
+    );
+}
+
+#[tokio::test]
 async fn a_stalled_database_does_not_hold_up_samples_or_heartbeats() {
     let server = start().await;
     let agent = identity();
