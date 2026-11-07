@@ -764,24 +764,33 @@ impl MetricsReader for ClickHouseReader {
         );
         // An idle interface says nothing, but a CPU at 0% does.
         let having = if is_rate(query.metric.source) {
-            "HAVING max(v) > 0"
+            "WHERE peak > 0"
         } else {
             ""
         };
+        // Ranked in one pass, as ClickHouse would work a `WITH` out again for each use.
         let sql = format!(
-            "WITH usable AS ({values}),
-             ranked AS (
-                 SELECT series,
-                        row_number() OVER (ORDER BY avg(v) DESC, series) AS position,
-                        count() OVER () AS total
-                 FROM usable GROUP BY series {having}
+            "SELECT series, bucket, low_v AS min, high_v AS max, mean_v AS avg,
+                    toUInt64(lines) AS total
+             FROM (
+                 SELECT *, max(position) OVER () AS lines FROM (
+                     SELECT *, dense_rank() OVER (ORDER BY overall DESC, series) AS position
+                     FROM (
+                         SELECT *,
+                                sum(sum_v) OVER (PARTITION BY series)
+                                    / sum(rows_v) OVER (PARTITION BY series) AS overall,
+                                max(high_v) OVER (PARTITION BY series) AS peak
+                         FROM (
+                             SELECT series, toInt64(intDiv(t, {step}) * {step}) AS bucket,
+                                    avg(v) AS mean_v, min(v) AS low_v, max(v) AS high_v,
+                                    sum(v) AS sum_v, count() AS rows_v
+                             FROM ({values})
+                             GROUP BY series, bucket
+                         )
+                     ) {having}
+                 )
              )
-             SELECT u.series AS series, toInt64(intDiv(u.t, {step}) * {step}) AS bucket,
-                    avg(u.v) AS avg, min(u.v) AS min, max(u.v) AS max,
-                    toUInt64(any(r.total)) AS total
-             FROM usable u INNER JOIN ranked r ON u.series = r.series
-             WHERE r.position <= {max_series}
-             GROUP BY series, bucket
+             WHERE position <= {max_series}
              ORDER BY series, bucket",
             values = computed(query.metric, &scope),
             step = range.step_ms,
@@ -945,22 +954,25 @@ impl MetricsReader for ClickHouseReader {
             .map(|member| quoted(&member.agent_id))
             .collect();
         let agents = agents.join(", ");
-        let places: Vec<String> = places.iter().map(ToString::to_string).collect();
-        let places = places.join(", ");
 
         let range = query.range;
         let step = range.step_ms.max(SMALLEST_STEP_MS);
         let scope = format!(
-            "agent IN ({agents}) AND {}",
+            "has(chosen, agent) AND {}",
             time_between(range.from_ms, range.to_ms, "<")
         );
-        // Listing every machine again is slow to read, so it's only done if needed.
-        let line = if query.by_series {
-            "series".to_string()
+        // The list of machines is by far the longest part of the query, so it's only
+        // written once, and the list of groups only if there's more than one.
+        let (places, line) = if query.by_series {
+            (String::new(), "series".to_string())
         } else if groups.len() == 1 {
-            "'0'".to_string()
+            (String::new(), "'0'".to_string())
         } else {
-            format!("toString(transform(agent, [{agents}], [{places}], 0))")
+            let places: Vec<String> = places.iter().map(ToString::to_string).collect();
+            (
+                format!(", [{}] AS places", places.join(", ")),
+                "toString(transform(agent, chosen, places, 0))".to_string(),
+            )
         };
         // Named lines measure different things, like memory and swap, so they can't be
         // combined. Lines of the same thing, like each disk, can.
@@ -977,30 +989,31 @@ impl MetricsReader for ClickHouseReader {
             Calculation::Max => "max(v)",
             Calculation::Count => "toFloat64(count())",
         };
+        // Ranked in one pass, as ClickHouse would work a `WITH` out again for each use.
         let sql = format!(
-            "WITH per_series AS (
-                 SELECT {line} AS line, agent, series, intDiv(t, {step}) * {step} AS bucket,
-                        avg(v) AS v
-                 FROM ({values})
-                 WHERE 1 {only_main_line}
-                 GROUP BY line, agent, series, bucket
-             ),
-             combined AS (
-                 SELECT line, bucket, {combined} AS v
-                 FROM per_series
-                 WHERE bucket + {step} <= {to_ms}
-                 GROUP BY line, bucket
-             ),
-             ranked AS (
-                 SELECT line,
-                        row_number() OVER (ORDER BY avg(v) DESC, line) AS position,
-                        count() OVER () AS total
-                 FROM combined GROUP BY line
+            "WITH [{agents}] AS chosen{places}
+             SELECT line, toInt64(bucket) AS bucket, toFloat64(combined) AS value,
+                    toUInt64(lines) AS total
+             FROM (
+                 SELECT *, max(position) OVER () AS lines FROM (
+                     SELECT *, dense_rank() OVER (ORDER BY overall DESC, line) AS position
+                     FROM (
+                         SELECT *, avg(combined) OVER (PARTITION BY line) AS overall
+                         FROM (
+                             SELECT line, bucket, {combined} AS combined FROM (
+                                 SELECT {line} AS line, agent, series,
+                                        intDiv(t, {step}) * {step} AS bucket, avg(v) AS v
+                                 FROM ({values})
+                                 WHERE 1 {only_main_line}
+                                 GROUP BY line, agent, series, bucket
+                             )
+                             WHERE bucket + {step} <= {to_ms}
+                             GROUP BY line, bucket
+                         )
+                     )
+                 )
              )
-             SELECT c.line AS line, toInt64(c.bucket) AS bucket, toFloat64(c.v) AS value,
-                    toUInt64(r.total) AS total
-             FROM combined c INNER JOIN ranked r ON c.line = r.line
-             WHERE r.position <= {max_lines}
+             WHERE position <= {max_lines}
              ORDER BY line, bucket",
             values = computed(query.metric, &scope),
             to_ms = range.to_ms,
