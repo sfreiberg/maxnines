@@ -789,6 +789,13 @@ fn calculation_sql(
     } else {
         "grp::VARCHAR"
     };
+    // Named lines measure different things, like memory and swap, so they can't be
+    // combined. Lines of the same thing, like each disk, can. These names come from
+    // the catalog, never from a request.
+    let only_main_line = match query.metric.source {
+        Source::Fields([(name, _), _, ..]) if !query.by_series => format!("AND series = '{name}'"),
+        _ => String::new(),
+    };
     let combined = match query.calculation {
         Calculation::Avg => "avg(v)",
         Calculation::Sum => "sum(v)",
@@ -803,7 +810,7 @@ fn calculation_sql(
          computed AS ({values}),
          usable AS (
              SELECT agent_id, t, series, v FROM computed
-             WHERE series IS NOT NULL AND abs(v) <= {LARGEST_VALUE}
+             WHERE series IS NOT NULL AND abs(v) <= {LARGEST_VALUE} {only_main_line}
          ),
          per_series AS (
              SELECT m.grp, u.agent_id, u.series,
@@ -2213,6 +2220,22 @@ mod tests {
         assert_eq!(line(&result.series[0]), [20.0]);
         assert_eq!(result.series[1].name, "/data");
         assert_eq!(line(&result.series[1]), [50.0]);
+    }
+
+    #[test]
+    fn a_metrics_different_measures_are_not_mixed_together() {
+        let mut store = in_memory();
+        let load =
+            |one: f64| json!({ "load_average": { "one": one, "five": 100.0, "fifteen": 200.0 } });
+        write_metric(&mut store, "a", 1000, "cpu", load(1.0));
+        write_metric(&mut store, "b", 1000, "cpu", load(3.0));
+        let everyone = [("a", "All"), ("b", "All")];
+
+        let main_line = calculate(&store, "cpu.load", Calculation::Avg, &everyone, false);
+        assert_eq!(line(&main_line.series[0]), [2.0]);
+
+        let each_line = calculate(&store, "cpu.load", Calculation::Avg, &everyone, true);
+        assert_eq!(each_line.series.len(), 3);
     }
 
     #[test]

@@ -942,7 +942,9 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 Combines a metric across machines, the same way dashboards do. Each series is averaged
 within a moment first, so a machine reporting more often doesn't count for more. Only
-approved machines count, and the server itself isn't one of them.
+approved machines count, and the server itself isn't one of them. Machines are combined
+over whole minutes, leaving out the one still filling up. A metric that measures several
+things, like memory and swap, uses the first unless `group_by` is `series`.
 
 | Parameter | Meaning |
 | --- | --- |

@@ -41,7 +41,7 @@
       <option value="series"{% if widget.group_by == "series" %} selected{% endif %}>Series, such as each disk</option>
       <option value="fact"{% if widget.group_by == "fact" %} selected{% endif %}>Value of a fact</option>
     </select>
-    <span class="note">A single number always combines everything.</span>
+    <span class="note">A single number always combines everything. Metrics that measure several things, like memory and swap, use the first unless each series gets a line.</span>
   </label>
 
   <label>Fact

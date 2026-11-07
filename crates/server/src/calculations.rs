@@ -24,7 +24,8 @@ const MAX_FILTER_LEN: usize = 500;
 
 /// How values are combined. Each series is averaged within a moment first, so a
 /// machine reporting more often doesn't count for more, and a sample stored twice
-/// changes nothing.
+/// changes nothing. A metric with differently named lines, such as memory and swap,
+/// uses its first unless each series has a line of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Calculation {
