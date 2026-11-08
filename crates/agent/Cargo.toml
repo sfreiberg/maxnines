@@ -17,6 +17,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 serde.workspace = true
 serde_json.workspace = true
 sysinfo = "0.40.1"
+# Asks the resolver for the machine's fully qualified name, as `hostname -f` does.
+dns-lookup = "4"
 tokio = { version = "1.54.1", features = ["io-util", "rt", "macros", "process", "time", "signal", "sync"] }
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 tracing.workspace = true

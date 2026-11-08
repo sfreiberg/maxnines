@@ -24,9 +24,12 @@ use crate::system_collector::SystemCollector;
 /// What this agent can run, reported to the server as a fact.
 pub const SUPPORTED: [&str; 12] = COLLECTORS;
 
-/// The name samples are reported under.
+/// The name samples are reported under: the short name, as the domain is a fact.
 pub fn host_name() -> String {
-    System::host_name().unwrap_or_else(|_| "unknown".to_string())
+    System::host_name().map_or_else(
+        |_| "unknown".to_string(),
+        |name| crate::facts::short_name(&name).to_string(),
+    )
 }
 
 /// Builds everything a config turns on.

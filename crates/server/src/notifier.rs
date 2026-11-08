@@ -1,10 +1,13 @@
 //! Delivers notifications from the queue. Deliveries are at least once: a crash
 //! between sending and saving sends it again, so webhooks carry an ID to spot that.
 
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use futures_util::FutureExt;
 use hyper_rustls::HttpsConnectorBuilder;
 use lettre::message::Mailbox;
 use lettre::message::header::ContentType;
@@ -1014,7 +1017,8 @@ fn send_blocking(
 }
 
 /// Sends one notification, and gives what the service called it if that matters
-/// later. A panic counts as a failed delivery.
+/// later. A panic counts as a failed delivery, whichever way it's sent, so one
+/// delivery can't stop the rest of a pass or be retried straight away.
 pub async fn send(
     channel: Channel,
     notice: Notice,
@@ -1022,12 +1026,8 @@ pub async fn send(
     senders: Senders,
 ) -> Result<Option<String>> {
     if channel.channel.kind == ChannelKind::Slack {
-        return timeout(
-            SEND_TIMEOUT,
-            send_to_slack(&channel, &notice, reply_to.as_deref(), &senders),
-        )
-        .await
-        .map_err(|_| anyhow!("Slack timed out"))?;
+        let sending = send_to_slack(&channel, &notice, reply_to.as_deref(), &senders);
+        return guarded("Slack", SEND_TIMEOUT, sending).await;
     }
 
     tokio::task::spawn_blocking(move || {
@@ -1035,6 +1035,19 @@ pub async fn send(
     })
     .await
     .map_err(|_| anyhow!("sending failed unexpectedly"))?
+}
+
+/// Runs a send with a time limit, turning a panic into an ordinary failure.
+async fn guarded<T>(
+    who: &str,
+    limit: Duration,
+    sending: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    match timeout(limit, AssertUnwindSafe(sending).catch_unwind()).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(anyhow!("sending to {who} failed unexpectedly")),
+        Err(_) => Err(anyhow!("{who} timed out")),
+    }
 }
 
 #[derive(Clone)]
@@ -1138,8 +1151,11 @@ impl Notifier {
         }
 
         while let Some(finished) = sends.join_next().await {
-            let (delivery, result) = finished.context("a delivery stopped unexpectedly")?;
-            self.record(&delivery, result, now_ms).await?;
+            match finished {
+                Ok((delivery, result)) => self.record(&delivery, result, now_ms).await?,
+                // The rest of the batch still gets recorded.
+                Err(error) => error!(%error, "a delivery stopped unexpectedly"),
+            }
         }
         Ok(())
     }
@@ -1213,6 +1229,27 @@ mod tests {
             alert: Some(alert),
             text,
         }
+    }
+
+    #[tokio::test]
+    async fn a_send_that_panics_or_hangs_is_an_ordinary_failure() {
+        let panicking = async { panic!("deliberate test panic") };
+        let error = guarded::<()>("Slack", Duration::from_secs(1), panicking)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "sending to Slack failed unexpectedly");
+
+        let hanging = std::future::pending::<Result<()>>();
+        let error = guarded("Slack", Duration::from_millis(10), hanging)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Slack timed out");
+
+        let fine = async { Ok(Some("id".to_string())) };
+        let sent = guarded("Slack", Duration::from_secs(1), fine)
+            .await
+            .unwrap();
+        assert_eq!(sent.as_deref(), Some("id"));
     }
 
     #[test]

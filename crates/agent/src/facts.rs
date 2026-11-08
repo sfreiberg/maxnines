@@ -1,13 +1,68 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use anyhow::Result;
+use dns_lookup::{AddrInfoHints, getaddrinfo};
 use maxnines_protocol::build_info;
 use serde_json::{Value, json};
 use sysinfo::{CpuRefreshKind, IpNetwork, MacAddr, Motherboard, Networks, Product, System};
 
 use crate::collector;
 use crate::custom::Definitions;
+
+/// Asks for the canonical name. The value is the same on every platform we build for.
+const AI_CANONNAME: i32 = 2;
+
+/// How long the resolver gets before the machine is left with its short name.
+const FQDN_LOOKUP_LIMIT: Duration = Duration::from_secs(2);
+
+/// The part of a hostname before the first dot, which is what machines are called.
+pub fn short_name(hostname: &str) -> &str {
+    hostname.split('.').next().unwrap_or(hostname)
+}
+
+/// What the resolver calls this machine, as `hostname -f` finds out. It can hang on a
+/// broken resolver, so it gets its own thread and a time limit.
+fn canonical_name(hostname: &str) -> Option<String> {
+    let (sender, receiver) = mpsc::channel();
+    let host = hostname.to_string();
+    std::thread::spawn(move || {
+        let hints = AddrInfoHints {
+            flags: AI_CANONNAME,
+            address: 0,
+            socktype: 0,
+            protocol: 0,
+        };
+        let found = getaddrinfo(Some(&host), None, Some(hints))
+            .ok()
+            .and_then(|mut found| found.find_map(|info| info.ok()?.canonname));
+        sender.send(found).ok();
+    });
+    receiver.recv_timeout(FQDN_LOOKUP_LIMIT).ok().flatten()
+}
+
+/// The machine's names, as facter calls them: `hostname` is the short name, `fqdn` the
+/// name with its domain, and `domain` the rest. Without a resolver answer, a hostname
+/// that already has dots in it is its own fully qualified name.
+fn name_facts(hostname: Option<&str>, canonical: Option<&str>) -> Value {
+    let short = hostname.map(short_name);
+    let qualified = |name: &str| name.contains('.');
+    let fqdn = canonical
+        .filter(|name| qualified(name))
+        .or_else(|| hostname.filter(|name| qualified(name)))
+        .or(short)
+        .map(|name| name.trim_end_matches('.').to_lowercase());
+    let domain = match (&fqdn, short) {
+        (Some(fqdn), Some(short)) => fqdn
+            .strip_prefix(&short.to_lowercase())
+            .and_then(|rest| rest.strip_prefix('.'))
+            .map(str::to_string),
+        _ => None,
+    };
+    json!({ "hostname": short, "fqdn": fqdn, "domain": domain })
+}
 
 /// Loopback is the same everywhere. Link-local addresses are plentiful, can change with
 /// each reboot or VPN connection, and every change would be kept as history.
@@ -62,6 +117,15 @@ pub fn gather(custom: &BTreeMap<String, Value>, metrics: &Definitions) -> Result
         let name = name.to_string_lossy().into_owned();
         (name, data.mac_address(), data.ip_networks())
     });
+    let hostname = System::host_name().ok();
+    let canonical = hostname.as_deref().and_then(canonical_name);
+    let mut networking = network_facts(interfaces);
+    if let (Some(networking), Some(names)) = (
+        networking.as_object_mut(),
+        name_facts(hostname.as_deref(), canonical.as_deref()).as_object(),
+    ) {
+        networking.extend(names.clone());
+    }
 
     Ok(json!({
         "os": {
@@ -72,7 +136,7 @@ pub fn gather(custom: &BTreeMap<String, Value>, metrics: &Definitions) -> Result
             "kernel": System::kernel_version().ok(),
         },
         "host": {
-            "name": System::host_name().ok(),
+            "name": hostname.as_deref().map(short_name),
             "arch": System::cpu_arch(),
         },
         "cpu": {
@@ -83,7 +147,7 @@ pub fn gather(custom: &BTreeMap<String, Value>, metrics: &Definitions) -> Result
         "memory": {
             "total_bytes": system.total_memory(),
         },
-        "network": network_facts(interfaces),
+        "networking": networking,
         // Virtual machines and missing rights leave some of these out.
         "hardware": {
             "vendor": Product::vendor_name().ok(),
@@ -118,9 +182,52 @@ mod tests {
         assert!(facts["host"]["arch"].is_string());
         assert!(facts["cpu"]["logical_cores"].as_u64().unwrap() > 0);
         assert!(facts["memory"]["total_bytes"].as_u64().unwrap() > 0);
-        assert!(facts["network"]["addresses"].is_array());
+        assert!(facts["networking"]["addresses"].is_array());
+        let short = facts["host"]["name"].as_str().unwrap();
+        assert!(!short.contains('.'), "{short}");
+        assert_eq!(facts["networking"]["hostname"], short);
+        assert!(facts["networking"]["fqdn"].is_string());
         assert_eq!(facts["agent"]["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(facts["agent"]["collectors"], json!(collector::SUPPORTED));
+    }
+
+    #[test]
+    fn names_follow_facter() {
+        let names = name_facts(Some("web-1"), Some("web-1.example.com"));
+        assert_eq!(
+            names,
+            json!({ "hostname": "web-1", "fqdn": "web-1.example.com", "domain": "example.com" })
+        );
+
+        // A hostname that was set fully qualified is its own answer.
+        let names = name_facts(Some("Web-1.Example.com"), None);
+        assert_eq!(
+            names,
+            json!({ "hostname": "Web-1", "fqdn": "web-1.example.com", "domain": "example.com" })
+        );
+
+        // Nothing from the resolver, and nothing to add.
+        let names = name_facts(Some("web-1"), Some("web-1"));
+        assert_eq!(
+            names,
+            json!({ "hostname": "web-1", "fqdn": "web-1", "domain": null })
+        );
+        assert_eq!(
+            name_facts(Some("web-1"), None),
+            json!({ "hostname": "web-1", "fqdn": "web-1", "domain": null })
+        );
+
+        // The resolver knows the machine by another name, which isn't its domain.
+        let names = name_facts(Some("web-1"), Some("alias.example.net."));
+        assert_eq!(
+            names,
+            json!({ "hostname": "web-1", "fqdn": "alias.example.net", "domain": null })
+        );
+
+        assert_eq!(
+            name_facts(None, None),
+            json!({ "hostname": null, "fqdn": null, "domain": null })
+        );
     }
 
     fn network(text: &str) -> IpNetwork {
