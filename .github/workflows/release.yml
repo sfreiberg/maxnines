@@ -13,6 +13,7 @@ on:
     branches: ["**"]
     paths:
       - .github/workflows/release.yml
+      - .github/workflows/ci.yml
       - packaging/**
       - Cargo.toml
       - Cargo.lock
