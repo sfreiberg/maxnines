@@ -137,7 +137,9 @@ pub struct StoreStats {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CollectorStats {
     pub name: String,
-    pub rows: i64,
+    /// Over all time, where the store can say cheaply. ClickHouse only counts the
+    /// last hour, so it leaves this out.
+    pub rows: Option<i64>,
     pub rows_last_hour: i64,
     pub oldest_ms: i64,
     pub newest_ms: i64,
@@ -391,9 +393,14 @@ fn save(store: &mut dyn Store, samples: &[NewSample], counts: &WriteCounts) -> b
             Err(failure) => error = failure,
         }
     }
+    // From agents, as the saved count is, so the two add up.
+    let from_agents = samples
+        .iter()
+        .filter(|new| new.agent_id != LOCAL_AGENT_ID)
+        .count();
     counts
         .failed
-        .fetch_add(samples.len() as u64, Ordering::Relaxed);
+        .fetch_add(from_agents as u64, Ordering::Relaxed);
     error!(error, samples = samples.len(), "write failed, not saved");
     false
 }

@@ -30,17 +30,19 @@ struct WatchedPath {
     busy: Arc<AtomicBool>,
 }
 
-/// There's no async way to ask about a file, so this uses the blocking pool. A
-/// time limit can stop waiting but can't stop the call, so a path that's still
-/// stuck from before isn't queued again.
+/// There's no async way to ask about a file, so each path gets a thread of its own
+/// for the call. A time limit can stop waiting but can't stop the call, so a path
+/// that's still stuck from before isn't asked again, and a dead mount holds one
+/// thread per path on it rather than starving the paths that work.
 async fn check_path(watched: Arc<WatchedPath>) -> Value {
     let Some(busy) = Busy::try_start(&watched.busy) else {
         return timed_out(&watched);
     };
     let path = watched.path.clone();
-    let inspected = tokio::task::spawn_blocking(move || {
+    let (answer, inspected) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
         let _busy = busy;
-        inspect(&path, SystemTime::now())
+        answer.send(inspect(&path, SystemTime::now())).ok();
     });
     inspected.await.unwrap_or_else(|_| timed_out(&watched))
 }

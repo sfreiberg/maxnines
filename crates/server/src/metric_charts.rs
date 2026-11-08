@@ -188,12 +188,7 @@ pub fn build_as(
     range: TimeRange,
 ) -> Chart {
     let axis = Axis::new(unit, &result.series, frame);
-    let slots: Vec<usize> = result
-        .series
-        .iter()
-        .enumerate()
-        .map(|(index, series)| metric.position(&series.name).unwrap_or(index) + 1)
-        .collect();
+    let slots = colour_slots(metric, &result.series);
 
     Chart {
         name: metric.name,
@@ -348,6 +343,38 @@ fn gap_limit_ms(series: &Series, range: TimeRange) -> f64 {
     spacing.sort_unstable();
     let typical = spacing.get(spacing.len() / 2).copied().unwrap_or(0);
     GAP_STEPS * typical.max(range.step_ms) as f64
+}
+
+/// Which colour each series gets. A metric with named fields gives each of its
+/// first few fields a colour of its own, the same on every machine, whichever
+/// other fields a machine reports. Fields beyond the colours there are, as in
+/// the memory breakdown, take whichever colours the machine's other fields leave
+/// free, so no line is drawn in a colour that doesn't exist. Other metrics colour
+/// their series in order.
+fn colour_slots(metric: &Metric, series: &[Series]) -> Vec<usize> {
+    let positions: Vec<Option<usize>> = series
+        .iter()
+        .map(|series| metric.position(&series.name))
+        .collect();
+    let mut slots: Vec<usize> = positions
+        .iter()
+        .enumerate()
+        .map(|(index, position)| match position {
+            Some(position) if *position < MAX_SERIES => position + 1,
+            Some(_) => 0,
+            None => index + 1,
+        })
+        .collect();
+    let taken = slots.clone();
+    let mut spare = (1..=MAX_SERIES).filter(move |slot| !taken.contains(slot));
+    let mut overflow: Vec<usize> = (0..slots.len()).filter(|i| slots[*i] == 0).collect();
+    overflow.sort_by_key(|i| positions[*i]);
+    for index in overflow {
+        slots[index] = spare
+            .next()
+            .unwrap_or(positions[index].unwrap_or(index) % MAX_SERIES + 1);
+    }
+    slots
 }
 
 fn line(series: &Series, slot: usize, axis: &Axis, range: TimeRange) -> Line {
@@ -835,6 +862,34 @@ mod tests {
         let times: Vec<i64> = chart.columns.iter().map(|column| column.time_ms).collect();
         assert_eq!(times, [0, 60_000]);
         assert_eq!(chart.reach_ms, 75_000);
+    }
+
+    /// macOS reports fields from the end of the memory breakdown's list, which
+    /// would otherwise land on colours that don't exist.
+    #[test]
+    fn every_line_gets_one_of_the_colours_there_are() {
+        let names = [
+            "Active",
+            "Wired",
+            "Compressed",
+            "Speculative",
+            "Purgeable",
+            "Free",
+        ];
+        let all = names.map(|name| series(name, &[(0, 1.0)])).to_vec();
+
+        let built = chart("memory.detail", all);
+
+        // Active, Wired and Compressed keep their own colours; the three fields past
+        // the eighth take the lowest colours left.
+        let slots: Vec<usize> = built.lines.iter().map(|line| line.slot).collect();
+        assert_eq!(slots, [1, 3, 8, 2, 4, 5]);
+        assert!(slots.iter().all(|slot| (1..=MAX_SERIES).contains(slot)));
+
+        let linux = ["Active", "Inactive", "Cached", "Free"].map(|name| series(name, &[(0, 1.0)]));
+        let built = chart("memory.detail", linux.to_vec());
+        let slots: Vec<usize> = built.lines.iter().map(|line| line.slot).collect();
+        assert_eq!(slots, [1, 2, 4, 3]);
     }
 
     #[test]

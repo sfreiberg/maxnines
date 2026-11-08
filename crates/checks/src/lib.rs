@@ -6,7 +6,7 @@
 //! Errors only ever say what kind of failure it was, as a URL can hold a password.
 
 use std::io::Read;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::process::Stdio;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -567,12 +567,20 @@ fn dns_answers(bytes: &[u8], id: u16) -> Result<usize> {
     }
 }
 
-async fn query_server(check: &Check, server: &str, findings: &mut Findings) -> Result<usize> {
-    let (host, port) = if server.contains('.') && server.contains(':') {
-        host_and_port(server)?
+/// A DNS server is a name or address, with a port only when written as `host:port`
+/// or `[v6]:port`. A bare IPv6 address has colons of its own and no port.
+fn dns_server(server: &str) -> Result<(String, u16)> {
+    let bare_address = server.parse::<IpAddr>().is_ok();
+    let with_port = server.starts_with('[') || (!bare_address && server.contains(':'));
+    if with_port {
+        host_and_port(server)
     } else {
-        (server.to_string(), DNS_PORT)
-    };
+        Ok((server.to_string(), DNS_PORT))
+    }
+}
+
+async fn query_server(check: &Check, server: &str, findings: &mut Findings) -> Result<usize> {
+    let (host, port) = dns_server(server)?;
     let addresses = lookup_host((host.as_str(), port))
         .await
         .map_err(|_| anyhow!("the DNS server wasn't found"))?
@@ -1018,6 +1026,27 @@ mod tests {
         });
         assert_eq!(output["up"], 1, "{output}");
         assert_eq!(output["status"], 200);
+    }
+
+    #[test]
+    fn dns_servers_can_be_written_every_way() {
+        let server = |text: &str| dns_server(text).unwrap();
+        assert_eq!(server("8.8.8.8"), ("8.8.8.8".to_string(), 53));
+        assert_eq!(server("8.8.8.8:5353"), ("8.8.8.8".to_string(), 5353));
+        assert_eq!(
+            server("dns.example.com"),
+            ("dns.example.com".to_string(), 53)
+        );
+        assert_eq!(
+            server("dns.example.com:5353"),
+            ("dns.example.com".to_string(), 5353)
+        );
+        assert_eq!(server("2001:db8::1"), ("2001:db8::1".to_string(), 53));
+        assert_eq!(
+            server("[2001:db8::1]:5353"),
+            ("2001:db8::1".to_string(), 5353)
+        );
+        assert!(dns_server("[2001:db8::1]:port").is_err());
     }
 
     #[test]

@@ -1110,7 +1110,7 @@ impl MetricsReader for DuckDbReader {
         let rows = statement.query_map(params![hour_ago_ms], |row| {
             Ok(CollectorStats {
                 name: row.get(0)?,
-                rows: row.get(1)?,
+                rows: Some(row.get(1)?),
                 rows_last_hour: row.get(2)?,
                 oldest_ms: row.get(3)?,
                 newest_ms: row.get(4)?,
@@ -1173,14 +1173,14 @@ mod tests {
             [
                 CollectorStats {
                     name: "cpu".to_string(),
-                    rows: 3,
+                    rows: Some(3),
                     rows_last_hour: 2,
                     oldest_ms: 1000,
                     newest_ms: 9000,
                 },
                 CollectorStats {
                     name: "disk".to_string(),
-                    rows: 1,
+                    rows: Some(1),
                     rows_last_hour: 0,
                     oldest_ms: 2000,
                     newest_ms: 2000,

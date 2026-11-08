@@ -1092,11 +1092,11 @@ impl MetricsReader for ClickHouseReader {
         let collectors = collectors
             .into_iter()
             .map(|row| {
-                let rows = i64::try_from(row.rows).unwrap_or(i64::MAX);
                 CollectorStats {
                     name: row.name,
-                    rows,
-                    rows_last_hour: rows,
+                    // Counting all time per collector would scan the whole table.
+                    rows: None,
+                    rows_last_hour: i64::try_from(row.rows).unwrap_or(i64::MAX),
                     oldest_ms: row.oldest_ms,
                     newest_ms: row.newest_ms,
                 }

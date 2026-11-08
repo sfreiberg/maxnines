@@ -189,7 +189,12 @@ fn server_page(stats: ServerStats, now_ms: i64) -> ServerPage {
         .metrics
         .as_ref()
         .and_then(|metrics| metrics.total_rows)
-        .unwrap_or_else(|| collectors.iter().map(|collector| collector.rows).sum());
+        .unwrap_or_else(|| {
+            collectors
+                .iter()
+                .filter_map(|collector| collector.rows)
+                .sum()
+        });
     let activity = &stats.activity;
     let last_pass = activity.last_alert_pass_ms;
 
@@ -217,7 +222,9 @@ fn server_page(stats: ServerStats, now_ms: i64) -> ServerPage {
             .iter()
             .map(|collector| CollectorRow {
                 name: collector.name.clone(),
-                rows: count(collector.rows.max(0) as u64),
+                rows: collector
+                    .rows
+                    .map_or_else(|| "–".to_string(), |rows| count(rows.max(0) as u64)),
                 last_hour: count(collector.rows_last_hour.max(0) as u64),
                 oldest: time(collector.oldest_ms),
                 newest: time(collector.newest_ms),

@@ -274,7 +274,8 @@ fn a_good_item_survives_bad_items_beside_it() {
 }
 
 #[test]
-fn numbers_that_are_not_finite_are_skipped() {
+fn text_where_a_number_is_expected_is_skipped() {
+    // JSON can't carry NaN or infinity, so these arrive as text if at all.
     let mut store = in_memory();
     for (time_ms, usage) in [
         (1000, json!("NaN")),

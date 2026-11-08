@@ -286,10 +286,13 @@ mod tests {
         let mut collector = CpuCollector::new().unwrap();
         std::thread::sleep(Duration::from_millis(250));
         let output = collector.collect().unwrap();
+        // Linux also reports iowait and steal, so every part counts.
         let time = &output["time_percent"];
-        let total: f64 = ["user", "nice", "system", "interrupt", "idle"]
-            .iter()
-            .map(|name| time[name].as_f64().unwrap())
+        let total: f64 = time
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|part| part.as_f64().unwrap())
             .sum();
         assert!((99.0..=101.0).contains(&total), "{time}");
     }
