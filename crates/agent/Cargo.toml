@@ -3,6 +3,9 @@ name = "maxnines-agent"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "MaxNines monitoring agent"
 
 [dependencies]
 anyhow.workspace = true
@@ -35,3 +38,40 @@ tempfile = "3"
 
 [build-dependencies]
 vergen-gitcl = { version = "10", features = ["build"] }
+
+# Linux packages, made by cargo-deb and cargo-generate-rpm from a binary that's
+# already built. The release workflow builds it with --target, which both tools
+# substitute into target/release.
+[package.metadata.deb]
+maintainer = "MaxNines <https://github.com/sfreiberg/maxnines/issues>"
+copyright = "2026 Sam Freiberg"
+license-file = ["../../LICENSE", "0"]
+extended-description = "Reports how a machine is doing to a MaxNines server. What it watches is set on\nthe server, and it keeps its key and unsent samples in /var/lib/maxnines-agent."
+section = "admin"
+priority = "optional"
+# Fully static, so it needs nothing else.
+depends = ""
+assets = [
+  ["target/release/maxnines-agent", "usr/bin/", "755"],
+  ["../../packaging/linux/agent.hcl", "etc/maxnines/agent.hcl", "640"],
+  ["../../README.md", "usr/share/doc/maxnines-agent/README.md", "644"],
+]
+maintainer-scripts = "../../packaging/linux/deb/agent"
+# Installing doesn't start it, as it needs its config first.
+systemd-units = { unit-name = "maxnines-agent", unit-scripts = "../../packaging/linux", enable = false, start = false, restart-after-upgrade = true }
+
+[package.metadata.generate-rpm]
+description = "Reports how a machine is doing to a MaxNines server. What it watches is set on\nthe server, and it keeps its key and unsent samples in /var/lib/maxnines-agent."
+summary = "MaxNines monitoring agent"
+assets = [
+  { source = "target/release/maxnines-agent", dest = "/usr/bin/maxnines-agent", mode = "755" },
+  { source = "../../packaging/linux/agent.hcl", dest = "/etc/maxnines/agent.hcl", mode = "640", config = "noreplace" },
+  { source = "../../packaging/linux/maxnines-agent.service", dest = "/usr/lib/systemd/system/maxnines-agent.service", mode = "644" },
+  { source = "../../README.md", dest = "/usr/share/doc/maxnines-agent/README.md", mode = "644", doc = true },
+  { source = "../../LICENSE", dest = "/usr/share/licenses/maxnines-agent/LICENSE", mode = "644", doc = true },
+]
+pre_install_script = "../../packaging/linux/add-user.sh"
+post_install_script = "../../packaging/linux/rpm/agent-post.sh"
+pre_uninstall_script = "../../packaging/linux/rpm/agent-preun.sh"
+post_uninstall_script = "../../packaging/linux/rpm/agent-postun.sh"
+auto-req = "no"

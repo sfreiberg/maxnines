@@ -297,6 +297,18 @@ mod tests {
         assert_eq!(config.key_file(), PathBuf::from("data.nosync/agent.key"));
     }
 
+    /// What the Linux packages install.
+    #[test]
+    fn packaged_config_parses() {
+        let config = Config::parse(include_str!("../../../packaging/linux/agent.hcl")).unwrap();
+
+        assert_eq!(config.server.url, "ws://127.0.0.1:9000/ws");
+        assert_eq!(
+            config.key_file(),
+            PathBuf::from("/var/lib/maxnines-agent/agent.key")
+        );
+    }
+
     #[test]
     fn only_the_server_is_required() {
         let config = parse("").unwrap();

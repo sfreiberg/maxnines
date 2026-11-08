@@ -1,0 +1,8 @@
+#!/bin/sh
+# The config can hold secrets, so only root and the service can read it.
+set -e
+if [ "$1" = "configure" ]; then
+  chgrp maxnines /etc/maxnines/server.hcl
+  chmod 0640 /etc/maxnines/server.hcl
+fi
+#DEBHELPER#

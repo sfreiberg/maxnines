@@ -1,0 +1,24 @@
+[Unit]
+Description=MaxNines monitoring agent
+Documentation=https://github.com/sfreiberg/maxnines
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=maxnines
+Group=maxnines
+ExecStart=/usr/bin/maxnines-agent --config /etc/maxnines/agent.hcl
+# Its key, its last config and samples waiting to be sent.
+StateDirectory=maxnines-agent
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/maxnines-agent
+Restart=on-failure
+RestartSec=5
+# It only reads the machine, apart from its own folder. Custom metric commands run
+# with these limits too.
+NoNewPrivileges=yes
+ProtectSystem=full
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

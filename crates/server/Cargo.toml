@@ -3,6 +3,9 @@ name = "maxnines-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "MaxNines monitoring server"
 
 [dependencies]
 anyhow.workspace = true
@@ -12,9 +15,9 @@ chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
 # Stay on DuckDB 1.5: 1.20000.x bundles a pre-release 2.0 with a development
 # storage format. Tilde because a minor bump changes the bundled DuckDB.
+duckdb = { version = "~1.10506.1", features = ["bundled", "json"] }
 # Unpacks the built-in place list.
 flate2 = "1"
-duckdb = { version = "~1.10506.1", features = ["bundled", "json"] }
 hcl-rs.workspace = true
 indexmap = { version = "2.14.2", features = ["serde"] }
 hex.workspace = true
@@ -66,3 +69,44 @@ vergen-gitcl = { version = "10", features = ["build"] }
 [features]
 # Runs the metrics store tests against a ClickHouse server as well.
 clickhouse-tests = []
+
+# Linux packages, made by cargo-deb and cargo-generate-rpm from a binary that's
+# already built. The release workflow builds it with --target, which both tools
+# substitute into target/release.
+[package.metadata.deb]
+maintainer = "MaxNines <https://github.com/sfreiberg/maxnines/issues>"
+copyright = "2026 Sam Freiberg"
+license-file = ["../../LICENSE", "0"]
+extended-description = "The server MaxNines agents report to, with the web pages, alerting and the API.\nIt keeps its data in /var/lib/maxnines-server."
+section = "admin"
+priority = "optional"
+depends = "libc6 (>= 2.31), libgcc-s1, libstdc++6 (>= 10)"
+assets = [
+  ["target/release/maxnines-server", "usr/bin/", "755"],
+  ["../../packaging/linux/server.hcl", "etc/maxnines/server.hcl", "640"],
+  ["../../README.md", "usr/share/doc/maxnines-server/README.md", "644"],
+]
+maintainer-scripts = "../../packaging/linux/deb/server"
+# Installing doesn't start it, as it needs its config first.
+systemd-units = { unit-name = "maxnines-server", unit-scripts = "../../packaging/linux", enable = false, start = false, restart-after-upgrade = true }
+
+[package.metadata.generate-rpm]
+description = "The server MaxNines agents report to, with the web pages, alerting and the API.\nIt keeps its data in /var/lib/maxnines-server."
+summary = "MaxNines monitoring server"
+assets = [
+  { source = "target/release/maxnines-server", dest = "/usr/bin/maxnines-server", mode = "755" },
+  { source = "../../packaging/linux/server.hcl", dest = "/etc/maxnines/server.hcl", mode = "640", config = "noreplace" },
+  { source = "../../packaging/linux/maxnines-server.service", dest = "/usr/lib/systemd/system/maxnines-server.service", mode = "644" },
+  { source = "../../README.md", dest = "/usr/share/doc/maxnines-server/README.md", mode = "644", doc = true },
+  { source = "../../LICENSE", dest = "/usr/share/licenses/maxnines-server/LICENSE", mode = "644", doc = true },
+]
+pre_install_script = "../../packaging/linux/add-user.sh"
+post_install_script = "../../packaging/linux/rpm/server-post.sh"
+pre_uninstall_script = "../../packaging/linux/rpm/server-preun.sh"
+post_uninstall_script = "../../packaging/linux/rpm/server-postun.sh"
+auto-req = "no"
+
+[package.metadata.generate-rpm.requires]
+glibc = ">= 2.31"
+libgcc = "*"
+"libstdc++" = "*"

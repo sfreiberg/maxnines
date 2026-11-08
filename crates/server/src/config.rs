@@ -568,6 +568,41 @@ mod tests {
         assert!(config.registration.rule.is_empty());
     }
 
+    /// What the Linux packages install, which keeps everything in the service's
+    /// own folder.
+    #[test]
+    fn packaged_config_parses() {
+        let config = parse(include_str!("../../../packaging/linux/server.hcl")).unwrap();
+        assert_eq!(
+            config.metrics,
+            MetricsConfig::Duckdb {
+                path: "/var/lib/maxnines-server/metrics.duckdb".into(),
+                memory_limit: "1GB".to_string(),
+            }
+        );
+        assert_eq!(
+            config.database.url.as_deref(),
+            Some("sqlite:///var/lib/maxnines-server/maxnines.sqlite?mode=rwc")
+        );
+        assert_eq!(config.audience(), "ws://127.0.0.1:9000/ws");
+    }
+
+    /// What the Docker image runs, which listens on every address in the container
+    /// unless told otherwise.
+    #[test]
+    fn container_config_parses() {
+        let config = parse(include_str!("../../../packaging/docker/server.hcl")).unwrap();
+        assert_eq!(config.listen.to_string(), "0.0.0.0:9000");
+        assert_eq!(config.audience(), "ws://localhost:9000/ws");
+        assert_eq!(
+            config.metrics,
+            MetricsConfig::Duckdb {
+                path: "/var/lib/maxnines-server/metrics.duckdb".into(),
+                memory_limit: "1GB".to_string(),
+            }
+        );
+    }
+
     #[test]
     fn server_settings_have_defaults() {
         let config = parse(STORAGE).unwrap();
