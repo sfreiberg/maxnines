@@ -149,6 +149,34 @@ pub async fn run(check: &Check) -> Value {
     report(check, findings, result)
 }
 
+/// Fetches a page for a collector to read, such as a web server's status page,
+/// and gives its text. Only a successful answer counts, and the certificate is
+/// checked as it is for a web check.
+pub async fn fetch_page(url: &str, limit: Duration) -> Result<String> {
+    let check = Check::new("page", CheckKind::Http, url);
+    let work = async {
+        let answer = request(&check, &mut Findings::default()).await?;
+        let status = answer.status;
+        ensure!(
+            (200..300).contains(&status),
+            "the page returned status {status}"
+        );
+        tokio::task::spawn_blocking(move || {
+            let body = if answer.compressed {
+                decompress(&answer.body).context("the page couldn't be unpacked")?
+            } else {
+                answer.body
+            };
+            String::from_utf8(body).map_err(|_| anyhow!("the page isn't text"))
+        })
+        .await
+        .map_err(|_| anyhow!("the request failed"))?
+    };
+    timeout(limit, work)
+        .await
+        .unwrap_or_else(|_| Err(timed_out()))
+}
+
 fn host_and_port(target: &str) -> Result<(String, u16)> {
     let (host, port) = target.rsplit_once(':').context("no port")?;
     let host = host.trim_start_matches('[').trim_end_matches(']');
@@ -464,9 +492,16 @@ fn examine(
     Ok((body.len(), matched))
 }
 
-/// Redirects aren't followed, as a second request would muddle every timing. A
-/// redirect is an answer from a working site, so anything below 400 is up.
-async fn check_http(check: &Check, findings: &mut Findings) -> Result<()> {
+/// What came back from a web request.
+struct Answer {
+    status: u16,
+    compressed: bool,
+    body: Vec<u8>,
+}
+
+/// Makes a web request, timing each stage. Redirects aren't followed, as a second
+/// request would muddle every timing.
+async fn request(check: &Check, findings: &mut Findings) -> Result<Answer> {
     let uri: Uri = check
         .target
         .parse()
@@ -511,6 +546,20 @@ async fn check_http(check: &Check, findings: &mut Findings) -> Result<()> {
 
     let body = read_body(&mut response).await?;
     findings.download_ms = Some(elapsed_ms(downloading));
+    Ok(Answer {
+        status,
+        compressed,
+        body,
+    })
+}
+
+/// A redirect is an answer from a working site, so anything below 400 is up.
+async fn check_http(check: &Check, findings: &mut Findings) -> Result<()> {
+    let Answer {
+        status,
+        compressed,
+        body,
+    } = request(check, findings).await?;
 
     // Unpacking and searching a big page takes real time, so it can't run on a
     // task, where it would hold up everything else on the thread.
@@ -900,6 +949,68 @@ mod tests {
         assert_eq!(output["up"], 0);
         assert!(!output.to_string().contains("secret"), "{output}");
         assert!(!output.to_string().contains("token"), "{output}");
+    }
+
+    fn fetch(url: &str) -> Result<String> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fetch_page(url, Duration::from_secs(5)))
+    }
+
+    #[test]
+    fn a_page_is_fetched_as_text() {
+        let (address, server) =
+            serve_once(b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\nBusyWorkers: 3\n");
+        let text = fetch(&format!("http://{address}/server-status?auto")).unwrap();
+        assert_eq!(text, "BusyWorkers: 3\n");
+        assert!(
+            server
+                .join()
+                .unwrap()
+                .starts_with("GET /server-status?auto ")
+        );
+    }
+
+    #[test]
+    fn a_compressed_page_is_unpacked() {
+        let body = gzipped("Active connections: 1\n");
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&body);
+        let (address, _server) = serve_once(Box::leak(response.into_boxed_slice()));
+        assert_eq!(
+            fetch(&format!("http://{address}/")).unwrap(),
+            "Active connections: 1\n"
+        );
+    }
+
+    #[test]
+    fn only_a_successful_page_counts() {
+        for (response, error) in [
+            (
+                &b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"[..],
+                "the page returned status 403",
+            ),
+            (
+                &b"HTTP/1.1 302 Found\r\nLocation: /login\r\nContent-Length: 0\r\n\r\n"[..],
+                "the page returned status 302",
+            ),
+            (
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n\xff\xfe"[..],
+                "the page isn't text",
+            ),
+        ] {
+            let (address, _server) = serve_once(response);
+            let failure = fetch(&format!("http://{address}/")).unwrap_err();
+            assert_eq!(failure.to_string(), error);
+        }
+        let failure = fetch(&format!("http://user:secret@{}/token", closed_port())).unwrap_err();
+        assert!(!format!("{failure:#}").contains("secret"));
     }
 
     #[test]

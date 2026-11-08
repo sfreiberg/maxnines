@@ -17,7 +17,8 @@ use serde_json::Value;
 
 /// Every collector the project knows about. An agent reports the ones it can
 /// run in its facts, because older agents may not have them all.
-pub const COLLECTORS: [&str; 12] = [
+pub const COLLECTORS: [&str; 15] = [
+    "apache",
     "checks",
     "cpu",
     "custom",
@@ -26,6 +27,8 @@ pub const COLLECTORS: [&str; 12] = [
     "host",
     "memory",
     "network",
+    "nginx",
+    "php_fpm",
     "processes",
     "sensors",
     "services",
@@ -34,6 +37,10 @@ pub const COLLECTORS: [&str; 12] = [
 
 /// How many things one collector can be told to watch.
 const MAX_WATCHED: usize = 64;
+
+/// A machine rarely runs more than a few web servers or PHP pools, and each page
+/// is a request every round.
+const MAX_STATUS_PAGES: usize = 16;
 
 /// What the server can store for one setting.
 const MAX_SETTING_LEN: usize = 255;
@@ -170,6 +177,51 @@ pub struct CollectorSettings {
     /// Checks collector only: what to try reaching.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checks: Option<Vec<Check>>,
+    /// Apache, nginx and PHP-FPM collectors only: the status pages to read. Without
+    /// any, the collector reads [`default_status_page`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub urls: Option<Vec<String>>,
+}
+
+/// Where a collector looks for a status page when it isn't told. These are the
+/// addresses the software's own documentation suggests.
+pub fn default_status_page(collector: &str) -> Option<&'static str> {
+    match collector {
+        "apache" => Some("http://localhost/server-status?auto"),
+        "nginx" => Some("http://localhost/nginx_status"),
+        "php_fpm" => Some("http://localhost/status"),
+        _ => None,
+    }
+}
+
+/// A status page has to be a plain web address. A username or password in it
+/// would show up on every page that lists the setting, so those are refused, and
+/// status pages are normally limited to the machine itself anyway.
+fn check_status_page(url: &str) -> Result<()> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"));
+    let Some(rest) = rest else {
+        anyhow::bail!("the status page {url:?} has to start with http:// or https://");
+    };
+    ensure!(
+        url.len() <= MAX_SETTING_LEN,
+        "the status page {url:?} is too long"
+    );
+    ensure!(
+        !url.chars().any(|c| c.is_whitespace() || c.is_control()),
+        "the status page {url:?} can't contain spaces"
+    );
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    ensure!(
+        !authority.is_empty(),
+        "the status page {url:?} needs a host name"
+    );
+    ensure!(
+        !authority.contains('@'),
+        "status pages can't hold a username or password"
+    );
+    Ok(())
 }
 
 /// Something an agent tries reaching, to see if it's up.
@@ -481,6 +533,16 @@ impl CollectorSettings {
             );
         }
 
+        let urls = self.urls.as_deref().unwrap_or_default();
+        ensure!(
+            urls.len() <= MAX_STATUS_PAGES,
+            "a collector can read at most {MAX_STATUS_PAGES} status pages"
+        );
+        for (index, url) in urls.iter().enumerate() {
+            check_status_page(url)?;
+            ensure!(!urls[..index].contains(url), "{url:?} is listed twice");
+        }
+
         let checks = self.checks.as_deref().unwrap_or_default();
         ensure!(
             checks.len() <= MAX_CHECKS,
@@ -718,6 +780,43 @@ mod tests {
         assert!(files(json!(["x".repeat(256)])).validate().is_err());
         let too_many: Vec<String> = (0..=MAX_WATCHED).map(|i| i.to_string()).collect();
         assert!(files(json!(too_many)).validate().is_err());
+    }
+
+    #[test]
+    fn status_pages_are_plain_web_addresses() {
+        let pages = |urls: Value| with("apache", json!({ "urls": urls })).validate();
+        pages(json!([
+            "http://localhost/server-status?auto",
+            "https://[::1]:8443/status"
+        ]))
+        .unwrap();
+        for bad in [
+            json!(["localhost/server-status"]),
+            json!(["ftp://localhost/"]),
+            json!(["http://"]),
+            json!(["http:///status"]),
+            json!(["http://local host/"]),
+            json!(["http://admin:secret@localhost/status"]),
+            json!(["http://localhost/a", "http://localhost/a"]),
+            json!([format!("http://localhost/{}", "x".repeat(255))]),
+        ] {
+            assert!(pages(bad.clone()).is_err(), "{bad}");
+        }
+        // An @ further along is part of the path or query, not a password.
+        pages(json!(["http://localhost/status?who=@me"])).unwrap();
+        let too_many: Vec<String> = (0..=MAX_STATUS_PAGES)
+            .map(|i| format!("http://localhost/{i}"))
+            .collect();
+        assert!(pages(json!(too_many)).is_err());
+    }
+
+    #[test]
+    fn every_status_page_collector_has_a_default_page() {
+        for collector in ["apache", "nginx", "php_fpm"] {
+            let page = default_status_page(collector).unwrap();
+            check_status_page(page).unwrap();
+        }
+        assert_eq!(default_status_page("cpu"), None);
     }
 
     fn check(kind: &str, target: &str) -> AgentConfig {

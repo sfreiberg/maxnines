@@ -87,6 +87,21 @@
       <small>One path per line. This reports whether each exists, its size and how long since it changed. Contents are never read.</small>
     </label>
 
+    <label>Apache status pages
+      <textarea name="apache_urls" rows="2" spellcheck="false" placeholder="{{ default_pages.apache }}">{{ rule.apache_urls }}</textarea>
+      <small>One address per line, for Apache's <code>mod_status</code> page. Leave empty for <code>{{ default_pages.apache }}</code>.</small>
+    </label>
+
+    <label>nginx status pages
+      <textarea name="nginx_urls" rows="2" spellcheck="false" placeholder="{{ default_pages.nginx }}">{{ rule.nginx_urls }}</textarea>
+      <small>One address per line, for nginx's <code>stub_status</code> page. Leave empty for <code>{{ default_pages.nginx }}</code>.</small>
+    </label>
+
+    <label>PHP-FPM status pages
+      <textarea name="php_fpm_urls" rows="2" spellcheck="false" placeholder="{{ default_pages.php_fpm }}">{{ rule.php_fpm_urls }}</textarea>
+      <small>One address per line, one for each pool's <code>pm.status_path</code>. Leave empty for <code>{{ default_pages.php_fpm }}</code>.</small>
+    </label>
+
     <label>Checks
       <textarea name="checks" rows="4" spellcheck="false" placeholder="tcp db db1:5432">{{ rule.checks }}</textarea>
       <small>One per line, as a kind, a name and a target: <code>tcp db db1:5432</code>, <code>http site https://example.com/</code>, <code>tls site example.com:443</code>, <code>dns resolver example.com</code> or <code>ping gateway 10.0.0.1</code>. Options can follow: <code>timeout=5</code>, <code>insecure</code>, for http <code>method=POST</code>, <code>body=...</code> and <code>regex="Welcome back"</code>, for dns <code>server=8.8.8.8</code> and <code>record=MX</code>, and for ping <code>count=5</code>.</small>

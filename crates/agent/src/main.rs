@@ -10,6 +10,7 @@ mod own_usage;
 mod saved_config;
 mod services;
 mod spool;
+mod status_pages;
 mod system_collector;
 mod websocket;
 

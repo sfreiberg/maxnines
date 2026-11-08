@@ -384,9 +384,11 @@ lowest priority first, so higher priorities win.
 | `names` | `processes`, `services`, `custom` | What to watch. Custom metrics must be defined in the agent's own config |
 | `paths` | `files` | The files and folders to watch |
 | `checks` | `checks` | What to try reaching, as in [remote checks](#remote-checks) |
+| `urls` | `apache`, `nginx`, `php_fpm` | The status pages to read. Leave it out for the usual page on the machine itself |
 
-The collectors are `checks`, `cpu`, `custom`, `disk`, `files`, `host`, `memory`,
-`network`, `processes`, `sensors`, `services` and `system`.
+The collectors are `apache`, `checks`, `cpu`, `custom`, `disk`, `files`, `host`,
+`memory`, `network`, `nginx`, `php_fpm`, `processes`, `sensors`, `services` and
+`system`.
 
 ### List config rules
 

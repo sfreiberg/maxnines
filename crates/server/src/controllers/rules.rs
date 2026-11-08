@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
-use maxnines_protocol::{COLLECTORS, Check, CheckKind};
+use maxnines_protocol::{COLLECTORS, Check, CheckKind, default_status_page};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
@@ -45,6 +45,9 @@ struct RuleForm {
     custom_names: String,
     service_names: String,
     file_paths: String,
+    apache_urls: String,
+    nginx_urls: String,
+    php_fpm_urls: String,
     checks: String,
     collectors: Vec<CollectorChoice>,
 }
@@ -93,6 +96,9 @@ impl RuleForm {
             custom_names: lines(&rule.settings["collectors"]["custom"]["names"]),
             service_names: lines(&rule.settings["collectors"]["services"]["names"]),
             file_paths: lines(&rule.settings["collectors"]["files"]["paths"]),
+            apache_urls: lines(&rule.settings["collectors"]["apache"]["urls"]),
+            nginx_urls: lines(&rule.settings["collectors"]["nginx"]["urls"]),
+            php_fpm_urls: lines(&rule.settings["collectors"]["php_fpm"]["urls"]),
             checks: check_lines(&rule.settings["collectors"]["checks"]["checks"]),
             collectors: choices(|name| {
                 match rule.settings["collectors"][name]["enabled"].as_bool() {
@@ -120,6 +126,9 @@ impl RuleForm {
             custom_names: text("custom_names"),
             service_names: text("service_names"),
             file_paths: text("file_paths"),
+            apache_urls: text("apache_urls"),
+            nginx_urls: text("nginx_urls"),
+            php_fpm_urls: text("php_fpm_urls"),
             checks: text("checks"),
             collectors: choices(|name| text(&format!("collector_{name}"))),
         }
@@ -158,6 +167,9 @@ impl RuleForm {
                 "custom" => Some(("names", &self.custom_names)),
                 "services" => Some(("names", &self.service_names)),
                 "files" => Some(("paths", &self.file_paths)),
+                "apache" => Some(("urls", &self.apache_urls)),
+                "nginx" => Some(("urls", &self.nginx_urls)),
+                "php_fpm" => Some(("urls", &self.php_fpm_urls)),
                 _ => None,
             };
             if let Some((name, text)) = list {
@@ -322,6 +334,14 @@ fn check_lines(value: &Value) -> String {
     lines.join("\n")
 }
 
+/// Where each status page collector looks when a rule doesn't say.
+fn default_pages() -> BTreeMap<&'static str, &'static str> {
+    COLLECTORS
+        .iter()
+        .filter_map(|name| Some((*name, default_status_page(name)?)))
+        .collect()
+}
+
 fn choices(mut choice: impl FnMut(&str) -> String) -> Vec<CollectorChoice> {
     COLLECTORS
         .iter()
@@ -440,6 +460,7 @@ async fn form_view<'a>(
         .with("rule", form)
         .with("operators", &operators())
         .with("known_facts", &known)
+        .with("default_pages", &default_pages())
         .with("preview", &None::<Preview>)
 }
 
@@ -682,6 +703,11 @@ mod tests {
                 "services": { "enabled": true, "names": ["nginx.service"] },
                 "custom": { "enabled": true, "names": ["queue", "disk.temp"] },
                 "files": { "enabled": true, "paths": ["/var/backup/latest.tar"] },
+                "apache": { "urls": ["http://localhost/server-status?auto"] },
+                "php_fpm": {
+                    "enabled": true,
+                    "urls": ["http://localhost/status-www", "http://localhost/status-api"]
+                },
                 "checks": { "enabled": true, "checks": [
                     { "name": "db", "kind": "tcp", "target": "db1:5432" },
                     { "name": "site", "kind": "http", "target": "https://example.com/",

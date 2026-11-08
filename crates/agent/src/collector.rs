@@ -19,10 +19,11 @@ use crate::checks::CheckCollector;
 use crate::custom::{CustomCollector, Definitions};
 use crate::files::FileCollector;
 use crate::services::ServiceCollector;
+use crate::status_pages::{Software, StatusPageCollector};
 use crate::system_collector::SystemCollector;
 
 /// What this agent can run, reported to the server as a fact.
-pub const SUPPORTED: [&str; 12] = COLLECTORS;
+pub const SUPPORTED: [&str; 15] = COLLECTORS;
 
 /// The name samples are reported under: the short name, as the domain is a fact.
 pub fn host_name() -> String {
@@ -76,6 +77,13 @@ fn build(
         "files" => {
             let paths = config.paths.clone().unwrap_or_default();
             Box::new(FileCollector::new(paths, interval))
+        }
+        "apache" | "nginx" | "php_fpm" => {
+            let urls = config.urls.clone().unwrap_or_default();
+            match Software::from_collector(name) {
+                Some(software) => Box::new(StatusPageCollector::new(software, urls, interval)),
+                None => bail!("unknown collector {name:?}"),
+            }
         }
         other => bail!("unknown collector {other:?}"),
     })

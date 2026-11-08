@@ -3480,6 +3480,90 @@ async fn a_failing_metrics_query_only_fails_that_request() {
     assert_eq!(browser.get(&server, "/agents").await.status, 200);
 }
 
+#[tokio::test]
+async fn web_server_status_pages_become_charts() {
+    let server = start_with_metrics().await;
+    let agent = identity();
+    let mut client = server.connect_approved(&agent, "web-1").await;
+    let id = agent.id();
+    let apache_page = "http://localhost/server-status";
+    let pool = "http://localhost/status-www";
+
+    // As the agent sends them: totals as the change since the sample before.
+    let now = now_ms() as u64;
+    for seconds_ago in [45, 30, 15] {
+        let metrics = BTreeMap::from([
+            (
+                "apache".to_string(),
+                json!([{
+                    "name": apache_page, "up": 1, "busy_workers": 3.0,
+                    "idle_workers": 12.0, "worker_slots": 15.0, "requests": 30, "bytes": 15360
+                }]),
+            ),
+            (
+                "php_fpm".to_string(),
+                json!([
+                    { "name": pool, "up": 1, "listen_queue": 2.0, "active_processes": 1.0 },
+                    { "name": "http://localhost/status-api", "up": 0, "error": "timed out" }
+                ]),
+            ),
+        ]);
+        let message = AgentMessage::Sample(Sample {
+            timestamp_ms: now - seconds_ago * 1000,
+            metrics,
+        });
+        send(&mut client, &message).await;
+    }
+
+    let series = |metric: &str| format!("/api/v1/agents/{id}/metrics/{metric}?range=1h");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let requests = loop {
+        let body = json_body(
+            &server
+                .http("GET", &series("apache.requests"), Some(&server.api_key))
+                .await,
+        );
+        if body["series"]
+            .as_array()
+            .is_some_and(|lines| !lines.is_empty())
+        {
+            break body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the samples never arrived: {body}"
+        );
+        tokio::time::timeout(Duration::from_millis(10), client.next())
+            .await
+            .ok();
+    };
+    assert_eq!(requests["unit"], "per_second");
+    assert_eq!(requests["series"][0]["name"], apache_page);
+    assert_eq!(requests["series"][0]["points"][0]["avg"], 2.0);
+
+    let get = |metric: &str| {
+        let path = series(metric);
+        let server = &server;
+        async move { json_body(&server.http("GET", &path, Some(&server.api_key)).await) }
+    };
+    let usage = get("apache.worker_usage").await;
+    assert_eq!(usage["series"][0]["points"][0]["avg"], 20.0);
+    let traffic = get("apache.traffic").await;
+    assert_eq!(traffic["series"][0]["points"][0]["avg"], 1024.0);
+
+    let queue = get("php_fpm.listen_queue").await;
+    assert_eq!(queue["series"][0]["name"], pool);
+    assert_eq!(queue["series"][0]["points"][0]["avg"], 2.0);
+    let up = get("php_fpm.up").await;
+    let names: Vec<&str> = up["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|line| line["name"].as_str())
+        .collect();
+    assert_eq!(names.len(), 2, "{up}");
+}
+
 // ---- finding hosts
 
 async fn report_facts(server: &TestServer, host: &str, facts: Value) -> (Identity, Client) {

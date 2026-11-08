@@ -2,7 +2,7 @@
 //! `resolve` that agents get their config from, once with the saved rules and
 //! once with the rule as it stands in the form, and compares the results.
 
-use maxnines_protocol::{AgentConfig, Check, CollectorSettings};
+use maxnines_protocol::{AgentConfig, Check, CollectorSettings, default_status_page};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -185,6 +185,14 @@ fn describe_changes(before: &ResolvedConfig, after: &ResolvedConfig) -> Vec<Stri
                     describe_list(now.paths.as_ref())
                 ));
             }
+            let old_urls = was.and_then(|settings| settings.urls.as_ref());
+            if old_urls != now.urls.as_ref() {
+                changes.push(format!(
+                    "{name} reads: {} → {}",
+                    describe_pages(name, old_urls),
+                    describe_pages(name, now.urls.as_ref())
+                ));
+            }
             let old_checks = was.and_then(|settings| settings.checks.as_ref());
             if old_checks != now.checks.as_ref() {
                 changes.push(format!(
@@ -215,6 +223,15 @@ fn describe_mounts(mounts: Option<&Vec<String>>) -> String {
 
 fn describe_list(items: Option<&Vec<String>>) -> String {
     items.map_or("nothing".to_string(), |items| items.join(", "))
+}
+
+/// Without a list, a status page collector reads its usual page.
+fn describe_pages(collector: &str, urls: Option<&Vec<String>>) -> String {
+    match (urls, default_status_page(collector)) {
+        (Some(urls), _) => urls.join(", "),
+        (None, Some(page)) => page.to_string(),
+        (None, None) => "nothing".to_string(),
+    }
 }
 
 fn describe_checks(checks: Option<&Vec<Check>>) -> String {
