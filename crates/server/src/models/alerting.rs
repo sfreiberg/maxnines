@@ -364,9 +364,12 @@ async fn resolve_in<C: ConnectionTrait>(
         .exec(connection)
         .await
         .context("dropping notifications")?;
+    // A channel whose firing notification was given up on never heard the alert
+    // start, so it shouldn't hear it end either.
     let told = notification::Entity::find()
         .filter(notification::Column::AlertId.eq(id))
         .filter(notification::Column::Event.eq(Event::Firing.as_str()))
+        .filter(notification::Column::State.ne(FAILED))
         .all(connection)
         .await
         .context("loading notifications")?;

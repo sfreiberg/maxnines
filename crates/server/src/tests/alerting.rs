@@ -2714,6 +2714,15 @@ async fn a_delivery_is_given_up_on_after_a_day_and_says_so() {
     let page = Browser::default().get(&test.server, "/alerts").await;
     assert!(page.body.contains("Gave up"), "{}", page.body);
     assert!(page.body.contains("the webhook returned status 502"));
+
+    // The channel never heard the alert start, so it doesn't hear it end.
+    test.cpu(2 * day, 10.0).await;
+    notifier
+        .deliver_due(test.now + 2 * day + 1000)
+        .await
+        .unwrap();
+    assert_eq!(hook.events(), ["firing", "firing"]);
+    assert!(due(&test, test.now + 2 * day + 2000).await.is_empty());
 }
 
 #[tokio::test]
