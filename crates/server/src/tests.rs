@@ -130,8 +130,9 @@ async fn start_on(
         heartbeat: Heartbeat {
             interval: Duration::from_millis(50),
             // Short to keep tests quick, but long enough that a busy machine running
-            // every test at once doesn't look like a client gone quiet.
-            timeout: Duration::from_secs(1),
+            // every test at once doesn't look like a client gone quiet. A Windows CI
+            // machine went over a second.
+            timeout: Duration::from_secs(3),
         },
         audience: AUDIENCE.into(),
         trusted_proxies: config.trusted_networks().unwrap().into(),
@@ -891,8 +892,9 @@ async fn an_agent_answering_pings_stays_online() {
     let agent = identity();
     let mut client = server.connect_approved(&agent, "web-1").await;
 
-    // Three times the timeout. Reading is what answers the pings.
-    let deadline = Instant::now() + Duration::from_millis(600);
+    // Past the point where a quiet agent counts as gone. Reading is what answers
+    // the pings.
+    let deadline = Instant::now() + server.state.heartbeat.timeout + Duration::from_millis(500);
     while tokio::time::timeout_at(deadline, client.next())
         .await
         .is_ok()

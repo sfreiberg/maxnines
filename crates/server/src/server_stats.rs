@@ -303,9 +303,9 @@ fn disk_stats(path: &Path) -> Option<DiskStats> {
     let folder = path
         .parent()
         .filter(|folder| !folder.as_os_str().is_empty());
-    let full = path
-        .canonicalize()
-        .or_else(|_| folder.unwrap_or(Path::new(".")).canonicalize())
+    // Windows' canonical paths start \\?\, which no mount point does.
+    let full = dunce::canonicalize(path)
+        .or_else(|_| dunce::canonicalize(folder.unwrap_or(Path::new("."))))
         .ok()?;
     let disks = Disks::new_with_refreshed_list().ok()?;
     let disk = disks
