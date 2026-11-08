@@ -220,6 +220,7 @@ async fn a_site_on_plain_http_can_still_keep_a_session() {
     let plain = TestServer {
         address,
         session: String::new(),
+        api_key: server.api_key.clone(),
         state: server.state.clone(),
         saved: Saved::default(),
         _folder: None,

@@ -3508,8 +3508,9 @@ async fn alert_pages_keep_the_strict_security_policy() {
 async fn api(server: &TestServer, method: &str, path: &str, body: &Value) -> (u16, Value) {
     let body = body.to_string();
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {ADMIN_TOKEN}\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        server.api_key,
         body.len()
     );
     let page = Browser::default().send(server, request).await;
@@ -3521,7 +3522,7 @@ async fn api(server: &TestServer, method: &str, path: &str, body: &Value) -> (u1
 }
 
 #[tokio::test]
-async fn the_alert_api_needs_the_admin_token() {
+async fn the_alert_api_needs_an_api_key() {
     let server = start().await;
     for path in [
         "/api/v1/alerts",
@@ -3894,7 +3895,7 @@ mod remote {
         assert!(!page.body.contains("Agent details"));
 
         let response = server
-            .http("GET", "/api/v1/agents", Some(ADMIN_TOKEN))
+            .http("GET", "/api/v1/agents", Some(&server.api_key))
             .await;
         assert!(!response.contains("MaxNines server"));
 
@@ -5726,7 +5727,7 @@ mod server_page {
     async fn the_old_address_of_the_server_page_still_works() {
         let server = start().await;
         let response = server
-            .http("GET", "/settings/server", Some(ADMIN_TOKEN))
+            .http("GET", "/settings/server", Some(&server.api_key))
             .await;
         assert!(response.starts_with("HTTP/1.1 308"), "{response}");
         assert!(

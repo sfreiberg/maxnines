@@ -50,7 +50,6 @@ pub struct AppState {
     /// The URL agents must have signed.
     pub audience: Arc<str>,
     pub trusted_proxies: Arc<[IpNet]>,
-    pub admin_token_hash: Arc<[u8]>,
     pub views: Arc<Views>,
     pub csrf: CsrfConfig,
     /// Where people reach the site, for links they're given.

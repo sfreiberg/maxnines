@@ -1,6 +1,9 @@
-//! The admin commands. They go through the running server, which holds the agent
-//! list and the metrics database, using the token kept in the main database.
+//! The command-line tools. Users and API keys are managed in the main database
+//! itself, which is how the first user gets in before anyone can sign in. Agents
+//! live in the running server's memory, so those commands go through its API with
+//! an API key, as any script would.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,24 +15,42 @@ use serde_json::Value;
 use crate::config::Config;
 use crate::controllers::api::{AgentView, BASE_PATH};
 use crate::fact_history::{describe_history, format_time};
-use crate::models::{Database, FactVersion};
+use crate::metrics::now_ms;
+use crate::models::{
+    Database, FactVersion, UserChange, check_api_key_name, check_new_user, expiry_after,
+};
+use crate::notifier::web_url;
 
-/// Reads the admin token from the main database.
-fn admin_token(config: &Config) -> Result<String> {
+/// Where scripts and these commands find a key for the running server's API.
+const API_KEY_VARIABLE: &str = "MAXNINES_API_KEY";
+
+/// Runs database work to completion, as these commands aren't async themselves.
+fn with_database<T, Work, Done>(config: &Config, work: Work) -> Result<T>
+where
+    Work: FnOnce(Database) -> Done,
+    Done: Future<Output = Result<T>>,
+{
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .context("reading the admin token")?;
+        .context("starting")?;
     runtime.block_on(async {
         let database = Database::connect(&config.database.resolve_url()?).await?;
-        database.admin_token().await
+        work(database).await
     })
 }
 
-/// Prints the admin token, for scripts that use the admin API.
-pub fn print_admin_token(config: &Config) -> Result<()> {
-    println!("{}", admin_token(config)?);
-    Ok(())
+fn api_key() -> Result<String> {
+    std::env::var(API_KEY_VARIABLE)
+        .ok()
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
+        .with_context(|| {
+            format!(
+                "set {API_KEY_VARIABLE} to a key for the running server, which \
+                 `maxnines-server api-keys create` makes"
+            )
+        })
 }
 
 /// Where this machine reaches the server, even if it listens on all addresses. With
@@ -77,7 +98,7 @@ fn client(config: &Config) -> Result<ureq::Agent> {
 fn explain(error: ureq::Error, url: &str) -> anyhow::Error {
     match error {
         ureq::Error::StatusCode(401) => {
-            anyhow::anyhow!("the server refused the admin token")
+            anyhow::anyhow!("the server refused the API key in {API_KEY_VARIABLE}")
         }
         ureq::Error::StatusCode(404) => anyhow::anyhow!("no agent with that ID"),
         ureq::Error::StatusCode(code) => anyhow::anyhow!("the server returned status {code}"),
@@ -85,16 +106,20 @@ fn explain(error: ureq::Error, url: &str) -> anyhow::Error {
     }
 }
 
-pub fn print_agents(config: &Config) -> Result<()> {
+fn get_json(config: &Config, path: &str) -> Result<String> {
     let base = server_url(config);
-    let token = admin_token(config)?;
+    let key = api_key()?;
 
     let mut response = client(config)?
-        .get(format!("{base}{BASE_PATH}/agents"))
-        .header("Authorization", format!("Bearer {token}"))
+        .get(format!("{base}{path}"))
+        .header("Authorization", format!("Bearer {key}"))
         .call()
         .map_err(|error| explain(error, &base))?;
-    let body = response.body_mut().read_to_string()?;
+    Ok(response.body_mut().read_to_string()?)
+}
+
+pub fn print_agents(config: &Config) -> Result<()> {
+    let body = get_json(config, &format!("{BASE_PATH}/agents"))?;
     let agents: Vec<AgentView> = serde_json::from_str(&body).context("invalid server response")?;
 
     if agents.is_empty() {
@@ -118,18 +143,6 @@ pub fn print_agents(config: &Config) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn get_json(config: &Config, path: &str) -> Result<String> {
-    let base = server_url(config);
-    let token = admin_token(config)?;
-
-    let mut response = client(config)?
-        .get(format!("{base}{path}"))
-        .header("Authorization", format!("Bearer {token}"))
-        .call()
-        .map_err(|error| explain(error, &base))?;
-    Ok(response.body_mut().read_to_string()?)
 }
 
 pub fn print_facts(config: &Config, id: &str) -> Result<()> {
@@ -158,11 +171,11 @@ pub fn print_facts_history(config: &Config, id: &str) -> Result<()> {
 
 pub fn change_agent(config: &Config, id: &str, action: &str) -> Result<()> {
     let base = server_url(config);
-    let token = admin_token(config)?;
+    let key = api_key()?;
 
     let result = client(config)?
         .post(format!("{base}{BASE_PATH}/agents/{id}/{action}"))
-        .header("Authorization", format!("Bearer {token}"))
+        .header("Authorization", format!("Bearer {key}"))
         .send_empty();
     match result {
         Ok(_) => {
@@ -174,60 +187,52 @@ pub fn change_agent(config: &Config, id: &str, action: &str) -> Result<()> {
 }
 
 pub fn print_api_keys(config: &Config) -> Result<()> {
-    let body = get_json(config, &format!("{BASE_PATH}/api-keys"))?;
-    let keys: Vec<Value> = serde_json::from_str(&body).context("invalid server response")?;
+    let keys = with_database(
+        config,
+        |database| async move { database.list_api_keys().await },
+    )?;
     if keys.is_empty() {
         println!("no API keys yet");
         return Ok(());
     }
 
-    let now = crate::metrics::now_ms();
+    let now = now_ms();
     println!(
         "{:<6} {:<16} {:<8} {:<20} NAME",
         "ID", "KEY", "STATE", "EXPIRES"
     );
     for key in keys {
-        let expires = key["expires_ms"].as_i64();
-        let state = if !key["revoked_ms"].is_null() {
+        let state = if key.revoked_ms.is_some() {
             "revoked"
-        } else if expires.is_some_and(|time| now >= time) {
+        } else if key.has_expired(now) {
             "expired"
         } else {
             "active"
         };
         println!(
             "{:<6} {:<16} {:<8} {:<20} {}",
-            key["id"],
-            format!("{}...", key["hint"].as_str().unwrap_or_default()),
+            key.id,
+            format!("{}...", key.hint),
             state,
-            expires
+            key.expires_ms
                 .and_then(|time| u64::try_from(time).ok())
                 .map_or_else(|| "never".to_string(), format_time),
-            key["name"].as_str().unwrap_or_default(),
+            key.name,
         );
     }
     Ok(())
 }
 
 pub fn create_api_key(config: &Config, name: &str, expires_in: Option<Duration>) -> Result<()> {
-    let base = server_url(config);
-    let token = admin_token(config)?;
-
-    let mut response = client(config)?
-        .post(format!("{base}{BASE_PATH}/api-keys"))
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Content-Type", "application/json")
-        .send(
-            serde_json::json!({
-                "name": name,
-                "expires_in_secs": expires_in.map(|time| time.as_secs()),
-            })
-            .to_string(),
-        )
-        .map_err(|error| explain(error, &base))?;
-    let body = response.body_mut().read_to_string()?;
-    let created: Value = serde_json::from_str(&body).context("invalid server response")?;
-    let key = created["key"].as_str().context("invalid server response")?;
+    let name = name.trim();
+    check_api_key_name(name)?;
+    let now = now_ms();
+    let expires_ms = expires_in
+        .map(|time| expiry_after(time.as_secs(), now))
+        .transpose()?;
+    let (_, key) = with_database(config, |database| async move {
+        database.create_api_key(name, expires_ms, now).await
+    })?;
 
     println!("{key}");
     eprintln!("Save this now. It can't be shown again.");
@@ -235,132 +240,94 @@ pub fn create_api_key(config: &Config, name: &str, expires_in: Option<Duration>)
 }
 
 pub fn revoke_api_key(config: &Config, id: i64) -> Result<()> {
-    let base = server_url(config);
-    let token = admin_token(config)?;
-
-    let result = client(config)?
-        .delete(format!("{base}{BASE_PATH}/api-keys/{id}"))
-        .header("Authorization", format!("Bearer {token}"))
-        .call();
-    match result {
-        Ok(_) => {
-            println!("revoked: {id}");
-            Ok(())
-        }
-        Err(ureq::Error::StatusCode(404)) => bail!("no API key with that ID"),
-        Err(error) => bail!(explain(error, &base)),
+    let revoked = with_database(config, |database| async move {
+        database.revoke_api_key(id, now_ms()).await
+    })?;
+    if !revoked {
+        bail!("no API key with that ID");
     }
-}
-
-/// What the server said was wrong, or a plain explanation if it didn't say.
-fn users_error(error: ureq::Error, url: &str) -> anyhow::Error {
-    match error {
-        ureq::Error::StatusCode(404) => anyhow::anyhow!("no user with that ID"),
-        ureq::Error::StatusCode(409) => {
-            anyhow::anyhow!(
-                "refused: this would leave nobody able to sign in, or they aren't disabled"
-            )
-        }
-        ureq::Error::StatusCode(422) => anyhow::anyhow!("that isn't a valid address and name"),
-        other => explain(other, url),
-    }
+    println!("revoked: {id}");
+    Ok(())
 }
 
 pub fn print_users(config: &Config) -> Result<()> {
-    let base = server_url(config);
-    let token = admin_token(config)?;
-
-    let mut response = client(config)?
-        .get(format!("{base}{BASE_PATH}/users"))
-        .header("Authorization", format!("Bearer {token}"))
-        .call()
-        .map_err(|error| explain(error, &base))?;
-    let body = response.body_mut().read_to_string()?;
-    let users: Vec<Value> = serde_json::from_str(&body).context("invalid server response")?;
-
+    let users = with_database(
+        config,
+        |database| async move { database.list_users().await },
+    )?;
     for user in users {
-        let status = if !user["disabled_ms"].is_null() {
+        let status = if user.disabled_ms.is_some() {
             "disabled"
-        } else if user["has_password"] == true {
+        } else if user.has_password {
             "active"
         } else {
             "invited"
         };
-        println!(
-            "{}  {status:<8}  {}  {}",
-            user["id"],
-            user["email"].as_str().unwrap_or_default(),
-            user["name"].as_str().unwrap_or_default(),
-        );
+        println!("{}  {status:<8}  {}  {}", user.id, user.email, user.name);
     }
     Ok(())
 }
 
 /// Prints the link, the only time it can be seen.
-fn print_link(body: &str) -> Result<()> {
-    let answer: Value = serde_json::from_str(body).context("invalid server response")?;
-    let url = answer["setup_url"]
-        .as_str()
-        .context("invalid server response")?;
-    println!("{url}");
+fn print_link(config: &Config, token: &str) {
+    let site = web_url(config.audience()).unwrap_or_default();
+    println!("{site}/setup/{token}");
     eprintln!("Open this to set a password. It works once and lasts 7 days.");
-    Ok(())
 }
 
 pub fn create_user(config: &Config, email: &str, name: &str) -> Result<()> {
-    let base = server_url(config);
-    let token = admin_token(config)?;
-
-    let result = client(config)?
-        .post(format!("{base}{BASE_PATH}/users"))
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Content-Type", "application/json")
-        .send(serde_json::json!({ "email": email, "name": name }).to_string());
-    let mut response = match result {
-        Ok(response) => response,
-        Err(ureq::Error::StatusCode(409)) => bail!("there's already a user with that address"),
-        Err(error) => bail!(users_error(error, &base)),
+    let (email, name) = check_new_user(email, name)?;
+    let created = with_database(config, |database| async move {
+        database.create_user(&email, &name, now_ms()).await
+    })?;
+    let Some((_, token)) = created else {
+        bail!("there's already a user with that address");
     };
-    print_link(&response.body_mut().read_to_string()?)
+    print_link(config, &token);
+    Ok(())
 }
 
 pub fn print_setup_link(config: &Config, id: i64) -> Result<()> {
-    let base = server_url(config);
-    let token = admin_token(config)?;
-
-    let mut response = client(config)?
-        .post(format!("{base}{BASE_PATH}/users/{id}/setup-link"))
-        .header("Authorization", format!("Bearer {token}"))
-        .send_empty()
-        .map_err(|error| users_error(error, &base))?;
-    print_link(&response.body_mut().read_to_string()?)
+    let token = with_database(config, |database| async move {
+        database.new_setup_link(id, now_ms()).await
+    })?;
+    let Some(token) = token else {
+        bail!("no user with that ID");
+    };
+    print_link(config, &token);
+    Ok(())
 }
 
-/// `action` is the last part of the API's address for it.
-pub fn change_user(config: &Config, id: i64, action: &str) -> Result<()> {
-    let base = server_url(config);
-    let token = admin_token(config)?;
+/// Says what stood in the way of a change, in the words the page uses.
+fn changed(change: UserChange, done: &str) -> Result<()> {
+    match change {
+        UserChange::Done => {
+            println!("{done}");
+            Ok(())
+        }
+        UserChange::NoSuchUser => bail!("no user with that ID"),
+        UserChange::LastUser => bail!("refused: this would leave nobody able to sign in"),
+        UserChange::StillEnabled => bail!("refused: only a disabled user can be deleted"),
+    }
+}
 
-    client(config)?
-        .post(format!("{base}{BASE_PATH}/users/{id}/{action}"))
-        .header("Authorization", format!("Bearer {token}"))
-        .send_empty()
-        .map_err(|error| users_error(error, &base))?;
-    println!("{action}d: {id}");
-    Ok(())
+/// `action` is `disable` or `enable`.
+pub fn change_user(config: &Config, id: i64, action: &str) -> Result<()> {
+    let change = with_database(config, |database| async move {
+        match action {
+            "disable" => database.disable_user(id, now_ms()).await,
+            _ => database.enable_user(id).await,
+        }
+    })?;
+    changed(change, &format!("{action}d: {id}"))
 }
 
 pub fn delete_user(config: &Config, id: i64) -> Result<()> {
-    let base = server_url(config);
-    let token = admin_token(config)?;
-
-    client(config)?
-        .delete(format!("{base}{BASE_PATH}/users/{id}"))
-        .header("Authorization", format!("Bearer {token}"))
-        .call()
-        .map_err(|error| users_error(error, &base))?;
-    println!("deleted: {id}");
-    Ok(())
+    let change = with_database(
+        config,
+        |database| async move { database.delete_user(id).await },
+    )?;
+    changed(change, &format!("deleted: {id}"))
 }
 
 #[cfg(test)]

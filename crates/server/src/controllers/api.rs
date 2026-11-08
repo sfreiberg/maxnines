@@ -30,7 +30,7 @@ use crate::models::{
 };
 use crate::notifier::{self, Notice};
 use crate::presence::AgentPresence;
-use crate::registration::{AgentRecord, AgentState, hash_token};
+use crate::registration::{AgentRecord, AgentState};
 use crate::remote_checks::{RemoteCheck, RemoteCheckInput};
 use crate::rule_engine::{self, ResolvedConfig};
 use crate::silences::{ActiveSilences, Cover, SilenceInput};
@@ -179,7 +179,6 @@ pub async fn token_accepted(state: &AppState, headers: &HeaderMap) -> anyhow::Re
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
     match presented {
-        Some(token) if hash_token(token) == *state.admin_token_hash => Ok(true),
         Some(key) => state.database.accept_api_key(key, now_ms()).await,
         None => Ok(false),
     }

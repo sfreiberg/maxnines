@@ -32,7 +32,7 @@ use crate::facts::FlatFacts;
 use crate::metrics::{Metrics, TimeRange, now_ms};
 use crate::models::{Database, FactVersion, RuleInput};
 use crate::presence::Presence;
-use crate::registration::{AgentState, Registry, Rules, hash_token};
+use crate::registration::{AgentState, Registry, Rules};
 use crate::server_stats::ServerStatus;
 use crate::store::testing::{MemoryStore, Saved};
 use crate::store::{self, MetricsReader, Store, WRITE_QUEUE_SIZE, spawn_writer};
@@ -40,7 +40,6 @@ use crate::views::Views;
 use crate::{AgentsCommand, Cli, Command};
 
 const AUDIENCE: &str = "wss://monitor.example.com/ws";
-const ADMIN_TOKEN: &str = "test-admin-token";
 
 type Client = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -48,6 +47,8 @@ struct TestServer {
     address: SocketAddr,
     /// A signed in user's session, which browsers use unless they're anonymous.
     session: String,
+    /// A key for the API, as scripts use.
+    api_key: String,
     state: AppState,
     saved: Saved,
     /// Holds the metrics database, for tests that use a real one.
@@ -105,6 +106,10 @@ async fn start_on(
         .unwrap()
         .unwrap();
     let session = database.start_session(user.id, now_ms()).await.unwrap();
+    let (_, api_key) = database
+        .create_api_key("tests", None, now_ms())
+        .await
+        .unwrap();
     let status = Arc::new(ServerStatus::new(None).unwrap());
     let (writer, _thread) = spawn_writer(store, status.writes.clone());
     let state = AppState {
@@ -130,7 +135,6 @@ async fn start_on(
         },
         audience: AUDIENCE.into(),
         trusted_proxies: config.trusted_networks().unwrap().into(),
-        admin_token_hash: hash_token(ADMIN_TOKEN).into(),
         views: Arc::new(Views::load().unwrap()),
         csrf: CsrfConfig::default(),
         web_url: "http://site.test".into(),
@@ -145,6 +149,7 @@ async fn start_on(
     TestServer {
         address,
         session,
+        api_key,
         state,
         saved,
         _folder: folder,
@@ -966,7 +971,7 @@ async fn custom_fact_names_with_dots_are_shown_nested() {
         .http(
             "GET",
             &format!("/api/v1/agents/{id}/facts"),
-            Some(ADMIN_TOKEN),
+            Some(&server.api_key),
         )
         .await;
     let body = response.split("\r\n\r\n").nth(1).unwrap();
@@ -993,7 +998,7 @@ async fn list_items_are_stored_under_indexed_names() {
         .http(
             "GET",
             &format!("/api/v1/agents/{id}/facts"),
-            Some(ADMIN_TOKEN),
+            Some(&server.api_key),
         )
         .await;
     let body = response.split("\r\n\r\n").nth(1).unwrap();
@@ -1037,7 +1042,7 @@ async fn values_come_back_with_the_type_they_went_in_with() {
         .http(
             "GET",
             &format!("/api/v1/agents/{id}/facts"),
-            Some(ADMIN_TOKEN),
+            Some(&server.api_key),
         )
         .await;
     let body = response.split("\r\n\r\n").nth(1).unwrap();
@@ -1107,7 +1112,7 @@ async fn the_admin_api_separates_trusted_and_reported_facts() {
         .http(
             "GET",
             &format!("/api/v1/agents/{id}/facts"),
-            Some(ADMIN_TOKEN),
+            Some(&server.api_key),
         )
         .await;
     let body = response.split("\r\n\r\n").nth(1).unwrap();
@@ -1140,7 +1145,7 @@ async fn the_facts_api_needs_the_token_and_a_known_agent() {
         "/api/v1/agents/nope/facts",
         "/api/v1/agents/nope/facts/history",
     ] {
-        let response = server.http("GET", path, Some(ADMIN_TOKEN)).await;
+        let response = server.http("GET", path, Some(&server.api_key)).await;
         assert!(response.starts_with("HTTP/1.1 404"), "{response}");
     }
 }
@@ -1156,7 +1161,7 @@ async fn the_history_api_returns_every_change_in_order() {
     server.wait_for_facts(&id, 3).await;
 
     let path = format!("/api/v1/agents/{id}/facts/history");
-    let response = server.http("GET", &path, Some(ADMIN_TOKEN)).await;
+    let response = server.http("GET", &path, Some(&server.api_key)).await;
     let body = response.split("\r\n\r\n").nth(1).unwrap();
     let history: Vec<FactVersion> = serde_json::from_str(body).unwrap();
 
@@ -1197,8 +1202,9 @@ impl TestServer {
     async fn request(&self, method: &str, path: &str, body: &str) -> String {
         let mut stream = TcpStream::connect(self.address).await.unwrap();
         let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {ADMIN_TOKEN}\r\n\
+            "{method} {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {}\r\n\
              Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            self.api_key,
             body.len()
         );
         stream.write_all(request.as_bytes()).await.unwrap();
@@ -1575,12 +1581,6 @@ async fn every_page_renders() {
         assert_eq!(page.status, 200, "{path}: {}", page.body);
         assert!(page.body.contains("MaxNines"), "{path}");
     }
-}
-
-#[test]
-fn the_admin_token_has_a_command() {
-    let cli = Cli::parse_from(["maxnines-server", "admin-token"]);
-    assert_eq!(cli.command, Some(Command::AdminToken));
 }
 
 #[tokio::test]
@@ -2449,7 +2449,7 @@ async fn the_admin_api_lists_approves_and_revokes() {
     handshake(&mut client, &agent, "web-1", None).await;
 
     let list = server
-        .http("GET", "/api/v1/agents", Some(ADMIN_TOKEN))
+        .http("GET", "/api/v1/agents", Some(&server.api_key))
         .await;
     assert!(list.starts_with("HTTP/1.1 200"), "{list}");
     assert!(list.contains(&id), "{list}");
@@ -2457,12 +2457,12 @@ async fn the_admin_api_lists_approves_and_revokes() {
     assert!(list.contains(r#""online":false"#), "{list}");
 
     let path = format!("/api/v1/agents/{id}/approve");
-    let response = server.http("POST", &path, Some(ADMIN_TOKEN)).await;
+    let response = server.http("POST", &path, Some(&server.api_key)).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert!(server.state.registry.is_approved(&id).await);
 
     let path = format!("/api/v1/agents/{id}/revoke");
-    let response = server.http("POST", &path, Some(ADMIN_TOKEN)).await;
+    let response = server.http("POST", &path, Some(&server.api_key)).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert!(!server.state.registry.is_approved(&id).await);
 }
@@ -2471,7 +2471,7 @@ async fn the_admin_api_lists_approves_and_revokes() {
 async fn approving_an_unknown_agent_is_not_found() {
     let server = start().await;
     let response = server
-        .http("POST", "/api/v1/agents/nope/approve", Some(ADMIN_TOKEN))
+        .http("POST", "/api/v1/agents/nope/approve", Some(&server.api_key))
         .await;
     assert!(response.starts_with("HTTP/1.1 404"), "{response}");
 }
@@ -3277,7 +3277,7 @@ async fn the_agent_and_metric_pages_link_to_each_other() {
 }
 
 #[tokio::test]
-async fn the_metrics_api_needs_the_admin_token() {
+async fn the_metrics_api_needs_an_api_key() {
     let server = start().await;
     for path in [
         "/api/v1/metrics",
@@ -3299,7 +3299,7 @@ async fn the_metrics_api_lists_what_can_be_asked_for() {
     let server = start().await;
 
     let response = server
-        .http("GET", "/api/v1/metrics", Some(ADMIN_TOKEN))
+        .http("GET", "/api/v1/metrics", Some(&server.api_key))
         .await;
 
     let catalog = json_body(&response);
@@ -3320,7 +3320,7 @@ async fn the_metrics_api_returns_series_and_current_values() {
     let id = agent.id();
 
     let path = format!("/api/v1/agents/{id}/metrics/cpu.usage");
-    let body = json_body(&server.http("GET", &path, Some(ADMIN_TOKEN)).await);
+    let body = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
 
     assert_eq!(body["metric"], "cpu.usage");
     assert_eq!(body["unit"], "percent");
@@ -3334,7 +3334,7 @@ async fn the_metrics_api_returns_series_and_current_values() {
 
     let body = json_body(
         &server
-            .http("GET", "/api/v1/metrics/current", Some(ADMIN_TOKEN))
+            .http("GET", "/api/v1/metrics/current", Some(&server.api_key))
             .await,
     );
     assert_eq!(body[&id]["cpu_percent"], 42.5);
@@ -3353,11 +3353,11 @@ async fn the_metrics_api_can_be_given_a_time_range() {
         now - 7_200_000,
         now - 3_600_000
     );
-    let body = json_body(&server.http("GET", &path, Some(ADMIN_TOKEN)).await);
+    let body = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
     assert_eq!(body["series"], json!([]));
 
     let path = format!("{base}?from_ms={}&to_ms={now}", now - 86_400_000);
-    let body = json_body(&server.http("GET", &path, Some(ADMIN_TOKEN)).await);
+    let body = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
     assert_eq!(body["step_ms"], 600_000);
     assert_eq!(body["series"][0]["name"], "CPU");
 }
@@ -3368,7 +3368,7 @@ async fn the_metrics_api_refuses_what_it_can_not_answer() {
     let agent = identity();
     let _client = server.connect_approved(&agent, "web-1").await;
     let id = agent.id();
-    let token = Some(ADMIN_TOKEN);
+    let token = Some(server.api_key.as_str());
 
     let metric = format!("/api/v1/agents/{id}/metrics/cpu.usage");
     for query in [
@@ -4089,7 +4089,8 @@ async fn the_keys_page_offers_only_set_lifetimes() {
         .await;
 
     assert_eq!(page.status, 422, "{}", page.body);
-    assert!(!page.body.contains("mxn_"), "{}", page.body);
+    assert!(!page.body.contains("Your new key"), "{}", page.body);
+    assert!(!page.body.contains(r#"class="secret""#), "{}", page.body);
 }
 
 #[tokio::test]

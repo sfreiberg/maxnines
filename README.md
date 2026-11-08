@@ -37,8 +37,9 @@ someone already here, so a new server starts with the command line:
 maxnines-server users create you@example.com "Your Name"
 ```
 
-That prints a link for setting a password. It works once and lasts 7 days. After
-that, add people on the Settings page, which gives you a link to send them. The same
+That works on the main database directly, so the server needn't be running. It
+prints a link for setting a password, which works once and lasts 7 days. After that,
+add people on the Settings page, which gives you a link to send them. The same
 command line can recover from a forgotten password with `users setup-link`.
 
 Over plain `http://`, passwords cross the network unencrypted, so put anything beyond
@@ -73,9 +74,10 @@ Then start it:
 ```
 
 It creates a key in `state`, logs its agent ID, and waits to be approved. Approve it
-on the Agents page, or on the server with:
+on the Agents page, or from the command line with an API key:
 
 ```sh
+export MAXNINES_API_KEY=$(maxnines-server api-keys create "Admin")
 maxnines-server agents approve <agent-id>
 ```
 
@@ -244,8 +246,10 @@ certificate logs `invalid peer certificate` and keeps trying.
 
 ### Command line tools
 
-With a `tls` block, `maxnines-server agents`, `users` and `api-keys` connect to
-`public_url` and check the certificate like anything else. That name has to work from
+`maxnines-server users` and `api-keys` work on the main database directly.
+`maxnines-server agents` talks to the running server, as that's where the agent list
+lives, with the API key in `MAXNINES_API_KEY`. With a `tls` block it connects to
+`public_url` and checks the certificate like anything else. That name has to work from
 the server itself. If they report `invalid peer certificate: UnknownIssuer`, the
 certificate is from a private authority and the `tls` block needs its `ca_file`.
 

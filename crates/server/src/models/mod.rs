@@ -368,8 +368,6 @@ impl Database {
     }
 }
 
-const ADMIN_TOKEN: &str = "admin_token";
-
 /// What the database column holds.
 const MAX_API_KEY_NAME_LEN: usize = 100;
 /// How much of a key is kept to tell it apart, which is `mxn_` and 8 of its 64 digits.
@@ -511,10 +509,6 @@ impl Database {
                 .context("noting an API key's use")?;
         }
         Ok(true)
-    }
-
-    pub async fn admin_token(&self) -> Result<String> {
-        self.server_secret(ADMIN_TOKEN).await
     }
 
     /// A secret the server made for itself, created the first time it's asked for.
@@ -1076,22 +1070,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_admin_token_survives_a_restart() {
+    async fn a_server_secret_survives_a_restart() {
         let folder = tempfile::tempdir().unwrap();
         let url = format!("sqlite://{}?mode=rwc", folder.path().join("db").display());
 
         let first = Database::connect(&url).await.unwrap();
-        let token = first.admin_token().await.unwrap();
+        let secret = first.server_secret("csrf_key").await.unwrap();
         drop(first);
 
         let reopened = Database::connect(&url).await.unwrap();
-        assert_eq!(reopened.admin_token().await.unwrap(), token);
+        assert_eq!(reopened.server_secret("csrf_key").await.unwrap(), secret);
+        assert_ne!(reopened.server_secret("csrf_salt").await.unwrap(), secret);
     }
 
     #[tokio::test]
-    async fn each_database_gets_its_own_admin_token() {
-        let first = Database::for_test().await.admin_token().await.unwrap();
-        let second = Database::for_test().await.admin_token().await.unwrap();
+    async fn each_database_gets_its_own_secrets() {
+        let first = Database::for_test()
+            .await
+            .server_secret("csrf_key")
+            .await
+            .unwrap();
+        let second = Database::for_test()
+            .await
+            .server_secret("csrf_key")
+            .await
+            .unwrap();
         assert_ne!(first, second);
     }
 
@@ -1419,9 +1422,9 @@ mod tests {
         exercise_alerting(database, agent).await;
         exercise_remote_checks(database).await;
 
-        let token = database.admin_token().await.unwrap();
-        assert!(token.len() >= 32);
-        assert_eq!(database.admin_token().await.unwrap(), token);
+        let secret = database.server_secret("csrf_key").await.unwrap();
+        assert!(secret.len() >= 32);
+        assert_eq!(database.server_secret("csrf_key").await.unwrap(), secret);
 
         let stats = database.stats().await.unwrap();
         assert!(stats.size_bytes.unwrap_or(0) > 0, "{stats:?}");

@@ -55,7 +55,7 @@ use metrics::{Metrics, now_ms};
 use models::Database;
 use notifier::{Mailer, Notifier, Senders, web_url};
 use presence::Presence;
-use registration::{Registry, Rules, hash_token};
+use registration::{Registry, Rules};
 use remote_checks::{LOCAL_AGENT_ID, LatestResults, Scheduler};
 use server_stats::ServerStatus;
 use store::WriterCommand;
@@ -84,17 +84,15 @@ struct Cli {
 enum Command {
     /// Run the server (the default)
     Run,
-    /// Manage registered agents on a running server
+    /// Manage registered agents on the running server, with MAXNINES_API_KEY set
     #[command(subcommand)]
     Agents(AgentsCommand),
-    /// Manage keys for the API on a running server
+    /// Manage keys for the API, in the main database
     #[command(subcommand)]
     ApiKeys(ApiKeysCommand),
-    /// Manage who can sign in on a running server
+    /// Manage who can sign in, in the main database
     #[command(subcommand)]
     Users(UsersCommand),
-    /// Print the server's own token, which works like an API key and can't be revoked
-    AdminToken,
     /// Run the server as a Windows service
     #[cfg(windows)]
     #[command(subcommand)]
@@ -178,7 +176,6 @@ fn main() -> Result<()> {
                 UsersCommand::Delete { id } => cli::delete_user(&config, id),
             }
         }
-        Command::AdminToken => cli::print_admin_token(&Config::load(&cli.config)?),
         Command::ApiKeys(command) => {
             let config = Config::load(&cli.config)?;
             match command {
@@ -210,7 +207,6 @@ async fn serve(path: &Path) -> Result<()> {
     let rules = Rules::compile(&config.registration)?;
 
     let database = Database::connect(&config.database.resolve_url()?).await?;
-    let admin_token = database.admin_token().await?;
     let secure_site = config.audience().starts_with("wss://");
     let csrf = csrf::config(&database, secure_site).await?;
     let agents = database.load_agents().await.context("loading agents")?;
@@ -249,7 +245,6 @@ async fn serve(path: &Path) -> Result<()> {
         },
         audience: config.audience().into(),
         trusted_proxies: config.trusted_networks()?.into(),
-        admin_token_hash: hash_token(&admin_token).into(),
         views: Arc::new(Views::load()?),
         csrf,
         web_url: web_url(config.audience()).unwrap_or_default().into(),

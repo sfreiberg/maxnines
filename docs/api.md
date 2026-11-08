@@ -26,8 +26,9 @@ export AGENT_ID=$(curl -s -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 **Authentication.** Every request needs an `Authorization: Bearer` header holding an
 API key. A key can do everything the API can, so give each tool its own. Without a
-valid key, the answer is `401`. The token from `maxnines-server admin-token` also
-works, but it can't be revoked, so it's better kept for the server's own commands.
+valid key, the answer is `401`. Keys are made on the Settings page or with
+`maxnines-server api-keys create`, which writes to the main database directly, so it
+works before anyone can sign in.
 
 **Encryption.** Use the server's own TLS, either your certificates or automatic ones
 through ACME, or put it behind a proxy that terminates TLS. Anywhere beyond one
