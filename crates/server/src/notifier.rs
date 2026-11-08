@@ -371,6 +371,37 @@ fn alerts_link(web_url: &str) -> String {
     format!("{web_url}/alerts")
 }
 
+/// What a Slack app for MaxNines needs: a bot that can post anywhere, can look up
+/// who pressed a button, and hears buttons through Socket Mode.
+fn slack_manifest_value() -> Value {
+    json!({
+        "display_information": { "name": "MaxNines" },
+        "features": { "bot_user": { "display_name": "maxnines", "always_online": false } },
+        "oauth_config": {
+            "scopes": {
+                "bot": ["chat:write", "chat:write.public", "users:read", "users:read.email"],
+            },
+        },
+        "settings": {
+            "interactivity": { "is_enabled": true },
+            "socket_mode_enabled": true,
+        },
+    })
+}
+
+/// The manifest to paste into Slack by hand.
+pub fn slack_manifest() -> String {
+    serde_json::to_string_pretty(&slack_manifest_value()).unwrap_or_default()
+}
+
+/// Opens Slack's new app page with the manifest already filled in.
+pub fn slack_manifest_link() -> String {
+    let manifest = slack_manifest_value().to_string();
+    let query = serde_urlencoded::to_string([("new_app", "1"), ("manifest_json", &manifest)])
+        .unwrap_or_default();
+    format!("https://api.slack.com/apps?{query}")
+}
+
 /// What AlertOps' sample data box needs, to map its fields from.
 pub fn alertops_sample() -> String {
     let event = Notice::test().alertops_event(Incident::Open, Some("https://maxnines.example.com"));
@@ -1333,6 +1364,28 @@ mod tests {
             .unwrap();
         assert!(text.chars().count() <= SLACK_SECTION_MAX_CHARS);
         assert!(text.ends_with("&lt;"), "{}", &text[text.len() - 10..]);
+    }
+
+    #[test]
+    fn the_slack_link_and_the_manifest_to_paste_say_the_same_thing() {
+        let link = slack_manifest_link();
+        let query = link.strip_prefix("https://api.slack.com/apps?").unwrap();
+        let fields: Vec<(String, String)> = serde_urlencoded::from_str(query).unwrap();
+        assert_eq!(fields[0], ("new_app".to_string(), "1".to_string()));
+        assert_eq!(fields[1].0, "manifest_json");
+        let linked: Value = serde_json::from_str(&fields[1].1).unwrap();
+        let pasted: Value = serde_json::from_str(&slack_manifest()).unwrap();
+        assert_eq!(linked, pasted);
+        assert_eq!(linked["settings"]["socket_mode_enabled"], true);
+        assert_eq!(
+            linked["oauth_config"]["scopes"]["bot"],
+            json!([
+                "chat:write",
+                "chat:write.public",
+                "users:read",
+                "users:read.email"
+            ])
+        );
     }
 
     #[test]

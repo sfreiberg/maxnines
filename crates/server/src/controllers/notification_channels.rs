@@ -190,6 +190,8 @@ fn form_page(
         .with("id", &id)
         .with("channel", form)
         .with("alertops_sample", &notifier::alertops_sample())
+        .with("slack_manifest", &notifier::slack_manifest())
+        .with("slack_manifest_link", &notifier::slack_manifest_link())
         .with("email_ready", &state.senders.mailer.is_some())
         .with("error", &error);
     match error {

@@ -28,6 +28,27 @@
     {% if not email_ready %}<small>Email needs an <code>email</code> block in the server config.</small>{% endif %}
   </label>
 
+  <details class="for-slack setup"{% if not channel.has_credential %} open{% endif %}>
+    <summary>How to set up the Slack app</summary>
+    <ol>
+      <li><a class="button secondary" href="{{ slack_manifest_link }}" target="_blank" rel="noopener">Create the Slack app</a> Slack opens with everything filled in. Pick your workspace, check the summary, and choose Create.</li>
+      <li>In the app's menu, open <strong>Install App</strong>, choose <strong>Install to</strong> your workspace, then <strong>Allow</strong>.</li>
+      <li>Open <strong>OAuth &amp; Permissions</strong> and copy the <strong>Bot User OAuth Token</strong> into the bot token box below. It starts with <code>xoxb-</code>.</li>
+      <li>For Acknowledge and Silence buttons, open <strong>Basic Information</strong> and find <strong>App-Level Tokens</strong>. Choose <strong>Generate Token and Scopes</strong>, give it any name, add the <code>connections:write</code> scope, and generate it. Copy it into the app-level token box below. It starts with <code>xapp-</code>.</li>
+      <li>Put the channel to post in, such as <code>#alerts</code>, in the box below. For a private channel, invite the app to it first with <code>/invite @maxnines</code>.</li>
+    </ol>
+    <p class="note">Buttons act as the MaxNines user with the same email address as the person pressing them, so everyone needs a MaxNines account with the email they use in Slack. Guests and people from other organizations can't use them. The server connects out to Slack for them, so it doesn't need to be reachable from the internet.</p>
+    <details>
+      <summary>Creating the app by hand instead</summary>
+      <p>At <a href="https://api.slack.com/apps">api.slack.com/apps</a>, choose Create New App, then From a manifest. Pick your workspace, choose JSON, and paste this in:</p>
+      <div class="copyable">
+<pre id="slack-manifest">{{ slack_manifest }}</pre>
+        <button type="button" class="secondary copy" data-copy="slack-manifest" aria-live="polite" hidden>Copy</button>
+      </div>
+      <p>On an Enterprise Grid org-wide install, use the channel's ID rather than its name. It's at the bottom of the channel's details in Slack.</p>
+    </details>
+  </details>
+
   <label>Sends to
     <input type="text" name="target" value="{{ channel.target }}" spellcheck="false" autocomplete="off"{% if channel.preview %} placeholder="{{ channel.preview }}"{% endif %}>
     <small>{% if channel.preview %}Leave empty to keep what's saved, which isn't shown because it can work like a password.{% else %}A webhook's URL, a Discord webhook URL, email addresses separated by commas, for Slack a channel such as <code>#alerts</code>, for PagerDuty an integration key, the URL from AlertOps or SIGNL4, or for Telegram a chat ID.{% endif %}</small>
@@ -69,8 +90,18 @@
 
   <label class="for-token">Bot token
     <input type="password" name="credential" autocomplete="off" spellcheck="false"{% if channel.has_credential %} placeholder="Saved"{% endif %}>
-    <small>{% if channel.has_credential %}Leave empty to keep the saved token, which isn't shown.{% else %}<span class="for-slack">It starts with <code>xoxb-</code>.</span><span class="for-telegram">BotFather gives it out, as a number, a colon, then a long code.</span>{% endif %}</small>
+    <small>{% if channel.has_credential %}Leave empty to keep the saved token, which isn't shown.{% else %}<span class="for-slack">From <strong>OAuth &amp; Permissions</strong> in the Slack app, once it's installed. It starts with <code>xoxb-</code>.</span><span class="for-telegram">BotFather gives it out, as a number, a colon, then a long code.</span>{% endif %}</small>
   </label>
+
+  <label class="for-slack">App-level token, for buttons
+    <input type="password" name="app_token" autocomplete="off" spellcheck="false"{% if channel.has_app_token %} placeholder="Saved"{% endif %}>
+    <small>{% if channel.has_app_token %}Leave empty to keep the saved token, which isn't shown.{% else %}Optional. From <strong>Basic Information</strong>, then <strong>App-Level Tokens</strong>, in the Slack app. It starts with <code>xapp-</code>.{% endif %}</small>
+  </label>
+  {% if channel.has_app_token %}
+  <label class="checkbox for-slack">
+    <input type="checkbox" name="remove_app_token"> Remove the app-level token, so alerts have no buttons
+  </label>
+  {% endif %}
 
   <details class="for-telegram">
     <summary>How to set up a Telegram bot</summary>
@@ -82,49 +113,6 @@
     <p class="note">When an alert resolves, the message replies to the one that said it started.</p>
   </details>
 
-  <fieldset class="for-slack">
-    <legend>Slack</legend>
-    <label>App-level token, for buttons
-      <input type="password" name="app_token" autocomplete="off" spellcheck="false"{% if channel.has_app_token %} placeholder="Saved"{% endif %}>
-      <small>{% if channel.has_app_token %}Leave empty to keep the saved token, which isn't shown.{% else %}Optional. It starts with <code>xapp-</code>, and adds Acknowledge and Silence buttons to alerts.{% endif %}</small>
-    </label>
-    {% if channel.has_app_token %}
-    <label class="checkbox">
-      <input type="checkbox" name="remove_app_token"> Remove the app-level token, so alerts have no buttons
-    </label>
-    {% endif %}
-    <details>
-      <summary>How to create the Slack app</summary>
-      <ol>
-        <li>At <a href="https://api.slack.com/apps">api.slack.com/apps</a>, choose Create New App, then From a manifest.</li>
-        <li>Pick your workspace and paste this in:
-          <div class="copyable">
-<pre id="slack-manifest">display_information:
-  name: MaxNines
-features:
-  bot_user:
-    display_name: maxnines
-oauth_config:
-  scopes:
-    bot:
-      - chat:write
-      - chat:write.public
-      - users:read
-      - users:read.email
-settings:
-  interactivity:
-    is_enabled: true
-  socket_mode_enabled: true</pre>
-            <button type="button" class="secondary copy" data-copy="slack-manifest" aria-live="polite" hidden>Copy</button>
-          </div></li>
-        <li>Install the app to your workspace, then copy its bot token here. It starts with <code>xoxb-</code>.</li>
-        <li>For buttons, open Basic Information, then App-Level Tokens. Generate one with the <code>connections:write</code> scope, and copy it into the app-level token box. It starts with <code>xapp-</code>.</li>
-        <li>For a private channel, invite the app to it first.</li>
-        <li>On an Enterprise Grid org-wide install, use the channel's ID rather than its name. It's at the bottom of the channel's details in Slack.</li>
-      </ol>
-      <p class="note">Buttons act as the MaxNines user with the same email address as the person pressing them. Slack guests and people from other organizations can't use them. The server connects out to Slack for them, so it doesn't need to be reachable from the internet.</p>
-    </details>
-  </fieldset>
 
   <div class="actions">
     <button type="submit">Save channel</button>

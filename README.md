@@ -319,7 +319,8 @@ acknowledging an alert here doesn't acknowledge it in PagerDuty, or the other wa
 
 Slack alerts can have **Acknowledge** and **Silence 1 hour** buttons. They need the
 Slack app's app-level token as well as its bot token. The form for a Slack channel has
-the steps and an app manifest to paste into Slack.
+a button that creates the app in Slack with everything filled in, and says where in
+Slack to find each token.
 
 The server connects out to Slack to hear the buttons, using Slack's Socket Mode, so it
 doesn't need to be reachable from the internet.
