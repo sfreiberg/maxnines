@@ -148,11 +148,20 @@ impl Snapshot {
             RuleKind::Offline => Some("The rule changed"),
             RuleKind::Calculation => None,
             RuleKind::Metric => {
+                // The agent still reports the metric, so one of three things has
+                // happened to this series.
                 let metric = rule.rule.metric()?;
-                let readings = self.readings.get(metric.name)?;
-                readings
-                    .contains_key(&alert.agent_id)
-                    .then_some("This series is no longer reported")
+                let readings = self.readings.get(metric.name)?.get(&alert.agent_id)?;
+                let reported = readings
+                    .iter()
+                    .any(|reading| clean(&reading.series) == alert.series);
+                Some(if !reported {
+                    "This series is no longer reported"
+                } else if !rule.rule.watches_series(&alert.series) {
+                    "The rule no longer covers this series"
+                } else {
+                    "This agent reports more series than a rule can watch"
+                })
             }
         }
     }

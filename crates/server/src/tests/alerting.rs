@@ -563,6 +563,41 @@ async fn a_series_that_disappears_closes_its_alert() {
     );
 }
 
+/// The disk is still there; the rule was changed to leave it out, and the reason
+/// should say so rather than blame the agent.
+#[tokio::test]
+async fn a_series_the_rule_stops_watching_closes_with_that_reason() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        metric: Some("disk.usage".to_string()),
+        for_secs: 0,
+        ..cpu_rule()
+    };
+    let id = test.database().create_alert_rule(&rule).await.unwrap();
+    test.script
+        .set(vec![test.reading("/mnt/usb", test.now, 95.0)]);
+    test.evaluate(0).await;
+    assert_eq!(test.open().await.len(), 1);
+
+    let narrowed = AlertRuleInput {
+        series: Some("/data*".to_string()),
+        ..rule
+    };
+    test.database()
+        .update_alert_rule(id, &narrowed)
+        .await
+        .unwrap();
+    let time = test.now + MINUTE_MS;
+    test.script.set(vec![test.reading("/mnt/usb", time, 95.0)]);
+    test.evaluate(MINUTE_MS).await;
+
+    assert!(test.open().await.is_empty());
+    assert_eq!(
+        test.resolved().await[0].resolve_reason.as_deref(),
+        Some("The rule no longer covers this series")
+    );
+}
+
 #[tokio::test]
 async fn a_restart_does_not_repeat_an_open_alert() {
     let mut test = Harness::start().await;
