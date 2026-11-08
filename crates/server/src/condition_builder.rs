@@ -242,11 +242,16 @@ fn literal(value: &str, kind: ValueKind, fact: &str) -> Result<String> {
     })
 }
 
+/// Only what CEL reads as a number: digits, with an optional sign and fraction.
+/// Rust would also take "1." or "1e3", which CEL refuses with a cryptic error.
 fn number(value: &str, fact: &str) -> Result<String> {
-    let is_number = value.parse::<f64>().is_ok_and(f64::is_finite)
-        && value
-            .chars()
-            .all(|c| c.is_ascii_digit() || c == '.' || c == '-');
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    let (whole, fraction) = match digits.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (digits, None),
+    };
+    let all_digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    let is_number = all_digits(whole) && fraction.is_none_or(all_digits);
     ensure!(is_number, "{fact} needs a number");
     Ok(value.to_string())
 }
@@ -438,6 +443,18 @@ fn parse_literal(text: &str) -> Option<(String, ValueKind, &str)> {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    #[test]
+    fn only_numbers_cel_accepts_pass_as_numbers() {
+        for good in ["1", "-1", "1.5", "0.25", "-0.5", "1000000"] {
+            assert_eq!(number(good, "f").unwrap(), good);
+        }
+        for bad in [
+            "1.", ".5", "1e3", "1_000", "", "-", "1.2.3", "NaN", "inf", " 1",
+        ] {
+            assert!(number(bad, "f").is_err(), "{bad:?}");
+        }
+    }
 
     use super::*;
     use crate::rule_engine::evaluate;

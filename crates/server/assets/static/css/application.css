@@ -366,8 +366,10 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
   .preview td:last-child { grid-column: 1 / -1; }
 }
 
-/* An offline rule has no metric to choose. Without :has() the fields just stay. */
+/* An offline rule has no metric to choose, and a calculation picks its machines with
+   a filter rather than a condition. Without :has() the fields just stay. */
 .alert-rule:has(select[name="kind"] option[value="offline"]:checked) .metric-fields { display: none; }
+.alert-rule:has(select[name="kind"] option[value="calculation"]:checked) .applies-to { display: none; }
 .metric-fields { display: contents; }
 
 /* Only the options a kind of check uses. Without :has() they all stay. */

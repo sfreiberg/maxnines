@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::Path;
+use std::sync::PoisonError;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
@@ -162,6 +163,8 @@ impl Rules {
 
 pub struct Registry {
     agents: Mutex<BTreeMap<String, AgentRecord>>,
+    /// When each waiting agent last tried to connect. In memory, as it asks again.
+    asked_ms: std::sync::Mutex<BTreeMap<String, u64>>,
     rules: Rules,
     max_pending: usize,
     database: Database,
@@ -178,6 +181,7 @@ impl Registry {
     ) -> Self {
         Self {
             agents: Mutex::new(agents.into_iter().map(|a| (a.id.clone(), a)).collect()),
+            asked_ms: std::sync::Mutex::default(),
             rules,
             max_pending,
             database,
@@ -234,6 +238,9 @@ impl Registry {
             );
             return Ok(RegistrationStatus::Pending);
         }
+        if existing.is_some() {
+            self.note_asked(request.id);
+        }
 
         let now = now_ms();
         let mut agent = existing.clone().unwrap_or_else(|| AgentRecord {
@@ -258,6 +265,9 @@ impl Registry {
             AgentState::Approved => RegistrationStatus::Approved,
             _ => RegistrationStatus::Pending,
         };
+        if status == RegistrationStatus::Pending {
+            self.note_asked(request.id);
+        }
         if existing.as_ref() != Some(&agent) {
             if existing.is_none() && status == RegistrationStatus::Pending {
                 info!(
@@ -269,6 +279,22 @@ impl Registry {
             self.save(&mut agents, agent).await?;
         }
         Ok(status)
+    }
+
+    fn note_asked(&self, id: &str) {
+        self.asked_ms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id.to_string(), now_ms());
+    }
+
+    /// When a waiting agent last tried to connect, if it has since the server started.
+    pub fn last_asked_ms(&self, id: &str) -> Option<u64> {
+        self.asked_ms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+            .copied()
     }
 
     /// A decision made through the API or the command line.
@@ -296,6 +322,10 @@ impl Registry {
         agent.decided_at_ms = Some(now_ms());
         self.save(&mut agents, agent.clone()).await?;
         drop(agents);
+        self.asked_ms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id);
 
         info!(agent = id, state = state.as_str(), "admin decision");
         self.revisions.send_modify(|revision| *revision += 1);

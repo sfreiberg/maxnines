@@ -29,8 +29,9 @@ API key. A key can do everything the API can, so give each tool its own. Without
 valid key, the answer is `401`. The token from `maxnines-server admin-token` also
 works, but it can't be revoked, so it's better kept for the server's own commands.
 
-**Encryption.** The server doesn't handle TLS itself. Anywhere beyond one machine,
-put it behind a proxy that does, so that keys aren't sent in the clear.
+**Encryption.** Use the server's own TLS, either your certificates or automatic ones
+through ACME, or put it behind a proxy that terminates TLS. Anywhere beyond one
+machine, keys shouldn't cross the network in the clear.
 
 **Requests and responses.** Requests with a body are JSON, with
 `Content-Type: application/json`. Responses are JSON unless noted.
@@ -52,6 +53,7 @@ put it behind a proxy that does, so that keys aren't sent in the clear.
 | `400` | The request couldn't be understood, such as a filter that can't be read |
 | `401` | The key is missing, wrong, revoked or expired |
 | `404` | There's nothing at that address, or no such item |
+| `409` | It clashes with what's there, such as a user with that email already, or disabling the last enabled user |
 | `422` | The request was understood but refused, such as an invalid rule |
 | `500` | Something went wrong on the server |
 | `502` | A test notification couldn't be delivered |

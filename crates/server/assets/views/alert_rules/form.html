@@ -92,7 +92,7 @@
     </label>
 
     <label>Remind every (minutes)
-      <input type="number" name="remind_every_minutes" value="{{ rule.remind_every_minutes }}" min="5">
+      <input type="number" name="remind_every_minutes" value="{{ rule.remind_every_minutes }}" min="5" step="any">
       <small>Says it's still firing until someone acknowledges it, on every channel but on-call services, which repeat for themselves. Leave empty for no reminders.</small>
     </label>
 
@@ -104,7 +104,7 @@
     </label>
   </fieldset>
 
-  <fieldset>
+  <fieldset class="applies-to">
     <legend>Applies to</legend>
     {% include "rules/_applies_to.html" %}
   </fieldset>

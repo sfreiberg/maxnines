@@ -263,8 +263,10 @@ async fn index(
         }
         let presence = state.presence.get(&agent.id);
         if agent.state == AgentState::Pending {
+            // Waiting agents never get as far as presence, so the registry remembers.
+            let asked = state.registry.last_asked_ms(&agent.id);
             waiting.push(WaitingAgent {
-                seen: presence.map(|p| ago(p.last_seen_ms, now_ms() as u64)),
+                seen: asked.map(|ms| ago(ms, now_ms() as u64)),
                 id: agent.id,
                 host: agent.host,
             });
@@ -313,7 +315,10 @@ async fn index(
     .collect();
 
     let online = listed.iter().filter(|item| item.online).count();
-    let total = listed.len();
+    let total = listed
+        .iter()
+        .filter(|item| item.agent.state == AgentState::Approved)
+        .count();
     listed.retain(|item| matches(selected, item));
 
     let pages = paginate(&mut listed, page_number(params.page.as_deref()), |page| {

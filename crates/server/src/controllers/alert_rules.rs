@@ -85,9 +85,16 @@ impl AlertRuleForm {
             fact,
             filter: rule.filter.clone().unwrap_or_default(),
             window_secs: rule.window().to_string(),
+            // Shown in minutes, with a fraction when the API set something finer.
             remind_every_minutes: rule
                 .remind_every_secs
-                .map(|secs| (secs / 60).to_string())
+                .map(|secs| {
+                    if secs % 60 == 0 {
+                        (secs / 60).to_string()
+                    } else {
+                        (secs as f64 / 60.0).to_string()
+                    }
+                })
                 .unwrap_or_default(),
             name: rule.name.clone(),
             kind: rule.kind.as_str().to_string(),
@@ -141,10 +148,12 @@ impl AlertRuleForm {
         let remind_every_secs = match self.remind_every_minutes.as_str() {
             "" => None,
             text => {
-                let minutes: u64 = text
+                let minutes: f64 = text
                     .parse()
-                    .context("reminders must be a whole number of minutes")?;
-                Some(minutes.saturating_mul(60))
+                    .ok()
+                    .filter(|minutes: &f64| minutes.is_finite() && *minutes >= 0.0)
+                    .context("reminders must be a number of minutes")?;
+                Some((minutes * 60.0).round() as u64)
             }
         };
 

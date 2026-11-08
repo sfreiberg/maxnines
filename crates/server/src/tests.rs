@@ -548,6 +548,37 @@ async fn facts_reported_too_often_are_dropped() {
 }
 
 #[tokio::test]
+async fn the_agents_page_says_when_a_waiting_agent_last_asked() {
+    let server = start().await;
+    let agent = identity();
+    let mut client = server.connect().await;
+    handshake(&mut client, &agent, "new-box", None).await;
+
+    let page = Browser::default().get(&server, "/agents").await;
+
+    assert!(page.body.contains("Waiting for approval"), "{}", page.body);
+    assert!(page.body.contains("asked "), "{}", page.body);
+}
+
+#[tokio::test]
+async fn the_online_count_is_out_of_approved_agents_only() {
+    let server = start().await;
+    let (kept, revoked) = (identity(), identity());
+    let _client = server.connect_approved(&kept, "web-1").await;
+    let _gone = server.connect_approved(&revoked, "web-2").await;
+    server
+        .state
+        .registry
+        .decide(&revoked.id(), AgentState::Revoked)
+        .await
+        .unwrap();
+
+    let page = Browser::default().get(&server, "/agents").await;
+
+    assert!(page.body.contains("1 of 1 online"), "{}", page.body);
+}
+
+#[tokio::test]
 async fn a_connection_that_never_answers_the_challenge_is_closed() {
     let server = start().await;
     let mut client = server.connect().await;
@@ -3658,14 +3689,22 @@ fn hosts_in(response: &str) -> Vec<String> {
 
 /// The addresses in the API's routes, read from its source so a new one can't be
 /// missed.
-fn api_routes() -> Vec<&'static str> {
+/// Every method and path the API router sets up, read from its source.
+fn api_routes() -> Vec<(String, String)> {
     let source = include_str!("controllers/api.rs");
     let start = source.find("pub fn routes").unwrap();
     let end = source.find(".route_layer(").unwrap();
-    source[start..end]
-        .split('"')
-        .filter(|text| text.starts_with('/'))
-        .collect()
+    let mut routes = Vec::new();
+    for piece in source[start..end].split(".route(").skip(1) {
+        let path = piece.split('"').nth(1).unwrap().to_string();
+        let handlers = piece.split('"').nth(2).unwrap();
+        for method in ["get", "post", "put", "delete"] {
+            if handlers.contains(&format!("{method}(")) {
+                routes.push((method.to_uppercase(), path.clone()));
+            }
+        }
+    }
+    routes
 }
 
 #[test]
@@ -3673,10 +3712,13 @@ fn every_api_route_is_documented() {
     let docs = include_str!("../../../docs/api.md");
     let routes = api_routes();
 
-    assert!(routes.len() > 20, "{routes:?}");
-    for route in routes {
-        let heading = format!(" /api/v1{route}`");
-        assert!(docs.contains(&heading), "{route} isn't in docs/api.md");
+    assert!(routes.len() > 40, "{routes:?}");
+    for (method, path) in routes {
+        let heading = format!("`{method} /api/v1{path}`");
+        assert!(
+            docs.contains(&heading),
+            "{method} {path} isn't in docs/api.md"
+        );
     }
 }
 
