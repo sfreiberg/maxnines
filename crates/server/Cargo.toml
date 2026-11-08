@@ -39,6 +39,8 @@ tower-http = { version = "0.6", features = ["compression-gzip"] }
 tracing.workspace = true
 clickhouse = { version = "0.15", default-features = false, features = ["lz4", "rustls-tls-ring", "rustls-tls-webpki-roots"] }
 ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
+# TLS for Slack's Socket Mode connections, which slack-morphism makes with it.
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "rustls", "ring", "webpki-roots"] }
 wildmatch = "2.7.0"
 cel = "0.15"
@@ -53,7 +55,6 @@ cookie = "0.18"
 rcgen = "0.14"
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 tempfile = "3"
-tokio-tungstenite.workspace = true
 
 [build-dependencies]
 vergen-gitcl = { version = "10", features = ["build"] }

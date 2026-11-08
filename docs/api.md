@@ -816,6 +816,7 @@ and Telegram tokens can be set but never read back, so `target_preview` only sho
 | `kind` | Required. `webhook`, `email`, `discord`, `slack`, `pagerduty`, `alertops`, `signl4` or `telegram` |
 | `target` | Required. A webhook's address, email addresses separated by commas, a Slack channel, a PagerDuty integration key, the URL from AlertOps or SIGNL4, or a Telegram chat ID such as `-1001234567890` or `@channel` |
 | `credential` | Slack's or Telegram's bot token |
+| `app_token` | Optional, Slack only. The app-level token, starting `xapp-`, that adds Acknowledge and Silence buttons |
 
 ### List notification channels
 

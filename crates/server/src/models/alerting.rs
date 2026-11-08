@@ -98,6 +98,7 @@ fn to_channel(row: notification_channel::Model) -> Result<Channel> {
             kind: ChannelKind::parse(&row.kind)?,
             target: row.target,
             credential: row.credential,
+            app_token: row.app_token,
         },
     })
 }
@@ -282,6 +283,7 @@ impl Database {
             kind: Set(input.kind.as_str().to_string()),
             target: Set(input.target.clone()),
             credential: Set(input.credential.clone()),
+            app_token: Set(input.app_token.clone()),
             ..Default::default()
         };
         let result = notification_channel::Entity::insert(row)
@@ -302,6 +304,7 @@ impl Database {
             kind: Set(input.kind.as_str().to_string()),
             target: Set(input.target.clone()),
             credential: Set(input.credential.clone()),
+            app_token: Set(input.app_token.clone()),
         };
         notification_channel::Entity::update(row)
             .exec(&self.connection)
@@ -500,6 +503,14 @@ impl Database {
 
     /// Says someone is dealing with an alert. The first person to say so stays on it.
     /// Returns false if there's no such alert firing.
+    pub async fn get_alert(&self, id: i64) -> Result<Option<Alert>> {
+        let row = alert::Entity::find_by_id(id)
+            .one(&self.connection)
+            .await
+            .context("loading alert")?;
+        row.map(to_alert).transpose()
+    }
+
     pub async fn acknowledge_alert(&self, id: i64, by: &str, now_ms: i64) -> Result<bool> {
         let firing = alert::Entity::find_by_id(id)
             .filter(alert::Column::ResolvedMs.is_null())

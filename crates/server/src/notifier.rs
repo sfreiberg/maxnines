@@ -14,10 +14,14 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use slack_morphism::api::{SlackApiChatPostMessageRequest, SlackApiChatUpdateRequest};
 use slack_morphism::errors::SlackClientError;
-use slack_morphism::prelude::{SlackClientHyperConnector, SlackClientHyperHttpsConnector};
+use slack_morphism::prelude::{
+    SlackActionBlockElement, SlackActionsBlock, SlackBlock, SlackBlockButtonElement,
+    SlackBlockButtonStyle, SlackBlockMarkDownText, SlackBlockPlainText, SlackClientHyperConnector,
+    SlackClientHyperHttpsConnector, SlackContextBlock, SlackContextBlockElement, SlackSectionBlock,
+};
 use slack_morphism::{
-    SlackApiToken, SlackApiTokenValue, SlackChannelId, SlackClient, SlackClientHttpConnector,
-    SlackMessageAttachment, SlackMessageContent, SlackTs,
+    SlackActionId, SlackApiToken, SlackApiTokenValue, SlackChannelId, SlackClient,
+    SlackClientHttpConnector, SlackMessageAttachment, SlackMessageContent, SlackTs,
 };
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{MissedTickBehavior, timeout};
@@ -86,16 +90,23 @@ pub struct Notice {
 
 impl Notice {
     pub fn for_delivery(delivery: &Delivery) -> Self {
-        let alert = &delivery.alert;
-        let text = match delivery.event {
+        Self {
+            id: delivery.id,
+            ..Self::for_alert(delivery.alert.clone(), delivery.event)
+        }
+    }
+
+    /// What a message about this alert says, outside the queue.
+    pub fn for_alert(alert: Alert, event: Event) -> Self {
+        let text = match event {
             Event::Reminder => format!("Still firing: {}", alert.summary),
             Event::Resolved => format!("Resolved: {}", alert.summary),
             _ => alert.summary.clone(),
         };
         Self {
-            id: delivery.id,
-            event: delivery.event,
-            alert: Some(alert.clone()),
+            id: 0,
+            event,
+            alert: Some(alert),
             text,
         }
     }
@@ -295,7 +306,7 @@ impl Notice {
     }
 }
 
-fn format_ms(ms: i64) -> String {
+pub fn format_ms(ms: i64) -> String {
     u64::try_from(ms).map_or_else(|_| ms.to_string(), crate::fact_history::format_time)
 }
 
@@ -672,11 +683,108 @@ fn slack_text(notice: &Notice, web_url: Option<&str>) -> String {
     lines.join("\n")
 }
 
-fn slack_content(notice: &Notice, web_url: Option<&str>) -> SlackMessageContent {
+/// Says which button was pressed, when Slack tells us. The button's value is the alert.
+pub const ACKNOWLEDGE_ACTION: &str = "maxnines_acknowledge";
+pub const SILENCE_HOUR_ACTION: &str = "maxnines_silence_hour";
+
+/// Buttons under an alert, for a Slack app the server hears through Socket Mode.
+#[derive(Debug, Clone, Default)]
+pub struct SlackControls {
+    /// Who silenced it and until when, shown in place of its button.
+    pub silenced: Option<String>,
+}
+
+/// The most text Slack shows in one section of a message.
+const SLACK_SECTION_MAX_CHARS: usize = 3000;
+
+/// Shortens escaped text without cutting an `&amp;` in two.
+fn clip_escaped(text: String, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text;
+    }
+    let mut clipped: String = text.chars().take(max).collect();
+    if let Some(start) = clipped.rfind('&')
+        && !clipped[start..].contains(';')
+    {
+        clipped.truncate(start);
+    }
+    clipped
+}
+
+/// What's been done about it so far.
+fn slack_status(notice: &Notice, controls: Option<&SlackControls>) -> Vec<String> {
+    let mut lines = Vec::new();
+    let acknowledged = notice
+        .alert
+        .as_ref()
+        .and_then(|a| a.acknowledged_by.as_deref());
+    if let Some(by) = acknowledged {
+        lines.push(format!("Acknowledged by {}", escape_slack(by)));
+    }
+    if let Some(silenced) = controls.and_then(|c| c.silenced.as_deref()) {
+        lines.push(escape_slack(silenced));
+    }
+    lines
+}
+
+/// Only while it's firing, and only what hasn't been done yet.
+fn slack_buttons(
+    notice: &Notice,
+    controls: Option<&SlackControls>,
+) -> Vec<SlackActionBlockElement> {
+    let (Some(controls), Some(alert)) = (controls, &notice.alert) else {
+        return Vec::new();
+    };
+    let firing = matches!(notice.event, Event::Firing | Event::Reminder);
+    if !firing || alert.resolved_ms.is_some() {
+        return Vec::new();
+    }
+    let button = |action: &str, label: &str| {
+        SlackBlockButtonElement::new(SlackBlockPlainText::new(label.to_string()).into())
+            .with_action_id(SlackActionId(action.to_string()))
+            .with_value(alert.id.to_string())
+    };
+    let mut buttons = Vec::new();
+    if alert.acknowledged_by.is_none() {
+        let acknowledge =
+            button(ACKNOWLEDGE_ACTION, "Acknowledge").with_style(SlackBlockButtonStyle::Primary);
+        buttons.push(SlackActionBlockElement::Button(acknowledge));
+    }
+    if controls.silenced.is_none() {
+        buttons.push(SlackActionBlockElement::Button(button(
+            SILENCE_HOUR_ACTION,
+            "Silence 1 hour",
+        )));
+    }
+    buttons
+}
+
+/// One colored attachment holding the message, what's been done about it, and any
+/// buttons. `text` is what notifications and older clients show.
+pub fn slack_content(
+    notice: &Notice,
+    web_url: Option<&str>,
+    controls: Option<&SlackControls>,
+) -> SlackMessageContent {
+    let text = clip_escaped(slack_text(notice, web_url), SLACK_SECTION_MAX_CHARS);
+    let mut blocks: Vec<SlackBlock> = vec![
+        SlackSectionBlock::new()
+            .with_text(SlackBlockMarkDownText::new(text).into())
+            .into(),
+    ];
+    let status = slack_status(notice, controls);
+    if !status.is_empty() {
+        let line = SlackBlockMarkDownText::new(status.join(" · "));
+        blocks.push(SlackContextBlock::new(vec![SlackContextBlockElement::MarkDown(line)]).into());
+    }
+    let buttons = slack_buttons(notice, controls);
+    if !buttons.is_empty() {
+        blocks.push(SlackActionsBlock::new(buttons).into());
+    }
     let attachment = SlackMessageAttachment::new()
         .with_color(slack_color(notice).to_string())
-        .with_text(slack_text(notice, web_url))
-        .with_mrkdwn_in(vec!["text".to_string()]);
+        .with_fallback(escape_slack(&notice.text))
+        .with_blocks(blocks);
     SlackMessageContent::new()
         .with_text(escape_slack(&notice.text))
         .with_attachments(vec![attachment])
@@ -695,7 +803,7 @@ fn slack_post(
 
 /// Uses the certificates built into this binary, as the rest of the server does,
 /// so that Slack works on machines without their own.
-fn slack_connector() -> Result<SlackClientHyperHttpsConnector> {
+pub fn slack_connector() -> Result<SlackClientHyperHttpsConnector> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let https = HttpsConnectorBuilder::new()
         .with_provider_and_webpki_roots(provider)
@@ -714,7 +822,7 @@ fn slack_message_id(external_id: &str) -> Option<(SlackChannelId, SlackTs)> {
 
 /// Slack's error codes are safe to keep and say what's wrong, but anything else
 /// could quote the request, which holds the token.
-fn explain_slack(error: &SlackClientError) -> anyhow::Error {
+pub fn explain_slack(error: &SlackClientError) -> anyhow::Error {
     match error {
         SlackClientError::ApiError(error) => explain_slack_code(&error.code),
         SlackClientError::RateLimitError(_) => anyhow!("Slack asked us to slow down"),
@@ -763,7 +871,13 @@ where
         .context("this channel has no bot token")?;
     let token = SlackApiToken::new(SlackApiTokenValue(token));
     let session = client.open_session(&token);
-    let content = slack_content(notice, web_url);
+    // A resolved alert has nothing left to press.
+    let controls = channel
+        .channel
+        .app_token
+        .is_some()
+        .then(SlackControls::default);
+    let content = slack_content(notice, web_url, controls.as_ref());
 
     if let Some((message_channel, ts)) = reply_to
         .filter(|_| notice.event == Event::Resolved)
@@ -798,6 +912,13 @@ where
         .chat_post_message(&request)
         .await
         .map_err(|error| explain_slack(&error))?;
+
+    // Otherwise a wrong token would only show in the server's log.
+    if let (Event::Test, Some(app_token)) = (notice.event, &channel.channel.app_token) {
+        crate::slack_actions::check_app_token(client, app_token)
+            .await
+            .context("the test message was sent, but the buttons won't work")?;
+    }
     Ok(Some(format!("{}:{}", response.channel, response.ts)))
 }
 
@@ -1097,7 +1218,7 @@ mod tests {
             "{text}"
         );
 
-        let content = slack_content(&notice, None);
+        let content = slack_content(&notice, None, None);
         assert!(!content.text.unwrap().contains('<'));
     }
 
@@ -1147,6 +1268,71 @@ mod tests {
     #[test]
     fn slack_needs_no_certificates_or_tls_setup_from_the_machine() {
         slack_connector().unwrap();
+    }
+
+    fn block_types(content: &SlackMessageContent) -> Vec<String> {
+        let value = serde_json::to_value(content).unwrap();
+        value["attachments"][0]["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|block| block["type"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn slack_buttons_only_show_while_firing_and_for_what_is_left_to_do() {
+        let controls = SlackControls::default();
+        let firing = notice(Event::Firing, alert());
+        assert_eq!(
+            block_types(&slack_content(&firing, None, None)),
+            ["section"]
+        );
+        assert_eq!(
+            block_types(&slack_content(&firing, None, Some(&controls))),
+            ["section", "actions"]
+        );
+
+        let resolved = Alert {
+            resolved_ms: Some(2_000),
+            ..alert()
+        };
+        let content = slack_content(&notice(Event::Resolved, resolved), None, Some(&controls));
+        assert_eq!(block_types(&content), ["section"]);
+
+        let handled = Alert {
+            acknowledged_by: Some("sam@example.com".to_string()),
+            ..alert()
+        };
+        let silenced = SlackControls {
+            silenced: Some("Silenced by sam@example.com until later".to_string()),
+        };
+        let content = slack_content(&notice(Event::Reminder, handled), None, Some(&silenced));
+        assert_eq!(block_types(&content), ["section", "context"]);
+        let value = serde_json::to_value(&content).unwrap();
+        assert_eq!(
+            value["attachments"][0]["blocks"][1]["elements"][0]["text"],
+            "Acknowledged by sam@example.com · Silenced by sam@example.com until later"
+        );
+    }
+
+    #[test]
+    fn a_long_slack_message_is_cut_without_breaking_an_escape() {
+        assert_eq!(clip_escaped("a&amp;b".to_string(), 4), "a");
+        assert_eq!(clip_escaped("a&amp;b".to_string(), 6), "a&amp;");
+        assert_eq!(clip_escaped("short".to_string(), 10), "short");
+
+        let alert = Alert {
+            summary: "<".repeat(5000),
+            ..alert()
+        };
+        let content = slack_content(&notice(Event::Firing, alert), None, None);
+        let value = serde_json::to_value(&content).unwrap();
+        let text = value["attachments"][0]["blocks"][0]["text"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(text.chars().count() <= SLACK_SECTION_MAX_CHARS);
+        assert!(text.ends_with("&lt;"), "{}", &text[text.len() - 10..]);
     }
 
     #[test]

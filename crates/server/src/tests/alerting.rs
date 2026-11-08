@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use axum::Router;
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::routing::{any, post};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use super::*;
@@ -16,7 +16,11 @@ use crate::alerting::{
     Severity,
 };
 use crate::metrics::{Metric, NewestReading};
-use crate::notifier::{Mailer, Notice, Notifier, Senders};
+use crate::notifier::{ACKNOWLEDGE_ACTION, Mailer, Notice, Notifier, SILENCE_HOUR_ACTION, Senders};
+use crate::slack_actions::SlackActions;
+use hyper_util::client::legacy::connect::HttpConnector;
+use slack_morphism::SlackClient;
+use slack_morphism::prelude::{SlackClientHyperConnector, SlackInteractionBlockActionsEvent};
 
 const MINUTE_MS: i64 = 60_000;
 
@@ -1111,6 +1115,7 @@ fn webhook_channel(url: &str) -> ChannelInput {
         kind: ChannelKind::Webhook,
         target: url.to_string(),
         credential: None,
+        app_token: None,
     }
 }
 
@@ -1176,6 +1181,7 @@ async fn a_discord_channel_gets_discords_message_format() {
         kind: ChannelKind::Discord,
         target: url,
         credential: None,
+        app_token: None,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -1246,11 +1252,16 @@ async fn a_wrong_url_for_discord_is_refused_on_the_form() {
 }
 
 /// A stand-in for Slack's API. It keeps what it's sent, and answers each call with
-/// the next error if there is one.
+/// the next error if there is one. `user` is who it says pressed a button, and
+/// `connect_error` is what it says about an app-level token.
 #[derive(Clone, Default)]
 struct FakeSlack {
     calls: Arc<Mutex<Vec<(String, String, Value)>>>,
     errors: Arc<Mutex<Vec<&'static str>>>,
+    user: Arc<Mutex<Value>>,
+    connect_error: Arc<Mutex<Option<&'static str>>>,
+    /// Where it's listening, once started.
+    address: Arc<Mutex<String>>,
 }
 
 impl FakeSlack {
@@ -1262,12 +1273,17 @@ impl FakeSlack {
                     .and_then(|value| value.to_str().ok())
                     .unwrap_or_default()
                     .to_string();
-                let body: Value = serde_json::from_str(&body).unwrap();
+                let body: Value =
+                    serde_json::from_str(&body).unwrap_or_else(|_| Value::String(body.clone()));
                 slack
                     .calls
                     .lock()
                     .unwrap()
                     .push((method.to_string(), auth, body));
+                let refused = *slack.connect_error.lock().unwrap();
+                if let (Some(code), "connect") = (refused, method) {
+                    return axum::Json(json!({ "ok": false, "error": code }));
+                }
                 let mut errors = slack.errors.lock().unwrap();
                 if errors.is_empty() {
                     axum::Json(json!({
@@ -1275,6 +1291,8 @@ impl FakeSlack {
                         "channel": "C123",
                         "ts": "1700000000.000100",
                         "message": { "ts": "1700000000.000100", "text": "sent" },
+                        "url": "wss://slack.invalid/link",
+                        "user": slack.user.lock().unwrap().clone(),
                     }))
                 } else {
                     axum::Json(json!({ "ok": false, "error": errors.remove(0) }))
@@ -1283,11 +1301,33 @@ impl FakeSlack {
         };
         let router = Router::new()
             .route("/api/chat.postMessage", post(answer("post", self.clone())))
-            .route("/api/chat.update", post(answer("update", self.clone())));
+            .route("/api/chat.update", post(answer("update", self.clone())))
+            .route("/api/users.info", any(answer("users.info", self.clone())))
+            .route(
+                "/api/apps.connections.open",
+                post(answer("connect", self.clone())),
+            )
+            .route("/respond", post(answer("respond", self.clone())));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router).await });
+        *self.address.lock().unwrap() = format!("http://{address}");
         format!("http://{address}/api")
+    }
+
+    /// A client for the server's side of a Slack app, pointed here.
+    fn client(&self) -> SlackClient<SlackClientHyperConnector<HttpConnector>> {
+        let url = format!("{}/api", self.address.lock().unwrap());
+        let connector = SlackClientHyperConnector::with_connector(HttpConnector::new())
+            .with_slack_api_url(&url);
+        SlackClient::new(connector)
+    }
+
+    /// The last thing a button press was answered with.
+    fn answer(&self) -> Value {
+        let calls = self.calls();
+        let (_, _, body) = calls.iter().rev().find(|call| call.0 == "respond").unwrap();
+        body.clone()
     }
 
     fn calls(&self) -> Vec<(String, String, Value)> {
@@ -1355,6 +1395,7 @@ async fn firing_on(
         kind,
         target: target.to_string(),
         credential: None,
+        app_token: None,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -1452,6 +1493,7 @@ async fn a_test_opens_an_incident_and_closes_it_again_on_every_service() {
                 kind,
                 target: service.start().await,
                 credential: None,
+                app_token: None,
             },
         };
 
@@ -1630,6 +1672,7 @@ async fn a_pagerduty_test_opens_an_incident_and_closes_it_again() {
             kind: ChannelKind::PagerDuty,
             target: PAGERDUTY_KEY.to_string(),
             credential: None,
+            app_token: None,
         },
     };
     let senders = Senders {
@@ -1739,6 +1782,7 @@ async fn firing_on_telegram(test: &mut Harness, telegram: &FakeTelegram) -> Noti
         kind: ChannelKind::Telegram,
         target: "-1001234567890".to_string(),
         credential: Some(TELEGRAM_TOKEN.to_string()),
+        app_token: None,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -1846,6 +1890,7 @@ async fn not_reaching_telegram_says_so_without_the_token() {
             kind: ChannelKind::Telegram,
             target: "-100123".to_string(),
             credential: Some(TELEGRAM_TOKEN.to_string()),
+            app_token: None,
         },
     };
     let senders = Senders {
@@ -1915,12 +1960,22 @@ async fn a_telegram_channel_needs_its_token_on_the_form() {
 
 /// A firing alert with a Slack channel, ready to deliver.
 async fn firing_on_slack(test: &mut Harness, slack: &FakeSlack) -> Notifier {
+    firing_on_slack_app(test, slack, None).await
+}
+
+/// The same, for a Slack app the server listens to when it has an app-level token.
+async fn firing_on_slack_app(
+    test: &mut Harness,
+    slack: &FakeSlack,
+    app_token: Option<&str>,
+) -> Notifier {
     let url = slack.start().await;
     let channel = ChannelInput {
         name: "Slack".to_string(),
         kind: ChannelKind::Slack,
         target: "#alerts".to_string(),
         credential: Some("xoxb-secret-token".to_string()),
+        app_token: app_token.map(str::to_string),
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -1940,6 +1995,317 @@ async fn firing_on_slack(test: &mut Harness, slack: &FakeSlack) -> Notifier {
     )
 }
 
+const SLACK_MEMBER: &str = "sam@example.com";
+
+/// A firing alert on a Slack channel with buttons, already posted, and a MaxNines
+/// account for whoever Slack says is pressing them.
+async fn slack_buttons(test: &mut Harness, slack: &FakeSlack) -> (SlackActions, i64) {
+    let notifier = firing_on_slack_app(test, slack, Some("xapp-secret-token")).await;
+    notifier.deliver_due(test.now).await.unwrap();
+    test.database()
+        .create_user(SLACK_MEMBER, "Sam", test.now)
+        .await
+        .unwrap();
+    *slack.user.lock().unwrap() = json!({ "id": "U1", "profile": { "email": "Sam@Example.com" } });
+    let actions = SlackActions::new(
+        test.database().clone(),
+        Some("https://monitor.example.com".to_string()),
+        "xoxb-secret-token",
+    );
+    (actions, test.open().await[0].id)
+}
+
+/// What Slack sends over Socket Mode when someone presses a button.
+async fn press(slack: &FakeSlack, actions: &SlackActions, action: &str, alert_id: i64) {
+    let event: SlackInteractionBlockActionsEvent = serde_json::from_value(json!({
+        "team": { "id": "T1" },
+        "user": { "id": "U1" },
+        "api_app_id": "A1",
+        "container": { "type": "message", "message_ts": "1700000000.000100", "channel_id": "C123" },
+        "trigger_id": "1.2.3",
+        "response_url": format!("{}/respond", slack.address.lock().unwrap()),
+        "actions": [{ "type": "button", "action_id": action, "value": alert_id.to_string() }],
+    }))
+    .unwrap();
+    actions.handle(&slack.client(), event).await;
+}
+
+/// The buttons a message still offers.
+fn buttons(message: &Value) -> Vec<String> {
+    message["attachments"][0]["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|block| block["type"] == "actions")
+        .flat_map(|block| block["elements"].as_array().unwrap().clone())
+        .map(|button| button["action_id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// What a message says has been done about it.
+fn status(message: &Value) -> String {
+    message["attachments"][0]["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|block| block["type"] == "context")
+        .map(|block| block["elements"][0]["text"].as_str().unwrap().to_string())
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn slack_alerts_get_buttons_when_the_server_listens_to_the_app() {
+    let mut test = Harness::start().await;
+    let slack = FakeSlack::default();
+    let notifier = firing_on_slack_app(&mut test, &slack, Some("xapp-1")).await;
+    notifier.deliver_due(test.now).await.unwrap();
+
+    let posted = &slack.calls()[0].2;
+    assert_eq!(buttons(posted), [ACKNOWLEDGE_ACTION, SILENCE_HOUR_ACTION]);
+    let alert_id = test.open().await[0].id.to_string();
+    let first = &posted["attachments"][0]["blocks"][1]["elements"][0];
+    assert_eq!(first["value"], alert_id);
+    assert_eq!(first["style"], "primary");
+
+    test.cpu(MINUTE_MS, 10.0).await;
+    notifier.deliver_due(test.now + MINUTE_MS).await.unwrap();
+    let update = &slack.calls()[1].2;
+    assert!(buttons(update).is_empty(), "{update}");
+}
+
+#[tokio::test]
+async fn a_slack_member_with_an_account_can_acknowledge() {
+    let mut test = Harness::start().await;
+    let slack = FakeSlack::default();
+    let (actions, alert_id) = slack_buttons(&mut test, &slack).await;
+
+    press(&slack, &actions, ACKNOWLEDGE_ACTION, alert_id).await;
+
+    let alert = &test.open().await[0];
+    assert_eq!(alert.acknowledged_by.as_deref(), Some(SLACK_MEMBER));
+    let answer = slack.answer();
+    assert_eq!(answer["replace_original"], true);
+    assert_eq!(status(&answer), "Acknowledged by sam@example.com");
+    assert_eq!(buttons(&answer), [SILENCE_HOUR_ACTION]);
+    let (_, auth, _) = slack
+        .calls()
+        .into_iter()
+        .find(|call| call.0 == "users.info")
+        .unwrap();
+    assert_eq!(auth, "Bearer xoxb-secret-token");
+}
+
+#[tokio::test]
+async fn silencing_from_slack_covers_just_that_alert_for_an_hour() {
+    let mut test = Harness::start().await;
+    let slack = FakeSlack::default();
+    let (actions, alert_id) = slack_buttons(&mut test, &slack).await;
+
+    press(&slack, &actions, SILENCE_HOUR_ACTION, alert_id).await;
+    press(&slack, &actions, SILENCE_HOUR_ACTION, alert_id).await;
+
+    let silences = test.database().active_silences(now_ms()).await.unwrap();
+    assert_eq!(silences.len(), 1, "{silences:?}");
+    let silence = &silences[0];
+    assert_eq!(silence.rule_id, test.open().await[0].rule_id);
+    assert_eq!(silence.filter, "hostname=web-1");
+    assert_eq!(silence.created_by, SLACK_MEMBER);
+    assert_eq!(silence.reason, "Silenced from Slack");
+    assert_eq!(silence.ends_ms - silence.starts_ms, 3_600_000);
+
+    let answer = slack.answer();
+    assert!(
+        status(&answer).starts_with("Silenced by sam@example.com until "),
+        "{answer}"
+    );
+    assert_eq!(buttons(&answer), [ACKNOWLEDGE_ACTION]);
+}
+
+#[tokio::test]
+async fn someone_without_an_account_is_told_and_nothing_changes() {
+    let mut test = Harness::start().await;
+    let slack = FakeSlack::default();
+    let (actions, alert_id) = slack_buttons(&mut test, &slack).await;
+    *slack.user.lock().unwrap() =
+        json!({ "id": "U1", "profile": { "email": "other@example.com" } });
+
+    press(&slack, &actions, ACKNOWLEDGE_ACTION, alert_id).await;
+
+    assert_eq!(test.open().await[0].acknowledged_by, None);
+    let answer = slack.answer();
+    assert_eq!(answer["replace_original"], false);
+    let text = answer["text"].as_str().unwrap();
+    assert!(
+        text.contains("no MaxNines account for other@example.com"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn slack_guests_cannot_act() {
+    let mut test = Harness::start().await;
+    let slack = FakeSlack::default();
+    let (actions, alert_id) = slack_buttons(&mut test, &slack).await;
+    *slack.user.lock().unwrap() = json!({
+        "id": "U1",
+        "is_restricted": true,
+        "profile": { "email": SLACK_MEMBER },
+    });
+
+    press(&slack, &actions, ACKNOWLEDGE_ACTION, alert_id).await;
+
+    assert_eq!(test.open().await[0].acknowledged_by, None);
+    let text = slack.answer()["text"].as_str().unwrap().to_string();
+    assert!(text.contains("Only full members"), "{text}");
+}
+
+#[tokio::test]
+async fn slack_is_asked_who_someone_is_only_once_in_a_while() {
+    let mut test = Harness::start().await;
+    let slack = FakeSlack::default();
+    let (actions, alert_id) = slack_buttons(&mut test, &slack).await;
+
+    press(&slack, &actions, SILENCE_HOUR_ACTION, alert_id).await;
+    press(&slack, &actions, ACKNOWLEDGE_ACTION, alert_id).await;
+
+    let lookups = slack
+        .calls()
+        .into_iter()
+        .filter(|call| call.0 == "users.info")
+        .count();
+    assert_eq!(lookups, 1);
+    assert_eq!(
+        test.open().await[0].acknowledged_by.as_deref(),
+        Some(SLACK_MEMBER)
+    );
+}
+
+#[tokio::test]
+async fn a_disabled_account_stops_working_at_once() {
+    let mut test = Harness::start().await;
+    let slack = FakeSlack::default();
+    let (actions, alert_id) = slack_buttons(&mut test, &slack).await;
+    press(&slack, &actions, SILENCE_HOUR_ACTION, alert_id).await;
+
+    let user = test
+        .database()
+        .active_user_by_email(SLACK_MEMBER)
+        .await
+        .unwrap()
+        .unwrap();
+    test.database()
+        .disable_user(user.id, now_ms())
+        .await
+        .unwrap();
+    press(&slack, &actions, ACKNOWLEDGE_ACTION, alert_id).await;
+
+    assert_eq!(test.open().await[0].acknowledged_by, None);
+    assert_eq!(slack.answer()["replace_original"], false);
+}
+
+#[tokio::test]
+async fn a_button_on_a_resolved_alert_shows_that_it_resolved() {
+    let mut test = Harness::start().await;
+    let slack = FakeSlack::default();
+    let (actions, alert_id) = slack_buttons(&mut test, &slack).await;
+    test.cpu(MINUTE_MS, 10.0).await;
+
+    press(&slack, &actions, SILENCE_HOUR_ACTION, alert_id).await;
+
+    let answer = slack.answer();
+    assert!(buttons(&answer).is_empty(), "{answer}");
+    let text = answer["attachments"][0]["blocks"][0]["text"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(text.starts_with("*RESOLVED*"), "{text}");
+    assert!(
+        test.database()
+            .active_silences(now_ms())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_slack_test_says_when_the_app_level_token_is_wrong() {
+    let slack = FakeSlack::default();
+    let url = slack.start().await;
+    *slack.connect_error.lock().unwrap() = Some("invalid_auth");
+    let channel = Channel {
+        id: 1,
+        channel: ChannelInput {
+            name: "Slack".to_string(),
+            kind: ChannelKind::Slack,
+            target: "#alerts".to_string(),
+            credential: Some("xoxb-secret-token".to_string()),
+            app_token: Some("xapp-secret-token".to_string()),
+        },
+    };
+    let senders = Senders {
+        slack_api_url: Some(url),
+        ..Senders::default()
+    };
+
+    let error = crate::notifier::send(channel, Notice::test(), None, senders)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        format!("{error:#}"),
+        "the test message was sent, but the buttons won't work: Slack didn't accept the \
+         app-level token (invalid_auth)"
+    );
+    let (_, auth, _) = slack
+        .calls()
+        .into_iter()
+        .find(|call| call.0 == "connect")
+        .unwrap();
+    assert_eq!(auth, "Bearer xapp-secret-token");
+}
+
+#[tokio::test]
+async fn an_app_level_token_can_be_set_on_the_form_and_stays_hidden() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    let fields = [
+        ("name", "Team"),
+        ("kind", "slack"),
+        ("target", "#alerts"),
+        ("credential", "xoxb-secret"),
+        ("app_token", "xapp-secret"),
+    ];
+    let page = browser
+        .submit(&server, "/alerts/channels/new", "/alerts/channels", &fields)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    let saved = server.state.database.list_channels().await.unwrap();
+    assert_eq!(saved[0].channel.app_token.as_deref(), Some("xapp-secret"));
+
+    let page = browser
+        .get(&server, &format!("/alerts/channels/{}/edit", saved[0].id))
+        .await;
+    assert!(!page.body.contains("xapp-secret"), "{}", page.body);
+    assert!(page.body.contains("remove_app_token"), "{}", page.body);
+
+    let fields = [
+        ("name", "Team"),
+        ("kind", "slack"),
+        ("target", "#alerts"),
+        ("app_token", "not-a-token"),
+    ];
+    let page = browser
+        .submit(
+            &server,
+            &format!("/alerts/channels/{}/edit", saved[0].id),
+            &format!("/alerts/channels/{}", saved[0].id),
+            &fields,
+        )
+        .await;
+    assert_eq!(page.status, 422);
+    assert!(page.body.contains("starts with xapp-"), "{}", page.body);
+}
+
 #[tokio::test]
 async fn an_alert_posts_to_slack_with_the_bot_token() {
     let mut test = Harness::start().await;
@@ -1957,7 +2323,10 @@ async fn an_alert_posts_to_slack_with_the_bot_token() {
     assert_eq!(body["attachments"][0]["color"], "#b3261e");
     assert_eq!(body["unfurl_links"], false);
     assert_eq!(body["unfurl_media"], false);
-    let text = body["attachments"][0]["text"].as_str().unwrap();
+    let text = body["attachments"][0]["blocks"][0]["text"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(body["attachments"][0]["blocks"][1].is_null(), "{body}");
     assert!(
         text.contains("<https://monitor.example.com/alerts|View alerts>"),
         "{text}"
@@ -2055,6 +2424,7 @@ async fn not_reaching_slack_says_so_without_any_detail() {
             kind: ChannelKind::Slack,
             target: "#alerts".to_string(),
             credential: Some("xoxb-secret-token".to_string()),
+            app_token: None,
         },
     };
     let senders = Senders {
@@ -2399,6 +2769,7 @@ async fn email_channels_send_a_message_to_every_address() {
         kind: ChannelKind::Email,
         target: "a@example.com, b@example.com".to_string(),
         credential: None,
+        app_token: None,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -2439,6 +2810,7 @@ async fn an_email_channel_without_a_mail_server_says_so() {
         kind: ChannelKind::Email,
         target: "a@example.com".to_string(),
         credential: None,
+        app_token: None,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -4176,6 +4548,7 @@ mod reminders {
             kind,
             target: target.to_string(),
             credential: None,
+            app_token: None,
         };
         let channel = test.database().create_channel(&channel).await.unwrap();
         let rule = AlertRuleInput {

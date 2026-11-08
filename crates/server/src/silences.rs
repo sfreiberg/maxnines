@@ -11,7 +11,7 @@ use tracing::warn;
 
 use crate::alerting::Alert;
 use crate::facts::FlatFacts;
-use crate::host_filter::HostFilter;
+use crate::host_filter::{HostFilter, PartialValue};
 use crate::maintenance::MaintenanceWindow;
 use crate::models::Database;
 use crate::remote_checks::FLEET_AGENT_ID;
@@ -41,6 +41,22 @@ pub struct SilenceInput {
     pub filter: String,
     pub reason: String,
     pub duration_secs: u64,
+}
+
+/// A silence covering just this alert: its rule, on its host. An alert about the
+/// fleet has no host, so its rule alone.
+pub fn silence_for(alert: &Alert, reason: &str, duration_secs: u64) -> SilenceInput {
+    let filter = if alert.agent_id == FLEET_AGENT_ID {
+        None
+    } else {
+        PartialValue::of("hostname=").map(|term| term.suggestion(&alert.host).text)
+    };
+    SilenceInput {
+        rule_id: alert.rule_id,
+        filter: filter.unwrap_or_default(),
+        reason: reason.to_string(),
+        duration_secs,
+    }
 }
 
 /// Whether a silence makes sense, apart from whether its rule exists.

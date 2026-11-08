@@ -81,6 +81,15 @@
 
   <fieldset class="for-slack">
     <legend>Slack</legend>
+    <label>App-level token, for buttons
+      <input type="password" name="app_token" autocomplete="off" spellcheck="false"{% if channel.has_app_token %} placeholder="Saved"{% endif %}>
+      <small>{% if channel.has_app_token %}Leave empty to keep the saved token, which isn't shown.{% else %}Optional. It starts with <code>xapp-</code>, and adds Acknowledge and Silence buttons to alerts.{% endif %}</small>
+    </label>
+    {% if channel.has_app_token %}
+    <label class="checkbox">
+      <input type="checkbox" name="remove_app_token"> Remove the app-level token, so alerts have no buttons
+    </label>
+    {% endif %}
     <details>
       <summary>How to create the Slack app</summary>
       <ol>
@@ -95,11 +104,19 @@ oauth_config:
   scopes:
     bot:
       - chat:write
-      - chat:write.public</pre></li>
+      - chat:write.public
+      - users:read
+      - users:read.email
+settings:
+  interactivity:
+    is_enabled: true
+  socket_mode_enabled: true</pre></li>
         <li>Install the app to your workspace, then copy its bot token here. It starts with <code>xoxb-</code>.</li>
+        <li>For buttons, open Basic Information, then App-Level Tokens. Generate one with the <code>connections:write</code> scope, and copy it into the app-level token box. It starts with <code>xapp-</code>.</li>
         <li>For a private channel, invite the app to it first.</li>
         <li>On an Enterprise Grid org-wide install, use the channel's ID rather than its name. It's at the bottom of the channel's details in Slack.</li>
       </ol>
+      <p class="note">Buttons act as the MaxNines user with the same email address as the person pressing them. Slack guests and people from other organizations can't use them. The server connects out to Slack for them, so it doesn't need to be reachable from the internet.</p>
     </details>
   </fieldset>
 

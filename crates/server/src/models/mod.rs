@@ -1472,6 +1472,7 @@ mod tests {
                 kind: ChannelKind::Webhook,
                 target: "https://example.com/hook".to_string(),
                 credential: Some("secret".to_string()),
+                app_token: None,
             })
             .await
             .unwrap();

@@ -464,10 +464,18 @@ pub struct ChannelInput {
     /// not read back.
     #[serde(default)]
     pub credential: Option<String>,
+    /// A Slack app's own token, so the server hears its buttons being pressed.
+    /// Write-only too.
+    #[serde(default)]
+    pub app_token: Option<String>,
 }
 
 pub fn check_channel(channel: &ChannelInput) -> Result<()> {
     ensure!(!channel.name.trim().is_empty(), "a channel needs a name");
+    ensure!(
+        channel.app_token.is_none() || channel.kind == ChannelKind::Slack,
+        "only Slack channels take an app-level token"
+    );
     ensure!(
         channel.name.len() <= MAX_NAME_LEN,
         "the channel name is too long"
@@ -539,6 +547,12 @@ fn check_slack(channel: &ChannelInput) -> Result<()> {
         token.starts_with("xoxb-"),
         "enter the app's bot token, which starts with xoxb-"
     );
+    if let Some(token) = &channel.app_token {
+        ensure!(
+            token.trim().starts_with("xapp-"),
+            "the app-level token starts with xapp-. Leave it empty for messages without buttons"
+        );
+    }
     Ok(())
 }
 
@@ -798,6 +812,7 @@ mod tests {
             kind: ChannelKind::Webhook,
             target: target.to_string(),
             credential: None,
+            app_token: None,
         }
     }
 
@@ -1104,6 +1119,23 @@ mod tests {
     }
 
     #[test]
+    fn an_app_level_token_is_only_for_slack_and_must_look_right() {
+        let with = |kind: ChannelInput, token: &str| ChannelInput {
+            app_token: Some(token.to_string()),
+            ..kind
+        };
+        check_channel(&with(slack("#alerts", Some("xoxb-1")), "xapp-1-A1-abc")).unwrap();
+        assert!(check_channel(&with(slack("#alerts", Some("xoxb-1")), "xoxb-2")).is_err());
+        assert!(
+            check_channel(&with(
+                discord("https://discord.com/api/webhooks/1/t"),
+                "xapp-1"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn a_slack_channel_is_shown_but_its_token_is_not() {
         let channel = slack("#alerts", Some("xoxb-secret"));
         assert_eq!(channel.target_preview(), "#alerts");
@@ -1115,6 +1147,7 @@ mod tests {
             kind: ChannelKind::Telegram,
             target: target.to_string(),
             credential: token.map(str::to_string),
+            app_token: None,
         }
     }
 

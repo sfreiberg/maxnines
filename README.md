@@ -315,6 +315,20 @@ Press **Acknowledge** on a firing alert to say you're dealing with it. That show
 name on the Alerts page and stops the reminders. It only applies inside MaxNines, so
 acknowledging an alert here doesn't acknowledge it in PagerDuty, or the other way round.
 
+## Slack buttons
+
+Slack alerts can have **Acknowledge** and **Silence 1 hour** buttons. They need the
+Slack app's app-level token as well as its bot token. The form for a Slack channel has
+the steps and an app manifest to paste into Slack.
+
+The server connects out to Slack to hear the buttons, using Slack's Socket Mode, so it
+doesn't need to be reachable from the internet.
+
+Pressing a button acts as the MaxNines user with the same email address as the person
+in Slack, so each person needs a MaxNines account with the email they use in Slack.
+Slack guests, people from other organizations through Slack Connect, and disabled
+MaxNines users can't use them. Use **Test** on the channel to check both tokens.
+
 ## Telegram
 
 Alerts can go to a Telegram group, channel or private chat through a bot of your own.

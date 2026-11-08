@@ -37,6 +37,11 @@ struct ChannelForm {
     /// shown again.
     credential: String,
     has_credential: bool,
+    /// A Slack app-level token, which works the same way.
+    app_token: String,
+    has_app_token: bool,
+    /// Ticked to turn a Slack channel's buttons off again.
+    remove_app_token: bool,
 }
 
 impl ChannelForm {
@@ -48,6 +53,9 @@ impl ChannelForm {
             preview: None,
             credential: String::new(),
             has_credential: false,
+            app_token: String::new(),
+            has_app_token: false,
+            remove_app_token: false,
         }
     }
 
@@ -71,6 +79,9 @@ impl ChannelForm {
             preview: hidden.then(|| channel.target_preview()),
             credential: String::new(),
             has_credential: channel.credential.is_some(),
+            app_token: String::new(),
+            has_app_token: channel.app_token.is_some(),
+            remove_app_token: false,
         }
     }
 
@@ -83,6 +94,9 @@ impl ChannelForm {
             preview: None,
             credential: text("credential"),
             has_credential: false,
+            app_token: text("app_token"),
+            has_app_token: false,
+            remove_app_token: fields.contains_key("remove_app_token"),
         }
     }
 
@@ -102,11 +116,19 @@ impl ChannelForm {
             Some(saved) if saved.kind == kind => saved.credential.clone(),
             _ => None,
         };
+        let typed = self.app_token.trim();
+        let app_token = match saved {
+            _ if kind != ChannelKind::Slack || self.remove_app_token => None,
+            _ if !typed.is_empty() => Some(typed.to_string()),
+            Some(saved) if saved.kind == kind => saved.app_token.clone(),
+            _ => None,
+        };
         Ok(ChannelInput {
             name: self.name.trim().to_string(),
             kind,
             target,
             credential,
+            app_token,
         })
     }
 }
@@ -289,6 +311,7 @@ mod tests {
             kind: ChannelKind::Webhook,
             target: "https://hooks.example.com/secret".to_string(),
             credential: None,
+            app_token: None,
         }
     }
 
@@ -344,6 +367,35 @@ mod tests {
         form.kind = "webhook".to_string();
         form.target = "https://example.com/x".to_string();
         assert_eq!(form.to_channel(Some(&saved)).unwrap().credential, None);
+    }
+
+    #[test]
+    fn an_app_token_is_kept_until_removed_and_never_shown() {
+        let saved = ChannelInput {
+            app_token: Some("xapp-secret".to_string()),
+            ..slack()
+        };
+        let form = ChannelForm::from_channel(&saved);
+        assert_eq!(form.app_token, "");
+        assert!(form.has_app_token);
+        assert_eq!(form.to_channel(Some(&saved)).unwrap(), saved);
+
+        let mut form = ChannelForm::from_channel(&saved);
+        form.app_token = " xapp-new ".to_string();
+        let channel = form.to_channel(Some(&saved)).unwrap();
+        assert_eq!(channel.app_token.as_deref(), Some("xapp-new"));
+
+        let mut form = ChannelForm::from_channel(&saved);
+        form.remove_app_token = true;
+        assert_eq!(form.to_channel(Some(&saved)).unwrap().app_token, None);
+    }
+
+    #[test]
+    fn an_app_token_is_only_for_slack() {
+        let mut form = ChannelForm::from_channel(&webhook());
+        form.app_token = "xapp-1".to_string();
+        form.target = "https://example.com/x".to_string();
+        assert_eq!(form.to_channel(None).unwrap().app_token, None);
     }
 
     #[test]

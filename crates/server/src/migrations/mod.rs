@@ -22,6 +22,7 @@ impl MigratorTrait for Migrator {
             Box::new(CreateSilences),
             Box::new(AddRemindersAndAcknowledging),
             Box::new(CreateMaintenanceWindows),
+            Box::new(AddSlackAppTokens),
         ]
     }
 }
@@ -1555,6 +1556,45 @@ impl MigrationTrait for CreateMaintenanceWindows {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
             .drop_table(Table::drop().table(MaintenanceWindows::Table).to_owned())
+            .await
+    }
+}
+
+struct AddSlackAppTokens;
+
+impl MigrationName for AddSlackAppTokens {
+    fn name(&self) -> &str {
+        "m20261108_000015_add_slack_app_tokens"
+    }
+}
+
+#[derive(Iden)]
+enum ChannelAppToken {
+    AppToken,
+}
+
+/// A Slack app's own token, which lets the server hear its buttons being pressed.
+#[async_trait::async_trait]
+impl MigrationTrait for AddSlackAppTokens {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(NotificationChannels::Table)
+                    .add_column(ColumnDef::new(ChannelAppToken::AppToken).text())
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(NotificationChannels::Table)
+                    .drop_column(ChannelAppToken::AppToken)
+                    .to_owned(),
+            )
             .await
     }
 }

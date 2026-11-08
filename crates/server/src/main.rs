@@ -24,6 +24,7 @@ mod rule_engine;
 mod rule_preview;
 mod server_stats;
 mod silences;
+mod slack_actions;
 mod store;
 mod tls;
 mod views;
@@ -273,6 +274,7 @@ async fn serve(path: &Path) -> Result<()> {
     )
     .spawn();
     Notifier::new(state.database.clone(), state.senders.clone()).spawn();
+    slack_actions::spawn(state.database.clone(), state.senders.web_url.clone());
     Scheduler::new(
         state.database.clone(),
         state.writer.clone(),
