@@ -16,7 +16,7 @@ use crate::app_state::AppState;
 use crate::calculations::Calculation;
 use crate::condition_builder::Builder;
 use crate::dashboards::grouping_fields;
-use crate::metrics::{METRICS, Unit};
+use crate::metrics::{METRICS, Unit, now_ms};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -455,7 +455,7 @@ async fn update(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfFo
 }
 
 async fn delete(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfForm) -> Response {
-    match state.database.delete_alert_rule(id).await {
+    match state.database.delete_alert_rule(id, now_ms()).await {
         Ok(true) => (form.token, Redirect::to("/alerts/rules")).into_response(),
         Ok(false) => not_found(&state, &form.token),
         Err(error) => server_error(&error),

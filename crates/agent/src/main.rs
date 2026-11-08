@@ -134,21 +134,23 @@ struct Monitoring {
 impl Monitoring {
     /// Fails without side effects, so a bad config leaves the old one running.
     fn start(update: &ConfigUpdate, definitions: &Definitions) -> Result<Self> {
-        let collectors = catch_unwind(AssertUnwindSafe(|| {
+        // Everything that could go wrong with a config happens in here, so a bad
+        // one is refused rather than taking the agent down.
+        let (collectors, ticker) = catch_unwind(AssertUnwindSafe(|| {
             update.config.validate()?;
             let mut collectors = collector::build_all(&update.config, definitions)?;
             collectors.push(Box::new(OwnUsageCollector::new()?));
-            anyhow::Ok(collectors)
+
+            // CPU usage is measured between refreshes, so the first sample waits. The
+            // random part is because a config can reach every agent at the same moment,
+            // and they would then all collect together from then on.
+            let period = Duration::from_secs(update.config.interval_secs);
+            let first = Instant::now() + collector::WARMUP + jitter(period);
+            let mut ticker = interval_at(first, period);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            anyhow::Ok((collectors, ticker))
         }))
         .map_err(|_| anyhow!("building collectors panicked"))??;
-
-        // CPU usage is measured between refreshes, so the first sample waits. The
-        // random part is because a config can reach every agent at the same moment,
-        // and they would then all collect together from then on.
-        let period = Duration::from_secs(update.config.interval_secs);
-        let first = Instant::now() + collector::WARMUP + jitter(period);
-        let mut ticker = interval_at(first, period);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         Ok(Self {
             version: update.version.clone(),

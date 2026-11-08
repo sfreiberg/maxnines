@@ -1068,16 +1068,18 @@ impl Notifier {
         })
     }
 
-    /// Lets go of what no silence covers any more.
+    /// Lets go of what no silence covers any more. Something held for an alert
+    /// that has since ended is dropped instead: the alert ended in the moment
+    /// between the queue being read and the hold, and nobody needs to hear of it.
     async fn release_held(&self, silences: &ActiveSilences, now_ms: i64) -> Result<()> {
-        let ids: Vec<i64> = self
-            .database
-            .held_deliveries()
-            .await?
-            .into_iter()
-            .filter(|(alert, _)| silences.covering(alert).is_none())
-            .flat_map(|(_, ids)| ids)
-            .collect();
+        let mut ids = Vec::new();
+        for (alert, held) in self.database.held_deliveries().await? {
+            if alert.resolved_ms.is_some() {
+                self.database.drop_held_for(alert.id).await?;
+            } else if silences.covering(&alert).is_none() {
+                ids.extend(held);
+            }
+        }
         if !ids.is_empty() {
             self.database.release_deliveries(&ids, now_ms).await?;
         }

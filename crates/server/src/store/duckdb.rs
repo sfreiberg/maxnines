@@ -373,7 +373,10 @@ fn write_rows(transaction: &Transaction<'_>, rows: &Rows) -> Result<()> {
 
 pub struct DuckDbStore {
     connection: Connection,
-    names: Names,
+    /// What's in the catalog tables. Empty after a failed write whose reload also
+    /// failed, so that the next write loads it afresh rather than trusting names
+    /// the rolled-back write added, which would leave samples pointing nowhere.
+    names: Option<Names>,
 }
 
 impl DuckDbStore {
@@ -393,7 +396,10 @@ impl DuckDbStore {
     fn with_connection(mut connection: Connection) -> Result<Self> {
         migrate(&mut connection, MIGRATIONS)?;
         let names = Names::load(&connection).context("loading metric names")?;
-        Ok(Self { connection, names })
+        Ok(Self {
+            connection,
+            names: Some(names),
+        })
     }
 
     /// Moves part of a finished hour into the sorted table, in one transaction, so
@@ -457,9 +463,14 @@ impl DuckDbStore {
     }
 
     fn write_samples(&mut self, samples: &[NewSample]) -> Result<()> {
+        if self.names.is_none() {
+            let names = Names::load(&self.connection).context("reloading metric names")?;
+            self.names = Some(names);
+        }
+        let names = self.names.as_mut().context("loading metric names")?;
         let mut rows = Rows::default();
         for new in samples {
-            self.names.add_sample(new, &mut rows)?;
+            names.add_sample(new, &mut rows)?;
         }
         let transaction = self.connection.transaction()?;
         write_rows(&transaction, &rows)?;
@@ -502,8 +513,9 @@ impl Store for DuckDbStore {
     fn write(&mut self, samples: &[NewSample]) -> Result<()> {
         let result = self.write_samples(samples);
         if result.is_err() {
-            // What was remembered for this batch never reached the database.
-            self.names = Names::load(&self.connection).context("reloading metric names")?;
+            // What was remembered for this batch never reached the database. If
+            // that can't be reloaded now, the next write does it first.
+            self.names = Names::load(&self.connection).ok();
         }
         result
     }
@@ -1232,6 +1244,37 @@ mod tests {
         assert!(row_count(&store) > 0);
     }
 
+    /// A failed write rolls back what it added to the catalog. If the catalog can't
+    /// be reloaded either, the store must not keep trusting those names: the next
+    /// write would skip adding them and leave samples pointing at nothing.
+    #[test]
+    fn a_catalog_that_could_not_be_reloaded_is_loaded_again_before_the_next_write() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut store = DuckDbStore::open(&folder.path().join("m.duckdb"), "1GB").unwrap();
+        write_one(&mut store, "a", "h", &sample()).unwrap();
+        let newcomer = Sample {
+            timestamp_ms: 1_700_000_001_000,
+            metrics: BTreeMap::from([("memory".to_string(), json!({ "used_percent": 40.0 }))]),
+        };
+
+        // Adding a collector and reloading the catalog both need this table.
+        let hide = "ALTER TABLE collectors RENAME TO collectors_away";
+        store.connection.execute_batch(hide).unwrap();
+        assert!(write_one(&mut store, "a", "h", &newcomer).is_err());
+        assert!(store.names.is_none());
+        let restore = "ALTER TABLE collectors_away RENAME TO collectors";
+        store.connection.execute_batch(restore).unwrap();
+
+        write_one(&mut store, "a", "h", &newcomer).unwrap();
+
+        let reader = store.reader().unwrap();
+        let latest = reader
+            .latest_output("a", "memory", 0, 2_000_000_000_000)
+            .unwrap();
+        let latest = latest.expect("the sample should be readable");
+        assert_eq!(latest["used_percent"].as_f64(), Some(40.0));
+    }
+
     #[test]
     fn closing_saves_recent_writes_even_with_a_reader_open() {
         let folder = tempfile::tempdir().unwrap();
@@ -1443,8 +1486,18 @@ mod tests {
     #[test]
     fn one_agent_cannot_flood_the_store() {
         let mut store = in_memory();
-        store.names.series_per_agent.insert(1, MAX_SERIES_PER_AGENT);
-        store.names.agents.insert("noisy".to_string(), 1);
+        store
+            .names
+            .as_mut()
+            .unwrap()
+            .series_per_agent
+            .insert(1, MAX_SERIES_PER_AGENT);
+        store
+            .names
+            .as_mut()
+            .unwrap()
+            .agents
+            .insert("noisy".to_string(), 1);
 
         write_metric(
             &mut store,
@@ -1573,7 +1626,7 @@ mod tests {
             .unwrap_or_default();
         let result = write_one(&mut store, "a", "h", &sample());
         assert!(result.is_err());
-        assert!(store.names.agents.is_empty());
+        assert!(store.names.as_ref().unwrap().agents.is_empty());
     }
 
     fn sorted_count(store: &DuckDbStore) -> i64 {

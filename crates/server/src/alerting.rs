@@ -13,6 +13,9 @@ use crate::calculations::{Calculation, Grouping, Question};
 use crate::metric_charts::format_value;
 use crate::metrics::{self, Metric, Source};
 
+/// Why an alert ends when its rule goes, however it goes.
+pub const RULE_GONE_REASON: &str = "The rule was deleted or disabled";
+
 /// What the database columns hold.
 const MAX_NAME_LEN: usize = 255;
 const MAX_TARGET_LEN: usize = 2048;

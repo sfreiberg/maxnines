@@ -39,8 +39,17 @@ pub fn check_rule(rule: &RuleInput) -> Result<()> {
     }
 
     ensure!(rule.settings.is_object(), "settings must be a map");
-    let config: AgentConfig =
-        serde_json::from_value(rule.settings.clone()).context("invalid settings")?;
+    // Agents ignore settings they don't know, so a mistake is only caught here.
+    let mut unknown = Vec::new();
+    let config: AgentConfig = serde_ignored::deserialize(rule.settings.clone(), |path| {
+        unknown.push(path.to_string());
+    })
+    .context("invalid settings")?;
+    ensure!(
+        unknown.is_empty(),
+        "invalid settings: no such setting as {}",
+        unknown.join(", ")
+    );
     config.validate().context("invalid settings")?;
 
     // Settings are stored flat, and an empty list has no rows to store.
@@ -357,6 +366,24 @@ mod tests {
 
         assert_eq!(resolved.config.interval_secs, 15);
         assert!(resolved.config.collectors.is_empty());
+    }
+
+    #[test]
+    fn a_rule_with_a_setting_no_agent_knows_is_refused() {
+        let input = rule("r", None, json!({ "intervl_secs": 30 }));
+        let error = check_rule(&input.rule).unwrap_err().to_string();
+        assert_eq!(error, "invalid settings: no such setting as intervl_secs");
+
+        let nested = rule(
+            "r",
+            None,
+            json!({ "collectors": { "disk": { "mounts": ["/"] } } }),
+        );
+        let error = check_rule(&nested.rule).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "invalid settings: no such setting as collectors.disk.mounts"
+        );
     }
 
     #[test]

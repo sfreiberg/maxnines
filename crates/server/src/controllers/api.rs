@@ -1011,7 +1011,7 @@ async fn update_alert_rule(
 }
 
 async fn delete_alert_rule(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
-    match state.database.delete_alert_rule(id).await {
+    match state.database.delete_alert_rule(id, now_ms()).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),

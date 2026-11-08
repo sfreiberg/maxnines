@@ -130,8 +130,11 @@ macro_rules! build_info {
 
 /// What the server tells an agent to do. Everything about monitoring comes from
 /// here, and the agent's own config only says how to reach the server.
+///
+/// Settings this build doesn't know are ignored rather than refused, so a newer
+/// server's config still reaches an older agent. The server refuses them when a
+/// rule is saved, which is where a typo can be put right.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     /// Seconds between samples.
     #[serde(default = "default_interval_secs")]
@@ -144,7 +147,6 @@ pub struct AgentConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CollectorSettings {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -166,7 +168,6 @@ pub struct CollectorSettings {
 
 /// Something an agent tries reaching, to see if it's up.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Check {
     /// What it's called on charts and in alerts.
     pub name: String,
@@ -389,12 +390,25 @@ fn default_enabled() -> bool {
     true
 }
 
+/// Longer than anyone wants between samples, and far below what a timer can hold.
+pub const MAX_INTERVAL_SECS: u64 = 86_400;
+/// A week between fact reports, on top of one on every connection.
+pub const MAX_FACTS_INTERVAL_SECS: u64 = 7 * 86_400;
+
 impl AgentConfig {
     pub fn validate(&self) -> Result<()> {
         ensure!(self.interval_secs > 0, "interval_secs must be at least 1");
         ensure!(
+            self.interval_secs <= MAX_INTERVAL_SECS,
+            "interval_secs can be at most {MAX_INTERVAL_SECS}, a day"
+        );
+        ensure!(
             self.facts_interval_secs > 0,
             "facts_interval_secs must be at least 1"
+        );
+        ensure!(
+            self.facts_interval_secs <= MAX_FACTS_INTERVAL_SECS,
+            "facts_interval_secs can be at most {MAX_FACTS_INTERVAL_SECS}, a week"
         );
         for (name, settings) in &self.collectors {
             ensure!(
@@ -576,6 +590,53 @@ mod tests {
     fn watching(names: Value) -> AgentConfig {
         serde_json::from_value(json!({ "collectors": { "processes": { "names": names } } }))
             .unwrap()
+    }
+
+    /// A timer can't hold a span anywhere near `u64::MAX` seconds, and the agent
+    /// would otherwise fall over on the arithmetic, every time it restarted.
+    #[test]
+    fn intervals_have_limits() {
+        let with = |interval: u64, facts: u64| AgentConfig {
+            interval_secs: interval,
+            facts_interval_secs: facts,
+            ..config()
+        };
+        with(MAX_INTERVAL_SECS, MAX_FACTS_INTERVAL_SECS)
+            .validate()
+            .unwrap();
+        for bad in [
+            with(0, 60),
+            with(MAX_INTERVAL_SECS + 1, 60),
+            with(u64::MAX, 60),
+            with(60, 0),
+            with(60, MAX_FACTS_INTERVAL_SECS + 1),
+            with(60, u64::MAX),
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
+    }
+
+    /// A newer server can add settings without older agents refusing every config
+    /// it sends from then on.
+    #[test]
+    fn settings_from_a_newer_server_are_ignored() {
+        let config: AgentConfig = serde_json::from_value(json!({
+            "interval_secs": 30,
+            "brand_new_setting": true,
+            "collectors": {
+                "cpu": { "enabled": true, "per_core_detail": "all" },
+                "checks": {
+                    "checks": [{
+                        "name": "site", "kind": "http", "target": "https://example.com/",
+                        "follow_redirects": true,
+                    }],
+                },
+            },
+        }))
+        .unwrap();
+        assert_eq!(config.interval_secs, 30);
+        assert_eq!(config.collectors.len(), 2);
+        config.validate().unwrap();
     }
 
     #[test]
@@ -785,12 +846,6 @@ mod tests {
         assert_eq!(config.facts_interval_secs, 3600);
         assert!(config.collectors["cpu"].enabled);
         assert_eq!(config.collectors["cpu"].mount_points, None);
-    }
-
-    #[test]
-    fn a_config_rejects_settings_it_does_not_know() {
-        let typo = json!({ "intervl_secs": 5 });
-        assert!(serde_json::from_value::<AgentConfig>(typo).is_err());
     }
 
     #[test]

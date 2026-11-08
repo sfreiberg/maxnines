@@ -461,6 +461,25 @@ async fn an_oversized_hostname_ends_the_connection() {
     assert!(server.state.registry.list().await.is_empty());
 }
 
+/// Anyone can open a connection, so what one can make the server hold in memory
+/// is limited before the handshake as well as after it.
+#[tokio::test]
+async fn a_huge_message_ends_the_connection_before_and_after_the_handshake() {
+    let server = start().await;
+    let huge = "x".repeat(2 * 1024 * 1024);
+
+    let mut client = server.connect().await;
+    read_nonce(&mut client).await;
+    let _ = client.send(Message::text(huge.clone())).await;
+    assert!(is_closed(&mut client).await);
+
+    let agent = identity();
+    let mut client = server.connect_approved(&agent, "web-1").await;
+    let _ = client.send(Message::text(huge)).await;
+    assert!(is_closed(&mut client).await);
+    assert!(server.saved.samples.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn a_connection_that_never_answers_the_challenge_is_closed() {
     let server = start().await;

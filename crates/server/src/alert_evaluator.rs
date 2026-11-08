@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info};
 
-use crate::alerting::{Alert, AlertRule, NewAlert, RuleKind, clean};
+use crate::alerting::{Alert, AlertRule, NewAlert, RULE_GONE_REASON, RuleKind, clean};
 use crate::calculations::{
     self, Calculation, Grouping, Question, SMALLEST_STEP_MS, Sources, over_window,
 };
@@ -130,7 +130,7 @@ impl Snapshot {
             .and_then(|id| self.rules.get(&id))
             .filter(|rule| rule.rule.enabled)
         else {
-            return Some("The rule was deleted or disabled");
+            return Some(RULE_GONE_REASON);
         };
         // Checking a calculation deals with its own alerts. Getting here means it
         // couldn't be read, which says nothing about whether anything is wrong.
@@ -323,8 +323,7 @@ impl Evaluator {
         }
 
         for alert in orphans {
-            self.close(&alert, now_ms, "The rule was deleted or disabled")
-                .await?;
+            self.close(&alert, now_ms, RULE_GONE_REASON).await?;
         }
         for (key, alert) in &open {
             if !checked.contains(key)

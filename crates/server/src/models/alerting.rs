@@ -5,13 +5,14 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use anyhow::{Context, Result};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    TransactionTrait,
 };
 
 use super::{Database, alert, alert_rule, alert_rule_channel, notification, notification_channel};
 use crate::alerting::{
     Alert, AlertRule, AlertRuleInput, Channel, ChannelInput, ChannelKind, Comparison, Delivery,
-    DeliveryProblem, Event, NewAlert, RuleKind, Severity,
+    DeliveryProblem, Event, NewAlert, RULE_GONE_REASON, RuleKind, Severity,
 };
 use crate::calculations::Calculation;
 
@@ -248,12 +249,30 @@ impl Database {
         Ok(true)
     }
 
-    /// Alerts from the rule stay as history. Returns false if there's no such rule.
-    pub async fn delete_alert_rule(&self, id: i64) -> Result<bool> {
-        let result = alert_rule::Entity::delete_by_id(id)
-            .exec(&self.connection)
+    /// Alerts from the rule stay as history, and its open ones end now. The rule's
+    /// silences go with it, so an alert they were holding back has to end in the
+    /// same step, or its notifications would go out in the moments before the
+    /// evaluator noticed. Returns false if there's no such rule.
+    pub async fn delete_alert_rule(&self, id: i64, now_ms: i64) -> Result<bool> {
+        let transaction = self
+            .connection
+            .begin()
             .await
             .context("deleting alert rule")?;
+        let open = alert::Entity::find()
+            .filter(alert::Column::RuleId.eq(id))
+            .filter(alert::Column::ResolvedMs.is_null())
+            .all(&transaction)
+            .await
+            .context("loading alerts")?;
+        for alert in open {
+            resolve_in(&transaction, alert.id, now_ms, RULE_GONE_REASON).await?;
+        }
+        let result = alert_rule::Entity::delete_by_id(id)
+            .exec(&transaction)
+            .await
+            .context("deleting alert rule")?;
+        transaction.commit().await.context("deleting alert rule")?;
         Ok(result.rows_affected > 0)
     }
 }
@@ -322,6 +341,50 @@ impl Database {
             .context("deleting channel")?;
         Ok(result.rows_affected > 0)
     }
+}
+
+/// Ends an alert within a transaction: see [`Database::resolve_alert`].
+async fn resolve_in<C: ConnectionTrait>(
+    connection: &C,
+    id: i64,
+    now_ms: i64,
+    reason: &str,
+) -> Result<()> {
+    let result = alert::Entity::update_many()
+        .col_expr(alert::Column::ResolvedMs, Expr::value(now_ms))
+        .col_expr(alert::Column::ResolveReason, Expr::value(reason))
+        .filter(alert::Column::Id.eq(id))
+        .filter(alert::Column::ResolvedMs.is_null())
+        .exec(connection)
+        .await
+        .context("resolving alert")?;
+    if result.rows_affected == 0 {
+        return Ok(());
+    }
+
+    notification::Entity::delete_many()
+        .filter(notification::Column::AlertId.eq(id))
+        .filter(notification::Column::State.eq(HELD))
+        .exec(connection)
+        .await
+        .context("dropping notifications")?;
+    let told = notification::Entity::find()
+        .filter(notification::Column::AlertId.eq(id))
+        .filter(notification::Column::Event.eq(Event::Firing.as_str()))
+        .all(connection)
+        .await
+        .context("loading notifications")?;
+    let rows: Vec<_> = told
+        .into_iter()
+        .map(|row| queued(id, row.channel_id, Event::Resolved, now_ms))
+        .collect();
+    if !rows.is_empty() {
+        notification::Entity::insert_many(rows)
+            .exec_without_returning(connection)
+            .await
+            .context("queueing notifications")?;
+    }
+    Ok(())
 }
 
 impl Database {
@@ -396,39 +459,7 @@ impl Database {
     /// has since changed or gone. Anyone a silence kept it from never hears of it.
     pub async fn resolve_alert(&self, id: i64, now_ms: i64, reason: &str) -> Result<()> {
         let transaction = self.connection.begin().await.context("resolving alert")?;
-        let result = alert::Entity::update_many()
-            .col_expr(alert::Column::ResolvedMs, Expr::value(now_ms))
-            .col_expr(alert::Column::ResolveReason, Expr::value(reason))
-            .filter(alert::Column::Id.eq(id))
-            .filter(alert::Column::ResolvedMs.is_null())
-            .exec(&transaction)
-            .await
-            .context("resolving alert")?;
-
-        if result.rows_affected > 0 {
-            notification::Entity::delete_many()
-                .filter(notification::Column::AlertId.eq(id))
-                .filter(notification::Column::State.eq(HELD))
-                .exec(&transaction)
-                .await
-                .context("dropping notifications")?;
-            let told = notification::Entity::find()
-                .filter(notification::Column::AlertId.eq(id))
-                .filter(notification::Column::Event.eq(Event::Firing.as_str()))
-                .all(&transaction)
-                .await
-                .context("loading notifications")?;
-            let rows: Vec<_> = told
-                .into_iter()
-                .map(|row| queued(id, row.channel_id, Event::Resolved, now_ms))
-                .collect();
-            if !rows.is_empty() {
-                notification::Entity::insert_many(rows)
-                    .exec_without_returning(&transaction)
-                    .await
-                    .context("queueing notifications")?;
-            }
-        }
+        resolve_in(&transaction, id, now_ms, reason).await?;
         transaction.commit().await.context("resolving alert")?;
         Ok(())
     }
@@ -640,27 +671,59 @@ impl Database {
     }
 
     /// Keeps a notification back because of a silence. An alert that's already over
-    /// has nothing to wait for, so nobody hears about it starting or ending.
+    /// has nothing to wait for, so nobody hears about it starting or ending. The
+    /// alert can end between the queue being read and this, so the database decides
+    /// from the alert as it is now, not as the queue saw it.
     pub async fn hold_delivery(&self, delivery: &Delivery) -> Result<()> {
-        if delivery.alert.resolved_ms.is_some() {
-            notification::Entity::delete_many()
-                .filter(notification::Column::AlertId.eq(delivery.alert.id))
-                .filter(notification::Column::ChannelId.eq(delivery.channel.id))
-                .filter(notification::Column::State.eq(PENDING))
-                .exec(&self.connection)
-                .await
-                .context("dropping notifications")?;
-            return Ok(());
-        }
-
-        notification::Entity::update_many()
+        let still_open = sea_orm::sea_query::Query::select()
+            .column(alert::Column::Id)
+            .from(alert::Entity)
+            .and_where(alert::Column::Id.eq(delivery.alert.id))
+            .and_where(alert::Column::ResolvedMs.is_null())
+            .to_owned();
+        let held = notification::Entity::update_many()
             .col_expr(notification::Column::State, Expr::value(HELD))
             .col_expr(notification::Column::Attempts, Expr::value(0))
             .col_expr(notification::Column::LastError, Expr::value(None::<String>))
             .filter(notification::Column::Id.eq(delivery.id))
+            .filter(notification::Column::State.eq(PENDING))
+            .filter(notification::Column::AlertId.in_subquery(still_open))
             .exec(&self.connection)
             .await
             .context("saving notification")?;
+        if held.rows_affected == 0 {
+            self.drop_unsent(delivery.alert.id, delivery.channel.id)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Forgets what a channel was never told about an alert, held or waiting.
+    async fn drop_unsent(&self, alert_id: i64, channel_id: i64) -> Result<()> {
+        notification::Entity::delete_many()
+            .filter(notification::Column::AlertId.eq(alert_id))
+            .filter(notification::Column::ChannelId.eq(channel_id))
+            .filter(notification::Column::State.is_in([PENDING, HELD]))
+            .exec(&self.connection)
+            .await
+            .context("dropping notifications")?;
+        Ok(())
+    }
+
+    /// Drops everything held back about an alert that has since ended, along with
+    /// anything else queued for the same channels: they never heard it start, so
+    /// they shouldn't hear it end.
+    pub async fn drop_held_for(&self, alert_id: i64) -> Result<()> {
+        let held = notification::Entity::find()
+            .filter(notification::Column::AlertId.eq(alert_id))
+            .filter(notification::Column::State.eq(HELD))
+            .all(&self.connection)
+            .await
+            .context("loading notifications")?;
+        let channels: BTreeSet<i64> = held.into_iter().map(|row| row.channel_id).collect();
+        for channel_id in channels {
+            self.drop_unsent(alert_id, channel_id).await?;
+        }
         Ok(())
     }
 

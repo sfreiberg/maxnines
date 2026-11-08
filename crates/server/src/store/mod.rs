@@ -253,21 +253,29 @@ fn run_writer(
     while !stopping && commands.blocking_recv_many(&mut queued, WRITE_QUEUE_SIZE) > 0 {
         gather_until(next_write, &mut commands, &mut queued);
         let mut samples = Vec::with_capacity(queued.len());
-        let mut acks = Vec::with_capacity(queued.len());
-        let mut repeats = Vec::new();
+        // Every acknowledgement each sample owes: a sample sent twice in one batch is
+        // stored once, and both copies hear about it only if the batch is saved.
+        let mut acks: Vec<Vec<mpsc::Sender<u64>>> = Vec::with_capacity(queued.len());
+        let mut in_batch: HashMap<(String, u64), usize> = HashMap::new();
+        // Repeats of samples stored by an earlier batch, which can be answered now.
+        let mut answered = Vec::new();
         for command in queued.drain(..) {
             match command {
                 WriterCommand::Save(sample) => {
                     samples.push(sample);
-                    acks.push(None);
+                    acks.push(Vec::new());
                 }
                 WriterCommand::SaveAndAck { sample, acks: ack } => {
                     let time = sample.sample.timestamp_ms;
-                    if recent.seen(&sample.agent_id, time) {
-                        repeats.push((ack, time));
+                    let key = (sample.agent_id.clone(), time);
+                    if let Some(&index) = in_batch.get(&key) {
+                        acks[index].push(ack);
+                    } else if recent.seen(&sample.agent_id, time) {
+                        answered.push((ack, time));
                     } else {
+                        in_batch.insert(key, samples.len());
                         samples.push(sample);
-                        acks.push(Some(ack));
+                        acks.push(vec![ack]);
                     }
                 }
                 WriterCommand::Stop => {
@@ -279,17 +287,17 @@ fn run_writer(
         next_write = Instant::now() + every;
         if !samples.is_empty() {
             let saved = save(store.as_mut(), &samples, counts);
-            for (new, ack) in samples.iter().zip(acks) {
+            for (new, acks) in samples.iter().zip(acks) {
                 let time = new.sample.timestamp_ms;
-                match ack {
-                    Some(ack) if saved => repeats.push((ack, time)),
-                    Some(_) => recent.forget(&new.agent_id, time),
-                    None => {}
+                if saved {
+                    answered.extend(acks.into_iter().map(|ack| (ack, time)));
+                } else if !acks.is_empty() {
+                    recent.forget(&new.agent_id, time);
                 }
             }
         }
         // An agent that's gone will send the sample again, and hear back then.
-        for (ack, time) in repeats {
+        for (ack, time) in answered {
             ack.try_send(time).ok();
         }
         if Instant::now() >= next_tidy {
@@ -581,6 +589,35 @@ mod tests {
         writer.blocking_send(WriterCommand::Stop).unwrap();
         thread.join().unwrap();
         assert_eq!(saved.samples.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_sample_sent_twice_in_one_batch_is_stored_once_and_answered_twice() {
+        let (stored, acked) = run(|acks| {
+            vec![
+                from_agent("web", 1, acks),
+                from_agent("web", 1, acks),
+                from_agent("web", 2, acks),
+            ]
+        });
+        assert_eq!(stored, [1, 2]);
+        assert_eq!(acked, [1, 1, 2]);
+    }
+
+    /// An agent sends a sample again after a minute without an answer, which during a
+    /// long database outage lands in the same batch as the first copy. Answering the
+    /// second copy when the batch fails would make the agent throw the sample away.
+    #[test]
+    fn a_repeat_in_a_failed_batch_is_not_acknowledged() {
+        let (stored, acked) = run(|acks| {
+            vec![
+                from_agent("fail", 1, acks),
+                from_agent("fail", 1, acks),
+                from_agent("fail", 2, acks),
+            ]
+        });
+        assert!(stored.is_empty());
+        assert!(acked.is_empty(), "{acked:?}");
     }
 
     #[test]

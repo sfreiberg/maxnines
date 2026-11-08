@@ -912,7 +912,7 @@ Checks the server runs itself, against remote sites.
 | `method` | http | Defaults to `GET` |
 | `body` | http | What to send, for methods like `POST` |
 | `regex` | http | A regular expression the page has to match |
-| `insecure` | http, tls | Measure a site whose certificate can't be verified, without counting that as down |
+| `insecure` | http, tls | Measure a site whose certificate can't be verified, without counting that as down. Without it, an HTTP check never sends its request to a server that fails the certificate check |
 | `server` | dns | Ask this server instead of the system's resolver |
 | `record` | dns | The record type to ask for, with `server`. Defaults to `A` |
 | `count` | ping | How many packets to send. Defaults to 1 |

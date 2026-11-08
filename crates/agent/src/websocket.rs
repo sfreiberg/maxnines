@@ -31,6 +31,9 @@ use crate::spool::Spool;
 
 /// The server pings regularly, so this much silence means the connection died.
 const SERVER_SILENCE_LIMIT: Duration = Duration::from_secs(30);
+/// How long connecting, and then the handshake, each get. A server, firewall or load
+/// balancer that accepts the connection and then says nothing would otherwise hold
+/// the agent offline for good.
 const HANDSHAKE_LIMIT: Duration = Duration::from_secs(15);
 /// Configs arrive rarely, and only the newest one matters.
 const CONFIG_QUEUE_SIZE: usize = 8;
@@ -200,13 +203,21 @@ async fn stay_connected(connection: Connection, mut pending: mpsc::Receiver<Stri
     }
 }
 
+/// Opens the connection, giving up after `limit` if the other end doesn't finish
+/// its side, as a stuck one would never fail on its own.
+async fn connect(url: &str, connector: &Connector, limit: Duration) -> Result<Socket> {
+    let connecting = connect_async_tls_with_config(url, None, false, Some(connector.clone()));
+    let (socket, _) = timeout(limit, connecting)
+        .await
+        .with_context(|| format!("connecting to {url} timed out"))?
+        .with_context(|| format!("connecting to {url}"))?;
+    Ok(socket)
+}
+
 /// Runs one connection until it fails. Reading also answers the server's pings.
 async fn session(connection: &Connection, pending: &mut mpsc::Receiver<String>) -> Result<()> {
     let url = connection.url.as_str();
-    let connector = Some(connection.connector.clone());
-    let (mut socket, _) = connect_async_tls_with_config(url, None, false, connector)
-        .await
-        .with_context(|| format!("connecting to {url}"))?;
+    let mut socket = connect(url, &connection.connector, HANDSHAKE_LIMIT).await?;
 
     timeout(HANDSHAKE_LIMIT, authenticate(&mut socket, connection))
         .await
@@ -452,6 +463,19 @@ mod tests {
             next_message(&mut socket).await,
             AgentMessage::Sample(sample())
         );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_accepts_but_never_answers_is_given_up_on() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        let connector = tls_connector(None).unwrap();
+
+        let error = connect(&url, &connector, Duration::from_millis(100))
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
     }
 
     #[tokio::test]

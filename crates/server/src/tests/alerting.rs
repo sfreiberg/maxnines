@@ -433,7 +433,12 @@ async fn deleting_a_rule_closes_its_alerts_and_keeps_the_history() {
     let id = test.database().create_alert_rule(&rule).await.unwrap();
     test.cpu(0, 95.0).await;
 
-    assert!(test.database().delete_alert_rule(id).await.unwrap());
+    assert!(
+        test.database()
+            .delete_alert_rule(id, test.now)
+            .await
+            .unwrap()
+    );
     test.evaluate(MINUTE_MS).await;
 
     assert!(test.open().await.is_empty());
@@ -2655,7 +2660,10 @@ async fn resolved_notices_go_to_whoever_heard_it_fired_even_if_the_rule_is_gone(
     notifier.deliver_due(test.now).await.unwrap();
 
     let rule = test.database().list_alert_rules().await.unwrap()[0].id;
-    test.database().delete_alert_rule(rule).await.unwrap();
+    test.database()
+        .delete_alert_rule(rule, test.now)
+        .await
+        .unwrap();
     test.evaluate(MINUTE_MS).await;
     notifier.deliver_due(test.now + MINUTE_MS).await.unwrap();
 
@@ -3994,6 +4002,60 @@ mod silences {
         assert_eq!(test.open().await.len(), 1);
     }
 
+    /// Deleting a rule takes its silences with it. Its alerts have to end in the
+    /// same step, or the notifications the silence was holding back would go out
+    /// in the moments before the evaluator closed them.
+    #[tokio::test]
+    async fn deleting_a_silenced_rule_tells_nobody() {
+        let mut test = Harness::start().await;
+        let hook = FakeOnCall::default();
+        let notifier = on_a_webhook(&mut test, &hook).await;
+        let rule = test.open().await[0].rule_id.unwrap();
+        let silence = SilenceInput {
+            rule_id: Some(rule),
+            ..silence("")
+        };
+        test.database()
+            .create_silence(&silence, "sam", test.now)
+            .await
+            .unwrap();
+        assert_eq!(deliver(&test, &notifier, &hook, 1000).await, 0);
+
+        test.database()
+            .delete_alert_rule(rule, test.now + 2000)
+            .await
+            .unwrap();
+
+        assert_eq!(deliver(&test, &notifier, &hook, 3000).await, 0);
+        assert!(test.open().await.is_empty());
+        assert_eq!(
+            test.resolved().await[0].resolve_reason.as_deref(),
+            Some("The rule was deleted or disabled")
+        );
+    }
+
+    /// The evaluator can end an alert between the notifier reading the queue and
+    /// holding a notification from it. Holding it anyway would send it as a new
+    /// alert when the silence ended, with nothing ever closing it.
+    #[tokio::test]
+    async fn a_hold_decided_before_the_alert_ended_does_not_happen() {
+        let mut test = Harness::start().await;
+        let hook = FakeOnCall::default();
+        let notifier = on_a_webhook(&mut test, &hook).await;
+        let due = test.database().due_deliveries(test.now, 16).await.unwrap();
+        assert_eq!(due.len(), 1);
+
+        test.cpu(MINUTE_MS, 10.0).await;
+        test.database().hold_delivery(&due[0]).await.unwrap();
+
+        assert!(test.database().held_deliveries().await.unwrap().is_empty());
+        assert_eq!(deliver(&test, &notifier, &hook, MINUTE_MS + 1000).await, 0);
+        assert_eq!(
+            deliver(&test, &notifier, &hook, HOUR_MS + MINUTE_MS).await,
+            0
+        );
+    }
+
     #[tokio::test]
     async fn notifications_go_out_when_the_silence_ends_if_it_is_still_firing() {
         let mut test = Harness::start().await;
@@ -4157,7 +4219,10 @@ mod silences {
             .await;
         let id = id.unwrap();
 
-        test.database().delete_alert_rule(rule).await.unwrap();
+        test.database()
+            .delete_alert_rule(rule, test.now)
+            .await
+            .unwrap();
 
         assert_eq!(test.database().get_silence(id).await.unwrap(), None);
     }
@@ -4403,7 +4468,10 @@ mod maintenance_windows {
             .await
             .unwrap();
 
-        test.database().delete_alert_rule(rule).await.unwrap();
+        test.database()
+            .delete_alert_rule(rule, test.now)
+            .await
+            .unwrap();
 
         let found = test.database().get_maintenance_window(id).await.unwrap();
         assert_eq!(found, None);

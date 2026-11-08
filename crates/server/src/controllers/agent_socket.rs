@@ -27,6 +27,12 @@ use crate::store::{LATEST_SAMPLE_MS, NewSample, WriterCommand};
 const MAX_HOST_LEN: usize = 255;
 /// Far more than real facts need, so one agent can't fill the database.
 const MAX_FACTS_LEN: usize = 64 * 1024;
+
+/// The most a single message from an agent can be. Facts are limited well below
+/// this, and a sample from even a large machine is a few hundred KiB, so anything
+/// bigger is a mistake or an attack, and a connection sending one is closed before
+/// the server holds the whole of it in memory.
+const MAX_MESSAGE_LEN: usize = 1024 * 1024;
 /// What the database column holds.
 const MAX_VERSION_LEN: usize = 32;
 /// Plenty to explain a problem, without letting an agent store anything it likes.
@@ -56,6 +62,8 @@ pub async fn upgrade(
     socket
         .read_buffer_size(SOCKET_BUFFER_SIZE)
         .write_buffer_size(SOCKET_BUFFER_SIZE)
+        .max_message_size(MAX_MESSAGE_LEN)
+        .max_frame_size(MAX_MESSAGE_LEN)
         .on_upgrade(move |socket| handle(socket, source, state))
 }
 

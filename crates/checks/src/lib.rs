@@ -184,8 +184,10 @@ async fn check_tcp(check: &Check, findings: &mut Findings) -> Result<()> {
     Ok(())
 }
 
-/// Lets a handshake finish whatever the certificate's like, so that a site with
-/// a bad one can still be measured, and remembers what the real check said.
+/// Lets a handshake finish whatever the certificate's like, so that a site with a
+/// bad one can still have its certificate's dates and name read, and remembers what
+/// the real check said. Nothing is sent over the connection afterwards unless the
+/// check was told not to mind, as a request can carry a secret.
 #[derive(Debug)]
 struct RecordingVerifier {
     real: Arc<WebPkiServerVerifier>,
@@ -479,11 +481,11 @@ async fn check_http(check: &Check, findings: &mut Findings) -> Result<()> {
     let addresses = resolve(&host, port, findings).await?;
     let socket = connect(&addresses, findings).await?;
 
-    let mut problem = None;
     let (sent, mut response) = if secure_site {
         let alpn: [&[u8]; 2] = [b"h2", b"http/1.1"];
         let secured = secure(&host, socket, &alpn, findings).await?;
-        problem = secured.problem;
+        // Before the request, which can hold a password, reaches whoever this is.
+        certificate_verdict(check, secured.problem)?;
         let (_, connection) = secured.stream.get_ref();
         let use_http2 = connection.alpn_protocol() == Some(b"h2");
         let request = build_request(check, &uri, use_http2)?;
@@ -518,7 +520,6 @@ async fn check_http(check: &Check, findings: &mut Findings) -> Result<()> {
     findings.content_length = Some(length);
     findings.regex_matched = matched;
 
-    certificate_verdict(check, problem)?;
     ensure!(status < 400, "the server returned status {status}");
     ensure!(
         findings.regex_matched != Some(false),
@@ -546,24 +547,20 @@ fn dns_query(check: &Check, id: u16) -> Result<Vec<u8>> {
     let name = Name::from_utf8(format!("{}.", check.target.trim_end_matches('.')))
         .map_err(|_| anyhow!("invalid name"))?;
 
-    let mut message = Message::new();
-    message
-        .set_id(id)
-        .set_message_type(MessageType::Query)
-        .set_op_code(OpCode::Query)
-        .set_recursion_desired(true)
-        .add_query(Query::query(name, record));
+    let mut message = Message::new(id, MessageType::Query, OpCode::Query);
+    message.metadata.recursion_desired = true;
+    message.add_query(Query::query(name, record));
     message.to_vec().map_err(|_| anyhow!("invalid query"))
 }
 
 fn dns_answers(bytes: &[u8], id: u16) -> Result<usize> {
     let message = Message::from_vec(bytes).map_err(|_| anyhow!("unreadable DNS answer"))?;
     ensure!(
-        message.id() == id,
+        message.metadata.id == id,
         "the DNS answer didn't match the question"
     );
-    match message.response_code() {
-        ResponseCode::NoError => Ok(message.answers().len()),
+    match message.metadata.response_code {
+        ResponseCode::NoError => Ok(message.answers.len()),
         ResponseCode::NXDomain => bail!("the name wasn't found"),
         _ => bail!("the DNS server refused"),
     }
@@ -992,15 +989,20 @@ mod tests {
         assert_eq!(output["cert_valid"], false);
     }
 
+    /// The request could carry a password in its URL, so it's never sent to a
+    /// server that failed the certificate check, though the certificate itself is
+    /// still measured.
     #[test]
-    fn a_secure_page_with_a_bad_certificate_is_measured_all_the_way() {
-        let target = format!("https://{}/", serve_tls(&["localhost"]));
+    fn a_secure_page_with_a_bad_certificate_is_not_sent_the_request() {
+        let target = format!("https://{}/secret?token=abc", serve_tls(&["localhost"]));
         let output = run(&check(CheckKind::Http, &target));
 
         assert_eq!(output["up"], 0, "{output}");
         assert_eq!(output["error"], "the certificate isn't trusted");
-        assert_eq!(output["status"], 200);
-        assert!(output["first_byte_ms"].is_f64(), "{output}");
+        assert_eq!(output["cert_valid"], false);
+        assert!(output["tls_ms"].is_f64(), "{output}");
+        assert!(output["status"].is_null(), "{output}");
+        assert!(output["first_byte_ms"].is_null(), "{output}");
     }
 
     #[test]
@@ -1080,16 +1082,14 @@ mod tests {
             let mut buffer = [0; 512];
             let (size, from) = socket.recv_from(&mut buffer).unwrap();
             let question = Message::from_vec(&buffer[..size]).unwrap();
-            let mut answer = Message::new();
-            answer
-                .set_id(question.id())
-                .set_message_type(MessageType::Response)
-                .set_response_code(code);
-            for query in question.queries() {
+            let mut answer =
+                Message::new(question.metadata.id, MessageType::Response, OpCode::Query);
+            answer.metadata.response_code = code;
+            for query in &question.queries {
                 answer.add_query(query.clone());
                 for index in 0..answers {
                     answer.add_answer(hickory_proto::rr::Record::from_rdata(
-                        query.name().clone(),
+                        query.name.clone(),
                         60,
                         hickory_proto::rr::RData::A(hickory_proto::rr::rdata::A::new(
                             10,

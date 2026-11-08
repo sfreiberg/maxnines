@@ -1558,7 +1558,12 @@ mod tests {
         );
 
         // The alert outlives its rule, and its queue goes with its channel.
-        assert!(database.delete_alert_rule(rule).await.unwrap());
+        assert!(
+            database
+                .delete_alert_rule(rule, started_ms + 20)
+                .await
+                .unwrap()
+        );
         let history = database.resolved_alerts(10).await.unwrap();
         let ended = history.iter().find(|a| a.id == alert).unwrap();
         assert_eq!(ended.rule_id, None);
