@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::alerting::{Alert, Severity};
 use crate::app_state::AppState;
 use crate::fact_history::format_time;
+use crate::facts::FlatFacts;
 use crate::metric_charts::format_value;
 use crate::metrics::{CurrentValues, Unit, now_ms};
 use crate::registration::{AgentRecord, AgentState, short_id};
@@ -55,11 +56,37 @@ impl Health {
     }
 }
 
+/// Which system an agent runs, for drawing its icon. Only these names reach a
+/// page, never the fact an agent sent, and anything else gets no icon.
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OsFamily {
+    Macos,
+    Linux,
+    Windows,
+    Freebsd,
+    Openbsd,
+}
+
+impl OsFamily {
+    pub fn of(facts: &FlatFacts) -> Option<Self> {
+        match facts.get("os.family")?.as_str()? {
+            "macos" => Some(Self::Macos),
+            "linux" => Some(Self::Linux),
+            "windows" => Some(Self::Windows),
+            "freebsd" => Some(Self::Freebsd),
+            "openbsd" => Some(Self::Openbsd),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct FleetRow {
     pub id: String,
     pub short_id: String,
     pub host: String,
+    pub os_family: Option<OsFamily>,
     pub online: bool,
     pub health: Health,
     pub cpu: Option<Meter>,
@@ -70,9 +97,16 @@ pub struct FleetRow {
     pub updated: Option<String>,
 }
 
-fn row(state: &AppState, agent: AgentRecord, values: CurrentValues, alerts: &[&Alert]) -> FleetRow {
+fn row(
+    state: &AppState,
+    agent: AgentRecord,
+    values: CurrentValues,
+    facts: Option<&FlatFacts>,
+    alerts: &[&Alert],
+) -> FleetRow {
     let online = state.presence.get(&agent.id).is_some_and(|p| p.online);
     FleetRow {
+        os_family: facts.and_then(OsFamily::of),
         online,
         health: Health::of(online, alerts),
         cpu: Meter::new(values.cpu_percent),
@@ -99,16 +133,23 @@ pub async fn rows(state: &AppState) -> Result<Vec<FleetRow>> {
         alerts.entry(&alert.agent_id).or_default().push(alert);
     }
 
-    let mut rows: Vec<FleetRow> = state
+    let agents: Vec<AgentRecord> = state
         .registry
         .list()
         .await
         .into_iter()
         .filter(|agent| agent.state == AgentState::Approved && !agent.is_local())
+        .collect();
+    let ids: Vec<&str> = agents.iter().map(|agent| agent.id.as_str()).collect();
+    let facts = state.database.facts_of(&ids).await?;
+
+    let mut rows: Vec<FleetRow> = agents
+        .into_iter()
         .map(|agent| {
             let values = current.remove(&agent.id).unwrap_or_default();
             let mine = alerts.get(agent.id.as_str()).map_or(&[][..], Vec::as_slice);
-            row(state, agent, values, mine)
+            let known = facts.get(&agent.id);
+            row(state, agent, values, known, mine)
         })
         .collect();
     rows.sort_by(|a, b| a.health.cmp(&b.health).then_with(|| a.host.cmp(&b.host)));
@@ -117,6 +158,8 @@ pub async fn rows(state: &AppState) -> Result<Vec<FleetRow>> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+
     use super::*;
 
     #[test]
@@ -125,6 +168,24 @@ mod tests {
         assert_eq!(Meter::new(Some(-5.0)).unwrap().width, 0.0);
         assert_eq!(Meter::new(Some(250.0)).unwrap().text, "250%");
         assert!(Meter::new(None).is_none());
+    }
+
+    #[test]
+    fn only_known_systems_get_an_icon() {
+        let family = |value: Value| {
+            let facts: FlatFacts = [("os.family".to_string(), value)].into_iter().collect();
+            OsFamily::of(&facts)
+        };
+        assert_eq!(family(json!("macos")), Some(OsFamily::Macos));
+        assert_eq!(family(json!("linux")), Some(OsFamily::Linux));
+        assert_eq!(family(json!("windows")), Some(OsFamily::Windows));
+        assert_eq!(family(json!("freebsd")), Some(OsFamily::Freebsd));
+        assert_eq!(family(json!("openbsd")), Some(OsFamily::Openbsd));
+        // NetBSD's logo can't be used as an icon, so it has none.
+        assert_eq!(family(json!("netbsd")), None);
+        assert_eq!(family(json!("<svg onload=x>")), None);
+        assert_eq!(family(json!(7)), None);
+        assert_eq!(OsFamily::of(&FlatFacts::new()), None);
     }
 
     #[test]

@@ -5,7 +5,7 @@
 <div class="title-row">
   <div>
     <h1>{{ agent.host }}</h1>
-    {% if os %}<p class="subtitle">{{ os }}</p>{% endif %}
+    {% if os %}<p class="subtitle host-name">{% include "agents/_os_icon.html" %}{{ os }}</p>{% endif %}
   </div>
   <div class="actions">
     {% include "agents/_health.html" %}

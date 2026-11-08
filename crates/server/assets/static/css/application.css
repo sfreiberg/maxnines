@@ -105,6 +105,15 @@ main > .breadcrumb { margin-bottom: -12px; }
 .note { margin: 0; color: var(--muted); font-size: 13px; }
 /* The start of an agent's ID, which tells machines with the same name apart. */
 .agent-id { color: var(--muted); font-family: var(--mono); font-size: 12px; font-weight: 400; }
+/* A name with its system's icon in front. */
+.host-name { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
+/* Logos are masks, so they take the theme's colour whatever colour they came in. */
+.os-icon { flex: none; width: 20px; height: 20px; background: currentColor; color: var(--muted); -webkit-mask: no-repeat center / contain; mask: no-repeat center / contain; }
+.os-macos { -webkit-mask-image: url("/assets/os/macos.svg"); mask-image: url("/assets/os/macos.svg"); }
+.os-linux { -webkit-mask-image: url("/assets/os/linux.svg"); mask-image: url("/assets/os/linux.svg"); }
+.os-windows { -webkit-mask-image: url("/assets/os/windows.svg"); mask-image: url("/assets/os/windows.svg"); }
+.os-freebsd { -webkit-mask-image: url("/assets/os/freebsd.svg"); mask-image: url("/assets/os/freebsd.svg"); }
+.os-openbsd { -webkit-mask-image: url("/assets/os/openbsd.svg"); mask-image: url("/assets/os/openbsd.svg"); }
 
 /* Surfaces */
 .card, fieldset { display: flex; flex-direction: column; gap: 14px; min-width: 0; margin: 0; padding: 24px 28px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }

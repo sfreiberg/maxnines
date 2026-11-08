@@ -10,7 +10,7 @@ use axum_csrf::CsrfToken;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::fleet::Health;
+use super::fleet::{Health, OsFamily};
 use super::host_list::{HostSearch, address, page_number, paginate};
 use super::{CsrfForm, Page, server_error, signed_in_user};
 use crate::alerting::Alert;
@@ -43,6 +43,7 @@ struct AgentRow {
     online: bool,
     health: Health,
     os: Option<String>,
+    os_family: Option<OsFamily>,
     seen: Option<String>,
     config: Option<ConfigState>,
 }
@@ -158,6 +159,7 @@ fn row(
         online: presence.as_ref().is_some_and(|p| p.online),
         health,
         os: facts.and_then(os_of),
+        os_family: facts.and_then(OsFamily::of),
         seen: presence.map(|p| ago(p.last_seen_ms, now_ms() as u64)),
         config: None,
         state: agent.state.as_str(),
@@ -513,6 +515,7 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
             &own_memory.map(|bytes| format_value(Unit::Bytes, bytes)),
         )
         .with("os", &os_of(&flat))
+        .with("os_family", &OsFamily::of(&flat))
         .with("source", &presence.map(|p| p.source.to_string()))
         .with("agent_version", &text_fact(&flat, "agent.version"))
         .with("agent_commit", &text_fact(&flat, "agent.commit"))

@@ -56,7 +56,7 @@
   <div class="wall">
     {% for agent in agents %}
     <a class="tile{% if agent.health == "critical" %} critical{% elif agent.health == "warning" %} alert{% elif agent.health == "offline" %} gone{% endif %}" href="/agents/{{ agent.id }}/metrics">
-      <span class="tile-head">{{ agent.host }} {% include "agents/_health.html" %}</span>
+      {% set os_family = agent.os_family %}<span class="tile-head"><span class="host-name">{% include "agents/_os_icon.html" %}{{ agent.host }}</span> {% include "agents/_health.html" %}</span>
       <span class="agent-id">{{ agent.short_id }}</span>
       {% if agent.online %}{% include "agents/_meters.html" %}{% else %}<span class="note">{% if agent.updated %}Last sample {{ agent.updated }}{% else %}No recent data{% endif %}</span>{% endif %}
     </a>

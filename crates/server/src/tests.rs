@@ -1628,6 +1628,15 @@ async fn embedded_assets_are_served_and_nothing_else_is() {
         );
     }
 
+    // Every logo the stylesheet asks for.
+    for system in ["macos", "linux", "windows", "freebsd", "openbsd"] {
+        let path = format!("/assets/os/{system}.svg");
+        assert!(css.body.contains(&path), "{path}");
+        let logo = browser.get(&server, &path).await;
+        assert_eq!(logo.status, 200, "{path}");
+        assert_eq!(logo.header("content-type"), Some("image/svg+xml"), "{path}");
+    }
+
     for path in [
         "/assets/nope.css",
         "/assets/../Cargo.toml",
@@ -3496,6 +3505,36 @@ async fn hosts_on(server: &TestServer, path: &str) -> (bool, bool) {
     let page = Browser::default().get(server, path).await;
     assert_eq!(page.status, 200, "{path}: {}", page.body);
     (page.body.contains(">web-1"), page.body.contains(">db-1"))
+}
+
+#[tokio::test]
+async fn each_host_shows_an_icon_for_its_system() {
+    let server = start().await;
+    let [(web, _web), (db, _db)] = two_hosts(&server).await;
+    let odd = json!({ "os": { "family": "<b>plan9</b>" } });
+    let _odd = report_facts(&server, "odd-1", odd).await;
+    let mut browser = Browser::default();
+
+    for path in ["/", "/agents", "/agents?view=table", "/metrics"] {
+        let page = browser.get(&server, path).await;
+        assert_eq!(page.status, 200, "{path}: {}", page.body);
+        assert!(
+            page.body.contains("aria-label=\"Linux\""),
+            "{path}: {}",
+            page.body
+        );
+        assert!(
+            page.body.contains("aria-label=\"macOS\""),
+            "{path}: {}",
+            page.body
+        );
+        assert_eq!(page.body.matches("class=\"os-icon ").count(), 2, "{path}");
+        assert!(!page.body.contains("plan9</b>"), "{path}");
+    }
+    let page = browser.get(&server, &format!("/agents/{}", web.id())).await;
+    assert!(page.body.contains("aria-label=\"Linux\""), "{}", page.body);
+    let page = browser.get(&server, &format!("/agents/{}", db.id())).await;
+    assert!(page.body.contains("aria-label=\"macOS\""), "{}", page.body);
 }
 
 #[tokio::test]
