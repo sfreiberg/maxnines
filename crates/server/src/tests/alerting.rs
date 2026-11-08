@@ -12,8 +12,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use super::*;
 use crate::alert_evaluator::Evaluator;
 use crate::alerting::{
-    AlertRuleInput, Channel, ChannelInput, ChannelKind, Comparison, Delivery, Event, RuleKind,
-    Severity,
+    AlertRuleInput, Channel, ChannelInput, ChannelKind, Comparison, Delivery, Event, NewAlert,
+    RuleKind, Severity,
 };
 use crate::metrics::{Metric, NewestReading};
 use crate::notifier::{ACKNOWLEDGE_ACTION, Mailer, Notice, Notifier, SILENCE_HOUR_ACTION, Senders};
@@ -2617,6 +2617,79 @@ async fn a_resolved_notice_waits_for_its_firing_notice() {
     notifier.deliver_due(test.now + 31_000).await.unwrap();
     notifier.deliver_due(test.now + 31_001).await.unwrap();
     assert_eq!(hook.events(), ["firing", "firing", "resolved"]);
+}
+
+/// Hundreds of alerts on a channel that's down sit in the queue being retried.
+/// They mustn't hide what's queued for channels that work.
+#[tokio::test]
+async fn a_channel_that_is_down_does_not_hold_up_the_others() {
+    let test = Harness::start().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let nowhere = format!("http://{}/hook", listener.local_addr().unwrap());
+    drop(listener);
+    let channel = |name: &str, target: String| ChannelInput {
+        name: name.to_string(),
+        kind: ChannelKind::Webhook,
+        target,
+        credential: None,
+        app_token: None,
+    };
+    let dead = test
+        .database()
+        .create_channel(&channel("Dead", nowhere))
+        .await
+        .unwrap();
+    let hook = FakeOnCall::default();
+    let healthy = test
+        .database()
+        .create_channel(&channel("Healthy", hook.start().await))
+        .await
+        .unwrap();
+    let rule = test
+        .database()
+        .create_alert_rule(&cpu_rule())
+        .await
+        .unwrap();
+    // One alert per disk on the test's agent, as alerts belong to registered agents.
+    let alert = |series: &str| NewAlert {
+        rule_id: rule,
+        rule_name: "Disk full".to_string(),
+        severity: Severity::Critical,
+        agent_id: test.id(),
+        host: "web-1".to_string(),
+        series: series.to_string(),
+        value: Some(99.0),
+        summary: format!("{series} on web-1 is 99% full"),
+        started_ms: test.now,
+    };
+    for n in 0..600 {
+        test.database()
+            .fire_alert(&alert(&format!("/disk{n:03}")), &[dead])
+            .await
+            .unwrap();
+    }
+    test.database()
+        .fire_alert(&alert("/lucky"), &[healthy])
+        .await
+        .unwrap();
+    let notifier = Notifier::new(test.database().clone(), Senders::default());
+
+    // Each pass takes a batch. The dead channel's rows fail at once and wait to be
+    // retried, so the healthy channel's turn comes within a few dozen passes.
+    for pass in 0..60 {
+        notifier.deliver_due(test.now + pass).await.unwrap();
+        if !hook.events().is_empty() {
+            break;
+        }
+    }
+
+    assert_eq!(hook.events().len(), 1, "the healthy channel was told");
+    let problems = test.database().delivery_problems(1000).await.unwrap();
+    assert_eq!(
+        problems.len(),
+        600,
+        "every dead delivery is waiting to be retried"
+    );
 }
 
 #[tokio::test]

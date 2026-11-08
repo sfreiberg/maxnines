@@ -1,9 +1,9 @@
 //! Alert rules, notification channels, alerts and the notification queue.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result};
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
     TransactionTrait,
@@ -21,10 +21,6 @@ const SENT: &str = "sent";
 const FAILED: &str = "failed";
 /// Kept back by a silence.
 const HELD: &str = "held";
-
-/// How much of the queue is looked at each time. Anything beyond this waits for
-/// the rows in front of it to be sent or given up on.
-const QUEUE_WINDOW: u64 = 500;
 
 fn to_alert_rule(row: alert_rule::Model, channels: Vec<i64>) -> Result<AlertRule> {
     Ok(AlertRule {
@@ -468,21 +464,35 @@ impl Database {
     /// resolved notification waits while its firing one is being retried, or a
     /// receiver would see the alert start after it ended, and never close it.
     pub async fn due_deliveries(&self, now_ms: i64, limit: usize) -> Result<Vec<Delivery>> {
-        let rows = notification::Entity::find()
+        // Both conditions are in the query, so rows waiting to be retried cost
+        // nothing: a channel that's down can't hold up the others.
+        let earlier = Alias::new("earlier");
+        let waiting_behind_another = Query::select()
+            .expr(Expr::val(1))
+            .from_as(notification::Entity, earlier.clone())
+            .and_where(
+                Expr::col((earlier.clone(), notification::Column::AlertId))
+                    .equals((notification::Entity, notification::Column::AlertId)),
+            )
+            .and_where(
+                Expr::col((earlier.clone(), notification::Column::ChannelId))
+                    .equals((notification::Entity, notification::Column::ChannelId)),
+            )
+            .and_where(Expr::col((earlier.clone(), notification::Column::State)).eq(PENDING))
+            .and_where(
+                Expr::col((earlier, notification::Column::Id))
+                    .lt(Expr::col((notification::Entity, notification::Column::Id))),
+            )
+            .to_owned();
+        let due = notification::Entity::find()
             .filter(notification::Column::State.eq(PENDING))
+            .filter(notification::Column::NextAttemptMs.lte(now_ms))
+            .filter(Expr::not_exists(waiting_behind_another))
             .order_by_asc(notification::Column::Id)
-            .limit(QUEUE_WINDOW)
+            .limit(limit as u64)
             .all(&self.connection)
             .await
             .context("loading notifications")?;
-
-        let mut seen = HashSet::new();
-        let due: Vec<notification::Model> = rows
-            .into_iter()
-            .filter(|row| seen.insert((row.alert_id, row.channel_id)))
-            .filter(|row| row.next_attempt_ms <= now_ms)
-            .take(limit)
-            .collect();
         if due.is_empty() {
             return Ok(Vec::new());
         }
@@ -622,7 +632,7 @@ impl Database {
             match row.sent_ms {
                 Some(sent) => {
                     let last = last_told.entry(key).or_default();
-                    *last = sent.max(*last);
+                    *last = std::cmp::max(sent, *last);
                 }
                 None if row.state != FAILED => {
                     waiting.insert(key);
