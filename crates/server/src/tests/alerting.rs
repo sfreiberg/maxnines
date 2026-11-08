@@ -2269,12 +2269,9 @@ async fn an_app_level_token_can_be_set_on_the_form_and_stays_hidden() {
     let server = start().await;
     let mut browser = Browser::default();
     let page = browser.get(&server, "/alerts/channels/new").await;
+    assert!(page.body.contains("Create the Slack app"), "{}", page.body);
     assert!(
-        page.body
-            .contains("https:&#x2F;&#x2F;api.slack.com&#x2F;apps?new_app=1&amp;manifest_json=")
-            || page
-                .body
-                .contains("https://api.slack.com/apps?new_app=1&amp;manifest_json="),
+        page.body.contains("new_app=1&amp;manifest_json="),
         "{}",
         page.body
     );

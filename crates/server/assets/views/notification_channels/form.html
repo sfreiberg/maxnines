@@ -31,7 +31,10 @@
   <details class="for-slack setup"{% if not channel.has_credential %} open{% endif %}>
     <summary>How to set up the Slack app</summary>
     <ol>
-      <li><a class="button secondary" href="{{ slack_manifest_link }}" target="_blank" rel="noopener">Create the Slack app</a> Slack opens with everything filled in. Pick your workspace, check the summary, and choose Create.</li>
+      <li>
+        <a class="button secondary" href="{{ slack_manifest_link }}" target="_blank" rel="noopener">Create the Slack app</a>
+        <p>Slack opens with everything filled in. Pick your workspace, check the summary, and choose Create.</p>
+      </li>
       <li>In the app's menu, open <strong>Install App</strong>, choose <strong>Install to</strong> your workspace, then <strong>Allow</strong>.</li>
       <li>Open <strong>OAuth &amp; Permissions</strong> and copy the <strong>Bot User OAuth Token</strong> into the bot token box below. It starts with <code>xoxb-</code>.</li>
       <li>For Acknowledge and Silence buttons, open <strong>Basic Information</strong> and find <strong>App-Level Tokens</strong>. Choose <strong>Generate Token and Scopes</strong>, give it any name, add the <code>connections:write</code> scope, and generate it. Copy it into the app-level token box below. It starts with <code>xapp-</code>.</li>
