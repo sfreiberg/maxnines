@@ -514,29 +514,37 @@ impl Database {
     }
 
     pub async fn admin_token(&self) -> Result<String> {
-        let saved = server_secret::Entity::find_by_id(ADMIN_TOKEN)
+        self.server_secret(ADMIN_TOKEN).await
+    }
+
+    /// A secret the server made for itself, created the first time it's asked for.
+    /// Two servers starting on one database get the same one.
+    pub async fn server_secret(&self, name: &str) -> Result<String> {
+        let saved = server_secret::Entity::find_by_id(name)
             .one(&self.connection)
             .await
-            .context("reading the admin token")?;
+            .with_context(|| format!("reading the {name}"))?;
         if let Some(saved) = saved {
             return Ok(saved.value);
         }
 
         let row = server_secret::ActiveModel {
-            name: Set(ADMIN_TOKEN.to_string()),
+            name: Set(name.to_string()),
             value: Set(new_nonce()?),
         };
         server_secret::Entity::insert(row)
             .on_conflict_do_nothing_on([server_secret::Column::Name])
             .exec_without_returning(&self.connection)
             .await
-            .context("saving the admin token")?;
+            .with_context(|| format!("saving the {name}"))?;
 
-        let saved = server_secret::Entity::find_by_id(ADMIN_TOKEN)
+        let saved = server_secret::Entity::find_by_id(name)
             .one(&self.connection)
             .await
-            .context("reading the admin token")?;
-        Ok(saved.context("the admin token wasn't saved")?.value)
+            .with_context(|| format!("reading the {name}"))?;
+        Ok(saved
+            .with_context(|| format!("the {name} wasn't saved"))?
+            .value)
     }
 }
 

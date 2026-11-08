@@ -6,6 +6,7 @@ mod cli;
 mod condition_builder;
 mod config;
 mod controllers;
+mod csrf;
 mod dashboards;
 mod fact_history;
 mod facts;
@@ -38,7 +39,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use axum_csrf::CsrfConfig;
 use clap::{Parser, Subcommand};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -211,6 +211,8 @@ async fn serve(path: &Path) -> Result<()> {
 
     let database = Database::connect(&config.database.resolve_url()?).await?;
     let admin_token = database.admin_token().await?;
+    let secure_site = config.audience().starts_with("wss://");
+    let csrf = csrf::config(&database, secure_site).await?;
     let agents = database.load_agents().await.context("loading agents")?;
     let store = store::open(&config.metrics)?;
     let metrics = Metrics::new(store.reader()?);
@@ -249,7 +251,7 @@ async fn serve(path: &Path) -> Result<()> {
         trusted_proxies: config.trusted_networks()?.into(),
         admin_token_hash: hash_token(&admin_token).into(),
         views: Arc::new(Views::load()?),
-        csrf: CsrfConfig::default().with_secure(config.audience().starts_with("wss://")),
+        csrf,
         web_url: web_url(config.audience()).unwrap_or_default().into(),
         sign_ins: Arc::default(),
     };

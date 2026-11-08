@@ -91,6 +91,9 @@ reached, and sent when it's back.
 - **Names aren't unique.** The key is the agent's identity, so two machines can share
   a name, such as a caching name server in every office, and a renamed machine
   simply reports under its new name.
+- **Only administrators should be able to change `agent.hcl`.** Custom metrics in it
+  are commands the agent runs, so anyone who can edit the file can run commands as
+  the agent. Keep it owned by the agent's user or root and not writable by others.
 - **Upgrade the server first.** Older agents work with a newer server, but a newer
   agent may need things an older server doesn't have.
 - **macOS and downloads:** a file that came through a browser or AirDrop is blocked
@@ -151,7 +154,9 @@ rights, which depends on how you run the server.
 ### No TLS
 
 Leave the `tls` block out. Behind a proxy that handles HTTPS, set `public_url` to the
-address agents use, and list the proxy so client addresses are read correctly:
+address agents use, and list the proxy so client addresses are read correctly.
+Sign-in attempts are limited per client address, so without `trusted_proxies` every
+browser behind the proxy shares one allowance:
 
 ```hcl
 listen          = "127.0.0.1:9000"
