@@ -43,3 +43,47 @@ Idiomorph.defaults.callbacks.beforeNodeMorphed = (node) => node.id !== "host-fil
 // Leaves anything someone has opened on the page open when its data updates.
 Idiomorph.defaults.callbacks.beforeAttributeUpdated = (name, element) =>
   !(name === "open" && element.tagName === "DETAILS");
+
+// Copy buttons beside text meant for pasting elsewhere, such as an app manifest.
+// They stay hidden without scripts. Browsers only allow the clipboard API over
+// HTTPS or on localhost, so plain http falls back to selecting the text and copying
+// that, and if even that's refused, the text is left selected to copy by hand.
+function selectText(element) {
+  const range = document.createRange();
+  range.selectNodeContents(element);
+  const selection = window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
+async function copyText(element) {
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(element.textContent);
+      return true;
+    } catch {
+      // Falls back to selecting it below.
+    }
+  }
+  selectText(element);
+  try {
+    return document.execCommand("copy");
+  } catch {
+    return false;
+  }
+}
+
+for (const button of document.querySelectorAll("button[data-copy]")) button.hidden = false;
+
+document.addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-copy]");
+  const source = button && document.getElementById(button.dataset.copy);
+  if (!source) return;
+  const copied = await copyText(source);
+  const shortcut = /Mac|iPhone|iPad/.test(navigator.userAgent) ? "⌘C" : "Ctrl+C";
+  button.textContent = copied ? "Copied" : `Press ${shortcut}`;
+  clearTimeout(button.resetLabel);
+  button.resetLabel = setTimeout(() => {
+    button.textContent = "Copy";
+  }, 2000);
+});

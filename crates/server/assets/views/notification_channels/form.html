@@ -49,7 +49,10 @@
       <li>In AlertOps, go to Configuration, then Integrations. Under Inbound Integrations, choose API and add one using the Custom card, with the escalation policy you want.</li>
       <li>Open its rules for opening and closing an alert. Keep the method as POST and the content as JSON.</li>
       <li>Paste this in as the sample data:
-<pre>{{ alertops_sample }}</pre></li>
+        <div class="copyable">
+<pre id="alertops-sample">{{ alertops_sample }}</pre>
+          <button type="button" class="secondary copy" data-copy="alertops-sample" aria-live="polite" hidden>Copy</button>
+        </div></li>
       <li>Map <code>alert_id</code> to both Source Name and Source Id, so each alert stays separate. A fixed Source Name would merge them into one.</li>
       <li>Map <code>status</code> as the status field. Open an alert when it contains <code>open</code>, and close it when it contains <code>closed</code>.</li>
       <li>Map <code>subject</code> and <code>message</code> to the text fields you want, and <code>link</code> to Source URL.</li>
@@ -95,7 +98,8 @@
       <ol>
         <li>At <a href="https://api.slack.com/apps">api.slack.com/apps</a>, choose Create New App, then From a manifest.</li>
         <li>Pick your workspace and paste this in:
-<pre>display_information:
+          <div class="copyable">
+<pre id="slack-manifest">display_information:
   name: MaxNines
 features:
   bot_user:
@@ -110,7 +114,9 @@ oauth_config:
 settings:
   interactivity:
     is_enabled: true
-  socket_mode_enabled: true</pre></li>
+  socket_mode_enabled: true</pre>
+            <button type="button" class="secondary copy" data-copy="slack-manifest" aria-live="polite" hidden>Copy</button>
+          </div></li>
         <li>Install the app to your workspace, then copy its bot token here. It starts with <code>xoxb-</code>.</li>
         <li>For buttons, open Basic Information, then App-Level Tokens. Generate one with the <code>connections:write</code> scope, and copy it into the app-level token box. It starts with <code>xapp-</code>.</li>
         <li>For a private channel, invite the app to it first.</li>

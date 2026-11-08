@@ -218,6 +218,11 @@ td.nowrap { white-space: nowrap; }
 
 pre { margin: 0; padding: 14px 16px; overflow-x: auto; background: var(--sunken); border: 1px solid var(--border); border-radius: var(--radius-small); }
 
+/* A copy button in the corner of text meant for pasting elsewhere. */
+.copyable { position: relative; margin-top: 8px; }
+.copyable pre { padding-right: 96px; }
+.copyable .copy { position: absolute; top: 8px; right: 8px; min-height: 32px; padding: 0 12px; font-size: 13px; background: var(--sunken); }
+
 .history { display: flex; flex-direction: column; gap: 10px; margin: 0; padding: 0; list-style: none; }
 .history time { color: var(--muted); font-family: var(--mono); font-size: 13px; }
 .history ul { margin: 2px 0 0; padding-left: 1.25rem; }

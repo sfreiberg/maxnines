@@ -2268,6 +2268,20 @@ async fn a_slack_test_says_when_the_app_level_token_is_wrong() {
 async fn an_app_level_token_can_be_set_on_the_form_and_stays_hidden() {
     let server = start().await;
     let mut browser = Browser::default();
+    let page = browser.get(&server, "/alerts/channels/new").await;
+    for id in ["slack-manifest", "alertops-sample"] {
+        assert!(
+            page.body.contains(&format!(r#"<pre id="{id}">"#)),
+            "{}",
+            page.body
+        );
+        assert!(
+            page.body.contains(&format!(r#"data-copy="{id}""#)),
+            "{}",
+            page.body
+        );
+    }
+
     let fields = [
         ("name", "Team"),
         ("kind", "slack"),
