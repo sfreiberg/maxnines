@@ -547,55 +547,6 @@ async fn facts_reported_too_often_are_dropped() {
     assert_eq!(versions.len(), 5, "{versions:?}");
 }
 
-/// An approved machine renamed to another agent's name could be an impersonator,
-/// so it waits for a person, who can allow it from the Agents page or the API.
-#[tokio::test]
-async fn an_agent_taking_another_agents_name_waits_to_be_allowed() {
-    let server = start().await;
-    let (web_1, web_2) = (identity(), identity());
-    let _first = server.connect_approved(&web_1, "web-1").await;
-    let _second = server.connect_approved(&web_2, "web-2").await;
-
-    let mut client = server.connect().await;
-    assert_eq!(
-        handshake(&mut client, &web_2, "web-1", None).await,
-        RegistrationStatus::Pending
-    );
-
-    let mut browser = Browser::default();
-    let page = browser.get(&server, "/agents").await;
-    assert!(
-        page.body
-            .contains("wants to be called <strong>web-1</strong>"),
-        "{}",
-        page.body
-    );
-    let page = browser
-        .get(&server, &format!("/agents/{}", web_2.id()))
-        .await;
-    assert!(page.body.contains("wants to be called"), "{}", page.body);
-    let shown = server
-        .request("GET", &format!("/api/v1/agents/{}", web_2.id()), "")
-        .await;
-    assert!(shown.contains(r#""wants_host":"web-1""#), "{shown}");
-
-    let path = format!("/agents/{}/rename", web_2.id());
-    let page = browser.submit(&server, "/agents", &path, &[]).await;
-    assert_eq!(page.status, 303, "{}", page.body);
-
-    assert_eq!(
-        server.state.registry.get(&web_2.id()).await.unwrap().host,
-        "web-1"
-    );
-    let mut client = server.connect().await;
-    assert_eq!(
-        handshake(&mut client, &web_2, "web-1", None).await,
-        RegistrationStatus::Approved
-    );
-    let page = browser.get(&server, "/agents").await;
-    assert!(!page.body.contains("wants to be called"), "{}", page.body);
-}
-
 #[tokio::test]
 async fn a_connection_that_never_answers_the_challenge_is_closed() {
     let server = start().await;

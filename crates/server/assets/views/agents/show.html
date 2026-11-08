@@ -25,19 +25,6 @@
   </div>
 </div>
 
-{% if wants %}
-<section class="card">
-  <div class="problem">
-    <span class="badge warn">Waiting</span>
-    <span class="text">This agent wants to be called <strong>{{ wants }}</strong>, which belongs to another agent, so it can't connect until someone allows it.</span>
-    <form method="post" action="/agents/{{ agent.id }}/rename">
-      <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
-      <button type="submit">Allow</button>
-    </form>
-  </div>
-</section>
-{% endif %}
-
 {% if alerts %}
 <section class="card">
   {% for alert in alerts %}
