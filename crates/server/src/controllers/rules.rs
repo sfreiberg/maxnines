@@ -390,7 +390,11 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
         .into_iter()
         .filter(|agent| agent.state == AgentState::Approved && !agent.is_local())
         .map(|agent| {
-            let shape = facts.get(&agent.id).map(unflatten).unwrap_or(Value::Null);
+            // No facts yet is an empty set, as it is when a config is worked out,
+            // or `has()` in a condition would fail here and pass there.
+            let shape = facts
+                .get(&agent.id)
+                .map_or_else(|| Value::Object(Map::new()), unflatten);
             (agent.id, shape)
         })
         .collect();

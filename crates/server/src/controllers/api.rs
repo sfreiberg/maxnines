@@ -99,6 +99,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
         )
         .route("/server", get(server_stats))
         .route("/alerts", get(list_alerts))
+        .route("/alerts/delivery-problems", get(list_delivery_problems))
         .route("/alerts/{id}/acknowledge", post(acknowledge_alert))
         .route("/alerts/{id}/unacknowledge", post(unacknowledge_alert))
         .route("/silences", get(list_silences).post(create_silence))
@@ -663,6 +664,24 @@ async fn list_alerts(State(state): State<AppState>) -> Response {
     };
     match alerts.await {
         Ok(alerts) => Json(alerts).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// Notifications that haven't arrived, as the Alerts page lists them.
+async fn list_delivery_problems(State(state): State<AppState>) -> Response {
+    match state
+        .database
+        .delivery_problems(super::alerts::PROBLEMS)
+        .await
+    {
+        Ok(problems) => {
+            let problems: Vec<_> = problems
+                .into_iter()
+                .filter(|problem| problem.state != "sent")
+                .collect();
+            Json(problems).into_response()
+        }
         Err(error) => server_error(&error),
     }
 }

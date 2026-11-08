@@ -43,6 +43,12 @@ const MAX_CHECKS: usize = 32;
 
 /// A check runs inside a sampling round, so it can't take forever.
 const MAX_CHECK_TIMEOUT_SECS: u64 = 60;
+/// How long a check gets when it doesn't say.
+pub const DEFAULT_CHECK_TIMEOUT_SECS: u64 = 10;
+
+/// How long an agent waits to hear anything from the server before it reconnects.
+/// The server's heartbeat has to come well inside this.
+pub const AGENT_SILENCE_LIMIT_SECS: u64 = 30;
 
 const MAX_PING_COUNT: u32 = 20;
 
@@ -373,6 +379,13 @@ impl Check {
             ensure!(
                 (1..=MAX_PING_COUNT).contains(&count),
                 "check {name:?} needs a count from 1 to {MAX_PING_COUNT}"
+            );
+            // Every platform's ping sends one a second, whatever it's told.
+            let limit = self.timeout_secs.unwrap_or(DEFAULT_CHECK_TIMEOUT_SECS);
+            ensure!(
+                u64::from(count) < limit,
+                "check {name:?} sends one ping a second, so a count of {count} needs \
+                 timeout_secs above {count}"
             );
         }
         Ok(())
@@ -787,6 +800,11 @@ mod tests {
             ),
             ("dns", "example.com", json!({ "server": "10.0.0.1:5353" })),
             ("ping", "example.com", json!({ "count": 5 })),
+            (
+                "ping",
+                "example.com",
+                json!({ "count": 20, "timeout_secs": 21 }),
+            ),
         ] {
             option(kind, target, good).validate().unwrap();
         }
@@ -810,6 +828,13 @@ mod tests {
             ),
             ("ping", "example.com", json!({ "count": 0 })),
             ("ping", "example.com", json!({ "count": 21 })),
+            // One ping a second never fits ten of them in the default ten seconds.
+            ("ping", "example.com", json!({ "count": 10 })),
+            (
+                "ping",
+                "example.com",
+                json!({ "count": 5, "timeout_secs": 5 }),
+            ),
         ] {
             assert!(
                 option(kind, target, bad.clone()).validate().is_err(),

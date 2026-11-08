@@ -1773,6 +1773,35 @@ async fn a_rule_created_in_the_browser_is_stored_and_reaches_agents() {
     assert!(list.body.contains("every 30s"));
 }
 
+/// An agent that hasn't reported facts counts for the same rules on the Rules
+/// page as it gets a config for, including ones about facts it doesn't have.
+#[tokio::test]
+async fn the_rules_page_counts_agents_without_facts_the_same_as_their_config() {
+    let server = start().await;
+    let agent = identity();
+    let _client = server.connect_approved(&agent, "web-1").await;
+    server
+        .create_rule(
+            "Needs setup",
+            10,
+            "!has(facts.os)",
+            json!({ "interval_secs": 5 }),
+        )
+        .await;
+    let config = server.state.config_for(&agent.id()).await.unwrap();
+    assert!(
+        config.matched_rules.contains(&"Needs setup".to_string()),
+        "{:?}",
+        config.matched_rules
+    );
+
+    let page = Browser::default().get(&server, "/rules").await;
+
+    let row = &page.body[page.body.find("Needs setup").unwrap()..];
+    let row = &row[..row.find("</tr>").unwrap()];
+    assert!(row.contains(r#"<td class="number">1</td>"#), "{row}");
+}
+
 #[tokio::test]
 async fn a_rule_can_be_edited_and_deleted_in_the_browser() {
     let server = start().await;

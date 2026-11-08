@@ -248,7 +248,8 @@ impl SimulatedAgent {
             let churn = self.next_churn;
             tokio::select! {
                 _ = stop.changed() => return Ok(End::Stopped),
-                _ = outage.changed() => {
+                // A closed switch answers at once every time, so it's left alone.
+                Ok(()) = outage.changed() => {
                     if *outage.borrow() {
                         return Ok(End::Outage);
                     }

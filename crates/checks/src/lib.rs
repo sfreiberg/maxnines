@@ -43,7 +43,8 @@ use tokio_rustls::client::TlsStream;
 use x509_parser::parse_x509_certificate;
 
 /// How long a check gets unless it says otherwise. A slower answer counts as down.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_TIMEOUT: Duration =
+    Duration::from_secs(maxnines_protocol::DEFAULT_CHECK_TIMEOUT_SECS);
 
 /// A name can have several addresses, and one that's gone shouldn't use up the
 /// whole time limit before the others are tried.
@@ -614,14 +615,17 @@ fn now_nanos() -> u128 {
 }
 
 /// Sending ICMP directly needs special rights, so this uses the system's own
-/// `ping`, which every platform ships with those rights. Their options differ.
+/// `ping`, which every platform ships with those rights. Their options differ:
+/// macOS and FreeBSD take a deadline for the whole run, Linux takes a per-reply
+/// wait and a separate deadline, and Windows only takes a per-reply wait, so the
+/// limit is shared out between the replies there.
 fn ping_arguments(os: &str, host: &str, count: u32, limit: Duration) -> Vec<String> {
+    let per_reply_ms = (limit.as_millis() / u128::from(count.max(1))).to_string();
     let count = count.to_string();
     let seconds = limit.as_secs().to_string();
-    let millis = limit.as_millis().to_string();
     let options: Vec<&str> = match os {
-        "windows" => vec!["-n", &count, "-w", &millis],
-        "linux" => vec!["-c", &count, "-W", &seconds],
+        "windows" => vec!["-n", &count, "-w", &per_reply_ms],
+        "linux" => vec!["-c", &count, "-W", &seconds, "-w", &seconds],
         _ => vec!["-c", &count, "-t", &seconds],
     };
     options
@@ -1144,7 +1148,7 @@ mod tests {
         let limit = Duration::from_secs(10);
         assert_eq!(
             ping_arguments("linux", "a", 5, limit),
-            ["-c", "5", "-W", "10", "a"]
+            ["-c", "5", "-W", "10", "-w", "10", "a"]
         );
         assert_eq!(
             ping_arguments("macos", "a", 5, limit),
@@ -1156,7 +1160,8 @@ mod tests {
         );
         assert_eq!(
             ping_arguments("windows", "a", 5, limit),
-            ["-n", "5", "-w", "10000", "a"]
+            ["-n", "5", "-w", "2000", "a"],
+            "Windows only waits per reply, so the limit is shared out"
         );
     }
 

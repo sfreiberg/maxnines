@@ -567,11 +567,13 @@ async fn run(options: Options) -> Result<Outcome> {
             took
         })
     };
+    // The switch stays with the run: once every sender is gone, waiting on it
+    // answers at once every time, and every agent would spin.
     if let Some(at) = options.outage_at {
         tokio::spawn(run_outage(
             at,
             options.outage_for,
-            outage,
+            outage.clone(),
             plan.clone(),
             measurements.clone(),
             wanted,

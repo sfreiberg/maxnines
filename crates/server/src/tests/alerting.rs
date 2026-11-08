@@ -3540,6 +3540,32 @@ async fn the_api_lists_open_and_resolved_alerts() {
     );
 }
 
+#[tokio::test]
+async fn the_api_lists_notifications_that_have_not_arrived() {
+    let mut test = Harness::start().await;
+    let hook = FakeOnCall::default();
+    hook.statuses.lock().unwrap().push(500);
+    let url = hook.start().await;
+    let notifier = firing_on(&mut test, ChannelKind::Webhook, &url, Senders::default()).await;
+    let path = "/api/v1/alerts/delivery-problems";
+
+    let (status, problems) = api(&test.server, "GET", path, &Value::Null).await;
+    assert_eq!(status, 200);
+    assert_eq!(problems, json!([]));
+
+    notifier.deliver_due(test.now).await.unwrap();
+    let (_, problems) = api(&test.server, "GET", path, &Value::Null).await;
+    assert_eq!(problems[0]["channel"], "On call");
+    assert_eq!(problems[0]["event"], "firing");
+    assert_eq!(problems[0]["state"], "pending");
+    assert_eq!(problems[0]["attempts"], 1);
+    assert_eq!(problems[0]["error"], "the webhook returned status 500");
+
+    notifier.deliver_due(test.now + 30_000).await.unwrap();
+    let (_, problems) = api(&test.server, "GET", path, &Value::Null).await;
+    assert_eq!(problems, json!([]), "sent, so no longer a problem");
+}
+
 #[test]
 fn events_read_back_as_written() {
     assert_eq!(Event::parse(Event::Firing.as_str()).unwrap(), Event::Firing);

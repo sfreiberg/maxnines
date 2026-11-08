@@ -17,7 +17,7 @@ use crate::silences::{self, ActiveSilences};
 const HISTORY: u64 = 50;
 
 /// How many delivery problems the page shows.
-const PROBLEMS: u64 = 20;
+pub(super) const PROBLEMS: u64 = 20;
 
 pub fn routes() -> Router<AppState> {
     Router::new()

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result, bail, ensure};
 use indexmap::IndexMap;
 use ipnet::IpNet;
-use maxnines_protocol::hcl_env::config_context;
+use maxnines_protocol::{AGENT_SILENCE_LIMIT_SECS, hcl_env::config_context};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -286,6 +286,14 @@ impl Config {
         ensure!(
             config.heartbeat_timeout_secs > config.heartbeat_interval_secs,
             "heartbeat_timeout_secs must be longer than heartbeat_interval_secs"
+        );
+        // Agents reconnect after this long without a word, so one heartbeat
+        // arriving late mustn't be enough to cause that.
+        let longest_interval = AGENT_SILENCE_LIMIT_SECS / 2;
+        ensure!(
+            config.heartbeat_interval_secs <= longest_interval,
+            "heartbeat_interval_secs can be at most {longest_interval}, as agents give up \
+             after {AGENT_SILENCE_LIMIT_SECS} seconds without hearing from the server"
         );
         config.trusted_networks()?;
         if let Some(email) = &config.email {
@@ -588,6 +596,11 @@ mod tests {
     fn rejects_unusable_heartbeat_settings() {
         assert!(parse(&format!("heartbeat_interval_secs = 0\n{STORAGE}")).is_err());
         assert!(parse(&format!("heartbeat_timeout_secs = 5\n{STORAGE}")).is_err());
+        let slow = "heartbeat_interval_secs = 16\nheartbeat_timeout_secs = 40\n";
+        let error = parse(&format!("{slow}{STORAGE}")).unwrap_err().to_string();
+        assert!(error.contains("at most 15"), "{error}");
+        let slowest = "heartbeat_interval_secs = 15\nheartbeat_timeout_secs = 40\n";
+        parse(&format!("{slowest}{STORAGE}")).unwrap();
     }
 
     #[test]

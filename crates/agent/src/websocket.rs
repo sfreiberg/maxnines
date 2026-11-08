@@ -30,7 +30,8 @@ use crate::facts;
 use crate::spool::Spool;
 
 /// The server pings regularly, so this much silence means the connection died.
-const SERVER_SILENCE_LIMIT: Duration = Duration::from_secs(30);
+const SERVER_SILENCE_LIMIT: Duration =
+    Duration::from_secs(maxnines_protocol::AGENT_SILENCE_LIMIT_SECS);
 /// How long connecting, and then the handshake, each get. A server, firewall or load
 /// balancer that accepts the connection and then says nothing would otherwise hold
 /// the agent offline for good.
