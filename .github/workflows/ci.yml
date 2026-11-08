@@ -26,8 +26,9 @@ env:
 jobs:
   format:
     name: Formatting
-    # A pull request from a branch here is already covered by its push.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    # A pull request from a branch here is already covered by its push. Only when
+    # this runs by itself, though: the release workflow needs these to run.
+    if: github.workflow != 'CI' || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -38,7 +39,7 @@ jobs:
 
   test:
     name: Clippy and tests on ${{ matrix.name }}
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    if: github.workflow != 'CI' || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
