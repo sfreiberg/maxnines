@@ -4,6 +4,10 @@ MaxNines is fast, low-resource, open source monitoring software, written in Rust
 It's meant to be running and useful within minutes of installing it, with great
 defaults instead of a pile of configuration.
 
+![The overview, with every machine's health at a glance](docs/screenshots/overview.png)
+
+![An agent's charts, updating live](docs/screenshots/charts.png)
+
 ## Goals
 
 - **Fast and light.** A small agent that barely registers on the machines it
