@@ -3,14 +3,15 @@
 # with a suffix, such as v0.1.0-rc.1, makes a pre-release. The tag has to match
 # the version in Cargo.toml.
 #
-# Changing this file or the packaging runs everything except publishing, so the
-# release machinery is known to work before a tag needs it.
+# A pull request that changes the release machinery runs everything except
+# publishing, so it's known to work before a tag needs it. So does starting this
+# by hand from the Actions tab.
 name: Release
 
 on:
   push:
     tags: ["v*"]
-    branches: ["**"]
+  pull_request:
     paths:
       - .github/workflows/release.yml
       - .github/workflows/ci.yml
