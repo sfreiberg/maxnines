@@ -731,17 +731,23 @@ mod tests {
         let store = Box::new(Timed(Arc::clone(&writes)));
         let (writer, thread) = spawn_writer(store, Arc::default());
 
+        let started = Instant::now();
         for time in 0..20 {
             writer.blocking_send(save("web", time)).unwrap();
             thread::sleep(Duration::from_millis(2));
         }
+        let sending = started.elapsed();
         thread::sleep(Duration::from_millis(250));
         writer.blocking_send(WriterCommand::Stop).unwrap();
         thread.join().unwrap();
 
+        // A write for every 100 ms they took to arrive, and one for the rest. A busy
+        // machine can sleep far longer than asked, so the limit follows the clock.
+        let most = usize::try_from(sending.as_millis() / 100).unwrap() + 2;
         let writes = writes.lock().unwrap();
         assert_eq!(writes.iter().sum::<usize>(), 20);
-        assert!(writes.len() <= 3, "{writes:?}");
+        assert!(writes.len() <= most, "{writes:?} in {sending:?}");
+        assert!(writes.len() < 20, "nothing was gathered: {writes:?}");
     }
 
     #[test]

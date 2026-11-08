@@ -692,8 +692,7 @@ fn ping_arguments(os: &str, host: &str, count: u32, limit: Duration) -> Vec<Stri
         .collect()
 }
 
-/// Reads the summary Unix pings end with. Windows words its own by language, so
-/// there only the exit code is used.
+/// Reads the summary Unix pings end with.
 fn read_ping_summary(output: &str, findings: &mut Findings) {
     for line in output.lines() {
         if let Some(before) = line
@@ -723,6 +722,50 @@ fn read_ping_summary(output: &str, findings: &mut Findings) {
     }
 }
 
+/// Reads the summary Windows' ping ends with. Its words change with the system's
+/// language, but its shape doesn't:
+///
+/// ```text
+///     Packets: Sent = 2, Received = 2, Lost = 0 (0% loss),
+///     Minimum = 0ms, Maximum = 1ms, Average = 0ms
+/// ```
+///
+/// So the loss is the percentage in brackets, as in `(perte 0%)` in French, and the
+/// times are the three ` = Nms` values, smallest first, then largest, then average.
+/// Replies are written `time=1ms`, without the spaces.
+fn read_windows_ping_summary(output: &str, findings: &mut Findings) {
+    for line in output.lines() {
+        let bracketed = line
+            .split_once('(')
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(inside, _)| inside);
+        if let Some((before, _)) = bracketed.and_then(|inside| inside.split_once('%')) {
+            let start = before
+                .rfind(|c: char| !c.is_ascii_digit() && c != '.')
+                .map_or(0, |at| at + 1);
+            if let Ok(loss) = before[start..].parse() {
+                findings.packet_loss_percent = Some(loss);
+            }
+        }
+
+        let times: Vec<f64> = line
+            .split(" = ")
+            .skip(1)
+            .filter_map(|value| {
+                let digits = value.find(|c: char| !c.is_ascii_digit())?;
+                value[digits..]
+                    .starts_with("ms")
+                    .then(|| value[..digits].parse().ok())
+                    .flatten()
+            })
+            .collect();
+        if let [min, max, _] = times[..] {
+            findings.rtt_min_ms = Some(min);
+            findings.rtt_max_ms = Some(max);
+        }
+    }
+}
+
 async fn check_ping(check: &Check, findings: &mut Findings) -> Result<()> {
     let count = check.count.unwrap_or(1);
     let arguments = ping_arguments(std::env::consts::OS, &check.target, count, limit(check));
@@ -733,7 +776,12 @@ async fn check_ping(check: &Check, findings: &mut Findings) -> Result<()> {
         .output()
         .await
         .map_err(|_| anyhow!("couldn't run ping"))?;
-    read_ping_summary(&String::from_utf8_lossy(&output.stdout), findings);
+    let summary = String::from_utf8_lossy(&output.stdout);
+    if cfg!(windows) {
+        read_windows_ping_summary(&summary, findings);
+    } else {
+        read_ping_summary(&summary, findings);
+    }
     ensure!(output.status.success(), "no reply");
     Ok(())
 }
@@ -1322,6 +1370,44 @@ mod tests {
         read_ping_summary(bsd, &mut findings);
         assert_eq!(findings.packet_loss_percent, Some(0.0));
         assert_eq!(findings.rtt_min_ms, Some(0.1));
+    }
+
+    #[test]
+    fn windows_ping_summaries_are_read_in_any_language() {
+        let english = "Pinging 10.0.0.1 with 32 bytes of data:\r\n\
+                       Reply from 10.0.0.1: bytes=32 time=3ms TTL=64\r\n\
+                       Request timed out.\r\n\
+                       \r\n\
+                       Ping statistics for 10.0.0.1:\r\n\
+                       \x20   Packets: Sent = 2, Received = 1, Lost = 1 (50% loss),\r\n\
+                       Approximate round trip times in milli-seconds:\r\n\
+                       \x20   Minimum = 3ms, Maximum = 12ms, Average = 7ms\r\n";
+        let german = "    Pakete: Gesendet = 4, Empfangen = 4, Verloren = 0\r\n\
+                      \x20   (0% Verlust),\r\n\
+                      \x20   Minimum = 1ms, Maximum = 2ms, Mittelwert = 1ms\r\n";
+        let french = "    Paquets : envoyés = 4, reçus = 3, perdus = 1 (perte 25%),\r\n\
+                      \x20   Minimum = 0ms, Maximum = 5ms, Moyenne = 2ms\r\n";
+        for (output, loss, min, max) in [
+            (english, 50.0, 3.0, 12.0),
+            (german, 0.0, 1.0, 2.0),
+            (french, 25.0, 0.0, 5.0),
+        ] {
+            let mut findings = Findings::default();
+            read_windows_ping_summary(output, &mut findings);
+            assert_eq!(findings.packet_loss_percent, Some(loss), "{output}");
+            assert_eq!(findings.rtt_min_ms, Some(min), "{output}");
+            assert_eq!(findings.rtt_max_ms, Some(max), "{output}");
+            assert_eq!(findings.rtt_stddev_ms, None);
+        }
+
+        // Nothing came back, so there are no times to report.
+        let mut findings = Findings::default();
+        read_windows_ping_summary(
+            "    Packets: Sent = 1, Received = 0, Lost = 1 (100% loss),\r\n",
+            &mut findings,
+        );
+        assert_eq!(findings.packet_loss_percent, Some(100.0));
+        assert_eq!(findings.rtt_min_ms, None);
     }
 
     #[test]
