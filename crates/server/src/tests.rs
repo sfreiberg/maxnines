@@ -3710,6 +3710,55 @@ async fn the_api_still_needs_the_token() {
     assert_eq!(page.status, 401, "{}", page.body);
 }
 
+/// Names needn't be unique, so the ID is the one way to mean a single machine.
+#[tokio::test]
+async fn the_filter_can_pick_an_agent_by_id() {
+    let server = start().await;
+    let hosts = two_hosts(&server).await;
+    let web = hosts[0].0.id();
+
+    let by_id = server
+        .request("GET", &format!("/api/v1/agents?q=id%3D{web}"), "")
+        .await;
+    assert_eq!(hosts_in(&by_id), ["web-1"]);
+
+    let prefix = &web[..8];
+    assert_eq!(
+        hosts_on(&server, &format!("/agents?q=id%3D{prefix}*")).await,
+        (true, false)
+    );
+    assert_eq!(
+        hosts_on(&server, &format!("/agents?q=id!%3D{prefix}*")).await,
+        (false, true)
+    );
+}
+
+#[tokio::test]
+async fn the_filter_suggests_agents_by_name_for_an_id() {
+    let server = start().await;
+    let hosts = two_hosts(&server).await;
+    let web = hosts[0].0.id();
+
+    let found = options(&server, "id%3Dweb").await;
+
+    assert_eq!(option_texts(&found), [format!("id={web}")]);
+    assert_eq!(found[0]["label"], format!("web-1 ({})", &web[..8]));
+    let by_prefix = options(&server, &format!("id%3D{}", &web[..4])).await;
+    assert_eq!(option_texts(&by_prefix), [format!("id={web}")]);
+}
+
+#[tokio::test]
+async fn pages_show_the_start_of_each_agents_id_beside_its_name() {
+    let server = start().await;
+    let hosts = two_hosts(&server).await;
+    let marker = format!(r#"<span class="agent-id">{}</span>"#, &hosts[0].0.id()[..8]);
+
+    for path in ["/agents", "/agents?view=table", "/", "/metrics"] {
+        let page = Browser::default().get(&server, path).await;
+        assert!(page.body.contains(&marker), "{path}: {}", page.body);
+    }
+}
+
 #[tokio::test]
 async fn the_api_filters_hosts_the_same_way_as_the_pages() {
     let server = start().await;

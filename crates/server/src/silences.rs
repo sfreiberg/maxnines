@@ -11,7 +11,7 @@ use tracing::warn;
 
 use crate::alerting::Alert;
 use crate::facts::FlatFacts;
-use crate::host_filter::{HostFilter, PartialValue};
+use crate::host_filter::HostFilter;
 use crate::maintenance::MaintenanceWindow;
 use crate::models::Database;
 use crate::remote_checks::FLEET_AGENT_ID;
@@ -43,17 +43,17 @@ pub struct SilenceInput {
     pub duration_secs: u64,
 }
 
-/// A silence covering just this alert: its rule, on its host. An alert about the
-/// fleet has no host, so its rule alone.
+/// A silence covering just this alert: its rule, on its machine, by ID, as names
+/// needn't be unique. An alert about the fleet has no machine, so its rule alone.
 pub fn silence_for(alert: &Alert, reason: &str, duration_secs: u64) -> SilenceInput {
     let filter = if alert.agent_id == FLEET_AGENT_ID {
-        None
+        String::new()
     } else {
-        PartialValue::of("hostname=").map(|term| term.suggestion(&alert.host).text)
+        format!("id={}", alert.agent_id)
     };
     SilenceInput {
         rule_id: alert.rule_id,
-        filter: filter.unwrap_or_default(),
+        filter,
         reason: reason.to_string(),
         duration_secs,
     }
@@ -183,7 +183,11 @@ impl ActiveSilences {
             let rule = entry.rule_id.is_none_or(|id| alert.rule_id == Some(id));
             let host = entry.filter.as_ref().is_none_or(|filter| {
                 alert.agent_id != FLEET_AGENT_ID
-                    && filter.matches(&alert.host, self.facts.get(&alert.agent_id))
+                    && filter.matches(
+                        &alert.agent_id,
+                        &alert.host,
+                        self.facts.get(&alert.agent_id),
+                    )
             });
             rule && host
         };

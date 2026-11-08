@@ -11,6 +11,8 @@ use crate::alerting::{Alert, DeliveryProblem};
 use crate::app_state::AppState;
 use crate::fact_history::format_time;
 use crate::metrics::now_ms;
+use crate::registration::short_id;
+use crate::remote_checks::{FLEET_AGENT_ID, LOCAL_AGENT_ID};
 use crate::silences::{self, ActiveSilences};
 
 /// How many ended alerts the page shows.
@@ -35,6 +37,8 @@ struct AlertRow {
     id: i64,
     acknowledged_by: Option<String>,
     agent_id: String,
+    /// Empty for the fleet and the server, which are one of a kind.
+    short_id: String,
     host: String,
     rule_name: String,
     severity: &'static str,
@@ -72,6 +76,11 @@ impl From<Alert> for AlertRow {
             started: time(alert.started_ms),
             resolved: alert.resolved_ms.map(time),
             reason: alert.resolve_reason,
+            short_id: if alert.agent_id == FLEET_AGENT_ID || alert.agent_id == LOCAL_AGENT_ID {
+                String::new()
+            } else {
+                short_id(&alert.agent_id).to_string()
+            },
             agent_id: alert.agent_id,
             host: alert.host,
             rule_name: alert.rule_name,

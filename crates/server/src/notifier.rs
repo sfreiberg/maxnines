@@ -31,6 +31,7 @@ use crate::alerting::{Alert, Channel, ChannelKind, Delivery, Event, Severity, re
 use crate::config::{EmailConfig, EmailSecurity};
 use crate::metrics::now_ms;
 use crate::models::Database;
+use crate::registration::short_id;
 use crate::remote_checks::FLEET_AGENT_ID;
 use crate::silences::ActiveSilences;
 
@@ -482,14 +483,17 @@ fn telegram_text(notice: &Notice, web_url: Option<&str>) -> String {
         escape_telegram(clip_utf16(&alert.summary, TELEGRAM_MAX_SUMMARY))
     )];
     let place = if alert.agent_id == FLEET_AGENT_ID {
-        "Machines"
+        format!("Machines: {}", clip(&alert.host))
     } else {
-        "Agent"
+        format!(
+            "Agent: {} ({})",
+            clip(&alert.host),
+            short_id(&alert.agent_id)
+        )
     };
     lines.push(format!(
-        "Rule: {} · {place}: {} · Started: {}",
+        "Rule: {} · {place} · Started: {}",
         clip(&alert.rule_name),
-        clip(&alert.host),
         format_ms(alert.started_ms)
     ));
     if let (Event::Resolved, Some(reason)) = (notice.event, &alert.resolve_reason) {
@@ -696,15 +700,15 @@ fn slack_text(notice: &Notice, web_url: Option<&str>) -> String {
     )];
     let mut details = vec![
         format!("Rule: {}", escape_slack(&alert.rule_name)),
-        format!(
-            "{}: {}",
-            if alert.agent_id == FLEET_AGENT_ID {
-                "Machines"
-            } else {
-                "Agent"
-            },
-            escape_slack(&alert.host)
-        ),
+        if alert.agent_id == FLEET_AGENT_ID {
+            format!("Machines: {}", escape_slack(&alert.host))
+        } else {
+            format!(
+                "Agent: {} ({})",
+                escape_slack(&alert.host),
+                short_id(&alert.agent_id)
+            )
+        },
         format!("Started: {}", format_ms(alert.started_ms)),
     ];
     if let Some(url) = web_url {
@@ -1448,7 +1452,7 @@ mod tests {
         assert_eq!(
             text,
             "<b>CRITICAL</b> CPU usage on web-1 is 97%, above 90%\n\
-             Rule: High CPU · Agent: web-1 · Started: 1970-01-01 00:00:01 UTC\n\
+             Rule: High CPU · Agent: web-1 (abc) · Started: 1970-01-01 00:00:01 UTC\n\
              <a href=\"https://m.example.com/alerts\">View alerts</a>"
         );
         assert_eq!(

@@ -1,7 +1,7 @@
 //! Questions about a whole group of machines rather than one, such as the average CPU
 //! of every Linux host. Dashboards ask these, and so do alert rules.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,7 @@ use crate::controllers::host_list::HostSearch;
 use crate::host_filter::HostFilter;
 use crate::metrics::{Metric, Metrics, Point, SeriesResult, TimeRange, Unit, find};
 use crate::models::Database;
-use crate::registration::{AgentState, Registry};
+use crate::registration::{AgentRecord, AgentState, Registry, short_id};
 
 /// What a line stands for when a machine hasn't reported the fact it's grouped by.
 const NO_VALUE: &str = "(none)";
@@ -185,15 +185,35 @@ async fn members(sources: &Sources<'_>, question: &Question) -> Result<Vec<Membe
     };
 
     let agents = sources.registry.list().await;
-    let chosen = agents.into_iter().filter(|agent| {
-        agent.state == AgentState::Approved
-            && !agent.is_local()
-            && search.includes(&agent.id, &agent.host)
-    });
+    let chosen: Vec<AgentRecord> = agents
+        .into_iter()
+        .filter(|agent| {
+            agent.state == AgentState::Approved
+                && !agent.is_local()
+                && search.includes(&agent.id, &agent.host)
+        })
+        .collect();
+    // Names needn't be unique, so machines sharing one are told apart by ID
+    // rather than merged into one line.
+    let mut named = HashMap::new();
+    for agent in &chosen {
+        *named.entry(agent.host.as_str()).or_insert(0) += 1;
+    }
+    let host_label = |agent: &AgentRecord| {
+        if named
+            .get(agent.host.as_str())
+            .is_some_and(|count| *count > 1)
+        {
+            format!("{} ({})", agent.host, short_id(&agent.id))
+        } else {
+            agent.host.clone()
+        }
+    };
     Ok(chosen
+        .iter()
         .map(|agent| {
             let group = match (&question.grouping, &facts) {
-                (Grouping::Host, _) => agent.host.clone(),
+                (Grouping::Host, _) => host_label(agent),
                 (_, Some((name, facts))) => facts
                     .get(&agent.id)
                     .and_then(|facts| facts.get(*name))
@@ -201,7 +221,7 @@ async fn members(sources: &Sources<'_>, question: &Question) -> Result<Vec<Membe
                 _ => question.metric.title.to_string(),
             };
             Member {
-                agent_id: agent.id,
+                agent_id: agent.id.clone(),
                 group,
             }
         })

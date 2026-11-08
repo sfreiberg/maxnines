@@ -2113,7 +2113,11 @@ async fn silencing_from_slack_covers_just_that_alert_for_an_hour() {
     assert_eq!(silences.len(), 1, "{silences:?}");
     let silence = &silences[0];
     assert_eq!(silence.rule_id, test.open().await[0].rule_id);
-    assert_eq!(silence.filter, "hostname=web-1");
+    assert_eq!(
+        silence.filter,
+        format!("id={}", test.open().await[0].agent_id),
+        "by ID, as another machine could share the name"
+    );
     assert_eq!(silence.created_by, SLACK_MEMBER);
     assert_eq!(silence.reason, "Silenced from Slack");
     assert_eq!(silence.ends_ms - silence.starts_ms, 3_600_000);

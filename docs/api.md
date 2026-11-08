@@ -263,6 +263,7 @@ becomes `os%3Dlinux`. With curl, `-G --data-urlencode` does this for you.
 | --- | --- |
 | `web` | Host names containing "web" |
 | `hostname=web*` | Host names starting with "web" |
+| `id=3f2a1c9d*` | The agent whose ID starts like that, as names needn't be unique |
 | `os=linux` | That operating system family. `os` is short for `os.family` |
 | `network.addresses=10.0.*` | Any of the machine's IP addresses. Loopback and link-local addresses aren't listed |
 | `os!=windows` | Everything else, including hosts that haven't said |

@@ -18,6 +18,8 @@ pub const MAX_SUGGESTIONS: usize = 12;
 /// Short names for what people look for most. The host name isn't a fact, as agents
 /// are listed before they've reported any.
 const HOST_NAMES: [&str; 2] = ["hostname", "host"];
+/// Picks out one machine whatever it's called, as names needn't be unique.
+const ID_NAME: &str = "id";
 const OS_NAME: &str = "os";
 const OS_FACT: &str = "os.family";
 
@@ -26,6 +28,11 @@ enum Term {
     /// Text anywhere in the host name, in lower case.
     Text(String),
     Host {
+        pattern: String,
+        negated: bool,
+    },
+    /// The agent's ID, or the start of it with a wildcard.
+    Id {
         pattern: String,
         negated: bool,
     },
@@ -87,6 +94,8 @@ fn parse_term(text: &str) -> Result<Term, String> {
     let pattern = value.to_string();
     Ok(if HOST_NAMES.contains(&name) {
         Term::Host { pattern, negated }
+    } else if name == ID_NAME {
+        Term::Id { pattern, negated }
     } else {
         Term::Fact {
             name: fact_name(name).to_string(),
@@ -126,10 +135,11 @@ impl HostFilter {
             .collect()
     }
 
-    pub fn matches(&self, host: &str, facts: Option<&FlatFacts>) -> bool {
+    pub fn matches(&self, id: &str, host: &str, facts: Option<&FlatFacts>) -> bool {
         self.terms.iter().all(|term| match term {
             Term::Text(text) => host.to_lowercase().contains(text),
             Term::Host { pattern, negated } => matches(pattern, host) != *negated,
+            Term::Id { pattern, negated } => matches(pattern, id) != *negated,
             Term::Fact {
                 name,
                 pattern,
@@ -184,6 +194,10 @@ impl<'a> PartialValue<'a> {
         HOST_NAMES.contains(&self.written_name)
     }
 
+    pub fn is_id(&self) -> bool {
+        self.written_name == ID_NAME
+    }
+
     pub fn fact(&self) -> &str {
         fact_name(self.written_name)
     }
@@ -201,13 +215,26 @@ impl<'a> PartialValue<'a> {
             label: value.to_string(),
         }
     }
+
+    /// A suggestion shown as something other than the value it fills in, such as
+    /// an agent's name for its ID.
+    pub fn labelled(&self, value: &str, label: String) -> Suggestion {
+        Suggestion {
+            label,
+            ..self.suggestion(value)
+        }
+    }
 }
 
 /// Names matching what's been typed, those starting with it first.
 pub fn suggest_names(term: &str, facts: impl IntoIterator<Item = String>) -> Vec<Suggestion> {
     let term = term.to_lowercase();
     let mut names: BTreeSet<String> = facts.into_iter().collect();
-    names.extend([HOST_NAMES[0].to_string(), OS_NAME.to_string()]);
+    names.extend([
+        HOST_NAMES[0].to_string(),
+        ID_NAME.to_string(),
+        OS_NAME.to_string(),
+    ]);
 
     let mut found: Vec<String> = names
         .into_iter()
@@ -241,10 +268,23 @@ mod tests {
         ])
     }
 
+    const ID: &str = "3f2a1c9d0b7e4a6f8c1d2e3f4a5b6c7d";
+
     fn found(filter: &str) -> bool {
         HostFilter::parse(filter)
             .unwrap()
-            .matches("Web-01.example.com", Some(&facts()))
+            .matches(ID, "Web-01.example.com", Some(&facts()))
+    }
+
+    /// Names needn't be unique, so the ID is how to mean one machine.
+    #[test]
+    fn an_id_picks_out_one_machine() {
+        assert!(found(&format!("id={ID}")));
+        assert!(found("id=3f2a1c9d*"));
+        assert!(found("id!=abcdef*"));
+        assert!(!found("id=abcdef*"));
+        assert!(!found(&format!("id!={ID}")));
+        assert!(found(&format!("web id={ID}")));
     }
 
     #[test]
@@ -252,7 +292,7 @@ mod tests {
         assert!(found(""));
         assert!(found("   "));
         let filter = HostFilter::parse("").unwrap();
-        assert!(filter.matches("web", None));
+        assert!(filter.matches(ID, "web", None));
     }
 
     #[test]
@@ -323,7 +363,7 @@ mod tests {
         assert!(!found("custom.rack=a1"));
         assert!(found("custom.rack!=a1"));
         let filter = HostFilter::parse("os=linux").unwrap();
-        assert!(!filter.matches("web", None));
+        assert!(!filter.matches(ID, "web", None));
     }
 
     #[test]
@@ -402,6 +442,6 @@ mod tests {
 
         let facts = FlatFacts::from([("custom.note".to_string(), json!(reported))]);
         let filter = HostFilter::parse(&suggestion.text).unwrap();
-        assert!(filter.matches("web", Some(&facts)));
+        assert!(filter.matches(ID, "web", Some(&facts)));
     }
 }

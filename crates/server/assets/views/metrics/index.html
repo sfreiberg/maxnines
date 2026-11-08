@@ -15,7 +15,7 @@
   <tbody>
     {% for agent in agents %}
     <tr>
-      <td><a href="/agents/{{ agent.id }}/metrics">{{ agent.host }}</a></td>
+      <td><a href="/agents/{{ agent.id }}/metrics">{{ agent.host }}</a> <span class="agent-id">{{ agent.short_id }}</span></td>
       <td>{% include "agents/_health.html" %}</td>
       <td>{% if agent.cpu %}<span class="meters single"><svg class="meter" aria-hidden="true"><rect class="track" width="100%" height="7" rx="3.5"/><rect class="fill" width="{{ agent.cpu.width }}%" height="7" rx="3.5"/></svg><span class="value">{{ agent.cpu.text }}</span></span>{% else %}–{% endif %}</td>
       <td>{% if agent.memory %}<span class="meters single"><svg class="meter" aria-hidden="true"><rect class="track" width="100%" height="7" rx="3.5"/><rect class="fill" width="{{ agent.memory.width }}%" height="7" rx="3.5"/></svg><span class="value">{{ agent.memory.text }}</span></span>{% else %}–{% endif %}</td>

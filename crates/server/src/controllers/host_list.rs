@@ -57,7 +57,7 @@ impl HostSearch {
     pub fn includes(&self, id: &str, host: &str) -> bool {
         self.filter
             .as_ref()
-            .is_some_and(|filter| filter.matches(host, self.facts.get(id)))
+            .is_some_and(|filter| filter.matches(id, host, self.facts.get(id)))
     }
 }
 

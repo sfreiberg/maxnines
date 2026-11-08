@@ -72,6 +72,14 @@ pub struct AgentRecord {
     pub decided_at_ms: Option<u64>,
 }
 
+/// Enough of an agent's ID to tell it from another with the same name, where the
+/// whole thing would be clutter. IDs are hashes, so the start is as good as any part.
+pub const SHORT_ID_LEN: usize = 8;
+
+pub fn short_id(id: &str) -> &str {
+    id.get(..SHORT_ID_LEN).unwrap_or(id)
+}
+
 /// A verified agent asking to connect. The key is proven, but the host and
 /// token are only what the agent claims.
 pub struct Admission<'a> {

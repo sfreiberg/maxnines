@@ -127,6 +127,44 @@ mod query_api {
         assert_eq!(names, ["db-1", "web-1", "web-2"]);
     }
 
+    /// Two machines can share a name, and still each get a line of their own.
+    #[tokio::test]
+    async fn machines_sharing_a_name_each_keep_their_own_line() {
+        let server = start_with_metrics().await;
+        let (first, _one) = machine(&server, "cache", 10.0, json!({ "role": "cache" })).await;
+        let (second, _two) = machine(&server, "cache", 30.0, json!({ "role": "cache" })).await;
+        let (_lone, _three) = machine(&server, "web-1", 50.0, json!({ "role": "web" })).await;
+
+        let path = "/api/v1/query?metric=cpu.usage&group_by=host";
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = loop {
+            let result = query(&server, path).await;
+            if result["series"].as_array().unwrap().len() == 3 {
+                break result;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "not every machine arrived: {result}"
+            );
+            sleep(Duration::from_millis(20)).await;
+        };
+
+        let mut names: Vec<&str> = result["series"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|series| series["name"].as_str().unwrap())
+            .collect();
+        names.sort_unstable();
+        let mut expected = vec![
+            format!("cache ({})", &first.id()[..8]),
+            format!("cache ({})", &second.id()[..8]),
+            "web-1".to_string(),
+        ];
+        expected.sort_unstable();
+        assert_eq!(names, expected);
+    }
+
     #[tokio::test]
     async fn the_server_is_not_part_of_the_fleet() {
         let server = start_with_metrics().await;

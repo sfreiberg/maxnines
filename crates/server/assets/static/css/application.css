@@ -103,6 +103,8 @@ h2 { margin: 0 0 12px; font-size: 17px; font-weight: 600; letter-spacing: -0.01e
 main > .breadcrumb { margin-bottom: -12px; }
 .hint, .empty { margin: 0; color: var(--muted); }
 .note { margin: 0; color: var(--muted); font-size: 13px; }
+/* The start of an agent's ID, which tells machines with the same name apart. */
+.agent-id { color: var(--muted); font-family: var(--mono); font-size: 12px; font-weight: 400; }
 
 /* Surfaces */
 .card, fieldset { display: flex; flex-direction: column; gap: 14px; min-width: 0; margin: 0; padding: 24px 28px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }

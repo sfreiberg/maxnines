@@ -10,7 +10,7 @@ use crate::app_state::AppState;
 use crate::fact_history::format_time;
 use crate::metric_charts::format_value;
 use crate::metrics::{CurrentValues, Unit, now_ms};
-use crate::registration::{AgentRecord, AgentState};
+use crate::registration::{AgentRecord, AgentState, short_id};
 
 /// A disk this full is drawn in the warning color.
 const FULL_DISK_PERCENT: f64 = 90.0;
@@ -58,6 +58,7 @@ impl Health {
 #[derive(Serialize)]
 pub struct FleetRow {
     pub id: String,
+    pub short_id: String,
     pub host: String,
     pub online: bool,
     pub health: Health,
@@ -83,6 +84,7 @@ fn row(state: &AppState, agent: AgentRecord, values: CurrentValues, alerts: &[&A
             .ok()
             .filter(|time| *time > 0)
             .map(format_time),
+        short_id: short_id(&agent.id).to_string(),
         id: agent.id,
         host: agent.host,
     }

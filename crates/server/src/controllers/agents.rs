@@ -22,7 +22,7 @@ use crate::metric_charts::format_value;
 use crate::metrics::Unit;
 use crate::metrics::now_ms;
 use crate::models::ConfigStatus;
-use crate::registration::{AgentRecord, AgentState};
+use crate::registration::{AgentRecord, AgentState, short_id};
 use crate::rule_engine;
 
 pub fn routes() -> Router<AppState> {
@@ -37,6 +37,7 @@ pub fn routes() -> Router<AppState> {
 #[derive(Serialize)]
 struct AgentRow {
     id: String,
+    short_id: String,
     host: String,
     state: &'static str,
     online: bool,
@@ -160,6 +161,7 @@ fn row(
         seen: presence.map(|p| ago(p.last_seen_ms, now_ms() as u64)),
         config: None,
         state: agent.state.as_str(),
+        short_id: short_id(&agent.id).to_string(),
         id: agent.id,
         host: agent.host,
     }
@@ -389,6 +391,29 @@ pub async fn suggestions(state: &AppState, term: &str) -> anyhow::Result<Vec<Sug
         hosts.sort();
         hosts.truncate(MAX_SUGGESTIONS);
         hosts
+    } else if value.is_id() {
+        // By the start of the ID or by name, shown as the name so it can be picked.
+        let wanted = value.partial.to_lowercase();
+        let mut agents: Vec<AgentRecord> = state
+            .registry
+            .list()
+            .await
+            .into_iter()
+            .filter(|agent| {
+                !agent.is_local()
+                    && (agent.id.starts_with(&wanted)
+                        || agent.host.to_lowercase().contains(&wanted))
+            })
+            .collect();
+        agents.sort_by(|a, b| a.host.cmp(&b.host).then_with(|| a.id.cmp(&b.id)));
+        agents.truncate(MAX_SUGGESTIONS);
+        return Ok(agents
+            .iter()
+            .map(|agent| {
+                let label = format!("{} ({})", agent.host, short_id(&agent.id));
+                value.labelled(&agent.id, label)
+            })
+            .collect());
     } else {
         state
             .database

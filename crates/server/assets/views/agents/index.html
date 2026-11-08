@@ -49,7 +49,7 @@
   <tbody>
     {% for agent in agents %}
     <tr>
-      <td><a href="/agents/{{ agent.id }}">{{ agent.host }}</a></td>
+      <td><a href="/agents/{{ agent.id }}">{{ agent.host }}</a> <span class="agent-id">{{ agent.short_id }}</span></td>
       <td>{% include "agents/_health.html" %}</td>
       <td>{{ agent.os }}</td>
       <td><span class="badge {{ agent.config.class }}">{{ agent.config.label }}</span></td>
@@ -63,6 +63,7 @@
   {% for agent in agents %}
   <a class="tile{% if agent.health == "critical" %} critical{% elif agent.health == "warning" %} alert{% elif agent.health == "offline" %} gone{% endif %}" href="/agents/{{ agent.id }}">
     <span class="tile-head">{{ agent.host }} {% include "agents/_health.html" %}</span>
+    <span class="agent-id">{{ agent.short_id }}</span>
     {% if agent.os %}<span class="note">{{ agent.os }}</span>{% endif %}
     {% if agent.seen %}<span class="note">Seen {{ agent.seen }}</span>{% endif %}
   </a>
