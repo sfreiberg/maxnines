@@ -45,7 +45,7 @@ sudo apt install ./maxnines-server_0.1.0-1_amd64.deb    # Debian and Ubuntu
 sudo dnf install ./maxnines-server-0.1.0-1.x86_64.rpm   # RHEL, Rocky, Alma and Fedora
 ```
 
-The server needs Ubuntu 20.04, Debian 11, RHEL 9 or newer. The agent needs nothing
+The server needs Ubuntu 22.04, Debian 12, RHEL 9 or newer. The agent needs nothing
 else, so it installs on any of them and older.
 
 Neither starts until it's set up. For the server, check `/etc/maxnines/server.hcl`,

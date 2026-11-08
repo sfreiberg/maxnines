@@ -80,7 +80,7 @@ license-file = ["../../LICENSE", "0"]
 extended-description = "The server MaxNines agents report to, with the web pages, alerting and the API.\nIt keeps its data in /var/lib/maxnines-server."
 section = "admin"
 priority = "optional"
-depends = "libc6 (>= 2.31), libgcc-s1, libstdc++6 (>= 10)"
+depends = "libc6 (>= 2.34), libgcc-s1, libstdc++6 (>= 11)"
 assets = [
   ["target/release/maxnines-server", "usr/bin/", "755"],
   ["../../packaging/linux/server.hcl", "etc/maxnines/server.hcl", "640"],
@@ -107,6 +107,6 @@ post_uninstall_script = "../../packaging/linux/rpm/server-postun.sh"
 auto-req = "no"
 
 [package.metadata.generate-rpm.requires]
-glibc = ">= 2.31"
+glibc = ">= 2.34"
 libgcc = "*"
 "libstdc++" = "*"

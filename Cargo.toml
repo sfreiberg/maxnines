@@ -29,4 +29,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-strip = true
+# Keeps function names, so a panic's backtrace says how the code got there. The
+# debug info itself goes, which is what makes up most of an unstripped binary.
+strip = "debuginfo"

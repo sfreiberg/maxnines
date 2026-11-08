@@ -1,5 +1,7 @@
 //! Where a program's logs go.
 
+use std::backtrace::Backtrace;
+use std::panic::PanicHookInfo;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -16,15 +18,22 @@ pub fn to_stderr() {
         .with_env_filter(filter())
         .with_writer(std::io::stderr)
         .init();
+    std::panic::set_hook(Box::new(log_panic));
 }
 
-/// For a program with no terminal, where stderr leads nowhere. That goes for panic
-/// messages too, so they're sent to the log.
+/// For a program with no terminal, where stderr leads nowhere.
 pub fn to_files(folder: &Path, name: &str) -> Result<()> {
     tracing::subscriber::set_global_default(file_subscriber(folder, name)?)
         .context("setting up logging")?;
-    std::panic::set_hook(Box::new(|panic| tracing::error!("{panic}")));
+    std::panic::set_hook(Box::new(log_panic));
     Ok(())
+}
+
+/// Panics are recovered from, so each is logged with how the code got there. That
+/// needs the function names release builds keep.
+fn log_panic(panic: &PanicHookInfo<'_>) {
+    let backtrace = Backtrace::force_capture();
+    tracing::error!("{panic}\n{backtrace}");
 }
 
 fn file_subscriber(folder: &Path, name: &str) -> Result<impl Subscriber + Send + Sync + use<>> {
@@ -72,6 +81,32 @@ mod tests {
         let text = fs::read_to_string(files[0].path()).unwrap();
         assert!(text.contains("it started"), "{text}");
         assert!(!text.contains('\u{1b}'), "colour codes in a file: {text}");
+    }
+
+    #[test]
+    fn a_panic_is_logged_with_how_it_got_there() {
+        let folder = tempfile::tempdir().unwrap();
+        let subscriber = file_subscriber(folder.path(), "agent").unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(log_panic));
+            let result = std::panic::catch_unwind(|| panic!("a test panic"));
+            std::panic::set_hook(previous);
+            assert!(result.is_err());
+        });
+
+        let file = fs::read_dir(folder.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let text = fs::read_to_string(file.path()).unwrap();
+        assert!(text.contains("a test panic"), "{text}");
+        assert!(text.contains("logging.rs"), "{text}");
+        assert!(
+            text.contains("a_panic_is_logged_with_how_it_got_there"),
+            "{text}"
+        );
     }
 
     #[test]

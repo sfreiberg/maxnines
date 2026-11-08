@@ -33,17 +33,13 @@ env:
 
 jobs:
   check:
-    name: Check and test
+    name: Version
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
       - name: Work out the version
         id: version
         run: |
@@ -59,17 +55,19 @@ jobs:
           esac
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
 
-  # Built on Debian 11, so it runs on any distribution with glibc 2.31 or later:
-  # Ubuntu 20.04, Debian 11 and RHEL 9 onwards.
+  # The same checks as every push, on every system, before building anything.
+  tests:
+    name: Tests
+    uses: ./.github/workflows/ci.yml
+
+  # Built on Rocky Linux 9, so it runs on any distribution with glibc 2.34 or
+  # later: RHEL 9, Ubuntu 22.04 and Debian 12 onwards.
   linux-server:
     name: Server for Linux ${{ matrix.arch }}
-    needs: check
+    needs: [check, tests]
     runs-on: ${{ matrix.runner }}
-    container: debian:11
+    container: rockylinux:9
     strategy:
       matrix:
         include:
@@ -80,8 +78,7 @@ jobs:
     steps:
       - name: Install build tools
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends build-essential ca-certificates curl git
+          dnf install -y gcc gcc-c++ make git
       - uses: actions/checkout@v4
       # The build records its commit, which git refuses to read for another user.
       - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -103,7 +100,7 @@ jobs:
   # Fully static, so it runs on any Linux, Alpine and older distributions included.
   linux-agent:
     name: Agent for Linux ${{ matrix.arch }}
-    needs: check
+    needs: [check, tests]
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
@@ -124,7 +121,7 @@ jobs:
       - run: cargo build --release --locked -p maxnines-agent --target "$TARGET"
       - name: Check it needs nothing else
         run: |
-          file "$TARGET_DIR/$TARGET/release/maxnines-agent" | tee /dev/stderr | grep -q "statically linked"
+          file "$TARGET_DIR/$TARGET/release/maxnines-agent" | tee /dev/stderr | grep -qE "static(ally|-pie) linked"
       - run: packaging/archive.sh maxnines-agent "${{ needs.check.outputs.version }}" "$TARGET" dist
       - uses: actions/upload-artifact@v4
         with:
@@ -135,7 +132,7 @@ jobs:
 
   macos:
     name: macOS ${{ matrix.arch }}
-    needs: check
+    needs: [check, tests]
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
@@ -164,7 +161,7 @@ jobs:
 
   windows:
     name: Windows ${{ matrix.arch }}
-    needs: check
+    needs: [check, tests]
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
@@ -205,7 +202,7 @@ jobs:
   # GitHub has no FreeBSD runners, so this builds in a FreeBSD virtual machine.
   freebsd:
     name: FreeBSD x86_64
-    needs: check
+    needs: [check, tests]
     runs-on: ubuntu-24.04
     env:
       TARGET: x86_64-unknown-freebsd
@@ -267,8 +264,8 @@ jobs:
           name: packages-${{ matrix.arch }}
           path: packages/
 
-  # Installs every package on the oldest and newest systems it's meant for, and
-  # runs what it installed.
+  # Installs every package on the oldest of each system it's meant for, and the
+  # newest Ubuntu, and runs what it installed.
   test-packages:
     name: Install on ${{ matrix.image }} ${{ matrix.arch }}
     needs: linux-packages
@@ -277,7 +274,7 @@ jobs:
       fail-fast: false
       matrix:
         arch: [x86_64, aarch64]
-        image: ["debian:11", "ubuntu:24.04", "rockylinux:9"]
+        image: ["ubuntu:22.04", "debian:12", "ubuntu:24.04", "rockylinux:9"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
