@@ -11,6 +11,7 @@ use axum::response::Response;
 use ipnet::IpNet;
 use maxnines_protocol::{AgentMessage, RegistrationStatus, ServerMessage, auth};
 use serde_json::Value;
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{Instant, interval, timeout};
@@ -143,7 +144,7 @@ async fn handle(mut socket: WebSocket, source: IpAddr, state: AppState) {
     };
     info!(id = agent.id, host = agent.host, %source, "agent online");
 
-    let reason = serve(&mut socket, agent.clone(), &state).await;
+    let reason = serve(&mut socket, agent.clone(), &state, &connected.replaced).await;
     info!(id = agent.id, host = agent.host, reason, "agent offline");
 }
 
@@ -188,7 +189,7 @@ async fn authenticate(
         }
     };
 
-    let status = state
+    let mut status = state
         .registry
         .admit(&Admission {
             id: &id,
@@ -198,6 +199,12 @@ async fn authenticate(
             token: token.as_deref(),
         })
         .await?;
+    // Told to wait, as an agent is after any other refusal, rather than let one
+    // key open connections as fast as it likes.
+    if status == RegistrationStatus::Approved && !state.presence.allow_connection(&id) {
+        warn!(id, host, %source, "agent is connecting too often, telling it to wait");
+        status = RegistrationStatus::Pending;
+    }
     send_status(socket, status).await?;
 
     Ok((status == RegistrationStatus::Approved).then(|| Arc::new(Agent { id, host })))
@@ -231,7 +238,12 @@ enum Job {
 /// everything else goes to [`do_jobs`], which is its own task so that a query is never
 /// abandoned half way when the connection ends. When the writer's queue is full
 /// reading stops, so that agents slow down, but heartbeats carry on.
-async fn serve(socket: &mut WebSocket, agent: Arc<Agent>, state: &AppState) -> &'static str {
+async fn serve(
+    socket: &mut WebSocket,
+    agent: Arc<Agent>,
+    state: &AppState,
+    replaced: &Notify,
+) -> &'static str {
     let mut ping = interval(state.heartbeat.interval);
     let mut last_heard = Instant::now();
     let mut waiting_sample = None;
@@ -249,6 +261,7 @@ async fn serve(socket: &mut WebSocket, agent: Arc<Agent>, state: &AppState) -> &
     loop {
         tokio::select! {
             reason = &mut work => return reason.unwrap_or("database work failed"),
+            () = replaced.notified() => return "replaced by a newer connection",
             _ = ping.tick() => {
                 // Nothing is being read while a sample waits, so silence means nothing.
                 if waiting_sample.is_none() && last_heard.elapsed() >= state.heartbeat.timeout {
@@ -414,6 +427,10 @@ fn receive(
         }
         Ok(AgentMessage::Facts { .. }) if text.len() > MAX_FACTS_LEN => {
             warn!(id = agent.id, size = text.len(), "skipping oversized facts");
+            return None;
+        }
+        Ok(AgentMessage::Facts { .. }) if !state.presence.allow_facts(&agent.id) => {
+            warn!(id = agent.id, "facts reported too often, skipping");
             return None;
         }
         Ok(AgentMessage::Facts { facts }) => Job::Facts(facts),

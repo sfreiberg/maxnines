@@ -480,6 +480,122 @@ async fn a_huge_message_ends_the_connection_before_and_after_the_handshake() {
     assert!(server.saved.samples.lock().unwrap().is_empty());
 }
 
+/// One key, one connection: a second machine with the same key would otherwise
+/// share the agent's identity quietly.
+#[tokio::test]
+async fn a_newer_connection_replaces_the_older_one() {
+    let server = start().await;
+    let agent = identity();
+    let mut first = server.connect_approved(&agent, "web-1").await;
+
+    let mut second = server.connect().await;
+    assert_eq!(
+        handshake(&mut second, &agent, "web-1", None).await,
+        RegistrationStatus::Approved
+    );
+
+    assert!(is_closed(&mut first).await);
+    assert!(server.state.presence.get(&agent.id()).unwrap().online);
+}
+
+#[tokio::test]
+async fn an_agent_connecting_too_often_is_told_to_wait() {
+    let server = start().await;
+    let agent = identity();
+    let _first = server.connect_approved(&agent, "web-1").await;
+
+    let mut clients = Vec::new();
+    for _ in 1..10 {
+        let mut client = server.connect().await;
+        assert_eq!(
+            handshake(&mut client, &agent, "web-1", None).await,
+            RegistrationStatus::Approved
+        );
+        clients.push(client);
+    }
+
+    let mut client = server.connect().await;
+    assert_eq!(
+        handshake(&mut client, &agent, "web-1", None).await,
+        RegistrationStatus::Pending
+    );
+    assert!(is_closed(&mut client).await);
+}
+
+#[tokio::test]
+async fn facts_reported_too_often_are_dropped() {
+    let server = start().await;
+    let agent = identity();
+    let mut client = server.connect_approved(&agent, "web-1").await;
+
+    for version in 0..8 {
+        send(&mut client, &facts(&format!("24.{version}"))).await;
+    }
+    sleep(Duration::from_millis(200)).await;
+
+    let history = server
+        .state
+        .database
+        .facts_history(&agent.id())
+        .await
+        .unwrap();
+    let versions: Vec<&str> = history
+        .iter()
+        .filter(|fact| fact.name == "os.version")
+        .filter_map(|fact| fact.value.as_str())
+        .collect();
+    assert_eq!(versions.len(), 5, "{versions:?}");
+}
+
+/// An approved machine renamed to another agent's name could be an impersonator,
+/// so it waits for a person, who can allow it from the Agents page or the API.
+#[tokio::test]
+async fn an_agent_taking_another_agents_name_waits_to_be_allowed() {
+    let server = start().await;
+    let (web_1, web_2) = (identity(), identity());
+    let _first = server.connect_approved(&web_1, "web-1").await;
+    let _second = server.connect_approved(&web_2, "web-2").await;
+
+    let mut client = server.connect().await;
+    assert_eq!(
+        handshake(&mut client, &web_2, "web-1", None).await,
+        RegistrationStatus::Pending
+    );
+
+    let mut browser = Browser::default();
+    let page = browser.get(&server, "/agents").await;
+    assert!(
+        page.body
+            .contains("wants to be called <strong>web-1</strong>"),
+        "{}",
+        page.body
+    );
+    let page = browser
+        .get(&server, &format!("/agents/{}", web_2.id()))
+        .await;
+    assert!(page.body.contains("wants to be called"), "{}", page.body);
+    let shown = server
+        .request("GET", &format!("/api/v1/agents/{}", web_2.id()), "")
+        .await;
+    assert!(shown.contains(r#""wants_host":"web-1""#), "{shown}");
+
+    let path = format!("/agents/{}/rename", web_2.id());
+    let page = browser.submit(&server, "/agents", &path, &[]).await;
+    assert_eq!(page.status, 303, "{}", page.body);
+
+    assert_eq!(
+        server.state.registry.get(&web_2.id()).await.unwrap().host,
+        "web-1"
+    );
+    let mut client = server.connect().await;
+    assert_eq!(
+        handshake(&mut client, &web_2, "web-1", None).await,
+        RegistrationStatus::Approved
+    );
+    let page = browser.get(&server, "/agents").await;
+    assert!(!page.body.contains("wants to be called"), "{}", page.body);
+}
+
 #[tokio::test]
 async fn a_connection_that_never_answers_the_challenge_is_closed() {
     let server = start().await;

@@ -33,6 +33,28 @@
 </section>
 {% endif %}
 
+{% if renaming %}
+<section class="card">
+  <h2>Asking for another agent's name</h2>
+  <p class="note">A renamed machine, or one pretending to be another. Allowing it gives two agents the same name until the other is revoked.</p>
+  {% for agent in renaming %}
+  <div class="problem">
+    <span class="text"><a href="/agents/{{ agent.id }}">{{ agent.host }}</a> wants to be called <strong>{{ agent.wants }}</strong></span>
+    <div class="actions">
+      <form method="post" action="/agents/{{ agent.id }}/rename">
+        <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+        <button type="submit">Allow</button>
+      </form>
+      <form method="post" action="/agents/{{ agent.id }}/revoke">
+        <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+        <button type="submit" class="danger">Revoke</button>
+      </form>
+    </div>
+  </div>
+  {% endfor %}
+</section>
+{% endif %}
+
 {% include "agents/_filter.html" %}
 
 <nav class="tabs" aria-label="Filter">

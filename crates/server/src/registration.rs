@@ -154,6 +154,10 @@ impl Rules {
 
 pub struct Registry {
     agents: Mutex<BTreeMap<String, AgentRecord>>,
+    /// Approved agents asking to be called by a name another approved agent has,
+    /// which only a person can allow. Kept in memory: a refused agent asks again.
+    /// Locked after `agents`, never before it.
+    wanted_hosts: Mutex<BTreeMap<String, String>>,
     rules: Rules,
     max_pending: usize,
     database: Database,
@@ -170,6 +174,7 @@ impl Registry {
     ) -> Self {
         Self {
             agents: Mutex::new(agents.into_iter().map(|a| (a.id.clone(), a)).collect()),
+            wanted_hosts: Mutex::default(),
             rules,
             max_pending,
             database,
@@ -187,9 +192,36 @@ impl Registry {
             Some(AgentState::Approved) => {
                 let mut agent = existing.expect("state came from this record");
                 if agent.host != request.host {
+                    // A machine renamed to another agent's name could be an
+                    // impersonator, as with a new key, so a person decides.
+                    if hostname_taken(&agents, request) {
+                        warn!(
+                            agent = request.id,
+                            host = agent.host,
+                            wants = request.host,
+                            "wants a hostname that belongs to another agent, waiting for approval"
+                        );
+                        self.wanted_hosts
+                            .lock()
+                            .await
+                            .insert(request.id.to_string(), request.host.to_string());
+                        return Ok(RegistrationStatus::Pending);
+                    }
                     agent.host = request.host.to_string();
-                    self.save(&mut agents, agent).await?;
+                    // An approved agent stays approved while the database is away.
+                    // The old name stays in memory, so the save is tried again next time.
+                    match self.database.save_agent(&agent).await {
+                        Ok(()) => {
+                            agents.insert(agent.id.clone(), agent);
+                        }
+                        Err(error) => warn!(
+                            agent = request.id,
+                            error = format!("{error:#}"),
+                            "couldn't save the agent's new hostname, trying again next time"
+                        ),
+                    }
                 }
+                self.wanted_hosts.lock().await.remove(request.id);
                 return Ok(RegistrationStatus::Approved);
             }
             Some(AgentState::Pending) | None => {}
@@ -227,14 +259,8 @@ impl Registry {
 
         // A new key claiming a known hostname could be an impersonator, or a
         // reinstalled machine. Only a person can tell, so a rule can't approve.
-        let hostname_taken = agents.values().any(|other| {
-            other.id != request.id
-                && other.host == request.host
-                && other.state == AgentState::Approved
-        });
-
         if let Some(rule) = rule {
-            if hostname_taken {
+            if hostname_taken(&agents, request) {
                 warn!(
                     agent = request.id,
                     host = request.host,
@@ -264,6 +290,35 @@ impl Registry {
             self.save(&mut agents, agent).await?;
         }
         Ok(status)
+    }
+
+    /// The approved agents waiting to be called by another agent's name, and the
+    /// names they want.
+    pub async fn wanted_hosts(&self) -> BTreeMap<String, String> {
+        let _agents = self.agents.lock().await;
+        self.wanted_hosts.lock().await.clone()
+    }
+
+    /// Lets an agent have the name it asked for. Returns `None` if it wasn't
+    /// waiting for one.
+    pub async fn allow_rename(&self, id: &str, by: &str) -> Result<Option<AgentRecord>> {
+        let mut agents = self.agents.lock().await;
+        let Some(wanted) = self.wanted_hosts.lock().await.remove(id) else {
+            return Ok(None);
+        };
+        let Some(mut agent) = agents.get(id).cloned() else {
+            return Ok(None);
+        };
+        info!(
+            agent = id,
+            from = agent.host,
+            to = wanted,
+            by,
+            "rename allowed"
+        );
+        agent.host = wanted;
+        self.save(&mut agents, agent.clone()).await?;
+        Ok(Some(agent))
     }
 
     /// A decision made through the API or the command line.
@@ -332,6 +387,13 @@ impl Registry {
         agents.insert(agent.id.clone(), agent);
         Ok(())
     }
+}
+
+/// Whether another approved agent already goes by the name this one claims.
+fn hostname_taken(agents: &BTreeMap<String, AgentRecord>, request: &Admission) -> bool {
+    agents.values().any(|other| {
+        other.id != request.id && other.host == request.host && other.state == AgentState::Approved
+    })
 }
 
 fn now_ms() -> u64 {
@@ -704,5 +766,105 @@ mod tests {
             .unwrap();
 
         assert_eq!(registry.list().await[0].host, "new");
+    }
+
+    /// A compromised machine mustn't be able to pass its data off as another's by
+    /// taking its name.
+    #[tokio::test]
+    async fn an_approved_agent_taking_another_agents_name_waits_for_a_person() {
+        let registry = registry(SUBNET_RULE).await;
+        registry
+            .admit(&request("a", "web-1", "10.0.0.1"))
+            .await
+            .unwrap();
+        registry
+            .admit(&request("b", "web-2", "10.0.0.2"))
+            .await
+            .unwrap();
+
+        let status = registry
+            .admit(&request("b", "web-1", "10.0.0.2"))
+            .await
+            .unwrap();
+
+        assert_eq!(status, RegistrationStatus::Pending);
+        assert_eq!(registry.get("b").await.unwrap().host, "web-2");
+        assert_eq!(
+            registry.wanted_hosts().await,
+            BTreeMap::from([("b".to_string(), "web-1".to_string())])
+        );
+
+        let allowed = registry.allow_rename("b", "sam").await.unwrap().unwrap();
+        assert_eq!(allowed.host, "web-1");
+        assert!(registry.wanted_hosts().await.is_empty());
+        assert_eq!(
+            registry
+                .admit(&request("b", "web-1", "10.0.0.2"))
+                .await
+                .unwrap(),
+            RegistrationStatus::Approved
+        );
+        assert!(registry.allow_rename("b", "sam").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_goes_back_to_its_own_name_is_no_longer_waiting() {
+        let registry = registry(SUBNET_RULE).await;
+        for (id, host, source) in [("a", "web-1", "10.0.0.1"), ("b", "web-2", "10.0.0.2")] {
+            registry.admit(&request(id, host, source)).await.unwrap();
+        }
+        registry
+            .admit(&request("b", "web-1", "10.0.0.2"))
+            .await
+            .unwrap();
+
+        registry
+            .admit(&request("b", "web-2", "10.0.0.2"))
+            .await
+            .unwrap();
+
+        assert!(registry.wanted_hosts().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_name_a_revoked_agent_had_is_free_to_take() {
+        let registry = registry(SUBNET_RULE).await;
+        for (id, host, source) in [("a", "web-1", "10.0.0.1"), ("b", "web-2", "10.0.0.2")] {
+            registry.admit(&request(id, host, source)).await.unwrap();
+        }
+        registry.decide("a", AgentState::Revoked).await.unwrap();
+
+        let status = registry
+            .admit(&request("b", "web-1", "10.0.0.2"))
+            .await
+            .unwrap();
+
+        assert_eq!(status, RegistrationStatus::Approved);
+        assert_eq!(registry.get("b").await.unwrap().host, "web-1");
+    }
+
+    #[tokio::test]
+    async fn a_renamed_agent_still_connects_while_the_database_is_down() {
+        let database = Database::for_test().await;
+        let registry = registry_with(SUBNET_RULE, database.clone()).await;
+        registry
+            .admit(&request("a", "old", "10.0.0.1"))
+            .await
+            .unwrap();
+
+        database.break_for_test().await;
+
+        assert_eq!(
+            registry
+                .admit(&request("a", "new", "10.0.0.1"))
+                .await
+                .unwrap(),
+            RegistrationStatus::Approved
+        );
+        assert_eq!(
+            registry.get("a").await.unwrap().host,
+            "old",
+            "the name the database still has, until it can be saved"
+        );
     }
 }

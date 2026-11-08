@@ -32,6 +32,7 @@ pub fn routes() -> Router<AppState> {
         .route("/agents/{id}", get(show))
         .route("/agents/{id}/approve", post(approve))
         .route("/agents/{id}/revoke", post(revoke))
+        .route("/agents/{id}/rename", post(rename))
 }
 
 #[derive(Serialize)]
@@ -188,6 +189,14 @@ struct WaitingAgent {
     seen: Option<String>,
 }
 
+/// An approved agent asking to be called by a name another agent has.
+#[derive(Serialize)]
+struct Renaming {
+    id: String,
+    host: String,
+    wants: String,
+}
+
 /// An agent in the list, with only what it takes to sort and count them all.
 struct Listed {
     agent: AgentRecord,
@@ -254,10 +263,19 @@ async fn index(
     }
 
     let mut waiting = Vec::new();
+    let mut renaming = Vec::new();
     let mut listed = Vec::new();
+    let wanted_hosts = state.registry.wanted_hosts().await;
     for agent in state.registry.list().await {
         if agent.is_local() {
             continue;
+        }
+        if let Some(wants) = wanted_hosts.get(&agent.id) {
+            renaming.push(Renaming {
+                id: agent.id.clone(),
+                host: agent.host.clone(),
+                wants: wants.clone(),
+            });
         }
         let presence = state.presence.get(&agent.id);
         if agent.state == AgentState::Pending {
@@ -333,6 +351,7 @@ async fn index(
     Page::new(&state, &token, "agents/index.html")
         .with("agents", &agents)
         .with("waiting", &waiting)
+        .with("renaming", &renaming)
         .with("filters", &filters)
         .with("online_count", &online)
         .with("total", &total)
@@ -472,8 +491,10 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         Some(desired.version.as_str()),
         reported.as_ref(),
     ));
+    let wants = state.registry.wanted_hosts().await.remove(&id);
     Page::new(&state, &token, "agents/show.html")
         .with("agent", &row)
+        .with("wants", &wants)
         .with("decided_by", &agent.decided_by)
         .with("has_facts", &!flat.is_empty())
         .with("alerts", &alerts)
@@ -502,6 +523,16 @@ async fn approve(state: State<AppState>, id: Path<String>, form: CsrfForm) -> Re
 
 async fn revoke(state: State<AppState>, id: Path<String>, form: CsrfForm) -> Response {
     decide(state, id, form, AgentState::Revoked).await
+}
+
+/// Lets an agent take the name it asked for.
+async fn rename(State(state): State<AppState>, Path(id): Path<String>, form: CsrfForm) -> Response {
+    let by = signed_in_user().map_or_else(|| "admin".to_string(), |user| user.email.clone());
+    match state.registry.allow_rename(&id, &by).await {
+        Ok(Some(_)) => (form.token, Redirect::to(&format!("/agents/{id}"))).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
 }
 
 async fn decide(

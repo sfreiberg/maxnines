@@ -405,6 +405,8 @@ fn default_enabled() -> bool {
 
 /// Longer than anyone wants between samples, and far below what a timer can hold.
 pub const MAX_INTERVAL_SECS: u64 = 86_400;
+/// Facts rarely change, and the server drops reports that come faster than this.
+pub const MIN_FACTS_INTERVAL_SECS: u64 = 60;
 /// A week between fact reports, on top of one on every connection.
 pub const MAX_FACTS_INTERVAL_SECS: u64 = 7 * 86_400;
 
@@ -416,8 +418,8 @@ impl AgentConfig {
             "interval_secs can be at most {MAX_INTERVAL_SECS}, a day"
         );
         ensure!(
-            self.facts_interval_secs > 0,
-            "facts_interval_secs must be at least 1"
+            self.facts_interval_secs >= MIN_FACTS_INTERVAL_SECS,
+            "facts_interval_secs must be at least {MIN_FACTS_INTERVAL_SECS}"
         );
         ensure!(
             self.facts_interval_secs <= MAX_FACTS_INTERVAL_SECS,
@@ -622,6 +624,7 @@ mod tests {
             with(MAX_INTERVAL_SECS + 1, 60),
             with(u64::MAX, 60),
             with(60, 0),
+            with(60, MIN_FACTS_INTERVAL_SECS - 1),
             with(60, MAX_FACTS_INTERVAL_SECS + 1),
             with(60, u64::MAX),
         ] {

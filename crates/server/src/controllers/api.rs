@@ -43,6 +43,8 @@ pub struct AgentView {
     pub online: bool,
     pub health: Health,
     pub last_seen_ms: Option<u64>,
+    /// A name the agent asked for that another agent has, waiting to be allowed.
+    pub wants_host: Option<String>,
 }
 
 /// Facts come in two kinds. `trusted` is what the server knows for itself, and
@@ -148,6 +150,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/agents/filter-options", get(filter_options))
         .route("/agents/{id}/approve", post(approve))
         .route("/agents/{id}/revoke", post(revoke))
+        .route("/agents/{id}/rename", post(allow_rename))
         .route("/rules/preview", post(preview_rule))
         .route("/notification-channels/{id}/test", post(test_channel))
         .route("/users", get(list_users).post(create_user))
@@ -355,6 +358,7 @@ async fn list(State(state): State<AppState>, Query(params): Query<ListParams>) -
         alerts.entry(&alert.agent_id).or_default().push(alert);
     }
 
+    let mut wanted_hosts = state.registry.wanted_hosts().await;
     let views: Vec<AgentView> = state
         .registry
         .list()
@@ -369,6 +373,7 @@ async fn list(State(state): State<AppState>, Query(params): Query<ListParams>) -
                 online,
                 health: Health::of(online, mine),
                 last_seen_ms: presence.map(|p| p.last_seen_ms),
+                wants_host: wanted_hosts.remove(&agent.id),
                 agent,
             }
         })
@@ -391,6 +396,7 @@ async fn show_agent(State(state): State<AppState>, UrlPath(id): UrlPath<String>)
         online,
         health: Health::of(online, &mine),
         last_seen_ms: presence.map(|p| p.last_seen_ms),
+        wants_host: state.registry.wanted_hosts().await.remove(&id),
         agent,
     })
     .into_response()
@@ -1199,6 +1205,15 @@ async fn approve(State(state): State<AppState>, UrlPath(id): UrlPath<String>) ->
 
 async fn revoke(State(state): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
     decide(&state, &id, AgentState::Revoked).await
+}
+
+/// Lets an agent take the name it asked for.
+async fn allow_rename(State(state): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
+    match state.registry.allow_rename(&id, "api").await {
+        Ok(Some(agent)) => Json(agent).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
 }
 
 async fn decide(state: &AppState, id: &str, decision: AgentState) -> Response {

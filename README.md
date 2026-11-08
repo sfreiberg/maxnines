@@ -86,7 +86,12 @@ reached, and sent when it's back.
 
 - **One key per machine.** Copy the program and `agent.hcl` to another machine, but
   never `state`. The key inside it is the agent's identity, so a copy looks like the
-  same machine.
+  same machine. If two machines do share a key, each connection knocks the other off,
+  and the Agents page shows the agent reconnecting over and over.
+- **Renamed machines.** A machine that changes its hostname keeps reporting under the
+  new name. If the new name belongs to another approved agent, it waits instead, and
+  the Agents page asks whether to allow it, since a machine pretending to be another
+  would look the same.
 - **Upgrade the server first.** Older agents work with a newer server, but a newer
   agent may need things an older server doesn't have.
 - **macOS and downloads:** a file that came through a browser or AirDrop is blocked

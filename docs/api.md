@@ -93,10 +93,15 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
     "decided_at_ms": 1793940265752,
     "online": true,
     "health": "online",
-    "last_seen_ms": 1793940282225
+    "last_seen_ms": 1793940282225,
+    "wants_host": null
   }
 ]
 ```
+
+`wants_host` is a name the agent asked to be called that another approved agent already
+has. The agent can't connect until someone [allows it](#allow-an-agent-to-change-its-name)
+or revokes one of them.
 
 ### Get an agent
 
@@ -118,6 +123,19 @@ Lets an agent connect, and gives back the agent's record.
 ```sh
 curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "$MAXNINES_URL/api/v1/agents/$AGENT_ID/approve"
+```
+
+### Allow an agent to change its name
+
+`POST /api/v1/agents/{id}/rename`
+
+Lets an agent take the name in `wants_host`, and gives back the agent's record. Gives `404`
+if the agent isn't waiting for a name. The other agent keeps the name too, until it's
+revoked.
+
+```sh
+curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  "$MAXNINES_URL/api/v1/agents/$AGENT_ID/rename"
 ```
 
 ### Revoke an agent
