@@ -18,6 +18,7 @@ impl MigratorTrait for Migrator {
             Box::new(CreateAlerting),
             Box::new(CreateRemoteChecks),
             Box::new(CreateDashboards),
+            Box::new(CreateLocationRules),
         ]
     }
 }
@@ -1198,5 +1199,69 @@ impl MigrationTrait for CreateDashboards {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         drop_tables(manager, &["dashboard_widgets", "dashboards"]).await
+    }
+}
+
+// ---- Where machines are
+
+struct CreateLocationRules;
+
+impl MigrationName for CreateLocationRules {
+    fn name(&self) -> &str {
+        "m20261108_000007_create_location_rules"
+    }
+}
+
+#[derive(Iden)]
+enum LocationRules {
+    Table,
+    Id,
+    /// What the map calls the machines it covers.
+    Name,
+    /// Which machines, in the host filter's form. Every machine, if empty.
+    Filter,
+    /// Where it is in words, such as "Leeds, England, United Kingdom".
+    Place,
+    Latitude,
+    Longitude,
+    /// When several rules match a machine, the highest wins.
+    Priority,
+}
+
+/// Rules that say where machines are, for the map. A machine placed by hand is a
+/// rule whose filter is its ID.
+#[async_trait::async_trait]
+impl MigrationTrait for CreateLocationRules {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(LocationRules::Table)
+                    .col(id(LocationRules::Id))
+                    .col(
+                        ColumnDef::new(LocationRules::Name)
+                            .string_len(255)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(LocationRules::Filter)
+                            .string_len(500)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(LocationRules::Place)
+                            .string_len(255)
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(LocationRules::Latitude).double().not_null())
+                    .col(ColumnDef::new(LocationRules::Longitude).double().not_null())
+                    .col(ColumnDef::new(LocationRules::Priority).integer().not_null())
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        drop_tables(manager, &["location_rules"]).await
     }
 }

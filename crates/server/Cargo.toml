@@ -12,6 +12,8 @@ chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
 # Stay on DuckDB 1.5: 1.20000.x bundles a pre-release 2.0 with a development
 # storage format. Tilde because a minor bump changes the bundled DuckDB.
+# Unpacks the built-in place list.
+flate2 = "1"
 duckdb = { version = "~1.10506.1", features = ["bundled", "json"] }
 hcl-rs.workspace = true
 indexmap = { version = "2.14.2", features = ["serde"] }

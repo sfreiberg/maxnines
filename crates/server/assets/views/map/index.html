@@ -1,0 +1,76 @@
+{% extends "layouts/live.html" %}
+{% block title %}Map · MaxNines{% endblock title %}
+{% block refresh_every %}30s{% endblock refresh_every %}
+{% block head %}<noscript><meta http-equiv="refresh" content="60"></noscript>
+  <script src="/assets/js/map.js" defer></script>
+{% endblock head %}
+{% block content %}
+<div class="title-row">
+  <div>
+    <p class="eyebrow">{{ site_count }} site{% if site_count != 1 %}s{% endif %} · {{ machine_count }} machine{% if machine_count != 1 %}s{% endif %}</p>
+    <h1>Map</h1>
+  </div>
+  <div class="actions">
+    <a class="button secondary" href="/map/rules">Location rules</a>
+  </div>
+</div>
+
+<div class="map-regions" role="group" aria-label="Show">
+  <button type="button" data-region="world" aria-pressed="true">World</button>
+  <button type="button" data-region="europe" aria-pressed="false">Europe</button>
+  <button type="button" data-region="americas" aria-pressed="false">North America</button>
+  <button type="button" data-region="apac" aria-pressed="false">Asia–Pacific</button>
+</div>
+
+<div class="map-layout">
+  <section class="map-card" aria-label="Map of sites">
+    <div id="map-canvas" class="map-canvas" data-world="/assets/map/world.json">
+      <p class="hint">The map needs JavaScript. The sites are listed beside it.</p>
+    </div>
+    <div id="map-data" hidden data-map="{{ map_json }}"></div>
+    <div class="map-legend">
+      <span class="label">Health</span>
+      <span class="map-key"><span class="map-dot critical"></span>Critical</span>
+      <span class="map-key"><span class="map-dot warning"></span>Warning</span>
+      <span class="map-key"><span class="map-dot offline"></span>Offline</span>
+      <span class="map-key"><span class="map-dot online"></span>Online</span>
+      <span class="credit map-credit">{{ credit }}</span>
+    </div>
+  </section>
+
+  <aside class="map-sites" aria-label="Sites">
+    <div class="map-sites-head">
+      <h2>Sites</h2>
+      <span class="label">{% if attention > 0 %}{{ attention }} need{% if attention == 1 %}s{% endif %} attention{% else %}All well{% endif %}</span>
+    </div>
+    {% if sites %}
+    <ul id="map-site-list" class="map-site-list">
+      {% for site in sites %}
+      <li>
+        <button type="button" class="map-site" data-rule="{{ site.rule_id }}">
+          <span class="map-dot {{ site.health }}"></span>
+          <span class="name">{{ site.name }}</span>
+          <span class="machines">{{ site.total }} machine{% if site.total != 1 %}s{% endif %}</span>
+          <span class="detail">{{ site.breakdown }}</span>
+          {% if site.place %}<span class="place">{{ site.place }}</span>{% endif %}
+        </button>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="hint map-empty">No machines have a location yet. <a href="/map/rules/new">Add a location rule</a> to put them on the map.</p>
+    {% endif %}
+    {% if unplaced %}
+    <div class="map-unplaced">
+      <h3>No location yet</h3>
+      <p class="hint">No location rule covers these. Place one by hand, or add a rule that covers several at once.</p>
+      <ul>
+        {% for machine in unplaced %}
+        <li><a href="/agents/{{ machine.id }}">{{ machine.host }}</a> <span class="agent-id">{{ machine.short_id }}</span> <a class="place-it" href="/map/rules/new?agent={{ machine.id }}">Place it</a></li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+  </aside>
+</div>
+{% endblock content %}

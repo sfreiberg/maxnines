@@ -17,6 +17,7 @@ mod fleet;
 mod health;
 pub mod host_list;
 mod maintenance_windows;
+pub mod map;
 mod metrics;
 mod notification_channels;
 mod overview;
@@ -80,6 +81,7 @@ pub fn app(state: AppState) -> Router {
         .merge(alert_rules::routes())
         .merge(notification_channels::routes())
         .merge(remote_checks::routes())
+        .merge(map::routes())
         .merge(compressed(metrics::routes()))
         .merge(rules::routes())
         .fallback(not_found)
@@ -143,6 +145,7 @@ fn section_of(template: &str) -> &'static str {
         "remote_checks" => "checks",
         "alerts" | "silences" | "maintenance_windows" => "alerts",
         "server" => "server",
+        "map" => "map",
         "dashboards" => "dashboards",
         "settings" | "rules" | "alert_rules" | "notification_channels" => "settings",
         "profile" => "profile",

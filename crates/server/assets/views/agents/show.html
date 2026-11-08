@@ -46,6 +46,7 @@
       {% if uptime %}<dt>Uptime</dt><dd>{{ uptime }}</dd>{% endif %}
       {% if agent_uptime %}<dt>Agent uptime</dt><dd>{{ agent_uptime }}</dd>{% endif %}
       {% if own_memory %}<dt>Agent memory</dt><dd>{{ own_memory }}</dd>{% endif %}
+      {% if agent.state == "approved" %}<dt>Location</dt><dd>{% if location %}<a href="/map/rules/{{ location.rule_id }}/edit">{{ location.name }}</a>{% if location.place and location.place != location.name %}, {{ location.place }}{% endif %}{% if not location.just_this_one %} · <a href="/map/rules/new?agent={{ agent.id }}">Place it by itself</a>{% endif %}{% else %}Not on the map · <a href="/map/rules/new?agent={{ agent.id }}">Place it</a>{% endif %}</dd>{% endif %}
       {% if source %}<dt>Connected from</dt><dd><code>{{ source }}</code></dd>{% endif %}
       {% if agent_version %}<dt>Agent version</dt><dd>{{ agent_version }}{% if agent_commit %}, commit <code>{{ agent_commit }}</code>{% endif %}</dd>{% endif %}
       <dt>Agent ID</dt><dd><code>{{ agent.id }}</code></dd>

@@ -1576,6 +1576,10 @@ async fn every_page_renders() {
         "/rules".to_string(),
         "/rules/new".to_string(),
         format!("/rules/{rule}/edit"),
+        "/map".to_string(),
+        "/map/rules".to_string(),
+        "/map/rules/new".to_string(),
+        format!("/map/rules/new?agent={}", agent.id()),
     ] {
         let page = browser.get(&server, &path).await;
         assert_eq!(page.status, 200, "{path}: {}", page.body);
@@ -1618,6 +1622,7 @@ async fn embedded_assets_are_served_and_nothing_else_is() {
         "/assets/js/idiomorph-ext.min.js",
         "/assets/js/application.js",
         "/assets/js/charts.js",
+        "/assets/js/map.js",
     ] {
         let script = browser.get(&server, path).await;
         assert_eq!(script.status, 200, "{path}");
@@ -4236,4 +4241,277 @@ async fn a_key_can_be_revoked_from_its_page() {
     assert_eq!(status_of(&response), "401", "{response}");
     let page = browser.get(&server, "/settings/api-keys").await;
     assert!(page.body.contains("Revoked"), "{}", page.body);
+}
+
+// ---- the map
+
+const LEEDS: [(&str, &str); 6] = [
+    ("name", "Leeds office"),
+    ("filter", "hostname=web*"),
+    ("place", "Leeds, England, United Kingdom"),
+    ("latitude", "53.79648"),
+    ("longitude", "-1.54785"),
+    ("priority", "0"),
+];
+
+#[tokio::test]
+async fn the_map_puts_machines_where_their_rules_say() {
+    let server = start().await;
+    let web = identity();
+    let db = identity();
+    let _web = server.connect_approved(&web, "web-1").await;
+    let _db = server.connect_approved(&db, "db-1").await;
+    let mut browser = Browser::default();
+
+    let saved = browser
+        .submit(&server, "/map/rules/new", "/map/rules", &LEEDS)
+        .await;
+    assert_eq!(saved.status, 303, "{}", saved.body);
+
+    let page = browser.get(&server, "/map").await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("Leeds office"), "{}", page.body);
+    assert!(page.body.contains("1 site · 2 machines"), "{}", page.body);
+    // The machine no rule covers is listed to be placed.
+    let place_db = format!("/map/rules/new?agent={}", db.id());
+    assert!(page.body.contains(&place_db), "{}", page.body);
+    assert!(
+        !page.body.contains(&format!("agent={}", web.id())),
+        "{}",
+        page.body
+    );
+
+    let map = body_of(&server.request("GET", "/api/v1/map", "").await);
+    assert_eq!(map["sites"][0]["name"], "Leeds office");
+    assert_eq!(map["sites"][0]["counts"]["online"], 1);
+    assert_eq!(map["sites"][0]["machines"][0]["host"], "web-1");
+    assert_eq!(map["sites"][0]["machines"][0]["short_id"], &web.id()[..8]);
+    assert_eq!(map["unplaced"][0]["host"], "db-1");
+
+    let rules = browser.get(&server, "/map/rules").await;
+    assert!(rules.body.contains("hostname=web*"), "{}", rules.body);
+}
+
+#[tokio::test]
+async fn a_machine_placed_from_its_page_outranks_a_broader_rule() {
+    let server = start().await;
+    let web = identity();
+    server.connect_approved(&web, "web-1").await;
+    let mut browser = Browser::default();
+    browser
+        .submit(&server, "/map/rules/new", "/map/rules", &LEEDS)
+        .await;
+
+    let agent_page = format!("/agents/{}", web.id());
+    let page = browser.get(&server, &agent_page).await;
+    assert!(page.body.contains("Leeds office"), "{}", page.body);
+    assert!(page.body.contains("Place it by itself"), "{}", page.body);
+
+    let form = format!("/map/rules/new?agent={}", web.id());
+    let page = browser.get(&server, &form).await;
+    let filter = format!("id={}", web.id());
+    assert!(page.body.contains(&filter), "{}", page.body);
+    assert!(
+        page.body.contains(r#"name="priority" value="100""#),
+        "{}",
+        page.body
+    );
+
+    let saved = browser
+        .submit(
+            &server,
+            &form,
+            "/map/rules",
+            &[
+                ("name", "Rack 4"),
+                ("filter", &filter),
+                ("place", "Wetherby, England, United Kingdom"),
+                ("latitude", "53.92"),
+                ("longitude", "-1.38"),
+                ("priority", "100"),
+            ],
+        )
+        .await;
+    assert_eq!(saved.status, 303, "{}", saved.body);
+
+    let page = browser.get(&server, &agent_page).await;
+    assert!(page.body.contains("Rack 4"), "{}", page.body);
+    assert!(!page.body.contains("Place it by itself"), "{}", page.body);
+    let map = body_of(&server.request("GET", "/api/v1/map", "").await);
+    assert_eq!(map["sites"].as_array().unwrap().len(), 1);
+    assert_eq!(map["sites"][0]["name"], "Rack 4");
+}
+
+#[tokio::test]
+async fn a_location_with_a_mistake_is_shown_again_with_the_reason() {
+    let server = start().await;
+    let mut browser = Browser::default();
+
+    let mut fields = LEEDS.to_vec();
+    fields[3] = ("latitude", "91");
+    let page = browser
+        .submit(&server, "/map/rules/new", "/map/rules", &fields)
+        .await;
+    assert_eq!(page.status, 422, "{}", page.body);
+    assert!(page.body.contains("between -90 and 90"), "{}", page.body);
+    assert!(page.body.contains("Leeds office"), "{}", page.body);
+
+    fields[3] = ("latitude", "");
+    let page = browser
+        .submit(&server, "/map/rules/new", "/map/rules", &fields)
+        .await;
+    assert_eq!(page.status, 422, "{}", page.body);
+    assert!(page.body.contains("Choose a place"), "{}", page.body);
+    assert!(
+        server
+            .state
+            .database
+            .list_location_rules()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_location_can_be_changed_and_deleted_from_its_page() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    browser
+        .submit(&server, "/map/rules/new", "/map/rules", &LEEDS)
+        .await;
+    let id = server.state.database.list_location_rules().await.unwrap()[0].id;
+    let edit = format!("/map/rules/{id}/edit");
+
+    let mut fields = LEEDS.to_vec();
+    fields[0] = ("name", "Leeds data centre");
+    let saved = browser
+        .submit(&server, &edit, &format!("/map/rules/{id}"), &fields)
+        .await;
+    assert_eq!(saved.status, 303, "{}", saved.body);
+    let rule = server
+        .state
+        .database
+        .get_location_rule(id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rule.rule.name, "Leeds data centre");
+
+    let deleted = browser
+        .submit(&server, &edit, &format!("/map/rules/{id}/delete"), &[])
+        .await;
+    assert_eq!(deleted.status, 303, "{}", deleted.body);
+    assert_eq!(browser.get(&server, &edit).await.status, 404);
+}
+
+#[tokio::test]
+async fn location_rules_can_be_managed_through_the_api() {
+    let server = start().await;
+
+    let body = json!({
+        "name": "Leeds office",
+        "filter": "networking.addresses=10.1.*",
+        "latitude": 53.8,
+        "longitude": -1.55
+    });
+    let created = server
+        .request("POST", "/api/v1/location-rules", &body.to_string())
+        .await;
+    assert_eq!(status_of(&created), "201", "{created}");
+    let path = format!("/api/v1/location-rules/{}", body_of(&created)["id"]);
+
+    let shown = body_of(&server.request("GET", &path, "").await);
+    assert_eq!(shown["priority"], 0);
+    assert_eq!(shown["place"], "");
+
+    let changed = json!({ "name": "Leeds", "latitude": 53.8, "longitude": -1.55, "priority": 5 });
+    let updated = server.request("PUT", &path, &changed.to_string()).await;
+    assert_eq!(status_of(&updated), "204", "{updated}");
+    let listed = body_of(&server.request("GET", "/api/v1/location-rules", "").await);
+    assert_eq!(listed[0]["name"], "Leeds");
+    assert_eq!(listed[0]["filter"], "");
+
+    for (bad, reason) in [
+        (
+            json!({ "name": "", "latitude": 1, "longitude": 1 }),
+            "needs a name",
+        ),
+        (
+            json!({ "name": "a", "latitude": 1, "longitude": 200 }),
+            "longitude",
+        ),
+        (
+            json!({ "name": "a", "filter": "\"open", "latitude": 1, "longitude": 1 }),
+            "quote",
+        ),
+    ] {
+        let response = server
+            .request("POST", "/api/v1/location-rules", &bad.to_string())
+            .await;
+        assert_eq!(status_of(&response), "422", "{bad}: {response}");
+        assert!(response.contains(reason), "{bad}: {response}");
+    }
+
+    let deleted = server.request("DELETE", &path, "").await;
+    assert_eq!(status_of(&deleted), "204", "{deleted}");
+    assert_eq!(status_of(&server.request("GET", &path, "").await), "404");
+    assert_eq!(status_of(&server.request("DELETE", &path, "").await), "404");
+}
+
+#[tokio::test]
+async fn places_can_be_looked_up_from_the_form_and_the_api() {
+    let server = start().await;
+    let mut browser = Browser::default();
+
+    let page = browser.get(&server, "/map/places?q=leeds").await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    let found: Value = serde_json::from_str(&page.body).unwrap();
+    assert_eq!(found[0]["label"], "Leeds, England, United Kingdom");
+
+    let found = body_of(
+        &server
+            .request("GET", "/api/v1/places?q=portland,%20maine", "")
+            .await,
+    );
+    assert_eq!(found[0]["label"], "Portland, Maine, United States");
+    assert_eq!(found.as_array().unwrap().len(), 1);
+
+    let near = body_of(
+        &server
+            .request("GET", "/api/v1/places/nearest?lat=53.93&lon=-1.39", "")
+            .await,
+    );
+    assert_eq!(near["label"], "Wetherby, England, United Kingdom");
+
+    let page = browser.get(&server, "/map/nearest?lat=x&lon=1").await;
+    assert_eq!(page.status, 400);
+    let anonymous = Browser::anonymous()
+        .get(&server, "/map/places?q=leeds")
+        .await;
+    assert_ne!(anonymous.status, 200);
+}
+
+#[tokio::test]
+async fn names_on_the_map_stay_text() {
+    let server = start().await;
+    let agent = identity();
+    server.connect_approved(&agent, "<i>web</i>").await;
+    let mut browser = Browser::default();
+    let mut fields = LEEDS.to_vec();
+    fields[0] = ("name", "<b>Leeds</b>");
+    fields[1] = ("filter", "");
+    browser
+        .submit(&server, "/map/rules/new", "/map/rules", &fields)
+        .await;
+
+    let page = browser.get(&server, "/map").await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(!page.body.contains("<b>Leeds"), "{}", page.body);
+    assert!(!page.body.contains("<i>web"), "{}", page.body);
+    assert!(page.has_only_our_scripts(), "{}", page.body);
+    let page = browser
+        .get(&server, &format!("/agents/{}", agent.id()))
+        .await;
+    assert!(!page.body.contains("<b>Leeds"), "{}", page.body);
 }

@@ -1,5 +1,5 @@
 //! The versioned API, which shares the server's port. Everything the web pages can
-//! see and do is here too. It needs the admin token, because a proxy may expose it.
+//! see and do is here too. It needs an API key, because a proxy may expose it.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -23,6 +23,7 @@ use crate::app_state::AppState;
 use crate::calculations::{self, Calculation, Question};
 use crate::dashboards::{Placed, WidgetInput, check_layout, check_name};
 use crate::facts::unflatten;
+use crate::locations::{LocationRuleInput, check_rule};
 use crate::maintenance::MaintenanceWindowInput;
 use crate::metrics::{self, METRICS, Metric, SeriesResult, TimeRange, Unit, now_ms};
 use crate::models::{
@@ -143,6 +144,19 @@ pub fn routes(state: AppState) -> Router<AppState> {
                 .put(update_remote_check)
                 .delete(delete_remote_check),
         )
+        .route(
+            "/location-rules",
+            get(list_location_rules).post(create_location_rule),
+        )
+        .route(
+            "/location-rules/{id}",
+            get(show_location_rule)
+                .put(update_location_rule)
+                .delete(delete_location_rule),
+        )
+        .route("/map", get(map))
+        .route("/places", get(super::map::search_places))
+        .route("/places/nearest", get(super::map::nearest_place))
         .route("/api-keys", get(list_api_keys).post(create_api_key))
         .route("/api-keys/{id}", delete(revoke_api_key))
         .route("/agents/filter-options", get(filter_options))
@@ -172,7 +186,7 @@ fn failed(status: StatusCode, error: &str) -> Response {
     (status, Json(json!({ "error": error }))).into_response()
 }
 
-/// Whether a request carries the admin token or a working API key.
+/// Whether a request carries a working API key.
 pub async fn token_accepted(state: &AppState, headers: &HeaderMap) -> anyhow::Result<bool> {
     let presented = headers
         .get(header::AUTHORIZATION)
@@ -981,6 +995,68 @@ async fn delete_maintenance_window(
     match state.database.delete_maintenance_window(id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn list_location_rules(State(state): State<AppState>) -> Response {
+    match state.database.list_location_rules().await {
+        Ok(rules) => Json(rules).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn show_location_rule(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.get_location_rule(id).await {
+        Ok(Some(rule)) => Json(rule).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn create_location_rule(
+    State(state): State<AppState>,
+    Json(input): Json<LocationRuleInput>,
+) -> Response {
+    if let Err(error) = check_rule(&input) {
+        return refused(&error);
+    }
+    match state.database.create_location_rule(&input).await {
+        Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn update_location_rule(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<i64>,
+    Json(input): Json<LocationRuleInput>,
+) -> Response {
+    if let Err(error) = check_rule(&input) {
+        return refused(&error);
+    }
+    match state.database.update_location_rule(id, &input).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn delete_location_rule(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<i64>,
+) -> Response {
+    match state.database.delete_location_rule(id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// Every site on the map with its machines, and the machines no rule places.
+async fn map(State(state): State<AppState>) -> Response {
+    match super::map::map_data(&state).await {
+        Ok(data) => Json(data).into_response(),
         Err(error) => server_error(&error),
     }
 }

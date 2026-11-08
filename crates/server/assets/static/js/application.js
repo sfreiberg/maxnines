@@ -37,8 +37,9 @@ document.addEventListener("htmx:afterRequest", (event) => {
     : "Not updating";
 });
 
-// Leaves what someone is typing alone when the page's data updates.
-Idiomorph.defaults.callbacks.beforeNodeMorphed = (node) => node.id !== "host-filter";
+// Leaves what someone is typing alone when the page's data updates, and the drawn map,
+// which map.js redraws from the new data itself.
+Idiomorph.defaults.callbacks.beforeNodeMorphed = (node) => node.id !== "host-filter" && node.id !== "map-canvas";
 
 // Leaves anything someone has opened on the page open when its data updates.
 Idiomorph.defaults.callbacks.beforeAttributeUpdated = (name, element) =>

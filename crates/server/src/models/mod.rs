@@ -15,6 +15,8 @@ mod config_rule_setting;
 mod dashboard;
 mod dashboard_widget;
 mod dashboards;
+mod location_rule;
+mod location_rules;
 mod maintenance_window;
 mod maintenance_windows;
 mod notification;

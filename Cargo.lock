@@ -3087,6 +3087,7 @@ dependencies = [
  "clickhouse",
  "cookie",
  "duckdb",
+ "flate2",
  "futures-util",
  "governor",
  "hcl-rs",

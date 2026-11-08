@@ -18,6 +18,7 @@ use crate::app_state::AppState;
 use crate::fact_history::{describe_history, format_time};
 use crate::facts::{FlatFacts, fact_text, unflatten};
 use crate::host_filter::{MAX_SUGGESTIONS, PartialValue, Suggestion, suggest_names};
+use crate::locations::Locator;
 use crate::metric_charts::format_value;
 use crate::metrics::Unit;
 use crate::metrics::now_ms;
@@ -442,6 +443,15 @@ struct HistoryEntry {
     changes: Vec<String>,
 }
 
+/// Where the map puts a machine, and whether it's by a rule of its own.
+#[derive(Serialize)]
+struct Location {
+    rule_id: i64,
+    name: String,
+    place: String,
+    just_this_one: bool,
+}
+
 async fn show(State(state): State<AppState>, Path(id): Path<String>, token: CsrfToken) -> Response {
     let found = state.registry.get(&id).await;
     let Some(agent) = found.filter(|agent| !agent.is_local()) else {
@@ -486,6 +496,17 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         Ok(output) => output.and_then(|host| host["uptime_secs"].as_u64()),
         Err(error) => return server_error(&error),
     };
+    let locator = match Locator::load(&state.database).await {
+        Ok(locator) => locator,
+        Err(error) => return server_error(&error),
+    };
+    let own_filter = format!("id={id}");
+    let location = locator.locate(&id, &agent.host).map(|rule| Location {
+        rule_id: rule.id,
+        name: rule.rule.name.clone(),
+        place: rule.rule.place.clone(),
+        just_this_one: rule.rule.filter == own_filter,
+    });
     let presence = state.presence.get(&id);
     let config = serde_json::to_string_pretty(&desired.config).unwrap_or_default();
     let changes: Vec<HistoryEntry> = describe_history(&history)
@@ -519,6 +540,7 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
             "own_memory",
             &own_memory.map(|bytes| format_value(Unit::Bytes, bytes)),
         )
+        .with("location", &location)
         .with("os", &os_of(&flat))
         .with("os_family", &OsFamily::of(&flat))
         .with("source", &presence.map(|p| p.source.to_string()))
