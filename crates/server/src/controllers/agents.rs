@@ -474,10 +474,14 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
     let flat: FlatFacts = current.into_iter().map(|f| (f.name, f.value)).collect();
     let mut facts = Vec::new();
     fact_rows("", &unflatten(&flat), &mut facts);
-    let own_memory = match state.metrics.latest_output(&id, "agent", now_ms()).await {
-        Ok(output) => output.and_then(|agent| agent["memory_bytes"].as_f64()),
+    let own = match state.metrics.latest_output(&id, "agent", now_ms()).await {
+        Ok(output) => output,
         Err(error) => return server_error(&error),
     };
+    let own_memory = own
+        .as_ref()
+        .and_then(|agent| agent["memory_bytes"].as_f64());
+    let own_uptime = own.as_ref().and_then(|agent| agent["uptime_secs"].as_u64());
     let uptime = match state.metrics.latest_output(&id, "host", now_ms()).await {
         Ok(output) => output.and_then(|host| host["uptime_secs"].as_u64()),
         Err(error) => return server_error(&error),
@@ -510,6 +514,7 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         .with("has_facts", &!flat.is_empty())
         .with("alerts", &alerts)
         .with("uptime", &uptime.map(format_uptime))
+        .with("agent_uptime", &own_uptime.map(format_uptime))
         .with(
             "own_memory",
             &own_memory.map(|bytes| format_value(Unit::Bytes, bytes)),

@@ -44,6 +44,7 @@
       <dt>Status</dt><dd>{{ agent.state }}{% if decided_by %} by {{ decided_by }}{% endif %}</dd>
       <dt>Online</dt><dd>{% if agent.online %}Yes{% else %}No{% endif %}{% if agent.seen %}, seen {{ agent.seen }}{% endif %}</dd>
       {% if uptime %}<dt>Uptime</dt><dd>{{ uptime }}</dd>{% endif %}
+      {% if agent_uptime %}<dt>Agent uptime</dt><dd>{{ agent_uptime }}</dd>{% endif %}
       {% if own_memory %}<dt>Agent memory</dt><dd>{{ own_memory }}</dd>{% endif %}
       {% if source %}<dt>Connected from</dt><dd><code>{{ source }}</code></dd>{% endif %}
       {% if agent_version %}<dt>Agent version</dt><dd>{{ agent_version }}{% if agent_commit %}, commit <code>{{ agent_commit }}</code>{% endif %}</dd>{% endif %}

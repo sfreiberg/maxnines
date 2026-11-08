@@ -733,6 +733,14 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::WithData,
     },
     Metric {
+        name: "agent.uptime",
+        title: "Agent uptime",
+        unit: Unit::Seconds,
+        collector: "agent",
+        source: Source::Fields(&[("Uptime", Reading::Field("$.uptime_secs"))]),
+        chart: ShowChart::Never,
+    },
+    Metric {
         name: "host.uptime",
         title: "Uptime",
         unit: Unit::Seconds,

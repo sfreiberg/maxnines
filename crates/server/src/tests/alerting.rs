@@ -5281,10 +5281,16 @@ mod pages {
         let mut client = server.connect_approved(&agent, "web-1").await;
         let sample = AgentMessage::Sample(Sample {
             timestamp_ms: now_ms() as u64 - 1000,
-            metrics: BTreeMap::from([(
-                "host".to_string(),
-                json!({ "uptime_secs": 4_603_242, "boot_time_secs": 1 }),
-            )]),
+            metrics: BTreeMap::from([
+                (
+                    "host".to_string(),
+                    json!({ "uptime_secs": 4_603_242, "boot_time_secs": 1 }),
+                ),
+                (
+                    "agent".to_string(),
+                    json!({ "uptime_secs": 7_260, "memory_bytes": 9_000_000, "cpu_percent": 0.1 }),
+                ),
+            ]),
         });
         send(&mut client, &sample).await;
         let facts = FlatFacts::from([
@@ -5326,6 +5332,8 @@ mod pages {
             .await;
         for text in [
             "53 days, 6 hours",
+            "Agent uptime",
+            "2 hours, 1 minute",
             "Ubuntu 24.04",
             "cpu.logical_cores",
             "Disk is filling up",
@@ -5380,6 +5388,56 @@ mod pages {
 
         let open = server.state.database.open_alerts().await.unwrap();
         assert_eq!(open[0].summary, "Uptime on web-1 is 1.5 m, below 10 m");
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_keeps_restarting_can_be_alerted_on() {
+        let server = start_with_metrics().await;
+        let agent = identity();
+        let mut client = server.connect_approved(&agent, "web-1").await;
+        let rule = AlertRuleInput {
+            name: "Agent restarted".to_string(),
+            metric: Some("agent.uptime".to_string()),
+            comparison: Some(Comparison::Below),
+            threshold: Some(600.0),
+            for_secs: 0,
+            ..cpu_rule()
+        };
+        server
+            .state
+            .database
+            .create_alert_rule(&rule)
+            .await
+            .unwrap();
+        let sample = AgentMessage::Sample(Sample {
+            timestamp_ms: now_ms() as u64 - 1000,
+            metrics: BTreeMap::from([("agent".to_string(), json!({ "uptime_secs": 90 }))]),
+        });
+        send(&mut client, &sample).await;
+
+        let metric = crate::metrics::find("agent.uptime").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while server
+            .state
+            .metrics
+            .newest(metric, now_ms())
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            assert!(Instant::now() < deadline, "the sample never arrived");
+            sleep(Duration::from_millis(10)).await;
+        }
+        evaluator(&server, now_ms() - 60 * MINUTE_MS)
+            .evaluate(now_ms())
+            .await
+            .unwrap();
+
+        let open = server.state.database.open_alerts().await.unwrap();
+        assert_eq!(
+            open[0].summary,
+            "Agent uptime on web-1 is 1.5 m, below 10 m"
+        );
     }
 
     #[tokio::test]

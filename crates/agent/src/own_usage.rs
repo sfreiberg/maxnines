@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 use sysinfo::{CpuRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System};
@@ -47,10 +49,17 @@ impl Collector for OwnUsageCollector {
             .system
             .process(self.pid)
             .ok_or_else(|| anyhow!("can't find the agent's own process"))?;
+        // From when the process started rather than when this collector did, so a
+        // restart shows however the agent was started. It's what shows an agent
+        // that keeps crashing, which looks like no more than a reconnect otherwise.
+        let uptime_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |now| now.as_secs().saturating_sub(process.start_time()));
         Ok(json!({
             "memory_bytes": process.memory(),
             // As a share of the whole machine, as other CPU figures are.
             "cpu_percent": f64::from(process.cpu_usage()) / self.cores as f64,
+            "uptime_secs": uptime_secs,
         }))
     }
 }
@@ -69,5 +78,8 @@ mod tests {
         assert!(output["memory_bytes"].as_u64().unwrap() > 0, "{output}");
         let cpu = output["cpu_percent"].as_f64().unwrap();
         assert!((0.0..=100.0).contains(&cpu), "{output}");
+        // This test process started moments ago, not when the machine did.
+        let uptime = output["uptime_secs"].as_u64().unwrap();
+        assert!(uptime < 3600, "{output}");
     }
 }
