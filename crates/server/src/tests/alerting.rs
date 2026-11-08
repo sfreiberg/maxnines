@@ -5570,11 +5570,15 @@ mod server_page {
             .unwrap()
             .series
             .into_iter()
-            .find(|s| s.name == "Online");
+            .find(|s| s.name == "Online")
+            .unwrap();
+        // The server also records its numbers by itself, from before the agent
+        // connected, so only the newest reading is sure to count it.
         assert_eq!(
-            online.unwrap().points[0].max,
+            online.points.last().unwrap().max,
             1.0,
-            "the server isn't counted"
+            "the agent isn't counted: {:?}",
+            online.points
         );
     }
 

@@ -49,14 +49,14 @@ pub struct Limits {
 }
 
 /// Measures how CPU time is spent between one call and the next.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 pub struct CpuTime {
     stats: System,
     /// Has a fixed start, so each sample needs a new one.
     started: Option<systemstat::DelayedMeasurement<systemstat::CPULoad>>,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 impl CpuTime {
     pub fn new() -> Self {
         let stats = System::new();
@@ -80,8 +80,9 @@ impl CpuTime {
     }
 }
 
-/// `/proc/stat`'s first line, in clock ticks since boot.
-#[cfg(any(target_os = "linux", test))]
+/// CPU time since boot: `/proc/stat`'s first line on Linux, in clock ticks, and
+/// `GetSystemTimes` on Windows, in 100 ns units.
+#[cfg(any(target_os = "linux", windows, test))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct CpuTicks {
     user: u64,
@@ -93,8 +94,9 @@ struct CpuTicks {
     steal: u64,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", windows, test))]
 impl CpuTicks {
+    #[cfg(any(target_os = "linux", test))]
     fn parse(text: &str) -> Option<Self> {
         let line = text.lines().find(|line| line.starts_with("cpu "))?;
         let mut numbers = line.split_whitespace().skip(1).map(str::parse::<u64>);
@@ -143,13 +145,14 @@ impl CpuTicks {
     }
 }
 
-/// Measures how CPU time is spent between one call and the next.
-#[cfg(target_os = "linux")]
+/// Measures how CPU time is spent between one call and the next, from counters
+/// that always add up to the whole of the time.
+#[cfg(any(target_os = "linux", windows))]
 pub struct CpuTime {
     previous: Option<CpuTicks>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 impl CpuTime {
     pub fn new() -> Self {
         Self {
@@ -157,8 +160,35 @@ impl CpuTime {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn read() -> Option<CpuTicks> {
         CpuTicks::parse(&std::fs::read_to_string("/proc/stat").ok()?)
+    }
+
+    /// Windows' performance counters for user, privileged and idle time are each
+    /// read at a slightly different moment, and privileged time includes interrupts,
+    /// so they don't add up. These three totals do.
+    #[cfg(windows)]
+    fn read() -> Option<CpuTicks> {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::GetSystemTimes;
+
+        let mut idle = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut kernel, mut user) = (idle, idle);
+        // SAFETY: each pointer is to a FILETIME of ours, which is all it writes.
+        let read = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) } != 0;
+        let total =
+            |time: FILETIME| u64::from(time.dwHighDateTime) << 32 | u64::from(time.dwLowDateTime);
+        read.then(|| CpuTicks {
+            user: total(user),
+            // Kernel time includes the time spent idle.
+            system: total(kernel).saturating_sub(total(idle)),
+            idle: total(idle),
+            ..CpuTicks::default()
+        })
     }
 
     pub fn measure(&mut self) -> Option<Value> {
@@ -167,18 +197,34 @@ impl CpuTime {
             .zip(self.previous)
             .and_then(|(new, old)| new.percent_since(&old));
         self.previous = now;
-        time
+        time.map(only_what_is_measured)
     }
 }
 
-/// Reads `/proc/stat`'s `ctxt` and `intr` lines. The first number on `intr` is
-/// the total, and the rest are per interrupt.
+/// Linux measures every part of CPU time.
+#[cfg(target_os = "linux")]
+fn only_what_is_measured(time: Value) -> Value {
+    time
+}
+
+/// Windows only tells user, system and idle time apart, so the parts Linux has
+/// are left out rather than reported as none.
+#[cfg(windows)]
+fn only_what_is_measured(mut time: Value) -> Value {
+    if let Some(parts) = time.as_object_mut() {
+        parts.retain(|name, _| matches!(name.as_str(), "user" | "system" | "idle"));
+    }
+    time
+}
+
 impl Default for CpuTime {
     fn default() -> Self {
         Self::new()
     }
 }
 
+/// Reads `/proc/stat`'s `ctxt` and `intr` lines. The first number on `intr` is
+/// the total, and the rest are per interrupt.
 #[cfg(any(target_os = "linux", test))]
 fn parse_proc_stat(text: &str) -> (Option<u64>, Option<u64>) {
     let total = |wanted: &str| {
