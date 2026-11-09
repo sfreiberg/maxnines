@@ -2525,6 +2525,8 @@ fn parses_commands() {
     );
     assert_eq!(cli.config.to_str(), Some("my.hcl"));
 
+    assert_eq!(parse("version").unwrap().command, Some(Command::Version));
+
     assert!(parse("agents approve").is_err());
     assert!(parse("agents delete abc").is_err());
 }

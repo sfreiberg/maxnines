@@ -66,6 +66,8 @@ enum Command {
     Identity(IdentityCommand),
     /// Print the facts this agent reports
     Facts,
+    /// Print this agent's version, and exactly which build it is
+    Version,
     /// Run the agent as a Windows service
     #[cfg(windows)]
     #[command(subcommand)]
@@ -100,6 +102,11 @@ fn main() -> Result<()> {
         Command::Service(ServiceCommand::Uninstall) => service::uninstall(&SERVICE),
         #[cfg(windows)]
         Command::Service(ServiceCommand::Run) => service::run(&SERVICE, &cli.config, run),
+        Command::Version => {
+            let build = maxnines_protocol::build_info!();
+            println!("{}", build.describe(env!("CARGO_PKG_NAME")));
+            Ok(())
+        }
         Command::Facts => {
             let config = Config::load(&cli.config)?;
             let facts = facts::gather(&config.facts, &config.custom_metrics)?;
@@ -356,6 +363,9 @@ mod tests {
 
         let cli = parse("facts").unwrap();
         assert_eq!(cli.command, Some(Command::Facts));
+
+        let cli = parse("version").unwrap();
+        assert_eq!(cli.command, Some(Command::Version));
 
         let cli = parse("-c my.hcl identity show").unwrap();
         assert_eq!(cli.command, Some(Command::Identity(IdentityCommand::Show)));

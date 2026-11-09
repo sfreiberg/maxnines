@@ -125,6 +125,16 @@ impl BuildInfo {
             built_at: known(built_at),
         }
     }
+
+    /// What a program's `version` command prints: its name and version, then exactly
+    /// which build it is and what it runs on.
+    pub fn describe(&self, program: &str) -> String {
+        let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+        format!(
+            "{program} {}\ncommit:   {}\nbuilt:    {}\nplatform: {platform}",
+            self.version, self.commit, self.built_at
+        )
+    }
 }
 
 /// The calling program's own build. It's a macro so that the values come from
@@ -1031,6 +1041,21 @@ mod tests {
                 message
             );
         }
+    }
+
+    #[test]
+    fn a_build_describes_itself_for_the_version_command() {
+        let build = BuildInfo::new("1.2.3", "abc123", "false", "2026-11-04T10:00:00Z");
+
+        let text = build.describe("maxnines-agent");
+
+        let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+        assert_eq!(
+            text,
+            format!(
+                "maxnines-agent 1.2.3\ncommit:   abc123\nbuilt:    2026-11-04T10:00:00Z\nplatform: {platform}"
+            )
+        );
     }
 
     #[test]

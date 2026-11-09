@@ -97,6 +97,8 @@ enum Command {
     /// Manage who can sign in, in the main database
     #[command(subcommand)]
     Users(UsersCommand),
+    /// Print this server's version, and exactly which build it is
+    Version,
     /// Run the server as a Windows service
     #[cfg(windows)]
     #[command(subcommand)]
@@ -168,6 +170,11 @@ fn main() -> Result<()> {
         #[cfg(windows)]
         Command::Service(ServiceCommand::Run) => {
             service::run(&SERVICE, &cli.config, |path| serve(&path))
+        }
+        Command::Version => {
+            let build = maxnines_protocol::build_info!();
+            println!("{}", build.describe(env!("CARGO_PKG_NAME")));
+            Ok(())
         }
         Command::Users(command) => {
             let config = Config::load(&cli.config)?;

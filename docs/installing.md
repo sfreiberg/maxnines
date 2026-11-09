@@ -70,3 +70,15 @@ the GitHub CLI:
 gh attestation verify maxnines-agent-0.1.0-x86_64-unknown-linux-musl.tar.gz \
   --repo sfreiberg/maxnines
 ```
+
+## Checking what's installed
+
+Each program prints its version, the commit it was built from, when it was built and
+the system it's for:
+
+```sh
+maxnines-agent version
+maxnines-server version
+```
+
+`--version` prints just the version.
