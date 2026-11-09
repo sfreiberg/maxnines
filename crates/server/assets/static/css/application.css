@@ -126,6 +126,9 @@ main > .breadcrumb { margin-bottom: -12px; }
 .problem:last-child { border-bottom: 0; }
 .problem .text { flex: 1 1 320px; min-width: 0; overflow-wrap: anywhere; }
 .problem .button, .problem button { min-height: 36px; padding: 0 14px; font-size: 14px; }
+.problem .host-button { gap: 8px; }
+.problem-host { flex: 0 0 auto; min-width: 9rem; color: var(--text); font-weight: 600; text-decoration: none; }
+a.problem-host:hover { text-decoration: underline; }
 .error, .notice { margin: 0; padding: 12px 14px; border-radius: 13px; overflow-wrap: anywhere; }
 .error { background: var(--bad-surface); color: var(--bad); }
 .notice { background: var(--accent-surface); color: var(--accent-ink); }

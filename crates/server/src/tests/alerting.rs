@@ -1009,6 +1009,45 @@ async fn a_critical_alert_reaches_a_critical_only_channel_straight_away() {
 }
 
 #[tokio::test]
+async fn alerts_lead_with_the_machine_and_keep_its_id_for_hovering() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        for_secs: 0,
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    let client = test.client.as_mut().unwrap();
+    send(client, &facts("24.04")).await;
+    test.server.wait_for_facts(&test.id(), 2).await;
+    test.cpu(0, 95.0).await;
+    let short = crate::registration::short_id(&test.id()).to_string();
+
+    let mut browser = Browser::default();
+    let alerts = browser.get(&test.server, "/alerts").await;
+    assert!(
+        alerts.body.contains(&format!(
+            r#"title="Agent {short}"><span class="os-icon os-linux""#
+        )),
+        "{}",
+        alerts.body
+    );
+    assert!(
+        !alerts
+            .body
+            .contains(&format!(r#"<span class="agent-id">{short}"#))
+    );
+
+    let overview = browser.get(&test.server, "/").await;
+    let host = overview
+        .body
+        .find(r#"class="host-name problem-host""#)
+        .unwrap();
+    let summary = overview.body.find("CPU usage on web-1 is 95%").unwrap();
+    assert!(host < summary, "{}", overview.body);
+    assert!(overview.body.contains("os-linux"));
+}
+
+#[tokio::test]
 async fn a_rule_can_not_have_every_channel_and_some_of_them() {
     let rule = AlertRuleInput {
         all_channels: true,

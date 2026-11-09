@@ -7,12 +7,14 @@ use axum::routing::get;
 use axum_csrf::CsrfToken;
 use serde::Serialize;
 
+use super::fleet::OsFamily;
 use super::metrics::{CheckRow, check_row};
 use super::server::count;
 use super::{Page, fleet, server_error};
 use crate::alerting::Severity;
 use crate::app_state::AppState;
-use crate::registration::AgentState;
+use crate::registration::{AgentState, short_id};
+use crate::remote_checks::{FLEET_AGENT_ID, LOCAL_AGENT_ID};
 
 /// How many of each are shown. The page links to the full lists.
 const MAX_PROBLEMS: usize = 8;
@@ -27,6 +29,11 @@ pub fn routes() -> Router<AppState> {
 struct Problem {
     critical: bool,
     summary: String,
+    agent_id: String,
+    host: String,
+    /// Empty for the fleet and the server, which are one of a kind.
+    short_id: String,
+    os_family: Option<OsFamily>,
 }
 
 #[derive(Serialize)]
@@ -52,16 +59,28 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
         .iter()
         .filter(|alert| alert.severity == Severity::Critical)
         .count();
-    let mut problems: Vec<(bool, String)> = alerts
+    let ids: Vec<&str> = alerts.iter().map(|alert| alert.agent_id.as_str()).collect();
+    let facts = match state.database.facts_of(&ids).await {
+        Ok(facts) => facts,
+        Err(error) => return server_error(&error),
+    };
+    let mut problems: Vec<Problem> = alerts
         .into_iter()
-        .map(|alert| (alert.severity == Severity::Critical, alert.summary))
+        .map(|alert| Problem {
+            critical: alert.severity == Severity::Critical,
+            os_family: facts.get(&alert.agent_id).and_then(OsFamily::of),
+            short_id: if alert.agent_id == FLEET_AGENT_ID || alert.agent_id == LOCAL_AGENT_ID {
+                String::new()
+            } else {
+                short_id(&alert.agent_id).to_string()
+            },
+            summary: alert.summary,
+            agent_id: alert.agent_id,
+            host: alert.host,
+        })
         .collect();
-    problems.sort_by_key(|(critical, _)| !critical);
-    let problems: Vec<Problem> = problems
-        .into_iter()
-        .take(MAX_PROBLEMS)
-        .map(|(critical, summary)| Problem { critical, summary })
-        .collect();
+    problems.sort_by_key(|problem| !problem.critical);
+    problems.truncate(MAX_PROBLEMS);
 
     let agent_count = agents.len();
     let online_count = agents.iter().filter(|agent| agent.online).count();

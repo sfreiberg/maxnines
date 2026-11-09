@@ -6,6 +6,7 @@ use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
 use serde::Serialize;
 
+use super::fleet::OsFamily;
 use super::{CsrfForm, Page, local_time, server_error, signed_in_user};
 use crate::alerting::{Alert, DeliveryProblem};
 use crate::app_state::AppState;
@@ -35,6 +36,7 @@ struct AlertRow {
     /// Empty for the fleet and the server, which are one of a kind.
     short_id: String,
     host: String,
+    os_family: Option<OsFamily>,
     rule_name: String,
     severity: &'static str,
     summary: String,
@@ -78,6 +80,7 @@ impl From<Alert> for AlertRow {
             },
             agent_id: alert.agent_id,
             host: alert.host,
+            os_family: None,
             rule_name: alert.rule_name,
             summary: alert.summary,
         }
@@ -121,6 +124,19 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
         Ok(rows) => rows,
         Err(error) => return server_error(&error),
     };
+    let ids: Vec<&str> = open
+        .iter()
+        .chain(&resolved)
+        .map(|alert| alert.agent_id.as_str())
+        .collect();
+    let facts = match state.database.facts_of(&ids).await {
+        Ok(facts) => facts,
+        Err(error) => return server_error(&error),
+    };
+    let row = |alert: Alert| AlertRow {
+        os_family: facts.get(&alert.agent_id).and_then(OsFamily::of),
+        ..AlertRow::from(alert)
+    };
 
     let open: Vec<AlertRow> = open
         .into_iter()
@@ -130,11 +146,11 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
                 .map(|cover| local_time(cover.ends_ms()));
             AlertRow {
                 silenced_until: silence,
-                ..AlertRow::from(alert)
+                ..row(alert)
             }
         })
         .collect();
-    let resolved: Vec<AlertRow> = resolved.into_iter().map(AlertRow::from).collect();
+    let resolved: Vec<AlertRow> = resolved.into_iter().map(row).collect();
     let problems: Vec<ProblemRow> = problems
         .into_iter()
         .filter(|problem| problem.state != "sent")
