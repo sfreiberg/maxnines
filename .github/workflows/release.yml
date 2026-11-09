@@ -362,6 +362,11 @@ jobs:
           # Everything but the bare binaries, which are only there for packaging.
           find artifacts -type f ! -path '*/target.nosync/*' -exec cp {} release/ \;
           cd release
+          # GitHub turns the "~" in a pre-release package's name into ".", so
+          # it's done first, for the checksums to name the files people download.
+          for file in *~*; do
+            if [ -e "$file" ]; then mv "$file" "$(echo "$file" | tr '~' .)"; fi
+          done
           sha256sum * > SHA256SUMS
           ls -l
       # Lets anyone check a download was built here, from this repository.
