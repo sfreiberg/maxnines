@@ -1531,6 +1531,7 @@ mod tests {
             series: Some("/data*".to_string()),
             comparison: Some(Comparison::Above),
             threshold: Some(90.5),
+            warning_threshold: None,
             for_secs: 120,
             severity: Severity::Critical,
             condition: Some("true".to_string()),

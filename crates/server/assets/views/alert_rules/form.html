@@ -42,8 +42,13 @@
         </select>
       </label>
 
-      <label>Threshold
-        <input type="text" name="threshold" value="{{ rule.threshold }}" inputmode="decimal" spellcheck="false">
+      <label>Warning threshold
+        <input type="text" name="warning_threshold" value="{{ rule.warning_threshold }}" inputmode="decimal" spellcheck="false">
+      </label>
+
+      <label>Critical threshold
+        <input type="text" name="critical_threshold" value="{{ rule.critical_threshold }}" inputmode="decimal" spellcheck="false">
+        <small>Fill in either or both. With both, one alert starts as a warning and becomes critical at this threshold, and only the worse of the two is sent.</small>
       </label>
 
       <label>Combine machines using
@@ -101,6 +106,7 @@
         <option value="warning"{% if rule.severity == "warning" %} selected{% endif %}>Warning</option>
         <option value="critical"{% if rule.severity == "critical" %} selected{% endif %}>Critical</option>
       </select>
+      <small>Only for an agent going offline. A metric or calculation takes its severity from the thresholds.</small>
     </label>
   </fieldset>
 

@@ -11,6 +11,7 @@ pub struct Model {
     pub series: Option<String>,
     pub comparison: Option<String>,
     pub threshold: Option<f64>,
+    pub warning_threshold: Option<f64>,
     pub for_secs: i64,
     pub severity: String,
     pub condition_expr: Option<String>,

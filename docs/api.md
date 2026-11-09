@@ -731,8 +731,9 @@ Returns `204`.
 | `series` | Limits a metric rule to matching series, with `*` and `?` wildcards |
 | `comparison` | For metric and calculation rules, `above` or `below` |
 | `threshold` | For metric and calculation rules, the value to compare with |
+| `warning_threshold` | Optional, for a critical metric or calculation rule. Where it's a warning first, before `threshold`. One alert covers both, at the worse of the two, as in [warning, then critical](alerts.md#warning-then-critical) |
 | `for_secs` | Required. How long a problem lasts before firing, and how long it has to stay gone before resolving |
-| `severity` | Required. `warning` or `critical` |
+| `severity` | Required. `warning` or `critical`, for crossing `threshold` |
 | `condition` | A CEL expression limiting which agents this covers |
 | `enabled` | Defaults to `true` |
 | `channels` | IDs of the [channels](#notification-channels) to tell. With none, an alert only shows in the web interface |
@@ -818,6 +819,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "series": null,
   "comparison": "above",
   "threshold": 90.0,
+  "warning_threshold": null,
   "for_secs": 300,
   "severity": "warning",
   "condition": null,

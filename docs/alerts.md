@@ -2,25 +2,40 @@
 
 ## The built-in rules
 
-Every server starts with three alert rules:
+Every server starts with two alert rules:
 
 | Rule | Fires when | Severity |
 | --- | --- | --- |
 | **Agent offline** | An approved agent has been gone for 5 minutes | Critical |
-| **Disk filling up** | A disk has been over 80% full for 5 minutes | Warning |
-| **Disk nearly full** | A disk has been over 90% full for 5 minutes | Critical |
+| **Disk filling up** | A disk has been over 80% full for 5 minutes, or over 90% | Warning, then critical |
 
-Each disk alerts on its own, and a disk over 90% has both alerts open. They tell
-every notification channel, including ones added later, so they start working as soon
+Each disk alerts on its own. They tell every notification channel, including ones added later, so they start working as soon
 as there's a channel to tell. Until then they show on the Alerts page and the overview.
 
 They're ordinary rules from then on: change them, turn them off or delete them under
 **Settings > Alert rules**, and upgrades leave them alone. A server that already had an
 offline rule of its own when it upgraded doesn't get a second one, and one with a
-disk usage rule of its own doesn't get the disk rules.
+disk usage rule of its own doesn't get the disk rule.
 
 Any rule can tell every channel this way, with **Every channel, including ones added
 later**, or tell only the channels chosen.
+
+## Warning, then critical
+
+A metric or calculation rule can have a warning threshold, a critical threshold, or
+both. With both, there's one alert for each thing it watches, at the worse of the two:
+a disk at 85% is a warning, and the same alert becomes critical when the disk passes
+90%. Each threshold has to be crossed for the rule's **For at least** time to count, and
+be clear that long to stop counting.
+
+- **Getting worse** sends a **Now critical** notification to every channel that heard
+  the alert start, and clears any acknowledgement, so someone has to pick it up again.
+- **Getting better** without clearing sends **Down to a warning** to the same channels.
+- **Clearing** resolves the alert, whichever it was at.
+
+A channel whose first notification hasn't gone out yet gets the alert as it is when it
+does. On-call services get the change on the same incident, so they show the new
+severity without opening another. Webhooks see the events `escalated` and `eased`.
 
 ## Silences
 

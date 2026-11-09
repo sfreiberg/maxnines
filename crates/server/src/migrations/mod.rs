@@ -22,6 +22,7 @@ impl MigratorTrait for Migrator {
             Box::new(AddUserTimeZones),
             Box::new(AddBuiltInAlerts),
             Box::new(AddBuiltInDiskAlerts),
+            Box::new(AddWarningThresholds),
         ]
     }
 }
@@ -1486,6 +1487,99 @@ impl MigrationTrait for AddBuiltInDiskAlerts {
     }
 }
 
+// ---- Warning thresholds
+
+struct AddWarningThresholds;
+
+impl MigrationName for AddWarningThresholds {
+    fn name(&self) -> &str {
+        "m20261109_000011_add_warning_thresholds"
+    }
+}
+
+#[derive(Iden)]
+enum WarningThresholds {
+    #[iden = "alert_rules"]
+    Table,
+    /// For a critical rule, where it's a warning first.
+    WarningThreshold,
+}
+
+/// What the two built-in disk rules become: one alert per disk, at the worse of
+/// the two.
+const MERGED_DISK_RULE_NAME: &str = "Disk filling up";
+
+/// Lets one rule be a warning first and critical later, and makes the built-in
+/// disk rules one rule like that, so a full disk sends a critical alert instead of
+/// a warning and a critical one. They're only joined if both are still as added.
+#[async_trait::async_trait]
+impl MigrationTrait for AddWarningThresholds {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(WarningThresholds::Table)
+                    .add_column(ColumnDef::new(WarningThresholds::WarningThreshold).double())
+                    .to_owned(),
+            )
+            .await?;
+
+        let connection = manager.get_connection();
+        let mut built_in = Vec::new();
+        for (name, threshold, severity) in DISK_RULES {
+            let rule = Query::select()
+                .column(AlertRules::Id)
+                .from(AlertRules::Table)
+                .and_where(Expr::col(AlertRules::Name).eq(name))
+                .and_where(Expr::col(AlertRules::Kind).eq("metric"))
+                .and_where(Expr::col(AlertRules::Metric).eq(DISK_USAGE))
+                .and_where(Expr::col(AlertRules::Series).is_null())
+                .and_where(Expr::col(AlertRules::Comparison).eq("above"))
+                .and_where(Expr::col(AlertRules::Threshold).eq(threshold))
+                .and_where(Expr::col(AlertRules::ForSecs).eq(DISK_RULE_SECS))
+                .and_where(Expr::col(AlertRules::Severity).eq(severity))
+                .and_where(Expr::col(AlertRules::ConditionExpr).is_null())
+                .and_where(Expr::col(AlertRules::RemindEverySecs).is_null())
+                .and_where(Expr::col(AlertRules::Enabled).eq(true))
+                .and_where(Expr::col(EveryChannel::AllChannels).eq(true))
+                .to_owned();
+            match connection.query_one(&rule).await? {
+                Some(row) => built_in.push(row.try_get::<i64>("", "id")?),
+                None => return Ok(()),
+            }
+        }
+        let [warning, critical] = built_in[..] else {
+            return Ok(());
+        };
+
+        // Its open alerts end, with notifications, as for any deleted rule. It goes
+        // first, as the one kept takes its name.
+        let gone = Query::delete()
+            .from_table(AlertRules::Table)
+            .and_where(Expr::col(AlertRules::Id).eq(warning))
+            .to_owned();
+        manager.exec_stmt(gone).await?;
+        let merged = Query::update()
+            .table(AlertRules::Table)
+            .value(AlertRules::Name, MERGED_DISK_RULE_NAME)
+            .value(WarningThresholds::WarningThreshold, DISK_RULES[0].1)
+            .and_where(Expr::col(AlertRules::Id).eq(critical))
+            .to_owned();
+        manager.exec_stmt(merged).await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(WarningThresholds::Table)
+                    .drop_column(WarningThresholds::WarningThreshold)
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
@@ -1509,7 +1603,7 @@ mod tests {
             .max_connections(1)
             .to_owned();
         let connection = Database::connect(options).await.unwrap();
-        let before = Migrator::migrations().len() as u32 - 2;
+        let before = Migrator::migrations().len() as u32 - 3;
         Migrator::up(&connection, Some(before)).await.unwrap();
         connection
             .execute_unprepared(
@@ -1530,7 +1624,7 @@ mod tests {
             .max_connections(1)
             .to_owned();
         let connection = Database::connect(options).await.unwrap();
-        let before = Migrator::migrations().len() as u32 - 1;
+        let before = Migrator::migrations().len() as u32 - 2;
         Migrator::up(&connection, Some(before)).await.unwrap();
         connection
             .execute_unprepared(
@@ -1553,5 +1647,58 @@ mod tests {
             .map(|row| row.try_get::<String>("", "name").unwrap())
             .collect();
         assert_eq!(names, ["Full"]);
+    }
+
+    async fn disk_rules(connection: &impl ConnectionTrait) -> Vec<(String, f64, Option<f64>)> {
+        let query = Statement::from_string(
+            connection.get_database_backend(),
+            "SELECT name, threshold, warning_threshold FROM alert_rules
+             WHERE metric = 'disk.usage' ORDER BY id",
+        );
+        let rows = connection.query_all_raw(query).await.unwrap();
+        rows.iter()
+            .map(|row| {
+                (
+                    row.try_get("", "name").unwrap(),
+                    row.try_get("", "threshold").unwrap(),
+                    row.try_get("", "warning_threshold").unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    async fn fresh() -> sea_orm::DatabaseConnection {
+        let options = ConnectOptions::new("sqlite::memory:")
+            .max_connections(1)
+            .to_owned();
+        Database::connect(options).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_built_in_disk_rules_become_one_unless_they_were_changed() {
+        let connection = fresh().await;
+        Migrator::up(&connection, None).await.unwrap();
+        assert_eq!(
+            disk_rules(&connection).await,
+            [("Disk filling up".to_string(), 90.0, Some(80.0))]
+        );
+
+        let connection = fresh().await;
+        let before = Migrator::migrations().len() as u32 - 1;
+        Migrator::up(&connection, Some(before)).await.unwrap();
+        connection
+            .execute_unprepared(
+                "UPDATE alert_rules SET threshold = 85 WHERE name = 'Disk filling up'",
+            )
+            .await
+            .unwrap();
+        Migrator::up(&connection, None).await.unwrap();
+        assert_eq!(
+            disk_rules(&connection).await,
+            [
+                ("Disk filling up".to_string(), 85.0, None),
+                ("Disk nearly full".to_string(), 90.0, None),
+            ]
+        );
     }
 }

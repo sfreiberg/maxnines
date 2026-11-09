@@ -36,7 +36,8 @@ struct AlertRuleForm {
     metric: String,
     series: String,
     comparison: String,
-    threshold: String,
+    warning_threshold: String,
+    critical_threshold: String,
     for_secs: String,
     severity: String,
     enabled: bool,
@@ -60,7 +61,8 @@ impl AlertRuleForm {
             metric: METRICS[0].name.to_string(),
             series: String::new(),
             comparison: Comparison::Above.as_str().to_string(),
-            threshold: String::new(),
+            warning_threshold: String::new(),
+            critical_threshold: String::new(),
             for_secs: "300".to_string(),
             severity: Severity::Warning.as_str().to_string(),
             enabled: true,
@@ -105,7 +107,18 @@ impl AlertRuleForm {
             comparison: rule
                 .comparison
                 .map_or(blank.comparison, |c| c.as_str().to_string()),
-            threshold: rule.threshold.map(|t| t.to_string()).unwrap_or_default(),
+            warning_threshold: rule
+                .levels()
+                .iter()
+                .find(|(severity, _)| *severity == Severity::Warning)
+                .map(|(_, threshold)| threshold.to_string())
+                .unwrap_or_default(),
+            critical_threshold: rule
+                .levels()
+                .iter()
+                .find(|(severity, _)| *severity == Severity::Critical)
+                .map(|(_, threshold)| threshold.to_string())
+                .unwrap_or_default(),
             for_secs: rule.for_secs.to_string(),
             severity: rule.severity.as_str().to_string(),
             enabled: rule.enabled,
@@ -129,7 +142,8 @@ impl AlertRuleForm {
             metric: text("metric"),
             series: text("series"),
             comparison: text("comparison"),
-            threshold: text("threshold"),
+            warning_threshold: text("warning_threshold"),
+            critical_threshold: text("critical_threshold"),
             for_secs: text("for_secs"),
             severity: text("severity"),
             enabled: fields.contains_key("enabled"),
@@ -162,36 +176,31 @@ impl AlertRuleForm {
         };
 
         // The form always sends these, and they only mean something for metrics.
-        let (metric, series, comparison, threshold) = match kind {
-            RuleKind::Offline => (None, None, None, None),
-            RuleKind::Calculation => {
-                let threshold = self
-                    .threshold
-                    .trim()
-                    .parse()
-                    .context("the threshold must be a number")?;
-                (
-                    Some(self.metric.clone()),
-                    None,
-                    Some(Comparison::parse(&self.comparison)?),
-                    Some(threshold),
-                )
-            }
+        let (metric, series, comparison) = match kind {
+            RuleKind::Offline => (None, None, None),
+            RuleKind::Calculation => (
+                Some(self.metric.clone()),
+                None,
+                Some(Comparison::parse(&self.comparison)?),
+            ),
             RuleKind::Metric => {
-                let threshold = self.threshold.trim();
-                if threshold.is_empty() {
-                    bail!("a metric rule needs a threshold");
-                }
-                let threshold: f64 = threshold
-                    .parse()
-                    .context("the threshold must be a number")?;
                 let series = self.series.trim();
                 (
                     Some(self.metric.clone()),
                     (!series.is_empty()).then(|| series.to_string()),
                     Some(Comparison::parse(&self.comparison)?),
-                    Some(threshold),
                 )
+            }
+        };
+        let (threshold, warning_threshold, severity) = match kind {
+            RuleKind::Offline => (None, None, Severity::parse(&self.severity)?),
+            RuleKind::Metric | RuleKind::Calculation => {
+                let warning = number(&self.warning_threshold, "warning")?;
+                match (warning, number(&self.critical_threshold, "critical")?) {
+                    (None, None) => bail!("a rule needs a warning or critical threshold, or both"),
+                    (Some(warning), None) => (Some(warning), None, Severity::Warning),
+                    (warning, Some(critical)) => (Some(critical), warning, Severity::Critical),
+                }
             }
         };
 
@@ -228,13 +237,25 @@ impl AlertRuleForm {
             series,
             comparison,
             threshold,
+            warning_threshold,
             for_secs,
-            severity: Severity::parse(&self.severity)?,
+            severity,
             condition,
             enabled: self.enabled,
             channels: self.channels.iter().copied().collect(),
             all_channels: self.all_channels,
         })
+    }
+}
+
+/// A threshold typed into the form, which may be left empty.
+fn number(text: &str, which: &str) -> Result<Option<f64>> {
+    match text.trim() {
+        "" => Ok(None),
+        text => text
+            .parse()
+            .map(Some)
+            .with_context(|| format!("the {which} threshold must be a number")),
     }
 }
 
@@ -335,7 +356,8 @@ struct RuleRow {
     name: String,
     watches: String,
     applies_to: String,
-    severity: &'static str,
+    /// Mildest first. A rule with a warning and a critical threshold has both.
+    severities: Vec<&'static str>,
     channels: String,
     enabled: bool,
 }
@@ -367,7 +389,13 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
                     Some(condition) => Builder::from_expression(condition)
                         .map_or_else(|| condition.to_string(), |builder| builder.describe()),
                 },
-                severity: rule.rule.severity.as_str(),
+                severities: match rule.rule.levels().as_slice() {
+                    [] => vec![rule.rule.severity.as_str()],
+                    levels => levels
+                        .iter()
+                        .map(|(severity, _)| severity.as_str())
+                        .collect(),
+                },
                 channels: if rule.rule.all_channels {
                     "Every channel".to_string()
                 } else {
@@ -492,6 +520,7 @@ mod tests {
             series: Some("/data*".to_string()),
             comparison: Some(Comparison::Below),
             threshold: Some(12.5),
+            warning_threshold: None,
             for_secs: 60,
             severity: Severity::Critical,
             condition: Some("true".to_string()),
@@ -516,11 +545,52 @@ mod tests {
     }
 
     #[test]
+    fn warning_and_critical_thresholds_survive_the_trip_through_the_form() {
+        let both = AlertRuleInput {
+            warning_threshold: Some(20.0),
+            ..rule()
+        };
+        let warning_only = AlertRuleInput {
+            severity: Severity::Warning,
+            ..rule()
+        };
+        for original in [both, warning_only] {
+            let mut form = AlertRuleForm::from_rule(&original);
+            form.applies_to.use_expression = true;
+            form.applies_to.condition = "true".to_string();
+            assert_eq!(form.to_rule(&BTreeMap::new()).unwrap(), original);
+        }
+
+        let form = AlertRuleForm::from_rule(&AlertRuleInput {
+            warning_threshold: Some(20.0),
+            ..rule()
+        });
+        assert_eq!(form.warning_threshold, "20");
+        assert_eq!(form.critical_threshold, "12.5");
+    }
+
+    #[test]
+    fn only_an_offline_rule_takes_its_severity_from_the_form() {
+        let mut form = AlertRuleForm::blank();
+        form.name = "Gone".to_string();
+        form.kind = "offline".to_string();
+        form.severity = "nonsense".to_string();
+        let error = format!("{:#}", form.to_rule(&BTreeMap::new()).unwrap_err());
+        assert!(error.contains("unknown severity"), "{error}");
+
+        form.kind = "metric".to_string();
+        form.warning_threshold = "80".to_string();
+        let input = form.to_rule(&BTreeMap::new()).unwrap();
+        assert_eq!(input.severity, Severity::Warning);
+    }
+
+    #[test]
     fn an_offline_rule_ignores_the_metric_fields_the_form_still_sends() {
         let mut form = AlertRuleForm::blank();
         form.name = "Gone".to_string();
         form.kind = "offline".to_string();
-        form.threshold = "not a number".to_string();
+        form.warning_threshold = "not a number".to_string();
+        form.critical_threshold = "nor this".to_string();
         form.series = "/".to_string();
 
         let input = form.to_rule(&BTreeMap::new()).unwrap();
@@ -534,22 +604,31 @@ mod tests {
     #[test]
     fn typing_mistakes_are_explained() {
         for (change, expected) in [
-            (("threshold", ""), "needs a threshold"),
-            (("threshold", "lots"), "must be a number"),
+            (
+                ("critical_threshold", ""),
+                "needs a warning or critical threshold",
+            ),
+            (
+                ("critical_threshold", "lots"),
+                "critical threshold must be a number",
+            ),
+            (
+                ("warning_threshold", "some"),
+                "warning threshold must be a number",
+            ),
             (("for_secs", "soon"), "whole number"),
             (("for_secs", "-1"), "whole number"),
             (("kind", "nonsense"), "unknown rule kind"),
-            (("severity", "nonsense"), "unknown severity"),
             (("comparison", "nonsense"), "unknown comparison"),
         ] {
             let mut form = AlertRuleForm::blank();
-            form.threshold = "90".to_string();
+            form.critical_threshold = "90".to_string();
             let (field, value) = change;
             let target = match field {
-                "threshold" => &mut form.threshold,
+                "critical_threshold" => &mut form.critical_threshold,
+                "warning_threshold" => &mut form.warning_threshold,
                 "for_secs" => &mut form.for_secs,
                 "kind" => &mut form.kind,
-                "severity" => &mut form.severity,
                 _ => &mut form.comparison,
             };
             *target = value.to_string();

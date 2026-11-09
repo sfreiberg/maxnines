@@ -17,7 +17,7 @@
       <td><a href="/alerts/rules/{{ rule.id }}/edit">{{ rule.name }}</a></td>
       <td>{{ rule.watches }}</td>
       <td>{{ rule.applies_to }}</td>
-      <td>{% if rule.severity == "critical" %}<span class="badge bad">Critical</span>{% else %}<span class="badge warn">Warning</span>{% endif %}</td>
+      <td>{% for severity in rule.severities %}{% if severity == "critical" %}<span class="badge bad">Critical</span>{% else %}<span class="badge warn">Warning</span>{% endif %}{% if not loop.last %} {% endif %}{% endfor %}</td>
       <td>{% if rule.channels %}{{ rule.channels }}{% else %}<span class="hint">Only this site</span>{% endif %}</td>
       <td>{% if not rule.enabled %}<span class="badge neutral">Disabled</span>{% endif %}</td>
     </tr>

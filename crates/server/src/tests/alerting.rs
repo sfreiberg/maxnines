@@ -188,6 +188,7 @@ fn cpu_rule() -> AlertRuleInput {
         series: None,
         comparison: Some(Comparison::Above),
         threshold: Some(90.0),
+        warning_threshold: None,
         for_secs: 120,
         severity: Severity::Critical,
         condition: None,
@@ -710,10 +711,7 @@ async fn every_server_starts_with_rules_for_agents_going_offline_and_disks_filli
         .into_iter()
         .map(|rule| rule.name)
         .collect();
-    assert_eq!(
-        names,
-        ["Agent offline", "Disk filling up", "Disk nearly full"]
-    );
+    assert_eq!(names, ["Agent offline", "Disk filling up"]);
 }
 
 #[tokio::test]
@@ -761,62 +759,114 @@ async fn the_built_in_rule_tells_every_channel_once_an_agent_is_gone_5_minutes()
 #[tokio::test]
 async fn every_server_starts_with_a_warning_at_80_percent_full_and_critical_at_90() {
     let rules = built_in_rules().await;
-    let disk: Vec<(&str, Option<f64>, Severity)> = rules
+    let disk: Vec<&AlertRuleInput> = rules
         .iter()
         .filter(|rule| rule.metric.as_deref() == Some("disk.usage"))
-        .map(|rule| (rule.name.as_str(), rule.threshold, rule.severity))
         .collect();
+    let [rule] = disk[..] else {
+        panic!("{disk:?}");
+    };
+    assert_eq!(rule.name, "Disk filling up");
     assert_eq!(
-        disk,
-        [
-            ("Disk filling up", Some(80.0), Severity::Warning),
-            ("Disk nearly full", Some(90.0), Severity::Critical),
-        ]
+        rule.levels(),
+        [(Severity::Warning, 80.0), (Severity::Critical, 90.0)]
     );
-    for rule in rules.iter().filter(|rule| rule.kind == RuleKind::Metric) {
-        assert_eq!(rule.comparison, Some(Comparison::Above));
-        assert_eq!(rule.series, None);
-        assert_eq!(rule.for_secs, 300);
-        assert!(rule.enabled);
-        assert!(rule.all_channels);
-        check_rule(rule).unwrap();
+    assert_eq!(rule.comparison, Some(Comparison::Above));
+    assert_eq!(rule.series, None);
+    assert_eq!(rule.for_secs, 300);
+    assert!(rule.enabled);
+    assert!(rule.all_channels);
+    check_rule(rule).unwrap();
+}
+
+/// Marks everything due as sent, as if it had been delivered, and says what it was.
+async fn deliver_all(test: &Harness) -> Vec<Event> {
+    let due = test.database().due_deliveries(i64::MAX, 100).await.unwrap();
+    for delivery in &due {
+        test.database()
+            .delivery_sent(delivery.id, 1, test.now, None)
+            .await
+            .unwrap();
     }
+    due.iter().map(|delivery| delivery.event).collect()
+}
+
+/// Checks rules after a reading of `/` at `minute`, and gives what's open.
+async fn disk_at(test: &mut Harness, minute: i64, percent: f64) -> Vec<crate::alerting::Alert> {
+    let offset = minute * MINUTE_MS;
+    let reading = test.reading("/", test.now + offset, percent);
+    test.script.set(vec![reading]);
+    test.evaluate(offset).await;
+    test.open().await
 }
 
 #[tokio::test]
-async fn the_built_in_disk_rules_alert_on_each_disk_by_how_full_it_is() {
+async fn one_disk_alert_is_a_warning_then_critical_then_a_warning_again_until_it_clears() {
     let mut test = Harness::start().await;
     for rule in built_in_rules().await {
         if rule.kind == RuleKind::Metric {
             test.database().create_alert_rule(&rule).await.unwrap();
         }
     }
-    for offset in [0, 300_000] {
-        let time = test.now + offset;
-        let readings = vec![
-            test.reading("/", time, 50.0),
-            test.reading("/data", time, 85.0),
-            test.reading("/backup", time, 95.0),
-        ];
-        test.script.set(readings);
-        test.evaluate(offset).await;
-    }
+    let channel = webhook_channel("http://127.0.0.1:9/hook");
+    test.database().create_channel(&channel).await.unwrap();
 
-    let mut open: Vec<(String, Severity)> = test
-        .open()
+    disk_at(&mut test, 0, 85.0).await;
+    let open = disk_at(&mut test, 5, 85.0).await;
+    assert_eq!(open.len(), 1);
+    let alert = &open[0];
+    assert_eq!(alert.severity, Severity::Warning);
+    assert!(alert.summary.contains("above 80%"), "{}", alert.summary);
+    assert_eq!(deliver_all(&test).await, [Event::Firing]);
+    test.database()
+        .acknowledge_alert(alert.id, "sam", test.now)
         .await
-        .into_iter()
-        .map(|alert| (alert.series, alert.severity))
-        .collect();
-    open.sort_by_key(|(series, severity)| (series.clone(), *severity == Severity::Critical));
+        .unwrap();
+
+    disk_at(&mut test, 6, 95.0).await;
+    let open = disk_at(&mut test, 11, 95.0).await;
+    assert_eq!(open.len(), 1, "one alert, not a warning and a critical one");
+    assert_eq!(open[0].id, alert.id);
+    assert_eq!(open[0].severity, Severity::Critical);
+    assert!(open[0].summary.contains("above 90%"), "{}", open[0].summary);
     assert_eq!(
-        open,
-        [
-            ("/backup".to_string(), Severity::Warning),
-            ("/backup".to_string(), Severity::Critical),
-            ("/data".to_string(), Severity::Warning),
-        ]
+        open[0].acknowledged_by, None,
+        "worse needs acknowledging again"
     );
+    assert_eq!(deliver_all(&test).await, [Event::Escalated]);
+
+    disk_at(&mut test, 12, 85.0).await;
+    let open = disk_at(&mut test, 17, 85.0).await;
+    assert_eq!(open[0].severity, Severity::Warning);
+    assert_eq!(deliver_all(&test).await, [Event::Eased]);
+
+    disk_at(&mut test, 18, 50.0).await;
+    assert!(disk_at(&mut test, 23, 50.0).await.is_empty());
+    assert_eq!(deliver_all(&test).await, [Event::Resolved]);
+}
+
+#[tokio::test]
+async fn a_channel_not_told_yet_hears_of_the_alert_as_it_is_when_it_does() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        metric: Some("disk.usage".to_string()),
+        threshold: Some(90.0),
+        warning_threshold: Some(80.0),
+        for_secs: 0,
+        all_channels: true,
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    let channel = webhook_channel("http://127.0.0.1:9/hook");
+    test.database().create_channel(&channel).await.unwrap();
+
+    disk_at(&mut test, 0, 85.0).await;
+    disk_at(&mut test, 1, 95.0).await;
+
+    let due = test.database().due_deliveries(i64::MAX, 10).await.unwrap();
+    let events: Vec<Event> = due.iter().map(|delivery| delivery.event).collect();
+    assert_eq!(events, [Event::Firing]);
+    assert_eq!(due[0].alert.severity, Severity::Critical);
 }
 
 #[tokio::test]
@@ -3148,7 +3198,7 @@ const ALERT_RULE_FIELDS: [(&str, &str); 9] = [
     ("kind", "metric"),
     ("metric", "cpu.usage"),
     ("comparison", "above"),
-    ("threshold", "90"),
+    ("critical_threshold", "90"),
     ("series", ""),
     ("for_secs", "120"),
     ("severity", "critical"),
@@ -3224,7 +3274,7 @@ async fn an_alert_rule_can_be_created_changed_and_deleted_from_the_form() {
     assert!(list.body.contains("Every agent"));
 
     let mut fields = ALERT_RULE_FIELDS.to_vec();
-    fields[4] = ("threshold", "75.5");
+    fields[4] = ("critical_threshold", "75.5");
     let path = format!("/alerts/rules/{id}");
     let edit = format!("/alerts/rules/{id}/edit");
     let page = browser.submit(&server, &edit, &path, &fields).await;
@@ -3248,13 +3298,50 @@ async fn an_alert_rule_can_be_created_changed_and_deleted_from_the_form() {
 }
 
 #[tokio::test]
+async fn a_rule_can_warn_first_and_go_critical_later_from_the_form() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    let mut fields = ALERT_RULE_FIELDS.to_vec();
+    fields.push(("warning_threshold", "80"));
+
+    let page = browser
+        .submit(&server, "/alerts/rules/new", "/alerts/rules", &fields)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    let rules = server.state.database.list_alert_rules().await.unwrap();
+    assert_eq!(
+        rules[0].rule.levels(),
+        [(Severity::Warning, 80.0), (Severity::Critical, 90.0)]
+    );
+
+    let list = browser.get(&server, "/alerts/rules").await;
+    assert!(
+        list.body
+            .contains("CPU usage above 80% (warning), 90% (critical) for 2 minutes"),
+        "{}",
+        list.body
+    );
+    assert!(list.body.contains(
+        r#"<span class="badge warn">Warning</span> <span class="badge bad">Critical</span>"#
+    ));
+
+    let edit = format!("/alerts/rules/{}/edit", rules[0].id);
+    let form = browser.get(&server, &edit).await;
+    assert!(form.body.contains(r#"name="warning_threshold" value="80""#));
+    assert!(
+        form.body
+            .contains(r#"name="critical_threshold" value="90""#)
+    );
+}
+
+#[tokio::test]
 async fn an_offline_rule_can_be_made_from_the_form() {
     let server = start().await;
     let mut browser = Browser::default();
     let mut fields = ALERT_RULE_FIELDS.to_vec();
     fields[0] = ("name", "Gone");
     fields[1] = ("kind", "offline");
-    fields[4] = ("threshold", "");
+    fields[4] = ("critical_threshold", "");
     fields[6] = ("for_secs", "60");
 
     let page = browser
@@ -3271,14 +3358,15 @@ async fn a_rejected_rule_keeps_what_was_typed_and_says_why() {
     let mut browser = Browser::default();
     let mut fields = ALERT_RULE_FIELDS.to_vec();
     fields[0] = ("name", "Typed name");
-    fields[4] = ("threshold", "lots");
+    fields[4] = ("critical_threshold", "lots");
 
     let page = browser
         .submit(&server, "/alerts/rules/new", "/alerts/rules", &fields)
         .await;
     assert_eq!(page.status, 422);
     assert!(
-        page.body.contains("the threshold must be a number"),
+        page.body
+            .contains("the critical threshold must be a number"),
         "{}",
         page.body
     );
@@ -5371,7 +5459,7 @@ mod reminders {
             ("kind", "metric"),
             ("metric", "cpu.usage"),
             ("comparison", "above"),
-            ("threshold", "90"),
+            ("critical_threshold", "90"),
             ("for_secs", "60"),
             ("severity", "warning"),
             ("enabled", "on"),
@@ -5405,7 +5493,7 @@ mod reminders {
             ("kind", "metric"),
             ("metric", "cpu.usage"),
             ("comparison", "above"),
-            ("threshold", "90"),
+            ("critical_threshold", "90"),
             ("for_secs", "60"),
             ("severity", "warning"),
             ("remind_every_minutes", "1"),

@@ -12,7 +12,7 @@ use sea_orm::{
 use super::{Database, alert, alert_rule, alert_rule_channel, notification, notification_channel};
 use crate::alerting::{
     Alert, AlertRule, AlertRuleInput, Channel, ChannelInput, ChannelKind, Comparison, Delivery,
-    DeliveryProblem, Event, NewAlert, RULE_GONE_REASON, RuleKind, Severity,
+    DeliveryProblem, Event, NewAlert, RULE_GONE_REASON, RuleKind, Severity, SeverityChange,
 };
 use crate::calculations::Calculation;
 
@@ -36,6 +36,7 @@ fn to_alert_rule(row: alert_rule::Model, channels: Vec<i64>) -> Result<AlertRule
                 .map(Comparison::parse)
                 .transpose()?,
             threshold: row.threshold,
+            warning_threshold: row.warning_threshold,
             for_secs: u64::try_from(row.for_secs).context("invalid duration")?,
             severity: Severity::parse(&row.severity)?,
             condition: row.condition_expr,
@@ -67,6 +68,7 @@ fn alert_rule_row(input: &AlertRuleInput) -> Result<alert_rule::ActiveModel> {
         series: Set(input.series.clone()),
         comparison: Set(input.comparison.map(|c| c.as_str().to_string())),
         threshold: Set(input.threshold),
+        warning_threshold: Set(input.warning_threshold),
         for_secs: Set(i64::try_from(input.for_secs).context("invalid duration")?),
         severity: Set(input.severity.as_str().to_string()),
         condition_expr: Set(input.condition.clone()),
@@ -454,6 +456,68 @@ impl Database {
         }
         transaction.commit().await.context("saving alert")?;
         Ok(id)
+    }
+
+    /// Makes an open alert a warning or critical, with what it says now, and tells
+    /// each channel that heard it start. One whose first notification hasn't gone yet
+    /// gets the alert as it is now when it does. Getting worse needs someone to
+    /// acknowledge it again. Returns false if the alert isn't open or is already at
+    /// that severity.
+    pub async fn change_severity(&self, change: &SeverityChange) -> Result<bool> {
+        let transaction = self.connection.begin().await.context("saving alert")?;
+        let Some(alert) = alert::Entity::find_by_id(change.alert_id)
+            .filter(alert::Column::ResolvedMs.is_null())
+            .one(&transaction)
+            .await
+            .context("loading alert")?
+        else {
+            return Ok(false);
+        };
+        let before = Severity::parse(&alert.severity)?;
+        if before == change.severity {
+            return Ok(false);
+        }
+        let worse = change.severity > before;
+
+        let mut update = alert::Entity::update_many()
+            .col_expr(
+                alert::Column::Severity,
+                Expr::value(change.severity.as_str()),
+            )
+            .col_expr(alert::Column::Value, Expr::value(change.value))
+            .col_expr(alert::Column::Summary, Expr::value(change.summary.clone()))
+            .filter(alert::Column::Id.eq(change.alert_id));
+        if worse {
+            update = update
+                .col_expr(alert::Column::AcknowledgedBy, Expr::value(None::<String>))
+                .col_expr(alert::Column::AcknowledgedMs, Expr::value(None::<i64>));
+        }
+        update.exec(&transaction).await.context("saving alert")?;
+
+        let told = notification::Entity::find()
+            .filter(notification::Column::AlertId.eq(change.alert_id))
+            .filter(notification::Column::Event.eq(Event::Firing.as_str()))
+            .filter(notification::Column::State.eq(SENT))
+            .all(&transaction)
+            .await
+            .context("loading notifications")?;
+        let event = if worse {
+            Event::Escalated
+        } else {
+            Event::Eased
+        };
+        let rows: Vec<_> = told
+            .into_iter()
+            .map(|row| queued(change.alert_id, row.channel_id, event, change.now_ms))
+            .collect();
+        if !rows.is_empty() {
+            notification::Entity::insert_many(rows)
+                .exec_without_returning(&transaction)
+                .await
+                .context("queueing notifications")?;
+        }
+        transaction.commit().await.context("saving alert")?;
+        Ok(true)
     }
 
     /// Ends an alert and tells whoever was told it started, even if the rule

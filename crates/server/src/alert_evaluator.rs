@@ -17,7 +17,9 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info};
 
-use crate::alerting::{Alert, AlertRule, NewAlert, RULE_GONE_REASON, RuleKind, clean};
+use crate::alerting::{
+    Alert, AlertRule, NewAlert, RULE_GONE_REASON, RuleKind, Severity, SeverityChange, clean,
+};
 use crate::calculations::{
     self, Calculation, Grouping, Question, SMALLEST_STEP_MS, Sources, over_window,
 };
@@ -63,39 +65,104 @@ impl Key {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Change {
-    Fire,
+    Fire(Severity),
+    /// An open alert getting worse, or better without being over.
+    Become(Severity),
     Resolve,
 }
 
-/// How long something has been wrong, or right again.
+/// How long one level of a problem has lasted, or been gone.
 #[derive(Debug, Default)]
-struct Tracker {
+struct Hold {
     breached_since: Option<i64>,
     clear_since: Option<i64>,
+}
+
+impl Hold {
+    fn observe(&mut self, breached: bool, now_ms: i64) {
+        if breached {
+            self.clear_since = None;
+            self.breached_since.get_or_insert(now_ms);
+        } else {
+            self.breached_since = None;
+            self.clear_since.get_or_insert(now_ms);
+        }
+    }
+
+    fn breached_for(&self, now_ms: i64, hold_ms: i64) -> bool {
+        self.breached_since
+            .is_some_and(|since| now_ms - since >= hold_ms)
+    }
+
+    fn clear_for(&self, now_ms: i64, hold_ms: i64) -> bool {
+        self.clear_since
+            .is_some_and(|since| now_ms - since >= hold_ms)
+    }
+}
+
+/// How long each of a rule's levels has been crossed, or not.
+#[derive(Debug, Default)]
+struct Tracker {
+    /// One for each level, mildest first.
+    holds: Vec<Hold>,
     /// Each sample is only counted once, as checks run more often than some
     /// agents report.
     last_sample_ms: Option<i64>,
 }
 
 impl Tracker {
-    /// A problem has to last `hold_ms` to fire, and be gone that long to resolve,
-    /// so something hovering around a threshold doesn't send a stream of alerts.
+    /// The hold for a rule with one level, which an offline rule sets for itself.
+    fn only_hold(&mut self) -> &mut Hold {
+        self.holds.resize_with(1, Hold::default);
+        &mut self.holds[0]
+    }
+
+    /// Takes whether each of a rule's levels is crossed now, mildest first, and
+    /// what the alert is at, if it's open. A level has to last `hold_ms` to count,
+    /// and be gone that long to stop counting, so something hovering around a
+    /// threshold doesn't send a stream of notifications. The alert is at the worst
+    /// level that counts, and resolves when the mildest stops counting.
     fn observe(
         &mut self,
-        breached: bool,
+        levels: &[(Severity, bool)],
         now_ms: i64,
         hold_ms: i64,
-        firing: bool,
+        open: Option<Severity>,
     ) -> Option<Change> {
-        if breached {
-            self.clear_since = None;
-            let since = *self.breached_since.get_or_insert(now_ms);
-            (!firing && now_ms - since >= hold_ms).then_some(Change::Fire)
-        } else {
-            self.breached_since = None;
-            let since = *self.clear_since.get_or_insert(now_ms);
-            (firing && now_ms - since >= hold_ms).then_some(Change::Resolve)
+        self.holds.resize_with(levels.len(), Hold::default);
+        for (hold, (_, breached)) in self.holds.iter_mut().zip(levels) {
+            hold.observe(*breached, now_ms);
         }
+        let worst = |counts: &dyn Fn(&Hold) -> bool| {
+            levels
+                .iter()
+                .zip(&self.holds)
+                .rev()
+                .find(|(_, hold)| counts(hold))
+                .map(|((severity, _), _)| *severity)
+        };
+        let lasted = worst(&|hold| hold.breached_for(now_ms, hold_ms));
+
+        let Some(current) = open else {
+            return lasted.map(Change::Fire);
+        };
+        if self
+            .holds
+            .first()
+            .is_some_and(|mildest| mildest.clear_for(now_ms, hold_ms))
+        {
+            return Some(Change::Resolve);
+        }
+        if let Some(lasted) = lasted
+            && lasted > current
+        {
+            return Some(Change::Become(lasted));
+        }
+        // Better, once the worse levels have been gone long enough.
+        let remaining = worst(&|hold| !hold.clear_for(now_ms, hold_ms));
+        remaining
+            .filter(|remaining| *remaining < current)
+            .map(Change::Become)
     }
 }
 
@@ -373,16 +440,20 @@ impl Evaluator {
         let since = presence.map_or(self.started_ms, |p| p.since_ms as i64);
 
         let tracker = self.trackers.entry(key.clone()).or_default();
+        let hold = tracker.only_hold();
         if online {
-            tracker.clear_since = Some(since);
+            hold.breached_since = None;
+            hold.clear_since = Some(since);
         } else {
-            tracker.breached_since = Some(since);
+            hold.clear_since = None;
+            hold.breached_since = Some(since);
         }
-        let hold_ms = hold_ms(rule);
-        let change = tracker.observe(!online, snapshot.now_ms, hold_ms, open.contains_key(&key));
+        let levels = [(rule.rule.severity, !online)];
+        let current = open.get(&key).map(|alert| alert.severity);
+        let change = tracker.observe(&levels, snapshot.now_ms, hold_ms(rule), current);
 
-        let summary = rule.rule.offline_summary(&clean(&agent.host));
         let host = clean(&agent.host);
+        let summary = rule.rule.offline_summary(&host);
         self.apply(change, rule, &host, key, None, summary, snapshot, open)
             .await
     }
@@ -437,10 +508,10 @@ impl Evaluator {
         open: &mut HashMap<Key, Alert>,
         checked: &mut HashSet<Key>,
     ) -> Result<()> {
-        let (Some(comparison), Some(threshold)) = (rule.rule.comparison, rule.rule.threshold)
-        else {
+        let Some(comparison) = rule.rule.comparison else {
             return Ok(());
         };
+        let thresholds = rule.rule.levels();
         let question = match rule.rule.question() {
             Ok(question) => question,
             Err(error) => {
@@ -468,11 +539,16 @@ impl Evaluator {
             checked.insert(key.clone());
 
             let tracker = self.trackers.entry(key.clone()).or_default();
-            let firing = open.contains_key(&key);
-            let breached = comparison.is_breached(*value, threshold);
-            let change = tracker.observe(breached, snapshot.now_ms, hold_ms(rule), firing);
+            let current = open.get(&key).map(|alert| alert.severity);
+            let levels = crossed(&thresholds, comparison, *value);
+            let change = tracker.observe(&levels, snapshot.now_ms, hold_ms(rule), current);
 
-            let summary = rule.rule.calculation_summary(&question, line, *value)?;
+            let summary = match change.as_ref().and_then(Change::severity) {
+                Some(severity) => rule
+                    .rule
+                    .calculation_summary(&question, line, *value, severity)?,
+                None => String::new(),
+            };
             self.apply(
                 change,
                 rule,
@@ -513,10 +589,10 @@ impl Evaluator {
         checked: &mut HashSet<Key>,
     ) -> Result<()> {
         let metric = rule.rule.metric().context("unknown metric")?;
-        let (Some(comparison), Some(threshold)) = (rule.rule.comparison, rule.rule.threshold)
-        else {
+        let Some(comparison) = rule.rule.comparison else {
             return Ok(());
         };
+        let thresholds = rule.rule.levels();
         let Some(readings) = snapshot
             .readings
             .get(metric.name)
@@ -543,15 +619,19 @@ impl Evaluator {
             if tracker.last_sample_ms == Some(reading.time_ms) {
                 continue;
             }
-            let firing = open.contains_key(&key);
-            let breached = comparison.is_breached(reading.value, threshold);
-            let change = tracker.observe(breached, snapshot.now_ms, hold_ms(rule), firing);
+            let current = open.get(&key).map(|alert| alert.severity);
+            let levels = crossed(&thresholds, comparison, reading.value);
+            let change = tracker.observe(&levels, snapshot.now_ms, hold_ms(rule), current);
             tracker.last_sample_ms = Some(reading.time_ms);
 
             let host = clean(&agent.host);
-            let summary = rule
-                .rule
-                .metric_summary(metric, &host, &series, reading.value)?;
+            let summary = match change.as_ref().and_then(Change::severity) {
+                Some(severity) => {
+                    rule.rule
+                        .metric_summary(metric, &host, &series, reading.value, severity)?
+                }
+                None => String::new(),
+            };
             self.apply(
                 change,
                 rule,
@@ -588,11 +668,32 @@ impl Evaluator {
                 }
                 Ok(())
             }
-            Some(Change::Fire) => {
+            Some(Change::Become(severity)) => {
+                let Some(alert) = open.get(&key) else {
+                    return Ok(());
+                };
+                let change = SeverityChange {
+                    alert_id: alert.id,
+                    severity,
+                    value,
+                    summary,
+                    now_ms: snapshot.now_ms,
+                };
+                if self.database.change_severity(&change).await? {
+                    info!(
+                        rule = rule.rule.name,
+                        host,
+                        severity = severity.as_str(),
+                        "alert changed severity"
+                    );
+                }
+                Ok(())
+            }
+            Some(Change::Fire(severity)) => {
                 let new = NewAlert {
                     rule_id: rule.id,
                     rule_name: rule.rule.name.clone(),
-                    severity: rule.rule.severity,
+                    severity,
                     agent_id: key.agent_id,
                     host: host.to_string(),
                     series: key.series,
@@ -628,6 +729,28 @@ impl Evaluator {
     }
 }
 
+impl Change {
+    /// What the alert is at afterwards, if it's still open.
+    fn severity(&self) -> Option<Severity> {
+        match self {
+            Self::Fire(severity) | Self::Become(severity) => Some(*severity),
+            Self::Resolve => None,
+        }
+    }
+}
+
+/// Which of a rule's levels a value crosses, mildest first.
+fn crossed(
+    thresholds: &[(Severity, f64)],
+    comparison: crate::alerting::Comparison,
+    value: f64,
+) -> Vec<(Severity, bool)> {
+    thresholds
+        .iter()
+        .map(|(severity, threshold)| (*severity, comparison.is_breached(value, *threshold)))
+        .collect()
+}
+
 fn hold_ms(rule: &AlertRule) -> i64 {
     i64::try_from(rule.rule.for_secs).unwrap_or(i64::MAX / 1000) * 1000
 }
@@ -636,59 +759,147 @@ fn hold_ms(rule: &AlertRule) -> i64 {
 mod tests {
     use super::*;
 
+    const W: Severity = Severity::Warning;
+    const C: Severity = Severity::Critical;
+    const FIRING: Option<Severity> = Some(C);
+
+    /// A rule with one level.
+    fn one(breached: bool) -> [(Severity, bool); 1] {
+        [(C, breached)]
+    }
+
+    /// A rule with a warning and a critical level, and a value crossing as many.
+    fn two(crossed: usize) -> [(Severity, bool); 2] {
+        [(W, crossed >= 1), (C, crossed >= 2)]
+    }
+
     #[test]
     fn a_problem_has_to_last_before_it_fires() {
         let mut tracker = Tracker::default();
-        assert_eq!(tracker.observe(true, 0, 60, false), None);
-        assert_eq!(tracker.observe(true, 59, 60, false), None);
-        assert_eq!(tracker.observe(true, 60, 60, false), Some(Change::Fire));
+        assert_eq!(tracker.observe(&one(true), 0, 60, None), None);
+        assert_eq!(tracker.observe(&one(true), 59, 60, None), None);
+        assert_eq!(
+            tracker.observe(&one(true), 60, 60, None),
+            Some(Change::Fire(C))
+        );
     }
 
     #[test]
     fn a_problem_that_goes_away_starts_the_wait_again() {
         let mut tracker = Tracker::default();
-        tracker.observe(true, 0, 60, false);
-        assert_eq!(tracker.observe(false, 30, 60, false), None);
-        assert_eq!(tracker.observe(true, 40, 60, false), None);
-        assert_eq!(tracker.observe(true, 99, 60, false), None);
-        assert_eq!(tracker.observe(true, 100, 60, false), Some(Change::Fire));
+        tracker.observe(&one(true), 0, 60, None);
+        assert_eq!(tracker.observe(&one(false), 30, 60, None), None);
+        assert_eq!(tracker.observe(&one(true), 40, 60, None), None);
+        assert_eq!(tracker.observe(&one(true), 99, 60, None), None);
+        assert_eq!(
+            tracker.observe(&one(true), 100, 60, None),
+            Some(Change::Fire(C))
+        );
     }
 
     #[test]
     fn with_no_wait_a_problem_fires_at_once() {
         let mut tracker = Tracker::default();
-        assert_eq!(tracker.observe(true, 0, 0, false), Some(Change::Fire));
+        assert_eq!(
+            tracker.observe(&one(true), 0, 0, None),
+            Some(Change::Fire(C))
+        );
     }
 
     #[test]
     fn an_alert_already_firing_does_not_fire_again() {
         let mut tracker = Tracker::default();
-        assert_eq!(tracker.observe(true, 0, 0, true), None);
-        assert_eq!(tracker.observe(true, 100, 0, true), None);
+        assert_eq!(tracker.observe(&one(true), 0, 0, FIRING), None);
+        assert_eq!(tracker.observe(&one(true), 100, 0, FIRING), None);
     }
 
     #[test]
     fn a_problem_has_to_stay_gone_before_it_resolves() {
         let mut tracker = Tracker::default();
-        assert_eq!(tracker.observe(false, 0, 60, true), None);
-        assert_eq!(tracker.observe(false, 59, 60, true), None);
-        assert_eq!(tracker.observe(false, 60, 60, true), Some(Change::Resolve));
+        assert_eq!(tracker.observe(&one(false), 0, 60, FIRING), None);
+        assert_eq!(tracker.observe(&one(false), 59, 60, FIRING), None);
+        assert_eq!(
+            tracker.observe(&one(false), 60, 60, FIRING),
+            Some(Change::Resolve)
+        );
     }
 
     #[test]
     fn a_problem_coming_back_starts_the_wait_to_resolve_again() {
         let mut tracker = Tracker::default();
-        tracker.observe(false, 0, 60, true);
-        tracker.observe(true, 30, 60, true);
-        assert_eq!(tracker.observe(false, 40, 60, true), None);
-        assert_eq!(tracker.observe(false, 99, 60, true), None);
-        assert_eq!(tracker.observe(false, 100, 60, true), Some(Change::Resolve));
+        tracker.observe(&one(false), 0, 60, FIRING);
+        tracker.observe(&one(true), 30, 60, FIRING);
+        assert_eq!(tracker.observe(&one(false), 40, 60, FIRING), None);
+        assert_eq!(tracker.observe(&one(false), 99, 60, FIRING), None);
+        assert_eq!(
+            tracker.observe(&one(false), 100, 60, FIRING),
+            Some(Change::Resolve)
+        );
     }
 
     #[test]
     fn nothing_resolves_when_nothing_is_firing() {
         let mut tracker = Tracker::default();
-        assert_eq!(tracker.observe(false, 0, 0, false), None);
-        assert_eq!(tracker.observe(false, 100, 0, false), None);
+        assert_eq!(tracker.observe(&one(false), 0, 0, None), None);
+        assert_eq!(tracker.observe(&one(false), 100, 0, None), None);
+    }
+
+    #[test]
+    fn the_worst_level_that_has_lasted_fires() {
+        let mut tracker = Tracker::default();
+        assert_eq!(tracker.observe(&two(2), 0, 60, None), None);
+        assert_eq!(
+            tracker.observe(&two(2), 60, 60, None),
+            Some(Change::Fire(C))
+        );
+
+        let mut tracker = Tracker::default();
+        tracker.observe(&two(1), 0, 60, None);
+        assert_eq!(tracker.observe(&two(2), 30, 60, None), None);
+        // The warning has lasted, but the critical level hasn't yet.
+        assert_eq!(
+            tracker.observe(&two(2), 60, 60, None),
+            Some(Change::Fire(W))
+        );
+        assert_eq!(tracker.observe(&two(2), 89, 60, Some(W)), None);
+        assert_eq!(
+            tracker.observe(&two(2), 90, 60, Some(W)),
+            Some(Change::Become(C))
+        );
+    }
+
+    #[test]
+    fn a_critical_alert_eases_once_the_critical_level_has_been_gone_long_enough() {
+        let mut tracker = Tracker::default();
+        tracker.observe(&two(2), 0, 60, FIRING);
+        assert_eq!(tracker.observe(&two(1), 10, 60, FIRING), None);
+        assert_eq!(tracker.observe(&two(2), 20, 60, FIRING), None);
+        assert_eq!(tracker.observe(&two(1), 30, 60, FIRING), None);
+        assert_eq!(tracker.observe(&two(1), 89, 60, FIRING), None);
+        assert_eq!(
+            tracker.observe(&two(1), 90, 60, FIRING),
+            Some(Change::Become(W))
+        );
+        assert_eq!(tracker.observe(&two(1), 200, 60, Some(W)), None);
+    }
+
+    #[test]
+    fn an_alert_resolves_when_the_mildest_level_has_been_gone_long_enough() {
+        let mut tracker = Tracker::default();
+        tracker.observe(&two(2), 0, 60, FIRING);
+        assert_eq!(tracker.observe(&two(0), 10, 60, FIRING), None);
+        // Straight from critical, without easing first.
+        assert_eq!(
+            tracker.observe(&two(0), 70, 60, FIRING),
+            Some(Change::Resolve)
+        );
+    }
+
+    #[test]
+    fn a_warning_does_not_ease_or_resolve_while_it_lasts() {
+        let mut tracker = Tracker::default();
+        for now in [0, 100, 1000] {
+            assert_eq!(tracker.observe(&two(1), now, 60, Some(W)), None);
+        }
     }
 }

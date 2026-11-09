@@ -103,6 +103,8 @@ impl Notice {
     /// What a message about this alert says, outside the queue.
     pub fn for_alert(alert: Alert, event: Event) -> Self {
         let text = match event {
+            Event::Escalated => format!("Now critical: {}", alert.summary),
+            Event::Eased => format!("Down to a warning: {}", alert.summary),
             Event::Reminder => format!("Still firing: {}", alert.summary),
             Event::Resolved => format!("Resolved: {}", alert.summary),
             _ => alert.summary.clone(),
@@ -139,6 +141,8 @@ impl Notice {
     fn label(&self) -> String {
         match (self.event, &self.alert) {
             (Event::Firing, Some(alert)) => alert.severity.as_str().to_uppercase(),
+            (Event::Escalated, _) => "NOW CRITICAL".to_string(),
+            (Event::Eased, _) => "NOW WARNING".to_string(),
             (Event::Reminder, _) => "STILL FIRING".to_string(),
             (Event::Resolved, _) => "RESOLVED".to_string(),
             _ => "TEST".to_string(),
@@ -163,7 +167,8 @@ impl Notice {
     /// anything, so it closes it again rather than leave someone paged.
     fn incident_steps(&self) -> &'static [Incident] {
         match self.event {
-            Event::Firing => &[Incident::Open],
+            // Sent again with the same ID, which updates the incident's severity.
+            Event::Firing | Event::Escalated | Event::Eased => &[Incident::Open],
             Event::Resolved => &[Incident::Close],
             Event::Test => &[Incident::Open, Incident::Close],
             // They repeat for themselves, so they're never sent these.
@@ -686,6 +691,8 @@ fn escape_slack(text: &str) -> String {
 
 fn slack_color(notice: &Notice) -> &'static str {
     match (notice.event, &notice.alert) {
+        (Event::Escalated, _) => "#b3261e",
+        (Event::Eased, _) => "#b87a00",
         (Event::Firing | Event::Reminder, Some(alert)) if alert.severity == Severity::Critical => {
             "#b3261e"
         }
@@ -776,7 +783,10 @@ fn slack_buttons(
     let (Some(controls), Some(alert)) = (controls, &notice.alert) else {
         return Vec::new();
     };
-    let firing = matches!(notice.event, Event::Firing | Event::Reminder);
+    let firing = matches!(
+        notice.event,
+        Event::Firing | Event::Escalated | Event::Eased | Event::Reminder
+    );
     if !firing || alert.resolved_ms.is_some() {
         return Vec::new();
     }
@@ -1136,7 +1146,11 @@ impl Notifier {
 
         let mut sends = JoinSet::new();
         for delivery in due {
-            if delivery.event == Event::Firing && silences.covering(&delivery.alert).is_some() {
+            let tells_of_a_problem = matches!(
+                delivery.event,
+                Event::Firing | Event::Escalated | Event::Eased
+            );
+            if tells_of_a_problem && silences.covering(&delivery.alert).is_some() {
                 self.database.hold_delivery(&delivery).await?;
                 continue;
             }
@@ -1460,6 +1474,45 @@ mod tests {
             notice(Event::Resolved, alert()).discord_body()["content"],
             "**RESOLVED** CPU usage on web-1 is 97%, above 90%"
         );
+    }
+
+    #[test]
+    fn a_change_of_severity_says_which_way_it_went_and_updates_the_incident() {
+        let warning = Alert {
+            severity: Severity::Warning,
+            summary: "CPU usage on web-1 is 85%, above 80%".to_string(),
+            ..alert()
+        };
+        let escalated = notice(Event::Escalated, alert());
+        let eased = notice(Event::Eased, warning);
+
+        assert_eq!(
+            Notice::for_alert(alert(), Event::Escalated).text,
+            "Now critical: CPU usage on web-1 is 97%, above 90%"
+        );
+        let warning = eased.alert.clone().unwrap();
+        assert_eq!(
+            Notice::for_alert(warning, Event::Eased).text,
+            "Down to a warning: CPU usage on web-1 is 85%, above 80%"
+        );
+        assert_eq!(
+            escalated.discord_body()["content"],
+            "**NOW CRITICAL** CPU usage on web-1 is 97%, above 90%"
+        );
+        assert_eq!(
+            eased.subject(),
+            "[MaxNines NOW WARNING] CPU usage on web-1 is 85%, above 80%"
+        );
+        assert_eq!(slack_color(&escalated), "#b3261e");
+        assert_eq!(slack_color(&eased), "#b87a00");
+        for notice in [&escalated, &eased] {
+            assert_eq!(notice.incident_steps(), [Incident::Open]);
+            assert_eq!(notice.incident_id(), "maxnines-alert-7");
+        }
+        let event = eased.pagerduty_event(Incident::Open, "key", None);
+        assert_eq!(event["event_action"], "trigger");
+        assert_eq!(event["payload"]["severity"], "warning");
+        assert_eq!(escalated.webhook_body()["event"], "escalated");
     }
 
     #[test]

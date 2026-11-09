@@ -11,7 +11,7 @@ use wildmatch::WildMatch;
 
 use crate::calculations::{Calculation, Grouping, Question};
 use crate::metric_charts::format_value;
-use crate::metrics::{self, Metric, Source};
+use crate::metrics::{self, Metric, Source, Unit};
 
 /// Why an alert ends when its rule goes, however it goes.
 pub const RULE_GONE_REASON: &str = "The rule was deleted or disabled";
@@ -98,7 +98,8 @@ impl Comparison {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Mildest first, so the worse of two is the greater.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
     Warning,
@@ -144,8 +145,13 @@ pub struct AlertRuleInput {
     pub series: Option<String>,
     #[serde(default)]
     pub comparison: Option<Comparison>,
+    /// Where the rule's severity starts.
     #[serde(default)]
     pub threshold: Option<f64>,
+    /// For a critical rule on a metric or calculation, where it's a warning first.
+    /// One alert covers both, at the worse of the two.
+    #[serde(default)]
+    pub warning_threshold: Option<f64>,
     /// How long the problem has to last before the alert fires, and how long it
     /// has to stay gone before the alert resolves.
     pub for_secs: u64,
@@ -244,6 +250,30 @@ pub fn check_rule(rule: &AlertRuleInput) -> Result<()> {
             );
         }
     }
+    if let Some(warning) = rule.warning_threshold {
+        ensure!(
+            rule.kind != RuleKind::Offline,
+            "an offline rule doesn't take a warning threshold"
+        );
+        ensure!(
+            warning.is_finite(),
+            "the warning threshold must be a number"
+        );
+        ensure!(
+            rule.severity == Severity::Critical,
+            "a warning threshold goes with a critical threshold"
+        );
+        if let (Some(comparison), Some(critical)) = (rule.comparison, rule.threshold) {
+            ensure!(
+                warning != critical && !comparison.is_breached(warning, critical),
+                "the warning threshold has to come before the critical one, so it's {} it",
+                match comparison {
+                    Comparison::Above => "below",
+                    Comparison::Below => "above",
+                }
+            );
+        }
+    }
     if rule.kind != RuleKind::Calculation {
         ensure!(
             rule.calculation.is_none()
@@ -267,6 +297,44 @@ impl AlertRuleInput {
         )
     }
 
+    /// Each threshold with how bad crossing it is, mildest first. Empty for an
+    /// offline rule.
+    pub fn levels(&self) -> Vec<(Severity, f64)> {
+        let Some(threshold) = self.threshold else {
+            return Vec::new();
+        };
+        let warning = self
+            .warning_threshold
+            .map(|warning| (Severity::Warning, warning));
+        warning
+            .into_iter()
+            .chain([(self.severity, threshold)])
+            .collect()
+    }
+
+    fn threshold_for(&self, severity: Severity) -> Result<f64> {
+        self.levels()
+            .into_iter()
+            .find(|(level, _)| *level == severity)
+            .map(|(_, threshold)| threshold)
+            .with_context(|| format!("no {} threshold", severity.as_str()))
+    }
+
+    /// The thresholds, saying which is which when there are two.
+    fn thresholds_text(&self, unit: Unit) -> String {
+        let levels = self.levels();
+        match levels.as_slice() {
+            [(_, threshold)] => format_value(unit, *threshold),
+            _ => levels
+                .iter()
+                .map(|(severity, threshold)| {
+                    format!("{} ({})", format_value(unit, *threshold), severity.as_str())
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        }
+    }
+
     pub fn window(&self) -> u64 {
         self.window_secs.unwrap_or(DEFAULT_WINDOW_SECS)
     }
@@ -287,7 +355,7 @@ impl AlertRuleInput {
             0 => text,
             secs => format!("{text} for {}", format_duration(secs)),
         };
-        let (Some(metric), Some(comparison), Some(threshold)) =
+        let (Some(metric), Some(comparison), Some(_)) =
             (self.metric(), self.comparison, self.threshold)
         else {
             return wait("Offline".to_string());
@@ -298,7 +366,7 @@ impl AlertRuleInput {
                 question.calculation.label(),
                 metric.title,
                 comparison.as_str(),
-                format_value(question.unit(), threshold),
+                self.thresholds_text(question.unit()),
                 format_duration(self.window())
             ));
         }
@@ -310,20 +378,21 @@ impl AlertRuleInput {
             "{}{series} {} {}",
             metric.title,
             comparison.as_str(),
-            format_value(metric.unit, threshold)
+            self.thresholds_text(metric.unit)
         ))
     }
 
-    /// What a metric alert says when it fires.
+    /// What a metric alert says when it fires, or reaches `severity`.
     pub fn metric_summary(
         &self,
         metric: &Metric,
         host: &str,
         series: &str,
         value: f64,
+        severity: Severity,
     ) -> Result<String> {
         let comparison = self.comparison.context("no comparison")?;
-        let threshold = self.threshold.context("no threshold")?;
+        let threshold = self.threshold_for(severity)?;
         let name = match metric.source {
             Source::Fields([_]) => metric.title.to_string(),
             _ => format!("{} ({series})", metric.title),
@@ -340,15 +409,17 @@ impl AlertRuleInput {
         Ok(summary)
     }
 
-    /// What a calculation alert says when it fires. `line` is what's being watched.
+    /// What a calculation alert says when it fires, or reaches `severity`. `line`
+    /// is what's being watched.
     pub fn calculation_summary(
         &self,
         question: &Question,
         line: &str,
         value: f64,
+        severity: Severity,
     ) -> Result<String> {
         let comparison = self.comparison.context("no comparison")?;
-        let threshold = self.threshold.context("no threshold")?;
+        let threshold = self.threshold_for(severity)?;
         let unit = question.unit();
         let mut summary = format!(
             "{} of {}{} is {}, {} {}",
@@ -726,10 +797,24 @@ pub struct NewAlert {
     pub started_ms: i64,
 }
 
+/// An open alert becoming a warning or critical, with what it says then.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeverityChange {
+    pub alert_id: i64,
+    pub severity: Severity,
+    pub value: Option<f64>,
+    pub summary: String,
+    pub now_ms: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Event {
     Firing,
+    /// A warning became critical.
+    Escalated,
+    /// A critical alert went back to being a warning.
+    Eased,
     Reminder,
     Resolved,
     Test,
@@ -739,6 +824,8 @@ impl Event {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Firing => "firing",
+            Self::Escalated => "escalated",
+            Self::Eased => "eased",
             Self::Reminder => "reminder",
             Self::Resolved => "resolved",
             Self::Test => "test",
@@ -748,6 +835,8 @@ impl Event {
     pub fn parse(text: &str) -> Result<Self> {
         match text {
             "firing" => Ok(Self::Firing),
+            "escalated" => Ok(Self::Escalated),
+            "eased" => Ok(Self::Eased),
             "reminder" => Ok(Self::Reminder),
             "resolved" => Ok(Self::Resolved),
             other => bail!("unknown event {other:?}"),
@@ -792,6 +881,7 @@ mod tests {
             series: None,
             comparison: Some(Comparison::Above),
             threshold: Some(90.0),
+            warning_threshold: None,
             for_secs: 300,
             severity: Severity::Critical,
             condition: None,
@@ -969,12 +1059,113 @@ mod tests {
         assert_eq!(rule.describe(), "Disk usage (/) above 90%");
     }
 
+    fn disk_rule_with_a_warning() -> AlertRuleInput {
+        AlertRuleInput {
+            metric: Some("disk.usage".to_string()),
+            threshold: Some(90.0),
+            warning_threshold: Some(80.0),
+            ..metric_rule()
+        }
+    }
+
+    #[test]
+    fn a_rule_with_a_warning_describes_both_thresholds_and_says_each_in_its_alerts() {
+        let rule = disk_rule_with_a_warning();
+        assert_eq!(
+            rule.levels(),
+            [(Severity::Warning, 80.0), (Severity::Critical, 90.0)]
+        );
+        assert_eq!(
+            rule.describe(),
+            "Disk usage above 80% (warning), 90% (critical) for 5 minutes"
+        );
+        let metric = rule.metric().unwrap();
+        assert_eq!(
+            rule.metric_summary(metric, "web-1", "/", 85.0, Severity::Warning)
+                .unwrap(),
+            "Disk usage (/) on web-1 is 85%, above 80% for 5 minutes"
+        );
+        assert_eq!(
+            rule.metric_summary(metric, "web-1", "/", 95.0, Severity::Critical)
+                .unwrap(),
+            "Disk usage (/) on web-1 is 95%, above 90% for 5 minutes"
+        );
+        assert_eq!(metric_rule().levels(), [(Severity::Critical, 90.0)]);
+        assert!(offline_rule().levels().is_empty());
+    }
+
+    #[test]
+    fn a_warning_threshold_comes_before_the_critical_one() {
+        check_rule(&disk_rule_with_a_warning()).unwrap();
+        let below = AlertRuleInput {
+            comparison: Some(Comparison::Below),
+            threshold: Some(10.0),
+            warning_threshold: Some(20.0),
+            ..disk_rule_with_a_warning()
+        };
+        check_rule(&below).unwrap();
+
+        for (rule, expected) in [
+            (
+                AlertRuleInput {
+                    warning_threshold: Some(95.0),
+                    ..disk_rule_with_a_warning()
+                },
+                "below it",
+            ),
+            (
+                AlertRuleInput {
+                    warning_threshold: Some(90.0),
+                    ..disk_rule_with_a_warning()
+                },
+                "below it",
+            ),
+            (
+                AlertRuleInput {
+                    warning_threshold: Some(5.0),
+                    ..below
+                },
+                "above it",
+            ),
+            (
+                AlertRuleInput {
+                    severity: Severity::Warning,
+                    ..disk_rule_with_a_warning()
+                },
+                "goes with a critical threshold",
+            ),
+            (
+                AlertRuleInput {
+                    warning_threshold: Some(f64::NAN),
+                    ..disk_rule_with_a_warning()
+                },
+                "must be a number",
+            ),
+            (
+                AlertRuleInput {
+                    warning_threshold: Some(1.0),
+                    ..offline_rule()
+                },
+                "offline rule",
+            ),
+        ] {
+            let error = check_rule(&rule).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
     #[test]
     fn a_summary_only_names_the_series_when_there_are_several() {
         let cpu = metric_rule();
         assert_eq!(
-            cpu.metric_summary(cpu.metric().unwrap(), "web-1", "CPU", 97.25)
-                .unwrap(),
+            cpu.metric_summary(
+                cpu.metric().unwrap(),
+                "web-1",
+                "CPU",
+                97.25,
+                Severity::Critical
+            )
+            .unwrap(),
             "CPU usage on web-1 is 97.2%, above 90% for 5 minutes"
         );
 
@@ -984,8 +1175,14 @@ mod tests {
             ..metric_rule()
         };
         assert_eq!(
-            disk.metric_summary(disk.metric().unwrap(), "web-1", "/data", 91.0)
-                .unwrap(),
+            disk.metric_summary(
+                disk.metric().unwrap(),
+                "web-1",
+                "/data",
+                91.0,
+                Severity::Critical
+            )
+            .unwrap(),
             "Disk usage (/data) on web-1 is 91%, above 90%"
         );
     }

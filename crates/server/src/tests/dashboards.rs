@@ -557,6 +557,7 @@ mod calculation_alerts {
             series: None,
             comparison: Some(comparison),
             threshold: Some(threshold),
+            warning_threshold: None,
             for_secs: 0,
             severity: Severity::Warning,
             condition: None,
