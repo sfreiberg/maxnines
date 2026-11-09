@@ -20,7 +20,7 @@ use slack_morphism::prelude::{
 };
 use slack_morphism::{
     SlackApiToken, SlackApiTokenValue, SlackClient, SlackClientHttpConnector,
-    SlackClientSocketModeConfig, SlackClientSocketModeListener, SlackMessageContent,
+    SlackClientSocketModeConfig, SlackClientSocketModeListener, SlackFileId, SlackMessageContent,
     SlackSocketModeListenerCallbacks, SlackUser, SlackUserId, UserCallbackResult,
 };
 use tokio::task::JoinHandle;
@@ -183,7 +183,14 @@ impl SlackActions {
                 "That alert no longer exists.".to_string(),
             )));
         };
-        Ok(Some(Reply::Replace(self.content(&alert, now).await?)))
+        // The message keeps the chart it was sent with.
+        let chart = event
+            .message
+            .as_ref()
+            .and_then(|message| notifier::slack_chart(&message.content));
+        Ok(Some(Reply::Replace(
+            self.content(&alert, now, chart.as_ref()).await?,
+        )))
     }
 
     /// Silences just this alert, unless something already covers it or it's over.
@@ -205,7 +212,12 @@ impl SlackActions {
     }
 
     /// The message as it should look now, with only the buttons still worth pressing.
-    async fn content(&self, alert: &Alert, now: i64) -> Result<SlackMessageContent> {
+    async fn content(
+        &self,
+        alert: &Alert,
+        now: i64,
+        chart: Option<&SlackFileId>,
+    ) -> Result<SlackMessageContent> {
         let event = if alert.resolved_ms.is_some() {
             Event::Resolved
         } else {
@@ -232,6 +244,7 @@ impl SlackActions {
             &notice,
             self.web_url.as_deref(),
             Some(&controls),
+            chart,
         ))
     }
 

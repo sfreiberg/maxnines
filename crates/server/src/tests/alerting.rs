@@ -1670,6 +1670,7 @@ impl FakeSlack {
                 }
                 let mut errors = slack.errors.lock().unwrap();
                 if errors.is_empty() {
+                    let address = slack.address.lock().unwrap().clone();
                     axum::Json(json!({
                         "ok": true,
                         "channel": "C123",
@@ -1677,6 +1678,9 @@ impl FakeSlack {
                         "message": { "ts": "1700000000.000100", "text": "sent" },
                         "url": "wss://slack.invalid/link",
                         "user": slack.user.lock().unwrap().clone(),
+                        "upload_url": format!("{address}/upload"),
+                        "file_id": "F123",
+                        "files": [],
                     }))
                 } else {
                     axum::Json(json!({ "ok": false, "error": errors.remove(0) }))
@@ -1691,7 +1695,29 @@ impl FakeSlack {
                 "/api/apps.connections.open",
                 post(answer("connect", self.clone())),
             )
-            .route("/respond", post(answer("respond", self.clone())));
+            .route("/respond", post(answer("respond", self.clone())))
+            .route(
+                "/api/files.getUploadURLExternal",
+                any(answer("upload_url", self.clone())),
+            )
+            .route(
+                "/api/files.completeUploadExternal",
+                post(answer("complete", self.clone())),
+            )
+            .route("/upload", post(upload(self.clone())));
+        // The file itself, which is kept as its size.
+        fn upload(
+            slack: FakeSlack,
+        ) -> impl Fn(axum::body::Bytes) -> std::future::Ready<&'static str> + Clone {
+            move |body: axum::body::Bytes| {
+                slack.calls.lock().unwrap().push((
+                    "upload".to_string(),
+                    String::new(),
+                    json!(body.len()),
+                ));
+                std::future::ready("OK")
+            }
+        }
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router).await });
@@ -2133,10 +2159,14 @@ struct FakeTelegram {
 impl FakeTelegram {
     async fn start(&self) -> String {
         let fake = self.clone();
+        // A photo comes as a form, which is kept as text.
         let router = Router::new().fallback(post(
-            move |uri: axum::http::Uri, axum::Json(body): axum::Json<Value>| {
+            move |uri: axum::http::Uri, body: axum::body::Bytes| {
                 let fake = fake.clone();
                 async move {
+                    let body = serde_json::from_slice(&body).unwrap_or_else(|_| {
+                        Value::String(String::from_utf8_lossy(&body).into_owned())
+                    });
                     let mut calls = fake.calls.lock().unwrap();
                     calls.push((uri.path().to_string(), body));
                     let mut answers = fake.answers.lock().unwrap();
@@ -6519,5 +6549,373 @@ mod server_page {
         let server = start().await;
         let page = Browser::default().get(&server, "/settings").await;
         assert!(page.body.contains(r#"href="/server""#), "{}", page.body);
+    }
+}
+
+/// Charts sent with alerts, drawn from what an agent really reported.
+mod charts {
+    use super::*;
+    use crate::alert_charts::ChartSources;
+    use crate::alerting::{Alert, NewAlert};
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+    fn sources(server: &TestServer) -> ChartSources {
+        ChartSources {
+            database: server.state.database.clone(),
+            registry: server.state.registry.clone(),
+            metrics: server.state.metrics.clone(),
+        }
+    }
+
+    /// A disk alert for what `agent` reports, told to `channels`.
+    async fn disk_alert(
+        server: &TestServer,
+        agent: &Identity,
+        series: &str,
+        channels: &[i64],
+    ) -> Alert {
+        let database = &server.state.database;
+        let rule = AlertRuleInput {
+            name: format!("Disk {series}"),
+            metric: Some("disk.usage".to_string()),
+            threshold: Some(90.0),
+            warning_threshold: Some(80.0),
+            for_secs: 0,
+            channels: channels.to_vec(),
+            ..cpu_rule()
+        };
+        let rule_id = database.create_alert_rule(&rule).await.unwrap();
+        let new = NewAlert {
+            rule_id,
+            rule_name: rule.name,
+            severity: Severity::Critical,
+            agent_id: agent.id(),
+            host: "web-1".to_string(),
+            series: series.to_string(),
+            value: Some(95.0),
+            summary: format!("Disk usage ({series}) on web-1 is 95%, above 90%"),
+            started_ms: now_ms() - 30_000,
+        };
+        let id = database.fire_alert(&new, channels).await.unwrap();
+        database.get_alert(id).await.unwrap().unwrap()
+    }
+
+    /// Each post's content type and body.
+    type Posts = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+    /// Somewhere that keeps the content type and body of everything posted to it.
+    #[derive(Clone, Default)]
+    struct Capture {
+        posts: Posts,
+    }
+
+    impl Capture {
+        async fn start(&self) -> String {
+            let capture = self.clone();
+            let router = Router::new().route(
+                "/hook",
+                post(
+                    move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                        let capture = capture.clone();
+                        async move {
+                            let kind = headers
+                                .get("content-type")
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string();
+                            capture.posts.lock().unwrap().push((kind, body.to_vec()));
+                            StatusCode::OK
+                        }
+                    },
+                ),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, router).await });
+            format!("http://{address}/hook")
+        }
+
+        fn posts(&self) -> Vec<(String, String)> {
+            self.posts
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(kind, body)| (kind.clone(), String::from_utf8_lossy(body).into_owned()))
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_chart_is_drawn_from_what_the_agent_reported() {
+        let server = start_with_metrics().await;
+        let (agent, _client) = report_samples(&server, "/data").await;
+        let charts = sources(&server);
+        let now = now_ms();
+
+        let alert = disk_alert(&server, &agent, "/data", &[]).await;
+        let png = charts.draw(&alert, now).await.unwrap().unwrap();
+        assert_eq!(&png[..8], PNG);
+
+        let missing = disk_alert(&server, &agent, "/elsewhere", &[]).await;
+        assert!(charts.draw(&missing, now).await.unwrap().is_none());
+
+        let rule = server
+            .state
+            .database
+            .create_alert_rule(&offline_rule())
+            .await
+            .unwrap();
+        let offline = Alert {
+            rule_id: Some(rule),
+            series: String::new(),
+            ..alert
+        };
+        assert!(charts.draw(&offline, now).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn discord_gets_the_chart_attached_when_an_alert_starts_but_not_ends() {
+        let server = start_with_metrics().await;
+        let (agent, _client) = report_samples(&server, "/data").await;
+        let capture = Capture::default();
+        let channel = ChannelInput {
+            name: "Discord".to_string(),
+            kind: ChannelKind::Discord,
+            target: capture.start().await,
+            ..webhook_channel("unused")
+        };
+        let channel = server
+            .state
+            .database
+            .create_channel(&channel)
+            .await
+            .unwrap();
+        let alert = disk_alert(&server, &agent, "/data", &[channel]).await;
+        let notifier = Notifier::new(server.state.database.clone(), Senders::default())
+            .with_charts(sources(&server));
+
+        notifier.deliver_due(now_ms()).await.unwrap();
+        let posts = capture.posts();
+        assert_eq!(posts.len(), 1);
+        let (kind, body) = &posts[0];
+        assert!(kind.starts_with("multipart/form-data"), "{kind}");
+        assert!(body.contains(r#"name="payload_json""#), "{body}");
+        assert!(body.contains("**CRITICAL** Disk usage (/data) on web-1 is 95%"));
+        assert!(body.contains(r#"name="files[0]"; filename="chart.png""#));
+        assert!(body.contains("PNG"));
+
+        server
+            .state
+            .database
+            .resolve_alert(alert.id, now_ms(), "The problem cleared")
+            .await
+            .unwrap();
+        notifier.deliver_due(now_ms()).await.unwrap();
+        let posts = capture.posts();
+        assert_eq!(posts[1].0, "application/json");
+    }
+
+    #[tokio::test]
+    async fn telegram_gets_a_photo_with_the_alert_as_its_caption() {
+        let server = start_with_metrics().await;
+        let (agent, _client) = report_samples(&server, "/data").await;
+        let telegram = FakeTelegram::default();
+        let url = telegram.start().await;
+        let channel = ChannelInput {
+            name: "Telegram".to_string(),
+            kind: ChannelKind::Telegram,
+            target: "-100123".to_string(),
+            credential: Some(TELEGRAM_TOKEN.to_string()),
+            app_token: None,
+            severities: crate::alerting::every_severity(),
+        };
+        let channel = server
+            .state
+            .database
+            .create_channel(&channel)
+            .await
+            .unwrap();
+        disk_alert(&server, &agent, "/data", &[channel]).await;
+        let senders = Senders {
+            telegram_api_url: Some(url),
+            ..Senders::default()
+        };
+        Notifier::new(server.state.database.clone(), senders)
+            .with_charts(sources(&server))
+            .deliver_due(now_ms())
+            .await
+            .unwrap();
+
+        let calls = telegram.calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(calls[0].0.ends_with("/sendPhoto"));
+        let form = calls[0].1.as_str().unwrap();
+        assert!(form.contains(r#"name="caption""#), "{form}");
+        assert!(form.contains("<b>CRITICAL</b> Disk usage (/data) on web-1"));
+        assert!(form.contains(r#"name="photo"; filename="chart.png""#));
+    }
+
+    #[tokio::test]
+    async fn a_message_too_long_for_a_caption_goes_first_with_the_photo_replying() {
+        let server = start_with_metrics().await;
+        let (agent, _client) = report_samples(&server, "/data").await;
+        let telegram = FakeTelegram::default();
+        let url = telegram.start().await;
+        let channel = ChannelInput {
+            name: "Telegram".to_string(),
+            kind: ChannelKind::Telegram,
+            target: "-100123".to_string(),
+            credential: Some(TELEGRAM_TOKEN.to_string()),
+            app_token: None,
+            severities: crate::alerting::every_severity(),
+        };
+        let channel = server
+            .state
+            .database
+            .create_channel(&channel)
+            .await
+            .unwrap();
+        let long = "/".to_string() + &"d".repeat(200);
+        let alert = disk_alert(&server, &agent, &long, &[channel]).await;
+        let notice = crate::notifier::Notice {
+            chart: Some(Arc::new(PNG.to_vec())),
+            ..crate::notifier::Notice::for_alert(
+                Alert {
+                    summary: "x".repeat(1500),
+                    ..alert
+                },
+                Event::Firing,
+            )
+        };
+        let senders = Senders {
+            telegram_api_url: Some(url),
+            ..Senders::default()
+        };
+        let channel = server
+            .state
+            .database
+            .get_channel(channel)
+            .await
+            .unwrap()
+            .unwrap();
+        let sent = crate::notifier::send(channel, notice, None, senders)
+            .await
+            .unwrap();
+
+        let calls = telegram.calls();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(calls[0].0.ends_with("/sendMessage"));
+        assert!(calls[1].0.ends_with("/sendPhoto"));
+        let form = calls[1].1.as_str().unwrap();
+        assert!(!form.contains(r#"name="caption""#));
+        assert!(form.contains(r#""message_id":101"#), "{form}");
+        assert_eq!(sent.as_deref(), Some("101"));
+    }
+
+    #[tokio::test]
+    async fn slack_shows_the_chart_and_keeps_it_when_the_alert_resolves() {
+        let server = start_with_metrics().await;
+        let (agent, _client) = report_samples(&server, "/data").await;
+        let slack = FakeSlack::default();
+        let url = slack.start().await;
+        let channel = ChannelInput {
+            name: "Slack".to_string(),
+            kind: ChannelKind::Slack,
+            target: "#alerts".to_string(),
+            credential: Some("xoxb-secret-token".to_string()),
+            app_token: None,
+            severities: crate::alerting::every_severity(),
+        };
+        let channel = server
+            .state
+            .database
+            .create_channel(&channel)
+            .await
+            .unwrap();
+        let alert = disk_alert(&server, &agent, "/data", &[channel]).await;
+        let notifier = Notifier::new(
+            server.state.database.clone(),
+            Senders {
+                slack_api_url: Some(url),
+                ..Senders::default()
+            },
+        )
+        .with_charts(sources(&server));
+
+        notifier.deliver_due(now_ms()).await.unwrap();
+        let methods: Vec<String> = slack.calls().into_iter().map(|call| call.0).collect();
+        assert_eq!(methods, ["upload_url", "upload", "complete", "post"]);
+        let calls = slack.calls();
+        let blocks = &calls[3].2["attachments"][0]["blocks"];
+        assert_eq!(blocks[1]["type"], "image", "{blocks}");
+        assert_eq!(blocks[1]["slack_file"]["id"], "F123");
+
+        server
+            .state
+            .database
+            .resolve_alert(alert.id, now_ms(), "The problem cleared")
+            .await
+            .unwrap();
+        notifier.deliver_due(now_ms()).await.unwrap();
+        let calls = slack.calls();
+        let (method, _, update) = &calls[4];
+        assert_eq!(method, "update");
+        assert_eq!(
+            update["attachments"][0]["blocks"][1]["slack_file"]["id"],
+            "F123"
+        );
+    }
+
+    #[tokio::test]
+    async fn slack_still_gets_the_alert_when_the_chart_cannot_be_uploaded() {
+        let server = start_with_metrics().await;
+        let (agent, _client) = report_samples(&server, "/data").await;
+        let slack = FakeSlack::default();
+        let url = slack.start().await;
+        slack.errors.lock().unwrap().push("missing_scope");
+        let channel = ChannelInput {
+            name: "Slack".to_string(),
+            kind: ChannelKind::Slack,
+            target: "#alerts".to_string(),
+            credential: Some("xoxb-secret-token".to_string()),
+            app_token: None,
+            severities: crate::alerting::every_severity(),
+        };
+        let channel = server
+            .state
+            .database
+            .create_channel(&channel)
+            .await
+            .unwrap();
+        disk_alert(&server, &agent, "/data", &[channel]).await;
+        Notifier::new(
+            server.state.database.clone(),
+            Senders {
+                slack_api_url: Some(url),
+                ..Senders::default()
+            },
+        )
+        .with_charts(sources(&server))
+        .deliver_due(now_ms())
+        .await
+        .unwrap();
+
+        let calls = slack.calls();
+        let methods: Vec<&str> = calls.iter().map(|call| call.0.as_str()).collect();
+        assert_eq!(methods, ["upload_url", "post"]);
+        assert_eq!(
+            calls[1].2["attachments"][0]["blocks"][1]["type"],
+            json!(null)
+        );
+        assert!(
+            server
+                .state
+                .database
+                .delivery_problems(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

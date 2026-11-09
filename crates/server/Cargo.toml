@@ -49,7 +49,9 @@ rustls-acme = { version = "0.15", default-features = false, features = ["axum", 
 tower-http = { version = "0.6", features = ["compression-gzip"] }
 tracing.workspace = true
 clickhouse = { version = "0.15", default-features = false, features = ["lz4", "rustls-tls-ring", "rustls-tls-webpki-roots"] }
-ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
+ureq = { version = "3.5.1", default-features = false, features = ["rustls", "multipart"] }
+# Draws the charts sent with alerts. Fonts are built in, not read from the machine.
+resvg = { version = "0.47", default-features = false, features = ["text"] }
 # TLS for Slack's Socket Mode connections, which slack-morphism makes with it.
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "rustls", "ring", "webpki-roots"] }

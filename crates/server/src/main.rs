@@ -1,4 +1,5 @@
 mod agent_versions;
+mod alert_charts;
 mod alert_evaluator;
 mod alerting;
 mod app_state;
@@ -285,7 +286,13 @@ async fn serve(path: &Path) -> Result<()> {
         now_ms(),
     )
     .spawn();
-    Notifier::new(state.database.clone(), state.senders.clone()).spawn();
+    Notifier::new(state.database.clone(), state.senders.clone())
+        .with_charts(alert_charts::ChartSources {
+            database: state.database.clone(),
+            registry: state.registry.clone(),
+            metrics: state.metrics.clone(),
+        })
+        .spawn();
     slack_actions::spawn(state.database.clone(), state.senders.web_url.clone());
     Scheduler::new(
         state.database.clone(),

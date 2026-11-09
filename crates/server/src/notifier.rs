@@ -1,6 +1,7 @@
 //! Delivers notifications from the queue. Deliveries are at least once: a crash
 //! between sending and saving sends it again, so webhooks carry an ID to spot that.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -9,27 +10,35 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::FutureExt;
 use hyper_rustls::HttpsConnectorBuilder;
-use lettre::message::Mailbox;
 use lettre::message::header::ContentType;
+use lettre::message::{Attachment, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use serde::Serialize;
 use serde_json::{Value, json};
-use slack_morphism::api::{SlackApiChatPostMessageRequest, SlackApiChatUpdateRequest};
+use slack_morphism::api::{
+    SlackApiChatPostMessageRequest, SlackApiChatUpdateRequest, SlackApiFilesComplete,
+    SlackApiFilesCompleteUploadExternalRequest, SlackApiFilesGetUploadUrlExternalRequest,
+    SlackApiFilesUploadViaUrlRequest,
+};
 use slack_morphism::errors::SlackClientError;
 use slack_morphism::prelude::{
     SlackActionBlockElement, SlackActionsBlock, SlackBlock, SlackBlockButtonElement,
     SlackBlockButtonStyle, SlackBlockMarkDownText, SlackBlockPlainText, SlackClientHyperConnector,
-    SlackClientHyperHttpsConnector, SlackContextBlock, SlackContextBlockElement, SlackSectionBlock,
+    SlackClientHyperHttpsConnector, SlackContextBlock, SlackContextBlockElement, SlackFileIdOrUrl,
+    SlackImageBlock, SlackImageUrlOrFile, SlackSectionBlock,
 };
 use slack_morphism::{
     SlackActionId, SlackApiToken, SlackApiTokenValue, SlackChannelId, SlackClient,
-    SlackClientHttpConnector, SlackMessageAttachment, SlackMessageContent, SlackTs,
+    SlackClientHttpConnector, SlackClientSession, SlackFileId, SlackMessageAttachment,
+    SlackMessageContent, SlackTs,
 };
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{MissedTickBehavior, timeout};
 use tracing::{error, info, warn};
+use ureq::unversioned::multipart::{Form, Part};
 
+use crate::alert_charts::ChartSources;
 use crate::alerting::{Alert, Channel, ChannelKind, Delivery, Event, Severity, recipients};
 use crate::config::{EmailConfig, EmailSecurity};
 use crate::metrics::now_ms;
@@ -46,6 +55,9 @@ const BATCH_SIZE: usize = 16;
 
 /// How long one delivery can take.
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What a chart is called when it's sent as a file.
+const CHART_FILE: &str = "chart.png";
 
 /// The longest message Discord accepts.
 const DISCORD_MAX_CHARS: usize = 2000;
@@ -90,6 +102,9 @@ pub struct Notice {
     pub alert: Option<Alert>,
     /// One line in plain words.
     pub text: String,
+    /// A PNG of the last hour, for channels that show pictures.
+    #[serde(skip)]
+    pub chart: Option<Arc<Vec<u8>>>,
 }
 
 impl Notice {
@@ -114,6 +129,7 @@ impl Notice {
             event,
             alert: Some(alert),
             text,
+            chart: None,
         }
     }
 
@@ -123,7 +139,29 @@ impl Notice {
             event: Event::Test,
             alert: None,
             text: "This is a test notification from MaxNines.".to_string(),
+            chart: None,
         }
+    }
+
+    /// Words for whoever can't see the chart.
+    fn chart_description(&self) -> String {
+        let summary = self
+            .alert
+            .as_ref()
+            .map_or(self.text.as_str(), |a| &a.summary);
+        format!("The last hour: {summary}")
+    }
+
+    /// The plain text, with the chart under it.
+    fn email_html(&self) -> String {
+        format!(
+            "<!doctype html><html><body>\
+             <pre style=\"font-family: sans-serif; white-space: pre-wrap\">{}</pre>\
+             <img src=\"cid:chart\" alt=\"{}\" width=\"720\" style=\"max-width: 100%\">\
+             </body></html>",
+            escape_html(&self.email_body()),
+            escape_html(&self.chart_description())
+        )
     }
 
     /// `text` is what Slack and tools like it show, so a plain webhook works
@@ -357,17 +395,7 @@ impl Mailer {
     }
 
     fn send(&self, to: &str, notice: &Notice) -> Result<()> {
-        let mut message = Message::builder()
-            .from(self.from.clone())
-            .subject(notice.subject());
-        for address in recipients(to)? {
-            message = message.to(Mailbox::new(None, address));
-        }
-        let message = message
-            .header(ContentType::TEXT_PLAIN)
-            .body(notice.email_body())
-            .context("building the email")?;
-
+        let message = email_message(&self.from, to, notice)?;
         self.transport
             .send(&message)
             .map_err(|error| match error.status() {
@@ -377,6 +405,34 @@ impl Mailer {
             })?;
         Ok(())
     }
+}
+
+/// Plain text, or with a chart, plain text beside HTML that shows it.
+fn email_message(from: &Mailbox, to: &str, notice: &Notice) -> Result<Message> {
+    let mut message = Message::builder()
+        .from(from.clone())
+        .subject(notice.subject());
+    for address in recipients(to)? {
+        message = message.to(Mailbox::new(None, address));
+    }
+    let message = match &notice.chart {
+        None => message
+            .header(ContentType::TEXT_PLAIN)
+            .body(notice.email_body()),
+        Some(chart) => {
+            let png = ContentType::parse("image/png").context("naming the chart's type")?;
+            let shown = MultiPart::related()
+                .singlepart(SinglePart::html(notice.email_html()))
+                .singlepart(Attachment::new_inline("chart".to_string()).body(chart.to_vec(), png));
+            message.multipart(
+                MultiPart::alternative()
+                    .singlepart(SinglePart::plain(notice.email_body()))
+                    .multipart(shown),
+            )
+        }
+    }
+    .context("building the email")?;
+    Ok(message)
 }
 
 fn alerts_link(web_url: &str) -> String {
@@ -391,7 +447,13 @@ fn slack_manifest_value() -> Value {
         "features": { "bot_user": { "display_name": "maxnines", "always_online": false } },
         "oauth_config": {
             "scopes": {
-                "bot": ["chat:write", "chat:write.public", "users:read", "users:read.email"],
+                "bot": [
+                    "chat:write",
+                    "chat:write.public",
+                    "files:write",
+                    "users:read",
+                    "users:read.email",
+                ],
             },
         },
         "settings": {
@@ -420,8 +482,7 @@ pub fn alertops_sample() -> String {
     serde_json::to_string_pretty(&event).unwrap_or_default()
 }
 
-/// Posts JSON, and gives the response whatever its status.
-fn post(url: &str, body: &Value) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(SEND_TIMEOUT))
         .max_redirects(0)
@@ -429,9 +490,49 @@ fn post(url: &str, body: &Value) -> Result<ureq::http::Response<ureq::Body>, ure
         .user_agent(concat!("MaxNines/", env!("CARGO_PKG_VERSION")))
         .build()
         .new_agent()
+}
+
+/// Posts JSON, and gives the response whatever its status.
+fn post(url: &str, body: &Value) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+    agent()
         .post(url.trim())
         .header("content-type", "application/json")
         .send(body.to_string().as_bytes())
+}
+
+/// Posts a form with files in it, and gives the response whatever its status.
+fn post_form(url: &str, form: Form) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+    agent().post(url.trim()).send(form)
+}
+
+/// The chart as a part of a form.
+fn chart_part(chart: &[u8]) -> Result<Part<'_>> {
+    Part::bytes(chart)
+        .file_name(CHART_FILE)
+        .mime_str("image/png")
+        .context("naming the chart's type")
+}
+
+/// A Discord message, with the chart attached when there is one, which Discord
+/// shows under the text.
+fn post_to_discord(url: &str, notice: &Notice) -> Result<()> {
+    let body = notice.discord_body();
+    let Some(chart) = &notice.chart else {
+        return post_json("the webhook", url, &body);
+    };
+    let payload = body.to_string();
+    let json = Part::text(&payload)
+        .mime_str("application/json")
+        .context("naming the message's type")?;
+    let form = Form::new()
+        .part("payload_json", json)
+        .part("files[0]", chart_part(chart)?);
+    let response = post_form(url, form).map_err(|error| explain_http("the webhook", &error))?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("the webhook returned status {}", status.as_u16());
+    }
+    Ok(())
 }
 
 /// Errors are saved and shown, and a URL often holds a password, so they only
@@ -455,6 +556,14 @@ fn post_json(who: &str, url: &str, body: &Value) -> Result<()> {
         bail!("{who} returned status {}", status.as_u16());
     }
     Ok(())
+}
+
+/// For the HTML part of an email.
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 /// Telegram's HTML needs only these escaped, and agents choose their own names.
@@ -574,8 +683,12 @@ fn explain_telegram(status: u16, answer: &Value) -> anyhow::Error {
     }
 }
 
+/// The longest caption Telegram puts under a photo.
+const TELEGRAM_MAX_CAPTION: usize = 1024;
+
 /// Sends a message, as a reply to the alert's first one when there is one, and
-/// gives what Telegram called it.
+/// gives what Telegram called it. With a chart, the message is the photo's caption,
+/// or when it's too long for one, the photo is a reply to it.
 fn send_to_telegram(
     channel: &Channel,
     notice: &Notice,
@@ -587,18 +700,48 @@ fn send_to_telegram(
         .credential
         .as_deref()
         .context("this channel has no bot token")?;
-    let url = format!(
-        "{}/bot{}/sendMessage",
-        senders.telegram_api_url(),
-        token.trim()
-    );
-    let message = telegram_message(
-        notice,
-        &channel.channel.target,
-        reply_to,
-        senders.web_url.as_deref(),
-    );
-    let mut response = post(&url, &message).map_err(|error| explain_http("Telegram", &error))?;
+    let method = |name: &str| format!("{}/bot{}/{name}", senders.telegram_api_url(), token.trim());
+    let chat = channel.channel.target.trim();
+    let web_url = senders.web_url.as_deref();
+    let send_photo = |chart: &[u8], caption: Option<&str>, reply_to: Option<&str>| {
+        let reply = reply_to
+            .and_then(|id| id.parse::<i64>().ok())
+            .map(|id| json!({ "message_id": id, "allow_sending_without_reply": true }).to_string());
+        let mut form = Form::new()
+            .text("chat_id", chat)
+            .part("photo", chart_part(chart)?);
+        if let Some(caption) = caption {
+            form = form.text("caption", caption).text("parse_mode", "HTML");
+        }
+        if let Some(reply) = &reply {
+            form = form.text("reply_parameters", reply);
+        }
+        telegram_answer(post_form(&method("sendPhoto"), form))
+    };
+
+    let text = telegram_text(notice, web_url);
+    match &notice.chart {
+        Some(chart) if text.encode_utf16().count() <= TELEGRAM_MAX_CAPTION => {
+            send_photo(chart, Some(&text), reply_to)
+        }
+        Some(chart) => {
+            let message = telegram_message(notice, chat, reply_to, web_url);
+            let sent = telegram_answer(post(&method("sendMessage"), &message))?;
+            send_photo(chart, None, sent.as_deref())?;
+            Ok(sent)
+        }
+        None => {
+            let message = telegram_message(notice, chat, reply_to, web_url);
+            telegram_answer(post(&method("sendMessage"), &message))
+        }
+    }
+}
+
+/// What Telegram called what was sent, or why it refused it.
+fn telegram_answer(
+    response: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+) -> Result<Option<String>> {
+    let mut response = response.map_err(|error| explain_http("Telegram", &error))?;
     let status = response.status();
     let answer: Value = response
         .body_mut()
@@ -742,6 +885,9 @@ pub struct SlackControls {
     pub silenced: Option<String>,
 }
 
+/// The longest description Slack takes for an image.
+const SLACK_ALT_TEXT_MAX_CHARS: usize = 2000;
+
 /// The most text Slack shows in one section of a message.
 const SLACK_SECTION_MAX_CHARS: usize = 3000;
 
@@ -810,12 +956,13 @@ fn slack_buttons(
     buttons
 }
 
-/// One colored attachment holding the message, what's been done about it, and any
-/// buttons. `text` is what notifications and older clients show.
+/// One colored attachment holding the message, its chart, what's been done about
+/// it, and any buttons. `text` is what notifications and older clients show.
 pub fn slack_content(
     notice: &Notice,
     web_url: Option<&str>,
     controls: Option<&SlackControls>,
+    chart: Option<&SlackFileId>,
 ) -> SlackMessageContent {
     let text = clip_escaped(slack_text(notice, web_url), SLACK_SECTION_MAX_CHARS);
     let mut blocks: Vec<SlackBlock> = vec![
@@ -823,6 +970,13 @@ pub fn slack_content(
             .with_text(SlackBlockMarkDownText::new(text).into())
             .into(),
     ];
+    if let Some(file) = chart {
+        let image = SlackImageUrlOrFile::SlackFile {
+            slack_file: SlackFileIdOrUrl::Id { id: file.clone() },
+        };
+        let description = clip_escaped(notice.chart_description(), SLACK_ALT_TEXT_MAX_CHARS);
+        blocks.push(SlackImageBlock::new(image, description).into());
+    }
     let status = slack_status(notice, controls);
     if !status.is_empty() {
         let line = SlackBlockMarkDownText::new(status.join(" · "));
@@ -865,10 +1019,89 @@ pub fn slack_connector() -> Result<SlackClientHyperHttpsConnector> {
     Ok(SlackClientHyperConnector::with_connector(https))
 }
 
-/// The channel and timestamp that together name a Slack message.
-fn slack_message_id(external_id: &str) -> Option<(SlackChannelId, SlackTs)> {
-    let (channel, ts) = external_id.split_once(':')?;
-    Some((SlackChannelId(channel.to_string()), SlackTs(ts.to_string())))
+/// The channel and timestamp that together name a Slack message, and its chart if it
+/// has one, kept together as `channel:ts:file` so a changed message keeps its chart.
+fn slack_message_id(external_id: &str) -> Option<(SlackChannelId, SlackTs, Option<SlackFileId>)> {
+    let mut parts = external_id.splitn(3, ':');
+    let channel = parts.next().filter(|part| !part.is_empty())?;
+    let ts = parts.next().filter(|part| !part.is_empty())?;
+    let chart = parts.next().map(|file| SlackFileId(file.to_string()));
+    Some((
+        SlackChannelId(channel.to_string()),
+        SlackTs(ts.to_string()),
+        chart,
+    ))
+}
+
+fn slack_external_id(
+    channel: &SlackChannelId,
+    ts: &SlackTs,
+    chart: Option<&SlackFileId>,
+) -> String {
+    match chart {
+        Some(file) => format!("{channel}:{ts}:{file}"),
+        None => format!("{channel}:{ts}"),
+    }
+}
+
+/// The chart in a message Slack sent back, such as one whose button was pressed.
+pub fn slack_chart(content: &SlackMessageContent) -> Option<SlackFileId> {
+    let attached = content
+        .attachments
+        .iter()
+        .flatten()
+        .flat_map(|attachment| attachment.blocks.iter().flatten());
+    content
+        .blocks
+        .iter()
+        .flatten()
+        .chain(attached)
+        .find_map(|block| match block {
+            SlackBlock::Image(SlackImageBlock {
+                image_url_or_file:
+                    SlackImageUrlOrFile::SlackFile {
+                        slack_file: SlackFileIdOrUrl::Id { id },
+                    },
+                ..
+            }) => Some(id.clone()),
+            _ => None,
+        })
+}
+
+/// Uploads a chart for a message to show. It's shared with nobody until a message
+/// shows it.
+async fn upload_to_slack<C>(
+    session: &SlackClientSession<'_, C>,
+    chart: &[u8],
+    description: &str,
+) -> Result<SlackFileId>
+where
+    C: SlackClientHttpConnector + Send + Sync,
+{
+    let request =
+        SlackApiFilesGetUploadUrlExternalRequest::new(CHART_FILE.to_string(), chart.len())
+            .with_alt_txt(description.chars().take(SLACK_ALT_TEXT_MAX_CHARS).collect());
+    let upload = session
+        .get_upload_url_external(&request)
+        .await
+        .map_err(|error| explain_slack(&error))?;
+    let content = SlackApiFilesUploadViaUrlRequest::new(
+        upload.upload_url,
+        chart.to_vec(),
+        "image/png".to_string(),
+    );
+    session
+        .files_upload_via_url(&content)
+        .await
+        .map_err(|error| explain_slack(&error))?;
+    let done = SlackApiFilesCompleteUploadExternalRequest::new(vec![SlackApiFilesComplete::new(
+        upload.file_id.clone(),
+    )]);
+    session
+        .files_complete_upload_external(&done)
+        .await
+        .map_err(|error| explain_slack(&error))?;
+    Ok(upload.file_id)
 }
 
 /// Slack's error codes are safe to keep and say what's wrong, but anything else
@@ -896,6 +1129,10 @@ fn explain_slack_code(code: &str) -> anyhow::Error {
         _ => return anyhow!("Slack said {code}"),
     };
     anyhow!("{advice} ({code})")
+}
+
+fn is_invalid_blocks(error: &SlackClientError) -> bool {
+    matches!(error, SlackClientError::ApiError(error) if error.code == "invalid_blocks")
 }
 
 fn is_gone(error: &SlackClientError) -> bool {
@@ -928,12 +1165,12 @@ where
         .app_token
         .is_some()
         .then(SlackControls::default);
-    let content = slack_content(notice, web_url, controls.as_ref());
 
-    if let Some((message_channel, ts)) = reply_to
+    if let Some((message_channel, ts, chart)) = reply_to
         .filter(|_| notice.event == Event::Resolved)
         .and_then(slack_message_id)
     {
+        let content = slack_content(notice, web_url, controls.as_ref(), chart.as_ref());
         let update =
             SlackApiChatUpdateRequest::new(message_channel.clone(), content.clone(), ts.clone());
         match session.chat_update(&update).await {
@@ -957,12 +1194,36 @@ where
         }
     }
 
+    // The message matters more than its chart, so it goes without one that fails.
+    let mut chart = None;
+    if let Some(png) = notice.chart.as_deref() {
+        match upload_to_slack(&session, png, &notice.chart_description()).await {
+            Ok(file) => chart = Some(file),
+            Err(error) => warn!(
+                error = format!("{error:#}"),
+                "couldn't send a chart to Slack"
+            ),
+        }
+    }
     let target = SlackChannelId(channel.channel.target.trim().to_string());
-    let request = slack_post(target, content);
-    let response = session
-        .chat_post_message(&request)
+    let content = slack_content(notice, web_url, controls.as_ref(), chart.as_ref());
+    let response = match session
+        .chat_post_message(&slack_post(target.clone(), content))
         .await
-        .map_err(|error| explain_slack(&error))?;
+    {
+        Ok(response) => response,
+        // Slack can refuse a chart it hasn't finished taking in yet.
+        Err(error) if chart.is_some() && is_invalid_blocks(&error) => {
+            warn!("Slack wouldn't show the chart, so the alert went without it");
+            chart = None;
+            let content = slack_content(notice, web_url, controls.as_ref(), None);
+            session
+                .chat_post_message(&slack_post(target, content))
+                .await
+                .map_err(|error| explain_slack(&error))?
+        }
+        Err(error) => return Err(explain_slack(&error)),
+    };
 
     // Otherwise a wrong token would only show in the server's log.
     if let (Event::Test, Some(app_token)) = (notice.event, &channel.channel.app_token) {
@@ -970,7 +1231,11 @@ where
             .await
             .context("the test message was sent, but the buttons won't work")?;
     }
-    Ok(Some(format!("{}:{}", response.channel, response.ts)))
+    Ok(Some(slack_external_id(
+        &response.channel,
+        &response.ts,
+        chart.as_ref(),
+    )))
 }
 
 async fn send_to_slack(
@@ -1006,7 +1271,7 @@ fn send_blocking(
     let web_url = senders.web_url.as_deref();
     let sent = match channel.channel.kind {
         ChannelKind::Webhook => post_json("the webhook", target, &notice.webhook_body()),
-        ChannelKind::Discord => post_json("the webhook", target, &notice.discord_body()),
+        ChannelKind::Discord => post_to_discord(target, notice),
         ChannelKind::Email => senders
             .mailer
             .as_deref()
@@ -1050,6 +1315,16 @@ pub async fn send(
     .map_err(|_| anyhow!("sending failed unexpectedly"))?
 }
 
+/// Whether a notification goes with a chart: an alert starting or getting worse,
+/// on a channel that shows pictures.
+fn shows_chart(delivery: &Delivery) -> bool {
+    matches!(delivery.event, Event::Firing | Event::Escalated)
+        && matches!(
+            delivery.channel.channel.kind,
+            ChannelKind::Discord | ChannelKind::Telegram | ChannelKind::Slack | ChannelKind::Email
+        )
+}
+
 /// Runs a send with a time limit, turning a panic into an ordinary failure.
 async fn guarded<T>(
     who: &str,
@@ -1067,11 +1342,43 @@ async fn guarded<T>(
 pub struct Notifier {
     database: Database,
     senders: Senders,
+    /// Where charts come from, for channels that show them.
+    charts: Option<Arc<ChartSources>>,
 }
 
 impl Notifier {
     pub fn new(database: Database, senders: Senders) -> Self {
-        Self { database, senders }
+        Self {
+            database,
+            senders,
+            charts: None,
+        }
+    }
+
+    /// Sends charts with alerts to the channels that show them.
+    pub fn with_charts(mut self, charts: ChartSources) -> Self {
+        self.charts = Some(Arc::new(charts));
+        self
+    }
+
+    /// The chart for a delivery, if it gets one. Drawing one is never a reason not
+    /// to send the notification.
+    async fn chart_for(&self, delivery: &Delivery, now_ms: i64) -> Option<Arc<Vec<u8>>> {
+        let charts = self.charts.as_ref()?;
+        if !shows_chart(delivery) {
+            return None;
+        }
+        match charts.draw(&delivery.alert, now_ms).await {
+            Ok(chart) => chart.map(Arc::new),
+            Err(error) => {
+                warn!(
+                    alert = delivery.alert.id,
+                    error = format!("{error:#}"),
+                    "couldn't draw a chart for an alert"
+                );
+                None
+            }
+        }
     }
 
     /// Runs until the server stops. Each pass is its own task, so a panic costs
@@ -1145,6 +1452,8 @@ impl Notifier {
         let due = self.database.due_deliveries(now_ms, BATCH_SIZE).await?;
 
         let mut sends = JoinSet::new();
+        // Each chart is drawn once a pass, however many channels it goes to.
+        let mut charts: HashMap<(i64, Event), Option<Arc<Vec<u8>>>> = HashMap::new();
         for delivery in due {
             let tells_of_a_problem = matches!(
                 delivery.event,
@@ -1158,9 +1467,25 @@ impl Notifier {
                 self.database.drop_delivery(delivery.id).await?;
                 continue;
             }
+            let chart = if shows_chart(&delivery) {
+                let key = (delivery.alert.id, delivery.event);
+                match charts.get(&key) {
+                    Some(drawn) => drawn.clone(),
+                    None => {
+                        let drawn = self.chart_for(&delivery, now_ms).await;
+                        charts.insert(key, drawn.clone());
+                        drawn
+                    }
+                }
+            } else {
+                None
+            };
             let senders = self.senders.clone();
             sends.spawn(async move {
-                let notice = Notice::for_delivery(&delivery);
+                let notice = Notice {
+                    chart,
+                    ..Notice::for_delivery(&delivery)
+                };
                 let reply_to = delivery.reply_to.clone();
                 let result = send(delivery.channel.clone(), notice, reply_to, senders).await;
                 (delivery, result)
@@ -1245,6 +1570,7 @@ mod tests {
             event,
             alert: Some(alert),
             text,
+            chart: None,
         }
     }
 
@@ -1309,7 +1635,7 @@ mod tests {
             "{text}"
         );
 
-        let content = slack_content(&notice, None, None);
+        let content = slack_content(&notice, None, None, None);
         assert!(!content.text.unwrap().contains('<'));
     }
 
@@ -1376,11 +1702,11 @@ mod tests {
         let controls = SlackControls::default();
         let firing = notice(Event::Firing, alert());
         assert_eq!(
-            block_types(&slack_content(&firing, None, None)),
+            block_types(&slack_content(&firing, None, None, None)),
             ["section"]
         );
         assert_eq!(
-            block_types(&slack_content(&firing, None, Some(&controls))),
+            block_types(&slack_content(&firing, None, Some(&controls), None)),
             ["section", "actions"]
         );
 
@@ -1388,7 +1714,12 @@ mod tests {
             resolved_ms: Some(2_000),
             ..alert()
         };
-        let content = slack_content(&notice(Event::Resolved, resolved), None, Some(&controls));
+        let content = slack_content(
+            &notice(Event::Resolved, resolved),
+            None,
+            Some(&controls),
+            None,
+        );
         assert_eq!(block_types(&content), ["section"]);
 
         let handled = Alert {
@@ -1398,7 +1729,12 @@ mod tests {
         let silenced = SlackControls {
             silenced: Some("Silenced by sam@example.com until later".to_string()),
         };
-        let content = slack_content(&notice(Event::Reminder, handled), None, Some(&silenced));
+        let content = slack_content(
+            &notice(Event::Reminder, handled),
+            None,
+            Some(&silenced),
+            None,
+        );
         assert_eq!(block_types(&content), ["section", "context"]);
         let value = serde_json::to_value(&content).unwrap();
         assert_eq!(
@@ -1417,7 +1753,7 @@ mod tests {
             summary: "<".repeat(5000),
             ..alert()
         };
-        let content = slack_content(&notice(Event::Firing, alert), None, None);
+        let content = slack_content(&notice(Event::Firing, alert), None, None, None);
         let value = serde_json::to_value(&content).unwrap();
         let text = value["attachments"][0]["blocks"][0]["text"]["text"]
             .as_str()
@@ -1442,6 +1778,7 @@ mod tests {
             json!([
                 "chat:write",
                 "chat:write.public",
+                "files:write",
                 "users:read",
                 "users:read.email"
             ])
@@ -1455,12 +1792,89 @@ mod tests {
         assert_eq!(request.unfurl_media, Some(false));
     }
 
+    fn with_chart(event: Event) -> Notice {
+        Notice {
+            chart: Some(Arc::new(b"\x89PNG chart".to_vec())),
+            ..notice(event, alert())
+        }
+    }
+
     #[test]
-    fn a_message_id_needs_both_parts() {
-        let (channel, ts) = slack_message_id("C1:12.34").unwrap();
-        assert_eq!(channel.0, "C1");
-        assert_eq!(ts.0, "12.34");
+    fn an_email_with_a_chart_shows_it_beside_the_plain_text() {
+        let from: Mailbox = "maxnines@example.com".parse().unwrap();
+        let odd_host = Alert {
+            host: "web-<1>".to_string(),
+            ..alert()
+        };
+        let charted = Notice {
+            chart: Some(Arc::new(b"\x89PNG chart".to_vec())),
+            ..notice(Event::Firing, odd_host)
+        };
+        let message = email_message(&from, "ops@example.com", &charted).unwrap();
+        let text = String::from_utf8_lossy(&message.formatted()).to_string();
+
+        assert!(text.contains("multipart/alternative"), "{text}");
+        assert!(text.contains("multipart/related"));
+        assert!(text.contains("Content-ID: <chart>"));
+        assert!(text.contains("Content-Type: image/png"));
+        assert!(text.contains("src=3D\"cid:chart\"") || text.contains("src=\"cid:chart\""));
+        assert!(text.contains("web-&lt;1&gt;"), "{text}");
+
+        let plain =
+            email_message(&from, "ops@example.com", &notice(Event::Firing, alert())).unwrap();
+        let text = String::from_utf8_lossy(&plain.formatted()).to_string();
+        assert!(!text.contains("multipart"));
+    }
+
+    #[test]
+    fn a_slack_message_shows_its_chart_and_gives_it_back() {
+        let file = SlackFileId("F123".to_string());
+        let content = slack_content(&with_chart(Event::Firing), None, None, Some(&file));
+        let sent = serde_json::to_value(&content).unwrap();
+        let blocks = &sent["attachments"][0]["blocks"];
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["slack_file"]["id"], "F123");
+        assert!(
+            blocks[1]["alt_text"]
+                .as_str()
+                .unwrap()
+                .starts_with("The last hour: CPU usage on web-1")
+        );
+
+        let back: SlackMessageContent = serde_json::from_value(sent).unwrap();
+        assert_eq!(slack_chart(&back), Some(file));
+        let plain = slack_content(&notice(Event::Firing, alert()), None, None, None);
+        assert_eq!(slack_chart(&plain), None);
+    }
+
+    #[test]
+    fn the_slack_app_can_upload_charts() {
+        let manifest = slack_manifest_value();
+        let scopes = manifest["oauth_config"]["scopes"]["bot"]
+            .as_array()
+            .unwrap();
+        assert!(scopes.contains(&json!("files:write")));
+    }
+
+    #[test]
+    fn a_message_id_needs_both_parts_and_may_name_a_chart() {
+        let (channel, ts, chart) = slack_message_id("C1:12.34").unwrap();
+        assert_eq!(
+            (channel.0.as_str(), ts.0.as_str(), chart),
+            ("C1", "12.34", None)
+        );
+        let (_, _, chart) = slack_message_id("C1:12.34:F9").unwrap();
+        assert_eq!(chart, Some(SlackFileId("F9".to_string())));
         assert!(slack_message_id("nonsense").is_none());
+        assert!(slack_message_id(":12.34").is_none());
+        assert_eq!(
+            slack_external_id(
+                &SlackChannelId("C1".to_string()),
+                &SlackTs("12.34".to_string()),
+                Some(&SlackFileId("F9".to_string()))
+            ),
+            "C1:12.34:F9"
+        );
     }
 
     #[test]

@@ -191,7 +191,52 @@ pub fn build_as(
     range: TimeRange,
     zone: Tz,
 ) -> Chart {
-    let axis = Axis::new(unit, &result.series, frame);
+    let axis = Axis::new(unit, &result.series, frame, &[]);
+    chart_on(axis, metric, unit, title, frame, result, range, zone)
+}
+
+/// A chart whose scale reaches these values too, such as an alert's thresholds,
+/// with how far down the chart each one is.
+pub struct Marked {
+    pub chart: Chart,
+    pub marks: Vec<f64>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_marked(
+    metric: &Metric,
+    unit: Unit,
+    title: &str,
+    frame: Frame,
+    result: &SeriesResult,
+    range: TimeRange,
+    zone: Tz,
+    values: &[f64],
+) -> Marked {
+    let axis = Axis::new(unit, &result.series, frame, values);
+    let marks = values.iter().map(|value| axis.y(*value)).collect();
+    Marked {
+        chart: chart_on(axis, metric, unit, title, frame, result, range, zone),
+        marks,
+    }
+}
+
+/// How far across a chart a moment is.
+pub fn x_of(time_ms: i64, range: TimeRange, frame: Frame) -> f64 {
+    x_for(time_ms, range, frame)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chart_on(
+    axis: Axis,
+    metric: &Metric,
+    unit: Unit,
+    title: &str,
+    frame: Frame,
+    result: &SeriesResult,
+    range: TimeRange,
+    zone: Tz,
+) -> Chart {
     let slots = colour_slots(metric, &result.series);
 
     Chart {
@@ -251,12 +296,15 @@ struct Axis {
 }
 
 impl Axis {
-    fn new(unit: Unit, series: &[Series], frame: Frame) -> Self {
+    /// `include` are values the scale has to reach whatever the series do.
+    fn new(unit: Unit, series: &[Series], frame: Frame, include: &[f64]) -> Self {
         let values = || {
             series
                 .iter()
                 .flat_map(|series| &series.points)
-                .map(|point| point.avg.clamp(-LARGEST_VALUE, LARGEST_VALUE))
+                .map(|point| point.avg)
+                .chain(include.iter().copied())
+                .map(|value| value.clamp(-LARGEST_VALUE, LARGEST_VALUE))
         };
         let lowest = values().fold(0.0, f64::min);
         let highest = values().fold(0.0, f64::max);

@@ -1,5 +1,23 @@
 # Notification channels
 
+## Charts
+
+When an alert starts, or a warning becomes critical, Discord, Telegram, Slack and email
+get a chart with it: the last hour of what the alert watches, on that machine or for that
+calculation, with the rule's thresholds and the moment the alert started. Times on it are
+in UTC, like the rest of the message. Other notifications, and other channels, are text
+only. An alert about an agent going offline has nothing to chart.
+
+The chart is drawn inside the server, so nothing else needs to be installed. If one
+can't be drawn or sent, the notification goes without it, and the server's log says why.
+
+- **Slack** needs the app to have the `files:write` permission, which apps made from the
+  channel form's button have. For an app made before charts, add it under **OAuth &
+  Permissions**, then **Bot Token Scopes**, and reinstall the app to the workspace.
+- **Telegram** sends a photo with the alert as its caption, or for a long alert, the
+  message first with the photo as a reply.
+- **Email** shows the chart under the text, for mail apps that show HTML.
+
 ## Slack buttons
 
 Slack alerts can have **Acknowledge** and **Silence 1 hour** buttons. They need the
