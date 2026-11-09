@@ -58,7 +58,8 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
 
-  # The same checks as every push, on every system, before building anything.
+  # The same checks as every push, on every system. They run alongside the
+  # builds, and nothing is pushed or published unless they pass.
   tests:
     name: Tests
     uses: ./.github/workflows/ci.yml
@@ -67,7 +68,7 @@ jobs:
   # later: RHEL 9, Ubuntu 22.04 and Debian 12 onwards.
   linux-server:
     name: Server for Linux ${{ matrix.arch }}
-    needs: [check, tests]
+    needs: check
     runs-on: ${{ matrix.runner }}
     container: rockylinux:9
     strategy:
@@ -102,7 +103,7 @@ jobs:
   # Fully static, so it runs on any Linux, Alpine and older distributions included.
   linux-agent:
     name: Agent for Linux ${{ matrix.arch }}
-    needs: [check, tests]
+    needs: check
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
@@ -134,13 +135,15 @@ jobs:
 
   macos:
     name: macOS ${{ matrix.arch }}
-    needs: [check, tests]
+    needs: check
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
         include:
+          # Built on Apple Silicon for both: GitHub's Intel Macs take over twice
+          # as long.
           - { arch: aarch64, runner: macos-15 }
-          - { arch: x86_64, runner: macos-15-intel }
+          - { arch: x86_64, runner: macos-15 }
     env:
       TARGET: ${{ matrix.arch }}-apple-darwin
     steps:
@@ -163,7 +166,7 @@ jobs:
 
   windows:
     name: Windows ${{ matrix.arch }}
-    needs: [check, tests]
+    needs: check
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
@@ -204,7 +207,7 @@ jobs:
   # GitHub has no FreeBSD runners, so this builds in a FreeBSD virtual machine.
   freebsd:
     name: FreeBSD x86_64
-    needs: [check, tests]
+    needs: check
     runs-on: ubuntu-24.04
     env:
       TARGET: x86_64-unknown-freebsd
@@ -287,7 +290,7 @@ jobs:
 
   docker:
     name: Docker image
-    needs: [check, linux-server]
+    needs: [check, tests, linux-server]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -332,7 +335,7 @@ jobs:
   release:
     name: Publish the release
     if: github.ref_type == 'tag'
-    needs: [check, linux-packages, test-packages, macos, windows, freebsd, docker]
+    needs: [check, tests, linux-packages, test-packages, macos, windows, freebsd, docker]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
