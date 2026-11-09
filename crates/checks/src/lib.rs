@@ -821,9 +821,22 @@ mod tests {
         (address, handle)
     }
 
-    fn closed_port() -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().to_string()
+    /// A port nothing listens on, held for as long as this lives so no other test
+    /// can be given it in the meantime.
+    struct ClosedPort {
+        _held: tokio::net::TcpSocket,
+        address: String,
+    }
+
+    /// Bound without listening, so connecting is refused.
+    fn closed_port() -> ClosedPort {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = socket.local_addr().unwrap().to_string();
+        ClosedPort {
+            _held: socket,
+            address,
+        }
     }
 
     fn http_check(address: &str) -> Check {
@@ -846,7 +859,8 @@ mod tests {
 
     #[test]
     fn a_closed_port_is_down_and_says_why() {
-        let output = run(&check(CheckKind::Tcp, &closed_port()));
+        let closed = closed_port();
+        let output = run(&check(CheckKind::Tcp, &closed.address));
         assert_eq!(output["up"], 0);
         assert_eq!(output["error"], "couldn't connect");
         assert!(output.get("response_ms").is_none());
@@ -854,7 +868,8 @@ mod tests {
 
     #[test]
     fn a_failure_keeps_what_was_learned_before_it() {
-        let output = run(&check(CheckKind::Tcp, &closed_port()));
+        let closed = closed_port();
+        let output = run(&check(CheckKind::Tcp, &closed.address));
         assert!(output["dns_ms"].is_f64(), "{output}");
     }
 
@@ -992,7 +1007,8 @@ mod tests {
 
     #[test]
     fn a_failed_web_check_does_not_repeat_its_url() {
-        let target = format!("http://user:secret@{}/token", closed_port());
+        let closed = closed_port();
+        let target = format!("http://user:secret@{}/token", closed.address);
         let output = run(&check(CheckKind::Http, &target));
         assert_eq!(output["up"], 0);
         assert!(!output.to_string().contains("secret"), "{output}");
@@ -1057,7 +1073,8 @@ mod tests {
             let failure = fetch(&format!("http://{address}/")).unwrap_err();
             assert_eq!(failure.to_string(), error);
         }
-        let failure = fetch(&format!("http://user:secret@{}/token", closed_port())).unwrap_err();
+        let closed = closed_port();
+        let failure = fetch(&format!("http://user:secret@{}/token", closed.address)).unwrap_err();
         assert!(!format!("{failure:#}").contains("secret"));
     }
 

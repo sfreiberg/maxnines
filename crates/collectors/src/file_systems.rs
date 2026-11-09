@@ -245,7 +245,8 @@ mod tests {
     #[test]
     fn the_start_up_disk_is_not_a_disk_image() {
         let device = mounted_from(Path::new("/")).unwrap();
-        let interconnect = macos::interconnect(device.strip_prefix("/dev/").unwrap()).unwrap();
-        assert_ne!(interconnect, macos::DISK_IMAGE);
+        // A virtual machine's disk may not say how it's connected at all.
+        let interconnect = macos::interconnect(device.strip_prefix("/dev/").unwrap());
+        assert_ne!(interconnect.as_deref(), Some(macos::DISK_IMAGE));
     }
 }
