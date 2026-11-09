@@ -10,7 +10,7 @@ use axum_csrf::CsrfToken;
 use serde::Serialize;
 
 use super::{CsrfForm, Page, server_error};
-use crate::alerting::{Channel, ChannelInput, ChannelKind};
+use crate::alerting::{Channel, ChannelInput, ChannelKind, Severity};
 use crate::app_state::AppState;
 use crate::notifier::{self, Notice};
 
@@ -42,6 +42,7 @@ struct ChannelForm {
     has_app_token: bool,
     /// Ticked to turn a Slack channel's buttons off again.
     remove_app_token: bool,
+    min_severity: String,
 }
 
 impl ChannelForm {
@@ -56,6 +57,7 @@ impl ChannelForm {
             app_token: String::new(),
             has_app_token: false,
             remove_app_token: false,
+            min_severity: Severity::Warning.as_str().to_string(),
         }
     }
 
@@ -82,6 +84,7 @@ impl ChannelForm {
             app_token: String::new(),
             has_app_token: channel.app_token.is_some(),
             remove_app_token: false,
+            min_severity: channel.min_severity.as_str().to_string(),
         }
     }
 
@@ -97,6 +100,7 @@ impl ChannelForm {
             app_token: text("app_token"),
             has_app_token: false,
             remove_app_token: fields.contains_key("remove_app_token"),
+            min_severity: text("min_severity"),
         }
     }
 
@@ -129,6 +133,11 @@ impl ChannelForm {
             target,
             credential,
             app_token,
+            // Left out means every alert, as through the API.
+            min_severity: match self.min_severity.as_str() {
+                "" => Severity::Warning,
+                text => Severity::parse(text)?,
+            },
         })
     }
 }
@@ -141,6 +150,7 @@ struct ChannelRow {
     target: String,
     /// A plain webhook into Slack, which Slack is moving away from.
     legacy_slack: bool,
+    critical_only: bool,
 }
 
 impl From<Channel> for ChannelRow {
@@ -151,6 +161,7 @@ impl From<Channel> for ChannelRow {
             target: channel.channel.target_preview(),
             legacy_slack: channel.channel.kind == ChannelKind::Webhook
                 && channel.channel.target.contains("hooks.slack.com"),
+            critical_only: channel.channel.min_severity == Severity::Critical,
             name: channel.channel.name,
         }
     }
@@ -314,6 +325,7 @@ mod tests {
             target: "https://hooks.example.com/secret".to_string(),
             credential: None,
             app_token: None,
+            min_severity: Severity::Warning,
         }
     }
 

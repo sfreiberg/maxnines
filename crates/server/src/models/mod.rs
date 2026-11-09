@@ -1521,6 +1521,7 @@ mod tests {
                 target: "https://example.com/hook".to_string(),
                 credential: Some("secret".to_string()),
                 app_token: None,
+                min_severity: Severity::Warning,
             })
             .await
             .unwrap();

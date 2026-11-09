@@ -114,6 +114,14 @@ impl Severity {
         }
     }
 
+    /// With only two, the one that isn't this.
+    pub fn other(self) -> Self {
+        match self {
+            Self::Warning => Self::Critical,
+            Self::Critical => Self::Warning,
+        }
+    }
+
     pub fn parse(text: &str) -> Result<Self> {
         match text {
             "warning" => Ok(Self::Warning),
@@ -549,6 +557,14 @@ pub struct ChannelInput {
     /// Write-only too.
     #[serde(default)]
     pub app_token: Option<String>,
+    /// The mildest alert it hears of, so warnings can stay off a pager. An alert
+    /// that gets worse reaches it then.
+    #[serde(default = "every_severity")]
+    pub min_severity: Severity,
+}
+
+fn every_severity() -> Severity {
+    Severity::Warning
 }
 
 pub fn check_channel(channel: &ChannelInput) -> Result<()> {
@@ -914,6 +930,7 @@ mod tests {
             target: target.to_string(),
             credential: None,
             app_token: None,
+            min_severity: Severity::Warning,
         }
     }
 
@@ -1356,6 +1373,7 @@ mod tests {
             target: target.to_string(),
             credential: token.map(str::to_string),
             app_token: None,
+            min_severity: Severity::Warning,
         }
     }
 

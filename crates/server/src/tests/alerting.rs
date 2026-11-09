@@ -869,6 +869,113 @@ async fn a_channel_not_told_yet_hears_of_the_alert_as_it_is_when_it_does() {
     assert_eq!(due[0].alert.severity, Severity::Critical);
 }
 
+/// A webhook channel that only hears of critical alerts, like a pager.
+fn pager(url: &str) -> ChannelInput {
+    ChannelInput {
+        name: "Pager".to_string(),
+        min_severity: Severity::Critical,
+        ..webhook_channel(url)
+    }
+}
+
+/// What's due for each channel, marked sent, by channel.
+async fn deliver_by_channel(test: &Harness) -> Vec<(i64, Event)> {
+    let due = test.database().due_deliveries(i64::MAX, 100).await.unwrap();
+    for delivery in &due {
+        test.database()
+            .delivery_sent(delivery.id, 1, test.now, None)
+            .await
+            .unwrap();
+    }
+    let mut told: Vec<(i64, Event)> = due
+        .iter()
+        .map(|delivery| (delivery.channel.id, delivery.event))
+        .collect();
+    told.sort_by_key(|(channel, _)| *channel);
+    told
+}
+
+#[tokio::test]
+async fn a_critical_only_channel_hears_of_an_alert_once_it_is_critical() {
+    let mut test = Harness::start().await;
+    for rule in built_in_rules().await {
+        if rule.kind == RuleKind::Metric {
+            test.database().create_alert_rule(&rule).await.unwrap();
+        }
+    }
+    let chat = webhook_channel("http://127.0.0.1:9/chat");
+    let chat = test.database().create_channel(&chat).await.unwrap();
+    let pager = pager("http://127.0.0.1:9/pager");
+    let pager = test.database().create_channel(&pager).await.unwrap();
+
+    disk_at(&mut test, 0, 85.0).await;
+    disk_at(&mut test, 5, 85.0).await;
+    assert_eq!(deliver_by_channel(&test).await, [(chat, Event::Firing)]);
+
+    disk_at(&mut test, 6, 95.0).await;
+    disk_at(&mut test, 11, 95.0).await;
+    assert_eq!(
+        deliver_by_channel(&test).await,
+        [(chat, Event::Escalated), (pager, Event::Firing)]
+    );
+
+    disk_at(&mut test, 12, 85.0).await;
+    disk_at(&mut test, 17, 85.0).await;
+    assert_eq!(
+        deliver_by_channel(&test).await,
+        [(chat, Event::Eased), (pager, Event::Eased)]
+    );
+
+    disk_at(&mut test, 18, 50.0).await;
+    disk_at(&mut test, 23, 50.0).await;
+    assert_eq!(
+        deliver_by_channel(&test).await,
+        [(chat, Event::Resolved), (pager, Event::Resolved)]
+    );
+}
+
+#[tokio::test]
+async fn a_pager_is_not_sent_an_alert_that_eased_before_it_went() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        metric: Some("disk.usage".to_string()),
+        threshold: Some(90.0),
+        warning_threshold: Some(80.0),
+        for_secs: 0,
+        all_channels: true,
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    let chat = webhook_channel("http://127.0.0.1:9/chat");
+    let chat = test.database().create_channel(&chat).await.unwrap();
+    let pager = pager("http://127.0.0.1:9/pager");
+    test.database().create_channel(&pager).await.unwrap();
+
+    disk_at(&mut test, 0, 85.0).await;
+    disk_at(&mut test, 1, 95.0).await;
+    disk_at(&mut test, 2, 85.0).await;
+    assert_eq!(deliver_by_channel(&test).await, [(chat, Event::Firing)]);
+
+    disk_at(&mut test, 3, 50.0).await;
+    assert_eq!(deliver_by_channel(&test).await, [(chat, Event::Resolved)]);
+}
+
+#[tokio::test]
+async fn a_critical_alert_reaches_a_critical_only_channel_straight_away() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        all_channels: true,
+        for_secs: 0,
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    let pager = pager("http://127.0.0.1:9/pager");
+    let pager = test.database().create_channel(&pager).await.unwrap();
+
+    test.cpu(0, 99.0).await;
+    assert_eq!(deliver_by_channel(&test).await, [(pager, Event::Firing)]);
+}
+
 #[tokio::test]
 async fn a_rule_can_not_have_every_channel_and_some_of_them() {
     let rule = AlertRuleInput {
@@ -1351,6 +1458,7 @@ fn webhook_channel(url: &str) -> ChannelInput {
         target: url.to_string(),
         credential: None,
         app_token: None,
+        min_severity: Severity::Warning,
     }
 }
 
@@ -1417,6 +1525,7 @@ async fn a_discord_channel_gets_discords_message_format() {
         target: url,
         credential: None,
         app_token: None,
+        min_severity: Severity::Warning,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -1631,6 +1740,7 @@ async fn firing_on(
         target: target.to_string(),
         credential: None,
         app_token: None,
+        min_severity: Severity::Warning,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -1729,6 +1839,7 @@ async fn a_test_opens_an_incident_and_closes_it_again_on_every_service() {
                 target: service.start().await,
                 credential: None,
                 app_token: None,
+                min_severity: Severity::Warning,
             },
         };
 
@@ -1908,6 +2019,7 @@ async fn a_pagerduty_test_opens_an_incident_and_closes_it_again() {
             target: PAGERDUTY_KEY.to_string(),
             credential: None,
             app_token: None,
+            min_severity: Severity::Warning,
         },
     };
     let senders = Senders {
@@ -2018,6 +2130,7 @@ async fn firing_on_telegram(test: &mut Harness, telegram: &FakeTelegram) -> Noti
         target: "-1001234567890".to_string(),
         credential: Some(TELEGRAM_TOKEN.to_string()),
         app_token: None,
+        min_severity: Severity::Warning,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -2126,6 +2239,7 @@ async fn not_reaching_telegram_says_so_without_the_token() {
             target: "-100123".to_string(),
             credential: Some(TELEGRAM_TOKEN.to_string()),
             app_token: None,
+            min_severity: Severity::Warning,
         },
     };
     let senders = Senders {
@@ -2211,6 +2325,7 @@ async fn firing_on_slack_app(
         target: "#alerts".to_string(),
         credential: Some("xoxb-secret-token".to_string()),
         app_token: app_token.map(str::to_string),
+        min_severity: Severity::Warning,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -2479,6 +2594,7 @@ async fn a_slack_test_says_when_the_app_level_token_is_wrong() {
             target: "#alerts".to_string(),
             credential: Some("xoxb-secret-token".to_string()),
             app_token: Some("xapp-secret-token".to_string()),
+            min_severity: Severity::Warning,
         },
     };
     let senders = Senders {
@@ -2684,6 +2800,7 @@ async fn not_reaching_slack_says_so_without_any_detail() {
             target: "#alerts".to_string(),
             credential: Some("xoxb-secret-token".to_string()),
             app_token: None,
+            min_severity: Severity::Warning,
         },
     };
     let senders = Senders {
@@ -2863,6 +2980,7 @@ async fn a_channel_that_is_down_does_not_hold_up_the_others() {
         target,
         credential: None,
         app_token: None,
+        min_severity: Severity::Warning,
     };
     let dead = test
         .database()
@@ -3114,6 +3232,7 @@ async fn email_channels_send_a_message_to_every_address() {
         target: "a@example.com, b@example.com".to_string(),
         credential: None,
         app_token: None,
+        min_severity: Severity::Warning,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -3155,6 +3274,7 @@ async fn an_email_channel_without_a_mail_server_says_so() {
         target: "a@example.com".to_string(),
         credential: None,
         app_token: None,
+        min_severity: Severity::Warning,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -3592,6 +3712,64 @@ async fn alert_forms_refuse_a_bad_csrf_token() {
         server.state.database.list_channels().await.unwrap().len(),
         1
     );
+}
+
+#[tokio::test]
+async fn a_channel_can_be_kept_to_critical_alerts_from_the_form_and_the_api() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    let fields = [
+        ("name", "Pager"),
+        ("kind", "pagerduty"),
+        ("target", PAGERDUTY_KEY),
+        ("min_severity", "critical"),
+    ];
+    let page = browser
+        .submit(&server, "/alerts/channels/new", "/alerts/channels", &fields)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    let channel = &server.state.database.list_channels().await.unwrap()[0];
+    assert_eq!(channel.channel.min_severity, Severity::Critical);
+
+    let list = browser.get(&server, "/alerts/channels").await;
+    assert!(list.body.contains("Critical alerts only"), "{}", list.body);
+    let edit = format!("/alerts/channels/{}/edit", channel.id);
+    let form = browser.get(&server, &edit).await;
+    assert!(form.body.contains(r#"<option value="critical" selected>"#));
+
+    let (_, listed) = api(
+        &server,
+        "GET",
+        "/api/v1/notification-channels",
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(listed[0]["min_severity"], "critical");
+
+    let body =
+        json!({ "name": "Chat", "kind": "webhook", "target": "https://hooks.example.com/a" });
+    let (status, made) = api(&server, "POST", "/api/v1/notification-channels", &body).await;
+    assert_eq!(status, 201, "{made}");
+    let id = made["id"].as_i64().unwrap();
+    let chat = server
+        .state
+        .database
+        .get_channel(id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(chat.channel.min_severity, Severity::Warning);
+
+    let fields = [
+        ("name", "Odd"),
+        ("kind", "webhook"),
+        ("target", "https://hooks.example.com/b"),
+        ("min_severity", "loud"),
+    ];
+    let page = browser
+        .submit(&server, "/alerts/channels/new", "/alerts/channels", &fields)
+        .await;
+    assert_eq!(page.status, 422);
 }
 
 #[tokio::test]
@@ -5200,6 +5378,7 @@ mod reminders {
             target: target.to_string(),
             credential: None,
             app_token: None,
+            min_severity: Severity::Warning,
         };
         let channel = test.database().create_channel(&channel).await.unwrap();
         let rule = AlertRuleInput {

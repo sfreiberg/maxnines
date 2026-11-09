@@ -1201,6 +1201,7 @@ struct ChannelView {
     name: String,
     kind: ChannelKind,
     target_preview: String,
+    min_severity: crate::alerting::Severity,
 }
 
 impl ChannelView {
@@ -1208,6 +1209,7 @@ impl ChannelView {
         Self {
             id: channel.id,
             target_preview: channel.channel.target_preview(),
+            min_severity: channel.channel.min_severity,
             name: channel.channel.name,
             kind: channel.channel.kind,
         }

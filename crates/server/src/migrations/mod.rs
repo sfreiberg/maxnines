@@ -23,6 +23,7 @@ impl MigratorTrait for Migrator {
             Box::new(AddBuiltInAlerts),
             Box::new(AddBuiltInDiskAlerts),
             Box::new(AddWarningThresholds),
+            Box::new(AddChannelSeverities),
         ]
     }
 }
@@ -1580,6 +1581,56 @@ impl MigrationTrait for AddWarningThresholds {
     }
 }
 
+// ---- Which alerts each channel hears of
+
+struct AddChannelSeverities;
+
+impl MigrationName for AddChannelSeverities {
+    fn name(&self) -> &str {
+        "m20261109_000012_add_channel_severities"
+    }
+}
+
+#[derive(Iden)]
+enum ChannelSeverities {
+    #[iden = "notification_channels"]
+    Table,
+    /// The mildest alert a channel hears of: warning, or critical to keep
+    /// warnings off a pager.
+    MinSeverity,
+}
+
+/// Every channel starts out hearing of every alert, as it did before.
+#[async_trait::async_trait]
+impl MigrationTrait for AddChannelSeverities {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(ChannelSeverities::Table)
+                    .add_column(
+                        ColumnDef::new(ChannelSeverities::MinSeverity)
+                            .string_len(16)
+                            .not_null()
+                            .default("warning"),
+                    )
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(ChannelSeverities::Table)
+                    .drop_column(ChannelSeverities::MinSeverity)
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
@@ -1603,7 +1654,7 @@ mod tests {
             .max_connections(1)
             .to_owned();
         let connection = Database::connect(options).await.unwrap();
-        let before = Migrator::migrations().len() as u32 - 3;
+        let before = Migrator::migrations().len() as u32 - 4;
         Migrator::up(&connection, Some(before)).await.unwrap();
         connection
             .execute_unprepared(
@@ -1624,7 +1675,7 @@ mod tests {
             .max_connections(1)
             .to_owned();
         let connection = Database::connect(options).await.unwrap();
-        let before = Migrator::migrations().len() as u32 - 2;
+        let before = Migrator::migrations().len() as u32 - 3;
         Migrator::up(&connection, Some(before)).await.unwrap();
         connection
             .execute_unprepared(
@@ -1684,7 +1735,7 @@ mod tests {
         );
 
         let connection = fresh().await;
-        let before = Migrator::migrations().len() as u32 - 1;
+        let before = Migrator::migrations().len() as u32 - 2;
         Migrator::up(&connection, Some(before)).await.unwrap();
         connection
             .execute_unprepared(

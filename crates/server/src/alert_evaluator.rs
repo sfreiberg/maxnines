@@ -679,7 +679,8 @@ impl Evaluator {
                     summary,
                     now_ms: snapshot.now_ms,
                 };
-                if self.database.change_severity(&change).await? {
+                let channels = self.channels_for(rule).await?;
+                if self.database.change_severity(&change, &channels).await? {
                     info!(
                         rule = rule.rule.name,
                         host,
@@ -701,18 +702,22 @@ impl Evaluator {
                     summary,
                     started_ms: snapshot.now_ms,
                 };
-                // Read now, so a channel added since the rule was saved hears too.
-                let channels = if rule.rule.all_channels {
-                    let every = self.database.list_channels().await?;
-                    every.into_iter().map(|channel| channel.id).collect()
-                } else {
-                    rule.rule.channels.clone()
-                };
+                let channels = self.channels_for(rule).await?;
                 self.database.fire_alert(&new, &channels).await?;
                 info!(rule = rule.rule.name, host, "alert fired");
                 Ok(())
             }
         }
+    }
+
+    /// Read when needed, so a channel added since the rule was saved hears too.
+    async fn channels_for(&self, rule: &AlertRule) -> Result<Vec<i64>> {
+        Ok(if rule.rule.all_channels {
+            let every = self.database.list_channels().await?;
+            every.into_iter().map(|channel| channel.id).collect()
+        } else {
+            rule.rule.channels.clone()
+        })
     }
 
     async fn close(&self, alert: &Alert, now_ms: i64, reason: &str) -> Result<()> {

@@ -117,6 +117,14 @@
   </details>
 
 
+  <label>Alerts to send
+    <select name="min_severity">
+      <option value="warning"{% if channel.min_severity == "warning" %} selected{% endif %}>Warnings and critical alerts</option>
+      <option value="critical"{% if channel.min_severity == "critical" %} selected{% endif %}>Critical alerts only</option>
+    </select>
+    <small>Critical only keeps warnings off a pager. A warning that becomes critical is sent then, and if it goes back to a warning, this channel hears that too.</small>
+  </label>
+
   <div class="actions">
     <button type="submit">Save channel</button>
     <a class="button secondary" href="/alerts/channels">Cancel</a>

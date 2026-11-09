@@ -10,6 +10,7 @@ pub struct Model {
     pub target: String,
     pub credential: Option<String>,
     pub app_token: Option<String>,
+    pub min_severity: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
