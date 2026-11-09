@@ -325,6 +325,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/build-push-action@v6
+        env:
+          # Otherwise it uploads a build record as an artifact, which isn't an
+          # ordinary one: downloading every artifact to publish then fails.
+          DOCKER_BUILD_RECORD_UPLOAD: false
         with:
           context: .
           file: packaging/docker/Dockerfile
