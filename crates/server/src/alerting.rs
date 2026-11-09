@@ -2,6 +2,8 @@
 //! to tell, and the alerts that result. [`crate::alert_evaluator`] decides when
 //! alerts start and end, and [`crate::notifier`] delivers them.
 
+use std::collections::BTreeSet;
+
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use axum::http::Uri;
 use cel::Program;
@@ -111,14 +113,6 @@ impl Severity {
         match self {
             Self::Warning => "warning",
             Self::Critical => "critical",
-        }
-    }
-
-    /// With only two, the one that isn't this.
-    pub fn other(self) -> Self {
-        match self {
-            Self::Warning => Self::Critical,
-            Self::Critical => Self::Warning,
         }
     }
 
@@ -557,18 +551,23 @@ pub struct ChannelInput {
     /// Write-only too.
     #[serde(default)]
     pub app_token: Option<String>,
-    /// The mildest alert it hears of, so warnings can stay off a pager. An alert
-    /// that gets worse reaches it then.
+    /// Which alerts it's sent, so warnings can stay off a pager. A channel hears of
+    /// an alert once it reaches one of these, and then of every change until it
+    /// resolves.
     #[serde(default = "every_severity")]
-    pub min_severity: Severity,
+    pub severities: BTreeSet<Severity>,
 }
 
-fn every_severity() -> Severity {
-    Severity::Warning
+pub fn every_severity() -> BTreeSet<Severity> {
+    BTreeSet::from([Severity::Warning, Severity::Critical])
 }
 
 pub fn check_channel(channel: &ChannelInput) -> Result<()> {
     ensure!(!channel.name.trim().is_empty(), "a channel needs a name");
+    ensure!(
+        !channel.severities.is_empty(),
+        "choose warnings, critical alerts or both"
+    );
     ensure!(
         channel.app_token.is_none() || channel.kind == ChannelKind::Slack,
         "only Slack channels take an app-level token"
@@ -930,7 +929,7 @@ mod tests {
             target: target.to_string(),
             credential: None,
             app_token: None,
-            min_severity: Severity::Warning,
+            severities: every_severity(),
         }
     }
 
@@ -1373,7 +1372,7 @@ mod tests {
             target: target.to_string(),
             credential: token.map(str::to_string),
             app_token: None,
-            min_severity: Severity::Warning,
+            severities: every_severity(),
         }
     }
 

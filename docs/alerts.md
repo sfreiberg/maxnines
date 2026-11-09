@@ -33,14 +33,22 @@ be clear that long to stop counting.
 - **Getting better** without clearing sends **Down to a warning** to the same channels.
 - **Clearing** resolves the alert, whichever it was at.
 
-A channel set to **Critical alerts only**, under **Alerts to send**, keeps warnings off
-a pager: it hears of an alert when it becomes critical, then of it easing and resolving
-like everyone else. A pager that hasn't been sent an alert yet isn't sent it if it eases
-first.
-
 A channel whose first notification hasn't gone out yet gets the alert as it is when it
 does. On-call services get the change on the same incident, so they show the new
 severity without opening another. Webhooks see the events `escalated` and `eased`.
+
+## Which channels hear what
+
+Each channel takes warnings, critical alerts or both, under **Alerts to send** on its
+form. A channel hears of an alert once it reaches a severity the channel takes, and from
+then on of every change until it resolves:
+
+- **Critical alerts only**, for a pager: a warning isn't sent, and if it becomes
+  critical, the pager hears of it starting then. If it eases, the pager hears that too,
+  on the same incident. One that eases before the pager was sent it isn't sent at all.
+- **Warnings only**, for email or chat: a warning is sent, and so is it becoming
+  critical. An alert that's critical from the start isn't sent.
+- **Both**, the default: everything.
 
 ## Silences
 

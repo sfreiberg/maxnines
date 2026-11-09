@@ -873,7 +873,7 @@ async fn a_channel_not_told_yet_hears_of_the_alert_as_it_is_when_it_does() {
 fn pager(url: &str) -> ChannelInput {
     ChannelInput {
         name: "Pager".to_string(),
-        min_severity: Severity::Critical,
+        severities: std::collections::BTreeSet::from([Severity::Critical]),
         ..webhook_channel(url)
     }
 }
@@ -932,6 +932,38 @@ async fn a_critical_only_channel_hears_of_an_alert_once_it_is_critical() {
         deliver_by_channel(&test).await,
         [(chat, Event::Resolved), (pager, Event::Resolved)]
     );
+}
+
+#[tokio::test]
+async fn a_warnings_only_channel_follows_a_warning_that_goes_critical_but_not_one_critical_at_once()
+{
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        metric: Some("disk.usage".to_string()),
+        threshold: Some(90.0),
+        warning_threshold: Some(80.0),
+        for_secs: 0,
+        all_channels: true,
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    let mail = ChannelInput {
+        name: "Mail".to_string(),
+        severities: std::collections::BTreeSet::from([Severity::Warning]),
+        ..webhook_channel("http://127.0.0.1:9/mail")
+    };
+    let mail = test.database().create_channel(&mail).await.unwrap();
+
+    disk_at(&mut test, 0, 85.0).await;
+    assert_eq!(deliver_by_channel(&test).await, [(mail, Event::Firing)]);
+    disk_at(&mut test, 1, 95.0).await;
+    assert_eq!(deliver_by_channel(&test).await, [(mail, Event::Escalated)]);
+    disk_at(&mut test, 2, 50.0).await;
+    assert_eq!(deliver_by_channel(&test).await, [(mail, Event::Resolved)]);
+
+    disk_at(&mut test, 3, 95.0).await;
+    assert_eq!(test.open().await[0].severity, Severity::Critical);
+    assert_eq!(deliver_by_channel(&test).await, []);
 }
 
 #[tokio::test]
@@ -1458,7 +1490,7 @@ fn webhook_channel(url: &str) -> ChannelInput {
         target: url.to_string(),
         credential: None,
         app_token: None,
-        min_severity: Severity::Warning,
+        severities: crate::alerting::every_severity(),
     }
 }
 
@@ -1525,7 +1557,7 @@ async fn a_discord_channel_gets_discords_message_format() {
         target: url,
         credential: None,
         app_token: None,
-        min_severity: Severity::Warning,
+        severities: crate::alerting::every_severity(),
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -1556,7 +1588,13 @@ async fn a_discord_channel_can_be_made_from_the_form_and_keeps_its_url_hidden() 
     let server = start().await;
     let mut browser = Browser::default();
     let url = "https://discord.com/api/webhooks/123/secret-token";
-    let fields = [("name", "Team"), ("kind", "discord"), ("target", url)];
+    let fields = [
+        ("name", "Team"),
+        ("kind", "discord"),
+        ("target", url),
+        ("sends_warnings", "on"),
+        ("sends_critical", "on"),
+    ];
 
     let page = browser
         .submit(&server, "/alerts/channels/new", "/alerts/channels", &fields)
@@ -1587,6 +1625,8 @@ async fn a_wrong_url_for_discord_is_refused_on_the_form() {
         ("name", "Team"),
         ("kind", "discord"),
         ("target", "https://hooks.slack.com/services/x"),
+        ("sends_warnings", "on"),
+        ("sends_critical", "on"),
     ];
     let page = Browser::default()
         .submit(&server, "/alerts/channels/new", "/alerts/channels", &fields)
@@ -1740,7 +1780,7 @@ async fn firing_on(
         target: target.to_string(),
         credential: None,
         app_token: None,
-        min_severity: Severity::Warning,
+        severities: crate::alerting::every_severity(),
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -1839,7 +1879,7 @@ async fn a_test_opens_an_incident_and_closes_it_again_on_every_service() {
                 target: service.start().await,
                 credential: None,
                 app_token: None,
-                min_severity: Severity::Warning,
+                severities: crate::alerting::every_severity(),
             },
         };
 
@@ -2019,7 +2059,7 @@ async fn a_pagerduty_test_opens_an_incident_and_closes_it_again() {
             target: PAGERDUTY_KEY.to_string(),
             credential: None,
             app_token: None,
-            min_severity: Severity::Warning,
+            severities: crate::alerting::every_severity(),
         },
     };
     let senders = Senders {
@@ -2130,7 +2170,7 @@ async fn firing_on_telegram(test: &mut Harness, telegram: &FakeTelegram) -> Noti
         target: "-1001234567890".to_string(),
         credential: Some(TELEGRAM_TOKEN.to_string()),
         app_token: None,
-        min_severity: Severity::Warning,
+        severities: crate::alerting::every_severity(),
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -2239,7 +2279,7 @@ async fn not_reaching_telegram_says_so_without_the_token() {
             target: "-100123".to_string(),
             credential: Some(TELEGRAM_TOKEN.to_string()),
             app_token: None,
-            min_severity: Severity::Warning,
+            severities: crate::alerting::every_severity(),
         },
     };
     let senders = Senders {
@@ -2263,6 +2303,8 @@ async fn a_telegram_channel_can_be_made_from_the_form_and_keeps_its_token_hidden
         ("kind", "telegram"),
         ("target", "-1001234567890"),
         ("credential", TELEGRAM_TOKEN),
+        ("sends_warnings", "on"),
+        ("sends_critical", "on"),
     ];
 
     let page = browser
@@ -2295,6 +2337,8 @@ async fn a_telegram_channel_needs_its_token_on_the_form() {
         ("name", "Team"),
         ("kind", "telegram"),
         ("target", "-1001234567890"),
+        ("sends_warnings", "on"),
+        ("sends_critical", "on"),
     ];
     let page = Browser::default()
         .submit(&server, "/alerts/channels/new", "/alerts/channels", &fields)
@@ -2325,7 +2369,7 @@ async fn firing_on_slack_app(
         target: "#alerts".to_string(),
         credential: Some("xoxb-secret-token".to_string()),
         app_token: app_token.map(str::to_string),
-        min_severity: Severity::Warning,
+        severities: crate::alerting::every_severity(),
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -2594,7 +2638,7 @@ async fn a_slack_test_says_when_the_app_level_token_is_wrong() {
             target: "#alerts".to_string(),
             credential: Some("xoxb-secret-token".to_string()),
             app_token: Some("xapp-secret-token".to_string()),
-            min_severity: Severity::Warning,
+            severities: crate::alerting::every_severity(),
         },
     };
     let senders = Senders {
@@ -2649,6 +2693,8 @@ async fn an_app_level_token_can_be_set_on_the_form_and_stays_hidden() {
         ("target", "#alerts"),
         ("credential", "xoxb-secret"),
         ("app_token", "xapp-secret"),
+        ("sends_warnings", "on"),
+        ("sends_critical", "on"),
     ];
     let page = browser
         .submit(&server, "/alerts/channels/new", "/alerts/channels", &fields)
@@ -2668,6 +2714,8 @@ async fn an_app_level_token_can_be_set_on_the_form_and_stays_hidden() {
         ("kind", "slack"),
         ("target", "#alerts"),
         ("app_token", "not-a-token"),
+        ("sends_warnings", "on"),
+        ("sends_critical", "on"),
     ];
     let page = browser
         .submit(
@@ -2800,7 +2848,7 @@ async fn not_reaching_slack_says_so_without_any_detail() {
             target: "#alerts".to_string(),
             credential: Some("xoxb-secret-token".to_string()),
             app_token: None,
-            min_severity: Severity::Warning,
+            severities: crate::alerting::every_severity(),
         },
     };
     let senders = Senders {
@@ -2837,6 +2885,8 @@ async fn a_slack_channel_can_be_made_from_the_form_and_hides_its_token() {
         ("kind", "slack"),
         ("target", "#alerts"),
         ("credential", "xoxb-secret-token"),
+        ("sends_warnings", "on"),
+        ("sends_critical", "on"),
     ];
     let page = browser
         .submit(&server, "/alerts/channels/new", "/alerts/channels", &fields)
@@ -2867,6 +2917,8 @@ async fn a_slack_channel_can_be_made_from_the_form_and_hides_its_token() {
         ("kind", "slack"),
         ("target", "#ops"),
         ("credential", ""),
+        ("sends_warnings", "on"),
+        ("sends_critical", "on"),
     ];
     let page = browser
         .submit(&server, &edit, &format!("/alerts/channels/{id}"), &fields)
@@ -2980,7 +3032,7 @@ async fn a_channel_that_is_down_does_not_hold_up_the_others() {
         target,
         credential: None,
         app_token: None,
-        min_severity: Severity::Warning,
+        severities: crate::alerting::every_severity(),
     };
     let dead = test
         .database()
@@ -3232,7 +3284,7 @@ async fn email_channels_send_a_message_to_every_address() {
         target: "a@example.com, b@example.com".to_string(),
         credential: None,
         app_token: None,
-        min_severity: Severity::Warning,
+        severities: crate::alerting::every_severity(),
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -3274,7 +3326,7 @@ async fn an_email_channel_without_a_mail_server_says_so() {
         target: "a@example.com".to_string(),
         credential: None,
         app_token: None,
-        min_severity: Severity::Warning,
+        severities: crate::alerting::every_severity(),
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -3715,27 +3767,37 @@ async fn alert_forms_refuse_a_bad_csrf_token() {
 }
 
 #[tokio::test]
-async fn a_channel_can_be_kept_to_critical_alerts_from_the_form_and_the_api() {
+async fn a_channel_can_take_warnings_critical_alerts_or_both_from_the_form_and_the_api() {
     let server = start().await;
     let mut browser = Browser::default();
     let fields = [
         ("name", "Pager"),
         ("kind", "pagerduty"),
         ("target", PAGERDUTY_KEY),
-        ("min_severity", "critical"),
+        ("sends_critical", "on"),
     ];
     let page = browser
         .submit(&server, "/alerts/channels/new", "/alerts/channels", &fields)
         .await;
     assert_eq!(page.status, 303, "{}", page.body);
     let channel = &server.state.database.list_channels().await.unwrap()[0];
-    assert_eq!(channel.channel.min_severity, Severity::Critical);
+    assert_eq!(
+        channel.channel.severities,
+        std::collections::BTreeSet::from([Severity::Critical])
+    );
 
     let list = browser.get(&server, "/alerts/channels").await;
     assert!(list.body.contains("Critical alerts only"), "{}", list.body);
     let edit = format!("/alerts/channels/{}/edit", channel.id);
     let form = browser.get(&server, &edit).await;
-    assert!(form.body.contains(r#"<option value="critical" selected>"#));
+    assert!(
+        form.body
+            .contains(r#"<input type="checkbox" name="sends_warnings"> Warnings"#)
+    );
+    assert!(
+        form.body
+            .contains(r#"<input type="checkbox" name="sends_critical" checked> Critical alerts"#)
+    );
 
     let (_, listed) = api(
         &server,
@@ -3744,7 +3806,7 @@ async fn a_channel_can_be_kept_to_critical_alerts_from_the_form_and_the_api() {
         &Value::Null,
     )
     .await;
-    assert_eq!(listed[0]["min_severity"], "critical");
+    assert_eq!(listed[0]["severities"], json!(["critical"]));
 
     let body =
         json!({ "name": "Chat", "kind": "webhook", "target": "https://hooks.example.com/a" });
@@ -3758,18 +3820,36 @@ async fn a_channel_can_be_kept_to_critical_alerts_from_the_form_and_the_api() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(chat.channel.min_severity, Severity::Warning);
+    assert_eq!(chat.channel.severities, crate::alerting::every_severity());
 
+    let body = json!({
+        "name": "Mail", "kind": "webhook", "target": "https://hooks.example.com/b",
+        "severities": ["warning"],
+    });
+    let (status, made) = api(&server, "POST", "/api/v1/notification-channels", &body).await;
+    assert_eq!(status, 201, "{made}");
+    let list = browser.get(&server, "/alerts/channels").await;
+    assert!(list.body.contains("Warnings only"), "{}", list.body);
+
+    let body = json!({
+        "name": "Nothing", "kind": "webhook", "target": "https://hooks.example.com/c",
+        "severities": [],
+    });
+    let (status, answer) = api(&server, "POST", "/api/v1/notification-channels", &body).await;
+    assert_eq!(status, 422, "{answer}");
     let fields = [
         ("name", "Odd"),
         ("kind", "webhook"),
-        ("target", "https://hooks.example.com/b"),
-        ("min_severity", "loud"),
+        ("target", "https://hooks.example.com/d"),
     ];
     let page = browser
         .submit(&server, "/alerts/channels/new", "/alerts/channels", &fields)
         .await;
     assert_eq!(page.status, 422);
+    assert!(
+        page.body
+            .contains("choose warnings, critical alerts or both")
+    );
 }
 
 #[tokio::test]
@@ -3778,7 +3858,13 @@ async fn a_saved_webhook_url_is_never_shown_again() {
     let mut browser = Browser::default();
     let url = "https://hooks.example.com/services/secret-token";
 
-    let fields = [("name", "Ops"), ("kind", "webhook"), ("target", url)];
+    let fields = [
+        ("name", "Ops"),
+        ("kind", "webhook"),
+        ("target", url),
+        ("sends_warnings", "on"),
+        ("sends_critical", "on"),
+    ];
     let page = browser
         .submit(&server, "/alerts/channels/new", "/alerts/channels", &fields)
         .await;
@@ -3799,13 +3885,25 @@ async fn a_saved_webhook_url_is_never_shown_again() {
 
     // A failed save shows the form again, and mustn't bring it back either.
     let path = format!("/alerts/channels/{id}");
-    let fields = [("name", ""), ("kind", "webhook"), ("target", "")];
+    let fields = [
+        ("name", ""),
+        ("kind", "webhook"),
+        ("target", ""),
+        ("sends_warnings", "on"),
+        ("sends_critical", "on"),
+    ];
     let page = browser.submit(&server, &edit, &path, &fields).await;
     assert_eq!(page.status, 422);
     assert!(!page.body.contains("secret-token"));
 
     // Saving without touching the box keeps it.
-    let fields = [("name", "Renamed"), ("kind", "webhook"), ("target", "")];
+    let fields = [
+        ("name", "Renamed"),
+        ("kind", "webhook"),
+        ("target", ""),
+        ("sends_warnings", "on"),
+        ("sends_critical", "on"),
+    ];
     let page = browser.submit(&server, &edit, &path, &fields).await;
     assert_eq!(page.status, 303, "{}", page.body);
     let channel = server
@@ -3840,6 +3938,8 @@ async fn a_bad_channel_is_refused_without_repeating_the_url() {
         ("name", "Ops"),
         ("kind", "webhook"),
         ("target", "ftp://example.com/nope"),
+        ("sends_warnings", "on"),
+        ("sends_critical", "on"),
     ];
     let page = Browser::default()
         .submit(&server, "/alerts/channels/new", "/alerts/channels", &fields)
@@ -5378,7 +5478,7 @@ mod reminders {
             target: target.to_string(),
             credential: None,
             app_token: None,
-            min_severity: Severity::Warning,
+            severities: crate::alerting::every_severity(),
         };
         let channel = test.database().create_channel(&channel).await.unwrap();
         let rule = AlertRuleInput {

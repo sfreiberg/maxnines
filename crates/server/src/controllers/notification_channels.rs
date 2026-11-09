@@ -42,7 +42,8 @@ struct ChannelForm {
     has_app_token: bool,
     /// Ticked to turn a Slack channel's buttons off again.
     remove_app_token: bool,
-    min_severity: String,
+    sends_warnings: bool,
+    sends_critical: bool,
 }
 
 impl ChannelForm {
@@ -57,7 +58,8 @@ impl ChannelForm {
             app_token: String::new(),
             has_app_token: false,
             remove_app_token: false,
-            min_severity: Severity::Warning.as_str().to_string(),
+            sends_warnings: true,
+            sends_critical: true,
         }
     }
 
@@ -84,7 +86,8 @@ impl ChannelForm {
             app_token: String::new(),
             has_app_token: channel.app_token.is_some(),
             remove_app_token: false,
-            min_severity: channel.min_severity.as_str().to_string(),
+            sends_warnings: channel.severities.contains(&Severity::Warning),
+            sends_critical: channel.severities.contains(&Severity::Critical),
         }
     }
 
@@ -100,7 +103,8 @@ impl ChannelForm {
             app_token: text("app_token"),
             has_app_token: false,
             remove_app_token: fields.contains_key("remove_app_token"),
-            min_severity: text("min_severity"),
+            sends_warnings: fields.contains_key("sends_warnings"),
+            sends_critical: fields.contains_key("sends_critical"),
         }
     }
 
@@ -133,11 +137,13 @@ impl ChannelForm {
             target,
             credential,
             app_token,
-            // Left out means every alert, as through the API.
-            min_severity: match self.min_severity.as_str() {
-                "" => Severity::Warning,
-                text => Severity::parse(text)?,
-            },
+            severities: [
+                (Severity::Warning, self.sends_warnings),
+                (Severity::Critical, self.sends_critical),
+            ]
+            .into_iter()
+            .filter_map(|(severity, ticked)| ticked.then_some(severity))
+            .collect(),
         })
     }
 }
@@ -150,7 +156,8 @@ struct ChannelRow {
     target: String,
     /// A plain webhook into Slack, which Slack is moving away from.
     legacy_slack: bool,
-    critical_only: bool,
+    /// Which alerts it takes, when it isn't all of them.
+    only: Option<&'static str>,
 }
 
 impl From<Channel> for ChannelRow {
@@ -161,7 +168,11 @@ impl From<Channel> for ChannelRow {
             target: channel.channel.target_preview(),
             legacy_slack: channel.channel.kind == ChannelKind::Webhook
                 && channel.channel.target.contains("hooks.slack.com"),
-            critical_only: channel.channel.min_severity == Severity::Critical,
+            only: match channel.channel.severities.iter().collect::<Vec<_>>()[..] {
+                [Severity::Warning] => Some("Warnings only"),
+                [Severity::Critical] => Some("Critical alerts only"),
+                _ => None,
+            },
             name: channel.channel.name,
         }
     }
@@ -325,7 +336,7 @@ mod tests {
             target: "https://hooks.example.com/secret".to_string(),
             credential: None,
             app_token: None,
-            min_severity: Severity::Warning,
+            severities: crate::alerting::every_severity(),
         }
     }
 

@@ -100,7 +100,13 @@ fn to_channel(row: notification_channel::Model) -> Result<Channel> {
             target: row.target,
             credential: row.credential,
             app_token: row.app_token,
-            min_severity: Severity::parse(&row.min_severity)?,
+            severities: [
+                (Severity::Warning, row.sends_warnings),
+                (Severity::Critical, row.sends_critical),
+            ]
+            .into_iter()
+            .filter_map(|(severity, sent)| sent.then_some(severity))
+            .collect(),
         },
     })
 }
@@ -304,7 +310,8 @@ impl Database {
             target: Set(input.target.clone()),
             credential: Set(input.credential.clone()),
             app_token: Set(input.app_token.clone()),
-            min_severity: Set(input.min_severity.as_str().to_string()),
+            sends_warnings: Set(input.severities.contains(&Severity::Warning)),
+            sends_critical: Set(input.severities.contains(&Severity::Critical)),
             ..Default::default()
         };
         let result = notification_channel::Entity::insert(row)
@@ -326,7 +333,8 @@ impl Database {
             target: Set(input.target.clone()),
             credential: Set(input.credential.clone()),
             app_token: Set(input.app_token.clone()),
-            min_severity: Set(input.min_severity.as_str().to_string()),
+            sends_warnings: Set(input.severities.contains(&Severity::Warning)),
+            sends_critical: Set(input.severities.contains(&Severity::Critical)),
         };
         notification_channel::Entity::update(row)
             .exec(&self.connection)
@@ -467,10 +475,12 @@ impl Database {
     /// acknowledge it again. Returns false if the alert isn't open or is already at
     /// that severity.
     pub async fn change_severity(&self, change: &SeverityChange, channels: &[i64]) -> Result<bool> {
-        let hearing = self.channels_hearing(channels, change.severity).await?;
-        let hearing_before = self
-            .channels_hearing(channels, change.severity.other())
-            .await?;
+        let taking = self.channel_severities(channels).await?;
+        let takes = |channel: i64, severity: Severity| {
+            taking
+                .get(&channel)
+                .is_some_and(|severities| severities.contains(&severity))
+        };
         let transaction = self.connection.begin().await.context("saving alert")?;
         let Some(alert) = alert::Entity::find_by_id(change.alert_id)
             .filter(alert::Column::ResolvedMs.is_null())
@@ -518,25 +528,29 @@ impl Database {
             .map(|row| queued(change.alert_id, row.channel_id, event, change.now_ms))
             .collect();
         let heard: BTreeSet<i64> = firing.iter().map(|row| row.channel_id).collect();
-        if worse {
-            // Channels that only hear of worse alerts hear of this one starting now.
-            rows.extend(
-                hearing
-                    .iter()
-                    .filter(|channel| !hearing_before.contains(channel) && !heard.contains(channel))
-                    .map(|channel| queued(change.alert_id, *channel, Event::Firing, change.now_ms)),
-            );
-        } else {
-            // Anything not sent yet to channels that don't hear of this severity
-            // would now say it's milder than they care about.
-            let not_hearing: Vec<i64> = heard
-                .iter()
-                .filter(|channel| hearing_before.contains(channel) && !hearing.contains(channel))
-                .copied()
-                .collect();
+        // Channels that take this severity and not the one before hear of the
+        // alert starting now.
+        rows.extend(
+            taking
+                .keys()
+                .filter(|channel| {
+                    takes(**channel, change.severity)
+                        && !takes(**channel, before)
+                        && !heard.contains(channel)
+                })
+                .map(|channel| queued(change.alert_id, *channel, Event::Firing, change.now_ms)),
+        );
+        // What hasn't been sent yet to channels that don't take this severity
+        // would now tell them of an alert they don't want.
+        let not_taking: Vec<i64> = firing
+            .iter()
+            .filter(|row| row.state != SENT && !takes(row.channel_id, change.severity))
+            .map(|row| row.channel_id)
+            .collect();
+        if !not_taking.is_empty() {
             notification::Entity::delete_many()
                 .filter(notification::Column::AlertId.eq(change.alert_id))
-                .filter(notification::Column::ChannelId.is_in(not_hearing))
+                .filter(notification::Column::ChannelId.is_in(not_taking))
                 .filter(notification::Column::State.is_in([PENDING, HELD]))
                 .exec(&transaction)
                 .await
@@ -558,22 +572,31 @@ impl Database {
         channels: &[i64],
         severity: Severity,
     ) -> Result<BTreeSet<i64>> {
+        let taking = self.channel_severities(channels).await?;
+        Ok(taking
+            .into_iter()
+            .filter(|(_, severities)| severities.contains(&severity))
+            .map(|(channel, _)| channel)
+            .collect())
+    }
+
+    /// Which alerts each of these channels takes. One that's gone isn't there.
+    async fn channel_severities(
+        &self,
+        channels: &[i64],
+    ) -> Result<BTreeMap<i64, BTreeSet<Severity>>> {
         let wanted: BTreeSet<i64> = channels.iter().copied().collect();
         if wanted.is_empty() {
-            return Ok(wanted);
+            return Ok(BTreeMap::new());
         }
         let rows = notification_channel::Entity::find()
             .filter(notification_channel::Column::Id.is_in(wanted))
             .all(&self.connection)
             .await
             .context("loading channels")?;
-        let mut hearing = BTreeSet::new();
-        for row in rows {
-            if Severity::parse(&row.min_severity)? <= severity {
-                hearing.insert(row.id);
-            }
-        }
-        Ok(hearing)
+        rows.into_iter()
+            .map(|row| Ok((row.id, to_channel(row)?.channel.severities)))
+            .collect()
     }
 
     /// Ends an alert and tells whoever was told it started, even if the rule

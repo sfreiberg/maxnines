@@ -20,7 +20,7 @@
     <tr>
       <td><a href="/alerts/channels/{{ channel.id }}/edit">{{ channel.name }}</a></td>
       <td>{% if channel.kind == "email" %}Email{% elif channel.kind == "discord" %}Discord{% elif channel.kind == "slack" %}Slack{% elif channel.kind == "pagerduty" %}PagerDuty{% elif channel.kind == "alertops" %}AlertOps{% elif channel.kind == "signl4" %}SIGNL4{% elif channel.kind == "telegram" %}Telegram{% else %}Webhook{% endif %}</td>
-      <td>{{ channel.target }}{% if channel.critical_only %}<br><span class="note">Critical alerts only</span>{% endif %}{% if channel.legacy_slack %}<br><span class="note">Slack is moving away from these webhooks. Use a Slack channel instead.</span>{% endif %}</td>
+      <td>{{ channel.target }}{% if channel.only %}<br><span class="note">{{ channel.only }}</span>{% endif %}{% if channel.legacy_slack %}<br><span class="note">Slack is moving away from these webhooks. Use a Slack channel instead.</span>{% endif %}</td>
       <td>
         <form method="post" action="/alerts/channels/{{ channel.id }}/test">
           <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">

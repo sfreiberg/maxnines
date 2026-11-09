@@ -24,6 +24,7 @@ impl MigratorTrait for Migrator {
             Box::new(AddBuiltInDiskAlerts),
             Box::new(AddWarningThresholds),
             Box::new(AddChannelSeverities),
+            Box::new(ChooseChannelSeverities),
         ]
     }
 }
@@ -1631,6 +1632,89 @@ impl MigrationTrait for AddChannelSeverities {
     }
 }
 
+// ---- Which alerts each channel takes, by severity
+
+struct ChooseChannelSeverities;
+
+impl MigrationName for ChooseChannelSeverities {
+    fn name(&self) -> &str {
+        "m20261109_000013_choose_channel_severities"
+    }
+}
+
+#[derive(Iden)]
+enum ChannelChoices {
+    #[iden = "notification_channels"]
+    Table,
+    SendsWarnings,
+    SendsCritical,
+}
+
+/// Lets a channel take warnings, critical alerts or both, in place of the mildest
+/// it takes, so a channel can take warnings alone too.
+#[async_trait::async_trait]
+impl MigrationTrait for ChooseChannelSeverities {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for column in [ChannelChoices::SendsWarnings, ChannelChoices::SendsCritical] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(ChannelChoices::Table)
+                        .add_column(ColumnDef::new(column).boolean().not_null().default(true))
+                        .to_owned(),
+                )
+                .await?;
+        }
+        let critical_only = Query::update()
+            .table(ChannelChoices::Table)
+            .value(ChannelChoices::SendsWarnings, false)
+            .and_where(Expr::col(ChannelSeverities::MinSeverity).eq("critical"))
+            .to_owned();
+        manager.exec_stmt(critical_only).await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(ChannelChoices::Table)
+                    .drop_column(ChannelSeverities::MinSeverity)
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(ChannelChoices::Table)
+                    .add_column(
+                        ColumnDef::new(ChannelSeverities::MinSeverity)
+                            .string_len(16)
+                            .not_null()
+                            .default("warning"),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        let critical_only = Query::update()
+            .table(ChannelChoices::Table)
+            .value(ChannelSeverities::MinSeverity, "critical")
+            .and_where(Expr::col(ChannelChoices::SendsWarnings).eq(false))
+            .to_owned();
+        manager.exec_stmt(critical_only).await?;
+        for column in [ChannelChoices::SendsWarnings, ChannelChoices::SendsCritical] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(ChannelChoices::Table)
+                        .drop_column(column)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
@@ -1654,7 +1738,7 @@ mod tests {
             .max_connections(1)
             .to_owned();
         let connection = Database::connect(options).await.unwrap();
-        let before = Migrator::migrations().len() as u32 - 4;
+        let before = Migrator::migrations().len() as u32 - 5;
         Migrator::up(&connection, Some(before)).await.unwrap();
         connection
             .execute_unprepared(
@@ -1675,7 +1759,7 @@ mod tests {
             .max_connections(1)
             .to_owned();
         let connection = Database::connect(options).await.unwrap();
-        let before = Migrator::migrations().len() as u32 - 3;
+        let before = Migrator::migrations().len() as u32 - 4;
         Migrator::up(&connection, Some(before)).await.unwrap();
         connection
             .execute_unprepared(
@@ -1735,7 +1819,7 @@ mod tests {
         );
 
         let connection = fresh().await;
-        let before = Migrator::migrations().len() as u32 - 2;
+        let before = Migrator::migrations().len() as u32 - 3;
         Migrator::up(&connection, Some(before)).await.unwrap();
         connection
             .execute_unprepared(
@@ -1749,6 +1833,45 @@ mod tests {
             [
                 ("Disk filling up".to_string(), 85.0, None),
                 ("Disk nearly full".to_string(), 90.0, None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_critical_only_channel_keeps_warnings_off_when_channels_choose_both() {
+        let connection = fresh().await;
+        let before = Migrator::migrations().len() as u32 - 1;
+        Migrator::up(&connection, Some(before)).await.unwrap();
+        connection
+            .execute_unprepared(
+                "INSERT INTO notification_channels (name, kind, target, min_severity)
+                 VALUES ('Pager', 'webhook', 'https://p', 'critical'),
+                        ('Chat', 'webhook', 'https://c', 'warning')",
+            )
+            .await
+            .unwrap();
+        Migrator::up(&connection, None).await.unwrap();
+
+        let query = Statement::from_string(
+            connection.get_database_backend(),
+            "SELECT name, sends_warnings, sends_critical FROM notification_channels ORDER BY name",
+        );
+        let rows = connection.query_all_raw(query).await.unwrap();
+        let channels: Vec<(String, bool, bool)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.try_get("", "name").unwrap(),
+                    row.try_get("", "sends_warnings").unwrap(),
+                    row.try_get("", "sends_critical").unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            channels,
+            [
+                ("Chat".to_string(), true, true),
+                ("Pager".to_string(), false, true)
             ]
         );
     }

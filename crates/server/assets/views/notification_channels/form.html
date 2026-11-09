@@ -117,13 +117,16 @@
   </details>
 
 
-  <label>Alerts to send
-    <select name="min_severity">
-      <option value="warning"{% if channel.min_severity == "warning" %} selected{% endif %}>Warnings and critical alerts</option>
-      <option value="critical"{% if channel.min_severity == "critical" %} selected{% endif %}>Critical alerts only</option>
-    </select>
-    <small>Critical only keeps warnings off a pager. A warning that becomes critical is sent then, and if it goes back to a warning, this channel hears that too.</small>
-  </label>
+  <fieldset>
+    <legend>Alerts to send</legend>
+    <label class="checkbox">
+      <input type="checkbox" name="sends_warnings"{% if channel.sends_warnings %} checked{% endif %}> Warnings
+    </label>
+    <label class="checkbox">
+      <input type="checkbox" name="sends_critical"{% if channel.sends_critical %} checked{% endif %}> Critical alerts
+    </label>
+    <small class="hint">Leave warnings off to keep them off a pager. The channel hears of an alert once it reaches one of these, then of every change until it resolves.</small>
+  </fieldset>
 
   <div class="actions">
     <button type="submit">Save channel</button>
