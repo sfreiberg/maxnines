@@ -30,6 +30,7 @@ mod server_stats;
 mod silences;
 mod slack_actions;
 mod store;
+mod times;
 mod tls;
 mod views;
 

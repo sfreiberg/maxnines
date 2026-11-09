@@ -11,6 +11,8 @@ pub struct Model {
     /// Empty until they've set one, and for anyone who only signs in another way.
     pub password_hash: Option<String>,
     pub theme: String,
+    /// A name from the time zone database, like `Europe/London`.
+    pub time_zone: String,
     /// The link for setting a password. Only the hash is kept.
     pub setup_token_hash: Option<String>,
     pub setup_expires_ms: Option<i64>,

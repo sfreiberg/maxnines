@@ -9,12 +9,12 @@ use axum_csrf::CsrfToken;
 use serde::Serialize;
 
 use super::sessions::session_token;
-use super::{CsrfForm, Page, server_error, signed_in_user};
+use super::{CsrfForm, Page, local_time, server_error, signed_in_user};
 use crate::app_state::AppState;
-use crate::fact_history::format_time;
 use crate::metrics::now_ms;
 use crate::models::{THEMES, User, UserChange, check_new_password, check_new_user, is_theme};
 use crate::passwords::{hash_password, password_matches};
+use crate::times::{zone_named, zone_names};
 
 const USERS_PAGE: &str = "/settings/users";
 const PROFILE_PAGE: &str = "/profile";
@@ -28,16 +28,13 @@ pub fn routes() -> Router<AppState> {
         .route("/settings/users/{id}/setup-link", post(new_link))
         .route(PROFILE_PAGE, get(profile))
         .route("/profile/theme", post(choose_theme))
+        .route("/profile/time-zone", post(choose_time_zone))
         .route("/profile/password", post(change_password))
 }
 
 /// Where someone goes to set their password, which only works while the link does.
 pub fn setup_url(state: &AppState, token: &str) -> String {
     format!("{}/setup/{token}", state.web_url)
-}
-
-fn time(ms: i64) -> String {
-    u64::try_from(ms).map_or_else(|_| String::new(), format_time)
 }
 
 #[derive(Serialize)]
@@ -60,7 +57,7 @@ fn row(user: User, you: Option<i64>) -> UserRow {
         "Invited"
     };
     UserRow {
-        last_sign_in: user.last_sign_in_ms.map(time),
+        last_sign_in: user.last_sign_in_ms.map(local_time),
         disabled: user.disabled_ms.is_some(),
         is_you: you == Some(user.id),
         status,
@@ -220,6 +217,7 @@ fn profile_page(
     let page = Page::new(state, token, "profile/show.html")
         .with("person", user)
         .with("themes", &themes)
+        .with("zones", &zone_names())
         .with("saved", &saved)
         .with("error", &error);
     if error.is_some() {
@@ -246,6 +244,21 @@ async fn choose_theme(State(state): State<AppState>, form: CsrfForm) -> Response
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
     match state.database.set_theme(user.id, theme).await {
+        Ok(_) => Redirect::to(PROFILE_PAGE).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn choose_time_zone(State(state): State<AppState>, form: CsrfForm) -> Response {
+    let Some(user) = signed_in_user() else {
+        return Redirect::to("/login").into_response();
+    };
+    let name = form.fields.get("time_zone").map_or("", |name| name.trim());
+    let Some(zone) = zone_named(name) else {
+        let problem = format!("{name:?} isn't a time zone. Try one like Europe/London.");
+        return profile_page(&state, &form.token, &user, false, Some(&problem));
+    };
+    match state.database.set_time_zone(user.id, zone).await {
         Ok(_) => Redirect::to(PROFILE_PAGE).into_response(),
         Err(error) => server_error(&error),
     }

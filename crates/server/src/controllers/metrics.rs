@@ -4,12 +4,13 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::get;
 use axum_csrf::CsrfToken;
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::task::JoinSet;
 
 use super::host_list::{HostSearch, address, page_number, paginate};
-use super::{Page, fleet, server_error};
+use super::{Page, fleet, server_error, viewer_zone};
 use crate::app_state::AppState;
 use crate::metric_charts::{self, Chart, MAX_SERIES};
 use crate::metrics::{self, METRICS, Metric, ShowChart, TimeRange, Unit, now_ms};
@@ -158,12 +159,13 @@ async fn chart(
     agent_id: &str,
     metric: &'static Metric,
     range: TimeRange,
+    zone: Tz,
 ) -> anyhow::Result<Chart> {
     let result = state
         .metrics
         .series(agent_id, metric, range, MAX_SERIES)
         .await?;
-    Ok(metric_charts::build(metric, &result, range))
+    Ok(metric_charts::build(metric, &result, range, zone))
 }
 
 /// The links for choosing a range, with `selected` marked.
@@ -178,18 +180,24 @@ pub(super) fn range_links(selected: &str) -> Vec<RangeLink> {
         .collect()
 }
 
-/// Charts for these metrics, in this order. Each is its own query, so they run
-/// together rather than in turn.
+/// Charts for these metrics, in this order, with their times in `zone`. Each is its
+/// own query, so they run together rather than in turn.
 pub(super) async fn charts_for(
     state: &AppState,
     agent_id: &str,
     metrics: &[&'static Metric],
     range: TimeRange,
+    zone: Tz,
 ) -> anyhow::Result<Vec<Chart>> {
     let mut queries = JoinSet::new();
     for (position, metric) in metrics.iter().copied().enumerate() {
         let (state, agent_id) = (state.clone(), agent_id.to_string());
-        queries.spawn(async move { (position, chart(&state, &agent_id, metric, range).await) });
+        queries.spawn(async move {
+            (
+                position,
+                chart(&state, &agent_id, metric, range, zone).await,
+            )
+        });
     }
 
     let mut charts = Vec::with_capacity(metrics.len());
@@ -224,7 +232,7 @@ async fn show(
         .iter()
         .filter(|metric| metric.chart != ShowChart::Never)
         .collect();
-    let charts = match charts_for(&state, &agent.id, &shown, range).await {
+    let charts = match charts_for(&state, &agent.id, &shown, range, viewer_zone()).await {
         Ok(charts) => charts,
         Err(error) => return server_error(&error),
     };
@@ -294,7 +302,7 @@ async fn data(
         return not_found(&state, &token);
     };
 
-    match chart(&state, &agent.id, metric, range).await {
+    match chart(&state, &agent.id, metric, range, viewer_zone()).await {
         Ok(chart) => Page::new(&state, &token, "metrics/data.html")
             .with("agent_id", &agent.id)
             .with("host", &agent.host)

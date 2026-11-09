@@ -665,6 +665,52 @@ async fn a_theme_belongs_to_a_person_and_needs_no_scripts() {
 }
 
 #[tokio::test]
+async fn each_person_sees_times_in_their_own_time_zone() {
+    let server = start().await;
+    person(&server, "a@example.com").await;
+    let mut browser = signed_in(&server, "a@example.com").await;
+
+    // Their own last sign in is on the users page.
+    let page = browser.get(&server, "/settings/users").await;
+    assert!(page.body.contains(" UTC</td>"), "{}", page.body);
+    let page = browser.get(&server, "/profile").await;
+    assert!(page.body.contains(r#"name="time_zone" value="UTC""#));
+
+    let fields = [("time_zone", " Asia/Kolkata ")];
+    let page = browser
+        .submit(&server, "/profile", "/profile/time-zone", &fields)
+        .await;
+    assert_eq!(page.status, 303);
+
+    let page = browser.get(&server, "/settings/users").await;
+    assert!(page.body.contains(" IST</td>"), "{}", page.body);
+    let page = browser.get(&server, "/server").await;
+    assert!(page.body.contains("Times are in Asia/Kolkata."));
+    let page = browser.get(&server, "/profile").await;
+    assert!(
+        page.body
+            .contains(r#"name="time_zone" value="Asia/Kolkata""#)
+    );
+
+    let page = Browser::default().get(&server, "/server").await;
+    assert!(page.body.contains("Times are in UTC."), "someone else");
+
+    let fields = [("time_zone", "<b>Mars/Olympus</b>")];
+    let page = browser
+        .submit(&server, "/profile", "/profile/time-zone", &fields)
+        .await;
+    assert_eq!(page.status, 422);
+    assert!(
+        page.body
+            .contains("&quot;&lt;b&gt;Mars/Olympus&lt;/b&gt;&quot; isn&#39;t a time zone"),
+        "{}",
+        page.body
+    );
+    let page = browser.get(&server, "/server").await;
+    assert!(page.body.contains("Times are in Asia/Kolkata."), "kept");
+}
+
+#[tokio::test]
 async fn the_frame_shows_who_is_signed_in() {
     let server = start().await;
     let page = Browser::default().get(&server, "/").await;
@@ -765,6 +811,26 @@ async fn the_api_manages_users_without_giving_away_anything_secret() {
     assert_eq!(api(&server, "GET", &path, &none).await.1["theme"], "dusk");
     let theme = json!({ "theme": "nope" });
     assert_eq!(api(&server, "PUT", &path, &theme).await.0, 422);
+
+    assert_eq!(
+        api(&server, "GET", &path, &none).await.1["time_zone"],
+        "UTC"
+    );
+    let both = json!({ "theme": "paper", "time_zone": "America/New_York" });
+    assert_eq!(api(&server, "PUT", &path, &both).await.0, 204);
+    let (_, user) = api(&server, "GET", &path, &none).await;
+    assert_eq!(
+        (&user["theme"], &user["time_zone"]),
+        (&json!("paper"), &json!("America/New_York"))
+    );
+    let zone = json!({ "time_zone": "Mars/Olympus" });
+    assert_eq!(api(&server, "PUT", &path, &zone).await.0, 422);
+    assert_eq!(api(&server, "PUT", &path, &json!({})).await.0, 422);
+    let missing = json!({ "time_zone": "UTC" });
+    assert_eq!(
+        api(&server, "PUT", "/api/v1/users/999", &missing).await.0,
+        404
+    );
 
     assert_eq!(api(&server, "DELETE", &path, &none).await.0, 409, "enabled");
     let disable = format!("{path}/disable");

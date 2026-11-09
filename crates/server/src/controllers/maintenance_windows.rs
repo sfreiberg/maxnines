@@ -11,6 +11,7 @@ use serde::Serialize;
 use super::{CsrfForm, Page, server_error};
 use crate::app_state::AppState;
 use crate::maintenance::{DAYS, MaintenanceWindowInput};
+use crate::times::zone_names;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -136,10 +137,7 @@ async fn form_page(
             chosen: window.days.iter().any(|day| day == value),
         })
         .collect();
-    let zones: Vec<&str> = chrono_tz::TZ_VARIANTS
-        .iter()
-        .map(|zone| zone.name())
-        .collect();
+    let zones = zone_names();
 
     let mut page = Page::new(state, token, "maintenance_windows/form.html")
         .with("window", window)

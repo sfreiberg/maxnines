@@ -5170,6 +5170,14 @@ mod pages {
 
         let page = Browser::default().get(&test.server, "/").await;
         assert!(page.body.contains("web-1"), "{}", page.body);
+        // The tiles say online with a dot alone, which keeps its word for screen readers.
+        let dot = r#"<span class="badge good dot-only" role="img" aria-label="Online" title="Online"></span>"#;
+        assert!(page.body.contains(dot), "{}", page.body);
+        assert!(
+            !page
+                .body
+                .contains(r#"<span class="badge good">Online</span>"#)
+        );
         assert!(page.body.contains("site"), "{}", page.body);
         assert!(page.body.contains("Waiting"), "{}", page.body);
         assert!(

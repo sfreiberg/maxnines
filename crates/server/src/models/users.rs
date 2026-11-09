@@ -6,6 +6,7 @@
 //! sign-on, only has to find the user and call it.
 
 use anyhow::{Context, Result, ensure};
+use chrono_tz::Tz;
 use lettre::Address;
 use maxnines_protocol::auth::new_nonce;
 use sea_orm::sea_query::Expr;
@@ -17,6 +18,7 @@ use serde::Serialize;
 
 use super::{Database, user, user_session};
 use crate::registration::hash_token;
+use crate::times::{DEFAULT_TIME_ZONE, zone_named};
 
 pub const SESSION_LIFETIME_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const SETUP_LINK_LIFETIME_MS: i64 = 7 * 24 * 60 * 60 * 1000;
@@ -45,6 +47,8 @@ pub struct User {
     pub email: String,
     pub name: String,
     pub theme: String,
+    /// What the pages show times in, from the time zone database.
+    pub time_zone: String,
     pub has_password: bool,
     pub created_ms: i64,
     pub last_sign_in_ms: Option<i64>,
@@ -59,10 +63,19 @@ impl From<user::Model> for User {
             email: row.email,
             name: row.name,
             theme: row.theme,
+            time_zone: row.time_zone,
             created_ms: row.created_ms,
             last_sign_in_ms: row.last_sign_in_ms,
             disabled_ms: row.disabled_ms,
         }
+    }
+}
+
+impl User {
+    /// The zone they read times in. Only real zones are saved, so UTC only stands in
+    /// for one that a later version of the time zone database has dropped.
+    pub fn zone(&self) -> Tz {
+        zone_named(&self.time_zone).unwrap_or(DEFAULT_TIME_ZONE)
     }
 }
 
@@ -165,6 +178,7 @@ impl Database {
             email: Set(email.to_string()),
             name: Set(name.to_string()),
             theme: Set(DEFAULT_THEME.to_string()),
+            time_zone: Set(DEFAULT_TIME_ZONE.name().to_string()),
             setup_token_hash: Set(Some(token_hash(&token))),
             setup_expires_ms: Set(Some(now_ms + SETUP_LINK_LIFETIME_MS)),
             created_ms: Set(now_ms),
@@ -304,6 +318,17 @@ impl Database {
             .exec(&self.connection)
             .await
             .context("saving a theme")?;
+        Ok(updated.rows_affected == 1)
+    }
+
+    /// Returns false if there's no such user.
+    pub async fn set_time_zone(&self, id: i64, zone: Tz) -> Result<bool> {
+        let updated = user::Entity::update_many()
+            .col_expr(user::Column::TimeZone, Expr::value(zone.name()))
+            .filter(user::Column::Id.eq(id))
+            .exec(&self.connection)
+            .await
+            .context("saving a time zone")?;
         Ok(updated.rows_affected == 1)
     }
 

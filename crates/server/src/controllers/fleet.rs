@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use super::local_time;
 use crate::alerting::{Alert, Severity};
 use crate::app_state::AppState;
-use crate::fact_history::format_time;
 use crate::facts::FlatFacts;
 use crate::metric_charts::format_value;
 use crate::metrics::{CurrentValues, Unit, now_ms};
@@ -114,10 +114,9 @@ fn row(
         disk_is_full: values.disk_percent.is_some_and(|d| d >= FULL_DISK_PERCENT),
         disk: Meter::new(values.disk_percent),
         disk_mount_point: values.disk_mount_point,
-        updated: u64::try_from(values.time_ms)
-            .ok()
+        updated: Some(values.time_ms)
             .filter(|time| *time > 0)
-            .map(format_time),
+            .map(local_time),
         short_id: short_id(&agent.id).to_string(),
         id: agent.id,
         host: agent.host,

@@ -29,6 +29,21 @@
   </form>
 </section>
 
+<section class="card">
+  <h2>Time zone</h2>
+  <form method="post" action="/profile/time-zone" class="stacked">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <label>Show times in
+      <input type="text" name="time_zone" value="{{ person.time_zone }}" list="time-zones" required spellcheck="false" autocomplete="off">
+      <datalist id="time-zones">
+        {% for zone in zones %}<option value="{{ zone }}"></option>{% endfor %}
+      </datalist>
+      <small>A name like Europe/London or America/New_York. The API and alert messages stay in UTC.</small>
+    </label>
+    <div class="actions"><button type="submit">Save time zone</button></div>
+  </form>
+</section>
+
 {% if person.has_password %}
 <section class="card">
   <h2>Password</h2>

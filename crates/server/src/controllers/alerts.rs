@@ -6,10 +6,9 @@ use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
 use serde::Serialize;
 
-use super::{CsrfForm, Page, server_error, signed_in_user};
+use super::{CsrfForm, Page, local_time, server_error, signed_in_user};
 use crate::alerting::{Alert, DeliveryProblem};
 use crate::app_state::AppState;
-use crate::fact_history::format_time;
 use crate::metrics::now_ms;
 use crate::registration::short_id;
 use crate::remote_checks::{FLEET_AGENT_ID, LOCAL_AGENT_ID};
@@ -26,10 +25,6 @@ pub fn routes() -> Router<AppState> {
         .route("/alerts", get(index))
         .route("/alerts/{id}/acknowledge", post(acknowledge))
         .route("/alerts/{id}/unacknowledge", post(unacknowledge))
-}
-
-fn time(ms: i64) -> String {
-    u64::try_from(ms).map_or_else(|_| String::new(), format_time)
 }
 
 #[derive(Serialize)]
@@ -73,8 +68,8 @@ impl From<Alert> for AlertRow {
             id: alert.id,
             acknowledged_by: alert.acknowledged_by,
             severity: alert.severity.as_str(),
-            started: time(alert.started_ms),
-            resolved: alert.resolved_ms.map(time),
+            started: local_time(alert.started_ms),
+            resolved: alert.resolved_ms.map(local_time),
             reason: alert.resolve_reason,
             short_id: if alert.agent_id == FLEET_AGENT_ID || alert.agent_id == LOCAL_AGENT_ID {
                 String::new()
@@ -105,7 +100,7 @@ impl From<DeliveryProblem> for ProblemRow {
         Self {
             event: problem.event.as_str(),
             gave_up: problem.state == "failed",
-            created: time(problem.created_ms),
+            created: local_time(problem.created_ms),
             channel: problem.channel,
             summary: problem.summary,
             attempts: problem.attempts,
@@ -130,7 +125,9 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
     let open: Vec<AlertRow> = open
         .into_iter()
         .map(|alert| {
-            let silence = silences.covering(&alert).map(|cover| time(cover.ends_ms()));
+            let silence = silences
+                .covering(&alert)
+                .map(|cover| local_time(cover.ends_ms()));
             AlertRow {
                 silenced_until: silence,
                 ..AlertRow::from(alert)

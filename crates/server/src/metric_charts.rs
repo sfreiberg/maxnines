@@ -4,11 +4,12 @@
 
 use std::collections::BTreeMap;
 
-use chrono::DateTime;
+use chrono::{DateTime, TimeZone};
+use chrono_tz::Tz;
 use serde::Serialize;
 
-use crate::fact_history::format_time;
 use crate::metrics::{Metric, Series, SeriesResult, TimeRange, Unit};
+use crate::times::format_time;
 
 /// The chart palette has this many colors, and a chart shows no more series.
 pub const MAX_SERIES: usize = 8;
@@ -78,8 +79,8 @@ const LARGEST_VALUE: f64 = 1e300;
 const MAX_NAME_CHARS: usize = 15;
 const TOOLTIP_CHAR_WIDTH: f64 = 6.5;
 const TOOLTIP_PADDING: f64 = 30.0;
-/// Wide enough for the time, which every tooltip starts with.
-const TOOLTIP_MIN_WIDTH: f64 = 152.0;
+/// Wide enough for the time, which every tooltip starts with, in any time zone.
+const TOOLTIP_MIN_WIDTH: f64 = 166.0;
 const TOOLTIP_MAX_WIDTH: f64 = 190.0;
 const TOOLTIP_ROW_HEIGHT: f64 = 15.0;
 const TOOLTIP_GAP: f64 = 8.0;
@@ -166,7 +167,8 @@ pub struct Chart {
     pub summary: Vec<Summary>,
 }
 
-pub fn build(metric: &Metric, result: &SeriesResult, range: TimeRange) -> Chart {
+/// A chart with its times in `zone`.
+pub fn build(metric: &Metric, result: &SeriesResult, range: TimeRange, zone: Tz) -> Chart {
     build_as(
         metric,
         metric.unit,
@@ -174,11 +176,12 @@ pub fn build(metric: &Metric, result: &SeriesResult, range: TimeRange) -> Chart 
         Frame::STANDARD,
         result,
         range,
+        zone,
     )
 }
 
 /// A chart of something worked out from a metric, which can have its own unit and
-/// title.
+/// title. Its times are in `zone`.
 pub fn build_as(
     metric: &Metric,
     unit: Unit,
@@ -186,6 +189,7 @@ pub fn build_as(
     frame: Frame,
     result: &SeriesResult,
     range: TimeRange,
+    zone: Tz,
 ) -> Chart {
     let axis = Axis::new(unit, &result.series, frame);
     let slots = colour_slots(metric, &result.series);
@@ -209,14 +213,14 @@ pub fn build_as(
                 label: format_tick(unit, *tick),
             })
             .collect(),
-        x_ticks: time_ticks(range, frame),
+        x_ticks: time_ticks(range, frame, zone),
         lines: result
             .series
             .iter()
             .zip(&slots)
             .map(|(series, slot)| line(series, *slot, &axis, range))
             .collect(),
-        columns: columns(unit, &result.series, &slots, &axis, range),
+        columns: columns(unit, &result.series, &slots, &axis, range, zone),
         reach_ms: result
             .series
             .iter()
@@ -307,7 +311,10 @@ fn nice_step(span: f64) -> f64 {
     step * magnitude
 }
 
-fn time_ticks(range: TimeRange, frame: Frame) -> Vec<Tick> {
+/// Labels on round times in `zone`, so they read 09:00 in a zone half an hour from
+/// UTC, and days start at its midnight. Rounding is done on the zone's wall clock,
+/// counted as if it were UTC, then each label goes back to the moment it names.
+fn time_ticks(range: TimeRange, frame: Frame, zone: Tz) -> Vec<Tick> {
     let span = range.to_ms - range.from_ms;
     let step = TIME_LABEL_STEPS_MS
         .into_iter()
@@ -316,18 +323,26 @@ fn time_ticks(range: TimeRange, frame: Frame) -> Vec<Tick> {
         .max(1);
     let format = if step < DAY_MS { "%H:%M" } else { "%b %-d" };
 
-    let first = (range.from_ms / step + 1) * step;
-    (0..=MAX_TIME_LABELS)
+    let Some(start) = DateTime::from_timestamp_millis(range.from_ms) else {
+        return Vec::new();
+    };
+    let wall_start = start.with_timezone(&zone).naive_local().and_utc();
+    let first = (wall_start.timestamp_millis() / step + 1) * step;
+    // One more than fits, as clocks going back can make room for it.
+    (0..=MAX_TIME_LABELS + 1)
         .map(|index| first + index * step)
-        .take_while(|time| *time < range.to_ms)
-        .map(|time| (time, x_for(time, range, frame)))
+        .filter_map(|wall| {
+            let wall = DateTime::from_timestamp_millis(wall)?.naive_utc();
+            // Nothing, for a time skipped when the clocks go forward.
+            zone.from_local_datetime(&wall).earliest()
+        })
+        .map(|moment| (moment, moment.timestamp_millis()))
+        .take_while(|(_, time)| *time < range.to_ms)
+        .map(|(moment, time)| (moment, x_for(time, range, frame)))
         .filter(|(_, x)| *x - TIME_LABEL_MARGIN >= 0.0 && *x + TIME_LABEL_MARGIN <= frame.width)
-        .filter_map(|(time, x)| {
-            let label = DateTime::from_timestamp_millis(time)?.format(format);
-            Some(Tick {
-                position: x,
-                label: label.to_string(),
-            })
+        .map(|(moment, x)| Tick {
+            position: x,
+            label: moment.format(format).to_string(),
         })
         .collect()
 }
@@ -425,6 +440,7 @@ fn columns(
     slots: &[usize],
     axis: &Axis,
     range: TimeRange,
+    zone: Tz,
 ) -> Vec<Column> {
     // Every moment any series has a value for, with a place for each series.
     let mut moments: BTreeMap<i64, Vec<Option<f64>>> = BTreeMap::new();
@@ -460,6 +476,7 @@ fn columns(
                 values,
                 start,
                 end,
+                zone,
             )
         })
         .collect()
@@ -475,6 +492,7 @@ fn column(
     values: &[Option<f64>],
     start: f64,
     end: f64,
+    zone: Tz,
 ) -> Column {
     let rows: Vec<TooltipRow> = values
         .iter()
@@ -512,7 +530,7 @@ fn column(
         hit_x: start,
         hit_width: end - start,
         time_ms,
-        time: format_time(u64::try_from(time_ms).unwrap_or(0)),
+        time: format_time(u64::try_from(time_ms).unwrap_or(0), zone),
         tooltip_x,
         tooltip_width,
         tooltip_height: (rows.len() + 1) as f64 * TOOLTIP_ROW_HEIGHT + 12.0,
@@ -626,6 +644,7 @@ fn format_tick(unit: Unit, value: f64) -> String {
 mod tests {
     use super::*;
     use crate::metrics::{Point, find};
+    use chrono_tz::Tz;
 
     const HOUR_MS: i64 = 3_600_000;
 
@@ -651,7 +670,7 @@ mod tests {
 
     fn chart(metric: &str, series: Vec<Series>) -> Chart {
         let result = SeriesResult { series, hidden: 0 };
-        build(find(metric).unwrap(), &result, range())
+        build(find(metric).unwrap(), &result, range(), Tz::UTC)
     }
 
     fn labels(ticks: &[Tick]) -> Vec<&str> {
@@ -844,6 +863,7 @@ mod tests {
             frame,
             &result,
             range(),
+            Tz::UTC,
         );
 
         assert_eq!(chart.title, "Busy machines");
@@ -986,7 +1006,7 @@ mod tests {
         let start = 1_700_000_000_000;
         let ticks = |hours: i64| {
             let range = TimeRange::new(start, start + hours * HOUR_MS).unwrap();
-            time_ticks(range, Frame::STANDARD)
+            time_ticks(range, Frame::STANDARD, Tz::UTC)
         };
 
         assert_eq!(labels(&ticks(1)), ["22:15", "22:30", "22:45", "23:00"]);
@@ -995,12 +1015,77 @@ mod tests {
     }
 
     #[test]
+    fn time_labels_fall_on_round_times_in_the_readers_zone() {
+        let start = 1_700_000_000_000;
+        let ticks = |hours: i64, zone: Tz| {
+            let range = TimeRange::new(start, start + hours * HOUR_MS).unwrap();
+            time_ticks(range, Frame::STANDARD, zone)
+        };
+
+        // Half an hour from UTC, so labels on round UTC times would read 03:45 and so on.
+        assert_eq!(
+            labels(&ticks(1, Tz::Asia__Kolkata)),
+            ["03:45", "04:00", "04:15", "04:30"]
+        );
+        assert_eq!(
+            labels(&ticks(24, Tz::Asia__Kolkata)),
+            ["06:00", "12:00", "18:00", "00:00"]
+        );
+        assert_eq!(
+            labels(&ticks(24, Tz::America__Los_Angeles)),
+            ["18:00", "00:00", "06:00", "12:00"]
+        );
+        // A week is labelled every other day, at the zone's midnight. It starts at 11:13
+        // on Nov 15 in Auckland, when it's still Nov 14 in UTC.
+        let week = ticks(24 * 7, Tz::Pacific__Auckland);
+        assert_eq!(labels(&week).first(), Some(&"Nov 17"));
+        let auckland_midnight = 1_700_132_400_000; // Nov 17 00:00 NZDT
+        let range = TimeRange::new(start, start + 24 * 7 * HOUR_MS).unwrap();
+        assert_eq!(
+            week[0].position,
+            x_for(auckland_midnight, range, Frame::STANDARD)
+        );
+    }
+
+    #[test]
+    fn time_labels_skip_the_hour_the_clocks_jump_over() {
+        // Clocks in New York went from 02:00 to 03:00 on March 10, 2024 (07:00 UTC).
+        let from = 1_710_050_400_000; // 01:00 EST
+        let range = TimeRange::new(from, from + 3 * HOUR_MS).unwrap();
+
+        let ticks = time_ticks(range, Frame::STANDARD, Tz::America__New_York);
+
+        let labels = labels(&ticks);
+        assert!(!labels.contains(&"02:00"), "{labels:?}");
+        assert!(labels.contains(&"03:00"), "{labels:?}");
+        for pair in ticks.windows(2) {
+            assert!(pair[0].position < pair[1].position);
+        }
+    }
+
+    #[test]
+    fn tooltips_give_the_time_in_the_readers_zone() {
+        let result = SeriesResult {
+            series: vec![series("CPU", &[(0, 1.0)])],
+            hidden: 0,
+        };
+        let chart = build(
+            find("cpu.usage").unwrap(),
+            &result,
+            range(),
+            Tz::Asia__Kathmandu,
+        );
+
+        assert_eq!(chart.columns[0].time, "1970-01-01 05:30:00 +0530");
+    }
+
+    #[test]
     fn time_labels_stay_in_order_and_inside_the_chart() {
         for hours in [1, 6, 24, 24 * 7, 24 * 30, 24 * 366] {
             let from = 1_700_000_123_456;
             let range = TimeRange::new(from, from + hours * HOUR_MS).unwrap();
 
-            let ticks = time_ticks(range, Frame::STANDARD);
+            let ticks = time_ticks(range, Frame::STANDARD, Tz::UTC);
 
             assert!(!ticks.is_empty(), "{hours}");
             assert!(ticks.len() <= 6, "{hours}");

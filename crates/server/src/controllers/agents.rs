@@ -12,10 +12,10 @@ use serde_json::Value;
 
 use super::fleet::{Health, OsFamily};
 use super::host_list::{HostSearch, address, page_number, paginate};
-use super::{CsrfForm, Page, server_error, signed_in_user};
+use super::{CsrfForm, Page, server_error, signed_in_user, viewer_zone};
 use crate::alerting::Alert;
 use crate::app_state::AppState;
-use crate::fact_history::{describe_history, format_time};
+use crate::fact_history::describe_history;
 use crate::facts::{FlatFacts, fact_text, unflatten};
 use crate::host_filter::{MAX_SUGGESTIONS, PartialValue, Suggestion, suggest_names};
 use crate::locations::Locator;
@@ -25,6 +25,7 @@ use crate::metrics::now_ms;
 use crate::models::ConfigStatus;
 use crate::registration::{AgentRecord, AgentState, short_id};
 use crate::rule_engine;
+use crate::times::format_time;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -509,11 +510,12 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
     });
     let presence = state.presence.get(&id);
     let config = serde_json::to_string_pretty(&desired.config).unwrap_or_default();
+    let zone = viewer_zone();
     let changes: Vec<HistoryEntry> = describe_history(&history)
         .into_iter()
         .rev()
         .map(|(time, changes)| HistoryEntry {
-            time: format_time(time),
+            time: format_time(time, zone),
             changes,
         })
         .collect();

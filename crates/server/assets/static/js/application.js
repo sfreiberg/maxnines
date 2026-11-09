@@ -32,9 +32,7 @@ document.addEventListener("htmx:afterRequest", (event) => {
 
   const status = document.getElementById("live-status");
   status.classList.toggle("stale", !updated);
-  status.textContent = updated
-    ? `Live · ${new Date().toISOString().slice(11, 19)} UTC`
-    : "Not updating";
+  status.textContent = updated ? "Live" : "Not updating";
 });
 
 // Leaves what someone is typing alone when the page's data updates, and the drawn map,

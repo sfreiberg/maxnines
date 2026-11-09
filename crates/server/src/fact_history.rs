@@ -2,18 +2,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::DateTime;
 use serde_json::Value;
 
 use crate::facts::{FlatFacts, unflatten};
 use crate::models::FactVersion;
-
-pub fn format_time(ms: u64) -> String {
-    match DateTime::from_timestamp_millis(ms as i64) {
-        Some(time) => time.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
-        None => format!("{ms} ms"),
-    }
-}
 
 /// Turns stored versions into what happened and when, in order. Comparing whole
 /// rebuilt states, not rows, means a list reads as one change even though each
@@ -197,10 +189,5 @@ mod tests {
     fn a_first_report_is_summarized() {
         let history = [version("a", json!(1), 100, None)];
         assert_eq!(describe_history(&history)[&100], ["first report, 1 facts"]);
-    }
-
-    #[test]
-    fn formats_times_in_utc() {
-        assert_eq!(format_time(1_700_000_000_000), "2023-11-14 22:13:20 UTC");
     }
 }

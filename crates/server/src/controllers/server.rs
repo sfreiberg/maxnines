@@ -5,15 +5,14 @@ use axum::extract::{Query, State};
 use axum::response::Response;
 use axum::routing::get;
 use axum_csrf::CsrfToken;
-
+use chrono_tz::Tz;
 use serde::Serialize;
 use tracing::warn;
 
-use super::Page;
 use super::agents::format_uptime;
 use super::metrics::{RangeParams, charts_for, not_found, range_links, selected_range, time_range};
+use super::{Page, local_time, viewer_zone};
 use crate::app_state::AppState;
-use crate::fact_history::format_time;
 use crate::metric_charts::{Chart, format_value};
 use crate::metrics::{self, Metric, Unit, now_ms};
 use crate::remote_checks::LOCAL_AGENT_ID;
@@ -64,13 +63,17 @@ struct Section {
     charts: Vec<Chart>,
 }
 
-async fn sections(state: &AppState, range: metrics::TimeRange) -> anyhow::Result<Vec<Section>> {
+async fn sections(
+    state: &AppState,
+    range: metrics::TimeRange,
+    zone: Tz,
+) -> anyhow::Result<Vec<Section>> {
     let mut sections = Vec::with_capacity(SECTIONS.len());
     for (title, names) in SECTIONS {
         let wanted: Vec<&'static Metric> = names.iter().filter_map(|n| metrics::find(n)).collect();
         sections.push(Section {
             title,
-            charts: charts_for(state, LOCAL_AGENT_ID, &wanted, range).await?,
+            charts: charts_for(state, LOCAL_AGENT_ID, &wanted, range, zone).await?,
         });
     }
     Ok(sections)
@@ -88,10 +91,6 @@ fn latest(sections: &[Section], name: &str) -> String {
 
 fn bytes(value: f64) -> String {
     format_value(Unit::Bytes, value)
-}
-
-fn time(ms: i64) -> String {
-    u64::try_from(ms).map_or_else(|_| String::new(), format_time)
 }
 
 /// Thousands separated, as these get large.
@@ -199,7 +198,7 @@ fn server_page(stats: ServerStats, now_ms: i64) -> ServerPage {
     let last_pass = activity.last_alert_pass_ms;
 
     ServerPage {
-        started: time(stats.started_ms),
+        started: local_time(stats.started_ms),
         uptime: format_uptime(stats.uptime_secs),
         process_memory: process.map(|p| bytes(p.memory_bytes as f64)),
         process_cpu: process
@@ -226,8 +225,8 @@ fn server_page(stats: ServerStats, now_ms: i64) -> ServerPage {
                     .rows
                     .map_or_else(|| "–".to_string(), |rows| count(rows.max(0) as u64)),
                 last_hour: count(collector.rows_last_hour.max(0) as u64),
-                oldest: time(collector.oldest_ms),
-                newest: time(collector.newest_ms),
+                oldest: local_time(collector.oldest_ms),
+                newest: local_time(collector.newest_ms),
             })
             .collect(),
         total_rows: count(total_rows.max(0) as u64),
@@ -257,7 +256,7 @@ fn server_page(stats: ServerStats, now_ms: i64) -> ServerPage {
         agents_approved: activity.agents_approved,
         agents_waiting: activity.agents_waiting,
         alerts_firing: activity.alerts_firing,
-        last_alert_pass: last_pass.map(time),
+        last_alert_pass: last_pass.map(local_time),
         alert_rules_stalled: last_pass.is_some_and(|ms| now_ms - ms > ALERT_PASS_STALE_MS),
         metrics: stats.metrics,
         version: stats.version,
@@ -276,7 +275,10 @@ async fn show(
     let Some(range) = time_range(length_ms) else {
         return not_found(&state, &token);
     };
-    let (stats, sections) = tokio::join!(server_stats::gather(&state), sections(&state, range));
+    let (stats, sections) = tokio::join!(
+        server_stats::gather(&state),
+        sections(&state, range, viewer_zone())
+    );
     // This page matters most when something's failing, so the rest still shows.
     let charts_failed = sections.is_err();
     let sections = sections.unwrap_or_else(|error| {

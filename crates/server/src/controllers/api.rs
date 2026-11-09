@@ -35,6 +35,7 @@ use crate::registration::{AgentRecord, AgentState};
 use crate::remote_checks::{RemoteCheck, RemoteCheckInput};
 use crate::rule_engine::{self, ResolvedConfig};
 use crate::silences::{ActiveSilences, Cover, SilenceInput};
+use crate::times::zone_named;
 
 /// An agent as admins see it.
 #[derive(Debug, Serialize, Deserialize)]
@@ -250,9 +251,11 @@ async fn create_user(State(state): State<AppState>, Json(input): Json<NewUser>) 
     }
 }
 
+/// Either or both. Neither is refused, so a misspelled field isn't taken as done.
 #[derive(Deserialize)]
 struct UserChanges {
-    theme: String,
+    theme: Option<String>,
+    time_zone: Option<String>,
 }
 
 async fn update_user(
@@ -260,10 +263,38 @@ async fn update_user(
     UrlPath(id): UrlPath<i64>,
     Json(input): Json<UserChanges>,
 ) -> Response {
-    if !is_theme(&input.theme) {
+    if input.theme.is_none() && input.time_zone.is_none() {
+        return failed(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Give a theme, a time zone or both",
+        );
+    }
+    if input.theme.as_deref().is_some_and(|theme| !is_theme(theme)) {
         return failed(StatusCode::UNPROCESSABLE_ENTITY, "There's no such theme");
     }
-    match state.database.set_theme(id, &input.theme).await {
+    let zone = match input.time_zone.as_deref() {
+        Some(name) => match zone_named(name) {
+            Some(zone) => Some(zone),
+            None => {
+                return failed(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "There's no such time zone",
+                );
+            }
+        },
+        None => None,
+    };
+    let saved = async {
+        let mut found = true;
+        if let Some(theme) = &input.theme {
+            found &= state.database.set_theme(id, theme).await?;
+        }
+        if let Some(zone) = zone {
+            found &= state.database.set_time_zone(id, zone).await?;
+        }
+        anyhow::Ok(found)
+    };
+    match saved.await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => no_such_user(),
         Err(error) => server_error(&error),

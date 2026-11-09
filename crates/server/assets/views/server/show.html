@@ -44,7 +44,7 @@
   <a href="/server?range={{ option.key }}"{% if option.selected %} class="selected" aria-current="true"{% endif %}>{{ option.label }}</a>
   {% endfor %}
 </nav>
-<p class="hint">Times are UTC. Hover over a chart to see that moment on all of them.</p>
+<p class="hint">Times are in {{ time_zone }}. Hover over a chart to see that moment on all of them.</p>
 
 {% if charts_failed %}
 <p class="error">The charts couldn't be read. Check the server's log.</p>

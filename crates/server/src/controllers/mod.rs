@@ -43,6 +43,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Form, Router};
 use axum_csrf::CsrfToken;
+use chrono_tz::Tz;
 use tera::Context;
 use tower_http::compression::CompressionLayer;
 use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
@@ -50,6 +51,7 @@ use tracing::{error, warn};
 
 use crate::app_state::AppState;
 use crate::models::{DEFAULT_THEME, User};
+use crate::times::{DEFAULT_TIME_ZONE, format_time};
 
 const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; connect-src 'self'; \
      style-src 'self'; font-src 'self'; img-src 'self'; manifest-src 'self'; form-action 'self'; \
@@ -63,6 +65,17 @@ tokio::task_local! {
 /// Who's signed in, which is nobody on the sign in pages or for an API key.
 fn signed_in_user() -> Option<Arc<User>> {
     SIGNED_IN.try_with(Arc::clone).ok()
+}
+
+/// The zone whoever's signed in reads times in. Request handlers only, as a task
+/// they spawn doesn't know who's signed in: pass the zone to those instead.
+fn viewer_zone() -> Tz {
+    signed_in_user().map_or(DEFAULT_TIME_ZONE, |user| user.zone())
+}
+
+/// A time as whoever's signed in reads it, or nothing for one before 1970.
+fn local_time(ms: i64) -> String {
+    u64::try_from(ms).map_or_else(|_| String::new(), |ms| format_time(ms, viewer_zone()))
 }
 
 pub fn app(state: AppState) -> Router {
@@ -201,6 +214,7 @@ impl<'a> Page<'a> {
         context.insert("user", &user.as_deref().map(badge));
         let theme = user.as_deref().map_or(DEFAULT_THEME, |user| &user.theme);
         context.insert("theme", theme);
+        context.insert("time_zone", viewer_zone().name());
         Self {
             state,
             token: token.clone(),

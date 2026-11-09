@@ -13,7 +13,7 @@
   <a href="/agents/{{ agent_id }}/metrics?range={{ option.key }}"{% if option.selected %} class="selected" aria-current="true"{% endif %}>{{ option.label }}</a>
   {% endfor %}
 </nav>
-<p class="hint">Times are UTC. The charts update every minute.</p>
+<p class="hint">Times are in {{ time_zone }}. The charts update every minute.</p>
 
 {% if checks %}
 <section>

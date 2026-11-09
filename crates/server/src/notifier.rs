@@ -311,7 +311,10 @@ impl Notice {
 }
 
 pub fn format_ms(ms: i64) -> String {
-    u64::try_from(ms).map_or_else(|_| ms.to_string(), crate::fact_history::format_time)
+    u64::try_from(ms).map_or_else(
+        |_| ms.to_string(),
+        |ms| crate::times::format_time(ms, chrono_tz::Tz::UTC),
+    )
 }
 
 /// Sends email through the server in the config.

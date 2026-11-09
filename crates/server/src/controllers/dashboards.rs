@@ -13,7 +13,7 @@ use axum_csrf::CsrfToken;
 use serde::{Deserialize, Serialize};
 
 use super::metrics::{RangeParams, not_found, range_links, selected_range, time_range};
-use super::{CsrfForm, Page, server_error};
+use super::{CsrfForm, Page, server_error, viewer_zone};
 use crate::app_state::AppState;
 use crate::calculations::Calculation;
 use crate::dashboards::{
@@ -343,7 +343,7 @@ async fn show_widget(
     let Some(range) = time_range(length_ms) else {
         return not_found(&state, &token);
     };
-    let view = dashboards::view(&state, &widget, range).await;
+    let view = dashboards::view(&state, &widget, range, viewer_zone()).await;
     Page::new(&state, &token, "dashboards/_widget.html")
         .with("widget", &view)
         .with("chart", &view.chart)

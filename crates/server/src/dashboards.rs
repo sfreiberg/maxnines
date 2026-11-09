@@ -2,6 +2,7 @@
 //! fleet. Everyone signed in shares them for now.
 
 use anyhow::Result;
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -217,7 +218,8 @@ pub struct WidgetView {
 }
 
 /// One widget failing leaves the others working, so this always has something to show.
-pub async fn view(state: &AppState, widget: &Widget, range: TimeRange) -> WidgetView {
+/// Its times are in `zone`.
+pub async fn view(state: &AppState, widget: &Widget, range: TimeRange, zone: Tz) -> WidgetView {
     let input = &widget.input;
     let question = match input.question() {
         Ok(question) => question,
@@ -244,6 +246,7 @@ pub async fn view(state: &AppState, widget: &Widget, range: TimeRange) -> Widget
                 input.placement.frame(),
                 &result,
                 range,
+                zone,
             );
             WidgetView {
                 kind: input.kind.clone(),

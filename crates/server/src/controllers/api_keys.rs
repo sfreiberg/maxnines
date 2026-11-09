@@ -8,9 +8,8 @@ use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
 use serde::Serialize;
 
-use super::{CsrfForm, Page, server_error};
+use super::{CsrfForm, Page, local_time, server_error};
 use crate::app_state::AppState;
-use crate::fact_history::format_time;
 use crate::metrics::now_ms;
 use crate::models::{ApiKey, check_api_key_name, expiry_after};
 
@@ -71,10 +70,6 @@ fn chosen_lifetime(value: &str) -> Option<Option<u64>> {
         .then_some(Some(secs))
 }
 
-fn time(ms: i64) -> String {
-    u64::try_from(ms).map_or_else(|_| String::new(), format_time)
-}
-
 fn row(key: ApiKey, now_ms: i64) -> KeyRow {
     let status = if key.revoked_ms.is_some() {
         "Revoked"
@@ -84,9 +79,9 @@ fn row(key: ApiKey, now_ms: i64) -> KeyRow {
         "Active"
     };
     KeyRow {
-        created: time(key.created_ms),
-        expires: key.expires_ms.map(time),
-        last_used: key.last_used_ms.map(time),
+        created: local_time(key.created_ms),
+        expires: key.expires_ms.map(local_time),
+        last_used: key.last_used_ms.map(local_time),
         status,
         usable: status == "Active",
         id: key.id,

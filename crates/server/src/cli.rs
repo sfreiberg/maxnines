@@ -8,18 +8,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use chrono_tz::Tz;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
 use serde_json::Value;
 
 use crate::config::Config;
 use crate::controllers::api::{AgentView, BASE_PATH};
-use crate::fact_history::{describe_history, format_time};
+use crate::fact_history::describe_history;
 use crate::metrics::now_ms;
 use crate::models::{
     Database, FactVersion, UserChange, check_api_key_name, check_new_user, expiry_after,
 };
 use crate::notifier::web_url;
+use crate::times::format_time;
 
 /// Where scripts and these commands find a key for the running server's API.
 const API_KEY_VARIABLE: &str = "MAXNINES_API_KEY";
@@ -161,7 +163,7 @@ pub fn print_facts_history(config: &Config, id: &str) -> Result<()> {
         println!("no facts reported yet");
     }
     for (time, changes) in describe_history(&history) {
-        println!("{}", format_time(time));
+        println!("{}", format_time(time, Tz::UTC));
         for change in changes {
             println!("  {change}");
         }
@@ -216,7 +218,7 @@ pub fn print_api_keys(config: &Config) -> Result<()> {
             state,
             key.expires_ms
                 .and_then(|time| u64::try_from(time).ok())
-                .map_or_else(|| "never".to_string(), format_time),
+                .map_or_else(|| "never".to_string(), |time| format_time(time, Tz::UTC)),
             key.name,
         );
     }

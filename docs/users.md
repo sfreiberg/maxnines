@@ -14,3 +14,10 @@ command line can recover from a forgotten password with `users setup-link`.
 
 Over plain `http://`, passwords cross the network unencrypted, so put anything beyond
 a trusted network behind [HTTPS](https.md).
+
+## Time zones
+
+Everyone sees times in UTC until they choose their own time zone on their profile.
+The charts and the other times on the pages then use it, apart from a maintenance
+window's schedule, which keeps the zone it was given. The API and alert messages
+always use UTC, as they have no one person reading them.

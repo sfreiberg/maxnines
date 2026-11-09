@@ -6,9 +6,8 @@ use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
 use serde::{Deserialize, Serialize};
 
-use super::{CsrfForm, Page, server_error, signed_in_user};
+use super::{CsrfForm, Page, local_time, server_error, signed_in_user};
 use crate::app_state::AppState;
-use crate::fact_history::format_time;
 use crate::maintenance::MaintenanceWindow;
 use crate::metrics::now_ms;
 use crate::silences::{Silence, SilenceInput};
@@ -35,10 +34,6 @@ pub fn routes() -> Router<AppState> {
         .route("/alerts/silences", get(index).post(create))
         .route("/alerts/silences/new", get(new))
         .route("/alerts/silences/{id}/end", post(end))
-}
-
-fn time(ms: i64) -> String {
-    u64::try_from(ms).map_or_else(|_| String::new(), format_time)
 }
 
 #[derive(Serialize)]
@@ -74,8 +69,8 @@ async fn rows(state: &AppState, silences: Vec<Silence>) -> anyhow::Result<Vec<Si
             },
             reason: silence.reason,
             created_by: silence.created_by,
-            starts: time(silence.starts_ms),
-            ends: time(silence.ends_ms),
+            starts: local_time(silence.starts_ms),
+            ends: local_time(silence.ends_ms),
         })
         .collect())
 }

@@ -1464,6 +1464,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/users"
     "email": "sam@example.com",
     "name": "Sam",
     "theme": "carbon",
+    "time_zone": "Europe/London",
     "has_password": true,
     "created_ms": 1793977895109,
     "last_sign_in_ms": 1793978000000,
@@ -1493,6 +1494,7 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
     "email": "alex@example.com",
     "name": "Alex",
     "theme": "carbon",
+    "time_zone": "UTC",
     "has_password": false,
     "created_ms": 1793977895109,
     "last_sign_in_ms": null,
@@ -1512,16 +1514,18 @@ An address that's already in use gives `409`.
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/users/2"
 ```
 
-### Change a user's theme
+### Change a user's theme or time zone
 
 `PUT /api/v1/users/{id}`
 
-`theme` can be `carbon`, `midnight`, `dusk`, `paper`, `contrast` or `system`.
+Give either or both. `theme` can be `carbon`, `midnight`, `dusk`, `paper`, `contrast`
+or `system`. `time_zone` is a name from the time zone database, like
+`America/New_York`, and is what the pages show times in. Everyone starts on `UTC`.
 
 ```sh
 curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"theme": "paper"}' \
+  -d '{"theme": "paper", "time_zone": "America/New_York"}' \
   "$MAXNINES_URL/api/v1/users/2"
 ```
 

@@ -19,6 +19,7 @@ impl MigratorTrait for Migrator {
             Box::new(CreateRemoteChecks),
             Box::new(CreateDashboards),
             Box::new(CreateLocationRules),
+            Box::new(AddUserTimeZones),
         ]
     }
 }
@@ -1263,5 +1264,54 @@ impl MigrationTrait for CreateLocationRules {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         drop_tables(manager, &["location_rules"]).await
+    }
+}
+
+// ---- Each person's time zone
+
+struct AddUserTimeZones;
+
+impl MigrationName for AddUserTimeZones {
+    fn name(&self) -> &str {
+        "m20261109_000008_add_user_time_zones"
+    }
+}
+
+#[derive(Iden)]
+enum UserTimeZones {
+    #[iden = "users"]
+    Table,
+    /// A name from the time zone database, like `Europe/London`, for showing times.
+    TimeZone,
+}
+
+/// The time zone each person reads times in. Everyone starts on UTC.
+#[async_trait::async_trait]
+impl MigrationTrait for AddUserTimeZones {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(UserTimeZones::Table)
+                    .add_column(
+                        ColumnDef::new(UserTimeZones::TimeZone)
+                            .string_len(64)
+                            .not_null()
+                            .default("UTC"),
+                    )
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(UserTimeZones::Table)
+                    .drop_column(UserTimeZones::TimeZone)
+                    .to_owned(),
+            )
+            .await
     }
 }
