@@ -807,16 +807,44 @@ mod tests {
             .block_on(super::run(check))
     }
 
+    /// The whole of a request, its body too. Closing a connection with some of it
+    /// unread makes Windows reset the connection, and the answer is lost with it.
+    /// Something that isn't HTTP, like a TLS handshake, never ends the way a request
+    /// does, so it's taken to be over once nothing more comes for a moment.
+    fn read_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut buffer = [0; 4096];
+        loop {
+            if !request.is_empty() {
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+            }
+            if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                let length: usize = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse().ok())
+                    .unwrap_or(0);
+                if request.len() >= end + 4 + length {
+                    return request;
+                }
+            }
+            match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => return request,
+                Ok(size) => request.extend_from_slice(&buffer[..size]),
+            }
+        }
+    }
+
     /// Answers one request with `response`, and hands back what was asked.
     fn serve_once(response: &'static [u8]) -> (String, thread::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0; 2048];
-            let size = stream.read(&mut request).unwrap_or(0);
+            let request = read_request(&mut stream);
             let _ = stream.write_all(response);
-            String::from_utf8_lossy(&request[..size]).to_string()
+            String::from_utf8_lossy(&request).to_string()
         });
         (address, handle)
     }
