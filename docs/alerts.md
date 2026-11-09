@@ -1,15 +1,23 @@
 # Alerts
 
-## The built-in rule
+## The built-in rules
 
-Every server starts with one alert rule, **Agent offline**, which fires when an
-approved agent has been gone for 5 minutes. It tells every notification channel,
-including ones added later, so it starts working as soon as there's a channel to tell.
-Until then it shows on the Alerts page and the overview.
+Every server starts with three alert rules:
 
-It's an ordinary rule from then on: change it, turn it off or delete it under
-**Settings > Alert rules**, and upgrades leave it alone. A server that already had an
-offline rule of its own when it upgraded doesn't get a second one.
+| Rule | Fires when | Severity |
+| --- | --- | --- |
+| **Agent offline** | An approved agent has been gone for 5 minutes | Critical |
+| **Disk filling up** | A disk has been over 80% full for 5 minutes | Warning |
+| **Disk nearly full** | A disk has been over 90% full for 5 minutes | Critical |
+
+Each disk alerts on its own, and a disk over 90% has both alerts open. They tell
+every notification channel, including ones added later, so they start working as soon
+as there's a channel to tell. Until then they show on the Alerts page and the overview.
+
+They're ordinary rules from then on: change them, turn them off or delete them under
+**Settings > Alert rules**, and upgrades leave them alone. A server that already had an
+offline rule of its own when it upgraded doesn't get a second one, and one with a
+disk usage rule of its own doesn't get the disk rules.
 
 Any rule can tell every channel this way, with **Every channel, including ones added
 later**, or tell only the channels chosen.

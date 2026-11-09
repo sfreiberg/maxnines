@@ -3077,6 +3077,8 @@ name = "maxnines-collectors"
 version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
+ "objc2-core-foundation",
+ "objc2-io-kit",
  "rustix 1.1.6",
  "serde_json",
  "sysctl",

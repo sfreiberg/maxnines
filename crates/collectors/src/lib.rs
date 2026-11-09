@@ -1,5 +1,6 @@
 //! Reading what a machine is doing, for anything that runs on one.
 
+mod file_systems;
 pub mod machine;
 pub mod system;
 

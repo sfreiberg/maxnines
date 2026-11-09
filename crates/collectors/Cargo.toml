@@ -14,6 +14,11 @@ tokio = { version = "1.54.1", features = ["process", "time"] }
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 
+# For telling disk images from disks. Already used by sysinfo, so nothing new is built.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFDictionary", "CFString"] }
+objc2-io-kit = { version = "0.3.2", default-features = false, features = ["std", "libc"] }
+
 # For GetSystemTimes. Already used by sysinfo, so nothing new is built.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }

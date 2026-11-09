@@ -21,6 +21,7 @@ impl MigratorTrait for Migrator {
             Box::new(CreateLocationRules),
             Box::new(AddUserTimeZones),
             Box::new(AddBuiltInAlerts),
+            Box::new(AddBuiltInDiskAlerts),
         ]
     }
 }
@@ -1409,6 +1410,82 @@ impl MigrationTrait for AddBuiltInAlerts {
     }
 }
 
+// ---- Built-in disk alerts
+
+struct AddBuiltInDiskAlerts;
+
+impl MigrationName for AddBuiltInDiskAlerts {
+    fn name(&self) -> &str {
+        "m20261109_000010_add_built_in_disk_alerts"
+    }
+}
+
+const DISK_USAGE: &str = "disk.usage";
+const DISK_RULE_SECS: i64 = 300;
+/// Each rule's name, how full a disk is when it fires, and how bad that is.
+const DISK_RULES: [(&str, f64, &str); 2] = [
+    ("Disk filling up", 80.0, "warning"),
+    ("Disk nearly full", 90.0, "critical"),
+];
+
+/// Adds a warning for any disk over 80% full and a critical alert over 90%, telling
+/// every channel, like the offline rule. They're ordinary rules once added, so a
+/// server with a disk usage rule of its own already doesn't get them.
+#[async_trait::async_trait]
+impl MigrationTrait for AddBuiltInDiskAlerts {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let disk_rule = Query::select()
+            .column(AlertRules::Id)
+            .from(AlertRules::Table)
+            .and_where(Expr::col(AlertRules::Metric).eq(DISK_USAGE))
+            .limit(1)
+            .to_owned();
+        if manager
+            .get_connection()
+            .query_one(&disk_rule)
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let mut rules = Query::insert()
+            .into_table(AlertRules::Table)
+            .columns([
+                AlertRules::Name.into_iden(),
+                AlertRules::Kind.into_iden(),
+                AlertRules::Metric.into_iden(),
+                AlertRules::Comparison.into_iden(),
+                AlertRules::Threshold.into_iden(),
+                AlertRules::ForSecs.into_iden(),
+                AlertRules::Severity.into_iden(),
+                AlertRules::Enabled.into_iden(),
+                EveryChannel::AllChannels.into_iden(),
+            ])
+            .to_owned();
+        for (name, threshold, severity) in DISK_RULES {
+            rules
+                .values([
+                    name.into(),
+                    "metric".into(),
+                    DISK_USAGE.into(),
+                    "above".into(),
+                    threshold.into(),
+                    DISK_RULE_SECS.into(),
+                    severity.into(),
+                    true.into(),
+                    true.into(),
+                ])
+                .map_err(|error| DbErr::Custom(error.to_string()))?;
+        }
+        manager.exec_stmt(rules).await
+    }
+
+    /// The rules are left, as they may have been changed since.
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
@@ -1432,7 +1509,7 @@ mod tests {
             .max_connections(1)
             .to_owned();
         let connection = Database::connect(options).await.unwrap();
-        let before = Migrator::migrations().len() as u32 - 1;
+        let before = Migrator::migrations().len() as u32 - 2;
         Migrator::up(&connection, Some(before)).await.unwrap();
         connection
             .execute_unprepared(
@@ -1445,5 +1522,36 @@ mod tests {
         Migrator::up(&connection, None).await.unwrap();
 
         assert_eq!(offline_rules(&connection).await, ["Gone"]);
+    }
+
+    #[tokio::test]
+    async fn the_built_in_disk_rules_are_not_added_beside_one_already_there() {
+        let options = ConnectOptions::new("sqlite::memory:")
+            .max_connections(1)
+            .to_owned();
+        let connection = Database::connect(options).await.unwrap();
+        let before = Migrator::migrations().len() as u32 - 1;
+        Migrator::up(&connection, Some(before)).await.unwrap();
+        connection
+            .execute_unprepared(
+                "INSERT INTO alert_rules
+                   (name, kind, metric, comparison, threshold, for_secs, severity, enabled)
+                 VALUES ('Full', 'metric', 'disk.usage', 'above', 95, 60, 'critical', TRUE)",
+            )
+            .await
+            .unwrap();
+
+        Migrator::up(&connection, None).await.unwrap();
+
+        let query = Statement::from_string(
+            connection.get_database_backend(),
+            "SELECT name FROM alert_rules WHERE metric = 'disk.usage'",
+        );
+        let rows = connection.query_all_raw(query).await.unwrap();
+        let names: Vec<String> = rows
+            .iter()
+            .map(|row| row.try_get::<String>("", "name").unwrap())
+            .collect();
+        assert_eq!(names, ["Full"]);
     }
 }

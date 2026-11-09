@@ -686,12 +686,34 @@ async fn an_agent_going_offline_alerts_after_the_wait() {
     assert_eq!(open[0].series, "");
 }
 
-/// The rule every server starts with, as the migration adds it.
-async fn built_in_offline_rule() -> AlertRuleInput {
+/// The rules every server starts with, as the migrations add them.
+async fn built_in_rules() -> Vec<AlertRuleInput> {
     let fresh = Database::for_test().await;
     let rules = fresh.list_alert_rules().await.unwrap();
-    assert_eq!(rules.len(), 1);
-    rules[0].rule.clone()
+    rules.into_iter().map(|rule| rule.rule).collect()
+}
+
+async fn built_in_offline_rule() -> AlertRuleInput {
+    let rules = built_in_rules().await;
+    let mut offline = rules
+        .into_iter()
+        .filter(|rule| rule.kind == RuleKind::Offline);
+    let rule = offline.next().unwrap();
+    assert!(offline.next().is_none());
+    rule
+}
+
+#[tokio::test]
+async fn every_server_starts_with_rules_for_agents_going_offline_and_disks_filling() {
+    let names: Vec<String> = built_in_rules()
+        .await
+        .into_iter()
+        .map(|rule| rule.name)
+        .collect();
+    assert_eq!(
+        names,
+        ["Agent offline", "Disk filling up", "Disk nearly full"]
+    );
 }
 
 #[tokio::test]
@@ -734,6 +756,67 @@ async fn the_built_in_rule_tells_every_channel_once_an_agent_is_gone_5_minutes()
         .map(|delivery| delivery.channel.id)
         .collect();
     assert_eq!(told, [channel]);
+}
+
+#[tokio::test]
+async fn every_server_starts_with_a_warning_at_80_percent_full_and_critical_at_90() {
+    let rules = built_in_rules().await;
+    let disk: Vec<(&str, Option<f64>, Severity)> = rules
+        .iter()
+        .filter(|rule| rule.metric.as_deref() == Some("disk.usage"))
+        .map(|rule| (rule.name.as_str(), rule.threshold, rule.severity))
+        .collect();
+    assert_eq!(
+        disk,
+        [
+            ("Disk filling up", Some(80.0), Severity::Warning),
+            ("Disk nearly full", Some(90.0), Severity::Critical),
+        ]
+    );
+    for rule in rules.iter().filter(|rule| rule.kind == RuleKind::Metric) {
+        assert_eq!(rule.comparison, Some(Comparison::Above));
+        assert_eq!(rule.series, None);
+        assert_eq!(rule.for_secs, 300);
+        assert!(rule.enabled);
+        assert!(rule.all_channels);
+        check_rule(rule).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn the_built_in_disk_rules_alert_on_each_disk_by_how_full_it_is() {
+    let mut test = Harness::start().await;
+    for rule in built_in_rules().await {
+        if rule.kind == RuleKind::Metric {
+            test.database().create_alert_rule(&rule).await.unwrap();
+        }
+    }
+    for offset in [0, 300_000] {
+        let time = test.now + offset;
+        let readings = vec![
+            test.reading("/", time, 50.0),
+            test.reading("/data", time, 85.0),
+            test.reading("/backup", time, 95.0),
+        ];
+        test.script.set(readings);
+        test.evaluate(offset).await;
+    }
+
+    let mut open: Vec<(String, Severity)> = test
+        .open()
+        .await
+        .into_iter()
+        .map(|alert| (alert.series, alert.severity))
+        .collect();
+    open.sort_by_key(|(series, severity)| (series.clone(), *severity == Severity::Critical));
+    assert_eq!(
+        open,
+        [
+            ("/backup".to_string(), Severity::Warning),
+            ("/backup".to_string(), Severity::Critical),
+            ("/data".to_string(), Severity::Warning),
+        ]
+    );
 }
 
 #[tokio::test]

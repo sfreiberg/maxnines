@@ -60,6 +60,22 @@ reached, and sent when it's back.
   machine, and `./maxnines-agent identity show` prints its ID once it's been started.
   Use `-c` to point any of them at a config file somewhere else.
 
+## Disks
+
+An agent reports how full each disk is, and how much is read and written, for every
+file system on the machine's own storage. Mounts that are really files, memory or
+another file system seen again aren't reported at all:
+
+- **macOS:** disk images, such as a mounted installer, network shares, and the system's hidden
+  volumes.
+- **Linux:** loop devices, such as snaps and mounted image files, container layers,
+  network shares, and memory file systems like `tmpfs`.
+- **FreeBSD:** memory disks, null mounts such as jails', and memory file systems.
+- **Windows:** mounted ISOs. Attached virtual disks, such as a Dev Drive, are reported.
+
+To watch only some disks, list their mount points in a config rule under **Disk mount
+points**. Those are reported whatever they are, even a disk image.
+
 ## Removing an agent
 
 When a machine is gone for good, revoke its agent on its page, then delete it. That

@@ -5,10 +5,11 @@ use std::path::Path;
 
 use anyhow::Result;
 use serde_json::{Value, json};
-use sysinfo::{Disks, InterfaceOperationalState, Networks, System};
+use sysinfo::{Disk, Disks, InterfaceOperationalState, Networks, System};
 use systemstat::Platform;
 
 use crate::Collector;
+use crate::file_systems;
 use crate::system::{self, Change, CpuTime};
 
 pub struct HostCollector;
@@ -146,10 +147,13 @@ impl DiskCollector {
         })
     }
 
-    fn wanted(&self, mount_point: &str) -> bool {
-        self.mount_points
-            .as_ref()
-            .is_none_or(|wanted| wanted.iter().any(|m| m == mount_point))
+    /// Every real file system, unless some are named, which are reported whatever
+    /// they are.
+    fn wanted(&self, disk: &Disk) -> bool {
+        match &self.mount_points {
+            Some(wanted) => wanted.iter().any(|m| Path::new(m) == disk.mount_point()),
+            None => file_systems::is_real(disk),
+        }
     }
 }
 
@@ -164,31 +168,30 @@ impl Collector for DiskCollector {
         let disks: Vec<Value> = self
             .disks
             .iter()
-            .filter_map(|disk| {
+            .filter(|disk| self.wanted(disk))
+            .map(|disk| {
                 let mount_point = disk.mount_point().to_string_lossy();
-                self.wanted(&mount_point).then(|| {
-                    let total = disk.total_space();
-                    let available = disk.available_space();
-                    let usage = disk.usage();
-                    let mut output = json!({
-                        "name": disk.name().to_string_lossy(),
-                        "mount_point": mount_point,
-                        "file_system": disk.file_system().to_string_lossy(),
-                        "total_bytes": total,
-                        "available_bytes": available,
-                        "used_bytes": total.saturating_sub(available),
-                        "removable": disk.is_removable(),
-                        "read_only": disk.is_read_only(),
-                        "kind": disk.kind().to_string(),
-                        "read_bytes": usage.read_bytes,
-                        "written_bytes": usage.written_bytes,
-                    });
-                    if let Some((total, free)) = inodes(disk.mount_point()) {
-                        output["inodes_total"] = json!(total);
-                        output["inodes_used"] = json!(total.saturating_sub(free));
-                    }
-                    output
-                })
+                let total = disk.total_space();
+                let available = disk.available_space();
+                let usage = disk.usage();
+                let mut output = json!({
+                    "name": disk.name().to_string_lossy(),
+                    "mount_point": mount_point,
+                    "file_system": disk.file_system().to_string_lossy(),
+                    "total_bytes": total,
+                    "available_bytes": available,
+                    "used_bytes": total.saturating_sub(available),
+                    "removable": disk.is_removable(),
+                    "read_only": disk.is_read_only(),
+                    "kind": disk.kind().to_string(),
+                    "read_bytes": usage.read_bytes,
+                    "written_bytes": usage.written_bytes,
+                });
+                if let Some((total, free)) = inodes(disk.mount_point()) {
+                    output["inodes_total"] = json!(total);
+                    output["inodes_used"] = json!(total.saturating_sub(free));
+                }
+                output
             })
             .collect();
 

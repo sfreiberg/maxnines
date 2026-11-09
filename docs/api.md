@@ -396,7 +396,7 @@ lowest priority first, so higher priorities win.
 
 | Collector option | For | Description |
 | --- | --- | --- |
-| `mount_points` | `disk` | Only these disks |
+| `mount_points` | `disk` | Only these disks, even ones left out by default, like disk images |
 | `names` | `processes`, `services`, `custom` | What to watch. Custom metrics must be defined in the agent's own config |
 | `paths` | `files` | The files and folders to watch |
 | `checks` | `checks` | What to try reaching, as in [remote checks](#remote-checks) |
