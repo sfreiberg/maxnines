@@ -2,6 +2,7 @@
 
 mod alerting;
 mod dashboards;
+mod docs;
 mod users;
 
 use std::collections::{BTreeMap, HashMap};
@@ -1725,6 +1726,11 @@ fn every_theme_is_readable() {
         ("bad-text", "bad", TEXT),
         ("warn", "warn-surface", TEXT),
         ("warn", "surface", TEXT),
+        ("code-comment", "sunken", TEXT),
+        ("code-keyword", "sunken", TEXT),
+        ("code-string", "sunken", TEXT),
+        ("code-number", "sunken", TEXT),
+        ("code-name", "sunken", TEXT),
         ("meter", "surface", GRAPHIC),
         ("meter-hot", "surface", GRAPHIC),
     ];

@@ -8,6 +8,7 @@ mod config;
 mod controllers;
 mod csrf;
 mod dashboards;
+mod docs;
 mod fact_history;
 mod facts;
 mod host_filter;

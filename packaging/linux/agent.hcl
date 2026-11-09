@@ -1,8 +1,8 @@
 # The MaxNines agent's settings: only how to reach the server. What to monitor is
 # set on the server.
 #
-# Every setting is described in the README:
-# https://github.com/sfreiberg/maxnines#readme
+# Every setting is described in the documentation, on the server's Docs page
+# and at https://github.com/sfreiberg/maxnines/tree/main/docs
 
 server {
   # The server's public_url. Use wss:// for anything beyond a trusted network.

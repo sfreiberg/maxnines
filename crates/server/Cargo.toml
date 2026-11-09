@@ -55,7 +55,13 @@ wildmatch = "2.7.0"
 cel = "0.15"
 tera = "2.4"
 axum_csrf = "0.12"
-rust-embed = { version = "8.13", features = ["mime-guess"] }
+rust-embed = { version = "8.13", features = ["include-exclude", "mime-guess"] }
+# The documentation pages: Markdown, and colouring for the code in it. two-face adds
+# the syntaxes syntect lacks, such as HCL. The pure Rust regex engine avoids
+# building another C library on every platform.
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+syntect = { version = "5.3", default-features = false, features = ["html", "parsing", "dump-load", "regex-fancy"] }
+two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
 argon2 = "0.6.0"
 governor = "0.10.4"
 cookie = "0.18"

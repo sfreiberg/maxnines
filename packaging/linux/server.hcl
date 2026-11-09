@@ -1,8 +1,8 @@
 # The MaxNines server's settings. It only ever reads this file. Everything it
 # changes is kept in its databases, in /var/lib/maxnines-server.
 #
-# Every setting is described in the README:
-# https://github.com/sfreiberg/maxnines#readme
+# Every setting is described in the documentation, on the server's Docs page
+# and at https://github.com/sfreiberg/maxnines/tree/main/docs
 
 # Address to listen on. Agents, the web pages and the API share this one port.
 listen = "127.0.0.1:9000"

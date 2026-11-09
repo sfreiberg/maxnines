@@ -36,6 +36,7 @@
       <a class="rail-link{% if section == "map" %} on{% endif %}" href="/map"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17"/><path d="M12 3.5c2.4 2.3 3.6 5.1 3.6 8.5s-1.2 6.2-3.6 8.5c-2.4-2.3-3.6-5.1-3.6-8.5s1.2-6.2 3.6-8.5Z"/></svg>Map</a>
       <a class="rail-link{% if section == "server" %} on{% endif %}" href="/server"><svg viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="6" rx="7.5" ry="3"/><path d="M4.5 6v12c0 1.66 3.36 3 7.5 3s7.5-1.34 7.5-3V6"/><path d="M4.5 12c0 1.66 3.36 3 7.5 3s7.5-1.34 7.5-3"/></svg>Server</a>
       <a class="rail-link{% if section == "settings" %} on{% endif %}" href="/settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h9M18 7h2M4 17h2M11 17h9"/><circle cx="15.5" cy="7" r="2.5"/><circle cx="8.5" cy="17" r="2.5"/></svg>Settings</a>
+      <a class="rail-link{% if section == "docs" %} on{% endif %}" href="/docs"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5A1.5 1.5 0 0 1 5.5 4H11v16H5.5A1.5 1.5 0 0 1 4 18.5Z"/><path d="M20 5.5A1.5 1.5 0 0 0 18.5 4H13v16h5.5a1.5 1.5 0 0 0 1.5-1.5Z"/></svg>Docs</a>
       {% if user %}<a id="profile-link" class="rail-link profile{% if section == "profile" %} on{% endif %}" href="/profile" title="Connected to the server" aria-label="{{ user.name }}, connected to the server"><span class="avatar">{{ user.initial }}</span><span id="connection-label">Profile</span></a>{% endif %}
     </nav>
     <div class="workspace">

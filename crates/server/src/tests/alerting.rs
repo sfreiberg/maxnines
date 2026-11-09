@@ -1607,11 +1607,11 @@ async fn the_channel_form_offers_what_alertops_needs_to_map_from() {
         );
     }
     let sample = crate::notifier::alertops_sample();
-    let readme = include_str!("../../../../README.md");
+    let docs = include_str!("../../../../docs/notifications.md");
     for line in sample.lines() {
         assert!(
-            readme.contains(line),
-            "the README's sample is out of date: {line}"
+            docs.contains(line),
+            "the docs' sample is out of date: {line}"
         );
     }
     let sample: Value = serde_json::from_str(&sample).unwrap();

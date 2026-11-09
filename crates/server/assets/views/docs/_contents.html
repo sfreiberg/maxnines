@@ -1,0 +1,9 @@
+<nav class="docs-contents" aria-label="Documentation">
+  <form class="docs-search" action="/docs/search" method="get" role="search">
+    <input type="search" name="q" value="{{ query }}" placeholder="Search the docs" aria-label="Search the docs">
+  </form>
+  <ol>
+    {% for entry in contents %}<li><a href="/docs/{{ entry.name }}"{% if entry.name == current %} aria-current="page"{% endif %}>{{ entry.title }}</a></li>
+    {% endfor %}
+  </ol>
+</nav>

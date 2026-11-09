@@ -1,8 +1,8 @@
 # The MaxNines server's settings in its container. Set MAXNINES_PUBLIC_URL to the
 # address agents use, or mount your own file over this one.
 #
-# Every setting is described in the README:
-# https://github.com/sfreiberg/maxnines#readme
+# Every setting is described in the documentation, on the server's Docs page
+# and at https://github.com/sfreiberg/maxnines/tree/main/docs
 
 listen = env("MAXNINES_LISTEN", "0.0.0.0:9000")
 

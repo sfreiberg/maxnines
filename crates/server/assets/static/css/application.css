@@ -424,8 +424,42 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .map-picker-hint { padding: 10px 16px; border-top: 1px solid var(--border); font-size: 13px; }
 .credit { margin: 0; color: var(--muted); font-family: var(--mono); font-size: 11px; }
 .map-credit { margin-left: auto; }
+/* Documentation: the chapters beside the page, then the chapter itself. */
+.docs-layout { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 40px; align-items: start; }
+.docs-contents { position: sticky; top: 88px; display: flex; flex-direction: column; gap: 14px; }
+.docs-contents ol { display: flex; flex-direction: column; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.docs-contents a { display: block; padding: 6px 10px; border-radius: var(--radius-small); color: var(--muted); font-size: 14px; }
+.docs-contents a:hover { background: var(--surface); color: var(--text); }
+.docs-contents a[aria-current="page"] { background: var(--surface); color: var(--text); font-weight: 500; }
+.docs-search input { width: 100%; }
+.docs-page { max-width: 820px; min-width: 0; line-height: 1.6; }
+.docs-page h1 { margin-bottom: 20px; }
+.docs-page h2 { margin: 40px 0 12px; font-size: 24px; letter-spacing: -0.02em; }
+.docs-page h3 { margin: 28px 0 10px; font-size: 18px; }
+.docs-page h2, .docs-page h3 { scroll-margin-top: 88px; }
+.docs-page p, .docs-page ul, .docs-page ol { margin: 0 0 14px; }
+.docs-page li + li { margin-top: 4px; }
+.docs-page a { color: var(--accent-ink); text-decoration: underline; text-underline-offset: 2px; }
+.docs-page :not(pre) > code { padding: 1px 5px; background: var(--sunken); border: 1px solid var(--border); border-radius: 5px; overflow-wrap: anywhere; }
+.docs-page pre { margin: 0 0 16px; line-height: 1.5; }
+.docs-page .table-scroll { margin: 0 0 16px; overflow-x: auto; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
+.docs-page th { white-space: normal; }
+/* Headers are in capitals, but a name in one has to stay as it's written. */
+.docs-page th code { letter-spacing: 0; text-transform: none; }
+.docs-results { display: flex; flex-direction: column; gap: 12px; margin: 0; padding: 0; list-style: none; }
+.docs-results a { font-weight: 500; }
+.docs-results p { margin: 4px 0 0; color: var(--muted); font-size: 14px; }
+
+/* Code colours, from the classes the docs give each part of an example. */
+.code .hl-comment { color: var(--code-comment); }
+.code .hl-keyword, .code .hl-storage { color: var(--code-keyword); }
+.code .hl-string { color: var(--code-string); }
+.code .hl-constant { color: var(--code-number); }
+.code .hl-entity, .code .hl-support { color: var(--code-name); }
+
 @media (max-width: 60rem) {
-  .map-layout, .location-layout { grid-template-columns: minmax(0, 1fr); }
+  .map-layout, .location-layout, .docs-layout { grid-template-columns: minmax(0, 1fr); }
+  .docs-contents { position: static; order: 2; }
   .location-picker { position: static; }
 }
 

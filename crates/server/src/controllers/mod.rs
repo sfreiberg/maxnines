@@ -1,8 +1,8 @@
 //! Routes and request handling. Pages live in `overview`, `agents`, `alerts`,
-//! `alert_rules`, `metrics`, `notification_channels`, `remote_checks`, `rules` and
-//! `settings`, the token protected API in `api`, agent connections in `agent_socket`,
-//! signing in in `sessions`, people in `users`, and how an open page learns of a new
-//! build in `update_notice`.
+//! `alert_rules`, `metrics`, `notification_channels`, `remote_checks`, `rules`,
+//! `settings` and `docs`, the token protected API in `api`, agent connections in
+//! `agent_socket`, signing in in `sessions`, people in `users`, and how an open page
+//! learns of a new build in `update_notice`.
 
 pub mod agent_socket;
 mod agents;
@@ -13,6 +13,7 @@ mod api_keys;
 mod assets;
 mod condition_form;
 mod dashboards;
+mod docs;
 mod fleet;
 mod health;
 pub mod host_list;
@@ -72,6 +73,7 @@ pub fn app(state: AppState) -> Router {
         .merge(settings::routes())
         .merge(compressed(server::routes()))
         .merge(dashboards::routes())
+        .merge(docs::routes())
         .merge(api_keys::routes())
         .merge(users::routes())
         .merge(agents::routes())
@@ -149,6 +151,7 @@ fn section_of(template: &str) -> &'static str {
         "dashboards" => "dashboards",
         "settings" | "rules" | "alert_rules" | "notification_channels" => "settings",
         "profile" => "profile",
+        "docs" => "docs",
         _ => "",
     }
 }
