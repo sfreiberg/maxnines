@@ -149,9 +149,9 @@ a.stats-cell:hover { background: var(--raised); color: var(--text); }
 .badge.bad { background: var(--bad-surface); color: var(--bad); }
 .badge.warn { background: var(--warn-surface); color: var(--warn); }
 .badge.neutral { background: var(--neutral-surface); color: var(--muted); }
-/* Online and offline on the overview's tiles, where the dot says enough. */
-.badge.dot-only { padding: 4px; gap: 0; background: none; }
-.badge.dot-only::before { width: 8px; height: 8px; }
+/* Online and offline in lists of agents, where the dot says enough: the same pill
+   without its word, as tall as one with a word. */
+.badge.dot-only { min-height: calc(1lh + 6px); }
 
 /* Buttons */
 .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }

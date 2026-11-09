@@ -5242,6 +5242,12 @@ mod pages {
 
         let page = browser.get(&test.server, "/agents").await;
         assert!(page.body.contains("1 of 2 online"), "{}", page.body);
+        for state in ["Online", "Offline"] {
+            let dot =
+                format!(r#"dot-only" role="img" aria-label="{state}" title="{state}"></span>"#);
+            assert!(page.body.contains(&dot), "{state}: {}", page.body);
+            assert!(!page.body.contains(&format!(">{state}</span>")), "{state}");
+        }
         assert!(page.body.contains("All 2"), "{}", page.body);
         assert!(page.body.contains("class=\"tile"), "{}", page.body);
 
@@ -5255,6 +5261,12 @@ mod pages {
 
         let page = browser.get(&test.server, "/agents?view=table").await;
         assert!(page.body.contains("<table"), "{}", page.body);
+        assert!(
+            page.body.contains(r#"aria-label="Online""#),
+            "{}",
+            page.body
+        );
+        assert!(!page.body.contains(">Online</span>"));
         assert!(!page.body.contains("class=\"tile"));
     }
 
