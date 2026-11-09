@@ -1,5 +1,19 @@
 # Alerts
 
+## The built-in rule
+
+Every server starts with one alert rule, **Agent offline**, which fires when an
+approved agent has been gone for 5 minutes. It tells every notification channel,
+including ones added later, so it starts working as soon as there's a channel to tell.
+Until then it shows on the Alerts page and the overview.
+
+It's an ordinary rule from then on: change it, turn it off or delete it under
+**Settings > Alert rules**, and upgrades leave it alone. A server that already had an
+offline rule of its own when it upgraded doesn't get a second one.
+
+Any rule can tell every channel this way, with **Every channel, including ones added
+later**, or tell only the channels chosen.
+
 ## Silences
 
 A silence stops notifications for a while, as during planned work. Press **Silence** on

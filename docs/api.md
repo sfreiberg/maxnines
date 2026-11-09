@@ -736,6 +736,7 @@ Returns `204`.
 | `condition` | A CEL expression limiting which agents this covers |
 | `enabled` | Defaults to `true` |
 | `channels` | IDs of the [channels](#notification-channels) to tell. With none, an alert only shows in the web interface |
+| `all_channels` | `true` to tell every channel instead, including ones added later. Leave `channels` empty with it. Defaults to `false` |
 | `calculation` | For calculation rules, `avg`, `sum`, `min`, `max` or `count`, as in [a query](#ask-about-many-machines-at-once) |
 | `group_by` | For calculation rules, what's watched separately: `nothing`, `host`, `series` or `fact:<name>` |
 | `filter` | For calculation rules, which machines, as on the host list. It takes the place of `condition` |
@@ -821,7 +822,8 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "severity": "warning",
   "condition": null,
   "enabled": true,
-  "channels": []
+  "channels": [],
+  "all_channels": false
 }
 ```
 

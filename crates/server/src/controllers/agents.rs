@@ -284,7 +284,9 @@ async fn index(
                 host: agent.host,
             });
         } else if search.includes(&agent.id, &agent.host) {
-            let online = presence.is_some_and(|p| p.online);
+            // A revoked agent's connection closes a moment after it's revoked, and it
+            // doesn't count as online in the meantime.
+            let online = agent.state == AgentState::Approved && presence.is_some_and(|p| p.online);
             let mine = alerts.get(agent.id.as_str()).map_or(&[][..], Vec::as_slice);
             let health = Health::of(online, mine);
             listed.push(Listed {

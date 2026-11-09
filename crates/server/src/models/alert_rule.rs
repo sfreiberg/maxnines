@@ -20,6 +20,7 @@ pub struct Model {
     pub filter: Option<String>,
     pub window_secs: Option<i64>,
     pub remind_every_secs: Option<i64>,
+    pub all_channels: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -41,6 +41,7 @@ struct AlertRuleForm {
     severity: String,
     enabled: bool,
     channels: BTreeSet<i64>,
+    all_channels: bool,
     calculation: String,
     group_by: String,
     fact: String,
@@ -64,6 +65,7 @@ impl AlertRuleForm {
             severity: Severity::Warning.as_str().to_string(),
             enabled: true,
             channels: BTreeSet::new(),
+            all_channels: false,
             calculation: Calculation::Avg.as_str().to_string(),
             group_by: "nothing".to_string(),
             fact: String::new(),
@@ -108,6 +110,7 @@ impl AlertRuleForm {
             severity: rule.severity.as_str().to_string(),
             enabled: rule.enabled,
             channels: rule.channels.iter().copied().collect(),
+            all_channels: rule.all_channels,
             applies_to: ConditionForm::from_condition(rule.condition.as_deref()),
         }
     }
@@ -134,6 +137,7 @@ impl AlertRuleForm {
                 .keys()
                 .filter_map(|name| name.strip_prefix("channel_")?.parse().ok())
                 .collect(),
+            all_channels: fields.contains_key("all_channels"),
             applies_to: ConditionForm::from_fields(fields),
         }
     }
@@ -229,6 +233,7 @@ impl AlertRuleForm {
             condition,
             enabled: self.enabled,
             channels: self.channels.iter().copied().collect(),
+            all_channels: self.all_channels,
         })
     }
 }
@@ -363,7 +368,11 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
                         .map_or_else(|| condition.to_string(), |builder| builder.describe()),
                 },
                 severity: rule.rule.severity.as_str(),
-                channels: names.join(", "),
+                channels: if rule.rule.all_channels {
+                    "Every channel".to_string()
+                } else {
+                    names.join(", ")
+                },
                 enabled: rule.rule.enabled,
                 name: rule.rule.name,
             }
@@ -488,6 +497,7 @@ mod tests {
             condition: Some("true".to_string()),
             enabled: false,
             channels: vec![2, 5],
+            all_channels: false,
             calculation: None,
             group_by: None,
             filter: None,

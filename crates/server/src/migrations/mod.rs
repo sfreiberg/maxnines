@@ -20,6 +20,7 @@ impl MigratorTrait for Migrator {
             Box::new(CreateDashboards),
             Box::new(CreateLocationRules),
             Box::new(AddUserTimeZones),
+            Box::new(AddBuiltInAlerts),
         ]
     }
 }
@@ -1313,5 +1314,136 @@ impl MigrationTrait for AddUserTimeZones {
                     .to_owned(),
             )
             .await
+    }
+}
+
+// ---- Built-in alerts
+
+struct AddBuiltInAlerts;
+
+impl MigrationName for AddBuiltInAlerts {
+    fn name(&self) -> &str {
+        "m20261109_000009_add_built_in_alerts"
+    }
+}
+
+#[derive(Iden)]
+enum EveryChannel {
+    #[iden = "alert_rules"]
+    Table,
+    /// Tells every channel, including ones added later, instead of the ones chosen.
+    AllChannels,
+}
+
+/// What a new or upgraded server alerts on before anyone sets up a rule.
+const OFFLINE_RULE_NAME: &str = "Agent offline";
+const OFFLINE_RULE_SECS: i64 = 300;
+
+/// Lets a rule tell every channel, and adds a rule for agents going offline, which
+/// is what anyone monitoring wants first. Once it's here it's an ordinary rule to
+/// change or delete, so it's only ever added once, and not to a server that has an
+/// offline rule of its own already.
+#[async_trait::async_trait]
+impl MigrationTrait for AddBuiltInAlerts {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(EveryChannel::Table)
+                    .add_column(
+                        ColumnDef::new(EveryChannel::AllChannels)
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        let offline = Query::select()
+            .column(AlertRules::Id)
+            .from(AlertRules::Table)
+            .and_where(Expr::col(AlertRules::Kind).eq("offline"))
+            .limit(1)
+            .to_owned();
+        if manager
+            .get_connection()
+            .query_one(&offline)
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let rule = Query::insert()
+            .into_table(AlertRules::Table)
+            .columns([
+                AlertRules::Name.into_iden(),
+                AlertRules::Kind.into_iden(),
+                AlertRules::ForSecs.into_iden(),
+                AlertRules::Severity.into_iden(),
+                AlertRules::Enabled.into_iden(),
+                EveryChannel::AllChannels.into_iden(),
+            ])
+            .values([
+                OFFLINE_RULE_NAME.into(),
+                "offline".into(),
+                OFFLINE_RULE_SECS.into(),
+                "critical".into(),
+                true.into(),
+                true.into(),
+            ])
+            .map_err(|error| DbErr::Custom(error.to_string()))?
+            .to_owned();
+        manager.exec_stmt(rule).await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(EveryChannel::Table)
+                    .drop_column(EveryChannel::AllChannels)
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
+
+    use super::*;
+
+    async fn offline_rules(connection: &impl ConnectionTrait) -> Vec<String> {
+        let query = Statement::from_string(
+            connection.get_database_backend(),
+            "SELECT name FROM alert_rules WHERE kind = 'offline' ORDER BY id",
+        );
+        let rows = connection.query_all_raw(query).await.unwrap();
+        rows.iter()
+            .map(|row| row.try_get::<String>("", "name").unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_built_in_offline_rule_is_not_added_beside_one_already_there() {
+        let options = ConnectOptions::new("sqlite::memory:")
+            .max_connections(1)
+            .to_owned();
+        let connection = Database::connect(options).await.unwrap();
+        let before = Migrator::migrations().len() as u32 - 1;
+        Migrator::up(&connection, Some(before)).await.unwrap();
+        connection
+            .execute_unprepared(
+                "INSERT INTO alert_rules (name, kind, for_secs, severity, enabled)
+                 VALUES ('Gone', 'offline', 60, 'warning', TRUE)",
+            )
+            .await
+            .unwrap();
+
+        Migrator::up(&connection, None).await.unwrap();
+
+        assert_eq!(offline_rules(&connection).await, ["Gone"]);
     }
 }

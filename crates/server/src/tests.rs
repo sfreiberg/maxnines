@@ -101,6 +101,11 @@ async fn start_on(
     let config = Config::parse(&text).unwrap();
 
     let database = Database::for_test().await;
+    // Tests start with no alert rules, so each says what it relies on. The built-in
+    // rule has tests of its own.
+    for rule in database.list_alert_rules().await.unwrap() {
+        database.delete_alert_rule(rule.id, now_ms()).await.unwrap();
+    }
     let (user, _) = database
         .create_user("test@example.com", "Tester", now_ms())
         .await

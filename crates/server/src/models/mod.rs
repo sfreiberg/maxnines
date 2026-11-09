@@ -1536,6 +1536,7 @@ mod tests {
             condition: Some("true".to_string()),
             enabled: true,
             channels: vec![channel],
+            all_channels: false,
             calculation: None,
             group_by: None,
             filter: None,

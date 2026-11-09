@@ -13,7 +13,7 @@ use super::*;
 use crate::alert_evaluator::Evaluator;
 use crate::alerting::{
     AlertRuleInput, Channel, ChannelInput, ChannelKind, Comparison, Delivery, Event, NewAlert,
-    RuleKind, Severity,
+    RuleKind, Severity, check_rule,
 };
 use crate::metrics::{Metric, NewestReading};
 use crate::notifier::{ACKNOWLEDGE_ACTION, Mailer, Notice, Notifier, SILENCE_HOUR_ACTION, Senders};
@@ -193,6 +193,7 @@ fn cpu_rule() -> AlertRuleInput {
         condition: None,
         enabled: true,
         channels: Vec::new(),
+        all_channels: false,
         calculation: None,
         group_by: None,
         filter: None,
@@ -683,6 +684,67 @@ async fn an_agent_going_offline_alerts_after_the_wait() {
     assert_eq!(open.len(), 1);
     assert_eq!(open[0].summary, "web-1 has been offline for 1 minute");
     assert_eq!(open[0].series, "");
+}
+
+/// The rule every server starts with, as the migration adds it.
+async fn built_in_offline_rule() -> AlertRuleInput {
+    let fresh = Database::for_test().await;
+    let rules = fresh.list_alert_rules().await.unwrap();
+    assert_eq!(rules.len(), 1);
+    rules[0].rule.clone()
+}
+
+#[tokio::test]
+async fn every_server_starts_with_a_rule_for_agents_going_offline() {
+    let rule = built_in_offline_rule().await;
+
+    assert_eq!(rule.name, "Agent offline");
+    assert_eq!(rule.kind, RuleKind::Offline);
+    assert_eq!(rule.for_secs, 300);
+    assert_eq!(rule.severity, Severity::Critical);
+    assert!(rule.enabled);
+    assert!(rule.all_channels);
+    assert!(rule.channels.is_empty());
+    check_rule(&rule).unwrap();
+}
+
+#[tokio::test]
+async fn the_built_in_rule_tells_every_channel_once_an_agent_is_gone_5_minutes() {
+    let mut test = Harness::start().await;
+    test.database()
+        .create_alert_rule(&built_in_offline_rule().await)
+        .await
+        .unwrap();
+    // Added after the rule, and told all the same.
+    let channel = webhook_channel("http://127.0.0.1:9/hook");
+    let channel = test.database().create_channel(&channel).await.unwrap();
+
+    test.go_offline().await;
+    let gone = test.server.state.presence.get(&test.id()).unwrap().since_ms as i64;
+    test.evaluator.evaluate(gone + 299_000).await.unwrap();
+    assert!(test.open().await.is_empty());
+
+    test.evaluator.evaluate(gone + 300_000).await.unwrap();
+    let open = test.open().await;
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].summary, "web-1 has been offline for 5 minutes");
+    let deliveries = test.database().due_deliveries(i64::MAX, 10).await.unwrap();
+    let told: Vec<i64> = deliveries
+        .iter()
+        .map(|delivery| delivery.channel.id)
+        .collect();
+    assert_eq!(told, [channel]);
+}
+
+#[tokio::test]
+async fn a_rule_can_not_have_every_channel_and_some_of_them() {
+    let rule = AlertRuleInput {
+        all_channels: true,
+        channels: vec![1],
+        ..offline_rule()
+    };
+    let error = check_rule(&rule).unwrap_err().to_string();
+    assert!(error.contains("not both"), "{error}");
 }
 
 #[tokio::test]
@@ -3246,6 +3308,57 @@ async fn a_rule_can_choose_its_channels_from_the_form() {
 }
 
 #[tokio::test]
+async fn a_rule_can_tell_every_channel_from_the_form() {
+    let server = start().await;
+    let mut fields = ALERT_RULE_FIELDS.to_vec();
+    fields.push(("all_channels", "on"));
+    let mut browser = Browser::default();
+
+    let page = browser
+        .submit(&server, "/alerts/rules/new", "/alerts/rules", &fields)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    let rules = server.state.database.list_alert_rules().await.unwrap();
+    assert!(rules[0].rule.all_channels);
+    assert!(rules[0].rule.channels.is_empty());
+
+    let page = browser.get(&server, "/alerts/rules").await;
+    assert!(page.body.contains("Every channel"), "{}", page.body);
+    let edit = format!("/alerts/rules/{}/edit", rules[0].id);
+    let page = browser.get(&server, &edit).await;
+    assert!(
+        page.body.contains(r#"name="all_channels" checked"#),
+        "{}",
+        page.body
+    );
+
+    // Not both at once.
+    let channel = server
+        .state
+        .database
+        .create_channel(&webhook_channel("https://example.com/x"))
+        .await
+        .unwrap();
+    let box_name = format!("channel_{channel}");
+    fields.push((box_name.as_str(), "on"));
+    let page = browser
+        .submit(&server, "/alerts/rules/new", "/alerts/rules", &fields)
+        .await;
+    assert_eq!(page.status, 422);
+    assert!(page.body.contains("not both"), "{}", page.body);
+
+    let body = json!({
+        "name": "Gone", "kind": "offline", "for_secs": 300, "severity": "critical",
+        "all_channels": true,
+    });
+    let (status, created) = api(&server, "POST", "/api/v1/alert-rules", &body).await;
+    assert_eq!(status, 201, "{created}");
+    let path = format!("/api/v1/alert-rules/{}", created["id"]);
+    let (_, rule) = api(&server, "GET", &path, &Value::Null).await;
+    assert_eq!(rule["all_channels"], true, "{rule}");
+}
+
+#[tokio::test]
 async fn a_rule_cannot_use_a_channel_that_does_not_exist() {
     let server = start().await;
     let mut fields = ALERT_RULE_FIELDS.to_vec();
@@ -3454,7 +3567,7 @@ async fn names_from_agents_are_escaped_on_the_alerts_page() {
     let agent = identity();
     let host = "<script>alert(1)</script>";
     let _client = server.connect_approved(&agent, host).await;
-    server
+    let rule_id = server
         .state
         .database
         .create_alert_rule(&AlertRuleInput {
@@ -3468,7 +3581,7 @@ async fn names_from_agents_are_escaped_on_the_alerts_page() {
         .database
         .fire_alert(
             &crate::alerting::NewAlert {
-                rule_id: 1,
+                rule_id,
                 rule_name: "<b>rule</b>".to_string(),
                 severity: Severity::Warning,
                 agent_id: agent.id(),
@@ -4506,9 +4619,11 @@ mod silences {
         let hook = FakeOnCall::default();
         on_a_webhook(&mut test, &hook).await;
 
+        let rule = test.database().list_alert_rules().await.unwrap()[0].id;
         let page = Browser::default().get(&test.server, "/alerts").await;
         assert!(
-            page.body.contains("/alerts/silences/new?rule_id=1"),
+            page.body
+                .contains(&format!("/alerts/silences/new?rule_id={rule}")),
             "{}",
             page.body
         );
@@ -4524,12 +4639,14 @@ mod silences {
     #[tokio::test]
     async fn the_form_starts_from_the_alert_and_saves_who_asked() {
         let test = Harness::start().await;
-        test.database()
+        let rule = test
+            .database()
             .create_alert_rule(&cpu_rule())
             .await
             .unwrap();
         let mut browser = Browser::default();
-        let form = "/alerts/silences/new?rule_id=1&filter=hostname%3Dweb-1";
+        let form = format!("/alerts/silences/new?rule_id={rule}&filter=hostname%3Dweb-1");
+        let form = form.as_str();
 
         let page = browser.get(&test.server, form).await;
         assert!(
@@ -4537,11 +4654,13 @@ mod silences {
             "{}",
             page.body
         );
-        assert!(page.body.contains("value=\"1\" selected"), "{}", page.body);
+        let chosen = format!("value=\"{rule}\" selected");
+        assert!(page.body.contains(&chosen), "{}", page.body);
 
+        let rule_id = rule.to_string();
         let fields = [
             ("reason", "Upgrading"),
-            ("rule_id", "1"),
+            ("rule_id", rule_id.as_str()),
             ("filter", "hostname=web-1"),
             ("duration_secs", "3600"),
         ];
@@ -4552,7 +4671,7 @@ mod silences {
 
         let silences = test.database().active_silences(now_ms()).await.unwrap();
         assert_eq!(silences.len(), 1);
-        assert_eq!(silences[0].rule_id, Some(1));
+        assert_eq!(silences[0].rule_id, Some(rule));
         assert!(!silences[0].created_by.is_empty());
 
         let page = browser.get(&test.server, "/alerts/silences").await;
@@ -5221,9 +5340,9 @@ mod pages {
     use super::*;
     use crate::alerting::NewAlert;
 
-    fn alert(agent: &Identity, severity: Severity, summary: &str) -> NewAlert {
+    fn alert(rule_id: i64, agent: &Identity, severity: Severity, summary: &str) -> NewAlert {
         NewAlert {
-            rule_id: 1,
+            rule_id,
             rule_name: "Rule".to_string(),
             severity,
             agent_id: agent.id(),
@@ -5238,15 +5357,16 @@ mod pages {
     #[tokio::test]
     async fn the_overview_leads_with_problems_most_serious_first() {
         let test = Harness::start().await;
-        test.database()
+        let rule = test
+            .database()
             .create_alert_rule(&cpu_rule())
             .await
             .unwrap();
         let (warning, critical) = ("Disk is filling up", "Everything is on fire");
         // Newest comes first otherwise, so this has to be sorted to pass.
-        let new = alert(&test.agent, Severity::Critical, critical);
+        let new = alert(rule, &test.agent, Severity::Critical, critical);
         test.database().fire_alert(&new, &[]).await.unwrap();
-        let new = alert(&test.agent, Severity::Warning, warning);
+        let new = alert(rule, &test.agent, Severity::Warning, warning);
         test.database().fire_alert(&new, &[]).await.unwrap();
 
         let page = Browser::default().get(&test.server, "/").await;
@@ -5264,11 +5384,12 @@ mod pages {
     #[tokio::test]
     async fn one_problem_reads_as_one_problem() {
         let test = Harness::start().await;
-        test.database()
+        let rule = test
+            .database()
             .create_alert_rule(&cpu_rule())
             .await
             .unwrap();
-        let new = alert(&test.agent, Severity::Warning, "Disk is filling up");
+        let new = alert(rule, &test.agent, Severity::Warning, "Disk is filling up");
         test.database().fire_alert(&new, &[]).await.unwrap();
 
         let page = Browser::default().get(&test.server, "/").await;
@@ -5449,13 +5570,13 @@ mod pages {
             .record_facts(&agent.id(), &facts, now_ms() as u64)
             .await
             .unwrap();
-        server
+        let rule = server
             .state
             .database
             .create_alert_rule(&cpu_rule())
             .await
             .unwrap();
-        let new = alert(&agent, Severity::Warning, "Disk is filling up");
+        let new = alert(rule, &agent, Severity::Warning, "Disk is filling up");
         server.state.database.fire_alert(&new, &[]).await.unwrap();
 
         let metric = crate::metrics::find("host.uptime").unwrap();

@@ -562,6 +562,7 @@ mod calculation_alerts {
             condition: None,
             enabled: true,
             channels: Vec::new(),
+            all_channels: false,
             calculation: Some(calculation),
             group_by: None,
             filter: None,

@@ -111,13 +111,16 @@
 
   <fieldset>
     <legend>Notify</legend>
+    <label class="checkbox">
+      <input type="checkbox" name="all_channels"{% if rule.all_channels %} checked{% endif %}> Every channel, including ones added later
+    </label>
     {% if channels %}
     {% for channel in channels %}
     <label class="checkbox">
       <input type="checkbox" name="channel_{{ channel.id }}"{% if channel.selected %} checked{% endif %}> {{ channel.name }}
     </label>
     {% endfor %}
-    <small class="hint">With none chosen, alerts only show on the Alerts page.</small>
+    <small class="hint">Or choose some of them. With none chosen, alerts only show on the Alerts page.</small>
     {% else %}
     <p class="hint">There are no <a href="/alerts/channels">notification channels</a> yet, so alerts will only show on the Alerts page.</p>
     {% endif %}

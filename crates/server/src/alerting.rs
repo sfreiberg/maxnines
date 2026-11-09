@@ -158,6 +158,9 @@ pub struct AlertRuleInput {
     /// Who to tell. With none, the alert only shows in the web interface.
     #[serde(default)]
     pub channels: Vec<i64>,
+    /// Tell every channel instead, including ones added later.
+    #[serde(default)]
+    pub all_channels: bool,
     /// How to combine machines, for calculation rules.
     #[serde(default)]
     pub calculation: Option<Calculation>,
@@ -196,6 +199,10 @@ pub fn check_rule(rule: &AlertRuleInput) -> Result<()> {
         rule.remind_every_secs
             .is_none_or(|secs| secs >= MIN_REMINDER_SECS),
         "reminders can't be more often than every 5 minutes"
+    );
+    ensure!(
+        !(rule.all_channels && !rule.channels.is_empty()),
+        "choose every channel or some of them, not both"
     );
 
     if let Some(condition) = &rule.condition {
@@ -790,6 +797,7 @@ mod tests {
             condition: None,
             enabled: true,
             channels: Vec::new(),
+            all_channels: false,
             calculation: None,
             group_by: None,
             filter: None,

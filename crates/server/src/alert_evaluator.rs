@@ -600,7 +600,14 @@ impl Evaluator {
                     summary,
                     started_ms: snapshot.now_ms,
                 };
-                self.database.fire_alert(&new, &rule.rule.channels).await?;
+                // Read now, so a channel added since the rule was saved hears too.
+                let channels = if rule.rule.all_channels {
+                    let every = self.database.list_channels().await?;
+                    every.into_iter().map(|channel| channel.id).collect()
+                } else {
+                    rule.rule.channels.clone()
+                };
+                self.database.fire_alert(&new, &channels).await?;
                 info!(rule = rule.rule.name, host, "alert fired");
                 Ok(())
             }

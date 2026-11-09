@@ -41,6 +41,7 @@ fn to_alert_rule(row: alert_rule::Model, channels: Vec<i64>) -> Result<AlertRule
             condition: row.condition_expr,
             enabled: row.enabled,
             channels,
+            all_channels: row.all_channels,
             calculation: row.calculation.as_deref().and_then(Calculation::parse),
             group_by: row.group_by,
             filter: row.filter,
@@ -83,6 +84,7 @@ fn alert_rule_row(input: &AlertRuleInput) -> Result<alert_rule::ActiveModel> {
             .map(i64::try_from)
             .transpose()
             .context("invalid reminder")?),
+        all_channels: Set(input.all_channels),
         ..Default::default()
     })
 }
