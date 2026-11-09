@@ -16,6 +16,7 @@ use super::fleet::Health;
 use super::{CsrfForm, Page, server_error};
 use crate::alerting::Alert;
 use crate::app_state::AppState;
+use crate::host_filter;
 use crate::locations::{LocationRule, LocationRuleInput, Locator, check_rule};
 use crate::places::{self, CREDIT, Found, MAX_RESULTS};
 use crate::registration::{AgentState, short_id};
@@ -435,7 +436,7 @@ async fn new(
             return StatusCode::NOT_FOUND.into_response();
         };
         rule.name = agent.host;
-        rule.filter = format!("id={}", agent.id);
+        rule.filter = host_filter::only(&agent.id);
         rule.priority = ONE_MACHINE_PRIORITY.to_string();
     }
     form_page(&state, &token, None, &rule, None)

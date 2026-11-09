@@ -3522,6 +3522,131 @@ async fn api(server: &TestServer, method: &str, path: &str, body: &Value) -> (u1
 }
 
 #[tokio::test]
+async fn deleting_an_agent_takes_everything_about_it_once_it_is_revoked() {
+    let mut test = Harness::start().await;
+    let id = test.id();
+    let other = identity();
+    let _other_client = test.server.connect_approved(&other, "db-1").await;
+
+    // An alert with a notification waiting to go, facts, and a place on the map.
+    let channel = webhook_channel("http://127.0.0.1:9/hook");
+    let channel = test.database().create_channel(&channel).await.unwrap();
+    let rule = AlertRuleInput {
+        for_secs: 0,
+        channels: vec![channel],
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    test.cpu(0, 95.0).await;
+    assert_eq!(test.open().await.len(), 1);
+    let database = test.database().clone();
+    let deliveries = || async { database.due_deliveries(i64::MAX, 10).await.unwrap() };
+    assert_eq!(deliveries().await.len(), 1);
+    let client = test.client.as_mut().unwrap();
+    let facts = AgentMessage::Facts {
+        facts: json!({ "agent": { "version": "1.0.0" } }),
+    };
+    send(client, &facts).await;
+    test.server.wait_for_facts(&id, 1).await;
+    for filter in [crate::host_filter::only(&id), String::new()] {
+        let place = crate::locations::LocationRuleInput {
+            name: "Leeds".to_string(),
+            filter,
+            place: String::new(),
+            latitude: 53.8,
+            longitude: -1.5,
+            priority: 0,
+        };
+        test.database().create_location_rule(&place).await.unwrap();
+    }
+    let mut browser = Browser::default();
+    let page = format!("/agents/{id}");
+    let api_path = format!("/api/v1/agents/{id}");
+
+    // Only once it's revoked.
+    let response = browser
+        .submit(&test.server, &page, &format!("{page}/delete"), &[])
+        .await;
+    assert_eq!(response.status, 409);
+    let (status, body) = api(&test.server, "DELETE", &api_path, &Value::Null).await;
+    assert_eq!(status, 409);
+    assert_eq!(body["error"], "Revoke the agent before deleting it");
+    assert!(
+        !browser
+            .get(&test.server, &page)
+            .await
+            .body
+            .contains("/delete\"")
+    );
+
+    let response = browser
+        .submit(&test.server, &page, &format!("{page}/revoke"), &[])
+        .await;
+    assert_eq!(response.status, 303);
+    assert!(
+        browser
+            .get(&test.server, &page)
+            .await
+            .body
+            .contains(&format!("{page}/delete"))
+    );
+    let response = browser
+        .submit(&test.server, &page, &format!("{page}/delete"), &[])
+        .await;
+    assert_eq!(response.status, 303);
+    assert!(
+        response.headers.contains("location: /agents\r\n"),
+        "{}",
+        response.headers
+    );
+
+    assert!(test.server.state.registry.get(&id).await.is_none());
+    assert!(test.server.state.presence.get(&id).is_none());
+    assert!(database.current_facts(&id).await.unwrap().is_empty());
+    assert!(database.config_status(&id).await.unwrap().is_none());
+    assert!(test.open().await.is_empty());
+    assert!(test.resolved().await.is_empty());
+    assert!(deliveries().await.is_empty());
+    let places = database.list_location_rules().await.unwrap();
+    assert_eq!(places.len(), 1, "the one for every machine stays");
+    assert_eq!(
+        *test.server.saved.deleted.lock().unwrap(),
+        std::slice::from_ref(&id)
+    );
+    assert_eq!(browser.get(&test.server, &page).await.status, 404);
+    assert_eq!(
+        api(&test.server, "GET", &api_path, &Value::Null).await.0,
+        404
+    );
+    assert_eq!(
+        api(&test.server, "DELETE", &api_path, &Value::Null).await.0,
+        404
+    );
+    assert!(test.server.state.registry.get(&other.id()).await.is_some());
+
+    // If the machine still runs it, it's new, and waits to be approved.
+    let mut again = test.server.connect().await;
+    let status = handshake(&mut again, &test.agent, "web-1", None).await;
+    assert_eq!(status, RegistrationStatus::Pending);
+}
+
+#[tokio::test]
+async fn the_servers_own_agents_can_not_be_deleted() {
+    let server = start().await;
+    for id in [
+        crate::remote_checks::LOCAL_AGENT_ID,
+        crate::remote_checks::FLEET_AGENT_ID,
+    ] {
+        let path = format!("/api/v1/agents/{id}");
+        assert_eq!(
+            api(&server, "DELETE", &path, &Value::Null).await.0,
+            404,
+            "{id}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn the_alert_api_needs_an_api_key() {
     let server = start().await;
     for path in [

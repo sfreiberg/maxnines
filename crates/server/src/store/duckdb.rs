@@ -173,11 +173,17 @@ impl Names {
         id
     }
 
+    /// Numbered after the highest, as a deleted agent leaves a gap that counting
+    /// them would fill with a number still in use.
     fn agent(&mut self, agent_id: &str, rows: &mut Rows) -> i32 {
         if let Some(id) = self.agents.get(agent_id) {
             return *id;
         }
-        let id = i32::try_from(self.agents.len()).unwrap_or(i32::MAX) + 1;
+        let id = self
+            .agents
+            .values()
+            .max()
+            .map_or(1, |highest| highest.saturating_add(1));
         self.agents.insert(agent_id.to_string(), id);
         rows.agents.push((id, agent_id.to_string()));
         id
@@ -462,6 +468,32 @@ impl DuckDbStore {
         Ok(true)
     }
 
+    /// In one transaction, so an agent is either all there or all gone.
+    fn delete_agent_rows(&mut self, agent_id: &str) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        let agent: i32 = match transaction.query_row(
+            "SELECT id FROM agents WHERE agent_id = ?",
+            params![agent_id],
+            |row| row.get(0),
+        ) {
+            Ok(agent) => agent,
+            Err(duckdb::Error::QueryReturnedNoRows) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        for table in ["samples", "samples_recent", "texts", "series_labels"] {
+            transaction.execute(
+                &format!(
+                    "DELETE FROM {table} WHERE series_id IN (SELECT id FROM series WHERE agent = ?)"
+                ),
+                params![agent],
+            )?;
+        }
+        transaction.execute("DELETE FROM series WHERE agent = ?", params![agent])?;
+        transaction.execute("DELETE FROM agents WHERE id = ?", params![agent])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn write_samples(&mut self, samples: &[NewSample]) -> Result<()> {
         if self.names.is_none() {
             let names = Names::load(&self.connection).context("reloading metric names")?;
@@ -528,6 +560,16 @@ impl Store for DuckDbStore {
 
     fn tidy(&mut self, now_ms: i64) -> Result<bool> {
         self.tidy_up_to(now_ms, MAX_TIDY_ROWS)
+    }
+
+    fn delete_agent(&mut self, agent_id: &str) -> Result<()> {
+        let result = self
+            .delete_agent_rows(agent_id)
+            .context("deleting an agent's metrics");
+        // Loaded again rather than worked out, as the agent touched most of what's
+        // remembered. If that fails, the next write loads it first.
+        self.names = Names::load(&self.connection).ok();
+        result
     }
 
     /// Readers can outlive this connection, which would otherwise leave recent
@@ -1303,6 +1345,45 @@ mod tests {
             .connection
             .query_row("SELECT count(*) FROM all_samples", [], |row| row.get(0))
             .unwrap()
+    }
+
+    #[test]
+    fn deleting_an_agent_leaves_no_rows_of_it_in_any_table() {
+        let mut store = in_memory();
+        for agent in ["gone", "kept"] {
+            let checks = json!([{ "name": "site", "kind": "http", "up": 0, "error": "no" }]);
+            write_metric(&mut store, agent, 1000, "checks", checks);
+        }
+        tidy_all(&mut store, 2 * HOUR_MS);
+        write_metric(
+            &mut store,
+            "gone",
+            HOUR_MS as u64 + 1,
+            "cpu",
+            json!({ "usage_percent": 1 }),
+        );
+
+        store.delete_agent("gone").unwrap();
+
+        let count = |sql: &str| -> i64 {
+            store
+                .connection
+                .query_row(sql, [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(count("SELECT count(*) FROM agents"), 1);
+        let kept = count("SELECT count(*) FROM series");
+        assert_eq!(count("SELECT count(*) FROM series WHERE agent = 2"), kept);
+        for table in ["samples", "samples_recent", "texts", "series_labels"] {
+            let orphans = count(&format!(
+                "SELECT count(*) FROM {table} WHERE series_id NOT IN (SELECT id FROM series)"
+            ));
+            assert_eq!(orphans, 0, "{table}");
+        }
+        assert!(
+            count("SELECT count(*) FROM samples") > 0,
+            "the other agent's"
+        );
     }
 
     #[test]

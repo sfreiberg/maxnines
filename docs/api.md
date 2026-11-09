@@ -136,6 +136,22 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "$MAXNINES_URL/api/v1/agents/REVOKED_AGENT_ID/revoke"
 ```
 
+### Delete an agent
+
+`DELETE /api/v1/agents/{id}`
+
+Deletes a revoked agent with all its metrics, facts and alerts, and its place on the
+map if it has one of its own. It can't be undone. An agent that isn't revoked gives
+`409`, so it always takes two steps.
+
+If the machine still runs the agent, it comes back as a new agent waiting to be
+approved, and a rule can approve it like any other.
+
+```sh
+curl -X DELETE -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  "$MAXNINES_URL/api/v1/agents/REVOKED_AGENT_ID"
+```
+
 ### Get an agent's facts
 
 `GET /api/v1/agents/{id}/facts`

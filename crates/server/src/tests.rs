@@ -2527,8 +2527,14 @@ fn parses_commands() {
 
     assert_eq!(parse("version").unwrap().command, Some(Command::Version));
 
+    assert_eq!(
+        parse("agents delete abc").unwrap().command,
+        Some(Command::Agents(AgentsCommand::Delete {
+            id: "abc".to_string()
+        }))
+    );
     assert!(parse("agents approve").is_err());
-    assert!(parse("agents delete abc").is_err());
+    assert!(parse("agents delete").is_err());
 }
 
 // ---- agent versions

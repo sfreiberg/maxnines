@@ -145,6 +145,11 @@ impl Presence {
         }
     }
 
+    /// For an agent that's been deleted.
+    pub fn forget(&self, id: &str) {
+        self.state.lock().unwrap().agents.remove(id);
+    }
+
     pub fn get(&self, id: &str) -> Option<AgentPresence> {
         let state = self.state.lock().unwrap();
         state.agents.get(id).map(|entry| entry.presence)

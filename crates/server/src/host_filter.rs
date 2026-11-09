@@ -226,6 +226,11 @@ impl<'a> PartialValue<'a> {
     }
 }
 
+/// The filter for one machine alone, by its ID, as names needn't be unique.
+pub fn only(agent_id: &str) -> String {
+    format!("{ID_NAME}={agent_id}")
+}
+
 /// Names matching what's been typed, those starting with it first.
 pub fn suggest_names(term: &str, facts: impl IntoIterator<Item = String>) -> Vec<Suggestion> {
     let term = term.to_lowercase();

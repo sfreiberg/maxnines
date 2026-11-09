@@ -188,6 +188,26 @@ pub fn change_agent(config: &Config, id: &str, action: &str) -> Result<()> {
     }
 }
 
+pub fn delete_agent(config: &Config, id: &str) -> Result<()> {
+    let base = server_url(config);
+    let key = api_key()?;
+
+    let result = client(config)?
+        .delete(format!("{base}{BASE_PATH}/agents/{id}"))
+        .header("Authorization", format!("Bearer {key}"))
+        .call();
+    match result {
+        Ok(_) => {
+            println!("deleted: {id}");
+            Ok(())
+        }
+        Err(ureq::Error::StatusCode(409)) => {
+            bail!("revoke the agent before deleting it: maxnines-server agents revoke {id}")
+        }
+        Err(error) => bail!(explain(error, &base)),
+    }
+}
+
 pub fn print_api_keys(config: &Config) -> Result<()> {
     let keys = with_database(
         config,

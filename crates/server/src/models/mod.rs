@@ -56,6 +56,7 @@ pub use self::users::{
     check_new_user, is_theme,
 };
 use crate::facts::{FlatFacts, decode, encode, flatten, unflatten};
+use crate::host_filter;
 use crate::migrations::Migrator;
 use crate::registration::hash_token;
 use crate::registration::{AgentRecord, AgentState};
@@ -189,6 +190,40 @@ impl Database {
             .await
             .context("saving agent")?;
         Ok(())
+    }
+
+    /// Deletes an agent and everything kept about it: its facts, what it said about
+    /// its config, its alerts with their notifications, and a place on the map made
+    /// for it alone. All or nothing. Returns false if there was no such agent.
+    pub async fn delete_agent(&self, id: &str) -> Result<bool> {
+        let _only_writer = self.facts_lock.lock().await;
+        let transaction = self.connection.begin().await.context("deleting an agent")?;
+        // Their notifications go with them.
+        alert::Entity::delete_many()
+            .filter(alert::Column::AgentId.eq(id))
+            .exec(&transaction)
+            .await
+            .context("deleting an agent's alerts")?;
+        agent_fact::Entity::delete_many()
+            .filter(agent_fact::Column::AgentId.eq(id))
+            .exec(&transaction)
+            .await
+            .context("deleting an agent's facts")?;
+        agent_config_status::Entity::delete_by_id(id)
+            .exec(&transaction)
+            .await
+            .context("deleting an agent's config status")?;
+        location_rule::Entity::delete_many()
+            .filter(location_rule::Column::Filter.eq(host_filter::only(id)))
+            .exec(&transaction)
+            .await
+            .context("deleting an agent's place on the map")?;
+        let deleted = agent::Entity::delete_by_id(id)
+            .exec(&transaction)
+            .await
+            .context("deleting an agent")?;
+        transaction.commit().await.context("deleting an agent")?;
+        Ok(deleted.rows_affected > 0)
     }
 }
 

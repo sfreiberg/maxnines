@@ -332,6 +332,16 @@ impl Registry {
         Ok(Some(agent))
     }
 
+    /// Takes a deleted agent off the list. If it connects again, it's new.
+    pub async fn forget(&self, id: &str) {
+        self.agents.lock().await.remove(id);
+        self.asked_ms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id);
+        self.revisions.send_modify(|revision| *revision += 1);
+    }
+
     /// Adds an agent as if it had been loaded at startup.
     #[cfg(test)]
     pub async fn insert_for_test(&self, agent: AgentRecord) {

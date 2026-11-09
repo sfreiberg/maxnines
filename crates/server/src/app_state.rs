@@ -22,8 +22,18 @@ use crate::rule_engine::{self, ResolvedConfig};
 use crate::rule_preview::{self, Preview, PreviewAgent};
 use crate::server_stats::ServerStatus;
 use crate::silences::{self, SilenceInput};
-use crate::store::WriterCommand;
+use crate::store::{self, WriterCommand};
 use crate::views::Views;
+
+/// What came of deleting an agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentDeletion {
+    Deleted,
+    NoSuchAgent,
+    /// Only a revoked agent can be deleted, so it always takes two steps, and one
+    /// that's sending can't be deleted halfway through a report.
+    NotRevoked,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Heartbeat {
@@ -64,6 +74,25 @@ impl FromRef<AppState> for CsrfConfig {
 }
 
 impl AppState {
+    /// Deletes a revoked agent and everything kept about it. Metrics go first: if
+    /// anything fails, the agent is still listed, revoked, to try again.
+    pub async fn delete_agent(&self, id: &str) -> Result<AgentDeletion> {
+        match self.registry.get(id).await {
+            None => return Ok(AgentDeletion::NoSuchAgent),
+            Some(agent) if agent.is_local() => return Ok(AgentDeletion::NoSuchAgent),
+            Some(agent) if agent.state != AgentState::Revoked => {
+                return Ok(AgentDeletion::NotRevoked);
+            }
+            Some(_) => {}
+        }
+        store::delete_agent(&self.writer, id).await?;
+        self.database.delete_agent(id).await?;
+        self.registry.forget(id).await;
+        self.presence.forget(id);
+        tracing::info!(agent = id, "deleted an agent and its metrics");
+        Ok(AgentDeletion::Deleted)
+    }
+
     /// Works out what an agent should be running right now.
     /// Where calculations get their answers.
     pub fn sources(&self) -> Sources<'_> {

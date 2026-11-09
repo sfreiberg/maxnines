@@ -1080,3 +1080,51 @@ fn names_with_quotes_in_them_come_back_unharmed() {
 
     assert_eq!(names(&result), [odd]);
 }
+
+#[test]
+fn deleting_an_agent_removes_everything_it_sent_and_nothing_else() {
+    let mut store = in_memory();
+    for agent in ["gone", "kept"] {
+        write_metric(&mut store, agent, 1000, "cpu", json!({ "usage_percent": 5.0 }));
+        let checks = json!([{ "name": "site", "kind": "http", "up": 0, "error": "refused" }]);
+        write_metric(&mut store, agent, 2000, "checks", checks);
+    }
+    // Into the sorted table too, for a store that has one, as the hour is over.
+    while store.tidy(2 * HOUR_MS).unwrap() {}
+    write_metric(&mut store, "gone", HOUR_MS as u64 + 1000, "cpu", json!({ "usage_percent": 6.0 }));
+
+    store.delete_agent("gone").unwrap();
+
+    assert!(query(&store, "gone", "cpu.usage", 8).series.is_empty());
+    assert_eq!(latest_output(&store, "gone", "checks"), None);
+    let reader = store.reader().unwrap();
+    let agents: Vec<String> = reader
+        .last_samples(0, 9000)
+        .unwrap()
+        .into_iter()
+        .map(|last| last.agent_id)
+        .collect();
+    assert_eq!(agents, ["kept"]);
+    assert_eq!(averages(&query(&store, "kept", "cpu.usage", 8).series[0]), [5.0]);
+    assert!(latest_output(&store, "kept", "checks").is_some());
+
+    // Deleting what isn't there does nothing.
+    store.delete_agent("gone").unwrap();
+    store.delete_agent("never-here").unwrap();
+}
+
+#[test]
+fn a_deleted_agent_starts_afresh_and_new_agents_keep_to_themselves() {
+    let mut store = in_memory();
+    for agent in ["gone", "kept"] {
+        write_metric(&mut store, agent, 1000, "cpu", json!({ "usage_percent": 5.0 }));
+    }
+    store.delete_agent("gone").unwrap();
+
+    write_metric(&mut store, "new", 2000, "cpu", json!({ "usage_percent": 7.0 }));
+    write_metric(&mut store, "gone", 3000, "cpu", json!({ "usage_percent": 9.0 }));
+
+    assert_eq!(averages(&query(&store, "kept", "cpu.usage", 8).series[0]), [5.0]);
+    assert_eq!(averages(&query(&store, "new", "cpu.usage", 8).series[0]), [7.0]);
+    assert_eq!(averages(&query(&store, "gone", "cpu.usage", 8).series[0]), [9.0]);
+}

@@ -15,10 +15,10 @@ use super::host_list::{HostSearch, address, page_number, paginate};
 use super::{CsrfForm, Page, server_error, signed_in_user, viewer_zone};
 use crate::agent_versions::{self, NEWEST_AGENT_VERSION, VersionState};
 use crate::alerting::Alert;
-use crate::app_state::AppState;
+use crate::app_state::{AgentDeletion, AppState};
 use crate::fact_history::describe_history;
 use crate::facts::{FlatFacts, fact_text, unflatten};
-use crate::host_filter::{MAX_SUGGESTIONS, PartialValue, Suggestion, suggest_names};
+use crate::host_filter::{self, MAX_SUGGESTIONS, PartialValue, Suggestion, suggest_names};
 use crate::locations::Locator;
 use crate::metric_charts::format_value;
 use crate::metrics::Unit;
@@ -35,6 +35,7 @@ pub fn routes() -> Router<AppState> {
         .route("/agents/{id}", get(show))
         .route("/agents/{id}/approve", post(approve))
         .route("/agents/{id}/revoke", post(revoke))
+        .route("/agents/{id}/delete", post(delete))
 }
 
 #[derive(Serialize)]
@@ -510,7 +511,7 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         Ok(locator) => locator,
         Err(error) => return server_error(&error),
     };
-    let own_filter = format!("id={id}");
+    let own_filter = host_filter::only(&id);
     let location = locator.locate(&id, &agent.host).map(|rule| Location {
         rule_id: rule.id,
         name: rule.rule.name.clone(),
@@ -585,6 +586,18 @@ async fn decide(
     match state.registry.decide_as(&id, decision, &by).await {
         Ok(Some(_)) => (form.token, Redirect::to(&format!("/agents/{id}"))).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// Only a revoked agent offers this, so it always takes two steps.
+async fn delete(State(state): State<AppState>, Path(id): Path<String>, form: CsrfForm) -> Response {
+    match state.delete_agent(&id).await {
+        Ok(AgentDeletion::Deleted) => (form.token, Redirect::to("/agents")).into_response(),
+        Ok(AgentDeletion::NoSuchAgent) => StatusCode::NOT_FOUND.into_response(),
+        Ok(AgentDeletion::NotRevoked) => {
+            (StatusCode::CONFLICT, "Revoke the agent before deleting it.").into_response()
+        }
         Err(error) => server_error(&error),
     }
 }

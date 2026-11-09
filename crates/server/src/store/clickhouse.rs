@@ -202,6 +202,27 @@ fn labelled(labels: &[(String, String)]) -> Labels {
 }
 
 impl Memory {
+    /// For an agent whose rows have been deleted.
+    fn forget(&mut self, agent: &str) {
+        let texts = self
+            .text_series
+            .iter()
+            .filter(|((owner, _), _)| owner == agent)
+            .flat_map(|(_, series)| series.keys().copied());
+        let prints: Vec<u64> = self
+            .series
+            .remove(agent)
+            .unwrap_or_default()
+            .into_iter()
+            .chain(texts)
+            .collect();
+        for print in prints {
+            self.texts.remove(&print);
+        }
+        self.text_series.retain(|(owner, _), _| owner != agent);
+        self.over_limit.remove(agent);
+    }
+
     /// False once an agent has as many series as it's allowed.
     fn allow(
         &mut self,
@@ -532,6 +553,20 @@ impl ClickHouseStore {
         Ok(())
     }
 
+    /// Samples first and the list of series last, so a delete that fails partway
+    /// still knows what's left to delete when it's tried again.
+    async fn delete_rows(&self, agent_id: &str) -> Result<()> {
+        for table in ["samples", "texts", "reports", "series"] {
+            self.client
+                .query(&format!("DELETE FROM {table} WHERE agent = ?"))
+                .bind(agent_id)
+                .execute()
+                .await
+                .with_context(|| format!("deleting an agent's {table}"))?;
+        }
+        Ok(())
+    }
+
     async fn write_rows(&self, rows: &Rows) -> Result<()> {
         self.insert("series", &rows.series).await?;
         self.insert("texts", &rows.texts).await?;
@@ -566,6 +601,12 @@ impl Store for ClickHouseStore {
         Ok(Arc::new(ClickHouseReader {
             client: self.client.clone(),
         }))
+    }
+
+    fn delete_agent(&mut self, agent_id: &str) -> Result<()> {
+        wait(self.delete_rows(agent_id))?;
+        self.memory.forget(agent_id);
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
@@ -1179,6 +1220,37 @@ mod tests {
         wait(store.client.query("OPTIMIZE TABLE samples FINAL").execute()).unwrap();
 
         assert_eq!(count(&store, "SELECT count() FROM samples"), 2);
+    }
+
+    #[test]
+    fn deleting_an_agent_forgets_it_in_memory_and_in_every_table() {
+        let mut store = in_memory();
+        for agent in ["gone", "kept"] {
+            let checks = json!([{ "name": "site", "kind": "http", "up": 0, "error": "no" }]);
+            write_metric(&mut store, agent, 1000, "checks", checks);
+        }
+        store.memory.over_limit.insert("gone".to_string());
+
+        store.delete_agent("gone").unwrap();
+
+        for table in ["samples", "texts", "series", "reports"] {
+            let sql = format!("SELECT count() FROM {table} WHERE agent = 'gone'");
+            assert_eq!(count(&store, &sql), 0, "{table}");
+            let sql = format!("SELECT count() FROM {table} WHERE agent = 'kept'");
+            assert!(count(&store, &sql) > 0, "{table}");
+        }
+        assert!(!store.memory.series.contains_key("gone"));
+        assert!(store.memory.series.contains_key("kept"));
+        assert!(
+            store
+                .memory
+                .text_series
+                .keys()
+                .all(|(agent, _)| agent == "kept")
+        );
+        let kept_texts: usize = store.memory.text_series.values().map(HashMap::len).sum();
+        assert_eq!(store.memory.texts.len(), kept_texts);
+        assert!(store.memory.over_limit.is_empty());
     }
 
     #[test]

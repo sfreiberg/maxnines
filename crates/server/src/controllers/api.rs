@@ -19,7 +19,7 @@ use super::fleet::Health;
 use super::host_list::HostSearch;
 use super::users::{refusal, setup_url};
 use crate::alerting::{Alert, AlertRuleInput, ChannelInput, ChannelKind};
-use crate::app_state::AppState;
+use crate::app_state::{AgentDeletion, AppState};
 use crate::calculations::{self, Calculation, Question};
 use crate::dashboards::{Placed, WidgetInput, check_layout, check_name};
 use crate::facts::unflatten;
@@ -73,7 +73,7 @@ pub const BASE_PATH: &str = "/api/v1";
 pub fn routes(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/agents", get(list))
-        .route("/agents/{id}", get(show_agent))
+        .route("/agents/{id}", get(show_agent).delete(delete_agent))
         .route("/agents/{id}/facts", get(facts))
         .route("/agents/{id}/facts/history", get(facts_history))
         .route("/agents/{id}/config", get(agent_config))
@@ -1305,6 +1305,17 @@ async fn approve(State(state): State<AppState>, UrlPath(id): UrlPath<String>) ->
 
 async fn revoke(State(state): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
     decide(&state, &id, AgentState::Revoked).await
+}
+
+async fn delete_agent(State(state): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
+    match state.delete_agent(&id).await {
+        Ok(AgentDeletion::Deleted) => StatusCode::NO_CONTENT.into_response(),
+        Ok(AgentDeletion::NoSuchAgent) => StatusCode::NOT_FOUND.into_response(),
+        Ok(AgentDeletion::NotRevoked) => {
+            failed(StatusCode::CONFLICT, "Revoke the agent before deleting it")
+        }
+        Err(error) => server_error(&error),
+    }
 }
 
 async fn decide(state: &AppState, id: &str, decision: AgentState) -> Response {

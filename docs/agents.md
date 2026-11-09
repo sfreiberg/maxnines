@@ -59,3 +59,17 @@ reached, and sent when it's back.
 - **Other commands:** `./maxnines-agent facts` prints what it reports about the
   machine, and `./maxnines-agent identity show` prints its ID once it's been started.
   Use `-c` to point any of them at a config file somewhere else.
+
+## Removing an agent
+
+When a machine is gone for good, revoke its agent on its page, then delete it. That
+takes its metrics, facts and alerts with it, and can't be undone. From the command
+line:
+
+```sh
+maxnines-server agents revoke <agent-id>
+maxnines-server agents delete <agent-id>
+```
+
+Stop the agent on the machine first, if it's still there. Otherwise it comes back as
+a new agent waiting to be approved, and an approval rule may let it straight in.

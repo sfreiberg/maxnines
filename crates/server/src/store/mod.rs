@@ -20,6 +20,7 @@ use maxnines_protocol::Sample;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc::{self, error::TryRecvError};
+use tokio::sync::oneshot;
 use tracing::{error, warn};
 
 use crate::calculations::CalculationQuery;
@@ -79,6 +80,10 @@ pub trait Store: Send {
     fn tidy(&mut self, _now_ms: i64) -> Result<bool> {
         Ok(false)
     }
+
+    /// Forgets an agent: everything it ever sent, and anything kept in memory about
+    /// it. If it sends again, it starts afresh.
+    fn delete_agent(&mut self, agent_id: &str) -> Result<()>;
 
     /// Called once at shutdown, after the last write.
     fn close(&mut self) -> Result<()>;
@@ -189,8 +194,32 @@ pub enum WriterCommand {
         sample: NewSample,
         acks: mpsc::Sender<u64>,
     },
+    /// Deletes everything an agent sent, after anything queued before this is saved.
+    /// `done` hears whether that worked.
+    DeleteAgent {
+        agent_id: String,
+        done: oneshot::Sender<Result<(), String>>,
+    },
     /// Finish queued work and close the database cleanly.
     Stop,
+}
+
+/// Deletes everything an agent sent, once the writer gets to it.
+pub async fn delete_agent(writer: &mpsc::Sender<WriterCommand>, agent_id: &str) -> Result<()> {
+    let (done, finished) = oneshot::channel();
+    let command = WriterCommand::DeleteAgent {
+        agent_id: agent_id.to_string(),
+        done,
+    };
+    writer
+        .send(command)
+        .await
+        .map_err(|_| anyhow::anyhow!("the metrics writer has stopped"))?;
+    match finished.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => anyhow::bail!("deleting the agent's metrics failed: {error}"),
+        Err(_) => anyhow::bail!("the metrics writer stopped before deleting the agent's metrics"),
+    }
 }
 
 /// The samples each agent sent last. An agent sends a sample again if it never heard
@@ -225,6 +254,11 @@ impl RecentSamples {
             recent.retain(|time| *time != timestamp_ms);
         }
     }
+
+    /// For an agent that's been deleted, whose samples have gone with it.
+    fn forget_agent(&mut self, agent_id: &str) {
+        self.0.remove(agent_id);
+    }
 }
 
 /// Runs the store on its own thread, so slow database calls can't hold up the
@@ -252,7 +286,10 @@ fn run_writer(
     let mut next_tidy = Instant::now();
     let every = store.batch_every();
     let mut next_write = Instant::now();
-    while !stopping && commands.blocking_recv_many(&mut queued, WRITE_QUEUE_SIZE) > 0 {
+    // What's left from last time goes first, without waiting for more.
+    while !stopping
+        && (!queued.is_empty() || commands.blocking_recv_many(&mut queued, WRITE_QUEUE_SIZE) > 0)
+    {
         gather_until(next_write, &mut commands, &mut queued);
         let mut samples = Vec::with_capacity(queued.len());
         // Every acknowledgement each sample owes: a sample sent twice in one batch is
@@ -261,7 +298,14 @@ fn run_writer(
         let mut in_batch: HashMap<(String, u64), usize> = HashMap::new();
         // Repeats of samples stored by an earlier batch, which can be answered now.
         let mut answered = Vec::new();
-        for command in queued.drain(..) {
+        let mut deletion = None;
+        // A batch ends at a delete, so what came before it is deleted with it and what
+        // came after is written after it.
+        let end = queued
+            .iter()
+            .position(|command| matches!(command, WriterCommand::DeleteAgent { .. }))
+            .map_or(queued.len(), |delete| delete + 1);
+        for command in queued.drain(..end) {
             match command {
                 WriterCommand::Save(sample) => {
                     samples.push(sample);
@@ -280,6 +324,7 @@ fn run_writer(
                         acks.push(vec![ack]);
                     }
                 }
+                WriterCommand::DeleteAgent { agent_id, done } => deletion = Some((agent_id, done)),
                 WriterCommand::Stop => {
                     stopping = true;
                     break;
@@ -301,6 +346,14 @@ fn run_writer(
         // An agent that's gone will send the sample again, and hear back then.
         for (ack, time) in answered {
             ack.try_send(time).ok();
+        }
+        // After the batch, so nothing the agent sent before this is left behind.
+        if let Some((agent_id, done)) = deletion {
+            let result = delete_from(store.as_mut(), &agent_id);
+            if result.is_ok() {
+                recent.forget_agent(&agent_id);
+            }
+            done.send(result).ok();
         }
         if Instant::now() >= next_tidy {
             let more = tidy(store.as_mut());
@@ -330,6 +383,28 @@ fn gather_until(
             Ok(command) => queued.push(command),
             Err(TryRecvError::Empty) => thread::sleep(GATHER_EVERY),
             Err(TryRecvError::Disconnected) => return,
+        }
+    }
+}
+
+/// Deletes an agent's samples, or says why that didn't work.
+fn delete_from(store: &mut dyn Store, agent_id: &str) -> Result<(), String> {
+    match catch_unwind(AssertUnwindSafe(|| store.delete_agent(agent_id))) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            let error = format!("{error:#}");
+            error!(
+                agent = agent_id,
+                error, "deleting an agent's metrics failed"
+            );
+            Err(error)
+        }
+        Err(_) => {
+            error!(
+                agent = agent_id,
+                "the store panicked deleting an agent's metrics"
+            );
+            Err("the store panicked".to_string())
         }
     }
 }
@@ -435,6 +510,8 @@ pub mod testing {
         pub closed: Arc<Mutex<bool>>,
         /// Holds up writes while it's set, as a slow disk does.
         pub paused: Arc<AtomicBool>,
+        /// Agents deleted, in order.
+        pub deleted: Arc<Mutex<Vec<String>>>,
     }
 
     /// Has nothing to report, for tests that aren't about metrics.
@@ -513,6 +590,17 @@ pub mod testing {
 
         fn reader(&self) -> Result<Arc<dyn MetricsReader>> {
             Ok(Arc::new(EmptyReader))
+        }
+
+        /// Fails for an agent called "fail".
+        fn delete_agent(&mut self, agent_id: &str) -> Result<()> {
+            if agent_id == "fail" {
+                bail!("deliberate test failure");
+            }
+            let mut samples = self.0.samples.lock().unwrap();
+            samples.retain(|(agent, _, _)| agent != agent_id);
+            self.0.deleted.lock().unwrap().push(agent_id.to_string());
+            Ok(())
         }
 
         fn close(&mut self) -> Result<()> {
@@ -677,6 +765,10 @@ mod tests {
             Ok(Arc::new(super::testing::EmptyReader))
         }
 
+        fn delete_agent(&mut self, _agent_id: &str) -> Result<()> {
+            Ok(())
+        }
+
         fn close(&mut self) -> Result<()> {
             Ok(())
         }
@@ -718,6 +810,10 @@ mod tests {
 
         fn reader(&self) -> Result<Arc<dyn MetricsReader>> {
             Ok(Arc::new(super::testing::EmptyReader))
+        }
+
+        fn delete_agent(&mut self, _agent_id: &str) -> Result<()> {
+            Ok(())
         }
 
         fn close(&mut self) -> Result<()> {
@@ -837,6 +933,45 @@ mod tests {
 
     fn timestamps(saved: &Saved) -> Vec<u64> {
         saved.samples.lock().unwrap().iter().map(|s| s.2).collect()
+    }
+
+    fn delete(agent_id: &str) -> (WriterCommand, oneshot::Receiver<Result<(), String>>) {
+        let (done, finished) = oneshot::channel();
+        let command = WriterCommand::DeleteAgent {
+            agent_id: agent_id.to_string(),
+            done,
+        };
+        (command, finished)
+    }
+
+    #[test]
+    fn an_agent_is_deleted_after_what_was_queued_before_it() {
+        let (deletion, mut finished) = delete("agent-1");
+        let (saved, _) = run_with(vec![save("a", 1), deletion, WriterCommand::Stop]);
+
+        assert_eq!(finished.try_recv().unwrap(), Ok(()));
+        assert!(timestamps(&saved).is_empty());
+        assert_eq!(*saved.deleted.lock().unwrap(), ["agent-1"]);
+    }
+
+    #[test]
+    fn a_delete_that_fails_says_why() {
+        let (deletion, mut finished) = delete("fail");
+        run_with(vec![deletion, WriterCommand::Stop]);
+
+        let error = finished.try_recv().unwrap().unwrap_err();
+        assert!(error.contains("deliberate test failure"), "{error}");
+    }
+
+    #[test]
+    fn a_deleted_agent_sending_the_same_moment_again_is_stored_again() {
+        let (stored, acked) = run(|acks| {
+            let (deletion, _) = delete("agent-1");
+            vec![from_agent("a", 1, acks), deletion, from_agent("a", 1, acks)]
+        });
+
+        assert_eq!(stored, [1]);
+        assert_eq!(acked, [1, 1]);
     }
 
     #[test]

@@ -152,6 +152,8 @@ enum AgentsCommand {
     Approve { id: String },
     /// Stop an agent from connecting, and drop it if it's connected
     Revoke { id: String },
+    /// Delete a revoked agent with its metrics, facts and alerts, for good
+    Delete { id: String },
 }
 
 fn main() -> Result<()> {
@@ -208,6 +210,7 @@ fn main() -> Result<()> {
                 }
                 AgentsCommand::Approve { id } => cli::change_agent(&config, &id, "approve"),
                 AgentsCommand::Revoke { id } => cli::change_agent(&config, &id, "revoke"),
+                AgentsCommand::Delete { id } => cli::delete_agent(&config, &id),
             }
         }
     }

@@ -49,7 +49,7 @@ pub fn silence_for(alert: &Alert, reason: &str, duration_secs: u64) -> SilenceIn
     let filter = if alert.agent_id == FLEET_AGENT_ID {
         String::new()
     } else {
-        format!("id={}", alert.agent_id)
+        crate::host_filter::only(&alert.agent_id)
     };
     SilenceInput {
         rule_id: alert.rule_id,
