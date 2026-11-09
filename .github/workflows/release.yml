@@ -238,7 +238,7 @@ jobs:
 
   linux-packages:
     name: Linux packages for ${{ matrix.arch }}
-    needs: [linux-server, linux-agent]
+    needs: [check, linux-server, linux-agent]
     runs-on: ubuntu-24.04
     strategy:
       matrix:
@@ -256,13 +256,17 @@ jobs:
         env:
           SERVER: ${{ matrix.arch }}-unknown-linux-gnu
           AGENT: ${{ matrix.arch }}-unknown-linux-musl
+          VERSION: ${{ needs.check.outputs.version }}
         run: |
           chmod 755 "$TARGET_DIR"/*/release/maxnines-*
           mkdir -p packages
           cargo deb -p maxnines-server --no-build --no-strip --target "$SERVER" -o packages/
           cargo deb -p maxnines-agent --no-build --no-strip --target "$AGENT" -o packages/
-          cargo generate-rpm -p crates/server --target "$SERVER" --target-dir "$TARGET_DIR" -o packages/
-          cargo generate-rpm -p crates/agent --target "$AGENT" --target-dir "$TARGET_DIR" -o packages/
+          # RPM versions can't contain "-". A "~" sorts a pre-release before the
+          # release, as cargo deb does for Debian.
+          rpm_metadata="version = \"$(echo "$VERSION" | tr - '~')\""
+          cargo generate-rpm -p crates/server --target "$SERVER" --target-dir "$TARGET_DIR" -s "$rpm_metadata" -o packages/
+          cargo generate-rpm -p crates/agent --target "$AGENT" --target-dir "$TARGET_DIR" -s "$rpm_metadata" -o packages/
           ls -l packages
       - uses: actions/upload-artifact@v4
         with:
@@ -290,7 +294,9 @@ jobs:
 
   docker:
     name: Docker image
-    needs: [check, tests, linux-server]
+    # On a tag this pushes the image, so it waits until everything else has
+    # passed, as publishing does.
+    needs: [check, tests, linux-server, test-packages, macos, windows, freebsd]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
