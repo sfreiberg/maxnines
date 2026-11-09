@@ -33,6 +33,8 @@ sea-orm = { version = "2.0.4", default-features = false, features = ["macros", "
 sea-orm-migration = { version = "2.0.4", default-features = false, features = ["runtime-tokio-rustls", "sqlx-mysql", "sqlx-postgres", "sqlx-sqlite"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http2", "ring", "tls12", "webpki-tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Compares agents' versions with the newest, pre-releases included.
+semver = "1"
 serde.workspace = true
 serde_urlencoded = "0.7"
 # Catches settings no agent knows when a rule is saved, as the wire format ignores them.

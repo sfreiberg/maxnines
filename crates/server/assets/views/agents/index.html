@@ -45,7 +45,7 @@
 {% if agents and as_table %}
 <div class="tablebox"><table>
   <thead>
-    <tr><th>Host</th><th>Status</th><th>System</th><th>Config</th><th>Last seen</th></tr>
+    <tr><th>Host</th><th>Status</th><th>System</th><th>Version</th><th>Config</th><th>Last seen</th></tr>
   </thead>
   <tbody>
     {% for agent in agents %}
@@ -53,6 +53,7 @@
       <td><a href="/agents/{{ agent.id }}">{{ agent.host }}</a> <span class="agent-id">{{ agent.short_id }}</span></td>
       <td>{% include "agents/_health.html" %}</td>
       {% set os_family = agent.os_family %}<td><span class="host-name">{% include "agents/_os_icon.html" %}{{ agent.os }}</span></td>
+      <td class="nowrap">{% if agent.version %}{{ agent.version }} {% endif %}{% include "agents/_version.html" %}</td>
       <td><span class="badge {{ agent.config.class }}">{{ agent.config.label }}</span></td>
       <td class="nowrap">{{ agent.seen }}</td>
     </tr>
@@ -67,6 +68,7 @@
     <span class="agent-id">{{ agent.short_id }}</span>
     {% if agent.os %}<span class="note">{{ agent.os }}</span>{% endif %}
     {% if agent.seen %}<span class="note">Seen {{ agent.seen }}</span>{% endif %}
+    {% include "agents/_version.html" %}
   </a>
   {% endfor %}
 </div>

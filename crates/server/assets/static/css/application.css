@@ -198,6 +198,7 @@ button.danger:hover { border-color: var(--bad); background: var(--bad-surface); 
 .tile.alert { border-color: var(--warn); }
 .tile.critical { border-color: var(--bad); }
 .tile.gone { background: var(--sunken); }
+.tile > .badge { align-self: flex-start; }
 .tile-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
 .stat { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; color: var(--muted); font-size: 13px; text-align: right; }
 .big { flex: none; white-space: nowrap; color: var(--text); font-size: 22px; font-weight: 600; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }

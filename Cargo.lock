@@ -3166,6 +3166,7 @@ dependencies = [
  "rustls-acme",
  "sea-orm",
  "sea-orm-migration",
+ "semver",
  "serde",
  "serde_ignored",
  "serde_json",

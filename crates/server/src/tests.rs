@@ -2531,6 +2531,59 @@ fn parses_commands() {
     assert!(parse("agents delete abc").is_err());
 }
 
+// ---- agent versions
+
+async fn report_version(server: &TestServer, client: &mut Client, id: &str, version: &str) {
+    TestServer::next_config(client).await;
+    let facts = AgentMessage::Facts {
+        facts: json!({ "agent": { "version": version } }),
+    };
+    send(client, &facts).await;
+    server.wait_for_facts(id, 1).await;
+}
+
+#[tokio::test]
+async fn the_agents_page_shows_which_agents_have_an_update() {
+    let server = start().await;
+    let newest = crate::agent_versions::NEWEST_AGENT_VERSION;
+    let (old, current, newer) = (identity(), identity(), identity());
+    let mut clients = Vec::new();
+    for (agent, host, version) in [
+        (&old, "old-1", "0.0.1"),
+        (&current, "current-1", newest),
+        (&newer, "newer-1", "999.0.0"),
+    ] {
+        let mut client = server.connect_approved(agent, host).await;
+        report_version(&server, &mut client, &agent.id(), version).await;
+        clients.push(client);
+    }
+    let mut browser = Browser::default();
+
+    let page = browser.get(&server, "/agents?view=table").await;
+    assert!(page.body.contains("<th>Version</th>"), "{}", page.body);
+    assert_eq!(page.body.matches(">Update available</span>").count(), 1);
+    assert!(page.body.contains(&format!(
+        "This agent runs 0.0.1, and the newest is {newest}."
+    )));
+    assert_eq!(page.body.matches(">Newer than server</span>").count(), 1);
+    assert!(
+        page.body
+            .contains(&format!(r#"<td class="nowrap">{newest} "#))
+    );
+
+    let page = browser.get(&server, "/agents").await;
+    assert_eq!(page.body.matches(">Update available</span>").count(), 1);
+
+    let page = browser.get(&server, &format!("/agents/{}", old.id())).await;
+    assert!(page.body.contains(">Update available</span>"));
+    assert!(page.body.contains(&format!("The newest is {newest}.")));
+    let page = browser
+        .get(&server, &format!("/agents/{}", current.id()))
+        .await;
+    assert!(!page.body.contains(">Update available</span>"));
+    assert!(!page.body.contains(">Newer than server</span>"));
+}
+
 // ---- rule preview
 
 async fn report_role(server: &TestServer, client: &mut Client, id: &str, role: &str) {

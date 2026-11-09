@@ -13,6 +13,7 @@ use serde_json::Value;
 use super::fleet::{Health, OsFamily};
 use super::host_list::{HostSearch, address, page_number, paginate};
 use super::{CsrfForm, Page, server_error, signed_in_user, viewer_zone};
+use crate::agent_versions::{self, NEWEST_AGENT_VERSION, VersionState};
 use crate::alerting::Alert;
 use crate::app_state::AppState;
 use crate::fact_history::describe_history;
@@ -48,6 +49,10 @@ struct AgentRow {
     os_family: Option<OsFamily>,
     seen: Option<String>,
     config: Option<ConfigState>,
+    /// The agent's own version, as it reports it.
+    version: Option<String>,
+    /// Nothing when it hasn't said, or what it said isn't a version.
+    version_state: Option<VersionState>,
 }
 
 /// How an agent's running config compares with what it should be running.
@@ -157,7 +162,10 @@ fn row(
     health: Health,
 ) -> AgentRow {
     let presence = state.presence.get(&agent.id);
+    let version = facts.and_then(|facts| text_fact(facts, "agent.version"));
     AgentRow {
+        version_state: version.as_deref().and_then(agent_versions::compare),
+        version,
         online: presence.as_ref().is_some_and(|p| p.online),
         health,
         os: facts.and_then(os_of),
@@ -348,6 +356,7 @@ async fn index(
         .with("online_count", &online)
         .with("total", &total)
         .with("as_table", &as_table)
+        .with("newest_agent_version", NEWEST_AGENT_VERSION)
         .with("pages", &pages)
         .with("search", &search)
         .with("search_path", "/agents")
@@ -546,7 +555,7 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         .with("os", &os_of(&flat))
         .with("os_family", &OsFamily::of(&flat))
         .with("source", &presence.map(|p| p.source.to_string()))
-        .with("agent_version", &text_fact(&flat, "agent.version"))
+        .with("newest_agent_version", NEWEST_AGENT_VERSION)
         .with("agent_commit", &text_fact(&flat, "agent.commit"))
         .with("facts", &facts)
         .with("config", &config)

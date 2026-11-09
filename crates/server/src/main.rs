@@ -1,3 +1,4 @@
+mod agent_versions;
 mod alert_evaluator;
 mod alerting;
 mod app_state;

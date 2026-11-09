@@ -51,7 +51,9 @@ reached, and sent when it's back.
   are commands the agent runs, so anyone who can edit the file can run commands as
   the agent. Keep it owned by the agent's user or root and not writable by others.
 - **Upgrade the server first.** Older agents work with a newer server, but a newer
-  agent may need things an older server doesn't have.
+  agent may need things an older server doesn't have. The Agents page marks agents
+  older than the one released with the server **Update available**, and any newer
+  than the server **Newer than server**.
 - **macOS and downloads:** a file that came through a browser or AirDrop is blocked
   until you run `xattr -d com.apple.quarantine maxnines-agent`.
 - **Other commands:** `./maxnines-agent facts` prints what it reports about the
