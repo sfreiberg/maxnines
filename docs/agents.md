@@ -73,8 +73,13 @@ another file system seen again aren't reported at all:
 - **FreeBSD:** memory disks, null mounts such as jails', and memory file systems.
 - **Windows:** mounted ISOs. Attached virtual disks, such as a Dev Drive, are reported.
 
+On a Mac, the volumes in one APFS container share its space, so they're always exactly
+as full as each other. Only one is reported for each container: `/` for the startup
+disk, and otherwise the first by mount point.
+
 To watch only some disks, list their mount points in a config rule under **Disk mount
-points**. Those are reported whatever they are, even a disk image.
+points**. Those are reported whatever they are, even a disk image or every volume in
+a container.
 
 ## Removing an agent
 

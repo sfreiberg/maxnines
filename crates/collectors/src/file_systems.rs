@@ -5,10 +5,14 @@
 //! mounted installer would read as a full disk, and a container's layers would
 //! repeat the disk under them, so they aren't reported at all.
 //!
+//! APFS volumes share the space of the container they're in, so on a Mac `/` and
+//! `/System/Volumes/Data` are always exactly as full as each other. Only one volume
+//! per container is reported, so one disk doesn't alert twice.
+//!
 //! sysinfo already leaves out network shares and memory file systems such as tmpfs,
 //! and on macOS anything the Finder hides, such as the system's own volumes.
 
-#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos", test))]
+use std::collections::HashSet;
 use std::path::Path;
 
 use sysinfo::Disk;
@@ -17,6 +21,46 @@ use sysinfo::Disk;
 pub fn is_real(disk: &Disk) -> bool {
     // Pseudo file systems hold nothing and report no size.
     disk.total_space() > 0 && !is_stand_in(disk)
+}
+
+/// Keeps the first of the file systems that share their space, by mount point,
+/// which puts `/` before the rest. Each is also sorted by mount point.
+pub fn one_per_space<T>(
+    mut disks: Vec<T>,
+    mount_point: impl Fn(&T) -> &Path,
+    space: impl Fn(&T) -> Option<String>,
+) -> Vec<T> {
+    disks.sort_by(|a, b| mount_point(a).cmp(mount_point(b)));
+    let mut seen = HashSet::new();
+    disks.retain(|disk| space(disk).is_none_or(|space| seen.insert(space)));
+    disks
+}
+
+/// Where a file system's space comes from when it shares it with others: the
+/// container, for an APFS volume.
+#[cfg(target_os = "macos")]
+pub fn shared_space(disk: &Disk) -> Option<String> {
+    if disk.file_system() != "apfs" {
+        return None;
+    }
+    let device = mounted_from(disk.mount_point())?;
+    apfs_container(&device).map(str::to_owned)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn shared_space(_disk: &Disk) -> Option<String> {
+    None
+}
+
+/// The container an APFS volume is in, which is the whole disk its name starts
+/// with: `/dev/disk3` for `/dev/disk3s5`, or for `/dev/disk3s1s1`, a snapshot of one.
+#[cfg(any(target_os = "macos", test))]
+fn apfs_container(device: &str) -> Option<&str> {
+    let number = device.strip_prefix("/dev/disk")?;
+    let digits = number
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(number.len());
+    (digits > 0).then(|| &device[..device.len() - number.len() + digits])
 }
 
 #[cfg(target_os = "linux")]
@@ -156,6 +200,39 @@ mod tests {
         assert!(!freebsd_stand_in("zfs", "zroot/usr/home"));
         assert!(freebsd_stand_in("ufs", "/dev/md0"));
         assert!(freebsd_stand_in("nullfs", "/usr/home"));
+    }
+
+    #[test]
+    fn apfs_volumes_belong_to_the_whole_disk_they_are_named_after() {
+        assert_eq!(apfs_container("/dev/disk3s5"), Some("/dev/disk3"));
+        assert_eq!(apfs_container("/dev/disk3s1s1"), Some("/dev/disk3"));
+        assert_eq!(apfs_container("/dev/disk12s2"), Some("/dev/disk12"));
+        assert_eq!(apfs_container("/dev/disks"), None);
+        assert_eq!(apfs_container("map auto_home"), None);
+    }
+
+    #[test]
+    fn one_file_system_is_kept_for_each_space_and_root_comes_first() {
+        let disks = vec![
+            ("/System/Volumes/Data", Some("/dev/disk3")),
+            ("/Volumes/Media", Some("/dev/disk5")),
+            ("/", Some("/dev/disk3")),
+            ("/Volumes/Backup", Some("/dev/disk5")),
+            ("/Volumes/USB", None),
+            ("/Volumes/Other", None),
+        ];
+        let kept: Vec<&str> = one_per_space(
+            disks,
+            |(mount_point, _)| Path::new(mount_point),
+            |(_, space)| space.map(str::to_owned),
+        )
+        .into_iter()
+        .map(|(mount_point, _)| mount_point)
+        .collect();
+        assert_eq!(
+            kept,
+            ["/", "/Volumes/Backup", "/Volumes/Other", "/Volumes/USB"]
+        );
     }
 
     #[test]

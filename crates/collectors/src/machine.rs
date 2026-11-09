@@ -165,10 +165,17 @@ impl Collector for DiskCollector {
     fn collect(&mut self) -> Result<Value> {
         self.disks.refresh(true);
 
-        let disks: Vec<Value> = self
-            .disks
-            .iter()
-            .filter(|disk| self.wanted(disk))
+        let wanted: Vec<&Disk> = self.disks.iter().filter(|disk| self.wanted(disk)).collect();
+        let disks = match self.mount_points {
+            Some(_) => wanted,
+            None => file_systems::one_per_space(
+                wanted,
+                |disk| disk.mount_point(),
+                |disk| file_systems::shared_space(disk),
+            ),
+        };
+        let disks: Vec<Value> = disks
+            .into_iter()
             .map(|disk| {
                 let mount_point = disk.mount_point().to_string_lossy();
                 let total = disk.total_space();
@@ -323,6 +330,20 @@ mod tests {
         assert_eq!(link_up(InterfaceOperationalState::Up), Some(1));
         assert_eq!(link_up(InterfaceOperationalState::Down), Some(0));
         assert_eq!(link_up(InterfaceOperationalState::Unknown), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_mac_reports_its_start_up_disk_once_as_root() {
+        let output = DiskCollector::new(None).unwrap().collect().unwrap();
+        let mount_points: Vec<&str> = output
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|disk| disk["mount_point"].as_str())
+            .collect();
+        assert!(mount_points.contains(&"/"), "{output}");
+        assert!(!mount_points.contains(&"/System/Volumes/Data"), "{output}");
     }
 
     #[test]
