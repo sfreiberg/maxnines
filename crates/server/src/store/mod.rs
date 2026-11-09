@@ -795,16 +795,21 @@ mod tests {
         }
     }
 
-    /// Wants a gap between writes, and says how big each was.
-    struct Timed(Arc<std::sync::Mutex<Vec<usize>>>);
+    /// Each write's size and when it happened.
+    type Writes = Arc<std::sync::Mutex<Vec<(usize, Instant)>>>;
+
+    /// Wants a gap between writes, and says how big each was and when.
+    struct Timed(Writes);
+
+    const BATCH_EVERY: Duration = Duration::from_millis(100);
 
     impl Store for Timed {
         fn batch_every(&self) -> Duration {
-            Duration::from_millis(100)
+            BATCH_EVERY
         }
 
         fn write(&mut self, samples: &[NewSample]) -> Result<()> {
-            self.0.lock().unwrap().push(samples.len());
+            self.0.lock().unwrap().push((samples.len(), Instant::now()));
             Ok(())
         }
 
@@ -823,32 +828,37 @@ mod tests {
 
     #[test]
     fn a_store_can_ask_for_samples_to_be_gathered_into_a_batch() {
-        let writes = Arc::default();
+        let writes: Writes = Arc::default();
         let store = Box::new(Timed(Arc::clone(&writes)));
         let (writer, thread) = spawn_writer(store, Arc::default());
 
-        let started = Instant::now();
         for time in 0..20 {
             writer.blocking_send(save("web", time)).unwrap();
             thread::sleep(Duration::from_millis(2));
         }
-        let sending = started.elapsed();
         thread::sleep(Duration::from_millis(250));
         writer.blocking_send(WriterCommand::Stop).unwrap();
         thread.join().unwrap();
 
-        // A write for every 100 ms they took to arrive, and one for the rest. A busy
-        // machine can sleep far longer than asked, so the limit follows the clock.
-        let most = usize::try_from(sending.as_millis() / 100).unwrap() + 2;
         let writes = writes.lock().unwrap();
-        assert_eq!(writes.iter().sum::<usize>(), 20);
-        assert!(writes.len() <= most, "{writes:?} in {sending:?}");
-        assert!(writes.len() < 20, "nothing was gathered: {writes:?}");
+        let sizes: Vec<usize> = writes.iter().map(|(size, _)| *size).collect();
+        assert_eq!(sizes.iter().sum::<usize>(), 20);
+        assert!(sizes.len() < 20, "nothing was gathered: {sizes:?}");
+        // Each write waits the store's time after the one before, however the
+        // machine schedules the threads. The time is counted from just before the
+        // previous write starts, so a sliver of it can be spent getting there.
+        for pair in writes.windows(2) {
+            let gap = pair[1].1 - pair[0].1;
+            assert!(
+                gap >= BATCH_EVERY - Duration::from_millis(5),
+                "{gap:?} in {sizes:?}"
+            );
+        }
     }
 
     #[test]
     fn a_full_batch_does_not_wait_for_the_timer() {
-        let writes = Arc::default();
+        let writes: Writes = Arc::default();
         let store = Box::new(Timed(Arc::clone(&writes)));
         let (writer, thread) = spawn_writer(store, Arc::default());
 
@@ -859,10 +869,8 @@ mod tests {
         writer.blocking_send(WriterCommand::Stop).unwrap();
         thread.join().unwrap();
 
-        assert_eq!(
-            writes.lock().unwrap().iter().sum::<usize>(),
-            2 * WRITE_QUEUE_SIZE
-        );
+        let written: usize = writes.lock().unwrap().iter().map(|(size, _)| size).sum();
+        assert_eq!(written, 2 * WRITE_QUEUE_SIZE);
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
