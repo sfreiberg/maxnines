@@ -239,9 +239,9 @@ jobs:
             for program in maxnines-agent maxnines-server; do
               packaging/archive.sh "$program" "${{ needs.check.outputs.version }}" "$TARGET" dist
             done
-            # Copyback brings the whole folder out of the VM, and the build is several
-            # GB that nothing needs: copying it took long enough for the VM to drop
-            # the connection.
+            # Copyback brings the whole folder out of the VM, and the build's
+            # intermediate files are far bigger than the archives and needed by
+            # nothing: copying them took long enough for the VM to drop the connection.
             rm -rf target.nosync
       - uses: actions/upload-artifact@v4
         with:

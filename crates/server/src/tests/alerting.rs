@@ -733,6 +733,7 @@ async fn every_server_starts_with_rules_for_agents_going_offline_and_disks_filli
             "Agent offline",
             "Container down",
             "Disk filling up",
+            "Disk running out of inodes",
             "Disk will be full soon"
         ]
     );
@@ -845,6 +846,27 @@ async fn every_server_starts_with_a_warning_at_80_percent_full_and_critical_at_9
     check_rule(rule).unwrap();
 }
 
+#[tokio::test]
+async fn every_server_starts_with_a_rule_for_inodes_running_out() {
+    let rules = built_in_rules().await;
+    let rule = rules
+        .iter()
+        .find(|rule| rule.metric.as_deref() == Some("disk.inodes"))
+        .unwrap();
+    assert_eq!(rule.name, "Disk running out of inodes");
+    assert_eq!(rule.kind, RuleKind::Metric);
+    assert_eq!(
+        rule.levels(),
+        [(Severity::Warning, 80.0), (Severity::Critical, 90.0)]
+    );
+    assert_eq!(rule.comparison, Some(Comparison::Above));
+    assert_eq!(rule.series, None);
+    assert_eq!(rule.for_secs, 300);
+    assert!(rule.enabled);
+    assert!(rule.all_channels);
+    check_rule(rule).unwrap();
+}
+
 /// Marks everything due as sent, as if it had been delivered, and says what it was.
 async fn deliver_all(test: &Harness) -> Vec<Event> {
     let due = test.database().due_deliveries(i64::MAX, 100).await.unwrap();
@@ -869,8 +891,10 @@ async fn disk_at(test: &mut Harness, minute: i64, percent: f64) -> Vec<crate::al
 #[tokio::test]
 async fn one_disk_alert_is_a_warning_then_critical_then_a_warning_again_until_it_clears() {
     let mut test = Harness::start().await;
+    // The test store gives every metric the same reading, so only the disk space
+    // rule is added.
     for rule in built_in_rules().await {
-        if rule.kind == RuleKind::Metric {
+        if rule.kind == RuleKind::Metric && rule.metric.as_deref() == Some("disk.usage") {
             test.database().create_alert_rule(&rule).await.unwrap();
         }
     }
@@ -964,8 +988,10 @@ async fn deliver_by_channel(test: &Harness) -> Vec<(i64, Event)> {
 #[tokio::test]
 async fn a_critical_only_channel_hears_of_an_alert_once_it_is_critical() {
     let mut test = Harness::start().await;
+    // The test store gives every metric the same reading, so only the disk space
+    // rule is added.
     for rule in built_in_rules().await {
-        if rule.kind == RuleKind::Metric {
+        if rule.kind == RuleKind::Metric && rule.metric.as_deref() == Some("disk.usage") {
             test.database().create_alert_rule(&rule).await.unwrap();
         }
     }

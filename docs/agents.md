@@ -81,6 +81,26 @@ To watch only some disks, list their mount points in a config rule under **Disk 
 points**. Those are reported whatever they are, even a disk image or every volume in
 a container.
 
+On Linux, macOS and FreeBSD, each disk also reports how many of its inodes are used.
+A disk that runs out of them can't take new files however much space it has left,
+which the built-in **Disk running out of inodes** rule warns about. Windows file
+systems don't have inodes.
+
+## Processes and logins
+
+Every agent also reports how many processes are running, how many login sessions
+there are and how many files are open, each against the system's limit where it has
+one. They come from the `system` collector, which the Default config rule turns on.
+
+- **Processes** are counted the same way on every system, without their threads.
+  Linux limits threads rather than processes, so a Linux machine also reports its
+  threads, against that limit.
+- **Login sessions** come from `who`, and from `quser` on Windows. Each session counts,
+  so someone with three terminals open counts three times. Windows Home editions
+  don't have `quser`, so they don't report sessions.
+- **Windows** has no system-wide limits like these, so it reports processes and
+  sessions only.
+
 ## Containers
 
 On Linux, an agent can report on every Docker or Podman container on its machine:

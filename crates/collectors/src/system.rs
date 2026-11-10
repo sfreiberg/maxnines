@@ -46,6 +46,9 @@ pub struct Limits {
     open_files: Option<u64>,
     max_processes: Option<u64>,
     processes: Option<u64>,
+    /// Only Linux, whose limit is on threads rather than processes.
+    max_threads: Option<u64>,
+    threads: Option<u64>,
 }
 
 /// Measures how CPU time is spent between one call and the next.
@@ -251,10 +254,31 @@ fn parse_vmstat(text: &str) -> (Option<u64>, Option<u64>) {
     (total("pswpin"), total("pswpout"))
 }
 
+/// Each process has a directory in `/proc` named by its number. Threads don't, as
+/// they're under their process's `task` directory.
+#[cfg(any(target_os = "linux", test))]
+fn count_process_entries<N: AsRef<std::ffi::OsStr>>(names: impl Iterator<Item = N>) -> u64 {
+    names
+        .filter(|name| {
+            name.as_ref()
+                .to_str()
+                .is_some_and(|name| !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .count() as u64
+}
+
+#[cfg(target_os = "linux")]
+fn process_count() -> Option<u64> {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    Some(count_process_entries(entries.filter_map(|entry| {
+        entry.ok().map(|entry| entry.file_name())
+    })))
+}
+
 /// Reads `/proc/loadavg`, whose fourth field is `running/total`. Linux counts every
 /// thread here, and it's threads that its limits apply to.
 #[cfg(any(target_os = "linux", test))]
-fn parse_task_count(text: &str) -> Option<u64> {
+fn parse_thread_count(text: &str) -> Option<u64> {
     text.split_whitespace()
         .nth(3)?
         .split_once('/')?
@@ -294,17 +318,21 @@ pub fn limits() -> Limits {
         open_files: std::fs::read_to_string("/proc/sys/fs/file-nr")
             .ok()
             .and_then(|text| parse_file_nr(&text)),
-        // Whichever runs out first.
-        max_processes: [
+        // Every thread takes a process ID, so both limits apply to threads, and
+        // whichever runs out first is the one that matters. Processes have no limit
+        // of their own.
+        max_processes: None,
+        processes: process_count(),
+        max_threads: [
             number("/proc/sys/kernel/pid_max"),
             number("/proc/sys/kernel/threads-max"),
         ]
         .into_iter()
         .flatten()
         .min(),
-        processes: std::fs::read_to_string("/proc/loadavg")
+        threads: std::fs::read_to_string("/proc/loadavg")
             .ok()
-            .and_then(|text| parse_task_count(&text)),
+            .and_then(|text| parse_thread_count(&text)),
     }
 }
 
@@ -348,6 +376,7 @@ pub fn limits() -> Limits {
         open_files: sysctl_number("kern.openfiles"),
         max_processes: sysctl_number("kern.maxproc"),
         processes: process_count(),
+        ..Limits::default()
     }
 }
 
@@ -358,6 +387,7 @@ pub fn limits() -> Limits {
         open_files: sysctl_number("kern.num_files"),
         max_processes: sysctl_number("kern.maxproc"),
         processes: process_count(),
+        ..Limits::default()
     }
 }
 
@@ -483,6 +513,8 @@ pub fn report(limits: &Limits, sessions: Option<u64>) -> Value {
         "open_files": limits.open_files,
         "max_processes": limits.max_processes,
         "processes": limits.processes,
+        "max_threads": limits.max_threads,
+        "threads": limits.threads,
         "login_sessions": sessions,
     })
 }
@@ -606,10 +638,25 @@ pgpgin 900
     }
 
     #[test]
-    fn loadavg_gives_the_number_of_tasks() {
-        assert_eq!(parse_task_count("0.20 0.18 0.12 1/80 11206\n"), Some(80));
-        assert_eq!(parse_task_count("0.20 0.18 0.12"), None);
-        assert_eq!(parse_task_count(""), None);
+    fn loadavg_gives_the_number_of_threads() {
+        assert_eq!(parse_thread_count("0.20 0.18 0.12 1/80 11206\n"), Some(80));
+        assert_eq!(parse_thread_count("0.20 0.18 0.12"), None);
+        assert_eq!(parse_thread_count(""), None);
+    }
+
+    #[test]
+    fn only_numbered_proc_entries_are_processes() {
+        let names = [
+            "1",
+            "42",
+            "self",
+            "thread-self",
+            "cpuinfo",
+            "sys",
+            "",
+            "12a",
+        ];
+        assert_eq!(count_process_entries(names.iter()), 2);
     }
 
     #[test]
@@ -679,6 +726,17 @@ pgpgin 900
             processes > 1 && processes < limits.max_processes.unwrap(),
             "{limits:?}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn this_linux_machine_counts_processes_and_threads_apart() {
+        let limits = limits();
+        let processes = limits.processes.unwrap();
+        let threads = limits.threads.unwrap();
+        assert!(processes > 1 && processes <= threads, "{limits:?}");
+        assert!(threads < limits.max_threads.unwrap(), "{limits:?}");
+        assert_eq!(limits.max_processes, None);
     }
 
     #[cfg(target_os = "macos")]

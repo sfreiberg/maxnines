@@ -657,6 +657,32 @@ pub const METRICS: &[Metric] = &[
         )]),
         chart: ShowChart::WithData,
     },
+    // Only Linux sends threads, as its limit is on them rather than on processes.
+    Metric {
+        name: "system.threads",
+        title: "Threads",
+        unit: Unit::Number,
+        collector: "system",
+        source: Source::Fields(&[
+            ("Running", Reading::Field("$.threads")),
+            ("Limit", Reading::Field("$.max_threads")),
+        ]),
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "system.threads_used",
+        title: "Thread limit used",
+        unit: Unit::Percent,
+        collector: "system",
+        source: Source::Fields(&[(
+            "Used",
+            Reading::Percent {
+                part: "$.threads",
+                whole: "$.max_threads",
+            },
+        )]),
+        chart: ShowChart::WithData,
+    },
     Metric {
         name: "system.sessions",
         title: "Login sessions",

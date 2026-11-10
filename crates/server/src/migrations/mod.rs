@@ -35,6 +35,8 @@ impl MigratorTrait for Migrator {
             Box::new(AddChannelRequests),
             Box::new(AddForecasts),
             Box::new(CreateDashboardVariables),
+            Box::new(TurnOnSystemCollector),
+            Box::new(AddBuiltInInodeAlert),
         ]
     }
 }
@@ -2611,6 +2613,142 @@ impl MigrationTrait for CreateDashboardVariables {
     }
 }
 
+// ---- Processes and login sessions by default
+
+struct TurnOnSystemCollector;
+
+impl MigrationName for TurnOnSystemCollector {
+    fn name(&self) -> &str {
+        "m20261110_000024_turn_on_system_collector"
+    }
+}
+
+const SYSTEM_SETTING: &str = "collectors.system.enabled";
+
+/// Adds processes, login sessions and open files to what every machine reports,
+/// by turning the system collector on in the Default rule. A Default rule that
+/// already turns it on or off is left as it is, as is a server whose Default rule
+/// has been renamed or deleted.
+#[async_trait::async_trait]
+impl MigrationTrait for TurnOnSystemCollector {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let connection = manager.get_connection();
+        let default_rule = Query::select()
+            .column(ConfigRules::Id)
+            .from(ConfigRules::Table)
+            .and_where(Expr::col(ConfigRules::Name).eq("Default"))
+            .to_owned();
+        let Some(row) = connection.query_one(&default_rule).await? else {
+            return Ok(());
+        };
+        let rule_id: i64 = row.try_get("", "id")?;
+        let existing = Query::select()
+            .column(ConfigRuleSettings::Id)
+            .from(ConfigRuleSettings::Table)
+            .and_where(Expr::col(ConfigRuleSettings::RuleId).eq(rule_id))
+            .and_where(Expr::col(ConfigRuleSettings::Name).eq(SYSTEM_SETTING))
+            .to_owned();
+        if connection.query_one(&existing).await?.is_some() {
+            return Ok(());
+        }
+        let setting = Query::insert()
+            .into_table(ConfigRuleSettings::Table)
+            .columns([
+                ConfigRuleSettings::RuleId,
+                ConfigRuleSettings::Name,
+                ConfigRuleSettings::Value,
+                ConfigRuleSettings::ValueType,
+            ])
+            .values([
+                rule_id.into(),
+                SYSTEM_SETTING.into(),
+                "true".into(),
+                "boolean".into(),
+            ])
+            .map_err(|error| DbErr::Custom(error.to_string()))?
+            .to_owned();
+        manager.exec_stmt(setting).await
+    }
+
+    /// The setting is left, as it may have been changed since.
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
+    }
+}
+
+// ---- Inodes running out
+
+struct AddBuiltInInodeAlert;
+
+impl MigrationName for AddBuiltInInodeAlert {
+    fn name(&self) -> &str {
+        "m20261110_000025_add_built_in_inode_alert"
+    }
+}
+
+const DISK_INODES: &str = "disk.inodes";
+/// Its name, and how much of a disk's inodes are used when it's a warning and when
+/// it's critical, like the disk space rule.
+const INODE_RULE: (&str, f64, f64) = ("Disk running out of inodes", 80.0, 90.0);
+
+/// Alerts when a disk's inodes are running out, which stops new files being made
+/// however much space is left. It tells every channel, like the other built-in
+/// rules, and a server with a rule on inodes already doesn't get it.
+#[async_trait::async_trait]
+impl MigrationTrait for AddBuiltInInodeAlert {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let existing = Query::select()
+            .column(AlertRules::Id)
+            .from(AlertRules::Table)
+            .and_where(Expr::col(AlertRules::Metric).eq(DISK_INODES))
+            .limit(1)
+            .to_owned();
+        if manager
+            .get_connection()
+            .query_one(&existing)
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let (name, warning, critical) = INODE_RULE;
+        let rule = Query::insert()
+            .into_table(AlertRules::Table)
+            .columns([
+                AlertRules::Name.into_iden(),
+                AlertRules::Kind.into_iden(),
+                AlertRules::Metric.into_iden(),
+                AlertRules::Comparison.into_iden(),
+                AlertRules::Threshold.into_iden(),
+                WarningThresholds::WarningThreshold.into_iden(),
+                AlertRules::ForSecs.into_iden(),
+                AlertRules::Severity.into_iden(),
+                AlertRules::Enabled.into_iden(),
+                EveryChannel::AllChannels.into_iden(),
+            ])
+            .values([
+                name.into(),
+                "metric".into(),
+                DISK_INODES.into(),
+                "above".into(),
+                critical.into(),
+                warning.into(),
+                DISK_RULE_SECS.into(),
+                "critical".into(),
+                true.into(),
+                true.into(),
+            ])
+            .map_err(|error| DbErr::Custom(error.to_string()))?
+            .to_owned();
+        manager.exec_stmt(rule).await
+    }
+
+    /// The rule is left, as it may have been changed since.
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
@@ -2803,5 +2941,90 @@ mod tests {
         );
         let row = connection.query_one_raw(query).await.unwrap().unwrap();
         assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0);
+    }
+
+    async fn system_settings(connection: &impl ConnectionTrait) -> Vec<String> {
+        let query = Statement::from_string(
+            connection.get_database_backend(),
+            "SELECT value FROM config_rule_settings WHERE name = 'collectors.system.enabled'",
+        );
+        let rows = connection.query_all_raw(query).await.unwrap();
+        rows.iter()
+            .map(|row| row.try_get::<String>("", "value").unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_default_rule_turns_on_the_system_collector() {
+        let connection = fresh().await;
+        Migrator::up(&connection, None).await.unwrap();
+        assert_eq!(system_settings(&connection).await, ["true"]);
+    }
+
+    #[tokio::test]
+    async fn a_default_rule_that_already_chose_keeps_its_choice() {
+        let connection = fresh().await;
+        Migrator::up(&connection, Some(before(&TurnOnSystemCollector)))
+            .await
+            .unwrap();
+        connection
+            .execute_unprepared(
+                "INSERT INTO config_rule_settings (rule_id, name, value, value_type)
+                 SELECT id, 'collectors.system.enabled', 'false', 'boolean'
+                 FROM config_rules WHERE name = 'Default'",
+            )
+            .await
+            .unwrap();
+
+        Migrator::up(&connection, None).await.unwrap();
+
+        assert_eq!(system_settings(&connection).await, ["false"]);
+    }
+
+    #[tokio::test]
+    async fn a_server_without_a_default_rule_gets_none() {
+        let connection = fresh().await;
+        Migrator::up(&connection, Some(before(&TurnOnSystemCollector)))
+            .await
+            .unwrap();
+        connection
+            .execute_unprepared(
+                "UPDATE config_rules SET name = 'Everything' WHERE name = 'Default'",
+            )
+            .await
+            .unwrap();
+
+        Migrator::up(&connection, None).await.unwrap();
+
+        assert!(system_settings(&connection).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_built_in_inode_rule_is_not_added_beside_one_already_there() {
+        let connection = fresh().await;
+        Migrator::up(&connection, Some(before(&AddBuiltInInodeAlert)))
+            .await
+            .unwrap();
+        connection
+            .execute_unprepared(
+                "INSERT INTO alert_rules
+                   (name, kind, metric, comparison, threshold, for_secs, severity, enabled)
+                 VALUES ('Inodes', 'metric', 'disk.inodes', 'above', 95, 60, 'critical', TRUE)",
+            )
+            .await
+            .unwrap();
+
+        Migrator::up(&connection, None).await.unwrap();
+
+        let query = Statement::from_string(
+            connection.get_database_backend(),
+            "SELECT name FROM alert_rules WHERE metric = 'disk.inodes'",
+        );
+        let rows = connection.query_all_raw(query).await.unwrap();
+        let names: Vec<String> = rows
+            .iter()
+            .map(|row| row.try_get::<String>("", "name").unwrap())
+            .collect();
+        assert_eq!(names, ["Inodes"]);
     }
 }

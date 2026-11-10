@@ -1293,7 +1293,8 @@ async fn an_approved_agent_is_sent_the_default_config() {
 
     assert_eq!(version, config.version().unwrap());
     assert_eq!(config.interval_secs, 15);
-    assert_eq!(config.collectors.len(), 5);
+    assert_eq!(config.collectors.len(), 6);
+    assert!(config.collectors["system"].enabled);
 }
 
 #[tokio::test]

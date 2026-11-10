@@ -673,6 +673,7 @@ fn limits_and_sessions_read_what_the_agent_sends() {
     let data = json!({
         "open_files": 250, "max_open_files": 1000,
         "processes": 1024, "max_processes": 4096, "login_sessions": 2,
+        "threads": 3000, "max_threads": 30000,
     });
     write_metric(&mut store, "a", 1000, "system", data);
 
@@ -683,6 +684,10 @@ fn limits_and_sessions_read_what_the_agent_sends() {
     assert_eq!(
         newest(&store, "system.processes_used", 0, HOUR_MS)[0].value,
         25.0
+    );
+    assert_eq!(
+        newest(&store, "system.threads_used", 0, HOUR_MS)[0].value,
+        10.0
     );
     assert_eq!(newest(&store, "system.sessions", 0, HOUR_MS)[0].value, 2.0);
     assert_eq!(
