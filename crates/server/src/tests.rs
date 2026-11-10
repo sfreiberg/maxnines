@@ -5,6 +5,7 @@ mod audit;
 mod dashboards;
 mod docs;
 mod roles;
+mod two_factor;
 mod users;
 
 use std::collections::{BTreeMap, HashMap};
@@ -178,6 +179,7 @@ async fn start_with_heartbeat(
         csrf: CsrfConfig::default(),
         web_url: "http://site.test".into(),
         sign_ins: Arc::default(),
+        require_two_factor: Arc::default(),
     };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

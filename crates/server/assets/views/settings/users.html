@@ -33,6 +33,23 @@
   </dl>
 </section>
 
+<section class="card">
+  <h2>Two-factor sign-in</h2>
+  {% if two_factor_required %}
+  <p><span class="badge good">Required</span> Everyone has to set up an authenticator app before they can use MaxNines. API keys keep working.</p>
+  <form method="post" action="/settings/users/two-factor">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <button type="submit" name="required" value="false" class="secondary">Make it optional</button>
+  </form>
+  {% else %}
+  <p class="hint">Each person can turn it on from their profile. Requiring it sends anyone without it to their profile to set it up when they next open a page. API keys keep working.</p>
+  <form method="post" action="/settings/users/two-factor">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <button type="submit" name="required" value="true" class="secondary">Require it for everyone</button>
+  </form>
+  {% endif %}
+</section>
+
 <div class="tablebox"><table>
   <thead>
     <tr><th>Name</th><th>Email</th><th>Role</th><th>Last sign in</th><th>Status</th><th></th></tr>
@@ -52,13 +69,14 @@
         </form>
       </td>
       <td class="nowrap">{% if person.last_sign_in %}{{ person.last_sign_in }}{% else %}Never{% endif %}</td>
-      <td><span class="badge {% if person.disabled %}neutral{% elif person.status == "Active" %}good{% else %}warn{% endif %}">{{ person.status }}</span></td>
+      <td><span class="badge {% if person.disabled %}neutral{% elif person.status == "Active" %}good{% else %}warn{% endif %}">{{ person.status }}</span>{% if person.two_factor %} <span class="badge neutral">Two-factor</span>{% endif %}</td>
       <td>
         <div class="actions row-actions">
           {% if person.disabled %}
           <form method="post" action="/settings/users/{{ person.id }}/enable"><input type="hidden" name="authenticity_token" value="{{ csrf_token }}"><button type="submit" class="secondary">Enable</button></form>
           <form method="post" action="/settings/users/{{ person.id }}/delete"><input type="hidden" name="authenticity_token" value="{{ csrf_token }}"><button type="submit" class="danger">Delete</button></form>
           {% else %}
+          {% if person.two_factor %}<form method="post" action="/settings/users/{{ person.id }}/two-factor/reset"><input type="hidden" name="authenticity_token" value="{{ csrf_token }}"><button type="submit" class="secondary" title="For someone who's lost their phone and their recovery codes">Reset two-factor</button></form>{% endif %}
           <form method="post" action="/settings/users/{{ person.id }}/setup-link"><input type="hidden" name="authenticity_token" value="{{ csrf_token }}"><button type="submit" class="secondary">New password link</button></form>
           {% if not person.is_you %}<form method="post" action="/settings/users/{{ person.id }}/disable"><input type="hidden" name="authenticity_token" value="{{ csrf_token }}"><button type="submit" class="danger">Disable</button></form>{% endif %}
           {% endif %}

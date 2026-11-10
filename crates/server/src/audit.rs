@@ -217,10 +217,12 @@ pub enum Kind {
     RemoteCheck,
     LocationRule,
     Dashboard,
+    /// A setting for the whole server.
+    Setting,
 }
 
 impl Kind {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::User,
         Self::ApiKey,
         Self::Agent,
@@ -233,6 +235,7 @@ impl Kind {
         Self::RemoteCheck,
         Self::LocationRule,
         Self::Dashboard,
+        Self::Setting,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -249,6 +252,7 @@ impl Kind {
             Self::RemoteCheck => "remote_check",
             Self::LocationRule => "location_rule",
             Self::Dashboard => "dashboard",
+            Self::Setting => "setting",
         }
     }
 
@@ -266,6 +270,7 @@ impl Kind {
             Self::RemoteCheck => "Remote check",
             Self::LocationRule => "Location rule",
             Self::Dashboard => "Dashboard",
+            Self::Setting => "Setting",
         }
     }
 

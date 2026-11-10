@@ -177,6 +177,11 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/users/{id}/disable", post(disable_user))
         .route("/users/{id}/enable", post(enable_user))
         .route("/users/{id}/setup-link", post(new_setup_link))
+        .route("/users/{id}/two-factor/reset", post(reset_two_factor))
+        .route(
+            "/users/two-factor",
+            get(two_factor_requirement).put(require_two_factor),
+        )
         .route_layer(middleware::from_fn_with_state(state, require_token))
         .fallback(no_such_route)
 }
@@ -349,6 +354,39 @@ async fn enable_user(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -
 
 async fn delete_user(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
     after_user_change(state.database.delete_user(id).await)
+}
+
+/// Turns off someone's two-factor, for when they've lost their phone and codes.
+async fn reset_two_factor(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.turn_off_two_factor(id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => no_such_user(),
+        Err(error) => server_error(&error),
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct TwoFactorRequirement {
+    /// Whether everyone has to set up two-factor to use the pages.
+    required: bool,
+}
+
+async fn two_factor_requirement(State(state): State<AppState>) -> Response {
+    let required = state
+        .require_two_factor
+        .load(std::sync::atomic::Ordering::Relaxed);
+    Json(TwoFactorRequirement { required }).into_response()
+}
+
+async fn require_two_factor(
+    State(state): State<AppState>,
+    Json(input): Json<TwoFactorRequirement>,
+) -> Response {
+    match super::users::require_for_everyone(&state, input.required).await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(problem)) => failed(StatusCode::CONFLICT, problem),
+        Err(error) => server_error(&error),
+    }
 }
 
 /// Replaces a user's setup link, which is also how a forgotten password is reset.

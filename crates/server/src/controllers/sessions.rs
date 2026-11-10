@@ -2,6 +2,7 @@
 //! a login. Agents and the API prove who they are in their own ways.
 
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 
 use axum::Router;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
@@ -18,32 +19,37 @@ use tracing::warn;
 use super::{CsrfForm, Page, api, request_source, run_as, server_error};
 use crate::app_state::AppState;
 use crate::metrics::now_ms;
-use crate::models::{SESSION_LIFETIME_MS, User, check_new_password};
+use crate::models::{CHALLENGE_LIFETIME_MS, SESSION_LIFETIME_MS, User, check_new_password};
 use crate::passwords::{hash_password, password_matches};
 
 const SESSION_COOKIE: &str = "maxnines_session";
 const SIGNED_IN_HOME: &str = "/";
+/// What a browser holds between a right password and a right code.
+const CHALLENGE_COOKIE: &str = "maxnines_challenge";
+const CODE_PAGE: &str = "/login/code";
+/// Where someone sets up two-factor.
+const PROFILE_PAGE: &str = "/profile";
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/login", get(sign_in_page).post(sign_in))
+        .route(CODE_PAGE, get(code_page).post(check_code))
         .route("/logout", post(sign_out))
         .route("/setup/{token}", get(setup_page).post(setup))
 }
 
 /// The session token this browser sent, if any.
 pub fn session_token(headers: &HeaderMap) -> Option<&str> {
+    cookie_named(headers, SESSION_COOKIE)
+}
+
+fn cookie_named<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(';'))
-        .find_map(|cookie| {
-            cookie
-                .trim()
-                .strip_prefix(SESSION_COOKIE)?
-                .strip_prefix('=')
-        })
+        .find_map(|cookie| cookie.trim().strip_prefix(name)?.strip_prefix('='))
 }
 
 async fn session_user(state: &AppState, headers: &HeaderMap) -> anyhow::Result<Option<User>> {
@@ -61,7 +67,17 @@ pub async fn require_login(
     next: Next,
 ) -> Response {
     match session_user(&state, request.headers()).await {
-        Ok(Some(user)) => run_as(&state, user, None, request, next).await,
+        Ok(Some(user)) => {
+            // When everyone has to use two-factor, someone without it can only
+            // reach their profile, to set it up, and sign out.
+            let path = request.uri().path();
+            let required = state.require_two_factor.load(Ordering::Relaxed);
+            let allowed = path.starts_with(PROFILE_PAGE) || path == "/logout";
+            if required && !user.two_factor && !allowed {
+                return redirect(&request, PROFILE_PAGE);
+            }
+            run_as(&state, user, None, request, next).await
+        }
         Ok(None) => match api::key_holder(&state, request.headers()).await {
             Ok(Some((owner, via))) => run_as(&state, owner, Some(via), request, next).await,
             Ok(None) => to_sign_in(&request),
@@ -77,19 +93,21 @@ fn to_sign_in(request: &Request) -> Response {
         .path_and_query()
         .map_or(SIGNED_IN_HOME, |path| path.as_str());
     let query = serde_urlencoded::to_string([("next", path)]).unwrap_or_default();
-    let address = format!("/login?{query}");
+    redirect(request, &format!("/login?{query}"))
+}
 
-    // A page updating itself would swap the sign in form into the page it's showing,
-    // so this asks htmx to leave for it instead.
+/// Sends a browser elsewhere. A page updating itself would swap the other page
+/// into the one it's showing, so this asks htmx to leave for it instead.
+fn redirect(request: &Request, address: &str) -> Response {
     if request.headers().contains_key("hx-request") {
-        let redirect = HeaderValue::from_str(&address).ok();
+        let redirect = HeaderValue::from_str(address).ok();
         let mut response = StatusCode::UNAUTHORIZED.into_response();
         if let Some(redirect) = redirect {
             response.headers_mut().insert("hx-redirect", redirect);
         }
         return response;
     }
-    Redirect::to(&address).into_response()
+    Redirect::to(address).into_response()
 }
 
 /// Only ever a page on this site, so a link can't send someone elsewhere after
@@ -122,6 +140,130 @@ async fn signed_in_response(state: &AppState, user_id: i64, next: &str) -> Respo
     };
     let mut response = Redirect::to(next).into_response();
     if let Some(cookie) = session_cookie(state, token, SESSION_LIFETIME_MS) {
+        response.headers_mut().append(header::SET_COOKIE, cookie);
+    }
+    response
+}
+
+fn challenge_cookie(state: &AppState, value: String, lifetime_ms: i64) -> Option<HeaderValue> {
+    let cookie = Cookie::build((CHALLENGE_COOKIE, value))
+        .path("/login")
+        .http_only(true)
+        .same_site(SameSite::Strict)
+        .secure(state.audience.starts_with("wss://"))
+        .max_age(Duration::milliseconds(lifetime_ms));
+    HeaderValue::from_str(&cookie.to_string()).ok()
+}
+
+/// What follows a right password, or a password set from a link: signed in, or for
+/// someone with two-factor on, asked for a code first.
+async fn after_password(state: &AppState, user: &User, next: &str) -> Response {
+    if !user.two_factor {
+        return signed_in_response(state, user.id, next).await;
+    }
+    let token = match state
+        .database
+        .start_sign_in_challenge(user.id, now_ms())
+        .await
+    {
+        Ok(token) => token,
+        Err(error) => return server_error(&error),
+    };
+    let query = serde_urlencoded::to_string([("next", next)]).unwrap_or_default();
+    let mut response = Redirect::to(&format!("{CODE_PAGE}?{query}")).into_response();
+    if let Some(cookie) = challenge_cookie(state, token, CHALLENGE_LIFETIME_MS) {
+        response.headers_mut().append(header::SET_COOKIE, cookie);
+    }
+    response
+}
+
+/// Who gave the right password and still owes a code, with their token.
+async fn challenged<'a>(
+    state: &AppState,
+    headers: &'a HeaderMap,
+) -> anyhow::Result<Option<(User, &'a str)>> {
+    let Some(token) = cookie_named(headers, CHALLENGE_COOKIE) else {
+        return Ok(None);
+    };
+    let user = state
+        .database
+        .sign_in_challenge_user(token, now_ms())
+        .await?;
+    Ok(user.map(|user| (user, token)))
+}
+
+fn code_form(
+    state: &AppState,
+    token: &CsrfToken,
+    next: &str,
+    problem: Option<(StatusCode, &str)>,
+) -> Response {
+    let page = Page::new(state, token, "sessions/code.html")
+        .with("next", next)
+        .with("error", &problem.map(|(_, error)| error))
+        .with_status(problem.map_or(StatusCode::OK, |(status, _)| status));
+    not_stored(page.render())
+}
+
+async fn code_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    token: CsrfToken,
+    Query(query): Query<SignInQuery>,
+) -> Response {
+    match challenged(&state, &headers).await {
+        Ok(Some(_)) => code_form(&state, &token, safe_next(query.next.as_deref()), None),
+        // It ran out, or they never gave a password.
+        Ok(None) => Redirect::to("/login").into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn check_code(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    form: CsrfForm,
+) -> Response {
+    let next = safe_next(form.fields.get("next").map(String::as_str)).to_string();
+    let (user, challenge) = match challenged(&state, &headers).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return Redirect::to("/login").into_response(),
+        Err(error) => return server_error(&error),
+    };
+    // Guesses at a code are limited as guesses at a password are.
+    let source = request_source(peer, &headers, &state.trusted_proxies);
+    if !state.sign_ins.allow(source, &user.email) {
+        warn!(%source, "too many sign in attempts");
+        let problem = (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many attempts. Wait a minute and try again.",
+        );
+        return code_form(&state, &form.token, &next, Some(problem));
+    }
+    let code = form.fields.get("code").map_or("", String::as_str);
+    let accepted = state
+        .database
+        .accept_two_factor_code(user.id, code, now_ms());
+    match accepted.await {
+        Ok(true) => {}
+        Ok(false) => {
+            let failed = state
+                .database
+                .record_failed_sign_in(&user.email, Some(&user));
+            if let Err(error) = failed.await {
+                return server_error(&error);
+            }
+            let problem = (StatusCode::UNAUTHORIZED, "That code isn't right.");
+            return code_form(&state, &form.token, &next, Some(problem));
+        }
+        Err(error) => return server_error(&error),
+    }
+    if let Err(error) = state.database.end_sign_in_challenge(challenge).await {
+        return server_error(&error);
+    }
+    let mut response = signed_in_response(&state, user.id, &next).await;
+    if let Some(cookie) = challenge_cookie(&state, String::new(), 0) {
         response.headers_mut().append(header::SET_COOKIE, cookie);
     }
     response
@@ -193,7 +335,7 @@ async fn sign_in(
         Err(error) => return server_error(&error),
     };
     if matches && let Some(user) = &user {
-        return signed_in_response(&state, user.id, &next).await;
+        return after_password(&state, user, &next).await;
     }
     if let Err(error) = state
         .database
@@ -291,7 +433,7 @@ async fn setup(
         .use_setup_link(user.id, &link, &hash, now_ms())
         .await;
     match saved {
-        Ok(true) => signed_in_response(&state, user.id, SIGNED_IN_HOME).await,
+        Ok(true) => after_password(&state, &user, SIGNED_IN_HOME).await,
         Ok(false) => setup_form(&state, &form.token, &link, None, None),
         Err(error) => server_error(&error),
     }

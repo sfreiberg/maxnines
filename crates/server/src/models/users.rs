@@ -57,6 +57,8 @@ pub struct User {
     /// What the pages show times in, from the time zone database.
     pub time_zone: String,
     pub has_password: bool,
+    /// Whether signing in also takes a code from their authenticator app.
+    pub two_factor: bool,
     pub created_ms: i64,
     pub last_sign_in_ms: Option<i64>,
     pub disabled_ms: Option<i64>,
@@ -67,6 +69,7 @@ impl From<user::Model> for User {
         Self {
             id: row.id,
             has_password: row.password_hash.is_some(),
+            two_factor: row.totp_enabled,
             // Only real roles are saved, so the least stands in for one a later
             // version has dropped.
             role: Role::parse(&row.role).unwrap_or(Role::Viewer),
@@ -138,7 +141,7 @@ pub fn is_theme(theme: &str) -> bool {
     THEMES.iter().any(|(name, _)| *name == theme)
 }
 
-fn token_hash(token: &str) -> String {
+pub(super) fn token_hash(token: &str) -> String {
     hex::encode(hash_token(token))
 }
 
@@ -153,6 +156,7 @@ fn snapshot(row: &user::Model) -> Snapshot {
         "time_zone": row.time_zone,
         "password": row.password_hash,
         "disabled": row.disabled_ms.is_some(),
+        "two_factor": row.totp_enabled,
     });
     Snapshot::new(row.email.clone(), fields).with_secrets(&["password"])
 }
@@ -164,7 +168,10 @@ fn as_actor(row: &user::Model) -> Actor {
     }
 }
 
-async fn load<C: ConnectionTrait>(connection: &C, id: i64) -> Result<Option<user::Model>> {
+pub(super) async fn load<C: ConnectionTrait>(
+    connection: &C,
+    id: i64,
+) -> Result<Option<user::Model>> {
     user::Entity::find_by_id(id)
         .one(connection)
         .await
@@ -172,7 +179,7 @@ async fn load<C: ConnectionTrait>(connection: &C, id: i64) -> Result<Option<user
 }
 
 /// Records how a user changed from `before`, reading them as they are now.
-async fn record_user<C: ConnectionTrait>(
+pub(super) async fn record_user<C: ConnectionTrait>(
     connection: &C,
     id: i64,
     before: Option<&user::Model>,
@@ -524,6 +531,7 @@ impl Database {
             .exec(&transaction)
             .await
             .context("ending sessions")?;
+        super::two_factor::forget(&transaction, id).await?;
         // Their keys act as them, so they go too.
         let keys = api_key::Entity::find()
             .filter(api_key::Column::UserId.eq(id))

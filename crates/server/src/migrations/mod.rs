@@ -31,6 +31,7 @@ impl MigratorTrait for Migrator {
             Box::new(AddApiKeyOwners),
             Box::new(AddAuditVia),
             Box::new(AddRoles),
+            Box::new(AddTwoFactor),
         ]
     }
 }
@@ -2158,6 +2159,173 @@ impl MigrationTrait for AddRoles {
                     .to_owned(),
             )
             .await
+    }
+}
+
+// ---- Two-factor sign-in
+
+struct AddTwoFactor;
+
+impl MigrationName for AddTwoFactor {
+    fn name(&self) -> &str {
+        "m20261110_000020_add_two_factor"
+    }
+}
+
+#[derive(Iden)]
+enum UserTwoFactor {
+    #[iden = "users"]
+    Table,
+    /// The secret shared with their authenticator app. It has to be kept as it
+    /// is, as the server works out the same codes from it.
+    TotpSecret,
+    /// Off until they've proved the app works by typing a code from it.
+    TotpEnabled,
+    /// The last 30-second step a code was accepted for, so none works twice.
+    TotpLastStep,
+}
+
+#[derive(Iden)]
+enum RecoveryCodes {
+    Table,
+    Id,
+    UserId,
+    /// Only the hash is kept.
+    CodeHash,
+    UsedMs,
+}
+
+/// Someone who has given their password and still owes a code.
+#[derive(Iden)]
+enum SignInChallenges {
+    Table,
+    Id,
+    UserId,
+    /// Only the hash is kept.
+    TokenHash,
+    ExpiresMs,
+}
+
+/// Settings admins change on the pages, by name.
+#[derive(Iden)]
+enum ServerSettings {
+    Table,
+    Name,
+    Value,
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for AddTwoFactor {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let columns = [
+            ColumnDef::new(UserTwoFactor::TotpSecret)
+                .string_len(128)
+                .null()
+                .to_owned(),
+            ColumnDef::new(UserTwoFactor::TotpEnabled)
+                .boolean()
+                .not_null()
+                .default(false)
+                .to_owned(),
+            ColumnDef::new(UserTwoFactor::TotpLastStep)
+                .big_integer()
+                .null()
+                .to_owned(),
+        ];
+        for column in columns {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(UserTwoFactor::Table)
+                        .add_column(column)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        manager
+            .create_table(
+                Table::create()
+                    .table(RecoveryCodes::Table)
+                    .col(id(RecoveryCodes::Id))
+                    .col(
+                        ColumnDef::new(RecoveryCodes::UserId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(RecoveryCodes::CodeHash)
+                            .string_len(64)
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(RecoveryCodes::UsedMs).big_integer().null())
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(SignInChallenges::Table)
+                    .col(id(SignInChallenges::Id))
+                    .col(
+                        ColumnDef::new(SignInChallenges::UserId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(SignInChallenges::TokenHash)
+                            .string_len(64)
+                            .not_null()
+                            .unique_key(),
+                    )
+                    .col(
+                        ColumnDef::new(SignInChallenges::ExpiresMs)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(ServerSettings::Table)
+                    .col(
+                        ColumnDef::new(ServerSettings::Name)
+                            .string_len(64)
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(ServerSettings::Value)
+                            .string_len(255)
+                            .not_null(),
+                    )
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        drop_tables(
+            manager,
+            &["server_settings", "sign_in_challenges", "recovery_codes"],
+        )
+        .await?;
+        for column in [
+            UserTwoFactor::TotpSecret,
+            UserTwoFactor::TotpEnabled,
+            UserTwoFactor::TotpLastStep,
+        ] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(UserTwoFactor::Table)
+                        .drop_column(column)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
     }
 }
 

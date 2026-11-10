@@ -1561,6 +1561,7 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
     "theme": "carbon",
     "time_zone": "UTC",
     "has_password": false,
+    "two_factor": false,
     "created_ms": 1793977895109,
     "last_sign_in_ms": null,
     "disabled_ms": null
@@ -1593,6 +1594,37 @@ curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"theme": "paper", "time_zone": "America/New_York"}' \
   "$MAXNINES_URL/api/v1/users/2"
+```
+
+### Reset a user's two-factor sign-in
+
+`POST /api/v1/users/{id}/two-factor/reset`
+
+Turns off [two-factor sign-in](users.md#two-factor-sign-in) for someone who's lost
+their phone and their recovery codes, so they can sign in with their password and set
+it up again. A user's `two_factor` says whether they have it on. Setting it up needs
+the person and their phone, so it's only done on their profile page.
+
+```sh
+curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  "$MAXNINES_URL/api/v1/users/2/two-factor/reset"
+```
+
+### Require two-factor for everyone
+
+`GET /api/v1/users/two-factor`
+
+`PUT /api/v1/users/two-factor`
+
+Whether everyone has to set up two-factor before using the pages, as
+`{"required": true}`. Requiring it gives `409` unless the key's owner has two-factor
+themselves. API keys keep working either way.
+
+```sh
+curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"required": true}' \
+  "$MAXNINES_URL/api/v1/users/two-factor"
 ```
 
 ### Make a new setup link

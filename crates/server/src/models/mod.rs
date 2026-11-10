@@ -23,12 +23,16 @@ mod maintenance_window;
 mod maintenance_windows;
 mod notification;
 mod notification_channel;
+mod recovery_code;
 mod remote_check;
 mod remote_checks;
 mod server_secret;
+mod server_setting;
+mod sign_in_challenge;
 mod silence;
 mod silences;
 mod stats;
+mod two_factor;
 mod user;
 mod user_session;
 mod users;
@@ -54,6 +58,7 @@ use tokio::sync::Mutex;
 
 use self::audit::record_change;
 pub use self::stats::DatabaseStats;
+pub use self::two_factor::CHALLENGE_LIFETIME_MS;
 pub use self::users::{
     DEFAULT_THEME, SESSION_LIFETIME_MS, THEMES, User, UserChange, check_new_password,
     check_new_user, is_theme,

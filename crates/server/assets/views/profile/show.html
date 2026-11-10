@@ -44,7 +44,55 @@
   </form>
 </section>
 
+{% if new_codes %}
+<section class="card">
+  <h2>Your recovery codes</h2>
+  <p class="hint">Keep these somewhere safe, away from your phone. Each one signs you in once if you can't use your authenticator app. They can't be shown again, and these replace any you had before.</p>
+  <ul class="recovery-codes">
+    {% for code in new_codes %}<li><code>{{ code }}</code></li>{% endfor %}
+  </ul>
+</section>
+{% endif %}
+
 {% if person.has_password %}
+<section class="card" id="two-factor">
+  <h2>Two-factor sign-in</h2>
+  {% if two_factor.on %}
+  <p><span class="badge good">On</span> Signing in takes your password and a code from your authenticator app. You have {{ two_factor.codes_left }} recovery code{{ two_factor.codes_left | pluralize }} left.</p>
+  <form method="post" action="/profile/two-factor/codes" class="stacked">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <input type="text" name="username" value="{{ person.email }}" autocomplete="username" hidden>
+    <label>Current password <input type="password" name="current" autocomplete="current-password" required></label>
+    <div class="actions">
+      <button type="submit" class="secondary">New recovery codes</button>
+      {% if not two_factor.required %}<button type="submit" class="danger" formaction="/profile/two-factor/off">Turn off two-factor</button>{% endif %}
+    </div>
+    {% if two_factor.required %}<small class="hint">An admin has made two-factor required for everyone, so it can't be turned off.</small>{% endif %}
+  </form>
+  {% elif two_factor.pending_secret %}
+  <ol class="setup">
+    <li>Scan this with an authenticator app, such as Authy, Google Authenticator or 1Password.
+      <p><img class="qr" src="/profile/two-factor/qr.png" width="220" height="220" alt="QR code for your authenticator app"></p>
+      <p class="hint">Can't scan it? Type this into the app instead: <code class="secret">{{ two_factor.pending_secret }}</code></p>
+    </li>
+    <li>Type the six-digit code the app shows, to check it works.
+      <form method="post" action="/profile/two-factor/confirm" class="stacked">
+        <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+        <label>Code <input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="7" required></label>
+        <div class="actions"><button type="submit">Turn on two-factor</button></div>
+      </form>
+    </li>
+  </ol>
+  {% else %}
+  {% if two_factor.required %}<p class="notice">An admin has made two-factor required for everyone. Set it up here to use the rest of MaxNines.</p>{% endif %}
+  <p class="hint">Adds a second step when you sign in: a six-digit code from an authenticator app on your phone, such as Authy.</p>
+  <form method="post" action="/profile/two-factor/start">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <button type="submit">Set up two-factor</button>
+  </form>
+  {% endif %}
+</section>
+
 <section class="card">
   <h2>Password</h2>
   <form method="post" action="/profile/password" class="stacked">

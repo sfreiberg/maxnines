@@ -8,8 +8,10 @@ and there's no way to change or delete them from MaxNines.
 ## What's recorded
 
 - Signing in, signing out, and failed sign ins, with the email address that was tried
-- Users: adding, disabling, enabling and deleting them, password changes, new
-  password links, and each person's theme and time zone
+- Users: adding, disabling, enabling and deleting them, role changes, password
+  changes, new password links, two-factor being turned on, off or reset, and each
+  person's theme and time zone
+- Two-factor being made required for everyone, or optional again
 - API keys being created and revoked, and deleted with their owner
 - Agents being approved, revoked, renamed by their machine, and deleted, and new agents
   asking to join

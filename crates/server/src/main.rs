@@ -37,6 +37,7 @@ mod slack_actions;
 mod store;
 mod times;
 mod tls;
+mod two_factor;
 mod views;
 
 #[cfg(test)]
@@ -128,6 +129,8 @@ enum UsersCommand {
         #[arg(value_parser = roles::Role::parse)]
         role: roles::Role,
     },
+    /// Turn off someone's two-factor sign-in, as when they've lost their phone
+    ResetTwoFactor { id: i64 },
     /// Print a new link for someone to set a password, as when they've forgotten it
     SetupLink { id: i64 },
     /// Stop someone signing in, and sign them out
@@ -210,6 +213,7 @@ fn main() -> Result<()> {
                     cli::create_user(&config, &email, &name, role)
                 }
                 UsersCommand::Role { id, role } => cli::set_role(&config, id, role),
+                UsersCommand::ResetTwoFactor { id } => cli::reset_two_factor(&config, id),
                 UsersCommand::SetupLink { id } => cli::print_setup_link(&config, id),
                 UsersCommand::Disable { id } => cli::change_user(&config, id, "disable"),
                 UsersCommand::Enable { id } => cli::change_user(&config, id, "enable"),
@@ -261,6 +265,7 @@ async fn serve(path: &Path) -> Result<()> {
     )?);
     let (writer, writer_thread) = store::spawn_writer(store, status.writes.clone());
 
+    let require_two_factor = database.two_factor_required().await?;
     let state = AppState {
         presence: Arc::new(Presence::default()),
         registry: Arc::new(Registry::new(
@@ -286,6 +291,7 @@ async fn serve(path: &Path) -> Result<()> {
         csrf,
         web_url: web_url(config.audience()).unwrap_or_default().into(),
         sign_ins: Arc::default(),
+        require_two_factor: Arc::new(require_two_factor.into()),
     };
 
     let listener = TcpListener::bind(config.listen)

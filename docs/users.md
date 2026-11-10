@@ -48,6 +48,39 @@ a tool that only reads, like an AI assistant, can be a Viewer however much its o
 can do. A key never does more than its owner can now, so giving someone a lower role
 lowers their keys with them.
 
+## Two-factor sign-in
+
+Anyone can add a second step to signing in: a six-digit code from an authenticator
+app on their phone, such as Authy, Google Authenticator or 1Password.
+
+1. Open your profile and choose **Set up two-factor**.
+2. Scan the QR code with the app, or type in the secret shown under it.
+3. Type the code the app shows, to check it works.
+4. Keep the 10 recovery codes it then shows somewhere safe, away from your phone.
+   They're only shown once.
+
+From then on, signing in asks for your password, then a code. Each recovery code
+works once in place of a code, for when you can't use the app. Turning two-factor
+off, or getting new recovery codes, takes your password again.
+
+If someone loses their phone and their recovery codes, an admin can choose
+**Reset two-factor** beside them on the Users page, or run:
+
+```sh
+maxnines-server users reset-two-factor <id>
+```
+
+They then sign in with their password alone and can set it up again.
+
+An admin can also require it for everyone, from the Users page. Anyone without it is
+sent to their profile to set it up before they can open anything else. The admin
+turning this on has to have two-factor themselves first. API keys aren't affected:
+they keep working whether or not their owner has two-factor.
+
+Codes depend on the time, so the server's clock has to be right to within about 30
+seconds. The secret each app shares is kept in the main database as it is, because
+the server needs it to work out the same codes, so keep that database private.
+
 ## Time zones
 
 Everyone sees times in UTC until they choose their own time zone on their profile.

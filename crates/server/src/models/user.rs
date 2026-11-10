@@ -21,6 +21,10 @@ pub struct Model {
     pub created_ms: i64,
     pub last_sign_in_ms: Option<i64>,
     pub disabled_ms: Option<i64>,
+    /// The secret shared with their authenticator app.
+    pub totp_secret: Option<String>,
+    pub totp_enabled: bool,
+    pub totp_last_step: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -1,0 +1,14 @@
+{% extends "layouts/public.html" %}
+{% block title %}Sign in · MaxNines{% endblock title %}
+{% block content %}
+<h1>Enter your code</h1>
+<p class="hint">Open your authenticator app and type the six-digit code it shows for MaxNines. If you've lost it, type one of your recovery codes instead.</p>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+<form method="post" action="/login/code" class="stacked">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  <input type="hidden" name="next" value="{{ next }}">
+  <label>Code <input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" autocapitalize="none" spellcheck="false" maxlength="32" required autofocus></label>
+  <button type="submit">Sign in</button>
+</form>
+<p><a href="/login">Start again</a></p>
+{% endblock content %}

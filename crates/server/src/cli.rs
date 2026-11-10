@@ -366,6 +366,17 @@ fn changed(change: UserChange, done: &str) -> Result<()> {
     }
 }
 
+pub fn reset_two_factor(config: &Config, id: i64) -> Result<()> {
+    let found = with_database(config, |database| async move {
+        database.turn_off_two_factor(id).await
+    })?;
+    if !found {
+        bail!("no user with that ID");
+    }
+    println!("two-factor is off for {id}, until they set it up again");
+    Ok(())
+}
+
 pub fn set_role(config: &Config, id: i64, role: Role) -> Result<()> {
     let change = with_database(config, |database| async move {
         database.set_role(id, role).await
