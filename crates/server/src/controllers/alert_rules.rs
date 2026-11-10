@@ -11,7 +11,9 @@ use serde::Serialize;
 
 use super::condition_form::{ConditionForm, operators};
 use super::{CsrfForm, Page, server_error};
-use crate::alerting::{AlertRuleInput, Comparison, RuleKind, Severity};
+use crate::alerting::{
+    AlertRuleInput, Comparison, DEFAULT_FORECAST_WINDOW_SECS, RuleKind, Severity,
+};
 use crate::app_state::AppState;
 use crate::calculations::Calculation;
 use crate::condition_builder::Builder;
@@ -49,6 +51,12 @@ struct AlertRuleForm {
     filter: String,
     window_secs: String,
     remind_every_minutes: String,
+    /// For a forecast: the level it's heading for, how many hours ahead is a
+    /// warning or critical, and how many hours back to judge by.
+    level: String,
+    warning_within_hours: String,
+    critical_within_hours: String,
+    forecast_window_hours: String,
     #[serde(flatten)]
     applies_to: ConditionForm,
 }
@@ -74,6 +82,10 @@ impl AlertRuleForm {
             filter: String::new(),
             window_secs: "300".to_string(),
             remind_every_minutes: String::new(),
+            level: String::new(),
+            warning_within_hours: "24".to_string(),
+            critical_within_hours: "4".to_string(),
+            forecast_window_hours: hours(DEFAULT_FORECAST_WINDOW_SECS),
             applies_to: ConditionForm::blank(),
         }
     }
@@ -81,14 +93,58 @@ impl AlertRuleForm {
     fn from_rule(rule: &AlertRuleInput) -> Self {
         let blank = Self::blank();
         let (group_by, fact) = grouping_fields(rule.group_by.as_deref().unwrap_or_default());
+        let forecast = rule.kind == RuleKind::Forecast;
+        let within = |wanted: Severity| {
+            rule.forecast_levels()
+                .into_iter()
+                .find(|(severity, _)| *severity == wanted)
+                .map(|(_, secs)| hours(secs))
+                .unwrap_or_default()
+        };
+        let threshold = |wanted: Severity| {
+            if forecast {
+                return String::new();
+            }
+            rule.levels()
+                .iter()
+                .find(|(severity, _)| *severity == wanted)
+                .map(|(_, threshold)| threshold.to_string())
+                .unwrap_or_default()
+        };
         Self {
+            level: if forecast {
+                rule.threshold
+                    .map(|level| level.to_string())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            },
+            warning_within_hours: if forecast {
+                within(Severity::Warning)
+            } else {
+                blank.warning_within_hours
+            },
+            critical_within_hours: if forecast {
+                within(Severity::Critical)
+            } else {
+                blank.critical_within_hours
+            },
+            forecast_window_hours: if forecast {
+                hours(rule.window())
+            } else {
+                blank.forecast_window_hours
+            },
             calculation: rule
                 .calculation
                 .map_or(blank.calculation, |c| c.as_str().to_string()),
             group_by,
             fact,
             filter: rule.filter.clone().unwrap_or_default(),
-            window_secs: rule.window().to_string(),
+            window_secs: if forecast {
+                blank.window_secs
+            } else {
+                rule.window().to_string()
+            },
             // Shown in minutes, with a fraction when the API set something finer.
             remind_every_minutes: rule
                 .remind_every_secs
@@ -107,18 +163,8 @@ impl AlertRuleForm {
             comparison: rule
                 .comparison
                 .map_or(blank.comparison, |c| c.as_str().to_string()),
-            warning_threshold: rule
-                .levels()
-                .iter()
-                .find(|(severity, _)| *severity == Severity::Warning)
-                .map(|(_, threshold)| threshold.to_string())
-                .unwrap_or_default(),
-            critical_threshold: rule
-                .levels()
-                .iter()
-                .find(|(severity, _)| *severity == Severity::Critical)
-                .map(|(_, threshold)| threshold.to_string())
-                .unwrap_or_default(),
+            warning_threshold: threshold(Severity::Warning),
+            critical_threshold: threshold(Severity::Critical),
             for_secs: rule.for_secs.to_string(),
             severity: rule.severity.as_str().to_string(),
             enabled: rule.enabled,
@@ -137,6 +183,10 @@ impl AlertRuleForm {
             filter: text("filter").trim().to_string(),
             window_secs: text("window_secs"),
             remind_every_minutes: text("remind_every_minutes").trim().to_string(),
+            level: text("level").trim().to_string(),
+            warning_within_hours: text("warning_within_hours").trim().to_string(),
+            critical_within_hours: text("critical_within_hours").trim().to_string(),
+            forecast_window_hours: text("forecast_window_hours").trim().to_string(),
             name: text("name"),
             kind: text("kind"),
             metric: text("metric"),
@@ -183,7 +233,7 @@ impl AlertRuleForm {
                 None,
                 Some(Comparison::parse(&self.comparison)?),
             ),
-            RuleKind::Metric => {
+            RuleKind::Metric | RuleKind::Forecast => {
                 let series = self.series.trim();
                 (
                     Some(self.metric.clone()),
@@ -192,8 +242,34 @@ impl AlertRuleForm {
                 )
             }
         };
+        let mut forecast_secs = None;
+        let mut warning_forecast_secs = None;
         let (threshold, warning_threshold, severity) = match kind {
             RuleKind::Offline => (None, None, Severity::parse(&self.severity)?),
+            RuleKind::Forecast => {
+                let level: f64 = match self.level.as_str() {
+                    "" => bail!("a forecast needs a level to watch for"),
+                    text => text.parse().context("the level must be a number")?,
+                };
+                let warning = seconds(&self.warning_within_hours, "warning")?;
+                let severity = match seconds(&self.critical_within_hours, "critical")? {
+                    None => {
+                        forecast_secs = warning;
+                        Severity::Warning
+                    }
+                    Some(critical) => {
+                        forecast_secs = Some(critical);
+                        warning_forecast_secs = warning;
+                        Severity::Critical
+                    }
+                };
+                if forecast_secs.is_none() {
+                    bail!(
+                        "a forecast needs how many hours ahead to warn, or to be critical, or both"
+                    );
+                }
+                (Some(level), None, severity)
+            }
             RuleKind::Metric | RuleKind::Calculation => {
                 let warning = number(&self.warning_threshold, "warning")?;
                 match (warning, number(&self.critical_threshold, "critical")?) {
@@ -211,11 +287,16 @@ impl AlertRuleForm {
         } else {
             self.group_by.clone()
         };
-        let window_secs = if is_calculation {
-            let secs = self.window_secs.trim().parse();
-            Some(secs.context("how far back has to be a whole number of seconds")?)
-        } else {
-            None
+        let window_secs = match kind {
+            RuleKind::Calculation => {
+                let secs = self.window_secs.trim().parse();
+                Some(secs.context("how far back has to be a whole number of seconds")?)
+            }
+            RuleKind::Forecast => Some(
+                seconds(&self.forecast_window_hours, "looking back")?
+                    .context("a forecast needs how many hours back to judge by")?,
+            ),
+            _ => None,
         };
         let condition = if is_calculation {
             None
@@ -244,7 +325,33 @@ impl AlertRuleForm {
             enabled: self.enabled,
             channels: self.channels.iter().copied().collect(),
             all_channels: self.all_channels,
+            forecast_secs,
+            warning_forecast_secs,
         })
+    }
+}
+
+/// Seconds as hours for the form, with a fraction only when needed.
+fn hours(secs: u64) -> String {
+    if secs.is_multiple_of(3600) {
+        (secs / 3600).to_string()
+    } else {
+        (secs as f64 / 3600.0).to_string()
+    }
+}
+
+/// Hours typed into the form as seconds, which may be left empty.
+fn seconds(text: &str, which: &str) -> Result<Option<u64>> {
+    match text.trim() {
+        "" => Ok(None),
+        text => {
+            let hours: f64 = text
+                .parse()
+                .ok()
+                .filter(|hours: &f64| hours.is_finite() && *hours > 0.0)
+                .with_context(|| format!("the {which} time must be a number of hours"))?;
+            Ok(Some((hours * 3600.0).round() as u64))
+        }
     }
 }
 
@@ -389,12 +496,18 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
                     Some(condition) => Builder::from_expression(condition)
                         .map_or_else(|| condition.to_string(), |builder| builder.describe()),
                 },
-                severities: match rule.rule.levels().as_slice() {
-                    [] => vec![rule.rule.severity.as_str()],
-                    levels => levels
-                        .iter()
-                        .map(|(severity, _)| severity.as_str())
-                        .collect(),
+                severities: {
+                    let levels: Vec<Severity> = if rule.rule.kind == RuleKind::Forecast {
+                        let levels = rule.rule.forecast_levels();
+                        levels.into_iter().map(|(severity, _)| severity).collect()
+                    } else {
+                        let levels = rule.rule.levels();
+                        levels.into_iter().map(|(severity, _)| severity).collect()
+                    };
+                    match levels.as_slice() {
+                        [] => vec![rule.rule.severity.as_str()],
+                        levels => levels.iter().map(|severity| severity.as_str()).collect(),
+                    }
                 },
                 channels: if rule.rule.all_channels {
                     "Every channel".to_string()
@@ -532,6 +645,8 @@ mod tests {
             filter: None,
             window_secs: None,
             remind_every_secs: None,
+            forecast_secs: None,
+            warning_forecast_secs: None,
         }
     }
 

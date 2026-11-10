@@ -1128,3 +1128,78 @@ fn a_deleted_agent_starts_afresh_and_new_agents_keep_to_themselves() {
     assert_eq!(averages(&query(&store, "new", "cpu.usage", 8).series[0]), [7.0]);
     assert_eq!(averages(&query(&store, "gone", "cpu.usage", 8).series[0]), [9.0]);
 }
+
+fn trends(store: &TestStore, metric: &str, since: i64, until: i64) -> Vec<Trend> {
+    store
+        .reader()
+        .unwrap()
+        .trends(find(metric).unwrap(), since, until)
+        .unwrap()
+}
+
+#[test]
+fn trends_fit_a_line_through_each_series() {
+    let mut store = in_memory();
+    let minute = 60_000;
+    // The root disk fills a percent a minute, give or take, and /data doesn't change.
+    for (i, used) in [10, 12, 11, 13, 14].into_iter().enumerate() {
+        let disks = json!([
+            { "mount_point": "/", "total_bytes": 100, "used_bytes": used },
+            { "mount_point": "/data", "total_bytes": 100, "used_bytes": 50 },
+        ]);
+        write_metric(&mut store, "a", minute * (i as u64 + 1), "disk", disks);
+    }
+    write_metric(
+        &mut store,
+        "b",
+        minute,
+        "disk",
+        json!([{ "mount_point": "/", "total_bytes": 100, "used_bytes": 90 }]),
+    );
+    write_metric(
+        &mut store,
+        "b",
+        3 * minute,
+        "disk",
+        json!([{ "mount_point": "/", "total_bytes": 100, "used_bytes": 80 }]),
+    );
+
+    let found = trends(&store, "disk.usage", 0, HOUR_MS);
+    let summary: Vec<(&str, &str, i64, f64, i64, u64)> = found
+        .iter()
+        .map(|t| {
+            let value = (t.value * 1e6).round() / 1e6;
+            (t.agent_id.as_str(), t.series.as_str(), t.time_ms, value, t.first_ms, t.samples)
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("a", "/", 5 * 60_000, 14.0, 60_000, 5),
+            ("a", "/data", 5 * 60_000, 50.0, 60_000, 5),
+            ("b", "/", 3 * 60_000, 80.0, 60_000, 2),
+        ]
+    );
+    // Least squares through 10, 12, 11, 13, 14 a minute apart is 0.9 a minute.
+    let per_minute = |trend: &Trend| trend.slope_per_ms * 60_000.0;
+    assert!((per_minute(&found[0]) - 0.9).abs() < 1e-9, "{found:?}");
+    assert!(per_minute(&found[1]).abs() < 1e-9, "{found:?}");
+    assert!((per_minute(&found[2]) + 5.0).abs() < 1e-9, "{found:?}");
+}
+
+#[test]
+fn trends_need_two_readings_at_different_times_inside_the_window() {
+    let mut store = in_memory();
+    let cpu = |percent: f64| json!({ "usage_percent": percent });
+    write_metric(&mut store, "a", 1000, "cpu", cpu(10.0));
+    write_metric(&mut store, "b", 1000, "cpu", cpu(10.0));
+    write_metric(&mut store, "b", 2000, "cpu", cpu(20.0));
+    write_metric(&mut store, "b", 3000, "cpu", cpu(90.0));
+
+    // One reading makes no line, and a window with one of b's makes none either.
+    assert!(trends(&store, "cpu.usage", 0, 1500).is_empty());
+    let found = trends(&store, "cpu.usage", 1500, HOUR_MS);
+    assert_eq!(found.len(), 1);
+    assert_eq!((found[0].agent_id.as_str(), found[0].samples), ("b", 2));
+    assert!((found[0].slope_per_ms - 0.07).abs() < 1e-9, "{found:?}");
+}

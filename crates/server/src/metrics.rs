@@ -1253,6 +1253,22 @@ pub struct NewestReading {
     pub value: f64,
 }
 
+/// Which way a series has been heading: its newest value, and the slope of the
+/// straight line that fits its readings best.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Trend {
+    pub agent_id: String,
+    pub series: String,
+    /// The newest reading.
+    pub time_ms: i64,
+    pub value: f64,
+    /// The oldest reading, so a line through a few minutes isn't trusted for days.
+    pub first_ms: i64,
+    pub samples: u64,
+    /// How much the value changes each millisecond.
+    pub slope_per_ms: f64,
+}
+
 /// What the headline numbers come from.
 const CPU_USAGE: &str = "cpu.usage";
 const MEMORY_USAGE: &str = "memory.usage";
@@ -1351,6 +1367,20 @@ impl Metrics {
         })
         .await
         .context("reading metrics")?
+    }
+
+    /// Which way each series of a metric has been heading between two times,
+    /// across every agent.
+    pub async fn trends(
+        &self,
+        metric: &'static Metric,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> Result<Vec<Trend>> {
+        let reader = self.reader.clone();
+        tokio::task::spawn_blocking(move || reader.trends(metric, since_ms, until_ms))
+            .await
+            .context("reading metrics")?
     }
 
     pub async fn stats(&self, hour_ago_ms: i64) -> Result<StoreStats> {

@@ -62,6 +62,16 @@ fn to_alert_rule(row: alert_rule::Model, channels: Vec<i64>) -> Result<AlertRule
                 .map(u64::try_from)
                 .transpose()
                 .context("invalid reminder")?,
+            forecast_secs: row
+                .forecast_secs
+                .map(u64::try_from)
+                .transpose()
+                .context("invalid forecast")?,
+            warning_forecast_secs: row
+                .warning_forecast_secs
+                .map(u64::try_from)
+                .transpose()
+                .context("invalid forecast")?,
         },
     })
 }
@@ -93,6 +103,16 @@ fn alert_rule_row(input: &AlertRuleInput) -> Result<alert_rule::ActiveModel> {
             .transpose()
             .context("invalid reminder")?),
         all_channels: Set(input.all_channels),
+        forecast_secs: Set(input
+            .forecast_secs
+            .map(i64::try_from)
+            .transpose()
+            .context("invalid forecast")?),
+        warning_forecast_secs: Set(input
+            .warning_forecast_secs
+            .map(i64::try_from)
+            .transpose()
+            .context("invalid forecast")?),
         ..Default::default()
     })
 }

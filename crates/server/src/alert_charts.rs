@@ -112,7 +112,7 @@ impl ChartSources {
     ) -> Result<Option<(&'static Metric, Unit, SeriesResult)>> {
         match rule.kind {
             RuleKind::Offline => Ok(None),
-            RuleKind::Metric => {
+            RuleKind::Metric | RuleKind::Forecast => {
                 let Some(metric) = rule.metric() else {
                     return Ok(None);
                 };
@@ -379,6 +379,8 @@ mod tests {
             filter: None,
             window_secs: None,
             remind_every_secs: None,
+            forecast_secs: None,
+            warning_forecast_secs: None,
         }
     }
 

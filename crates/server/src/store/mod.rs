@@ -25,7 +25,7 @@ use tracing::{error, warn};
 
 use crate::calculations::CalculationQuery;
 use crate::config::MetricsConfig;
-use crate::metrics::{LastSample, Metric, NewestReading, SeriesQuery, SeriesResult, now_ms};
+use crate::metrics::{LastSample, Metric, NewestReading, SeriesQuery, SeriesResult, Trend, now_ms};
 use crate::remote_checks::LOCAL_AGENT_ID;
 
 /// Samples waiting to be written. When this fills up, connections stop reading
@@ -112,6 +112,11 @@ pub trait MetricsReader: Send + Sync {
     /// The newest value of each series of a metric, across every agent, between
     /// two times. Values that aren't usable numbers are skipped.
     fn newest(&self, metric: &Metric, since_ms: i64, until_ms: i64) -> Result<Vec<NewestReading>>;
+
+    /// Which way each series of a metric has been heading between two times,
+    /// across every agent, from a straight line fitted to its readings. A series
+    /// needs two readings at different times to have one.
+    fn trends(&self, metric: &Metric, since_ms: i64, until_ms: i64) -> Result<Vec<Trend>>;
 
     /// How the database itself is doing. `hour_ago_ms` is the start of the last
     /// hour, for how much is arriving now.
@@ -542,6 +547,10 @@ pub mod testing {
             _since_ms: i64,
             _until_ms: i64,
         ) -> Result<Vec<NewestReading>> {
+            Ok(Vec::new())
+        }
+
+        fn trends(&self, _metric: &Metric, _since_ms: i64, _until_ms: i64) -> Result<Vec<Trend>> {
             Ok(Vec::new())
         }
 

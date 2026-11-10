@@ -1934,6 +1934,8 @@ mod tests {
             filter: None,
             window_secs: None,
             remind_every_secs: None,
+            forecast_secs: None,
+            warning_forecast_secs: None,
         };
         let rule = database.create_alert_rule(&input).await.unwrap();
         assert_eq!(

@@ -30,6 +30,13 @@ const MIN_WINDOW_SECS: u64 = 60;
 const MAX_WINDOW_SECS: u64 = 86_400;
 const DEFAULT_WINDOW_SECS: u64 = 300;
 
+/// How far back a forecast looks by default, and at least. Less than an hour is
+/// mostly noise, and more than a day is a lot to read every few minutes.
+pub const DEFAULT_FORECAST_WINDOW_SECS: u64 = 6 * 3600;
+const MIN_FORECAST_WINDOW_SECS: u64 = 3600;
+/// How far ahead a forecast can look. A line through a day says little about a month.
+const MAX_FORECAST_SECS: u64 = 30 * 86_400;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuleKind {
@@ -37,6 +44,9 @@ pub enum RuleKind {
     Offline,
     /// Something worked out across a group of machines, such as their average CPU.
     Calculation,
+    /// A metric heading for a level soon, such as a disk filling up, judged by the
+    /// line through its recent readings.
+    Forecast,
 }
 
 impl RuleKind {
@@ -45,6 +55,7 @@ impl RuleKind {
             Self::Metric => "metric",
             Self::Offline => "offline",
             Self::Calculation => "calculation",
+            Self::Forecast => "forecast",
         }
     }
 
@@ -53,6 +64,7 @@ impl RuleKind {
             "metric" => Ok(Self::Metric),
             "offline" => Ok(Self::Offline),
             "calculation" => Ok(Self::Calculation),
+            "forecast" => Ok(Self::Forecast),
             other => bail!("unknown rule kind {other:?}"),
         }
     }
@@ -174,6 +186,14 @@ pub struct AlertRuleInput {
     /// if empty. On-call services are left out, as repeating is their job.
     #[serde(default)]
     pub remind_every_secs: Option<u64>,
+    /// For a forecast, how soon the metric has to be on course to reach `threshold`
+    /// for the rule's severity.
+    #[serde(default)]
+    pub forecast_secs: Option<u64>,
+    /// For a critical forecast, a longer time ahead that's a warning first. One alert
+    /// covers both, as with thresholds.
+    #[serde(default)]
+    pub warning_forecast_secs: Option<u64>,
 }
 
 fn default_enabled() -> bool {
@@ -240,6 +260,13 @@ pub fn check_rule(rule: &AlertRuleInput) -> Result<()> {
                 "an offline rule doesn't take a metric or threshold"
             );
         }
+        RuleKind::Forecast => check_forecast(rule)?,
+    }
+    if rule.kind != RuleKind::Forecast {
+        ensure!(
+            rule.forecast_secs.is_none() && rule.warning_forecast_secs.is_none(),
+            "only a forecast looks ahead"
+        );
     }
     if let Some(warning) = rule.warning_threshold {
         ensure!(
@@ -267,13 +294,58 @@ pub fn check_rule(rule: &AlertRuleInput) -> Result<()> {
     }
     if rule.kind != RuleKind::Calculation {
         ensure!(
-            rule.calculation.is_none()
-                && rule.group_by.is_none()
-                && rule.filter.is_none()
-                && rule.window_secs.is_none(),
-            "only a calculation rule takes a calculation, grouping, filter or window"
+            rule.calculation.is_none() && rule.group_by.is_none() && rule.filter.is_none(),
+            "only a calculation rule takes a calculation, grouping or filter"
+        );
+        ensure!(
+            rule.window_secs.is_none() || rule.kind == RuleKind::Forecast,
+            "only a calculation or forecast looks back over a window"
         );
     }
+    Ok(())
+}
+
+fn check_forecast(rule: &AlertRuleInput) -> Result<()> {
+    let name = rule.metric.as_deref().context("choose a metric")?;
+    metrics::find(name).with_context(|| format!("unknown metric {name:?}"))?;
+    ensure!(rule.comparison.is_some(), "choose rising or falling");
+    let level = rule
+        .threshold
+        .context("a forecast needs a level to watch for")?;
+    ensure!(level.is_finite(), "the level must be a number");
+    ensure!(
+        rule.warning_threshold.is_none(),
+        "a forecast takes how soon, not a warning threshold"
+    );
+    if let Some(series) = &rule.series {
+        ensure!(series.len() <= MAX_NAME_LEN, "the series name is too long");
+    }
+    let soon = rule
+        .forecast_secs
+        .context("a forecast needs how far ahead to look")?;
+    for secs in [Some(soon), rule.warning_forecast_secs]
+        .into_iter()
+        .flatten()
+    {
+        ensure!(
+            (60..=MAX_FORECAST_SECS).contains(&secs),
+            "a forecast can look between a minute and 30 days ahead"
+        );
+    }
+    if let Some(warning) = rule.warning_forecast_secs {
+        ensure!(
+            rule.severity == Severity::Critical,
+            "a warning goes with a critical forecast"
+        );
+        ensure!(
+            warning > soon,
+            "the warning has to look further ahead than the critical alert"
+        );
+    }
+    ensure!(
+        (MIN_FORECAST_WINDOW_SECS..=MAX_WINDOW_SECS).contains(&rule.window()),
+        "a forecast has to look back between an hour and a day"
+    );
     Ok(())
 }
 
@@ -327,7 +399,21 @@ impl AlertRuleInput {
     }
 
     pub fn window(&self) -> u64 {
-        self.window_secs.unwrap_or(DEFAULT_WINDOW_SECS)
+        self.window_secs.unwrap_or(match self.kind {
+            RuleKind::Forecast => DEFAULT_FORECAST_WINDOW_SECS,
+            _ => DEFAULT_WINDOW_SECS,
+        })
+    }
+
+    /// For a forecast, how far ahead each severity looks, mildest first.
+    pub fn forecast_levels(&self) -> Vec<(Severity, u64)> {
+        let Some(soon) = self.forecast_secs else {
+            return Vec::new();
+        };
+        let warning = self
+            .warning_forecast_secs
+            .map(|secs| (Severity::Warning, secs));
+        warning.into_iter().chain([(self.severity, soon)]).collect()
     }
 
     pub fn metric(&self) -> Option<&'static Metric> {
@@ -346,11 +432,37 @@ impl AlertRuleInput {
             0 => text,
             secs => format!("{text} for {}", format_duration(secs)),
         };
-        let (Some(metric), Some(comparison), Some(_)) =
+        let (Some(metric), Some(comparison), Some(level)) =
             (self.metric(), self.comparison, self.threshold)
         else {
             return wait("Offline".to_string());
         };
+        if self.kind == RuleKind::Forecast {
+            let series = match &self.series {
+                Some(series) => format!(" ({series})"),
+                None => String::new(),
+            };
+            let ahead = self
+                .forecast_levels()
+                .iter()
+                .map(|(severity, secs)| {
+                    let within = format_duration(*secs);
+                    if self.warning_forecast_secs.is_some() {
+                        format!("{within} ({})", severity.as_str())
+                    } else {
+                        within
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return wait(format!(
+                "{}{series} on course to {} {} within {ahead}, judging by the last {}",
+                metric.title,
+                heading(comparison),
+                format_value(metric.unit, level),
+                format_duration(self.window())
+            ));
+        }
         if let Ok(question) = self.question() {
             return wait(format!(
                 "{} of {} {} {} over {}",
@@ -430,12 +542,72 @@ impl AlertRuleInput {
         Ok(summary)
     }
 
+    /// What a forecast alert says when it fires, or reaches `severity`, for a value
+    /// changing `slope_per_ms` and reaching the level in `eta_secs`.
+    pub fn forecast_summary(
+        &self,
+        metric: &Metric,
+        host: &str,
+        series: &str,
+        value: f64,
+        slope_per_ms: f64,
+        eta_secs: u64,
+    ) -> Result<String> {
+        let comparison = self.comparison.context("no comparison")?;
+        let level = self.threshold.context("no level")?;
+        let name = match metric.source {
+            Source::Fields([_]) => metric.title.to_string(),
+            _ => format!("{} ({series})", metric.title),
+        };
+        let now = format_value(metric.unit, value);
+        let goal = format_value(metric.unit, level);
+        if eta_secs == 0 {
+            return Ok(format!(
+                "{name} on {host} is {now}, already {} {goal}",
+                comparison.as_str()
+            ));
+        }
+        let per_hour = format_value(metric.unit, (slope_per_ms * 3_600_000.0).abs());
+        let direction = if slope_per_ms > 0.0 {
+            "rising"
+        } else {
+            "falling"
+        };
+        Ok(format!(
+            "{name} on {host} is {now} and {direction} by {per_hour} an hour, so it reaches {goal} in about {}",
+            format_eta(eta_secs)
+        ))
+    }
+
     /// What an offline alert says when it fires.
     pub fn offline_summary(&self, host: &str) -> String {
         match self.for_secs {
             0 => format!("{host} is offline"),
             secs => format!("{host} has been offline for {}", format_duration(secs)),
         }
+    }
+}
+
+/// Which way a forecast watches a metric go, in words.
+fn heading(comparison: Comparison) -> &'static str {
+    match comparison {
+        Comparison::Above => "rise to",
+        Comparison::Below => "fall to",
+    }
+}
+
+/// How long until something happens, roughly, as nobody can say to the minute
+/// when a line through the past will be right.
+pub fn format_eta(secs: u64) -> String {
+    let plural = |count: u64, unit: &str| match count {
+        1 => format!("1 {unit}"),
+        _ => format!("{count} {unit}s"),
+    };
+    let rounded = |unit: u64| (secs + unit / 2) / unit;
+    match secs {
+        _ if rounded(60) < 60 => plural(rounded(60).max(1), "minute"),
+        _ if rounded(3600) < 48 => plural(rounded(3600), "hour"),
+        _ => plural(rounded(86_400), "day"),
     }
 }
 
@@ -831,6 +1003,8 @@ mod tests {
             filter: None,
             window_secs: None,
             remind_every_secs: None,
+            forecast_secs: None,
+            warning_forecast_secs: None,
         }
     }
 
@@ -1454,5 +1628,138 @@ mod tests {
         assert!(check_channel(&long).is_err());
         let huge = webhook(&format!("https://example.com/{}", "x".repeat(3000)));
         assert!(check_channel(&huge).is_err());
+    }
+
+    #[test]
+    fn a_time_ahead_is_rounded_to_what_a_forecast_can_say() {
+        let cases = [
+            (10, "1 minute"),
+            (29 * 60, "29 minutes"),
+            (3570, "1 hour"),
+            (5 * 3600 + 1700, "5 hours"),
+            (47 * 3600, "47 hours"),
+            (48 * 3600, "2 days"),
+            (10 * 86_400, "10 days"),
+        ];
+        for (secs, words) in cases {
+            assert_eq!(format_eta(secs), words, "{secs}");
+        }
+    }
+
+    fn forecast() -> AlertRuleInput {
+        AlertRuleInput {
+            name: "Disk".to_string(),
+            kind: RuleKind::Forecast,
+            metric: Some("disk.usage".to_string()),
+            series: None,
+            comparison: Some(Comparison::Above),
+            threshold: Some(100.0),
+            warning_threshold: None,
+            for_secs: 0,
+            severity: Severity::Critical,
+            condition: None,
+            enabled: true,
+            channels: Vec::new(),
+            all_channels: false,
+            calculation: None,
+            group_by: None,
+            filter: None,
+            window_secs: None,
+            remind_every_secs: None,
+            forecast_secs: Some(4 * 3600),
+            warning_forecast_secs: Some(24 * 3600),
+        }
+    }
+
+    #[test]
+    fn forecasts_are_checked_like_any_rule() {
+        assert!(check_rule(&forecast()).is_ok());
+        assert_eq!(forecast().window(), DEFAULT_FORECAST_WINDOW_SECS);
+        assert_eq!(
+            forecast().forecast_levels(),
+            [(Severity::Warning, 86_400), (Severity::Critical, 14_400)]
+        );
+        let refused = |rule: AlertRuleInput, words: &str| {
+            let error = check_rule(&rule).unwrap_err().to_string();
+            assert!(error.contains(words), "{words}: {error}");
+        };
+        refused(
+            AlertRuleInput {
+                forecast_secs: None,
+                ..forecast()
+            },
+            "how far ahead",
+        );
+        refused(
+            AlertRuleInput {
+                threshold: None,
+                ..forecast()
+            },
+            "a level",
+        );
+        refused(
+            AlertRuleInput {
+                threshold: Some(f64::NAN),
+                ..forecast()
+            },
+            "a number",
+        );
+        refused(
+            AlertRuleInput {
+                comparison: None,
+                ..forecast()
+            },
+            "rising or falling",
+        );
+        refused(
+            AlertRuleInput {
+                warning_forecast_secs: Some(3600),
+                ..forecast()
+            },
+            "further ahead",
+        );
+        refused(
+            AlertRuleInput {
+                forecast_secs: Some(31 * 86_400),
+                ..forecast()
+            },
+            "30 days",
+        );
+        refused(
+            AlertRuleInput {
+                window_secs: Some(600),
+                ..forecast()
+            },
+            "an hour and a day",
+        );
+        refused(
+            AlertRuleInput {
+                warning_threshold: Some(90.0),
+                ..forecast()
+            },
+            "not a warning threshold",
+        );
+        refused(
+            AlertRuleInput {
+                severity: Severity::Warning,
+                ..forecast()
+            },
+            "goes with a critical",
+        );
+        refused(
+            AlertRuleInput {
+                kind: RuleKind::Metric,
+                ..forecast()
+            },
+            "only a forecast looks ahead",
+        );
+        let metric = AlertRuleInput {
+            kind: RuleKind::Metric,
+            forecast_secs: None,
+            warning_forecast_secs: None,
+            window_secs: Some(3600),
+            ..forecast()
+        };
+        refused(metric, "only a calculation or forecast");
     }
 }

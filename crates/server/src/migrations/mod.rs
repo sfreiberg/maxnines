@@ -33,6 +33,7 @@ impl MigratorTrait for Migrator {
             Box::new(AddRoles),
             Box::new(AddTwoFactor),
             Box::new(AddChannelRequests),
+            Box::new(AddForecasts),
         ]
     }
 }
@@ -2402,6 +2403,116 @@ impl MigrationTrait for AddChannelRequests {
     }
 }
 
+// ---- Forecasts
+
+struct AddForecasts;
+
+impl MigrationName for AddForecasts {
+    fn name(&self) -> &str {
+        "m20261110_000022_add_forecasts"
+    }
+}
+
+#[derive(Iden)]
+enum RuleForecasts {
+    #[iden = "alert_rules"]
+    Table,
+    /// How soon a forecast rule's metric has to be on course to reach its level.
+    ForecastSecs,
+    /// A longer time ahead that's a warning first, for a critical forecast.
+    WarningForecastSecs,
+}
+
+/// The built-in forecast: a disk on course to be full within a day is a warning,
+/// and within 4 hours is critical, judging by the last 6 hours. It has to last
+/// half an hour, so one big download doesn't page anyone.
+const DISK_FORECAST: (&str, f64, i64, i64, i64, i64) = (
+    "Disk will be full soon",
+    100.0,
+    4 * 3600,
+    24 * 3600,
+    6 * 3600,
+    1800,
+);
+
+/// Lets a rule look ahead, and adds a forecast for disks filling up, telling every
+/// channel like the other built-in rules. It's an ordinary rule once added.
+#[async_trait::async_trait]
+impl MigrationTrait for AddForecasts {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for column in [
+            RuleForecasts::ForecastSecs,
+            RuleForecasts::WarningForecastSecs,
+        ] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(RuleForecasts::Table)
+                        .add_column(ColumnDef::new(column).big_integer().null())
+                        .to_owned(),
+                )
+                .await?;
+        }
+        let (name, level, soon, warning, window, for_secs) = DISK_FORECAST;
+        let rule = Query::insert()
+            .into_table(AlertRules::Table)
+            .columns([
+                AlertRules::Name.into_iden(),
+                AlertRules::Kind.into_iden(),
+                AlertRules::Metric.into_iden(),
+                AlertRules::Comparison.into_iden(),
+                AlertRules::Threshold.into_iden(),
+                AlertRules::ForSecs.into_iden(),
+                AlertRules::Severity.into_iden(),
+                AlertRules::Enabled.into_iden(),
+                AlertRules::WindowSecs.into_iden(),
+                EveryChannel::AllChannels.into_iden(),
+                RuleForecasts::ForecastSecs.into_iden(),
+                RuleForecasts::WarningForecastSecs.into_iden(),
+            ])
+            .values([
+                name.into(),
+                "forecast".into(),
+                DISK_USAGE.into(),
+                "above".into(),
+                level.into(),
+                for_secs.into(),
+                "critical".into(),
+                true.into(),
+                window.into(),
+                true.into(),
+                soon.into(),
+                warning.into(),
+            ])
+            .map_err(|error| DbErr::Custom(error.to_string()))?
+            .to_owned();
+        manager.exec_stmt(rule).await
+    }
+
+    /// The rule is left, as it may have been changed since, and stops being read as
+    /// a forecast without the columns.
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared("DELETE FROM alert_rules WHERE kind = 'forecast'")
+            .await?;
+        for column in [
+            RuleForecasts::ForecastSecs,
+            RuleForecasts::WarningForecastSecs,
+        ] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(RuleForecasts::Table)
+                        .drop_column(column)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
@@ -2470,7 +2581,7 @@ mod tests {
 
         let query = Statement::from_string(
             connection.get_database_backend(),
-            "SELECT name FROM alert_rules WHERE metric = 'disk.usage'",
+            "SELECT name FROM alert_rules WHERE metric = 'disk.usage' AND kind = 'metric'",
         );
         let rows = connection.query_all_raw(query).await.unwrap();
         let names: Vec<String> = rows
@@ -2484,7 +2595,7 @@ mod tests {
         let query = Statement::from_string(
             connection.get_database_backend(),
             "SELECT name, threshold, warning_threshold FROM alert_rules
-             WHERE metric = 'disk.usage' ORDER BY id",
+             WHERE metric = 'disk.usage' AND kind = 'metric' ORDER BY id",
         );
         let rows = connection.query_all_raw(query).await.unwrap();
         rows.iter()

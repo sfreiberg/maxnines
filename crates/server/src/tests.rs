@@ -3601,6 +3601,15 @@ impl MetricsReader for BrokenReader {
         anyhow::bail!("deliberate test failure with a secret in it");
     }
 
+    fn trends(
+        &self,
+        _metric: &crate::metrics::Metric,
+        _since_ms: i64,
+        _until_ms: i64,
+    ) -> anyhow::Result<Vec<crate::metrics::Trend>> {
+        anyhow::bail!("deliberate test failure with a secret in it");
+    }
+
     fn stats(&self, _hour_ago_ms: i64) -> anyhow::Result<crate::store::StoreStats> {
         anyhow::bail!("deliberate test failure with a secret in it");
     }

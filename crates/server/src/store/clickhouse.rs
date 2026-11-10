@@ -26,6 +26,7 @@ use super::{CollectorStats, LATEST_SAMPLE_MS, MetricsReader, NewSample, Store, S
 use crate::calculations::{Calculation, CalculationQuery, SMALLEST_STEP_MS, numbered};
 use crate::metrics::{
     LastSample, Metric, NewestReading, Point, Reading, Series, SeriesQuery, SeriesResult, Source,
+    Trend,
 };
 
 /// Anything beyond this is skipped, as in the other stores.
@@ -754,6 +755,17 @@ struct NewestRow {
 }
 
 #[derive(Row, Deserialize)]
+struct TrendRow {
+    agent: String,
+    series: String,
+    time_ms: i64,
+    value: f64,
+    first_ms: i64,
+    samples: u64,
+    slope: f64,
+}
+
+#[derive(Row, Deserialize)]
 struct LatestRow {
     metric: String,
     labels: Labels,
@@ -977,6 +989,36 @@ impl MetricsReader for ClickHouseReader {
                 series: row.series,
                 time_ms: row.time_ms,
                 value: row.value,
+            })
+            .collect())
+    }
+
+    /// Times are counted from the start, as milliseconds since 1970 are big enough
+    /// to cost the fit its precision.
+    fn trends(&self, metric: &Metric, since_ms: i64, until_ms: i64) -> Result<Vec<Trend>> {
+        let scope = time_between(since_ms, until_ms, "<=");
+        let sql = format!(
+            "SELECT agent, series, toInt64(max(t)) AS time_ms, argMax(v, t) AS value,
+                    toInt64(min(t)) AS first_ms, count() AS samples,
+                    tupleElement(simpleLinearRegression(toFloat64(t - {since_ms}), v), 1) AS slope
+             FROM ({values})
+             GROUP BY agent, series
+             HAVING time_ms > first_ms
+             ORDER BY agent, series",
+            values = computed(metric, &scope),
+        );
+        let rows: Vec<TrendRow> = wait(self.client.query_raw(&sql).fetch_all())?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| row.slope.is_finite())
+            .map(|row| Trend {
+                agent_id: row.agent,
+                series: row.series,
+                time_ms: row.time_ms,
+                value: row.value,
+                first_ms: row.first_ms,
+                samples: row.samples,
+                slope_per_ms: row.slope,
             })
             .collect())
     }

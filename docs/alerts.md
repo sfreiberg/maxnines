@@ -2,13 +2,14 @@
 
 ## The built-in rules
 
-Every server starts with three alert rules:
+Every server starts with four alert rules:
 
 | Rule | Fires when | Severity |
 | --- | --- | --- |
 | **Agent offline** | An approved agent has been gone for 5 minutes | Critical |
 | **Disk filling up** | A disk has been over 80% full for 5 minutes, or over 90% | Warning, then critical |
 | **Container down** | A container has been failing for 5 minutes, on machines that report [containers](agents.md#containers) | Critical |
+| **Disk will be full soon** | A disk has been on course to be full within a day for half an hour, judging by the last 6 hours, or within 4 hours | Warning, then critical |
 
 Each disk alerts on its own. They tell every notification channel, including ones added later, so they start working as soon
 as there's a channel to tell. Until then they show on the Alerts page and the overview.
@@ -20,6 +21,32 @@ disk usage rule or a containers rule of its own doesn't get that one.
 
 Any rule can tell every channel this way, with **Every channel, including ones added
 later**, or tell only the channels chosen.
+
+## Forecasts
+
+A forecast rule alerts before a problem rather than once it's there, such as a disk that
+will be full in a few hours while it's still at 70%. It draws the straight line that best
+fits each series over the last few hours, carries it on, and alerts when that line
+reaches a level within the time you choose.
+
+On the rule's page, choose **A metric is on course to reach a level soon**, then:
+
+- **Level** is what the metric is heading for, like 100 for a disk being full. Above
+  means rising to it, and below means falling to it.
+- **Warning if it gets there within** and **Critical if it gets there within** are in
+  hours. Fill in either or both. With both, one alert starts as a warning and becomes
+  critical once the level is closer, as with thresholds.
+- **Judging by the last** is how many hours the line is drawn through, from 1 to 24.
+  A longer time is steadier, and a shorter one notices a change sooner.
+
+Forecasts are worked out every 5 minutes. A series needs at least 10 readings, from at
+least half the time looked back over, and one in the last 10 minutes, before it has a
+forecast at all, so a new machine waits a while. A series that's already reached the
+level counts as getting there now. When the line stops heading for the level, the
+alert clears once that's lasted the rule's **For at least** time.
+
+The alert says where the metric is and how fast it's moving, like *Disk usage (/) on
+web-1 is 92% and rising by 3% an hour, so it reaches 100% in about 3 hours*.
 
 ## Warning, then critical
 

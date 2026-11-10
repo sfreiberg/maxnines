@@ -22,6 +22,8 @@ pub struct Model {
     pub window_secs: Option<i64>,
     pub remind_every_secs: Option<i64>,
     pub all_channels: bool,
+    pub forecast_secs: Option<i64>,
+    pub warning_forecast_secs: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -17,6 +17,7 @@ use super::{CollectorStats, MetricsReader, NewSample, Store, StoreStats};
 use crate::calculations::{Calculation, CalculationQuery, SMALLEST_STEP_MS, numbered};
 use crate::metrics::{
     LastSample, Metric, NewestReading, Point, Reading, Series, SeriesQuery, SeriesResult, Source,
+    Trend,
 };
 
 /// A schema change. SeaORM doesn't support DuckDB, so this mirrors how its
@@ -857,7 +858,9 @@ fn calculation_sql(
 }
 
 /// Parameters: from and to.
-fn newest_sql(connection: &Connection, metric: &Metric) -> Result<String> {
+/// Each reading of a metric across every agent between `$1` and `$2`, as a
+/// `computed` table of agent, time, series and value, with counts made rates.
+fn computed_sql(connection: &Connection, metric: &Metric) -> Result<String> {
     let values = if is_rate(metric.source) {
         "SELECT agent_id, t, series,
                 v * 1000.0 / NULLIF(
@@ -871,16 +874,39 @@ fn newest_sql(connection: &Connection, metric: &Metric) -> Result<String> {
         agent: None,
         time: "s.time >= epoch_ms($1::BIGINT) AND s.time <= epoch_ms($2::BIGINT)",
     };
-
     Ok(format!(
         "WITH readings AS ({readings}),
-         computed AS ({values})
+         computed AS ({values})",
+        readings = readings(connection, metric, &scope)?,
+    ))
+}
+
+fn newest_sql(connection: &Connection, metric: &Metric) -> Result<String> {
+    Ok(format!(
+        "{computed}
          SELECT agent_id, series, max(t), arg_max(v, t)
          FROM computed
          WHERE series IS NOT NULL AND abs(v) <= {LARGEST_VALUE}
          GROUP BY agent_id, series
          ORDER BY agent_id, series",
-        readings = readings(connection, metric, &scope)?,
+        computed = computed_sql(connection, metric)?,
+    ))
+}
+
+/// Each series' newest value and the slope of the line that fits it best, by least
+/// squares. Times are counted from the start, as milliseconds since 1970 are big
+/// enough to cost the fit its precision.
+fn trends_sql(connection: &Connection, metric: &Metric) -> Result<String> {
+    Ok(format!(
+        "{computed}
+         SELECT agent_id, series, max(t), arg_max(v, t), min(t), count(*),
+                regr_slope(v, (t - $1::BIGINT)::DOUBLE)
+         FROM computed
+         WHERE series IS NOT NULL AND abs(v) <= {LARGEST_VALUE}
+         GROUP BY agent_id, series
+         HAVING max(t) > min(t)
+         ORDER BY agent_id, series",
+        computed = computed_sql(connection, metric)?,
     ))
 }
 
@@ -1052,6 +1078,36 @@ impl MetricsReader for DuckDbReader {
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    fn trends(&self, metric: &Metric, since_ms: i64, until_ms: i64) -> Result<Vec<Trend>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(&trends_sql(&connection, metric)?)?;
+        let rows = statement.query_map(params![since_ms, until_ms], |row| {
+            Ok((
+                Trend {
+                    agent_id: row.get(0)?,
+                    series: row.get(1)?,
+                    time_ms: row.get(2)?,
+                    value: row.get(3)?,
+                    first_ms: row.get(4)?,
+                    samples: row.get(5)?,
+                    slope_per_ms: 0.0,
+                },
+                row.get::<_, Option<f64>>(6)?,
+            ))
+        })?;
+        let mut trends = Vec::new();
+        for row in rows {
+            let (trend, slope) = row?;
+            if let Some(slope) = slope.filter(|slope| slope.is_finite()) {
+                trends.push(Trend {
+                    slope_per_ms: slope,
+                    ..trend
+                });
+            }
+        }
+        Ok(trends)
     }
 
     fn calculate(&self, query: &CalculationQuery) -> Result<SeriesResult> {

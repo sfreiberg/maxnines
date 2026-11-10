@@ -576,6 +576,8 @@ mod calculation_alerts {
             filter: None,
             window_secs: Some(300),
             remind_every_secs: None,
+            forecast_secs: None,
+            warning_forecast_secs: None,
         }
     }
 
@@ -909,6 +911,15 @@ impl MetricsReader for FailingReader {
         _since_ms: i64,
         _until_ms: i64,
     ) -> anyhow::Result<Vec<crate::metrics::NewestReading>> {
+        Ok(Vec::new())
+    }
+
+    fn trends(
+        &self,
+        _metric: &crate::metrics::Metric,
+        _since_ms: i64,
+        _until_ms: i64,
+    ) -> anyhow::Result<Vec<crate::metrics::Trend>> {
         Ok(Vec::new())
     }
 

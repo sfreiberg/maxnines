@@ -525,6 +525,10 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .alert-rule:has(select[name="kind"] option[value="offline"]:checked) .metric-fields { display: none; }
 .alert-rule:has(select[name="kind"] option[value="calculation"]:checked) .applies-to { display: none; }
 .metric-fields { display: contents; }
+/* A forecast watches for a level within some hours instead of thresholds. */
+.alert-rule:not(:has(select[name="kind"] option[value="forecast"]:checked)) .forecast-fields { display: none; }
+.alert-rule:has(select[name="kind"] option[value="forecast"]:checked) .threshold-fields { display: none; }
+.forecast-fields, .threshold-fields { display: contents; }
 
 /* Only the options a kind of check uses. Without :has() they all stay. */
 .remote-check:not(:has(option[value="http"]:checked)) .for-http { display: none; }

@@ -29,6 +29,7 @@ const MINUTE_MS: i64 = 60_000;
 #[derive(Clone, Default)]
 struct Script {
     readings: Arc<Mutex<Vec<NewestReading>>>,
+    trends: Arc<Mutex<Vec<crate::metrics::Trend>>>,
     broken: Arc<Mutex<bool>>,
 }
 
@@ -78,6 +79,18 @@ impl MetricsReader for Script {
             anyhow::bail!("deliberate test failure");
         }
         Ok(self.readings.lock().unwrap().clone())
+    }
+
+    fn trends(
+        &self,
+        _metric: &crate::metrics::Metric,
+        _since_ms: i64,
+        _until_ms: i64,
+    ) -> anyhow::Result<Vec<crate::metrics::Trend>> {
+        if *self.broken.lock().unwrap() {
+            anyhow::bail!("deliberate test failure");
+        }
+        Ok(self.trends.lock().unwrap().clone())
     }
 
     fn stats(&self, _hour_ago_ms: i64) -> anyhow::Result<crate::store::StoreStats> {
@@ -201,6 +214,8 @@ fn cpu_rule() -> AlertRuleInput {
         filter: None,
         window_secs: None,
         remind_every_secs: None,
+        forecast_secs: None,
+        warning_forecast_secs: None,
     }
 }
 
@@ -714,7 +729,12 @@ async fn every_server_starts_with_rules_for_agents_going_offline_and_disks_filli
         .collect();
     assert_eq!(
         names,
-        ["Agent offline", "Container down", "Disk filling up"]
+        [
+            "Agent offline",
+            "Container down",
+            "Disk filling up",
+            "Disk will be full soon"
+        ]
     );
 }
 
@@ -807,6 +827,7 @@ async fn every_server_starts_with_a_warning_at_80_percent_full_and_critical_at_9
     let disk: Vec<&AlertRuleInput> = rules
         .iter()
         .filter(|rule| rule.metric.as_deref() == Some("disk.usage"))
+        .filter(|rule| rule.kind == RuleKind::Metric)
         .collect();
     let [rule] = disk[..] else {
         panic!("{disk:?}");
@@ -7576,4 +7597,238 @@ async fn a_custom_webhook_whose_template_does_not_work_is_not_saved() {
             .unwrap()
             .is_empty()
     );
+}
+
+const HOUR_MS: i64 = 3_600_000;
+const DISK_FORECAST: &str = "Disk will be full soon";
+
+/// The root disk at `percent`, changing `per_hour`, with six hours of readings.
+fn disk_trend(
+    test: &Harness,
+    offset_ms: i64,
+    percent: f64,
+    per_hour: f64,
+) -> crate::metrics::Trend {
+    crate::metrics::Trend {
+        agent_id: test.id(),
+        series: "/".to_string(),
+        time_ms: test.now + offset_ms,
+        value: percent,
+        first_ms: test.now + offset_ms - 6 * HOUR_MS,
+        samples: 360,
+        slope_per_ms: per_hour / HOUR_MS as f64,
+    }
+}
+
+/// Checks rules at `minute` with the root disk heading this way, and gives the
+/// forecast alerts open then.
+async fn forecast_at(
+    test: &mut Harness,
+    minute: i64,
+    percent: f64,
+    per_hour: f64,
+) -> Vec<crate::alerting::Alert> {
+    let offset = minute * MINUTE_MS;
+    *test.script.trends.lock().unwrap() = vec![disk_trend(test, offset, percent, per_hour)];
+    test.evaluate(offset).await;
+    test.open().await
+}
+
+#[tokio::test]
+async fn the_built_in_forecast_warns_a_day_ahead_and_goes_critical_four_hours_ahead() {
+    let mut test = Harness::start().await;
+    let built_in = built_in_rules().await;
+    let forecast = built_in
+        .iter()
+        .find(|rule| rule.name == DISK_FORECAST)
+        .unwrap();
+    test.database().create_alert_rule(forecast).await.unwrap();
+
+    // Ten hours from full is a warning, once it's lasted half an hour.
+    assert!(forecast_at(&mut test, 0, 90.0, 1.0).await.is_empty());
+    assert!(forecast_at(&mut test, 25, 90.0, 1.0).await.is_empty());
+    let open = forecast_at(&mut test, 30, 90.0, 1.0).await;
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].rule_name, DISK_FORECAST);
+    assert_eq!(open[0].severity, Severity::Warning);
+    assert_eq!(open[0].series, "/");
+    assert_eq!(open[0].value, Some(90.0));
+    assert_eq!(
+        open[0].summary,
+        "Disk usage (/) on web-1 is 90% and rising by 1% an hour, so it reaches 100% in about 10 hours"
+    );
+
+    // Readings are only fetched every 5 minutes, so faster filling shows then.
+    let open = forecast_at(&mut test, 31, 91.0, 3.0).await;
+    assert_eq!(open[0].severity, Severity::Warning);
+    assert!(forecast_at(&mut test, 35, 91.0, 3.0).await[0].severity == Severity::Warning);
+    let open = forecast_at(&mut test, 65, 92.0, 3.0).await;
+    assert_eq!(open[0].severity, Severity::Critical);
+    assert_eq!(
+        open[0].summary,
+        "Disk usage (/) on web-1 is 92% and rising by 3% an hour, so it reaches 100% in about 3 hours"
+    );
+
+    // Once it stops filling for half an hour, the alert ends.
+    assert_eq!(forecast_at(&mut test, 70, 92.0, 0.0).await.len(), 1);
+    assert_eq!(forecast_at(&mut test, 95, 92.0, 0.0).await.len(), 1);
+    assert!(forecast_at(&mut test, 100, 92.0, 0.0).await.is_empty());
+    let resolved = test.resolved().await;
+    assert_eq!(
+        resolved[0].resolve_reason.as_deref(),
+        Some("The problem cleared")
+    );
+}
+
+/// A forecast for the root disk that fires as soon as it's on course to be full
+/// within 4 hours.
+async fn quick_forecast(test: &Harness) -> i64 {
+    let rule = AlertRuleInput {
+        name: "Filling now".to_string(),
+        kind: RuleKind::Forecast,
+        metric: Some("disk.usage".to_string()),
+        comparison: Some(Comparison::Above),
+        threshold: Some(100.0),
+        warning_threshold: None,
+        for_secs: 0,
+        severity: Severity::Critical,
+        window_secs: Some(6 * 3600),
+        forecast_secs: Some(4 * 3600),
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_forecast_needs_enough_recent_readings_to_trust() {
+    let mut test = Harness::start().await;
+    quick_forecast(&test).await;
+    let filling = |test: &Harness, minute: i64| disk_trend(test, minute * MINUTE_MS, 95.0, 5.0);
+
+    let few = crate::metrics::Trend {
+        samples: 9,
+        ..filling(&test, 0)
+    };
+    let short = crate::metrics::Trend {
+        first_ms: test.now + 5 * MINUTE_MS - 2 * HOUR_MS,
+        ..filling(&test, 5)
+    };
+    let stale = crate::metrics::Trend {
+        time_ms: test.now - 11 * MINUTE_MS + 10 * MINUTE_MS,
+        ..filling(&test, 10)
+    };
+    for (minute, trend) in [(0, few), (5, short), (10, stale)] {
+        *test.script.trends.lock().unwrap() = vec![trend];
+        test.evaluate(minute * MINUTE_MS).await;
+        assert!(test.open().await.is_empty(), "minute {minute}");
+    }
+
+    let open = forecast_at(&mut test, 15, 95.0, 5.0).await;
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].rule_name, "Filling now");
+    assert_eq!(
+        open[0].summary,
+        "Disk usage (/) on web-1 is 95% and rising by 5% an hour, so it reaches 100% in about 1 hour"
+    );
+}
+
+#[tokio::test]
+async fn a_full_disk_is_already_there_and_a_falling_one_is_not_heading_there() {
+    let mut test = Harness::start().await;
+    quick_forecast(&test).await;
+    assert!(forecast_at(&mut test, 0, 60.0, -5.0).await.is_empty());
+    let open = forecast_at(&mut test, 5, 100.0, 0.0).await;
+    assert_eq!(
+        open[0].summary,
+        "Disk usage (/) on web-1 is 100%, already above 100%"
+    );
+}
+
+#[tokio::test]
+async fn a_forecast_rule_can_be_made_on_the_form_and_through_the_api() {
+    let server = start().await;
+    let fields = [
+        ("name", "Logs filling"),
+        ("kind", "forecast"),
+        ("metric", "disk.usage"),
+        ("comparison", "above"),
+        ("series", "/var*"),
+        ("level", "95"),
+        ("warning_within_hours", "48"),
+        ("critical_within_hours", "2.5"),
+        ("forecast_window_hours", "12"),
+        ("for_secs", "600"),
+        ("severity", "warning"),
+        ("enabled", "on"),
+    ];
+    let mut browser = Browser::default();
+    let page = browser
+        .submit(&server, "/alerts/rules/new", "/alerts/rules", &fields)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+
+    let rules = server.state.database.list_alert_rules().await.unwrap();
+    let rule = rules
+        .iter()
+        .find(|rule| rule.rule.name == "Logs filling")
+        .unwrap();
+    assert_eq!(rule.rule.kind, RuleKind::Forecast);
+    assert_eq!(rule.rule.threshold, Some(95.0));
+    assert_eq!(rule.rule.severity, Severity::Critical);
+    assert_eq!(rule.rule.forecast_secs, Some(9000));
+    assert_eq!(rule.rule.warning_forecast_secs, Some(48 * 3600));
+    assert_eq!(rule.rule.window_secs, Some(12 * 3600));
+    assert_eq!(rule.rule.series.as_deref(), Some("/var*"));
+
+    let page = browser
+        .get(&server, &format!("/alerts/rules/{}/edit", rule.id))
+        .await;
+    for shown in [
+        r#"name="level" value="95""#,
+        r#"name="warning_within_hours" value="48""#,
+        r#"name="critical_within_hours" value="2.5""#,
+        r#"name="forecast_window_hours" value="12""#,
+        r#"<option value="forecast" selected>"#,
+    ] {
+        assert!(page.body.contains(shown), "{shown}: {}", page.body);
+    }
+    let page = browser.get(&server, "/alerts/rules").await;
+    let row = page.body.split("Logs filling").nth(1).unwrap();
+    let row = row.split("</tr>").next().unwrap();
+    assert!(row.contains("Warning") && row.contains("Critical"), "{row}");
+    assert!(
+        page.body.contains("Disk usage (/var*) on course to rise to 95% within 2 days (warning), 150 minutes (critical), judging by the last 12 hours for 10 minutes"),
+        "{}",
+        page.body
+    );
+
+    // A warning has to look further ahead than critical.
+    let mut wrong = fields.to_vec();
+    wrong[6] = ("warning_within_hours", "1");
+    let page = browser
+        .submit(&server, "/alerts/rules/new", "/alerts/rules", &wrong)
+        .await;
+    assert_eq!(page.status, 422);
+    assert!(page.body.contains("further ahead"), "{}", page.body);
+
+    let body = json!({
+        "name": "Memory leak", "kind": "forecast", "metric": "memory.usage",
+        "comparison": "above", "threshold": 100, "for_secs": 0, "severity": "warning",
+        "forecast_secs": 86400,
+    });
+    let (status, created) = api(&server, "POST", "/api/v1/alert-rules", &body).await;
+    assert_eq!(status, 201, "{created}");
+    let path = format!("/api/v1/alert-rules/{}", created["id"]);
+    let (_, rule) = api(&server, "GET", &path, &Value::Null).await;
+    assert_eq!(rule["kind"], "forecast", "{rule}");
+    assert_eq!(rule["forecast_secs"], 86400, "{rule}");
+    assert_eq!(rule["window_secs"], Value::Null, "{rule}");
+
+    let body = json!({
+        "name": "Nowhere", "kind": "forecast", "metric": "memory.usage",
+        "comparison": "above", "threshold": 100, "for_secs": 0, "severity": "warning",
+    });
+    let (status, refused) = api(&server, "POST", "/api/v1/alert-rules", &body).await;
+    assert_eq!(status, 422, "{refused}");
+    assert!(refused.to_string().contains("how far ahead"), "{refused}");
 }
