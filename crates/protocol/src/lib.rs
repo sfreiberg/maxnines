@@ -17,9 +17,10 @@ use serde_json::Value;
 
 /// Every collector the project knows about. An agent reports the ones it can
 /// run in its facts, because older agents may not have them all.
-pub const COLLECTORS: [&str; 15] = [
+pub const COLLECTORS: [&str; 16] = [
     "apache",
     "checks",
+    "containers",
     "cpu",
     "custom",
     "disk",

@@ -2,12 +2,13 @@
 
 ## The built-in rules
 
-Every server starts with two alert rules:
+Every server starts with three alert rules:
 
 | Rule | Fires when | Severity |
 | --- | --- | --- |
 | **Agent offline** | An approved agent has been gone for 5 minutes | Critical |
 | **Disk filling up** | A disk has been over 80% full for 5 minutes, or over 90% | Warning, then critical |
+| **Container down** | A container has been failing for 5 minutes, on machines that report [containers](agents.md#containers) | Critical |
 
 Each disk alerts on its own. They tell every notification channel, including ones added later, so they start working as soon
 as there's a channel to tell. Until then they show on the Alerts page and the overview.
@@ -15,7 +16,7 @@ as there's a channel to tell. Until then they show on the Alerts page and the ov
 They're ordinary rules from then on: change them, turn them off or delete them under
 **Settings > Alert rules**, and upgrades leave them alone. A server that already had an
 offline rule of its own when it upgraded doesn't get a second one, and one with a
-disk usage rule of its own doesn't get the disk rule.
+disk usage rule or a containers rule of its own doesn't get that one.
 
 Any rule can tell every channel this way, with **Every channel, including ones added
 later**, or tell only the channels chosen.

@@ -81,6 +81,33 @@ To watch only some disks, list their mount points in a config rule under **Disk 
 points**. Those are reported whatever they are, even a disk image or every volume in
 a container.
 
+## Containers
+
+On Linux, an agent can report on every Docker or Podman container on its machine:
+whether it's up, its CPU, memory, network and disk use, and how often it has
+restarted. Turn on the `containers` collector in a config rule. It's off until then,
+because reading containers needs the agent's user to be allowed Docker's socket, and
+that's as good as root on the machine:
+
+```sh
+sudo usermod -aG docker maxnines-agent
+sudo systemctl restart maxnines-agent
+```
+
+The agent finds the socket at `/var/run/docker.sock`, or Podman's at
+`/run/podman/podman.sock`, or wherever `DOCKER_HOST` says in the agent's environment.
+Containers keep the names Docker gives them, so one that Compose recreates keeps its
+history, and an agent reports at most 64.
+
+A container is **up** while it's running and its health check, if it has one, doesn't
+call it unhealthy. One that stopped with an error, keeps restarting, or is unhealthy
+is down, and the built-in **Container down** rule alerts once it has been for 5
+minutes. One that exited cleanly isn't counted either way, as that's a job finishing
+or a service stopped on purpose.
+
+Other systems run containers inside a Linux virtual machine, as Docker Desktop does on
+macOS and Windows, so only the Linux agent reads them.
+
 ## Removing an agent
 
 When a machine is gone for good, revoke its agent on its page, then delete it. That

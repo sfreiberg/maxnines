@@ -30,6 +30,11 @@ webpki-roots = "0.26"
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = ["process", "std"] }
 
+# Reads containers through Docker's API, which Podman offers too. Only Linux runs
+# containers for real, so the other agents leave it out.
+[target.'cfg(target_os = "linux")'.dependencies]
+bollard = { version = "0.21", default-features = false, features = ["pipe"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
 

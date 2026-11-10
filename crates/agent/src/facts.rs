@@ -171,7 +171,7 @@ fn gather_named(
             "version": build.version,
             "commit": build.commit,
             "built_at": build.built_at,
-            "collectors": collector::SUPPORTED,
+            "collectors": collector::supported(),
             // Only the names. What they run stays on this machine.
             "custom_metrics": metrics.keys().collect::<Vec<_>>(),
         },
@@ -198,7 +198,7 @@ mod tests {
         assert_eq!(facts["networking"]["hostname"], short);
         assert!(facts["networking"]["fqdn"].is_string());
         assert_eq!(facts["agent"]["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(facts["agent"]["collectors"], json!(collector::SUPPORTED));
+        assert_eq!(facts["agent"]["collectors"], json!(collector::supported()));
     }
 
     #[test]

@@ -402,7 +402,7 @@ lowest priority first, so higher priorities win.
 | `checks` | `checks` | What to try reaching, as in [remote checks](#remote-checks) |
 | `urls` | `apache`, `nginx`, `php_fpm` | The status pages to read. Leave it out for the usual page on the machine itself |
 
-The collectors are `apache`, `checks`, `cpu`, `custom`, `disk`, `files`, `host`,
+The collectors are `apache`, `checks`, `containers`, `cpu`, `custom`, `disk`, `files`, `host`,
 `memory`, `network`, `nginx`, `php_fpm`, `processes`, `sensors`, `services` and
 `system`.
 

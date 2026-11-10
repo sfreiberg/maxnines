@@ -22,8 +22,16 @@ use crate::services::ServiceCollector;
 use crate::status_pages::{Software, StatusPageCollector};
 use crate::system_collector::SystemCollector;
 
+/// Only Linux runs containers for real, so that's the only agent that reads them.
+const LINUX_ONLY: [&str; 1] = ["containers"];
+
 /// What this agent can run, reported to the server as a fact.
-pub const SUPPORTED: [&str; 15] = COLLECTORS;
+pub fn supported() -> Vec<&'static str> {
+    COLLECTORS
+        .into_iter()
+        .filter(|name| cfg!(target_os = "linux") || !LINUX_ONLY.contains(name))
+        .collect()
+}
 
 /// The name samples are reported under: the short name, as the domain is a fact.
 pub fn host_name() -> String {
@@ -74,6 +82,8 @@ fn build(
             let names = config.names.clone().unwrap_or_default();
             Box::new(ServiceCollector::new(names, interval))
         }
+        #[cfg(target_os = "linux")]
+        "containers" => Box::new(crate::containers::ContainerCollector::new(interval)),
         "files" => {
             let paths = config.paths.clone().unwrap_or_default();
             Box::new(FileCollector::new(paths, interval))
@@ -264,11 +274,10 @@ mod tests {
 
     #[test]
     fn every_supported_collector_can_be_built() {
-        let settings = SUPPORTED.map(|name| (name, json!({})));
         let collectors = Value::Object(
-            settings
+            supported()
                 .into_iter()
-                .map(|(name, value)| (name.to_string(), value))
+                .map(|name| (name.to_string(), json!({})))
                 .collect(),
         );
 
@@ -276,7 +285,7 @@ mod tests {
             build_all(&config(collectors), &Definitions::new())
                 .unwrap()
                 .len(),
-            SUPPORTED.len()
+            supported().len()
         );
     }
 

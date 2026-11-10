@@ -2,6 +2,8 @@ mod background;
 mod checks;
 mod collector;
 mod config;
+#[cfg(target_os = "linux")]
+mod containers;
 mod custom;
 mod facts;
 mod files;

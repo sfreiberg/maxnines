@@ -505,6 +505,108 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::WithData,
     },
     Metric {
+        name: "container.up",
+        title: "Containers up",
+        unit: Unit::Number,
+        collector: "containers",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.up"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "container.cpu",
+        title: "Container CPU usage",
+        unit: Unit::Percent,
+        collector: "containers",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.cpu_percent"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "container.memory",
+        title: "Container memory",
+        unit: Unit::Bytes,
+        collector: "containers",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.memory_bytes"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "container.memory_limit",
+        title: "Container memory of its limit",
+        unit: Unit::Percent,
+        collector: "containers",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Percent {
+                part: "$.memory_bytes",
+                whole: "$.memory_limit_bytes",
+            },
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "container.received",
+        title: "Container network received",
+        unit: Unit::BytesPerSecond,
+        collector: "containers",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Rate("$.received_bytes"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "container.sent",
+        title: "Container network sent",
+        unit: Unit::BytesPerSecond,
+        collector: "containers",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Rate("$.sent_bytes"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "container.read",
+        title: "Container disk reads",
+        unit: Unit::BytesPerSecond,
+        collector: "containers",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Rate("$.read_bytes"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "container.written",
+        title: "Container disk writes",
+        unit: Unit::BytesPerSecond,
+        collector: "containers",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Rate("$.written_bytes"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "container.restarts",
+        title: "Container restarts",
+        unit: Unit::Number,
+        collector: "containers",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.restarts"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
         name: "system.open_files",
         title: "Open files",
         unit: Unit::Number,

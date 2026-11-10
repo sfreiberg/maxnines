@@ -713,7 +713,51 @@ async fn every_server_starts_with_rules_for_agents_going_offline_and_disks_filli
         .into_iter()
         .map(|rule| rule.name)
         .collect();
-    assert_eq!(names, ["Agent offline", "Disk filling up"]);
+    assert_eq!(
+        names,
+        ["Agent offline", "Container down", "Disk filling up"]
+    );
+}
+
+#[tokio::test]
+async fn every_server_starts_with_a_rule_for_failing_containers() {
+    let rules = built_in_rules().await;
+    let rule = rules
+        .iter()
+        .find(|rule| rule.metric.as_deref() == Some("container.up"))
+        .unwrap();
+    assert_eq!(rule.name, "Container down");
+    assert_eq!(rule.comparison, Some(Comparison::Below));
+    assert_eq!(rule.levels(), [(Severity::Critical, 1.0)]);
+    assert_eq!(rule.for_secs, 300);
+    assert!(rule.all_channels);
+    check_rule(rule).unwrap();
+}
+
+#[tokio::test]
+async fn a_failing_container_alerts_after_five_minutes() {
+    let mut test = Harness::start().await;
+    let rule = built_in_rules()
+        .await
+        .into_iter()
+        .find(|rule| rule.metric.as_deref() == Some("container.up"))
+        .unwrap();
+    test.database().create_alert_rule(&rule).await.unwrap();
+
+    for minute in [0, 5] {
+        let offset = minute * MINUTE_MS;
+        let readings = vec![
+            test.reading("web", test.now + offset, 0.0),
+            test.reading("db", test.now + offset, 1.0),
+        ];
+        test.script.set(readings);
+        test.evaluate(offset).await;
+    }
+
+    let open = test.open().await;
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].series, "web");
+    assert_eq!(open[0].severity, Severity::Critical);
 }
 
 #[tokio::test]

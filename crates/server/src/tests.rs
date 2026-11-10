@@ -3606,6 +3606,72 @@ async fn a_failing_metrics_query_only_fails_that_request() {
 }
 
 #[tokio::test]
+async fn containers_become_charts_of_each_one() {
+    let server = start_with_metrics().await;
+    let agent = identity();
+    let mut client = server.connect_approved(&agent, "web-1").await;
+    let id = agent.id();
+
+    // As the agent sends them: a failing container has no figures to give.
+    let now = now_ms() as u64;
+    for (step, seconds_ago) in [45_u64, 30, 15].into_iter().enumerate() {
+        let containers = json!([
+            {
+                "name": "web", "image": "nginx", "state": "running", "health": "healthy",
+                "up": 1, "restarts": 0, "cpu_percent": 12.5, "memory_bytes": 200,
+                "memory_limit_bytes": 1000, "received_bytes": 1500 * step,
+                "sent_bytes": 3000 * step, "read_bytes": 0, "written_bytes": 0,
+            },
+            { "name": "worker", "image": "app", "state": "exited", "exit_code": 1,
+              "up": 0, "restarts": 4 },
+        ]);
+        let message = AgentMessage::Sample(Sample {
+            timestamp_ms: now - seconds_ago * 1000,
+            metrics: BTreeMap::from([("containers".to_string(), containers)]),
+        });
+        send(&mut client, &message).await;
+    }
+
+    let series = |metric: &str| format!("/api/v1/agents/{id}/metrics/{metric}?range=1h");
+    let read = async |metric: &str| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let body = json_body(
+                &server
+                    .http("GET", &series(metric), Some(&server.api_key))
+                    .await,
+            );
+            if body["series"]
+                .as_array()
+                .is_some_and(|lines| !lines.is_empty())
+            {
+                return body;
+            }
+            assert!(Instant::now() < deadline, "{metric}: {body}");
+            sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let up = read("container.up").await;
+    let names: Vec<&str> = up["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["web", "worker"]);
+    let memory = read("container.memory_limit").await;
+    assert_eq!(memory["series"][0]["points"][0]["avg"], 20.0);
+    let received = read("container.received").await;
+    assert_eq!(received["series"][0]["name"], "web");
+
+    let page = Browser::default()
+        .get(&server, &format!("/agents/{id}/metrics"))
+        .await;
+    assert!(page.body.contains("Containers up"), "{}", page.body);
+    assert!(page.body.contains("Container CPU usage"));
+}
+
+#[tokio::test]
 async fn web_server_status_pages_become_charts() {
     let server = start_with_metrics().await;
     let agent = identity();

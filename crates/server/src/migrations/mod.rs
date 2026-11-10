@@ -25,6 +25,7 @@ impl MigratorTrait for Migrator {
             Box::new(AddWarningThresholds),
             Box::new(AddChannelSeverities),
             Box::new(ChooseChannelSeverities),
+            Box::new(AddBuiltInContainerAlert),
         ]
     }
 }
@@ -1715,6 +1716,76 @@ impl MigrationTrait for ChooseChannelSeverities {
     }
 }
 
+// ---- Built-in container alert
+
+struct AddBuiltInContainerAlert;
+
+impl MigrationName for AddBuiltInContainerAlert {
+    fn name(&self) -> &str {
+        "m20261110_000014_add_built_in_container_alert"
+    }
+}
+
+const CONTAINER_UP: &str = "container.up";
+const CONTAINER_RULE_NAME: &str = "Container down";
+const CONTAINER_RULE_SECS: i64 = 300;
+
+/// Alerts when a container has been failing for 5 minutes: stopped with an error,
+/// restarting, or unhealthy. It only covers machines whose config turns on the
+/// containers collector, and tells every channel, like the other built-in rules. A
+/// server with a rule on containers being up already doesn't get it.
+#[async_trait::async_trait]
+impl MigrationTrait for AddBuiltInContainerAlert {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let existing = Query::select()
+            .column(AlertRules::Id)
+            .from(AlertRules::Table)
+            .and_where(Expr::col(AlertRules::Metric).eq(CONTAINER_UP))
+            .limit(1)
+            .to_owned();
+        if manager
+            .get_connection()
+            .query_one(&existing)
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let rule = Query::insert()
+            .into_table(AlertRules::Table)
+            .columns([
+                AlertRules::Name.into_iden(),
+                AlertRules::Kind.into_iden(),
+                AlertRules::Metric.into_iden(),
+                AlertRules::Comparison.into_iden(),
+                AlertRules::Threshold.into_iden(),
+                AlertRules::ForSecs.into_iden(),
+                AlertRules::Severity.into_iden(),
+                AlertRules::Enabled.into_iden(),
+                EveryChannel::AllChannels.into_iden(),
+            ])
+            .values([
+                CONTAINER_RULE_NAME.into(),
+                "metric".into(),
+                CONTAINER_UP.into(),
+                "below".into(),
+                1.0.into(),
+                CONTAINER_RULE_SECS.into(),
+                "critical".into(),
+                true.into(),
+                true.into(),
+            ])
+            .map_err(|error| DbErr::Custom(error.to_string()))?
+            .to_owned();
+        manager.exec_stmt(rule).await
+    }
+
+    /// The rule is left, as it may have been changed since.
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
@@ -1738,7 +1809,7 @@ mod tests {
             .max_connections(1)
             .to_owned();
         let connection = Database::connect(options).await.unwrap();
-        let before = Migrator::migrations().len() as u32 - 5;
+        let before = Migrator::migrations().len() as u32 - 6;
         Migrator::up(&connection, Some(before)).await.unwrap();
         connection
             .execute_unprepared(
@@ -1759,7 +1830,7 @@ mod tests {
             .max_connections(1)
             .to_owned();
         let connection = Database::connect(options).await.unwrap();
-        let before = Migrator::migrations().len() as u32 - 4;
+        let before = Migrator::migrations().len() as u32 - 5;
         Migrator::up(&connection, Some(before)).await.unwrap();
         connection
             .execute_unprepared(
@@ -1819,7 +1890,7 @@ mod tests {
         );
 
         let connection = fresh().await;
-        let before = Migrator::migrations().len() as u32 - 3;
+        let before = Migrator::migrations().len() as u32 - 4;
         Migrator::up(&connection, Some(before)).await.unwrap();
         connection
             .execute_unprepared(
@@ -1840,7 +1911,7 @@ mod tests {
     #[tokio::test]
     async fn a_critical_only_channel_keeps_warnings_off_when_channels_choose_both() {
         let connection = fresh().await;
-        let before = Migrator::migrations().len() as u32 - 1;
+        let before = Migrator::migrations().len() as u32 - 2;
         Migrator::up(&connection, Some(before)).await.unwrap();
         connection
             .execute_unprepared(
