@@ -132,6 +132,9 @@ enum ApiKeysCommand {
     /// Make a key and print it, which is the only time it can be seen
     Create {
         name: String,
+        /// The email address of the user the key acts as
+        #[arg(long, value_name = "EMAIL")]
+        user: String,
         /// How long it lasts, like 1h or 30d. Without this it never expires
         #[arg(long, value_name = "TIME", value_parser = humantime::parse_duration)]
         expires_in: Option<std::time::Duration>,
@@ -197,9 +200,11 @@ fn main() -> Result<()> {
             let config = Config::load(&cli.config)?;
             match command {
                 ApiKeysCommand::List => cli::print_api_keys(&config),
-                ApiKeysCommand::Create { name, expires_in } => {
-                    cli::create_api_key(&config, &name, expires_in)
-                }
+                ApiKeysCommand::Create {
+                    name,
+                    user,
+                    expires_in,
+                } => cli::create_api_key(&config, &name, &user, expires_in),
                 ApiKeysCommand::Revoke { id } => cli::revoke_api_key(&config, id),
             }
         }

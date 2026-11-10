@@ -6,6 +6,8 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i64,
     pub name: String,
+    /// Who it acts as.
+    pub user_id: i64,
     /// The start of the key, to tell keys apart once the key itself is gone.
     pub hint: String,
     /// Only the hash is kept, so reading the database doesn't give anyone a key.

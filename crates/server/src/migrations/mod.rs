@@ -28,6 +28,8 @@ impl MigratorTrait for Migrator {
             Box::new(AddBuiltInContainerAlert),
             Box::new(CreateAuditLog),
             Box::new(AddChannelMailSettings),
+            Box::new(AddApiKeyOwners),
+            Box::new(AddAuditVia),
         ]
     }
 }
@@ -1960,6 +1962,128 @@ impl MigrationTrait for AddChannelMailSettings {
     }
 }
 
+// ---- API keys belong to people
+
+struct AddApiKeyOwners;
+
+impl MigrationName for AddApiKeyOwners {
+    fn name(&self) -> &str {
+        "m20261110_000017_add_api_key_owners"
+    }
+}
+
+#[derive(Iden)]
+enum ApiKeyOwners {
+    #[iden = "api_keys"]
+    Table,
+    /// Who the key acts as. It stops working while they're disabled.
+    UserId,
+}
+
+/// Each key acts as the person who owns it. Nobody owned the keys made before, so
+/// they're dropped, and people make new ones of their own.
+#[async_trait::async_trait]
+impl MigrationTrait for AddApiKeyOwners {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared("DELETE FROM api_keys")
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(ApiKeyOwners::Table)
+                    .add_column(
+                        // SQLite can only add a required column with a default. Every
+                        // key is saved with its owner, so it's never used.
+                        ColumnDef::new(ApiKeyOwners::UserId)
+                            .big_integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(ApiKeyOwners::Table)
+                    .drop_column(ApiKeyOwners::UserId)
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+// ---- How someone acted, for the audit log
+
+struct AddAuditVia;
+
+impl MigrationName for AddAuditVia {
+    fn name(&self) -> &str {
+        "m20261110_000018_add_audit_via"
+    }
+}
+
+#[derive(Iden)]
+enum AuditVia {
+    #[iden = "audit_log"]
+    Table,
+    /// `api_key` or `slack`, when someone acted through one rather than the pages.
+    ViaKind,
+    ViaId,
+    /// The key's name at the time.
+    ViaName,
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for AddAuditVia {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let columns = [
+            ColumnDef::new(AuditVia::ViaKind)
+                .string_len(16)
+                .null()
+                .to_owned(),
+            ColumnDef::new(AuditVia::ViaId)
+                .string_len(64)
+                .null()
+                .to_owned(),
+            ColumnDef::new(AuditVia::ViaName)
+                .string_len(255)
+                .null()
+                .to_owned(),
+        ];
+        for column in columns {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(AuditVia::Table)
+                        .add_column(column)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for column in [AuditVia::ViaKind, AuditVia::ViaId, AuditVia::ViaName] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(AuditVia::Table)
+                        .drop_column(column)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
@@ -2128,5 +2252,29 @@ mod tests {
                 ("Pager".to_string(), false, true)
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn keys_made_before_owners_are_dropped() {
+        let connection = fresh().await;
+        Migrator::up(&connection, Some(before(&AddApiKeyOwners)))
+            .await
+            .unwrap();
+        connection
+            .execute_unprepared(
+                "INSERT INTO api_keys (name, hint, token_hash, created_ms) \
+                 VALUES ('old', 'mxn_1', 'h1', 0)",
+            )
+            .await
+            .unwrap();
+
+        Migrator::up(&connection, None).await.unwrap();
+
+        let query = Statement::from_string(
+            connection.get_database_backend(),
+            "SELECT COUNT(*) AS n FROM api_keys",
+        );
+        let row = connection.query_one_raw(query).await.unwrap().unwrap();
+        assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0);
     }
 }

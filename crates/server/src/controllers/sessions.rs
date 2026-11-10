@@ -2,7 +2,6 @@
 //! a login. Agents and the API prove who they are in their own ways.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
@@ -16,9 +15,8 @@ use cookie::{Cookie, SameSite};
 use serde::Deserialize;
 use tracing::warn;
 
-use super::{CsrfForm, Page, SIGNED_IN, api, request_source, server_error};
+use super::{CsrfForm, Page, api, request_source, run_as, server_error};
 use crate::app_state::AppState;
-use crate::audit::{self, Actor};
 use crate::metrics::now_ms;
 use crate::models::{SESSION_LIFETIME_MS, User, check_new_password};
 use crate::passwords::{hash_password, password_matches};
@@ -63,16 +61,9 @@ pub async fn require_login(
     next: Next,
 ) -> Response {
     match session_user(&state, request.headers()).await {
-        Ok(Some(user)) => {
-            let actor = Actor::Person {
-                id: user.id,
-                email: user.email.clone(),
-            };
-            let signed_in = SIGNED_IN.scope(Arc::new(user), next.run(request));
-            audit::acting_as(actor, signed_in).await
-        }
-        Ok(None) => match api::token_holder(&state, request.headers()).await {
-            Ok(Some(actor)) => audit::acting_as(actor, next.run(request)).await,
+        Ok(Some(user)) => run_as(user, None, request, next).await,
+        Ok(None) => match api::key_holder(&state, request.headers()).await {
+            Ok(Some((owner, via))) => run_as(owner, Some(via), request, next).await,
             Ok(None) => to_sign_in(&request),
             Err(error) => server_error(&error),
         },

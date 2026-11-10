@@ -145,7 +145,7 @@ async fn start_with_heartbeat(
         .unwrap();
     let session = database.start_session(user.id, now_ms()).await.unwrap();
     let (_, api_key) = database
-        .create_api_key("tests", None, now_ms())
+        .create_api_key("tests", user.id, None, now_ms())
         .await
         .unwrap();
     let status = Arc::new(ServerStatus::new(None).unwrap());
@@ -190,6 +190,13 @@ async fn start_with_heartbeat(
 }
 
 impl TestServer {
+    /// The signed in user's ID.
+    async fn user_id(&self) -> i64 {
+        let database = &self.state.database;
+        let user = database.active_user_by_email("test@example.com").await;
+        user.unwrap().unwrap().id
+    }
+
     async fn connect(&self) -> Client {
         connect_async(format!("ws://{}/ws", self.address))
             .await
@@ -2588,6 +2595,19 @@ fn parses_commands() {
     );
     assert!(parse("agents approve").is_err());
     assert!(parse("agents delete").is_err());
+
+    // A key always has an owner.
+    assert!(parse("api-keys create ci").is_err());
+    assert_eq!(
+        parse("api-keys create ci --user ci@example.com")
+            .unwrap()
+            .command,
+        Some(Command::ApiKeys(crate::ApiKeysCommand::Create {
+            name: "ci".to_string(),
+            user: "ci@example.com".to_string(),
+            expires_in: None,
+        }))
+    );
 }
 
 // ---- agent versions
@@ -4252,6 +4272,8 @@ async fn new_key(server: &TestServer, details: Value) -> Value {
 async fn a_key_from_the_api_opens_the_api_until_it_is_revoked() {
     let server = start().await;
     let created = new_key(&server, json!({ "name": "backup" })).await;
+    // A key made with a key belongs to the same person.
+    assert_eq!(created["owner"], "test@example.com", "{created}");
     let key = created["key"].as_str().unwrap();
     assert!(key.starts_with("mxn_"));
 
@@ -4311,7 +4333,12 @@ async fn a_key_that_has_run_out_is_refused() {
     let (_, key) = server
         .state
         .database
-        .create_api_key("old", Some(now_ms() - 1000), now_ms() - 5000)
+        .create_api_key(
+            "old",
+            server.user_id().await,
+            Some(now_ms() - 1000),
+            now_ms() - 5000,
+        )
         .await
         .unwrap();
 

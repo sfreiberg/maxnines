@@ -440,10 +440,14 @@ const API_KEY_HINT_LEN: usize = 12;
 const API_KEY_USE_ACCURACY_MS: i64 = 60_000;
 
 /// A key for the API, without the key itself, which only exists when it's created.
+/// It acts as the person who owns it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ApiKey {
     pub id: i64,
     pub name: String,
+    pub user_id: i64,
+    /// The owner's email address.
+    pub owner: String,
     pub hint: String,
     pub created_ms: i64,
     /// Empty means it never expires.
@@ -458,11 +462,13 @@ impl ApiKey {
     }
 }
 
-impl From<api_key::Model> for ApiKey {
-    fn from(row: api_key::Model) -> Self {
+impl ApiKey {
+    fn from_row(row: api_key::Model, owner: String) -> Self {
         Self {
             id: row.id,
             name: row.name,
+            user_id: row.user_id,
+            owner,
             hint: row.hint,
             created_ms: row.created_ms,
             expires_ms: row.expires_ms,
@@ -491,10 +497,23 @@ pub fn expiry_after(secs: u64, now_ms: i64) -> Result<i64> {
         .context("That's too long for a key to last. Leave it out for a key that never expires.")
 }
 
+/// Everyone's email address, by their ID, to name keys' owners.
+async fn owner_emails(connection: &impl ConnectionTrait) -> Result<BTreeMap<i64, String>> {
+    let users = user::Entity::find()
+        .all(connection)
+        .await
+        .context("loading users")?;
+    Ok(users
+        .into_iter()
+        .map(|user| (user.id, user.email))
+        .collect())
+}
+
 /// A key as the audit log compares them. The key itself is never kept.
-fn api_key_snapshot(row: &api_key::Model) -> Snapshot {
+fn api_key_snapshot(row: &api_key::Model, owner: &str) -> Snapshot {
     let fields = serde_json::json!({
         "name": row.name,
+        "owner": owner,
         "hint": row.hint,
         "expires": row.expires_ms.map(crate::audit::time),
         "revoked": row.revoked_ms.is_some(),
@@ -510,17 +529,26 @@ impl Database {
     /// The token that protects the admin API, created the first time it's asked
     /// for. Two servers starting at once can't end up with different tokens, as
     /// only the first insert counts and both read the result.
-    /// Makes a key, and gives back the only copy of it there'll ever be.
+    /// Makes a key that acts as `user_id`, and gives back the only copy of it
+    /// there'll ever be. The owner has to be someone who can sign in.
     pub async fn create_api_key(
         &self,
         name: &str,
+        user_id: i64,
         expires_ms: Option<i64>,
         now_ms: i64,
     ) -> Result<(ApiKey, String)> {
         let key = format!("mxn_{}", new_nonce()?);
         let transaction = self.connection.begin().await.context("saving an API key")?;
+        let owner = user::Entity::find_by_id(user_id)
+            .filter(user::Column::DisabledMs.is_null())
+            .one(&transaction)
+            .await
+            .context("loading the key's owner")?
+            .context("a key's owner has to be a user who isn't disabled")?;
         let row = api_key::ActiveModel {
             name: Set(name.to_string()),
+            user_id: Set(user_id),
             hint: Set(key[..API_KEY_HINT_LEN].to_string()),
             token_hash: Set(api_key_hash(&key)),
             created_ms: Set(now_ms),
@@ -530,10 +558,10 @@ impl Database {
         .insert(&transaction)
         .await
         .context("saving an API key")?;
-        let after = api_key_snapshot(&row);
+        let after = api_key_snapshot(&row, &owner.email);
         record_change(&transaction, Kind::ApiKey, row.id, None, Some(&after), None).await?;
         transaction.commit().await.context("saving an API key")?;
-        Ok((row.into(), key))
+        Ok((ApiKey::from_row(row, owner.email), key))
     }
 
     /// Every key, newest first, including revoked ones.
@@ -543,7 +571,14 @@ impl Database {
             .all(&self.connection)
             .await
             .context("loading API keys")?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        let owners = owner_emails(&self.connection).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let owner = owners.get(&row.user_id).cloned().unwrap_or_default();
+                ApiKey::from_row(row, owner)
+            })
+            .collect())
     }
 
     /// Stops a key working. Returns false if there's no such key.
@@ -556,19 +591,23 @@ impl Database {
             return Ok(false);
         };
         if row.revoked_ms.is_none() {
-            let before = api_key_snapshot(&row);
             let transaction = self
                 .connection
                 .begin()
                 .await
                 .context("revoking an API key")?;
+            let owner = owner_emails(&transaction)
+                .await?
+                .remove(&row.user_id)
+                .unwrap_or_default();
+            let before = api_key_snapshot(&row, &owner);
             let mut row: api_key::ActiveModel = row.into();
             row.revoked_ms = Set(Some(now_ms));
             let row = row
                 .update(&transaction)
                 .await
                 .context("revoking an API key")?;
-            let after = api_key_snapshot(&row);
+            let after = api_key_snapshot(&row, &owner);
             record_change(
                 &transaction,
                 Kind::ApiKey,
@@ -583,8 +622,9 @@ impl Database {
         Ok(true)
     }
 
-    /// The key, if it still works, noting that it's been used.
-    pub async fn accept_api_key(&self, key: &str, now_ms: i64) -> Result<Option<ApiKey>> {
+    /// The key and who it acts as, if it still works, noting that it's been used. A
+    /// key stops working while its owner is disabled.
+    pub async fn accept_api_key(&self, key: &str, now_ms: i64) -> Result<Option<(ApiKey, User)>> {
         let row = api_key::Entity::find()
             .filter(api_key::Column::TokenHash.eq(api_key_hash(key)))
             .filter(api_key::Column::RevokedMs.is_null())
@@ -595,19 +635,27 @@ impl Database {
         else {
             return Ok(None);
         };
+        let owner = user::Entity::find_by_id(row.user_id)
+            .filter(user::Column::DisabledMs.is_null())
+            .one(&self.connection)
+            .await
+            .context("loading an API key's owner")?;
+        let Some(owner) = owner.map(User::from) else {
+            return Ok(None);
+        };
         let stale = row
             .last_used_ms
             .is_none_or(|used| now_ms - used >= API_KEY_USE_ACCURACY_MS);
-        if !stale {
-            return Ok(Some(row.into()));
-        }
-        let mut row: api_key::ActiveModel = row.into();
-        row.last_used_ms = Set(Some(now_ms));
-        let row = row
-            .update(&self.connection)
-            .await
-            .context("noting an API key's use")?;
-        Ok(Some(row.into()))
+        let row = if stale {
+            let mut row: api_key::ActiveModel = row.into();
+            row.last_used_ms = Set(Some(now_ms));
+            row.update(&self.connection)
+                .await
+                .context("noting an API key's use")?
+        } else {
+            row
+        };
+        Ok(Some((ApiKey::from_row(row, owner.email.clone()), owner)))
     }
 
     /// A secret the server made for itself, created the first time it's asked for.
@@ -1093,10 +1141,77 @@ mod tests {
         records
     }
 
+    /// Someone to own keys, made the first time it's asked for.
+    async fn owner(database: &Database) -> i64 {
+        if let Some(user) = database.list_users().await.unwrap().first() {
+            return user.id;
+        }
+        let made = database.create_user("owner@example.com", "Owner", 0).await;
+        made.unwrap().unwrap().0.id
+    }
+
+    #[tokio::test]
+    async fn a_key_acts_as_its_owner_and_stops_while_they_are_disabled() {
+        let database = Database::for_test().await;
+        let id = owner(&database).await;
+        database
+            .create_user("other@example.com", "Other", 0)
+            .await
+            .unwrap();
+        let (key, secret) = database.create_api_key("ci", id, None, 0).await.unwrap();
+        assert_eq!(key.owner, "owner@example.com");
+
+        let (_, acts_as) = database.accept_api_key(&secret, 1).await.unwrap().unwrap();
+        assert_eq!(acts_as.id, id);
+        database.disable_user(id, 2).await.unwrap();
+        assert!(database.accept_api_key(&secret, 3).await.unwrap().is_none());
+        database.enable_user(id).await.unwrap();
+        assert!(database.accept_api_key(&secret, 4).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn deleting_someone_deletes_their_keys() {
+        let database = Database::for_test().await;
+        let id = owner(&database).await;
+        database
+            .create_user("other@example.com", "Other", 0)
+            .await
+            .unwrap();
+        let (_, secret) = database.create_api_key("ci", id, None, 0).await.unwrap();
+
+        database.disable_user(id, 1).await.unwrap();
+        database.delete_user(id).await.unwrap();
+
+        assert!(database.list_api_keys().await.unwrap().is_empty());
+        assert!(database.accept_api_key(&secret, 2).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_disabled_or_missing_user_cannot_be_given_a_key() {
+        let database = Database::for_test().await;
+        let id = owner(&database).await;
+        database
+            .create_user("other@example.com", "Other", 0)
+            .await
+            .unwrap();
+        database.disable_user(id, 1).await.unwrap();
+
+        assert!(database.create_api_key("ci", id, None, 2).await.is_err());
+        assert!(
+            database
+                .create_api_key("ci", id + 100, None, 2)
+                .await
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn an_api_key_works_until_it_is_revoked() {
         let database = Database::for_test().await;
-        let (key, secret) = database.create_api_key("backup", None, 1000).await.unwrap();
+        let (key, secret) = database
+            .create_api_key("backup", owner(&database).await, None, 1000)
+            .await
+            .unwrap();
 
         assert!(
             database
@@ -1118,7 +1233,10 @@ mod tests {
     #[tokio::test]
     async fn only_a_real_key_is_accepted() {
         let database = Database::for_test().await;
-        database.create_api_key("backup", None, 1000).await.unwrap();
+        database
+            .create_api_key("backup", owner(&database).await, None, 1000)
+            .await
+            .unwrap();
 
         assert!(
             database
@@ -1133,7 +1251,10 @@ mod tests {
     #[tokio::test]
     async fn the_key_itself_is_never_stored() {
         let database = Database::for_test().await;
-        let (_, secret) = database.create_api_key("backup", None, 1000).await.unwrap();
+        let (_, secret) = database
+            .create_api_key("backup", owner(&database).await, None, 1000)
+            .await
+            .unwrap();
 
         let rows = api_key::Entity::find()
             .all(&database.connection)
@@ -1149,15 +1270,24 @@ mod tests {
     #[tokio::test]
     async fn each_key_is_different() {
         let database = Database::for_test().await;
-        let (_, first) = database.create_api_key("a", None, 1).await.unwrap();
-        let (_, second) = database.create_api_key("a", None, 1).await.unwrap();
+        let (_, first) = database
+            .create_api_key("a", owner(&database).await, None, 1)
+            .await
+            .unwrap();
+        let (_, second) = database
+            .create_api_key("a", owner(&database).await, None, 1)
+            .await
+            .unwrap();
         assert_ne!(first, second);
     }
 
     #[tokio::test]
     async fn using_a_key_is_noted_without_writing_every_time() {
         let database = Database::for_test().await;
-        let (_, secret) = database.create_api_key("backup", None, 0).await.unwrap();
+        let (_, secret) = database
+            .create_api_key("backup", owner(&database).await, None, 0)
+            .await
+            .unwrap();
         let used = async || database.list_api_keys().await.unwrap()[0].last_used_ms;
         assert_eq!(used().await, None);
 
@@ -1174,7 +1304,10 @@ mod tests {
     #[tokio::test]
     async fn revoking_twice_keeps_the_first_time() {
         let database = Database::for_test().await;
-        let (key, _) = database.create_api_key("backup", None, 0).await.unwrap();
+        let (key, _) = database
+            .create_api_key("backup", owner(&database).await, None, 0)
+            .await
+            .unwrap();
 
         database.revoke_api_key(key.id, 100).await.unwrap();
         database.revoke_api_key(key.id, 200).await.unwrap();
@@ -1188,7 +1321,7 @@ mod tests {
     async fn a_key_stops_working_when_it_expires() {
         let database = Database::for_test().await;
         let (key, secret) = database
-            .create_api_key("deploy", Some(5000), 1000)
+            .create_api_key("deploy", owner(&database).await, Some(5000), 1000)
             .await
             .unwrap();
 
@@ -1220,7 +1353,10 @@ mod tests {
     #[tokio::test]
     async fn a_key_with_no_expiry_lasts() {
         let database = Database::for_test().await;
-        let (key, secret) = database.create_api_key("a", None, 0).await.unwrap();
+        let (key, secret) = database
+            .create_api_key("a", owner(&database).await, None, 0)
+            .await
+            .unwrap();
 
         assert!(
             database

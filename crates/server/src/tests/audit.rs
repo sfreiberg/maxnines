@@ -133,6 +133,14 @@ async fn a_change_on_the_pages_records_who_made_it() {
     assert_eq!(entry.source.as_deref(), Some("127.0.0.1"));
     assert_eq!(entry.subject.kind, "api_key");
     assert_eq!(entry.subject.name, "Backup script");
+    let owner = entry.changes.iter().find(|c| c.field == "owner").unwrap();
+    assert_eq!(owner.after, Some(json!("test@example.com")));
+    let listed = Browser::default().get(&server, "/settings/api-keys").await;
+    assert!(
+        listed.body.contains("<td>test@example.com</td>"),
+        "{}",
+        listed.body
+    );
 }
 
 /// Calls the API from behind a proxy that says the request came from `client`.
@@ -180,8 +188,11 @@ async fn an_api_change_records_the_key_and_the_values_before_and_after() {
     let entries = since(&server, before).await;
     assert_eq!(actions(&entries), ["created", "changed"]);
     let changed = &entries[1];
-    assert_eq!(changed.actor.kind, "api_key");
-    assert_eq!(changed.actor.name, "tests");
+    assert_eq!(changed.actor.kind, "person");
+    assert_eq!(changed.actor.name, "test@example.com");
+    let via = changed.via.as_ref().unwrap();
+    assert_eq!((via.kind.as_str(), via.name.as_str()), ("api_key", "tests"));
+    assert_eq!(changed.via_label().as_deref(), Some("via API key tests"));
     assert_eq!(changed.source.as_deref(), Some("203.0.113.9"));
     assert_eq!(changed.subject.name, "Night ops");
     assert_eq!(changed.changes.len(), 1, "{:?}", changed.changes);
@@ -328,6 +339,7 @@ async fn changes_with_nobody_acting_are_maxnines_own() {
         actor: Actor::CommandLine {
             account: Some("sam".into()),
         },
+        via: None,
         source: None,
     };
     audit::acting(command_line, database.create_dashboard("By hand", now_ms()))
@@ -358,13 +370,20 @@ async fn approving_an_agent_records_its_state_changing() {
     let entries = since(&server, before).await;
     assert_eq!(actions(&entries), ["changed"]);
     let entry = &entries[0];
-    assert_eq!(entry.actor.kind, "api_key");
+    assert_eq!(entry.actor.name, "test@example.com");
+    assert_eq!(entry.via.as_ref().unwrap().kind, "api_key");
     assert_eq!(entry.subject.kind, "agent");
     assert_eq!(entry.subject.id, Some(agent.id()));
     assert_eq!(entry.subject.name, "web-1");
     let state = entry.changes.iter().find(|c| c.field == "state").unwrap();
     assert_eq!(state.before, Some(json!("pending")));
     assert_eq!(state.after, Some(json!("approved")));
+    let by = entry
+        .changes
+        .iter()
+        .find(|c| c.field == "decided_by")
+        .unwrap();
+    assert_eq!(by.after, Some(json!("test@example.com")));
 }
 
 #[tokio::test]
@@ -419,9 +438,19 @@ async fn the_page_shows_entries_without_secrets() {
         .await
         .unwrap();
 
+    api_from(
+        &server,
+        "127.0.0.1",
+        "POST",
+        "/api/v1/dashboards",
+        r#"{"name": "Keyed"}"#,
+    )
+    .await;
+
     let page = Browser::default().get(&server, "/settings/audit-log").await;
 
     assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("via API key tests"), "{}", page.body);
     assert!(page.body.contains("Notification channel"), "{}", page.body);
     assert!(page.body.contains("&lt;b&gt;Ops"), "{}", page.body);
     assert!(!page.body.contains("<b>Ops</b>"));

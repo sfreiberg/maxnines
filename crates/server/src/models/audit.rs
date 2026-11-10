@@ -7,7 +7,9 @@ use sea_orm::{
 };
 
 use super::{Database, audit_entry};
-use crate::audit::{self, Action, Change, Entry, EntryActor, EntrySubject, Kind, Record, Snapshot};
+use crate::audit::{
+    self, Action, Change, Entry, EntryActor, EntrySubject, EntryVia, Kind, Record, Snapshot, Via,
+};
 use crate::metrics::now_ms;
 
 /// The longest name kept, in characters, as the columns allow.
@@ -27,6 +29,12 @@ pub(super) async fn record<C: ConnectionTrait>(connection: &C, record: Record) -
         actor_kind: Set(actor.kind().to_string()),
         actor_id: Set(actor.id()),
         actor_name: Set(clip(&actor.name(), MAX_NAME_CHARS)),
+        via_kind: Set(acting.via.as_ref().map(|via| via.kind().to_string())),
+        via_id: Set(acting.via.as_ref().and_then(Via::id)),
+        via_name: Set(acting
+            .via
+            .as_ref()
+            .map(|via| clip(&via.name(), MAX_NAME_CHARS))),
         source: Set(acting.source.map(|ip| ip.to_string())),
         action: Set(record.action.as_str().to_string()),
         subject_kind: Set(record.subject.kind.as_str().to_string()),
@@ -69,6 +77,11 @@ fn to_entry(row: audit_entry::Model) -> Entry {
             id: row.actor_id,
             name: row.actor_name,
         },
+        via: row.via_kind.map(|kind| EntryVia {
+            kind,
+            id: row.via_id,
+            name: row.via_name.unwrap_or_default(),
+        }),
         source: row.source,
         action: row.action,
         subject: EntrySubject {

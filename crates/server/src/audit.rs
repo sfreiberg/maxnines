@@ -30,22 +30,12 @@ pub enum Actor {
         id: i64,
         email: String,
     },
-    ApiKey {
-        id: i64,
-        name: String,
-    },
     /// The server's own commands, by the account that ran them, if it's known.
     CommandLine {
         account: Option<String>,
     },
     /// The server itself, like an agent approved by a registration rule.
     MaxNines,
-    /// Someone pressing an alert's buttons in Slack, by the account Slack's address
-    /// for them matched.
-    Slack {
-        id: i64,
-        email: String,
-    },
     /// Someone who isn't signed in, like a failed sign in.
     Nobody,
 }
@@ -54,27 +44,22 @@ impl Actor {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Person { .. } => "person",
-            Self::ApiKey { .. } => "api_key",
             Self::CommandLine { .. } => "command_line",
             Self::MaxNines => "maxnines",
-            Self::Slack { .. } => "slack",
             Self::Nobody => "nobody",
         }
     }
 
     pub fn id(&self) -> Option<String> {
         match self {
-            Self::Person { id, .. } | Self::ApiKey { id, .. } | Self::Slack { id, .. } => {
-                Some(id.to_string())
-            }
+            Self::Person { id, .. } => Some(id.to_string()),
             _ => None,
         }
     }
 
     pub fn name(&self) -> String {
         match self {
-            Self::Person { email, .. } | Self::Slack { email, .. } => email.clone(),
-            Self::ApiKey { name, .. } => name.clone(),
+            Self::Person { email, .. } => email.clone(),
             Self::CommandLine { account } => match account {
                 Some(account) => format!("Command line ({account})"),
                 None => "Command line".to_string(),
@@ -85,10 +70,43 @@ impl Actor {
     }
 }
 
-/// Who is acting, and the address their request came from.
+/// How someone acted, when it wasn't on the pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Via {
+    /// One of their API keys, which acts as them.
+    ApiKey { id: i64, name: String },
+    /// An alert's buttons in Slack, matched to them by email address.
+    Slack,
+}
+
+impl Via {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::ApiKey { .. } => "api_key",
+            Self::Slack => "slack",
+        }
+    }
+
+    pub fn id(&self) -> Option<String> {
+        match self {
+            Self::ApiKey { id, .. } => Some(id.to_string()),
+            Self::Slack => None,
+        }
+    }
+
+    pub fn name(&self) -> String {
+        match self {
+            Self::ApiKey { name, .. } => name.clone(),
+            Self::Slack => "Slack".to_string(),
+        }
+    }
+}
+
+/// Who is acting, how, and the address their request came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Acting {
     pub actor: Actor,
+    pub via: Option<Via>,
     pub source: Option<IpAddr>,
 }
 
@@ -101,10 +119,11 @@ pub async fn acting<F: Future>(acting: Acting, work: F) -> F::Output {
     ACTING.scope(acting, work).await
 }
 
-/// Runs `work` as `actor`, keeping the address the request came from.
-pub async fn acting_as<F: Future>(actor: Actor, work: F) -> F::Output {
+/// Runs `work` as `actor`, acting `via` something if they are, keeping the address
+/// the request came from.
+pub async fn acting_as<F: Future>(actor: Actor, via: Option<Via>, work: F) -> F::Output {
     let source = source();
-    acting(Acting { actor, source }, work).await
+    acting(Acting { actor, via, source }, work).await
 }
 
 /// Who is acting now. A task spawned from a request doesn't carry this, so a change
@@ -112,6 +131,7 @@ pub async fn acting_as<F: Future>(actor: Actor, work: F) -> F::Output {
 pub fn current() -> Acting {
     ACTING.try_with(Clone::clone).unwrap_or(Acting {
         actor: Actor::MaxNines,
+        via: None,
         source: None,
     })
 }
@@ -464,6 +484,14 @@ pub struct EntryActor {
     pub name: String,
 }
 
+/// How they acted, when it wasn't on the pages.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EntryVia {
+    pub kind: String,
+    pub id: Option<String>,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EntrySubject {
     pub kind: String,
@@ -477,6 +505,7 @@ pub struct Entry {
     pub id: i64,
     pub at_ms: i64,
     pub actor: EntryActor,
+    pub via: Option<EntryVia>,
     /// The address the request came from.
     pub source: Option<String>,
     pub action: String,
@@ -488,12 +517,19 @@ impl Entry {
     /// Who did it, in words.
     pub fn actor_label(&self) -> String {
         match self.actor.kind.as_str() {
-            "person" => self.actor.name.clone(),
-            "api_key" => format!("API key {}", self.actor.name),
-            "slack" => format!("{} in Slack", self.actor.name),
             "nobody" => "Someone".to_string(),
             _ => self.actor.name.clone(),
         }
+    }
+
+    /// How they acted, in words, when it wasn't on the pages.
+    pub fn via_label(&self) -> Option<String> {
+        let via = self.via.as_ref()?;
+        Some(match via.kind.as_str() {
+            "api_key" => format!("via API key {}", via.name),
+            "slack" => "via Slack".to_string(),
+            _ => format!("via {}", via.name),
+        })
     }
 
     pub fn action_label(&self) -> String {
@@ -625,6 +661,7 @@ mod tests {
         assert_eq!(current().actor, Actor::MaxNines);
         let someone = Acting {
             actor: Actor::CommandLine { account: None },
+            via: None,
             source: Some([10, 0, 0, 1].into()),
         };
 

@@ -53,7 +53,7 @@ use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Pr
 use tracing::{error, warn};
 
 use crate::app_state::AppState;
-use crate::audit::{self, Acting, Actor};
+use crate::audit::{self, Acting, Actor, Via};
 use crate::models::{DEFAULT_THEME, User};
 use crate::times::{DEFAULT_TIME_ZONE, format_time};
 
@@ -69,6 +69,17 @@ tokio::task_local! {
 /// Who's signed in, which is nobody on the sign in pages or for an API key.
 fn signed_in_user() -> Option<Arc<User>> {
     SIGNED_IN.try_with(Arc::clone).ok()
+}
+
+/// Runs a request as `user`, for the page's frame and the audit log, `via` an API
+/// key or the like if that's how they came.
+async fn run_as(user: User, via: Option<Via>, request: Request, next: Next) -> Response {
+    let actor = Actor::Person {
+        id: user.id,
+        email: user.email.clone(),
+    };
+    let signed_in = SIGNED_IN.scope(Arc::new(user), next.run(request));
+    audit::acting_as(actor, via, signed_in).await
 }
 
 /// The zone whoever's signed in reads times in. Request handlers only, as a task
@@ -102,6 +113,7 @@ async fn note_source(State(state): State<AppState>, request: Request, next: Next
         .map(|ConnectInfo(peer)| request_source(*peer, request.headers(), &state.trusted_proxies));
     let acting = Acting {
         actor: Actor::Nobody,
+        via: None,
         source,
     };
     audit::acting(acting, next.run(request)).await

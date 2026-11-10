@@ -756,10 +756,13 @@ async fn an_approval_records_who_made_it() {
 }
 
 #[tokio::test]
-async fn an_api_key_can_read_pages_but_not_submit_forms() {
+async fn an_api_key_reads_pages_as_its_owner_but_cannot_submit_forms() {
     let server = start().await;
     let database = &server.state.database;
-    let (_, key) = database.create_api_key("k", None, now_ms()).await.unwrap();
+    let (_, key) = database
+        .create_api_key("k", server.user_id().await, None, now_ms())
+        .await
+        .unwrap();
     let mut browser = Browser::anonymous();
 
     let request = format!(
@@ -768,7 +771,8 @@ async fn an_api_key_can_read_pages_but_not_submit_forms() {
     );
     let page = browser.send(&server, request).await;
     assert_eq!(page.status, 200);
-    assert!(!page.body.contains(r#"id="profile-link""#));
+    // A key acts as its owner, so the page is theirs.
+    assert!(page.body.contains(r#"id="profile-link""#));
 
     let body = "email=a%40example.com&name=A";
     let request = format!(

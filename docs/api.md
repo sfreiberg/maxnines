@@ -9,7 +9,7 @@ Make a key, then send it as a bearer token with every request:
 
 ```sh
 export MAXNINES_URL=http://localhost:9000
-export MAXNINES_API_KEY=$(maxnines-server api-keys create "My script" --expires-in 30d)
+export MAXNINES_API_KEY=$(maxnines-server api-keys create "My script" --user you@example.com --expires-in 30d)
 
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/agents"
 ```
@@ -25,10 +25,13 @@ export AGENT_ID=$(curl -s -H "Authorization: Bearer $MAXNINES_API_KEY" \
 ## How the API works
 
 **Authentication.** Every request needs an `Authorization: Bearer` header holding an
-API key. A key can do everything the API can, so give each tool its own. Without a
-valid key, the answer is `401`. Keys are made on the Settings page or with
-`maxnines-server api-keys create`, which writes to the main database directly, so it
-works before anyone can sign in.
+API key. Each key belongs to a user and acts as them: what it does is recorded in the
+[audit log](audit-log.md) as that person, via the key, and it stops working while
+they're disabled. Give each tool its own key. Without a valid key, the answer is
+`401`. Keys are made on the Settings page, through this API, or with
+`maxnines-server api-keys create --user <email>`, which writes to the main database
+directly, so it works while the server is stopped. For a script that isn't anyone's,
+add a user for it, such as `ci@example.com`, which never needs a password.
 
 **Encryption.** Use the server's own TLS, either your certificates or automatic ones
 through ACME, or put it behind a proxy that terminates TLS. Anywhere beyond one
@@ -1419,7 +1422,8 @@ Takes a list of widgets' `id`, `x`, `y`, `w` and `h`, and saves them together.
 
 Keys can also be managed on the Settings page, and with `maxnines-server api-keys`.
 Only a hash of each key is kept, so a key can only be seen when it's created. `hint` is
-the start of it, to tell keys apart.
+the start of it, to tell keys apart. Each key acts as its owner, `user_id`, whose
+email address is `owner`. Deleting a user deletes their keys.
 
 ### List API keys
 
@@ -1436,6 +1440,8 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/api-keys
   {
     "id": 1,
     "name": "My script",
+    "user_id": 1,
+    "owner": "you@example.com",
     "hint": "mxn_9689a740",
     "created_ms": 1793940265767,
     "expires_ms": 1793943865767,
@@ -1453,7 +1459,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/api-keys
 
 | Field | Description |
 | --- | --- |
-| `name` | Required. What the key is for, up to 100 characters |
+| `name` | Required. What the key is for, up to 100 characters. The key belongs to whoever owns the key making it |
 | `expires_in_secs` | How long it lasts. Leave it out for a key that never expires |
 
 ```sh
@@ -1467,6 +1473,8 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
 {
   "id": 2,
   "name": "Deploy job",
+  "user_id": 1,
+  "owner": "you@example.com",
   "hint": "mxn_6ffd6467",
   "key": "mxn_6ffd6467588f1ad1cbdca9b9961ff4be70e64ef4ff330c805ee3015463c00357",
   "created_ms": 1793940286623,
@@ -1650,6 +1658,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
     "id": 42,
     "at_ms": 1794180214377,
     "actor": { "kind": "person", "id": "1", "name": "sam@example.com" },
+    "via": { "kind": "api_key", "id": "3", "name": "Deploy job" },
     "source": "192.168.0.20",
     "action": "changed",
     "subject": { "kind": "alert_rule", "id": "3", "name": "Disk filling up" },
@@ -1662,6 +1671,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
     "id": 41,
     "at_ms": 1794180190012,
     "actor": { "kind": "person", "id": "1", "name": "sam@example.com" },
+    "via": null,
     "source": "192.168.0.20",
     "action": "signed_in",
     "subject": { "kind": "user", "id": "1", "name": "sam@example.com" },
@@ -1674,12 +1684,14 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 | Kind | Who |
 | --- | --- |
-| `person` | Someone signed in to the web pages. `name` is their email address |
-| `api_key` | A script using an API key. `name` is the key's name |
-| `slack` | Someone pressing an alert's buttons in Slack, matched to a user by email address |
+| `person` | A user. `name` is their email address |
 | `command_line` | A `maxnines-server` command run on the server's machine |
 | `maxnines` | The server itself, like a registration rule approving an agent |
 | `nobody` | Someone who isn't signed in, like a failed sign in |
+
+`via` says how a person acted when it wasn't on the pages: `api_key`, with the key's
+`id` and `name`, or `slack`, for an alert's buttons in Slack, matched to the user by
+email address.
 
 `action` is `created`, `changed`, `deleted`, `signed_in`, `sign_in_failed`,
 `signed_out`, `new_setup_link`, `acknowledged` or `unacknowledged`. `subject.kind` is

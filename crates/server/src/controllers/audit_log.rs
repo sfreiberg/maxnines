@@ -29,6 +29,8 @@ struct Paging {
 struct Row {
     at: String,
     actor: String,
+    /// Like "via API key Deploy job".
+    via: Option<String>,
     source: Option<String>,
     action: String,
     kind: String,
@@ -77,6 +79,7 @@ fn row(entry: &Entry) -> Row {
     Row {
         at: local_time(entry.at_ms),
         actor: entry.actor_label(),
+        via: entry.via_label(),
         source: entry.source.clone(),
         action: entry.action_label(),
         kind: entry.kind_label(),

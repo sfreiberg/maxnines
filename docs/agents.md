@@ -31,7 +31,7 @@ It creates a key in `state`, logs its agent ID, and waits to be approved. Approv
 on the Agents page, or from the command line with an API key:
 
 ```sh
-export MAXNINES_API_KEY=$(maxnines-server api-keys create "Admin")
+export MAXNINES_API_KEY=$(maxnines-server api-keys create "Admin" --user you@example.com)
 maxnines-server agents approve <agent-id>
 ```
 

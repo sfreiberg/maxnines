@@ -20,13 +20,14 @@ use super::host_list::HostSearch;
 use super::users::{refusal, setup_url};
 use crate::alerting::{Alert, AlertRuleInput, ChannelInput, ChannelKind};
 use crate::app_state::{AgentDeletion, AppState};
-use crate::audit::{self, Actor};
+use crate::audit::Via;
 use crate::calculations::{self, Calculation, Question};
 use crate::dashboards::{Placed, WidgetInput, check_layout, check_name};
 use crate::facts::unflatten;
 use crate::locations::{LocationRuleInput, check_rule};
 use crate::maintenance::MaintenanceWindowInput;
 use crate::metrics::{self, METRICS, Metric, SeriesResult, TimeRange, Unit, now_ms};
+use crate::models::User;
 use crate::models::{
     ConfigStatus, RuleInput, UserChange, check_api_key_name, check_new_user, expiry_after, is_theme,
 };
@@ -189,8 +190,11 @@ fn failed(status: StatusCode, error: &str) -> Response {
     (status, Json(json!({ "error": error }))).into_response()
 }
 
-/// Who a request is from, if it carries a working API key.
-pub async fn token_holder(state: &AppState, headers: &HeaderMap) -> anyhow::Result<Option<Actor>> {
+/// Who a request acts as, and the key it came with, if it carries a working API key.
+pub async fn key_holder(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> anyhow::Result<Option<(User, Via)>> {
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -198,16 +202,19 @@ pub async fn token_holder(state: &AppState, headers: &HeaderMap) -> anyhow::Resu
     let Some(key) = presented else {
         return Ok(None);
     };
-    let key = state.database.accept_api_key(key, now_ms()).await?;
-    Ok(key.map(|key| Actor::ApiKey {
-        id: key.id,
-        name: key.name,
+    let accepted = state.database.accept_api_key(key, now_ms()).await?;
+    Ok(accepted.map(|(key, owner)| {
+        let via = Via::ApiKey {
+            id: key.id,
+            name: key.name,
+        };
+        (owner, via)
     }))
 }
 
 async fn require_token(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    match token_holder(&state, request.headers()).await {
-        Ok(Some(actor)) => audit::acting_as(actor, next.run(request)).await,
+    match key_holder(&state, request.headers()).await {
+        Ok(Some((owner, via))) => super::run_as(owner, Some(via), request, next).await,
         Ok(None) => StatusCode::UNAUTHORIZED.into_response(),
         Err(error) => server_error(&error),
     }
@@ -363,7 +370,15 @@ async fn create_api_key(State(state): State<AppState>, Json(input): Json<NewApiK
         Some(Err(error)) => return refused(&error),
         None => None,
     };
-    match state.database.create_api_key(name, expires_ms, now).await {
+    // Always someone, as every request here comes with a key that acts as its owner.
+    let Some(owner) = super::signed_in_user() else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    match state
+        .database
+        .create_api_key(name, owner.id, expires_ms, now)
+        .await
+    {
         Ok((details, key)) => {
             let mut body = json!(details);
             body["key"] = json!(key);
@@ -1353,8 +1368,12 @@ async fn delete_agent(State(state): State<AppState>, UrlPath(id): UrlPath<String
     }
 }
 
+/// Recorded as the key's owner, as a decision on the pages is.
 async fn decide(state: &AppState, id: &str, decision: AgentState) -> Response {
-    match state.registry.decide(id, decision).await {
+    let Some(owner) = super::signed_in_user() else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    match state.registry.decide_as(id, decision, &owner.email).await {
         Ok(Some(agent)) => Json(agent).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),

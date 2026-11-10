@@ -8,7 +8,7 @@ use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
 use serde::Serialize;
 
-use super::{CsrfForm, Page, local_time, server_error};
+use super::{CsrfForm, Page, local_time, server_error, signed_in_user};
 use crate::app_state::AppState;
 use crate::metrics::now_ms;
 use crate::models::{ApiKey, check_api_key_name, expiry_after};
@@ -34,6 +34,8 @@ const LIFETIMES: [(&str, Option<u64>); 7] = [
 struct KeyRow {
     id: i64,
     name: String,
+    /// Who it acts as.
+    owner: String,
     hint: String,
     created: String,
     expires: Option<String>,
@@ -86,6 +88,7 @@ fn row(key: ApiKey, now_ms: i64) -> KeyRow {
         usable: status == "Active",
         id: key.id,
         name: key.name,
+        owner: key.owner,
         hint: key.hint,
     }
 }
@@ -134,7 +137,15 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
         Ok(expires) => expires,
         Err(error) => return server_error(&error),
     };
-    match state.database.create_api_key(name, expires_ms, now).await {
+    // Everyone here is signed in, as a person or with a key that acts as one.
+    let Some(owner) = signed_in_user() else {
+        return server_error(&anyhow::anyhow!("nobody signed in to own a key"));
+    };
+    match state
+        .database
+        .create_api_key(name, owner.id, expires_ms, now)
+        .await
+    {
         Ok((_, key)) => {
             let mut response = page(&state, &form.token, Some(&key), None).await;
             // The key is on this page, and nowhere else from now on.
@@ -170,6 +181,8 @@ mod tests {
         ApiKey {
             id: 1,
             name: "a".to_string(),
+            user_id: 1,
+            owner: "a@example.com".to_string(),
             hint: "mxn_".to_string(),
             created_ms: 0,
             expires_ms,

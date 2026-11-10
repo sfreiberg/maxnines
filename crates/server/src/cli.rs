@@ -43,6 +43,7 @@ where
         .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()));
     let acting = Acting {
         actor: Actor::CommandLine { account },
+        via: None,
         source: None,
     };
     runtime.block_on(audit::acting(acting, async {
@@ -229,8 +230,8 @@ pub fn print_api_keys(config: &Config) -> Result<()> {
 
     let now = now_ms();
     println!(
-        "{:<6} {:<16} {:<8} {:<20} NAME",
-        "ID", "KEY", "STATE", "EXPIRES"
+        "{:<6} {:<16} {:<8} {:<20} {:<30} NAME",
+        "ID", "KEY", "STATE", "EXPIRES", "OWNER"
     );
     for key in keys {
         let state = if key.revoked_ms.is_some() {
@@ -241,20 +242,27 @@ pub fn print_api_keys(config: &Config) -> Result<()> {
             "active"
         };
         println!(
-            "{:<6} {:<16} {:<8} {:<20} {}",
+            "{:<6} {:<16} {:<8} {:<20} {:<30} {}",
             key.id,
             format!("{}...", key.hint),
             state,
             key.expires_ms
                 .and_then(|time| u64::try_from(time).ok())
                 .map_or_else(|| "never".to_string(), |time| format_time(time, Tz::UTC)),
+            key.owner,
             key.name,
         );
     }
     Ok(())
 }
 
-pub fn create_api_key(config: &Config, name: &str, expires_in: Option<Duration>) -> Result<()> {
+/// Makes a key that acts as the user with this email address.
+pub fn create_api_key(
+    config: &Config,
+    name: &str,
+    owner: &str,
+    expires_in: Option<Duration>,
+) -> Result<()> {
     let name = name.trim();
     check_api_key_name(name)?;
     let now = now_ms();
@@ -262,7 +270,13 @@ pub fn create_api_key(config: &Config, name: &str, expires_in: Option<Duration>)
         .map(|time| expiry_after(time.as_secs(), now))
         .transpose()?;
     let (_, key) = with_database(config, |database| async move {
-        database.create_api_key(name, expires_ms, now).await
+        let owner = database
+            .active_user_by_email(owner)
+            .await?
+            .with_context(|| format!("no user who can sign in has the address {owner}"))?;
+        database
+            .create_api_key(name, owner.id, expires_ms, now)
+            .await
     })?;
 
     println!("{key}");

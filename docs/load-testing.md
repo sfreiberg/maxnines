@@ -8,7 +8,7 @@ Run it against a test server, because simulated agents are approved and saved li
 real ones.
 
 ```sh
-export MAXNINES_API_KEY=$(maxnines-server api-keys create "Load test" --expires-in 1d)
+export MAXNINES_API_KEY=$(maxnines-server api-keys create "Load test" --user you@example.com --expires-in 1d)
 maxnines-loadtest --url ws://localhost:9000/ws --agents 5000 --duration 15m
 ```
 

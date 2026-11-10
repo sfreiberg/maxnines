@@ -10,7 +10,7 @@ and there's no way to change or delete them from MaxNines.
 - Signing in, signing out, and failed sign ins, with the email address that was tried
 - Users: adding, disabling, enabling and deleting them, password changes, new
   password links, and each person's theme and time zone
-- API keys being created and revoked
+- API keys being created and revoked, and deleted with their owner
 - Agents being approved, revoked, renamed by their machine, and deleted, and new agents
   asking to join
 - Config rules, alert rules, notification channels, silences, maintenance windows,
@@ -25,9 +25,9 @@ already keeps their history.
 
 Each entry says who acted:
 
-- someone signed in, by their email address
-- an API key, by its name
-- someone pressing an alert's buttons in Slack, by the user their Slack email matched
+- a user, by their email address, on the pages, with one of their API keys, which
+  the entry names, or by pressing an alert's buttons in Slack, matched to them by
+  email address
 - the command line, with the system account that ran `maxnines-server`
 - MaxNines itself, like a registration rule approving an agent
 - someone not signed in, for a failed sign in

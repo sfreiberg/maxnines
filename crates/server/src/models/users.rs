@@ -18,7 +18,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use super::audit::{record, record_change};
-use super::{Database, user, user_session};
+use super::{Database, api_key, api_key_snapshot, user, user_session};
 use crate::audit::{Action, Actor, Kind, Record, Snapshot, Subject};
 use crate::registration::hash_token;
 use crate::times::{DEFAULT_TIME_ZONE, zone_named};
@@ -491,6 +491,29 @@ impl Database {
             .exec(&transaction)
             .await
             .context("ending sessions")?;
+        // Their keys act as them, so they go too.
+        let keys = api_key::Entity::find()
+            .filter(api_key::Column::UserId.eq(id))
+            .all(&transaction)
+            .await
+            .context("loading their API keys")?;
+        api_key::Entity::delete_many()
+            .filter(api_key::Column::UserId.eq(id))
+            .exec(&transaction)
+            .await
+            .context("deleting their API keys")?;
+        for key in &keys {
+            let before = api_key_snapshot(key, &row.email);
+            record_change(
+                &transaction,
+                Kind::ApiKey,
+                key.id,
+                Some(&before),
+                None,
+                None,
+            )
+            .await?;
+        }
         user::Entity::delete_by_id(id)
             .exec(&transaction)
             .await
