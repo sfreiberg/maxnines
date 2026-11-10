@@ -375,8 +375,12 @@ mod tests {
     #[test]
     fn a_process_that_has_exited_does_not_count_as_running() {
         let mut child = std::process::Command::new("true").spawn().unwrap();
-        // It stays a zombie until it's waited for.
-        std::thread::sleep(Duration::from_millis(300));
+        // Waits for it to exit without reaping it, so it stays a zombie until the
+        // collector has looked.
+        let pid = rustix::process::Pid::from_child(&child);
+        let options =
+            rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT;
+        rustix::process::waitid(rustix::process::WaitId::Pid(pid), options).unwrap();
 
         let mut collector = ProcessCollector::new(Some(vec!["true".to_string()])).unwrap();
         let output = collector.collect().unwrap();

@@ -107,6 +107,18 @@ fn network_facts<'a>(
 /// should rarely change, because each change is kept as history. That's why
 /// swap size, which some systems resize on demand, isn't included.
 pub fn gather(custom: &BTreeMap<String, Value>, metrics: &Definitions) -> Result<Value> {
+    let hostname = System::host_name().ok();
+    let canonical = hostname.as_deref().and_then(canonical_name);
+    gather_named(custom, metrics, hostname.as_deref(), canonical.as_deref())
+}
+
+/// Everything but asking the resolver what the machine is called.
+fn gather_named(
+    custom: &BTreeMap<String, Value>,
+    metrics: &Definitions,
+    hostname: Option<&str>,
+    canonical: Option<&str>,
+) -> Result<Value> {
     let build = build_info!();
     let mut system = System::new()?;
     system.refresh_memory();
@@ -117,12 +129,10 @@ pub fn gather(custom: &BTreeMap<String, Value>, metrics: &Definitions) -> Result
         let name = name.to_string_lossy().into_owned();
         (name, data.mac_address(), data.ip_networks())
     });
-    let hostname = System::host_name().ok();
-    let canonical = hostname.as_deref().and_then(canonical_name);
     let mut networking = network_facts(interfaces);
     if let (Some(networking), Some(names)) = (
         networking.as_object_mut(),
-        name_facts(hostname.as_deref(), canonical.as_deref()).as_object(),
+        name_facts(hostname, canonical).as_object(),
     ) {
         networking.extend(names.clone());
     }
@@ -136,7 +146,7 @@ pub fn gather(custom: &BTreeMap<String, Value>, metrics: &Definitions) -> Result
             "kernel": System::kernel_version().ok(),
         },
         "host": {
-            "name": hostname.as_deref().map(short_name),
+            "name": hostname.map(short_name),
             "arch": System::cpu_arch(),
         },
         "cpu": {
@@ -337,13 +347,14 @@ mod tests {
 
     #[test]
     fn gathering_twice_gives_the_same_facts() {
-        // A difference here would fill the history with false changes.
+        // A difference here would fill the history with false changes. The resolver
+        // is asked once, as it can answer one time and be too slow the next.
         let custom = BTreeMap::new();
         let none = Definitions::new();
-        assert_eq!(
-            gather(&custom, &none).unwrap(),
-            gather(&custom, &none).unwrap()
-        );
+        let named = |custom, none| {
+            gather_named(custom, none, Some("web-1"), Some("web-1.example.com")).unwrap()
+        };
+        assert_eq!(named(&custom, &none), named(&custom, &none));
     }
 
     #[test]

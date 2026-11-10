@@ -57,17 +57,26 @@ fn modified(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
-/// Picks up a certificate replaced on disk. One that can't be read is left for next
-/// time, and the one in use carries on, as a renewal may only be half done.
+/// When the certificate and key were last changed.
+type FileTimes = (Option<SystemTime>, Option<SystemTime>);
+
+fn file_times(certificate: &Path, key: &Path) -> FileTimes {
+    (modified(certificate), modified(key))
+}
+
+/// Picks up a certificate replaced on disk since `seen`, which is from before the one
+/// in use was read, so nothing replaced in between is missed. One that can't be read
+/// is left for next time, and the one in use carries on, as a renewal may only be
+/// half done.
 fn keep_certificate_current(
     certificate: PathBuf,
     key: PathBuf,
     serving: RustlsConfig,
     every: Duration,
+    mut seen: FileTimes,
 ) {
     tokio::spawn(async move {
-        let times = || (modified(&certificate), modified(&key));
-        let mut seen = times();
+        let times = || file_times(&certificate, &key);
         loop {
             tokio::time::sleep(every).await;
             if times() == seen {
@@ -95,9 +104,10 @@ async fn serve_certificate(
     service: Service,
     reload_every: Duration,
 ) -> Result<()> {
+    let seen = file_times(&certificate, &key);
     let config = load_certificate(&certificate, &key)?;
     let serving = RustlsConfig::from_config(Arc::new(config));
-    keep_certificate_current(certificate, key, serving.clone(), reload_every);
+    keep_certificate_current(certificate, key, serving.clone(), reload_every, seen);
     axum_server::from_tcp_rustls(listener.into_std()?, serving)?
         .serve(service)
         .await?;
@@ -245,18 +255,32 @@ mod tests {
         let (cert, key, old) = on_disk(&folder, "site");
         let address = serving(cert.clone(), key.clone(), Duration::from_millis(50)).await;
 
-        // File times can be coarse, so the new ones have to land clearly later.
-        tokio::time::sleep(Duration::from_millis(1100)).await;
         let (new_cert, new_key, new) = on_disk(&folder, "renewed");
         std::fs::rename(new_cert, &cert).unwrap();
         std::fs::rename(new_key, &key).unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // File times can be coarse, so the new ones are moved clearly later.
+        let later = SystemTime::now() + Duration::from_secs(60);
+        for path in [&cert, &key] {
+            let file = std::fs::File::options().write(true).open(path).unwrap();
+            file.set_modified(later).unwrap();
+        }
 
-        let (with_new, with_old) =
-            tokio::task::spawn_blocking(move || (fetch(address, &new), fetch(address, &old)))
+        // However long a busy machine takes to notice.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let new = new.clone();
+            let with_new = tokio::task::spawn_blocking(move || fetch(address, &new))
                 .await
                 .unwrap();
-        assert_eq!(with_new.unwrap(), "ok");
+            if with_new.as_deref() == Ok("ok") {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "{with_new:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let with_old = tokio::task::spawn_blocking(move || fetch(address, &old))
+            .await
+            .unwrap();
         assert!(with_old.is_err(), "the old certificate has gone");
     }
 

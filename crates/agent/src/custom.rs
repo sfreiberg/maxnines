@@ -527,13 +527,19 @@ mod tests {
         async fn a_timeout_also_stops_what_the_command_started() {
             let folder = tempfile::tempdir().unwrap();
             let file = folder.path().join("pid");
-            let script = format!("sleep 30 & echo $! > {}; wait", file.display());
+            // Written in one go, so it's never read half done.
+            let script = format!(
+                "sleep 30 & echo $! > {file}.new; mv {file}.new {file}; wait",
+                file = file.display()
+            );
 
+            // Long enough for a busy machine to start the shell and what it starts.
             let stuck = metric(&["/bin/sh", "-c", &script]);
-            let result = measure("m", &stuck, Duration::from_millis(300)).await;
+            let result = measure("m", &stuck, Duration::from_secs(2)).await;
 
             assert_eq!(result, Err(TIMED_OUT.to_string()));
             let pid = std::fs::read_to_string(&file).unwrap();
+            assert!(!pid.trim().is_empty());
             wait_until(|| !is_running(pid.trim()));
         }
 

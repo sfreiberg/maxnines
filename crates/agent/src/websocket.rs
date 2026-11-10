@@ -374,9 +374,13 @@ mod tests {
         }
     }
 
-    async fn free_address() -> std::net::SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap()
+    /// Waits for something the agent does in its own time, however slow the machine.
+    async fn until(done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "it never happened");
+            sleep(Duration::from_millis(5)).await;
+        }
     }
 
     async fn next_message<S>(socket: &mut WebSocketStream<S>) -> AgentMessage
@@ -424,9 +428,9 @@ mod tests {
 
     /// Connects an agent to a throwaway server and gets past its first facts.
     async fn connected() -> (ServerLink, WebSocketStream<TcpStream>) {
-        let address = free_address().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
         let url = format!("ws://{address}/ws");
-        let listener = TcpListener::bind(address).await.unwrap();
 
         let link = ServerLink::start(&config(&url), "web-1", identity()).unwrap();
         let (stream, _) = listener.accept().await.unwrap();
@@ -438,8 +442,11 @@ mod tests {
 
     #[tokio::test]
     async fn delivers_samples_queued_before_the_server_came_up() {
-        // Find a free port, then leave it closed so the first attempt fails.
-        let address = free_address().await;
+        // A port held without listening, so the first attempt is refused and no
+        // other test can be given it before the server comes up.
+        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = reserved.local_addr().unwrap();
         let url = format!("ws://{address}/ws");
 
         let agent = identity();
@@ -450,7 +457,7 @@ mod tests {
         // Let the first connection attempt run and fail.
         sleep(Duration::from_millis(100)).await;
 
-        let listener = TcpListener::bind(address).await.unwrap();
+        let listener = reserved.listen(16).unwrap();
         let (stream, _) = listener.accept().await.unwrap();
         let mut socket = accept_async(stream).await.unwrap();
 
@@ -534,9 +541,9 @@ mod tests {
 
     #[tokio::test]
     async fn holds_samples_back_until_approved() {
-        let address = free_address().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
         let url = format!("ws://{address}/ws");
-        let listener = TcpListener::bind(address).await.unwrap();
 
         let link = ServerLink::start(&config(&url), "web-1", identity()).unwrap();
         link.send_sample(&sample()).unwrap();
@@ -561,9 +568,9 @@ mod tests {
 
     #[tokio::test]
     async fn sends_again_a_sample_the_connection_lost() {
-        let address = free_address().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
         let url = format!("ws://{address}/ws");
-        let listener = TcpListener::bind(address).await.unwrap();
         let link = ServerLink::start(&config(&url), "web-1", identity()).unwrap();
 
         let (stream, _) = listener.accept().await.unwrap();
@@ -571,7 +578,7 @@ mod tests {
         accept_agent(&mut socket, &url).await;
         next_message(&mut socket).await;
         drop(socket);
-        sleep(Duration::from_millis(100)).await;
+        until(|| !link.spool.is_online()).await;
 
         link.send_sample(&sample()).unwrap();
         assert!(link.spool.saved_bytes() > 0, "offline samples go to disk");
@@ -626,9 +633,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_sample_the_server_never_confirmed_is_sent_again() {
-        let address = free_address().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
         let url = format!("ws://{address}/ws");
-        let listener = TcpListener::bind(address).await.unwrap();
         let link = ServerLink::start(&config(&url), "web-1", identity()).unwrap();
         let mut socket = reconnected(&listener, &url).await;
 
@@ -648,9 +655,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_confirmed_sample_is_not_sent_again() {
-        let address = free_address().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
         let url = format!("ws://{address}/ws");
-        let listener = TcpListener::bind(address).await.unwrap();
         let link = ServerLink::start(&config(&url), "web-1", identity()).unwrap();
         let mut socket = reconnected(&listener, &url).await;
 
@@ -658,7 +665,7 @@ mod tests {
         next_message(&mut socket).await;
         let ack = ServerMessage::Ack { timestamp_ms: 7 };
         send_to_agent(&mut socket, &ack).await;
-        sleep(Duration::from_millis(100)).await;
+        until(|| link.spool.unconfirmed() == 0).await;
         drop(socket);
 
         let mut socket = reconnected(&listener, &url).await;
@@ -668,9 +675,9 @@ mod tests {
 
     #[tokio::test]
     async fn delivers_samples_saved_before_a_restart() {
-        let address = free_address().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
         let url = format!("ws://{address}/ws");
-        let listener = TcpListener::bind(address).await.unwrap();
         let settings = config(&url);
         let saved = serde_json::to_string(&AgentMessage::Sample(sample())).unwrap();
         Spool::open(&settings.sample_queue_folder()).push(saved);

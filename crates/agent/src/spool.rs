@@ -84,7 +84,7 @@ impl Spool {
     /// Carries on in memory if the folder can't be used, because a full or read-only
     /// disk must not stop an agent reporting while it's connected.
     pub fn open(folder: &Path) -> Self {
-        Self::with_limits(folder, MAX_SAVED_BYTES, BACKLOG_GAP, ACK_WAIT)
+        Self::with_limits(folder, MAX_SAVED_BYTES, BACKLOG_GAP, ACK_WAIT, LOCK_WAIT)
     }
 
     fn with_limits(
@@ -92,8 +92,9 @@ impl Spool {
         max_bytes: u64,
         backlog_gap: Duration,
         ack_wait: Duration,
+        lock_wait: Duration,
     ) -> Self {
-        let saved = Saved::open(folder, max_bytes)
+        let saved = Saved::open(folder, max_bytes, lock_wait)
             .inspect_err(|error| {
                 let error = format!("{error:#}");
                 warn!(error, "can't save samples to disk, keeping them in memory");
@@ -205,6 +206,18 @@ impl Spool {
             state.unconfirmed -= 1;
             state.others_confirmed = true;
         }
+    }
+
+    #[cfg(test)]
+    pub fn is_online(&self) -> bool {
+        self.state().online
+    }
+
+    /// How many samples have gone to the server and not been confirmed yet.
+    #[cfg(test)]
+    pub fn unconfirmed(&self) -> usize {
+        let state = self.state();
+        state.unconfirmed + usize::from(state.saved_unconfirmed.is_some())
     }
 
     #[cfg(test)]
@@ -332,7 +345,7 @@ struct Saved {
 }
 
 impl Saved {
-    fn open(folder: &Path, max_bytes: u64) -> Result<Self> {
+    fn open(folder: &Path, max_bytes: u64, lock_wait: Duration) -> Result<Self> {
         fs::create_dir_all(folder).with_context(|| format!("creating {}", folder.display()))?;
         let position_path = folder.join("position");
         let mut position = OpenOptions::new()
@@ -342,7 +355,7 @@ impl Saved {
             .truncate(false)
             .open(&position_path)
             .with_context(|| format!("opening {}", position_path.display()))?;
-        lock_folder(&position, folder)?;
+        lock_folder(&position, folder, lock_wait)?;
 
         let (position_file, position_offset) = read_position(&mut position).unwrap_or((0, 0));
         let files = saved_files(folder)?;
@@ -495,12 +508,12 @@ impl Saved {
 /// Waits a moment for the lock, as it can take that long to be let go. An agent being
 /// restarted can overlap with the one before it, and a process being started holds
 /// onto this one's files until it's running.
-fn lock_folder(position: &File, folder: &Path) -> Result<()> {
+fn lock_folder(position: &File, folder: &Path, lock_wait: Duration) -> Result<()> {
     let began = std::time::Instant::now();
     loop {
         match position.try_lock() {
             Ok(()) => return Ok(()),
-            Err(TryLockError::WouldBlock) if began.elapsed() < LOCK_WAIT => {
+            Err(TryLockError::WouldBlock) if began.elapsed() < lock_wait => {
                 std::thread::sleep(LOCK_RETRY_EVERY);
             }
             Err(TryLockError::WouldBlock) => {
@@ -582,16 +595,22 @@ mod tests {
     }
 
     fn limited(folder: &Path, max_bytes: u64) -> Spool {
-        Spool::with_limits(folder, max_bytes, Duration::ZERO, ACK_WAIT)
+        Spool::with_limits(folder, max_bytes, Duration::ZERO, ACK_WAIT, LOCK_WAIT)
     }
 
     fn paced(folder: &Path, gap: Duration) -> Spool {
-        Spool::with_limits(folder, MAX_SAVED_BYTES, gap, ACK_WAIT)
+        Spool::with_limits(folder, MAX_SAVED_BYTES, gap, ACK_WAIT, LOCK_WAIT)
     }
 
     /// Sends saved samples again as soon as asked for them.
     fn impatient(folder: &Path) -> Spool {
-        Spool::with_limits(folder, MAX_SAVED_BYTES, Duration::ZERO, Duration::ZERO)
+        Spool::with_limits(
+            folder,
+            MAX_SAVED_BYTES,
+            Duration::ZERO,
+            Duration::ZERO,
+            LOCK_WAIT,
+        )
     }
 
     fn sample(time: u64) -> String {
@@ -686,7 +705,8 @@ mod tests {
         assert_eq!(drain(&spool), ["2", "1"]);
     }
 
-    #[tokio::test]
+    /// On a paused clock, so a busy machine can't make the wait look longer or shorter.
+    #[tokio::test(start_paused = true)]
     async fn the_backlog_goes_at_a_steady_pace() {
         let (_parent, path) = folder();
         let gap = Duration::from_millis(200);
@@ -701,7 +721,7 @@ mod tests {
 
         spool.wait().await;
 
-        assert!(sent.elapsed() >= gap - Duration::from_millis(20));
+        assert_eq!(sent.elapsed(), gap);
         assert_eq!(deliver(&spool), Some(2));
     }
 
@@ -978,10 +998,18 @@ mod tests {
         first.push(sample(1));
 
         let handover = std::thread::spawn(move || {
-            std::thread::sleep(LOCK_WAIT / 5);
+            std::thread::sleep(Duration::from_millis(100));
             drop(first);
         });
-        let second = unpaced(&path);
+        // Waits far longer than it needs to, as a busy machine can take its time
+        // letting go, and the point is that it's taken once it is.
+        let second = Spool::with_limits(
+            &path,
+            MAX_SAVED_BYTES,
+            Duration::ZERO,
+            ACK_WAIT,
+            Duration::from_secs(30),
+        );
         handover.join().unwrap();
 
         assert!(second.state().saved.is_some());

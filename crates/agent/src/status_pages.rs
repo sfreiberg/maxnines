@@ -360,6 +360,7 @@ impl Collector for StatusPageCollector {
 mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
     use std::time::Instant;
 
@@ -543,28 +544,51 @@ slow requests:        7
         );
     }
 
-    /// Serves `bodies` in turn, one request each, forever repeating the last.
-    fn serve(bodies: Vec<&'static str>) -> String {
+    /// A page that answers every request with the body the test has moved it on to.
+    struct Served {
+        address: String,
+        showing: Arc<AtomicUsize>,
+    }
+
+    impl Served {
+        fn show(&self, body: usize) {
+            self.showing.store(body, Ordering::Relaxed);
+        }
+    }
+
+    /// Serves the first of `bodies`, or nothing if there are none, until told to
+    /// move on, so what the collector reads doesn't depend on how fast it reads.
+    fn serve(bodies: Vec<&'static str>) -> Served {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap().to_string();
+        let showing = Arc::new(AtomicUsize::new(0));
+        let shown = Arc::clone(&showing);
         thread::spawn(move || {
-            let mut bodies = bodies.into_iter().peekable();
-            let mut last = "";
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
-                let mut request = [0; 2048];
-                let _ = stream.read(&mut request);
-                if let Some(body) = bodies.next() {
-                    last = body;
+                // The whole request goes first: closing with some of it unread makes
+                // Windows reset the connection, losing the answer.
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(size) => request.extend_from_slice(&buffer[..size]),
+                    }
                 }
+                let body = bodies
+                    .get(shown.load(Ordering::Relaxed))
+                    .or(bodies.last())
+                    .copied()
+                    .unwrap_or_default();
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{last}",
-                    last.len()
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
                 );
                 let _ = stream.write_all(response.as_bytes());
             }
         });
-        address
+        Served { address, showing }
     }
 
     fn collect_until(collector: &mut StatusPageCollector, done: impl Fn(&Value) -> bool) -> Value {
@@ -583,7 +607,8 @@ slow requests:        7
     fn totals_become_the_change_since_the_last_sample() {
         let first = "Active connections: 1\nserver accepts handled requests\n 10 10 100\nReading: 0 Writing: 1 Waiting: 0\n";
         let second = "Active connections: 2\nserver accepts handled requests\n 15 14 130\nReading: 0 Writing: 1 Waiting: 1\n";
-        let address = serve(vec![first, second]);
+        let served = serve(vec![first, second]);
+        let address = &served.address;
         let url = format!("http://{address}/nginx_status");
         let mut collector =
             StatusPageCollector::new(Software::Nginx, vec![url], Duration::from_millis(200));
@@ -596,6 +621,7 @@ slow requests:        7
         assert!(page.get("requests").is_none(), "{page}");
         assert!(page.get("totals").is_none(), "{page}");
 
+        served.show(1);
         let output = collect_until(&mut collector, |output| output[0]["connections"] == 2.0);
         let page = &output[0];
         assert_eq!(page["requests"], 30);
@@ -605,7 +631,7 @@ slow requests:        7
 
     #[test]
     fn a_page_that_cannot_be_read_says_why() {
-        let address = serve(vec!["<html>It works!</html>"]);
+        let address = serve(vec!["<html>It works!</html>"]).address;
         let url = format!("http://{address}/server-status");
         let mut collector =
             StatusPageCollector::new(Software::Apache, vec![url], Duration::from_millis(200));
@@ -616,7 +642,7 @@ slow requests:        7
 
     #[test]
     fn a_page_that_stops_answering_starts_its_totals_afresh() {
-        let address = serve(vec![]);
+        let address = serve(vec![]).address;
         let page =
             |requests: u64| json!({ "name": "p", "up": 1, "totals": { "requests": requests } });
         let mut collector = StatusPageCollector::new(

@@ -232,16 +232,22 @@ mod tests {
     fn background_work_stops_when_dropped() {
         let rounds = Arc::new(AtomicUsize::new(0));
         let counted = rounds.clone();
+        // Goes when the work does, which is when its thread has finished.
+        let (alive, gone) = std::sync::mpsc::channel::<()>();
         let background = Background::start(Duration::from_millis(5), move || {
+            let _ = &alive;
             let count = counted.fetch_add(1, Ordering::Relaxed);
             async move { json!(count) }
         });
         wait_until(|| rounds.load(Ordering::Relaxed) > 0);
 
         drop(background);
-        thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            gone.recv_timeout(Duration::from_secs(10)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        );
         let after_stopping = rounds.load(Ordering::Relaxed);
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(20));
         assert_eq!(rounds.load(Ordering::Relaxed), after_stopping);
     }
 
@@ -315,10 +321,12 @@ mod tests {
         wait_until(|| flag.load(Ordering::Relaxed));
     }
 
-    #[tokio::test]
+    /// The tests that measure time run on a paused clock, which only moves when
+    /// everything is waiting, so a busy machine can't change what they measure.
+    #[tokio::test(start_paused = true)]
     async fn items_start_at_different_times_in_the_first_half_of_the_interval() {
         let interval = Duration::from_secs(1);
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         let waits = probe_all(
             &items(&[0; 20]),
             interval,
@@ -330,7 +338,7 @@ mod tests {
 
         let (first, last) = (waits.iter().min().unwrap(), waits.iter().max().unwrap());
         assert!(*last - *first > interval / 10, "{waits:?}");
-        assert!(*last < interval / 2 + SHORT, "{waits:?}");
+        assert!(*last < interval / 2, "{waits:?}");
     }
 
     #[tokio::test]
@@ -363,9 +371,9 @@ mod tests {
         assert_eq!(results, [30, 1, 15]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn items_run_at_the_same_time() {
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         probe_all(
             &items(&[200; 10]),
             Duration::ZERO,
@@ -374,12 +382,12 @@ mod tests {
             |_| (),
         )
         .await;
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(started.elapsed(), Duration::from_millis(200));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_slow_item_times_out_without_holding_up_the_rest() {
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         let results = probe_all(
             &items(&[5000, 1]),
             Duration::ZERO,
@@ -392,7 +400,7 @@ mod tests {
         )
         .await;
         assert_eq!(results, ["timed out", "done"]);
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(started.elapsed(), SHORT);
     }
 
     #[tokio::test]
