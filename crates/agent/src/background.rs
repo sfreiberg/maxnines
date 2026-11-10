@@ -338,7 +338,9 @@ mod tests {
 
         let (first, last) = (waits.iter().min().unwrap(), waits.iter().max().unwrap());
         assert!(*last - *first > interval / 10, "{waits:?}");
-        assert!(*last < interval / 2, "{waits:?}");
+        // Tokio's timer rounds a sleep up to the next whole millisecond, so a start
+        // just short of half the interval measures as exactly half.
+        assert!(*last <= interval / 2, "{waits:?}");
     }
 
     #[tokio::test]

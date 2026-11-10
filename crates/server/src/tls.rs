@@ -231,18 +231,33 @@ mod tests {
             })
     }
 
-    async fn serving(cert: PathBuf, key: PathBuf, reload_every: Duration) -> SocketAddr {
+    /// Serves the certificate in these files, and waits until it's answering with
+    /// `pem`. The files are read in the server's own task, so a test changing them
+    /// before that could leave a certificate beside the wrong key.
+    async fn serving(cert: PathBuf, key: PathBuf, pem: &str, reload_every: Duration) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(serve_certificate(listener, cert, key, app(), reload_every));
-        address
+        let server = tokio::spawn(serve_certificate(listener, cert, key, app(), reload_every));
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let pem = pem.to_string();
+            let answer = tokio::task::spawn_blocking(move || fetch(address, &pem))
+                .await
+                .unwrap();
+            if answer.as_deref() == Ok("ok") {
+                return address;
+            }
+            assert!(!server.is_finished(), "the server stopped: {answer:?}");
+            assert!(std::time::Instant::now() < deadline, "{answer:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_certificate_from_files_serves_https() {
         let folder = tempfile::tempdir().unwrap();
         let (cert, key, pem) = on_disk(&folder, "site");
-        let address = serving(cert, key, RELOAD_EVERY).await;
+        let address = serving(cert, key, &pem, RELOAD_EVERY).await;
 
         let answer = tokio::task::spawn_blocking(move || fetch(address, &pem));
 
@@ -253,7 +268,7 @@ mod tests {
     async fn a_replaced_certificate_is_picked_up_without_a_restart() {
         let folder = tempfile::tempdir().unwrap();
         let (cert, key, old) = on_disk(&folder, "site");
-        let address = serving(cert.clone(), key.clone(), Duration::from_millis(50)).await;
+        let address = serving(cert.clone(), key.clone(), &old, Duration::from_millis(50)).await;
 
         let (new_cert, new_key, new) = on_disk(&folder, "renewed");
         std::fs::rename(new_cert, &cert).unwrap();
@@ -288,7 +303,7 @@ mod tests {
     async fn a_broken_replacement_leaves_the_working_certificate_in_place() {
         let folder = tempfile::tempdir().unwrap();
         let (cert, key, pem) = on_disk(&folder, "site");
-        let address = serving(cert.clone(), key, Duration::from_millis(50)).await;
+        let address = serving(cert.clone(), key, &pem, Duration::from_millis(50)).await;
 
         tokio::time::sleep(Duration::from_millis(1100)).await;
         std::fs::write(&cert, "not a certificate").unwrap();
