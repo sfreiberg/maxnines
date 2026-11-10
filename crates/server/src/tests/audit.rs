@@ -25,7 +25,7 @@ async fn since(server: &TestServer, mark: i64) -> Vec<Entry> {
 async fn person(server: &TestServer, email: &str) -> i64 {
     let database = &server.state.database;
     let (user, link) = database
-        .create_user(email, "Someone", now_ms())
+        .create_user(email, "Someone", crate::roles::Role::Admin, now_ms())
         .await
         .unwrap()
         .unwrap();
@@ -119,7 +119,11 @@ async fn a_change_on_the_pages_records_who_made_it() {
     let server = start().await;
     let before = mark(&server).await;
 
-    let fields = [("name", "Backup script"), ("lifetime", "")];
+    let fields = [
+        ("name", "Backup script"),
+        ("role", "admin"),
+        ("lifetime", ""),
+    ];
     let page = Browser::default()
         .submit(&server, "/settings/api-keys", "/settings/api-keys", &fields)
         .await;

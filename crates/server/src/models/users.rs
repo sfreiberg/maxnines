@@ -21,6 +21,7 @@ use super::audit::{record, record_change};
 use super::{Database, api_key, api_key_snapshot, user, user_session};
 use crate::audit::{Action, Actor, Kind, Record, Snapshot, Subject};
 use crate::registration::hash_token;
+use crate::roles::Role;
 use crate::times::{DEFAULT_TIME_ZONE, zone_named};
 
 pub const SESSION_LIFETIME_MS: i64 = 30 * 24 * 60 * 60 * 1000;
@@ -49,6 +50,9 @@ pub struct User {
     pub id: i64,
     pub email: String,
     pub name: String,
+    /// What they may do. For a request made with an API key, it's what the key may
+    /// do, which is never more.
+    pub role: Role,
     pub theme: String,
     /// What the pages show times in, from the time zone database.
     pub time_zone: String,
@@ -63,6 +67,9 @@ impl From<user::Model> for User {
         Self {
             id: row.id,
             has_password: row.password_hash.is_some(),
+            // Only real roles are saved, so the least stands in for one a later
+            // version has dropped.
+            role: Role::parse(&row.role).unwrap_or(Role::Viewer),
             email: row.email,
             name: row.name,
             theme: row.theme,
@@ -87,8 +94,8 @@ impl User {
 pub enum UserChange {
     Done,
     NoSuchUser,
-    /// It would leave nobody able to sign in.
-    LastUser,
+    /// It would leave no admin able to sign in.
+    LastAdmin,
     /// Only disabled users can be deleted, so it always takes two steps.
     StillEnabled,
 }
@@ -141,6 +148,7 @@ fn snapshot(row: &user::Model) -> Snapshot {
     let fields = json!({
         "email": row.email,
         "name": row.name,
+        "role": row.role,
         "theme": row.theme,
         "time_zone": row.time_zone,
         "password": row.password_hash,
@@ -217,6 +225,7 @@ impl Database {
         &self,
         email: &str,
         name: &str,
+        role: Role,
         now_ms: i64,
     ) -> Result<Option<(User, String)>> {
         let taken = user::Entity::find()
@@ -232,6 +241,7 @@ impl Database {
         let row = user::ActiveModel {
             email: Set(email.to_string()),
             name: Set(name.to_string()),
+            role: Set(role.as_str().to_string()),
             theme: Set(DEFAULT_THEME.to_string()),
             time_zone: Set(DEFAULT_TIME_ZONE.name().to_string()),
             setup_token_hash: Set(Some(token_hash(&token))),
@@ -415,15 +425,38 @@ impl Database {
         Ok(updated.rows_affected == 1)
     }
 
-    /// Whether anyone else could still sign in without this user.
-    async fn is_last_enabled_user(&self, id: i64) -> Result<bool> {
+    /// Whether no other admin could still sign in without this user.
+    async fn is_last_enabled_admin(&self, id: i64) -> Result<bool> {
         let others = user::Entity::find()
             .filter(user::Column::Id.ne(id))
             .filter(user::Column::DisabledMs.is_null())
+            .filter(user::Column::Role.eq(Role::Admin.as_str()))
             .count(&self.connection)
             .await
-            .context("counting users")?;
+            .context("counting admins")?;
         Ok(others == 0)
+    }
+
+    /// Changes what someone may do. There's always an admin who can sign in, so the
+    /// last one can't be given less.
+    pub async fn set_role(&self, id: i64, role: Role) -> Result<UserChange> {
+        let Some(before) = load(&self.connection, id).await? else {
+            return Ok(UserChange::NoSuchUser);
+        };
+        let was_admin = before.role == Role::Admin.as_str() && before.disabled_ms.is_none();
+        if was_admin && role != Role::Admin && self.is_last_enabled_admin(id).await? {
+            return Ok(UserChange::LastAdmin);
+        }
+        let transaction = self.connection.begin().await.context("starting a save")?;
+        user::Entity::update_many()
+            .col_expr(user::Column::Role, Expr::value(role.as_str()))
+            .filter(user::Column::Id.eq(id))
+            .exec(&transaction)
+            .await
+            .context("saving a role")?;
+        record_user(&transaction, id, Some(&before), None).await?;
+        transaction.commit().await.context("saving a role")?;
+        Ok(UserChange::Done)
     }
 
     /// Stops someone signing in, and signs them out.
@@ -438,8 +471,8 @@ impl Database {
         if row.disabled_ms.is_some() {
             return Ok(UserChange::Done);
         }
-        if self.is_last_enabled_user(id).await? {
-            return Ok(UserChange::LastUser);
+        if row.role == Role::Admin.as_str() && self.is_last_enabled_admin(id).await? {
+            return Ok(UserChange::LastAdmin);
         }
         let transaction = self.connection.begin().await.context("starting a save")?;
         let before = row.clone();

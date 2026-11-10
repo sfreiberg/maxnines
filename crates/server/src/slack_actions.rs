@@ -37,6 +37,7 @@ use crate::channels::slack::{
 use crate::metrics::now_ms;
 use crate::models::Database;
 use crate::notifier::{Notice, format_ms};
+use crate::roles::Role;
 use crate::silences::{self, ActiveSilences, Cover};
 
 const SILENCE_SECS: u64 = 3600;
@@ -58,6 +59,7 @@ enum Refusal {
     Outsider,
     NoEmail,
     NoAccount(String),
+    RoleTooLow,
 }
 
 impl Refusal {
@@ -68,6 +70,9 @@ impl Refusal {
             }
             Self::NoEmail => "Slack didn't share your email address, so MaxNines can't tell who \
                               you are. The Slack app needs the users:read.email permission."
+                .to_string(),
+            Self::RoleTooLow => "Your MaxNines role only lets you look. Ask an admin for the \
+                                 Responder role to acknowledge and silence alerts."
                 .to_string(),
             Self::NoAccount(email) => format!(
                 "There's no MaxNines account for {email}. Ask someone to add you, using the \
@@ -164,6 +169,10 @@ impl SlackActions {
         let Some(account) = self.database.active_user_by_email(&email).await? else {
             return Ok(Some(Reply::Tell(Refusal::NoAccount(email).message())));
         };
+        // The same as the pages ask for acknowledging and silencing.
+        if account.role < Role::Responder {
+            return Ok(Some(Reply::Tell(Refusal::RoleTooLow.message())));
+        }
 
         let now = now_ms();
         let actor = Actor::Person {

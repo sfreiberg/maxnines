@@ -9,7 +9,7 @@ const PASSWORD: &str = "a long enough password";
 async fn person(server: &TestServer, email: &str) -> i64 {
     let database = &server.state.database;
     let (user, link) = database
-        .create_user(email, "Someone", now_ms())
+        .create_user(email, "Someone", crate::roles::Role::Admin, now_ms())
         .await
         .unwrap()
         .unwrap();
@@ -266,7 +266,12 @@ async fn someone_who_never_set_a_password_cannot_sign_in() {
     let server = start().await;
     let database = &server.state.database;
     database
-        .create_user("new@example.com", "New", now_ms())
+        .create_user(
+            "new@example.com",
+            "New",
+            crate::roles::Role::Admin,
+            now_ms(),
+        )
         .await
         .unwrap();
 
@@ -342,7 +347,7 @@ async fn sessions_and_links_are_only_stored_as_hashes() {
     let server = start().await;
     let database = &server.state.database;
     let (user, link) = database
-        .create_user("a@example.com", "A", now_ms())
+        .create_user("a@example.com", "A", crate::roles::Role::Admin, now_ms())
         .await
         .unwrap()
         .unwrap();
@@ -363,7 +368,11 @@ async fn someone_new_sets_their_own_password_from_a_link() {
             &server,
             "/settings/users",
             "/settings/users",
-            &[("email", "New@Example.com"), ("name", "New Person")],
+            &[
+                ("email", "New@Example.com"),
+                ("name", "New Person"),
+                ("role", "viewer"),
+            ],
         )
         .await;
     assert_eq!(page.status, 200, "{}", page.body);
@@ -415,7 +424,7 @@ async fn an_old_setup_link_stops_working() {
     let database = &server.state.database;
     let week_ago = now_ms() - 8 * 24 * 60 * 60 * 1000;
     let (_, link) = database
-        .create_user("a@example.com", "A", week_ago)
+        .create_user("a@example.com", "A", crate::roles::Role::Admin, week_ago)
         .await
         .unwrap()
         .unwrap();
@@ -541,7 +550,7 @@ async fn nobody_can_lock_everyone_out() {
     let change = server.state.database.disable_user(id, now_ms()).await;
     assert_eq!(change.unwrap(), UserChange::Done);
     let change = server.state.database.disable_user(me, now_ms()).await;
-    assert_eq!(change.unwrap(), UserChange::LastUser);
+    assert_eq!(change.unwrap(), UserChange::LastAdmin);
 }
 
 #[tokio::test]
@@ -727,7 +736,7 @@ async fn names_are_only_ever_text() {
     server
         .state
         .database
-        .create_user("a@example.com", name, now_ms())
+        .create_user("a@example.com", name, crate::roles::Role::Admin, now_ms())
         .await
         .unwrap();
 
@@ -760,7 +769,13 @@ async fn an_api_key_reads_pages_as_its_owner_but_cannot_submit_forms() {
     let server = start().await;
     let database = &server.state.database;
     let (_, key) = database
-        .create_api_key("k", server.user_id().await, None, now_ms())
+        .create_api_key(
+            "k",
+            server.user_id().await,
+            crate::roles::Role::Admin,
+            None,
+            now_ms(),
+        )
         .await
         .unwrap();
     let mut browser = Browser::anonymous();

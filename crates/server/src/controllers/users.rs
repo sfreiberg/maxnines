@@ -14,6 +14,7 @@ use crate::app_state::AppState;
 use crate::metrics::now_ms;
 use crate::models::{THEMES, User, UserChange, check_new_password, check_new_user, is_theme};
 use crate::passwords::{hash_password, password_matches};
+use crate::roles::Role;
 use crate::times::{zone_named, zone_names};
 
 const USERS_PAGE: &str = "/settings/users";
@@ -25,6 +26,7 @@ pub fn routes() -> Router<AppState> {
         .route("/settings/users/{id}/disable", post(disable))
         .route("/settings/users/{id}/enable", post(enable))
         .route("/settings/users/{id}/delete", post(delete))
+        .route("/settings/users/{id}/role", post(choose_role))
         .route("/settings/users/{id}/setup-link", post(new_link))
         .route(PROFILE_PAGE, get(profile))
         .route("/profile/theme", post(choose_theme))
@@ -46,6 +48,27 @@ struct UserRow {
     status: &'static str,
     disabled: bool,
     is_you: bool,
+    role: &'static str,
+}
+
+/// A role to choose, with what it adds.
+#[derive(Serialize)]
+pub struct RoleChoice {
+    value: &'static str,
+    label: &'static str,
+    adds: &'static str,
+}
+
+pub fn role_choices(up_to: Role) -> Vec<RoleChoice> {
+    Role::ALL
+        .into_iter()
+        .filter(|role| *role <= up_to)
+        .map(|role| RoleChoice {
+            value: role.as_str(),
+            label: role.label(),
+            adds: role.describe(),
+        })
+        .collect()
 }
 
 fn row(user: User, you: Option<i64>) -> UserRow {
@@ -60,6 +83,7 @@ fn row(user: User, you: Option<i64>) -> UserRow {
         last_sign_in: user.last_sign_in_ms.map(local_time),
         disabled: user.disabled_ms.is_some(),
         is_you: you == Some(user.id),
+        role: user.role.as_str(),
         status,
         id: user.id,
         email: user.email,
@@ -88,6 +112,7 @@ async fn page(
     let rows: Vec<UserRow> = users.into_iter().map(|user| row(user, you)).collect();
     let page = Page::new(state, token, "settings/users.html")
         .with("users", &rows)
+        .with("roles", &role_choices(Role::Admin))
         .with("new_link", &new_link)
         .with("error", &error);
     let mut response = if error.is_some() {
@@ -114,7 +139,16 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
         Ok(checked) => checked,
         Err(error) => return page(&state, &form.token, None, Some(&format!("{error:#}"))).await,
     };
-    match state.database.create_user(&email, &name, now_ms()).await {
+    let role = form.fields.get("role").map_or("", String::as_str);
+    let role = match Role::parse(role) {
+        Ok(role) => role,
+        Err(error) => return page(&state, &form.token, None, Some(&format!("{error:#}"))).await,
+    };
+    match state
+        .database
+        .create_user(&email, &name, role, now_ms())
+        .await
+    {
         Ok(Some((_, link))) => {
             let url = setup_url(&state, &link);
             let new_link = NewLink { name: &name, url };
@@ -128,11 +162,24 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
     }
 }
 
+async fn choose_role(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    form: CsrfForm,
+) -> Response {
+    let role = form.fields.get("role").map_or("", String::as_str);
+    let change = match Role::parse(role) {
+        Ok(role) => state.database.set_role(id, role).await,
+        Err(error) => return page(&state, &form.token, None, Some(&format!("{error:#}"))).await,
+    };
+    after_change(&state, &form.token, change).await
+}
+
 /// What to tell someone about a change that wasn't made.
 pub fn refusal(change: UserChange) -> Option<&'static str> {
     match change {
         UserChange::Done | UserChange::NoSuchUser => None,
-        UserChange::LastUser => Some("That would leave nobody able to sign in."),
+        UserChange::LastAdmin => Some("That would leave no admin able to sign in."),
         UserChange::StillEnabled => Some("Disable this user before deleting them."),
     }
 }

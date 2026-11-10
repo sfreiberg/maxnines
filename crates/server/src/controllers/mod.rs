@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::Error;
-use axum::extract::{ConnectInfo, FromRequest, FromRequestParts, Request, State};
+use axum::extract::{ConnectInfo, FromRequest, FromRequestParts, MatchedPath, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
@@ -47,6 +47,7 @@ use axum::{Form, Router};
 use axum_csrf::CsrfToken;
 use chrono_tz::Tz;
 use ipnet::IpNet;
+use serde_json::json;
 use tera::Context;
 use tower_http::compression::CompressionLayer;
 use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
@@ -55,6 +56,7 @@ use tracing::{error, warn};
 use crate::app_state::AppState;
 use crate::audit::{self, Acting, Actor, Via};
 use crate::models::{DEFAULT_THEME, User};
+use crate::roles::{self, Role};
 use crate::times::{DEFAULT_TIME_ZONE, format_time};
 
 const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; connect-src 'self'; \
@@ -73,13 +75,62 @@ fn signed_in_user() -> Option<Arc<User>> {
 
 /// Runs a request as `user`, for the page's frame and the audit log, `via` an API
 /// key or the like if that's how they came.
-async fn run_as(user: User, via: Option<Via>, request: Request, next: Next) -> Response {
+/// Nothing runs for someone whose role doesn't allow it: see [`roles::required`].
+async fn run_as(
+    state: &AppState,
+    user: User,
+    via: Option<Via>,
+    request: Request,
+    next: Next,
+) -> Response {
     let actor = Actor::Person {
         id: user.id,
         email: user.email.clone(),
     };
-    let signed_in = SIGNED_IN.scope(Arc::new(user), next.run(request));
+    // The route as it's written, so an ID in the address can't change what's needed.
+    // What isn't found has no route, and only ever says so.
+    let matched = request.extensions().get::<MatchedPath>().cloned();
+    let route = matched
+        .as_ref()
+        .map_or_else(|| request.uri().path(), MatchedPath::as_str);
+    let (is_api, route) = match route.strip_prefix(api::BASE_PATH) {
+        Some(rest) => (true, rest),
+        None => (false, route),
+    };
+    let needed = roles::required(request.method(), route);
+    let yours = user.role;
+    let answer = async {
+        if yours >= needed {
+            return next.run(request).await;
+        }
+        if is_api {
+            let error = format!(
+                "This needs the {} role, and this key acts as {} {}",
+                needed.as_str(),
+                article(yours),
+                yours.as_str()
+            );
+            return (StatusCode::FORBIDDEN, axum::Json(json!({ "error": error }))).into_response();
+        }
+        let (mut parts, _) = request.into_parts();
+        match CsrfToken::from_request_parts(&mut parts, state).await {
+            Ok(token) => Page::new(state, &token, "errors/forbidden.html")
+                .with("needed", needed.label())
+                .with("yours", yours.label())
+                .with_status(StatusCode::FORBIDDEN)
+                .render(),
+            Err(_) => StatusCode::FORBIDDEN.into_response(),
+        }
+    };
+    let signed_in = SIGNED_IN.scope(Arc::new(user), answer);
     audit::acting_as(actor, via, signed_in).await
+}
+
+fn article(role: Role) -> &'static str {
+    match role {
+        Role::Editor | Role::Admin => "an",
+        Role::Viewer | Role::Responder => "a",
+    }
 }
 
 /// The zone whoever's signed in reads times in. Request handlers only, as a task
@@ -255,6 +306,11 @@ impl<'a> Page<'a> {
         context.insert("firing", &state.status.firing.load(Ordering::Relaxed));
         let user = signed_in_user();
         context.insert("user", &user.as_deref().map(badge));
+        // What the pages offer. The server checks each request whatever they show.
+        let role = user.as_deref().map(|user| user.role);
+        context.insert("can_respond", &(role >= Some(Role::Responder)));
+        context.insert("can_edit", &(role >= Some(Role::Editor)));
+        context.insert("is_admin", &(role >= Some(Role::Admin)));
         let theme = user.as_deref().map_or(DEFAULT_THEME, |user| &user.theme);
         context.insert("theme", theme);
         context.insert("time_zone", viewer_zone().name());

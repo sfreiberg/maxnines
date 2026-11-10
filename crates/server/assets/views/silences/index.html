@@ -4,7 +4,7 @@
 <p class="breadcrumb"><a href="/alerts">Alerts</a></p>
 <div class="title-row">
   <h1>Silences</h1>
-  <div class="actions"><a class="button" href="/alerts/silences/new">New silence</a></div>
+  {% if can_respond %}<div class="actions"><a class="button" href="/alerts/silences/new">New silence</a></div>{% endif %}
 </div>
 <p class="hint">Alerts still fire and show while they're silenced, but nobody is notified. If one is still firing when its silence ends, the notifications go out then.</p>
 
@@ -22,10 +22,12 @@
       <td class="nowrap">{{ silence.ends }}</td>
       <td>{{ silence.created_by }}</td>
       <td>
+        {% if can_respond %}
         <form method="post" action="/alerts/silences/{{ silence.id }}/end">
           <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
           <button type="submit" class="secondary">End now</button>
         </form>
+        {% endif %}
       </td>
     </tr>
     {% endfor %}
@@ -38,7 +40,7 @@
 <section>
 <div class="title-row">
   <h2>Maintenance windows</h2>
-  <div class="actions"><a class="button secondary" href="/alerts/maintenance/new">New window</a></div>
+  {% if can_edit %}<div class="actions"><a class="button secondary" href="/alerts/maintenance/new">New window</a></div>{% endif %}
 </div>
 {% if windows %}
 <div class="tablebox"><table>

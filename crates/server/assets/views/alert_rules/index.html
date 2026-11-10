@@ -4,7 +4,7 @@
 <p class="breadcrumb"><a href="/settings">Settings</a></p>
 <div class="title-row">
   <h1>Alert rules</h1>
-  <div class="actions"><a class="button" href="/alerts/rules/new">New rule</a></div>
+  {% if can_edit %}<div class="actions"><a class="button" href="/alerts/rules/new">New rule</a></div>{% endif %}
 </div>
 {% if rules %}
 <div class="tablebox"><table>

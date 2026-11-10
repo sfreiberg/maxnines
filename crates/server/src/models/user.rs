@@ -8,6 +8,8 @@ pub struct Model {
     /// Lowercase, as this is what someone signs in with.
     pub email: String,
     pub name: String,
+    /// `viewer`, `responder`, `editor` or `admin`.
+    pub role: String,
     /// Empty until they've set one, and for anyone who only signs in another way.
     pub password_hash: Option<String>,
     pub theme: String,

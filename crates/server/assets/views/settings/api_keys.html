@@ -4,7 +4,7 @@
 <p class="breadcrumb"><a href="/settings">Settings</a></p>
 <div>
   <h1>API keys</h1>
-  <p class="subtitle">For scripts and tools that use the API. A key acts as the person who made it, so it can do what they can, its changes are recorded as theirs, and it stops working while they're disabled. Give each tool its own, and revoke any you stop using. For a script that isn't anyone's, add a user for it.</p>
+  <p class="subtitle">For scripts and tools that use the API. A key acts as the person who made it, so it can do what they can, its changes are recorded as theirs, and it stops working while they're disabled. Give each tool its own, and revoke any you stop using. Choose a lower role for a tool that should do less, like Viewer for one that only reads. {% if sees_all %}As an admin you see everyone's keys. {% endif %}For a script that isn't anyone's, add a user for it.</p>
 </div>
 
 {% if new_key %}
@@ -24,6 +24,9 @@
     <div class="host-filter-box">
       <input type="text" name="name" aria-label="What this key is for" placeholder="What it's for, like backup script" maxlength="100" required>
     </div>
+    <select name="role" aria-label="What the key can do">
+      {% for role in roles %}<option value="{{ role.value }}"{% if role.value == your_role %} selected{% endif %}>{{ role.label }}</option>{% endfor %}
+    </select>
     <select name="lifetime" aria-label="How long the key lasts">
       {% for lifetime in lifetimes %}<option value="{{ lifetime.value }}">{{ lifetime.label }}</option>{% endfor %}
     </select>
@@ -34,13 +37,14 @@
 {% if keys %}
 <div class="tablebox"><table>
   <thead>
-    <tr><th>Name</th><th>Owner</th><th>Key</th><th>Created</th><th>Expires</th><th>Last used</th><th>Status</th><th></th></tr>
+    <tr><th>Name</th><th>Owner</th><th>Role</th><th>Key</th><th>Created</th><th>Expires</th><th>Last used</th><th>Status</th><th></th></tr>
   </thead>
   <tbody>
     {% for key in keys %}
     <tr{% if not key.usable %} class="disabled"{% endif %}>
       <td>{{ key.name }}</td>
       <td>{{ key.owner }}</td>
+      <td>{{ key.role }}</td>
       <td><code>{{ key.hint }}…</code></td>
       <td class="nowrap">{{ key.created }}</td>
       <td class="nowrap">{% if key.expires %}{{ key.expires }}{% else %}Never{% endif %}</td>

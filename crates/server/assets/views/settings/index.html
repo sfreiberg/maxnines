@@ -18,18 +18,22 @@
     <span class="tile-head">Notification channels <span class="badge neutral">{{ channels }}</span></span>
     <span class="note">Slack, Teams, Discord, webhooks and email addresses that alerts go to.</span>
   </a>
+  {% if is_admin %}
   <a class="tile" href="/settings/users">
     <span class="tile-head">Users <span class="badge neutral">{{ users }}</span></span>
-    <span class="note">Who can sign in.</span>
+    <span class="note">Who can sign in, and what each person may do.</span>
   </a>
+  {% endif %}
   <a class="tile" href="/settings/api-keys">
     <span class="tile-head">API keys <span class="badge neutral">{{ api_keys }}</span></span>
     <span class="note">Access for scripts and tools that use the API.</span>
   </a>
+  {% if is_admin %}
   <a class="tile" href="/settings/audit-log">
     <span class="tile-head">Audit log</span>
     <span class="note">Who changed what, and who signed in from where.</span>
   </a>
+  {% endif %}
   <a class="tile" href="/server">
     <span class="tile-head">Server</span>
     <span class="note">Memory, databases and how the server is doing.</span>

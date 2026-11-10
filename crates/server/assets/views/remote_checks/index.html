@@ -8,7 +8,7 @@
   </div>
   <div class="actions">
     <a class="button secondary" href="/agents/{{ agent_id }}/metrics">Charts</a>
-    <a class="button" href="/checks/new">New check</a>
+    {% if can_edit %}<a class="button" href="/checks/new">New check</a>{% endif %}
   </div>
 </div>
 <p class="hint">The server runs these itself, against remote sites. To check something from where an agent is, add it to a config rule. Alert rules cover both.</p>

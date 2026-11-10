@@ -8,6 +8,8 @@ pub struct Model {
     pub name: String,
     /// Who it acts as.
     pub user_id: i64,
+    /// `viewer`, `responder`, `editor` or `admin`.
+    pub role: String,
     /// The start of the key, to tell keys apart once the key itself is gone.
     pub hint: String,
     /// Only the hash is kept, so reading the database doesn't give anyone a key.

@@ -7,7 +7,7 @@
     <h1>Location rules</h1>
     <p class="subtitle">Each rule puts the machines its filter matches in one place. Where several match a machine, the highest priority decides.</p>
   </div>
-  <a class="button" href="/map/rules/new">Add a location</a>
+  {% if can_edit %}<a class="button" href="/map/rules/new">Add a location</a>{% endif %}
 </div>
 {% if rules %}
 <div class="tablebox"><table>

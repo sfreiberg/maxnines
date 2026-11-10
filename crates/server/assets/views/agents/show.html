@@ -11,6 +11,7 @@
     {% include "agents/_version.html" %}
     {% include "agents/_health.html" %}
     <a class="button secondary" href="/agents/{{ agent.id }}/metrics">View metrics</a>
+    {% if can_edit %}
     {% if agent.state != "approved" %}
     <form method="post" action="/agents/{{ agent.id }}/approve">
       <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
@@ -22,11 +23,12 @@
       <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
       <button type="submit" class="danger">Revoke</button>
     </form>
-    {% else %}
+    {% elif is_admin %}
     <form method="post" action="/agents/{{ agent.id }}/delete">
       <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
       <button type="submit" class="danger" title="Deletes this agent with its metrics, facts and alerts, for good">Delete</button>
     </form>
+    {% endif %}
     {% endif %}
   </div>
 </div>

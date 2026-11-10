@@ -4,6 +4,7 @@ mod alerting;
 mod audit;
 mod dashboards;
 mod docs;
+mod roles;
 mod users;
 
 use std::collections::{BTreeMap, HashMap};
@@ -139,13 +140,18 @@ async fn start_with_heartbeat(
         database.delete_alert_rule(rule.id, now_ms()).await.unwrap();
     }
     let (user, _) = database
-        .create_user("test@example.com", "Tester", now_ms())
+        .create_user(
+            "test@example.com",
+            "Tester",
+            crate::roles::Role::Admin,
+            now_ms(),
+        )
         .await
         .unwrap()
         .unwrap();
     let session = database.start_session(user.id, now_ms()).await.unwrap();
     let (_, api_key) = database
-        .create_api_key("tests", user.id, None, now_ms())
+        .create_api_key("tests", user.id, crate::roles::Role::Admin, None, now_ms())
         .await
         .unwrap();
     let status = Arc::new(ServerStatus::new(None).unwrap());
@@ -2605,6 +2611,7 @@ fn parses_commands() {
         Some(Command::ApiKeys(crate::ApiKeysCommand::Create {
             name: "ci".to_string(),
             user: "ci@example.com".to_string(),
+            role: None,
             expires_in: None,
         }))
     );
@@ -4336,6 +4343,7 @@ async fn a_key_that_has_run_out_is_refused() {
         .create_api_key(
             "old",
             server.user_id().await,
+            crate::roles::Role::Admin,
             Some(now_ms() - 1000),
             now_ms() - 5000,
         )
@@ -4376,6 +4384,7 @@ async fn the_keys_page_shows_a_new_key_once() {
             &[
                 ("authenticity_token", token.as_str()),
                 ("name", "Backup script"),
+                ("role", "admin"),
                 ("lifetime", "3600"),
             ],
         )
@@ -4426,6 +4435,7 @@ async fn the_keys_page_offers_only_set_lifetimes() {
             &[
                 ("authenticity_token", token.as_str()),
                 ("name", "a"),
+                ("role", "admin"),
                 ("lifetime", "5"),
             ],
         )

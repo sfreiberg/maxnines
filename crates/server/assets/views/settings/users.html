@@ -4,7 +4,7 @@
 <p class="breadcrumb"><a href="/settings">Settings</a></p>
 <div>
   <h1>Users</h1>
-  <p class="subtitle">Everyone who can sign in. There's no way to sign up, so people are only ever added here. Everyone can do everything for now.</p>
+  <p class="subtitle">Everyone who can sign in. There's no way to sign up, so people are only ever added here. Each person's role says what they may do.</p>
 </div>
 
 {% if new_link %}
@@ -23,19 +23,34 @@
     <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
     <div class="host-filter-box"><input type="text" name="name" aria-label="Name" placeholder="Name" maxlength="100" required></div>
     <div class="host-filter-box"><input type="email" name="email" aria-label="Email" placeholder="Email" maxlength="254" autocapitalize="none" spellcheck="false" required></div>
+    <select name="role" aria-label="Role">
+      {% for role in roles %}<option value="{{ role.value }}">{{ role.label }}</option>{% endfor %}
+    </select>
     <button type="submit">Add user</button>
   </form>
+  <dl class="roles">
+    {% for role in roles %}<dt>{{ role.label }}</dt><dd>{{ role.adds }}</dd>{% endfor %}
+  </dl>
 </section>
 
 <div class="tablebox"><table>
   <thead>
-    <tr><th>Name</th><th>Email</th><th>Last sign in</th><th>Status</th><th></th></tr>
+    <tr><th>Name</th><th>Email</th><th>Role</th><th>Last sign in</th><th>Status</th><th></th></tr>
   </thead>
   <tbody>
     {% for person in users %}
     <tr{% if person.disabled %} class="disabled"{% endif %}>
       <td>{{ person.name }}{% if person.is_you %} <span class="note">You</span>{% endif %}</td>
       <td>{{ person.email }}</td>
+      <td>
+        <form method="post" action="/settings/users/{{ person.id }}/role" class="role-choice">
+          <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+          <select name="role" aria-label="Role for {{ person.name }}">
+            {% for role in roles %}<option value="{{ role.value }}"{% if role.value == person.role %} selected{% endif %}>{{ role.label }}</option>{% endfor %}
+          </select>
+          <button type="submit" class="secondary">Save</button>
+        </form>
+      </td>
       <td class="nowrap">{% if person.last_sign_in %}{{ person.last_sign_in }}{% else %}Never{% endif %}</td>
       <td><span class="badge {% if person.disabled %}neutral{% elif person.status == "Active" %}good{% else %}warn{% endif %}">{{ person.status }}</span></td>
       <td>

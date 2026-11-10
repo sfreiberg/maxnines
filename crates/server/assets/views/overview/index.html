@@ -80,7 +80,7 @@
     {% endfor %}
   </div>
   {% else %}
-  <p class="empty">There are no checks yet. <a href="/checks/new">Add one</a>.</p>
+  <p class="empty">There are no checks yet.{% if can_edit %} <a href="/checks/new">Add one</a>.{% endif %}</p>
   {% endif %}
 </section>
 {% endblock content %}

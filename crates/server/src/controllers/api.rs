@@ -35,6 +35,7 @@ use crate::notifier::{self, Notice};
 use crate::presence::AgentPresence;
 use crate::registration::{AgentRecord, AgentState};
 use crate::remote_checks::{RemoteCheck, RemoteCheckInput};
+use crate::roles::Role;
 use crate::rule_engine::{self, ResolvedConfig};
 use crate::silences::{ActiveSilences, Cover, SilenceInput};
 use crate::times::zone_named;
@@ -214,7 +215,7 @@ pub async fn key_holder(
 
 async fn require_token(State(state): State<AppState>, request: Request, next: Next) -> Response {
     match key_holder(&state, request.headers()).await {
-        Ok(Some((owner, via))) => super::run_as(owner, Some(via), request, next).await,
+        Ok(Some((owner, via))) => super::run_as(&state, owner, Some(via), request, next).await,
         Ok(None) => StatusCode::UNAUTHORIZED.into_response(),
         Err(error) => server_error(&error),
     }
@@ -243,6 +244,8 @@ fn no_such_user() -> Response {
 struct NewUser {
     email: String,
     name: String,
+    /// What they may do. A viewer if left out.
+    role: Option<Role>,
 }
 
 /// Gives back the link for them to set a password, the only time it can be seen.
@@ -251,7 +254,12 @@ async fn create_user(State(state): State<AppState>, Json(input): Json<NewUser>) 
         Ok(checked) => checked,
         Err(error) => return refused(&error),
     };
-    match state.database.create_user(&email, &name, now_ms()).await {
+    let role = input.role.unwrap_or(Role::Viewer);
+    match state
+        .database
+        .create_user(&email, &name, role, now_ms())
+        .await
+    {
         Ok(Some((user, link))) => {
             let body = json!({ "user": user, "setup_url": setup_url(&state, &link) });
             (StatusCode::CREATED, Json(body)).into_response()
@@ -264,11 +272,12 @@ async fn create_user(State(state): State<AppState>, Json(input): Json<NewUser>) 
     }
 }
 
-/// Either or both. Neither is refused, so a misspelled field isn't taken as done.
+/// Any of them. None is refused, so a misspelled field isn't taken as done.
 #[derive(Deserialize)]
 struct UserChanges {
     theme: Option<String>,
     time_zone: Option<String>,
+    role: Option<Role>,
 }
 
 async fn update_user(
@@ -276,10 +285,10 @@ async fn update_user(
     UrlPath(id): UrlPath<i64>,
     Json(input): Json<UserChanges>,
 ) -> Response {
-    if input.theme.is_none() && input.time_zone.is_none() {
+    if input.theme.is_none() && input.time_zone.is_none() && input.role.is_none() {
         return failed(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "Give a theme, a time zone or both",
+            "Give a theme, a time zone or a role",
         );
     }
     if input.theme.as_deref().is_some_and(|theme| !is_theme(theme)) {
@@ -297,6 +306,13 @@ async fn update_user(
         },
         None => None,
     };
+    // First, as it's the one change that can be refused.
+    if let Some(role) = input.role {
+        match state.database.set_role(id, role).await {
+            Ok(UserChange::Done) => {}
+            other => return after_user_change(other),
+        }
+    }
     let saved = async {
         let mut found = true;
         if let Some(theme) = &input.theme {
@@ -344,8 +360,9 @@ async fn new_setup_link(State(state): State<AppState>, UrlPath(id): UrlPath<i64>
     }
 }
 
+/// Their own, or everyone's for an admin.
 async fn list_api_keys(State(state): State<AppState>) -> Response {
-    match state.database.list_api_keys().await {
+    match super::api_keys::visible_keys(&state).await {
         Ok(keys) => Json(keys).into_response(),
         Err(error) => server_error(&error),
     }
@@ -356,6 +373,8 @@ struct NewApiKey {
     name: String,
     /// How long it lasts. Leaving this out makes a key that doesn't expire.
     expires_in_secs: Option<u64>,
+    /// The most it can do, up to what the key making it can. That, if left out.
+    role: Option<Role>,
 }
 
 /// The only time a key can be seen.
@@ -374,9 +393,16 @@ async fn create_api_key(State(state): State<AppState>, Json(input): Json<NewApiK
     let Some(owner) = super::signed_in_user() else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
+    let role = input.role.unwrap_or(owner.role);
+    if role > owner.role {
+        return failed(
+            StatusCode::FORBIDDEN,
+            "A key can't do more than the key making it",
+        );
+    }
     match state
         .database
-        .create_api_key(name, owner.id, expires_ms, now)
+        .create_api_key(name, owner.id, role, expires_ms, now)
         .await
     {
         Ok((details, key)) => {
@@ -389,7 +415,7 @@ async fn create_api_key(State(state): State<AppState>, Json(input): Json<NewApiK
 }
 
 async fn revoke_api_key(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
-    match state.database.revoke_api_key(id, now_ms()).await {
+    match super::api_keys::revoke_if_allowed(&state, id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),

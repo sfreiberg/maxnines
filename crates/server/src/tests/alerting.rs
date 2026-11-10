@@ -2594,7 +2594,7 @@ async fn slack_buttons(test: &mut Harness, slack: &FakeSlack) -> (SlackActions, 
     let notifier = firing_on_slack_app(test, slack, Some("xapp-secret-token")).await;
     notifier.deliver_due(test.now).await.unwrap();
     test.database()
-        .create_user(SLACK_MEMBER, "Sam", test.now)
+        .create_user(SLACK_MEMBER, "Sam", crate::roles::Role::Admin, test.now)
         .await
         .unwrap();
     *slack.user.lock().unwrap() = json!({ "id": "U1", "profile": { "email": "Sam@Example.com" } });
@@ -2734,6 +2734,26 @@ async fn someone_without_an_account_is_told_and_nothing_changes() {
         text.contains("no MaxNines account for other@example.com"),
         "{text}"
     );
+}
+
+#[tokio::test]
+async fn a_viewer_cannot_act_from_slack() {
+    let mut test = Harness::start().await;
+    let slack = FakeSlack::default();
+    let (actions, alert_id) = slack_buttons(&mut test, &slack).await;
+    let viewer = crate::roles::Role::Viewer;
+    test.database()
+        .create_user("viewer@example.com", "Viewer", viewer, 0)
+        .await
+        .unwrap();
+    *slack.user.lock().unwrap() =
+        json!({ "id": "U1", "profile": { "email": "viewer@example.com" } });
+
+    press(&slack, &actions, ACKNOWLEDGE_ACTION, alert_id).await;
+
+    assert_eq!(test.open().await[0].acknowledged_by, None);
+    let text = slack.answer()["text"].as_str().unwrap().to_string();
+    assert!(text.contains("Responder role"), "{text}");
 }
 
 #[tokio::test]

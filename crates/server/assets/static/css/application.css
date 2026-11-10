@@ -229,6 +229,10 @@ td.number, th.number { text-align: right; white-space: nowrap; }
 td.number { font-family: var(--mono); font-size: 14px; }
 td.nowrap { white-space: nowrap; }
 .audit-source, .audit-subject { display: block; }
+.role-choice { display: flex; align-items: center; gap: 8px; }
+.roles { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 16px 0 0; color: var(--muted); font-size: 13px; }
+.roles dt { color: var(--text); }
+.roles dd { margin: 0; }
 .audit-subject { overflow-wrap: anywhere; }
 .audit-changes { margin: 0; padding: 0; list-style: none; }
 .audit-changes li { overflow-wrap: anywhere; }

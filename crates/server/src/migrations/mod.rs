@@ -30,6 +30,7 @@ impl MigratorTrait for Migrator {
             Box::new(AddChannelMailSettings),
             Box::new(AddApiKeyOwners),
             Box::new(AddAuditVia),
+            Box::new(AddRoles),
         ]
     }
 }
@@ -2081,6 +2082,82 @@ impl MigrationTrait for AddAuditVia {
                 .await?;
         }
         Ok(())
+    }
+}
+
+// ---- Roles
+
+struct AddRoles;
+
+impl MigrationName for AddRoles {
+    fn name(&self) -> &str {
+        "m20261110_000019_add_roles"
+    }
+}
+
+#[derive(Iden)]
+enum UserRoles {
+    #[iden = "users"]
+    Table,
+    /// `viewer`, `responder`, `editor` or `admin`.
+    Role,
+}
+
+#[derive(Iden)]
+enum ApiKeyRoles {
+    #[iden = "api_keys"]
+    Table,
+    /// The most the key can do. Its owner's role caps it too.
+    Role,
+}
+
+/// Everyone here before roles could do everything, so they become admins, and
+/// their keys keep doing what they do.
+#[async_trait::async_trait]
+impl MigrationTrait for AddRoles {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let role = |column: DynIden| {
+            ColumnDef::new(column)
+                .string_len(16)
+                .not_null()
+                .default("admin")
+                .to_owned()
+        };
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(UserRoles::Table)
+                    .add_column(role(UserRoles::Role.into_iden()))
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(ApiKeyRoles::Table)
+                    .add_column(role(ApiKeyRoles::Role.into_iden()))
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(UserRoles::Table)
+                    .drop_column(UserRoles::Role)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(ApiKeyRoles::Table)
+                    .drop_column(ApiKeyRoles::Role)
+                    .to_owned(),
+            )
+            .await
     }
 }
 

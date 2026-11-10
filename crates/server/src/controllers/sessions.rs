@@ -61,9 +61,9 @@ pub async fn require_login(
     next: Next,
 ) -> Response {
     match session_user(&state, request.headers()).await {
-        Ok(Some(user)) => run_as(user, None, request, next).await,
+        Ok(Some(user)) => run_as(&state, user, None, request, next).await,
         Ok(None) => match api::key_holder(&state, request.headers()).await {
-            Ok(Some((owner, via))) => run_as(owner, Some(via), request, next).await,
+            Ok(Some((owner, via))) => run_as(&state, owner, Some(via), request, next).await,
             Ok(None) => to_sign_in(&request),
             Err(error) => server_error(&error),
         },

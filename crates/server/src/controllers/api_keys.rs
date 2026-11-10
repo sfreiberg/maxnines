@@ -8,10 +8,12 @@ use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
 use serde::Serialize;
 
+use super::users::role_choices;
 use super::{CsrfForm, Page, local_time, server_error, signed_in_user};
 use crate::app_state::AppState;
 use crate::metrics::now_ms;
 use crate::models::{ApiKey, check_api_key_name, expiry_after};
+use crate::roles::Role;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -36,6 +38,7 @@ struct KeyRow {
     name: String,
     /// Who it acts as.
     owner: String,
+    role: &'static str,
     hint: String,
     created: String,
     expires: Option<String>,
@@ -89,8 +92,31 @@ fn row(key: ApiKey, now_ms: i64) -> KeyRow {
         id: key.id,
         name: key.name,
         owner: key.owner,
+        role: key.role.label(),
         hint: key.hint,
     }
+}
+
+/// The keys whoever's signed in may see and revoke: their own, or for an admin,
+/// everyone's.
+pub async fn visible_keys(state: &AppState) -> anyhow::Result<Vec<ApiKey>> {
+    let Some(viewer) = signed_in_user() else {
+        return Ok(Vec::new());
+    };
+    let mut keys = state.database.list_api_keys().await?;
+    if viewer.role < Role::Admin {
+        keys.retain(|key| key.user_id == viewer.id);
+    }
+    Ok(keys)
+}
+
+/// Revokes a key if it's one they may. Returns false for any other, as if it
+/// weren't there.
+pub async fn revoke_if_allowed(state: &AppState, id: i64) -> anyhow::Result<bool> {
+    if !visible_keys(state).await?.iter().any(|key| key.id == id) {
+        return Ok(false);
+    }
+    state.database.revoke_api_key(id, now_ms()).await
 }
 
 /// `new_key` is only ever on the page right after creating it.
@@ -100,15 +126,19 @@ async fn page(
     new_key: Option<&str>,
     error: Option<&str>,
 ) -> Response {
-    let keys = match state.database.list_api_keys().await {
+    let keys = match visible_keys(state).await {
         Ok(keys) => keys,
         Err(error) => return server_error(&error),
     };
+    let yours = signed_in_user().map_or(Role::Viewer, |user| user.role);
     let now = now_ms();
     let rows: Vec<KeyRow> = keys.into_iter().map(|key| row(key, now)).collect();
     let page = Page::new(state, token, "settings/api_keys.html")
         .with("keys", &rows)
         .with("lifetimes", &lifetimes())
+        .with("roles", &role_choices(yours))
+        .with("your_role", yours.as_str())
+        .with("sees_all", &(yours >= Role::Admin))
         .with("new_key", &new_key)
         .with("error", &error);
     if error.is_some() {
@@ -141,9 +171,18 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
     let Some(owner) = signed_in_user() else {
         return server_error(&anyhow::anyhow!("nobody signed in to own a key"));
     };
+    let role = form.fields.get("role").map_or("", String::as_str);
+    let role = match Role::parse(role) {
+        Ok(role) if role <= owner.role => role,
+        Ok(_) => {
+            let error = "A key can't do more than you can.";
+            return page(&state, &form.token, None, Some(error)).await;
+        }
+        Err(error) => return page(&state, &form.token, None, Some(&format!("{error:#}"))).await,
+    };
     match state
         .database
-        .create_api_key(name, owner.id, expires_ms, now)
+        .create_api_key(name, owner.id, role, expires_ms, now)
         .await
     {
         Ok((_, key)) => {
@@ -159,7 +198,7 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
 }
 
 async fn revoke(State(state): State<AppState>, Path(id): Path<i64>, _form: CsrfForm) -> Response {
-    match state.database.revoke_api_key(id, now_ms()).await {
+    match revoke_if_allowed(&state, id).await {
         Ok(_) => Redirect::to("/settings/api-keys").into_response(),
         Err(error) => server_error(&error),
     }
@@ -183,6 +222,7 @@ mod tests {
             name: "a".to_string(),
             user_id: 1,
             owner: "a@example.com".to_string(),
+            role: Role::Admin,
             hint: "mxn_".to_string(),
             created_ms: 0,
             expires_ms,

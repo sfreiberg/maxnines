@@ -22,6 +22,7 @@ use crate::models::{
     Database, FactVersion, UserChange, check_api_key_name, check_new_user, expiry_after,
 };
 use crate::notifier::web_url;
+use crate::roles::Role;
 use crate::times::format_time;
 
 /// Where scripts and these commands find a key for the running server's API.
@@ -230,8 +231,8 @@ pub fn print_api_keys(config: &Config) -> Result<()> {
 
     let now = now_ms();
     println!(
-        "{:<6} {:<16} {:<8} {:<20} {:<30} NAME",
-        "ID", "KEY", "STATE", "EXPIRES", "OWNER"
+        "{:<6} {:<16} {:<8} {:<20} {:<30} {:<9} NAME",
+        "ID", "KEY", "STATE", "EXPIRES", "OWNER", "ROLE"
     );
     for key in keys {
         let state = if key.revoked_ms.is_some() {
@@ -242,7 +243,7 @@ pub fn print_api_keys(config: &Config) -> Result<()> {
             "active"
         };
         println!(
-            "{:<6} {:<16} {:<8} {:<20} {:<30} {}",
+            "{:<6} {:<16} {:<8} {:<20} {:<30} {:<9} {}",
             key.id,
             format!("{}...", key.hint),
             state,
@@ -250,6 +251,7 @@ pub fn print_api_keys(config: &Config) -> Result<()> {
                 .and_then(|time| u64::try_from(time).ok())
                 .map_or_else(|| "never".to_string(), |time| format_time(time, Tz::UTC)),
             key.owner,
+            key.role.as_str(),
             key.name,
         );
     }
@@ -261,6 +263,7 @@ pub fn create_api_key(
     config: &Config,
     name: &str,
     owner: &str,
+    role: Option<Role>,
     expires_in: Option<Duration>,
 ) -> Result<()> {
     let name = name.trim();
@@ -274,8 +277,9 @@ pub fn create_api_key(
             .active_user_by_email(owner)
             .await?
             .with_context(|| format!("no user who can sign in has the address {owner}"))?;
+        let role = role.unwrap_or(owner.role);
         database
-            .create_api_key(name, owner.id, expires_ms, now)
+            .create_api_key(name, owner.id, role, expires_ms, now)
             .await
     })?;
 
@@ -308,7 +312,13 @@ pub fn print_users(config: &Config) -> Result<()> {
         } else {
             "invited"
         };
-        println!("{}  {status:<8}  {}  {}", user.id, user.email, user.name);
+        println!(
+            "{}  {status:<8}  {:<9}  {}  {}",
+            user.id,
+            user.role.as_str(),
+            user.email,
+            user.name
+        );
     }
     Ok(())
 }
@@ -320,10 +330,10 @@ fn print_link(config: &Config, token: &str) {
     eprintln!("Open this to set a password. It works once and lasts 7 days.");
 }
 
-pub fn create_user(config: &Config, email: &str, name: &str) -> Result<()> {
+pub fn create_user(config: &Config, email: &str, name: &str, role: Role) -> Result<()> {
     let (email, name) = check_new_user(email, name)?;
     let created = with_database(config, |database| async move {
-        database.create_user(&email, &name, now_ms()).await
+        database.create_user(&email, &name, role, now_ms()).await
     })?;
     let Some((_, token)) = created else {
         bail!("there's already a user with that address");
@@ -351,9 +361,16 @@ fn changed(change: UserChange, done: &str) -> Result<()> {
             Ok(())
         }
         UserChange::NoSuchUser => bail!("no user with that ID"),
-        UserChange::LastUser => bail!("refused: this would leave nobody able to sign in"),
+        UserChange::LastAdmin => bail!("refused: this would leave no admin able to sign in"),
         UserChange::StillEnabled => bail!("refused: only a disabled user can be deleted"),
     }
+}
+
+pub fn set_role(config: &Config, id: i64, role: Role) -> Result<()> {
+    let change = with_database(config, |database| async move {
+        database.set_role(id, role).await
+    })?;
+    changed(change, &format!("{id} is now {}", role.as_str()))
 }
 
 /// `action` is `disable` or `enable`.

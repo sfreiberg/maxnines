@@ -10,7 +10,7 @@
 <form method="post" action="{% if id %}/rules/{{ id }}{% else %}/rules{% endif %}" class="stacked">
   <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
   {# Pressing Enter uses the first button in a form, so it has to be Save. #}
-  <button type="submit" class="default-submit" tabindex="-1" aria-hidden="true">Save rule</button>
+  {% if can_edit %}<button type="submit" class="default-submit" tabindex="-1" aria-hidden="true">Save rule</button>{% endif %}
 
   <label>Name
     <input type="text" name="name" value="{{ rule.name }}" required maxlength="255">
@@ -110,9 +110,9 @@
   </fieldset>
 
   <div class="actions">
-    <button type="submit">Save rule</button>
+    {% if can_edit %}<button type="submit">Save rule</button>{% else %}<span class="note">Your role lets you look at this, but not change it.</span>{% endif %}
     {# The fragment brings the results into view, since the page reloads at the top. #}
-    <button type="submit" name="form_action" value="preview" class="secondary" formaction="{% if id %}/rules/{{ id }}{% else %}/rules{% endif %}#preview" formnovalidate>Preview</button>
+    {% if can_edit %}<button type="submit" name="form_action" value="preview" class="secondary" formaction="{% if id %}/rules/{{ id }}{% else %}/rules{% endif %}#preview" formnovalidate>Preview</button>{% endif %}
     <a class="button secondary" href="/rules">Cancel</a>
   </div>
 </form>
@@ -160,7 +160,7 @@
 </section>
 {% endif %}
 
-{% if id %}
+{% if id and can_edit %}
 <form method="post" action="/rules/{{ id }}/delete" class="delete-form">
   <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
   <button type="submit" class="danger">Delete rule</button>

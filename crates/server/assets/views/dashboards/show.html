@@ -12,7 +12,7 @@
   {% if editing %}
   <a class="button" href="/dashboards/{{ dashboard.id }}">Done</a>
   {% else %}
-  <a class="button secondary" href="/dashboards/{{ dashboard.id }}/edit">Edit</a>
+  {% if can_edit %}<a class="button secondary" href="/dashboards/{{ dashboard.id }}/edit">Edit</a>{% endif %}
   {% endif %}
 </div>
 
@@ -52,6 +52,6 @@
   {% endfor %}
 </div>
 {% elif not editing %}
-<p class="empty">Nothing here yet. <a href="/dashboards/{{ dashboard.id }}/edit">Add a widget</a>.</p>
+<p class="empty">Nothing here yet.{% if can_edit %} <a href="/dashboards/{{ dashboard.id }}/edit">Add a widget</a>.{% endif %}</p>
 {% endif %}
 {% endblock content %}

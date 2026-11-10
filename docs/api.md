@@ -28,7 +28,11 @@ export AGENT_ID=$(curl -s -H "Authorization: Bearer $MAXNINES_API_KEY" \
 API key. Each key belongs to a user and acts as them: what it does is recorded in the
 [audit log](audit-log.md) as that person, via the key, and it stops working while
 they're disabled. Give each tool its own key. Without a valid key, the answer is
-`401`. Keys are made on the Settings page, through this API, or with
+`401`.
+
+**Roles.** A key has a [role](users.md#roles), its owner's or lower, and can do
+what that role can: reading needs a viewer, acknowledging and silencing a responder,
+changing the setup an editor, and users, the audit log and deleting agents an admin. Anything else gives `403`. Keys are made on the Settings page, through this API, or with
 `maxnines-server api-keys create --user <email>`, which writes to the main database
 directly, so it works while the server is stopped. For a script that isn't anyone's,
 add a user for it, such as `ci@example.com`, which never needs a password.
@@ -55,9 +59,10 @@ machine, keys shouldn't cross the network in the clear.
 | `201` | It was created, and the body holds its `id` |
 | `204` | It worked, and there's nothing to return |
 | `400` | The request couldn't be understood, such as a filter that can't be read |
-| `401` | The key is missing, wrong, revoked or expired |
+| `401` | The key is missing, wrong, revoked or expired, or its owner is disabled |
+| `403` | The key's role doesn't allow it. The `error` says which role it needs |
 | `404` | There's nothing at that address, or no such item |
-| `409` | It clashes with what's there, such as a user with that email already, or disabling the last enabled user |
+| `409` | It clashes with what's there, such as a user with that email already, or disabling the last admin |
 | `422` | The request was understood but refused, such as an invalid rule |
 | `500` | Something went wrong on the server |
 | `502` | A test notification couldn't be delivered |
@@ -1423,7 +1428,8 @@ Takes a list of widgets' `id`, `x`, `y`, `w` and `h`, and saves them together.
 Keys can also be managed on the Settings page, and with `maxnines-server api-keys`.
 Only a hash of each key is kept, so a key can only be seen when it's created. `hint` is
 the start of it, to tell keys apart. Each key acts as its owner, `user_id`, whose
-email address is `owner`. Deleting a user deletes their keys.
+email address is `owner`, with at most its `role`. Deleting a user deletes their keys.
+Admins see and revoke everyone's keys, and everyone else only their own.
 
 ### List API keys
 
@@ -1442,6 +1448,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/api-keys
     "name": "My script",
     "user_id": 1,
     "owner": "you@example.com",
+    "role": "admin",
     "hint": "mxn_9689a740",
     "created_ms": 1793940265767,
     "expires_ms": 1793943865767,
@@ -1461,6 +1468,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/api-keys
 | --- | --- |
 | `name` | Required. What the key is for, up to 100 characters. The key belongs to whoever owns the key making it |
 | `expires_in_secs` | How long it lasts. Leave it out for a key that never expires |
+| `role` | `viewer`, `responder`, `editor` or `admin`: the most it can do, up to the role of the key making it, which is what it gets if left out. More than that gives `403` |
 
 ```sh
 curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
@@ -1475,6 +1483,7 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "name": "Deploy job",
   "user_id": 1,
   "owner": "you@example.com",
+  "role": "admin",
   "hint": "mxn_6ffd6467",
   "key": "mxn_6ffd6467588f1ad1cbdca9b9961ff4be70e64ef4ff330c805ee3015463c00357",
   "created_ms": 1793940286623,
@@ -1531,8 +1540,9 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/users"
 
 `POST /api/v1/users`
 
-The answer holds a link for them to set a password. It works once, lasts 7 days and
-can't be seen again, so pass it on.
+Takes an `email`, a `name`, and a `role`: `viewer`, the default, `responder`, `editor`
+or `admin`. The answer holds a link for them to set a password. It works once, lasts
+7 days and can't be seen again, so pass it on.
 
 ```sh
 curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
@@ -1547,6 +1557,7 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
     "id": 2,
     "email": "alex@example.com",
     "name": "Alex",
+    "role": "viewer",
     "theme": "carbon",
     "time_zone": "UTC",
     "has_password": false,
@@ -1568,11 +1579,12 @@ An address that's already in use gives `409`.
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/users/2"
 ```
 
-### Change a user's theme or time zone
+### Change a user's role, theme or time zone
 
 `PUT /api/v1/users/{id}`
 
-Give either or both. `theme` can be `carbon`, `midnight`, `dusk`, `paper`, `contrast`
+Give any of them. `role` is `viewer`, `responder`, `editor` or `admin`, and taking it
+from the last admin gives `409`. `theme` can be `carbon`, `midnight`, `dusk`, `paper`, `contrast`
 or `system`. `time_zone` is a name from the time zone database, like
 `America/New_York`, and is what the pages show times in. Everyone starts on `UTC`.
 

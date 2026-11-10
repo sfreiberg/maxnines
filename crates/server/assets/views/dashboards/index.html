@@ -19,6 +19,7 @@
 <p class="empty">No dashboards yet.</p>
 {% endif %}
 
+{% if can_edit %}
 <section class="card">
   <h2>New dashboard</h2>
   <form method="post" action="/dashboards" class="stacked">
@@ -29,4 +30,5 @@
     <button type="submit">Create dashboard</button>
   </form>
 </section>
+{% endif %}
 {% endblock content %}

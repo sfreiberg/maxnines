@@ -47,7 +47,7 @@
     </label>
 
     <div class="actions">
-      <button type="submit">Save location</button>
+      {% if can_edit %}<button type="submit">Save location</button>{% else %}<span class="note">Your role lets you look at this, but not change it.</span>{% endif %}
       <a class="button secondary" href="/map/rules">Cancel</a>
     </div>
     <p class="credit">{{ credit }}</p>
@@ -61,7 +61,7 @@
   </section>
 </div>
 
-{% if id %}
+{% if id and can_edit %}
 <form method="post" action="/map/rules/{{ id }}/delete" class="delete-form">
   <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
   <button type="submit" class="danger">Delete location</button>

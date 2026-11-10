@@ -170,12 +170,12 @@
   </fieldset>
 
   <div class="actions">
-    <button type="submit">Save channel</button>
+    {% if can_edit %}<button type="submit">Save channel</button>{% else %}<span class="note">Your role lets you look at this, but not change it.</span>{% endif %}
     <a class="button secondary" href="/alerts/channels">Cancel</a>
   </div>
 </form>
 
-{% if id %}
+{% if id and can_edit %}
 <form method="post" action="/alerts/channels/{{ id }}/delete" class="delete-form">
   <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
   <button type="submit" class="danger">Delete channel</button>

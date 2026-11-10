@@ -4,7 +4,7 @@
 <p class="breadcrumb"><a href="/settings">Settings</a></p>
 <div class="title-row">
   <h1>Notification channels</h1>
-  <div class="actions"><a class="button" href="/alerts/channels/new">New channel</a></div>
+  {% if can_edit %}<div class="actions"><a class="button" href="/alerts/channels/new">New channel</a></div>{% endif %}
 </div>
 
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
@@ -22,10 +22,12 @@
       <td>{{ channel.kind_name }}</td>
       <td>{{ channel.target }}{% if channel.only %}<br><span class="note">{{ channel.only }}</span>{% endif %}{% if channel.legacy_slack %}<br><span class="note">Slack is moving away from these webhooks. Use a Slack channel instead.</span>{% endif %}</td>
       <td>
+        {% if can_edit %}
         <form method="post" action="/alerts/channels/{{ channel.id }}/test">
           <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
           <button type="submit" class="secondary">Send a test</button>
         </form>
+        {% endif %}
       </td>
     </tr>
     {% endfor %}

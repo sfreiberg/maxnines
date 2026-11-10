@@ -58,7 +58,7 @@
       {% endfor %}
     </ul>
     {% else %}
-    <p class="hint map-empty">No machines have a location yet. <a href="/map/rules/new">Add a location rule</a> to put them on the map.</p>
+    <p class="hint map-empty">No machines have a location yet. {% if can_edit %}<a href="/map/rules/new">Add a location rule</a> to put them on the map.{% endif %}</p>
     {% endif %}
     {% if unplaced %}
     <div class="map-unplaced">
@@ -66,7 +66,7 @@
       <p class="hint">No location rule covers these. Place one by hand, or add a rule that covers several at once.</p>
       <ul>
         {% for machine in unplaced %}
-        <li><a href="/agents/{{ machine.id }}">{{ machine.host }}</a> <span class="agent-id">{{ machine.short_id }}</span> <a class="place-it" href="/map/rules/new?agent={{ machine.id }}">Place it</a></li>
+        <li><a href="/agents/{{ machine.id }}">{{ machine.host }}</a> <span class="agent-id">{{ machine.short_id }}</span> {% if can_edit %}<a class="place-it" href="/map/rules/new?agent={{ machine.id }}">Place it</a>{% endif %}</li>
         {% endfor %}
       </ul>
     </div>

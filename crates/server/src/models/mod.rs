@@ -64,6 +64,7 @@ use crate::host_filter;
 use crate::migrations::Migrator;
 use crate::registration::hash_token;
 use crate::registration::{AgentRecord, AgentState};
+use crate::roles::Role;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Registry calls run one at a time, so a small pool is plenty.
@@ -448,6 +449,8 @@ pub struct ApiKey {
     pub user_id: i64,
     /// The owner's email address.
     pub owner: String,
+    /// The most it can do. It never does more than its owner can either.
+    pub role: Role,
     pub hint: String,
     pub created_ms: i64,
     /// Empty means it never expires.
@@ -469,6 +472,7 @@ impl ApiKey {
             name: row.name,
             user_id: row.user_id,
             owner,
+            role: Role::parse(&row.role).unwrap_or(Role::Viewer),
             hint: row.hint,
             created_ms: row.created_ms,
             expires_ms: row.expires_ms,
@@ -514,6 +518,7 @@ fn api_key_snapshot(row: &api_key::Model, owner: &str) -> Snapshot {
     let fields = serde_json::json!({
         "name": row.name,
         "owner": owner,
+        "role": row.role,
         "hint": row.hint,
         "expires": row.expires_ms.map(crate::audit::time),
         "revoked": row.revoked_ms.is_some(),
@@ -529,12 +534,14 @@ impl Database {
     /// The token that protects the admin API, created the first time it's asked
     /// for. Two servers starting at once can't end up with different tokens, as
     /// only the first insert counts and both read the result.
-    /// Makes a key that acts as `user_id`, and gives back the only copy of it
-    /// there'll ever be. The owner has to be someone who can sign in.
+    /// Makes a key that acts as `user_id` with at most `role`, and gives back the
+    /// only copy of it there'll ever be. The owner has to be someone who can sign in,
+    /// and can't make a key that does more than they can.
     pub async fn create_api_key(
         &self,
         name: &str,
         user_id: i64,
+        role: Role,
         expires_ms: Option<i64>,
         now_ms: i64,
     ) -> Result<(ApiKey, String)> {
@@ -546,9 +553,12 @@ impl Database {
             .await
             .context("loading the key's owner")?
             .context("a key's owner has to be a user who isn't disabled")?;
+        let most = Role::parse(&owner.role).unwrap_or(Role::Viewer);
+        anyhow::ensure!(role <= most, "a key can't do more than its owner");
         let row = api_key::ActiveModel {
             name: Set(name.to_string()),
             user_id: Set(user_id),
+            role: Set(role.as_str().to_string()),
             hint: Set(key[..API_KEY_HINT_LEN].to_string()),
             token_hash: Set(api_key_hash(&key)),
             created_ms: Set(now_ms),
@@ -640,9 +650,12 @@ impl Database {
             .one(&self.connection)
             .await
             .context("loading an API key's owner")?;
-        let Some(owner) = owner.map(User::from) else {
+        let Some(mut owner) = owner.map(User::from) else {
             return Ok(None);
         };
+        // The key acts as its owner, with whichever of their roles is less.
+        let key_role = Role::parse(&row.role).unwrap_or(Role::Viewer);
+        owner.role = owner.role.min(key_role);
         let stale = row
             .last_used_ms
             .is_none_or(|used| now_ms - used >= API_KEY_USE_ACCURACY_MS);
@@ -1146,7 +1159,9 @@ mod tests {
         if let Some(user) = database.list_users().await.unwrap().first() {
             return user.id;
         }
-        let made = database.create_user("owner@example.com", "Owner", 0).await;
+        let made = database
+            .create_user("owner@example.com", "Owner", crate::roles::Role::Admin, 0)
+            .await;
         made.unwrap().unwrap().0.id
     }
 
@@ -1155,10 +1170,13 @@ mod tests {
         let database = Database::for_test().await;
         let id = owner(&database).await;
         database
-            .create_user("other@example.com", "Other", 0)
+            .create_user("other@example.com", "Other", crate::roles::Role::Admin, 0)
             .await
             .unwrap();
-        let (key, secret) = database.create_api_key("ci", id, None, 0).await.unwrap();
+        let (key, secret) = database
+            .create_api_key("ci", id, crate::roles::Role::Admin, None, 0)
+            .await
+            .unwrap();
         assert_eq!(key.owner, "owner@example.com");
 
         let (_, acts_as) = database.accept_api_key(&secret, 1).await.unwrap().unwrap();
@@ -1174,10 +1192,13 @@ mod tests {
         let database = Database::for_test().await;
         let id = owner(&database).await;
         database
-            .create_user("other@example.com", "Other", 0)
+            .create_user("other@example.com", "Other", crate::roles::Role::Admin, 0)
             .await
             .unwrap();
-        let (_, secret) = database.create_api_key("ci", id, None, 0).await.unwrap();
+        let (_, secret) = database
+            .create_api_key("ci", id, crate::roles::Role::Admin, None, 0)
+            .await
+            .unwrap();
 
         database.disable_user(id, 1).await.unwrap();
         database.delete_user(id).await.unwrap();
@@ -1191,15 +1212,20 @@ mod tests {
         let database = Database::for_test().await;
         let id = owner(&database).await;
         database
-            .create_user("other@example.com", "Other", 0)
+            .create_user("other@example.com", "Other", crate::roles::Role::Admin, 0)
             .await
             .unwrap();
         database.disable_user(id, 1).await.unwrap();
 
-        assert!(database.create_api_key("ci", id, None, 2).await.is_err());
         assert!(
             database
-                .create_api_key("ci", id + 100, None, 2)
+                .create_api_key("ci", id, crate::roles::Role::Admin, None, 2)
+                .await
+                .is_err()
+        );
+        assert!(
+            database
+                .create_api_key("ci", id + 100, crate::roles::Role::Admin, None, 2)
                 .await
                 .is_err()
         );
@@ -1209,7 +1235,13 @@ mod tests {
     async fn an_api_key_works_until_it_is_revoked() {
         let database = Database::for_test().await;
         let (key, secret) = database
-            .create_api_key("backup", owner(&database).await, None, 1000)
+            .create_api_key(
+                "backup",
+                owner(&database).await,
+                crate::roles::Role::Admin,
+                None,
+                1000,
+            )
             .await
             .unwrap();
 
@@ -1234,7 +1266,13 @@ mod tests {
     async fn only_a_real_key_is_accepted() {
         let database = Database::for_test().await;
         database
-            .create_api_key("backup", owner(&database).await, None, 1000)
+            .create_api_key(
+                "backup",
+                owner(&database).await,
+                crate::roles::Role::Admin,
+                None,
+                1000,
+            )
             .await
             .unwrap();
 
@@ -1252,7 +1290,13 @@ mod tests {
     async fn the_key_itself_is_never_stored() {
         let database = Database::for_test().await;
         let (_, secret) = database
-            .create_api_key("backup", owner(&database).await, None, 1000)
+            .create_api_key(
+                "backup",
+                owner(&database).await,
+                crate::roles::Role::Admin,
+                None,
+                1000,
+            )
             .await
             .unwrap();
 
@@ -1271,11 +1315,23 @@ mod tests {
     async fn each_key_is_different() {
         let database = Database::for_test().await;
         let (_, first) = database
-            .create_api_key("a", owner(&database).await, None, 1)
+            .create_api_key(
+                "a",
+                owner(&database).await,
+                crate::roles::Role::Admin,
+                None,
+                1,
+            )
             .await
             .unwrap();
         let (_, second) = database
-            .create_api_key("a", owner(&database).await, None, 1)
+            .create_api_key(
+                "a",
+                owner(&database).await,
+                crate::roles::Role::Admin,
+                None,
+                1,
+            )
             .await
             .unwrap();
         assert_ne!(first, second);
@@ -1285,7 +1341,13 @@ mod tests {
     async fn using_a_key_is_noted_without_writing_every_time() {
         let database = Database::for_test().await;
         let (_, secret) = database
-            .create_api_key("backup", owner(&database).await, None, 0)
+            .create_api_key(
+                "backup",
+                owner(&database).await,
+                crate::roles::Role::Admin,
+                None,
+                0,
+            )
             .await
             .unwrap();
         let used = async || database.list_api_keys().await.unwrap()[0].last_used_ms;
@@ -1305,7 +1367,13 @@ mod tests {
     async fn revoking_twice_keeps_the_first_time() {
         let database = Database::for_test().await;
         let (key, _) = database
-            .create_api_key("backup", owner(&database).await, None, 0)
+            .create_api_key(
+                "backup",
+                owner(&database).await,
+                crate::roles::Role::Admin,
+                None,
+                0,
+            )
             .await
             .unwrap();
 
@@ -1321,7 +1389,13 @@ mod tests {
     async fn a_key_stops_working_when_it_expires() {
         let database = Database::for_test().await;
         let (key, secret) = database
-            .create_api_key("deploy", owner(&database).await, Some(5000), 1000)
+            .create_api_key(
+                "deploy",
+                owner(&database).await,
+                crate::roles::Role::Admin,
+                Some(5000),
+                1000,
+            )
             .await
             .unwrap();
 
@@ -1354,7 +1428,13 @@ mod tests {
     async fn a_key_with_no_expiry_lasts() {
         let database = Database::for_test().await;
         let (key, secret) = database
-            .create_api_key("a", owner(&database).await, None, 0)
+            .create_api_key(
+                "a",
+                owner(&database).await,
+                crate::roles::Role::Admin,
+                None,
+                0,
+            )
             .await
             .unwrap();
 

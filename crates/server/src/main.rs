@@ -28,6 +28,7 @@ mod places;
 mod presence;
 mod registration;
 mod remote_checks;
+mod roles;
 mod rule_engine;
 mod rule_preview;
 mod server_stats;
@@ -114,7 +115,19 @@ enum UsersCommand {
     /// List everyone who can sign in
     List,
     /// Add someone and print the link for them to set a password
-    Create { email: String, name: String },
+    Create {
+        email: String,
+        name: String,
+        /// What they may do: viewer, responder, editor or admin
+        #[arg(long, default_value = "admin", value_parser = roles::Role::parse)]
+        role: roles::Role,
+    },
+    /// Change what someone may do: viewer, responder, editor or admin
+    Role {
+        id: i64,
+        #[arg(value_parser = roles::Role::parse)]
+        role: roles::Role,
+    },
     /// Print a new link for someone to set a password, as when they've forgotten it
     SetupLink { id: i64 },
     /// Stop someone signing in, and sign them out
@@ -135,6 +148,10 @@ enum ApiKeysCommand {
         /// The email address of the user the key acts as
         #[arg(long, value_name = "EMAIL")]
         user: String,
+        /// The most the key can do: viewer, responder, editor or admin. Without this
+        /// it's the user's own role
+        #[arg(long, value_parser = roles::Role::parse)]
+        role: Option<roles::Role>,
         /// How long it lasts, like 1h or 30d. Without this it never expires
         #[arg(long, value_name = "TIME", value_parser = humantime::parse_duration)]
         expires_in: Option<std::time::Duration>,
@@ -189,7 +206,10 @@ fn main() -> Result<()> {
             let config = Config::load(&cli.config)?;
             match command {
                 UsersCommand::List => cli::print_users(&config),
-                UsersCommand::Create { email, name } => cli::create_user(&config, &email, &name),
+                UsersCommand::Create { email, name, role } => {
+                    cli::create_user(&config, &email, &name, role)
+                }
+                UsersCommand::Role { id, role } => cli::set_role(&config, id, role),
                 UsersCommand::SetupLink { id } => cli::print_setup_link(&config, id),
                 UsersCommand::Disable { id } => cli::change_user(&config, id, "disable"),
                 UsersCommand::Enable { id } => cli::change_user(&config, id, "enable"),
@@ -203,8 +223,9 @@ fn main() -> Result<()> {
                 ApiKeysCommand::Create {
                     name,
                     user,
+                    role,
                     expires_in,
-                } => cli::create_api_key(&config, &name, &user, expires_in),
+                } => cli::create_api_key(&config, &name, &user, role, expires_in),
                 ApiKeysCommand::Revoke { id } => cli::revoke_api_key(&config, id),
             }
         }

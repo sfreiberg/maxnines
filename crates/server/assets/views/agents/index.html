@@ -18,6 +18,7 @@
   {% for agent in waiting %}
   <div class="problem">
     <span class="text"><a href="/agents/{{ agent.id }}">{{ agent.host }}</a>{% if agent.seen %} <span class="note">asked {{ agent.seen }}</span>{% endif %}</span>
+    {% if can_edit %}
     <div class="actions">
       <form method="post" action="/agents/{{ agent.id }}/approve">
         <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
@@ -28,6 +29,7 @@
         <button type="submit" class="danger">Reject</button>
       </form>
     </div>
+    {% endif %}
   </div>
   {% endfor %}
 </section>
