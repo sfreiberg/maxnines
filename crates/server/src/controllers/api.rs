@@ -1231,6 +1231,9 @@ struct ChannelView {
     kind: ChannelKind,
     target_preview: String,
     severities: std::collections::BTreeSet<crate::alerting::Severity>,
+    /// Who email comes from and the mail server, for email channels. The password
+    /// is write-only, like every other secret.
+    mail: Option<crate::alerting::Mail>,
 }
 
 impl ChannelView {
@@ -1239,6 +1242,7 @@ impl ChannelView {
             id: channel.id,
             target_preview: channel.channel.target_preview(),
             severities: channel.channel.severities.clone(),
+            mail: channel.channel.mail.clone(),
             name: channel.channel.name,
             kind: channel.channel.kind,
         }

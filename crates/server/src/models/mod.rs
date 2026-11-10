@@ -1689,6 +1689,7 @@ mod tests {
                 credential: Some("secret".to_string()),
                 app_token: None,
                 severities: crate::alerting::every_severity(),
+                mail: None,
             })
             .await
             .unwrap();

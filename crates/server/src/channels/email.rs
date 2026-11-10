@@ -1,68 +1,116 @@
-//! Email, through the mail server in the server's config.
+//! Email, through the mail server set on the channel.
 
-use std::sync::Arc;
-
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use lettre::message::header::ContentType;
 use lettre::message::{Attachment, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Address, Message, SmtpTransport, Transport};
 
 use super::{ChannelType, SEND_TIMEOUT, blocking};
-use crate::alerting::{Channel, ChannelInput};
-use crate::config::{EmailConfig, EmailSecurity};
+use crate::alerting::{Channel, ChannelInput, Mail, MailSecurity, MailServer};
 use crate::notifier::{Notice, Senders, format_ms};
 use crate::remote_checks::FLEET_AGENT_ID;
 
 pub(crate) const MAX_RECIPIENTS: usize = 20;
+/// The longest host name DNS allows.
+const MAX_HOST_LEN: usize = 253;
+const MAX_USERNAME_LEN: usize = 255;
 
 pub struct Email;
 
-/// Sends email through the server in the config.
-pub struct Mailer {
-    transport: SmtpTransport,
-    from: Mailbox,
+/// The channel's mail server, ready to send.
+fn transport(server: &MailServer, password: Option<&str>) -> Result<SmtpTransport> {
+    let host = server.host.trim();
+    let mut builder = match server.security {
+        MailSecurity::Tls => SmtpTransport::relay(host)?,
+        MailSecurity::Starttls => SmtpTransport::starttls_relay(host)?,
+        MailSecurity::None => SmtpTransport::builder_dangerous(host),
+    };
+    if let Some(port) = server.port {
+        builder = builder.port(port);
+    }
+    if let Some(username) = &server.username {
+        let password = password.unwrap_or_default().to_string();
+        builder = builder.credentials(Credentials::new(username.clone(), password));
+    }
+    Ok(builder.timeout(Some(SEND_TIMEOUT)).build())
 }
 
-impl Mailer {
-    pub fn new(config: &EmailConfig) -> Result<Self> {
-        let from: Mailbox = config
-            .from
-            .parse()
-            .with_context(|| format!("invalid from address {:?}", config.from))?;
+/// Sends through the channel's own mail server. Errors only say how it failed, as
+/// a mail server's reply can repeat what it was sent.
+fn send_through(channel: &ChannelInput, notice: &Notice) -> Result<()> {
+    let (from, server) = settings(channel)?;
+    let message = message(&from, &channel.target, notice)?;
+    transport(server, channel.credential.as_deref())?
+        .send(&message)
+        .map_err(|error| match error.status() {
+            Some(code) => anyhow!("the mail server refused it with code {code}"),
+            None if error.is_timeout() => anyhow!("the mail server timed out"),
+            None => anyhow!("couldn't reach the mail server"),
+        })?;
+    Ok(())
+}
 
-        let mut builder = match config.security {
-            EmailSecurity::Tls => SmtpTransport::relay(&config.host)?,
-            EmailSecurity::Starttls => SmtpTransport::starttls_relay(&config.host)?,
-            EmailSecurity::None => SmtpTransport::builder_dangerous(&config.host),
-        };
-        if let Some(port) = config.port {
-            builder = builder.port(port);
+/// Who it's from and the server it goes through, which every email channel needs.
+fn settings(channel: &ChannelInput) -> Result<(Mailbox, &MailServer)> {
+    let mail = channel
+        .mail
+        .as_ref()
+        .context("this channel needs a from address and a mail server")?;
+    let server = mail
+        .server
+        .as_ref()
+        .context("this channel needs a mail server")?;
+    Ok((sender(mail)?, server))
+}
+
+/// Who email comes from, as written on the channel.
+pub(super) fn sender(mail: &Mail) -> Result<Mailbox> {
+    mail.from
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("{:?} isn't a valid from address", mail.from.trim()))
+}
+
+/// The addresses a channel sends to, which every email channel checks the same way.
+pub(super) fn check_recipients(target: &str) -> Result<()> {
+    let recipients = recipients(target)?;
+    ensure!(!recipients.is_empty(), "add at least one email address");
+    ensure!(
+        recipients.len() <= MAX_RECIPIENTS,
+        "a channel can have at most {MAX_RECIPIENTS} email addresses"
+    );
+    Ok(())
+}
+
+fn check_server(server: &MailServer, has_password: bool) -> Result<()> {
+    let host = server.host.trim();
+    ensure!(!host.is_empty(), "add the mail server's host name");
+    ensure!(
+        host.len() <= MAX_HOST_LEN && !host.chars().any(|c| c.is_whitespace() || c == '/'),
+        "the mail server's host should be a name like smtp.example.com, without anything else"
+    );
+    ensure!(server.port != Some(0), "the mail server's port can't be 0");
+    match &server.username {
+        Some(username) => {
+            ensure!(
+                !username.trim().is_empty() && username.len() <= MAX_USERNAME_LEN,
+                "the mail server's username isn't valid"
+            );
+            ensure!(
+                has_password,
+                "add the password for the mail server's username"
+            );
+            ensure!(
+                server.security != MailSecurity::None,
+                "choose TLS or STARTTLS to sign in to the mail server, as without \
+                 encryption the password would cross the network for anyone to read"
+            );
         }
-        if let Some(username) = &config.username {
-            builder = builder.credentials(Credentials::new(
-                username.clone(),
-                config.password()?.unwrap_or_default(),
-            ));
-        }
-
-        Ok(Self {
-            transport: builder.timeout(Some(SEND_TIMEOUT)).build(),
-            from,
-        })
+        None if has_password => bail!("add the username that goes with the password"),
+        None => {}
     }
-
-    fn send(&self, to: &str, notice: &Notice) -> Result<()> {
-        let message = message(&self.from, to, notice)?;
-        self.transport
-            .send(&message)
-            .map_err(|error| match error.status() {
-                Some(code) => anyhow!("the mail server refused it with code {code}"),
-                None if error.is_timeout() => anyhow!("the mail server timed out"),
-                None => anyhow!("couldn't reach the mail server"),
-            })?;
-        Ok(())
-    }
+    Ok(())
 }
 
 /// Email addresses separated by commas.
@@ -79,7 +127,7 @@ pub fn recipients(target: &str) -> Result<Vec<Address>> {
         .collect()
 }
 
-fn subject(notice: &Notice) -> String {
+pub(super) fn subject(notice: &Notice) -> String {
     let label = notice.label();
     let summary = notice
         .alert
@@ -88,7 +136,7 @@ fn subject(notice: &Notice) -> String {
     format!("[MaxNines {label}] {summary}")
 }
 
-fn text(notice: &Notice) -> String {
+pub(super) fn text(notice: &Notice) -> String {
     let Some(alert) = &notice.alert else {
         return format!("{}\n", notice.text);
     };
@@ -123,7 +171,7 @@ fn escape_html(text: &str) -> String {
 }
 
 /// The plain text, with the chart under it.
-fn html(notice: &Notice) -> String {
+pub(super) fn html(notice: &Notice) -> String {
     format!(
         "<!doctype html><html><body>\
          <pre style=\"font-family: sans-serif; white-space: pre-wrap\">{}</pre>\
@@ -167,13 +215,26 @@ impl ChannelType for Email {
     }
 
     fn check(&self, channel: &ChannelInput) -> Result<()> {
-        let recipients = recipients(&channel.target)?;
-        ensure!(!recipients.is_empty(), "add at least one email address");
-        ensure!(
-            recipients.len() <= MAX_RECIPIENTS,
-            "a channel can have at most {MAX_RECIPIENTS} email addresses"
-        );
-        Ok(())
+        check_recipients(&channel.target)?;
+        let mail = channel
+            .mail
+            .as_ref()
+            .context("add who the email comes from and the mail server it goes through")?;
+        sender(mail)?;
+        let server = mail
+            .server
+            .as_ref()
+            .context("add the mail server the email goes through")?;
+        check_server(server, channel.credential.is_some())
+    }
+
+    /// The mail server's password.
+    fn has_credential(&self) -> bool {
+        true
+    }
+
+    fn sends_mail(&self) -> bool {
+        true
     }
 
     fn shows_charts(&self) -> bool {
@@ -185,20 +246,18 @@ impl ChannelType for Email {
         channel: &Channel,
         notice: &Notice,
         _reply_to: Option<&str>,
-        senders: &Senders,
+        _senders: &Senders,
     ) -> Result<Option<String>> {
-        let mailer: Arc<Mailer> = senders
-            .mailer
-            .clone()
-            .context("email isn't set up in the server config")?;
-        let to = channel.channel.target.clone();
+        let channel = channel.channel.clone();
         let notice = notice.clone();
-        blocking(move || mailer.send(&to, &notice).map(|()| None)).await
+        blocking(move || send_through(&channel, &notice).map(|()| None)).await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::alerting::{Alert, Event};
     use crate::channels::testing::{alert, notice};

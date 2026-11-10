@@ -15,7 +15,8 @@ use super::audit::{record, record_change};
 use super::{Database, alert, alert_rule, alert_rule_channel, notification, notification_channel};
 use crate::alerting::{
     Alert, AlertRule, AlertRuleInput, Channel, ChannelInput, ChannelKind, Comparison, Delivery,
-    DeliveryProblem, Event, NewAlert, RULE_GONE_REASON, RuleKind, Severity, SeverityChange,
+    DeliveryProblem, Event, Mail, MailSecurity, MailServer, NewAlert, RULE_GONE_REASON, RuleKind,
+    Severity, SeverityChange,
 };
 use crate::audit::{Action, Kind, Record, Snapshot, Subject};
 use crate::calculations::Calculation;
@@ -96,7 +97,55 @@ fn alert_rule_row(input: &AlertRuleInput) -> Result<alert_rule::ActiveModel> {
     })
 }
 
+fn channel_row(input: &ChannelInput) -> notification_channel::ActiveModel {
+    let mail = input.mail.as_ref();
+    let server = mail.and_then(|mail| mail.server.as_ref());
+    notification_channel::ActiveModel {
+        name: Set(input.name.clone()),
+        kind: Set(input.kind.as_str().to_string()),
+        target: Set(input.target.clone()),
+        credential: Set(input.credential.clone()),
+        app_token: Set(input.app_token.clone()),
+        sends_warnings: Set(input.severities.contains(&Severity::Warning)),
+        sends_critical: Set(input.severities.contains(&Severity::Critical)),
+        mail_from: Set(mail.map(|mail| mail.from.trim().to_string())),
+        mail_host: Set(server.map(|server| server.host.trim().to_string())),
+        mail_port: Set(server.and_then(|server| server.port).map(i32::from)),
+        mail_security: Set(server.map(|server| server.security.as_str().to_string())),
+        mail_username: Set(server.and_then(|server| server.username.clone())),
+        ..Default::default()
+    }
+}
+
+/// How a channel sends email, if it does. A channel saved before email channels had
+/// their own mail server has none, and is told so when it's next used.
+fn to_mail(row: &notification_channel::Model) -> Result<Option<Mail>> {
+    let Some(from) = row.mail_from.clone() else {
+        return Ok(None);
+    };
+    let server = match &row.mail_host {
+        None => None,
+        Some(host) => Some(MailServer {
+            host: host.clone(),
+            port: row
+                .mail_port
+                .map(u16::try_from)
+                .transpose()
+                .context("invalid mail port")?,
+            security: row
+                .mail_security
+                .as_deref()
+                .map(MailSecurity::parse)
+                .transpose()?
+                .unwrap_or_default(),
+            username: row.mail_username.clone(),
+        }),
+    };
+    Ok(Some(Mail { from, server }))
+}
+
 fn to_channel(row: notification_channel::Model) -> Result<Channel> {
+    let mail = to_mail(&row)?;
     Ok(Channel {
         id: row.id,
         channel: ChannelInput {
@@ -112,6 +161,7 @@ fn to_channel(row: notification_channel::Model) -> Result<Channel> {
             .into_iter()
             .filter_map(|(severity, sent)| sent.then_some(severity))
             .collect(),
+            mail,
         },
     })
 }
@@ -305,17 +355,7 @@ impl Database {
 
     pub async fn create_channel(&self, input: &ChannelInput) -> Result<i64> {
         let transaction = self.connection.begin().await.context("saving channel")?;
-        let row = notification_channel::ActiveModel {
-            name: Set(input.name.clone()),
-            kind: Set(input.kind.as_str().to_string()),
-            target: Set(input.target.clone()),
-            credential: Set(input.credential.clone()),
-            app_token: Set(input.app_token.clone()),
-            sends_warnings: Set(input.severities.contains(&Severity::Warning)),
-            sends_critical: Set(input.severities.contains(&Severity::Critical)),
-            ..Default::default()
-        };
-        let id = notification_channel::Entity::insert(row)
+        let id = notification_channel::Entity::insert(channel_row(input))
             .exec(&transaction)
             .await
             .context("saving channel")?
@@ -331,16 +371,8 @@ impl Database {
         let Some(before) = load_channel(&transaction, id).await? else {
             return Ok(false);
         };
-        let row = notification_channel::ActiveModel {
-            id: Set(id),
-            name: Set(input.name.clone()),
-            kind: Set(input.kind.as_str().to_string()),
-            target: Set(input.target.clone()),
-            credential: Set(input.credential.clone()),
-            app_token: Set(input.app_token.clone()),
-            sends_warnings: Set(input.severities.contains(&Severity::Warning)),
-            sends_critical: Set(input.severities.contains(&Severity::Critical)),
-        };
+        let mut row = channel_row(input);
+        row.id = Set(id);
         notification_channel::Entity::update(row)
             .exec(&transaction)
             .await
@@ -449,6 +481,7 @@ fn channel_snapshot(channel: &Channel) -> Snapshot {
         "credential": input.credential,
         "app_token": input.app_token,
         "severities": severities,
+        "mail": input.mail,
     });
     let snapshot =
         Snapshot::new(input.name.clone(), fields).with_secrets(&["credential", "app_token"]);

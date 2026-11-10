@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -10,7 +10,9 @@ use axum_csrf::CsrfToken;
 use serde::Serialize;
 
 use super::{CsrfForm, Page, server_error};
-use crate::alerting::{Channel, ChannelInput, ChannelKind, Severity};
+use crate::alerting::{
+    Channel, ChannelInput, ChannelKind, Mail, MailSecurity, MailServer, Severity,
+};
 use crate::app_state::AppState;
 use crate::channels;
 use crate::notifier::{self, Notice};
@@ -45,6 +47,13 @@ struct ChannelForm {
     remove_app_token: bool,
     sends_warnings: bool,
     sends_critical: bool,
+    /// Who email comes from, for email and Resend.
+    mail_from: String,
+    /// An email channel's mail server. Its password is the credential.
+    mail_host: String,
+    mail_port: String,
+    mail_security: String,
+    mail_username: String,
 }
 
 impl ChannelForm {
@@ -61,11 +70,18 @@ impl ChannelForm {
             remove_app_token: false,
             sends_warnings: true,
             sends_critical: true,
+            mail_from: String::new(),
+            mail_host: String::new(),
+            mail_port: String::new(),
+            mail_security: MailSecurity::default().as_str().to_string(),
+            mail_username: String::new(),
         }
     }
 
     fn from_channel(channel: &ChannelInput) -> Self {
         let hidden = channels::of(channel.kind).hides_target();
+        let mail = channel.mail.as_ref();
+        let server = mail.and_then(|mail| mail.server.as_ref());
         Self {
             name: channel.name.clone(),
             kind: channel.kind.as_str().to_string(),
@@ -82,6 +98,20 @@ impl ChannelForm {
             remove_app_token: false,
             sends_warnings: channel.severities.contains(&Severity::Warning),
             sends_critical: channel.severities.contains(&Severity::Critical),
+            mail_from: mail.map(|mail| mail.from.clone()).unwrap_or_default(),
+            mail_host: server.map(|server| server.host.clone()).unwrap_or_default(),
+            mail_port: server
+                .and_then(|server| server.port)
+                .map(|port| port.to_string())
+                .unwrap_or_default(),
+            mail_security: server
+                .map(|server| server.security)
+                .unwrap_or_default()
+                .as_str()
+                .to_string(),
+            mail_username: server
+                .and_then(|server| server.username.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -99,7 +129,48 @@ impl ChannelForm {
             remove_app_token: fields.contains_key("remove_app_token"),
             sends_warnings: fields.contains_key("sends_warnings"),
             sends_critical: fields.contains_key("sends_critical"),
+            mail_from: text("mail_from"),
+            mail_host: text("mail_host"),
+            mail_port: text("mail_port"),
+            mail_security: text("mail_security"),
+            mail_username: text("mail_username"),
         }
+    }
+
+    /// How the channel sends email, if it's a kind that does. Empty boxes are left
+    /// out, so the checks can say what's missing.
+    fn to_mail(&self, kind: ChannelKind) -> Result<Option<Mail>> {
+        if !kind.sends_mail() {
+            return Ok(None);
+        }
+        let from = self.mail_from.trim();
+        if from.is_empty() {
+            return Ok(None);
+        }
+        let host = self.mail_host.trim();
+        let server = if kind == ChannelKind::Email && !host.is_empty() {
+            let port = self.mail_port.trim();
+            let port = if port.is_empty() {
+                None
+            } else {
+                Some(port.parse::<u16>().map_err(|_| {
+                    anyhow!("the mail server's port should be a number from 1 to 65535")
+                })?)
+            };
+            let username = self.mail_username.trim();
+            Some(MailServer {
+                host: host.to_string(),
+                port,
+                security: MailSecurity::parse(self.mail_security.trim())?,
+                username: (!username.is_empty()).then(|| username.to_string()),
+            })
+        } else {
+            None
+        };
+        Ok(Some(Mail {
+            from: from.to_string(),
+            server,
+        }))
     }
 
     /// `saved` is the channel being edited. Its destination is kept if the box
@@ -111,9 +182,17 @@ impl ChannelForm {
             Some(saved) if typed.is_empty() && saved.kind == kind => saved.target.clone(),
             _ => typed.to_string(),
         };
+        let mail = self.to_mail(kind)?;
+        // A mail server's password only goes with a username, so clearing the
+        // username clears the password too.
+        let signs_in = mail
+            .as_ref()
+            .and_then(|mail| mail.server.as_ref())
+            .is_some_and(|server| server.username.is_some());
         let typed = self.credential.trim();
         let credential = match saved {
             _ if !kind.has_credential() => None,
+            _ if kind == ChannelKind::Email && !signs_in => None,
             _ if !typed.is_empty() => Some(typed.to_string()),
             Some(saved) if saved.kind == kind => saved.credential.clone(),
             _ => None,
@@ -138,6 +217,7 @@ impl ChannelForm {
             .into_iter()
             .filter_map(|(severity, ticked)| ticked.then_some(severity))
             .collect(),
+            mail,
         })
     }
 }
@@ -188,7 +268,6 @@ async fn index_page(
     let rows: Vec<ChannelRow> = channels.into_iter().map(ChannelRow::from).collect();
     Page::new(state, token, "notification_channels/index.html")
         .with("channels", &rows)
-        .with("email_ready", &state.senders.mailer.is_some())
         .with("notice", &notice)
         .with("error", &error)
         .render()
@@ -226,7 +305,7 @@ fn form_page(
         .with("alertops_sample", &channels::alertops::sample())
         .with("slack_manifest", &channels::slack::manifest())
         .with("slack_manifest_link", &channels::slack::manifest_link())
-        .with("email_ready", &state.senders.mailer.is_some())
+        .with("securities", &MailSecurity::ALL.map(MailSecurity::as_str))
         .with("error", &error);
     match error {
         Some(_) => page.with_status(StatusCode::UNPROCESSABLE_ENTITY).render(),
@@ -349,7 +428,80 @@ mod tests {
             credential: None,
             app_token: None,
             severities: crate::alerting::every_severity(),
+            mail: None,
         }
+    }
+
+    fn email() -> ChannelInput {
+        ChannelInput {
+            kind: ChannelKind::Email,
+            target: "ops@example.com".to_string(),
+            credential: Some("mail-secret".to_string()),
+            mail: Some(Mail {
+                from: "MaxNines <alerts@example.com>".to_string(),
+                server: Some(MailServer {
+                    host: "smtp.example.com".to_string(),
+                    port: Some(2525),
+                    security: MailSecurity::Tls,
+                    username: Some("alerts".to_string()),
+                }),
+            }),
+            ..webhook()
+        }
+    }
+
+    #[test]
+    fn an_email_channel_comes_back_from_its_form_as_it_was_without_the_password() {
+        let saved = email();
+        let form = ChannelForm::from_channel(&saved);
+        assert_eq!(form.credential, "");
+        assert!(form.has_credential);
+        assert_eq!(form.mail_host, "smtp.example.com");
+        assert_eq!(form.mail_port, "2525");
+        assert_eq!(form.mail_security, "tls");
+        assert_eq!(form.to_channel(Some(&saved)).unwrap(), saved);
+    }
+
+    #[test]
+    fn clearing_the_username_drops_the_password() {
+        let saved = email();
+        let mut form = ChannelForm::from_channel(&saved);
+        form.mail_username = String::new();
+        let channel = form.to_channel(Some(&saved)).unwrap();
+        assert_eq!(channel.credential, None);
+        assert_eq!(channel.mail.unwrap().server.unwrap().username, None);
+    }
+
+    #[test]
+    fn a_port_has_to_be_a_port() {
+        let mut form = ChannelForm::from_channel(&email());
+        for port in ["0x19", "70000", "-1"] {
+            form.mail_port = port.to_string();
+            assert!(form.to_channel(None).is_err(), "{port}");
+        }
+        form.mail_port = String::new();
+        let channel = form.to_channel(None).unwrap();
+        assert_eq!(channel.mail.unwrap().server.unwrap().port, None);
+    }
+
+    #[test]
+    fn resend_keeps_a_from_address_but_no_mail_server() {
+        let mut form = ChannelForm::from_channel(&email());
+        form.kind = "resend".to_string();
+        form.credential = "re_key".to_string();
+        let channel = form.to_channel(None).unwrap();
+        let mail = channel.mail.unwrap();
+        assert_eq!(mail.from, "MaxNines <alerts@example.com>");
+        assert_eq!(mail.server, None);
+        assert_eq!(channel.credential.as_deref(), Some("re_key"));
+    }
+
+    #[test]
+    fn other_kinds_drop_mail_settings() {
+        let mut form = ChannelForm::from_channel(&email());
+        form.kind = "webhook".to_string();
+        form.target = "https://example.com/x".to_string();
+        assert_eq!(form.to_channel(None).unwrap().mail, None);
     }
 
     #[test]

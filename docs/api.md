@@ -861,17 +861,40 @@ curl -X DELETE -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 ## Notification channels
 
-Where alerts go. Webhook addresses, Teams workflow URLs, PagerDuty keys, AlertOps and SIGNL4 URLs, and Slack
-and Telegram tokens can be set but never read back, so `target_preview` only shows enough to recognize a channel.
+Where alerts go. Webhook addresses, Teams workflow URLs, PagerDuty keys, AlertOps and SIGNL4 URLs, Slack
+and Telegram tokens, mail server passwords and Resend API keys can be set but never read back, so
+`target_preview` only shows enough to recognize a channel.
 
 | Field | Description |
 | --- | --- |
 | `name` | Required |
-| `kind` | Required. `webhook`, `email`, `discord`, `slack`, `teams`, `pagerduty`, `alertops`, `signl4` or `telegram` |
-| `target` | Required. A webhook's address, a Teams workflow's URL, email addresses separated by commas, a Slack channel, a PagerDuty integration key, the URL from AlertOps or SIGNL4, or a Telegram chat ID such as `-1001234567890` or `@channel` |
-| `credential` | Slack's or Telegram's bot token |
+| `kind` | Required. `webhook`, `email`, `resend`, `discord`, `slack`, `teams`, `pagerduty`, `alertops`, `signl4` or `telegram` |
+| `target` | Required. A webhook's address, a Teams workflow's URL, email addresses separated by commas for email and Resend, a Slack channel, a PagerDuty integration key, the URL from AlertOps or SIGNL4, or a Telegram chat ID such as `-1001234567890` or `@channel` |
+| `credential` | Slack's or Telegram's bot token, the mail server's password for email, or the API key for Resend |
+| `mail` | Email and Resend only. See below |
 | `app_token` | Optional, Slack only. The app-level token, starting `xapp-`, that adds Acknowledge and Silence buttons |
 | `severities` | Which alerts it's sent: `["warning", "critical"]`, the default, or one of them, as in [which channels hear what](alerts.md#which-channels-hear-what) |
+
+Email and Resend channels have `mail`:
+
+| Field | Description |
+| --- | --- |
+| `from` | Required. Who the email comes from, like `MaxNines <alerts@example.com>`. For Resend, on a domain verified there |
+| `server` | Email only, and required for it. The mail server it goes through |
+| `server.host` | Required. Like `smtp.example.com` |
+| `server.port` | The usual port for `security` if left out: 587 for `starttls`, 465 for `tls`, 25 for `none` |
+| `server.security` | `starttls`, the default, `tls`, or `none` for a relay on a trusted network |
+| `server.username` | For a server that asks you to sign in. The password goes in `credential`, and needs `starttls` or `tls` |
+
+```sh
+curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Ops email", "kind": "email", "target": "ops@example.com",
+       "credential": "the password",
+       "mail": {"from": "MaxNines <alerts@example.com>",
+                "server": {"host": "smtp.example.com", "username": "alerts@example.com"}}}' \
+  "$MAXNINES_URL/api/v1/notification-channels"
+```
 
 ### List notification channels
 
@@ -911,7 +934,9 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "id": 1,
   "name": "Ops",
   "kind": "webhook",
-  "target_preview": "https://hooks.example.com/…"
+  "target_preview": "https://hooks.example.com/…",
+  "severities": ["warning", "critical"],
+  "mail": null
 }
 ```
 

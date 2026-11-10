@@ -27,6 +27,7 @@ impl MigratorTrait for Migrator {
             Box::new(ChooseChannelSeverities),
             Box::new(AddBuiltInContainerAlert),
             Box::new(CreateAuditLog),
+            Box::new(AddChannelMailSettings),
         ]
     }
 }
@@ -1870,6 +1871,92 @@ impl MigrationTrait for CreateAuditLog {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         drop_tables(manager, &["audit_log"]).await
+    }
+}
+
+// ---- Each email channel's own mail server
+
+struct AddChannelMailSettings;
+
+impl MigrationName for AddChannelMailSettings {
+    fn name(&self) -> &str {
+        "m20261110_000016_add_channel_mail_settings"
+    }
+}
+
+#[derive(Iden)]
+enum ChannelMail {
+    #[iden = "notification_channels"]
+    Table,
+    /// Who email comes from, for email and Resend channels.
+    MailFrom,
+    /// An email channel's mail server. Its password is the channel's credential.
+    MailHost,
+    MailPort,
+    /// `tls`, `starttls` or `none`.
+    MailSecurity,
+    MailUsername,
+}
+
+/// Moves the mail server from the server's config to each email channel. Email
+/// channels saved before have none, so they need one set before they send again.
+#[async_trait::async_trait]
+impl MigrationTrait for AddChannelMailSettings {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let columns = [
+            ColumnDef::new(ChannelMail::MailFrom)
+                .string_len(320)
+                .null()
+                .to_owned(),
+            ColumnDef::new(ChannelMail::MailHost)
+                .string_len(255)
+                .null()
+                .to_owned(),
+            ColumnDef::new(ChannelMail::MailPort)
+                .integer()
+                .null()
+                .to_owned(),
+            ColumnDef::new(ChannelMail::MailSecurity)
+                .string_len(16)
+                .null()
+                .to_owned(),
+            ColumnDef::new(ChannelMail::MailUsername)
+                .string_len(255)
+                .null()
+                .to_owned(),
+        ];
+        // One at a time, as SQLite only adds one column per statement.
+        for column in columns {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(ChannelMail::Table)
+                        .add_column(column)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for column in [
+            ChannelMail::MailFrom,
+            ChannelMail::MailHost,
+            ChannelMail::MailPort,
+            ChannelMail::MailSecurity,
+            ChannelMail::MailUsername,
+        ] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(ChannelMail::Table)
+                        .drop_column(column)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
     }
 }
 

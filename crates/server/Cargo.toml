@@ -56,6 +56,7 @@ ureq = { version = "3.5.1", default-features = false, features = ["rustls", "mul
 resvg = { version = "0.47", default-features = false, features = ["text"] }
 # TLS for Slack's Socket Mode connections, which slack-morphism makes with it.
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+base64 = "0.22"
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "rustls", "ring", "webpki-roots"] }
 wildmatch = "2.7.0"
 cel = "0.15"

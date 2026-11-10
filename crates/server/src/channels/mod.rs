@@ -7,6 +7,7 @@ mod discord;
 pub mod email;
 mod on_call;
 pub mod pagerduty;
+pub mod resend;
 mod signl4;
 pub mod slack;
 mod teams;
@@ -66,6 +67,11 @@ pub trait ChannelType: Send + Sync {
         false
     }
 
+    /// Whether it sends email, so it has a from address and maybe a mail server.
+    fn sends_mail(&self) -> bool {
+        false
+    }
+
     /// Whether an alert starting or getting worse goes with a chart.
     fn shows_charts(&self) -> bool {
         false
@@ -84,9 +90,10 @@ pub trait ChannelType: Send + Sync {
 
 /// Every kind, in the order the pages offer them. A kind has to be here to be
 /// read back from what's stored.
-pub const ALL: [ChannelKind; 9] = [
+pub const ALL: [ChannelKind; 10] = [
     ChannelKind::Webhook,
     ChannelKind::Email,
+    ChannelKind::Resend,
     ChannelKind::Discord,
     ChannelKind::Slack,
     ChannelKind::Teams,
@@ -101,6 +108,7 @@ pub fn of(kind: ChannelKind) -> &'static dyn ChannelType {
     match kind {
         ChannelKind::Webhook => &webhook::Webhook,
         ChannelKind::Email => &email::Email,
+        ChannelKind::Resend => &resend::Resend,
         ChannelKind::Discord => &discord::Discord,
         ChannelKind::Slack => &slack::Slack,
         ChannelKind::Teams => &teams::Teams,

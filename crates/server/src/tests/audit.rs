@@ -216,6 +216,7 @@ fn channel(kind: ChannelKind, target: &str, credential: Option<&str>) -> Channel
         credential: credential.map(String::from),
         app_token: None,
         severities: every_severity(),
+        mail: None,
     }
 }
 

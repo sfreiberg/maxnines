@@ -31,8 +31,6 @@ pub struct Config {
     pub database: DatabaseConfig,
     #[serde(default)]
     pub registration: RegistrationConfig,
-    /// The mail server for email notifications. Without it, they can't be sent.
-    pub email: Option<EmailConfig>,
     /// Serves HTTPS. Leave it out behind a proxy, or on a trusted network.
     pub tls: Option<TlsConfig>,
 }
@@ -83,57 +81,6 @@ impl TlsConfig {
             }
             None => ensure!(files, "set certificate_file and key_file, or an acme block"),
         }
-        Ok(())
-    }
-}
-
-/// How to reach a mail server. The password lives in a file, so this one can be
-/// shared.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EmailConfig {
-    pub host: String,
-    /// Defaults to the usual port for `security`.
-    pub port: Option<u16>,
-    #[serde(default)]
-    pub security: EmailSecurity,
-    pub username: Option<String>,
-    pub password_file: Option<PathBuf>,
-    /// Who notifications come from, such as "MaxNines <alerts@example.com>".
-    pub from: String,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EmailSecurity {
-    /// Encrypted from the first byte, usually on port 465.
-    Tls,
-    /// Upgrades to encryption after connecting, usually on port 587.
-    #[default]
-    Starttls,
-    /// No encryption, which only suits a relay on the same machine.
-    None,
-}
-
-impl EmailConfig {
-    pub fn password(&self) -> Result<Option<String>> {
-        let Some(path) = &self.password_file else {
-            return Ok(None);
-        };
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading email password {}", path.display()))?;
-        Ok(Some(text.trim().to_string()))
-    }
-
-    fn validate(&self) -> Result<()> {
-        ensure!(
-            self.username.is_some() == self.password_file.is_some(),
-            "set both username and password_file in the email block, or neither"
-        );
-        ensure!(
-            self.security != EmailSecurity::None || self.username.is_none(),
-            "email security can't be \"none\" with a password, which would be sent unencrypted"
-        );
         Ok(())
     }
 }
@@ -296,9 +243,6 @@ impl Config {
              after {AGENT_SILENCE_LIMIT_SECS} seconds without hearing from the server"
         );
         config.trusted_networks()?;
-        if let Some(email) = &config.email {
-            email.validate().context("email block")?;
-        }
         if let Some(tls) = &config.tls {
             tls.validate().context("tls block")?;
             ensure!(

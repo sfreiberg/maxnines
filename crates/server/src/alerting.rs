@@ -477,12 +477,19 @@ pub enum ChannelKind {
     Telegram,
     /// A Teams channel, through the workflow Teams makes to post what's sent to it.
     Teams,
+    /// Email through Resend's API, rather than a mail server.
+    Resend,
 }
 
 impl ChannelKind {
     /// Whether it needs a token beside its destination.
     pub fn has_credential(self) -> bool {
         channels::of(self).has_credential()
+    }
+
+    /// Whether it sends email, with a from address and maybe a mail server.
+    pub fn sends_mail(self) -> bool {
+        channels::of(self).sends_mail()
     }
 
     /// Whether the service keeps after people itself until someone responds.
@@ -501,6 +508,7 @@ impl ChannelKind {
             Self::Signl4 => "signl4",
             Self::Telegram => "telegram",
             Self::Teams => "teams",
+            Self::Resend => "resend",
         }
     }
 
@@ -541,6 +549,65 @@ pub struct ChannelInput {
     /// resolves.
     #[serde(default = "every_severity")]
     pub severities: BTreeSet<Severity>,
+    /// Who email comes from, and for an email channel, the mail server it goes
+    /// through. Only email and Resend channels have it.
+    #[serde(default)]
+    pub mail: Option<Mail>,
+}
+
+/// How a channel sends email. The mail server's password is the channel's
+/// `credential`, so it's write-only like every other secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mail {
+    /// Who it's from, like `MaxNines <alerts@example.com>`.
+    pub from: String,
+    /// The mail server, for an email channel. Resend is its own.
+    #[serde(default)]
+    pub server: Option<MailServer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailServer {
+    pub host: String,
+    /// The usual port for `security` if empty.
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub security: MailSecurity,
+    /// Empty for a server that doesn't ask anyone to sign in.
+    #[serde(default)]
+    pub username: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MailSecurity {
+    /// Encrypted from the first byte, usually on port 465.
+    Tls,
+    /// Upgrades to encryption after connecting, usually on port 587.
+    #[default]
+    Starttls,
+    /// No encryption, which only suits a relay on the same machine or network.
+    None,
+}
+
+impl MailSecurity {
+    pub const ALL: [Self; 3] = [Self::Starttls, Self::Tls, Self::None];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tls => "tls",
+            Self::Starttls => "starttls",
+            Self::None => "none",
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|security| security.as_str() == text)
+            .with_context(|| format!("unknown mail security {text:?}"))
+    }
 }
 
 pub fn every_severity() -> BTreeSet<Severity> {
@@ -557,6 +624,10 @@ pub fn check_channel(channel: &ChannelInput) -> Result<()> {
     ensure!(
         channel.app_token.is_none() || kind.takes_app_token(),
         "only Slack channels take an app-level token"
+    );
+    ensure!(
+        channel.mail.is_none() || kind.sends_mail(),
+        "only email channels have mail settings"
     );
     ensure!(
         channel.name.len() <= MAX_NAME_LEN,
@@ -731,14 +802,49 @@ mod tests {
             credential: None,
             app_token: None,
             severities: every_severity(),
+            mail: None,
         }
     }
 
     fn email(target: &str) -> ChannelInput {
         ChannelInput {
             kind: ChannelKind::Email,
+            mail: Some(Mail {
+                from: "MaxNines <alerts@example.com>".to_string(),
+                server: Some(MailServer {
+                    host: "smtp.example.com".to_string(),
+                    port: None,
+                    security: MailSecurity::Starttls,
+                    username: None,
+                }),
+            }),
             ..webhook(target)
         }
+    }
+
+    #[test]
+    fn an_email_channel_needs_a_from_address_and_a_mail_server() {
+        let mut channel = email("a@example.com");
+        channel.mail.as_mut().unwrap().from = "not an address".to_string();
+        assert!(format!("{:#}", check_channel(&channel).unwrap_err()).contains("from address"));
+        let mut channel = email("a@example.com");
+        channel.mail.as_mut().unwrap().server = None;
+        assert!(format!("{:#}", check_channel(&channel).unwrap_err()).contains("mail server"));
+        for host in ["", "smtp.example.com/x", "smtp example.com"] {
+            let mut channel = email("a@example.com");
+            channel.mail.as_mut().unwrap().server.as_mut().unwrap().host = host.to_string();
+            assert!(check_channel(&channel).is_err(), "{host:?}");
+        }
+    }
+
+    #[test]
+    fn only_email_channels_have_mail_settings() {
+        let channel = ChannelInput {
+            mail: email("a@example.com").mail,
+            ..webhook("https://example.com/")
+        };
+        let error = format!("{:#}", check_channel(&channel).unwrap_err());
+        assert!(error.contains("only email channels"), "{error}");
     }
 
     #[test]
@@ -1197,6 +1303,7 @@ mod tests {
             credential: token.map(str::to_string),
             app_token: None,
             severities: every_severity(),
+            mail: None,
         }
     }
 

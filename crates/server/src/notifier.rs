@@ -17,8 +17,7 @@ use tracing::{error, info, warn};
 
 use crate::alert_charts::ChartSources;
 use crate::alerting::{Alert, Channel, Delivery, Event};
-use crate::channels::email::Mailer;
-use crate::channels::{self, pagerduty, telegram};
+use crate::channels::{self, pagerduty, resend, telegram};
 use crate::metrics::now_ms;
 use crate::models::Database;
 use crate::silences::ActiveSilences;
@@ -128,7 +127,6 @@ pub fn format_ms(ms: i64) -> String {
 /// What sending needs beyond the channel itself.
 #[derive(Clone, Default)]
 pub struct Senders {
-    pub mailer: Option<Arc<Mailer>>,
     /// Where people reach this server's pages, for links in messages.
     pub web_url: Option<String>,
     /// Where to find a stand-in for Slack.
@@ -140,12 +138,14 @@ pub struct Senders {
     /// Where to find a stand-in for Telegram.
     #[cfg(test)]
     pub telegram_api_url: Option<String>,
+    /// Where to find a stand-in for Resend.
+    #[cfg(test)]
+    pub resend_url: Option<String>,
 }
 
 impl Senders {
-    pub fn new(mailer: Option<Arc<Mailer>>, web_url: Option<String>) -> Self {
+    pub fn new(web_url: Option<String>) -> Self {
         Self {
-            mailer,
             web_url,
             #[cfg(test)]
             slack_api_url: None,
@@ -153,6 +153,8 @@ impl Senders {
             pagerduty_url: None,
             #[cfg(test)]
             telegram_api_url: None,
+            #[cfg(test)]
+            resend_url: None,
         }
     }
 
@@ -166,6 +168,16 @@ impl Senders {
         self.telegram_api_url
             .as_deref()
             .unwrap_or(telegram::API_URL)
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn resend_url(&self) -> &str {
+        resend::EMAILS_URL
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resend_url(&self) -> &str {
+        self.resend_url.as_deref().unwrap_or(resend::EMAILS_URL)
     }
 
     #[cfg(not(test))]

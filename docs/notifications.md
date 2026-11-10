@@ -2,8 +2,8 @@
 
 ## Charts
 
-When an alert starts, or a warning becomes critical, Discord, Telegram, Slack and email
-get a chart with it: the last hour of what the alert watches, on that machine or for that
+When an alert starts, or a warning becomes critical, Discord, Telegram, Slack, email and
+Resend get a chart with it: the last hour of what the alert watches, on that machine or for that
 calculation, with the rule's thresholds and the moment the alert started. Times on it are
 in UTC, like the rest of the message. Other notifications, and other channels, are text
 only. An alert about an agent going offline has nothing to chart.
@@ -16,7 +16,37 @@ can't be drawn or sent, the notification goes without it, and the server's log s
   Permissions**, then **Bot Token Scopes**, and reinstall the app to the workspace.
 - **Telegram** sends a photo with the alert as its caption, or for a long alert, the
   message first with the photo as a reply.
-- **Email** shows the chart under the text, for mail apps that show HTML.
+- **Email** and **Resend** show the chart under the text, for mail apps that show HTML.
+
+## Email
+
+An email channel sends through a mail server you choose for it, on its page under
+Settings, then **Notification channels**. Different channels can use different servers.
+
+- **From** is who the email comes from, like `MaxNines <alerts@example.com>`. Most mail
+  servers only send for their own addresses.
+- **Security** is STARTTLS, usually on port 587, TLS, usually on port 465, or none, which
+  only suits a relay on a trusted network. Leave the port empty for the usual one.
+- **Username** and **password** are for a server that asks you to sign in. They need
+  STARTTLS or TLS, so the password is never sent unencrypted. The password is never shown
+  again: leave it empty to keep it, or clear the username to remove both.
+
+Email channels made before each channel had its own mail server need one set before
+they send again. Until then, each notification fails and the channel's problems say so.
+
+## Resend
+
+[Resend](https://resend.com) sends email through its API, for a server that can't reach
+a mail server or that you'd rather not run one for. The channel form walks through it:
+
+1. In Resend, open **Domains**, choose **Add Domain**, and add the DNS records it lists
+   until the domain shows as **Verified**.
+2. Open **API Keys**, choose **Create API Key** with **Sending access** for that domain,
+   and paste the key, which starts with `re_`, into the channel's API key box.
+3. Put an address on that domain in **From**.
+
+The key is never shown again. Each notification goes with a key Resend uses to spot a
+repeat, so one retried after a timeout isn't sent twice.
 
 ## Slack buttons
 

@@ -20,7 +20,6 @@
       <option value="{{ kind.value }}"{% if channel.kind == kind.value %} selected{% endif %}>{{ kind.name }}</option>
       {% endfor %}
     </select>
-    {% if not email_ready %}<small>Email needs an <code>email</code> block in the server config.</small>{% endif %}
   </label>
 
   <details class="for-slack setup"{% if not channel.has_credential %} open{% endif %}>
@@ -49,7 +48,7 @@
 
   <label>Sends to
     <input type="text" name="target" value="{{ channel.target }}" spellcheck="false" autocomplete="off"{% if channel.preview %} placeholder="{{ channel.preview }}"{% endif %}>
-    <small>{% if channel.preview %}Leave empty to keep what's saved, which isn't shown because it can work like a password.{% else %}A webhook's URL, a Discord webhook URL, a Teams workflow's URL, email addresses separated by commas, for Slack a channel such as <code>#alerts</code>, for PagerDuty an integration key, the URL from AlertOps or SIGNL4, or for Telegram a chat ID.{% endif %}</small>
+    <small>{% if channel.preview %}Leave empty to keep what's saved, which isn't shown because it can work like a password.{% else %}A webhook's URL, a Discord webhook URL, a Teams workflow's URL, for email or Resend the addresses to send to, separated by commas, for Slack a channel such as <code>#alerts</code>, for PagerDuty an integration key, the URL from AlertOps or SIGNL4, or for Telegram a chat ID.{% endif %}</small>
   </label>
 
   <details class="for-pagerduty">
@@ -97,9 +96,45 @@
     <p class="note">Sending a test opens an alert and resolves it straight away, which can notify whoever is on call.</p>
   </details>
 
-  <label class="for-token">Bot token
+  <details class="for-resend setup"{% if not channel.has_credential %} open{% endif %}>
+    <summary>How to set up Resend</summary>
+    <ol>
+      <li>In Resend, open <strong>Domains</strong>, choose <strong>Add Domain</strong>, and add the DNS records it lists until the domain shows as <strong>Verified</strong>.</li>
+      <li>Open <strong>API Keys</strong> and choose <strong>Create API Key</strong>. Give it <strong>Sending access</strong>, just for that domain, and copy the key into the API key box below. It starts with <code>re_</code>.</li>
+      <li>Put an address on that domain in the From box, like <code>MaxNines &lt;alerts@example.com&gt;</code>.</li>
+    </ol>
+  </details>
+
+  <label class="for-mail">From
+    <input type="text" name="mail_from" value="{{ channel.mail_from }}" spellcheck="false" autocomplete="off" maxlength="320" placeholder="MaxNines &lt;alerts@example.com&gt;">
+    <small><span class="for-email">Who the email comes from. The mail server may only accept addresses it sends for.</span><span class="for-resend">An address on a domain verified in Resend.</span></small>
+  </label>
+
+  <fieldset class="for-email">
+    <legend>Mail server</legend>
+    <label>Host
+      <input type="text" name="mail_host" value="{{ channel.mail_host }}" spellcheck="false" autocomplete="off" maxlength="253" placeholder="smtp.example.com">
+    </label>
+    <label>Security
+      <select name="mail_security">
+        {% for security in securities %}
+        <option value="{{ security }}"{% if channel.mail_security == security %} selected{% endif %}>{% if security == "starttls" %}STARTTLS, usually port 587{% elif security == "tls" %}TLS, usually port 465{% else %}None, for a relay on a trusted network{% endif %}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Port
+      <input type="text" name="mail_port" value="{{ channel.mail_port }}" inputmode="numeric" autocomplete="off" maxlength="5">
+      <small>Leave empty for the usual port for the security chosen.</small>
+    </label>
+    <label>Username
+      <input type="text" name="mail_username" value="{{ channel.mail_username }}" spellcheck="false" autocomplete="off" maxlength="255">
+      <small>Leave empty for a server that doesn't ask anyone to sign in. Clearing it removes the saved password too.</small>
+    </label>
+  </fieldset>
+
+  <label class="for-token"><span class="for-bot">Bot token</span><span class="for-email">Password</span><span class="for-resend">API key</span>
     <input type="password" name="credential" autocomplete="off" spellcheck="false"{% if channel.has_credential %} placeholder="Saved"{% endif %}>
-    <small>{% if channel.has_credential %}Leave empty to keep the saved token, which isn't shown.{% else %}<span class="for-slack">From <strong>OAuth &amp; Permissions</strong> in the Slack app, once it's installed. It starts with <code>xoxb-</code>.</span><span class="for-telegram">BotFather gives it out, as a number, a colon, then a long code.</span>{% endif %}</small>
+    <small>{% if channel.has_credential %}Leave empty to keep what's saved, which isn't shown.{% else %}<span class="for-email">The mail server's password for the username above.</span><span class="for-resend">From <strong>API Keys</strong> in Resend.</span><span class="for-slack">From <strong>OAuth &amp; Permissions</strong> in the Slack app, once it's installed. It starts with <code>xoxb-</code>.</span><span class="for-telegram">BotFather gives it out, as a number, a colon, then a long code.</span>{% endif %}</small>
   </label>
 
   <label class="for-slack">App-level token, for buttons

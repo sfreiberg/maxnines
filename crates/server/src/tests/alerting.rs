@@ -12,10 +12,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use super::*;
 use crate::alert_evaluator::Evaluator;
 use crate::alerting::{
-    AlertRuleInput, Channel, ChannelInput, ChannelKind, Comparison, Delivery, Event, NewAlert,
-    RuleKind, Severity, check_rule,
+    AlertRuleInput, Channel, ChannelInput, ChannelKind, Comparison, Delivery, Event, Mail,
+    MailSecurity, MailServer, NewAlert, RuleKind, Severity, check_rule,
 };
-use crate::channels::email::Mailer;
 use crate::channels::slack::{ACKNOWLEDGE_ACTION, SILENCE_HOUR_ACTION};
 use crate::metrics::{Metric, NewestReading};
 use crate::notifier::{Notice, Notifier, Senders};
@@ -1576,6 +1575,7 @@ fn webhook_channel(url: &str) -> ChannelInput {
         credential: None,
         app_token: None,
         severities: crate::alerting::every_severity(),
+        mail: None,
     }
 }
 
@@ -1643,6 +1643,7 @@ async fn a_discord_channel_gets_discords_message_format() {
         credential: None,
         app_token: None,
         severities: crate::alerting::every_severity(),
+        mail: None,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -1969,6 +1970,7 @@ async fn firing_on(
         credential: None,
         app_token: None,
         severities: crate::alerting::every_severity(),
+        mail: None,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -2068,6 +2070,7 @@ async fn a_test_opens_an_incident_and_closes_it_again_on_every_service() {
                 credential: None,
                 app_token: None,
                 severities: crate::alerting::every_severity(),
+                mail: None,
             },
         };
 
@@ -2248,6 +2251,7 @@ async fn a_pagerduty_test_opens_an_incident_and_closes_it_again() {
             credential: None,
             app_token: None,
             severities: crate::alerting::every_severity(),
+            mail: None,
         },
     };
     let senders = Senders {
@@ -2363,6 +2367,7 @@ async fn firing_on_telegram(test: &mut Harness, telegram: &FakeTelegram) -> Noti
         credential: Some(TELEGRAM_TOKEN.to_string()),
         app_token: None,
         severities: crate::alerting::every_severity(),
+        mail: None,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -2470,6 +2475,7 @@ async fn not_reaching_telegram_says_so_without_the_token() {
             credential: Some(TELEGRAM_TOKEN.to_string()),
             app_token: None,
             severities: crate::alerting::every_severity(),
+            mail: None,
         },
     };
     let senders = Senders {
@@ -2560,6 +2566,7 @@ async fn firing_on_slack_app(
         credential: Some("xoxb-secret-token".to_string()),
         app_token: app_token.map(str::to_string),
         severities: crate::alerting::every_severity(),
+        mail: None,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -2829,6 +2836,7 @@ async fn a_slack_test_says_when_the_app_level_token_is_wrong() {
             credential: Some("xoxb-secret-token".to_string()),
             app_token: Some("xapp-secret-token".to_string()),
             severities: crate::alerting::every_severity(),
+            mail: None,
         },
     };
     let senders = Senders {
@@ -3037,6 +3045,7 @@ async fn not_reaching_slack_says_so_without_any_detail() {
             credential: Some("xoxb-secret-token".to_string()),
             app_token: None,
             severities: crate::alerting::every_severity(),
+            mail: None,
         },
     };
     let senders = Senders {
@@ -3220,6 +3229,7 @@ async fn a_channel_that_is_down_does_not_hold_up_the_others() {
         credential: None,
         app_token: None,
         severities: crate::alerting::every_severity(),
+        mail: None,
     };
     let dead = test
         .database()
@@ -3450,28 +3460,36 @@ async fn start_mail_server() -> (u16, tokio::task::JoinHandle<String>) {
     (port, handle)
 }
 
-fn mailer(port: u16) -> Arc<Mailer> {
-    let text = format!(
-        "email {{\n  host = \"127.0.0.1\"\n  port = {port}\n  security = \"none\"\n  \
-         from = \"MaxNines <alerts@example.com>\"\n}}\n\
-         metrics \"duckdb\" {{\n  path = \"x\"\n}}\n"
-    );
-    let config = Config::parse(&text).unwrap();
-    Arc::new(Mailer::new(config.email.as_ref().unwrap()).unwrap())
-}
-
-#[tokio::test]
-async fn email_channels_send_a_message_to_every_address() {
-    let mut test = Harness::start().await;
-    let channel = ChannelInput {
+/// A channel sending through the fake mail server on `port`.
+fn mail_channel(port: u16) -> ChannelInput {
+    ChannelInput {
         name: "On call".to_string(),
         kind: ChannelKind::Email,
         target: "a@example.com, b@example.com".to_string(),
         credential: None,
         app_token: None,
         severities: crate::alerting::every_severity(),
-    };
-    let channel = test.database().create_channel(&channel).await.unwrap();
+        mail: Some(Mail {
+            from: "MaxNines <alerts@example.com>".to_string(),
+            server: Some(MailServer {
+                host: "127.0.0.1".to_string(),
+                port: Some(port),
+                security: MailSecurity::None,
+                username: None,
+            }),
+        }),
+    }
+}
+
+#[tokio::test]
+async fn email_channels_send_a_message_to_every_address() {
+    let mut test = Harness::start().await;
+    let (port, heard) = start_mail_server().await;
+    let channel = test
+        .database()
+        .create_channel(&mail_channel(port))
+        .await
+        .unwrap();
     let rule = AlertRuleInput {
         for_secs: 0,
         channels: vec![channel],
@@ -3480,14 +3498,7 @@ async fn email_channels_send_a_message_to_every_address() {
     test.database().create_alert_rule(&rule).await.unwrap();
     test.cpu(0, 95.0).await;
 
-    let (port, heard) = start_mail_server().await;
-    let notifier = Notifier::new(
-        test.database().clone(),
-        Senders {
-            mailer: Some(mailer(port)),
-            ..Senders::default()
-        },
-    );
+    let notifier = Notifier::new(test.database().clone(), Senders::default());
     notifier.deliver_due(test.now).await.unwrap();
 
     let heard = heard.await.unwrap();
@@ -3503,15 +3514,11 @@ async fn email_channels_send_a_message_to_every_address() {
 }
 
 #[tokio::test]
-async fn an_email_channel_without_a_mail_server_says_so() {
+async fn an_email_channel_from_before_mail_servers_were_per_channel_says_what_it_needs() {
     let mut test = Harness::start().await;
     let channel = ChannelInput {
-        name: "On call".to_string(),
-        kind: ChannelKind::Email,
-        target: "a@example.com".to_string(),
-        credential: None,
-        app_token: None,
-        severities: crate::alerting::every_severity(),
+        mail: None,
+        ..mail_channel(25)
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -3528,24 +3535,178 @@ async fn an_email_channel_without_a_mail_server_says_so() {
         .unwrap();
 
     let problems = test.database().delivery_problems(10).await.unwrap();
-    assert_eq!(problems[0].error, "email isn't set up in the server config");
+    assert_eq!(
+        problems[0].error,
+        "this channel needs a from address and a mail server"
+    );
 }
 
 #[test]
 fn an_unencrypted_mail_server_cannot_be_given_a_password() {
-    let text = "email {\n  host = \"x\"\n  security = \"none\"\n  username = \"u\"\n  \
-                password_file = \"p\"\n  from = \"a@example.com\"\n}\n\
-                metrics \"duckdb\" {\n  path = \"x\"\n}\n";
-    let error = format!("{:#}", Config::parse(text).unwrap_err());
-    assert!(error.contains("unencrypted"), "{error}");
+    let mut channel = mail_channel(25);
+    channel.credential = Some("secret".to_string());
+    if let Some(server) = channel.mail.as_mut().and_then(|mail| mail.server.as_mut()) {
+        server.username = Some("alerts".to_string());
+    }
+    let error = format!(
+        "{:#}",
+        crate::alerting::check_channel(&channel).unwrap_err()
+    );
+    assert!(error.contains("without encryption"), "{error}");
+    assert!(!error.contains("secret"), "{error}");
 }
 
 #[test]
-fn a_username_needs_a_password_file() {
-    let text = "email {\n  host = \"x\"\n  username = \"u\"\n  from = \"a@example.com\"\n}\n\
-                metrics \"duckdb\" {\n  path = \"x\"\n}\n";
-    let error = format!("{:#}", Config::parse(text).unwrap_err());
-    assert!(error.contains("password_file"), "{error}");
+fn a_username_needs_a_password_and_a_password_a_username() {
+    let mut channel = mail_channel(25);
+    if let Some(server) = channel.mail.as_mut().and_then(|mail| mail.server.as_mut()) {
+        server.security = MailSecurity::Starttls;
+        server.username = Some("alerts".to_string());
+    }
+    let error = format!(
+        "{:#}",
+        crate::alerting::check_channel(&channel).unwrap_err()
+    );
+    assert!(error.contains("add the password"), "{error}");
+
+    let mut channel = mail_channel(25);
+    channel.credential = Some("secret".to_string());
+    let error = format!(
+        "{:#}",
+        crate::alerting::check_channel(&channel).unwrap_err()
+    );
+    assert!(error.contains("add the username"), "{error}");
+}
+
+/// A stand-in for Resend that keeps what it's sent and answers with `status`.
+async fn start_resend(status: u16) -> (String, tokio::task::JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/emails", listener.local_addr().unwrap());
+    let handle = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0; 8192];
+        // The whole request, headers and body, before answering.
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            request.extend_from_slice(&buffer[..read]);
+            let text = String::from_utf8_lossy(&request).to_string();
+            if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                if body.len() >= length {
+                    break;
+                }
+            }
+            if read == 0 {
+                break;
+            }
+        }
+        let reply = if status == 200 {
+            r#"{"id":"49a3999c"}"#
+        } else {
+            r#"{"statusCode":403,"name":"validation_error","message":"The example.com domain is not verified"}"#
+        };
+        let response = format!(
+            "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+            reply.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        String::from_utf8_lossy(&request).to_string()
+    });
+    (url, handle)
+}
+
+fn resend_channel() -> ChannelInput {
+    ChannelInput {
+        name: "Resend".to_string(),
+        kind: ChannelKind::Resend,
+        target: "a@example.com".to_string(),
+        credential: Some("re_test_key".to_string()),
+        app_token: None,
+        severities: crate::alerting::every_severity(),
+        mail: Some(Mail {
+            from: "MaxNines <alerts@example.com>".to_string(),
+            server: None,
+        }),
+    }
+}
+
+async fn resend_firing(test: &mut Harness) {
+    let channel = test
+        .database()
+        .create_channel(&resend_channel())
+        .await
+        .unwrap();
+    let rule = AlertRuleInput {
+        for_secs: 0,
+        channels: vec![channel],
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    test.cpu(0, 95.0).await;
+}
+
+#[tokio::test]
+async fn resend_channels_send_through_the_api_with_the_key() {
+    let mut test = Harness::start().await;
+    resend_firing(&mut test).await;
+    let (url, heard) = start_resend(200).await;
+
+    let senders = Senders {
+        resend_url: Some(url),
+        ..Senders::default()
+    };
+    Notifier::new(test.database().clone(), senders)
+        .deliver_due(test.now)
+        .await
+        .unwrap();
+
+    let heard = heard.await.unwrap();
+    let lower = heard.to_lowercase();
+    assert!(lower.starts_with("post /emails "), "{heard}");
+    assert!(
+        lower.contains("authorization: bearer re_test_key"),
+        "{heard}"
+    );
+    assert!(lower.contains("idempotency-key: maxnines-"), "{heard}");
+    assert!(lower.contains("user-agent: maxnines/"), "{heard}");
+    assert!(heard.contains(r#""to":["a@example.com"]"#), "{heard}");
+    assert!(
+        heard.contains("[MaxNines CRITICAL] CPU usage on web-1 is 95%"),
+        "{heard}"
+    );
+    assert!(due(&test, test.now + 10 * MINUTE_MS).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_resend_refusal_says_what_to_check_without_the_key() {
+    let mut test = Harness::start().await;
+    resend_firing(&mut test).await;
+    let (url, _heard) = start_resend(403).await;
+
+    let senders = Senders {
+        resend_url: Some(url),
+        ..Senders::default()
+    };
+    Notifier::new(test.database().clone(), senders)
+        .deliver_due(test.now)
+        .await
+        .unwrap();
+
+    let problems = test.database().delivery_problems(10).await.unwrap();
+    assert!(
+        problems[0].error.contains("verified in Resend"),
+        "{}",
+        problems[0].error
+    );
+    assert!(!problems[0].error.contains("re_test_key"));
 }
 
 // ---- pages
@@ -5662,6 +5823,7 @@ mod reminders {
             credential: None,
             app_token: None,
             severities: crate::alerting::every_severity(),
+            mail: None,
         };
         let channel = test.database().create_channel(&channel).await.unwrap();
         let rule = AlertRuleInput {
@@ -6882,6 +7044,7 @@ mod charts {
             credential: Some(TELEGRAM_TOKEN.to_string()),
             app_token: None,
             severities: crate::alerting::every_severity(),
+            mail: None,
         };
         let channel = server
             .state
@@ -6922,6 +7085,7 @@ mod charts {
             credential: Some(TELEGRAM_TOKEN.to_string()),
             app_token: None,
             severities: crate::alerting::every_severity(),
+            mail: None,
         };
         let channel = server
             .state
@@ -6979,6 +7143,7 @@ mod charts {
             credential: Some("xoxb-secret-token".to_string()),
             app_token: None,
             severities: crate::alerting::every_severity(),
+            mail: None,
         };
         let channel = server
             .state
@@ -7034,6 +7199,7 @@ mod charts {
             credential: Some("xoxb-secret-token".to_string()),
             app_token: None,
             severities: crate::alerting::every_severity(),
+            mail: None,
         };
         let channel = server
             .state

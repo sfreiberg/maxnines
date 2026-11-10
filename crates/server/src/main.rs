@@ -54,7 +54,6 @@ use tracing::info;
 
 use alert_evaluator::Evaluator;
 use app_state::{AppState, Heartbeat};
-use channels::email::Mailer;
 use config::Config;
 use maxnines_protocol::logging;
 #[cfg(windows)]
@@ -235,13 +234,6 @@ async fn serve(path: &Path) -> Result<()> {
         config.metrics.path().map(Path::to_path_buf),
     )?);
     let (writer, writer_thread) = store::spawn_writer(store, status.writes.clone());
-    let mailer = config
-        .email
-        .as_ref()
-        .map(Mailer::new)
-        .transpose()
-        .context("setting up email")?
-        .map(Arc::new);
 
     let state = AppState {
         presence: Arc::new(Presence::default()),
@@ -255,7 +247,7 @@ async fn serve(path: &Path) -> Result<()> {
         config_changes: Arc::new(watch::Sender::new(0)),
         writer: writer.clone(),
         metrics,
-        senders: Senders::new(mailer, web_url(config.audience())),
+        senders: Senders::new(web_url(config.audience())),
         check_results: Arc::new(LatestResults::default()),
         status,
         heartbeat: Heartbeat {
