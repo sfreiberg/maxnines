@@ -286,6 +286,10 @@ struct ProfileNotes<'a> {
     two_factor_error: Option<&'a str>,
     /// Recovery codes, the one time they're shown.
     new_codes: Option<&'a [String]>,
+    /// Whether they're in the middle of setting up two-factor, so the QR code shows.
+    /// Only as the answer to pressing the button, or to a wrong code: coming back to
+    /// the page later starts again.
+    setting_up: bool,
 }
 
 async fn profile_page(
@@ -311,7 +315,10 @@ async fn profile_page(
     };
     let two_factor = TwoFactorView {
         on: user.two_factor,
-        pending_secret: secret.as_deref().map(two_factor::grouped),
+        pending_secret: secret
+            .as_deref()
+            .filter(|_| notes.setting_up)
+            .map(two_factor::grouped),
         codes_left,
         required: state.require_two_factor.load(Ordering::Relaxed),
     };
@@ -372,8 +379,12 @@ async fn start_two_factor(State(state): State<AppState>, form: CsrfForm) -> Resp
     let Some(user) = signed_in_user() else {
         return Redirect::to("/login").into_response();
     };
+    let notes = ProfileNotes {
+        setting_up: true,
+        ..ProfileNotes::default()
+    };
     match state.database.start_two_factor(user.id).await {
-        Ok(_) => profile_page(&state, &form.token, &user, ProfileNotes::default()).await,
+        Ok(_) => profile_page(&state, &form.token, &user, notes).await,
         Err(error) => server_error(&error),
     }
 }
@@ -422,7 +433,11 @@ async fn confirm_two_factor(State(state): State<AppState>, form: CsrfForm) -> Re
         Ok(None) => {
             let problem = "That code isn't right. Check the app shows a code for MaxNines, and \
                            that this machine's clock and your phone's are right.";
-            profile_page(&state, &form.token, &user, two_factor_problem(problem)).await
+            let notes = ProfileNotes {
+                setting_up: true,
+                ..two_factor_problem(problem)
+            };
+            profile_page(&state, &form.token, &user, notes).await
         }
         Err(error) => server_error(&error),
     }

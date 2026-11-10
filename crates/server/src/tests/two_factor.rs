@@ -447,3 +447,61 @@ async fn the_two_factor_card_updates_in_place() {
         .await;
     assert_eq!(page.status, 303, "{}", page.body);
 }
+
+#[tokio::test]
+async fn coming_back_to_an_unfinished_setup_starts_again() {
+    let server = start().await;
+    person(&server, EMAIL).await;
+    let mut browser = Browser::anonymous();
+    give_password(&server, &mut browser, EMAIL).await;
+
+    let started = browser
+        .submit(&server, "/profile", "/profile/two-factor/start", &[])
+        .await;
+    assert!(started.body.contains("/profile/two-factor/qr.png"));
+    // A wrong code keeps them where they were.
+    let wrong = browser
+        .submit(
+            &server,
+            "/profile",
+            "/profile/two-factor/confirm",
+            &[("code", "000000")],
+        )
+        .await;
+    assert!(wrong.body.contains("/profile/two-factor/qr.png"));
+
+    // Coming back later, in this browser or another, shows the button again.
+    let later = browser.get(&server, "/profile").await;
+    assert!(
+        !later.body.contains("/profile/two-factor/qr.png"),
+        "{}",
+        later.body
+    );
+    assert!(later.body.contains("Set up two-factor"));
+
+    // And setting up again is a new secret.
+    let id = server
+        .state
+        .database
+        .active_user_by_email(EMAIL)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let first = server
+        .state
+        .database
+        .pending_two_factor_secret(id)
+        .await
+        .unwrap();
+    browser
+        .submit(&server, "/profile", "/profile/two-factor/start", &[])
+        .await;
+    let second = server
+        .state
+        .database
+        .pending_two_factor_secret(id)
+        .await
+        .unwrap();
+    assert_ne!(first, second);
+}

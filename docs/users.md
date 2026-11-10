@@ -59,6 +59,9 @@ app on their phone, such as Authy, Google Authenticator or 1Password.
 4. Keep the 10 recovery codes it then shows somewhere safe, away from your phone.
    They're only shown once.
 
+If you leave before typing the code, nothing changes: the next time you open your
+profile, you start again with a new QR code.
+
 From then on, signing in asks for your password, then a code. Each recovery code
 works once in place of a code, for when you can't use the app. Turning two-factor
 off, or getting new recovery codes, takes your password again.
