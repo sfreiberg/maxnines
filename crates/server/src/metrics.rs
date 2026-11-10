@@ -121,7 +121,8 @@ pub const METRICS: &[Metric] = &[
             ("5 minutes", Reading::Field("$.load_average.five")),
             ("15 minutes", Reading::Field("$.load_average.fifteen")),
         ]),
-        chart: ShowChart::Always,
+        // Windows has no load average, so its agents send none.
+        chart: ShowChart::WithData,
     },
     Metric {
         name: "cpu.time",

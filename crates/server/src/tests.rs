@@ -2938,18 +2938,29 @@ fn full_sample(timestamp_ms: u64, mount_point: &str) -> AgentMessage {
     })
 }
 
+/// What a Windows agent sends: everything but a load average.
+fn windows_sample(timestamp_ms: u64, mount_point: &str) -> AgentMessage {
+    let mut message = full_sample(timestamp_ms, mount_point);
+    if let AgentMessage::Sample(sample) = &mut message {
+        sample.metrics.get_mut("cpu").unwrap()["load_average"] = Value::Null;
+    }
+    message
+}
+
 /// Connects an agent and waits until what it sent can be read back.
 async fn report_samples(server: &TestServer, mount_point: &str) -> (Identity, Client) {
+    report(server, |time_ms| full_sample(time_ms, mount_point)).await
+}
+
+/// Connects an agent, sends four samples made by `sample` and waits until they
+/// can be read back.
+async fn report(server: &TestServer, sample: impl Fn(u64) -> AgentMessage) -> (Identity, Client) {
     let agent = identity();
     let mut client = server.connect_approved(&agent, "web-1").await;
 
     let now = now_ms() as u64;
     for seconds_ago in [60, 45, 30, 15] {
-        send(
-            &mut client,
-            &full_sample(now - seconds_ago * 1000, mount_point),
-        )
-        .await;
+        send(&mut client, &sample(now - seconds_ago * 1000)).await;
     }
 
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -3022,6 +3033,24 @@ async fn samples_from_an_agent_reach_its_charts() {
         page.body.contains("200 B/s"),
         "3000 bytes in 15s: {}",
         page.body
+    );
+}
+
+#[tokio::test]
+async fn a_machine_without_a_load_average_gets_no_load_average_chart() {
+    let server = start_with_metrics().await;
+    let (agent, _client) = report(&server, |time_ms| windows_sample(time_ms, "C:\\")).await;
+
+    let page = Browser::default()
+        .get(&server, &format!("/agents/{}/metrics", agent.id()))
+        .await;
+
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("CPU usage"), "{}", page.body);
+    assert!(!page.body.contains("Load average"), "{}", page.body);
+    assert_eq!(
+        page.body.matches("<table class=\"chart-summary\">").count(),
+        5
     );
 }
 
@@ -3381,7 +3410,8 @@ async fn an_agent_with_no_metrics_gets_empty_charts() {
         .get(&server, &format!("/agents/{}/metrics", agent.id()))
         .await;
     assert_eq!(page.status, 200, "{}", page.body);
-    assert_eq!(page.body.matches("No data in this range").count(), 6);
+    // Load average waits for data, since Windows machines never send one.
+    assert_eq!(page.body.matches("No data in this range").count(), 5);
 
     let page = browser.get(&server, "/metrics").await;
     assert!(
