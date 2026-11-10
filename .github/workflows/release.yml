@@ -41,7 +41,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Work out the version
         id: version
         run: |
@@ -82,7 +82,7 @@ jobs:
       - name: Install build tools
         run: |
           dnf install -y gcc gcc-c++ make git
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # The build records its commit, which git refuses to read for another user.
       - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: dtolnay/rust-toolchain@stable
@@ -115,7 +115,7 @@ jobs:
       TARGET: ${{ matrix.arch }}-unknown-linux-musl
     steps:
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ env.TARGET }}
@@ -149,7 +149,7 @@ jobs:
     env:
       TARGET: ${{ matrix.arch }}-apple-darwin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ env.TARGET }}
@@ -182,7 +182,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ env.TARGET }}
@@ -220,7 +220,7 @@ jobs:
     env:
       TARGET: x86_64-unknown-freebsd
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: vmactions/freebsd-vm@v1
         with:
           release: "14.3"
@@ -252,7 +252,7 @@ jobs:
       matrix:
         arch: [x86_64, aarch64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deb,cargo-generate-rpm
@@ -293,7 +293,7 @@ jobs:
         arch: [x86_64, aarch64]
         image: ["ubuntu:22.04", "debian:12", "ubuntu:24.04", "rockylinux:9"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
         with:
           name: packages-${{ matrix.arch }}
@@ -310,7 +310,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
         with:
           name: linux-server-x86_64
@@ -360,7 +360,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
