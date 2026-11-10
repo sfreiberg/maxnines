@@ -3,6 +3,7 @@
 //! the host name, and `*` and `?` work as wildcards in values.
 
 use std::collections::BTreeSet;
+use std::ops::Range;
 
 use serde::Serialize;
 use serde_json::Value;
@@ -106,7 +107,7 @@ fn parse_term(text: &str) -> Result<Term, String> {
 }
 
 /// The fact a name in a filter means.
-fn fact_name(name: &str) -> &str {
+pub fn fact_name(name: &str) -> &str {
     if name == OS_NAME { OS_FACT } else { name }
 }
 
@@ -203,15 +204,13 @@ impl<'a> PartialValue<'a> {
     }
 
     pub fn suggestion(&self, value: &str) -> Suggestion {
-        // There's no way to write a quote inside quotes, so it's left to a wildcard.
-        let safe = value.replace('"', "?");
-        let written = if safe.chars().any(char::is_whitespace) {
-            format!("\"{safe}\"")
-        } else {
-            safe
-        };
         Suggestion {
-            text: format!("{}{}{written}", self.written_name, self.operator),
+            text: format!(
+                "{}{}{}",
+                self.written_name,
+                self.operator,
+                written_value(value)
+            ),
             label: value.to_string(),
         }
     }
@@ -224,6 +223,41 @@ impl<'a> PartialValue<'a> {
             ..self.suggestion(value)
         }
     }
+}
+
+/// A value as a filter has to write it, so it stays one term. There's no way to
+/// write a quote inside quotes, so it's left to a wildcard.
+pub fn written_value(value: &str) -> String {
+    let safe = value.replace('"', "?");
+    if safe.chars().any(char::is_whitespace) {
+        format!("\"{safe}\"")
+    } else {
+        safe
+    }
+}
+
+/// Where each term is in `text`, quotes and all, split the way [`HostFilter::parse`]
+/// splits them.
+pub fn term_spans(text: &str) -> Vec<Range<usize>> {
+    let mut spans = Vec::new();
+    let mut start = None;
+    let mut quoted = false;
+    for (index, character) in text.char_indices() {
+        if character == '"' {
+            quoted = !quoted;
+        }
+        if character.is_whitespace() && !quoted {
+            if let Some(start) = start.take() {
+                spans.push(start..index);
+            }
+        } else if start.is_none() {
+            start = Some(index);
+        }
+    }
+    if let Some(start) = start {
+        spans.push(start..text.len());
+    }
+    spans
 }
 
 /// The filter for one machine alone, by its ID, as names needn't be unique.
@@ -258,6 +292,26 @@ pub fn suggest_names(term: &str, facts: impl IntoIterator<Item = String>) -> Vec
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terms_are_found_where_they_are_written() {
+        let text = r#" os=linux  hostname="web 1" $machine"#;
+        let terms: Vec<&str> = term_spans(text)
+            .into_iter()
+            .map(|span| &text[span])
+            .collect();
+        assert_eq!(terms, ["os=linux", r#"hostname="web 1""#, "$machine"]);
+        assert!(term_spans("   ").is_empty());
+    }
+
+    #[test]
+    fn a_written_value_is_one_term() {
+        assert_eq!(written_value("linux"), "linux");
+        assert_eq!(written_value("Ubuntu Linux"), r#""Ubuntu Linux""#);
+        assert_eq!(written_value(r#"say "hi" there"#), r#""say ?hi? there""#);
+        let term = format!("os.name={}", written_value("Windows Server 2022"));
+        assert_eq!(term_spans(&term).len(), 1);
+    }
+
     use serde_json::json;
 
     use super::*;

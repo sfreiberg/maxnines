@@ -1418,7 +1418,8 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 Everyone signed in shares dashboards. A widget sits on a grid 12 columns wide, and
 asks one question, using the same `metric`, `calculation`, `group_by` and `filter` as
-`GET /api/v1/query`.
+`GET /api/v1/query`. A widget's filter can also use the dashboard's
+[variables](#variables), as terms like `$machine`.
 
 | Widget field | Meaning |
 | --- | --- |
@@ -1445,7 +1446,7 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 `GET /api/v1/dashboards/{id}`
 
-The dashboard with its `widgets`, from the top of the page down.
+The dashboard with its `variables` and its `widgets`, from the top of the page down.
 
 ### Rename a dashboard
 
@@ -1482,6 +1483,47 @@ Changing a widget replaces all of it, including where it sits.
 `PUT /api/v1/dashboards/{id}/layout`
 
 Takes a list of widgets' `id`, `x`, `y`, `w` and `h`, and saves them together.
+
+### What a widget shows
+
+`GET /api/v1/dashboards/{id}/widgets/{widget}`
+
+The widget's answer, as `GET /api/v1/query` gives it, with its `title`, its `kind`
+and its `filter` with variables filled in. `from_ms` and `to_ms` pick the time, and
+default to the last hour. Each variable is picked with `var-<name>`, as the
+dashboard's address does: a value that isn't offered is the same as none, which is
+the first machine for a machine variable and every value for a fact. A machine
+variable with no machine to offer is refused with 422.
+
+```sh
+curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  "$MAXNINES_URL/api/v1/dashboards/1/widgets/2?var-machine=5e8e7eb8dd45b90e77472cee36541d9b"
+```
+
+### Variables
+
+`GET /api/v1/dashboards/{id}/variables`
+
+`PUT /api/v1/dashboards/{id}/variables`
+
+A dashboard has up to 10 variables, each a picker at the top of the page. Getting
+them adds the `choices` each one offers now, each with a `value` and a `label`.
+Saving replaces the whole list, in order, and is refused while a widget uses a
+variable that would be gone.
+
+| Field | Meaning |
+| --- | --- |
+| `name` | Written as `$name` in a widget's filter or title. Letters, digits and `_`, starting with a letter, up to 32. |
+| `label` | What the picker is called. Empty uses the name. |
+| `kind` | `machine` picks one machine. `fact` picks a value of a fact, or all of them. |
+| `fact` | Which fact's values a `fact` variable offers. |
+| `filter` | Which machines it offers, or whose values it offers. Empty for every machine. |
+
+```sh
+curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  -d '[{"name": "machine", "label": "Machine", "kind": "machine", "filter": "os=windows"}]' \
+  "$MAXNINES_URL/api/v1/dashboards/1/variables"
+```
 
 ## API keys
 

@@ -51,12 +51,12 @@
 
   <label>Machines
     <input type="text" name="filter" value="{{ widget.filter }}" maxlength="500" placeholder="os=linux">
-    <span class="note">The same filter as the host list. Leave it empty for every machine.</span>
+    <span class="note">The same filter as the host list. Leave it empty for every machine.{% if variables %} To follow a picker at the top of the dashboard, add {% for variable in variables %}<code>{{ variable }}</code>{% if not loop.last %} or {% endif %}{% endfor %} as a term on its own.{% endif %}</span>
   </label>
 
   <label>Title
     <input type="text" name="title" value="{{ widget.title }}" maxlength="100">
-    <span class="note">Leave it empty to use the metric's name.</span>
+    <span class="note">Leave it empty to use the metric's name.{% if variables %} A variable here, such as <code>{{ variables[0] }}</code>, shows what's picked.{% endif %}</span>
   </label>
 
   <button type="submit">{% if id %}Save{% else %}Add widget{% endif %}</button>

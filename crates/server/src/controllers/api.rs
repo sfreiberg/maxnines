@@ -22,6 +22,7 @@ use crate::alerting::{Alert, AlertRuleInput, ChannelInput, ChannelKind};
 use crate::app_state::{AgentDeletion, AppState};
 use crate::audit::Via;
 use crate::calculations::{self, Calculation, Question};
+use crate::dashboard_variables::{self, Picks, Variable};
 use crate::dashboards::{Placed, WidgetInput, check_layout, check_name};
 use crate::facts::unflatten;
 use crate::locations::{LocationRuleInput, check_rule};
@@ -95,7 +96,11 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/dashboards/{id}/widgets", post(create_widget))
         .route(
             "/dashboards/{id}/widgets/{widget}",
-            put(update_widget).delete(delete_widget),
+            get(widget_data).put(update_widget).delete(delete_widget),
+        )
+        .route(
+            "/dashboards/{id}/variables",
+            get(list_variables).put(save_variables),
         )
         .route("/rules", get(list_rules).post(create_rule))
         .route(
@@ -1031,14 +1036,14 @@ async fn create_widget(
     UrlPath(id): UrlPath<i64>,
     Json(input): Json<WidgetInput>,
 ) -> Response {
-    if let Err(error) = input.check() {
-        return refused(&anyhow::anyhow!(error));
-    }
     let dashboard = match state.database.get_dashboard(id).await {
         Ok(Some(dashboard)) => dashboard,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return server_error(&error),
     };
+    if let Err(error) = input.check(&dashboard.variables) {
+        return refused(&anyhow::anyhow!(error));
+    }
     if dashboard.is_full() {
         return refused(&anyhow::anyhow!(
             "This dashboard has as many widgets as it can."
@@ -1055,7 +1060,12 @@ async fn update_widget(
     UrlPath((id, widget)): UrlPath<(i64, i64)>,
     Json(input): Json<WidgetInput>,
 ) -> Response {
-    if let Err(error) = input.check() {
+    let dashboard = match state.database.get_dashboard(id).await {
+        Ok(Some(dashboard)) => dashboard,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return server_error(&error),
+    };
+    if let Err(error) = input.check(&dashboard.variables) {
         return refused(&anyhow::anyhow!(error));
     }
     match state.database.update_widget(id, widget, &input).await {
@@ -1072,6 +1082,117 @@ async fn delete_widget(
     match state.database.delete_widget(id, widget).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// A variable with what its picker offers.
+#[derive(Serialize)]
+struct VariableView {
+    #[serde(flatten)]
+    variable: Variable,
+    choices: Vec<dashboard_variables::Choice>,
+}
+
+async fn list_variables(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    let dashboard = match state.database.get_dashboard(id).await {
+        Ok(Some(dashboard)) => dashboard,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return server_error(&error),
+    };
+    let mut views = Vec::with_capacity(dashboard.variables.len());
+    for variable in dashboard.variables {
+        match dashboard_variables::choices(&state.sources(), &variable).await {
+            Ok(choices) => views.push(VariableView { variable, choices }),
+            Err(error) => return server_error(&error),
+        }
+    }
+    Json(views).into_response()
+}
+
+async fn save_variables(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<i64>,
+    Json(variables): Json<Vec<Variable>>,
+) -> Response {
+    let dashboard = match state.database.get_dashboard(id).await {
+        Ok(Some(dashboard)) => dashboard,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return server_error(&error),
+    };
+    let variables: Vec<Variable> = variables.into_iter().map(Variable::tidy).collect();
+    if let Err(error) = dashboard.check_variables(&variables) {
+        return refused(&anyhow::anyhow!(error));
+    }
+    match state.database.save_variables(id, &variables).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// What a widget shows, with `var-<name>` parameters picking what its variables
+/// stand for, as the dashboard's pickers do.
+#[derive(Serialize)]
+struct WidgetData {
+    title: String,
+    kind: String,
+    /// The widget's filter with its variables filled in.
+    filter: String,
+    #[serde(flatten)]
+    view: MetricView,
+}
+
+async fn widget_data(
+    State(state): State<AppState>,
+    UrlPath((id, widget_id)): UrlPath<(i64, i64)>,
+    Query(params): Query<BTreeMap<String, String>>,
+) -> Response {
+    let dashboard = match state.database.get_dashboard(id).await {
+        Ok(Some(dashboard)) => dashboard,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return server_error(&error),
+    };
+    let Some(widget) = dashboard.widgets.iter().find(|w| w.id == widget_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let number = |name: &str| params.get(name).map(|text| text.parse::<i64>());
+    let (to_ms, from_ms) = match (number("to_ms").transpose(), number("from_ms").transpose()) {
+        (Ok(to_ms), Ok(from_ms)) => (to_ms, from_ms),
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let to_ms = to_ms.unwrap_or_else(now_ms);
+    let from_ms = from_ms.unwrap_or_else(|| to_ms.saturating_sub(DEFAULT_RANGE_MS));
+    let Some(range) = TimeRange::new(from_ms, to_ms) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let picks = match Picks::from_params(&state.sources(), &dashboard.variables, &params).await {
+        Ok(picks) => picks,
+        Err(error) => return server_error(&error),
+    };
+    let input = &widget.input;
+    let question = picks
+        .fill_filter(&input.filter)
+        .and_then(|filter| input.question_for(&filter));
+    let question = match question {
+        Ok(question) => question,
+        Err(error) => return refused(&anyhow::anyhow!(error)),
+    };
+    match calculations::answer(&state.sources(), &question, range, input.max_lines()).await {
+        Ok(result) => Json(WidgetData {
+            title: input.title(&question, &picks),
+            kind: input.kind.clone(),
+            filter: question.filter.clone(),
+            view: MetricView {
+                metric: question.metric.name,
+                unit: question.unit(),
+                from_ms,
+                to_ms,
+                step_ms: range.step_ms,
+                result,
+            },
+        })
+        .into_response(),
         Err(error) => server_error(&error),
     }
 }

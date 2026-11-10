@@ -31,12 +31,53 @@
   </form>
   <span id="layout-status" class="note" role="status">Drag widgets to move them, and their corners to resize them.</span>
 </div>
+
+<section class="dashboard-variables">
+  <h2>Variables</h2>
+  <p class="note">Each one is a picker at the top of the dashboard. A widget follows it when its filter has the variable as a term on its own, such as <code>$machine</code>, and a title can mention it the same way.</p>
+  {% if dashboard.variables %}
+  <div class="tablebox"><table>
+    <thead><tr><th>Variable</th><th>Picker</th><th>Picks</th><th>Offers</th><th></th></tr></thead>
+    <tbody>
+      {% for variable in dashboard.variables %}
+      <tr>
+        <td><code>${{ variable.name }}</code></td>
+        <td>{% if variable.label %}{{ variable.label }}{% else %}{{ variable.name }}{% endif %}</td>
+        <td>{% if variable.kind == "machine" %}A machine{% else %}A value of <code>{{ variable.fact }}</code>, or all{% endif %}</td>
+        <td>{% if variable.filter %}<code>{{ variable.filter }}</code>{% else %}Every machine{% endif %}</td>
+        <td><a href="/dashboards/{{ dashboard.id }}/variables/{{ variable.name }}/edit">Edit</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+  <a class="button secondary" href="/dashboards/{{ dashboard.id }}/variables/new">Add variable</a>
+</section>
 {% else %}
-<nav class="tabs" aria-label="Time range">
-  {% for option in ranges %}
-  <a href="/dashboards/{{ dashboard.id }}?range={{ option.key }}"{% if option.selected %} class="selected" aria-current="true"{% endif %}>{{ option.label }}</a>
-  {% endfor %}
-</nav>
+<div class="dashboard-controls">
+  {% if pickers %}
+  <form id="dashboard-pickers" class="dashboard-pickers" method="get" action="/dashboards/{{ dashboard.id }}">
+    <input type="hidden" name="range" value="{{ range }}">
+    {% for picker in pickers %}
+    <label>{{ picker.title }}
+      <select name="{{ picker.param }}"{% if not picker.choices and not picker.offers_all %} disabled{% endif %}>
+        {% if picker.offers_all %}<option value=""{% if picker.selected == "" %} selected{% endif %}>All</option>{% endif %}
+        {% for choice in picker.choices %}
+        <option value="{{ choice.value }}"{% if picker.selected == choice.value %} selected{% endif %}>{{ choice.label }}</option>
+        {% endfor %}
+        {% if not picker.choices and not picker.offers_all %}<option>No machines</option>{% endif %}
+      </select>
+    </label>
+    {% endfor %}
+    <button type="submit" class="secondary">Show</button>
+  </form>
+  {% endif %}
+  <nav class="tabs" aria-label="Time range">
+    {% for option in ranges %}
+    <a href="/dashboards/{{ dashboard.id }}?range={{ option.key }}{% if var_query %}&amp;{{ var_query }}{% endif %}"{% if option.selected %} class="selected" aria-current="true"{% endif %}>{{ option.label }}</a>
+    {% endfor %}
+  </nav>
+</div>
 {% endif %}
 
 {% if dashboard.widgets %}
@@ -44,7 +85,7 @@
   {% for widget in dashboard.widgets %}
   <div class="grid-stack-item" gs-id="{{ widget.id }}" gs-x="{{ widget.x }}" gs-y="{{ widget.y }}" gs-w="{{ widget.w }}" gs-h="{{ widget.h }}">
     <div class="grid-stack-item-content">
-      <section class="widget" hx-get="/dashboards/{{ dashboard.id }}/widgets/{{ widget.id }}?range={{ range }}{% if editing %}&amp;edit=1{% endif %}" hx-trigger="load{% if not editing %}, every 30s{% endif %}" hx-swap="morph:innerHTML">
+      <section class="widget" hx-get="/dashboards/{{ dashboard.id }}/widgets/{{ widget.id }}?range={{ range }}{% if var_query %}&amp;{{ var_query }}{% endif %}{% if editing %}&amp;edit=1{% endif %}" hx-trigger="load{% if not editing %}, every 30s{% endif %}" hx-swap="morph:innerHTML">
         <p class="note">Loading…</p>
       </section>
     </div>

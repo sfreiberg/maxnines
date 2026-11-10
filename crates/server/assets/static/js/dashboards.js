@@ -1,3 +1,12 @@
+// Shows what's picked as soon as it's picked, so the button is only for pages
+// without this script.
+(() => {
+  const pickers = document.getElementById("dashboard-pickers");
+  if (!pickers) return;
+  pickers.querySelector("button[type=submit]")?.remove();
+  pickers.addEventListener("change", () => pickers.requestSubmit());
+})();
+
 // Lays out a dashboard's widgets, and saves where they're dragged to.
 (() => {
   const element = document.getElementById("dashboard-grid");

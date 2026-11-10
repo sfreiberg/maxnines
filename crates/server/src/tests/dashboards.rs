@@ -550,6 +550,367 @@ mod dashboard_pages {
     }
 }
 
+mod variables {
+    use super::*;
+
+    async fn dashboard_with(server: &TestServer, variables: Value, widget: Value) -> (i64, i64) {
+        let (status, created) = api(
+            server,
+            "POST",
+            "/api/v1/dashboards",
+            &json!({ "name": "Machine" }),
+        )
+        .await;
+        assert_eq!(status, 201, "{created}");
+        let id = created["id"].as_i64().unwrap();
+        let path = format!("/api/v1/dashboards/{id}/variables");
+        let (status, answer) = api(server, "PUT", &path, &variables).await;
+        assert_eq!(status, 204, "{answer}");
+        let path = format!("/api/v1/dashboards/{id}/widgets");
+        let (status, created) = api(server, "POST", &path, &widget).await;
+        assert_eq!(status, 201, "{created}");
+        (id, created["id"].as_i64().unwrap())
+    }
+
+    fn machine_variable() -> Value {
+        json!([{ "name": "machine", "label": "Machine", "kind": "machine" }])
+    }
+
+    fn per_machine_widget() -> Value {
+        json!({
+            "metric": "cpu.usage", "group_by": "host",
+            "filter": "$machine", "title": "CPU on $machine",
+        })
+    }
+
+    #[tokio::test]
+    async fn a_machine_picker_shows_one_machine_at_a_time() {
+        let server = start_with_metrics().await;
+        let machines = three_machines(&server).await;
+        wait_for_all_three(&server).await;
+        let web_2 = machines[1].0.id();
+        let (id, widget) = dashboard_with(&server, machine_variable(), per_machine_widget()).await;
+        let mut browser = Browser::default();
+
+        let page = browser.get(&server, &format!("/dashboards/{id}")).await;
+        assert_eq!(page.status, 200, "{}", page.body);
+        assert!(page.body.contains(r#"name="var-machine""#), "{}", page.body);
+        let db_first = page.body.find(">db-1<").unwrap() < page.body.find(">web-1<").unwrap();
+        assert!(db_first, "machines are in order: {}", page.body);
+
+        let path = format!("/dashboards/{id}/widgets/{widget}?var-machine={web_2}");
+        let drawn = browser.get(&server, &path).await;
+        assert!(drawn.body.contains("CPU on web-2"), "{}", drawn.body);
+        assert!(!drawn.body.contains("db-1"), "{}", drawn.body);
+
+        let path = format!("/dashboards/{id}/widgets/{widget}");
+        let drawn = browser.get(&server, &path).await;
+        assert!(
+            drawn.body.contains("CPU on db-1"),
+            "the first machine when none is picked: {}",
+            drawn.body
+        );
+    }
+
+    #[tokio::test]
+    async fn the_range_and_what_is_picked_are_kept_together() {
+        let server = start_with_metrics().await;
+        let machines = three_machines(&server).await;
+        wait_for_all_three(&server).await;
+        let web_2 = machines[1].0.id();
+        let (id, _) = dashboard_with(&server, machine_variable(), per_machine_widget()).await;
+
+        let path = format!("/dashboards/{id}?range=6h&var-machine={web_2}");
+        let page = Browser::default().get(&server, &path).await;
+
+        let kept = format!("?range=24h&amp;var-machine={web_2}");
+        assert!(
+            page.body.contains(&kept),
+            "range links keep the pick: {}",
+            page.body
+        );
+        assert!(
+            page.body.contains(r#"name="range" value="6h""#),
+            "pickers keep the range: {}",
+            page.body
+        );
+        let selected = format!(r#"value="{web_2}" selected"#);
+        assert!(page.body.contains(&selected), "{}", page.body);
+    }
+
+    #[tokio::test]
+    async fn a_fact_picker_offers_each_value_and_all_of_them() {
+        let server = start_with_metrics().await;
+        let _machines = three_machines(&server).await;
+        wait_for_all_three(&server).await;
+        let variables = json!([{ "name": "role", "kind": "fact", "fact": "role" }]);
+        let widget = json!({ "metric": "cpu.usage", "kind": "number", "filter": "$role" });
+        let (id, widget) = dashboard_with(&server, variables, widget).await;
+
+        let path = format!("/api/v1/dashboards/{id}/variables");
+        let (status, listed) = api(&server, "GET", &path, &Value::Null).await;
+        assert_eq!(status, 200, "{listed}");
+        assert_eq!(listed[0]["name"], "role");
+        let choices: Vec<&str> = listed[0]["choices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|choice| choice["value"].as_str().unwrap())
+            .collect();
+        assert_eq!(choices, ["db", "web"]);
+
+        let data = format!("/api/v1/dashboards/{id}/widgets/{widget}");
+        let web = query(&server, &format!("{data}?var-role=web")).await;
+        assert_eq!(web["filter"], "role=web");
+        assert_eq!(newest(&web["series"][0]), 20.0);
+        let all = query(&server, &format!("{data}?var-role=")).await;
+        assert_eq!(all["filter"], "");
+        assert_eq!(newest(&all["series"][0]), 40.0);
+    }
+
+    #[tokio::test]
+    async fn only_what_a_picker_offers_reaches_a_filter() {
+        let server = start_with_metrics().await;
+        let _machines = three_machines(&server).await;
+        wait_for_all_three(&server).await;
+        let variables = json!([{ "name": "role", "kind": "fact", "fact": "role" }]);
+        let widget = json!({ "metric": "cpu.usage", "kind": "number", "filter": "$role" });
+        let (id, widget) = dashboard_with(&server, variables, widget).await;
+
+        let path = format!("/api/v1/dashboards/{id}/widgets/{widget}?var-role=web%20role%3Ddb");
+        let result = query(&server, &path).await;
+
+        assert_eq!(result["filter"], "", "{result}");
+    }
+
+    #[tokio::test]
+    async fn a_picker_offers_only_the_machines_its_filter_picks() {
+        let server = start_with_metrics().await;
+        let _machines = three_machines(&server).await;
+        wait_for_all_three(&server).await;
+        let variables = json!([{ "name": "machine", "kind": "machine", "filter": "role=web" }]);
+        let (id, _) = dashboard_with(&server, variables, per_machine_widget()).await;
+
+        let path = format!("/api/v1/dashboards/{id}/variables");
+        let (_, listed) = api(&server, "GET", &path, &Value::Null).await;
+        let labels: Vec<&str> = listed[0]["choices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|choice| choice["label"].as_str().unwrap())
+            .collect();
+        assert_eq!(labels, ["web-1", "web-2"]);
+    }
+
+    #[tokio::test]
+    async fn with_no_machine_to_pick_a_widget_says_so() {
+        let server = start().await;
+        let (id, widget) = dashboard_with(&server, machine_variable(), per_machine_widget()).await;
+        let mut browser = Browser::default();
+
+        let page = browser.get(&server, &format!("/dashboards/{id}")).await;
+        assert!(page.body.contains("No machines"), "{}", page.body);
+        let path = format!("/dashboards/{id}/widgets/{widget}");
+        let drawn = browser.get(&server, &path).await;
+        assert!(
+            drawn.body.contains("no machine to pick for Machine"),
+            "{}",
+            drawn.body
+        );
+        let data = format!("/api/v1/dashboards/{id}/widgets/{widget}");
+        assert_eq!(api(&server, "GET", &data, &Value::Null).await.0, 422);
+    }
+
+    #[tokio::test]
+    async fn a_widget_can_only_use_the_dashboards_variables() {
+        let server = start().await;
+        let (status, created) = api(
+            &server,
+            "POST",
+            "/api/v1/dashboards",
+            &json!({ "name": "Fleet" }),
+        )
+        .await;
+        assert_eq!(status, 201);
+        let id = created["id"].as_i64().unwrap();
+
+        let path = format!("/api/v1/dashboards/{id}/widgets");
+        let (status, answer) = api(&server, "POST", &path, &per_machine_widget()).await;
+        assert_eq!(status, 422);
+        assert_eq!(
+            answer["error"],
+            "This dashboard has no variable called $machine."
+        );
+
+        let mut browser = Browser::default();
+        let page = browser
+            .submit(
+                &server,
+                &format!("/dashboards/{id}/widgets/new"),
+                &format!("/dashboards/{id}/widgets"),
+                &[
+                    ("kind", "chart"),
+                    ("metric", "cpu.usage"),
+                    ("calculation", "avg"),
+                    ("group_by", "host"),
+                    ("filter", "$machine"),
+                ],
+            )
+            .await;
+        assert_eq!(page.status, 200);
+        assert!(
+            page.body.contains("no variable called $machine"),
+            "{}",
+            page.body
+        );
+    }
+
+    #[tokio::test]
+    async fn a_variable_a_widget_uses_can_not_be_removed() {
+        let server = start().await;
+        let (id, _) = dashboard_with(&server, machine_variable(), per_machine_widget()).await;
+
+        let path = format!("/api/v1/dashboards/{id}/variables");
+        let (status, answer) = api(&server, "PUT", &path, &json!([])).await;
+        assert_eq!(status, 422);
+        assert!(
+            answer["error"].as_str().unwrap().contains("uses $machine"),
+            "{answer}"
+        );
+
+        let mut browser = Browser::default();
+        let page = browser
+            .submit(
+                &server,
+                &format!("/dashboards/{id}/edit"),
+                &format!("/dashboards/{id}/variables/machine/delete"),
+                &[],
+            )
+            .await;
+        assert_eq!(page.status, 200);
+        assert!(page.body.contains("uses $machine"), "{}", page.body);
+        let kept = server
+            .state
+            .database
+            .get_dashboard(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.variables.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn variables_can_be_added_changed_and_removed_on_the_pages() {
+        let server = start().await;
+        let (status, created) = api(
+            &server,
+            "POST",
+            "/api/v1/dashboards",
+            &json!({ "name": "Fleet" }),
+        )
+        .await;
+        assert_eq!(status, 201);
+        let id = created["id"].as_i64().unwrap();
+        let mut browser = Browser::default();
+        let database = &server.state.database;
+
+        let page = browser
+            .submit(
+                &server,
+                &format!("/dashboards/{id}/variables/new"),
+                &format!("/dashboards/{id}/variables"),
+                &[
+                    ("name", "$env"),
+                    ("label", "Environment"),
+                    ("kind", "fact"),
+                    ("fact", "environment"),
+                    ("filter", "os=linux"),
+                ],
+            )
+            .await;
+        assert_eq!(page.status, 303, "{}", page.body);
+        let saved = &database.get_dashboard(id).await.unwrap().unwrap().variables;
+        assert_eq!(saved[0].name, "env");
+        assert_eq!(saved[0].fact, "environment");
+
+        let edit = browser
+            .get(&server, &format!("/dashboards/{id}/edit"))
+            .await;
+        assert!(edit.body.contains("<code>$env</code>"), "{}", edit.body);
+
+        let page = browser
+            .submit(
+                &server,
+                &format!("/dashboards/{id}/variables/env/edit"),
+                &format!("/dashboards/{id}/variables/env"),
+                &[
+                    ("name", "env"),
+                    ("label", ""),
+                    ("kind", "fact"),
+                    ("fact", ""),
+                    ("filter", ""),
+                ],
+            )
+            .await;
+        assert_eq!(page.status, 200, "a fact variable needs a fact");
+        assert!(page.body.contains("Choose which fact"), "{}", page.body);
+
+        let page = browser
+            .submit(
+                &server,
+                &format!("/dashboards/{id}/edit"),
+                &format!("/dashboards/{id}/variables/env/delete"),
+                &[],
+            )
+            .await;
+        assert_eq!(page.status, 303, "{}", page.body);
+        let saved = database.get_dashboard(id).await.unwrap().unwrap();
+        assert!(saved.variables.is_empty());
+    }
+
+    #[tokio::test]
+    async fn machine_names_in_a_picker_are_never_markup() {
+        let server = start_with_metrics().await;
+        let hostile = "<b>web</b>";
+        let (_agent, _client) = machine(&server, hostile, 10.0, json!({ "role": "web" })).await;
+        let (id, _) = dashboard_with(&server, machine_variable(), per_machine_widget()).await;
+
+        let page = Browser::default()
+            .get(&server, &format!("/dashboards/{id}"))
+            .await;
+
+        assert!(!page.body.contains(hostile), "{}", page.body);
+        assert!(page.body.contains("&lt;b&gt;web"), "{}", page.body);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_dashboard_takes_its_variables_with_it() {
+        let server = start().await;
+        let (id, _) = dashboard_with(&server, machine_variable(), per_machine_widget()).await;
+
+        let path = format!("/api/v1/dashboards/{id}");
+        assert_eq!(api(&server, "DELETE", &path, &Value::Null).await.0, 204);
+
+        let database = &server.state.database;
+        let id = database.create_dashboard("Again", now_ms()).await.unwrap();
+        let fresh = database.get_dashboard(id).await.unwrap().unwrap();
+        assert!(fresh.variables.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_variable_that_does_not_exist_is_not_found() {
+        let server = start().await;
+        let (id, _) = dashboard_with(&server, machine_variable(), per_machine_widget()).await;
+        let mut browser = Browser::default();
+        for path in [
+            "/dashboards/99/variables/new".to_string(),
+            format!("/dashboards/{id}/variables/nope/edit"),
+        ] {
+            assert_eq!(browser.get(&server, &path).await.status, 404, "{path}");
+        }
+    }
+}
+
 mod calculation_alerts {
     use super::*;
     use crate::alert_evaluator::Evaluator;

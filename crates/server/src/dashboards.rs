@@ -8,6 +8,7 @@ use tracing::warn;
 
 use crate::app_state::AppState;
 use crate::calculations::{self, Grouping, Question};
+use crate::dashboard_variables::{Picks, Variable, check_uses, check_variables, uses};
 use crate::metric_charts::{self, Chart, Frame, MAX_SERIES};
 use crate::metrics::TimeRange;
 
@@ -119,16 +120,31 @@ pub struct WidgetInput {
 impl WidgetInput {
     /// A number shows one value, so nothing gets a line of its own.
     pub fn question(&self) -> Result<Question, String> {
+        self.question_for(&self.filter)
+    }
+
+    /// The question with its filter as variables fill it in.
+    pub fn question_for(&self, filter: &str) -> Result<Question, String> {
         let group_by = if self.kind == "number" {
             "nothing"
         } else {
             self.group_by.as_str()
         };
-        Question::new(&self.metric, &self.calculation, group_by, &self.filter)
+        Question::new(&self.metric, &self.calculation, group_by, filter)
     }
 
-    /// The error says what's wrong, to show whoever chose it.
-    pub fn check(&self) -> Result<(), String> {
+    /// How many lines it has room for.
+    pub fn max_lines(&self) -> usize {
+        match self.kind.as_str() {
+            "table" => MAX_TABLE_LINES,
+            "number" => 1,
+            _ => MAX_SERIES,
+        }
+    }
+
+    /// The error says what's wrong, to show whoever chose it. Its filter can only use
+    /// the dashboard's `variables`.
+    pub fn check(&self, variables: &[Variable]) -> Result<(), String> {
         if self.title.chars().count() > MAX_NAME_LEN {
             return Err(format!("A title can be up to {MAX_NAME_LEN} characters."));
         }
@@ -138,13 +154,14 @@ impl WidgetInput {
         if !self.placement.is_valid() {
             return Err("That doesn't fit on the grid.".to_string());
         }
+        check_uses(&self.filter, variables)?;
         self.question().map(|_| ())
     }
 
-    fn title(&self, question: &Question) -> String {
+    pub fn title(&self, question: &Question, picks: &Picks) -> String {
         match self.title.trim() {
             "" => question.metric.title.to_string(),
-            title => title.to_string(),
+            title => picks.fill_title(title),
         }
     }
 }
@@ -160,6 +177,7 @@ pub struct Widget {
 pub struct Dashboard {
     pub id: i64,
     pub name: String,
+    pub variables: Vec<Variable>,
     pub widgets: Vec<Widget>,
 }
 
@@ -175,6 +193,27 @@ impl Dashboard {
 
     pub fn is_full(&self) -> bool {
         self.widgets.len() >= MAX_WIDGETS
+    }
+
+    /// Whether its widgets could all still be shown with these variables instead.
+    /// The error names a widget that uses one that would be gone.
+    pub fn check_variables(&self, variables: &[Variable]) -> Result<(), String> {
+        check_variables(variables)?;
+        for widget in &self.widgets {
+            if let Some(name) = uses(&widget.input.filter)
+                .into_iter()
+                .find(|name| !variables.iter().any(|variable| variable.name == *name))
+            {
+                let title = match widget.input.title.trim() {
+                    "" => widget.input.metric.as_str(),
+                    title => title,
+                };
+                return Err(format!(
+                    "The widget \u{201c}{title}\u{201d} uses ${name}. Change its filter first."
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -215,13 +254,32 @@ pub struct WidgetView {
     /// Lines left out because there are too many to show.
     pub hidden: usize,
     pub failed: bool,
+    /// Why there's nothing to show, such as no machine to pick.
+    pub missing: Option<String>,
 }
 
 /// One widget failing leaves the others working, so this always has something to show.
-/// Its times are in `zone`.
-pub async fn view(state: &AppState, widget: &Widget, range: TimeRange, zone: Tz) -> WidgetView {
+/// Its times are in `zone`, and its variables stand for what's in `picks`.
+pub async fn view(
+    state: &AppState,
+    widget: &Widget,
+    picks: &Picks,
+    range: TimeRange,
+    zone: Tz,
+) -> WidgetView {
     let input = &widget.input;
-    let question = match input.question() {
+    let filter = match picks.fill_filter(&input.filter) {
+        Ok(filter) => filter,
+        Err(missing) => {
+            return WidgetView {
+                title: picks.fill_title(&input.title),
+                missing: Some(missing),
+                failed: false,
+                ..failed_view(input)
+            };
+        }
+    };
+    let question = match input.question_for(&filter) {
         Ok(question) => question,
         Err(error) => {
             warn!(
@@ -231,14 +289,9 @@ pub async fn view(state: &AppState, widget: &Widget, range: TimeRange, zone: Tz)
             return failed_view(input);
         }
     };
-    let max_lines = match input.kind.as_str() {
-        "table" => MAX_TABLE_LINES,
-        "number" => 1,
-        _ => MAX_SERIES,
-    };
-    match calculations::answer(&state.sources(), &question, range, max_lines).await {
+    match calculations::answer(&state.sources(), &question, range, input.max_lines()).await {
         Ok(result) => {
-            let title = input.title(&question);
+            let title = input.title(&question, picks);
             let chart = metric_charts::build_as(
                 question.metric,
                 question.unit(),
@@ -254,6 +307,7 @@ pub async fn view(state: &AppState, widget: &Widget, range: TimeRange, zone: Tz)
                 hidden: chart.hidden,
                 chart: Some(chart),
                 failed: false,
+                missing: None,
             }
         }
         Err(error) => {
@@ -271,6 +325,7 @@ fn failed_view(input: &WidgetInput) -> WidgetView {
         chart: None,
         hidden: 0,
         failed: true,
+        missing: None,
     }
 }
 
@@ -304,7 +359,7 @@ mod tests {
         let at = |x, y, w, h| {
             let mut widget = input();
             widget.placement = Placement { x, y, w, h };
-            widget.check()
+            widget.check(&[])
         };
         assert!(at(0, 0, 12, 4).is_ok());
         assert!(at(6, 100, 6, 24).is_ok());
@@ -320,15 +375,15 @@ mod tests {
     fn a_widget_has_to_be_something_it_can_show() {
         let mut widget = input();
         widget.kind = "pie".to_string();
-        assert!(widget.check().is_err());
+        assert!(widget.check(&[]).is_err());
 
         let mut widget = input();
         widget.metric = "nope".to_string();
-        assert!(widget.check().is_err());
+        assert!(widget.check(&[]).is_err());
 
         let mut widget = input();
         widget.title = "x".repeat(101);
-        assert!(widget.check().is_err());
+        assert!(widget.check(&[]).is_err());
     }
 
     #[test]
@@ -342,7 +397,7 @@ mod tests {
     fn a_widget_with_no_title_is_named_after_its_metric() {
         let widget = input();
         let question = widget.question().unwrap();
-        assert_eq!(widget.title(&question), "CPU usage");
+        assert_eq!(widget.title(&question, &Picks::default()), "CPU usage");
     }
 
     #[test]
@@ -350,6 +405,7 @@ mod tests {
         let mut dashboard = Dashboard {
             id: 1,
             name: "Fleet".to_string(),
+            variables: Vec::new(),
             widgets: Vec::new(),
         };
         assert_eq!(dashboard.next_row(), 0);
@@ -373,6 +429,51 @@ mod tests {
         assert_eq!(check_name("  Fleet "), Ok("Fleet".to_string()));
         assert!(check_name("   ").is_err());
         assert!(check_name(&"x".repeat(101)).is_err());
+    }
+
+    fn machine() -> Variable {
+        Variable {
+            name: "machine".to_string(),
+            label: String::new(),
+            kind: crate::dashboard_variables::VariableKind::Machine,
+            fact: String::new(),
+            filter: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_widget_can_only_use_the_dashboards_variables() {
+        let mut widget = input();
+        widget.filter = "$machine os=linux".to_string();
+        assert!(widget.check(&[machine()]).is_ok());
+        assert_eq!(
+            widget.check(&[]),
+            Err("This dashboard has no variable called $machine.".to_string())
+        );
+    }
+
+    #[test]
+    fn a_variable_a_widget_uses_stays() {
+        let mut widget = input();
+        widget.title = "Busy".to_string();
+        widget.filter = "$machine".to_string();
+        let dashboard = Dashboard {
+            id: 1,
+            name: "Machine".to_string(),
+            variables: vec![machine()],
+            widgets: vec![Widget {
+                id: 1,
+                input: widget,
+            }],
+        };
+        assert!(dashboard.check_variables(&[machine()]).is_ok());
+        assert_eq!(
+            dashboard.check_variables(&[]),
+            Err(
+                "The widget \u{201c}Busy\u{201d} uses $machine. Change its filter first."
+                    .to_string()
+            )
+        );
     }
 
     #[test]

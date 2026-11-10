@@ -11,6 +11,7 @@ mod condition_builder;
 mod config;
 mod controllers;
 mod csrf;
+mod dashboard_variables;
 mod dashboards;
 mod docs;
 mod fact_history;

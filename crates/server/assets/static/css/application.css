@@ -323,6 +323,13 @@ legend { padding: 0 8px; color: var(--muted); font-size: 12px; font-weight: 500;
 .widget-table { flex: 1; min-height: 0; overflow-y: auto; }
 .dashboard-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 .dashboard-tools form { display: flex; gap: 8px; margin: 0; }
+.dashboard-controls { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 12px; }
+.dashboard-pickers { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; margin: 0; }
+.dashboard-pickers label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 13px; font-weight: 500; }
+.dashboard-pickers select { min-width: 10rem; max-width: 100%; }
+.dashboard-variables { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; }
+.dashboard-variables h2 { margin: 0; }
+.dashboard-variables .tablebox { align-self: stretch; }
 .chart-section { display: flex; flex-direction: column; gap: 12px; }
 .chart-card { display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 20px 24px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
 .chart-card .empty, .chart-card .hint { font-size: 14px; }

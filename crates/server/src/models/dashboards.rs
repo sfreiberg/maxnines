@@ -8,9 +8,22 @@ use sea_orm::{
 use serde_json::{Map, Value, json};
 
 use super::audit::record_change;
-use super::{Database, dashboard, dashboard_widget};
+use super::{Database, dashboard, dashboard_variable, dashboard_widget};
 use crate::audit::{Kind, Snapshot};
+use crate::dashboard_variables::{Variable, VariableKind};
 use crate::dashboards::{Dashboard, DashboardSummary, Placed, Placement, Widget, WidgetInput};
+
+/// A row is only ever written from a checked variable, so an unknown kind is a
+/// database someone changed by hand, and it's read as a fact rather than lost.
+fn to_variable(row: dashboard_variable::Model) -> Variable {
+    Variable {
+        name: row.name,
+        label: row.label,
+        kind: VariableKind::parse(&row.kind).unwrap_or(VariableKind::Fact),
+        fact: row.fact,
+        filter: row.filter,
+    }
+}
 
 fn to_widget(row: dashboard_widget::Model) -> Widget {
     Widget {
@@ -66,9 +79,16 @@ async fn load<C: ConnectionTrait>(connection: &C, id: i64) -> Result<Option<Dash
         .all(connection)
         .await
         .context("loading widgets")?;
+    let variables = dashboard_variable::Entity::find()
+        .filter(dashboard_variable::Column::DashboardId.eq(id))
+        .order_by_asc(dashboard_variable::Column::Position)
+        .all(connection)
+        .await
+        .context("loading variables")?;
     Ok(Some(Dashboard {
         id: row.id,
         name: row.name,
+        variables: variables.into_iter().map(to_variable).collect(),
         widgets: widgets.into_iter().map(to_widget).collect(),
     }))
 }
@@ -81,7 +101,11 @@ fn snapshot(dashboard: &Dashboard) -> Result<Snapshot> {
         let fields = serde_json::to_value(&widget.input).context("recording a widget")?;
         widgets.insert(widget.id.to_string(), fields);
     }
-    let fields = json!({"name": dashboard.name, "widgets": Value::Object(widgets)});
+    let fields = json!({
+        "name": dashboard.name,
+        "variables": dashboard.variables,
+        "widgets": Value::Object(widgets),
+    });
     Ok(Snapshot::new(dashboard.name.clone(), fields))
 }
 
@@ -176,6 +200,11 @@ impl Database {
             .exec(&transaction)
             .await
             .context("removing widgets")?;
+        dashboard_variable::Entity::delete_many()
+            .filter(dashboard_variable::Column::DashboardId.eq(id))
+            .exec(&transaction)
+            .await
+            .context("removing variables")?;
         let result = dashboard::Entity::delete_by_id(id)
             .exec(&transaction)
             .await
@@ -244,6 +273,39 @@ impl Database {
         record(&transaction, dashboard_id, before.as_ref()).await?;
         transaction.commit().await.context("removing widget")?;
         Ok(result.rows_affected > 0)
+    }
+
+    /// Replaces a dashboard's variables with these, in this order. Returns false if
+    /// there's no such dashboard.
+    pub async fn save_variables(&self, dashboard_id: i64, variables: &[Variable]) -> Result<bool> {
+        let transaction = self.connection.begin().await.context("saving variables")?;
+        let Some(before) = load(&transaction, dashboard_id).await? else {
+            return Ok(false);
+        };
+        dashboard_variable::Entity::delete_many()
+            .filter(dashboard_variable::Column::DashboardId.eq(dashboard_id))
+            .exec(&transaction)
+            .await
+            .context("saving variables")?;
+        for (position, variable) in (0..).zip(variables) {
+            let row = dashboard_variable::ActiveModel {
+                dashboard_id: Set(dashboard_id),
+                position: Set(position),
+                name: Set(variable.name.clone()),
+                label: Set(variable.label.clone()),
+                kind: Set(variable.kind.as_str().to_string()),
+                fact: Set(variable.fact.clone()),
+                filter: Set(variable.filter.clone()),
+                ..Default::default()
+            };
+            dashboard_variable::Entity::insert(row)
+                .exec(&transaction)
+                .await
+                .context("saving variables")?;
+        }
+        record(&transaction, dashboard_id, Some(&before)).await?;
+        transaction.commit().await.context("saving variables")?;
+        Ok(true)
     }
 
     /// Moves widgets together, so a layout is never left half saved. Widgets that

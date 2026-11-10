@@ -15,6 +15,7 @@ mod audit_entry;
 mod config_rule;
 mod config_rule_setting;
 mod dashboard;
+mod dashboard_variable;
 mod dashboard_widget;
 mod dashboards;
 mod location_rule;

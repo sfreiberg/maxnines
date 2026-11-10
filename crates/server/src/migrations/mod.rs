@@ -34,6 +34,7 @@ impl MigratorTrait for Migrator {
             Box::new(AddTwoFactor),
             Box::new(AddChannelRequests),
             Box::new(AddForecasts),
+            Box::new(CreateDashboardVariables),
         ]
     }
 }
@@ -2510,6 +2511,103 @@ impl MigrationTrait for AddForecasts {
                 .await?;
         }
         Ok(())
+    }
+}
+
+// ---- Dashboard variables
+
+struct CreateDashboardVariables;
+
+impl MigrationName for CreateDashboardVariables {
+    fn name(&self) -> &str {
+        "m20261110_000023_create_dashboard_variables"
+    }
+}
+
+#[derive(Iden)]
+enum DashboardVariables {
+    Table,
+    Id,
+    DashboardId,
+    /// Where its picker sits, counting from 0 on the left.
+    Position,
+    /// Written as `$name` in a widget's filter and title.
+    Name,
+    Label,
+    /// `machine` or `fact`.
+    Kind,
+    /// The fact whose values a fact variable offers. Empty for a machine.
+    Fact,
+    /// Which machines it offers, in the host list's filter.
+    Filter,
+}
+
+/// Pickers at the top of a dashboard, so one dashboard can show any machine.
+#[async_trait::async_trait]
+impl MigrationTrait for CreateDashboardVariables {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(DashboardVariables::Table)
+                    .col(id(DashboardVariables::Id))
+                    .col(
+                        ColumnDef::new(DashboardVariables::DashboardId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(DashboardVariables::Position)
+                            .integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(DashboardVariables::Name)
+                            .string_len(32)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(DashboardVariables::Label)
+                            .string_len(100)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(DashboardVariables::Kind)
+                            .string_len(16)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(DashboardVariables::Fact)
+                            .string_len(200)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(DashboardVariables::Filter)
+                            .string_len(500)
+                            .not_null(),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(DashboardVariables::Table, DashboardVariables::DashboardId)
+                            .to(Dashboards::Table, Dashboards::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_dashboard_variables_dashboard")
+                    .table(DashboardVariables::Table)
+                    .col(DashboardVariables::DashboardId)
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        drop_tables(manager, &["dashboard_variables"]).await
     }
 }
 

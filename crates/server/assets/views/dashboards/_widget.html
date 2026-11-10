@@ -2,7 +2,9 @@
   <h2>{{ widget.title }}</h2>
   {% if edit_url %}<a href="{{ edit_url }}">Edit</a>{% endif %}
 </div>
-{% if widget.failed %}
+{% if widget.missing %}
+<p class="empty">{{ widget.missing }}</p>
+{% elif widget.failed %}
 <p class="error">This widget couldn't be read. Check the server's log.</p>
 {% elif not chart.has_data %}
 <p class="empty">No data in this range.</p>
