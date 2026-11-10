@@ -53,7 +53,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # The build goes where .cargo/config.toml says, not ./target. A run whose
+      # tests fail still saves what it built, which is the slow part.
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target.nosync"
+          cache-on-failure: true
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # Every crate's tests run, so one run shows every failure.
       - run: cargo test --workspace --locked --no-fail-fast

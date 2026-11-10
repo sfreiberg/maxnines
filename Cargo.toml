@@ -25,6 +25,15 @@ tokio-tungstenite = "0.30.0"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
+# Debug builds, which the tests use, keep line numbers for our own code, so a
+# panic still says where. Full debug info, mostly for dependencies, made builds
+# many times larger and slower to link.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 opt-level = 3
 lto = "fat"
