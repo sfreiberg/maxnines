@@ -15,8 +15,10 @@ use crate::alerting::{
     AlertRuleInput, Channel, ChannelInput, ChannelKind, Comparison, Delivery, Event, NewAlert,
     RuleKind, Severity, check_rule,
 };
+use crate::channels::email::Mailer;
+use crate::channels::slack::{ACKNOWLEDGE_ACTION, SILENCE_HOUR_ACTION};
 use crate::metrics::{Metric, NewestReading};
-use crate::notifier::{ACKNOWLEDGE_ACTION, Mailer, Notice, Notifier, SILENCE_HOUR_ACTION, Senders};
+use crate::notifier::{Notice, Notifier, Senders};
 use crate::slack_actions::SlackActions;
 use hyper_util::client::legacy::connect::HttpConnector;
 use slack_morphism::SlackClient;
@@ -2094,7 +2096,7 @@ async fn the_channel_form_offers_what_alertops_needs_to_map_from() {
             "{choice}"
         );
     }
-    let sample = crate::notifier::alertops_sample();
+    let sample = crate::channels::alertops::sample();
     let docs = include_str!("../../../../docs/notifications.md");
     for line in sample.lines() {
         assert!(

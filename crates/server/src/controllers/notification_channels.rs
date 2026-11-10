@@ -12,6 +12,7 @@ use serde::Serialize;
 use super::{CsrfForm, Page, server_error};
 use crate::alerting::{Channel, ChannelInput, ChannelKind, Severity};
 use crate::app_state::AppState;
+use crate::channels;
 use crate::notifier::{self, Notice};
 
 pub fn routes() -> Router<AppState> {
@@ -64,15 +65,7 @@ impl ChannelForm {
     }
 
     fn from_channel(channel: &ChannelInput) -> Self {
-        let hidden = matches!(
-            channel.kind,
-            ChannelKind::Webhook
-                | ChannelKind::Discord
-                | ChannelKind::Teams
-                | ChannelKind::PagerDuty
-                | ChannelKind::AlertOps
-                | ChannelKind::Signl4
-        );
+        let hidden = channels::of(channel.kind).hides_target();
         Self {
             name: channel.name.clone(),
             kind: channel.kind.as_str().to_string(),
@@ -127,7 +120,7 @@ impl ChannelForm {
         };
         let typed = self.app_token.trim();
         let app_token = match saved {
-            _ if kind != ChannelKind::Slack || self.remove_app_token => None,
+            _ if !channels::of(kind).takes_app_token() || self.remove_app_token => None,
             _ if !typed.is_empty() => Some(typed.to_string()),
             Some(saved) if saved.kind == kind => saved.app_token.clone(),
             _ => None,
@@ -154,6 +147,8 @@ struct ChannelRow {
     id: i64,
     name: String,
     kind: &'static str,
+    /// What the kind is called.
+    kind_name: &'static str,
     target: String,
     /// A plain webhook into Slack, which Slack is moving away from.
     legacy_slack: bool,
@@ -166,6 +161,7 @@ impl From<Channel> for ChannelRow {
         Self {
             id: channel.id,
             kind: channel.channel.kind.as_str(),
+            kind_name: channels::of(channel.channel.kind).name(),
             target: channel.channel.target_preview(),
             legacy_slack: channel.channel.kind == ChannelKind::Webhook
                 && channel.channel.target.contains("hooks.slack.com"),
@@ -202,6 +198,13 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
     index_page(&state, &token, None, None).await
 }
 
+/// A kind of channel to choose from on the form.
+#[derive(Serialize)]
+struct KindChoice {
+    value: &'static str,
+    name: &'static str,
+}
+
 fn form_page(
     state: &AppState,
     token: &CsrfToken,
@@ -209,12 +212,20 @@ fn form_page(
     form: &ChannelForm,
     error: Option<&str>,
 ) -> Response {
+    let kinds: Vec<KindChoice> = channels::ALL
+        .into_iter()
+        .map(|kind| KindChoice {
+            value: kind.as_str(),
+            name: channels::of(kind).name(),
+        })
+        .collect();
     let page = Page::new(state, token, "notification_channels/form.html")
         .with("id", &id)
         .with("channel", form)
-        .with("alertops_sample", &notifier::alertops_sample())
-        .with("slack_manifest", &notifier::slack_manifest())
-        .with("slack_manifest_link", &notifier::slack_manifest_link())
+        .with("kinds", &kinds)
+        .with("alertops_sample", &channels::alertops::sample())
+        .with("slack_manifest", &channels::slack::manifest())
+        .with("slack_manifest_link", &channels::slack::manifest_link())
         .with("email_ready", &state.senders.mailer.is_some())
         .with("error", &error);
     match error {
@@ -282,7 +293,7 @@ async fn update(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfFo
         Err(error) => {
             let message = format!("{error:#}");
             if saved.channel.kind.as_str() == fields.kind
-                && saved.channel.kind != ChannelKind::Email
+                && channels::of(saved.channel.kind).hides_target()
             {
                 fields.preview = Some(saved.channel.target_preview());
             }

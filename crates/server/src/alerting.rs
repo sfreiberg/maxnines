@@ -5,13 +5,12 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use axum::http::Uri;
 use cel::Program;
-use lettre::Address;
 use serde::{Deserialize, Serialize};
 use wildmatch::WildMatch;
 
 use crate::calculations::{Calculation, Grouping, Question};
+use crate::channels;
 use crate::metric_charts::format_value;
 use crate::metrics::{self, Metric, Source, Unit};
 
@@ -26,20 +25,10 @@ const MAX_TARGET_LEN: usize = 2048;
 /// rule can take to resolve, since the two match.
 const MAX_FOR_SECS: u64 = 7 * 86_400;
 
-const MAX_RECIPIENTS: usize = 20;
-
 /// A calculation needs a finished minute to look at.
 const MIN_WINDOW_SECS: u64 = 60;
 const MAX_WINDOW_SECS: u64 = 86_400;
 const DEFAULT_WINDOW_SECS: u64 = 300;
-
-/// Where Discord's webhooks live, including its test builds and older domain.
-const DISCORD_HOSTS: [&str; 4] = [
-    "discord.com",
-    "discordapp.com",
-    "ptb.discord.com",
-    "canary.discord.com",
-];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -493,12 +482,12 @@ pub enum ChannelKind {
 impl ChannelKind {
     /// Whether it needs a token beside its destination.
     pub fn has_credential(self) -> bool {
-        matches!(self, Self::Slack | Self::Telegram)
+        channels::of(self).has_credential()
     }
 
     /// Whether the service keeps after people itself until someone responds.
     pub fn is_on_call(self) -> bool {
-        matches!(self, Self::PagerDuty | Self::AlertOps | Self::Signl4)
+        channels::of(self).is_on_call()
     }
 
     pub fn as_str(self) -> &'static str {
@@ -516,18 +505,10 @@ impl ChannelKind {
     }
 
     pub fn parse(text: &str) -> Result<Self> {
-        match text {
-            "webhook" => Ok(Self::Webhook),
-            "email" => Ok(Self::Email),
-            "discord" => Ok(Self::Discord),
-            "slack" => Ok(Self::Slack),
-            "pagerduty" => Ok(Self::PagerDuty),
-            "alertops" => Ok(Self::AlertOps),
-            "signl4" => Ok(Self::Signl4),
-            "telegram" => Ok(Self::Telegram),
-            "teams" => Ok(Self::Teams),
-            other => bail!("unknown channel kind {other:?}"),
-        }
+        channels::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == text)
+            .with_context(|| format!("unknown channel kind {text:?}"))
     }
 }
 
@@ -572,8 +553,9 @@ pub fn check_channel(channel: &ChannelInput) -> Result<()> {
         !channel.severities.is_empty(),
         "choose warnings, critical alerts or both"
     );
+    let kind = channels::of(channel.kind);
     ensure!(
-        channel.app_token.is_none() || channel.kind == ChannelKind::Slack,
+        channel.app_token.is_none() || kind.takes_app_token(),
         "only Slack channels take an app-level token"
     );
     ensure!(
@@ -584,219 +566,13 @@ pub fn check_channel(channel: &ChannelInput) -> Result<()> {
         channel.target.len() <= MAX_TARGET_LEN,
         "the channel's destination is too long"
     );
-    match channel.kind {
-        ChannelKind::Webhook => {
-            webhook_host(&channel.target)?;
-        }
-        ChannelKind::Discord => check_discord_url(&channel.target)?,
-        ChannelKind::Teams => check_teams_url(&channel.target)?,
-        ChannelKind::Slack => check_slack(channel)?,
-        ChannelKind::Telegram => check_telegram(channel)?,
-        ChannelKind::PagerDuty => check_pagerduty_key(&channel.target)?,
-        ChannelKind::AlertOps => check_service_url(
-            &channel.target,
-            ".alertops.com",
-            "/POSTAlert/",
-            "that doesn't look like an AlertOps integration URL, which looks like \
-             https://notify.alertops.com/POSTAlert/ followed by its token",
-        )?,
-        ChannelKind::Signl4 => check_service_url(
-            &channel.target,
-            ".signl4.com",
-            "/webhook/",
-            "that doesn't look like a SIGNL4 webhook URL, which is \
-             https://connect.signl4.com/webhook/ followed by your secret",
-        )?,
-        ChannelKind::Email => {
-            let recipients = recipients(&channel.target)?;
-            ensure!(!recipients.is_empty(), "add at least one email address");
-            ensure!(
-                recipients.len() <= MAX_RECIPIENTS,
-                "a channel can have at most {MAX_RECIPIENTS} email addresses"
-            );
-        }
-    }
-    Ok(())
-}
-
-/// How long PagerDuty's integration keys are.
-const PAGERDUTY_KEY_LEN: usize = 32;
-
-/// Says what's wrong without repeating the key, as this ends up on the page.
-fn check_pagerduty_key(key: &str) -> Result<()> {
-    ensure!(
-        key.len() == PAGERDUTY_KEY_LEN && key.chars().all(|c| c.is_ascii_alphanumeric()),
-        "that doesn't look like a PagerDuty integration key, which is \
-         {PAGERDUTY_KEY_LEN} letters and numbers"
-    );
-    Ok(())
-}
-
-/// Slack's own limit on a channel name, plus its leading `#`.
-const MAX_SLACK_CHANNEL_LEN: usize = 81;
-
-fn check_slack(channel: &ChannelInput) -> Result<()> {
-    let target = channel.target.trim();
-    ensure!(
-        !target.is_empty()
-            && target.len() <= MAX_SLACK_CHANNEL_LEN
-            && !target.contains(char::is_whitespace),
-        "enter a Slack channel, such as #alerts or C0123456789"
-    );
-    let token = channel.credential.as_deref().unwrap_or_default();
-    ensure!(
-        token.starts_with("xoxb-"),
-        "enter the app's bot token, which starts with xoxb-"
-    );
-    if let Some(token) = &channel.app_token {
-        ensure!(
-            token.trim().starts_with("xapp-"),
-            "the app-level token starts with xapp-. Leave it empty for messages without buttons"
-        );
-    }
-    Ok(())
-}
-
-/// Telegram's limits on a public channel's or group's username.
-const TELEGRAM_USERNAME_LEN: std::ops::RangeInclusive<usize> = 5..=32;
-
-/// A chat's number, which is negative for groups and channels, or the `@username`
-/// of a public one.
-fn is_telegram_chat(target: &str) -> bool {
-    match target.strip_prefix('@') {
-        Some(name) => {
-            TELEGRAM_USERNAME_LEN.contains(&name.len())
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        }
-        None => target.parse::<i64>().is_ok_and(|id| id != 0),
-    }
-}
-
-/// The bot's number, a colon, and its secret. Errors don't repeat the token.
-fn is_telegram_token(token: &str) -> bool {
-    let Some((bot, secret)) = token.split_once(':') else {
-        return false;
-    };
-    !bot.is_empty()
-        && bot.chars().all(|c| c.is_ascii_digit())
-        && secret.len() >= 30
-        && secret
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-}
-
-fn check_telegram(channel: &ChannelInput) -> Result<()> {
-    ensure!(
-        is_telegram_chat(channel.target.trim()),
-        "enter a Telegram chat ID, such as -1001234567890, or a public channel such as \
-         @alerts"
-    );
-    ensure!(
-        is_telegram_token(channel.credential.as_deref().unwrap_or_default().trim()),
-        "enter the bot token from BotFather, which is a number, a colon, then a long code"
-    );
-    Ok(())
-}
-
-/// Catches pasting the wrong thing here, which would otherwise only show up when
-/// the first alert failed to arrive. Errors don't repeat the URL.
-fn check_discord_url(url: &str) -> Result<()> {
-    let uri: Uri = url
-        .trim()
-        .parse()
-        .map_err(|_| anyhow!("the Discord webhook URL isn't valid"))?;
-    let host = uri.host().unwrap_or_default();
-    ensure!(
-        uri.scheme_str() == Some("https")
-            && DISCORD_HOSTS.contains(&host)
-            && uri.path().starts_with("/api/webhooks/"),
-        "that doesn't look like a Discord webhook URL, which starts with \
-         https://discord.com/api/webhooks/"
-    );
-    Ok(())
-}
-
-/// Where Teams workflows take requests: Power Automate's older and newer addresses.
-const TEAMS_HOSTS: [&str; 2] = [".logic.azure.com", ".powerplatform.com"];
-
-/// Catches pasting the wrong thing, such as a retired Office 365 connector's URL.
-/// Errors don't repeat the URL, which holds a signature that works like a password.
-fn check_teams_url(url: &str) -> Result<()> {
-    let complaint = "that doesn't look like the URL of a Teams workflow, which comes from \
-                     its \"When a Teams webhook request is received\" step";
-    let uri: Uri = url.trim().parse().map_err(|_| anyhow!("{complaint}"))?;
-    let host = uri.host().unwrap_or_default();
-    ensure!(
-        uri.scheme_str() == Some("https")
-            && TEAMS_HOSTS.iter().any(|end| host.ends_with(end))
-            && uri.path().contains("/workflows/"),
-        "{complaint}"
-    );
-    Ok(())
-}
-
-/// A URL from an on-call service, which has a secret after `path`. `complaint` is
-/// fixed text, as the URL itself mustn't end up on the page.
-fn check_service_url(url: &str, domain: &str, path: &str, complaint: &str) -> Result<()> {
-    let uri: Uri = url.trim().parse().map_err(|_| anyhow!("{complaint}"))?;
-    let secret = uri.path().strip_prefix(path).unwrap_or_default();
-    ensure!(
-        uri.scheme_str() == Some("https")
-            && uri.host().unwrap_or_default().ends_with(domain)
-            && !secret.is_empty(),
-        "{complaint}"
-    );
-    Ok(())
-}
-
-/// The part of a webhook's URL that's safe to show. Errors don't repeat the URL.
-fn webhook_host(url: &str) -> Result<String> {
-    let uri: Uri = url
-        .trim()
-        .parse()
-        .map_err(|_| anyhow!("the webhook URL isn't valid"))?;
-    let scheme = uri.scheme_str().unwrap_or_default();
-    ensure!(
-        matches!(scheme, "http" | "https"),
-        "the webhook URL must start with http:// or https://"
-    );
-    let host = uri.host().context("the webhook URL needs a host")?;
-    Ok(format!("{scheme}://{host}"))
-}
-
-/// Email addresses separated by commas.
-pub fn recipients(target: &str) -> Result<Vec<Address>> {
-    target
-        .split(',')
-        .map(str::trim)
-        .filter(|address| !address.is_empty())
-        .map(|address| {
-            address
-                .parse()
-                .map_err(|_| anyhow!("{address:?} isn't a valid email address"))
-        })
-        .collect()
+    kind.check(channel)
 }
 
 impl ChannelInput {
     /// Enough to recognize a channel, without giving away a webhook's secret.
     pub fn target_preview(&self) -> String {
-        match self.kind {
-            ChannelKind::Webhook
-            | ChannelKind::Discord
-            | ChannelKind::Teams
-            | ChannelKind::AlertOps
-            | ChannelKind::Signl4 => webhook_host(&self.target)
-                .map_or_else(|_| "Unknown".to_string(), |host| format!("{host}/…")),
-            ChannelKind::Email | ChannelKind::Slack | ChannelKind::Telegram => self.target.clone(),
-            ChannelKind::PagerDuty => {
-                let start = self.target.len().saturating_sub(4);
-                format!(
-                    "Key ending {}",
-                    self.target.get(start..).unwrap_or_default()
-                )
-            }
-        }
+        channels::of(self.kind).preview(&self.target)
     }
 }
 
@@ -1498,7 +1274,7 @@ mod tests {
         assert!(check_channel(&email("")).is_err());
         assert!(check_channel(&email(" , ")).is_err());
         assert!(check_channel(&email("not an address")).is_err());
-        let many = vec!["a@example.com"; MAX_RECIPIENTS + 1].join(",");
+        let many = vec!["a@example.com"; crate::channels::email::MAX_RECIPIENTS + 1].join(",");
         assert!(check_channel(&email(&many)).is_err());
     }
 

@@ -30,11 +30,12 @@ use anyhow::anyhow;
 use slack_morphism::errors::SlackClientError;
 
 use crate::alerting::{Alert, ChannelKind, Event};
+use crate::channels::slack::{
+    self, ACKNOWLEDGE_ACTION, SILENCE_HOUR_ACTION, SlackControls, explain as explain_slack,
+};
 use crate::metrics::now_ms;
 use crate::models::Database;
-use crate::notifier::{
-    self, ACKNOWLEDGE_ACTION, Notice, SILENCE_HOUR_ACTION, SlackControls, explain_slack, format_ms,
-};
+use crate::notifier::{Notice, format_ms};
 use crate::silences::{self, ActiveSilences, Cover};
 
 const SILENCE_SECS: u64 = 3600;
@@ -187,7 +188,7 @@ impl SlackActions {
         let chart = event
             .message
             .as_ref()
-            .and_then(|message| notifier::slack_chart(&message.content));
+            .and_then(|message| slack::chart_in(&message.content));
         Ok(Some(Reply::Replace(
             self.content(&alert, now, chart.as_ref()).await?,
         )))
@@ -240,7 +241,7 @@ impl SlackActions {
         };
         let notice = Notice::for_alert(alert.clone(), event);
         let controls = SlackControls { silenced };
-        Ok(notifier::slack_content(
+        Ok(slack::content(
             &notice,
             self.web_url.as_deref(),
             Some(&controls),
@@ -433,7 +434,7 @@ async fn listen(
     web_url: Option<&String>,
     (app_token, bot_token): &AppTokens,
 ) -> Result<Listener> {
-    let client = Arc::new(SlackClient::new(notifier::slack_connector()?));
+    let client = Arc::new(SlackClient::new(slack::connector()?));
     check_app_token(&client, app_token).await?;
 
     let actions = Arc::new(SlackActions::new(

@@ -8,6 +8,8 @@ homepage.workspace = true
 description = "MaxNines monitoring server"
 
 [dependencies]
+# Lets each kind of notification channel send in its own way behind one trait.
+async-trait = "0.1"
 anyhow.workspace = true
 clap.workspace = true
 axum = { version = "0.8.9", features = ["ws"] }

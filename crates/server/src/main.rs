@@ -4,6 +4,7 @@ mod alert_evaluator;
 mod alerting;
 mod app_state;
 mod calculations;
+mod channels;
 mod cli;
 mod condition_builder;
 mod config;
@@ -52,6 +53,7 @@ use tracing::info;
 
 use alert_evaluator::Evaluator;
 use app_state::{AppState, Heartbeat};
+use channels::email::Mailer;
 use config::Config;
 use maxnines_protocol::logging;
 #[cfg(windows)]
@@ -59,7 +61,7 @@ use maxnines_protocol::service::{self, Service, ServiceCommand};
 use maxnines_protocol::stopping::StopSignal;
 use metrics::{Metrics, now_ms};
 use models::Database;
-use notifier::{Mailer, Notifier, Senders, web_url};
+use notifier::{Notifier, Senders, web_url};
 use presence::Presence;
 use registration::{Registry, Rules};
 use remote_checks::{LOCAL_AGENT_ID, LatestResults, Scheduler};

@@ -3216,6 +3216,7 @@ version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "argon2",
+ "async-trait",
  "axum",
  "axum-server",
  "axum_csrf",

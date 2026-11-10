@@ -16,15 +16,9 @@
 
   <label>Type
     <select name="kind">
-      <option value="webhook"{% if channel.kind == "webhook" %} selected{% endif %}>Webhook</option>
-      <option value="email"{% if channel.kind == "email" %} selected{% endif %}>Email</option>
-      <option value="discord"{% if channel.kind == "discord" %} selected{% endif %}>Discord</option>
-      <option value="slack"{% if channel.kind == "slack" %} selected{% endif %}>Slack</option>
-      <option value="pagerduty"{% if channel.kind == "pagerduty" %} selected{% endif %}>PagerDuty</option>
-      <option value="alertops"{% if channel.kind == "alertops" %} selected{% endif %}>AlertOps</option>
-      <option value="signl4"{% if channel.kind == "signl4" %} selected{% endif %}>SIGNL4</option>
-      <option value="teams"{% if channel.kind == "teams" %} selected{% endif %}>Microsoft Teams</option>
-      <option value="telegram"{% if channel.kind == "telegram" %} selected{% endif %}>Telegram</option>
+      {% for kind in kinds %}
+      <option value="{{ kind.value }}"{% if channel.kind == kind.value %} selected{% endif %}>{{ kind.name }}</option>
+      {% endfor %}
     </select>
     {% if not email_ready %}<small>Email needs an <code>email</code> block in the server config.</small>{% endif %}
   </label>
