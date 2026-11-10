@@ -176,6 +176,19 @@ impl ActiveSilences {
         Ok(Self { quiet, facts })
     }
 
+    /// Whatever holds back every alert about a machine for longest, whichever rule
+    /// it's from.
+    pub fn covering_machine(&self, agent_id: &str, host: &str) -> Option<Cover> {
+        let covers = |entry: &&Quiet| {
+            entry.rule_id.is_none()
+                && entry
+                    .filter
+                    .as_ref()
+                    .is_none_or(|filter| filter.matches(agent_id, host, self.facts.get(agent_id)))
+        };
+        self.quiet.iter().find(covers).map(|entry| entry.cover)
+    }
+
     /// Whatever covers an alert for longest. A group's alert has no host to compare, so
     /// a filter never covers one.
     pub fn covering(&self, alert: &Alert) -> Option<Cover> {

@@ -552,3 +552,8 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .body-preview pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 .variables dt { margin-top: 0.5rem; }
 .variables dd { margin: 0.125rem 0 0; color: var(--muted); }
+
+/* Quieting a machine from its page: the choices on one line where there's room. */
+.maintenance-form { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: flex-end; }
+.maintenance-form label { flex: 1 1 12rem; margin: 0; }
+.maintenance .hint { margin: 0.75rem 0 0; }

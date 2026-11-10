@@ -26,6 +26,7 @@ use crate::metrics::now_ms;
 use crate::models::ConfigStatus;
 use crate::registration::{AgentRecord, AgentState, short_id};
 use crate::rule_engine;
+use crate::silences::{ActiveSilences, Cover, SilenceInput};
 use crate::times::format_time;
 
 pub fn routes() -> Router<AppState> {
@@ -36,6 +37,8 @@ pub fn routes() -> Router<AppState> {
         .route("/agents/{id}/approve", post(approve))
         .route("/agents/{id}/revoke", post(revoke))
         .route("/agents/{id}/delete", post(delete))
+        .route("/agents/{id}/maintenance", post(start_maintenance))
+        .route("/agents/{id}/maintenance/end", post(end_maintenance))
 }
 
 #[derive(Serialize)]
@@ -520,6 +523,18 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         place: rule.rule.place.clone(),
         just_this_one: rule.rule.filter == own_filter,
     });
+    let maintenance = match maintenance_of(&state, &agent).await {
+        Ok(maintenance) => maintenance,
+        Err(error) => return server_error(&error),
+    };
+    let choices: Vec<MaintenanceChoice> = MAINTENANCE_CHOICES
+        .iter()
+        .map(|(secs, label)| MaintenanceChoice {
+            secs: *secs,
+            label,
+            chosen: *secs == DEFAULT_MAINTENANCE_SECS,
+        })
+        .collect();
     let presence = state.presence.get(&id);
     let config = serde_json::to_string_pretty(&desired.config).unwrap_or_default();
     let zone = viewer_zone();
@@ -555,6 +570,8 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
             &own_memory.map(|bytes| format_value(Unit::Bytes, bytes)),
         )
         .with("location", &location)
+        .with("maintenance", &maintenance)
+        .with("maintenance_choices", &choices)
         .with("os", &os_of(&flat))
         .with("os_family", &OsFamily::of(&flat))
         .with("source", &presence.map(|p| p.source.to_string()))
@@ -568,6 +585,144 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         .with("reported", &reported)
         .with("history", &changes)
         .render()
+}
+
+/// How long maintenance can be started for from a machine's page, in seconds, with
+/// what the page calls each. Anything else goes through Silences.
+const MAINTENANCE_CHOICES: [(u64, &str); 6] = [
+    (1800, "30 minutes"),
+    (3600, "1 hour"),
+    (2 * 3600, "2 hours"),
+    (4 * 3600, "4 hours"),
+    (8 * 3600, "8 hours"),
+    (86_400, "1 day"),
+];
+const DEFAULT_MAINTENANCE_SECS: u64 = 3600;
+
+/// What's holding back this machine's notifications, for its page.
+#[derive(Serialize)]
+struct Maintenance {
+    until: String,
+    /// The silence's reason, or the maintenance window's name.
+    why: String,
+    by: Option<String>,
+    /// Started for this machine alone, so its page can end it.
+    just_this_one: bool,
+    window: bool,
+}
+
+#[derive(Serialize)]
+struct MaintenanceChoice {
+    secs: u64,
+    label: &'static str,
+    chosen: bool,
+}
+
+/// What's keeping all of this machine's alerts quiet, if anything is. A silence
+/// for some rules only doesn't count, as the machine isn't quiet.
+async fn maintenance_of(state: &AppState, agent: &AgentRecord) -> Result<Option<Maintenance>> {
+    let now = now_ms();
+    let active = ActiveSilences::load(&state.database, now).await?;
+    let Some(cover) = active.covering_machine(&agent.id, &agent.host) else {
+        return Ok(None);
+    };
+    let until = super::local_time(cover.ends_ms());
+    Ok(match cover {
+        Cover::Silence { id, .. } => {
+            let silences = state.database.active_silences(now).await?;
+            silences
+                .into_iter()
+                .find(|silence| silence.id == id)
+                .map(|silence| Maintenance {
+                    until,
+                    just_this_one: silence.filter == host_filter::only(&agent.id),
+                    why: silence.reason,
+                    by: Some(silence.created_by),
+                    window: false,
+                })
+        }
+        Cover::Window { id, .. } => {
+            let windows = state.database.list_maintenance_windows().await?;
+            windows
+                .into_iter()
+                .find(|window| window.id == id)
+                .map(|window| Maintenance {
+                    until,
+                    why: window.window.name,
+                    by: None,
+                    just_this_one: false,
+                    window: true,
+                })
+        }
+    })
+}
+
+/// Holds back every notification about this machine for a while, with a silence
+/// of its own, so the Silences page shows it like any other.
+async fn start_maintenance(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    form: CsrfForm,
+) -> Response {
+    let Some(agent) = state
+        .registry
+        .get(&id)
+        .await
+        .filter(|agent| !agent.is_local())
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let duration_secs = form
+        .fields
+        .get("duration_secs")
+        .and_then(|secs| secs.parse().ok())
+        .filter(|secs| MAINTENANCE_CHOICES.iter().any(|(choice, _)| choice == secs));
+    let Some(duration_secs) = duration_secs else {
+        return (StatusCode::BAD_REQUEST, "Choose how long from the list.").into_response();
+    };
+    let reason = form.fields.get("reason").map(|reason| reason.trim());
+    let reason = match reason {
+        Some(reason) if !reason.is_empty() => reason.to_string(),
+        _ => format!("Maintenance on {}", agent.host),
+    };
+    let input = SilenceInput {
+        rule_id: None,
+        filter: host_filter::only(&agent.id),
+        reason,
+        duration_secs,
+    };
+    if let Err(error) = state.check_silence(&input).await {
+        return (StatusCode::UNPROCESSABLE_ENTITY, format!("{error:#}")).into_response();
+    }
+    let by = signed_in_user().map_or_else(|| "admin".to_string(), |user| user.email.clone());
+    match state.database.create_silence(&input, &by, now_ms()).await {
+        Ok(_) => (form.token, Redirect::to(&format!("/agents/{id}"))).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// Ends the silences started for this machine alone. Wider ones, and maintenance
+/// windows, are left to their own pages.
+async fn end_maintenance(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    form: CsrfForm,
+) -> Response {
+    let now = now_ms();
+    let silences = match state.database.active_silences(now).await {
+        Ok(silences) => silences,
+        Err(error) => return server_error(&error),
+    };
+    let own = host_filter::only(&id);
+    for silence in silences
+        .iter()
+        .filter(|silence| silence.rule_id.is_none() && silence.filter == own)
+    {
+        if let Err(error) = state.database.end_silence(silence.id, now).await {
+            return server_error(&error);
+        }
+    }
+    (form.token, Redirect::to(&format!("/agents/{id}"))).into_response()
 }
 
 async fn approve(state: State<AppState>, id: Path<String>, form: CsrfForm) -> Response {

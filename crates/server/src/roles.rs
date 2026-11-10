@@ -77,7 +77,9 @@ const ADMIN_ONLY: [&str; 4] = [
 const OWN: [&str; 4] = ["/profile", "/logout", "/settings/api-keys", "/api-keys"];
 
 /// Dealing with alerts as they happen: acknowledging them and silencing them.
-const RESPONDING: [&str; 7] = [
+const RESPONDING: [&str; 9] = [
+    "/agents/{id}/maintenance",
+    "/agents/{id}/maintenance/end",
     "/alerts/{id}/acknowledge",
     "/alerts/{id}/unacknowledge",
     "/alerts/silences",

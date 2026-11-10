@@ -624,6 +624,16 @@ already told about an alert still hears when it ends.
 
 Deleting a rule deletes its silences too.
 
+**Start maintenance** on a machine's page is a silence with no `rule_id` and the filter
+`id=` followed by the agent's ID, so the same request does it through the API:
+
+```sh
+curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"filter": "id=7f3c2a9e5b1d4c6a", "reason": "Rebooting", "duration_secs": 3600}' \
+  "$MAXNINES_URL/api/v1/silences"
+```
+
 ### List silences
 
 `GET /api/v1/silences`

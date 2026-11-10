@@ -7832,3 +7832,187 @@ async fn a_forecast_rule_can_be_made_on_the_form_and_through_the_api() {
     assert_eq!(status, 422, "{refused}");
     assert!(refused.to_string().contains("how far ahead"), "{refused}");
 }
+
+/// An alert about this machine, to see whether it'd be held back.
+fn alert_about(agent_id: &str, rule_id: i64) -> crate::alerting::Alert {
+    crate::alerting::Alert {
+        agent_id: agent_id.to_string(),
+        rule_id: Some(rule_id),
+        ..crate::channels::testing::alert()
+    }
+}
+
+async fn held(server: &TestServer, alert: &crate::alerting::Alert) -> bool {
+    let active = crate::silences::ActiveSilences::load(&server.state.database, now_ms())
+        .await
+        .unwrap();
+    active.covering(alert).is_some()
+}
+
+#[tokio::test]
+async fn a_machine_can_be_quieted_from_its_page_and_brought_back() {
+    let server = start().await;
+    let agent = identity();
+    let _client = server.connect_approved(&agent, "web-1").await;
+    let other = identity();
+    let _other_client = server.connect_approved(&other, "web-2").await;
+    let id = agent.id();
+    let page_path = format!("/agents/{id}");
+    let mut browser = Browser::default();
+
+    let page = browser.get(&server, &page_path).await;
+    assert!(page.body.contains("Start maintenance"), "{}", page.body);
+    assert!(
+        page.body
+            .contains(r#"<option value="3600" selected>1 hour</option>"#)
+    );
+
+    let fields = [("duration_secs", "7200"), ("reason", "")];
+    let page = browser
+        .submit(
+            &server,
+            &page_path,
+            &format!("/agents/{id}/maintenance"),
+            &fields,
+        )
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+
+    let silences = server
+        .state
+        .database
+        .active_silences(now_ms())
+        .await
+        .unwrap();
+    let [silence] = &silences[..] else {
+        panic!("{silences:?}");
+    };
+    assert_eq!(silence.rule_id, None);
+    assert_eq!(silence.filter, crate::host_filter::only(&id));
+    assert_eq!(silence.reason, "Maintenance on web-1");
+    assert_eq!(silence.ends_ms - silence.starts_ms, 2 * 3600 * 1000);
+    assert!(held(&server, &alert_about(&id, 1)).await);
+    assert!(!held(&server, &alert_about(&other.id(), 1)).await);
+
+    // The page says so, and offers to end it, with no second one to start.
+    let page = browser.get(&server, &page_path).await;
+    assert!(
+        page.body
+            .contains("Notifications about this machine are held until"),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains("Maintenance on web-1, started by"));
+    assert!(page.body.contains("End now"));
+    assert!(!page.body.contains("Start maintenance"));
+    // It's an ordinary silence, so it's on the Silences page too.
+    let page = browser.get(&server, "/alerts/silences").await;
+    assert!(page.body.contains("Maintenance on web-1"), "{}", page.body);
+
+    let page = browser
+        .submit(
+            &server,
+            &page_path,
+            &format!("/agents/{id}/maintenance/end"),
+            &[],
+        )
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    assert!(
+        server
+            .state
+            .database
+            .active_silences(now_ms())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!held(&server, &alert_about(&id, 1)).await);
+    let page = browser.get(&server, &page_path).await;
+    assert!(page.body.contains("Start maintenance"), "{}", page.body);
+}
+
+#[tokio::test]
+async fn a_machine_page_names_a_wider_silence_but_leaves_ending_it_to_its_page() {
+    let server = start().await;
+    let agent = identity();
+    let _client = server.connect_approved(&agent, "web-1").await;
+    let id = agent.id();
+    let everything = crate::silences::SilenceInput {
+        rule_id: None,
+        filter: String::new(),
+        reason: "Moving data centres".to_string(),
+        duration_secs: 3600,
+    };
+    server
+        .state
+        .database
+        .create_silence(&everything, "ops@example.com", now_ms())
+        .await
+        .unwrap();
+    // One rule alone doesn't make the machine quiet, so it isn't mentioned.
+    let rule = server
+        .state
+        .database
+        .create_alert_rule(&cpu_rule())
+        .await
+        .unwrap();
+    let one_rule = crate::silences::SilenceInput {
+        rule_id: Some(rule),
+        filter: crate::host_filter::only(&id),
+        reason: "Noisy CPU rule".to_string(),
+        duration_secs: 7200,
+    };
+    server
+        .state
+        .database
+        .create_silence(&one_rule, "ops@example.com", now_ms())
+        .await
+        .unwrap();
+
+    let mut browser = Browser::default();
+    let page_path = format!("/agents/{id}");
+    let page = browser.get(&server, &page_path).await;
+    assert!(
+        page.body
+            .contains("Moving data centres, started by ops@example.com"),
+        "{}",
+        page.body
+    );
+    assert!(!page.body.contains("Noisy CPU rule"));
+    assert!(!page.body.contains("End now"));
+    assert!(page.body.contains(r#"href="/alerts/silences""#));
+
+    // Ending from the machine's page leaves silences it didn't start alone.
+    let page = browser
+        .submit(
+            &server,
+            &page_path,
+            &format!("/agents/{id}/maintenance/end"),
+            &[],
+        )
+        .await;
+    assert_eq!(page.status, 303);
+    assert_eq!(
+        server
+            .state
+            .database
+            .active_silences(now_ms())
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Only the lengths offered can be chosen.
+    let fields = [("duration_secs", "999999"), ("reason", "x")];
+    let page = browser
+        .submit(
+            &server,
+            &page_path,
+            &format!("/agents/{id}/maintenance"),
+            &fields,
+        )
+        .await;
+    assert_eq!(page.status, 400, "{}", page.body);
+}

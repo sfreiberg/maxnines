@@ -557,3 +557,42 @@ async fn the_pages_only_offer_what_a_role_allows() {
         );
     }
 }
+
+#[tokio::test]
+async fn only_a_responder_can_quiet_a_machine() {
+    let server = start().await;
+    let agent = identity();
+    let _client = server.connect_approved(&agent, "web-1").await;
+    let id = agent.id();
+    let page_path = format!("/agents/{id}");
+    let start_path = format!("/agents/{id}/maintenance");
+    let fields = [("duration_secs", "3600"), ("reason", "Rebooting")];
+
+    let mut viewer = browser_as(&server, Role::Viewer).await;
+    let page = viewer.get(&server, &page_path).await;
+    assert!(!page.body.contains("Start maintenance"), "{}", page.body);
+    // The page has no form for them, so the token comes from their profile.
+    let page = viewer
+        .submit(&server, "/profile", &start_path, &fields)
+        .await;
+    assert_eq!(page.status, 403, "{}", page.body);
+    assert!(
+        server
+            .state
+            .database
+            .active_silences(now_ms())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let mut responder = browser_as(&server, Role::Responder).await;
+    let page = responder.get(&server, &page_path).await;
+    assert!(page.body.contains("Start maintenance"), "{}", page.body);
+    let page = responder
+        .submit(&server, &page_path, &start_path, &fields)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    let page = responder.get(&server, &page_path).await;
+    assert!(page.body.contains("End now"), "{}", page.body);
+}

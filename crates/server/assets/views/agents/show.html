@@ -45,6 +45,43 @@
 </section>
 {% endif %}
 
+{% if agent.state == "approved" %}
+<section id="maintenance" class="card maintenance">
+  {% if maintenance %}
+  <div class="problem">
+    <span class="badge warn">Quiet</span>
+    <span class="text">Notifications about this machine are held until {{ maintenance.until }}{% if maintenance.window %}, by the {{ maintenance.why }} maintenance window{% else %}: {{ maintenance.why }}{% if maintenance.by %}, started by {{ maintenance.by }}{% endif %}{% endif %}. Alerts still show here and on the Alerts page, and any still firing then are sent when it ends.</span>
+    {% if maintenance.just_this_one and can_respond %}
+    <form method="post" action="/agents/{{ agent.id }}/maintenance/end" hx-post="/agents/{{ agent.id }}/maintenance/end" hx-target="#maintenance" hx-select="#maintenance" hx-swap="morph:outerHTML">
+      <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+      <button type="submit" class="secondary">End now</button>
+    </form>
+    {% elif maintenance.window %}
+    <a class="button secondary" href="/alerts/maintenance">Maintenance windows</a>
+    {% else %}
+    <a class="button secondary" href="/alerts/silences">Silences</a>
+    {% endif %}
+  </div>
+  {% elif can_respond %}
+  <form method="post" action="/agents/{{ agent.id }}/maintenance" hx-post="/agents/{{ agent.id }}/maintenance" hx-target="#maintenance" hx-select="#maintenance" hx-swap="morph:outerHTML" class="maintenance-form">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <label>Quiet this machine for
+      <select name="duration_secs">
+        {% for choice in maintenance_choices %}
+        <option value="{{ choice.secs }}"{% if choice.chosen %} selected{% endif %}>{{ choice.label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Reason
+      <input type="text" name="reason" maxlength="255" placeholder="Maintenance on {{ agent.host }}" autocomplete="off">
+    </label>
+    <button type="submit" class="secondary">Start maintenance</button>
+  </form>
+  <p class="hint">Holds back every notification about this machine, such as while it's rebooted or upgraded. Alerts still show, and any still firing when it ends are sent then.</p>
+  {% endif %}
+</section>
+{% endif %}
+
 <div class="split">
   <section class="card">
     <h2>Status</h2>

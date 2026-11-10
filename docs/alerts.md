@@ -90,6 +90,14 @@ silence ends, the notifications go out then, and if it ends first, nobody hears 
 Anyone who had already been told about an alert still hears when it ends, which keeps
 on-call services from leaving an incident open.
 
+To quiet one machine, such as while it's rebooted or upgraded, use **Start maintenance**
+on its page under **Agents**. Choose how long, from 30 minutes to a day, and a reason if
+you like. It's a silence for every rule on that machine alone, so it shows under
+**Alerts > Silences** too, and **End now** on the machine's page stops it early. While
+anything holds back all of a machine's notifications, its page says what and until when,
+including a wider silence or a maintenance window, which are ended from their own pages.
+It takes the responder role, like any silence.
+
 A maintenance window is a silence that comes round on a schedule, like Sundays from 02:00
 for two hours. Add one under **Alerts > Silences**, with a time zone so it keeps its place
 in the day when the clocks change.
