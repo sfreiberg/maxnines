@@ -11,7 +11,17 @@ set -euo pipefail
 
 runtime='vcruntime[0-9]*\.dll|msvcp[0-9]*\.dll|api-ms-win-crt-[a-z0-9-]*\.dll|ucrtbase\.dll'
 failed=0
+if [ "$#" -eq 0 ]; then
+  echo "name the programs to check" >&2
+  exit 2
+fi
 for program in "$@"; do
+  # A program that isn't there would otherwise pass, as it names nothing.
+  if [ ! -f "$program" ]; then
+    echo "$program isn't there" >&2
+    failed=1
+    continue
+  fi
   needs=$(grep -aoiE "$runtime" "$program" | sort -fu || true)
   if [ -n "$needs" ]; then
     echo "$program needs the Visual C++ runtime:" >&2

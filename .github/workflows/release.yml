@@ -159,10 +159,6 @@ jobs:
           workspaces: ". -> ${{ env.TARGET_DIR }}"
       - run: cargo build --release --locked -p maxnines-agent -p maxnines-server --target "$TARGET"
       - run: |
-          packaging/check-windows-dlls.sh \
-            "$TARGET_DIR/$TARGET/release/maxnines-agent.exe" \
-            "$TARGET_DIR/$TARGET/release/maxnines-server.exe"
-      - run: |
           for program in maxnines-agent maxnines-server; do
             packaging/archive.sh "$program" "${{ needs.check.outputs.version }}" "$TARGET" dist
           done
@@ -203,6 +199,10 @@ jobs:
             echo "C:\Program Files\LLVM\bin" >> "$GITHUB_PATH"
           fi
       - run: cargo build --release --locked -p maxnines-agent -p maxnines-server --target "$TARGET"
+      - run: |
+          packaging/check-windows-dlls.sh \
+            "$TARGET_DIR/$TARGET/release/maxnines-agent.exe" \
+            "$TARGET_DIR/$TARGET/release/maxnines-server.exe"
       - run: |
           for program in maxnines-agent maxnines-server; do
             packaging/archive.sh "$program" "${{ needs.check.outputs.version }}" "$TARGET" dist
