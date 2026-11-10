@@ -62,3 +62,12 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # Every crate's tests run, so one run shows every failure.
       - run: cargo test --workspace --locked --no-fail-fast
+      # Windows only runs a program whose DLLs it can find. These are on every
+      # Windows machine, so anything else, such as the Visual C++ runtime, means the
+      # programs won't start where it isn't installed.
+      - name: Check the Windows programs need nothing installed
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cargo build --locked -p maxnines-agent -p maxnines-server
+          packaging/check-windows-dlls.sh target.nosync/debug/maxnines-agent.exe target.nosync/debug/maxnines-server.exe
