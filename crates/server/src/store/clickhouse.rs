@@ -1188,11 +1188,17 @@ mod tests {
             .unwrap_or_else(|_| "http://127.0.0.1:18123".to_string())
     }
 
-    /// A name of its own for every test, as tests run at the same time.
+    /// A name of its own for every test, as tests run at the same time. Process IDs
+    /// come round again and databases are left behind, so it has when this run
+    /// started in it too, or a later run could find an old run's rows.
     fn new_database() -> String {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static RUN: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+            let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+            since.map_or(0, |since| since.as_secs())
+        });
         let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        format!("test_{}_{next}", std::process::id())
+        format!("test_{}_{}_{next}", *RUN, std::process::id())
     }
 
     fn opened(database: &str) -> TestStore {

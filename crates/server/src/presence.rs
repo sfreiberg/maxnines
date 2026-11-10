@@ -59,6 +59,19 @@ impl Default for Presence {
     }
 }
 
+#[cfg(test)]
+impl Presence {
+    /// The same allowances, given back by the hour, so a test that uses them up isn't
+    /// handed another by a slow machine taking longer than expected.
+    pub fn refilling_slowly() -> Self {
+        Self {
+            state: Mutex::default(),
+            connections: RateLimiter::keyed(Quota::per_hour(CONNECTIONS_PER_MINUTE)),
+            facts: RateLimiter::keyed(Quota::per_hour(FACTS_PER_MINUTE).allow_burst(FACTS_BURST)),
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
     agents: BTreeMap<String, Entry>,

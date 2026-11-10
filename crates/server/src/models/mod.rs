@@ -859,8 +859,15 @@ async fn fresh_test_database(server: &str) -> String {
     use sea_orm::ConnectionTrait;
 
     static MADE: AtomicU32 = AtomicU32::new(0);
+    // Process IDs come round again, and test databases are left behind, so the name
+    // has when this run started in it too.
+    static RUN: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+        since.map_or(0, |since| since.as_secs())
+    });
     let name = format!(
-        "maxnines_test_{}_{}",
+        "maxnines_test_{}_{}_{}",
+        *RUN,
         std::process::id(),
         MADE.fetch_add(1, Ordering::Relaxed)
     );

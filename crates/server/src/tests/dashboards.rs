@@ -12,14 +12,21 @@ async fn api(server: &TestServer, method: &str, path: &str, body: &Value) -> (u1
     (status, serde_json::from_str(text).unwrap_or(Value::Null))
 }
 
+/// When every machine's reading was taken: the middle of a minute that's over, as the
+/// one still filling up isn't counted. It's the same for every machine, as one taking
+/// its own time could land in the next minute and be counted apart.
+static READING_TIME: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    let minute = MINUTE_MS as u64;
+    (now_ms() as u64 / minute - 2) * minute + minute / 2
+});
+
 /// An approved machine reporting a CPU reading, with these facts.
 async fn machine(server: &TestServer, host: &str, usage: f64, facts: Value) -> (Identity, Client) {
     let agent = identity();
     let mut client = server.connect_approved(&agent, host).await;
     send(&mut client, &AgentMessage::Facts { facts }).await;
     let sample = AgentMessage::Sample(Sample {
-        // In a minute that's over, as the one still filling up isn't counted.
-        timestamp_ms: now_ms() as u64 - 90_000,
+        timestamp_ms: *READING_TIME,
         metrics: BTreeMap::from([("cpu".to_string(), json!({ "usage_percent": usage }))]),
     });
     send(&mut client, &sample).await;
@@ -29,7 +36,7 @@ async fn machine(server: &TestServer, host: &str, usage: f64, facts: Value) -> (
 
 /// Asks until the samples have been written, which happens in the background.
 async fn query(server: &TestServer, path: &str) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let (status, result) = api(server, "GET", path, &Value::Null).await;
         assert_eq!(status, 200, "{result}");
@@ -55,7 +62,7 @@ async fn three_machines(server: &TestServer) -> Vec<(Identity, Client)> {
 }
 
 async fn wait_for_all_three(server: &TestServer) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let path = "/api/v1/query?metric=cpu.usage&calculation=count";
         let result = query(server, path).await;

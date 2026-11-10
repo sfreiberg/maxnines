@@ -14,7 +14,7 @@ use serde_json::Value;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::time::{Instant, interval, timeout};
+use tokio::time::{Instant, MissedTickBehavior, interval, timeout};
 use tracing::{info, warn};
 
 use crate::app_state::AppState;
@@ -245,6 +245,8 @@ async fn serve(
     replaced: &Notify,
 ) -> &'static str {
     let mut ping = interval(state.heartbeat.interval);
+    // After a stall, one ping goes at once, not one for each that was missed.
+    ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_heard = Instant::now();
     let mut waiting_sample = None;
 
@@ -262,7 +264,13 @@ async fn serve(
         tokio::select! {
             reason = &mut work => return reason.unwrap_or("database work failed"),
             () = replaced.notified() => return "replaced by a newer connection",
-            _ = ping.tick() => {
+            due = ping.tick() => {
+                // A ping this late means this server was too busy to run, not that
+                // the agent went quiet, and what it sent is still waiting to be read.
+                // The agent gets its whole time again.
+                if due.elapsed() > state.heartbeat.interval {
+                    last_heard = Instant::now();
+                }
                 // Nothing is being read while a sample waits, so silence means nothing.
                 if waiting_sample.is_none() && last_heard.elapsed() >= state.heartbeat.timeout {
                     return "heartbeat timeout";

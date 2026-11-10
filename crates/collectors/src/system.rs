@@ -117,16 +117,19 @@ impl CpuTicks {
 
     /// Percentages of the time between two readings. Nothing can be said if no
     /// time passed, or if the counters went backwards.
+    /// Linux's iowait can go backwards, as time waiting is moved to idle when the task
+    /// wakes on another CPU, so a part that went down counts as none rather than
+    /// losing the whole reading.
     fn percent_since(&self, old: &Self) -> Option<Value> {
-        let spent = |new: u64, old: u64| new.checked_sub(old);
+        let spent = |new: u64, old: u64| new.saturating_sub(old);
         let parts = [
-            spent(self.user, old.user)?,
-            spent(self.nice, old.nice)?,
-            spent(self.system, old.system)?,
-            spent(self.idle, old.idle)?,
-            spent(self.iowait, old.iowait)?,
-            spent(self.interrupt, old.interrupt)?,
-            spent(self.steal, old.steal)?,
+            spent(self.user, old.user),
+            spent(self.nice, old.nice),
+            spent(self.system, old.system),
+            spent(self.idle, old.idle),
+            spent(self.iowait, old.iowait),
+            spent(self.interrupt, old.interrupt),
+            spent(self.steal, old.steal),
         ];
         let total: u64 = parts.iter().sum();
         if total == 0 {
@@ -571,6 +574,25 @@ pgpgin 900
         assert_eq!(time["steal"], 20.0);
         assert_eq!(time["user"], 40.0);
         assert_eq!(time["iowait"], 5.0);
+    }
+
+    #[test]
+    fn a_counter_going_backwards_loses_only_its_own_part() {
+        let old = CpuTicks {
+            user: 10,
+            idle: 10,
+            iowait: 5,
+            ..CpuTicks::default()
+        };
+        let new = CpuTicks {
+            user: 20,
+            idle: 30,
+            iowait: 3,
+            ..CpuTicks::default()
+        };
+        let time = new.percent_since(&old).unwrap();
+        assert_eq!(time["iowait"], 0.0);
+        assert_eq!(time["idle"], 200.0 / 3.0);
     }
 
     #[test]

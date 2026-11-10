@@ -80,6 +80,26 @@ async fn start_with(config: &str) -> TestServer {
     start_on(config, store, reader, saved, None).await
 }
 
+/// Pings often, so tests about pings needn't wait, and gives up on a quiet client only
+/// after a long time. Most tests hold clients they don't read, and a busy machine
+/// running every test at once can leave a test unable to read for seconds.
+const TEST_HEARTBEAT: Heartbeat = Heartbeat {
+    interval: Duration::from_millis(50),
+    timeout: Duration::from_secs(120),
+};
+
+/// For the tests about giving up on a quiet client, which wait for it to happen.
+async fn start_quick_to_drop() -> TestServer {
+    let saved = Saved::default();
+    let store = Box::new(MemoryStore(saved.clone()));
+    let reader = store.reader().unwrap();
+    let heartbeat = Heartbeat {
+        timeout: Duration::from_secs(1),
+        ..TEST_HEARTBEAT
+    };
+    start_with_heartbeat("", store, reader, saved, None, heartbeat).await
+}
+
 /// Starts with a real metrics database, for tests of what's stored.
 async fn start_with_metrics() -> TestServer {
     let folder = tempfile::tempdir().unwrap();
@@ -96,6 +116,17 @@ async fn start_on(
     reader: Arc<dyn MetricsReader>,
     saved: Saved,
     folder: Option<tempfile::TempDir>,
+) -> TestServer {
+    start_with_heartbeat(config, store, reader, saved, folder, TEST_HEARTBEAT).await
+}
+
+async fn start_with_heartbeat(
+    config: &str,
+    store: Box<dyn Store>,
+    reader: Arc<dyn MetricsReader>,
+    saved: Saved,
+    folder: Option<tempfile::TempDir>,
+    heartbeat: Heartbeat,
 ) -> TestServer {
     let text = format!("{config}\nmetrics \"duckdb\" {{\n  path = \"x\"\n}}\n");
     let config = Config::parse(&text).unwrap();
@@ -119,7 +150,7 @@ async fn start_on(
     let status = Arc::new(ServerStatus::new(None).unwrap());
     let (writer, _thread) = spawn_writer(store, status.writes.clone());
     let state = AppState {
-        presence: Arc::new(Presence::default()),
+        presence: Arc::new(Presence::refilling_slowly()),
         registry: Arc::new(Registry::new(
             Vec::new(),
             Rules::compile(&config.registration).unwrap(),
@@ -133,13 +164,7 @@ async fn start_on(
         senders: Default::default(),
         check_results: Arc::default(),
         status,
-        heartbeat: Heartbeat {
-            interval: Duration::from_millis(50),
-            // Short to keep tests quick, but long enough that a busy machine running
-            // every test at once doesn't look like a client gone quiet. A Windows CI
-            // machine went over a second.
-            timeout: Duration::from_secs(3),
-        },
+        heartbeat,
         audience: AUDIENCE.into(),
         trusted_proxies: config.trusted_networks().unwrap().into(),
         views: Arc::new(Views::load().unwrap()),
@@ -205,8 +230,9 @@ impl TestServer {
         registry.decide(&id, AgentState::Approved).await.unwrap();
     }
 
+    /// Returns as soon as it's so, so a long deadline costs nothing.
     async fn wait_for_online(&self, id: &str, online: bool) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if self
                 .state
@@ -312,7 +338,7 @@ async fn is_closed(client: &mut Client) -> bool {
             }
         }
     };
-    tokio::time::timeout(Duration::from_secs(5), reading)
+    tokio::time::timeout(Duration::from_secs(30), reading)
         .await
         .is_ok()
 }
@@ -543,14 +569,25 @@ async fn facts_reported_too_often_are_dropped() {
     for version in 0..8 {
         send(&mut client, &facts(&format!("24.{version}"))).await;
     }
-    sleep(Duration::from_millis(200)).await;
-
-    let history = server
-        .state
-        .database
-        .facts_history(&agent.id())
+    // Messages are judged in the order they come, so once a sample after them is
+    // confirmed, every one of the facts has been kept or dropped.
+    send(&mut client, &sample(1)).await;
+    let confirmed = async {
+        while let Some(Ok(message)) = client.next().await {
+            if let Message::Text(text) = message
+                && let Ok(ServerMessage::Ack { .. }) = serde_json::from_str(&text)
+            {
+                return;
+            }
+        }
+        panic!("the connection ended");
+    };
+    tokio::time::timeout(Duration::from_secs(30), confirmed)
         .await
         .unwrap();
+
+    // The family once, and each version kept.
+    let history = server.wait_for_facts(&agent.id(), 6).await;
     let versions: Vec<&str> = history
         .iter()
         .filter(|fact| fact.name == "os.version")
@@ -592,7 +629,7 @@ async fn the_online_count_is_out_of_approved_agents_only() {
 
 #[tokio::test]
 async fn a_connection_that_never_answers_the_challenge_is_closed() {
-    let server = start().await;
+    let server = start_quick_to_drop().await;
     let mut client = server.connect().await;
 
     assert!(is_closed(&mut client).await);
@@ -675,6 +712,21 @@ fn count_pings(receiver: futures_util::stream::SplitStream<Client>) -> Arc<Atomi
         }
     });
     pings
+}
+
+/// An address nothing can listen on, so connecting fails at once on every system. A
+/// port that was free a moment ago can be given to another test meanwhile, and one
+/// held without listening is refused on Linux but ignored on macOS until it times out.
+const CLOSED_ADDRESS: &str = "127.0.0.1:0";
+
+/// Waits for another ping to arrive, however long the machine takes.
+async fn more_pings(pings: &AtomicU64) {
+    let before = pings.load(Ordering::Relaxed);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while pings.load(Ordering::Relaxed) == before {
+        assert!(Instant::now() < deadline, "pings stopped");
+        sleep(Duration::from_millis(10)).await;
+    }
 }
 
 mod health {
@@ -831,9 +883,7 @@ async fn a_stalled_database_does_not_hold_up_samples_or_heartbeats() {
     }
 
     assert_eq!(server.wait_for_sample().await.2, 1);
-    let before = pings.load(Ordering::Relaxed);
-    sleep(Duration::from_millis(300)).await;
-    assert!(pings.load(Ordering::Relaxed) > before, "pings stopped");
+    more_pings(&pings).await;
 
     drop(stalled);
     let facts = server.wait_for_facts(&agent.id(), 1).await;
@@ -842,7 +892,7 @@ async fn a_stalled_database_does_not_hold_up_samples_or_heartbeats() {
 
 #[tokio::test]
 async fn a_full_write_queue_stops_reading_but_not_the_heartbeat() {
-    let server = start().await;
+    let server = start_quick_to_drop().await;
     let agent = identity();
     let client = server.connect_approved(&agent, "web-1").await;
     let (mut sender, receiver) = client.split();
@@ -857,14 +907,12 @@ async fn a_full_write_queue_stops_reading_but_not_the_heartbeat() {
     }
 
     // Long enough to be taken for dead, had the wait counted as silence.
-    sleep(Duration::from_millis(1200)).await;
-    let before = pings.load(Ordering::Relaxed);
-    sleep(Duration::from_millis(300)).await;
-    assert!(pings.load(Ordering::Relaxed) > before, "pings stopped");
+    sleep(server.state.heartbeat.timeout + Duration::from_millis(500)).await;
+    more_pings(&pings).await;
     assert!(server.state.presence.get(&agent.id()).unwrap().online);
 
     server.saved.paused.store(false, Ordering::Relaxed);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while (server.saved.samples.lock().unwrap().len() as u64) < count {
         assert!(Instant::now() < deadline, "samples went missing");
         sleep(Duration::from_millis(10)).await;
@@ -884,7 +932,7 @@ async fn a_dropped_connection_marks_the_agent_offline() {
 
 #[tokio::test]
 async fn an_agent_that_stops_responding_goes_offline() {
-    let server = start().await;
+    let server = start_quick_to_drop().await;
     let agent = identity();
     // Held open but never read, like a hung agent or a dead network.
     let _client = server.connect_approved(&agent, "web-1").await;
@@ -894,17 +942,15 @@ async fn an_agent_that_stops_responding_goes_offline() {
 
 #[tokio::test]
 async fn an_agent_answering_pings_stays_online() {
-    let server = start().await;
+    let server = start_quick_to_drop().await;
     let agent = identity();
     let mut client = server.connect_approved(&agent, "web-1").await;
 
     // Past the point where a quiet agent counts as gone. Reading is what answers
     // the pings.
     let deadline = Instant::now() + server.state.heartbeat.timeout + Duration::from_millis(500);
-    while tokio::time::timeout_at(deadline, client.next())
-        .await
-        .is_ok()
-    {}
+    // Stops at the deadline, or when the server closes the connection.
+    while let Ok(Some(Ok(_))) = tokio::time::timeout_at(deadline, client.next()).await {}
 
     assert!(server.state.presence.get(&agent.id()).unwrap().online);
 }
@@ -924,7 +970,7 @@ async fn invalid_messages_do_not_end_the_connection() {
 
 impl TestServer {
     async fn wait_for_facts(&self, id: &str, count: usize) -> Vec<FactVersion> {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             let history = self.state.database.facts_history(id).await.unwrap();
             if history.len() >= count {

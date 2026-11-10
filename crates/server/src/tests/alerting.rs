@@ -2337,9 +2337,7 @@ async fn a_telegram_error_is_retried_and_never_shows_the_token() {
 
 #[tokio::test]
 async fn not_reaching_telegram_says_so_without_the_token() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
+    let address = CLOSED_ADDRESS;
     let channel = Channel {
         id: 1,
         channel: ChannelInput {
@@ -2906,9 +2904,7 @@ async fn a_slack_error_is_retried_and_says_what_slack_said() {
 
 #[tokio::test]
 async fn not_reaching_slack_says_so_without_any_detail() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
+    let address = CLOSED_ADDRESS;
     let channel = crate::alerting::Channel {
         id: 1,
         channel: ChannelInput {
@@ -3092,9 +3088,8 @@ async fn a_resolved_notice_waits_for_its_firing_notice() {
 #[tokio::test]
 async fn a_channel_that_is_down_does_not_hold_up_the_others() {
     let test = Harness::start().await;
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let nowhere = format!("http://{}/hook", listener.local_addr().unwrap());
-    drop(listener);
+    let address = CLOSED_ADDRESS;
+    let nowhere = format!("http://{address}/hook");
     let channel = |name: &str, target: String| ChannelInput {
         name: name.to_string(),
         kind: ChannelKind::Webhook,
@@ -3269,9 +3264,7 @@ async fn deleting_a_channel_drops_what_was_queued_for_it() {
 #[tokio::test]
 async fn a_webhook_url_never_appears_in_a_saved_error() {
     let mut test = Harness::start().await;
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
+    let address = CLOSED_ADDRESS;
     let url = format!("http://{address}/secret-token");
     let notifier = firing_with_channel(&mut test, &url).await;
 
@@ -4561,8 +4554,7 @@ mod remote {
     #[tokio::test]
     async fn a_failing_server_check_can_alert_like_anything_else() {
         let server = server().await;
-        let (listener, target) = open_port();
-        drop(listener);
+        let target = CLOSED_ADDRESS.to_string();
         let input = tcp_input("db", &target);
         server
             .state
@@ -4788,8 +4780,7 @@ mod remote {
     #[tokio::test]
     async fn results_show_on_the_checks_page_and_agent_page() {
         let server = server().await;
-        let (listener, target) = open_port();
-        drop(listener);
+        let target = CLOSED_ADDRESS.to_string();
         let input = tcp_input("<b>db</b>", &target);
         server
             .state

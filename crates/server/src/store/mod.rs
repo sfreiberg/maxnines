@@ -799,13 +799,13 @@ mod tests {
     type Writes = Arc<std::sync::Mutex<Vec<(usize, Instant)>>>;
 
     /// Wants a gap between writes, and says how big each was and when.
-    struct Timed(Writes);
+    struct Timed(Writes, Duration);
 
     const BATCH_EVERY: Duration = Duration::from_millis(100);
 
     impl Store for Timed {
         fn batch_every(&self) -> Duration {
-            BATCH_EVERY
+            self.1
         }
 
         fn write(&mut self, samples: &[NewSample]) -> Result<()> {
@@ -829,14 +829,15 @@ mod tests {
     #[test]
     fn a_store_can_ask_for_samples_to_be_gathered_into_a_batch() {
         let writes: Writes = Arc::default();
-        let store = Box::new(Timed(Arc::clone(&writes)));
+        let store = Box::new(Timed(Arc::clone(&writes), BATCH_EVERY));
         let (writer, thread) = spawn_writer(store, Arc::default());
 
         for time in 0..20 {
             writer.blocking_send(save("web", time)).unwrap();
             thread::sleep(Duration::from_millis(2));
         }
-        thread::sleep(Duration::from_millis(250));
+        // Stopping writes what's left at once, so it waits for everything first.
+        wait_for_written(&writes, 20);
         writer.blocking_send(WriterCommand::Stop).unwrap();
         thread.join().unwrap();
 
@@ -856,22 +857,47 @@ mod tests {
         }
     }
 
+    /// Waits for this many samples to have been written, however long that takes.
+    fn wait_for_written(writes: &Writes, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let written = || {
+            writes
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(size, _)| size)
+                .sum::<usize>()
+        };
+        while written() < count {
+            assert!(Instant::now() < deadline, "only {} were written", written());
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn a_full_batch_does_not_wait_for_the_timer() {
+        // An hour between batches, so only a full one can be written in time.
         let writes: Writes = Arc::default();
-        let store = Box::new(Timed(Arc::clone(&writes)));
+        let store = Box::new(Timed(Arc::clone(&writes), Duration::from_secs(3600)));
         let (writer, thread) = spawn_writer(store, Arc::default());
 
-        let started = Instant::now();
-        for time in 0..2 * WRITE_QUEUE_SIZE as u64 {
+        // The first goes at once, as nothing came before it.
+        writer.blocking_send(save("web", 0)).unwrap();
+        wait_for_written(&writes, 1);
+        for time in 1..=WRITE_QUEUE_SIZE as u64 {
             writer.blocking_send(save("web", time)).unwrap();
         }
+        wait_for_written(&writes, 1 + WRITE_QUEUE_SIZE);
+
+        let sizes: Vec<usize> = writes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(size, _)| *size)
+            .collect();
+        assert_eq!(sizes, [1, WRITE_QUEUE_SIZE]);
         writer.blocking_send(WriterCommand::Stop).unwrap();
         thread.join().unwrap();
-
-        let written: usize = writes.lock().unwrap().iter().map(|(size, _)| size).sum();
-        assert_eq!(written, 2 * WRITE_QUEUE_SIZE);
-        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

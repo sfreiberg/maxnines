@@ -812,10 +812,14 @@ mod tests {
     /// Something that isn't HTTP, like a TLS handshake, never ends the way a request
     /// does, so it's taken to be over once nothing more comes for a moment.
     fn read_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
-        let mut request = Vec::new();
+        let mut request: Vec<u8> = Vec::new();
         let mut buffer = [0; 4096];
         loop {
-            if !request.is_empty() {
+            // A request starts with its method in capitals.
+            if request
+                .first()
+                .is_some_and(|byte| !byte.is_ascii_uppercase())
+            {
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
             }
             if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -849,23 +853,11 @@ mod tests {
         (address, handle)
     }
 
-    /// A port nothing listens on, held for as long as this lives so no other test
-    /// can be given it in the meantime.
-    struct ClosedPort {
-        _held: tokio::net::TcpSocket,
-        address: String,
-    }
-
-    /// Bound without listening, so connecting is refused.
-    fn closed_port() -> ClosedPort {
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let address = socket.local_addr().unwrap().to_string();
-        ClosedPort {
-            _held: socket,
-            address,
-        }
-    }
+    /// An address nothing can listen on, so connecting fails at once on every system.
+    /// A port that was free a moment ago can be given to another test meanwhile, and
+    /// one held without listening is refused on Linux but ignored on macOS until the
+    /// connection times out.
+    const CLOSED_ADDRESS: &str = "127.0.0.1:0";
 
     fn http_check(address: &str) -> Check {
         check(CheckKind::Http, &format!("http://{address}/health"))
@@ -887,8 +879,7 @@ mod tests {
 
     #[test]
     fn a_closed_port_is_down_and_says_why() {
-        let closed = closed_port();
-        let output = run(&check(CheckKind::Tcp, &closed.address));
+        let output = run(&check(CheckKind::Tcp, CLOSED_ADDRESS));
         assert_eq!(output["up"], 0);
         assert_eq!(output["error"], "couldn't connect");
         assert!(output.get("response_ms").is_none());
@@ -896,8 +887,7 @@ mod tests {
 
     #[test]
     fn a_failure_keeps_what_was_learned_before_it() {
-        let closed = closed_port();
-        let output = run(&check(CheckKind::Tcp, &closed.address));
+        let output = run(&check(CheckKind::Tcp, CLOSED_ADDRESS));
         assert!(output["dns_ms"].is_f64(), "{output}");
     }
 
@@ -1035,8 +1025,7 @@ mod tests {
 
     #[test]
     fn a_failed_web_check_does_not_repeat_its_url() {
-        let closed = closed_port();
-        let target = format!("http://user:secret@{}/token", closed.address);
+        let target = format!("http://user:secret@{CLOSED_ADDRESS}/token");
         let output = run(&check(CheckKind::Http, &target));
         assert_eq!(output["up"], 0);
         assert!(!output.to_string().contains("secret"), "{output}");
@@ -1101,8 +1090,7 @@ mod tests {
             let failure = fetch(&format!("http://{address}/")).unwrap_err();
             assert_eq!(failure.to_string(), error);
         }
-        let closed = closed_port();
-        let failure = fetch(&format!("http://user:secret@{}/token", closed.address)).unwrap_err();
+        let failure = fetch(&format!("http://user:secret@{CLOSED_ADDRESS}/token")).unwrap_err();
         assert!(!format!("{failure:#}").contains("secret"));
     }
 
@@ -1119,14 +1107,15 @@ mod tests {
         let address = listener.local_addr().unwrap().to_string();
         let started = Instant::now();
         let output = run(&Check {
-            timeout_secs: Some(1),
+            timeout_secs: Some(2),
             ..http_check(&address)
         });
 
         assert_eq!(output["up"], 0);
         assert_eq!(output["error"], "timed out");
         assert!(output["connect_ms"].is_f64(), "{output}");
-        assert!(started.elapsed() < Duration::from_secs(3));
+        // Well short of the 10 seconds a check gets when it doesn't say.
+        assert!(started.elapsed() < Duration::from_secs(8));
         drop(listener);
     }
 
@@ -1155,18 +1144,28 @@ mod tests {
             .with_single_cert(chain, key)
             .unwrap();
 
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // On the address localhost means first, which is the one checks try first, so
+        // none of them waits on another being refused, which takes Windows seconds.
+        let listener = TcpListener::bind("localhost:0").unwrap();
         let address = listener.local_addr().unwrap();
         thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
+            let _ = socket.set_read_timeout(Some(Duration::from_secs(10)));
             let mut connection = rustls::ServerConnection::new(Arc::new(config)).unwrap();
             let mut stream = rustls::Stream::new(&mut connection, &mut socket);
-            let mut request = [0; 1024];
-            if stream.read(&mut request).is_ok() {
-                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
-                let _ = stream.flush();
+            // The whole request, then the answer, then whatever the check sends until
+            // it closes, so nothing is left unread to make Windows reset the connection.
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => return,
+                    Ok(size) => request.extend_from_slice(&buffer[..size]),
+                }
             }
-            thread::sleep(Duration::from_millis(200));
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            let _ = stream.flush();
+            while matches!(stream.read(&mut buffer), Ok(size) if size > 0) {}
         });
         format!("localhost:{}", address.port())
     }
