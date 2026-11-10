@@ -11,12 +11,15 @@ use lettre::Address;
 use maxnines_protocol::auth::new_nonce;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter,
+    QueryOrder, Set, TransactionTrait,
 };
 use serde::Serialize;
+use serde_json::json;
 
+use super::audit::{record, record_change};
 use super::{Database, user, user_session};
+use crate::audit::{Action, Actor, Kind, Record, Snapshot, Subject};
 use crate::registration::hash_token;
 use crate::times::{DEFAULT_TIME_ZONE, zone_named};
 
@@ -132,6 +135,57 @@ fn token_hash(token: &str) -> String {
     hex::encode(hash_token(token))
 }
 
+/// A user as the audit log compares them. The password is a secret, so only
+/// whether it was set or changed is kept.
+fn snapshot(row: &user::Model) -> Snapshot {
+    let fields = json!({
+        "email": row.email,
+        "name": row.name,
+        "theme": row.theme,
+        "time_zone": row.time_zone,
+        "password": row.password_hash,
+        "disabled": row.disabled_ms.is_some(),
+    });
+    Snapshot::new(row.email.clone(), fields).with_secrets(&["password"])
+}
+
+fn as_actor(row: &user::Model) -> Actor {
+    Actor::Person {
+        id: row.id,
+        email: row.email.clone(),
+    }
+}
+
+async fn load<C: ConnectionTrait>(connection: &C, id: i64) -> Result<Option<user::Model>> {
+    user::Entity::find_by_id(id)
+        .one(connection)
+        .await
+        .context("loading a user")
+}
+
+/// Records how a user changed from `before`, reading them as they are now.
+async fn record_user<C: ConnectionTrait>(
+    connection: &C,
+    id: i64,
+    before: Option<&user::Model>,
+    by: Option<Actor>,
+) -> Result<()> {
+    let after = load(connection, id).await?;
+    let Some(entry) = Record::of_change(
+        Kind::User,
+        id,
+        before.map(snapshot).as_ref(),
+        after.as_ref().map(snapshot).as_ref(),
+        None,
+    ) else {
+        return Ok(());
+    };
+    match by {
+        Some(actor) => record(connection, entry.by(actor)).await,
+        None => record(connection, entry).await,
+    }
+}
+
 impl Database {
     pub async fn list_users(&self) -> Result<Vec<User>> {
         let rows = user::Entity::find()
@@ -174,6 +228,7 @@ impl Database {
             return Ok(None);
         }
         let token = new_nonce()?;
+        let transaction = self.connection.begin().await.context("starting a save")?;
         let row = user::ActiveModel {
             email: Set(email.to_string()),
             name: Set(name.to_string()),
@@ -184,9 +239,19 @@ impl Database {
             created_ms: Set(now_ms),
             ..Default::default()
         }
-        .insert(&self.connection)
+        .insert(&transaction)
         .await
         .context("saving a user")?;
+        record_change(
+            &transaction,
+            Kind::User,
+            row.id,
+            None,
+            Some(&snapshot(&row)),
+            None,
+        )
+        .await?;
+        transaction.commit().await.context("saving a user")?;
         Ok(Some((row.into(), token)))
     }
 
@@ -201,12 +266,16 @@ impl Database {
             return Ok(None);
         };
         let token = new_nonce()?;
+        let subject = Subject::new(Kind::User, row.id, row.email.clone());
+        let transaction = self.connection.begin().await.context("starting a save")?;
         let mut row: user::ActiveModel = row.into();
         row.setup_token_hash = Set(Some(token_hash(&token)));
         row.setup_expires_ms = Set(Some(now_ms + SETUP_LINK_LIFETIME_MS));
-        row.update(&self.connection)
+        row.update(&transaction)
             .await
             .context("saving a setup link")?;
+        record(&transaction, Record::new(Action::NewSetupLink, subject)).await?;
+        transaction.commit().await.context("saving a setup link")?;
         Ok(Some(token))
     }
 
@@ -232,6 +301,7 @@ impl Database {
         now_ms: i64,
     ) -> Result<bool> {
         let transaction = self.connection.begin().await.context("starting a save")?;
+        let before = load(&transaction, user_id).await?;
         // One update, so a link used twice at once can only work once.
         let updated = user::Entity::update_many()
             .col_expr(user::Column::PasswordHash, Expr::value(password_hash))
@@ -258,6 +328,9 @@ impl Database {
             .exec(&transaction)
             .await
             .context("ending sessions")?;
+        // Whoever has the link is acting as the user it's for.
+        let by = before.as_ref().map(as_actor);
+        record_user(&transaction, user_id, before.as_ref(), by).await?;
         transaction.commit().await.context("saving a password")?;
         Ok(true)
     }
@@ -295,6 +368,7 @@ impl Database {
         keep_session: &str,
     ) -> Result<()> {
         let transaction = self.connection.begin().await.context("starting a save")?;
+        let before = load(&transaction, id).await?;
         user::Entity::update_many()
             .col_expr(user::Column::PasswordHash, Expr::value(password_hash))
             .filter(user::Column::Id.eq(id))
@@ -307,28 +381,37 @@ impl Database {
             .exec(&transaction)
             .await
             .context("ending sessions")?;
+        record_user(&transaction, id, before.as_ref(), None).await?;
         transaction.commit().await.context("saving a password")
     }
 
     /// Returns false if there's no such user.
     pub async fn set_theme(&self, id: i64, theme: &str) -> Result<bool> {
+        let transaction = self.connection.begin().await.context("starting a save")?;
+        let before = load(&transaction, id).await?;
         let updated = user::Entity::update_many()
             .col_expr(user::Column::Theme, Expr::value(theme))
             .filter(user::Column::Id.eq(id))
-            .exec(&self.connection)
+            .exec(&transaction)
             .await
             .context("saving a theme")?;
+        record_user(&transaction, id, before.as_ref(), None).await?;
+        transaction.commit().await.context("saving a theme")?;
         Ok(updated.rows_affected == 1)
     }
 
     /// Returns false if there's no such user.
     pub async fn set_time_zone(&self, id: i64, zone: Tz) -> Result<bool> {
+        let transaction = self.connection.begin().await.context("starting a save")?;
+        let before = load(&transaction, id).await?;
         let updated = user::Entity::update_many()
             .col_expr(user::Column::TimeZone, Expr::value(zone.name()))
             .filter(user::Column::Id.eq(id))
-            .exec(&self.connection)
+            .exec(&transaction)
             .await
             .context("saving a time zone")?;
+        record_user(&transaction, id, before.as_ref(), None).await?;
+        transaction.commit().await.context("saving a time zone")?;
         Ok(updated.rows_affected == 1)
     }
 
@@ -359,9 +442,11 @@ impl Database {
             return Ok(UserChange::LastUser);
         }
         let transaction = self.connection.begin().await.context("starting a save")?;
+        let before = row.clone();
         let mut row: user::ActiveModel = row.into();
         row.disabled_ms = Set(Some(now_ms));
         row.update(&transaction).await.context("disabling a user")?;
+        record_user(&transaction, id, Some(&before), None).await?;
         user_session::Entity::delete_many()
             .filter(user_session::Column::UserId.eq(id))
             .exec(&transaction)
@@ -372,12 +457,16 @@ impl Database {
     }
 
     pub async fn enable_user(&self, id: i64) -> Result<UserChange> {
+        let transaction = self.connection.begin().await.context("starting a save")?;
+        let before = load(&transaction, id).await?;
         let updated = user::Entity::update_many()
             .col_expr(user::Column::DisabledMs, Expr::value(Option::<i64>::None))
             .filter(user::Column::Id.eq(id))
-            .exec(&self.connection)
+            .exec(&transaction)
             .await
             .context("enabling a user")?;
+        record_user(&transaction, id, before.as_ref(), None).await?;
+        transaction.commit().await.context("enabling a user")?;
         Ok(if updated.rows_affected == 1 {
             UserChange::Done
         } else {
@@ -406,6 +495,7 @@ impl Database {
             .exec(&transaction)
             .await
             .context("deleting a user")?;
+        record_user(&transaction, id, Some(&row), None).await?;
         transaction.commit().await.context("deleting a user")?;
         Ok(UserChange::Done)
     }
@@ -419,6 +509,10 @@ impl Database {
             .await
             .context("clearing old sessions")?;
         let token = new_nonce()?;
+        let transaction = self.connection.begin().await.context("starting a save")?;
+        let row = load(&transaction, user_id)
+            .await?
+            .context("signing in someone who isn't a user")?;
         user_session::ActiveModel {
             user_id: Set(user_id),
             token_hash: Set(token_hash(&token)),
@@ -426,15 +520,19 @@ impl Database {
             expires_ms: Set(now_ms + SESSION_LIFETIME_MS),
             ..Default::default()
         }
-        .insert(&self.connection)
+        .insert(&transaction)
         .await
         .context("saving a session")?;
         user::Entity::update_many()
             .col_expr(user::Column::LastSignInMs, Expr::value(now_ms))
             .filter(user::Column::Id.eq(user_id))
-            .exec(&self.connection)
+            .exec(&transaction)
             .await
             .context("noting a sign in")?;
+        let subject = Subject::new(Kind::User, user_id, row.email.clone());
+        let entry = Record::new(Action::SignedIn, subject).by(as_actor(&row));
+        record(&transaction, entry).await?;
+        transaction.commit().await.context("saving a session")?;
         Ok(token)
     }
 
@@ -474,12 +572,37 @@ impl Database {
             .collect()
     }
 
+    /// Signs out the session with this token, if it's still there.
     pub async fn end_session(&self, token: &str) -> Result<()> {
-        user_session::Entity::delete_many()
+        let transaction = self.connection.begin().await.context("starting a save")?;
+        let session = user_session::Entity::find()
             .filter(user_session::Column::TokenHash.eq(token_hash(token)))
-            .exec(&self.connection)
+            .one(&transaction)
+            .await
+            .context("checking a session")?;
+        let Some(session) = session else {
+            return Ok(());
+        };
+        user_session::Entity::delete_by_id(session.id)
+            .exec(&transaction)
             .await
             .context("ending a session")?;
-        Ok(())
+        if let Some(row) = load(&transaction, session.user_id).await? {
+            let subject = Subject::new(Kind::User, row.id, row.email.clone());
+            let entry = Record::new(Action::SignedOut, subject).by(as_actor(&row));
+            record(&transaction, entry).await?;
+        }
+        transaction.commit().await.context("ending a session")
+    }
+
+    /// Notes that someone failed to sign in as `email`, which may be nobody's.
+    pub async fn record_failed_sign_in(&self, email: &str, user: Option<&User>) -> Result<()> {
+        let subject = Subject {
+            kind: Kind::User,
+            id: user.map(|user| user.id.to_string()),
+            name: normalise_email(email),
+        };
+        self.record_audit(Record::new(Action::SignInFailed, subject))
+            .await
     }
 }

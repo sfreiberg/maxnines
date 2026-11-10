@@ -54,12 +54,7 @@ pub async fn upgrade(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Response {
-    let forwarded: Vec<&str> = headers
-        .get_all("x-forwarded-for")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .collect();
-    let source = client_ip(peer.ip(), &forwarded.join(","), &state.trusted_proxies);
+    let source = super::request_source(peer, &headers, &state.trusted_proxies);
     socket
         .read_buffer_size(SOCKET_BUFFER_SIZE)
         .write_buffer_size(SOCKET_BUFFER_SIZE)

@@ -9,12 +9,17 @@ use sea_orm::{
     TransactionTrait,
 };
 
+use serde_json::json;
+
+use super::audit::{record, record_change};
 use super::{Database, alert, alert_rule, alert_rule_channel, notification, notification_channel};
 use crate::alerting::{
     Alert, AlertRule, AlertRuleInput, Channel, ChannelInput, ChannelKind, Comparison, Delivery,
     DeliveryProblem, Event, NewAlert, RULE_GONE_REASON, RuleKind, Severity, SeverityChange,
 };
+use crate::audit::{Action, Kind, Record, Snapshot, Subject};
 use crate::calculations::Calculation;
+use crate::channels;
 
 const PENDING: &str = "pending";
 const SENT: &str = "sent";
@@ -187,20 +192,7 @@ impl Database {
     }
 
     pub async fn get_alert_rule(&self, id: i64) -> Result<Option<AlertRule>> {
-        let Some(row) = alert_rule::Entity::find_by_id(id)
-            .one(&self.connection)
-            .await
-            .context("loading alert rule")?
-        else {
-            return Ok(None);
-        };
-        let channels = alert_rule_channel::Entity::find()
-            .filter(alert_rule_channel::Column::RuleId.eq(id))
-            .all(&self.connection)
-            .await
-            .context("loading alert rule channels")?;
-        let channels = channels.into_iter().map(|link| link.channel_id).collect();
-        to_alert_rule(row, channels).map(Some)
+        load_alert_rule(&self.connection, id).await
     }
 
     pub async fn create_alert_rule(&self, input: &AlertRuleInput) -> Result<i64> {
@@ -218,6 +210,7 @@ impl Database {
                 .await
                 .context("saving alert rule channels")?;
         }
+        record_alert_rule(&transaction, id, None).await?;
         transaction.commit().await.context("saving alert rule")?;
         Ok(id)
     }
@@ -225,13 +218,10 @@ impl Database {
     /// Returns false if there's no such rule.
     pub async fn update_alert_rule(&self, id: i64, input: &AlertRuleInput) -> Result<bool> {
         let transaction = self.connection.begin().await.context("saving alert rule")?;
-        let found = alert_rule::Entity::find_by_id(id)
-            .one(&transaction)
-            .await
-            .context("loading alert rule")?;
-        if found.is_none() {
+        let Some(before) = load_alert_rule(&transaction, id).await? else {
             return Ok(false);
-        }
+        };
+        let before = alert_rule_snapshot(&transaction, &before).await?;
 
         let mut row = alert_rule_row(input)?;
         row.id = Set(id);
@@ -252,6 +242,7 @@ impl Database {
                 .await
                 .context("saving alert rule channels")?;
         }
+        record_alert_rule(&transaction, id, Some(&before)).await?;
         transaction.commit().await.context("saving alert rule")?;
         Ok(true)
     }
@@ -266,6 +257,10 @@ impl Database {
             .begin()
             .await
             .context("deleting alert rule")?;
+        let before = match load_alert_rule(&transaction, id).await? {
+            Some(rule) => Some(alert_rule_snapshot(&transaction, &rule).await?),
+            None => None,
+        };
         let open = alert::Entity::find()
             .filter(alert::Column::RuleId.eq(id))
             .filter(alert::Column::ResolvedMs.is_null())
@@ -279,6 +274,15 @@ impl Database {
             .exec(&transaction)
             .await
             .context("deleting alert rule")?;
+        record_change(
+            &transaction,
+            Kind::AlertRule,
+            id,
+            before.as_ref(),
+            None,
+            None,
+        )
+        .await?;
         transaction.commit().await.context("deleting alert rule")?;
         Ok(result.rows_affected > 0)
     }
@@ -296,14 +300,11 @@ impl Database {
     }
 
     pub async fn get_channel(&self, id: i64) -> Result<Option<Channel>> {
-        let row = notification_channel::Entity::find_by_id(id)
-            .one(&self.connection)
-            .await
-            .context("loading channel")?;
-        row.map(to_channel).transpose()
+        load_channel(&self.connection, id).await
     }
 
     pub async fn create_channel(&self, input: &ChannelInput) -> Result<i64> {
+        let transaction = self.connection.begin().await.context("saving channel")?;
         let row = notification_channel::ActiveModel {
             name: Set(input.name.clone()),
             kind: Set(input.kind.as_str().to_string()),
@@ -314,18 +315,22 @@ impl Database {
             sends_critical: Set(input.severities.contains(&Severity::Critical)),
             ..Default::default()
         };
-        let result = notification_channel::Entity::insert(row)
-            .exec(&self.connection)
+        let id = notification_channel::Entity::insert(row)
+            .exec(&transaction)
             .await
-            .context("saving channel")?;
-        Ok(result.last_insert_id)
+            .context("saving channel")?
+            .last_insert_id;
+        record_channel(&transaction, id, None).await?;
+        transaction.commit().await.context("saving channel")?;
+        Ok(id)
     }
 
     /// Returns false if there's no such channel.
     pub async fn update_channel(&self, id: i64, input: &ChannelInput) -> Result<bool> {
-        if self.get_channel(id).await?.is_none() {
+        let transaction = self.connection.begin().await.context("saving channel")?;
+        let Some(before) = load_channel(&transaction, id).await? else {
             return Ok(false);
-        }
+        };
         let row = notification_channel::ActiveModel {
             id: Set(id),
             name: Set(input.name.clone()),
@@ -337,21 +342,149 @@ impl Database {
             sends_critical: Set(input.severities.contains(&Severity::Critical)),
         };
         notification_channel::Entity::update(row)
-            .exec(&self.connection)
+            .exec(&transaction)
             .await
             .context("saving channel")?;
+        record_channel(&transaction, id, Some(&before)).await?;
+        transaction.commit().await.context("saving channel")?;
         Ok(true)
     }
 
     /// Anything still queued for the channel goes with it. Returns false if
     /// there's no such channel.
     pub async fn delete_channel(&self, id: i64) -> Result<bool> {
+        let transaction = self.connection.begin().await.context("deleting channel")?;
+        let before = load_channel(&transaction, id).await?;
         let result = notification_channel::Entity::delete_by_id(id)
-            .exec(&self.connection)
+            .exec(&transaction)
             .await
             .context("deleting channel")?;
+        let before = before.as_ref().map(channel_snapshot);
+        record_change(&transaction, Kind::Channel, id, before.as_ref(), None, None).await?;
+        transaction.commit().await.context("deleting channel")?;
         Ok(result.rows_affected > 0)
     }
+}
+
+async fn load_alert_rule<C: ConnectionTrait>(connection: &C, id: i64) -> Result<Option<AlertRule>> {
+    let Some(row) = alert_rule::Entity::find_by_id(id)
+        .one(connection)
+        .await
+        .context("loading alert rule")?
+    else {
+        return Ok(None);
+    };
+    let channels = alert_rule_channel::Entity::find()
+        .filter(alert_rule_channel::Column::RuleId.eq(id))
+        .all(connection)
+        .await
+        .context("loading alert rule channels")?;
+    let channels = channels.into_iter().map(|link| link.channel_id).collect();
+    to_alert_rule(row, channels).map(Some)
+}
+
+/// A rule as the audit log compares them, with its channels by name.
+async fn alert_rule_snapshot<C: ConnectionTrait>(
+    connection: &C,
+    rule: &AlertRule,
+) -> Result<Snapshot> {
+    let mut fields = serde_json::to_value(&rule.rule).context("recording an alert rule")?;
+    let names: BTreeMap<i64, String> = notification_channel::Entity::find()
+        .filter(notification_channel::Column::Id.is_in(rule.rule.channels.clone()))
+        .all(connection)
+        .await
+        .context("loading channels")?
+        .into_iter()
+        .map(|channel| (channel.id, channel.name))
+        .collect();
+    let mut channels: Vec<String> = rule
+        .rule
+        .channels
+        .iter()
+        .map(|id| names.get(id).cloned().unwrap_or_else(|| format!("#{id}")))
+        .collect();
+    channels.sort();
+    fields["channels"] = json!(channels);
+    Ok(Snapshot::new(rule.rule.name.clone(), fields))
+}
+
+/// Records how an alert rule changed from `before`, reading it as it is now.
+async fn record_alert_rule<C: ConnectionTrait>(
+    connection: &C,
+    id: i64,
+    before: Option<&Snapshot>,
+) -> Result<()> {
+    let after = match load_alert_rule(connection, id).await? {
+        Some(rule) => Some(alert_rule_snapshot(connection, &rule).await?),
+        None => None,
+    };
+    record_change(
+        connection,
+        Kind::AlertRule,
+        id,
+        before,
+        after.as_ref(),
+        None,
+    )
+    .await
+}
+
+async fn load_channel<C: ConnectionTrait>(connection: &C, id: i64) -> Result<Option<Channel>> {
+    let row = notification_channel::Entity::find_by_id(id)
+        .one(connection)
+        .await
+        .context("loading channel")?;
+    row.map(to_channel).transpose()
+}
+
+/// A channel as the audit log compares them. Tokens are secrets, and so is the
+/// target for kinds where it works as a password, like a webhook's URL.
+fn channel_snapshot(channel: &Channel) -> Snapshot {
+    let input = &channel.channel;
+    let severities: Vec<&str> = input.severities.iter().map(|s| s.as_str()).collect();
+    let fields = json!({
+        "name": input.name,
+        "kind": input.kind.as_str(),
+        "target": input.target,
+        "credential": input.credential,
+        "app_token": input.app_token,
+        "severities": severities,
+    });
+    let snapshot =
+        Snapshot::new(input.name.clone(), fields).with_secrets(&["credential", "app_token"]);
+    if channels::of(input.kind).hides_target() {
+        snapshot.with_secrets(&["target"])
+    } else {
+        snapshot
+    }
+}
+
+async fn record_channel<C: ConnectionTrait>(
+    connection: &C,
+    id: i64,
+    before: Option<&Channel>,
+) -> Result<()> {
+    let after = load_channel(connection, id).await?;
+    let before = before.map(channel_snapshot);
+    let after = after.as_ref().map(channel_snapshot);
+    record_change(
+        connection,
+        Kind::Channel,
+        id,
+        before.as_ref(),
+        after.as_ref(),
+        None,
+    )
+    .await
+}
+
+/// An alert, named by its rule and machine as the alerts page shows it.
+fn alert_subject(row: &alert::Model) -> Subject {
+    Subject::new(
+        Kind::Alert,
+        row.id,
+        format!("{} on {}", row.rule_name, row.host),
+    )
 }
 
 /// Ends an alert within a transaction: see [`Database::resolve_alert`].
@@ -701,36 +834,55 @@ impl Database {
     }
 
     pub async fn acknowledge_alert(&self, id: i64, by: &str, now_ms: i64) -> Result<bool> {
+        let transaction = self.connection.begin().await.context("saving alert")?;
         let firing = alert::Entity::find_by_id(id)
             .filter(alert::Column::ResolvedMs.is_null())
-            .one(&self.connection)
+            .one(&transaction)
             .await
             .context("loading alert")?;
-        if firing.is_none() {
+        let Some(firing) = firing else {
             return Ok(false);
-        }
-        alert::Entity::update_many()
+        };
+        let updated = alert::Entity::update_many()
             .col_expr(alert::Column::AcknowledgedBy, Expr::value(by))
             .col_expr(alert::Column::AcknowledgedMs, Expr::value(now_ms))
             .filter(alert::Column::Id.eq(id))
             .filter(alert::Column::AcknowledgedMs.is_null())
-            .exec(&self.connection)
+            .exec(&transaction)
             .await
             .context("saving alert")?;
+        if updated.rows_affected > 0 {
+            let entry = Record::new(Action::Acknowledged, alert_subject(&firing));
+            record(&transaction, entry).await?;
+        }
+        transaction.commit().await.context("saving alert")?;
         Ok(true)
     }
 
     /// Returns false if there's no such alert firing.
     pub async fn unacknowledge_alert(&self, id: i64) -> Result<bool> {
-        let result = alert::Entity::update_many()
+        let transaction = self.connection.begin().await.context("saving alert")?;
+        let firing = alert::Entity::find_by_id(id)
+            .filter(alert::Column::ResolvedMs.is_null())
+            .one(&transaction)
+            .await
+            .context("loading alert")?;
+        let Some(firing) = firing else {
+            return Ok(false);
+        };
+        alert::Entity::update_many()
             .col_expr(alert::Column::AcknowledgedBy, Expr::value(None::<String>))
             .col_expr(alert::Column::AcknowledgedMs, Expr::value(None::<i64>))
             .filter(alert::Column::Id.eq(id))
-            .filter(alert::Column::ResolvedMs.is_null())
-            .exec(&self.connection)
+            .exec(&transaction)
             .await
             .context("saving alert")?;
-        Ok(result.rows_affected > 0)
+        if firing.acknowledged_ms.is_some() {
+            let entry = Record::new(Action::Unacknowledged, alert_subject(&firing));
+            record(&transaction, entry).await?;
+        }
+        transaction.commit().await.context("saving alert")?;
+        Ok(true)
     }
 
     /// Alerts that nobody has acknowledged, on rules that send reminders, with how often.

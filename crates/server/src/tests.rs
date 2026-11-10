@@ -1,6 +1,7 @@
 //! Tests that run the real router over real sockets.
 
 mod alerting;
+mod audit;
 mod dashboards;
 mod docs;
 mod users;
@@ -1625,6 +1626,7 @@ async fn every_page_renders() {
     for path in [
         "/".to_string(),
         "/settings".to_string(),
+        "/settings/audit-log".to_string(),
         "/agents".to_string(),
         format!("/agents/{}", agent.id()),
         "/rules".to_string(),

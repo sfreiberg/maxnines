@@ -13,6 +13,7 @@ use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
 use serde_json::Value;
 
+use crate::audit::{self, Acting, Actor};
 use crate::config::Config;
 use crate::controllers::api::{AgentView, BASE_PATH};
 use crate::fact_history::describe_history;
@@ -36,10 +37,18 @@ where
         .enable_all()
         .build()
         .context("starting")?;
-    runtime.block_on(async {
+    // Whoever ran it, as the system says, for the audit log.
+    let account = ["USER", "USERNAME"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()));
+    let acting = Acting {
+        actor: Actor::CommandLine { account },
+        source: None,
+    };
+    runtime.block_on(audit::acting(acting, async {
         let database = Database::connect(&config.database.resolve_url()?).await?;
         work(database).await
-    })
+    }))
 }
 
 fn api_key() -> Result<String> {

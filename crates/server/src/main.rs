@@ -3,6 +3,7 @@ mod alert_charts;
 mod alert_evaluator;
 mod alerting;
 mod app_state;
+mod audit;
 mod calculations;
 mod channels;
 mod cli;

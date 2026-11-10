@@ -3,6 +3,7 @@
 - [Introduction](introduction.md)
 - [Installing](installing.md)
 - [Users](users.md)
+- [Audit log](audit-log.md)
 - [Running an agent](agents.md)
 - [Windows services](windows-services.md)
 - [HTTPS](https.md)

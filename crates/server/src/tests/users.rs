@@ -68,6 +68,7 @@ async fn every_page_needs_someone_signed_in() {
         "/server",
         "/settings/users",
         "/settings/api-keys",
+        "/settings/audit-log",
         "/profile",
         "/no-such-page",
     ] {

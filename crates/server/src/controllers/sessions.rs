@@ -16,9 +16,9 @@ use cookie::{Cookie, SameSite};
 use serde::Deserialize;
 use tracing::warn;
 
-use super::agent_socket::client_ip;
-use super::{CsrfForm, Page, SIGNED_IN, api, server_error};
+use super::{CsrfForm, Page, SIGNED_IN, api, request_source, server_error};
 use crate::app_state::AppState;
+use crate::audit::{self, Actor};
 use crate::metrics::now_ms;
 use crate::models::{SESSION_LIFETIME_MS, User, check_new_password};
 use crate::passwords::{hash_password, password_matches};
@@ -63,10 +63,17 @@ pub async fn require_login(
     next: Next,
 ) -> Response {
     match session_user(&state, request.headers()).await {
-        Ok(Some(user)) => SIGNED_IN.scope(Arc::new(user), next.run(request)).await,
-        Ok(None) => match api::token_accepted(&state, request.headers()).await {
-            Ok(true) => next.run(request).await,
-            Ok(false) => to_sign_in(&request),
+        Ok(Some(user)) => {
+            let actor = Actor::Person {
+                id: user.id,
+                email: user.email.clone(),
+            };
+            let signed_in = SIGNED_IN.scope(Arc::new(user), next.run(request));
+            audit::acting_as(actor, signed_in).await
+        }
+        Ok(None) => match api::token_holder(&state, request.headers()).await {
+            Ok(Some(actor)) => audit::acting_as(actor, next.run(request)).await,
+            Ok(None) => to_sign_in(&request),
             Err(error) => server_error(&error),
         },
         Err(error) => server_error(&error),
@@ -175,12 +182,7 @@ async fn sign_in(
     let password = form.fields.get("password").cloned().unwrap_or_default();
     let next = safe_next(form.fields.get("next").map(String::as_str)).to_string();
 
-    let forwarded: Vec<&str> = headers
-        .get_all("x-forwarded-for")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .collect();
-    let source = client_ip(peer.ip(), &forwarded.join(","), &state.trusted_proxies);
+    let source = request_source(peer, &headers, &state.trusted_proxies);
     if !state.sign_ins.allow(source, &email.to_lowercase()) {
         warn!(%source, "too many sign in attempts");
         let problem = (
@@ -199,17 +201,22 @@ async fn sign_in(
         Ok(matches) => matches,
         Err(error) => return server_error(&error),
     };
-    match user.filter(|_| matches) {
-        Some(user) => signed_in_response(&state, user.id, &next).await,
-        None => {
-            // The same answer either way, so it doesn't show which addresses exist.
-            let problem = (
-                StatusCode::UNAUTHORIZED,
-                "That email or password isn't right.",
-            );
-            sign_in_form(&state, &form.token, email, &next, Some(problem)).await
-        }
+    if matches && let Some(user) = &user {
+        return signed_in_response(&state, user.id, &next).await;
     }
+    if let Err(error) = state
+        .database
+        .record_failed_sign_in(email, user.as_ref())
+        .await
+    {
+        return server_error(&error);
+    }
+    // The same answer either way, so it doesn't show which addresses exist.
+    let problem = (
+        StatusCode::UNAUTHORIZED,
+        "That email or password isn't right.",
+    );
+    sign_in_form(&state, &form.token, email, &next, Some(problem)).await
 }
 
 async fn sign_out(State(state): State<AppState>, headers: HeaderMap, _form: CsrfForm) -> Response {

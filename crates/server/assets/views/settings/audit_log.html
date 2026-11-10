@@ -1,0 +1,41 @@
+{% extends "layouts/application.html" %}
+{% block title %}Audit log · MaxNines{% endblock title %}
+{% block content %}
+<p class="breadcrumb"><a href="/settings">Settings</a></p>
+<div>
+  <h1>Audit log</h1>
+  <p class="subtitle">Every change to the server's setup, and every sign in, with who did it and where from. Entries are kept for good. Secrets only show whether they were set or changed.</p>
+</div>
+
+{% if entries %}
+<div class="tablebox"><table class="audit-log">
+  <thead>
+    <tr><th>When</th><th>Who</th><th>What</th><th>Changes</th></tr>
+  </thead>
+  <tbody>
+    {% for entry in entries %}
+    <tr>
+      <td class="nowrap">{{ entry.at }}</td>
+      <td>{{ entry.actor }}{% if entry.source %}<span class="note audit-source">{{ entry.source }}</span>{% endif %}</td>
+      <td>{{ entry.action }} <span class="note">{{ entry.kind }}</span><span class="audit-subject">{{ entry.subject }}</span></td>
+      <td>
+        {% if entry.changes %}
+        <ul class="audit-changes">
+          {% for change in entry.changes %}<li><span class="note">{{ change.field }}</span> {{ change.said }}</li>{% endfor %}
+        </ul>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table></div>
+{% if older or paged %}
+<nav class="pages" aria-label="Pages">
+  {% if paged %}<a class="button secondary" href="/settings/audit-log">Newest</a>{% endif %}
+  {% if older %}<a class="button secondary" href="{{ older }}" rel="next">Older</a>{% endif %}
+</nav>
+{% endif %}
+{% else %}
+<p class="empty">Nothing has been recorded yet.</p>
+{% endif %}
+{% endblock content %}

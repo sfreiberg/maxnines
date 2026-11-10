@@ -228,6 +228,10 @@ tr.disabled td { color: var(--muted); }
 td.number, th.number { text-align: right; white-space: nowrap; }
 td.number { font-family: var(--mono); font-size: 14px; }
 td.nowrap { white-space: nowrap; }
+.audit-source, .audit-subject { display: block; }
+.audit-subject { overflow-wrap: anywhere; }
+.audit-changes { margin: 0; padding: 0; list-style: none; }
+.audit-changes li { overflow-wrap: anywhere; }
 
 /* Key and value lists */
 .summary { display: grid; grid-template-columns: minmax(120px, max-content) minmax(0, 1fr); gap: 10px 24px; margin: 0; }

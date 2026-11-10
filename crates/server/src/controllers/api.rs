@@ -20,6 +20,7 @@ use super::host_list::HostSearch;
 use super::users::{refusal, setup_url};
 use crate::alerting::{Alert, AlertRuleInput, ChannelInput, ChannelKind};
 use crate::app_state::{AgentDeletion, AppState};
+use crate::audit::{self, Actor};
 use crate::calculations::{self, Calculation, Question};
 use crate::dashboards::{Placed, WidgetInput, check_layout, check_name};
 use crate::facts::unflatten;
@@ -159,6 +160,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/places", get(super::map::search_places))
         .route("/places/nearest", get(super::map::nearest_place))
         .route("/api-keys", get(list_api_keys).post(create_api_key))
+        .route("/audit-log", get(audit_log))
         .route("/api-keys/{id}", delete(revoke_api_key))
         .route("/agents/filter-options", get(filter_options))
         .route("/agents/{id}/approve", post(approve))
@@ -187,22 +189,26 @@ fn failed(status: StatusCode, error: &str) -> Response {
     (status, Json(json!({ "error": error }))).into_response()
 }
 
-/// Whether a request carries a working API key.
-pub async fn token_accepted(state: &AppState, headers: &HeaderMap) -> anyhow::Result<bool> {
+/// Who a request is from, if it carries a working API key.
+pub async fn token_holder(state: &AppState, headers: &HeaderMap) -> anyhow::Result<Option<Actor>> {
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
-    match presented {
-        Some(key) => state.database.accept_api_key(key, now_ms()).await,
-        None => Ok(false),
-    }
+    let Some(key) = presented else {
+        return Ok(None);
+    };
+    let key = state.database.accept_api_key(key, now_ms()).await?;
+    Ok(key.map(|key| Actor::ApiKey {
+        id: key.id,
+        name: key.name,
+    }))
 }
 
 async fn require_token(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    match token_accepted(&state, request.headers()).await {
-        Ok(true) => next.run(request).await,
-        Ok(false) => StatusCode::UNAUTHORIZED.into_response(),
+    match token_holder(&state, request.headers()).await {
+        Ok(Some(actor)) => audit::acting_as(actor, next.run(request)).await,
+        Ok(None) => StatusCode::UNAUTHORIZED.into_response(),
         Err(error) => server_error(&error),
     }
 }
@@ -371,6 +377,29 @@ async fn revoke_api_key(State(state): State<AppState>, UrlPath(id): UrlPath<i64>
     match state.database.revoke_api_key(id, now_ms()).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// The most entries one request can ask for.
+const MAX_AUDIT_ENTRIES: u64 = 1000;
+
+#[derive(Deserialize)]
+struct AuditParams {
+    /// Only entries older than this one, to read on from the last entry of a page.
+    before: Option<i64>,
+    limit: Option<u64>,
+}
+
+/// Newest first.
+async fn audit_log(State(state): State<AppState>, Query(params): Query<AuditParams>) -> Response {
+    let limit = params.limit.unwrap_or(super::audit_log::PAGE_SIZE);
+    if !(1..=MAX_AUDIT_ENTRIES).contains(&limit) {
+        let error = format!("limit has to be from 1 to {MAX_AUDIT_ENTRIES}");
+        return failed(StatusCode::BAD_REQUEST, &error);
+    }
+    match state.database.audit_log(params.before, limit).await {
+        Ok(entries) => Json(entries).into_response(),
         Err(error) => server_error(&error),
     }
 }

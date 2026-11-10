@@ -26,6 +26,7 @@ impl MigratorTrait for Migrator {
             Box::new(AddChannelSeverities),
             Box::new(ChooseChannelSeverities),
             Box::new(AddBuiltInContainerAlert),
+            Box::new(CreateAuditLog),
         ]
     }
 }
@@ -1786,11 +1787,106 @@ impl MigrationTrait for AddBuiltInContainerAlert {
     }
 }
 
+// ---- Audit log
+
+struct CreateAuditLog;
+
+impl MigrationName for CreateAuditLog {
+    fn name(&self) -> &str {
+        "m20261110_000015_create_audit_log"
+    }
+}
+
+#[derive(Iden)]
+enum AuditLog {
+    Table,
+    Id,
+    AtMs,
+    /// `person`, `api_key`, `command_line`, `maxnines`, `slack` or `nobody`.
+    ActorKind,
+    ActorId,
+    /// The person's address or the key's name at the time.
+    ActorName,
+    /// The address the request came from.
+    Source,
+    Action,
+    SubjectKind,
+    /// Text, as agents' IDs are.
+    SubjectId,
+    /// What it was called at the time.
+    SubjectName,
+    /// A JSON list of each field's value before and after, with secrets masked.
+    Changes,
+}
+
+/// Who changed what and who signed in. Entries are kept for good: nothing deletes
+/// them.
+#[async_trait::async_trait]
+impl MigrationTrait for CreateAuditLog {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // MySQL's text holds 64 KB, which a big config rule's before and after could
+        // pass, and a change mustn't fail for want of room to record it.
+        let mut changes = ColumnDef::new(AuditLog::Changes);
+        match manager.get_database_backend() {
+            sea_orm::DatabaseBackend::MySql => changes.custom(Alias::new("LONGTEXT")),
+            _ => changes.text(),
+        };
+        changes.not_null();
+        manager
+            .create_table(
+                Table::create()
+                    .table(AuditLog::Table)
+                    .col(id(AuditLog::Id))
+                    .col(ColumnDef::new(AuditLog::AtMs).big_integer().not_null())
+                    .col(
+                        ColumnDef::new(AuditLog::ActorKind)
+                            .string_len(16)
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(AuditLog::ActorId).string_len(64).null())
+                    .col(
+                        ColumnDef::new(AuditLog::ActorName)
+                            .string_len(255)
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(AuditLog::Source).string_len(45).null())
+                    .col(ColumnDef::new(AuditLog::Action).string_len(32).not_null())
+                    .col(
+                        ColumnDef::new(AuditLog::SubjectKind)
+                            .string_len(32)
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(AuditLog::SubjectId).string_len(128).null())
+                    .col(
+                        ColumnDef::new(AuditLog::SubjectName)
+                            .string_len(255)
+                            .not_null(),
+                    )
+                    .col(changes)
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        drop_tables(manager, &["audit_log"]).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
 
     use super::*;
+
+    /// How many migrations come before `migration`, to stop just short of it.
+    fn before(migration: &dyn MigrationName) -> u32 {
+        let position = Migrator::migrations()
+            .iter()
+            .position(|m| m.name() == migration.name())
+            .expect("a listed migration");
+        <u32 as TryFrom<usize>>::try_from(position).unwrap()
+    }
 
     async fn offline_rules(connection: &impl ConnectionTrait) -> Vec<String> {
         let query = Statement::from_string(
@@ -1809,7 +1905,7 @@ mod tests {
             .max_connections(1)
             .to_owned();
         let connection = Database::connect(options).await.unwrap();
-        let before = Migrator::migrations().len() as u32 - 6;
+        let before = before(&AddBuiltInAlerts);
         Migrator::up(&connection, Some(before)).await.unwrap();
         connection
             .execute_unprepared(
@@ -1830,7 +1926,7 @@ mod tests {
             .max_connections(1)
             .to_owned();
         let connection = Database::connect(options).await.unwrap();
-        let before = Migrator::migrations().len() as u32 - 5;
+        let before = before(&AddBuiltInDiskAlerts);
         Migrator::up(&connection, Some(before)).await.unwrap();
         connection
             .execute_unprepared(
@@ -1890,7 +1986,7 @@ mod tests {
         );
 
         let connection = fresh().await;
-        let before = Migrator::migrations().len() as u32 - 4;
+        let before = before(&AddWarningThresholds);
         Migrator::up(&connection, Some(before)).await.unwrap();
         connection
             .execute_unprepared(
@@ -1911,7 +2007,7 @@ mod tests {
     #[tokio::test]
     async fn a_critical_only_channel_keeps_warnings_off_when_channels_choose_both() {
         let connection = fresh().await;
-        let before = Migrator::migrations().len() as u32 - 2;
+        let before = before(&ChooseChannelSeverities);
         Migrator::up(&connection, Some(before)).await.unwrap();
         connection
             .execute_unprepared(

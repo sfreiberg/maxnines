@@ -10,6 +10,8 @@ mod alert_rule;
 mod alert_rule_channel;
 mod alerting;
 mod api_key;
+mod audit;
+mod audit_entry;
 mod config_rule;
 mod config_rule_setting;
 mod dashboard;
@@ -50,11 +52,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
+use self::audit::record_change;
 pub use self::stats::DatabaseStats;
 pub use self::users::{
     DEFAULT_THEME, SESSION_LIFETIME_MS, THEMES, User, UserChange, check_new_password,
     check_new_user, is_theme,
 };
+use crate::audit::{Kind, Snapshot};
 use crate::facts::{FlatFacts, decode, encode, flatten, unflatten};
 use crate::host_filter;
 use crate::migrations::Migrator;
@@ -184,11 +188,28 @@ impl Database {
             ])
             .to_owned();
 
+        let transaction = self.connection.begin().await.context("saving agent")?;
+        let before = agent::Entity::find_by_id(&record.id)
+            .one(&transaction)
+            .await
+            .context("loading agent")?;
         agent::Entity::insert(row)
             .on_conflict(on_conflict)
-            .exec_without_returning(&self.connection)
+            .exec_without_returning(&transaction)
             .await
             .context("saving agent")?;
+        let before = before.as_ref().map(agent_snapshot);
+        let after = agent_snapshot_of(record);
+        record_change(
+            &transaction,
+            Kind::Agent,
+            &record.id,
+            before.as_ref(),
+            Some(&after),
+            None,
+        )
+        .await?;
+        transaction.commit().await.context("saving agent")?;
         Ok(())
     }
 
@@ -198,6 +219,10 @@ impl Database {
     pub async fn delete_agent(&self, id: &str) -> Result<bool> {
         let _only_writer = self.facts_lock.lock().await;
         let transaction = self.connection.begin().await.context("deleting an agent")?;
+        let before = agent::Entity::find_by_id(id)
+            .one(&transaction)
+            .await
+            .context("loading agent")?;
         // Their notifications go with them.
         alert::Entity::delete_many()
             .filter(alert::Column::AgentId.eq(id))
@@ -222,6 +247,8 @@ impl Database {
             .exec(&transaction)
             .await
             .context("deleting an agent")?;
+        let before = before.as_ref().map(agent_snapshot);
+        record_change(&transaction, Kind::Agent, id, before.as_ref(), None, None).await?;
         transaction.commit().await.context("deleting an agent")?;
         Ok(deleted.rows_affected > 0)
     }
@@ -464,6 +491,17 @@ pub fn expiry_after(secs: u64, now_ms: i64) -> Result<i64> {
         .context("That's too long for a key to last. Leave it out for a key that never expires.")
 }
 
+/// A key as the audit log compares them. The key itself is never kept.
+fn api_key_snapshot(row: &api_key::Model) -> Snapshot {
+    let fields = serde_json::json!({
+        "name": row.name,
+        "hint": row.hint,
+        "expires": row.expires_ms.map(crate::audit::time),
+        "revoked": row.revoked_ms.is_some(),
+    });
+    Snapshot::new(row.name.clone(), fields)
+}
+
 fn api_key_hash(key: &str) -> String {
     hex::encode(hash_token(key))
 }
@@ -480,6 +518,7 @@ impl Database {
         now_ms: i64,
     ) -> Result<(ApiKey, String)> {
         let key = format!("mxn_{}", new_nonce()?);
+        let transaction = self.connection.begin().await.context("saving an API key")?;
         let row = api_key::ActiveModel {
             name: Set(name.to_string()),
             hint: Set(key[..API_KEY_HINT_LEN].to_string()),
@@ -488,9 +527,12 @@ impl Database {
             expires_ms: Set(expires_ms),
             ..Default::default()
         }
-        .insert(&self.connection)
+        .insert(&transaction)
         .await
         .context("saving an API key")?;
+        let after = api_key_snapshot(&row);
+        record_change(&transaction, Kind::ApiKey, row.id, None, Some(&after), None).await?;
+        transaction.commit().await.context("saving an API key")?;
         Ok((row.into(), key))
     }
 
@@ -514,17 +556,35 @@ impl Database {
             return Ok(false);
         };
         if row.revoked_ms.is_none() {
-            let mut row: api_key::ActiveModel = row.into();
-            row.revoked_ms = Set(Some(now_ms));
-            row.update(&self.connection)
+            let before = api_key_snapshot(&row);
+            let transaction = self
+                .connection
+                .begin()
                 .await
                 .context("revoking an API key")?;
+            let mut row: api_key::ActiveModel = row.into();
+            row.revoked_ms = Set(Some(now_ms));
+            let row = row
+                .update(&transaction)
+                .await
+                .context("revoking an API key")?;
+            let after = api_key_snapshot(&row);
+            record_change(
+                &transaction,
+                Kind::ApiKey,
+                id,
+                Some(&before),
+                Some(&after),
+                None,
+            )
+            .await?;
+            transaction.commit().await.context("revoking an API key")?;
         }
         Ok(true)
     }
 
-    /// Whether this is a key that still works, noting that it's been used.
-    pub async fn accept_api_key(&self, key: &str, now_ms: i64) -> Result<bool> {
+    /// The key, if it still works, noting that it's been used.
+    pub async fn accept_api_key(&self, key: &str, now_ms: i64) -> Result<Option<ApiKey>> {
         let row = api_key::Entity::find()
             .filter(api_key::Column::TokenHash.eq(api_key_hash(key)))
             .filter(api_key::Column::RevokedMs.is_null())
@@ -533,19 +593,21 @@ impl Database {
             .context("checking an API key")?;
         let Some(row) = row.filter(|row| row.expires_ms.is_none_or(|expires| now_ms < expires))
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let stale = row
             .last_used_ms
             .is_none_or(|used| now_ms - used >= API_KEY_USE_ACCURACY_MS);
-        if stale {
-            let mut row: api_key::ActiveModel = row.into();
-            row.last_used_ms = Set(Some(now_ms));
-            row.update(&self.connection)
-                .await
-                .context("noting an API key's use")?;
+        if !stale {
+            return Ok(Some(row.into()));
         }
-        Ok(true)
+        let mut row: api_key::ActiveModel = row.into();
+        row.last_used_ms = Set(Some(now_ms));
+        let row = row
+            .update(&self.connection)
+            .await
+            .context("noting an API key's use")?;
+        Ok(Some(row.into()))
     }
 
     /// A secret the server made for itself, created the first time it's asked for.
@@ -603,20 +665,7 @@ impl Database {
     }
 
     pub async fn get_rule(&self, id: i64) -> Result<Option<ConfigRule>> {
-        let row = config_rule::Entity::find_by_id(id)
-            .one(&self.connection)
-            .await
-            .context("loading rule")?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-
-        let settings = config_rule_setting::Entity::find()
-            .filter(config_rule_setting::Column::RuleId.eq(id))
-            .all(&self.connection)
-            .await
-            .context("loading rule settings")?;
-        to_rule(row, settings.iter()).map(Some)
+        load_rule(&self.connection, id).await
     }
 
     pub async fn create_rule(&self, input: &RuleInput) -> Result<i64> {
@@ -633,6 +682,7 @@ impl Database {
         .context("saving rule")?;
 
         save_settings(&transaction, row.id, &input.settings).await?;
+        record_rule(&transaction, row.id, None).await?;
         transaction.commit().await.context("saving rule")?;
         Ok(row.id)
     }
@@ -640,6 +690,7 @@ impl Database {
     /// Returns false if there's no such rule.
     pub async fn update_rule(&self, id: i64, input: &RuleInput) -> Result<bool> {
         let transaction = self.connection.begin().await.context("saving rule")?;
+        let before = load_rule(&transaction, id).await?;
         let found = config_rule::Entity::find_by_id(id)
             .one(&transaction)
             .await
@@ -661,6 +712,7 @@ impl Database {
             .await
             .context("replacing rule settings")?;
         save_settings(&transaction, id, &input.settings).await?;
+        record_rule(&transaction, id, before.as_ref()).await?;
 
         transaction.commit().await.context("saving rule")?;
         Ok(true)
@@ -669,6 +721,7 @@ impl Database {
     /// Returns false if there's no such rule.
     pub async fn delete_rule(&self, id: i64) -> Result<bool> {
         let transaction = self.connection.begin().await.context("deleting rule")?;
+        let before = load_rule(&transaction, id).await?;
         config_rule_setting::Entity::delete_many()
             .filter(config_rule_setting::Column::RuleId.eq(id))
             .exec(&transaction)
@@ -678,6 +731,7 @@ impl Database {
             .exec(&transaction)
             .await
             .context("deleting rule")?;
+        record_rule(&transaction, id, before.as_ref()).await?;
         transaction.commit().await.context("deleting rule")?;
         Ok(deleted.rows_affected > 0)
     }
@@ -716,6 +770,47 @@ impl Database {
             reported_at_ms: row.reported_at_ms as u64,
         }))
     }
+}
+
+async fn load_rule(connection: &impl ConnectionTrait, id: i64) -> Result<Option<ConfigRule>> {
+    let row = config_rule::Entity::find_by_id(id)
+        .one(connection)
+        .await
+        .context("loading rule")?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let settings = config_rule_setting::Entity::find()
+        .filter(config_rule_setting::Column::RuleId.eq(id))
+        .all(connection)
+        .await
+        .context("loading rule settings")?;
+    to_rule(row, settings.iter()).map(Some)
+}
+
+fn rule_snapshot(rule: &ConfigRule) -> Result<Snapshot> {
+    let fields = serde_json::to_value(&rule.rule).context("recording a rule")?;
+    Ok(Snapshot::new(rule.rule.name.clone(), fields))
+}
+
+/// Records how a config rule changed from `before`, reading it as it is now.
+async fn record_rule(
+    connection: &impl ConnectionTrait,
+    id: i64,
+    before: Option<&ConfigRule>,
+) -> Result<()> {
+    let after = load_rule(connection, id).await?;
+    let before = before.map(rule_snapshot).transpose()?;
+    let after = after.as_ref().map(rule_snapshot).transpose()?;
+    record_change(
+        connection,
+        Kind::ConfigRule,
+        id,
+        before.as_ref(),
+        after.as_ref(),
+        None,
+    )
+    .await
 }
 
 async fn save_settings(
@@ -809,6 +904,29 @@ fn to_fact_version(row: agent_fact::Model) -> Result<FactVersion> {
         valid_from_ms: row.valid_from_ms as u64,
         valid_to_ms: row.valid_to_ms.map(|ms| ms as u64),
     })
+}
+
+/// An agent as the audit log compares them: what it's called and whether it's
+/// allowed in. Its ID is its key, so neither can change.
+fn agent_snapshot(row: &agent::Model) -> Snapshot {
+    agent_fields(&row.host, &row.state, row.decided_by.as_deref())
+}
+
+fn agent_snapshot_of(record: &AgentRecord) -> Snapshot {
+    agent_fields(
+        &record.host,
+        record.state.as_str(),
+        record.decided_by.as_deref(),
+    )
+}
+
+fn agent_fields(host: &str, state: &str, decided_by: Option<&str>) -> Snapshot {
+    let fields = serde_json::json!({
+        "host": host,
+        "state": state,
+        "decided_by": decided_by,
+    });
+    Snapshot::new(host, fields)
 }
 
 fn to_record(row: agent::Model) -> Result<AgentRecord> {
@@ -980,9 +1098,21 @@ mod tests {
         let database = Database::for_test().await;
         let (key, secret) = database.create_api_key("backup", None, 1000).await.unwrap();
 
-        assert!(database.accept_api_key(&secret, 2000).await.unwrap());
+        assert!(
+            database
+                .accept_api_key(&secret, 2000)
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert!(database.revoke_api_key(key.id, 3000).await.unwrap());
-        assert!(!database.accept_api_key(&secret, 4000).await.unwrap());
+        assert!(
+            database
+                .accept_api_key(&secret, 4000)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -990,8 +1120,14 @@ mod tests {
         let database = Database::for_test().await;
         database.create_api_key("backup", None, 1000).await.unwrap();
 
-        assert!(!database.accept_api_key("mxn_guess", 2000).await.unwrap());
-        assert!(!database.accept_api_key("", 2000).await.unwrap());
+        assert!(
+            database
+                .accept_api_key("mxn_guess", 2000)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(database.accept_api_key("", 2000).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1056,9 +1192,27 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(database.accept_api_key(&secret, 4999).await.unwrap());
-        assert!(!database.accept_api_key(&secret, 5000).await.unwrap());
-        assert!(!database.accept_api_key(&secret, 9000).await.unwrap());
+        assert!(
+            database
+                .accept_api_key(&secret, 4999)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            database
+                .accept_api_key(&secret, 5000)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            database
+                .accept_api_key(&secret, 9000)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(!key.has_expired(4999));
         assert!(key.has_expired(5000));
     }
@@ -1068,7 +1222,13 @@ mod tests {
         let database = Database::for_test().await;
         let (key, secret) = database.create_api_key("a", None, 0).await.unwrap();
 
-        assert!(database.accept_api_key(&secret, i64::MAX).await.unwrap());
+        assert!(
+            database
+                .accept_api_key(&secret, i64::MAX)
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert!(!key.has_expired(i64::MAX));
     }
 

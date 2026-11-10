@@ -1,6 +1,6 @@
 //! Routes and request handling. Pages live in `overview`, `agents`, `alerts`,
 //! `alert_rules`, `metrics`, `notification_channels`, `remote_checks`, `rules`,
-//! `settings` and `docs`, the token protected API in `api`, agent connections in
+//! `settings`, `audit_log` and `docs`, the token protected API in `api`, agent connections in
 //! `agent_socket`, signing in in `sessions`, people in `users`, and how an open page
 //! learns of a new build in `update_notice`.
 
@@ -11,6 +11,7 @@ mod alerts;
 pub mod api;
 mod api_keys;
 mod assets;
+mod audit_log;
 mod condition_form;
 mod dashboards;
 mod docs;
@@ -32,24 +33,27 @@ mod update_notice;
 mod users;
 
 use std::collections::BTreeMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::Error;
-use axum::extract::{FromRequest, FromRequestParts, Request};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::extract::{ConnectInfo, FromRequest, FromRequestParts, Request, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Form, Router};
 use axum_csrf::CsrfToken;
 use chrono_tz::Tz;
+use ipnet::IpNet;
 use tera::Context;
 use tower_http::compression::CompressionLayer;
 use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tracing::{error, warn};
 
 use crate::app_state::AppState;
+use crate::audit::{self, Acting, Actor};
 use crate::models::{DEFAULT_THEME, User};
 use crate::times::{DEFAULT_TIME_ZONE, format_time};
 
@@ -78,6 +82,31 @@ fn local_time(ms: i64) -> String {
     u64::try_from(ms).map_or_else(|_| String::new(), |ms| format_time(ms, viewer_zone()))
 }
 
+/// Where a request came from: the address connecting, or for a trusted proxy, the
+/// one it says it's passing on.
+fn request_source(peer: SocketAddr, headers: &HeaderMap, trusted: &[IpNet]) -> IpAddr {
+    let forwarded: Vec<&str> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    agent_socket::client_ip(peer.ip(), &forwarded.join(","), trusted)
+}
+
+/// Notes where each request came from, for the audit log, with nobody acting until
+/// a sign in check says who it is.
+async fn note_source(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let source = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(peer)| request_source(*peer, request.headers(), &state.trusted_proxies));
+    let acting = Acting {
+        actor: Actor::Nobody,
+        source,
+    };
+    audit::acting(acting, next.run(request)).await
+}
+
 pub fn app(state: AppState) -> Router {
     // Everything here needs someone signed in, including what isn't found, so a
     // stranger can't tell which addresses exist.
@@ -88,6 +117,7 @@ pub fn app(state: AppState) -> Router {
         .merge(dashboards::routes())
         .merge(docs::routes())
         .merge(api_keys::routes())
+        .merge(audit_log::routes())
         .merge(users::routes())
         .merge(agents::routes())
         .merge(alerts::routes())
@@ -114,6 +144,7 @@ pub fn app(state: AppState) -> Router {
         .merge(update_notice::routes())
         .merge(health::routes())
         .nest(api::BASE_PATH, api::routes(state.clone()))
+        .layer(middleware::from_fn_with_state(state.clone(), note_source))
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
 }

@@ -30,6 +30,7 @@ use anyhow::anyhow;
 use slack_morphism::errors::SlackClientError;
 
 use crate::alerting::{Alert, ChannelKind, Event};
+use crate::audit::{self, Actor};
 use crate::channels::slack::{
     self, ACKNOWLEDGE_ACTION, SILENCE_HOUR_ACTION, SlackControls, explain as explain_slack,
 };
@@ -165,13 +166,21 @@ impl SlackActions {
         };
 
         let now = now_ms();
-        if action.action_id.0 == ACKNOWLEDGE_ACTION {
-            self.database
-                .acknowledge_alert(alert_id, &account.email, now)
-                .await?;
-        } else {
-            self.silence(alert_id, &account.email, now).await?;
-        }
+        let actor = Actor::Slack {
+            id: account.id,
+            email: account.email.clone(),
+        };
+        let done = audit::acting_as(actor, async {
+            if action.action_id.0 == ACKNOWLEDGE_ACTION {
+                self.database
+                    .acknowledge_alert(alert_id, &account.email, now)
+                    .await
+                    .map(|_| ())
+            } else {
+                self.silence(alert_id, &account.email, now).await
+            }
+        });
+        done.await?;
         info!(
             alert = alert_id,
             by = account.email,

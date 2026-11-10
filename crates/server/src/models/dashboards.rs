@@ -2,10 +2,14 @@
 
 use anyhow::{Context, Result};
 use sea_orm::{
-    ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
+    ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set,
+    TransactionTrait,
 };
+use serde_json::{Map, Value, json};
 
+use super::audit::record_change;
 use super::{Database, dashboard, dashboard_widget};
+use crate::audit::{Kind, Snapshot};
 use crate::dashboards::{Dashboard, DashboardSummary, Placed, Placement, Widget, WidgetInput};
 
 fn to_widget(row: dashboard_widget::Model) -> Widget {
@@ -46,6 +50,61 @@ fn to_row(dashboard_id: i64, input: &WidgetInput) -> dashboard_widget::ActiveMod
     }
 }
 
+/// With its widgets, from the top of the page down.
+async fn load<C: ConnectionTrait>(connection: &C, id: i64) -> Result<Option<Dashboard>> {
+    let Some(row) = dashboard::Entity::find_by_id(id)
+        .one(connection)
+        .await
+        .context("loading dashboard")?
+    else {
+        return Ok(None);
+    };
+    let widgets = dashboard_widget::Entity::find()
+        .filter(dashboard_widget::Column::DashboardId.eq(id))
+        .order_by_asc(dashboard_widget::Column::Y)
+        .order_by_asc(dashboard_widget::Column::X)
+        .all(connection)
+        .await
+        .context("loading widgets")?;
+    Ok(Some(Dashboard {
+        id: row.id,
+        name: row.name,
+        widgets: widgets.into_iter().map(to_widget).collect(),
+    }))
+}
+
+/// A dashboard as the audit log compares them, with each widget under its ID so
+/// one being removed doesn't look like every one after it changing.
+fn snapshot(dashboard: &Dashboard) -> Result<Snapshot> {
+    let mut widgets = Map::new();
+    for widget in &dashboard.widgets {
+        let fields = serde_json::to_value(&widget.input).context("recording a widget")?;
+        widgets.insert(widget.id.to_string(), fields);
+    }
+    let fields = json!({"name": dashboard.name, "widgets": Value::Object(widgets)});
+    Ok(Snapshot::new(dashboard.name.clone(), fields))
+}
+
+/// Records how a dashboard changed from `before`, reading it as it is now.
+async fn record<C: ConnectionTrait>(
+    connection: &C,
+    id: i64,
+    before: Option<&Dashboard>,
+) -> Result<()> {
+    let after = load(connection, id).await?;
+    let before = before.map(snapshot).transpose()?;
+    let after = after.as_ref().map(snapshot).transpose()?;
+    record_change(
+        connection,
+        Kind::Dashboard,
+        id,
+        before.as_ref(),
+        after.as_ref(),
+        None,
+    )
+    .await
+}
+
 impl Database {
     /// Sorted by name.
     pub async fn list_dashboards(&self) -> Result<Vec<DashboardSummary>> {
@@ -72,25 +131,7 @@ impl Database {
 
     /// With its widgets, from the top of the page down.
     pub async fn get_dashboard(&self, id: i64) -> Result<Option<Dashboard>> {
-        let Some(row) = dashboard::Entity::find_by_id(id)
-            .one(&self.connection)
-            .await
-            .context("loading dashboard")?
-        else {
-            return Ok(None);
-        };
-        let widgets = dashboard_widget::Entity::find()
-            .filter(dashboard_widget::Column::DashboardId.eq(id))
-            .order_by_asc(dashboard_widget::Column::Y)
-            .order_by_asc(dashboard_widget::Column::X)
-            .all(&self.connection)
-            .await
-            .context("loading widgets")?;
-        Ok(Some(Dashboard {
-            id: row.id,
-            name: row.name,
-            widgets: widgets.into_iter().map(to_widget).collect(),
-        }))
+        load(&self.connection, id).await
     }
 
     pub async fn create_dashboard(&self, name: &str, now_ms: i64) -> Result<i64> {
@@ -99,21 +140,29 @@ impl Database {
             created_ms: Set(now_ms),
             ..Default::default()
         };
-        let result = dashboard::Entity::insert(row)
-            .exec(&self.connection)
+        let transaction = self.connection.begin().await.context("saving dashboard")?;
+        let id = dashboard::Entity::insert(row)
+            .exec(&transaction)
             .await
-            .context("saving dashboard")?;
-        Ok(result.last_insert_id)
+            .context("saving dashboard")?
+            .last_insert_id;
+        record(&transaction, id, None).await?;
+        transaction.commit().await.context("saving dashboard")?;
+        Ok(id)
     }
 
     /// Returns false if there's no such dashboard.
     pub async fn rename_dashboard(&self, id: i64, name: &str) -> Result<bool> {
+        let transaction = self.connection.begin().await.context("saving dashboard")?;
+        let before = load(&transaction, id).await?;
         let result = dashboard::Entity::update_many()
             .col_expr(dashboard::Column::Name, name.into())
             .filter(dashboard::Column::Id.eq(id))
-            .exec(&self.connection)
+            .exec(&transaction)
             .await
             .context("saving dashboard")?;
+        record(&transaction, id, before.as_ref()).await?;
+        transaction.commit().await.context("saving dashboard")?;
         Ok(result.rows_affected > 0)
     }
 
@@ -121,6 +170,7 @@ impl Database {
     /// link between the tables the same way, so its widgets are removed here.
     pub async fn delete_dashboard(&self, id: i64) -> Result<bool> {
         let transaction = self.connection.begin().await?;
+        let before = load(&transaction, id).await?;
         dashboard_widget::Entity::delete_many()
             .filter(dashboard_widget::Column::DashboardId.eq(id))
             .exec(&transaction)
@@ -130,16 +180,22 @@ impl Database {
             .exec(&transaction)
             .await
             .context("removing dashboard")?;
+        record(&transaction, id, before.as_ref()).await?;
         transaction.commit().await?;
         Ok(result.rows_affected > 0)
     }
 
     pub async fn create_widget(&self, dashboard_id: i64, input: &WidgetInput) -> Result<i64> {
-        let result = dashboard_widget::Entity::insert(to_row(dashboard_id, input))
-            .exec(&self.connection)
+        let transaction = self.connection.begin().await.context("saving widget")?;
+        let before = load(&transaction, dashboard_id).await?;
+        let id = dashboard_widget::Entity::insert(to_row(dashboard_id, input))
+            .exec(&transaction)
             .await
-            .context("saving widget")?;
-        Ok(result.last_insert_id)
+            .context("saving widget")?
+            .last_insert_id;
+        record(&transaction, dashboard_id, before.as_ref()).await?;
+        transaction.commit().await.context("saving widget")?;
+        Ok(id)
     }
 
     /// Only if it's on this dashboard.
@@ -162,23 +218,31 @@ impl Database {
         if self.get_widget(dashboard_id, id).await?.is_none() {
             return Ok(false);
         }
+        let transaction = self.connection.begin().await.context("saving widget")?;
+        let before = load(&transaction, dashboard_id).await?;
         let mut row = to_row(dashboard_id, input);
         row.id = Set(id);
         dashboard_widget::Entity::update(row)
-            .exec(&self.connection)
+            .exec(&transaction)
             .await
             .context("saving widget")?;
+        record(&transaction, dashboard_id, before.as_ref()).await?;
+        transaction.commit().await.context("saving widget")?;
         Ok(true)
     }
 
     /// Returns false if it isn't on this dashboard.
     pub async fn delete_widget(&self, dashboard_id: i64, id: i64) -> Result<bool> {
+        let transaction = self.connection.begin().await.context("removing widget")?;
+        let before = load(&transaction, dashboard_id).await?;
         let result = dashboard_widget::Entity::delete_many()
             .filter(dashboard_widget::Column::Id.eq(id))
             .filter(dashboard_widget::Column::DashboardId.eq(dashboard_id))
-            .exec(&self.connection)
+            .exec(&transaction)
             .await
             .context("removing widget")?;
+        record(&transaction, dashboard_id, before.as_ref()).await?;
+        transaction.commit().await.context("removing widget")?;
         Ok(result.rows_affected > 0)
     }
 
@@ -186,6 +250,7 @@ impl Database {
     /// aren't on this dashboard are left alone.
     pub async fn place_widgets(&self, dashboard_id: i64, widgets: &[Placed]) -> Result<()> {
         let transaction = self.connection.begin().await?;
+        let before = load(&transaction, dashboard_id).await?;
         for widget in widgets {
             let placement = widget.placement;
             dashboard_widget::Entity::update_many()
@@ -199,6 +264,7 @@ impl Database {
                 .await
                 .context("moving widget")?;
         }
+        record(&transaction, dashboard_id, before.as_ref()).await?;
         transaction.commit().await?;
         Ok(())
     }
