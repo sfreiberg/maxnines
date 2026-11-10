@@ -1911,6 +1911,7 @@ mod tests {
                 app_token: None,
                 severities: crate::alerting::every_severity(),
                 mail: None,
+                request: None,
             })
             .await
             .unwrap();

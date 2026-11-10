@@ -96,6 +96,59 @@
     <p class="note">Sending a test opens an alert and resolves it straight away, which can notify whoever is on call.</p>
   </details>
 
+  <fieldset class="for-custom_webhook">
+    <legend>Request</legend>
+    <label>Method
+      <select name="request_method">
+        {% for method in methods %}
+        <option value="{{ method }}"{% if channel.request_method == method %} selected{% endif %}>{{ method }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Content type
+      <input type="text" name="request_content_type" value="{{ channel.request_content_type }}" spellcheck="false" autocomplete="off" maxlength="255">
+      <small>For JSON, such as <code>application/json</code>, whatever is filled in is escaped to fit inside a JSON string, and the body has to come out as valid JSON.</small>
+    </label>
+    <label>Headers
+      <textarea name="headers" rows="3" spellcheck="false" autocomplete="off"{% if channel.header_names %} placeholder="Saved"{% else %} placeholder="Authorization: Bearer abc123"{% endif %}>{{ channel.headers }}</textarea>
+      <small>{% if channel.header_names %}Saved: {{ channel.header_names | join(sep=", ") }}. Leave empty to keep them, as their values aren't shown, or type them all again to replace them.{% else %}Optional, one to a line, as <code>Name: value</code>. Like the URL, they're never shown again, as they usually hold a token.{% endif %}</small>
+    </label>
+    {% if channel.header_names %}
+    <label class="checkbox">
+      <input type="checkbox" name="remove_headers"{% if channel.remove_headers %} checked{% endif %}> Remove the saved headers
+    </label>
+    {% endif %}
+    <label>Body
+      <textarea name="request_body" rows="12" spellcheck="false" maxlength="16384">{{ channel.request_body }}</textarea>
+      <small>A template, filled in for each notification. Put a value in with <code>{{ "{{" }} alert.host {{ "}}" }}</code>, and use <code>| json</code> for a whole value with its quotes, or <code>null</code> when it's missing. See <a href="/docs/notifications#custom-webhooks">Custom webhooks</a> for everything it can use.</small>
+    </label>
+    <details>
+      <summary>What a template can use</summary>
+      <dl class="variables">
+        <dt><code>event</code></dt><dd><code>firing</code>, <code>escalated</code>, <code>eased</code>, <code>reminder</code>, <code>resolved</code> or <code>test</code></dd>
+        <dt><code>text</code></dt><dd>The notification in one line, like <q>Resolved: CPU usage on web-1 is 97%, above 90%</q></dd>
+        <dt><code>id</code></dt><dd>The same for every attempt at one notification, so a repeat can be spotted</dd>
+        <dt><code>link</code></dt><dd>The alerts page, if the server knows its own address</dd>
+        <dt><code>alert.rule_name</code>, <code>alert.host</code>, <code>alert.severity</code></dt><dd>The rule, the machine, and <code>warning</code> or <code>critical</code></dd>
+        <dt><code>alert.summary</code>, <code>alert.value</code>, <code>alert.series</code></dt><dd>What's wrong, the reading that started it, and which disk or container, if it's about one</dd>
+        <dt><code>alert.id</code>, <code>alert.agent_id</code></dt><dd>For a receiver that needs to match the alert up later</dd>
+        <dt><code>alert.started</code>, <code>alert.resolved</code></dt><dd>Times like <code>2026-11-10T14:03:00Z</code>, with <code>_ms</code> versions in milliseconds</dd>
+        <dt><code>alert.acknowledged_by</code></dt><dd>Who acknowledged it, if anyone</dd>
+      </dl>
+      <p class="note">A test fills in an example alert on <code>maxnines-test</code>, with the event <code>test</code>.</p>
+    </details>
+    <div class="actions">
+      <button type="submit" name="form_action" value="preview" class="secondary" formnovalidate formaction="{% if id %}/alerts/channels/{{ id }}{% else %}/alerts/channels{% endif %}#body-preview" hx-post="{% if id %}/alerts/channels/{{ id }}{% else %}/alerts/channels{% endif %}" hx-target="#body-preview" hx-select="#body-preview" hx-swap="morph:outerHTML">Preview the body</button>
+    </div>
+    <section id="body-preview" class="body-preview" aria-live="polite">
+      {% if preview %}
+      <h2>Preview</h2>
+      {% if preview.error %}<p class="error">{{ preview.error }}</p>{% else %}<p class="hint">What an example alert starting would send, as {{ preview.method }} with <code>{{ preview.content_type }}</code>. Nothing has been saved or sent.</p>{% endif %}
+      {% if preview.body %}<pre>{{ preview.body }}</pre>{% endif %}
+      {% endif %}
+    </section>
+  </fieldset>
+
   <details class="for-resend setup"{% if not channel.has_credential %} open{% endif %}>
     <summary>How to set up Resend</summary>
     <ol>

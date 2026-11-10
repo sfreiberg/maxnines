@@ -17,6 +17,9 @@ pub struct Model {
     pub mail_port: Option<i32>,
     pub mail_security: Option<String>,
     pub mail_username: Option<String>,
+    pub request_method: Option<String>,
+    pub request_content_type: Option<String>,
+    pub request_body: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

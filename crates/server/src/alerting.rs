@@ -479,6 +479,8 @@ pub enum ChannelKind {
     Teams,
     /// Email through Resend's API, rather than a mail server.
     Resend,
+    /// A webhook whose request is written by whoever sets it up.
+    CustomWebhook,
 }
 
 impl ChannelKind {
@@ -509,6 +511,7 @@ impl ChannelKind {
             Self::Telegram => "telegram",
             Self::Teams => "teams",
             Self::Resend => "resend",
+            Self::CustomWebhook => "custom_webhook",
         }
     }
 
@@ -536,8 +539,9 @@ pub struct ChannelInput {
     /// PagerDuty integration key, the URL AlertOps or SIGNL4 gave out, or a
     /// Telegram chat.
     pub target: String,
-    /// Slack's or Telegram's bot token. Like a webhook's URL, it can be set but
-    /// not read back.
+    /// Slack's or Telegram's bot token, a mail server's password, Resend's API key,
+    /// or a custom webhook's headers. Like a webhook's URL, it can be set but not
+    /// read back.
     #[serde(default)]
     pub credential: Option<String>,
     /// A Slack app's own token, so the server hears its buttons being pressed.
@@ -553,6 +557,49 @@ pub struct ChannelInput {
     /// through. Only email and Resend channels have it.
     #[serde(default)]
     pub mail: Option<Mail>,
+    /// The request a custom webhook sends. Its headers are the channel's
+    /// `credential`, as they usually hold a token.
+    #[serde(default)]
+    pub request: Option<WebhookRequest>,
+}
+
+/// What a custom webhook sends, apart from its headers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebhookRequest {
+    #[serde(default)]
+    pub method: WebhookMethod,
+    /// Like `application/json`. JSON bodies have what's filled in escaped for JSON.
+    pub content_type: String,
+    /// A Tera template, filled in with the notification.
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum WebhookMethod {
+    #[default]
+    Post,
+    Put,
+    Patch,
+}
+
+impl WebhookMethod {
+    pub const ALL: [Self; 3] = [Self::Post, Self::Put, Self::Patch];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Post => "POST",
+            Self::Put => "PUT",
+            Self::Patch => "PATCH",
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|method| method.as_str() == text)
+            .with_context(|| format!("unknown method {text:?}, which should be POST, PUT or PATCH"))
+    }
 }
 
 /// How a channel sends email. The mail server's password is the channel's
@@ -628,6 +675,10 @@ pub fn check_channel(channel: &ChannelInput) -> Result<()> {
     ensure!(
         channel.mail.is_none() || kind.sends_mail(),
         "only email channels have mail settings"
+    );
+    ensure!(
+        channel.request.is_none() || channel.kind == ChannelKind::CustomWebhook,
+        "only custom webhooks have a request to send"
     );
     ensure!(
         channel.name.len() <= MAX_NAME_LEN,
@@ -803,6 +854,7 @@ mod tests {
             app_token: None,
             severities: every_severity(),
             mail: None,
+            request: None,
         }
     }
 
@@ -1304,6 +1356,7 @@ mod tests {
             app_token: None,
             severities: every_severity(),
             mail: None,
+            request: None,
         }
     }
 

@@ -3,6 +3,7 @@
 //! stored and what the API takes, and [`of`] finds what does the work for each.
 
 pub mod alertops;
+pub mod custom_webhook;
 mod discord;
 pub mod email;
 mod on_call;
@@ -90,8 +91,9 @@ pub trait ChannelType: Send + Sync {
 
 /// Every kind, in the order the pages offer them. A kind has to be here to be
 /// read back from what's stored.
-pub const ALL: [ChannelKind; 10] = [
+pub const ALL: [ChannelKind; 11] = [
     ChannelKind::Webhook,
+    ChannelKind::CustomWebhook,
     ChannelKind::Email,
     ChannelKind::Resend,
     ChannelKind::Discord,
@@ -107,6 +109,7 @@ pub const ALL: [ChannelKind; 10] = [
 pub fn of(kind: ChannelKind) -> &'static dyn ChannelType {
     match kind {
         ChannelKind::Webhook => &webhook::Webhook,
+        ChannelKind::CustomWebhook => &custom_webhook::CustomWebhook,
         ChannelKind::Email => &email::Email,
         ChannelKind::Resend => &resend::Resend,
         ChannelKind::Discord => &discord::Discord,

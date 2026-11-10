@@ -182,6 +182,7 @@ mod tests {
                 from: "MaxNines <alerts@example.com>".into(),
                 server: None,
             }),
+            request: None,
         }
     }
 
@@ -234,6 +235,7 @@ mod tests {
         assert!(format!("{:#}", Resend.check(&keyless).unwrap_err()).contains("API key"));
         let fromless = ChannelInput {
             mail: None,
+            request: None,
             ..channel()
         };
         assert!(Resend.check(&fromless).is_err());

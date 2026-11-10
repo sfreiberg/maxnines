@@ -232,6 +232,7 @@ fn channel(kind: ChannelKind, target: &str, credential: Option<&str>) -> Channel
         app_token: None,
         severities: every_severity(),
         mail: None,
+        request: None,
     }
 }
 

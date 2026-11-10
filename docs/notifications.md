@@ -48,6 +48,69 @@ a mail server or that you'd rather not run one for. The channel form walks throu
 The key is never shown again. Each notification goes with a key Resend uses to spot a
 repeat, so one retried after a timeout isn't sent twice.
 
+## Custom webhooks
+
+A custom webhook sends a request you write yourself, for a service MaxNines has no
+channel for. Choose **Custom webhook** as the type, then set:
+
+- **Method**: POST, PUT or PATCH.
+- **Content type**: like `application/json`, which is where most services start.
+- **Headers**: optional, one to a line, like `Authorization: Bearer abc123`. They're
+  kept like a password and never shown again, only their names. Leave the box empty to
+  keep them, or type them all again to change one. MaxNines sets `Content-Type`,
+  `Content-Length` and `Host` itself.
+- **Body**: a [Tera](https://keats.github.io/tera/docs/) template, up to 16 KB, filled in
+  for each notification.
+
+A new custom webhook starts with this body:
+
+```text
+{
+  "title": "{{ alert.rule_name }} on {{ alert.host }}",
+  "message": "{{ text }}",
+  "severity": "{{ alert.severity }}",
+  "status": "{{ event }}",
+  "value": {{ alert.value | json }},
+  "link": {{ link | json }}
+}
+```
+
+When the content type is JSON, anything filled in with `{{ }}` is escaped to fit inside
+a JSON string, so a quote in a host name can't break the body. Add `| json` for a whole
+value with its quotes, such as a number, a list, or `null` for something missing. Other
+content types are filled in as they are.
+
+What a template can use:
+
+| Name | What it is |
+| --- | --- |
+| `event` | `firing`, `escalated`, `eased`, `reminder`, `resolved` or `test` |
+| `text` | The notification in one line, like `Resolved: CPU usage on web-1 is 97%, above 90%` |
+| `id` | The same for every attempt at one notification, so a receiver can spot a repeat |
+| `link` | The alerts page, when the server knows the address people reach it at |
+| `alert.id`, `alert.rule_id`, `alert.rule_name` | The alert, and the rule that started it |
+| `alert.severity` | `warning` or `critical` |
+| `alert.host`, `alert.agent_id` | The machine |
+| `alert.series` | The disk, container or other series it's about, if any |
+| `alert.value`, `alert.summary` | The reading that started it, and what's wrong in words |
+| `alert.started`, `alert.resolved` | Times like `2026-11-10T14:03:00Z`, with `alert.started_ms` and `alert.resolved_ms` in milliseconds |
+| `alert.resolve_reason` | Why it resolved, when it wasn't the reading recovering |
+| `alert.acknowledged_by`, `alert.acknowledged` | Who acknowledged it, if anyone, and `alert.acknowledged_ms` |
+
+Templates can also use Tera's `if` and `for`, and its filters, like
+`{{ alert.host | upper }}`.
+
+There are three ways to check a template works before an alert depends on it:
+
+- **Saving** fills the template in for an alert starting, one resolving and a test, and
+  refuses it if that fails, or if a JSON body doesn't come out as valid JSON.
+- **Preview the body**, on the form, shows what an example alert would send, without
+  saving or sending anything.
+- **Send a test**, on the list of channels, sends a real request. A test fills in an
+  example alert on `maxnines-test`, with the event `test`, so every name in the template
+  has a value. If the service refuses it, the error shows its status and the start of
+  its reply, which usually says what it didn't like.
+
 ## Slack buttons
 
 Slack alerts can have **Acknowledge** and **Silence 1 hour** buttons. They need the

@@ -1576,6 +1576,7 @@ fn webhook_channel(url: &str) -> ChannelInput {
         app_token: None,
         severities: crate::alerting::every_severity(),
         mail: None,
+        request: None,
     }
 }
 
@@ -1644,6 +1645,7 @@ async fn a_discord_channel_gets_discords_message_format() {
         app_token: None,
         severities: crate::alerting::every_severity(),
         mail: None,
+        request: None,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -1971,6 +1973,7 @@ async fn firing_on(
         app_token: None,
         severities: crate::alerting::every_severity(),
         mail: None,
+        request: None,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -2071,6 +2074,7 @@ async fn a_test_opens_an_incident_and_closes_it_again_on_every_service() {
                 app_token: None,
                 severities: crate::alerting::every_severity(),
                 mail: None,
+                request: None,
             },
         };
 
@@ -2252,6 +2256,7 @@ async fn a_pagerduty_test_opens_an_incident_and_closes_it_again() {
             app_token: None,
             severities: crate::alerting::every_severity(),
             mail: None,
+            request: None,
         },
     };
     let senders = Senders {
@@ -2368,6 +2373,7 @@ async fn firing_on_telegram(test: &mut Harness, telegram: &FakeTelegram) -> Noti
         app_token: None,
         severities: crate::alerting::every_severity(),
         mail: None,
+        request: None,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -2476,6 +2482,7 @@ async fn not_reaching_telegram_says_so_without_the_token() {
             app_token: None,
             severities: crate::alerting::every_severity(),
             mail: None,
+            request: None,
         },
     };
     let senders = Senders {
@@ -2567,6 +2574,7 @@ async fn firing_on_slack_app(
         app_token: app_token.map(str::to_string),
         severities: crate::alerting::every_severity(),
         mail: None,
+        request: None,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -2857,6 +2865,7 @@ async fn a_slack_test_says_when_the_app_level_token_is_wrong() {
             app_token: Some("xapp-secret-token".to_string()),
             severities: crate::alerting::every_severity(),
             mail: None,
+            request: None,
         },
     };
     let senders = Senders {
@@ -3066,6 +3075,7 @@ async fn not_reaching_slack_says_so_without_any_detail() {
             app_token: None,
             severities: crate::alerting::every_severity(),
             mail: None,
+            request: None,
         },
     };
     let senders = Senders {
@@ -3250,6 +3260,7 @@ async fn a_channel_that_is_down_does_not_hold_up_the_others() {
         app_token: None,
         severities: crate::alerting::every_severity(),
         mail: None,
+        request: None,
     };
     let dead = test
         .database()
@@ -3498,6 +3509,7 @@ fn mail_channel(port: u16) -> ChannelInput {
                 username: None,
             }),
         }),
+        request: None,
     }
 }
 
@@ -3538,6 +3550,7 @@ async fn an_email_channel_from_before_mail_servers_were_per_channel_says_what_it
     let mut test = Harness::start().await;
     let channel = ChannelInput {
         mail: None,
+        request: None,
         ..mail_channel(25)
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
@@ -3655,6 +3668,7 @@ fn resend_channel() -> ChannelInput {
             from: "MaxNines <alerts@example.com>".to_string(),
             server: None,
         }),
+        request: None,
     }
 }
 
@@ -5844,6 +5858,7 @@ mod reminders {
             app_token: None,
             severities: crate::alerting::every_severity(),
             mail: None,
+            request: None,
         };
         let channel = test.database().create_channel(&channel).await.unwrap();
         let rule = AlertRuleInput {
@@ -7065,6 +7080,7 @@ mod charts {
             app_token: None,
             severities: crate::alerting::every_severity(),
             mail: None,
+            request: None,
         };
         let channel = server
             .state
@@ -7106,6 +7122,7 @@ mod charts {
             app_token: None,
             severities: crate::alerting::every_severity(),
             mail: None,
+            request: None,
         };
         let channel = server
             .state
@@ -7164,6 +7181,7 @@ mod charts {
             app_token: None,
             severities: crate::alerting::every_severity(),
             mail: None,
+            request: None,
         };
         let channel = server
             .state
@@ -7220,6 +7238,7 @@ mod charts {
             app_token: None,
             severities: crate::alerting::every_severity(),
             mail: None,
+            request: None,
         };
         let channel = server
             .state
@@ -7257,4 +7276,304 @@ mod charts {
                 .is_empty()
         );
     }
+}
+
+/// What a custom webhook's receiver was sent.
+#[derive(Debug, Clone)]
+struct Received {
+    method: String,
+    path: String,
+    headers: axum::http::HeaderMap,
+    body: String,
+}
+
+/// Stands in for a service a custom webhook talks to. It answers with each reply
+/// in turn, then 200.
+#[derive(Clone, Default)]
+struct Receiver {
+    received: Arc<Mutex<Vec<Received>>>,
+    replies: Arc<Mutex<Vec<(StatusCode, &'static str)>>>,
+}
+
+impl Receiver {
+    async fn start(&self) -> String {
+        let receiver = self.clone();
+        let router = Router::new().fallback(any(
+            move |method: axum::http::Method,
+                  uri: axum::http::Uri,
+                  headers: axum::http::HeaderMap,
+                  body: String| {
+                let receiver = receiver.clone();
+                async move {
+                    receiver.received.lock().unwrap().push(Received {
+                        method: method.to_string(),
+                        path: uri.path().to_string(),
+                        headers,
+                        body,
+                    });
+                    let mut replies = receiver.replies.lock().unwrap();
+                    if replies.is_empty() {
+                        (StatusCode::OK, "")
+                    } else {
+                        replies.remove(0)
+                    }
+                }
+            },
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        format!("http://{address}")
+    }
+
+    fn received(&self) -> Vec<Received> {
+        self.received.lock().unwrap().clone()
+    }
+}
+
+const STATUS_BOARD_BODY: &str = r#"{
+  "title": "{{ alert.rule_name }} on {{ alert.host }}",
+  "state": "{% if event == "resolved" %}ok{% else %}{{ alert.severity }}{% endif %}",
+  "value": {{ alert.value | json }},
+  "started": "{{ alert.started }}"
+}"#;
+
+/// The fields of the form for a custom webhook to `url`.
+fn custom_webhook_fields<'a>(url: &'a str, body: &'a str) -> Vec<(&'a str, &'a str)> {
+    vec![
+        ("name", "Status board"),
+        ("kind", "custom_webhook"),
+        ("target", url),
+        ("request_method", "PUT"),
+        ("request_content_type", "application/json"),
+        (
+            "headers",
+            "Authorization: Bearer secret-header\r\nX-Team: ops",
+        ),
+        ("request_body", body),
+        ("sends_warnings", "on"),
+        ("sends_critical", "on"),
+    ]
+}
+
+#[tokio::test]
+async fn a_custom_webhook_made_on_the_form_sends_the_request_it_describes() {
+    let mut test = Harness::start().await;
+    let receiver = Receiver::default();
+    let url = format!("{}/events/secret-path", receiver.start().await);
+    let mut browser = Browser::default();
+    let body = STATUS_BOARD_BODY.replace('\n', "\r\n");
+    let page = browser
+        .submit(
+            &test.server,
+            "/alerts/channels/new",
+            "/alerts/channels",
+            &custom_webhook_fields(&url, &body),
+        )
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+
+    // Neither the URL nor the headers' values are shown again, but the names are.
+    let channel = test.database().list_channels().await.unwrap()[0].clone();
+    for path in [
+        "/alerts/channels",
+        &format!("/alerts/channels/{}/edit", channel.id),
+    ] {
+        let page = browser.get(&test.server, path).await;
+        assert!(page.body.contains("Custom webhook"), "{}", page.body);
+        assert!(!page.body.contains("secret-path"), "{}", page.body);
+        assert!(!page.body.contains("secret-header"), "{}", page.body);
+    }
+    let page = browser
+        .get(
+            &test.server,
+            &format!("/alerts/channels/{}/edit", channel.id),
+        )
+        .await;
+    assert!(
+        page.body.contains("Saved: authorization, x-team"),
+        "{}",
+        page.body
+    );
+    // The body comes back as it was typed, without the browser's line endings.
+    assert_eq!(
+        channel.channel.request.as_ref().unwrap().body,
+        STATUS_BOARD_BODY
+    );
+
+    let rule = AlertRuleInput {
+        for_secs: 0,
+        channels: vec![channel.id],
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    test.cpu(0, 95.0).await;
+    let notifier = Notifier::new(test.database().clone(), Senders::default());
+    notifier.deliver_due(test.now).await.unwrap();
+    test.cpu(MINUTE_MS, 10.0).await;
+    notifier.deliver_due(test.now + MINUTE_MS).await.unwrap();
+
+    let received = receiver.received();
+    assert_eq!(received.len(), 2);
+    let first = &received[0];
+    assert_eq!(first.method, "PUT");
+    assert_eq!(first.path, "/events/secret-path");
+    assert_eq!(first.headers["authorization"], "Bearer secret-header");
+    assert_eq!(first.headers["x-team"], "ops");
+    assert_eq!(first.headers["content-type"], "application/json");
+    let firing: Value = serde_json::from_str(&first.body).unwrap();
+    assert_eq!(firing["title"], "High CPU on web-1");
+    assert_eq!(firing["state"], "critical");
+    assert_eq!(firing["value"], 95.0);
+    assert!(
+        firing["started"].as_str().unwrap().ends_with('Z'),
+        "{firing}"
+    );
+    let resolved: Value = serde_json::from_str(&received[1].body).unwrap();
+    assert_eq!(resolved["state"], "ok");
+}
+
+#[tokio::test]
+async fn the_test_button_sends_a_custom_webhook_an_example_alert_and_shows_a_refusal() {
+    let server = start().await;
+    let receiver = Receiver::default();
+    let url = format!("{}/events", receiver.start().await);
+    let mut browser = Browser::default();
+    let page = browser
+        .submit(
+            &server,
+            "/alerts/channels/new",
+            "/alerts/channels",
+            &custom_webhook_fields(&url, STATUS_BOARD_BODY),
+        )
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    let id = server.state.database.list_channels().await.unwrap()[0].id;
+    let path = format!("/alerts/channels/{id}/test");
+
+    let page = browser
+        .submit(&server, "/alerts/channels", &path, &[])
+        .await;
+    assert!(
+        page.body
+            .contains("A test notification was sent to Status board."),
+        "{}",
+        page.body
+    );
+    let received = receiver.received();
+    let test: Value = serde_json::from_str(&received[0].body).unwrap();
+    assert_eq!(test["title"], "Test notification on maxnines-test");
+    assert_eq!(test["state"], "warning");
+    assert_eq!(test["value"], Value::Null);
+    assert_eq!(received[0].headers["authorization"], "Bearer secret-header");
+
+    // What the service said is wrong shows, so the template can be fixed.
+    receiver.replies.lock().unwrap().push((
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{\"error\": \"state must be one of ok, warn, crit\"}",
+    ));
+    let page = browser
+        .submit(&server, "/alerts/channels", &path, &[])
+        .await;
+    assert!(
+        page.body.contains("the webhook returned status 422: {&quot;error&quot;: &quot;state must be one of ok, warn, crit&quot;}"),
+        "{}",
+        page.body
+    );
+    assert!(!page.body.contains("secret-header"));
+}
+
+#[tokio::test]
+async fn previewing_a_custom_webhook_fills_in_its_body_without_saving_or_sending() {
+    let server = start().await;
+    let receiver = Receiver::default();
+    let url = format!("{}/events", receiver.start().await);
+    let mut browser = Browser::default();
+    let mut fields = custom_webhook_fields(&url, STATUS_BOARD_BODY);
+    fields.push(("form_action", "preview"));
+    let page = browser
+        .submit(&server, "/alerts/channels/new", "/alerts/channels", &fields)
+        .await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(
+        page.body
+            .contains("&quot;title&quot;: &quot;High CPU on web-1&quot;"),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains("Nothing has been saved or sent."));
+    // The form keeps what was typed, apart from the headers' values.
+    assert!(
+        page.body.contains(r#"<option value="PUT" selected>"#),
+        "{}",
+        page.body
+    );
+    assert!(
+        server
+            .state
+            .database
+            .list_channels()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(receiver.received().is_empty());
+
+    // A template that doesn't work says why, in the same place.
+    let broken = r#"{"title": {{ alert.rule_name }}}"#;
+    let mut fields = custom_webhook_fields(&url, broken);
+    fields.push(("form_action", "preview"));
+    let page = browser
+        .submit(&server, "/alerts/channels/new", "/alerts/channels", &fields)
+        .await;
+    assert!(
+        page.body
+            .contains("the body isn&#39;t valid JSON: expected value at line 1 column 11"),
+        "{}",
+        page.body
+    );
+    // What came out is shown too, as that's what the line and column count in.
+    assert!(
+        page.body.contains("{&quot;title&quot;: High CPU}"),
+        "{}",
+        page.body
+    );
+    assert!(!page.body.contains("Nothing has been saved or sent."));
+}
+
+#[tokio::test]
+async fn a_custom_webhook_whose_template_does_not_work_is_not_saved() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    for (body, problem) in [
+        (
+            r#"{"title": "{{ alert.rule_name }"}"#,
+            "the body template didn",
+        ),
+        (r#"{"title": {{ alert.rule_name }}}"#, "the body isn"),
+        (
+            r#"{"rule": "{{ alert.nothing_here }}"}"#,
+            "the body template didn",
+        ),
+    ] {
+        let page = browser
+            .submit(
+                &server,
+                "/alerts/channels/new",
+                "/alerts/channels",
+                &custom_webhook_fields("https://example.com/hook", body),
+            )
+            .await;
+        assert_eq!(page.status, 422, "{body}: {}", page.body);
+        assert!(page.body.contains(problem), "{body}: {}", page.body);
+    }
+    assert!(
+        server
+            .state
+            .database
+            .list_channels()
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

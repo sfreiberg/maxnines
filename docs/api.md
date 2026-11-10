@@ -869,17 +869,18 @@ curl -X DELETE -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 ## Notification channels
 
-Where alerts go. Webhook addresses, Teams workflow URLs, PagerDuty keys, AlertOps and SIGNL4 URLs, Slack
+Where alerts go. Webhook addresses, custom webhook headers, Teams workflow URLs, PagerDuty keys, AlertOps and SIGNL4 URLs, Slack
 and Telegram tokens, mail server passwords and Resend API keys can be set but never read back, so
 `target_preview` only shows enough to recognize a channel.
 
 | Field | Description |
 | --- | --- |
 | `name` | Required |
-| `kind` | Required. `webhook`, `email`, `resend`, `discord`, `slack`, `teams`, `pagerduty`, `alertops`, `signl4` or `telegram` |
+| `kind` | Required. `webhook`, `custom_webhook`, `email`, `resend`, `discord`, `slack`, `teams`, `pagerduty`, `alertops`, `signl4` or `telegram` |
 | `target` | Required. A webhook's address, a Teams workflow's URL, email addresses separated by commas for email and Resend, a Slack channel, a PagerDuty integration key, the URL from AlertOps or SIGNL4, or a Telegram chat ID such as `-1001234567890` or `@channel` |
-| `credential` | Slack's or Telegram's bot token, the mail server's password for email, or the API key for Resend |
+| `credential` | Slack's or Telegram's bot token, the mail server's password for email, the API key for Resend, or a custom webhook's headers, one to a line as `Name: value` |
 | `mail` | Email and Resend only. See below |
+| `request` | Custom webhooks only, and required for them. See below |
 | `app_token` | Optional, Slack only. The app-level token, starting `xapp-`, that adds Acknowledge and Silence buttons |
 | `severities` | Which alerts it's sent: `["warning", "critical"]`, the default, or one of them, as in [which channels hear what](alerts.md#which-channels-hear-what) |
 
@@ -893,6 +894,28 @@ Email and Resend channels have `mail`:
 | `server.port` | The usual port for `security` if left out: 587 for `starttls`, 465 for `tls`, 25 for `none` |
 | `server.security` | `starttls`, the default, `tls`, or `none` for a relay on a trusted network |
 | `server.username` | For a server that asks you to sign in. The password goes in `credential`, and needs `starttls` or `tls` |
+
+Custom webhooks have `request`, as in [custom webhooks](notifications.md#custom-webhooks):
+
+| Field | Description |
+| --- | --- |
+| `method` | `POST`, the default, `PUT` or `PATCH` |
+| `content_type` | Required. Like `application/json`, which has what's filled in escaped for JSON |
+| `body` | Required. A Tera template, up to 16 KB. It's checked when saved, and a JSON body has to come out as valid JSON |
+
+Reading a custom webhook back gives `header_names`, the names of its headers, but never
+their values.
+
+```sh
+curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Status board", "kind": "custom_webhook",
+       "target": "https://status.example.com/api/events",
+       "credential": "Authorization: Bearer abc123",
+       "request": {"method": "POST", "content_type": "application/json",
+                   "body": "{\"title\": \"{{ alert.rule_name }} on {{ alert.host }}\", \"status\": \"{{ event }}\"}"}}' \
+  "$MAXNINES_URL/api/v1/notification-channels"
+```
 
 ```sh
 curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
@@ -944,7 +967,9 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "kind": "webhook",
   "target_preview": "https://hooks.example.com/…",
   "severities": ["warning", "critical"],
-  "mail": null
+  "mail": null,
+  "request": null,
+  "header_names": null
 }
 ```
 

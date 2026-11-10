@@ -1313,6 +1313,10 @@ struct ChannelView {
     /// Who email comes from and the mail server, for email channels. The password
     /// is write-only, like every other secret.
     mail: Option<crate::alerting::Mail>,
+    /// What a custom webhook sends. Its headers are write-only, so only their
+    /// names are shown.
+    request: Option<crate::alerting::WebhookRequest>,
+    header_names: Option<Vec<String>>,
 }
 
 impl ChannelView {
@@ -1322,6 +1326,12 @@ impl ChannelView {
             target_preview: channel.channel.target_preview(),
             severities: channel.channel.severities.clone(),
             mail: channel.channel.mail.clone(),
+            request: channel.channel.request.clone(),
+            header_names: (channel.channel.kind == ChannelKind::CustomWebhook).then(|| {
+                crate::channels::custom_webhook::header_names(
+                    channel.channel.credential.as_deref().unwrap_or_default(),
+                )
+            }),
             name: channel.channel.name,
             kind: channel.channel.kind,
         }

@@ -32,6 +32,7 @@ impl MigratorTrait for Migrator {
             Box::new(AddAuditVia),
             Box::new(AddRoles),
             Box::new(AddTwoFactor),
+            Box::new(AddChannelRequests),
         ]
     }
 }
@@ -2320,6 +2321,78 @@ impl MigrationTrait for AddTwoFactor {
                 .alter_table(
                     Table::alter()
                         .table(UserTwoFactor::Table)
+                        .drop_column(column)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+// ---- Custom webhooks
+
+struct AddChannelRequests;
+
+impl MigrationName for AddChannelRequests {
+    fn name(&self) -> &str {
+        "m20261110_000021_add_channel_requests"
+    }
+}
+
+#[derive(Iden)]
+enum ChannelRequests {
+    #[iden = "notification_channels"]
+    Table,
+    /// `POST`, `PUT` or `PATCH`, for a custom webhook.
+    RequestMethod,
+    RequestContentType,
+    /// A Tera template, up to 16 KB. Its headers are the channel's credential.
+    RequestBody,
+}
+
+/// What a custom webhook sends. Other kinds of channel leave it empty.
+#[async_trait::async_trait]
+impl MigrationTrait for AddChannelRequests {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let columns = [
+            ColumnDef::new(ChannelRequests::RequestMethod)
+                .string_len(8)
+                .null()
+                .to_owned(),
+            ColumnDef::new(ChannelRequests::RequestContentType)
+                .string_len(255)
+                .null()
+                .to_owned(),
+            ColumnDef::new(ChannelRequests::RequestBody)
+                .text()
+                .null()
+                .to_owned(),
+        ];
+        // One at a time, as SQLite only adds one column per statement.
+        for column in columns {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(ChannelRequests::Table)
+                        .add_column(column)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for column in [
+            ChannelRequests::RequestMethod,
+            ChannelRequests::RequestContentType,
+            ChannelRequests::RequestBody,
+        ] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(ChannelRequests::Table)
                         .drop_column(column)
                         .to_owned(),
                 )

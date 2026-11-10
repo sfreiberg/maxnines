@@ -16,7 +16,7 @@ use super::{Database, alert, alert_rule, alert_rule_channel, notification, notif
 use crate::alerting::{
     Alert, AlertRule, AlertRuleInput, Channel, ChannelInput, ChannelKind, Comparison, Delivery,
     DeliveryProblem, Event, Mail, MailSecurity, MailServer, NewAlert, RULE_GONE_REASON, RuleKind,
-    Severity, SeverityChange,
+    Severity, SeverityChange, WebhookMethod, WebhookRequest,
 };
 use crate::audit::{Action, Kind, Record, Snapshot, Subject};
 use crate::calculations::Calculation;
@@ -100,6 +100,7 @@ fn alert_rule_row(input: &AlertRuleInput) -> Result<alert_rule::ActiveModel> {
 fn channel_row(input: &ChannelInput) -> notification_channel::ActiveModel {
     let mail = input.mail.as_ref();
     let server = mail.and_then(|mail| mail.server.as_ref());
+    let request = input.request.as_ref();
     notification_channel::ActiveModel {
         name: Set(input.name.clone()),
         kind: Set(input.kind.as_str().to_string()),
@@ -113,6 +114,9 @@ fn channel_row(input: &ChannelInput) -> notification_channel::ActiveModel {
         mail_port: Set(server.and_then(|server| server.port).map(i32::from)),
         mail_security: Set(server.map(|server| server.security.as_str().to_string())),
         mail_username: Set(server.and_then(|server| server.username.clone())),
+        request_method: Set(request.map(|request| request.method.as_str().to_string())),
+        request_content_type: Set(request.map(|request| request.content_type.trim().to_string())),
+        request_body: Set(request.map(|request| request.body.clone())),
         ..Default::default()
     }
 }
@@ -144,8 +148,21 @@ fn to_mail(row: &notification_channel::Model) -> Result<Option<Mail>> {
     Ok(Some(Mail { from, server }))
 }
 
+/// What a custom webhook sends, if it is one.
+fn to_request(row: &notification_channel::Model) -> Result<Option<WebhookRequest>> {
+    let Some(method) = &row.request_method else {
+        return Ok(None);
+    };
+    Ok(Some(WebhookRequest {
+        method: WebhookMethod::parse(method)?,
+        content_type: row.request_content_type.clone().unwrap_or_default(),
+        body: row.request_body.clone().unwrap_or_default(),
+    }))
+}
+
 fn to_channel(row: notification_channel::Model) -> Result<Channel> {
     let mail = to_mail(&row)?;
+    let request = to_request(&row)?;
     Ok(Channel {
         id: row.id,
         channel: ChannelInput {
@@ -162,6 +179,7 @@ fn to_channel(row: notification_channel::Model) -> Result<Channel> {
             .filter_map(|(severity, sent)| sent.then_some(severity))
             .collect(),
             mail,
+            request,
         },
     })
 }
@@ -482,6 +500,7 @@ fn channel_snapshot(channel: &Channel) -> Snapshot {
         "app_token": input.app_token,
         "severities": severities,
         "mail": input.mail,
+        "request": input.request,
     });
     let snapshot =
         Snapshot::new(input.name.clone(), fields).with_secrets(&["credential", "app_token"]);

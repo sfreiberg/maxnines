@@ -11,10 +11,12 @@ use serde::Serialize;
 
 use super::{CsrfForm, Page, server_error};
 use crate::alerting::{
-    Channel, ChannelInput, ChannelKind, Mail, MailSecurity, MailServer, Severity,
+    Channel, ChannelInput, ChannelKind, Mail, MailSecurity, MailServer, Severity, WebhookMethod,
+    WebhookRequest,
 };
 use crate::app_state::AppState;
 use crate::channels;
+use crate::channels::custom_webhook;
 use crate::notifier::{self, Notice};
 
 pub fn routes() -> Router<AppState> {
@@ -54,6 +56,15 @@ struct ChannelForm {
     mail_port: String,
     mail_security: String,
     mail_username: String,
+    /// A custom webhook's headers, one to a line. They usually hold a token, so
+    /// they're only ever typed in. Only their names are shown once saved.
+    headers: String,
+    header_names: Vec<String>,
+    /// Ticked to send no headers any more.
+    remove_headers: bool,
+    request_method: String,
+    request_content_type: String,
+    request_body: String,
 }
 
 impl ChannelForm {
@@ -75,6 +86,12 @@ impl ChannelForm {
             mail_port: String::new(),
             mail_security: MailSecurity::default().as_str().to_string(),
             mail_username: String::new(),
+            headers: String::new(),
+            header_names: Vec::new(),
+            remove_headers: false,
+            request_method: WebhookMethod::default().as_str().to_string(),
+            request_content_type: "application/json".to_string(),
+            request_body: custom_webhook::EXAMPLE_BODY.to_string(),
         }
     }
 
@@ -82,6 +99,9 @@ impl ChannelForm {
         let hidden = channels::of(channel.kind).hides_target();
         let mail = channel.mail.as_ref();
         let server = mail.and_then(|mail| mail.server.as_ref());
+        let blank = Self::blank();
+        let request = channel.request.as_ref();
+        let custom = channel.kind == ChannelKind::CustomWebhook;
         Self {
             name: channel.name.clone(),
             kind: channel.kind.as_str().to_string(),
@@ -112,6 +132,19 @@ impl ChannelForm {
             mail_username: server
                 .and_then(|server| server.username.clone())
                 .unwrap_or_default(),
+            headers: String::new(),
+            header_names: match &channel.credential {
+                Some(headers) if custom => custom_webhook::header_names(headers),
+                _ => Vec::new(),
+            },
+            remove_headers: false,
+            request_method: request.map_or(blank.request_method, |request| {
+                request.method.as_str().to_string()
+            }),
+            request_content_type: request.map_or(blank.request_content_type, |request| {
+                request.content_type.clone()
+            }),
+            request_body: request.map_or(blank.request_body, |request| request.body.clone()),
         }
     }
 
@@ -134,7 +167,40 @@ impl ChannelForm {
             mail_port: text("mail_port"),
             mail_security: text("mail_security"),
             mail_username: text("mail_username"),
+            headers: text("headers"),
+            header_names: Vec::new(),
+            remove_headers: fields.contains_key("remove_headers"),
+            request_method: text("request_method"),
+            request_content_type: text("request_content_type"),
+            request_body: text("request_body"),
         }
+    }
+
+    /// What a custom webhook sends, if it is one. Browsers send a text box's lines
+    /// ending in CRLF, which would end up in the body.
+    fn to_request(&self, kind: ChannelKind) -> Result<Option<WebhookRequest>> {
+        if kind != ChannelKind::CustomWebhook {
+            return Ok(None);
+        }
+        Ok(Some(WebhookRequest {
+            method: WebhookMethod::parse(self.request_method.trim())?,
+            content_type: self.request_content_type.trim().to_string(),
+            body: self.request_body.replace("\r\n", "\n"),
+        }))
+    }
+
+    /// What's been typed for the credential, which for a custom webhook is its
+    /// headers, tidied to one to a line.
+    fn typed_credential(&self, kind: ChannelKind) -> String {
+        if kind != ChannelKind::CustomWebhook {
+            return self.credential.trim().to_string();
+        }
+        self.headers
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// How the channel sends email, if it's a kind that does. Empty boxes are left
@@ -189,11 +255,12 @@ impl ChannelForm {
             .as_ref()
             .and_then(|mail| mail.server.as_ref())
             .is_some_and(|server| server.username.is_some());
-        let typed = self.credential.trim();
+        let typed = self.typed_credential(kind);
         let credential = match saved {
             _ if !kind.has_credential() => None,
             _ if kind == ChannelKind::Email && !signs_in => None,
-            _ if !typed.is_empty() => Some(typed.to_string()),
+            _ if kind == ChannelKind::CustomWebhook && self.remove_headers => None,
+            _ if !typed.is_empty() => Some(typed),
             Some(saved) if saved.kind == kind => saved.credential.clone(),
             _ => None,
         };
@@ -218,7 +285,34 @@ impl ChannelForm {
             .filter_map(|(severity, ticked)| ticked.then_some(severity))
             .collect(),
             mail,
+            request: self.to_request(kind)?,
         })
+    }
+}
+
+/// A custom webhook's body filled in with an example alert, or why it can't be.
+#[derive(Serialize)]
+struct BodyPreview {
+    method: String,
+    content_type: String,
+    body: Option<String>,
+    error: Option<String>,
+}
+
+fn body_preview(state: &AppState, form: &ChannelForm) -> BodyPreview {
+    let (body, error) = match form.to_request(ChannelKind::CustomWebhook) {
+        Ok(Some(request)) => {
+            let preview = custom_webhook::preview(&request, state.senders.web_url.as_deref());
+            (preview.body, preview.problem)
+        }
+        Ok(None) => (None, None),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    };
+    BodyPreview {
+        method: form.request_method.trim().to_string(),
+        content_type: form.request_content_type.trim().to_string(),
+        body,
+        error,
     }
 }
 
@@ -291,6 +385,17 @@ fn form_page(
     form: &ChannelForm,
     error: Option<&str>,
 ) -> Response {
+    form_page_with(state, token, id, form, error, None)
+}
+
+fn form_page_with(
+    state: &AppState,
+    token: &CsrfToken,
+    id: Option<i64>,
+    form: &ChannelForm,
+    error: Option<&str>,
+    preview: Option<&BodyPreview>,
+) -> Response {
     let kinds: Vec<KindChoice> = channels::ALL
         .into_iter()
         .map(|kind| KindChoice {
@@ -306,6 +411,8 @@ fn form_page(
         .with("slack_manifest", &channels::slack::manifest())
         .with("slack_manifest_link", &channels::slack::manifest_link())
         .with("securities", &MailSecurity::ALL.map(MailSecurity::as_str))
+        .with("methods", &WebhookMethod::ALL.map(WebhookMethod::as_str))
+        .with("preview", &preview)
         .with("error", &error);
     match error {
         Some(_) => page.with_status(StatusCode::UNPROCESSABLE_ENTITY).render(),
@@ -333,8 +440,28 @@ async fn edit(State(state): State<AppState>, Path(id): Path<i64>, token: CsrfTok
     }
 }
 
+/// Shows a custom webhook's body filled in, without saving anything.
+fn preview_page(
+    state: &AppState,
+    form: &CsrfForm,
+    id: Option<i64>,
+    fields: &ChannelForm,
+) -> Response {
+    let preview = body_preview(state, fields);
+    form_page_with(state, &form.token, id, fields, None, Some(&preview))
+}
+
+fn wants_preview(form: &CsrfForm) -> bool {
+    form.fields
+        .get("form_action")
+        .is_some_and(|action| action == "preview")
+}
+
 async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
     let fields = ChannelForm::from_fields(&form.fields);
+    if wants_preview(&form) {
+        return preview_page(&state, &form, None, &fields);
+    }
     let checked = async {
         let input = fields.to_channel(None)?;
         state.check_channel(&input, None).await?;
@@ -362,6 +489,17 @@ async fn update(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfFo
     };
 
     let mut fields = ChannelForm::from_fields(&form.fields);
+    if saved.channel.kind == ChannelKind::CustomWebhook {
+        fields.header_names = ChannelForm::from_channel(&saved.channel).header_names;
+    }
+    if wants_preview(&form) {
+        if saved.channel.kind.as_str() == fields.kind
+            && channels::of(saved.channel.kind).hides_target()
+        {
+            fields.preview = Some(saved.channel.target_preview());
+        }
+        return preview_page(&state, &form, Some(id), &fields);
+    }
     let checked = async {
         let input = fields.to_channel(Some(&saved.channel))?;
         state.check_channel(&input, Some(id)).await?;
@@ -429,6 +567,7 @@ mod tests {
             app_token: None,
             severities: crate::alerting::every_severity(),
             mail: None,
+            request: None,
         }
     }
 
@@ -651,6 +790,64 @@ mod tests {
         let mut form = ChannelForm::from_channel(&saved);
         form.kind = "email".to_string();
         assert_eq!(form.to_channel(Some(&saved)).unwrap().target, "");
+    }
+
+    fn custom() -> ChannelInput {
+        ChannelInput {
+            kind: ChannelKind::CustomWebhook,
+            credential: Some("Authorization: Bearer secret\nX-Team: ops".to_string()),
+            request: Some(WebhookRequest {
+                method: WebhookMethod::Put,
+                content_type: "application/json".to_string(),
+                body: custom_webhook::EXAMPLE_BODY.to_string(),
+            }),
+            ..webhook()
+        }
+    }
+
+    #[test]
+    fn a_custom_webhooks_headers_never_reach_the_form_but_their_names_do() {
+        let saved = custom();
+        let form = ChannelForm::from_channel(&saved);
+        assert_eq!(form.headers, "");
+        assert_eq!(form.header_names, ["authorization", "x-team"]);
+        assert_eq!(form.request_method, "PUT");
+        assert_eq!(form.to_channel(Some(&saved)).unwrap(), saved);
+    }
+
+    #[test]
+    fn typed_headers_replace_the_saved_ones_and_can_be_removed() {
+        let saved = custom();
+        let mut form = ChannelForm::from_channel(&saved);
+        form.headers = "  X-Key: new \r\n\r\nX-Other: 2\r\n".to_string();
+        let channel = form.to_channel(Some(&saved)).unwrap();
+        assert_eq!(
+            channel.credential.as_deref(),
+            Some("X-Key: new\nX-Other: 2")
+        );
+
+        let mut form = ChannelForm::from_channel(&saved);
+        form.remove_headers = true;
+        assert_eq!(form.to_channel(Some(&saved)).unwrap().credential, None);
+    }
+
+    #[test]
+    fn a_new_custom_webhook_starts_with_an_example_and_others_send_no_request() {
+        let mut form = ChannelForm::blank();
+        assert_eq!(form.request_body, custom_webhook::EXAMPLE_BODY);
+        assert_eq!(form.request_content_type, "application/json");
+        assert_eq!(form.to_channel(None).unwrap().request, None);
+        form.kind = "custom_webhook".to_string();
+        let request = form.to_channel(None).unwrap().request.unwrap();
+        assert_eq!(request.method, WebhookMethod::Post);
+
+        // A plain webhook made from a custom one keeps neither its headers nor its body.
+        let saved = custom();
+        let mut form = ChannelForm::from_channel(&saved);
+        form.kind = "webhook".to_string();
+        let channel = form.to_channel(Some(&saved)).unwrap();
+        assert_eq!(channel.credential, None);
+        assert_eq!(channel.request, None);
     }
 
     #[test]
