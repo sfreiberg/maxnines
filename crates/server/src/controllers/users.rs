@@ -281,6 +281,9 @@ struct TwoFactorView {
 struct ProfileNotes<'a> {
     password_changed: bool,
     error: Option<&'a str>,
+    /// A problem with two-factor, shown in its own part of the page, which updates
+    /// on its own.
+    two_factor_error: Option<&'a str>,
     /// Recovery codes, the one time they're shown.
     new_codes: Option<&'a [String]>,
 }
@@ -327,8 +330,9 @@ async fn profile_page(
         .with("saved", &notes.password_changed)
         .with("two_factor", &two_factor)
         .with("new_codes", &notes.new_codes)
+        .with("two_factor_error", &notes.two_factor_error)
         .with("error", &notes.error);
-    let mut response = if notes.error.is_some() {
+    let mut response = if notes.error.is_some() || notes.two_factor_error.is_some() {
         page.with_status(StatusCode::UNPROCESSABLE_ENTITY).render()
     } else {
         page.render()
@@ -347,6 +351,13 @@ fn user_id(user: &Option<User>) -> i64 {
 fn with_error(problem: &str) -> ProfileNotes<'_> {
     ProfileNotes {
         error: Some(problem),
+        ..ProfileNotes::default()
+    }
+}
+
+fn two_factor_problem(problem: &str) -> ProfileNotes<'_> {
+    ProfileNotes {
+        two_factor_error: Some(problem),
         ..ProfileNotes::default()
     }
 }
@@ -411,7 +422,7 @@ async fn confirm_two_factor(State(state): State<AppState>, form: CsrfForm) -> Re
         Ok(None) => {
             let problem = "That code isn't right. Check the app shows a code for MaxNines, and \
                            that this machine's clock and your phone's are right.";
-            profile_page(&state, &form.token, &user, with_error(problem)).await
+            profile_page(&state, &form.token, &user, two_factor_problem(problem)).await
         }
         Err(error) => server_error(&error),
     }
@@ -432,14 +443,14 @@ async fn change_two_factor(
     }
     if change == "off" && state.require_two_factor.load(Ordering::Relaxed) {
         let problem = "An admin has made two-factor required for everyone.";
-        return profile_page(&state, &form.token, &user, with_error(problem)).await;
+        return profile_page(&state, &form.token, &user, two_factor_problem(problem)).await;
     }
     let typed = form.fields.get("current").cloned().unwrap_or_default();
     match password_is(&state, &user, typed).await {
         Ok(true) => {}
         Ok(false) => {
             let problem = "Your current password isn't right.";
-            return profile_page(&state, &form.token, &user, with_error(problem)).await;
+            return profile_page(&state, &form.token, &user, two_factor_problem(problem)).await;
         }
         Err(error) => return server_error(&error),
     }

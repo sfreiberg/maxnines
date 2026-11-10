@@ -232,6 +232,9 @@ td.nowrap { white-space: nowrap; }
 .role-choice { display: flex; align-items: center; gap: 8px; }
 .qr { display: block; border-radius: 8px; background: #fff; }
 .recovery-codes { display: grid; grid-template-columns: repeat(2, max-content); gap: 6px 28px; margin: 12px 0 0; padding: 0; list-style: none; }
+.recovery { padding: 12px 14px; border: 1px solid var(--border); border-radius: 13px; }
+.recovery p { margin: 0 0 10px; }
+.recovery .recovery-codes { margin: 0; }
 .roles { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 16px 0 0; color: var(--muted); font-size: 13px; }
 .roles dt { color: var(--text); }
 .roles dd { margin: 0; }

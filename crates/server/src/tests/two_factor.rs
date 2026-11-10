@@ -391,3 +391,59 @@ async fn an_admin_resets_it_for_someone_who_lost_their_phone() {
     assert_eq!(entry.changes[0].field, "two_factor");
     assert_eq!(entry.actor.name, "test@example.com");
 }
+
+#[tokio::test]
+async fn the_two_factor_card_updates_in_place() {
+    let server = start().await;
+    person(&server, EMAIL).await;
+    let mut browser = Browser::anonymous();
+    give_password(&server, &mut browser, EMAIL).await;
+
+    let profile = browser.get(&server, "/profile").await;
+    // The card swaps itself for the same card from the answer, so the page around
+    // it stays where it was.
+    for attribute in [
+        r##"id="two-factor" hx-target="this" hx-select="#two-factor""##,
+        r#"hx-post="/profile/two-factor/start""#,
+    ] {
+        assert!(profile.body.contains(attribute), "{attribute}");
+    }
+    // A form with a problem comes back as 422, which htmx has to show.
+    assert!(profile.body.contains(r#"{"code":"422","swap":true}"#));
+
+    let token = profile.token();
+    let started = browser
+        .post(
+            &server,
+            "/profile/two-factor/start",
+            &[("authenticity_token", &token)],
+        )
+        .await;
+    assert!(
+        started
+            .body
+            .contains(r#"hx-post="/profile/two-factor/confirm""#)
+    );
+    // Its problems are inside it, where the swap shows them.
+    let token = started.token();
+    let wrong = browser
+        .post(
+            &server,
+            "/profile/two-factor/confirm",
+            &[("authenticity_token", &token), ("code", "000000")],
+        )
+        .await;
+    assert_eq!(wrong.status, 422);
+    let card = &wrong.body[wrong.body.find(r#"id="two-factor""#).unwrap()..];
+    let card = &card[..card.find("</section>").unwrap()];
+    assert!(card.contains("That code isn"), "{card}");
+    // And the other forms on the page still work with the token they had.
+    let page = browser
+        .post(
+            &server,
+            "/profile/theme",
+            &[("authenticity_token", &profile.token()), ("theme", "paper")],
+        )
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+}
