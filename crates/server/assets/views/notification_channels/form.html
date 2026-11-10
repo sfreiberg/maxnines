@@ -23,6 +23,7 @@
       <option value="pagerduty"{% if channel.kind == "pagerduty" %} selected{% endif %}>PagerDuty</option>
       <option value="alertops"{% if channel.kind == "alertops" %} selected{% endif %}>AlertOps</option>
       <option value="signl4"{% if channel.kind == "signl4" %} selected{% endif %}>SIGNL4</option>
+      <option value="teams"{% if channel.kind == "teams" %} selected{% endif %}>Microsoft Teams</option>
       <option value="telegram"{% if channel.kind == "telegram" %} selected{% endif %}>Telegram</option>
     </select>
     {% if not email_ready %}<small>Email needs an <code>email</code> block in the server config.</small>{% endif %}
@@ -54,7 +55,7 @@
 
   <label>Sends to
     <input type="text" name="target" value="{{ channel.target }}" spellcheck="false" autocomplete="off"{% if channel.preview %} placeholder="{{ channel.preview }}"{% endif %}>
-    <small>{% if channel.preview %}Leave empty to keep what's saved, which isn't shown because it can work like a password.{% else %}A webhook's URL, a Discord webhook URL, email addresses separated by commas, for Slack a channel such as <code>#alerts</code>, for PagerDuty an integration key, the URL from AlertOps or SIGNL4, or for Telegram a chat ID.{% endif %}</small>
+    <small>{% if channel.preview %}Leave empty to keep what's saved, which isn't shown because it can work like a password.{% else %}A webhook's URL, a Discord webhook URL, a Teams workflow's URL, email addresses separated by commas, for Slack a channel such as <code>#alerts</code>, for PagerDuty an integration key, the URL from AlertOps or SIGNL4, or for Telegram a chat ID.{% endif %}</small>
   </label>
 
   <details class="for-pagerduty">
@@ -83,6 +84,17 @@
       <li>Leave the authorization header off, then copy the integration's URL into the box above. Do this last, as changing its source changes the URL.</li>
     </ol>
     <p class="note">Sending a test opens an alert and closes it straight away, which can notify whoever is on call.</p>
+  </details>
+
+  <details class="for-teams">
+    <summary>How to get a Teams workflow URL</summary>
+    <ol>
+      <li>In Teams, open the channel that should get alerts, open its <strong>&middot;&middot;&middot;</strong> menu, and choose <strong>Workflows</strong>.</li>
+      <li>Choose <strong>Post to a channel when a webhook request is received</strong>, give it a name such as MaxNines, and choose <strong>Next</strong>.</li>
+      <li>Check the team and channel, then choose <strong>Add workflow</strong>.</li>
+      <li>Copy the URL it shows into the box above. Teams doesn't show it again, though Power Automate does, under the workflow's <strong>When a Teams webhook request is received</strong> step.</li>
+    </ol>
+    <p class="note">Office 365 connector URLs, on webhook.office.com, have been retired by Microsoft and no longer work. Teams messages don't include the chart, and have no Acknowledge or Silence buttons.</p>
   </details>
 
   <details class="for-signl4">

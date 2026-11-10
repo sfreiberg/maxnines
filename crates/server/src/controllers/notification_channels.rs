@@ -68,6 +68,7 @@ impl ChannelForm {
             channel.kind,
             ChannelKind::Webhook
                 | ChannelKind::Discord
+                | ChannelKind::Teams
                 | ChannelKind::PagerDuty
                 | ChannelKind::AlertOps
                 | ChannelKind::Signl4

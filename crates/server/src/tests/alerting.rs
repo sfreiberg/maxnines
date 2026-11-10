@@ -1658,6 +1658,83 @@ async fn a_discord_channel_can_be_made_from_the_form_and_keeps_its_url_hidden() 
 }
 
 #[tokio::test]
+async fn a_teams_channel_gets_an_adaptive_card() {
+    let mut test = Harness::start().await;
+    let hook = Hook::default();
+    let channel = ChannelInput {
+        name: "Teams".to_string(),
+        kind: ChannelKind::Teams,
+        ..webhook_channel(&format!("{}/secret-token", hook.start().await))
+    };
+    let channel = test.database().create_channel(&channel).await.unwrap();
+    let rule = AlertRuleInput {
+        for_secs: 0,
+        channels: vec![channel],
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    test.cpu(0, 95.0).await;
+
+    Notifier::new(test.database().clone(), Senders::default())
+        .deliver_due(test.now)
+        .await
+        .unwrap();
+
+    let received = hook.received.lock().unwrap();
+    let card = &received[0]["attachments"][0]["content"];
+    assert_eq!(card["type"], "AdaptiveCard", "{}", received[0]);
+    assert_eq!(
+        card["body"][1]["text"],
+        "CPU usage on web-1 is 95%, above 90%"
+    );
+}
+
+#[tokio::test]
+async fn a_teams_channel_can_be_made_from_the_form_and_keeps_its_url_hidden() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    let url = "https://prod-12.westus.logic.azure.com:443/workflows/abc/triggers/manual/paths/invoke?sig=secret-token";
+    let fields = [
+        ("name", "Ops in Teams"),
+        ("kind", "teams"),
+        ("target", url),
+        ("sends_warnings", "on"),
+        ("sends_critical", "on"),
+    ];
+    let page = browser
+        .submit(&server, "/alerts/channels/new", "/alerts/channels", &fields)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+
+    let page = browser.get(&server, "/alerts/channels").await;
+    assert!(page.body.contains("Microsoft Teams"), "{}", page.body);
+    assert!(!page.body.contains("secret-token"));
+    let id = server.state.database.list_channels().await.unwrap()[0].id;
+    let page = browser
+        .get(&server, &format!("/alerts/channels/{id}/edit"))
+        .await;
+    assert!(
+        page.body.contains(r#"value="teams" selected"#),
+        "{}",
+        page.body
+    );
+    assert!(!page.body.contains("secret-token"));
+
+    let fields = [
+        ("name", "Old connector"),
+        ("kind", "teams"),
+        ("target", "https://example.webhook.office.com/webhookb2/abc"),
+        ("sends_warnings", "on"),
+        ("sends_critical", "on"),
+    ];
+    let page = browser
+        .submit(&server, "/alerts/channels/new", "/alerts/channels", &fields)
+        .await;
+    assert_eq!(page.status, 422);
+    assert!(page.body.contains("Teams workflow"), "{}", page.body);
+}
+
+#[tokio::test]
 async fn a_wrong_url_for_discord_is_refused_on_the_form() {
     let server = start().await;
     let fields = [

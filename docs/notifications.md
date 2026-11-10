@@ -33,6 +33,25 @@ in Slack, so each person needs a MaxNines account with the email they use in Sla
 Slack guests, people from other organizations through Slack Connect, and disabled
 MaxNines users can't use them. Use **Test** on the channel to check both tokens.
 
+## Microsoft Teams
+
+Alerts go to a Teams channel through a workflow that posts whatever is sent to it.
+
+1. In Teams, open the channel, open its **···** menu, and choose **Workflows**.
+2. Choose **Post to a channel when a webhook request is received**, name it, and
+   choose **Next**, then **Add workflow**.
+3. Copy the URL it shows into the channel's **Sends to** box in MaxNines. Teams
+   doesn't show it again, but Power Automate does, under the workflow's **When a
+   Teams webhook request is received** step.
+
+Each notification is a card with the alert, its rule, the machine and when it started,
+and a **View alerts** link when the server knows its own address. Teams messages have
+no chart and no buttons, as a workflow can only post. The URL works like a password,
+so it's never shown again once saved.
+
+Microsoft has retired the older Office 365 connectors, whose URLs are on
+`webhook.office.com`, so those aren't accepted.
+
 ## Telegram
 
 Alerts can go to a Telegram group, channel or private chat through a bot of your own.

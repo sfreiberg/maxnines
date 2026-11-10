@@ -486,6 +486,8 @@ pub enum ChannelKind {
     AlertOps,
     Signl4,
     Telegram,
+    /// A Teams channel, through the workflow Teams makes to post what's sent to it.
+    Teams,
 }
 
 impl ChannelKind {
@@ -509,6 +511,7 @@ impl ChannelKind {
             Self::AlertOps => "alertops",
             Self::Signl4 => "signl4",
             Self::Telegram => "telegram",
+            Self::Teams => "teams",
         }
     }
 
@@ -522,6 +525,7 @@ impl ChannelKind {
             "alertops" => Ok(Self::AlertOps),
             "signl4" => Ok(Self::Signl4),
             "telegram" => Ok(Self::Telegram),
+            "teams" => Ok(Self::Teams),
             other => bail!("unknown channel kind {other:?}"),
         }
     }
@@ -585,6 +589,7 @@ pub fn check_channel(channel: &ChannelInput) -> Result<()> {
             webhook_host(&channel.target)?;
         }
         ChannelKind::Discord => check_discord_url(&channel.target)?,
+        ChannelKind::Teams => check_teams_url(&channel.target)?,
         ChannelKind::Slack => check_slack(channel)?,
         ChannelKind::Telegram => check_telegram(channel)?,
         ChannelKind::PagerDuty => check_pagerduty_key(&channel.target)?,
@@ -711,6 +716,25 @@ fn check_discord_url(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Where Teams workflows take requests: Power Automate's older and newer addresses.
+const TEAMS_HOSTS: [&str; 2] = [".logic.azure.com", ".powerplatform.com"];
+
+/// Catches pasting the wrong thing, such as a retired Office 365 connector's URL.
+/// Errors don't repeat the URL, which holds a signature that works like a password.
+fn check_teams_url(url: &str) -> Result<()> {
+    let complaint = "that doesn't look like the URL of a Teams workflow, which comes from \
+                     its \"When a Teams webhook request is received\" step";
+    let uri: Uri = url.trim().parse().map_err(|_| anyhow!("{complaint}"))?;
+    let host = uri.host().unwrap_or_default();
+    ensure!(
+        uri.scheme_str() == Some("https")
+            && TEAMS_HOSTS.iter().any(|end| host.ends_with(end))
+            && uri.path().contains("/workflows/"),
+        "{complaint}"
+    );
+    Ok(())
+}
+
 /// A URL from an on-call service, which has a secret after `path`. `complaint` is
 /// fixed text, as the URL itself mustn't end up on the page.
 fn check_service_url(url: &str, domain: &str, path: &str, complaint: &str) -> Result<()> {
@@ -760,6 +784,7 @@ impl ChannelInput {
         match self.kind {
             ChannelKind::Webhook
             | ChannelKind::Discord
+            | ChannelKind::Teams
             | ChannelKind::AlertOps
             | ChannelKind::Signl4 => webhook_host(&self.target)
                 .map_or_else(|_| "Unknown".to_string(), |host| format!("{host}/…")),
@@ -1251,6 +1276,29 @@ mod tests {
         ChannelInput {
             kind: ChannelKind::Discord,
             ..webhook(target)
+        }
+    }
+
+    #[test]
+    fn a_teams_channel_needs_a_workflow_url_and_keeps_it_hidden() {
+        let teams = |target: &str| of_kind(ChannelKind::Teams, target);
+        for good in [
+            "https://prod-12.westus.logic.azure.com:443/workflows/abc/triggers/manual/paths/invoke?sig=secret",
+            "https://default1234.56.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/abc/triggers/manual/paths/invoke?sig=secret",
+        ] {
+            check_channel(&teams(good)).unwrap();
+            assert!(!teams(good).target_preview().contains("secret"));
+        }
+        for bad in [
+            "https://example.webhook.office.com/webhookb2/abc",
+            "http://prod-12.westus.logic.azure.com/workflows/abc",
+            "https://logic.azure.com.example.net/workflows/abc",
+            "https://prod-12.westus.logic.azure.com/other",
+            "not a url",
+        ] {
+            let error = check_channel(&teams(bad)).unwrap_err().to_string();
+            assert!(error.contains("Teams workflow"), "{bad}: {error}");
+            assert!(!error.contains("abc"), "{error}");
         }
     }
 

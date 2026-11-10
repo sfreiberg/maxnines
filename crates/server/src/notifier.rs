@@ -59,6 +59,9 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// What a chart is called when it's sent as a file.
 const CHART_FILE: &str = "chart.png";
 
+/// Keeps a message well inside what Teams takes, which counts the card's markup too.
+const TEAMS_MAX_CHARS: usize = 3000;
+
 /// The longest message Discord accepts.
 const DISCORD_MAX_CHARS: usize = 2000;
 
@@ -199,6 +202,71 @@ impl Notice {
             .take(DISCORD_MAX_CHARS)
             .collect();
         json!({ "content": content, "allowed_mentions": { "parse": [] } })
+    }
+
+    /// An Adaptive Card, as a Teams workflow posts. Teams turns `[text](url)` into a
+    /// link, and agents choose their own names, so that's broken up in what they
+    /// chose. Mentions need a list of who's meant, which this never sends.
+    fn teams_body(&self, web_url: Option<&str>) -> Value {
+        let unlinked = |text: &str| -> String {
+            text.chars()
+                .take(TEAMS_MAX_CHARS)
+                .collect::<String>()
+                .replace("](", "]\u{200b}(")
+        };
+        let colour = match (self.event, &self.alert) {
+            (Event::Resolved, _) => "Good",
+            (Event::Test, _) | (_, None) => "Default",
+            (Event::Escalated, _) => "Attention",
+            (Event::Eased, _) => "Warning",
+            (_, Some(alert)) if alert.severity == Severity::Critical => "Attention",
+            (_, Some(_)) => "Warning",
+        };
+        let summary = self
+            .alert
+            .as_ref()
+            .map_or(self.text.as_str(), |a| &a.summary);
+        let mut body = vec![
+            json!({ "type": "TextBlock", "text": self.label(), "weight": "Bolder",
+                    "color": colour, "wrap": true }),
+            json!({ "type": "TextBlock", "text": unlinked(summary), "wrap": true }),
+        ];
+        if let Some(alert) = &self.alert {
+            let mut facts = vec![
+                json!({ "title": "Rule", "value": unlinked(&alert.rule_name) }),
+                if alert.agent_id == FLEET_AGENT_ID {
+                    json!({ "title": "Machines", "value": unlinked(&alert.host) })
+                } else {
+                    let agent = format!("{} ({})", alert.host, short_id(&alert.agent_id));
+                    json!({ "title": "Agent", "value": unlinked(&agent) })
+                },
+                json!({ "title": "Started", "value": format_ms(alert.started_ms) }),
+            ];
+            if let (Event::Resolved, Some(reason)) = (self.event, &alert.resolve_reason) {
+                facts.push(json!({ "title": "Reason", "value": unlinked(reason) }));
+            }
+            body.push(json!({ "type": "FactSet", "facts": facts }));
+        }
+        let mut card = json!({
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+            "type": "AdaptiveCard",
+            "version": "1.4",
+            "msteams": { "width": "Full" },
+            "body": body,
+        });
+        if let Some(url) = web_url {
+            card["actions"] = json!([
+                { "type": "Action.OpenUrl", "title": "View alerts", "url": alerts_link(url) }
+            ]);
+        }
+        json!({
+            "type": "message",
+            "attachments": [{
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "contentUrl": null,
+                "content": card,
+            }],
+        })
     }
 
     /// What this means for an on-call service. A test has to open an incident to prove
@@ -1272,6 +1340,7 @@ fn send_blocking(
     let sent = match channel.channel.kind {
         ChannelKind::Webhook => post_json("the webhook", target, &notice.webhook_body()),
         ChannelKind::Discord => post_to_discord(target, notice),
+        ChannelKind::Teams => post_json("the Teams workflow", target, &notice.teams_body(web_url)),
         ChannelKind::Email => senders
             .mailer
             .as_deref()
@@ -1927,6 +1996,52 @@ mod tests {
         assert_eq!(event["event_action"], "trigger");
         assert_eq!(event["payload"]["severity"], "warning");
         assert_eq!(escalated.webhook_body()["event"], "escalated");
+    }
+
+    #[test]
+    fn teams_gets_a_card_coloured_by_severity_with_a_link_back() {
+        let body = notice(Event::Firing, alert()).teams_body(Some("https://m.example.com"));
+        assert_eq!(body["type"], "message");
+        let attachment = &body["attachments"][0];
+        assert_eq!(
+            attachment["contentType"],
+            "application/vnd.microsoft.card.adaptive"
+        );
+        let card = &attachment["content"];
+        assert_eq!(card["type"], "AdaptiveCard");
+        assert_eq!(card["body"][0]["text"], "CRITICAL");
+        assert_eq!(card["body"][0]["color"], "Attention");
+        assert_eq!(
+            card["body"][1]["text"],
+            "CPU usage on web-1 is 97%, above 90%"
+        );
+        let facts = card["body"][2]["facts"].as_array().unwrap();
+        assert_eq!(facts[0], json!({ "title": "Rule", "value": "High CPU" }));
+        assert_eq!(facts[1]["title"], "Agent");
+        assert_eq!(card["actions"][0]["url"], "https://m.example.com/alerts");
+
+        let warning = Alert {
+            severity: Severity::Warning,
+            ..alert()
+        };
+        let card = |event, alert| {
+            notice(event, alert).teams_body(None)["attachments"][0]["content"].clone()
+        };
+        assert_eq!(card(Event::Firing, warning)["body"][0]["color"], "Warning");
+        let resolved = card(Event::Resolved, alert());
+        assert_eq!(resolved["body"][0]["color"], "Good");
+        assert!(resolved.get("actions").is_none());
+    }
+
+    #[test]
+    fn a_host_cannot_add_a_link_to_a_teams_card() {
+        let alert = Alert {
+            host: "[click](https://evil.example)".to_string(),
+            summary: "Disk on [click](https://evil.example) is full".to_string(),
+            ..alert()
+        };
+        let text = notice(Event::Firing, alert).teams_body(None).to_string();
+        assert!(!text.contains("](https"), "{text}");
     }
 
     #[test]
