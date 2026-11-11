@@ -256,6 +256,29 @@ pub const METRICS: &[Metric] = &[
         source: Source::Entries(Reading::Rate("$.transmitted_bytes")),
         chart: ShowChart::Always,
     },
+    // The programs using the most, by name, when a config rule turns this on.
+    Metric {
+        name: "top.cpu",
+        title: "Top processes by CPU",
+        unit: Unit::Percent,
+        collector: "top_processes",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.cpu_percent"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "top.memory",
+        title: "Top processes by memory",
+        unit: Unit::Bytes,
+        collector: "top_processes",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.memory_bytes"),
+        },
+        chart: ShowChart::WithData,
+    },
     Metric {
         name: "process.count",
         title: "Running processes",

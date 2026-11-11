@@ -414,8 +414,8 @@ lowest priority first, so higher priorities win.
 | `urls` | `apache`, `nginx`, `php_fpm` | The status pages to read. Leave it out for the usual page on the machine itself |
 
 The collectors are `apache`, `checks`, `containers`, `counters`, `cpu`, `custom`, `disk`, `files`, `host`,
-`memory`, `network`, `nginx`, `php_fpm`, `processes`, `sensors`, `services` and
-`system`.
+`memory`, `network`, `nginx`, `php_fpm`, `processes`, `sensors`, `services`,
+`system` and `top_processes`.
 
 ### List config rules
 

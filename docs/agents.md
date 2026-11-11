@@ -107,6 +107,18 @@ A disk that runs out of them can't take new files however much space it has left
 which the built-in **Disk running out of inodes** rule warns about. Windows file
 systems don't have inodes.
 
+## Top processes
+
+The `top_processes` collector reports the five programs using the most CPU and the five
+using the most memory, adding up every process of the same name, so twenty workers of
+one server are one line. They're charted as **Top processes by CPU** and **Top
+processes by memory**. Only program names are reported, never what they were started
+with, which can hold passwords.
+
+It's off unless a config rule turns it on, under **Collectors**, as it says what's
+running on a machine. The `processes` collector, by contrast, only answers about the
+names it's given.
+
 ## Network
 
 Each network interface reports what it received and sent, in bytes and packets, the

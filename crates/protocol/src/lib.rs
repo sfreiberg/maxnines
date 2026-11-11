@@ -17,7 +17,7 @@ use serde_json::Value;
 
 /// Every collector the project knows about. An agent reports the ones it can
 /// run in its facts, because older agents may not have them all.
-pub const COLLECTORS: [&str; 17] = [
+pub const COLLECTORS: [&str; 18] = [
     "apache",
     "checks",
     "containers",
@@ -35,6 +35,7 @@ pub const COLLECTORS: [&str; 17] = [
     "sensors",
     "services",
     "system",
+    "top_processes",
 ];
 
 /// How many things one collector can be told to watch.

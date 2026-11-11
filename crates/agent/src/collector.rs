@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::time::Duration;
@@ -72,6 +73,7 @@ fn build(
         "disk" => Box::new(DiskCollector::new(config.mount_points.clone())?),
         "network" => Box::new(NetworkCollector::new()?),
         "processes" => Box::new(ProcessCollector::new(config.names.clone())?),
+        "top_processes" => Box::new(TopProcessCollector::new()?),
         "counters" => Box::new(CounterCollector::new(
             config.names.clone().unwrap_or_default(),
         )),
@@ -203,30 +205,58 @@ fn tally(names: &[String], processes: &[RunningProcess], total_memory: u64) -> V
         .collect()
 }
 
+/// A process list ready to measure: CPU usage is measured between two refreshes, like
+/// the CPU collector's, so it's refreshed once now.
+fn process_list() -> Result<System> {
+    let mut system = System::new()?;
+    system.refresh_cpu_list(CpuRefreshKind::nothing());
+    refresh_processes(&mut system);
+    Ok(system)
+}
+
+fn refresh_processes(system: &mut System) {
+    system.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cpu()
+            .with_memory()
+            .with_exe(UpdateKind::OnlyIfNotSet)
+            .without_tasks(),
+    );
+}
+
+/// What's running, without threads or what has exited. A process's usage is per
+/// core, so it's scaled to match the CPU chart, where 100% is the whole machine.
+fn running(system: &System) -> Vec<RunningProcess<'_>> {
+    let cores = system.cpus().len().max(1) as f64;
+    system
+        .processes()
+        .values()
+        .filter(|process| process.thread_kind().is_none())
+        // A crashed service can linger as a zombie, which isn't running.
+        .filter(|process| {
+            !matches!(
+                process.status(),
+                ProcessStatus::Zombie | ProcessStatus::Dead
+            )
+        })
+        .map(|process| RunningProcess {
+            name: process.name(),
+            exe: process.exe(),
+            cpu_percent: f64::from(process.cpu_usage()) / cores,
+            memory_bytes: process.memory(),
+        })
+        .collect()
+}
+
 impl ProcessCollector {
     fn new(names: Option<Vec<String>>) -> Result<Self> {
-        let mut collector = Self {
-            system: System::new()?,
+        Ok(Self {
+            system: process_list()?,
             names: names.unwrap_or_default(),
-        };
-        collector.system.refresh_cpu_list(CpuRefreshKind::nothing());
-        // CPU usage is measured between two refreshes, like the CPU collector's.
-        collector.refresh();
-        Ok(collector)
-    }
-
-    fn refresh(&mut self) {
-        self.system
-            .refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
-        self.system.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::nothing()
-                .with_cpu()
-                .with_memory()
-                .with_exe(UpdateKind::OnlyIfNotSet)
-                .without_tasks(),
-        );
+        })
     }
 }
 
@@ -236,37 +266,80 @@ impl Collector for ProcessCollector {
     }
 
     fn collect(&mut self) -> Result<Value> {
-        self.refresh();
-
-        // A process's usage is per core, so it's scaled to match the CPU chart,
-        // where 100% is the whole machine.
-        let cores = self.system.cpus().len().max(1) as f64;
-        let running: Vec<RunningProcess> = self
-            .system
-            .processes()
-            .values()
-            .filter(|process| process.thread_kind().is_none())
-            // A crashed service can linger as a zombie, which isn't running.
-            .filter(|process| {
-                !matches!(
-                    process.status(),
-                    ProcessStatus::Zombie | ProcessStatus::Dead
-                )
-            })
-            .map(|process| RunningProcess {
-                name: process.name(),
-                exe: process.exe(),
-                cpu_percent: f64::from(process.cpu_usage()) / cores,
-                memory_bytes: process.memory(),
-            })
-            .collect();
-
+        refresh_processes(&mut self.system);
         Ok(Value::Array(tally(
             &self.names,
-            &running,
+            &running(&self.system),
             self.system.total_memory(),
         )))
     }
+}
+
+/// How many programs each of the top lists keeps.
+const TOP: usize = 5;
+
+/// The programs using the most CPU and the most memory, each adding up every process
+/// of that name, so twenty workers of one server are one line. Only names are reported,
+/// never what a program was started with, which can hold secrets. It's off unless a
+/// config rule turns it on, as it says what's running where the processes collector
+/// only answers about names it's given.
+struct TopProcessCollector {
+    system: System,
+}
+
+impl TopProcessCollector {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            system: process_list()?,
+        })
+    }
+}
+
+impl Collector for TopProcessCollector {
+    fn name(&self) -> &'static str {
+        "top_processes"
+    }
+
+    fn collect(&mut self) -> Result<Value> {
+        refresh_processes(&mut self.system);
+        Ok(Value::Array(top(&running(&self.system))))
+    }
+}
+
+/// The top programs by CPU and by memory, together, each once, busiest first.
+fn top(processes: &[RunningProcess]) -> Vec<Value> {
+    let mut programs: HashMap<String, (u64, f64, u64)> = HashMap::new();
+    for process in processes {
+        let program = programs.entry(base_name(process.name)).or_default();
+        program.0 += 1;
+        program.1 += process.cpu_percent;
+        program.2 = program.2.saturating_add(process.memory_bytes);
+    }
+    let mut programs: Vec<(String, (u64, f64, u64))> = programs.into_iter().collect();
+    programs.sort_by(|a, b| b.1.1.total_cmp(&a.1.1).then_with(|| a.0.cmp(&b.0)));
+    let mut kept: Vec<String> = programs
+        .iter()
+        .take(TOP)
+        .map(|(name, _)| name.clone())
+        .collect();
+    programs.sort_by(|a, b| b.1.2.cmp(&a.1.2).then_with(|| a.0.cmp(&b.0)));
+    for (name, _) in programs.iter().take(TOP) {
+        if !kept.contains(name) {
+            kept.push(name.clone());
+        }
+    }
+    let found: HashMap<&String, &(u64, f64, u64)> = programs.iter().map(|(n, v)| (n, v)).collect();
+    kept.iter()
+        .filter_map(|name| {
+            let (count, cpu, memory) = found.get(name)?;
+            Some(json!({
+                "name": name,
+                "count": count,
+                "cpu_percent": cpu,
+                "memory_bytes": memory,
+            }))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -419,6 +492,64 @@ mod tests {
             "{output}"
         );
         assert_eq!(output[1]["count"], 0);
+    }
+
+    fn using(name: &'static str, cpu_percent: f64, memory_bytes: u64) -> RunningProcess<'static> {
+        RunningProcess {
+            name: OsStr::new(name),
+            exe: None,
+            cpu_percent,
+            memory_bytes,
+        }
+    }
+
+    #[test]
+    fn the_top_programs_add_up_every_process_of_one_name() {
+        let processes = [
+            using("php-fpm", 10.0, 100),
+            using("php-fpm", 15.0, 100),
+            using("postgres", 20.0, 900),
+            using("Chrome.exe", 1.0, 50),
+        ];
+        let top = top(&processes);
+        assert_eq!(
+            top[0],
+            json!({ "name": "php-fpm", "count": 2, "cpu_percent": 25.0, "memory_bytes": 200 })
+        );
+        assert_eq!(top[1]["name"], "postgres");
+        assert_eq!(top[2]["name"], "chrome");
+        assert_eq!(top.len(), 3);
+    }
+
+    #[test]
+    fn the_top_lists_keep_the_busiest_and_the_biggest_once_each() {
+        let mut processes: Vec<RunningProcess> = ["a", "b", "c", "d", "e", "f", "g"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| using(name, 70.0 - i as f64 * 10.0, 10))
+            .collect();
+        // Idle, but the biggest.
+        processes.push(using("cache", 0.0, 10_000));
+        let names: Vec<Value> = top(&processes)
+            .into_iter()
+            .map(|program| program["name"].clone())
+            .collect();
+        assert_eq!(
+            names,
+            json!(["a", "b", "c", "d", "e", "cache"])
+                .as_array()
+                .unwrap()
+                .clone()
+        );
+    }
+
+    #[test]
+    fn the_top_processes_are_this_machines_own() {
+        let mut collector = TopProcessCollector::new().unwrap();
+        let output = collector.collect().unwrap();
+        let top = output.as_array().unwrap();
+        assert!(!top.is_empty() && top.len() <= 2 * TOP, "{output}");
+        assert!(top.iter().all(|program| program["memory_bytes"].is_u64()));
     }
 
     #[test]

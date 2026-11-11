@@ -246,6 +246,21 @@ fn drops_and_tcp_connections_read_what_the_agent_sends() {
 }
 
 #[test]
+fn the_top_processes_are_each_a_series_by_name() {
+    let mut store = in_memory();
+    let top = json!([
+        { "name": "postgres", "count": 12, "cpu_percent": 40.0, "memory_bytes": 4_000_000_000u64 },
+        { "name": "nginx", "count": 4, "cpu_percent": 5.0, "memory_bytes": 80_000_000 },
+    ]);
+    write_metric(&mut store, "a", 1000, "top_processes", top);
+
+    let cpu = query(&store, "a", "top.cpu", 8);
+    assert_eq!(names(&cpu), ["nginx", "postgres"]);
+    assert_eq!(averages(&cpu.series[1]), [40.0]);
+    assert_eq!(averages(&query(&store, "a", "top.memory", 8).series[1]), [4e9]);
+}
+
+#[test]
 fn each_core_is_a_series_named_by_its_number() {
     let mut store = in_memory();
     let cpu = json!({ "usage_percent": 40.0, "per_core_percent": [10.0, 90.0, 20.0] });
