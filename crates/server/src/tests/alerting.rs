@@ -442,7 +442,10 @@ async fn a_disabled_rule_watches_nothing_and_closes_its_alerts() {
 }
 
 #[tokio::test]
-async fn deleting_a_rule_closes_its_alerts_and_keeps_the_history() {
+async fn deleting_a_rule_closes_its_alerts_and_keeps_the_history_pointing_at_it() {
+    use crate::maintenance::MaintenanceWindowInput;
+    use crate::silences::SilenceInput;
+
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
         for_secs: 0,
@@ -450,19 +453,71 @@ async fn deleting_a_rule_closes_its_alerts_and_keeps_the_history() {
     };
     let id = test.database().create_alert_rule(&rule).await.unwrap();
     test.cpu(0, 95.0).await;
+    let silence = SilenceInput {
+        rule_id: Some(id),
+        filter: String::new(),
+        reason: "Upgrading".to_string(),
+        duration_secs: 3600,
+    };
+    let database = test.database();
+    let hour_ms = 3_600_000;
+    database
+        .create_silence(&silence, "sam", test.now - 2 * hour_ms)
+        .await
+        .unwrap();
+    database
+        .create_silence(&silence, "sam", test.now)
+        .await
+        .unwrap();
+    let window = MaintenanceWindowInput {
+        name: "Patching".to_string(),
+        rule_id: Some(id),
+        filter: String::new(),
+        days: vec!["sun".to_string()],
+        start_time: "02:00".to_string(),
+        duration_secs: 3600,
+        time_zone: "UTC".to_string(),
+    };
+    database.create_maintenance_window(&window).await.unwrap();
 
-    assert!(
-        test.database()
-            .delete_alert_rule(id, test.now)
-            .await
-            .unwrap()
-    );
+    assert!(database.delete_alert_rule(id, test.now).await.unwrap());
     test.evaluate(MINUTE_MS).await;
 
     assert!(test.open().await.is_empty());
     let resolved = test.resolved().await;
-    assert_eq!(resolved[0].rule_id, None);
+    assert_eq!(resolved[0].rule_id, Some(id), "it still says which rule");
     assert_eq!(resolved[0].rule_name, "High CPU");
+
+    let database = test.database();
+    assert!(database.get_alert_rule(id).await.unwrap().is_none());
+    assert!(
+        database
+            .list_alert_rules()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.id != id)
+    );
+    assert!(database.active_silences(test.now).await.unwrap().is_empty());
+    assert!(
+        database
+            .list_maintenance_windows()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let ended = database.ended_silences(test.now, 10).await.unwrap();
+    assert_eq!(ended.len(), 1, "a silence that ended is history");
+    assert_eq!(ended[0].rule_id, Some(id));
+    let page = Browser::default()
+        .get(&test.server, "/alerts/silences")
+        .await;
+    assert!(page.body.contains("High CPU (deleted)"), "{}", page.body);
+
+    // Its name is free for a new rule.
+    test.database().create_alert_rule(&rule).await.unwrap();
+    let names = test.server.state.check_alert_rule(&rule, None).await;
+    assert!(names.is_err(), "but only once");
 }
 
 #[tokio::test]
@@ -3549,11 +3604,72 @@ async fn deleting_a_channel_drops_what_was_queued_for_it() {
     let notifier = firing_with_channel(&mut test, "http://127.0.0.1:1/x").await;
 
     let channel = test.database().list_channels().await.unwrap()[0].id;
-    assert!(test.database().delete_channel(channel).await.unwrap());
+    assert!(
+        test.database()
+            .delete_channel(channel, test.now)
+            .await
+            .unwrap()
+    );
 
     notifier.deliver_due(test.now).await.unwrap();
     assert!(due(&test, test.now).await.is_empty());
     assert_eq!(test.open().await.len(), 1, "the alert itself stays");
+    assert!(test.database().list_channels().await.unwrap().is_empty());
+    assert!(
+        test.database()
+            .get_channel(channel)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_deleted_channel_keeps_what_it_sent_and_frees_its_name() {
+    let mut test = Harness::start().await;
+    let _notifier = firing_with_channel(&mut test, &format!("http://{CLOSED_ADDRESS}/x")).await;
+    let channel = test.database().list_channels().await.unwrap()[0].clone();
+    let waiting = due(&test, test.now).await;
+    let sent = &waiting[0];
+    test.database()
+        .delivery_sent(sent.id, 1, test.now, None)
+        .await
+        .unwrap();
+    assert_eq!(test.database().notifications_of(channel.id).await, 1);
+
+    assert!(
+        test.database()
+            .delete_channel(channel.id, test.now)
+            .await
+            .unwrap()
+    );
+
+    assert_eq!(
+        test.database().notifications_of(channel.id).await,
+        1,
+        "what was sent is history"
+    );
+    assert!(
+        test.database()
+            .delivery_problems(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let id = test
+        .database()
+        .create_channel(&channel.channel)
+        .await
+        .unwrap();
+    assert_ne!(id, channel.id);
+    assert!(
+        test.server
+            .state
+            .check_channel(&channel.channel, None)
+            .await
+            .is_err(),
+        "only one live channel can have a name"
+    );
 }
 
 #[tokio::test]
@@ -4770,6 +4886,13 @@ async fn alert_rules_can_be_managed_through_the_api() {
     assert_eq!(api(&server, "GET", &path, &Value::Null).await.0, 404);
     assert_eq!(api(&server, "DELETE", &path, &Value::Null).await.0, 404);
     assert_eq!(api(&server, "PUT", &path, &rule).await.0, 404);
+    let (_, list) = api(&server, "GET", "/api/v1/alert-rules", &Value::Null).await;
+    assert!(list.as_array().unwrap().is_empty());
+
+    // A deleted rule's name can be used again.
+    let (status, again) = api(&server, "POST", "/api/v1/alert-rules", &rule).await;
+    assert_eq!(status, 201, "{again}");
+    assert_ne!(again["id"], created["id"]);
 }
 
 #[tokio::test]

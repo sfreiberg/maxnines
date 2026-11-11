@@ -12,7 +12,10 @@ use sea_orm::{
 use serde_json::json;
 
 use super::audit::{record, record_change};
-use super::{Database, alert, alert_rule, alert_rule_channel, notification, notification_channel};
+use super::{
+    Database, alert, alert_rule, alert_rule_channel, maintenance_window, notification,
+    notification_channel, silence,
+};
 use crate::alerting::{
     Alert, AlertRule, AlertRuleInput, Channel, ChannelInput, ChannelKind, Comparison, Delivery,
     DeliveryProblem, Event, Mail, MailSecurity, MailServer, NewAlert, RULE_GONE_REASON, RuleKind,
@@ -254,6 +257,7 @@ impl Database {
     /// Sorted by name.
     pub async fn list_alert_rules(&self) -> Result<Vec<AlertRule>> {
         let rows = alert_rule::Entity::find()
+            .filter(alert_rule::Column::DeletedMs.is_null())
             .order_by_asc(alert_rule::Column::Name)
             .all(&self.connection)
             .await
@@ -335,8 +339,28 @@ impl Database {
         Ok(true)
     }
 
-    /// Alerts from the rule stay as history, and its open ones end now. The rule's
-    /// silences go with it, so an alert they were holding back has to end in the
+    /// Every rule's name by its ID, deleted ones too, for what still points at them,
+    /// like a silence that has ended. Deleted ones say so.
+    pub async fn alert_rule_names(&self) -> Result<BTreeMap<i64, String>> {
+        let rows = alert_rule::Entity::find()
+            .all(&self.connection)
+            .await
+            .context("loading alert rules")?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let name = match row.deleted_ms {
+                    Some(_) => format!("{} (deleted)", row.name),
+                    None => row.name,
+                };
+                (row.id, name)
+            })
+            .collect())
+    }
+
+    /// The rule is kept, marked deleted, so its alerts still say which rule they came
+    /// from, and its open ones end now. Its silences that haven't ended and its
+    /// maintenance windows go, so an alert they were holding back has to end in the
     /// same step, or its notifications would go out in the moments before the
     /// evaluator noticed. Returns false if there's no such rule.
     pub async fn delete_alert_rule(&self, id: i64, now_ms: i64) -> Result<bool> {
@@ -358,7 +382,23 @@ impl Database {
         for alert in open {
             resolve_in(&transaction, alert.id, now_ms, RULE_GONE_REASON).await?;
         }
-        let result = alert_rule::Entity::delete_by_id(id)
+        if before.is_none() {
+            return Ok(false);
+        }
+        silence::Entity::delete_many()
+            .filter(silence::Column::RuleId.eq(id))
+            .filter(silence::Column::EndsMs.gt(now_ms))
+            .exec(&transaction)
+            .await
+            .context("deleting the rule's silences")?;
+        maintenance_window::Entity::delete_many()
+            .filter(maintenance_window::Column::RuleId.eq(id))
+            .exec(&transaction)
+            .await
+            .context("deleting the rule's maintenance windows")?;
+        alert_rule::Entity::update_many()
+            .col_expr(alert_rule::Column::DeletedMs, Expr::value(now_ms))
+            .filter(alert_rule::Column::Id.eq(id))
             .exec(&transaction)
             .await
             .context("deleting alert rule")?;
@@ -372,7 +412,7 @@ impl Database {
         )
         .await?;
         transaction.commit().await.context("deleting alert rule")?;
-        Ok(result.rows_affected > 0)
+        Ok(true)
     }
 }
 
@@ -380,6 +420,7 @@ impl Database {
     /// Sorted by name.
     pub async fn list_channels(&self) -> Result<Vec<Channel>> {
         let rows = notification_channel::Entity::find()
+            .filter(notification_channel::Column::DeletedMs.is_null())
             .order_by_asc(notification_channel::Column::Name)
             .all(&self.connection)
             .await
@@ -420,24 +461,42 @@ impl Database {
         Ok(true)
     }
 
-    /// Anything still queued for the channel goes with it. Returns false if
-    /// there's no such channel.
-    pub async fn delete_channel(&self, id: i64) -> Result<bool> {
+    /// The channel is kept, marked deleted, so what was sent through it still says
+    /// where it went. Anything still waiting to go goes, and rules stop naming it.
+    /// Returns false if there's no such channel.
+    pub async fn delete_channel(&self, id: i64, now_ms: i64) -> Result<bool> {
         let transaction = self.connection.begin().await.context("deleting channel")?;
-        let before = load_channel(&transaction, id).await?;
-        let result = notification_channel::Entity::delete_by_id(id)
+        let Some(before) = load_channel(&transaction, id).await? else {
+            return Ok(false);
+        };
+        notification::Entity::delete_many()
+            .filter(notification::Column::ChannelId.eq(id))
+            .filter(notification::Column::State.eq("pending"))
+            .exec(&transaction)
+            .await
+            .context("deleting the channel's waiting notifications")?;
+        alert_rule_channel::Entity::delete_many()
+            .filter(alert_rule_channel::Column::ChannelId.eq(id))
+            .exec(&transaction)
+            .await
+            .context("deleting the channel from rules")?;
+        notification_channel::Entity::update_many()
+            .col_expr(notification_channel::Column::DeletedMs, Expr::value(now_ms))
+            .filter(notification_channel::Column::Id.eq(id))
             .exec(&transaction)
             .await
             .context("deleting channel")?;
-        let before = before.as_ref().map(channel_snapshot);
-        record_change(&transaction, Kind::Channel, id, before.as_ref(), None, None).await?;
+        let before = channel_snapshot(&before);
+        record_change(&transaction, Kind::Channel, id, Some(&before), None, None).await?;
         transaction.commit().await.context("deleting channel")?;
-        Ok(result.rows_affected > 0)
+        Ok(true)
     }
 }
 
+/// A rule that hasn't been deleted.
 async fn load_alert_rule<C: ConnectionTrait>(connection: &C, id: i64) -> Result<Option<AlertRule>> {
     let Some(row) = alert_rule::Entity::find_by_id(id)
+        .filter(alert_rule::Column::DeletedMs.is_null())
         .one(connection)
         .await
         .context("loading alert rule")?
@@ -499,8 +558,10 @@ async fn record_alert_rule<C: ConnectionTrait>(
     .await
 }
 
+/// A channel that hasn't been deleted.
 async fn load_channel<C: ConnectionTrait>(connection: &C, id: i64) -> Result<Option<Channel>> {
     let row = notification_channel::Entity::find_by_id(id)
+        .filter(notification_channel::Column::DeletedMs.is_null())
         .one(connection)
         .await
         .context("loading channel")?;
@@ -796,6 +857,7 @@ impl Database {
         }
         let rows = notification_channel::Entity::find()
             .filter(notification_channel::Column::Id.is_in(wanted))
+            .filter(notification_channel::Column::DeletedMs.is_null())
             .all(&self.connection)
             .await
             .context("loading channels")?;
@@ -961,6 +1023,7 @@ impl Database {
     pub async fn alerts_to_remind(&self) -> Result<Vec<(Alert, i64)>> {
         let rules: BTreeMap<i64, i64> = alert_rule::Entity::find()
             .filter(alert_rule::Column::RemindEverySecs.is_not_null())
+            .filter(alert_rule::Column::DeletedMs.is_null())
             .all(&self.connection)
             .await
             .context("loading alert rules")?
@@ -1200,6 +1263,17 @@ impl Database {
     }
 
     /// The newest deliveries that haven't worked, whether given up on or not.
+    /// How many notifications a channel has, sent or not, for tests.
+    #[cfg(test)]
+    pub async fn notifications_of(&self, channel_id: i64) -> u64 {
+        use sea_orm::PaginatorTrait;
+        notification::Entity::find()
+            .filter(notification::Column::ChannelId.eq(channel_id))
+            .count(&self.connection)
+            .await
+            .unwrap()
+    }
+
     pub async fn delivery_problems(&self, limit: u64) -> Result<Vec<DeliveryProblem>> {
         let rows = notification::Entity::find()
             .filter(notification::Column::LastError.is_not_null())
@@ -1225,7 +1299,9 @@ impl Database {
             .map(|channel| (channel.id, channel.channel.name))
             .collect();
 
+        // A deleted channel's problems are nobody's to fix any more.
         rows.into_iter()
+            .filter(|row| channels.contains_key(&row.channel_id))
             .map(|row| {
                 Ok(DeliveryProblem {
                     channel: channels.get(&row.channel_id).cloned().unwrap_or_default(),

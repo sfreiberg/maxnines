@@ -48,13 +48,9 @@ struct SilenceRow {
 }
 
 async fn rows(state: &AppState, silences: Vec<Silence>) -> anyhow::Result<Vec<SilenceRow>> {
-    let rules = state.database.list_alert_rules().await?;
-    let rule_name = |id: i64| {
-        rules
-            .iter()
-            .find(|rule| rule.id == id)
-            .map(|rule| rule.rule.name.clone())
-    };
+    // Silences that have ended can be for a rule deleted since.
+    let names = state.database.alert_rule_names().await?;
+    let rule_name = |id: i64| names.get(&id).cloned();
     Ok(silences
         .into_iter()
         .map(|silence| SilenceRow {
@@ -90,11 +86,8 @@ async fn window_rows(
     windows: Vec<MaintenanceWindow>,
     now: i64,
 ) -> anyhow::Result<Vec<WindowRow>> {
-    let rules = state.database.list_alert_rules().await?;
-    let rule_name = |id: i64| {
-        let rule = rules.iter().find(|rule| rule.id == id);
-        rule.map(|rule| rule.rule.name.clone()).unwrap_or_default()
-    };
+    let names = state.database.alert_rule_names().await?;
+    let rule_name = |id: i64| names.get(&id).cloned().unwrap_or_default();
     Ok(windows
         .into_iter()
         .map(|window| WindowRow {

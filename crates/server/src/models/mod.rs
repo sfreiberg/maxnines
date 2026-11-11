@@ -2000,7 +2000,8 @@ mod tests {
             Some("secret")
         );
 
-        // The alert outlives its rule, and its queue goes with its channel.
+        // The alert outlives its rule and still names it, and what was waiting for a
+        // deleted channel goes.
         assert!(
             database
                 .delete_alert_rule(rule, started_ms + 20)
@@ -2009,8 +2010,13 @@ mod tests {
         );
         let history = database.resolved_alerts(10).await.unwrap();
         let ended = history.iter().find(|a| a.id == alert).unwrap();
-        assert_eq!(ended.rule_id, None);
-        assert!(database.delete_channel(channel).await.unwrap());
+        assert_eq!(ended.rule_id, Some(rule));
+        assert!(
+            database
+                .delete_channel(channel, started_ms + 5)
+                .await
+                .unwrap()
+        );
         let due = database.due_deliveries(started_ms + 10, 500).await.unwrap();
         assert!(!due.iter().any(|d| d.alert.id == alert));
     }

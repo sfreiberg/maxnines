@@ -76,7 +76,7 @@ erDiagram
     }
     alert_rules {
         int id PK
-        string name UK
+        string name "unique among those not deleted"
         string kind "metric, calculation, forecast or offline"
         string metric
         string series
@@ -95,10 +95,11 @@ erDiagram
         int remind_every_secs
         int forecast_secs
         int warning_forecast_secs
+        int deleted_ms "kept so alerts can name it"
     }
     alerts {
         int id PK
-        int rule_id FK "empty once the rule is gone"
+        int rule_id FK "the rule that raised it, even once deleted"
         string rule_name
         string severity
         string host_id FK
@@ -114,7 +115,7 @@ erDiagram
     }
     notification_channels {
         int id PK
-        string name UK
+        string name "unique among those not deleted"
         string kind
         text target
         text credential "never shown back"
@@ -129,6 +130,7 @@ erDiagram
         string request_method
         string request_content_type
         text request_body
+        int deleted_ms "kept so notifications can name it"
     }
     alert_rule_channels {
         int rule_id PK, FK
@@ -333,9 +335,9 @@ erDiagram
 | `host_config_status` | The config each host's agent last applied, and why if it refused one |
 | `host_boots` | When each host last started, to notice restarts |
 | `config_rules`, `config_rule_settings` | What agents monitor, chosen by facts |
-| `alert_rules`, `alert_rule_channels` | What raises an alert, and who hears of it |
+| `alert_rules`, `alert_rule_channels` | What raises an alert, and who hears of it. A deleted rule is kept, marked by `deleted_ms`, so its alerts still name it |
 | `alerts` | Every alert, open or resolved, with the hostname it had at the time |
-| `notification_channels`, `notifications` | Where alerts are sent, and each delivery with its retries |
+| `notification_channels`, `notifications` | Where alerts are sent, and each delivery with its retries. A deleted channel is kept the same way, so what was sent through it still names it |
 | `silences`, `maintenance_windows` | When notifications are held back |
 | `events` | Annotations people and automations add, and restarts the server notices |
 | `dashboards`, `dashboard_widgets`, `dashboard_variables` | Dashboards and what's on them |

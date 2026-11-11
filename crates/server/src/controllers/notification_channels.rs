@@ -17,6 +17,7 @@ use crate::alerting::{
 use crate::app_state::AppState;
 use crate::channels;
 use crate::channels::custom_webhook;
+use crate::metrics::now_ms;
 use crate::notifier::{self, Notice};
 
 pub fn routes() -> Router<AppState> {
@@ -528,7 +529,7 @@ async fn update(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfFo
 }
 
 async fn delete(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfForm) -> Response {
-    match state.database.delete_channel(id).await {
+    match state.database.delete_channel(id, now_ms()).await {
         Ok(true) => (form.token, Redirect::to("/alerts/channels")).into_response(),
         Ok(false) => not_found(&state, &form.token),
         Err(error) => server_error(&error),

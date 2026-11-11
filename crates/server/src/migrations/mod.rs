@@ -2,13 +2,14 @@
 //! draws. A change to a table is a new migration after this one, with the README
 //! changed to match.
 
+use sea_orm::{DbBackend, Statement};
 use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
 
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(CreateTables)]
+        vec![Box::new(CreateTables), Box::new(SoftDeleteRulesAndChannels)]
     }
 }
 
@@ -1407,6 +1408,7 @@ enum NotificationChannels {
     RequestMethod,
     RequestContentType,
     RequestBody,
+    DeletedMs,
 }
 
 #[derive(Iden)]
@@ -1432,6 +1434,7 @@ enum AlertRules {
     RemindEverySecs,
     ForecastSecs,
     WarningForecastSecs,
+    DeletedMs,
 }
 
 #[derive(Iden)]
@@ -1616,6 +1619,387 @@ enum ServerSecrets {
     Value,
 }
 
+struct SoftDeleteRulesAndChannels;
+
+impl MigrationName for SoftDeleteRulesAndChannels {
+    fn name(&self) -> &str {
+        "m20261111_000002_soft_delete_rules_and_channels"
+    }
+}
+
+/// Alert rules and notification channels are marked deleted instead of going, so an
+/// alert still says which rule raised it and a notification where it was sent. A
+/// deleted one's name is free to use again, so the server checks names are unique
+/// among those left, not the database. SQLite can only drop a unique constraint by
+/// making the table again, and as other tables point at these two, that has to be
+/// done with foreign keys switched off, which SQLite only allows outside a
+/// transaction. Its pool has a single connection, so the switch holds for every
+/// step.
+#[async_trait::async_trait]
+impl MigrationTrait for SoftDeleteRulesAndChannels {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let connection = manager.get_connection();
+        match manager.get_database_backend() {
+            sea_orm::DatabaseBackend::Sqlite => {
+                remake_on_sqlite(
+                    manager,
+                    &[
+                        (
+                            "alert_rules",
+                            alert_rules_after_soft_delete(),
+                            ALERT_RULE_COLUMNS,
+                        ),
+                        (
+                            "notification_channels",
+                            notification_channels_after_soft_delete(),
+                            CHANNEL_COLUMNS,
+                        ),
+                    ],
+                )
+                .await
+            }
+            backend => {
+                for table in ["alert_rules", "notification_channels"] {
+                    let unique = if backend == sea_orm::DatabaseBackend::MySql {
+                        format!("ALTER TABLE {table} DROP INDEX name")
+                    } else {
+                        format!("ALTER TABLE {table} DROP CONSTRAINT {table}_name_key")
+                    };
+                    connection.execute_unprepared(&unique).await?;
+                    manager
+                        .alter_table(
+                            Table::alter()
+                                .table(Alias::new(table))
+                                .add_column(ColumnDef::new(Alias::new("deleted_ms")).big_integer())
+                                .to_owned(),
+                        )
+                        .await?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Deleted ones go for good, as there's nowhere to keep them.
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let connection = manager.get_connection();
+        connection
+            .execute_unprepared(
+                "DELETE FROM alert_rule_channels WHERE rule_id IN \
+                 (SELECT id FROM alert_rules WHERE deleted_ms IS NOT NULL)",
+            )
+            .await?;
+        connection
+            .execute_unprepared(
+                "UPDATE alerts SET rule_id = NULL WHERE rule_id IN \
+                 (SELECT id FROM alert_rules WHERE deleted_ms IS NOT NULL)",
+            )
+            .await?;
+        for table in ["silences", "maintenance_windows"] {
+            connection
+                .execute_unprepared(&format!(
+                    "DELETE FROM {table} WHERE rule_id IN \
+                     (SELECT id FROM alert_rules WHERE deleted_ms IS NOT NULL)"
+                ))
+                .await?;
+        }
+        connection
+            .execute_unprepared(
+                "DELETE FROM notifications WHERE channel_id IN \
+                 (SELECT id FROM notification_channels WHERE deleted_ms IS NOT NULL)",
+            )
+            .await?;
+        for table in ["alert_rules", "notification_channels"] {
+            connection
+                .execute_unprepared(&format!("DELETE FROM {table} WHERE deleted_ms IS NOT NULL"))
+                .await?;
+        }
+        if manager.get_database_backend() == sea_orm::DatabaseBackend::Sqlite {
+            return remake_on_sqlite(
+                manager,
+                &[
+                    (
+                        "alert_rules",
+                        alert_rules_before_soft_delete(),
+                        ALERT_RULE_COLUMNS,
+                    ),
+                    (
+                        "notification_channels",
+                        notification_channels_before_soft_delete(),
+                        CHANNEL_COLUMNS,
+                    ),
+                ],
+            )
+            .await;
+        }
+        for table in ["alert_rules", "notification_channels"] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(Alias::new(table))
+                        .drop_column(Alias::new("deleted_ms"))
+                        .to_owned(),
+                )
+                .await?;
+            let unique = if manager.get_database_backend() == sea_orm::DatabaseBackend::MySql {
+                format!("ALTER TABLE {table} ADD UNIQUE INDEX name (name)")
+            } else {
+                format!("ALTER TABLE {table} ADD CONSTRAINT {table}_name_key UNIQUE (name)")
+            };
+            connection.execute_unprepared(&unique).await?;
+        }
+        Ok(())
+    }
+}
+
+/// The columns both versions of each table have, to copy from one to the other.
+const ALERT_RULE_COLUMNS: &str = "id, name, kind, metric, series, comparison, threshold, \
+     warning_threshold, for_secs, severity, condition_expr, enabled, all_channels, \
+     calculation, group_by, filter, window_secs, remind_every_secs, forecast_secs, \
+     warning_forecast_secs";
+const CHANNEL_COLUMNS: &str = "id, name, kind, target, credential, app_token, \
+     sends_warnings, sends_critical, mail_from, mail_hostname, mail_port, mail_security, \
+     mail_username, request_method, request_content_type, request_body";
+
+/// Makes each table again as given on SQLite, keeping its rows and the next ID it
+/// would give, with foreign keys off so tables pointing at it are left alone, then
+/// checks nothing points anywhere it shouldn't before keeping the result. This is
+/// the order SQLite's own documentation gives for changes ALTER TABLE can't make.
+async fn remake_on_sqlite(
+    manager: &SchemaManager<'_>,
+    tables: &[(&str, TableCreateStatement, &str)],
+) -> Result<(), DbErr> {
+    let connection = manager.get_connection();
+    connection
+        .execute_unprepared("PRAGMA foreign_keys = OFF")
+        .await?;
+    let remade = async {
+        connection.execute_unprepared("BEGIN").await?;
+        for (table, create, columns) in tables {
+            let made = format!("{table}_remade");
+            let mut create = create.clone();
+            create.table(Alias::new(&made));
+            manager.create_table(create).await?;
+            connection
+                .execute_unprepared(&format!(
+                    "INSERT INTO {made} ({columns}) SELECT {columns} FROM {table}"
+                ))
+                .await?;
+            let next = format!("SELECT seq FROM sqlite_sequence WHERE name = '{table}'");
+            let seq: Option<i64> = connection
+                .query_one_raw(Statement::from_string(DbBackend::Sqlite, next))
+                .await?
+                .map(|row| row.try_get_by_index(0))
+                .transpose()?;
+            connection
+                .execute_unprepared(&format!("DROP TABLE {table}"))
+                .await?;
+            connection
+                .execute_unprepared(&format!("ALTER TABLE {made} RENAME TO {table}"))
+                .await?;
+            if let Some(seq) = seq {
+                connection
+                    .execute_unprepared(&format!(
+                        "UPDATE sqlite_sequence SET seq = max(seq, {seq}) WHERE name = '{table}'"
+                    ))
+                    .await?;
+            }
+        }
+        let broken = connection
+            .query_all_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "PRAGMA foreign_key_check",
+            ))
+            .await?;
+        if !broken.is_empty() {
+            return Err(DbErr::Migration(format!(
+                "{} rows would point at nothing",
+                broken.len()
+            )));
+        }
+        connection.execute_unprepared("COMMIT").await?;
+        Ok(())
+    }
+    .await;
+    if remade.is_err() {
+        connection.execute_unprepared("ROLLBACK").await.ok();
+    }
+    connection
+        .execute_unprepared("PRAGMA foreign_keys = ON")
+        .await?;
+    remade
+}
+
+/// `alert_rules` as migration 1 made it, for going back on SQLite.
+fn alert_rules_before_soft_delete() -> TableCreateStatement {
+    Table::create()
+        .table(AlertRules::Table)
+        .col(id(AlertRules::Id))
+        .col(
+            ColumnDef::new(AlertRules::Name)
+                .string_len(255)
+                .not_null()
+                .unique_key(),
+        )
+        .col(ColumnDef::new(AlertRules::Kind).string_len(16).not_null())
+        .col(ColumnDef::new(AlertRules::Metric).string_len(64))
+        .col(ColumnDef::new(AlertRules::Series).string_len(255))
+        .col(ColumnDef::new(AlertRules::Comparison).string_len(16))
+        .col(ColumnDef::new(AlertRules::Threshold).double())
+        .col(ColumnDef::new(AlertRules::WarningThreshold).double())
+        .col(ColumnDef::new(AlertRules::ForSecs).big_integer().not_null())
+        .col(
+            ColumnDef::new(AlertRules::Severity)
+                .string_len(16)
+                .not_null(),
+        )
+        .col(ColumnDef::new(AlertRules::ConditionExpr).text())
+        .col(ColumnDef::new(AlertRules::Enabled).boolean().not_null())
+        .col(
+            ColumnDef::new(AlertRules::AllChannels)
+                .boolean()
+                .not_null()
+                .default(false),
+        )
+        .col(ColumnDef::new(AlertRules::Calculation).string_len(16))
+        .col(ColumnDef::new(AlertRules::GroupBy).string_len(255))
+        .col(ColumnDef::new(AlertRules::Filter).string_len(500))
+        .col(ColumnDef::new(AlertRules::WindowSecs).big_integer())
+        .col(ColumnDef::new(AlertRules::RemindEverySecs).big_integer())
+        .col(ColumnDef::new(AlertRules::ForecastSecs).big_integer())
+        .col(ColumnDef::new(AlertRules::WarningForecastSecs).big_integer())
+        .to_owned()
+}
+
+/// `notification_channels` as migration 1 made it, for going back on SQLite.
+fn notification_channels_before_soft_delete() -> TableCreateStatement {
+    Table::create()
+        .table(NotificationChannels::Table)
+        .col(id(NotificationChannels::Id))
+        .col(
+            ColumnDef::new(NotificationChannels::Name)
+                .string_len(255)
+                .not_null()
+                .unique_key(),
+        )
+        .col(
+            ColumnDef::new(NotificationChannels::Kind)
+                .string_len(16)
+                .not_null(),
+        )
+        .col(
+            ColumnDef::new(NotificationChannels::Target)
+                .text()
+                .not_null(),
+        )
+        .col(ColumnDef::new(NotificationChannels::Credential).text())
+        .col(ColumnDef::new(NotificationChannels::AppToken).text())
+        .col(
+            ColumnDef::new(NotificationChannels::SendsWarnings)
+                .boolean()
+                .not_null()
+                .default(true),
+        )
+        .col(
+            ColumnDef::new(NotificationChannels::SendsCritical)
+                .boolean()
+                .not_null()
+                .default(true),
+        )
+        .col(ColumnDef::new(NotificationChannels::MailFrom).string_len(320))
+        .col(ColumnDef::new(NotificationChannels::MailHostname).string_len(255))
+        .col(ColumnDef::new(NotificationChannels::MailPort).integer())
+        .col(ColumnDef::new(NotificationChannels::MailSecurity).string_len(16))
+        .col(ColumnDef::new(NotificationChannels::MailUsername).string_len(255))
+        .col(ColumnDef::new(NotificationChannels::RequestMethod).string_len(8))
+        .col(ColumnDef::new(NotificationChannels::RequestContentType).string_len(255))
+        .col(ColumnDef::new(NotificationChannels::RequestBody).text())
+        .to_owned()
+}
+
+/// `alert_rules` as it is after migration 2, for making it again on SQLite.
+fn alert_rules_after_soft_delete() -> TableCreateStatement {
+    Table::create()
+        .table(AlertRules::Table)
+        .col(id(AlertRules::Id))
+        .col(ColumnDef::new(AlertRules::Name).string_len(255).not_null())
+        .col(ColumnDef::new(AlertRules::Kind).string_len(16).not_null())
+        .col(ColumnDef::new(AlertRules::Metric).string_len(64))
+        .col(ColumnDef::new(AlertRules::Series).string_len(255))
+        .col(ColumnDef::new(AlertRules::Comparison).string_len(16))
+        .col(ColumnDef::new(AlertRules::Threshold).double())
+        .col(ColumnDef::new(AlertRules::WarningThreshold).double())
+        .col(ColumnDef::new(AlertRules::ForSecs).big_integer().not_null())
+        .col(
+            ColumnDef::new(AlertRules::Severity)
+                .string_len(16)
+                .not_null(),
+        )
+        .col(ColumnDef::new(AlertRules::ConditionExpr).text())
+        .col(ColumnDef::new(AlertRules::Enabled).boolean().not_null())
+        .col(
+            ColumnDef::new(AlertRules::AllChannels)
+                .boolean()
+                .not_null()
+                .default(false),
+        )
+        .col(ColumnDef::new(AlertRules::Calculation).string_len(16))
+        .col(ColumnDef::new(AlertRules::GroupBy).string_len(255))
+        .col(ColumnDef::new(AlertRules::Filter).string_len(500))
+        .col(ColumnDef::new(AlertRules::WindowSecs).big_integer())
+        .col(ColumnDef::new(AlertRules::RemindEverySecs).big_integer())
+        .col(ColumnDef::new(AlertRules::ForecastSecs).big_integer())
+        .col(ColumnDef::new(AlertRules::WarningForecastSecs).big_integer())
+        .col(ColumnDef::new(AlertRules::DeletedMs).big_integer())
+        .to_owned()
+}
+
+/// `notification_channels` as it is after migration 2, for making it again on SQLite.
+fn notification_channels_after_soft_delete() -> TableCreateStatement {
+    Table::create()
+        .table(NotificationChannels::Table)
+        .col(id(NotificationChannels::Id))
+        .col(
+            ColumnDef::new(NotificationChannels::Name)
+                .string_len(255)
+                .not_null(),
+        )
+        .col(
+            ColumnDef::new(NotificationChannels::Kind)
+                .string_len(16)
+                .not_null(),
+        )
+        .col(
+            ColumnDef::new(NotificationChannels::Target)
+                .text()
+                .not_null(),
+        )
+        .col(ColumnDef::new(NotificationChannels::Credential).text())
+        .col(ColumnDef::new(NotificationChannels::AppToken).text())
+        .col(
+            ColumnDef::new(NotificationChannels::SendsWarnings)
+                .boolean()
+                .not_null()
+                .default(true),
+        )
+        .col(
+            ColumnDef::new(NotificationChannels::SendsCritical)
+                .boolean()
+                .not_null()
+                .default(true),
+        )
+        .col(ColumnDef::new(NotificationChannels::MailFrom).string_len(320))
+        .col(ColumnDef::new(NotificationChannels::MailHostname).string_len(255))
+        .col(ColumnDef::new(NotificationChannels::MailPort).integer())
+        .col(ColumnDef::new(NotificationChannels::MailSecurity).string_len(16))
+        .col(ColumnDef::new(NotificationChannels::MailUsername).string_len(255))
+        .col(ColumnDef::new(NotificationChannels::RequestMethod).string_len(8))
+        .col(ColumnDef::new(NotificationChannels::RequestContentType).string_len(255))
+        .col(ColumnDef::new(NotificationChannels::RequestBody).text())
+        .col(ColumnDef::new(NotificationChannels::DeletedMs).big_integer())
+        .to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
@@ -1676,5 +2060,77 @@ mod tests {
         .await;
         assert!(left.is_empty(), "{left:?}");
         Migrator::up(&connection, None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rules_and_channels_keep_their_rows_and_references_through_soft_delete() {
+        let connection = fresh().await;
+        Migrator::up(&connection, Some(1)).await.unwrap();
+        connection
+            .execute_unprepared(
+                "INSERT INTO notification_channels
+                   (id, name, kind, target, sends_warnings, sends_critical)
+                 VALUES (7, 'Ops', 'webhook', 'https://ops', TRUE, TRUE);
+                 INSERT INTO alert_rule_channels (rule_id, channel_id) VALUES (1, 7);
+                 INSERT INTO alerts (id, rule_id, rule_name, severity, host_id, hostname,
+                                     series, summary, started_ms)
+                 VALUES (3, 1, 'Host offline', 'critical', 'server', 'MaxNines server',
+                         '', 'Gone', 1);
+                 INSERT INTO notifications (alert_id, channel_id, event, state, attempts,
+                                            next_attempt_ms, created_ms)
+                 VALUES (3, 7, 'firing', 'sent', 1, 1, 1)",
+            )
+            .await
+            .unwrap();
+
+        Migrator::up(&connection, None).await.unwrap();
+
+        let count = |sql: &'static str| {
+            let connection = &connection;
+            async move { texts(connection, sql).await }
+        };
+        assert_eq!(
+            count("SELECT name FROM notification_channels").await,
+            ["Ops"]
+        );
+        assert_eq!(
+            count("SELECT CAST(rule_id AS TEXT) FROM alerts").await,
+            ["1"]
+        );
+        assert_eq!(count("SELECT event FROM notifications").await, ["firing"]);
+        let links = "SELECT CAST(channel_id AS TEXT) FROM alert_rule_channels";
+        assert_eq!(count(links).await, ["7"]);
+        // Names needn't be unique now, and references are still checked.
+        connection
+            .execute_unprepared(
+                "UPDATE notification_channels SET deleted_ms = 5;
+                 INSERT INTO notification_channels
+                   (name, kind, target, sends_warnings, sends_critical)
+                 VALUES ('Ops', 'webhook', 'https://new', TRUE, TRUE)",
+            )
+            .await
+            .unwrap();
+        let dangling = "INSERT INTO alert_rule_channels (rule_id, channel_id) VALUES (1, 99)";
+        assert!(connection.execute_unprepared(dangling).await.is_err());
+        let next = "SELECT CAST(max(id) AS TEXT) FROM notification_channels";
+        assert_eq!(
+            count(next).await,
+            ["8"],
+            "IDs carry on from where they were"
+        );
+
+        Migrator::down(&connection, Some(1)).await.unwrap();
+        assert_eq!(
+            count("SELECT target FROM notification_channels").await,
+            ["https://new"]
+        );
+        assert!(count("SELECT event FROM notifications").await.is_empty());
+        let twice = "INSERT INTO notification_channels
+                       (name, kind, target, sends_warnings, sends_critical)
+                     VALUES ('Ops', 'webhook', 'https://x', TRUE, TRUE)";
+        assert!(
+            connection.execute_unprepared(twice).await.is_err(),
+            "unique again"
+        );
     }
 }

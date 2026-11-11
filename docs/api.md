@@ -625,7 +625,8 @@ already told about an alert still hears when it ends.
 | `reason` | Why, which is required. |
 | `duration_secs` | How long it lasts from now, up to 30 days. |
 
-Deleting a rule deletes its silences too.
+Deleting a rule deletes its silences that haven't ended. Ones that have ended stay, still
+naming the rule.
 
 **Start maintenance** on a host's page is a silence with no `rule_id` and the filter
 `id=` followed by the host ID, so the same request does it through the API:
@@ -987,6 +988,11 @@ curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 `DELETE /api/v1/alert-rules/{id}`
 
+The rule stops watching, its open alerts end, and its silences that haven't ended and its
+maintenance windows go. It's kept, marked deleted, so its alerts still say which rule
+raised them as `rule_id`, but it's no longer listed or found, and its name is free for a
+new rule.
+
 ```sh
 curl -X DELETE -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "$MAXNINES_URL/api/v1/alert-rules/1"
@@ -1125,6 +1131,10 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
 ### Delete a notification channel
 
 `DELETE /api/v1/notification-channels/{id}`
+
+Anything still waiting to go through the channel is dropped, and rules stop naming it.
+It's kept, marked deleted, so what was sent through it still says where it went, but
+it's no longer listed or found, and its name is free for a new channel.
 
 ```sh
 curl -X DELETE -H "Authorization: Bearer $MAXNINES_API_KEY" \
