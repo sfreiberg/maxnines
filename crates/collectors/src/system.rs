@@ -487,13 +487,22 @@ fn count_quser(output: &str) -> u64 {
 
 /// Runs a system tool for what it prints, giving up if it takes too long.
 pub(crate) async fn run_quietly(program: &str, args: &[&str]) -> Option<std::process::Output> {
+    run_with_timeout(program, args, COMMAND_TIMEOUT).await
+}
+
+/// As [`run_quietly`], for a tool that takes longer, like a package manager.
+pub(crate) async fn run_with_timeout(
+    program: &str,
+    args: &[&str],
+    limit: Duration,
+) -> Option<std::process::Output> {
     let run = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .output();
-    timeout(COMMAND_TIMEOUT, run).await.ok()?.ok()
+    timeout(limit, run).await.ok()?.ok()
 }
 
 #[cfg(unix)]

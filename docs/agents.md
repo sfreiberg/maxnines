@@ -142,6 +142,16 @@ limit where it has one. They come from the `system` collector, which the Default
   services that start automatically and stopped with an error. Many of Windows' own
   stop by design once they've done their job, and those stop cleanly, so they don't
   count. macOS and FreeBSD have no such state, so they don't report this.
+- **Updates waiting**, and how many are security fixes, from the machine's own package
+  lists: `apt-get` on Debian and Ubuntu, `dnf` or `yum` on Red Hat and Fedora, and
+  `pkg` on FreeBSD. Nothing is fetched, so they're as current as the machine's own
+  update schedule keeps them. FreeBSD doesn't say which are security fixes, and
+  Windows and macOS don't report these yet.
+- **Restart needed**, as 1 when an update is waiting for one: on Debian and Ubuntu
+  when the system has said so, on Red Hat and Fedora from `needs-restarting`, on
+  Windows when Windows Update or servicing is waiting, and on FreeBSD when a newer
+  kernel is installed than the one running. macOS has no such flag. These two are
+  looked at every 15 minutes.
 - **TCP connections** are counted by state: established, listening, and two that pile up
   when something's wrong. Thousands in `TIME_WAIT` can use up the ports for new
   connections, and ones in `CLOSE_WAIT` are usually a program that never closed them.
