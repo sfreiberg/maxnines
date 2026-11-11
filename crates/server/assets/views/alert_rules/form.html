@@ -1,9 +1,9 @@
 {% extends "layouts/application.html" %}
-{% block title %}{% if id %}Edit alert rule{% else %}New alert rule{% endif %} · MaxNines{% endblock title %}
+{% block title %}{% if id %}Edit alert rule{% else %}Add alert rule{% endif %} · MaxNines{% endblock title %}
 {% block main_class %} class="narrow"{% endblock main_class %}
 {% block content %}
 <p class="breadcrumb"><a href="/alerts/rules">Alert rules</a></p>
-<h1>{% if id %}Edit alert rule{% else %}New alert rule{% endif %}</h1>
+<h1>{% if id %}Edit alert rule{% else %}Add alert rule{% endif %}</h1>
 
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
 
@@ -18,7 +18,7 @@
 
   <fieldset>
     <legend>Alert when</legend>
-    <label>Type
+    <label>Kind
       <select name="kind">
         <option value="metric"{% if rule.kind == "metric" %} selected{% endif %}>A metric crosses a threshold</option>
         <option value="offline"{% if rule.kind == "offline" %} selected{% endif %}>An agent goes offline</option>
@@ -170,7 +170,7 @@
 {% if id and can_edit %}
 <form method="post" action="/alerts/rules/{{ id }}/delete" class="delete-form">
   <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
-  <button type="submit" class="danger">Delete rule</button>
+  <button type="submit" class="danger">Delete</button>
 </form>
 {% endif %}
 {% endblock content %}

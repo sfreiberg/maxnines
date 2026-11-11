@@ -4,7 +4,7 @@
 <p class="breadcrumb"><a href="/alerts">Alerts</a></p>
 <div class="title-row">
   <h1>Silences</h1>
-  {% if can_respond %}<div class="actions"><a class="button" href="/alerts/silences/new">New silence</a></div>{% endif %}
+  {% if can_respond %}<div class="actions"><a class="button" href="/alerts/silences/new">Add silence</a></div>{% endif %}
 </div>
 <p class="hint">Alerts still fire and show while they're silenced, but nobody is notified. If one is still firing when its silence ends, the notifications go out then.</p>
 
@@ -40,7 +40,7 @@
 <section>
 <div class="title-row">
   <h2>Maintenance windows</h2>
-  {% if can_edit %}<div class="actions"><a class="button secondary" href="/alerts/maintenance/new">New window</a></div>{% endif %}
+  {% if can_edit %}<div class="actions"><a class="button secondary" href="/alerts/maintenance/new">Add window</a></div>{% endif %}
 </div>
 {% if windows %}
 <div class="tablebox"><table>

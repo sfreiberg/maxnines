@@ -18,7 +18,7 @@
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
 
 <section class="card">
-  <h2>New key</h2>
+  <h2>Add a key</h2>
   <form method="post" action="/settings/api-keys" class="host-filter">
     <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
     <div class="host-filter-box">
@@ -30,7 +30,7 @@
     <select name="lifetime" aria-label="How long the key lasts">
       {% for lifetime in lifetimes %}<option value="{{ lifetime.value }}">{{ lifetime.label }}</option>{% endfor %}
     </select>
-    <button type="submit">Create key</button>
+    <button type="submit">Add key</button>
   </form>
 </section>
 

@@ -1,9 +1,9 @@
 {% extends "layouts/application.html" %}
-{% block title %}{% if name %}Edit variable{% else %}New variable{% endif %} · MaxNines{% endblock title %}
+{% block title %}{% if name %}Edit variable{% else %}Add variable{% endif %} · MaxNines{% endblock title %}
 {% block main_class %} class="narrow"{% endblock main_class %}
 {% block content %}
 <p class="breadcrumb"><a href="/dashboards/{{ dashboard_id }}/edit">{{ dashboard_name }}</a></p>
-<h1>{% if name %}Edit variable{% else %}New variable{% endif %}</h1>
+<h1>{% if name %}Edit variable{% else %}Add variable{% endif %}</h1>
 
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
 
@@ -43,7 +43,7 @@
 {% if name %}
 <form method="post" action="/dashboards/{{ dashboard_id }}/variables/{{ name }}/delete">
   <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
-  <button type="submit" class="danger">Delete variable</button>
+  <button type="submit" class="danger">Delete</button>
 </form>
 {% endif %}
 {% endblock content %}

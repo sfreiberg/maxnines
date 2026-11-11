@@ -531,17 +531,17 @@ async fn the_pages_only_offer_what_a_role_allows() {
     assert_eq!(page.status, 200, "{}", page.body);
     assert!(page.body.contains("Office"));
     assert!(!page.body.contains("Save location"), "{}", page.body);
-    assert!(!page.body.contains("Delete location"));
+    assert!(!page.body.contains(">Delete</button>"));
     assert!(page.body.contains("but not change it"));
     let page = admin.get(&server, &path).await;
-    assert!(page.body.contains("Save location") && page.body.contains("Delete location"));
+    assert!(page.body.contains("Save location") && page.body.contains(">Delete</button>"));
 
     for (path, offer) in [
         ("/map/rules", "Add a location"),
-        ("/alerts/rules", "New rule"),
-        ("/alerts/channels", "New channel"),
-        ("/alerts/silences", "New silence"),
-        ("/dashboards", "Create dashboard"),
+        ("/alerts/rules", "Add rule"),
+        ("/alerts/channels", "Add channel"),
+        ("/alerts/silences", "Add silence"),
+        ("/dashboards", "Add dashboard"),
         ("/settings", "Audit log"),
         ("/settings", "/settings/users"),
     ] {

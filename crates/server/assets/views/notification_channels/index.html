@@ -4,7 +4,7 @@
 <p class="breadcrumb"><a href="/settings">Settings</a></p>
 <div class="title-row">
   <h1>Notification channels</h1>
-  {% if can_edit %}<div class="actions"><a class="button" href="/alerts/channels/new">New channel</a></div>{% endif %}
+  {% if can_edit %}<div class="actions"><a class="button" href="/alerts/channels/new">Add channel</a></div>{% endif %}
 </div>
 
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
@@ -13,7 +13,7 @@
 {% if channels %}
 <div class="tablebox"><table>
   <thead>
-    <tr><th>Name</th><th>Type</th><th>Sends to</th><th></th></tr>
+    <tr><th>Name</th><th>Kind</th><th>Sends to</th><th></th></tr>
   </thead>
   <tbody>
     {% for channel in channels %}

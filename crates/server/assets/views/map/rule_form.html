@@ -1,11 +1,11 @@
 {% extends "layouts/application.html" %}
-{% block title %}{% if id %}Edit location{% else %}New location{% endif %} · MaxNines{% endblock title %}
+{% block title %}{% if id %}Edit location{% else %}Add location{% endif %} · MaxNines{% endblock title %}
 {% block head %}
   <script src="/assets/js/map.js" defer></script>
 {% endblock head %}
 {% block content %}
 <p class="breadcrumb"><a href="/map/rules">Location rules</a></p>
-<h1>{% if id %}Edit location{% else %}New location{% endif %}</h1>
+<h1>{% if id %}Edit location{% else %}Add location{% endif %}</h1>
 
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
 
@@ -64,7 +64,7 @@
 {% if id and can_edit %}
 <form method="post" action="/map/rules/{{ id }}/delete" class="delete-form">
   <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
-  <button type="submit" class="danger">Delete location</button>
+  <button type="submit" class="danger">Delete</button>
 </form>
 {% endif %}
 {% endblock content %}

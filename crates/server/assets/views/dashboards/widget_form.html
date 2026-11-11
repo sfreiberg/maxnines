@@ -1,9 +1,9 @@
 {% extends "layouts/application.html" %}
-{% block title %}{% if id %}Edit widget{% else %}New widget{% endif %} · MaxNines{% endblock title %}
+{% block title %}{% if id %}Edit widget{% else %}Add widget{% endif %} · MaxNines{% endblock title %}
 {% block main_class %} class="narrow"{% endblock main_class %}
 {% block content %}
 <p class="breadcrumb"><a href="/dashboards/{{ dashboard_id }}/edit">{{ dashboard_name }}</a></p>
-<h1>{% if id %}Edit widget{% else %}New widget{% endif %}</h1>
+<h1>{% if id %}Edit widget{% else %}Add widget{% endif %}</h1>
 
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
 
@@ -65,7 +65,7 @@
 {% if id %}
 <form method="post" action="/dashboards/{{ dashboard_id }}/widgets/{{ id }}/delete">
   <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
-  <button type="submit" class="danger">Delete widget</button>
+  <button type="submit" class="danger">Delete</button>
 </form>
 {% endif %}
 {% endblock content %}

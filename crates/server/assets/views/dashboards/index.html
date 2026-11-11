@@ -21,13 +21,13 @@
 
 {% if can_edit %}
 <section class="card">
-  <h2>New dashboard</h2>
+  <h2>Add a dashboard</h2>
   <form method="post" action="/dashboards" class="stacked">
     <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
     <label>Name
       <input type="text" name="name" required maxlength="100">
     </label>
-    <button type="submit">Create dashboard</button>
+    <button type="submit">Add dashboard</button>
   </form>
 </section>
 {% endif %}

@@ -67,7 +67,7 @@
   {% endif %}
   {% if events %}
   <table class="event-list">
-    <thead><tr><th>When</th><th>Kind</th><th>What</th><th>By</th>{% if can_respond %}<th aria-label="Delete"></th>{% endif %}</tr></thead>
+    <thead><tr><th>When</th><th>Kind</th><th>What</th><th>Added by</th>{% if can_respond %}<th aria-label="Delete"></th>{% endif %}</tr></thead>
     <tbody>
       {% for event in events %}
       <tr>

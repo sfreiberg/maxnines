@@ -1,9 +1,9 @@
 {% extends "layouts/application.html" %}
-{% block title %}{% if id %}Edit channel{% else %}New channel{% endif %} · MaxNines{% endblock title %}
+{% block title %}{% if id %}Edit channel{% else %}Add channel{% endif %} · MaxNines{% endblock title %}
 {% block main_class %} class="narrow"{% endblock main_class %}
 {% block content %}
 <p class="breadcrumb"><a href="/alerts/channels">Notification channels</a></p>
-<h1>{% if id %}Edit channel{% else %}New channel{% endif %}</h1>
+<h1>{% if id %}Edit channel{% else %}Add channel{% endif %}</h1>
 
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
 
@@ -14,7 +14,7 @@
     <input type="text" name="name" value="{{ channel.name }}" required maxlength="255">
   </label>
 
-  <label>Type
+  <label>Kind
     <select name="kind">
       {% for kind in kinds %}
       <option value="{{ kind.value }}"{% if channel.kind == kind.value %} selected{% endif %}>{{ kind.name }}</option>
@@ -231,7 +231,7 @@
 {% if id and can_edit %}
 <form method="post" action="/alerts/channels/{{ id }}/delete" class="delete-form">
   <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
-  <button type="submit" class="danger">Delete channel</button>
+  <button type="submit" class="danger">Delete</button>
 </form>
 {% endif %}
 {% endblock content %}
