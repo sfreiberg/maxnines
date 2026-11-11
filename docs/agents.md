@@ -60,6 +60,13 @@ reached, and sent when it's back.
   machine, and `./maxnines-agent identity show` prints its ID once it's been started.
   Use `-c` to point any of them at a config file somewhere else.
 
+## CPU
+
+Besides the machine's total, an agent reports each core's usage, so one core stuck at
+100% shows up on a machine with many, where it barely moves the total. Cores are
+numbered from 0. The **CPU usage by core** chart shows the 8 busiest, and an alert
+rule on it alerts on each core that crosses its threshold.
+
 ## Disks
 
 An agent reports how full each disk is, and how much is read and written, for every

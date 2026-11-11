@@ -111,6 +111,20 @@ pub const METRICS: &[Metric] = &[
         source: Source::Fields(&[("CPU", Reading::Field("$.usage_percent"))]),
         chart: ShowChart::Always,
     },
+    // So one busy core shows on a machine with many, where it barely moves the total.
+    // Agents send a plain list, so each core is named by its number, from 0. A chart
+    // keeps the busiest.
+    Metric {
+        name: "cpu.cores",
+        title: "CPU usage by core",
+        unit: Unit::Percent,
+        collector: "cpu",
+        source: Source::Items {
+            name: "$.index",
+            reading: Reading::Field("$.per_core_percent"),
+        },
+        chart: ShowChart::WithData,
+    },
     Metric {
         name: "cpu.load",
         title: "Load average",

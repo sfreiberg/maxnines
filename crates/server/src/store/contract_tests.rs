@@ -207,6 +207,30 @@ fn each_disk_is_a_series() {
 }
 
 #[test]
+fn each_core_is_a_series_named_by_its_number() {
+    let mut store = in_memory();
+    let cpu = json!({ "usage_percent": 40.0, "per_core_percent": [10.0, 90.0, 20.0] });
+    write_metric(&mut store, "a", 1000, "cpu", cpu);
+
+    let result = query(&store, "a", "cpu.cores", 8);
+    assert_eq!(names(&result), ["0", "1", "2"]);
+    assert_eq!(averages(&result.series[1]), [90.0]);
+
+    // The busiest are kept, so one pegged core is never the one left out.
+    let result = query(&store, "a", "cpu.cores", 1);
+    assert_eq!(names(&result), ["1"]);
+    assert_eq!(result.hidden, 2);
+
+    let newest = newest(&store, "cpu.cores", 0, HOUR_MS);
+    let mut cores: Vec<(&str, f64)> = newest
+        .iter()
+        .map(|reading| (reading.series.as_str(), reading.value))
+        .collect();
+    cores.sort_by(|a, b| a.0.cmp(b.0));
+    assert_eq!(cores, [("0", 10.0), ("1", 90.0), ("2", 20.0)]);
+}
+
+#[test]
 fn network_counts_become_rates_using_the_time_between_samples() {
     let mut store = in_memory();
     for (time_ms, bytes) in [(0, 999_999), (10_000, 5000), (30_000, 20_000)] {
