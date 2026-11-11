@@ -28,6 +28,8 @@ The [documentation](docs/SUMMARY.md) covers installing, setting up and using
 MaxNines. Every server also shows it on its Docs page, matching the version it runs.
 Start with [Installing](docs/installing.md).
 
+The [database design](database/README.md) shows every table and how they connect.
+
 ## Get in touch
 
 If you'd like to help guide the project, we'd love to hear from you. What you need
