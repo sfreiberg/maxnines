@@ -129,8 +129,8 @@ fn fact_rows(prefix: &str, value: &Value, rows: &mut Vec<FactRow>) {
     }
 }
 
-/// A size in bytes, as a person would write it, like a memory total. The exact number
-/// is still there to hover over.
+/// A size in bytes, as a person would write it, like 48 GiB for a memory total. The
+/// exact number is still there to hover over.
 fn readable(name: &str, value: &Value) -> Option<String> {
     let bytes = value.as_f64().filter(|_| name.ends_with("_bytes"))?;
     Some(format_value(Unit::Bytes, bytes))
@@ -798,7 +798,7 @@ mod tests {
             shown,
             [
                 ("cpu.logical_cores", "8", None),
-                ("memory.total_bytes", "17.2 GB", Some("17179869184")),
+                ("memory.total_bytes", "16 GiB", Some("17179869184")),
             ]
         );
     }

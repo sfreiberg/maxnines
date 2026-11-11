@@ -360,7 +360,8 @@ impl Axis {
         let (floor, ceiling) = match unit {
             Unit::Percent => (0.0, 100.0),
             Unit::Number => (0.0, 1.0),
-            Unit::BytesPerSecond | Unit::Bytes => (0.0, 1000.0),
+            Unit::BytesPerSecond => (0.0, 1000.0),
+            Unit::Bytes => (0.0, KIB),
             Unit::PerSecond | Unit::Seconds | Unit::Milliseconds => (0.0, 10.0),
             Unit::Celsius => (0.0, 100.0),
         };
@@ -375,7 +376,14 @@ impl Axis {
             (floor, ceiling)
         };
 
-        let step = nice_step(highest - lowest);
+        // Sizes step in their own units, so the lines fall on 8 GiB and not 8.6 billion.
+        let step = match unit {
+            Unit::Bytes => {
+                let (divisor, _) = size_scale(highest.abs().max(lowest.abs()));
+                nice_step((highest - lowest) / divisor) * divisor
+            }
+            _ => nice_step(highest - lowest),
+        };
         let low = (lowest / step).floor() * step;
         let count = ((highest - low) / step).ceil().clamp(1.0, 12.0) as usize;
         let ticks: Vec<f64> = (0..=count).map(|index| low + index as f64 * step).collect();
@@ -698,14 +706,22 @@ fn trimmed(value: f64, decimals: usize) -> String {
     }
 }
 
-fn format_size(value: f64, decimals: usize) -> String {
-    let (divisor, label) = match value.abs() {
-        size if size >= 1e12 => (1e12, "TB"),
-        size if size >= 1e9 => (1e9, "GB"),
-        size if size >= 1e6 => (1e6, "MB"),
-        size if size >= 1e3 => (1e3, "KB"),
+const KIB: f64 = 1024.0;
+
+/// Sizes are in binary units, as memory is counted and as systems report it, so 48 GiB
+/// of memory reads 48 and not 51.5. Speeds stay decimal, as they're usually given.
+fn size_scale(value: f64) -> (f64, &'static str) {
+    match value.abs() {
+        size if size >= KIB.powi(4) => (KIB.powi(4), "TiB"),
+        size if size >= KIB.powi(3) => (KIB.powi(3), "GiB"),
+        size if size >= KIB.powi(2) => (KIB.powi(2), "MiB"),
+        size if size >= KIB => (KIB, "KiB"),
         _ => (1.0, "B"),
-    };
+    }
+}
+
+fn format_size(value: f64, decimals: usize) -> String {
+    let (divisor, label) = size_scale(value);
     format!("{} {label}", trimmed(value / divisor, decimals))
 }
 
@@ -1344,8 +1360,9 @@ mod tests {
             (Unit::Number, 2e20, "2.00e20"),
             (Unit::PerSecond, 12.5, "12.5/s"),
             (Unit::Bytes, 512.0, "512 B"),
-            (Unit::Bytes, 2_500_000.0, "2.5 MB"),
-            (Unit::Bytes, 4e12, "4 TB"),
+            (Unit::Bytes, 2_621_440.0, "2.5 MiB"),
+            (Unit::Bytes, 51_539_607_552.0, "48 GiB"),
+            (Unit::Bytes, 4.0 * 1024f64.powi(4), "4 TiB"),
             (Unit::Seconds, 45.0, "45 s"),
             (Unit::Seconds, 90.0, "1.5 m"),
             (Unit::Seconds, 7200.0, "2 h"),
@@ -1355,6 +1372,19 @@ mod tests {
         ] {
             assert_eq!(format_value(unit, value), text);
         }
+    }
+
+    #[test]
+    fn sizes_are_marked_in_round_binary_units() {
+        let gib = 1024f64.powi(3);
+        let chart = chart(
+            "agent.memory",
+            vec![series("Memory", &[(0, 30.0 * gib), (15_000, 46.0 * gib)])],
+        );
+        assert_eq!(
+            labels(&chart.y_ticks),
+            ["0 B", "20 GiB", "40 GiB", "60 GiB"]
+        );
     }
 
     #[test]
