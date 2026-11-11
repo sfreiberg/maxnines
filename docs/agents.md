@@ -88,6 +88,20 @@ To watch only some disks, list their mount points in a config rule under **Disk 
 points**. Those are reported whatever they are, even a disk image or every volume in
 a container.
 
+Each disk also reports how hard it's working, which bytes alone can't show, as a disk
+doing small random reads is flat out long before it moves many bytes:
+
+| Chart | What it is |
+| --- | --- |
+| **Disk busy** | The share of the time the disk was doing something |
+| **Disk read operations**, **Disk write operations** | Operations a second |
+| **Disk read latency**, **Disk write latency** | How long each took, on average |
+| **Disk queue length** | How many were waiting or under way, on average |
+
+They're worked out from one sample to the next, so they start with the second. On a
+Mac, each volume reports its whole physical disk, and there's no busy time or queue
+length. FreeBSD doesn't report these yet.
+
 On Linux, macOS and FreeBSD, each disk also reports how many of its inodes are used.
 A disk that runs out of them can't take new files however much space it has left,
 which the built-in **Disk running out of inodes** rule warns about. Windows file

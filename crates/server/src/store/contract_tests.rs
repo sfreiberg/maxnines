@@ -207,6 +207,26 @@ fn each_disk_is_a_series() {
 }
 
 #[test]
+fn each_disk_reports_how_hard_it_is_working() {
+    let mut store = in_memory();
+    let disks = json!([
+        { "mount_point": "/", "busy_percent": 12.5, "read_ops_per_sec": 40.0,
+          "write_latency_ms": 3.25, "queue_length": 0.5 },
+        { "mount_point": "/data", "busy_percent": 90.0, "read_ops_per_sec": 800.0,
+          "write_latency_ms": 18.0 },
+    ]);
+    write_metric(&mut store, "a", 1000, "disk", disks);
+
+    let busy = query(&store, "a", "disk.busy", 8);
+    assert_eq!(names(&busy), ["/", "/data"]);
+    assert_eq!(averages(&busy.series[1]), [90.0]);
+    assert_eq!(averages(&query(&store, "a", "disk.read_ops", 8).series[0]), [40.0]);
+    assert_eq!(averages(&query(&store, "a", "disk.write_latency", 8).series[0]), [3.25]);
+    // A platform without a queue length leaves that disk out of the chart.
+    assert_eq!(names(&query(&store, "a", "disk.queue", 8)), ["/"]);
+}
+
+#[test]
 fn each_core_is_a_series_named_by_its_number() {
     let mut store = in_memory();
     let cpu = json!({ "usage_percent": 40.0, "per_core_percent": [10.0, 90.0, 20.0] });

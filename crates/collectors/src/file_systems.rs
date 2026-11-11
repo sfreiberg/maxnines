@@ -112,7 +112,7 @@ fn freebsd_stand_in(file_system: &str, device: &str) -> bool {
 
 /// The device a file system is mounted from, like `/dev/disk3s5`.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-fn mounted_from(mount_point: &Path) -> Option<String> {
+pub fn mounted_from(mount_point: &Path) -> Option<String> {
     let stats = rustix::fs::statfs(mount_point).ok()?;
     // SAFETY: the kernel fills the name and ends it with a nul.
     let device = unsafe { std::ffi::CStr::from_ptr(stats.f_mntfromname.as_ptr()) };

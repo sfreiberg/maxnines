@@ -117,7 +117,7 @@ impl Collector for CounterCollector {
 }
 
 #[cfg(windows)]
-mod pdh {
+pub(crate) mod pdh {
     use std::ptr::{null, null_mut};
 
     use windows_sys::Win32::System::Performance::{
@@ -300,7 +300,7 @@ mod pdh {
 }
 
 #[cfg(not(windows))]
-mod pdh {
+pub(crate) mod pdh {
     use super::{NOT_WINDOWS, Reading};
 
     /// Elsewhere, every path fails the same way, so a rule that turns counters on

@@ -1,6 +1,7 @@
 //! Reading what a machine is doing, for anything that runs on one.
 
 pub mod counters;
+pub mod disk_activity;
 mod file_systems;
 pub mod machine;
 pub mod system;

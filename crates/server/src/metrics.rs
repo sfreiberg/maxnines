@@ -311,6 +311,74 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
+    // How hard each disk is working, which bytes alone can't show. macOS has no busy
+    // time or queue, and FreeBSD reports none of these yet.
+    Metric {
+        name: "disk.busy",
+        title: "Disk busy",
+        unit: Unit::Percent,
+        collector: "disk",
+        source: Source::Items {
+            name: "$.mount_point",
+            reading: Reading::Field("$.busy_percent"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "disk.read_ops",
+        title: "Disk read operations",
+        unit: Unit::PerSecond,
+        collector: "disk",
+        source: Source::Items {
+            name: "$.mount_point",
+            reading: Reading::Field("$.read_ops_per_sec"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "disk.write_ops",
+        title: "Disk write operations",
+        unit: Unit::PerSecond,
+        collector: "disk",
+        source: Source::Items {
+            name: "$.mount_point",
+            reading: Reading::Field("$.write_ops_per_sec"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "disk.read_latency",
+        title: "Disk read latency",
+        unit: Unit::Milliseconds,
+        collector: "disk",
+        source: Source::Items {
+            name: "$.mount_point",
+            reading: Reading::Field("$.read_latency_ms"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "disk.write_latency",
+        title: "Disk write latency",
+        unit: Unit::Milliseconds,
+        collector: "disk",
+        source: Source::Items {
+            name: "$.mount_point",
+            reading: Reading::Field("$.write_latency_ms"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "disk.queue",
+        title: "Disk queue length",
+        unit: Unit::Number,
+        collector: "disk",
+        source: Source::Items {
+            name: "$.mount_point",
+            reading: Reading::Field("$.queue_length"),
+        },
+        chart: ShowChart::WithData,
+    },
     Metric {
         name: "disk.inodes",
         title: "Inode usage",

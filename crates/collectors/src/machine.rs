@@ -9,6 +9,7 @@ use sysinfo::{Disk, Disks, InterfaceOperationalState, Networks, System};
 use systemstat::Platform;
 
 use crate::Collector;
+use crate::disk_activity::DiskActivity;
 use crate::file_systems;
 use crate::system::{self, Change, CpuTime};
 
@@ -137,6 +138,7 @@ impl Collector for MemoryCollector {
 pub struct DiskCollector {
     disks: Disks,
     mount_points: Option<Vec<String>>,
+    activity: DiskActivity,
 }
 
 impl DiskCollector {
@@ -144,6 +146,7 @@ impl DiskCollector {
         Ok(Self {
             disks: Disks::new_with_refreshed_list()?,
             mount_points,
+            activity: DiskActivity::new(),
         })
     }
 
@@ -174,6 +177,7 @@ impl Collector for DiskCollector {
                 |disk| file_systems::shared_space(disk),
             ),
         };
+        let activity = self.activity.measure(&disks);
         let disks: Vec<Value> = disks
             .into_iter()
             .map(|disk| {
@@ -197,6 +201,11 @@ impl Collector for DiskCollector {
                 if let Some((total, free)) = inodes(disk.mount_point()) {
                     output["inodes_total"] = json!(total);
                     output["inodes_used"] = json!(total.saturating_sub(free));
+                }
+                if let (Some(measured), Some(fields)) =
+                    (activity.get(mount_point.as_ref()), output.as_object_mut())
+                {
+                    measured.add_to(fields);
                 }
                 output
             })
@@ -344,6 +353,29 @@ mod tests {
             .collect();
         assert!(mount_points.contains(&"/"), "{output}");
         assert!(!mount_points.contains(&"/System/Volumes/Data"), "{output}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn disks_say_how_hard_they_are_working_from_the_second_sample() {
+        let mut collector = DiskCollector::new(None).unwrap();
+        let first = collector.collect().unwrap();
+        assert!(
+            first
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|disk| disk["read_ops_per_sec"].is_null())
+        );
+
+        std::thread::sleep(Duration::from_millis(200));
+        let output = collector.collect().unwrap();
+
+        let disks = output.as_array().unwrap();
+        assert!(
+            disks.iter().any(|disk| disk["read_ops_per_sec"].is_f64()),
+            "{output}"
+        );
     }
 
     #[test]
