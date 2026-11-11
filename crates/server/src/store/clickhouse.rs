@@ -45,341 +45,93 @@ const MAX_QUERY_BYTES: &str = "67108864";
 /// so each statement can safely run again. Months keep partitions to a number that
 /// can't grow out of hand, whatever times agents send. The hour in the sort order lets
 /// a query for what's recent skip everything older.
-const MIGRATIONS: &[(&str, &[&str])] = &[
-    (
-        "0001_create_tables",
-        &[
-            "CREATE TABLE IF NOT EXISTS samples (
-             metric String,
-             agent  String,
-             labels Map(String, String),
-             time   DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
-             value  Float64 CODEC(Gorilla, ZSTD(1)),
-             kind   String
-         )
-         ENGINE = ReplacingMergeTree
-         PARTITION BY toStartOfMonth(time)
-         ORDER BY (metric, toStartOfHour(time), agent, labels, time)",
-            // Text, only when it changes. Nothing means it stopped being reported.
-            "CREATE TABLE IF NOT EXISTS texts (
-             metric String,
-             agent  String,
-             labels Map(String, String),
-             time   DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
-             value  Nullable(String)
-         )
-         ENGINE = ReplacingMergeTree
-         PARTITION BY toStartOfMonth(time)
-         ORDER BY (agent, metric, labels, time)",
-            // What exists, to limit what an agent can create without reading the samples.
-            "CREATE TABLE IF NOT EXISTS series (
-             agent  String,
-             metric String,
-             labels Map(String, String)
-         )
-         ENGINE = ReplacingMergeTree
-         ORDER BY (agent, metric, labels)",
-            // When each agent reported, so asking who's current doesn't read the samples.
-            "CREATE TABLE IF NOT EXISTS reports (
-             time  DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
-             agent String
-         )
-         ENGINE = ReplacingMergeTree
-         PARTITION BY toStartOfMonth(time)
-         ORDER BY (time, agent)",
-        ],
-    ),
-    (
-        "0002_create_rollups",
-        &[
-            // What each chart in the catalog showed, a minute and an hour at a time, as
-            // the lowest, highest and total value and how many there were. An hour
-            // rolled up again is written again with a higher version, which replaces
-            // the old rows when ClickHouse merges them, and reads say FINAL until then.
-            "CREATE TABLE IF NOT EXISTS rollups_minute (
-                 metric  LowCardinality(String),
-                 agent   String,
-                 series  String,
-                 time    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
-                 low     Float64,
-                 high    Float64,
-                 summed  Float64,
-                 samples UInt64,
-                 version UInt64
-             )
-             ENGINE = ReplacingMergeTree(version)
-             PARTITION BY toStartOfMonth(time)
-             ORDER BY (metric, agent, series, time)",
-            "CREATE TABLE IF NOT EXISTS rollups_hour (
-                 metric  LowCardinality(String),
-                 agent   String,
-                 series  String,
-                 time    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
-                 low     Float64,
-                 high    Float64,
-                 summed  Float64,
-                 samples UInt64,
-                 version UInt64
-             )
-             ENGINE = ReplacingMergeTree(version)
-             PARTITION BY toStartOfYear(time)
-             ORDER BY (metric, agent, series, time)",
-            // How far each metric is rolled up: every hour before this, in milliseconds.
-            "CREATE TABLE IF NOT EXISTS rollup_progress (
-                 metric        String,
-                 done_until_ms Int64,
-                 version       UInt64
-             )
-             ENGINE = ReplacingMergeTree(version)
-             ORDER BY metric",
-            // Hours that got samples after they were rolled up, to roll up again.
-            "CREATE TABLE IF NOT EXISTS rollup_redo (hour_ms Int64)
-             ENGINE = ReplacingMergeTree
-             ORDER BY hour_ms",
-        ],
-    ),
-    (
-        "0003_five_minute_rollups",
-        &[
-            // Rollups of 5 minutes instead of 1, which are as fine as a chart of 20 hours
-            // or more can show and take a fifth of the space. Made from the minutes
-            // already rolled up, which gives exactly what rolling up the samples again
-            // would. Each statement can run again: the minutes are only dropped last,
-            // and an empty table stands in for them if that's already happened.
-            "CREATE TABLE IF NOT EXISTS rollups_five_minute (
-                 metric  LowCardinality(String),
-                 agent   String,
-                 series  String,
-                 time    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
-                 low     Float64,
-                 high    Float64,
-                 summed  Float64,
-                 samples UInt64,
-                 version UInt64
-             )
-             ENGINE = ReplacingMergeTree(version)
-             PARTITION BY toStartOfMonth(time)
-             ORDER BY (metric, agent, series, time)",
-            "CREATE TABLE IF NOT EXISTS rollups_minute AS rollups_five_minute",
-            "INSERT INTO rollups_five_minute
-             SELECT metric, agent, series, toStartOfFiveMinutes(time) AS span,
-                    min(low), max(high), sum(summed), sum(samples), max(version)
-             FROM rollups_minute FINAL
-             GROUP BY metric, agent, series, span",
-            "DROP TABLE IF EXISTS rollups_minute",
-        ],
-    ),
-    (
-        "0004_rename_agents_to_hosts",
-        &[
-            // The computer being watched is a host everywhere, so the column that said
-            // agent says host. ClickHouse can't rename a column in a table's sort order,
-            // so each table is copied into one made the new way, column for column, and
-            // the two swapped. Each table's steps can run again from the start: the copy
-            // is dropped first, which before the swap is a partial copy and after it is
-            // the old table, whose rows are already in the new one.
-            "DROP TABLE IF EXISTS samples_hosts",
-            "CREATE TABLE samples_hosts (
-             metric String,
-             host   String,
-             labels Map(String, String),
-             time   DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
-             value  Float64 CODEC(Gorilla, ZSTD(1)),
-             kind   String
-         )
-         ENGINE = ReplacingMergeTree
-         PARTITION BY toStartOfMonth(time)
-         ORDER BY (metric, toStartOfHour(time), host, labels, time)",
-            "INSERT INTO samples_hosts
-             SELECT * REPLACE (multiIf(metric = 'server.agents_online', 'server.hosts_online', metric = 'server.agents_approved', 'server.hosts_approved', metric = 'server.agents_waiting', 'server.hosts_waiting', metric) AS metric)
-             FROM samples SETTINGS max_partitions_per_insert_block = 0",
-            "EXCHANGE TABLES samples AND samples_hosts",
-            "DROP TABLE samples_hosts",
-            "DROP TABLE IF EXISTS texts_hosts",
-            "CREATE TABLE texts_hosts (
-             metric String,
-             host   String,
-             labels Map(String, String),
-             time   DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
-             value  Nullable(String)
-         )
-         ENGINE = ReplacingMergeTree
-         PARTITION BY toStartOfMonth(time)
-         ORDER BY (host, metric, labels, time)",
-            "INSERT INTO texts_hosts SELECT * FROM texts SETTINGS max_partitions_per_insert_block = 0",
-            "EXCHANGE TABLES texts AND texts_hosts",
-            "DROP TABLE texts_hosts",
-            "DROP TABLE IF EXISTS series_hosts",
-            "CREATE TABLE series_hosts (
-             host   String,
-             metric String,
-             labels Map(String, String)
-         )
-         ENGINE = ReplacingMergeTree
-         ORDER BY (host, metric, labels)",
-            "INSERT INTO series_hosts
-             SELECT * REPLACE (multiIf(metric = 'server.agents_online', 'server.hosts_online', metric = 'server.agents_approved', 'server.hosts_approved', metric = 'server.agents_waiting', 'server.hosts_waiting', metric) AS metric)
-             FROM series SETTINGS max_partitions_per_insert_block = 0",
-            "EXCHANGE TABLES series AND series_hosts",
-            "DROP TABLE series_hosts",
-            "DROP TABLE IF EXISTS reports_hosts",
-            "CREATE TABLE reports_hosts (
-             time DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
-             host String
-         )
-         ENGINE = ReplacingMergeTree
-         PARTITION BY toStartOfMonth(time)
-         ORDER BY (time, host)",
-            "INSERT INTO reports_hosts SELECT * FROM reports SETTINGS max_partitions_per_insert_block = 0",
-            "EXCHANGE TABLES reports AND reports_hosts",
-            "DROP TABLE reports_hosts",
-            "DROP TABLE IF EXISTS rollups_five_minute_hosts",
-            "CREATE TABLE rollups_five_minute_hosts (
-                 metric  LowCardinality(String),
-                 host    String,
-                 series  String,
-                 time    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
-                 low     Float64,
-                 high    Float64,
-                 summed  Float64,
-                 samples UInt64,
-                 version UInt64
-             )
-             ENGINE = ReplacingMergeTree(version)
-             PARTITION BY toStartOfMonth(time)
-             ORDER BY (metric, host, series, time)",
-            "INSERT INTO rollups_five_minute_hosts
-             SELECT * REPLACE (if(metric = 'server.agents', 'server.hosts', metric) AS metric)
-             FROM rollups_five_minute SETTINGS max_partitions_per_insert_block = 0",
-            "EXCHANGE TABLES rollups_five_minute AND rollups_five_minute_hosts",
-            "DROP TABLE rollups_five_minute_hosts",
-            "DROP TABLE IF EXISTS rollups_hour_hosts",
-            "CREATE TABLE rollups_hour_hosts (
-                 metric  LowCardinality(String),
-                 host    String,
-                 series  String,
-                 time    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
-                 low     Float64,
-                 high    Float64,
-                 summed  Float64,
-                 samples UInt64,
-                 version UInt64
-             )
-             ENGINE = ReplacingMergeTree(version)
-             PARTITION BY toStartOfYear(time)
-             ORDER BY (metric, host, series, time)",
-            "INSERT INTO rollups_hour_hosts
-             SELECT * REPLACE (if(metric = 'server.agents', 'server.hosts', metric) AS metric)
-             FROM rollups_hour SETTINGS max_partitions_per_insert_block = 0",
-            "EXCHANGE TABLES rollups_hour AND rollups_hour_hosts",
-            "DROP TABLE rollups_hour_hosts",
-            // The server's own count of hosts keeps its rollups and how far they got.
-            "INSERT INTO rollup_progress
-             SELECT 'server.hosts', done_until_ms, version FROM rollup_progress FINAL
-             WHERE metric = 'server.agents'",
-        ],
-    ),
-    (
-        "0005_name_host_ids",
-        &[
-            // What every table keeps about a host is its ID, so the column says so, as
-            // in the main database. Copied and swapped as in 0004, for the same reason.
-            "DROP TABLE IF EXISTS samples_host_ids",
-            "CREATE TABLE samples_host_ids (
-             metric String,
+const MIGRATIONS: &[(&str, &[&str])] = &[(
+    "0001_create_tables",
+    &[
+        "CREATE TABLE IF NOT EXISTS samples (
+             metric  String,
              host_id String,
-             labels Map(String, String),
-             time   DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
-             value  Float64 CODEC(Gorilla, ZSTD(1)),
-             kind   String
+             labels  Map(String, String),
+             time    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
+             value   Float64 CODEC(Gorilla, ZSTD(1)),
+             kind    String
          )
          ENGINE = ReplacingMergeTree
          PARTITION BY toStartOfMonth(time)
          ORDER BY (metric, toStartOfHour(time), host_id, labels, time)",
-            "INSERT INTO samples_host_ids SELECT * FROM samples
-             SETTINGS max_partitions_per_insert_block = 0",
-            "EXCHANGE TABLES samples AND samples_host_ids",
-            "DROP TABLE samples_host_ids",
-            "DROP TABLE IF EXISTS texts_host_ids",
-            "CREATE TABLE texts_host_ids (
-             metric String,
+        // Text, only when it changes. Nothing means it stopped being reported.
+        "CREATE TABLE IF NOT EXISTS texts (
+             metric  String,
              host_id String,
-             labels Map(String, String),
-             time   DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
-             value  Nullable(String)
+             labels  Map(String, String),
+             time    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
+             value   Nullable(String)
          )
          ENGINE = ReplacingMergeTree
          PARTITION BY toStartOfMonth(time)
          ORDER BY (host_id, metric, labels, time)",
-            "INSERT INTO texts_host_ids SELECT * FROM texts
-             SETTINGS max_partitions_per_insert_block = 0",
-            "EXCHANGE TABLES texts AND texts_host_ids",
-            "DROP TABLE texts_host_ids",
-            "DROP TABLE IF EXISTS series_host_ids",
-            "CREATE TABLE series_host_ids (
+        // What exists, to limit what a host can create without reading the samples.
+        "CREATE TABLE IF NOT EXISTS series (
              host_id String,
-             metric String,
-             labels Map(String, String)
+             metric  String,
+             labels  Map(String, String)
          )
          ENGINE = ReplacingMergeTree
          ORDER BY (host_id, metric, labels)",
-            "INSERT INTO series_host_ids SELECT * FROM series
-             SETTINGS max_partitions_per_insert_block = 0",
-            "EXCHANGE TABLES series AND series_host_ids",
-            "DROP TABLE series_host_ids",
-            "DROP TABLE IF EXISTS reports_host_ids",
-            "CREATE TABLE reports_host_ids (
-             time DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
+        // When each host reported, so asking who's current doesn't read the samples.
+        "CREATE TABLE IF NOT EXISTS reports (
+             time    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
              host_id String
          )
          ENGINE = ReplacingMergeTree
          PARTITION BY toStartOfMonth(time)
          ORDER BY (time, host_id)",
-            "INSERT INTO reports_host_ids SELECT * FROM reports
-             SETTINGS max_partitions_per_insert_block = 0",
-            "EXCHANGE TABLES reports AND reports_host_ids",
-            "DROP TABLE reports_host_ids",
-            "DROP TABLE IF EXISTS rollups_five_minute_host_ids",
-            "CREATE TABLE rollups_five_minute_host_ids (
-                 metric  LowCardinality(String),
-                 host_id String,
-                 series  String,
-                 time    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
-                 low     Float64,
-                 high    Float64,
-                 summed  Float64,
-                 samples UInt64,
-                 version UInt64
-             )
-             ENGINE = ReplacingMergeTree(version)
-             PARTITION BY toStartOfMonth(time)
-             ORDER BY (metric, host_id, series, time)",
-            "INSERT INTO rollups_five_minute_host_ids SELECT * FROM rollups_five_minute
-             SETTINGS max_partitions_per_insert_block = 0",
-            "EXCHANGE TABLES rollups_five_minute AND rollups_five_minute_host_ids",
-            "DROP TABLE rollups_five_minute_host_ids",
-            "DROP TABLE IF EXISTS rollups_hour_host_ids",
-            "CREATE TABLE rollups_hour_host_ids (
-                 metric  LowCardinality(String),
-                 host_id String,
-                 series  String,
-                 time    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
-                 low     Float64,
-                 high    Float64,
-                 summed  Float64,
-                 samples UInt64,
-                 version UInt64
-             )
-             ENGINE = ReplacingMergeTree(version)
-             PARTITION BY toStartOfYear(time)
-             ORDER BY (metric, host_id, series, time)",
-            "INSERT INTO rollups_hour_host_ids SELECT * FROM rollups_hour
-             SETTINGS max_partitions_per_insert_block = 0",
-            "EXCHANGE TABLES rollups_hour AND rollups_hour_host_ids",
-            "DROP TABLE rollups_hour_host_ids",
-        ],
-    ),
-];
+        // What each chart in the catalog showed, 5 minutes and an hour at a time, as the
+        // lowest, highest and total value and how many there were. A span rolled up
+        // again is written again with a higher version, which replaces the old rows
+        // when ClickHouse merges them, and reads say FINAL until then.
+        "CREATE TABLE IF NOT EXISTS rollups_five_minute (
+             metric  LowCardinality(String),
+             host_id String,
+             series  String,
+             time    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
+             low     Float64,
+             high    Float64,
+             summed  Float64,
+             samples UInt64,
+             version UInt64
+         )
+         ENGINE = ReplacingMergeTree(version)
+         PARTITION BY toStartOfMonth(time)
+         ORDER BY (metric, host_id, series, time)",
+        "CREATE TABLE IF NOT EXISTS rollups_hour (
+             metric  LowCardinality(String),
+             host_id String,
+             series  String,
+             time    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
+             low     Float64,
+             high    Float64,
+             summed  Float64,
+             samples UInt64,
+             version UInt64
+         )
+         ENGINE = ReplacingMergeTree(version)
+         PARTITION BY toStartOfYear(time)
+         ORDER BY (metric, host_id, series, time)",
+        // How far each metric is rolled up: every hour before this, in milliseconds.
+        "CREATE TABLE IF NOT EXISTS rollup_progress (
+             metric        String,
+             done_until_ms Int64,
+             version       UInt64
+         )
+         ENGINE = ReplacingMergeTree(version)
+         ORDER BY metric",
+        // Hours that got samples after they were rolled up, to roll up again.
+        "CREATE TABLE IF NOT EXISTS rollup_redo (hour_ms Int64)
+         ENGINE = ReplacingMergeTree
+         ORDER BY hour_ms",
+    ],
+)];
 
 /// One runtime for every store, as the client is async and stores aren't. It's never
 /// shut down, because that isn't allowed from the async code a store can be dropped in.
@@ -1905,135 +1657,6 @@ mod tests {
 
     fn count(store: &TestStore, sql: &str) -> u64 {
         wait(store.client.query(sql).fetch_one()).unwrap()
-    }
-
-    const HOST_TABLES: [&str; 6] = [
-        "samples",
-        "texts",
-        "series",
-        "reports",
-        "rollups_hour",
-        "rollups_five_minute",
-    ];
-
-    #[test]
-    fn agents_become_hosts_keeping_every_row_even_after_stopping_part_way() {
-        let database = new_database();
-        let client = Client::default().with_url(url());
-        let (_, rename) = MIGRATIONS[3];
-        // Stopped just after the first table was swapped, before its old one went.
-        let swapped = rename
-            .iter()
-            .position(|statement| statement.starts_with("EXCHANGE"))
-            .unwrap();
-        wait(async {
-            client
-                .query_raw(&format!("CREATE DATABASE IF NOT EXISTS `{database}`"))
-                .execute()
-                .await?;
-            let client = client.clone().with_database(&database);
-            migrate(&client, &MIGRATIONS[..3]).await?;
-            let time = "fromUnixTimestamp64Milli(toInt64(60000), 'UTC')";
-            for sql in [
-                format!("INSERT INTO samples VALUES ('cpu.usage', 'a', map(), {time}, 1, 'n')"),
-                format!("INSERT INTO texts VALUES ('os', 'a', map(), {time}, 'Linux')"),
-                "INSERT INTO series VALUES ('a', 'cpu.usage', map())".to_string(),
-                format!("INSERT INTO reports VALUES ({time}, 'a')"),
-                format!("INSERT INTO rollups_hour VALUES ('cpu.usage', 'a', 'CPU', {time}, 1, 2, 3, 4, 1)"),
-                format!(
-                    "INSERT INTO rollups_five_minute VALUES ('cpu.usage', 'a', 'CPU', {time}, 1, 2, 3, 4, 1)"
-                ),
-                format!("INSERT INTO samples VALUES ('server.agents_online', 'server', map(), {time}, 1, 'n')"),
-                format!("INSERT INTO rollups_hour VALUES ('server.agents', 'server', 'Online', {time}, 1, 2, 3, 4, 1)"),
-                "INSERT INTO rollup_progress VALUES ('server.agents', 60000, 1)".to_string(),
-            ] {
-                client.query_raw(&sql).execute().await?;
-            }
-            for statement in &rename[..=swapped] {
-                client.query_raw(statement).execute().await?;
-            }
-            anyhow::Ok(())
-        })
-        .unwrap();
-
-        let store = opened(&database);
-
-        for table in HOST_TABLES {
-            let sql = format!("SELECT count() FROM {table} WHERE host_id = 'a'");
-            assert_eq!(count(&store, &sql), 1, "{table}");
-        }
-        let left = count(
-            &store,
-            "SELECT count() FROM system.columns
-             WHERE database = currentDatabase() AND name IN ('agent', 'host')",
-        );
-        assert_eq!(left, 0, "no table still has the old column");
-        for sql in [
-            "SELECT count() FROM samples WHERE metric = 'server.hosts_online'",
-            "SELECT count() FROM rollups_hour WHERE metric = 'server.hosts'",
-            "SELECT count() FROM rollup_progress FINAL WHERE metric = 'server.hosts'",
-        ] {
-            assert_eq!(count(&store, sql), 1, "{sql}");
-        }
-        let copies = count(
-            &store,
-            "SELECT count() FROM system.tables
-             WHERE database = currentDatabase() AND (name LIKE '%_hosts' OR name LIKE '%_host_ids')",
-        );
-        assert_eq!(copies, 0);
-    }
-
-    #[test]
-    fn minute_rollups_become_exactly_the_five_minute_ones() {
-        let database = new_database();
-        let client = Client::default().with_url(url());
-        wait(async {
-            client
-                .query_raw(&format!("CREATE DATABASE IF NOT EXISTS `{database}`"))
-                .execute()
-                .await?;
-            let client = client.clone().with_database(&database);
-            migrate(&client, &MIGRATIONS[..2]).await?;
-            // Six minutes: five in the first span, with a spike, and one in the next.
-            for minute in 0..6i64 {
-                let high = if minute == 2 { 100.0 } else { 20.0 };
-                let sql = format!(
-                    "INSERT INTO rollups_minute VALUES ('cpu.usage', 'a', 'CPU',
-                     fromUnixTimestamp64Milli(toInt64({}), 'UTC'), 10, {high}, {}, 4, 1)",
-                    minute * 60_000,
-                    60 + minute
-                );
-                client.query_raw(&sql).execute().await?;
-            }
-            anyhow::Ok(())
-        })
-        .unwrap();
-
-        let store = opened(&database);
-
-        let spans: Vec<(i64, f64, f64, f64, u64)> = wait(
-            store
-                .client
-                .query(
-                    "SELECT toInt64(toUnixTimestamp64Milli(time)), low, high, summed, samples
-                     FROM rollups_five_minute FINAL ORDER BY time",
-                )
-                .fetch_all(),
-        )
-        .unwrap();
-        assert_eq!(
-            spans,
-            [
-                (0, 10.0, 100.0, 5.0 * 60.0 + 10.0, 20),
-                (300_000, 10.0, 20.0, 65.0, 4),
-            ]
-        );
-        let left = count(
-            &store,
-            "SELECT count() FROM system.tables
-             WHERE database = currentDatabase() AND name = 'rollups_minute'",
-        );
-        assert_eq!(left, 0);
     }
 
     #[test]

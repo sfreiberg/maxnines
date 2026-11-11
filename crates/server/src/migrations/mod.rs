@@ -1,48 +1,14 @@
-//! The main database's schema, as a few migrations that each create the tables
-//! for one part of the server. Applied ones are recorded in the database, so once
-//! a migration has shipped it's never edited: a change goes in a new one instead.
-//!
-//! Times are milliseconds since the Unix epoch, in columns ending in `_ms`.
+//! The main database's tables, made by one migration: what `database/README.md`
+//! draws. A change to a table is a new migration after this one, with the README
+//! changed to match.
 
 use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
 
-#[async_trait::async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![
-            Box::new(CreateAgents),
-            Box::new(CreateConfigRules),
-            Box::new(CreateUsers),
-            Box::new(CreateAlerting),
-            Box::new(CreateRemoteChecks),
-            Box::new(CreateDashboards),
-            Box::new(CreateLocationRules),
-            Box::new(AddUserTimeZones),
-            Box::new(AddBuiltInAlerts),
-            Box::new(AddBuiltInDiskAlerts),
-            Box::new(AddWarningThresholds),
-            Box::new(AddChannelSeverities),
-            Box::new(ChooseChannelSeverities),
-            Box::new(AddBuiltInContainerAlert),
-            Box::new(CreateAuditLog),
-            Box::new(AddChannelMailSettings),
-            Box::new(AddApiKeyOwners),
-            Box::new(AddAuditVia),
-            Box::new(AddRoles),
-            Box::new(AddTwoFactor),
-            Box::new(AddChannelRequests),
-            Box::new(AddForecasts),
-            Box::new(CreateDashboardVariables),
-            Box::new(TurnOnSystemCollector),
-            Box::new(AddBuiltInInodeAlert),
-            Box::new(CreateEvents),
-            Box::new(UnresolveEventFilters),
-            Box::new(RenameTimesAndDurations),
-            Box::new(RenameAgentsToHosts),
-            Box::new(AddMissingForeignKeys),
-        ]
+        vec![Box::new(CreateTables)]
     }
 }
 
@@ -56,244 +22,150 @@ fn id(column: impl IntoIden) -> ColumnDef {
         .to_owned()
 }
 
-async fn drop_tables(manager: &SchemaManager<'_>, tables: &[&str]) -> Result<(), DbErr> {
-    for table in tables {
-        manager
-            .drop_table(Table::drop().table(Alias::new(*table)).to_owned())
-            .await?;
-    }
-    Ok(())
-}
+struct CreateTables;
 
-// ---- Agents
-
-struct CreateAgents;
-
-impl MigrationName for CreateAgents {
+impl MigrationName for CreateTables {
     fn name(&self) -> &str {
-        "m20261108_000001_create_agents"
+        "m20261111_000001_create_tables"
     }
 }
 
-#[derive(Iden)]
-enum Agents {
-    Table,
-    /// A hash of the agent's public key, which is its identity. Names aren't unique.
-    Id,
-    PublicKey,
-    Host,
-    State,
-    /// Who approved it: "admin", someone's address, or "rule:<name>".
-    DecidedBy,
-    FirstSeenMs,
-    DecidedAtMs,
-    DecidedMs,
-}
-
-#[derive(Iden)]
-enum AgentFacts {
-    Table,
-    Id,
-    AgentId,
-    Name,
-    Value,
-    ValueType,
-    ValidFromMs,
-    ValidToMs,
-}
-
-#[derive(Iden)]
-enum AgentConfigStatus {
-    Table,
-    AgentId,
-    Version,
-    Error,
-    ReportedAtMs,
-    ReportedMs,
-}
-
-/// Two agents that aren't machines. The server records its own checks under
-/// `server`, and alerts about the machines as a whole belong to `fleet`. No key
-/// hashes to either ID, as real ones are 32 hex characters, so nothing can
-/// connect as them.
-const BUILT_IN_AGENTS: &str = "
-    INSERT INTO agents (id, public_key, host, state, decided_by, first_seen_ms)
-    VALUES ('server', '', 'MaxNines server', 'approved', 'built-in', 0),
-           ('fleet', '', 'Fleet', 'approved', 'built-in', 0)
-";
-
-/// Agents and what they report about themselves. A fact is one row per value it
-/// has had, with `valid_to_ms` empty for the current one, so one table answers
-/// what's true now and what was true before.
+/// Every table, in the order their foreign keys need, and what a new server starts
+/// with: the server itself and the fleet as hosts, a default config rule, and the
+/// built-in alert rules.
 #[async_trait::async_trait]
-impl MigrationTrait for CreateAgents {
+impl MigrationTrait for CreateTables {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // MySQL's text holds 64 KB, which a big config rule's before and after could
+        // pass, and a change mustn't fail for want of room to record it.
+        let mut changes = ColumnDef::new(AuditLog::Changes);
+        match manager.get_database_backend() {
+            sea_orm::DatabaseBackend::MySql => changes.custom(Alias::new("LONGTEXT")),
+            _ => changes.text(),
+        };
+        changes.not_null();
+
         manager
             .create_table(
                 Table::create()
-                    .table(Agents::Table)
+                    .table(Hosts::Table)
                     .col(
-                        ColumnDef::new(Agents::Id)
+                        ColumnDef::new(Hosts::Id)
                             .string_len(32)
                             .not_null()
                             .primary_key(),
                     )
-                    .col(ColumnDef::new(Agents::PublicKey).string_len(64).not_null())
-                    .col(ColumnDef::new(Agents::Host).string_len(255).not_null())
-                    .col(ColumnDef::new(Agents::State).string_len(16).not_null())
-                    .col(ColumnDef::new(Agents::DecidedBy).text())
-                    .col(ColumnDef::new(Agents::FirstSeenMs).big_integer().not_null())
-                    .col(ColumnDef::new(Agents::DecidedAtMs).big_integer())
+                    .col(ColumnDef::new(Hosts::PublicKey).string_len(64).not_null())
+                    .col(ColumnDef::new(Hosts::Hostname).string_len(255).not_null())
+                    .col(ColumnDef::new(Hosts::State).string_len(16).not_null())
+                    .col(ColumnDef::new(Hosts::DecidedBy).text())
+                    .col(ColumnDef::new(Hosts::FirstSeenMs).big_integer().not_null())
+                    .col(ColumnDef::new(Hosts::DecidedMs).big_integer())
                     .to_owned(),
             )
             .await?;
-
         manager
             .create_table(
                 Table::create()
-                    .table(AgentFacts::Table)
-                    .col(id(AgentFacts::Id))
+                    .table(HostFacts::Table)
+                    .col(id(HostFacts::Id))
+                    .col(ColumnDef::new(HostFacts::HostId).string_len(32).not_null())
+                    .col(ColumnDef::new(HostFacts::Name).string_len(255).not_null())
+                    .col(ColumnDef::new(HostFacts::Value).string_len(255).not_null())
                     .col(
-                        ColumnDef::new(AgentFacts::AgentId)
-                            .string_len(32)
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(AgentFacts::Name).string_len(255).not_null())
-                    .col(ColumnDef::new(AgentFacts::Value).string_len(255).not_null())
-                    .col(
-                        ColumnDef::new(AgentFacts::ValueType)
+                        ColumnDef::new(HostFacts::ValueType)
                             .string_len(16)
                             .not_null(),
                     )
                     .col(
-                        ColumnDef::new(AgentFacts::ValidFromMs)
+                        ColumnDef::new(HostFacts::ValidFromMs)
                             .big_integer()
                             .not_null(),
                     )
-                    .col(ColumnDef::new(AgentFacts::ValidToMs).big_integer())
+                    .col(ColumnDef::new(HostFacts::ValidToMs).big_integer())
                     .foreign_key(
                         ForeignKey::create()
-                            .from(AgentFacts::Table, AgentFacts::AgentId)
-                            .to(Agents::Table, Agents::Id),
+                            .name("fk_host_facts_host_id")
+                            .from(HostFacts::Table, HostFacts::HostId)
+                            .to(Hosts::Table, Hosts::Id),
                     )
                     .to_owned(),
             )
             .await?;
-        // Reading one agent's facts.
         manager
             .create_index(
                 Index::create()
-                    .name("idx_agent_facts_agent")
-                    .table(AgentFacts::Table)
-                    .col(AgentFacts::AgentId)
-                    .col(AgentFacts::ValidToMs)
+                    .name("idx_host_facts_host")
+                    .table(HostFacts::Table)
+                    .col(HostFacts::HostId)
+                    .col(HostFacts::ValidToMs)
                     .to_owned(),
             )
             .await?;
-        // Finding agents by a fact, such as every machine on one OS version.
         manager
             .create_index(
                 Index::create()
-                    .name("idx_agent_facts_name_value")
-                    .table(AgentFacts::Table)
-                    .col(AgentFacts::Name)
-                    .col(AgentFacts::Value)
+                    .name("idx_host_facts_name_value")
+                    .table(HostFacts::Table)
+                    .col(HostFacts::Name)
+                    .col(HostFacts::Value)
                     .to_owned(),
             )
             .await?;
-
-        // What each agent last said about the config it was sent.
         manager
             .create_table(
                 Table::create()
-                    .table(AgentConfigStatus::Table)
+                    .table(HostConfigStatus::Table)
                     .col(
-                        ColumnDef::new(AgentConfigStatus::AgentId)
+                        ColumnDef::new(HostConfigStatus::HostId)
                             .string_len(32)
                             .not_null()
                             .primary_key(),
                     )
                     .col(
-                        ColumnDef::new(AgentConfigStatus::Version)
+                        ColumnDef::new(HostConfigStatus::Version)
                             .string_len(32)
                             .not_null(),
                     )
-                    .col(ColumnDef::new(AgentConfigStatus::Error).text())
+                    .col(ColumnDef::new(HostConfigStatus::Error).text())
                     .col(
-                        ColumnDef::new(AgentConfigStatus::ReportedAtMs)
+                        ColumnDef::new(HostConfigStatus::ReportedMs)
                             .big_integer()
                             .not_null(),
                     )
                     .foreign_key(
                         ForeignKey::create()
-                            .from(AgentConfigStatus::Table, AgentConfigStatus::AgentId)
-                            .to(Agents::Table, Agents::Id),
+                            .name("fk_host_config_status_host_id")
+                            .from(HostConfigStatus::Table, HostConfigStatus::HostId)
+                            .to(Hosts::Table, Hosts::Id),
                     )
                     .to_owned(),
             )
             .await?;
-
         manager
-            .get_connection()
-            .execute_unprepared(BUILT_IN_AGENTS)
+            .create_table(
+                Table::create()
+                    .table(HostBoots::Table)
+                    .col(
+                        ColumnDef::new(HostBoots::HostId)
+                            .string_len(32)
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(HostBoots::BootMs).big_integer().not_null())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_host_boots_host_id")
+                            .from(HostBoots::Table, HostBoots::HostId)
+                            .to(Hosts::Table, Hosts::Id),
+                    )
+                    .to_owned(),
+            )
             .await?;
-        Ok(())
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        drop_tables(manager, &["agent_config_status", "agent_facts", "agents"]).await
-    }
-}
-
-// ---- Config rules
-
-struct CreateConfigRules;
-
-impl MigrationName for CreateConfigRules {
-    fn name(&self) -> &str {
-        "m20261108_000002_create_config_rules"
-    }
-}
-
-#[derive(Iden)]
-enum ConfigRules {
-    Table,
-    Id,
-    Name,
-    Priority,
-    ConditionExpr,
-    Enabled,
-}
-
-#[derive(Iden)]
-enum ConfigRuleSettings {
-    Table,
-    Id,
-    RuleId,
-    Name,
-    Value,
-    ValueType,
-}
-
-/// What a new install monitors until someone changes it.
-const DEFAULT_RULE: &str = "
-    INSERT INTO config_rules (name, priority, enabled) VALUES ('Default', 0, TRUE)
-";
-const DEFAULT_SETTINGS: [(&str, &str, &str); 7] = [
-    ("interval_secs", "15", "number"),
-    ("facts_interval_secs", "3600", "number"),
-    ("collectors.host.enabled", "true", "boolean"),
-    ("collectors.cpu.enabled", "true", "boolean"),
-    ("collectors.memory.enabled", "true", "boolean"),
-    ("collectors.disk.enabled", "true", "boolean"),
-    ("collectors.network.enabled", "true", "boolean"),
-];
-
-/// Rules that choose each agent's settings from its facts. Settings are stored
-/// flat, one row per leaf, so any shape of setting works without a schema change.
-#[async_trait::async_trait]
-impl MigrationTrait for CreateConfigRules {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
             .create_table(
                 Table::create()
@@ -311,7 +183,6 @@ impl MigrationTrait for CreateConfigRules {
                     .to_owned(),
             )
             .await?;
-
         manager
             .create_table(
                 Table::create()
@@ -339,6 +210,7 @@ impl MigrationTrait for CreateConfigRules {
                     )
                     .foreign_key(
                         ForeignKey::create()
+                            .name("fk_config_rule_settings_rule_id")
                             .from(ConfigRuleSettings::Table, ConfigRuleSettings::RuleId)
                             .to(ConfigRules::Table, ConfigRules::Id)
                             .on_delete(ForeignKeyAction::Cascade),
@@ -357,91 +229,6 @@ impl MigrationTrait for CreateConfigRules {
                     .to_owned(),
             )
             .await?;
-
-        let connection = manager.get_connection();
-        connection.execute_unprepared(DEFAULT_RULE).await?;
-        for (name, value, value_type) in DEFAULT_SETTINGS {
-            connection
-                .execute_unprepared(&format!(
-                    "INSERT INTO config_rule_settings (rule_id, name, value, value_type)
-                     SELECT id, '{name}', '{value}', '{value_type}'
-                     FROM config_rules WHERE name = 'Default'"
-                ))
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        drop_tables(manager, &["config_rule_settings", "config_rules"]).await
-    }
-}
-
-// ---- Users, API keys and the server's own secrets
-
-struct CreateUsers;
-
-impl MigrationName for CreateUsers {
-    fn name(&self) -> &str {
-        "m20261108_000003_create_users"
-    }
-}
-
-#[derive(Iden)]
-enum Users {
-    Table,
-    Id,
-    Email,
-    Name,
-    /// Empty until the setup link is used, or for ways of signing in without one.
-    PasswordHash,
-    Theme,
-    SetupTokenHash,
-    SetupExpiresMs,
-    CreatedMs,
-    LastSignInMs,
-    DisabledMs,
-}
-
-#[derive(Iden)]
-enum UserSessions {
-    Table,
-    Id,
-    UserId,
-    TokenHash,
-    CreatedMs,
-    ExpiresMs,
-}
-
-#[derive(Iden)]
-enum ApiKeys {
-    Table,
-    Id,
-    Name,
-    /// The start of the key, to recognize it by.
-    Hint,
-    TokenHash,
-    CreatedMs,
-    /// Empty means it never expires.
-    ExpiresMs,
-    LastUsedMs,
-    RevokedMs,
-}
-
-#[derive(Iden)]
-enum ServerSecrets {
-    Table,
-    Name,
-    Value,
-}
-
-/// People who can sign in, their sessions, keys for the API, and what the server
-/// generates for itself, such as the CSRF key. Sessions, setup links and API keys
-/// are only ever stored as hashes. Revoked keys stay, to show what existed and
-/// when it stopped.
-#[async_trait::async_trait]
-impl MigrationTrait for CreateUsers {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
             .create_table(
                 Table::create()
@@ -456,10 +243,22 @@ impl MigrationTrait for CreateUsers {
                     .col(ColumnDef::new(Users::Name).string_len(100).not_null())
                     .col(ColumnDef::new(Users::PasswordHash).string_len(255))
                     .col(
+                        ColumnDef::new(Users::Role)
+                            .string_len(16)
+                            .not_null()
+                            .default("admin"),
+                    )
+                    .col(
                         ColumnDef::new(Users::Theme)
                             .string_len(20)
                             .not_null()
                             .default("carbon"),
+                    )
+                    .col(
+                        ColumnDef::new(Users::TimeZone)
+                            .string_len(64)
+                            .not_null()
+                            .default("UTC"),
                     )
                     .col(
                         ColumnDef::new(Users::SetupTokenHash)
@@ -467,13 +266,20 @@ impl MigrationTrait for CreateUsers {
                             .unique_key(),
                     )
                     .col(ColumnDef::new(Users::SetupExpiresMs).big_integer())
+                    .col(ColumnDef::new(Users::TotpSecret).string_len(128))
+                    .col(
+                        ColumnDef::new(Users::TotpEnabled)
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .col(ColumnDef::new(Users::TotpLastStep).big_integer())
                     .col(ColumnDef::new(Users::CreatedMs).big_integer().not_null())
                     .col(ColumnDef::new(Users::LastSignInMs).big_integer())
                     .col(ColumnDef::new(Users::DisabledMs).big_integer())
                     .to_owned(),
             )
             .await?;
-
         manager
             .create_table(
                 Table::create()
@@ -502,6 +308,7 @@ impl MigrationTrait for CreateUsers {
                     )
                     .foreign_key(
                         ForeignKey::create()
+                            .name("fk_user_sessions_user_id")
                             .from(UserSessions::Table, UserSessions::UserId)
                             .to(Users::Table, Users::Id)
                             .on_delete(ForeignKeyAction::Cascade),
@@ -518,12 +325,12 @@ impl MigrationTrait for CreateUsers {
                     .to_owned(),
             )
             .await?;
-
         manager
             .create_table(
                 Table::create()
                     .table(ApiKeys::Table)
                     .col(id(ApiKeys::Id))
+                    .col(ColumnDef::new(ApiKeys::UserId).big_integer().not_null())
                     .col(ColumnDef::new(ApiKeys::Name).string_len(100).not_null())
                     .col(ColumnDef::new(ApiKeys::Hint).string_len(16).not_null())
                     .col(
@@ -532,213 +339,80 @@ impl MigrationTrait for CreateUsers {
                             .not_null()
                             .unique_key(),
                     )
+                    .col(
+                        ColumnDef::new(ApiKeys::Role)
+                            .string_len(16)
+                            .not_null()
+                            .default("admin"),
+                    )
                     .col(ColumnDef::new(ApiKeys::CreatedMs).big_integer().not_null())
                     .col(ColumnDef::new(ApiKeys::ExpiresMs).big_integer())
                     .col(ColumnDef::new(ApiKeys::LastUsedMs).big_integer())
                     .col(ColumnDef::new(ApiKeys::RevokedMs).big_integer())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_api_keys_user_id")
+                            .from(ApiKeys::Table, ApiKeys::UserId)
+                            .to(Users::Table, Users::Id),
+                    )
                     .to_owned(),
             )
             .await?;
-
         manager
             .create_table(
                 Table::create()
-                    .table(ServerSecrets::Table)
+                    .table(RecoveryCodes::Table)
+                    .col(id(RecoveryCodes::Id))
                     .col(
-                        ColumnDef::new(ServerSecrets::Name)
-                            .string_len(64)
-                            .not_null()
-                            .primary_key(),
+                        ColumnDef::new(RecoveryCodes::UserId)
+                            .big_integer()
+                            .not_null(),
                     )
-                    .col(ColumnDef::new(ServerSecrets::Value).text().not_null())
+                    .col(
+                        ColumnDef::new(RecoveryCodes::CodeHash)
+                            .string_len(64)
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(RecoveryCodes::UsedMs).big_integer())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_recovery_codes_user_id")
+                            .from(RecoveryCodes::Table, RecoveryCodes::UserId)
+                            .to(Users::Table, Users::Id),
+                    )
                     .to_owned(),
             )
-            .await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        drop_tables(
-            manager,
-            &["server_secrets", "api_keys", "user_sessions", "users"],
-        )
-        .await
-    }
-}
-
-// ---- Alerting
-
-struct CreateAlerting;
-
-impl MigrationName for CreateAlerting {
-    fn name(&self) -> &str {
-        "m20261108_000004_create_alerting"
-    }
-}
-
-#[derive(Iden)]
-enum AlertRules {
-    Table,
-    Id,
-    Name,
-    /// metric, offline or calculation.
-    Kind,
-    Metric,
-    /// Which of a metric's series to watch, as a pattern. Empty for all of them.
-    Series,
-    Comparison,
-    Threshold,
-    /// How long the condition has to hold before the alert fires, and clears.
-    ForSecs,
-    Severity,
-    /// Which agents the rule applies to, as a CEL expression over their facts.
-    ConditionExpr,
-    Enabled,
-    /// For a calculation across machines: what to work out, what gets a line of
-    /// its own, which machines, and how far back to look.
-    Calculation,
-    GroupBy,
-    Filter,
-    WindowSecs,
-    /// How often to repeat while firing and unacknowledged. Empty means never.
-    RemindEverySecs,
-}
-
-#[derive(Iden)]
-enum NotificationChannels {
-    Table,
-    Id,
-    Name,
-    Kind,
-    /// A webhook's URL, email addresses, a Slack channel, a PagerDuty key, an
-    /// AlertOps or SIGNL4 URL, or a Telegram chat. Write-only, as it's often a secret.
-    Target,
-    /// A bot token, for Slack and Telegram. Write-only.
-    Credential,
-    /// A Slack app-level token, for hearing buttons through Socket Mode. Write-only.
-    AppToken,
-}
-
-#[derive(Iden)]
-enum AlertRuleChannels {
-    Table,
-    RuleId,
-    ChannelId,
-}
-
-#[derive(Iden)]
-enum Alerts {
-    Table,
-    Id,
-    /// Empty once the rule is deleted; the alert keeps its own copy of the rest.
-    RuleId,
-    RuleName,
-    Severity,
-    AgentId,
-    Host,
-    /// Empty for alerts about the agent as a whole.
-    Series,
-    Value,
-    Summary,
-    StartedMs,
-    ResolvedMs,
-    ResolveReason,
-    AcknowledgedBy,
-    AcknowledgedMs,
-    HostId,
-    Hostname,
-}
-
-#[derive(Iden)]
-enum Notifications {
-    Table,
-    Id,
-    AlertId,
-    ChannelId,
-    /// firing, resolved or reminder.
-    Event,
-    /// pending, sent, failed, or held back by a silence.
-    State,
-    Attempts,
-    NextAttemptMs,
-    LastError,
-    CreatedMs,
-    SentMs,
-    /// What the service called the message, for updating or replying to it later.
-    ExternalId,
-}
-
-#[derive(Iden)]
-enum Silences {
-    Table,
-    Id,
-    /// Every rule, if empty.
-    RuleId,
-    /// Which machines, in the host filter's form. Every machine, if empty.
-    Filter,
-    Reason,
-    CreatedBy,
-    StartsMs,
-    EndsMs,
-}
-
-#[derive(Iden)]
-enum MaintenanceWindows {
-    Table,
-    Id,
-    Name,
-    RuleId,
-    Filter,
-    /// The weekdays it starts on, by name.
-    Days,
-    /// "HH:MM" in the window's time zone.
-    StartTime,
-    DurationMinutes,
-    DurationSecs,
-    TimeZone,
-}
-
-/// Rules say what to watch and channels say who to tell. An alert is one rule
-/// firing for one agent, and stays as history once it resolves, so it keeps its
-/// own copy of what it was about. Notifications are a queue, which lets a delivery
-/// survive a restart and be retried. Silences and maintenance windows hold
-/// notifications back for a while; a rule's go with it when it's deleted, as an
-/// empty rule would mean every rule.
-#[async_trait::async_trait]
-impl MigrationTrait for CreateAlerting {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+            .await?;
         manager
             .create_table(
                 Table::create()
-                    .table(AlertRules::Table)
-                    .col(id(AlertRules::Id))
+                    .table(SignInChallenges::Table)
+                    .col(id(SignInChallenges::Id))
                     .col(
-                        ColumnDef::new(AlertRules::Name)
-                            .string_len(255)
+                        ColumnDef::new(SignInChallenges::UserId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(SignInChallenges::TokenHash)
+                            .string_len(64)
                             .not_null()
                             .unique_key(),
                     )
-                    .col(ColumnDef::new(AlertRules::Kind).string_len(16).not_null())
-                    .col(ColumnDef::new(AlertRules::Metric).string_len(64))
-                    .col(ColumnDef::new(AlertRules::Series).string_len(255))
-                    .col(ColumnDef::new(AlertRules::Comparison).string_len(16))
-                    .col(ColumnDef::new(AlertRules::Threshold).double())
-                    .col(ColumnDef::new(AlertRules::ForSecs).big_integer().not_null())
                     .col(
-                        ColumnDef::new(AlertRules::Severity)
-                            .string_len(16)
+                        ColumnDef::new(SignInChallenges::ExpiresMs)
+                            .big_integer()
                             .not_null(),
                     )
-                    .col(ColumnDef::new(AlertRules::ConditionExpr).text())
-                    .col(ColumnDef::new(AlertRules::Enabled).boolean().not_null())
-                    .col(ColumnDef::new(AlertRules::Calculation).string_len(16))
-                    .col(ColumnDef::new(AlertRules::GroupBy).string_len(255))
-                    .col(ColumnDef::new(AlertRules::Filter).string_len(500))
-                    .col(ColumnDef::new(AlertRules::WindowSecs).big_integer())
-                    .col(ColumnDef::new(AlertRules::RemindEverySecs).big_integer())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_sign_in_challenges_user_id")
+                            .from(SignInChallenges::Table, SignInChallenges::UserId)
+                            .to(Users::Table, Users::Id),
+                    )
                     .to_owned(),
             )
             .await?;
-
         manager
             .create_table(
                 Table::create()
@@ -762,10 +436,70 @@ impl MigrationTrait for CreateAlerting {
                     )
                     .col(ColumnDef::new(NotificationChannels::Credential).text())
                     .col(ColumnDef::new(NotificationChannels::AppToken).text())
+                    .col(
+                        ColumnDef::new(NotificationChannels::SendsWarnings)
+                            .boolean()
+                            .not_null()
+                            .default(true),
+                    )
+                    .col(
+                        ColumnDef::new(NotificationChannels::SendsCritical)
+                            .boolean()
+                            .not_null()
+                            .default(true),
+                    )
+                    .col(ColumnDef::new(NotificationChannels::MailFrom).string_len(320))
+                    .col(ColumnDef::new(NotificationChannels::MailHostname).string_len(255))
+                    .col(ColumnDef::new(NotificationChannels::MailPort).integer())
+                    .col(ColumnDef::new(NotificationChannels::MailSecurity).string_len(16))
+                    .col(ColumnDef::new(NotificationChannels::MailUsername).string_len(255))
+                    .col(ColumnDef::new(NotificationChannels::RequestMethod).string_len(8))
+                    .col(ColumnDef::new(NotificationChannels::RequestContentType).string_len(255))
+                    .col(ColumnDef::new(NotificationChannels::RequestBody).text())
                     .to_owned(),
             )
             .await?;
-
+        manager
+            .create_table(
+                Table::create()
+                    .table(AlertRules::Table)
+                    .col(id(AlertRules::Id))
+                    .col(
+                        ColumnDef::new(AlertRules::Name)
+                            .string_len(255)
+                            .not_null()
+                            .unique_key(),
+                    )
+                    .col(ColumnDef::new(AlertRules::Kind).string_len(16).not_null())
+                    .col(ColumnDef::new(AlertRules::Metric).string_len(64))
+                    .col(ColumnDef::new(AlertRules::Series).string_len(255))
+                    .col(ColumnDef::new(AlertRules::Comparison).string_len(16))
+                    .col(ColumnDef::new(AlertRules::Threshold).double())
+                    .col(ColumnDef::new(AlertRules::WarningThreshold).double())
+                    .col(ColumnDef::new(AlertRules::ForSecs).big_integer().not_null())
+                    .col(
+                        ColumnDef::new(AlertRules::Severity)
+                            .string_len(16)
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(AlertRules::ConditionExpr).text())
+                    .col(ColumnDef::new(AlertRules::Enabled).boolean().not_null())
+                    .col(
+                        ColumnDef::new(AlertRules::AllChannels)
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .col(ColumnDef::new(AlertRules::Calculation).string_len(16))
+                    .col(ColumnDef::new(AlertRules::GroupBy).string_len(255))
+                    .col(ColumnDef::new(AlertRules::Filter).string_len(500))
+                    .col(ColumnDef::new(AlertRules::WindowSecs).big_integer())
+                    .col(ColumnDef::new(AlertRules::RemindEverySecs).big_integer())
+                    .col(ColumnDef::new(AlertRules::ForecastSecs).big_integer())
+                    .col(ColumnDef::new(AlertRules::WarningForecastSecs).big_integer())
+                    .to_owned(),
+            )
+            .await?;
         manager
             .create_table(
                 Table::create()
@@ -787,20 +521,21 @@ impl MigrationTrait for CreateAlerting {
                     )
                     .foreign_key(
                         ForeignKey::create()
-                            .from(AlertRuleChannels::Table, AlertRuleChannels::RuleId)
-                            .to(AlertRules::Table, AlertRules::Id)
+                            .name("fk_alert_rule_channels_channel_id")
+                            .from(AlertRuleChannels::Table, AlertRuleChannels::ChannelId)
+                            .to(NotificationChannels::Table, NotificationChannels::Id)
                             .on_delete(ForeignKeyAction::Cascade),
                     )
                     .foreign_key(
                         ForeignKey::create()
-                            .from(AlertRuleChannels::Table, AlertRuleChannels::ChannelId)
-                            .to(NotificationChannels::Table, NotificationChannels::Id)
+                            .name("fk_alert_rule_channels_rule_id")
+                            .from(AlertRuleChannels::Table, AlertRuleChannels::RuleId)
+                            .to(AlertRules::Table, AlertRules::Id)
                             .on_delete(ForeignKeyAction::Cascade),
                     )
                     .to_owned(),
             )
             .await?;
-
         manager
             .create_table(
                 Table::create()
@@ -809,8 +544,8 @@ impl MigrationTrait for CreateAlerting {
                     .col(ColumnDef::new(Alerts::RuleId).big_integer())
                     .col(ColumnDef::new(Alerts::RuleName).string_len(255).not_null())
                     .col(ColumnDef::new(Alerts::Severity).string_len(16).not_null())
-                    .col(ColumnDef::new(Alerts::AgentId).string_len(32).not_null())
-                    .col(ColumnDef::new(Alerts::Host).string_len(255).not_null())
+                    .col(ColumnDef::new(Alerts::HostId).string_len(32).not_null())
+                    .col(ColumnDef::new(Alerts::Hostname).string_len(255).not_null())
                     .col(ColumnDef::new(Alerts::Series).string_len(255).not_null())
                     .col(ColumnDef::new(Alerts::Value).double())
                     .col(ColumnDef::new(Alerts::Summary).text().not_null())
@@ -821,19 +556,20 @@ impl MigrationTrait for CreateAlerting {
                     .col(ColumnDef::new(Alerts::AcknowledgedMs).big_integer())
                     .foreign_key(
                         ForeignKey::create()
+                            .name("fk_alerts_host_id")
+                            .from(Alerts::Table, Alerts::HostId)
+                            .to(Hosts::Table, Hosts::Id),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_alerts_rule_id")
                             .from(Alerts::Table, Alerts::RuleId)
                             .to(AlertRules::Table, AlertRules::Id)
                             .on_delete(ForeignKeyAction::SetNull),
                     )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .from(Alerts::Table, Alerts::AgentId)
-                            .to(Agents::Table, Agents::Id),
-                    )
                     .to_owned(),
             )
             .await?;
-        // Finding what's firing, which happens on every evaluation.
         manager
             .create_index(
                 Index::create()
@@ -843,7 +579,6 @@ impl MigrationTrait for CreateAlerting {
                     .to_owned(),
             )
             .await?;
-        // Showing the newest history.
         manager
             .create_index(
                 Index::create()
@@ -853,7 +588,6 @@ impl MigrationTrait for CreateAlerting {
                     .to_owned(),
             )
             .await?;
-
         manager
             .create_table(
                 Table::create()
@@ -895,12 +629,14 @@ impl MigrationTrait for CreateAlerting {
                     .col(ColumnDef::new(Notifications::ExternalId).string_len(128))
                     .foreign_key(
                         ForeignKey::create()
+                            .name("fk_notifications_alert_id")
                             .from(Notifications::Table, Notifications::AlertId)
                             .to(Alerts::Table, Alerts::Id)
                             .on_delete(ForeignKeyAction::Cascade),
                     )
                     .foreign_key(
                         ForeignKey::create()
+                            .name("fk_notifications_channel_id")
                             .from(Notifications::Table, Notifications::ChannelId)
                             .to(NotificationChannels::Table, NotificationChannels::Id)
                             .on_delete(ForeignKeyAction::Cascade),
@@ -908,7 +644,15 @@ impl MigrationTrait for CreateAlerting {
                     .to_owned(),
             )
             .await?;
-        // Finding what's due to be sent, which happens every few seconds.
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_notifications_alert")
+                    .table(Notifications::Table)
+                    .col(Notifications::AlertId)
+                    .to_owned(),
+            )
+            .await?;
         manager
             .create_index(
                 Index::create()
@@ -919,17 +663,6 @@ impl MigrationTrait for CreateAlerting {
                     .to_owned(),
             )
             .await?;
-        // Finding who heard about an alert, to tell them when it resolves.
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_notifications_alert")
-                    .table(Notifications::Table)
-                    .col(Notifications::AlertId)
-                    .to_owned(),
-            )
-            .await?;
-
         manager
             .create_table(
                 Table::create()
@@ -947,6 +680,7 @@ impl MigrationTrait for CreateAlerting {
                     .col(ColumnDef::new(Silences::EndsMs).big_integer().not_null())
                     .foreign_key(
                         ForeignKey::create()
+                            .name("fk_silences_rule_id")
                             .from(Silences::Table, Silences::RuleId)
                             .to(AlertRules::Table, AlertRules::Id)
                             .on_delete(ForeignKeyAction::Cascade),
@@ -954,7 +688,6 @@ impl MigrationTrait for CreateAlerting {
                     .to_owned(),
             )
             .await?;
-        // Finding what's running, which happens every few seconds.
         manager
             .create_index(
                 Index::create()
@@ -964,7 +697,6 @@ impl MigrationTrait for CreateAlerting {
                     .to_owned(),
             )
             .await?;
-
         manager
             .create_table(
                 Table::create()
@@ -992,7 +724,7 @@ impl MigrationTrait for CreateAlerting {
                             .not_null(),
                     )
                     .col(
-                        ColumnDef::new(MaintenanceWindows::DurationMinutes)
+                        ColumnDef::new(MaintenanceWindows::DurationSecs)
                             .big_integer()
                             .not_null(),
                     )
@@ -1003,67 +735,14 @@ impl MigrationTrait for CreateAlerting {
                     )
                     .foreign_key(
                         ForeignKey::create()
+                            .name("fk_maintenance_windows_rule_id")
                             .from(MaintenanceWindows::Table, MaintenanceWindows::RuleId)
                             .to(AlertRules::Table, AlertRules::Id)
                             .on_delete(ForeignKeyAction::Cascade),
                     )
                     .to_owned(),
             )
-            .await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        drop_tables(
-            manager,
-            &[
-                "maintenance_windows",
-                "silences",
-                "notifications",
-                "alerts",
-                "alert_rule_channels",
-                "notification_channels",
-                "alert_rules",
-            ],
-        )
-        .await
-    }
-}
-
-// ---- Checks the server runs itself
-
-struct CreateRemoteChecks;
-
-impl MigrationName for CreateRemoteChecks {
-    fn name(&self) -> &str {
-        "m20261108_000005_create_remote_checks"
-    }
-}
-
-#[derive(Iden)]
-enum RemoteChecks {
-    Table,
-    Id,
-    Name,
-    Kind,
-    Target,
-    TimeoutSecs,
-    Method,
-    Body,
-    Regex,
-    Insecure,
-    Server,
-    Record,
-    Count,
-    IntervalSecs,
-    Enabled,
-}
-
-/// Checks the server runs against remote sites. Their results are stored under
-/// the built-in `server` agent, so charts and alert rules work on them like any
-/// other metric.
-#[async_trait::async_trait]
-impl MigrationTrait for CreateRemoteChecks {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+            .await?;
         manager
             .create_table(
                 Table::create()
@@ -1097,55 +776,7 @@ impl MigrationTrait for CreateRemoteChecks {
                     .col(ColumnDef::new(RemoteChecks::Enabled).boolean().not_null())
                     .to_owned(),
             )
-            .await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        drop_tables(manager, &["remote_checks"]).await
-    }
-}
-
-// ---- Dashboards
-
-struct CreateDashboards;
-
-impl MigrationName for CreateDashboards {
-    fn name(&self) -> &str {
-        "m20261108_000006_create_dashboards"
-    }
-}
-
-#[derive(Iden)]
-enum Dashboards {
-    Table,
-    Id,
-    Name,
-    CreatedMs,
-}
-
-#[derive(Iden)]
-enum DashboardWidgets {
-    Table,
-    Id,
-    DashboardId,
-    Title,
-    Kind,
-    Metric,
-    Calculation,
-    GroupBy,
-    Filter,
-    /// Where it sits on a grid of 12 columns.
-    X,
-    Y,
-    W,
-    H,
-}
-
-/// Dashboards everyone signed in shares, and what's on them. A widget keeps its
-/// question as what was chosen.
-#[async_trait::async_trait]
-impl MigrationTrait for CreateDashboards {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+            .await?;
         manager
             .create_table(
                 Table::create()
@@ -1160,7 +791,6 @@ impl MigrationTrait for CreateDashboards {
                     .to_owned(),
             )
             .await?;
-
         manager
             .create_table(
                 Table::create()
@@ -1207,6 +837,7 @@ impl MigrationTrait for CreateDashboards {
                     .col(ColumnDef::new(DashboardWidgets::H).integer().not_null())
                     .foreign_key(
                         ForeignKey::create()
+                            .name("fk_dashboard_widgets_dashboard_id")
                             .from(DashboardWidgets::Table, DashboardWidgets::DashboardId)
                             .to(Dashboards::Table, Dashboards::Id)
                             .on_delete(ForeignKeyAction::Cascade),
@@ -1222,1344 +853,7 @@ impl MigrationTrait for CreateDashboards {
                     .col(DashboardWidgets::DashboardId)
                     .to_owned(),
             )
-            .await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        drop_tables(manager, &["dashboard_widgets", "dashboards"]).await
-    }
-}
-
-// ---- Where machines are
-
-struct CreateLocationRules;
-
-impl MigrationName for CreateLocationRules {
-    fn name(&self) -> &str {
-        "m20261108_000007_create_location_rules"
-    }
-}
-
-#[derive(Iden)]
-enum LocationRules {
-    Table,
-    Id,
-    /// What the map calls the machines it covers.
-    Name,
-    /// Which machines, in the host filter's form. Every machine, if empty.
-    Filter,
-    /// Where it is in words, such as "Leeds, England, United Kingdom".
-    Place,
-    Latitude,
-    Longitude,
-    /// When several rules match a machine, the highest wins.
-    Priority,
-}
-
-/// Rules that say where machines are, for the map. A machine placed by hand is a
-/// rule whose filter is its ID.
-#[async_trait::async_trait]
-impl MigrationTrait for CreateLocationRules {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .create_table(
-                Table::create()
-                    .table(LocationRules::Table)
-                    .col(id(LocationRules::Id))
-                    .col(
-                        ColumnDef::new(LocationRules::Name)
-                            .string_len(255)
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(LocationRules::Filter)
-                            .string_len(500)
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(LocationRules::Place)
-                            .string_len(255)
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(LocationRules::Latitude).double().not_null())
-                    .col(ColumnDef::new(LocationRules::Longitude).double().not_null())
-                    .col(ColumnDef::new(LocationRules::Priority).integer().not_null())
-                    .to_owned(),
-            )
-            .await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        drop_tables(manager, &["location_rules"]).await
-    }
-}
-
-// ---- Each person's time zone
-
-struct AddUserTimeZones;
-
-impl MigrationName for AddUserTimeZones {
-    fn name(&self) -> &str {
-        "m20261109_000008_add_user_time_zones"
-    }
-}
-
-#[derive(Iden)]
-enum UserTimeZones {
-    #[iden = "users"]
-    Table,
-    /// A name from the time zone database, like `Europe/London`, for showing times.
-    TimeZone,
-}
-
-/// The time zone each person reads times in. Everyone starts on UTC.
-#[async_trait::async_trait]
-impl MigrationTrait for AddUserTimeZones {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(UserTimeZones::Table)
-                    .add_column(
-                        ColumnDef::new(UserTimeZones::TimeZone)
-                            .string_len(64)
-                            .not_null()
-                            .default("UTC"),
-                    )
-                    .to_owned(),
-            )
-            .await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(UserTimeZones::Table)
-                    .drop_column(UserTimeZones::TimeZone)
-                    .to_owned(),
-            )
-            .await
-    }
-}
-
-// ---- Built-in alerts
-
-struct AddBuiltInAlerts;
-
-impl MigrationName for AddBuiltInAlerts {
-    fn name(&self) -> &str {
-        "m20261109_000009_add_built_in_alerts"
-    }
-}
-
-#[derive(Iden)]
-enum EveryChannel {
-    #[iden = "alert_rules"]
-    Table,
-    /// Tells every channel, including ones added later, instead of the ones chosen.
-    AllChannels,
-}
-
-/// What a new or upgraded server alerts on before anyone sets up a rule.
-const OFFLINE_RULE_NAME: &str = "Agent offline";
-const OFFLINE_RULE_SECS: i64 = 300;
-
-/// Lets a rule tell every channel, and adds a rule for agents going offline, which
-/// is what anyone monitoring wants first. Once it's here it's an ordinary rule to
-/// change or delete, so it's only ever added once, and not to a server that has an
-/// offline rule of its own already.
-#[async_trait::async_trait]
-impl MigrationTrait for AddBuiltInAlerts {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(EveryChannel::Table)
-                    .add_column(
-                        ColumnDef::new(EveryChannel::AllChannels)
-                            .boolean()
-                            .not_null()
-                            .default(false),
-                    )
-                    .to_owned(),
-            )
             .await?;
-
-        let offline = Query::select()
-            .column(AlertRules::Id)
-            .from(AlertRules::Table)
-            .and_where(Expr::col(AlertRules::Kind).eq("offline"))
-            .limit(1)
-            .to_owned();
-        if manager
-            .get_connection()
-            .query_one(&offline)
-            .await?
-            .is_some()
-        {
-            return Ok(());
-        }
-        let rule = Query::insert()
-            .into_table(AlertRules::Table)
-            .columns([
-                AlertRules::Name.into_iden(),
-                AlertRules::Kind.into_iden(),
-                AlertRules::ForSecs.into_iden(),
-                AlertRules::Severity.into_iden(),
-                AlertRules::Enabled.into_iden(),
-                EveryChannel::AllChannels.into_iden(),
-            ])
-            .values([
-                OFFLINE_RULE_NAME.into(),
-                "offline".into(),
-                OFFLINE_RULE_SECS.into(),
-                "critical".into(),
-                true.into(),
-                true.into(),
-            ])
-            .map_err(|error| DbErr::Custom(error.to_string()))?
-            .to_owned();
-        manager.exec_stmt(rule).await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(EveryChannel::Table)
-                    .drop_column(EveryChannel::AllChannels)
-                    .to_owned(),
-            )
-            .await
-    }
-}
-
-// ---- Built-in disk alerts
-
-struct AddBuiltInDiskAlerts;
-
-impl MigrationName for AddBuiltInDiskAlerts {
-    fn name(&self) -> &str {
-        "m20261109_000010_add_built_in_disk_alerts"
-    }
-}
-
-const DISK_USAGE: &str = "disk.usage";
-const DISK_RULE_SECS: i64 = 300;
-/// Each rule's name, how full a disk is when it fires, and how bad that is.
-const DISK_RULES: [(&str, f64, &str); 2] = [
-    ("Disk filling up", 80.0, "warning"),
-    ("Disk nearly full", 90.0, "critical"),
-];
-
-/// Adds a warning for any disk over 80% full and a critical alert over 90%, telling
-/// every channel, like the offline rule. They're ordinary rules once added, so a
-/// server with a disk usage rule of its own already doesn't get them.
-#[async_trait::async_trait]
-impl MigrationTrait for AddBuiltInDiskAlerts {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let disk_rule = Query::select()
-            .column(AlertRules::Id)
-            .from(AlertRules::Table)
-            .and_where(Expr::col(AlertRules::Metric).eq(DISK_USAGE))
-            .limit(1)
-            .to_owned();
-        if manager
-            .get_connection()
-            .query_one(&disk_rule)
-            .await?
-            .is_some()
-        {
-            return Ok(());
-        }
-        let mut rules = Query::insert()
-            .into_table(AlertRules::Table)
-            .columns([
-                AlertRules::Name.into_iden(),
-                AlertRules::Kind.into_iden(),
-                AlertRules::Metric.into_iden(),
-                AlertRules::Comparison.into_iden(),
-                AlertRules::Threshold.into_iden(),
-                AlertRules::ForSecs.into_iden(),
-                AlertRules::Severity.into_iden(),
-                AlertRules::Enabled.into_iden(),
-                EveryChannel::AllChannels.into_iden(),
-            ])
-            .to_owned();
-        for (name, threshold, severity) in DISK_RULES {
-            rules
-                .values([
-                    name.into(),
-                    "metric".into(),
-                    DISK_USAGE.into(),
-                    "above".into(),
-                    threshold.into(),
-                    DISK_RULE_SECS.into(),
-                    severity.into(),
-                    true.into(),
-                    true.into(),
-                ])
-                .map_err(|error| DbErr::Custom(error.to_string()))?;
-        }
-        manager.exec_stmt(rules).await
-    }
-
-    /// The rules are left, as they may have been changed since.
-    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
-        Ok(())
-    }
-}
-
-// ---- Warning thresholds
-
-struct AddWarningThresholds;
-
-impl MigrationName for AddWarningThresholds {
-    fn name(&self) -> &str {
-        "m20261109_000011_add_warning_thresholds"
-    }
-}
-
-#[derive(Iden)]
-enum WarningThresholds {
-    #[iden = "alert_rules"]
-    Table,
-    /// For a critical rule, where it's a warning first.
-    WarningThreshold,
-}
-
-/// What the two built-in disk rules become: one alert per disk, at the worse of
-/// the two.
-const MERGED_DISK_RULE_NAME: &str = "Disk filling up";
-
-/// Lets one rule be a warning first and critical later, and makes the built-in
-/// disk rules one rule like that, so a full disk sends a critical alert instead of
-/// a warning and a critical one. They're only joined if both are still as added.
-#[async_trait::async_trait]
-impl MigrationTrait for AddWarningThresholds {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(WarningThresholds::Table)
-                    .add_column(ColumnDef::new(WarningThresholds::WarningThreshold).double())
-                    .to_owned(),
-            )
-            .await?;
-
-        let connection = manager.get_connection();
-        let mut built_in = Vec::new();
-        for (name, threshold, severity) in DISK_RULES {
-            let rule = Query::select()
-                .column(AlertRules::Id)
-                .from(AlertRules::Table)
-                .and_where(Expr::col(AlertRules::Name).eq(name))
-                .and_where(Expr::col(AlertRules::Kind).eq("metric"))
-                .and_where(Expr::col(AlertRules::Metric).eq(DISK_USAGE))
-                .and_where(Expr::col(AlertRules::Series).is_null())
-                .and_where(Expr::col(AlertRules::Comparison).eq("above"))
-                .and_where(Expr::col(AlertRules::Threshold).eq(threshold))
-                .and_where(Expr::col(AlertRules::ForSecs).eq(DISK_RULE_SECS))
-                .and_where(Expr::col(AlertRules::Severity).eq(severity))
-                .and_where(Expr::col(AlertRules::ConditionExpr).is_null())
-                .and_where(Expr::col(AlertRules::RemindEverySecs).is_null())
-                .and_where(Expr::col(AlertRules::Enabled).eq(true))
-                .and_where(Expr::col(EveryChannel::AllChannels).eq(true))
-                .to_owned();
-            match connection.query_one(&rule).await? {
-                Some(row) => built_in.push(row.try_get::<i64>("", "id")?),
-                None => return Ok(()),
-            }
-        }
-        let [warning, critical] = built_in[..] else {
-            return Ok(());
-        };
-
-        // Its open alerts end, with notifications, as for any deleted rule. It goes
-        // first, as the one kept takes its name.
-        let gone = Query::delete()
-            .from_table(AlertRules::Table)
-            .and_where(Expr::col(AlertRules::Id).eq(warning))
-            .to_owned();
-        manager.exec_stmt(gone).await?;
-        let merged = Query::update()
-            .table(AlertRules::Table)
-            .value(AlertRules::Name, MERGED_DISK_RULE_NAME)
-            .value(WarningThresholds::WarningThreshold, DISK_RULES[0].1)
-            .and_where(Expr::col(AlertRules::Id).eq(critical))
-            .to_owned();
-        manager.exec_stmt(merged).await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(WarningThresholds::Table)
-                    .drop_column(WarningThresholds::WarningThreshold)
-                    .to_owned(),
-            )
-            .await
-    }
-}
-
-// ---- Which alerts each channel hears of
-
-struct AddChannelSeverities;
-
-impl MigrationName for AddChannelSeverities {
-    fn name(&self) -> &str {
-        "m20261109_000012_add_channel_severities"
-    }
-}
-
-#[derive(Iden)]
-enum ChannelSeverities {
-    #[iden = "notification_channels"]
-    Table,
-    /// The mildest alert a channel hears of: warning, or critical to keep
-    /// warnings off a pager.
-    MinSeverity,
-}
-
-/// Every channel starts out hearing of every alert, as it did before.
-#[async_trait::async_trait]
-impl MigrationTrait for AddChannelSeverities {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(ChannelSeverities::Table)
-                    .add_column(
-                        ColumnDef::new(ChannelSeverities::MinSeverity)
-                            .string_len(16)
-                            .not_null()
-                            .default("warning"),
-                    )
-                    .to_owned(),
-            )
-            .await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(ChannelSeverities::Table)
-                    .drop_column(ChannelSeverities::MinSeverity)
-                    .to_owned(),
-            )
-            .await
-    }
-}
-
-// ---- Which alerts each channel takes, by severity
-
-struct ChooseChannelSeverities;
-
-impl MigrationName for ChooseChannelSeverities {
-    fn name(&self) -> &str {
-        "m20261109_000013_choose_channel_severities"
-    }
-}
-
-#[derive(Iden)]
-enum ChannelChoices {
-    #[iden = "notification_channels"]
-    Table,
-    SendsWarnings,
-    SendsCritical,
-}
-
-/// Lets a channel take warnings, critical alerts or both, in place of the mildest
-/// it takes, so a channel can take warnings alone too.
-#[async_trait::async_trait]
-impl MigrationTrait for ChooseChannelSeverities {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        for column in [ChannelChoices::SendsWarnings, ChannelChoices::SendsCritical] {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(ChannelChoices::Table)
-                        .add_column(ColumnDef::new(column).boolean().not_null().default(true))
-                        .to_owned(),
-                )
-                .await?;
-        }
-        let critical_only = Query::update()
-            .table(ChannelChoices::Table)
-            .value(ChannelChoices::SendsWarnings, false)
-            .and_where(Expr::col(ChannelSeverities::MinSeverity).eq("critical"))
-            .to_owned();
-        manager.exec_stmt(critical_only).await?;
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(ChannelChoices::Table)
-                    .drop_column(ChannelSeverities::MinSeverity)
-                    .to_owned(),
-            )
-            .await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(ChannelChoices::Table)
-                    .add_column(
-                        ColumnDef::new(ChannelSeverities::MinSeverity)
-                            .string_len(16)
-                            .not_null()
-                            .default("warning"),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-        let critical_only = Query::update()
-            .table(ChannelChoices::Table)
-            .value(ChannelSeverities::MinSeverity, "critical")
-            .and_where(Expr::col(ChannelChoices::SendsWarnings).eq(false))
-            .to_owned();
-        manager.exec_stmt(critical_only).await?;
-        for column in [ChannelChoices::SendsWarnings, ChannelChoices::SendsCritical] {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(ChannelChoices::Table)
-                        .drop_column(column)
-                        .to_owned(),
-                )
-                .await?;
-        }
-        Ok(())
-    }
-}
-
-// ---- Built-in container alert
-
-struct AddBuiltInContainerAlert;
-
-impl MigrationName for AddBuiltInContainerAlert {
-    fn name(&self) -> &str {
-        "m20261110_000014_add_built_in_container_alert"
-    }
-}
-
-const CONTAINER_UP: &str = "container.up";
-const CONTAINER_RULE_NAME: &str = "Container down";
-const CONTAINER_RULE_SECS: i64 = 300;
-
-/// Alerts when a container has been failing for 5 minutes: stopped with an error,
-/// restarting, or unhealthy. It only covers machines whose config turns on the
-/// containers collector, and tells every channel, like the other built-in rules. A
-/// server with a rule on containers being up already doesn't get it.
-#[async_trait::async_trait]
-impl MigrationTrait for AddBuiltInContainerAlert {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let existing = Query::select()
-            .column(AlertRules::Id)
-            .from(AlertRules::Table)
-            .and_where(Expr::col(AlertRules::Metric).eq(CONTAINER_UP))
-            .limit(1)
-            .to_owned();
-        if manager
-            .get_connection()
-            .query_one(&existing)
-            .await?
-            .is_some()
-        {
-            return Ok(());
-        }
-        let rule = Query::insert()
-            .into_table(AlertRules::Table)
-            .columns([
-                AlertRules::Name.into_iden(),
-                AlertRules::Kind.into_iden(),
-                AlertRules::Metric.into_iden(),
-                AlertRules::Comparison.into_iden(),
-                AlertRules::Threshold.into_iden(),
-                AlertRules::ForSecs.into_iden(),
-                AlertRules::Severity.into_iden(),
-                AlertRules::Enabled.into_iden(),
-                EveryChannel::AllChannels.into_iden(),
-            ])
-            .values([
-                CONTAINER_RULE_NAME.into(),
-                "metric".into(),
-                CONTAINER_UP.into(),
-                "below".into(),
-                1.0.into(),
-                CONTAINER_RULE_SECS.into(),
-                "critical".into(),
-                true.into(),
-                true.into(),
-            ])
-            .map_err(|error| DbErr::Custom(error.to_string()))?
-            .to_owned();
-        manager.exec_stmt(rule).await
-    }
-
-    /// The rule is left, as it may have been changed since.
-    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
-        Ok(())
-    }
-}
-
-// ---- Audit log
-
-struct CreateAuditLog;
-
-impl MigrationName for CreateAuditLog {
-    fn name(&self) -> &str {
-        "m20261110_000015_create_audit_log"
-    }
-}
-
-#[derive(Iden)]
-enum AuditLog {
-    Table,
-    Id,
-    AtMs,
-    TimeMs,
-    /// `person`, `api_key`, `command_line`, `maxnines`, `slack` or `nobody`.
-    ActorKind,
-    ActorId,
-    /// The person's address or the key's name at the time.
-    ActorName,
-    /// The address the request came from.
-    Source,
-    Action,
-    SubjectKind,
-    /// Text, as agents' IDs are.
-    SubjectId,
-    /// What it was called at the time.
-    SubjectName,
-    /// A JSON list of each field's value before and after, with secrets masked.
-    Changes,
-}
-
-/// Who changed what and who signed in. Entries are kept for good: nothing deletes
-/// them.
-#[async_trait::async_trait]
-impl MigrationTrait for CreateAuditLog {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        // MySQL's text holds 64 KB, which a big config rule's before and after could
-        // pass, and a change mustn't fail for want of room to record it.
-        let mut changes = ColumnDef::new(AuditLog::Changes);
-        match manager.get_database_backend() {
-            sea_orm::DatabaseBackend::MySql => changes.custom(Alias::new("LONGTEXT")),
-            _ => changes.text(),
-        };
-        changes.not_null();
-        manager
-            .create_table(
-                Table::create()
-                    .table(AuditLog::Table)
-                    .col(id(AuditLog::Id))
-                    .col(ColumnDef::new(AuditLog::AtMs).big_integer().not_null())
-                    .col(
-                        ColumnDef::new(AuditLog::ActorKind)
-                            .string_len(16)
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(AuditLog::ActorId).string_len(64).null())
-                    .col(
-                        ColumnDef::new(AuditLog::ActorName)
-                            .string_len(255)
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(AuditLog::Source).string_len(45).null())
-                    .col(ColumnDef::new(AuditLog::Action).string_len(32).not_null())
-                    .col(
-                        ColumnDef::new(AuditLog::SubjectKind)
-                            .string_len(32)
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(AuditLog::SubjectId).string_len(128).null())
-                    .col(
-                        ColumnDef::new(AuditLog::SubjectName)
-                            .string_len(255)
-                            .not_null(),
-                    )
-                    .col(changes)
-                    .to_owned(),
-            )
-            .await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        drop_tables(manager, &["audit_log"]).await
-    }
-}
-
-// ---- Each email channel's own mail server
-
-struct AddChannelMailSettings;
-
-impl MigrationName for AddChannelMailSettings {
-    fn name(&self) -> &str {
-        "m20261110_000016_add_channel_mail_settings"
-    }
-}
-
-#[derive(Iden)]
-enum ChannelMail {
-    #[iden = "notification_channels"]
-    Table,
-    /// Who email comes from, for email and Resend channels.
-    MailFrom,
-    /// An email channel's mail server. Its password is the channel's credential.
-    MailHost,
-    MailHostname,
-    MailPort,
-    /// `tls`, `starttls` or `none`.
-    MailSecurity,
-    MailUsername,
-}
-
-/// Moves the mail server from the server's config to each email channel. Email
-/// channels saved before have none, so they need one set before they send again.
-#[async_trait::async_trait]
-impl MigrationTrait for AddChannelMailSettings {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let columns = [
-            ColumnDef::new(ChannelMail::MailFrom)
-                .string_len(320)
-                .null()
-                .to_owned(),
-            ColumnDef::new(ChannelMail::MailHost)
-                .string_len(255)
-                .null()
-                .to_owned(),
-            ColumnDef::new(ChannelMail::MailPort)
-                .integer()
-                .null()
-                .to_owned(),
-            ColumnDef::new(ChannelMail::MailSecurity)
-                .string_len(16)
-                .null()
-                .to_owned(),
-            ColumnDef::new(ChannelMail::MailUsername)
-                .string_len(255)
-                .null()
-                .to_owned(),
-        ];
-        // One at a time, as SQLite only adds one column per statement.
-        for column in columns {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(ChannelMail::Table)
-                        .add_column(column)
-                        .to_owned(),
-                )
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        for column in [
-            ChannelMail::MailFrom,
-            ChannelMail::MailHost,
-            ChannelMail::MailPort,
-            ChannelMail::MailSecurity,
-            ChannelMail::MailUsername,
-        ] {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(ChannelMail::Table)
-                        .drop_column(column)
-                        .to_owned(),
-                )
-                .await?;
-        }
-        Ok(())
-    }
-}
-
-// ---- API keys belong to people
-
-struct AddApiKeyOwners;
-
-impl MigrationName for AddApiKeyOwners {
-    fn name(&self) -> &str {
-        "m20261110_000017_add_api_key_owners"
-    }
-}
-
-#[derive(Iden)]
-enum ApiKeyOwners {
-    #[iden = "api_keys"]
-    Table,
-    /// Who the key acts as. It stops working while they're disabled.
-    UserId,
-}
-
-/// Each key acts as the person who owns it. Nobody owned the keys made before, so
-/// they're dropped, and people make new ones of their own.
-#[async_trait::async_trait]
-impl MigrationTrait for AddApiKeyOwners {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .get_connection()
-            .execute_unprepared("DELETE FROM api_keys")
-            .await?;
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(ApiKeyOwners::Table)
-                    .add_column(
-                        // SQLite can only add a required column with a default. Every
-                        // key is saved with its owner, so it's never used.
-                        ColumnDef::new(ApiKeyOwners::UserId)
-                            .big_integer()
-                            .not_null()
-                            .default(0),
-                    )
-                    .to_owned(),
-            )
-            .await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(ApiKeyOwners::Table)
-                    .drop_column(ApiKeyOwners::UserId)
-                    .to_owned(),
-            )
-            .await
-    }
-}
-
-// ---- How someone acted, for the audit log
-
-struct AddAuditVia;
-
-impl MigrationName for AddAuditVia {
-    fn name(&self) -> &str {
-        "m20261110_000018_add_audit_via"
-    }
-}
-
-#[derive(Iden)]
-enum AuditVia {
-    #[iden = "audit_log"]
-    Table,
-    /// `api_key` or `slack`, when someone acted through one rather than the pages.
-    ViaKind,
-    ViaId,
-    /// The key's name at the time.
-    ViaName,
-}
-
-#[async_trait::async_trait]
-impl MigrationTrait for AddAuditVia {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let columns = [
-            ColumnDef::new(AuditVia::ViaKind)
-                .string_len(16)
-                .null()
-                .to_owned(),
-            ColumnDef::new(AuditVia::ViaId)
-                .string_len(64)
-                .null()
-                .to_owned(),
-            ColumnDef::new(AuditVia::ViaName)
-                .string_len(255)
-                .null()
-                .to_owned(),
-        ];
-        for column in columns {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(AuditVia::Table)
-                        .add_column(column)
-                        .to_owned(),
-                )
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        for column in [AuditVia::ViaKind, AuditVia::ViaId, AuditVia::ViaName] {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(AuditVia::Table)
-                        .drop_column(column)
-                        .to_owned(),
-                )
-                .await?;
-        }
-        Ok(())
-    }
-}
-
-// ---- Roles
-
-struct AddRoles;
-
-impl MigrationName for AddRoles {
-    fn name(&self) -> &str {
-        "m20261110_000019_add_roles"
-    }
-}
-
-#[derive(Iden)]
-enum UserRoles {
-    #[iden = "users"]
-    Table,
-    /// `viewer`, `responder`, `editor` or `admin`.
-    Role,
-}
-
-#[derive(Iden)]
-enum ApiKeyRoles {
-    #[iden = "api_keys"]
-    Table,
-    /// The most the key can do. Its owner's role caps it too.
-    Role,
-}
-
-/// Everyone here before roles could do everything, so they become admins, and
-/// their keys keep doing what they do.
-#[async_trait::async_trait]
-impl MigrationTrait for AddRoles {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let role = |column: DynIden| {
-            ColumnDef::new(column)
-                .string_len(16)
-                .not_null()
-                .default("admin")
-                .to_owned()
-        };
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(UserRoles::Table)
-                    .add_column(role(UserRoles::Role.into_iden()))
-                    .to_owned(),
-            )
-            .await?;
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(ApiKeyRoles::Table)
-                    .add_column(role(ApiKeyRoles::Role.into_iden()))
-                    .to_owned(),
-            )
-            .await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(UserRoles::Table)
-                    .drop_column(UserRoles::Role)
-                    .to_owned(),
-            )
-            .await?;
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(ApiKeyRoles::Table)
-                    .drop_column(ApiKeyRoles::Role)
-                    .to_owned(),
-            )
-            .await
-    }
-}
-
-// ---- Two-factor sign-in
-
-struct AddTwoFactor;
-
-impl MigrationName for AddTwoFactor {
-    fn name(&self) -> &str {
-        "m20261110_000020_add_two_factor"
-    }
-}
-
-#[derive(Iden)]
-enum UserTwoFactor {
-    #[iden = "users"]
-    Table,
-    /// The secret shared with their authenticator app. It has to be kept as it
-    /// is, as the server works out the same codes from it.
-    TotpSecret,
-    /// Off until they've proved the app works by typing a code from it.
-    TotpEnabled,
-    /// The last 30-second step a code was accepted for, so none works twice.
-    TotpLastStep,
-}
-
-#[derive(Iden)]
-enum RecoveryCodes {
-    Table,
-    Id,
-    UserId,
-    /// Only the hash is kept.
-    CodeHash,
-    UsedMs,
-}
-
-/// Someone who has given their password and still owes a code.
-#[derive(Iden)]
-enum SignInChallenges {
-    Table,
-    Id,
-    UserId,
-    /// Only the hash is kept.
-    TokenHash,
-    ExpiresMs,
-}
-
-/// Settings admins change on the pages, by name.
-#[derive(Iden)]
-enum ServerSettings {
-    Table,
-    Name,
-    Value,
-}
-
-#[async_trait::async_trait]
-impl MigrationTrait for AddTwoFactor {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let columns = [
-            ColumnDef::new(UserTwoFactor::TotpSecret)
-                .string_len(128)
-                .null()
-                .to_owned(),
-            ColumnDef::new(UserTwoFactor::TotpEnabled)
-                .boolean()
-                .not_null()
-                .default(false)
-                .to_owned(),
-            ColumnDef::new(UserTwoFactor::TotpLastStep)
-                .big_integer()
-                .null()
-                .to_owned(),
-        ];
-        for column in columns {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(UserTwoFactor::Table)
-                        .add_column(column)
-                        .to_owned(),
-                )
-                .await?;
-        }
-        manager
-            .create_table(
-                Table::create()
-                    .table(RecoveryCodes::Table)
-                    .col(id(RecoveryCodes::Id))
-                    .col(
-                        ColumnDef::new(RecoveryCodes::UserId)
-                            .big_integer()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(RecoveryCodes::CodeHash)
-                            .string_len(64)
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(RecoveryCodes::UsedMs).big_integer().null())
-                    .to_owned(),
-            )
-            .await?;
-        manager
-            .create_table(
-                Table::create()
-                    .table(SignInChallenges::Table)
-                    .col(id(SignInChallenges::Id))
-                    .col(
-                        ColumnDef::new(SignInChallenges::UserId)
-                            .big_integer()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(SignInChallenges::TokenHash)
-                            .string_len(64)
-                            .not_null()
-                            .unique_key(),
-                    )
-                    .col(
-                        ColumnDef::new(SignInChallenges::ExpiresMs)
-                            .big_integer()
-                            .not_null(),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-        manager
-            .create_table(
-                Table::create()
-                    .table(ServerSettings::Table)
-                    .col(
-                        ColumnDef::new(ServerSettings::Name)
-                            .string_len(64)
-                            .not_null()
-                            .primary_key(),
-                    )
-                    .col(
-                        ColumnDef::new(ServerSettings::Value)
-                            .string_len(255)
-                            .not_null(),
-                    )
-                    .to_owned(),
-            )
-            .await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        drop_tables(
-            manager,
-            &["server_settings", "sign_in_challenges", "recovery_codes"],
-        )
-        .await?;
-        for column in [
-            UserTwoFactor::TotpSecret,
-            UserTwoFactor::TotpEnabled,
-            UserTwoFactor::TotpLastStep,
-        ] {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(UserTwoFactor::Table)
-                        .drop_column(column)
-                        .to_owned(),
-                )
-                .await?;
-        }
-        Ok(())
-    }
-}
-
-// ---- Custom webhooks
-
-struct AddChannelRequests;
-
-impl MigrationName for AddChannelRequests {
-    fn name(&self) -> &str {
-        "m20261110_000021_add_channel_requests"
-    }
-}
-
-#[derive(Iden)]
-enum ChannelRequests {
-    #[iden = "notification_channels"]
-    Table,
-    /// `POST`, `PUT` or `PATCH`, for a custom webhook.
-    RequestMethod,
-    RequestContentType,
-    /// A Tera template, up to 16 KB. Its headers are the channel's credential.
-    RequestBody,
-}
-
-/// What a custom webhook sends. Other kinds of channel leave it empty.
-#[async_trait::async_trait]
-impl MigrationTrait for AddChannelRequests {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let columns = [
-            ColumnDef::new(ChannelRequests::RequestMethod)
-                .string_len(8)
-                .null()
-                .to_owned(),
-            ColumnDef::new(ChannelRequests::RequestContentType)
-                .string_len(255)
-                .null()
-                .to_owned(),
-            ColumnDef::new(ChannelRequests::RequestBody)
-                .text()
-                .null()
-                .to_owned(),
-        ];
-        // One at a time, as SQLite only adds one column per statement.
-        for column in columns {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(ChannelRequests::Table)
-                        .add_column(column)
-                        .to_owned(),
-                )
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        for column in [
-            ChannelRequests::RequestMethod,
-            ChannelRequests::RequestContentType,
-            ChannelRequests::RequestBody,
-        ] {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(ChannelRequests::Table)
-                        .drop_column(column)
-                        .to_owned(),
-                )
-                .await?;
-        }
-        Ok(())
-    }
-}
-
-// ---- Forecasts
-
-struct AddForecasts;
-
-impl MigrationName for AddForecasts {
-    fn name(&self) -> &str {
-        "m20261110_000022_add_forecasts"
-    }
-}
-
-#[derive(Iden)]
-enum RuleForecasts {
-    #[iden = "alert_rules"]
-    Table,
-    /// How soon a forecast rule's metric has to be on course to reach its level.
-    ForecastSecs,
-    /// A longer time ahead that's a warning first, for a critical forecast.
-    WarningForecastSecs,
-}
-
-/// The built-in forecast: a disk on course to be full within a day is a warning,
-/// and within 4 hours is critical, judging by the last 6 hours. It has to last
-/// half an hour, so one big download doesn't page anyone.
-const DISK_FORECAST: (&str, f64, i64, i64, i64, i64) = (
-    "Disk will be full soon",
-    100.0,
-    4 * 3600,
-    24 * 3600,
-    6 * 3600,
-    1800,
-);
-
-/// Lets a rule look ahead, and adds a forecast for disks filling up, telling every
-/// channel like the other built-in rules. It's an ordinary rule once added.
-#[async_trait::async_trait]
-impl MigrationTrait for AddForecasts {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        for column in [
-            RuleForecasts::ForecastSecs,
-            RuleForecasts::WarningForecastSecs,
-        ] {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(RuleForecasts::Table)
-                        .add_column(ColumnDef::new(column).big_integer().null())
-                        .to_owned(),
-                )
-                .await?;
-        }
-        let (name, level, soon, warning, window, for_secs) = DISK_FORECAST;
-        let rule = Query::insert()
-            .into_table(AlertRules::Table)
-            .columns([
-                AlertRules::Name.into_iden(),
-                AlertRules::Kind.into_iden(),
-                AlertRules::Metric.into_iden(),
-                AlertRules::Comparison.into_iden(),
-                AlertRules::Threshold.into_iden(),
-                AlertRules::ForSecs.into_iden(),
-                AlertRules::Severity.into_iden(),
-                AlertRules::Enabled.into_iden(),
-                AlertRules::WindowSecs.into_iden(),
-                EveryChannel::AllChannels.into_iden(),
-                RuleForecasts::ForecastSecs.into_iden(),
-                RuleForecasts::WarningForecastSecs.into_iden(),
-            ])
-            .values([
-                name.into(),
-                "forecast".into(),
-                DISK_USAGE.into(),
-                "above".into(),
-                level.into(),
-                for_secs.into(),
-                "critical".into(),
-                true.into(),
-                window.into(),
-                true.into(),
-                soon.into(),
-                warning.into(),
-            ])
-            .map_err(|error| DbErr::Custom(error.to_string()))?
-            .to_owned();
-        manager.exec_stmt(rule).await
-    }
-
-    /// The rule is left, as it may have been changed since, and stops being read as
-    /// a forecast without the columns.
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .get_connection()
-            .execute_unprepared("DELETE FROM alert_rules WHERE kind = 'forecast'")
-            .await?;
-        for column in [
-            RuleForecasts::ForecastSecs,
-            RuleForecasts::WarningForecastSecs,
-        ] {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(RuleForecasts::Table)
-                        .drop_column(column)
-                        .to_owned(),
-                )
-                .await?;
-        }
-        Ok(())
-    }
-}
-
-// ---- Dashboard variables
-
-struct CreateDashboardVariables;
-
-impl MigrationName for CreateDashboardVariables {
-    fn name(&self) -> &str {
-        "m20261110_000023_create_dashboard_variables"
-    }
-}
-
-#[derive(Iden)]
-enum DashboardVariables {
-    Table,
-    Id,
-    DashboardId,
-    /// Where its picker sits, counting from 0 on the left.
-    Position,
-    /// Written as `$name` in a widget's filter and title.
-    Name,
-    Label,
-    /// `machine` or `fact`.
-    Kind,
-    /// The fact whose values a fact variable offers. Empty for a machine.
-    Fact,
-    /// Which machines it offers, in the host list's filter.
-    Filter,
-}
-
-/// Pickers at the top of a dashboard, so one dashboard can show any machine.
-#[async_trait::async_trait]
-impl MigrationTrait for CreateDashboardVariables {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
             .create_table(
                 Table::create()
@@ -2602,6 +896,7 @@ impl MigrationTrait for CreateDashboardVariables {
                     )
                     .foreign_key(
                         ForeignKey::create()
+                            .name("fk_dashboard_variables_dashboard_id")
                             .from(DashboardVariables::Table, DashboardVariables::DashboardId)
                             .to(Dashboards::Table, Dashboards::Id)
                             .on_delete(ForeignKeyAction::Cascade),
@@ -2617,198 +912,33 @@ impl MigrationTrait for CreateDashboardVariables {
                     .col(DashboardVariables::DashboardId)
                     .to_owned(),
             )
-            .await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        drop_tables(manager, &["dashboard_variables"]).await
-    }
-}
-
-// ---- Processes and login sessions by default
-
-struct TurnOnSystemCollector;
-
-impl MigrationName for TurnOnSystemCollector {
-    fn name(&self) -> &str {
-        "m20261110_000024_turn_on_system_collector"
-    }
-}
-
-const SYSTEM_SETTING: &str = "collectors.system.enabled";
-
-/// Adds processes, login sessions and open files to what every machine reports,
-/// by turning the system collector on in the Default rule. A Default rule that
-/// already turns it on or off is left as it is, as is a server whose Default rule
-/// has been renamed or deleted.
-#[async_trait::async_trait]
-impl MigrationTrait for TurnOnSystemCollector {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let connection = manager.get_connection();
-        let default_rule = Query::select()
-            .column(ConfigRules::Id)
-            .from(ConfigRules::Table)
-            .and_where(Expr::col(ConfigRules::Name).eq("Default"))
-            .to_owned();
-        let Some(row) = connection.query_one(&default_rule).await? else {
-            return Ok(());
-        };
-        let rule_id: i64 = row.try_get("", "id")?;
-        let existing = Query::select()
-            .column(ConfigRuleSettings::Id)
-            .from(ConfigRuleSettings::Table)
-            .and_where(Expr::col(ConfigRuleSettings::RuleId).eq(rule_id))
-            .and_where(Expr::col(ConfigRuleSettings::Name).eq(SYSTEM_SETTING))
-            .to_owned();
-        if connection.query_one(&existing).await?.is_some() {
-            return Ok(());
-        }
-        let setting = Query::insert()
-            .into_table(ConfigRuleSettings::Table)
-            .columns([
-                ConfigRuleSettings::RuleId,
-                ConfigRuleSettings::Name,
-                ConfigRuleSettings::Value,
-                ConfigRuleSettings::ValueType,
-            ])
-            .values([
-                rule_id.into(),
-                SYSTEM_SETTING.into(),
-                "true".into(),
-                "boolean".into(),
-            ])
-            .map_err(|error| DbErr::Custom(error.to_string()))?
-            .to_owned();
-        manager.exec_stmt(setting).await
-    }
-
-    /// The setting is left, as it may have been changed since.
-    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
-        Ok(())
-    }
-}
-
-// ---- Inodes running out
-
-struct AddBuiltInInodeAlert;
-
-impl MigrationName for AddBuiltInInodeAlert {
-    fn name(&self) -> &str {
-        "m20261110_000025_add_built_in_inode_alert"
-    }
-}
-
-const DISK_INODES: &str = "disk.inodes";
-/// Its name, and how much of a disk's inodes are used when it's a warning and when
-/// it's critical, like the disk space rule.
-const INODE_RULE: (&str, f64, f64) = ("Disk running out of inodes", 80.0, 90.0);
-
-/// Alerts when a disk's inodes are running out, which stops new files being made
-/// however much space is left. It tells every channel, like the other built-in
-/// rules, and a server with a rule on inodes already doesn't get it.
-#[async_trait::async_trait]
-impl MigrationTrait for AddBuiltInInodeAlert {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let existing = Query::select()
-            .column(AlertRules::Id)
-            .from(AlertRules::Table)
-            .and_where(Expr::col(AlertRules::Metric).eq(DISK_INODES))
-            .limit(1)
-            .to_owned();
-        if manager
-            .get_connection()
-            .query_one(&existing)
-            .await?
-            .is_some()
-        {
-            return Ok(());
-        }
-        let (name, warning, critical) = INODE_RULE;
-        let rule = Query::insert()
-            .into_table(AlertRules::Table)
-            .columns([
-                AlertRules::Name.into_iden(),
-                AlertRules::Kind.into_iden(),
-                AlertRules::Metric.into_iden(),
-                AlertRules::Comparison.into_iden(),
-                AlertRules::Threshold.into_iden(),
-                WarningThresholds::WarningThreshold.into_iden(),
-                AlertRules::ForSecs.into_iden(),
-                AlertRules::Severity.into_iden(),
-                AlertRules::Enabled.into_iden(),
-                EveryChannel::AllChannels.into_iden(),
-            ])
-            .values([
-                name.into(),
-                "metric".into(),
-                DISK_INODES.into(),
-                "above".into(),
-                critical.into(),
-                warning.into(),
-                DISK_RULE_SECS.into(),
-                "critical".into(),
-                true.into(),
-                true.into(),
-            ])
-            .map_err(|error| DbErr::Custom(error.to_string()))?
-            .to_owned();
-        manager.exec_stmt(rule).await
-    }
-
-    /// The rule is left, as it may have been changed since.
-    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
-        Ok(())
-    }
-}
-
-// ---- Events, marked on charts
-
-struct CreateEvents;
-
-impl MigrationName for CreateEvents {
-    fn name(&self) -> &str {
-        "m20261110_000026_create_events"
-    }
-}
-
-#[derive(Iden)]
-enum Events {
-    Table,
-    Id,
-    /// When it happened, which needn't be when it was recorded.
-    TimeMs,
-    /// `deploy`, `note`, `restart` or `config`.
-    Kind,
-    Title,
-    Detail,
-    /// Which machines it was for, as a host filter. Empty for every machine.
-    Filter,
-    /// Who recorded it, or `server` for what the server noticed itself.
-    CreatedBy,
-    CreatedMs,
-}
-
-/// Which machines an event is for, worked out when it's recorded, so a machine added
-/// later doesn't get events from before it existed.
-#[derive(Iden)]
-enum EventAgents {
-    Table,
-    EventId,
-    AgentId,
-}
-
-/// When each machine last started, from the boot time its agent reports, so a
-/// restart can be noticed whenever the agent next connects.
-#[derive(Iden)]
-enum AgentBoots {
-    Table,
-    AgentId,
-    BootMs,
-}
-
-#[async_trait::async_trait]
-impl MigrationTrait for CreateEvents {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+            .await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(LocationRules::Table)
+                    .col(id(LocationRules::Id))
+                    .col(
+                        ColumnDef::new(LocationRules::Name)
+                            .string_len(255)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(LocationRules::Filter)
+                            .string_len(500)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(LocationRules::Place)
+                            .string_len(255)
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(LocationRules::Latitude).double().not_null())
+                    .col(ColumnDef::new(LocationRules::Longitude).double().not_null())
+                    .col(ColumnDef::new(LocationRules::Priority).integer().not_null())
+                    .to_owned(),
+            )
+            .await?;
         manager
             .create_table(
                 Table::create()
@@ -2836,236 +966,326 @@ impl MigrationTrait for CreateEvents {
         manager
             .create_table(
                 Table::create()
-                    .table(EventAgents::Table)
+                    .table(AuditLog::Table)
+                    .col(id(AuditLog::Id))
+                    .col(ColumnDef::new(AuditLog::TimeMs).big_integer().not_null())
                     .col(
-                        ColumnDef::new(EventAgents::EventId)
-                            .big_integer()
+                        ColumnDef::new(AuditLog::ActorKind)
+                            .string_len(16)
                             .not_null(),
                     )
+                    .col(ColumnDef::new(AuditLog::ActorId).string_len(64))
                     .col(
-                        ColumnDef::new(EventAgents::AgentId)
+                        ColumnDef::new(AuditLog::ActorName)
+                            .string_len(255)
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(AuditLog::ViaKind).string_len(16))
+                    .col(ColumnDef::new(AuditLog::ViaId).string_len(64))
+                    .col(ColumnDef::new(AuditLog::ViaName).string_len(255))
+                    .col(ColumnDef::new(AuditLog::Source).string_len(45))
+                    .col(ColumnDef::new(AuditLog::Action).string_len(32).not_null())
+                    .col(
+                        ColumnDef::new(AuditLog::SubjectKind)
                             .string_len(32)
                             .not_null(),
                     )
-                    .primary_key(
-                        Index::create()
-                            .col(EventAgents::EventId)
-                            .col(EventAgents::AgentId),
+                    .col(ColumnDef::new(AuditLog::SubjectId).string_len(128))
+                    .col(
+                        ColumnDef::new(AuditLog::SubjectName)
+                            .string_len(255)
+                            .not_null(),
                     )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .from(EventAgents::Table, EventAgents::EventId)
-                            .to(Events::Table, Events::Id)
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_event_agents_agent")
-                    .table(EventAgents::Table)
-                    .col(EventAgents::AgentId)
+                    .col(changes)
                     .to_owned(),
             )
             .await?;
         manager
             .create_table(
                 Table::create()
-                    .table(AgentBoots::Table)
+                    .table(ServerSettings::Table)
                     .col(
-                        ColumnDef::new(AgentBoots::AgentId)
-                            .string_len(32)
+                        ColumnDef::new(ServerSettings::Name)
+                            .string_len(64)
                             .not_null()
                             .primary_key(),
                     )
-                    .col(ColumnDef::new(AgentBoots::BootMs).big_integer().not_null())
+                    .col(
+                        ColumnDef::new(ServerSettings::Value)
+                            .string_len(255)
+                            .not_null(),
+                    )
                     .to_owned(),
             )
-            .await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        drop_tables(manager, &["agent_boots", "event_agents", "events"]).await
-    }
-}
-
-// ---- Annotations follow their filters
-
-struct UnresolveEventFilters;
-
-impl MigrationName for UnresolveEventFilters {
-    fn name(&self) -> &str {
-        "m20261110_000027_unresolve_event_filters"
-    }
-}
-
-/// An event shows on whichever machines its filter picks when a chart is drawn,
-/// rather than those it picked when it was recorded, so the list of those goes. What
-/// the server recorded about one machine, like a restart, gets a filter for that
-/// machine alone, as people's events already had one.
-#[async_trait::async_trait]
-impl MigrationTrait for UnresolveEventFilters {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let connection = manager.get_connection();
-        let links = Query::select()
-            .columns([EventAgents::EventId, EventAgents::AgentId])
-            .from(EventAgents::Table)
-            .and_where(
-                Expr::col(EventAgents::EventId).in_subquery(
-                    Query::select()
-                        .column(Events::Id)
-                        .from(Events::Table)
-                        .and_where(Expr::col(Events::CreatedBy).eq("server"))
-                        .to_owned(),
-                ),
-            )
-            .to_owned();
-        for row in connection.query_all(&links).await? {
-            let event: i64 = row.try_get("", "event_id")?;
-            let agent: String = row.try_get("", "agent_id")?;
-            let update = Query::update()
-                .table(Events::Table)
-                .value(Events::Filter, format!("id={agent}"))
-                .and_where(Expr::col(Events::Id).eq(event))
-                .to_owned();
-            manager.exec_stmt(update).await?;
-        }
-        drop_tables(manager, &["event_agents"]).await
-    }
-
-    /// The machines each was for can't be known again, so they're left out.
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+            .await?;
         manager
             .create_table(
                 Table::create()
-                    .table(EventAgents::Table)
+                    .table(ServerSecrets::Table)
                     .col(
-                        ColumnDef::new(EventAgents::EventId)
-                            .big_integer()
-                            .not_null(),
+                        ColumnDef::new(ServerSecrets::Name)
+                            .string_len(64)
+                            .not_null()
+                            .primary_key(),
                     )
-                    .col(
-                        ColumnDef::new(EventAgents::AgentId)
-                            .string_len(32)
-                            .not_null(),
-                    )
-                    .primary_key(
-                        Index::create()
-                            .col(EventAgents::EventId)
-                            .col(EventAgents::AgentId),
-                    )
+                    .col(ColumnDef::new(ServerSecrets::Value).text().not_null())
                     .to_owned(),
             )
-            .await
-    }
-}
+            .await?;
 
-struct RenameTimesAndDurations;
-
-impl MigrationName for RenameTimesAndDurations {
-    fn name(&self) -> &str {
-        "m20261110_000028_rename_times_and_durations"
-    }
-}
-
-/// Every moment is named for what happened, ending `_ms`, and every length is in
-/// seconds, so the three that weren't change to match.
-#[async_trait::async_trait]
-impl MigrationTrait for RenameTimesAndDurations {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        rename(
-            manager,
-            Agents::Table,
-            Agents::DecidedAtMs,
-            Agents::DecidedMs,
-        )
-        .await?;
-        rename(
-            manager,
-            AgentConfigStatus::Table,
-            AgentConfigStatus::ReportedAtMs,
-            AgentConfigStatus::ReportedMs,
-        )
-        .await?;
-        rename(manager, AuditLog::Table, AuditLog::AtMs, AuditLog::TimeMs).await?;
-        rename(
-            manager,
-            MaintenanceWindows::Table,
-            MaintenanceWindows::DurationMinutes,
-            MaintenanceWindows::DurationSecs,
-        )
-        .await?;
-        let in_seconds = Query::update()
-            .table(MaintenanceWindows::Table)
-            .value(
-                MaintenanceWindows::DurationSecs,
-                Expr::col(MaintenanceWindows::DurationSecs).mul(60),
-            )
-            .to_owned();
-        manager.exec_stmt(in_seconds).await
+        add_built_ins(manager).await
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let in_minutes = Query::update()
-            .table(MaintenanceWindows::Table)
-            .value(
-                MaintenanceWindows::DurationSecs,
-                Expr::col(MaintenanceWindows::DurationSecs).div(60),
-            )
-            .to_owned();
-        manager.exec_stmt(in_minutes).await?;
-        rename(
-            manager,
-            MaintenanceWindows::Table,
-            MaintenanceWindows::DurationSecs,
-            MaintenanceWindows::DurationMinutes,
-        )
-        .await?;
-        rename(manager, AuditLog::Table, AuditLog::TimeMs, AuditLog::AtMs).await?;
-        rename(
-            manager,
-            AgentConfigStatus::Table,
-            AgentConfigStatus::ReportedMs,
-            AgentConfigStatus::ReportedAtMs,
-        )
-        .await?;
-        rename(
-            manager,
-            Agents::Table,
-            Agents::DecidedMs,
-            Agents::DecidedAtMs,
-        )
-        .await
+        for table in [
+            "server_secrets",
+            "server_settings",
+            "audit_log",
+            "events",
+            "location_rules",
+            "dashboard_variables",
+            "dashboard_widgets",
+            "dashboards",
+            "remote_checks",
+            "maintenance_windows",
+            "silences",
+            "notifications",
+            "alerts",
+            "alert_rule_channels",
+            "alert_rules",
+            "notification_channels",
+            "sign_in_challenges",
+            "recovery_codes",
+            "api_keys",
+            "user_sessions",
+            "users",
+            "config_rule_settings",
+            "config_rules",
+            "host_boots",
+            "host_config_status",
+            "host_facts",
+            "hosts",
+        ] {
+            manager
+                .drop_table(Table::drop().table(Alias::new(table)).to_owned())
+                .await?;
+        }
+        Ok(())
     }
 }
 
-async fn rename(
-    manager: &SchemaManager<'_>,
-    table: impl Iden + 'static,
-    from: impl Iden + 'static,
-    to: impl Iden + 'static,
-) -> Result<(), DbErr> {
-    let statement = Table::alter()
-        .table(table)
-        .rename_column(from, to)
+/// The two hosts that aren't machines: the server records its own checks and
+/// numbers under one, and alerts about many hosts at once under the other.
+const BUILT_IN_HOSTS: [(&str, &str); 2] = [("server", "MaxNines server"), ("fleet", "Fleet")];
+
+/// What every agent collects unless a config rule says otherwise.
+const DEFAULT_SETTINGS: [(&str, &str, &str); 8] = [
+    ("interval_secs", "15", "number"),
+    ("facts_interval_secs", "3600", "number"),
+    ("collectors.host.enabled", "true", "boolean"),
+    ("collectors.cpu.enabled", "true", "boolean"),
+    ("collectors.memory.enabled", "true", "boolean"),
+    ("collectors.disk.enabled", "true", "boolean"),
+    ("collectors.network.enabled", "true", "boolean"),
+    ("collectors.system.enabled", "true", "boolean"),
+];
+
+/// One built-in alert rule. Each tells every channel, and is critical, with a warning
+/// first where it has a warning threshold or a longer forecast.
+struct BuiltInRule {
+    name: &'static str,
+    kind: &'static str,
+    metric: Option<&'static str>,
+    comparison: Option<&'static str>,
+    threshold: Option<f64>,
+    warning_threshold: Option<f64>,
+    for_secs: i64,
+    window_secs: Option<i64>,
+    forecast_secs: Option<i64>,
+    warning_forecast_secs: Option<i64>,
+}
+
+const BUILT_IN_RULES: [BuiltInRule; 5] = [
+    BuiltInRule {
+        name: "Host offline",
+        kind: "offline",
+        metric: None,
+        comparison: None,
+        threshold: None,
+        warning_threshold: None,
+        for_secs: 300,
+        window_secs: None,
+        forecast_secs: None,
+        warning_forecast_secs: None,
+    },
+    BuiltInRule {
+        name: "Disk filling up",
+        kind: "metric",
+        metric: Some("disk.usage"),
+        comparison: Some("above"),
+        threshold: Some(90.0),
+        warning_threshold: Some(80.0),
+        for_secs: 300,
+        window_secs: None,
+        forecast_secs: None,
+        warning_forecast_secs: None,
+    },
+    BuiltInRule {
+        name: "Container down",
+        kind: "metric",
+        metric: Some("container.up"),
+        comparison: Some("below"),
+        threshold: Some(1.0),
+        warning_threshold: None,
+        for_secs: 300,
+        window_secs: None,
+        forecast_secs: None,
+        warning_forecast_secs: None,
+    },
+    BuiltInRule {
+        name: "Disk will be full soon",
+        kind: "forecast",
+        metric: Some("disk.usage"),
+        comparison: Some("above"),
+        threshold: Some(100.0),
+        warning_threshold: None,
+        for_secs: 1800,
+        window_secs: Some(21_600),
+        forecast_secs: Some(14_400),
+        warning_forecast_secs: Some(86_400),
+    },
+    BuiltInRule {
+        name: "Disk running out of inodes",
+        kind: "metric",
+        metric: Some("disk.inodes"),
+        comparison: Some("above"),
+        threshold: Some(90.0),
+        warning_threshold: Some(80.0),
+        for_secs: 300,
+        window_secs: None,
+        forecast_secs: None,
+        warning_forecast_secs: None,
+    },
+];
+
+async fn add_built_ins(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let mut hosts = Query::insert()
+        .into_table(Hosts::Table)
+        .columns([
+            Hosts::Id,
+            Hosts::PublicKey,
+            Hosts::Hostname,
+            Hosts::State,
+            Hosts::DecidedBy,
+            Hosts::FirstSeenMs,
+        ])
         .to_owned();
-    manager.alter_table(statement).await
+    for (id, hostname) in BUILT_IN_HOSTS {
+        hosts.values_panic([
+            id.into(),
+            "".into(),
+            hostname.into(),
+            "approved".into(),
+            "built-in".into(),
+            0i64.into(),
+        ]);
+    }
+    manager.exec_stmt(hosts).await?;
+
+    let rule = Query::insert()
+        .into_table(ConfigRules::Table)
+        .columns([
+            ConfigRules::Name,
+            ConfigRules::Priority,
+            ConfigRules::Enabled,
+        ])
+        .values_panic(["Default".into(), 0.into(), true.into()])
+        .to_owned();
+    manager.exec_stmt(rule).await?;
+    for (name, value, value_type) in DEFAULT_SETTINGS {
+        let setting = Query::insert()
+            .into_table(ConfigRuleSettings::Table)
+            .columns([
+                ConfigRuleSettings::RuleId,
+                ConfigRuleSettings::Name,
+                ConfigRuleSettings::Value,
+                ConfigRuleSettings::ValueType,
+            ])
+            .select_from(
+                Query::select()
+                    .column(ConfigRules::Id)
+                    .expr(Expr::val(name))
+                    .expr(Expr::val(value))
+                    .expr(Expr::val(value_type))
+                    .from(ConfigRules::Table)
+                    .and_where(Expr::col(ConfigRules::Name).eq("Default"))
+                    .to_owned(),
+            )
+            .map_err(|error| DbErr::Migration(error.to_string()))?
+            .to_owned();
+        manager.exec_stmt(setting).await?;
+    }
+
+    for rule in BUILT_IN_RULES {
+        let insert = Query::insert()
+            .into_table(AlertRules::Table)
+            .columns([
+                AlertRules::Name,
+                AlertRules::Kind,
+                AlertRules::Metric,
+                AlertRules::Comparison,
+                AlertRules::Threshold,
+                AlertRules::WarningThreshold,
+                AlertRules::ForSecs,
+                AlertRules::Severity,
+                AlertRules::Enabled,
+                AlertRules::AllChannels,
+                AlertRules::WindowSecs,
+                AlertRules::ForecastSecs,
+                AlertRules::WarningForecastSecs,
+            ])
+            .values_panic([
+                rule.name.into(),
+                rule.kind.into(),
+                rule.metric.into(),
+                rule.comparison.into(),
+                rule.threshold.into(),
+                rule.warning_threshold.into(),
+                rule.for_secs.into(),
+                "critical".into(),
+                true.into(),
+                true.into(),
+                rule.window_secs.into(),
+                rule.forecast_secs.into(),
+                rule.warning_forecast_secs.into(),
+            ])
+            .to_owned();
+        manager.exec_stmt(insert).await?;
+    }
+    Ok(())
 }
 
 #[derive(Iden)]
 enum Hosts {
     Table,
+    Id,
+    PublicKey,
     Hostname,
+    State,
+    DecidedBy,
+    FirstSeenMs,
+    DecidedMs,
 }
 
 #[derive(Iden)]
 enum HostFacts {
     Table,
+    Id,
     HostId,
     Name,
     Value,
+    ValueType,
+    ValidFromMs,
     ValidToMs,
 }
 
@@ -3073,440 +1293,73 @@ enum HostFacts {
 enum HostConfigStatus {
     Table,
     HostId,
+    Version,
+    Error,
+    ReportedMs,
 }
 
 #[derive(Iden)]
 enum HostBoots {
     Table,
     HostId,
-}
-
-struct RenameAgentsToHosts;
-
-impl MigrationName for RenameAgentsToHosts {
-    fn name(&self) -> &str {
-        "m20261111_000029_rename_agents_to_hosts"
-    }
-}
-
-/// The computer being watched is a host everywhere, and a computer's name is its
-/// hostname, so the tables and columns that said agent or host change to match. What people wrote
-/// that used the old words changes too: a condition reading `trusted.agent_id`, a
-/// filter's `host=` term, a custom webhook's `alert.host` and `alert.agent_id`, a
-/// dashboard variable of machines, the audit log's entries about agents and events,
-/// the title of a restart the server noticed, and charts of `server.agents`.
-#[async_trait::async_trait]
-impl MigrationTrait for RenameAgentsToHosts {
-    /// All or nothing where the database can, which MySQL and MariaDB can't for
-    /// changes to tables.
-    fn use_transaction(&self) -> Option<bool> {
-        Some(true)
-    }
-
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        rename_table(manager, Agents::Table, Hosts::Table).await?;
-        rename(manager, Hosts::Table, Agents::Host, Hosts::Hostname).await?;
-        rename_table(manager, AgentFacts::Table, HostFacts::Table).await?;
-        rename(
-            manager,
-            HostFacts::Table,
-            AgentFacts::AgentId,
-            HostFacts::HostId,
-        )
-        .await?;
-        rename_table(manager, AgentConfigStatus::Table, HostConfigStatus::Table).await?;
-        rename(
-            manager,
-            HostConfigStatus::Table,
-            AgentConfigStatus::AgentId,
-            HostConfigStatus::HostId,
-        )
-        .await?;
-        rename_table(manager, AgentBoots::Table, HostBoots::Table).await?;
-        rename(
-            manager,
-            HostBoots::Table,
-            AgentBoots::AgentId,
-            HostBoots::HostId,
-        )
-        .await?;
-        rename(manager, Alerts::Table, Alerts::AgentId, Alerts::HostId).await?;
-        rename(manager, Alerts::Table, Alerts::Host, Alerts::Hostname).await?;
-        rename(
-            manager,
-            ChannelMail::Table,
-            ChannelMail::MailHost,
-            ChannelMail::MailHostname,
-        )
-        .await?;
-        replace_index(
-            manager,
-            "idx_agent_facts_agent",
-            Index::create()
-                .name("idx_host_facts_host")
-                .table(HostFacts::Table)
-                .col(HostFacts::HostId)
-                .col(HostFacts::ValidToMs)
-                .to_owned(),
-        )
-        .await?;
-        replace_index(
-            manager,
-            "idx_agent_facts_name_value",
-            Index::create()
-                .name("idx_host_facts_name_value")
-                .table(HostFacts::Table)
-                .col(HostFacts::Name)
-                .col(HostFacts::Value)
-                .to_owned(),
-        )
-        .await?;
-        rewrite_words(manager, &WORDS_NOW).await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        rewrite_words(manager, &WORDS_BEFORE).await?;
-        replace_index(
-            manager,
-            "idx_host_facts_name_value",
-            Index::create()
-                .name("idx_agent_facts_name_value")
-                .table(HostFacts::Table)
-                .col(HostFacts::Name)
-                .col(HostFacts::Value)
-                .to_owned(),
-        )
-        .await?;
-        replace_index(
-            manager,
-            "idx_host_facts_host",
-            Index::create()
-                .name("idx_agent_facts_agent")
-                .table(HostFacts::Table)
-                .col(HostFacts::HostId)
-                .col(HostFacts::ValidToMs)
-                .to_owned(),
-        )
-        .await?;
-        rename(
-            manager,
-            ChannelMail::Table,
-            ChannelMail::MailHostname,
-            ChannelMail::MailHost,
-        )
-        .await?;
-        rename(manager, Alerts::Table, Alerts::Hostname, Alerts::Host).await?;
-        rename(manager, Alerts::Table, Alerts::HostId, Alerts::AgentId).await?;
-        rename(
-            manager,
-            HostBoots::Table,
-            HostBoots::HostId,
-            AgentBoots::AgentId,
-        )
-        .await?;
-        rename_table(manager, HostBoots::Table, AgentBoots::Table).await?;
-        rename(
-            manager,
-            HostConfigStatus::Table,
-            HostConfigStatus::HostId,
-            AgentConfigStatus::AgentId,
-        )
-        .await?;
-        rename_table(manager, HostConfigStatus::Table, AgentConfigStatus::Table).await?;
-        rename(
-            manager,
-            HostFacts::Table,
-            HostFacts::HostId,
-            AgentFacts::AgentId,
-        )
-        .await?;
-        rename_table(manager, HostFacts::Table, AgentFacts::Table).await?;
-        rename(manager, Hosts::Table, Hosts::Hostname, Agents::Host).await?;
-        rename_table(manager, Hosts::Table, Agents::Table).await
-    }
-}
-
-/// The words people's own text used, and what they are now, for migration 29.
-struct Words {
-    /// Names written whole, in conditions and in custom webhooks' templates.
-    names: [(&'static str, &'static str); 3],
-    /// A filter term for the hostname.
-    hostname_term: (&'static str, &'static str),
-    /// A dashboard variable's kind.
-    variable_kind: (&'static str, &'static str),
-    /// What the audit log says a change was made to.
-    subject_kinds: [(&'static str, &'static str); 2],
-    /// The built-in rule for a host going quiet.
-    offline_rule: (&'static str, &'static str),
-    /// What the server titles a restart it notices.
-    restart_title: (&'static str, &'static str),
-    /// The server's own chart of how many hosts there are.
-    server_metric: (&'static str, &'static str),
-}
-
-const WORDS_NOW: Words = Words {
-    names: [
-        ("trusted.agent_id", "trusted.host_id"),
-        ("alert.agent_id", "alert.host_id"),
-        ("alert.host", "alert.hostname"),
-    ],
-    hostname_term: ("host", "hostname"),
-    variable_kind: ("machine", "host"),
-    subject_kinds: [("agent", "host"), ("event", "annotation")],
-    offline_rule: ("Agent offline", "Host offline"),
-    restart_title: ("Machine started", "Host started"),
-    server_metric: ("server.agents", "server.hosts"),
-};
-
-const WORDS_BEFORE: Words = Words {
-    names: [
-        ("trusted.host_id", "trusted.agent_id"),
-        ("alert.host_id", "alert.agent_id"),
-        ("alert.hostname", "alert.host"),
-    ],
-    hostname_term: ("hostname", "host"),
-    variable_kind: ("host", "machine"),
-    subject_kinds: [("host", "agent"), ("annotation", "event")],
-    offline_rule: ("Host offline", "Agent offline"),
-    restart_title: ("Host started", "Machine started"),
-    server_metric: ("server.hosts", "server.agents"),
-};
-
-/// The longest filter a column holds, as made by the migrations that added them.
-const MAX_FILTER_CHARS: usize = 500;
-
-async fn rename_table(
-    manager: &SchemaManager<'_>,
-    from: impl Iden + 'static,
-    to: impl Iden + 'static,
-) -> Result<(), DbErr> {
-    manager
-        .rename_table(Table::rename().table(from, to).to_owned())
-        .await
-}
-
-/// Makes an index in place of another, as an index can't be renamed the same way
-/// everywhere. The new one comes first, as MySQL won't drop the one a foreign key
-/// needs until another can serve it.
-async fn replace_index(
-    manager: &SchemaManager<'_>,
-    old: &str,
-    new: IndexCreateStatement,
-) -> Result<(), DbErr> {
-    manager.create_index(new).await?;
-    manager
-        .drop_index(Index::drop().name(old).table(HostFacts::Table).to_owned())
-        .await
-}
-
-/// Changes one text column row by row, by ID, where `change` gives something new.
-/// Comparing the old text instead could match another row the database thinks is
-/// equal, as MySQL ignores case and accents.
-async fn rewrite_column(
-    manager: &SchemaManager<'_>,
-    table: &str,
-    column: &str,
-    change: impl Fn(&str) -> Option<String>,
-) -> Result<(), DbErr> {
-    let rows = Query::select()
-        .columns([Alias::new("id"), Alias::new(column)])
-        .from(Alias::new(table))
-        .to_owned();
-    for row in manager.get_connection().query_all(&rows).await? {
-        let id: i64 = row.try_get("", "id")?;
-        let text: Option<String> = row.try_get("", column)?;
-        let Some(changed) = text.as_deref().and_then(&change) else {
-            continue;
-        };
-        let update = Query::update()
-            .table(Alias::new(table))
-            .value(Alias::new(column), changed)
-            .and_where(Expr::col(Alias::new("id")).eq(id))
-            .to_owned();
-        manager.exec_stmt(update).await?;
-    }
-    Ok(())
-}
-
-/// Sets `column` to `new` where it's `old`, in rows matching `only` too.
-async fn replace_value(
-    manager: &SchemaManager<'_>,
-    table: impl Iden + 'static,
-    column: impl IntoIden,
-    (old, new): (&str, &str),
-    only: Option<SimpleExpr>,
-) -> Result<(), DbErr> {
-    let column = column.into_iden();
-    let mut update = Query::update()
-        .table(table)
-        .value(column.clone(), new)
-        .and_where(Expr::col(column).eq(old))
-        .to_owned();
-    if let Some(only) = only {
-        update.and_where(only);
-    }
-    manager.exec_stmt(update).await
-}
-
-/// Changes the words people's own text used. Conditions and templates have names
-/// changed where they're written whole. Filters are rewritten term by term, leaving
-/// anything quoted alone, and one that would grow past what its column holds is left
-/// as it is.
-async fn rewrite_words(manager: &SchemaManager<'_>, words: &Words) -> Result<(), DbErr> {
-    let names = |text: &str| {
-        let renamed = words
-            .names
-            .iter()
-            .fold(text.to_string(), |text, (old, new)| {
-                rename_whole(&text, old, new)
-            });
-        (renamed != text).then_some(renamed)
-    };
-    rewrite_column(manager, "config_rules", "condition_expr", names).await?;
-    rewrite_column(manager, "alert_rules", "condition_expr", names).await?;
-    rewrite_column(manager, "notification_channels", "request_body", names).await?;
-
-    let filter = |text: &str| {
-        let renamed = rename_filter_term(text, words.hostname_term);
-        (renamed != text && renamed.chars().count() <= MAX_FILTER_CHARS).then_some(renamed)
-    };
-    for table in [
-        "alert_rules",
-        "silences",
-        "maintenance_windows",
-        "dashboard_widgets",
-        "location_rules",
-        "dashboard_variables",
-        "events",
-    ] {
-        rewrite_column(manager, table, "filter", filter).await?;
-    }
-
-    replace_value(
-        manager,
-        DashboardVariables::Table,
-        DashboardVariables::Kind,
-        words.variable_kind,
-        None,
-    )
-    .await?;
-    for kinds in words.subject_kinds {
-        replace_value(manager, AuditLog::Table, AuditLog::SubjectKind, kinds, None).await?;
-    }
-    replace_value(
-        manager,
-        Events::Table,
-        Events::Title,
-        words.restart_title,
-        Some(Expr::col(Events::Kind).eq("restart")),
-    )
-    .await?;
-    replace_value(
-        manager,
-        AlertRules::Table,
-        AlertRules::Metric,
-        words.server_metric,
-        None,
-    )
-    .await?;
-    replace_value(
-        manager,
-        DashboardWidgets::Table,
-        DashboardWidgets::Metric,
-        words.server_metric,
-        None,
-    )
-    .await?;
-
-    // Names are unique, so someone's own rule may already have the new one.
-    let (old_name, new_name) = words.offline_rule;
-    let taken = Query::select()
-        .column(AlertRules::Id)
-        .from(AlertRules::Table)
-        .and_where(Expr::col(AlertRules::Name).eq(new_name))
-        .to_owned();
-    if manager.get_connection().query_one(&taken).await?.is_none() {
-        replace_value(
-            manager,
-            AlertRules::Table,
-            AlertRules::Name,
-            (old_name, new_name),
-            Some(Expr::col(AlertRules::Kind).eq("offline")),
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-/// `text` with `old` changed to `new` wherever it's a whole name: not part of a
-/// longer one, like `trusted.agent_ids` or `alert.host_id`.
-fn rename_whole(text: &str, old: &str, new: &str) -> String {
-    let part_of_name = |c: char| c.is_alphanumeric() || c == '_' || c == '.';
-    let mut renamed = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find(old) {
-        let before = rest[..at].chars().next_back();
-        let after = rest[at + old.len()..].chars().next();
-        renamed.push_str(&rest[..at]);
-        if before.is_some_and(part_of_name)
-            || after.is_some_and(|c| c.is_alphanumeric() || c == '_')
-        {
-            renamed.push_str(old);
-        } else {
-            renamed.push_str(new);
-        }
-        rest = &rest[at + old.len()..];
-    }
-    renamed.push_str(rest);
-    renamed
-}
-
-/// A filter with each `old=` or `old!=` term naming `new` instead. Terms are separated
-/// by spaces, and a quoted value can hold spaces, so quotes are followed.
-fn rename_filter_term(filter: &str, (old, new): (&str, &str)) -> String {
-    let mut renamed = String::with_capacity(filter.len());
-    let mut quoted = false;
-    let mut at_term = true;
-    let mut rest = filter;
-    while let Some(next) = rest.chars().next() {
-        if at_term && !quoted {
-            let after = rest.strip_prefix(old);
-            if let Some(after) =
-                after.filter(|after| after.starts_with('=') || after.starts_with("!="))
-            {
-                renamed.push_str(new);
-                rest = after;
-                at_term = false;
-                continue;
-            }
-        }
-        if next == '"' {
-            quoted = !quoted;
-        }
-        at_term = !quoted && next.is_whitespace();
-        renamed.push(next);
-        rest = &rest[next.len_utf8()..];
-    }
-    renamed
+    BootMs,
 }
 
 #[derive(Iden)]
-enum KeyTables {
-    #[iden = "api_keys"]
-    ApiKeys,
-    #[iden = "recovery_codes"]
-    RecoveryCodes,
-    #[iden = "sign_in_challenges"]
-    SignInChallenges,
-    #[iden = "host_boots"]
-    HostBoots,
-    #[iden = "users"]
-    Users,
-    #[iden = "hosts"]
-    Hosts,
+enum ConfigRules {
+    Table,
+    Id,
+    Name,
+    Priority,
+    ConditionExpr,
+    Enabled,
+}
+
+#[derive(Iden)]
+enum ConfigRuleSettings {
+    Table,
+    Id,
+    RuleId,
+    Name,
+    Value,
+    ValueType,
+}
+
+#[derive(Iden)]
+enum Users {
+    Table,
+    Id,
+    Email,
+    Name,
+    PasswordHash,
+    Role,
+    Theme,
+    TimeZone,
+    SetupTokenHash,
+    SetupExpiresMs,
+    TotpSecret,
+    TotpEnabled,
+    TotpLastStep,
+    CreatedMs,
+    LastSignInMs,
+    DisabledMs,
+}
+
+#[derive(Iden)]
+enum UserSessions {
+    Table,
     Id,
     UserId,
-    HostId,
+    TokenHash,
+    CreatedMs,
+    ExpiresMs,
+}
+
+#[derive(Iden)]
+enum ApiKeys {
+    Table,
+    Id,
+    UserId,
     Name,
     Hint,
     TokenHash,
@@ -3515,220 +1368,252 @@ enum KeyTables {
     ExpiresMs,
     LastUsedMs,
     RevokedMs,
+}
+
+#[derive(Iden)]
+enum RecoveryCodes {
+    Table,
+    Id,
+    UserId,
     CodeHash,
     UsedMs,
-    BootMs,
 }
 
-struct AddMissingForeignKeys;
-
-impl MigrationName for AddMissingForeignKeys {
-    fn name(&self) -> &str {
-        "m20261111_000030_add_missing_foreign_keys"
-    }
+#[derive(Iden)]
+enum SignInChallenges {
+    Table,
+    Id,
+    UserId,
+    TokenHash,
+    ExpiresMs,
 }
 
-/// A user's keys, recovery codes and sign in challenges, and a host's boot time, only
-/// mean something while their user or host is there, so the database says so too.
-/// Anything left from one already gone goes first. SQLite can only add a foreign key
-/// by making the table again, so there each is made again, and an API key's owner
-/// loses the default it only had because SQLite needed one to add the column.
-#[async_trait::async_trait]
-impl MigrationTrait for AddMissingForeignKeys {
-    fn use_transaction(&self) -> Option<bool> {
-        Some(true)
-    }
-
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let connection = manager.get_connection();
-        for (table, column, parent) in OWNED {
-            connection
-                .execute_unprepared(&format!(
-                    "DELETE FROM {table} WHERE {column} NOT IN (SELECT id FROM {parent})"
-                ))
-                .await?;
-        }
-        if manager.get_database_backend() == sea_orm::DatabaseBackend::Sqlite {
-            for (table, _, _) in OWNED {
-                remake(manager, table, owned_table(table, true)).await?;
-            }
-            return Ok(());
-        }
-        connection
-            .execute_unprepared("ALTER TABLE api_keys ALTER COLUMN user_id DROP DEFAULT")
-            .await?;
-        for (table, column, parent) in OWNED {
-            manager
-                .create_foreign_key(
-                    ForeignKey::create()
-                        .name(foreign_key_name(table, column))
-                        .from(Alias::new(table), Alias::new(column))
-                        .to(Alias::new(parent), Alias::new("id"))
-                        .to_owned(),
-                )
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        if manager.get_database_backend() == sea_orm::DatabaseBackend::Sqlite {
-            for (table, _, _) in OWNED {
-                remake(manager, table, owned_table(table, false)).await?;
-            }
-            return Ok(());
-        }
-        for (table, column, _) in OWNED {
-            manager
-                .drop_foreign_key(
-                    ForeignKey::drop()
-                        .name(foreign_key_name(table, column))
-                        .table(Alias::new(table))
-                        .to_owned(),
-                )
-                .await?;
-        }
-        manager
-            .get_connection()
-            .execute_unprepared("ALTER TABLE api_keys ALTER COLUMN user_id SET DEFAULT 0")
-            .await?;
-        Ok(())
-    }
+#[derive(Iden)]
+enum NotificationChannels {
+    Table,
+    Id,
+    Name,
+    Kind,
+    Target,
+    Credential,
+    AppToken,
+    SendsWarnings,
+    SendsCritical,
+    MailFrom,
+    MailHostname,
+    MailPort,
+    MailSecurity,
+    MailUsername,
+    RequestMethod,
+    RequestContentType,
+    RequestBody,
 }
 
-/// Each table that belongs to a user or a host, the column saying which, and whose.
-const OWNED: [(&str, &str, &str); 4] = [
-    ("api_keys", "user_id", "users"),
-    ("recovery_codes", "user_id", "users"),
-    ("sign_in_challenges", "user_id", "users"),
-    ("host_boots", "host_id", "hosts"),
-];
-
-fn foreign_key_name(table: &str, column: &str) -> String {
-    format!("fk_{table}_{column}")
+#[derive(Iden)]
+enum AlertRules {
+    Table,
+    Id,
+    Name,
+    Kind,
+    Metric,
+    Series,
+    Comparison,
+    Threshold,
+    WarningThreshold,
+    ForSecs,
+    Severity,
+    ConditionExpr,
+    Enabled,
+    AllChannels,
+    Calculation,
+    GroupBy,
+    Filter,
+    WindowSecs,
+    RemindEverySecs,
+    ForecastSecs,
+    WarningForecastSecs,
 }
 
-/// One of the tables `OWNED` lists as it is with its foreign key, or as it was without.
-fn owned_table(table: &str, with_key: bool) -> TableCreateStatement {
-    use KeyTables as T;
-    let mut create = Table::create();
-    let (column, parent) = match table {
-        "api_keys" => {
-            let user = ColumnDef::new(T::UserId)
-                .big_integer()
-                .not_null()
-                .to_owned();
-            create
-                .table(T::ApiKeys)
-                .col(id(T::Id))
-                .col(ColumnDef::new(T::Name).string_len(100).not_null())
-                .col(ColumnDef::new(T::Hint).string_len(16).not_null())
-                .col(
-                    ColumnDef::new(T::TokenHash)
-                        .string_len(64)
-                        .not_null()
-                        .unique_key(),
-                )
-                .col(ColumnDef::new(T::CreatedMs).big_integer().not_null())
-                .col(ColumnDef::new(T::ExpiresMs).big_integer())
-                .col(ColumnDef::new(T::LastUsedMs).big_integer())
-                .col(ColumnDef::new(T::RevokedMs).big_integer())
-                .col(if with_key {
-                    user
-                } else {
-                    user.clone().default(0).to_owned()
-                })
-                .col(
-                    ColumnDef::new(T::Role)
-                        .string_len(16)
-                        .not_null()
-                        .default("admin"),
-                );
-            (T::UserId, T::Users)
-        }
-        "recovery_codes" => {
-            create
-                .table(T::RecoveryCodes)
-                .col(id(T::Id))
-                .col(ColumnDef::new(T::UserId).big_integer().not_null())
-                .col(ColumnDef::new(T::CodeHash).string_len(64).not_null())
-                .col(ColumnDef::new(T::UsedMs).big_integer().null());
-            (T::UserId, T::Users)
-        }
-        "sign_in_challenges" => {
-            create
-                .table(T::SignInChallenges)
-                .col(id(T::Id))
-                .col(ColumnDef::new(T::UserId).big_integer().not_null())
-                .col(
-                    ColumnDef::new(T::TokenHash)
-                        .string_len(64)
-                        .not_null()
-                        .unique_key(),
-                )
-                .col(ColumnDef::new(T::ExpiresMs).big_integer().not_null());
-            (T::UserId, T::Users)
-        }
-        _ => {
-            create
-                .table(T::HostBoots)
-                .col(
-                    ColumnDef::new(T::HostId)
-                        .string_len(32)
-                        .not_null()
-                        .primary_key(),
-                )
-                .col(ColumnDef::new(T::BootMs).big_integer().not_null());
-            (T::HostId, T::Hosts)
-        }
-    };
-    if with_key {
-        create.foreign_key(
-            ForeignKey::create()
-                .name(foreign_key_name(table, &column.to_string()))
-                .from(Alias::new(table), column)
-                .to(parent, T::Id),
-        );
-    }
-    create.to_owned()
+#[derive(Iden)]
+enum AlertRuleChannels {
+    Table,
+    RuleId,
+    ChannelId,
 }
 
-/// Makes `table` again as `new` says, keeping its rows. Nothing refers to these
-/// tables, so the old one can go before the new one takes its name.
-async fn remake(
-    manager: &SchemaManager<'_>,
-    table: &str,
-    mut new: TableCreateStatement,
-) -> Result<(), DbErr> {
-    let connection = manager.get_connection();
-    let made = format!("{table}_remade");
-    new.table(Alias::new(&made));
-    manager.create_table(new).await?;
-    let columns = owned_columns(table);
-    connection
-        .execute_unprepared(&format!(
-            "INSERT INTO {made} ({columns}) SELECT {columns} FROM {table}"
-        ))
-        .await?;
-    connection
-        .execute_unprepared(&format!("DROP TABLE {table}"))
-        .await?;
-    connection
-        .execute_unprepared(&format!("ALTER TABLE {made} RENAME TO {table}"))
-        .await?;
-    Ok(())
+#[derive(Iden)]
+enum Alerts {
+    Table,
+    Id,
+    RuleId,
+    RuleName,
+    Severity,
+    HostId,
+    Hostname,
+    Series,
+    Value,
+    Summary,
+    StartedMs,
+    ResolvedMs,
+    ResolveReason,
+    AcknowledgedBy,
+    AcknowledgedMs,
 }
 
-fn owned_columns(table: &str) -> &'static str {
-    match table {
-        "api_keys" => {
-            "id, name, hint, token_hash, created_ms, expires_ms, last_used_ms, revoked_ms, \
-             user_id, role"
-        }
-        "recovery_codes" => "id, user_id, code_hash, used_ms",
-        "sign_in_challenges" => "id, user_id, token_hash, expires_ms",
-        _ => "host_id, boot_ms",
-    }
+#[derive(Iden)]
+enum Notifications {
+    Table,
+    Id,
+    AlertId,
+    ChannelId,
+    Event,
+    State,
+    Attempts,
+    NextAttemptMs,
+    LastError,
+    CreatedMs,
+    SentMs,
+    ExternalId,
+}
+
+#[derive(Iden)]
+enum Silences {
+    Table,
+    Id,
+    RuleId,
+    Filter,
+    Reason,
+    CreatedBy,
+    StartsMs,
+    EndsMs,
+}
+
+#[derive(Iden)]
+enum MaintenanceWindows {
+    Table,
+    Id,
+    Name,
+    RuleId,
+    Filter,
+    Days,
+    StartTime,
+    DurationSecs,
+    TimeZone,
+}
+
+#[derive(Iden)]
+enum RemoteChecks {
+    Table,
+    Id,
+    Name,
+    Kind,
+    Target,
+    TimeoutSecs,
+    Method,
+    Body,
+    Regex,
+    Insecure,
+    Server,
+    Record,
+    Count,
+    IntervalSecs,
+    Enabled,
+}
+
+#[derive(Iden)]
+enum Dashboards {
+    Table,
+    Id,
+    Name,
+    CreatedMs,
+}
+
+#[derive(Iden)]
+enum DashboardWidgets {
+    Table,
+    Id,
+    DashboardId,
+    Title,
+    Kind,
+    Metric,
+    Calculation,
+    GroupBy,
+    Filter,
+    X,
+    Y,
+    W,
+    H,
+}
+
+#[derive(Iden)]
+enum DashboardVariables {
+    Table,
+    Id,
+    DashboardId,
+    Position,
+    Name,
+    Label,
+    Kind,
+    Fact,
+    Filter,
+}
+
+#[derive(Iden)]
+enum LocationRules {
+    Table,
+    Id,
+    Name,
+    Filter,
+    Place,
+    Latitude,
+    Longitude,
+    Priority,
+}
+
+#[derive(Iden)]
+enum Events {
+    Table,
+    Id,
+    TimeMs,
+    Kind,
+    Title,
+    Detail,
+    Filter,
+    CreatedBy,
+    CreatedMs,
+}
+
+#[derive(Iden)]
+enum AuditLog {
+    Table,
+    Id,
+    TimeMs,
+    ActorKind,
+    ActorId,
+    ActorName,
+    ViaKind,
+    ViaId,
+    ViaName,
+    Source,
+    Action,
+    SubjectKind,
+    SubjectId,
+    SubjectName,
+    Changes,
+}
+
+#[derive(Iden)]
+enum ServerSettings {
+    Table,
+    Name,
+    Value,
+}
+
+#[derive(Iden)]
+enum ServerSecrets {
+    Table,
+    Name,
+    Value,
 }
 
 #[cfg(test)]
@@ -3737,354 +1622,11 @@ mod tests {
 
     use super::*;
 
-    /// How many migrations come before `migration`, to stop just short of it.
-    fn before(migration: &dyn MigrationName) -> u32 {
-        let position = Migrator::migrations()
-            .iter()
-            .position(|m| m.name() == migration.name())
-            .expect("a listed migration");
-        <u32 as TryFrom<usize>>::try_from(position).unwrap()
-    }
-
-    async fn offline_rules(connection: &impl ConnectionTrait) -> Vec<String> {
-        let query = Statement::from_string(
-            connection.get_database_backend(),
-            "SELECT name FROM alert_rules WHERE kind = 'offline' ORDER BY id",
-        );
-        let rows = connection.query_all_raw(query).await.unwrap();
-        rows.iter()
-            .map(|row| row.try_get::<String>("", "name").unwrap())
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn the_built_in_offline_rule_is_not_added_beside_one_already_there() {
-        let options = ConnectOptions::new("sqlite::memory:")
-            .max_connections(1)
-            .to_owned();
-        let connection = Database::connect(options).await.unwrap();
-        let before = before(&AddBuiltInAlerts);
-        Migrator::up(&connection, Some(before)).await.unwrap();
-        connection
-            .execute_unprepared(
-                "INSERT INTO alert_rules (name, kind, for_secs, severity, enabled)
-                 VALUES ('Gone', 'offline', 60, 'warning', TRUE)",
-            )
-            .await
-            .unwrap();
-
-        Migrator::up(&connection, None).await.unwrap();
-
-        assert_eq!(offline_rules(&connection).await, ["Gone"]);
-    }
-
-    #[tokio::test]
-    async fn the_built_in_disk_rules_are_not_added_beside_one_already_there() {
-        let options = ConnectOptions::new("sqlite::memory:")
-            .max_connections(1)
-            .to_owned();
-        let connection = Database::connect(options).await.unwrap();
-        let before = before(&AddBuiltInDiskAlerts);
-        Migrator::up(&connection, Some(before)).await.unwrap();
-        connection
-            .execute_unprepared(
-                "INSERT INTO alert_rules
-                   (name, kind, metric, comparison, threshold, for_secs, severity, enabled)
-                 VALUES ('Full', 'metric', 'disk.usage', 'above', 95, 60, 'critical', TRUE)",
-            )
-            .await
-            .unwrap();
-
-        Migrator::up(&connection, None).await.unwrap();
-
-        let query = Statement::from_string(
-            connection.get_database_backend(),
-            "SELECT name FROM alert_rules WHERE metric = 'disk.usage' AND kind = 'metric'",
-        );
-        let rows = connection.query_all_raw(query).await.unwrap();
-        let names: Vec<String> = rows
-            .iter()
-            .map(|row| row.try_get::<String>("", "name").unwrap())
-            .collect();
-        assert_eq!(names, ["Full"]);
-    }
-
-    async fn disk_rules(connection: &impl ConnectionTrait) -> Vec<(String, f64, Option<f64>)> {
-        let query = Statement::from_string(
-            connection.get_database_backend(),
-            "SELECT name, threshold, warning_threshold FROM alert_rules
-             WHERE metric = 'disk.usage' AND kind = 'metric' ORDER BY id",
-        );
-        let rows = connection.query_all_raw(query).await.unwrap();
-        rows.iter()
-            .map(|row| {
-                (
-                    row.try_get("", "name").unwrap(),
-                    row.try_get("", "threshold").unwrap(),
-                    row.try_get("", "warning_threshold").unwrap(),
-                )
-            })
-            .collect()
-    }
-
     async fn fresh() -> sea_orm::DatabaseConnection {
         let options = ConnectOptions::new("sqlite::memory:")
             .max_connections(1)
             .to_owned();
         Database::connect(options).await.unwrap()
-    }
-
-    #[tokio::test]
-    async fn the_built_in_disk_rules_become_one_unless_they_were_changed() {
-        let connection = fresh().await;
-        Migrator::up(&connection, None).await.unwrap();
-        assert_eq!(
-            disk_rules(&connection).await,
-            [("Disk filling up".to_string(), 90.0, Some(80.0))]
-        );
-
-        let connection = fresh().await;
-        let before = before(&AddWarningThresholds);
-        Migrator::up(&connection, Some(before)).await.unwrap();
-        connection
-            .execute_unprepared(
-                "UPDATE alert_rules SET threshold = 85 WHERE name = 'Disk filling up'",
-            )
-            .await
-            .unwrap();
-        Migrator::up(&connection, None).await.unwrap();
-        assert_eq!(
-            disk_rules(&connection).await,
-            [
-                ("Disk filling up".to_string(), 85.0, None),
-                ("Disk nearly full".to_string(), 90.0, None),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn a_critical_only_channel_keeps_warnings_off_when_channels_choose_both() {
-        let connection = fresh().await;
-        let before = before(&ChooseChannelSeverities);
-        Migrator::up(&connection, Some(before)).await.unwrap();
-        connection
-            .execute_unprepared(
-                "INSERT INTO notification_channels (name, kind, target, min_severity)
-                 VALUES ('Pager', 'webhook', 'https://p', 'critical'),
-                        ('Chat', 'webhook', 'https://c', 'warning')",
-            )
-            .await
-            .unwrap();
-        Migrator::up(&connection, None).await.unwrap();
-
-        let query = Statement::from_string(
-            connection.get_database_backend(),
-            "SELECT name, sends_warnings, sends_critical FROM notification_channels ORDER BY name",
-        );
-        let rows = connection.query_all_raw(query).await.unwrap();
-        let channels: Vec<(String, bool, bool)> = rows
-            .iter()
-            .map(|row| {
-                (
-                    row.try_get("", "name").unwrap(),
-                    row.try_get("", "sends_warnings").unwrap(),
-                    row.try_get("", "sends_critical").unwrap(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            channels,
-            [
-                ("Chat".to_string(), true, true),
-                ("Pager".to_string(), false, true)
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn keys_made_before_owners_are_dropped() {
-        let connection = fresh().await;
-        Migrator::up(&connection, Some(before(&AddApiKeyOwners)))
-            .await
-            .unwrap();
-        connection
-            .execute_unprepared(
-                "INSERT INTO api_keys (name, hint, token_hash, created_ms) \
-                 VALUES ('old', 'mxn_1', 'h1', 0)",
-            )
-            .await
-            .unwrap();
-
-        Migrator::up(&connection, None).await.unwrap();
-
-        let query = Statement::from_string(
-            connection.get_database_backend(),
-            "SELECT COUNT(*) AS n FROM api_keys",
-        );
-        let row = connection.query_one_raw(query).await.unwrap().unwrap();
-        assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0);
-    }
-
-    async fn system_settings(connection: &impl ConnectionTrait) -> Vec<String> {
-        let query = Statement::from_string(
-            connection.get_database_backend(),
-            "SELECT value FROM config_rule_settings WHERE name = 'collectors.system.enabled'",
-        );
-        let rows = connection.query_all_raw(query).await.unwrap();
-        rows.iter()
-            .map(|row| row.try_get::<String>("", "value").unwrap())
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn the_default_rule_turns_on_the_system_collector() {
-        let connection = fresh().await;
-        Migrator::up(&connection, None).await.unwrap();
-        assert_eq!(system_settings(&connection).await, ["true"]);
-    }
-
-    #[tokio::test]
-    async fn a_default_rule_that_already_chose_keeps_its_choice() {
-        let connection = fresh().await;
-        Migrator::up(&connection, Some(before(&TurnOnSystemCollector)))
-            .await
-            .unwrap();
-        connection
-            .execute_unprepared(
-                "INSERT INTO config_rule_settings (rule_id, name, value, value_type)
-                 SELECT id, 'collectors.system.enabled', 'false', 'boolean'
-                 FROM config_rules WHERE name = 'Default'",
-            )
-            .await
-            .unwrap();
-
-        Migrator::up(&connection, None).await.unwrap();
-
-        assert_eq!(system_settings(&connection).await, ["false"]);
-    }
-
-    #[tokio::test]
-    async fn a_server_without_a_default_rule_gets_none() {
-        let connection = fresh().await;
-        Migrator::up(&connection, Some(before(&TurnOnSystemCollector)))
-            .await
-            .unwrap();
-        connection
-            .execute_unprepared(
-                "UPDATE config_rules SET name = 'Everything' WHERE name = 'Default'",
-            )
-            .await
-            .unwrap();
-
-        Migrator::up(&connection, None).await.unwrap();
-
-        assert!(system_settings(&connection).await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn the_servers_own_events_get_a_filter_for_their_machine() {
-        let connection = fresh().await;
-        Migrator::up(&connection, Some(before(&UnresolveEventFilters)))
-            .await
-            .unwrap();
-        connection
-            .execute_unprepared(
-                "INSERT INTO events (id, time_ms, kind, title, filter, created_by, created_ms)
-                 VALUES (1, 5, 'restart', 'Machine started', '', 'server', 5),
-                        (2, 6, 'deploy', 'Shop v2', 'role=web', 'sam@example.com', 6);
-                 INSERT INTO event_agents (event_id, agent_id)
-                 VALUES (1, 'abc123'), (2, 'web1'), (2, 'web2')",
-            )
-            .await
-            .unwrap();
-
-        Migrator::up(&connection, None).await.unwrap();
-
-        let query = Statement::from_string(
-            connection.get_database_backend(),
-            "SELECT filter FROM events ORDER BY id",
-        );
-        let rows = connection.query_all_raw(query).await.unwrap();
-        let filters: Vec<String> = rows
-            .iter()
-            .map(|row| row.try_get("", "filter").unwrap())
-            .collect();
-        assert_eq!(filters, ["id=abc123", "role=web"]);
-    }
-
-    #[tokio::test]
-    async fn the_built_in_inode_rule_is_not_added_beside_one_already_there() {
-        let connection = fresh().await;
-        Migrator::up(&connection, Some(before(&AddBuiltInInodeAlert)))
-            .await
-            .unwrap();
-        connection
-            .execute_unprepared(
-                "INSERT INTO alert_rules
-                   (name, kind, metric, comparison, threshold, for_secs, severity, enabled)
-                 VALUES ('Inodes', 'metric', 'disk.inodes', 'above', 95, 60, 'critical', TRUE)",
-            )
-            .await
-            .unwrap();
-
-        Migrator::up(&connection, None).await.unwrap();
-
-        let query = Statement::from_string(
-            connection.get_database_backend(),
-            "SELECT name FROM alert_rules WHERE metric = 'disk.inodes'",
-        );
-        let rows = connection.query_all_raw(query).await.unwrap();
-        let names: Vec<String> = rows
-            .iter()
-            .map(|row| row.try_get::<String>("", "name").unwrap())
-            .collect();
-        assert_eq!(names, ["Inodes"]);
-    }
-
-    async fn window_lengths(connection: &impl ConnectionTrait, column: &str) -> Vec<i64> {
-        let query = Statement::from_string(
-            connection.get_database_backend(),
-            format!("SELECT {column} FROM maintenance_windows ORDER BY id"),
-        );
-        let rows = connection.query_all_raw(query).await.unwrap();
-        rows.iter()
-            .map(|row| row.try_get("", column).unwrap())
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn maintenance_windows_keep_their_length_in_seconds_and_back() {
-        let connection = fresh().await;
-        Migrator::up(&connection, Some(before(&RenameTimesAndDurations)))
-            .await
-            .unwrap();
-        connection
-            .execute_unprepared(
-                "INSERT INTO maintenance_windows
-                   (name, filter, days, start_time, duration_minutes, time_zone)
-                 VALUES ('Patching', '', 'sun', '02:00', 120, 'UTC')",
-            )
-            .await
-            .unwrap();
-
-        Migrator::up(&connection, None).await.unwrap();
-        assert_eq!(window_lengths(&connection, "duration_secs").await, [7200]);
-
-        let total = <u32 as TryFrom<usize>>::try_from(Migrator::migrations().len()).unwrap();
-        let since = total - before(&RenameTimesAndDurations);
-        Migrator::down(&connection, Some(since)).await.unwrap();
-        assert_eq!(window_lengths(&connection, "duration_minutes").await, [120]);
-    }
-
-    #[test]
-    fn a_filters_hostname_term_is_renamed_but_not_inside_quotes() {
-        let rename = |filter| rename_filter_term(filter, ("host", "hostname"));
-        assert_eq!(rename("host=web*"), "hostname=web*");
-        assert_eq!(rename("os=linux host!=db*"), "os=linux hostname!=db*");
-        assert_eq!(rename("hostname=web*"), "hostname=web*");
-        assert_eq!(rename("custom.host=a"), "custom.host=a");
-        assert_eq!(rename("custom.note=\"host=a\""), "custom.note=\"host=a\"");
-        assert_eq!(rename("web"), "web");
     }
 
     async fn texts(connection: &impl ConnectionTrait, sql: &str) -> Vec<String> {
@@ -4096,183 +1638,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn what_people_wrote_follows_agents_becoming_hosts() {
+    async fn a_new_database_starts_with_the_built_ins() {
         let connection = fresh().await;
-        Migrator::up(&connection, Some(before(&RenameAgentsToHosts)))
-            .await
-            .unwrap();
-        connection
-            .execute_unprepared(
-                "UPDATE config_rules SET condition_expr = 'trusted.agent_id == \"abc\"';
-                 INSERT INTO silences (filter, reason, created_by, starts_ms, ends_ms)
-                 VALUES ('host=web* os=linux', 'Upgrading', 'sam', 1, 2);
-                 INSERT INTO audit_log
-                   (time_ms, actor_kind, actor_name, action, subject_kind, subject_name, changes)
-                 VALUES (1, 'person', 'sam', 'approved', 'agent', 'web-1', '{}'),
-                        (2, 'person', 'sam', 'created', 'event', 'Deploy', '{}');
-                 INSERT INTO events (time_ms, kind, title, filter, created_by, created_ms)
-                 VALUES (5, 'restart', 'Machine started', 'id=abc', 'server', 5);
-                 INSERT INTO notification_channels
-                   (name, kind, target, sends_warnings, sends_critical, request_body)
-                 VALUES ('Hook', 'custom_webhook', 'https://h', TRUE, TRUE,
-                         '{\"on\": \"{{ alert.host }}\", \"id\": \"{{alert.agent_id}}\"}');
-                 INSERT INTO alert_rules
-                   (name, kind, metric, comparison, threshold, for_secs, severity, enabled)
-                 VALUES ('Too many', 'metric', 'server.agents', 'above', 99, 60, 'warning', TRUE)",
-            )
-            .await
-            .unwrap();
-
         Migrator::up(&connection, None).await.unwrap();
 
-        let conditions = texts(&connection, "SELECT condition_expr FROM config_rules").await;
-        assert_eq!(conditions, ["trusted.host_id == \"abc\""]);
-        let filters = texts(&connection, "SELECT filter FROM silences").await;
-        assert_eq!(filters, ["hostname=web* os=linux"]);
-        let kinds = texts(
-            &connection,
-            "SELECT subject_kind FROM audit_log ORDER BY id",
-        )
-        .await;
-        assert_eq!(kinds, ["host", "annotation"]);
-        let offline = "SELECT name FROM alert_rules WHERE kind = 'offline'";
-        assert_eq!(texts(&connection, offline).await, ["Host offline"]);
-        let titles = texts(&connection, "SELECT title FROM events").await;
-        assert_eq!(titles, ["Host started"]);
-        let bodies = texts(
-            &connection,
-            "SELECT request_body FROM notification_channels",
-        )
-        .await;
-        assert_eq!(
-            bodies,
-            ["{\"on\": \"{{ alert.hostname }}\", \"id\": \"{{alert.host_id}}\"}"]
-        );
-        let metric = "SELECT metric FROM alert_rules WHERE name = 'Too many'";
-        assert_eq!(texts(&connection, metric).await, ["server.hosts"]);
         let hosts = texts(&connection, "SELECT hostname FROM hosts ORDER BY id").await;
         assert_eq!(hosts, ["Fleet", "MaxNines server"]);
+        let rules = texts(&connection, "SELECT name FROM alert_rules ORDER BY id").await;
+        assert_eq!(
+            rules,
+            [
+                "Host offline",
+                "Disk filling up",
+                "Container down",
+                "Disk will be full soon",
+                "Disk running out of inodes",
+            ]
+        );
+        let settings = "SELECT s.name FROM config_rule_settings s
+                        JOIN config_rules r ON r.id = s.rule_id
+                        WHERE r.name = 'Default' ORDER BY s.id";
+        let names = texts(&connection, settings).await;
+        assert_eq!(names.len(), DEFAULT_SETTINGS.len());
+        assert_eq!(names[0], "interval_secs");
+    }
 
-        let total = <u32 as TryFrom<usize>>::try_from(Migrator::migrations().len()).unwrap();
-        let since = total - before(&RenameAgentsToHosts);
-        Migrator::down(&connection, Some(since)).await.unwrap();
-        let filters = texts(&connection, "SELECT filter FROM silences").await;
-        assert_eq!(filters, ["host=web* os=linux"]);
-        let bodies = texts(
+    #[tokio::test]
+    async fn the_tables_can_be_dropped_and_made_again() {
+        let connection = fresh().await;
+        Migrator::up(&connection, None).await.unwrap();
+        Migrator::down(&connection, None).await.unwrap();
+        let left = texts(
             &connection,
-            "SELECT request_body FROM notification_channels",
+            "SELECT name FROM sqlite_master WHERE type = 'table'
+             AND name NOT IN ('seaql_migrations', 'sqlite_sequence')",
         )
         .await;
-        assert_eq!(
-            bodies,
-            ["{\"on\": \"{{ alert.host }}\", \"id\": \"{{alert.agent_id}}\"}"]
-        );
-        let names = texts(&connection, "SELECT host FROM agents ORDER BY id").await;
-        assert_eq!(names, ["Fleet", "MaxNines server"]);
-    }
-
-    #[test]
-    fn only_whole_names_are_renamed() {
-        let rename = |text| rename_whole(text, "alert.host", "alert.hostname");
-        assert_eq!(rename("{{ alert.host }}"), "{{ alert.hostname }}");
-        assert_eq!(rename("{{alert.host|upper}}"), "{{alert.hostname|upper}}");
-        assert_eq!(rename("{{ alert.host_id }}"), "{{ alert.host_id }}");
-        assert_eq!(rename("{{ alert.hostname }}"), "{{ alert.hostname }}");
-        assert_eq!(rename("{{ my_alert.host }}"), "{{ my_alert.host }}");
-        let trusted = rename_whole(
-            "trusted.agent_ids == x",
-            "trusted.agent_id",
-            "trusted.host_id",
-        );
-        assert_eq!(trusted, "trusted.agent_ids == x");
-    }
-
-    #[tokio::test]
-    async fn a_rule_already_called_host_offline_keeps_both_and_the_migration_finishes() {
-        let connection = fresh().await;
-        Migrator::up(&connection, Some(before(&RenameAgentsToHosts)))
-            .await
-            .unwrap();
-        let long = format!("host=web* {}", "x".repeat(MAX_FILTER_CHARS - 10));
-        connection
-            .execute_unprepared(&format!(
-                "INSERT INTO alert_rules (name, kind, for_secs, severity, enabled)
-                 VALUES ('Host offline', 'offline', 60, 'warning', TRUE);
-                 INSERT INTO silences (filter, reason, created_by, starts_ms, ends_ms)
-                 VALUES ('{long}', 'Long', 'sam', 1, 2)"
-            ))
-            .await
-            .unwrap();
-
+        assert!(left.is_empty(), "{left:?}");
         Migrator::up(&connection, None).await.unwrap();
-
-        let offline = "SELECT name FROM alert_rules WHERE kind = 'offline' ORDER BY name";
-        assert_eq!(
-            texts(&connection, offline).await,
-            ["Agent offline", "Host offline"]
-        );
-        // Growing it would overflow its column, so it's left as it was.
-        assert_eq!(
-            texts(&connection, "SELECT filter FROM silences").await,
-            [long]
-        );
-    }
-
-    #[tokio::test]
-    async fn keys_codes_and_boot_times_belong_to_someone_from_now_on() {
-        let connection = fresh().await;
-        Migrator::up(&connection, Some(before(&AddMissingForeignKeys)))
-            .await
-            .unwrap();
-        connection
-            .execute_unprepared(
-                "INSERT INTO users (id, email, name, theme, created_ms, time_zone, role)
-                 VALUES (1, 'sam@example.com', 'Sam', 'carbon', 1, 'UTC', 'admin');
-                 INSERT INTO api_keys (name, hint, token_hash, created_ms, user_id, role)
-                 VALUES ('Deploy', 'mx_a', 'kept', 1, 1, 'editor'),
-                        ('Old', 'mx_b', 'gone', 1, 9, 'viewer');
-                 INSERT INTO recovery_codes (user_id, code_hash) VALUES (1, 'a'), (9, 'b');
-                 INSERT INTO sign_in_challenges (user_id, token_hash, expires_ms)
-                 VALUES (1, 'c', 5), (9, 'd', 5);
-                 INSERT INTO host_boots (host_id, boot_ms) VALUES ('server', 5), ('gone', 6)",
-            )
-            .await
-            .unwrap();
-
-        Migrator::up(&connection, None).await.unwrap();
-
-        let kept = [
-            ("SELECT token_hash FROM api_keys", "kept"),
-            ("SELECT code_hash FROM recovery_codes", "a"),
-            ("SELECT token_hash FROM sign_in_challenges", "c"),
-            ("SELECT host_id FROM host_boots", "server"),
-        ];
-        for (sql, row) in kept {
-            assert_eq!(texts(&connection, sql).await, [row], "{sql}");
-        }
-        let roles = texts(&connection, "SELECT role FROM api_keys").await;
-        assert_eq!(roles, ["editor"]);
-        for orphan in [
-            "INSERT INTO api_keys (name, hint, token_hash, created_ms, user_id, role)
-             VALUES ('X', 'mx_c', 'x', 1, 9, 'viewer')",
-            "INSERT INTO recovery_codes (user_id, code_hash) VALUES (9, 'x')",
-            "INSERT INTO sign_in_challenges (user_id, token_hash, expires_ms) VALUES (9, 'x', 5)",
-            "INSERT INTO host_boots (host_id, boot_ms) VALUES ('nobody', 5)",
-        ] {
-            assert!(
-                connection.execute_unprepared(orphan).await.is_err(),
-                "{orphan}"
-            );
-        }
-        // An owner has to be given now.
-        let ownerless = "INSERT INTO api_keys (name, hint, token_hash, created_ms, role)
-                         VALUES ('Y', 'mx_d', 'y', 1, 'viewer')";
-        assert!(connection.execute_unprepared(ownerless).await.is_err());
-
-        Migrator::down(&connection, Some(1)).await.unwrap();
-        assert_eq!(
-            texts(&connection, "SELECT token_hash FROM api_keys").await,
-            ["kept"]
-        );
     }
 }

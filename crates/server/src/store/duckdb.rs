@@ -33,28 +33,10 @@ struct Migration {
 
 /// Every schema change, in order. Applied ones are recorded in the database, so
 /// never edit one that has shipped: add a new one instead.
-const MIGRATIONS: &[Migration] = &[
-    Migration {
-        name: "0001_create_tables",
-        sql: include_str!("migrations/0001_create_tables.sql"),
-    },
-    Migration {
-        name: "0002_create_rollups",
-        sql: include_str!("migrations/0002_create_rollups.sql"),
-    },
-    Migration {
-        name: "0003_five_minute_rollups",
-        sql: include_str!("migrations/0003_five_minute_rollups.sql"),
-    },
-    Migration {
-        name: "0004_rename_agents_to_hosts",
-        sql: include_str!("migrations/0004_rename_agents_to_hosts.sql"),
-    },
-    Migration {
-        name: "0005_number_hosts",
-        sql: include_str!("migrations/0005_number_hosts.sql"),
-    },
-];
+const MIGRATIONS: &[Migration] = &[Migration {
+    name: "0001_create_tables",
+    sql: include_str!("migrations/0001_create_tables.sql"),
+}];
 
 /// Only the bookkeeping table is created outside a migration, because it is
 /// what records them.
@@ -2513,104 +2495,6 @@ mod tests {
 
         assert!(table_exists(&connection, "second"));
         assert_eq!(applied_migrations(&connection), 2);
-    }
-
-    #[test]
-    fn agents_become_hosts_keeping_every_row() {
-        let mut connection = Connection::open_in_memory().unwrap();
-        migrate(&mut connection, &MIGRATIONS[..3]).unwrap();
-        connection
-            .execute_batch(
-                "INSERT INTO agents VALUES (1, 'abc');
-                 INSERT INTO collectors VALUES (3, 'server');
-                 INSERT INTO metrics VALUES (5, 3, 'agents_online', 'int');
-                 INSERT INTO rollup_progress VALUES ('server.agents', 10);
-                 INSERT INTO rollups_hour
-                 VALUES ('server.agents', 1, 'Online', TIMESTAMP '2026-11-01', 1, 2, 3, 4);
-                 INSERT INTO series VALUES (7, 1, 1);
-                 INSERT INTO rollups_hour
-                 VALUES ('cpu.usage', 1, 'CPU', TIMESTAMP '2026-11-01', 1, 2, 3, 4);
-                 INSERT INTO rollups_five_minute
-                 VALUES ('cpu.usage', 1, 'CPU', TIMESTAMP '2026-11-01', 1, 2, 3, 4);",
-            )
-            .unwrap();
-
-        migrate(&mut connection, MIGRATIONS).unwrap();
-
-        let count = |sql: &str| -> i64 { connection.query_row(sql, [], |row| row.get(0)).unwrap() };
-        assert_eq!(
-            count("SELECT count(*) FROM hosts WHERE host_id = 'abc' AND number = 1"),
-            1
-        );
-        assert_eq!(
-            count("SELECT count(*) FROM series WHERE host_number = 1"),
-            1
-        );
-        assert_eq!(
-            count("SELECT count(*) FROM rollups_hour WHERE host_number = 1"),
-            2
-        );
-        assert_eq!(
-            count("SELECT count(*) FROM rollups_five_minute WHERE host_number = 1"),
-            1
-        );
-        assert!(!table_exists(&connection, "agents"));
-        assert_eq!(
-            count("SELECT count(*) FROM metrics WHERE name = 'hosts_online'"),
-            1
-        );
-        let renamed = "SELECT count(*) FROM rollups_hour WHERE metric = 'server.hosts'";
-        assert_eq!(count(renamed), 1);
-        let progress = "SELECT count(*) FROM rollup_progress WHERE metric = 'server.hosts'";
-        assert_eq!(count(progress), 1);
-    }
-
-    #[test]
-    fn minute_rollups_become_exactly_the_five_minute_ones() {
-        let mut connection = Connection::open_in_memory().unwrap();
-        migrate(&mut connection, &MIGRATIONS[..2]).unwrap();
-        // Six minutes: five in the first span, with a spike, and one in the next.
-        for minute in 0..6i64 {
-            let high = if minute == 2 { 100.0 } else { 20.0 };
-            connection
-                .execute(
-                    "INSERT INTO rollups_minute
-                     VALUES ('cpu.usage', 1, 'CPU', epoch_ms($1::BIGINT)::TIMESTAMP,
-                             10.0, $2, $3, 4)",
-                    params![minute * 60_000, high, 4.0 * 15.0 + minute as f64],
-                )
-                .unwrap();
-        }
-
-        migrate(&mut connection, MIGRATIONS).unwrap();
-
-        assert!(!table_exists(&connection, "rollups_minute"));
-        let mut statement = connection
-            .prepare(
-                "SELECT epoch_ms(time), low, high, summed, samples FROM rollups_five_minute
-                 ORDER BY time",
-            )
-            .unwrap();
-        let spans: Vec<(i64, f64, f64, f64, i64)> = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })
-            .unwrap()
-            .collect::<duckdb::Result<_>>()
-            .unwrap();
-        assert_eq!(
-            spans,
-            [
-                (0, 10.0, 100.0, 5.0 * 60.0 + 10.0, 20),
-                (300_000, 10.0, 20.0, 65.0, 4),
-            ]
-        );
     }
 
     #[test]
