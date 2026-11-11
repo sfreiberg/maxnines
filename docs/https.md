@@ -107,7 +107,7 @@ certificate logs `invalid peer certificate` and keeps trying.
 ## Command line tools
 
 `maxnines-server users` and `api-keys` work on the main database directly.
-`maxnines-server agents` talks to the running server, as that's where the agent list
+`maxnines-server hosts` talks to the running server, as that's where the host list
 lives, with the API key in `MAXNINES_API_KEY`. With a `tls` block it connects to
 `public_url` and checks the certificate like anything else. That name has to work from
 the server itself. If they report `invalid peer certificate: UnknownIssuer`, the

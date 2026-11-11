@@ -30,7 +30,7 @@ use super::{CHART_FILE, ChannelType};
 use crate::alerting::{Channel, ChannelInput, Event, Severity};
 use crate::notifier::{Notice, Senders, format_ms};
 use crate::registration::short_id;
-use crate::remote_checks::FLEET_AGENT_ID;
+use crate::remote_checks::FLEET_HOST_ID;
 
 /// Says which button was pressed, when Slack tells us. The button's value is the alert.
 pub const ACKNOWLEDGE_ACTION: &str = "maxnines_acknowledge";
@@ -119,13 +119,13 @@ fn text(notice: &Notice, web_url: Option<&str>) -> String {
     let mut lines = vec![format!("*{}* {}", notice.label(), escape(&alert.summary))];
     let mut details = vec![
         format!("Rule: {}", escape(&alert.rule_name)),
-        if alert.agent_id == FLEET_AGENT_ID {
-            format!("Machines: {}", escape(&alert.host))
+        if alert.host_id == FLEET_HOST_ID {
+            format!("Hosts: {}", escape(&alert.hostname))
         } else {
             format!(
-                "Machine: {} ({})",
-                escape(&alert.host),
-                short_id(&alert.agent_id)
+                "Host: {} ({})",
+                escape(&alert.hostname),
+                short_id(&alert.host_id)
             )
         },
         format!("Started: {}", format_ms(alert.started_ms)),
@@ -250,7 +250,7 @@ fn post_request(
 }
 
 /// Uses the certificates built into this binary, as the rest of the server does,
-/// so that Slack works on machines without their own.
+/// so that Slack works on hosts without their own.
 pub fn connector() -> Result<SlackClientHyperHttpsConnector> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let https = HttpsConnectorBuilder::new()
@@ -550,7 +550,7 @@ mod tests {
     fn a_host_cannot_ping_a_slack_channel() {
         let alert = Alert {
             summary: "<!everyone> & <@U123> are <http://evil|offline>".to_string(),
-            host: "<!here>".to_string(),
+            hostname: "<!here>".to_string(),
             rule_name: "<!channel>".to_string(),
             ..alert()
         };
@@ -574,7 +574,7 @@ mod tests {
         );
         assert!(text.starts_with("*CRITICAL* CPU usage on web-1"), "{text}");
         assert!(text.contains("Rule: High CPU"), "{text}");
-        assert!(text.contains("Machine: web-1"), "{text}");
+        assert!(text.contains("Host: web-1"), "{text}");
         assert!(
             text.contains("<https://m.example.com/alerts|View alerts>"),
             "{text}"
@@ -612,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn slack_needs_no_certificates_or_tls_setup_from_the_machine() {
+    fn slack_needs_no_certificates_or_tls_setup_from_the_host() {
         connector().unwrap();
     }
 

@@ -120,7 +120,7 @@
     {% endif %}
     <label>Body
       <textarea name="request_body" rows="12" spellcheck="false" maxlength="16384">{{ channel.request_body }}</textarea>
-      <small>A template, filled in for each notification. Put a value in with <code>{{ "{{" }} alert.host {{ "}}" }}</code>, and use <code>| json</code> for a whole value with its quotes, or <code>null</code> when it's missing. See <a href="/docs/notifications#custom-webhooks">Custom webhooks</a> for everything it can use.</small>
+      <small>A template, filled in for each notification. Put a value in with <code>{{ "{{" }} alert.hostname {{ "}}" }}</code>, and use <code>| json</code> for a whole value with its quotes, or <code>null</code> when it's missing. See <a href="/docs/notifications#custom-webhooks">Custom webhooks</a> for everything it can use.</small>
     </label>
     <details>
       <summary>What a template can use</summary>
@@ -129,9 +129,9 @@
         <dt><code>text</code></dt><dd>The notification in one line, like <q>Resolved: CPU usage on web-1 is 97%, above 90%</q></dd>
         <dt><code>id</code></dt><dd>The same for every attempt at one notification, so a repeat can be spotted</dd>
         <dt><code>link</code></dt><dd>The alerts page, if the server knows its own address</dd>
-        <dt><code>alert.rule_name</code>, <code>alert.host</code>, <code>alert.severity</code></dt><dd>The rule, the machine, and <code>warning</code> or <code>critical</code></dd>
+        <dt><code>alert.rule_name</code>, <code>alert.hostname</code>, <code>alert.severity</code></dt><dd>The rule, the host, and <code>warning</code> or <code>critical</code></dd>
         <dt><code>alert.summary</code>, <code>alert.value</code>, <code>alert.series</code></dt><dd>What's wrong, the reading that started it, and which disk or container, if it's about one</dd>
-        <dt><code>alert.id</code>, <code>alert.agent_id</code></dt><dd>For a receiver that needs to match the alert up later</dd>
+        <dt><code>alert.id</code>, <code>alert.host_id</code></dt><dd>For a receiver that needs to match the alert up later</dd>
         <dt><code>alert.started</code>, <code>alert.resolved</code></dt><dd>Times like <code>2026-11-10T14:03:00Z</code>, with <code>_ms</code> versions in milliseconds</dd>
         <dt><code>alert.acknowledged_by</code></dt><dd>Who acknowledged it, if anyone</dd>
       </dl>
@@ -165,8 +165,8 @@
 
   <fieldset class="for-email">
     <legend>Mail server</legend>
-    <label>Host
-      <input type="text" name="mail_host" value="{{ channel.mail_host }}" spellcheck="false" autocomplete="off" maxlength="253" placeholder="smtp.example.com">
+    <label>Hostname
+      <input type="text" name="mail_hostname" value="{{ channel.mail_hostname }}" spellcheck="false" autocomplete="off" maxlength="253" placeholder="smtp.example.com">
     </label>
     <label>Security
       <select name="mail_security">

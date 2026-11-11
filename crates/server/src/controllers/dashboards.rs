@@ -455,9 +455,9 @@ struct VariableForm {
 impl VariableForm {
     fn blank() -> Self {
         Self::from_variable(&Variable {
-            name: "machine".to_string(),
-            label: "Machine".to_string(),
-            kind: VariableKind::Machine,
+            name: "host".to_string(),
+            label: "Host".to_string(),
+            kind: VariableKind::Host,
             fact: String::new(),
             filter: String::new(),
         })

@@ -212,7 +212,7 @@
     const siteById = (id) => data.sites.find((site) => site.rule_id === id);
 
     // Sites too close to tell apart at this zoom are drawn as one, where their
-    // machines are on average. A selected site always stands on its own.
+    // hosts are on average. A selected site always stands on its own.
     function cluster(map, u) {
       const found = [];
       const order = [...data.sites].sort((a, b) => total(b) - total(a));
@@ -253,8 +253,8 @@
           role: "button",
         });
         marker.setAttribute("aria-label", merged
-          ? `${group.members.length} sites with ${group.total} machines`
-          : `${site.name}, ${total(site)} machines`);
+          ? `${group.members.length} sites with ${group.total} hosts`
+          : `${site.name}, ${total(site)} hosts`);
         const ring = svgEl("circle", { class: "map-ring", r: group.r + 3.5 * u, "stroke-width": 2 * u });
         const dot = svgEl("circle", { class: "map-fill", r: group.r, "stroke-width": 2 * u });
         marker.append(ring, dot);
@@ -282,20 +282,20 @@
       if (chosen) showTip(map, chosen);
     }
 
-    function machineLine(machine) {
+    function hostLine(host) {
       const line = htmlEl("li");
-      line.append(htmlEl("span", `map-dot ${machine.health}`), htmlEl("span", "", machine.host), htmlEl("span", "agent-id", machine.short_id));
+      line.append(htmlEl("span", `map-dot ${host.health}`), htmlEl("span", "", host.hostname), htmlEl("span", "host-id", host.short_id));
       return line;
     }
 
     function showTip(map, group) {
       tooltip.replaceChildren();
       if (group.members.length > 1) {
-        tooltip.append(htmlEl("h3", "", `${group.members.length} sites close together`), htmlEl("p", "", `${group.total} machines`));
+        tooltip.append(htmlEl("h3", "", `${group.members.length} sites close together`), htmlEl("p", "", `${group.total} hosts`));
         const list = htmlEl("ul");
         for (const site of group.members) {
           const line = htmlEl("li");
-          line.append(htmlEl("span", `map-dot ${site.health}`), htmlEl("span", "", site.name), htmlEl("span", "agent-id", String(total(site))));
+          line.append(htmlEl("span", `map-dot ${site.health}`), htmlEl("span", "", site.name), htmlEl("span", "host-id", String(total(site))));
           list.append(line);
         }
         tooltip.append(list, htmlEl("p", "map-tip-hint", "Click to zoom in."));
@@ -305,9 +305,9 @@
         tooltip.append(htmlEl("h3", "", site.name), htmlEl("p", "", counts));
         if (site.place) tooltip.append(htmlEl("p", "map-tip-place", site.place));
         const list = htmlEl("ul");
-        for (const machine of site.machines.slice(0, 6)) list.append(machineLine(machine));
+        for (const host of site.hosts.slice(0, 6)) list.append(hostLine(host));
         tooltip.append(list);
-        if (site.machines.length > 6) tooltip.append(htmlEl("p", "map-tip-hint", `and ${site.machines.length - 6} more`));
+        if (site.hosts.length > 6) tooltip.append(htmlEl("p", "map-tip-hint", `and ${site.hosts.length - 6} more`));
       }
       tooltip.hidden = false;
       const [sx, sy] = map.toScreen(group.x, group.y);
@@ -538,7 +538,7 @@
 
     loadWorld(picker.dataset.world)
       .then((world) => {
-        map = createMap(picker, world, "A map of the world for picking where these machines are", drawPin);
+        map = createMap(picker, world, "A map of the world for picking where these hosts are", drawPin);
         map.svg.classList.add("picking");
         map.onClick = async (clientX, clientY) => {
           const at = map.pointAt(clientX, clientY);

@@ -280,7 +280,7 @@ mod tests {
             file.set_modified(later).unwrap();
         }
 
-        // However long a busy machine takes to notice.
+        // However long a busy host takes to notice.
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             let new = new.clone();

@@ -33,7 +33,7 @@ pub struct Options {
     )]
     pub api_key: String,
 
-    /// Allow a server that isn't on this machine
+    /// Allow a server that isn't on this host
     #[arg(long, help_heading = "Server")]
     pub yes: bool,
 
@@ -201,9 +201,9 @@ impl Options {
                 bail!("{name} is a percentage, from 0 to 100");
             }
         }
-        if !self.yes && !is_this_machine(&self.url) {
+        if !self.yes && !is_this_host(&self.url) {
             bail!(
-                "{} isn't on this machine. Simulated agents are approved and saved like real \
+                "{} isn't on this host. Simulated agents are approved and saved like real \
                  ones, so use a test server, and add --yes to go ahead",
                 self.url
             );
@@ -260,14 +260,14 @@ impl Options {
     }
 }
 
-fn is_this_machine(url: &str) -> bool {
+fn is_this_host(url: &str) -> bool {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let host = rest.split(['/', '?']).next().unwrap_or_default();
-    let host = match host.strip_prefix('[') {
+    let hostname = rest.split(['/', '?']).next().unwrap_or_default();
+    let hostname = match hostname.strip_prefix('[') {
         Some(ipv6) => ipv6.split(']').next().unwrap_or_default(),
-        None => host.split(':').next().unwrap_or_default(),
+        None => hostname.split(':').next().unwrap_or_default(),
     };
-    matches!(host, "localhost" | "127.0.0.1" | "::1")
+    matches!(hostname, "localhost" | "127.0.0.1" | "::1")
 }
 
 #[cfg(test)]
@@ -314,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn another_machine_has_to_be_confirmed() {
+    fn another_host_has_to_be_confirmed() {
         assert!(options("--url ws://127.0.0.1:9000/ws").check().is_ok());
         assert!(options("--url ws://localhost/ws").check().is_ok());
         assert!(options("--url ws://[::1]:9000/ws").check().is_ok());
@@ -324,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn looking_like_this_machine_is_not_enough() {
+    fn looking_like_this_host_is_not_enough() {
         let error = options("--url ws://localhost.example.com/ws").check();
         assert!(error.is_err());
     }

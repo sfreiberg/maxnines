@@ -103,8 +103,8 @@ h2 { margin: 0 0 12px; font-size: 17px; font-weight: 600; letter-spacing: -0.01e
 main > .breadcrumb { margin-bottom: -12px; }
 .hint, .empty { margin: 0; color: var(--muted); }
 .note { margin: 0; color: var(--muted); font-size: 13px; }
-/* The start of an agent's ID, which tells machines with the same name apart. */
-.agent-id { color: var(--muted); font-family: var(--mono); font-size: 12px; font-weight: 400; }
+/* The start of a host's ID, which tells hosts with the same name apart. */
+.host-id { color: var(--muted); font-family: var(--mono); font-size: 12px; font-weight: 400; }
 /* A name with its system's icon in front. */
 .host-name { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
 /* Logos are masks, so they take the theme's colour whatever colour they came in. */
@@ -152,7 +152,7 @@ a.stats-cell:hover { background: var(--raised); color: var(--text); }
 .badge.bad { background: var(--bad-surface); color: var(--bad); }
 .badge.warn { background: var(--warn-surface); color: var(--warn); }
 .badge.neutral { background: var(--neutral-surface); color: var(--muted); }
-/* Online and offline in lists of agents, where the dot says enough: the same pill
+/* Online and offline in lists of hosts, where the dot says enough: the same pill
    without its word, as tall as one with a word. */
 .badge.dot-only { min-height: calc(1lh + 6px); }
 
@@ -347,7 +347,7 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 /* Each moment's lowest to highest value, behind the lines, so spikes show on long ranges. */
 .chart .band { fill-opacity: 0.18; stroke: none; }
 .chart .whisker { stroke-width: 2; stroke-opacity: 0.35; stroke-linecap: round; }
-/* What happened to the machine: a line behind the data, and a dot on top to hover. */
+/* What happened to the host: a line behind the data, and a dot on top to hover. */
 .chart .event-line { stroke-width: 1; stroke-dasharray: 3 3; stroke: var(--muted); }
 .chart .event-dot { fill: var(--muted); stroke: var(--surface); stroke-width: 1.5; }
 .chart .event-line.k-deploy { stroke: var(--accent); } .chart .event-dot.k-deploy { fill: var(--accent); }
@@ -440,7 +440,7 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .map-site[aria-current="true"] { border-color: var(--border-strong); background: var(--raised); }
 .map-site .map-dot { align-self: center; }
 .map-site .name { min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
-.map-site .machines { color: var(--muted); font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; }
+.map-site .hosts { color: var(--muted); font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; }
 .map-site .detail { grid-column: 2 / 4; color: var(--muted); font-size: 13px; }
 .map-site .place { grid-column: 2 / 4; color: var(--muted); font-family: var(--mono); font-size: 11.5px; }
 .map-empty { padding: 14px 16px; }
@@ -536,7 +536,7 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
   .summary { grid-template-columns: minmax(0, 1fr); gap: 2px; }
   .summary dt { overflow-wrap: anywhere; }
   .summary dd + dt { margin-top: 10px; }
-  /* What changes matters most, so each agent stacks rather than scrolling it away. */
+  /* What changes matters most, so each host stacks rather than scrolling it away. */
   .preview thead { display: none; }
   .preview tbody { display: block; }
   .preview tr { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
@@ -545,7 +545,7 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
   .preview td:last-child { grid-column: 1 / -1; }
 }
 
-/* An offline rule has no metric to choose, and a calculation picks its machines with
+/* An offline rule has no metric to choose, and a calculation picks its hosts with
    a filter rather than a condition. Without :has() the fields just stay. */
 .alert-rule:has(select[name="kind"] option[value="offline"]:checked) .metric-fields { display: none; }
 .alert-rule:has(select[name="kind"] option[value="calculation"]:checked) .applies-to { display: none; }
@@ -578,7 +578,7 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .variables dt { margin-top: 0.5rem; }
 .variables dd { margin: 0.125rem 0 0; color: var(--muted); }
 
-/* Quieting a machine from its page: the choices on one line where there's room. */
+/* Quieting a host from its page: the choices on one line where there's room. */
 .maintenance-form { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: flex-end; }
 .maintenance-form label { flex: 1 1 12rem; margin: 0; }
 .events { margin-top: 1.5rem; }

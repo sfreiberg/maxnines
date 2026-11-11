@@ -29,6 +29,6 @@ JSON. Run `maxnines-loadtest --help` for everything that can be adjusted, includ
 | `--hot-agents` | Percent of agents at 99% CPU, to set off alert rules you've made |
 | `--viewers`, `--page-every` | People loading pages during the test |
 
-Each simulated agent takes a connection on the machine running the test, so run it
-from a separate machine to keep it from competing with the server. One address can
+Each simulated agent takes a connection on the host running the test, so run it
+from a separate host to keep it from competing with the server. One address can
 only make about 28,000 connections to a server.

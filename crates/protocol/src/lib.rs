@@ -41,7 +41,7 @@ pub const COLLECTORS: [&str; 18] = [
 /// How many things one collector can be told to watch.
 const MAX_WATCHED: usize = 64;
 
-/// A machine rarely runs more than a few web servers or PHP pools, and each page
+/// A host rarely runs more than a few web servers or PHP pools, and each page
 /// is a request every round.
 const MAX_STATUS_PAGES: usize = 16;
 
@@ -180,7 +180,7 @@ pub struct CollectorSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mount_points: Option<Vec<String>>,
     /// Processes, services, custom and counters collectors only: the names to watch.
-    /// Nothing else about what's running on a machine is reported. For custom metrics
+    /// Nothing else about what's running on a host is reported. For custom metrics
     /// these pick from what the agent's own config defines, and for counters they're
     /// Windows performance counter paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -210,7 +210,7 @@ pub fn default_status_page(collector: &str) -> Option<&'static str> {
 
 /// A status page has to be a plain web address. A username or password in it
 /// would show up on every page that lists the setting, so those are refused, and
-/// status pages are normally limited to the machine itself anyway.
+/// status pages are normally limited to the host itself anyway.
 fn check_status_page(url: &str) -> Result<()> {
     let rest = url
         .strip_prefix("http://")
@@ -229,7 +229,7 @@ fn check_status_page(url: &str) -> Result<()> {
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     ensure!(
         !authority.is_empty(),
-        "the status page {url:?} needs a host name"
+        "the status page {url:?} needs a hostname"
     );
     ensure!(
         !authority.contains('@'),
@@ -308,7 +308,7 @@ impl CheckKind {
 
 /// A Windows performance counter, by its English path, like
 /// `\Processor(_Total)\% Processor Time` or `\PhysicalDisk(*)\Disk Reads/sec`. It's
-/// only ever read, and only on the machine itself, so a path naming another computer,
+/// only ever read, and only on the host itself, so a path naming another computer,
 /// starting `\\computer`, isn't one.
 pub fn is_counter_path(path: &str) -> bool {
     let Some(rest) = path.strip_prefix('\\') else {
@@ -340,9 +340,9 @@ fn is_plain_name(name: &str, extra: &str) -> bool {
 }
 
 fn has_port(target: &str) -> bool {
-    target
-        .rsplit_once(':')
-        .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0))
+    target.rsplit_once(':').is_some_and(|(hostname, port)| {
+        !hostname.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0)
+    })
 }
 
 impl Check {
@@ -389,7 +389,7 @@ impl Check {
             ),
             CheckKind::Dns | CheckKind::Ping => ensure!(
                 is_plain_name(target, ":"),
-                "check {name:?} needs a host name as its target"
+                "check {name:?} needs a hostname as its target"
             ),
         }
         self.validate_options()
@@ -613,7 +613,7 @@ pub struct Sample {
 pub enum AgentMessage {
     /// The answer to [`ServerMessage::Challenge`].
     Hello {
-        host: String,
+        hostname: String,
         /// Hex-encoded Ed25519 public key.
         public_key: String,
         /// Hex-encoded signature, see [`auth`].
@@ -623,7 +623,7 @@ pub enum AgentMessage {
         token: Option<String>,
     },
     Sample(Sample),
-    /// What the agent reports about its machine, as a JSON object. The server
+    /// What the agent reports about its host, as a JSON object. The server
     /// doesn't interpret it, so new facts need no server change. Sent on every
     /// connection and then regularly, and the server keeps what changed.
     Facts {
@@ -1071,7 +1071,7 @@ mod tests {
     fn agent_messages_survive_a_json_round_trip() {
         let messages = [
             AgentMessage::Hello {
-                host: "web-1".to_string(),
+                hostname: "web-1".to_string(),
                 public_key: "ab".to_string(),
                 signature: "cd".to_string(),
                 token: Some("secret".to_string()),

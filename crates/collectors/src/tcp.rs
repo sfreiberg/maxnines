@@ -1,4 +1,4 @@
-//! How many TCP connections a machine has, in the states that matter: established,
+//! How many TCP connections a host has, in the states that matter: established,
 //! listening, and the two that pile up when something goes wrong. Thousands in
 //! `TIME_WAIT` can use up the ports for new connections, and connections in
 //! `CLOSE_WAIT` are ones a program never closed, which is usually a leak.
@@ -248,7 +248,7 @@ tcp4       0      0  127.0.0.1.60004        127.0.0.1.5432         SYN_SENT
     }
 
     #[test]
-    fn a_machine_that_can_not_say_reports_nothing_rather_than_zero() {
+    fn a_host_that_can_not_say_reports_nothing_rather_than_zero() {
         let report = TcpStates::report(None);
         assert!(report.iter().all(|(_, value)| value.is_null()));
         let report = TcpStates::report(Some(TcpStates {
@@ -260,7 +260,7 @@ tcp4       0      0  127.0.0.1.60004        127.0.0.1.5432         SYN_SENT
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[tokio::test]
-    async fn this_machine_counts_its_connections() {
+    async fn this_host_counts_its_connections() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let states = tcp_states().await.unwrap();
         assert!(states.listening >= 1, "{states:?}");

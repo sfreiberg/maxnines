@@ -1,6 +1,6 @@
-//! Whether a machine is waiting to be restarted, and how many updates it has waiting,
+//! Whether a host is waiting to be restarted, and how many updates it has waiting,
 //! as its own package manager sees them. Nothing here reaches out to the internet: the
-//! package lists are whatever the machine last fetched on its own schedule.
+//! package lists are whatever the host last fetched on its own schedule.
 //!
 //! Each is left out where a system can't say: macOS has no flag for a restart, and the
 //! update counts of Windows and macOS need their own services, so they're left out for

@@ -492,12 +492,12 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
                 id: rule.id,
                 watches: rule.rule.describe(),
                 applies_to: match (rule.rule.kind, rule.rule.condition.as_deref()) {
-                    // A calculation picks its machines with a filter, not a condition.
+                    // A calculation picks its hosts with a filter, not a condition.
                     (RuleKind::Calculation, _) => match rule.rule.filter.as_deref() {
-                        None | Some("") => "Every machine".to_string(),
+                        None | Some("") => "Every host".to_string(),
                         Some(filter) => filter.to_string(),
                     },
-                    (_, None) => "Every machine".to_string(),
+                    (_, None) => "Every host".to_string(),
                     (_, Some(condition)) => Builder::from_expression(condition)
                         .map_or_else(|| condition.to_string(), |builder| builder.describe()),
                 },

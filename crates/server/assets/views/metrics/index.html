@@ -4,32 +4,32 @@
 <div>
   <p class="eyebrow">Latest samples</p>
   <h1>Metrics</h1>
-  <p class="subtitle">Current values from each machine. Choose one to see its charts.</p>
+  <p class="subtitle">Current values from each host. Choose one to see its charts.</p>
 </div>
-{% set metrics_tab = "machines" %}{% include "metrics/_tabs.html" %}
-{% include "agents/_filter.html" %}
-{% if agents %}
+{% set metrics_tab = "hosts" %}{% include "metrics/_tabs.html" %}
+{% include "hosts/_filter.html" %}
+{% if hosts %}
 <div class="tablebox"><table>
   <thead>
-    <tr><th>Machine</th><th>Status</th><th>CPU</th><th>Memory</th><th>Fullest disk</th><th>Last sample</th></tr>
+    <tr><th>Host</th><th>Status</th><th>CPU</th><th>Memory</th><th>Fullest disk</th><th>Last sample</th></tr>
   </thead>
   <tbody>
-    {% for agent in agents %}
+    {% for host in hosts %}
     <tr>
-      {% set os_family = agent.os_family %}<td><span class="host-name">{% include "agents/_os_icon.html" %}<a href="/agents/{{ agent.id }}/metrics">{{ agent.host }}</a> <span class="agent-id">{{ agent.short_id }}</span></span></td>
-      <td>{% include "agents/_health.html" %}</td>
-      <td>{% if agent.cpu %}<span class="meters single"><svg class="meter" aria-hidden="true"><rect class="track" width="100%" height="7" rx="3.5"/><rect class="fill" width="{{ agent.cpu.width }}%" height="7" rx="3.5"/></svg><span class="value">{{ agent.cpu.text }}</span></span>{% else %}–{% endif %}</td>
-      <td>{% if agent.memory %}<span class="meters single"><svg class="meter" aria-hidden="true"><rect class="track" width="100%" height="7" rx="3.5"/><rect class="fill" width="{{ agent.memory.width }}%" height="7" rx="3.5"/></svg><span class="value">{{ agent.memory.text }}</span></span>{% else %}–{% endif %}</td>
-      <td>{% if agent.disk %}<span class="meters single"><svg class="meter" aria-hidden="true"><rect class="track" width="100%" height="7" rx="3.5"/><rect class="fill{% if agent.disk_is_full %} hot{% endif %}" width="{{ agent.disk.width }}%" height="7" rx="3.5"/></svg><span class="value">{{ agent.disk.text }}</span></span><span class="note">{{ agent.disk_mount_point }}</span>{% else %}–{% endif %}</td>
-      <td>{% if agent.updated %}{{ agent.updated }}{% else %}<span class="hint">None in the last 5 minutes</span>{% endif %}</td>
+      {% set os_family = host.os_family %}<td><span class="host-name">{% include "hosts/_os_icon.html" %}<a href="/hosts/{{ host.id }}/metrics">{{ host.hostname }}</a> <span class="host-id">{{ host.short_id }}</span></span></td>
+      <td>{% include "hosts/_health.html" %}</td>
+      <td>{% if host.cpu %}<span class="meters single"><svg class="meter" aria-hidden="true"><rect class="track" width="100%" height="7" rx="3.5"/><rect class="fill" width="{{ host.cpu.width }}%" height="7" rx="3.5"/></svg><span class="value">{{ host.cpu.text }}</span></span>{% else %}–{% endif %}</td>
+      <td>{% if host.memory %}<span class="meters single"><svg class="meter" aria-hidden="true"><rect class="track" width="100%" height="7" rx="3.5"/><rect class="fill" width="{{ host.memory.width }}%" height="7" rx="3.5"/></svg><span class="value">{{ host.memory.text }}</span></span>{% else %}–{% endif %}</td>
+      <td>{% if host.disk %}<span class="meters single"><svg class="meter" aria-hidden="true"><rect class="track" width="100%" height="7" rx="3.5"/><rect class="fill{% if host.disk_is_full %} hot{% endif %}" width="{{ host.disk.width }}%" height="7" rx="3.5"/></svg><span class="value">{{ host.disk.text }}</span></span><span class="note">{{ host.disk_mount_point }}</span>{% else %}–{% endif %}</td>
+      <td>{% if host.updated %}{{ host.updated }}{% else %}<span class="hint">None in the last 5 minutes</span>{% endif %}</td>
     </tr>
     {% endfor %}
   </tbody>
 </table></div>
-{% include "agents/_pages.html" %}
+{% include "hosts/_pages.html" %}
 {% elif search.text %}
-<p class="empty">No machines match this filter.</p>
+<p class="empty">No hosts match this filter.</p>
 {% else %}
-<p class="empty">There are no approved agents yet.</p>
+<p class="empty">There are no approved hosts yet.</p>
 {% endif %}
 {% endblock content %}

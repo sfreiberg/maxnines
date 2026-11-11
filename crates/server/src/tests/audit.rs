@@ -4,7 +4,7 @@ use super::*;
 use crate::alerting::{ChannelInput, ChannelKind, every_severity};
 use crate::audit::{self, Acting, Actor, Entry, HIDDEN};
 use crate::locations::LocationRuleInput;
-use crate::registration::AgentRecord;
+use crate::registration::HostRecord;
 
 const PASSWORD: &str = "a long enough password";
 
@@ -361,15 +361,15 @@ async fn changes_with_nobody_acting_are_maxnines_own() {
 #[tokio::test]
 async fn approving_an_agent_records_its_state_changing() {
     let server = start().await;
-    let agent = identity();
+    let host = identity();
     let mut client = server.connect().await;
     assert_eq!(
-        handshake(&mut client, &agent, "web-1", None).await,
+        handshake(&mut client, &host, "web-1", None).await,
         RegistrationStatus::Pending
     );
     let before = mark(&server).await;
 
-    let path = format!("/api/v1/agents/{}/approve", agent.id());
+    let path = format!("/api/v1/hosts/{}/approve", host.id());
     assert_eq!(api_from(&server, "127.0.0.1", "POST", &path, "").await, 200);
 
     let entries = since(&server, before).await;
@@ -377,8 +377,8 @@ async fn approving_an_agent_records_its_state_changing() {
     let entry = &entries[0];
     assert_eq!(entry.actor.name, "test@example.com");
     assert_eq!(entry.via.as_ref().unwrap().kind, "api_key");
-    assert_eq!(entry.subject.kind, "agent");
-    assert_eq!(entry.subject.id, Some(agent.id()));
+    assert_eq!(entry.subject.kind, "host");
+    assert_eq!(entry.subject.id, Some(host.id()));
     assert_eq!(entry.subject.name, "web-1");
     let state = entry.changes.iter().find(|c| c.field == "state").unwrap();
     assert_eq!(state.before, Some(json!("pending")));
@@ -395,18 +395,18 @@ async fn approving_an_agent_records_its_state_changing() {
 async fn an_agent_asking_to_join_is_recorded_as_maxnines() {
     let server = start().await;
     let before = mark(&server).await;
-    let record = AgentRecord {
+    let record = HostRecord {
         id: "ab".repeat(16),
         public_key: "cd".repeat(32),
-        host: "web-1".into(),
-        state: AgentState::Pending,
+        hostname: "web-1".into(),
+        state: HostState::Pending,
         decided_by: None,
         first_seen_ms: 0,
         decided_ms: None,
     };
 
-    server.state.database.save_agent(&record).await.unwrap();
-    server.state.database.save_agent(&record).await.unwrap();
+    server.state.database.save_host(&record).await.unwrap();
+    server.state.database.save_host(&record).await.unwrap();
 
     let entries = since(&server, before).await;
     assert_eq!(

@@ -202,8 +202,11 @@ pub fn web_url(agent_url: impl AsRef<str>) -> Option<String> {
         "ws" => "http",
         _ => return None,
     };
-    let host = rest.split('/').next().filter(|host| !host.is_empty())?;
-    Some(format!("{scheme}://{host}"))
+    let hostname = rest
+        .split('/')
+        .next()
+        .filter(|hostname| !hostname.is_empty())?;
+    Some(format!("{scheme}://{hostname}"))
 }
 
 /// Sends one notification, and gives what the service called it if that matters

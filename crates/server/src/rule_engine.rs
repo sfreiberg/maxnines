@@ -66,12 +66,12 @@ fn is_empty_map(value: &Value) -> bool {
 }
 
 /// Works out the config for one agent, given its facts in their natural shape.
-pub fn resolve(rules: &[ConfigRule], facts: &Value, agent_id: &str) -> Result<ResolvedConfig> {
+pub fn resolve(rules: &[ConfigRule], facts: &Value, host_id: &str) -> Result<ResolvedConfig> {
     let mut merged = Value::Object(Map::new());
     let mut matched_rules = Vec::new();
 
     for rule in rules {
-        if matches(&rule.rule, facts, agent_id) {
+        if matches(&rule.rule, facts, host_id) {
             merge(&mut merged, &rule.rule.settings);
             matched_rules.push(rule.rule.name.clone());
         }
@@ -91,7 +91,7 @@ pub fn resolve(rules: &[ConfigRule], facts: &Value, agent_id: &str) -> Result<Re
 
 /// A condition that can't be evaluated doesn't match. That's the normal case
 /// for a rule about a fact this agent doesn't have.
-pub fn matches(rule: &RuleInput, facts: &Value, agent_id: &str) -> bool {
+pub fn matches(rule: &RuleInput, facts: &Value, host_id: &str) -> bool {
     if !rule.enabled {
         return false;
     }
@@ -99,7 +99,7 @@ pub fn matches(rule: &RuleInput, facts: &Value, agent_id: &str) -> bool {
         return true;
     };
 
-    match evaluate(condition, facts, agent_id) {
+    match evaluate(condition, facts, host_id) {
         Ok(result) => result,
         Err(error) => {
             debug!(rule = rule.name, %error, "condition didn't match");
@@ -109,7 +109,7 @@ pub fn matches(rule: &RuleInput, facts: &Value, agent_id: &str) -> bool {
 }
 
 /// `facts` is what the agent reports. `trusted` is what the server knows itself.
-pub fn evaluate(condition: &str, facts: &Value, agent_id: &str) -> Result<bool> {
+pub fn evaluate(condition: &str, facts: &Value, host_id: &str) -> Result<bool> {
     let program = Program::compile(condition).map_err(|error| anyhow!("{error}"))?;
 
     let mut context = CelContext::default();
@@ -117,7 +117,7 @@ pub fn evaluate(condition: &str, facts: &Value, agent_id: &str) -> Result<bool> 
         .add_variable("facts", facts)
         .map_err(|error| anyhow!("{error}"))?;
     context
-        .add_variable("trusted", json!({ "agent_id": agent_id }))
+        .add_variable("trusted", json!({ "host_id": host_id }))
         .map_err(|error| anyhow!("{error}"))?;
 
     let result = program
@@ -193,7 +193,7 @@ mod tests {
     }
 
     fn resolve_for(rules: &[ConfigRule], facts: &Value) -> ResolvedConfig {
-        resolve(rules, facts, "agent-1").unwrap()
+        resolve(rules, facts, "host-1").unwrap()
     }
 
     #[test]
@@ -247,7 +247,7 @@ mod tests {
             r#""prod" in facts.custom.tags"#,
             "facts.memory.total_bytes > 500",
             r#"facts.os.family != "windows""#,
-            r#"trusted.agent_id == "agent-1""#,
+            r#"trusted.host_id == "host-1""#,
         ] {
             let rules = [
                 base(),

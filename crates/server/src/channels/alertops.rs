@@ -19,7 +19,7 @@ fn event(notice: &Notice, step: Incident, web_url: Option<&str>) -> Value {
         "subject": on_call::title(notice),
         "message": notice.text,
         "severity": on_call::severity(notice),
-        "host": on_call::host(notice),
+        "hostname": on_call::hostname(notice),
     });
     if let Some(url) = web_url {
         event["link"] = json!(alerts_link(url));

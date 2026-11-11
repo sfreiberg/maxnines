@@ -1,7 +1,7 @@
 //! Events marked on charts: annotations, recorded by people and their scripts, what the
-//! server noticed itself, and a machine's whole timeline, which adds its alerts and
+//! server noticed itself, and a host's whole timeline, which adds its alerts and
 //! updates from what's kept about them. An annotation keeps its filter, so it shows on
-//! whichever machines that picks when a chart is drawn.
+//! whichever hosts that picks when a chart is drawn.
 
 use std::collections::HashMap;
 
@@ -14,14 +14,14 @@ use sea_orm::{
 use serde_json::json;
 
 use super::audit::record_change;
-use super::{Database, agent_boot, agent_fact, alert, event, to_fact_version};
+use super::{Database, alert, event, host_boot, host_fact, to_fact_version};
 use crate::audit::{self, Kind, Snapshot};
 use crate::events::{Event, EventKind, SERVER, TimelineEvent, UPDATE_FACTS};
 use crate::host_filter;
 
-/// The most of a machine's events a timeline holds, newest first.
+/// The most of a host's events a timeline holds, newest first.
 pub const MAX_TIMELINE: u64 = 500;
-/// How many annotations in a range are looked at to find a machine's, as each one's
+/// How many annotations in a range are looked at to find a host's, as each one's
 /// filter is checked against it.
 const MAX_CANDIDATES: u64 = 10_000;
 
@@ -63,7 +63,7 @@ pub struct NewEvent<'a> {
     pub time_ms: i64,
     pub title: &'a str,
     pub detail: Option<&'a str>,
-    /// Which machines it's for, as a host filter. Empty for every machine.
+    /// Which hosts it's for, as a host filter. Empty for every host.
     pub filter: &'a str,
 }
 
@@ -92,23 +92,31 @@ impl Database {
         let transaction = self.connection.begin().await.context("saving event")?;
         let row = insert_event(&transaction, new, by, now_ms).await?;
         let after = snapshot(&row);
-        record_change(&transaction, Kind::Event, row.id, None, Some(&after), None).await?;
+        record_change(
+            &transaction,
+            Kind::Annotation,
+            row.id,
+            None,
+            Some(&after),
+            None,
+        )
+        .await?;
         transaction.commit().await.context("saving event")?;
         Ok(row.id)
     }
 
-    /// Saves something the server noticed about one machine, for that machine alone.
+    /// Saves something the server noticed about one host, for that host alone.
     /// These aren't changes anyone made, so they stay out of the audit log.
     pub async fn record_server_event(
         &self,
         kind: EventKind,
-        agent_id: &str,
+        host_id: &str,
         time_ms: i64,
         title: &str,
         detail: Option<&str>,
         now_ms: i64,
     ) -> Result<()> {
-        let filter = host_filter::only(agent_id);
+        let filter = host_filter::only(host_id);
         let new = NewEvent {
             kind,
             time_ms,
@@ -143,7 +151,15 @@ impl Database {
             .await
             .context("deleting event")?;
         let before = snapshot(&before);
-        record_change(&transaction, Kind::Event, id, Some(&before), None, None).await?;
+        record_change(
+            &transaction,
+            Kind::Annotation,
+            id,
+            Some(&before),
+            None,
+            None,
+        )
+        .await?;
         transaction.commit().await.context("deleting event")?;
         Ok(true)
     }
@@ -163,12 +179,12 @@ impl Database {
         Ok(rows.into_iter().map(to_event).collect())
     }
 
-    /// Everything that happened to a machine between two times, newest first: the events
+    /// Everything that happened to a host between two times, newest first: the events
     /// whose filter `picks`, its alerts starting and ending, and its agent, OS and
     /// kernel being updated.
     pub async fn timeline(
         &self,
-        agent_id: &str,
+        host_id: &str,
         from_ms: i64,
         to_ms: i64,
         picks: impl Fn(&str) -> bool,
@@ -204,7 +220,7 @@ impl Database {
                 .add(column.lt(to_ms))
         };
         let alerts = alert::Entity::find()
-            .filter(alert::Column::AgentId.eq(agent_id))
+            .filter(alert::Column::HostId.eq(host_id))
             .filter(
                 Condition::any()
                     .add(in_range(alert::Column::StartedMs))
@@ -214,7 +230,7 @@ impl Database {
             .limit(MAX_TIMELINE)
             .all(&self.connection)
             .await
-            .context("loading a machine's alerts")?;
+            .context("loading a host's alerts")?;
         for row in alerts {
             let title = format!("{} ({})", row.rule_name, row.severity);
             if (from_ms..to_ms).contains(&row.started_ms) {
@@ -244,14 +260,14 @@ impl Database {
 
         // A version is an update only if one came before it.
         let names: Vec<&str> = UPDATE_FACTS.iter().map(|(name, _)| *name).collect();
-        let rows = agent_fact::Entity::find()
-            .filter(agent_fact::Column::AgentId.eq(agent_id))
-            .filter(agent_fact::Column::Name.is_in(names))
-            .filter(agent_fact::Column::ValidFromMs.lt(to_ms))
-            .order_by_asc(agent_fact::Column::ValidFromMs)
+        let rows = host_fact::Entity::find()
+            .filter(host_fact::Column::HostId.eq(host_id))
+            .filter(host_fact::Column::Name.is_in(names))
+            .filter(host_fact::Column::ValidFromMs.lt(to_ms))
+            .order_by_asc(host_fact::Column::ValidFromMs)
             .all(&self.connection)
             .await
-            .context("loading a machine's updates")?;
+            .context("loading a host's updates")?;
         let mut before: HashMap<String, serde_json::Value> = HashMap::new();
         for row in rows {
             let version = to_fact_version(row)?;
@@ -281,19 +297,19 @@ impl Database {
         Ok(timeline)
     }
 
-    /// When a machine last started, as far as the server knows.
-    pub async fn boot_time(&self, agent_id: &str) -> Result<Option<i64>> {
-        let row = agent_boot::Entity::find_by_id(agent_id)
+    /// When a host last started, as far as the server knows.
+    pub async fn boot_time(&self, host_id: &str) -> Result<Option<i64>> {
+        let row = host_boot::Entity::find_by_id(host_id)
             .one(&self.connection)
             .await
             .context("loading a boot time")?;
         Ok(row.map(|row| row.boot_ms))
     }
 
-    /// Notes when a machine started, and marks a restart if it had started before.
+    /// Notes when a host started, and marks a restart if it had started before.
     pub async fn save_boot_time(
         &self,
-        agent_id: &str,
+        host_id: &str,
         boot_ms: i64,
         restarted: bool,
         now_ms: i64,
@@ -303,25 +319,25 @@ impl Database {
             .begin()
             .await
             .context("saving a boot time")?;
-        let row = agent_boot::ActiveModel {
-            agent_id: Set(agent_id.to_string()),
+        let row = host_boot::ActiveModel {
+            host_id: Set(host_id.to_string()),
             boot_ms: Set(boot_ms),
         };
-        agent_boot::Entity::insert(row)
+        host_boot::Entity::insert(row)
             .on_conflict(
-                OnConflict::column(agent_boot::Column::AgentId)
-                    .update_column(agent_boot::Column::BootMs)
+                OnConflict::column(host_boot::Column::HostId)
+                    .update_column(host_boot::Column::BootMs)
                     .to_owned(),
             )
             .exec_without_returning(&transaction)
             .await
             .context("saving a boot time")?;
         if restarted {
-            let filter = host_filter::only(agent_id);
+            let filter = host_filter::only(host_id);
             let new = NewEvent {
                 kind: EventKind::Restart,
                 time_ms: boot_ms,
-                title: "Machine started",
+                title: "Host started",
                 detail: None,
                 filter: &filter,
             };
@@ -332,20 +348,20 @@ impl Database {
     }
 }
 
-/// Forgets what was recorded about one machine alone, and when it started, as part of
-/// deleting it. Events for many machines stay.
-pub(super) async fn delete_agent_events<C: ConnectionTrait>(
+/// Forgets what was recorded about one host alone, and when it started, as part of
+/// deleting it. Events for many hosts stay.
+pub(super) async fn delete_host_events<C: ConnectionTrait>(
     connection: &C,
-    agent_id: &str,
+    host_id: &str,
 ) -> Result<()> {
     event::Entity::delete_many()
-        .filter(event::Column::Filter.eq(host_filter::only(agent_id)))
+        .filter(event::Column::Filter.eq(host_filter::only(host_id)))
         .exec(connection)
         .await
-        .context("deleting an agent's events")?;
-    agent_boot::Entity::delete_by_id(agent_id)
+        .context("deleting a host's events")?;
+    host_boot::Entity::delete_by_id(host_id)
         .exec(connection)
         .await
-        .context("deleting an agent's boot time")?;
+        .context("deleting a host's boot time")?;
     Ok(())
 }

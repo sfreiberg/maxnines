@@ -12,7 +12,7 @@ use crate::metrics::{METRICS, Source};
 /// stop one agent filling the database or the server's memory.
 pub const MAX_NAME_BYTES: usize = 512;
 pub const MAX_TEXT_BYTES: usize = 2048;
-pub const MAX_SERIES_PER_AGENT: usize = 100_000;
+pub const MAX_SERIES_PER_HOST: usize = 100_000;
 
 pub fn labels_key(labels: &[(String, String)]) -> String {
     let mut key = String::new();

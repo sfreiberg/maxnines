@@ -18,10 +18,10 @@ use crate::models::{Database, NewEvent, RuleInput};
 use crate::notifier::Senders;
 use crate::passwords::SignInThrottle;
 use crate::presence::Presence;
-use crate::registration::{AgentState, Registry};
+use crate::registration::{HostState, Registry};
 use crate::remote_checks::{self, LatestResults, RemoteCheckInput};
 use crate::rule_engine::{self, ResolvedConfig};
-use crate::rule_preview::{self, Preview, PreviewAgent};
+use crate::rule_preview::{self, Preview, PreviewHost};
 use crate::server_stats::ServerStatus;
 use crate::silences::{self, SilenceInput};
 use crate::store::{self, WriterCommand};
@@ -29,9 +29,9 @@ use crate::views::Views;
 
 /// What came of deleting an agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentDeletion {
+pub enum HostDeletion {
     Deleted,
-    NoSuchAgent,
+    NoSuchHost,
     /// Only a revoked agent can be deleted, so it always takes two steps, and one
     /// that's sending can't be deleted halfway through a report.
     NotRevoked,
@@ -86,7 +86,7 @@ pub enum EventRefusal {
 
 impl AppState {
     /// Records an annotation, as `by`. Its filter is kept as it is, and matched against each
-    /// machine when a chart is drawn, so one that picks nothing yet is fine.
+    /// host when a chart is drawn, so one that picks nothing yet is fine.
     pub async fn record_event(
         &self,
         mut input: EventInput,
@@ -109,47 +109,45 @@ impl AppState {
             .map_err(EventRefusal::Failed)
     }
 
-    /// Everything that happened to a machine between two times, newest first, with the
+    /// Everything that happened to a host between two times, newest first, with the
     /// annotations whose filters pick it by its current facts.
     pub async fn timeline(
         &self,
-        agent_id: &str,
+        host_id: &str,
         from_ms: i64,
         to_ms: i64,
     ) -> Result<Vec<TimelineEvent>> {
-        let host = self
+        let hostname = self
             .registry
-            .get(agent_id)
+            .get(host_id)
             .await
-            .map(|agent| agent.host)
+            .map(|host| host.hostname)
             .unwrap_or_default();
-        let facts = self.database.facts_of(&[agent_id]).await?;
-        let facts = facts.get(agent_id);
+        let facts = self.database.facts_of(&[host_id]).await?;
+        let facts = facts.get(host_id);
         let picks = |filter: &str| {
-            HostFilter::parse(filter).is_ok_and(|filter| filter.matches(agent_id, &host, facts))
+            HostFilter::parse(filter).is_ok_and(|filter| filter.matches(host_id, &hostname, facts))
         };
-        self.database
-            .timeline(agent_id, from_ms, to_ms, picks)
-            .await
+        self.database.timeline(host_id, from_ms, to_ms, picks).await
     }
 
     /// Deletes a revoked agent and everything kept about it. Metrics go first: if
     /// anything fails, the agent is still listed, revoked, to try again.
-    pub async fn delete_agent(&self, id: &str) -> Result<AgentDeletion> {
+    pub async fn delete_host(&self, id: &str) -> Result<HostDeletion> {
         match self.registry.get(id).await {
-            None => return Ok(AgentDeletion::NoSuchAgent),
-            Some(agent) if agent.is_local() => return Ok(AgentDeletion::NoSuchAgent),
-            Some(agent) if agent.state != AgentState::Revoked => {
-                return Ok(AgentDeletion::NotRevoked);
+            None => return Ok(HostDeletion::NoSuchHost),
+            Some(host) if host.is_local() => return Ok(HostDeletion::NoSuchHost),
+            Some(host) if host.state != HostState::Revoked => {
+                return Ok(HostDeletion::NotRevoked);
             }
             Some(_) => {}
         }
-        store::delete_agent(&self.writer, id).await?;
-        self.database.delete_agent(id).await?;
+        store::delete_host(&self.writer, id).await?;
+        self.database.delete_host(id).await?;
         self.registry.forget(id).await;
         self.presence.forget(id);
-        tracing::info!(agent = id, "deleted an agent and its metrics");
-        Ok(AgentDeletion::Deleted)
+        tracing::info!(host_id = id, "deleted a host and its metrics");
+        Ok(HostDeletion::Deleted)
     }
 
     /// Works out what an agent should be running right now.
@@ -162,16 +160,16 @@ impl AppState {
         }
     }
 
-    pub async fn config_for(&self, agent_id: &str) -> Result<ResolvedConfig> {
+    pub async fn config_for(&self, host_id: &str) -> Result<ResolvedConfig> {
         let rules = self.database.list_rules().await?;
         let facts: FlatFacts = self
             .database
-            .current_facts(agent_id)
+            .current_facts(host_id)
             .await?
             .into_iter()
             .map(|fact| (fact.name, fact.value))
             .collect();
-        rule_engine::resolve(&rules, &unflatten(&facts), agent_id)
+        rule_engine::resolve(&rules, &unflatten(&facts), host_id)
     }
 
     /// Works out what saving `rule` would do, without saving it. `id` is the
@@ -179,22 +177,22 @@ impl AppState {
     pub async fn preview_rule(&self, id: Option<i64>, rule: RuleInput) -> Result<Preview> {
         let rules = self.database.list_rules().await?;
         let mut facts = self.database.all_current_facts().await?;
-        let agents: Vec<PreviewAgent> = self
+        let hosts: Vec<PreviewHost> = self
             .registry
             .list()
             .await
             .into_iter()
-            .filter(|agent| agent.state == AgentState::Approved && !agent.is_local())
-            .map(|agent| PreviewAgent {
-                online: self.presence.get(&agent.id).is_some_and(|p| p.online),
-                facts: unflatten(&facts.remove(&agent.id).unwrap_or_default()),
-                id: agent.id,
-                host: agent.host,
+            .filter(|host| host.state == HostState::Approved && !host.is_local())
+            .map(|host| PreviewHost {
+                online: self.presence.get(&host.id).is_some_and(|p| p.online),
+                facts: unflatten(&facts.remove(&host.id).unwrap_or_default()),
+                id: host.id,
+                hostname: host.hostname,
             })
             .collect();
 
         // Evaluating every agent can take a while, and a panic stays in here.
-        tokio::task::spawn_blocking(move || rule_preview::preview(&rules, id, &rule, &agents))
+        tokio::task::spawn_blocking(move || rule_preview::preview(&rules, id, &rule, &hosts))
             .await
             .context("working out the preview")
     }

@@ -25,7 +25,7 @@ use windows_service::{define_windows_service, service_dispatcher};
 use crate::{logging, stopping};
 
 /// How long saving everything can take before Windows thinks something's wrong, which
-/// also applies while the machine shuts down.
+/// also applies while the host shuts down.
 const TIME_TO_STOP: Duration = Duration::from_secs(60);
 
 /// Long enough that a config mistake doesn't fill the log, and a server that's starting
@@ -38,7 +38,7 @@ const NEEDS_ADMIN: &str = "reaching the Windows service manager, which needs an 
 
 #[derive(Debug, PartialEq, Subcommand)]
 pub enum ServiceCommand {
-    /// Install the Windows service, which starts with the machine
+    /// Install the Windows service, which starts with the host
     Install,
     /// Stop and remove the Windows service, leaving the config and data in place
     Uninstall,
@@ -174,7 +174,7 @@ fn service_status(
     }
 }
 
-/// Registers this program to start with the machine, restarting if it fails.
+/// Registers this program to start with the host, restarting if it fails.
 pub fn install(service: &Service, config: &Path) -> Result<()> {
     let config = std::path::absolute(config).context("finding the config file")?;
     let manager =

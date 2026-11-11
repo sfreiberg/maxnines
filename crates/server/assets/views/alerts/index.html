@@ -20,7 +20,7 @@
   <div class="problem">
     {% if alert.severity == "critical" %}<span class="badge bad">Critical</span>{% else %}<span class="badge warn">Warning</span>{% endif %}
     <span class="text">{{ alert.summary }}<br><span class="note">{{ alert.rule_name }} · started {{ alert.started }}{% if alert.silenced_until %} · silenced until {{ alert.silenced_until }}{% endif %}{% if alert.acknowledged_by %} · acknowledged by {{ alert.acknowledged_by }}{% endif %}</span></span>
-    {% if alert.agent_id != "fleet" %}{% set os_family = alert.os_family %}<a class="button secondary host-button" href="/agents/{{ alert.agent_id }}{% if alert.agent_id == "server" %}/metrics{% endif %}"{% if alert.short_id %} title="Agent {{ alert.short_id }}"{% endif %}>{% include "agents/_os_icon.html" %}{{ alert.host }}</a>{% else %}<span class="badge">{{ alert.host }}</span>{% endif %}
+    {% if alert.host_id != "fleet" %}{% set os_family = alert.os_family %}<a class="button secondary host-button" href="/hosts/{{ alert.host_id }}{% if alert.host_id == "server" %}/metrics{% endif %}"{% if alert.short_id %} title="Host {{ alert.short_id }}"{% endif %}>{% include "hosts/_os_icon.html" %}{{ alert.hostname }}</a>{% else %}<span class="badge">{{ alert.hostname }}</span>{% endif %}
     {% if alert.silenced_until %}<span class="badge neutral">Silenced</span>{% elif can_respond %}<a class="button secondary" href="{{ alert.silence_link }}">Silence</a>{% endif %}
     {% if can_respond %}
     <form method="post" action="/alerts/{{ alert.id }}/{% if alert.acknowledged_by %}unacknowledge{% else %}acknowledge{% endif %}">
@@ -52,13 +52,13 @@
 {% if resolved %}
 <div class="tablebox"><table>
   <thead>
-    <tr><th>Alert</th><th>Machine</th><th>Started</th><th>Resolved</th><th>Why</th></tr>
+    <tr><th>Alert</th><th>Host</th><th>Started</th><th>Resolved</th><th>Why</th></tr>
   </thead>
   <tbody>
     {% for alert in resolved %}
     <tr>
       <td>{{ alert.summary }}</td>
-      <td class="nowrap">{% if alert.agent_id != "fleet" %}{% set os_family = alert.os_family %}<span class="host-name">{% include "agents/_os_icon.html" %}<a href="/agents/{{ alert.agent_id }}{% if alert.agent_id == "server" %}/metrics{% endif %}"{% if alert.short_id %} title="Agent {{ alert.short_id }}"{% endif %}>{{ alert.host }}</a></span>{% else %}{{ alert.host }}{% endif %}</td>
+      <td class="nowrap">{% if alert.host_id != "fleet" %}{% set os_family = alert.os_family %}<span class="host-name">{% include "hosts/_os_icon.html" %}<a href="/hosts/{{ alert.host_id }}{% if alert.host_id == "server" %}/metrics{% endif %}"{% if alert.short_id %} title="Host {{ alert.short_id }}"{% endif %}>{{ alert.hostname }}</a></span>{% else %}{{ alert.hostname }}{% endif %}</td>
       <td>{{ alert.started }}</td>
       <td>{{ alert.resolved }}</td>
       <td>{{ alert.reason }}</td>

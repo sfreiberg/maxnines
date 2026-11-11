@@ -31,7 +31,7 @@ const MAX_HOST_LEN: usize = 255;
 const MAX_FACTS_LEN: usize = 64 * 1024;
 
 /// The most a single message from an agent can be. Facts are limited well below
-/// this, and a sample from even a large machine is a few hundred KiB, so anything
+/// this, and a sample from even a large host is a few hundred KiB, so anything
 /// bigger is a mistake or an attack, and a connection sending one is closed before
 /// the server holds the whole of it in memory.
 const MAX_MESSAGE_LEN: usize = 1024 * 1024;
@@ -90,7 +90,7 @@ pub fn client_ip(peer: IpAddr, forwarded: &str, trusted: &[IpNet]) -> IpAddr {
 
 struct Agent {
     id: String,
-    host: String,
+    hostname: String,
 }
 
 /// Marks the agent offline however the connection ends. Running on drop means
@@ -129,8 +129,8 @@ async fn handle(mut socket: WebSocket, source: IpAddr, state: AppState) {
     if connected.already_online {
         warn!(
             id = agent.id,
-            host = agent.host,
-            "agent is already online, two machines may be sharing a key"
+            hostname = agent.hostname,
+            "agent is already online, two hosts may be sharing a key"
         );
     }
     let _online = OnlineGuard {
@@ -138,10 +138,15 @@ async fn handle(mut socket: WebSocket, source: IpAddr, state: AppState) {
         id: &agent.id,
         connection: connected.connection,
     };
-    info!(id = agent.id, host = agent.host, %source, "agent online");
+    info!(id = agent.id, hostname = agent.hostname, %source, "agent online");
 
     let reason = serve(&mut socket, agent.clone(), &state, &connected.replaced).await;
-    info!(id = agent.id, host = agent.host, reason, "agent offline");
+    info!(
+        id = agent.id,
+        hostname = agent.hostname,
+        reason,
+        "agent offline"
+    );
 }
 
 /// Challenges the agent and returns it if it is approved. Anything else ends
@@ -166,7 +171,7 @@ async fn authenticate(
         bail!("expected a text message");
     };
     let AgentMessage::Hello {
-        host,
+        hostname,
         public_key,
         signature,
         token,
@@ -175,7 +180,7 @@ async fn authenticate(
         bail!("expected hello");
     };
 
-    ensure!(host.len() <= MAX_HOST_LEN, "hostname is too long");
+    ensure!(hostname.len() <= MAX_HOST_LEN, "hostname is too long");
 
     let id = match auth::verify(&public_key, &state.audience, &nonce, &signature) {
         Ok(id) => id,
@@ -190,7 +195,7 @@ async fn authenticate(
         .admit(&Admission {
             id: &id,
             public_key: &public_key,
-            host: &host,
+            hostname: &hostname,
             source,
             token: token.as_deref(),
         })
@@ -198,12 +203,12 @@ async fn authenticate(
     // Told to wait, as an agent is after any other refusal, rather than let one
     // key open connections as fast as it likes.
     if status == RegistrationStatus::Approved && !state.presence.allow_connection(&id) {
-        warn!(id, host, %source, "agent is connecting too often, telling it to wait");
+        warn!(id, hostname, %source, "agent is connecting too often, telling it to wait");
         status = RegistrationStatus::Pending;
     }
     send_status(socket, status).await?;
 
-    Ok((status == RegistrationStatus::Approved).then(|| Arc::new(Agent { id, host })))
+    Ok((status == RegistrationStatus::Approved).then(|| Arc::new(Agent { id, hostname })))
 }
 
 async fn send_status(socket: &mut WebSocket, status: RegistrationStatus) -> Result<()> {
@@ -225,7 +230,7 @@ enum Job {
         version: String,
         error: Option<String>,
     },
-    /// When the machine started, in milliseconds, as a sample said.
+    /// When the host started, in milliseconds, as a sample said.
     Boot(i64),
 }
 
@@ -424,8 +429,8 @@ fn receive(
             note_boot(&sample, agent, jobs, last_boot);
             let command = WriterCommand::SaveAndAck {
                 sample: NewSample {
-                    agent_id: agent.id.clone(),
-                    host: agent.host.clone(),
+                    host_id: agent.id.clone(),
+                    hostname: agent.hostname.clone(),
                     sample,
                 },
                 acks: acks.clone(),
@@ -468,7 +473,7 @@ fn receive(
     None
 }
 
-/// Passes on when the machine started, only when it's a later start than this
+/// Passes on when the host started, only when it's a later start than this
 /// connection has already passed on. An agent sends samples it kept from before a
 /// restart after its live ones, and those mustn't look like another restart.
 fn note_boot(
@@ -480,7 +485,7 @@ fn note_boot(
     let Some(boot_ms) = sample
         .metrics
         .get("host")
-        .and_then(|host| host.get("boot_time_secs"))
+        .and_then(|output| output.get("boot_time_secs"))
         .and_then(Value::as_i64)
         .and_then(|secs| secs.checked_mul(1000))
     else {
@@ -497,7 +502,7 @@ fn note_boot(
     }
 }
 
-/// Notes when the machine started, and marks a restart when it's later than the start
+/// Notes when the host started, and marks a restart when it's later than the start
 /// the server last knew of. `known` is loaded the first time.
 async fn save_boot(boot_ms: i64, agent: &Agent, state: &AppState, known: &mut Option<Option<i64>>) {
     let previous = match known {
@@ -580,7 +585,7 @@ async fn save_config_result(
     }
 }
 
-/// Marks a new config on the machine's charts, saying which rules it came from.
+/// Marks a new config on the host's charts, saying which rules it came from.
 async fn record_config_change(agent: &Agent, state: &AppState, now_ms: i64) {
     let rules = match state.config_for(&agent.id).await {
         Ok(resolved) => Some(format!(
@@ -637,7 +642,7 @@ async fn save_facts(facts: Value, agent: &Agent, state: &AppState) -> bool {
         .await
     {
         Ok(true) => {
-            info!(id = agent.id, host = agent.host, "facts changed");
+            info!(id = agent.id, hostname = agent.hostname, "facts changed");
             true
         }
         Ok(false) => false,

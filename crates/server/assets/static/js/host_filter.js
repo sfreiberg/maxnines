@@ -81,7 +81,7 @@
     request = new AbortController();
     const term = currentTerm().text;
     try {
-      const response = await fetch(`/agents/filter-options?term=${encodeURIComponent(term)}`, {
+      const response = await fetch(`/hosts/filter-options?term=${encodeURIComponent(term)}`, {
         signal: request.signal,
       });
       if (response.ok && document.activeElement === input) show(await response.json());

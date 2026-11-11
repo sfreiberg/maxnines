@@ -1,6 +1,6 @@
-//! Things that happened to machines, marked on their charts so a change in a graph can
+//! Things that happened to hosts, marked on their charts so a change in a graph can
 //! be matched to what caused it. Annotations, deploys and notes, come from people and
-//! their scripts, for the machines a filter picks whenever a chart is drawn. The
+//! their scripts, for the hosts a filter picks whenever a chart is drawn. The
 //! server records restarts and config changes itself, and alerts and updates come from
 //! what's already kept about them.
 
@@ -76,7 +76,7 @@ impl EventKind {
     }
 }
 
-/// What someone records: a deploy or a note, for the machines a filter picks.
+/// What someone records: a deploy or a note, for the hosts a filter picks.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventInput {
@@ -89,8 +89,8 @@ pub struct EventInput {
     /// When it happened. Defaults to now.
     #[serde(default)]
     pub time_ms: Option<i64>,
-    /// Which machines, as a host filter, matched whenever a chart is drawn. Empty means
-    /// every machine.
+    /// Which hosts, as a host filter, matched whenever a chart is drawn. Empty means
+    /// every host.
     #[serde(default)]
     pub filter: Option<String>,
 }
@@ -166,7 +166,7 @@ pub struct Event {
     pub created_ms: i64,
 }
 
-/// One thing on a machine's timeline, from wherever it came from. Only those that were
+/// One thing on a host's timeline, from wherever it came from. Only those that were
 /// recorded have an `id`, and only they can be deleted.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TimelineEvent {
@@ -185,11 +185,11 @@ pub const UPDATE_FACTS: [(&str, &str); 3] = [
     ("os.kernel", "Kernel"),
 ];
 
-/// A machine is only taken to have restarted when its boot time moves by more than
+/// A host is only taken to have restarted when its boot time moves by more than
 /// this, as some systems work it out from the uptime and it wobbles.
 pub const BOOT_TIME_SLACK_MS: i64 = 60_000;
 
-/// Whether a boot time reported now means the machine restarted since `known`.
+/// Whether a boot time reported now means the host restarted since `known`.
 pub fn restarted(known: Option<i64>, reported: i64) -> bool {
     known.is_some_and(|known| (reported - known).abs() > BOOT_TIME_SLACK_MS)
 }

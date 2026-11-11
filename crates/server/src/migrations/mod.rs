@@ -40,6 +40,7 @@ impl MigratorTrait for Migrator {
             Box::new(CreateEvents),
             Box::new(UnresolveEventFilters),
             Box::new(RenameTimesAndDurations),
+            Box::new(RenameAgentsToHosts),
         ]
     }
 }
@@ -642,6 +643,8 @@ enum Alerts {
     ResolveReason,
     AcknowledgedBy,
     AcknowledgedMs,
+    HostId,
+    Hostname,
 }
 
 #[derive(Iden)]
@@ -1908,6 +1911,7 @@ enum ChannelMail {
     MailFrom,
     /// An email channel's mail server. Its password is the channel's credential.
     MailHost,
+    MailHostname,
     MailPort,
     /// `tls`, `starttls` or `none`.
     MailSecurity,
@@ -3049,6 +3053,442 @@ async fn rename(
     manager.alter_table(statement).await
 }
 
+#[derive(Iden)]
+enum Hosts {
+    Table,
+    Hostname,
+}
+
+#[derive(Iden)]
+enum HostFacts {
+    Table,
+    HostId,
+    Name,
+    Value,
+    ValidToMs,
+}
+
+#[derive(Iden)]
+enum HostConfigStatus {
+    Table,
+    HostId,
+}
+
+#[derive(Iden)]
+enum HostBoots {
+    Table,
+    HostId,
+}
+
+struct RenameAgentsToHosts;
+
+impl MigrationName for RenameAgentsToHosts {
+    fn name(&self) -> &str {
+        "m20261111_000029_rename_agents_to_hosts"
+    }
+}
+
+/// The computer being watched is a host everywhere, and a computer's name is its
+/// hostname, so the tables and columns that said agent or host change to match. What people wrote
+/// that used the old words changes too: a condition reading `trusted.agent_id`, a
+/// filter's `host=` term, a custom webhook's `alert.host` and `alert.agent_id`, a
+/// dashboard variable of machines, the audit log's entries about agents and events,
+/// the title of a restart the server noticed, and charts of `server.agents`.
+#[async_trait::async_trait]
+impl MigrationTrait for RenameAgentsToHosts {
+    /// All or nothing where the database can, which MySQL and MariaDB can't for
+    /// changes to tables.
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        rename_table(manager, Agents::Table, Hosts::Table).await?;
+        rename(manager, Hosts::Table, Agents::Host, Hosts::Hostname).await?;
+        rename_table(manager, AgentFacts::Table, HostFacts::Table).await?;
+        rename(
+            manager,
+            HostFacts::Table,
+            AgentFacts::AgentId,
+            HostFacts::HostId,
+        )
+        .await?;
+        rename_table(manager, AgentConfigStatus::Table, HostConfigStatus::Table).await?;
+        rename(
+            manager,
+            HostConfigStatus::Table,
+            AgentConfigStatus::AgentId,
+            HostConfigStatus::HostId,
+        )
+        .await?;
+        rename_table(manager, AgentBoots::Table, HostBoots::Table).await?;
+        rename(
+            manager,
+            HostBoots::Table,
+            AgentBoots::AgentId,
+            HostBoots::HostId,
+        )
+        .await?;
+        rename(manager, Alerts::Table, Alerts::AgentId, Alerts::HostId).await?;
+        rename(manager, Alerts::Table, Alerts::Host, Alerts::Hostname).await?;
+        rename(
+            manager,
+            ChannelMail::Table,
+            ChannelMail::MailHost,
+            ChannelMail::MailHostname,
+        )
+        .await?;
+        replace_index(
+            manager,
+            "idx_agent_facts_agent",
+            Index::create()
+                .name("idx_host_facts_host")
+                .table(HostFacts::Table)
+                .col(HostFacts::HostId)
+                .col(HostFacts::ValidToMs)
+                .to_owned(),
+        )
+        .await?;
+        replace_index(
+            manager,
+            "idx_agent_facts_name_value",
+            Index::create()
+                .name("idx_host_facts_name_value")
+                .table(HostFacts::Table)
+                .col(HostFacts::Name)
+                .col(HostFacts::Value)
+                .to_owned(),
+        )
+        .await?;
+        rewrite_words(manager, &WORDS_NOW).await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        rewrite_words(manager, &WORDS_BEFORE).await?;
+        replace_index(
+            manager,
+            "idx_host_facts_name_value",
+            Index::create()
+                .name("idx_agent_facts_name_value")
+                .table(HostFacts::Table)
+                .col(HostFacts::Name)
+                .col(HostFacts::Value)
+                .to_owned(),
+        )
+        .await?;
+        replace_index(
+            manager,
+            "idx_host_facts_host",
+            Index::create()
+                .name("idx_agent_facts_agent")
+                .table(HostFacts::Table)
+                .col(HostFacts::HostId)
+                .col(HostFacts::ValidToMs)
+                .to_owned(),
+        )
+        .await?;
+        rename(
+            manager,
+            ChannelMail::Table,
+            ChannelMail::MailHostname,
+            ChannelMail::MailHost,
+        )
+        .await?;
+        rename(manager, Alerts::Table, Alerts::Hostname, Alerts::Host).await?;
+        rename(manager, Alerts::Table, Alerts::HostId, Alerts::AgentId).await?;
+        rename(
+            manager,
+            HostBoots::Table,
+            HostBoots::HostId,
+            AgentBoots::AgentId,
+        )
+        .await?;
+        rename_table(manager, HostBoots::Table, AgentBoots::Table).await?;
+        rename(
+            manager,
+            HostConfigStatus::Table,
+            HostConfigStatus::HostId,
+            AgentConfigStatus::AgentId,
+        )
+        .await?;
+        rename_table(manager, HostConfigStatus::Table, AgentConfigStatus::Table).await?;
+        rename(
+            manager,
+            HostFacts::Table,
+            HostFacts::HostId,
+            AgentFacts::AgentId,
+        )
+        .await?;
+        rename_table(manager, HostFacts::Table, AgentFacts::Table).await?;
+        rename(manager, Hosts::Table, Hosts::Hostname, Agents::Host).await?;
+        rename_table(manager, Hosts::Table, Agents::Table).await
+    }
+}
+
+/// The words people's own text used, and what they are now, for migration 29.
+struct Words {
+    /// Names written whole, in conditions and in custom webhooks' templates.
+    names: [(&'static str, &'static str); 3],
+    /// A filter term for the hostname.
+    hostname_term: (&'static str, &'static str),
+    /// A dashboard variable's kind.
+    variable_kind: (&'static str, &'static str),
+    /// What the audit log says a change was made to.
+    subject_kinds: [(&'static str, &'static str); 2],
+    /// The built-in rule for a host going quiet.
+    offline_rule: (&'static str, &'static str),
+    /// What the server titles a restart it notices.
+    restart_title: (&'static str, &'static str),
+    /// The server's own chart of how many hosts there are.
+    server_metric: (&'static str, &'static str),
+}
+
+const WORDS_NOW: Words = Words {
+    names: [
+        ("trusted.agent_id", "trusted.host_id"),
+        ("alert.agent_id", "alert.host_id"),
+        ("alert.host", "alert.hostname"),
+    ],
+    hostname_term: ("host", "hostname"),
+    variable_kind: ("machine", "host"),
+    subject_kinds: [("agent", "host"), ("event", "annotation")],
+    offline_rule: ("Agent offline", "Host offline"),
+    restart_title: ("Machine started", "Host started"),
+    server_metric: ("server.agents", "server.hosts"),
+};
+
+const WORDS_BEFORE: Words = Words {
+    names: [
+        ("trusted.host_id", "trusted.agent_id"),
+        ("alert.host_id", "alert.agent_id"),
+        ("alert.hostname", "alert.host"),
+    ],
+    hostname_term: ("hostname", "host"),
+    variable_kind: ("host", "machine"),
+    subject_kinds: [("host", "agent"), ("annotation", "event")],
+    offline_rule: ("Host offline", "Agent offline"),
+    restart_title: ("Host started", "Machine started"),
+    server_metric: ("server.hosts", "server.agents"),
+};
+
+/// The longest filter a column holds, as made by the migrations that added them.
+const MAX_FILTER_CHARS: usize = 500;
+
+async fn rename_table(
+    manager: &SchemaManager<'_>,
+    from: impl Iden + 'static,
+    to: impl Iden + 'static,
+) -> Result<(), DbErr> {
+    manager
+        .rename_table(Table::rename().table(from, to).to_owned())
+        .await
+}
+
+/// Makes an index in place of another, as an index can't be renamed the same way
+/// everywhere. The new one comes first, as MySQL won't drop the one a foreign key
+/// needs until another can serve it.
+async fn replace_index(
+    manager: &SchemaManager<'_>,
+    old: &str,
+    new: IndexCreateStatement,
+) -> Result<(), DbErr> {
+    manager.create_index(new).await?;
+    manager
+        .drop_index(Index::drop().name(old).table(HostFacts::Table).to_owned())
+        .await
+}
+
+/// Changes one text column row by row, by ID, where `change` gives something new.
+/// Comparing the old text instead could match another row the database thinks is
+/// equal, as MySQL ignores case and accents.
+async fn rewrite_column(
+    manager: &SchemaManager<'_>,
+    table: &str,
+    column: &str,
+    change: impl Fn(&str) -> Option<String>,
+) -> Result<(), DbErr> {
+    let rows = Query::select()
+        .columns([Alias::new("id"), Alias::new(column)])
+        .from(Alias::new(table))
+        .to_owned();
+    for row in manager.get_connection().query_all(&rows).await? {
+        let id: i64 = row.try_get("", "id")?;
+        let text: Option<String> = row.try_get("", column)?;
+        let Some(changed) = text.as_deref().and_then(&change) else {
+            continue;
+        };
+        let update = Query::update()
+            .table(Alias::new(table))
+            .value(Alias::new(column), changed)
+            .and_where(Expr::col(Alias::new("id")).eq(id))
+            .to_owned();
+        manager.exec_stmt(update).await?;
+    }
+    Ok(())
+}
+
+/// Sets `column` to `new` where it's `old`, in rows matching `only` too.
+async fn replace_value(
+    manager: &SchemaManager<'_>,
+    table: impl Iden + 'static,
+    column: impl IntoIden,
+    (old, new): (&str, &str),
+    only: Option<SimpleExpr>,
+) -> Result<(), DbErr> {
+    let column = column.into_iden();
+    let mut update = Query::update()
+        .table(table)
+        .value(column.clone(), new)
+        .and_where(Expr::col(column).eq(old))
+        .to_owned();
+    if let Some(only) = only {
+        update.and_where(only);
+    }
+    manager.exec_stmt(update).await
+}
+
+/// Changes the words people's own text used. Conditions and templates have names
+/// changed where they're written whole. Filters are rewritten term by term, leaving
+/// anything quoted alone, and one that would grow past what its column holds is left
+/// as it is.
+async fn rewrite_words(manager: &SchemaManager<'_>, words: &Words) -> Result<(), DbErr> {
+    let names = |text: &str| {
+        let renamed = words
+            .names
+            .iter()
+            .fold(text.to_string(), |text, (old, new)| {
+                rename_whole(&text, old, new)
+            });
+        (renamed != text).then_some(renamed)
+    };
+    rewrite_column(manager, "config_rules", "condition_expr", names).await?;
+    rewrite_column(manager, "alert_rules", "condition_expr", names).await?;
+    rewrite_column(manager, "notification_channels", "request_body", names).await?;
+
+    let filter = |text: &str| {
+        let renamed = rename_filter_term(text, words.hostname_term);
+        (renamed != text && renamed.chars().count() <= MAX_FILTER_CHARS).then_some(renamed)
+    };
+    for table in [
+        "alert_rules",
+        "silences",
+        "maintenance_windows",
+        "dashboard_widgets",
+        "location_rules",
+        "dashboard_variables",
+        "events",
+    ] {
+        rewrite_column(manager, table, "filter", filter).await?;
+    }
+
+    replace_value(
+        manager,
+        DashboardVariables::Table,
+        DashboardVariables::Kind,
+        words.variable_kind,
+        None,
+    )
+    .await?;
+    for kinds in words.subject_kinds {
+        replace_value(manager, AuditLog::Table, AuditLog::SubjectKind, kinds, None).await?;
+    }
+    replace_value(
+        manager,
+        Events::Table,
+        Events::Title,
+        words.restart_title,
+        Some(Expr::col(Events::Kind).eq("restart")),
+    )
+    .await?;
+    replace_value(
+        manager,
+        AlertRules::Table,
+        AlertRules::Metric,
+        words.server_metric,
+        None,
+    )
+    .await?;
+    replace_value(
+        manager,
+        DashboardWidgets::Table,
+        DashboardWidgets::Metric,
+        words.server_metric,
+        None,
+    )
+    .await?;
+
+    // Names are unique, so someone's own rule may already have the new one.
+    let (old_name, new_name) = words.offline_rule;
+    let taken = Query::select()
+        .column(AlertRules::Id)
+        .from(AlertRules::Table)
+        .and_where(Expr::col(AlertRules::Name).eq(new_name))
+        .to_owned();
+    if manager.get_connection().query_one(&taken).await?.is_none() {
+        replace_value(
+            manager,
+            AlertRules::Table,
+            AlertRules::Name,
+            (old_name, new_name),
+            Some(Expr::col(AlertRules::Kind).eq("offline")),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// `text` with `old` changed to `new` wherever it's a whole name: not part of a
+/// longer one, like `trusted.agent_ids` or `alert.host_id`.
+fn rename_whole(text: &str, old: &str, new: &str) -> String {
+    let part_of_name = |c: char| c.is_alphanumeric() || c == '_' || c == '.';
+    let mut renamed = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(old) {
+        let before = rest[..at].chars().next_back();
+        let after = rest[at + old.len()..].chars().next();
+        renamed.push_str(&rest[..at]);
+        if before.is_some_and(part_of_name)
+            || after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            renamed.push_str(old);
+        } else {
+            renamed.push_str(new);
+        }
+        rest = &rest[at + old.len()..];
+    }
+    renamed.push_str(rest);
+    renamed
+}
+
+/// A filter with each `old=` or `old!=` term naming `new` instead. Terms are separated
+/// by spaces, and a quoted value can hold spaces, so quotes are followed.
+fn rename_filter_term(filter: &str, (old, new): (&str, &str)) -> String {
+    let mut renamed = String::with_capacity(filter.len());
+    let mut quoted = false;
+    let mut at_term = true;
+    let mut rest = filter;
+    while let Some(next) = rest.chars().next() {
+        if at_term && !quoted {
+            let after = rest.strip_prefix(old);
+            if let Some(after) =
+                after.filter(|after| after.starts_with('=') || after.starts_with("!="))
+            {
+                renamed.push_str(new);
+                rest = after;
+                at_term = false;
+                continue;
+            }
+        }
+        if next == '"' {
+            quoted = !quoted;
+        }
+        at_term = !quoted && next.is_whitespace();
+        renamed.push(next);
+        rest = &rest[next.len_utf8()..];
+    }
+    renamed
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
@@ -3388,7 +3828,151 @@ mod tests {
         Migrator::up(&connection, None).await.unwrap();
         assert_eq!(window_lengths(&connection, "duration_secs").await, [7200]);
 
-        Migrator::down(&connection, Some(1)).await.unwrap();
+        let total = <u32 as TryFrom<usize>>::try_from(Migrator::migrations().len()).unwrap();
+        let since = total - before(&RenameTimesAndDurations);
+        Migrator::down(&connection, Some(since)).await.unwrap();
         assert_eq!(window_lengths(&connection, "duration_minutes").await, [120]);
+    }
+
+    #[test]
+    fn a_filters_hostname_term_is_renamed_but_not_inside_quotes() {
+        let rename = |filter| rename_filter_term(filter, ("host", "hostname"));
+        assert_eq!(rename("host=web*"), "hostname=web*");
+        assert_eq!(rename("os=linux host!=db*"), "os=linux hostname!=db*");
+        assert_eq!(rename("hostname=web*"), "hostname=web*");
+        assert_eq!(rename("custom.host=a"), "custom.host=a");
+        assert_eq!(rename("custom.note=\"host=a\""), "custom.note=\"host=a\"");
+        assert_eq!(rename("web"), "web");
+    }
+
+    async fn texts(connection: &impl ConnectionTrait, sql: &str) -> Vec<String> {
+        let query = Statement::from_string(connection.get_database_backend(), sql);
+        let rows = connection.query_all_raw(query).await.unwrap();
+        rows.iter()
+            .map(|row| row.try_get_by_index(0).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn what_people_wrote_follows_agents_becoming_hosts() {
+        let connection = fresh().await;
+        Migrator::up(&connection, Some(before(&RenameAgentsToHosts)))
+            .await
+            .unwrap();
+        connection
+            .execute_unprepared(
+                "UPDATE config_rules SET condition_expr = 'trusted.agent_id == \"abc\"';
+                 INSERT INTO silences (filter, reason, created_by, starts_ms, ends_ms)
+                 VALUES ('host=web* os=linux', 'Upgrading', 'sam', 1, 2);
+                 INSERT INTO audit_log
+                   (time_ms, actor_kind, actor_name, action, subject_kind, subject_name, changes)
+                 VALUES (1, 'person', 'sam', 'approved', 'agent', 'web-1', '{}'),
+                        (2, 'person', 'sam', 'created', 'event', 'Deploy', '{}');
+                 INSERT INTO events (time_ms, kind, title, filter, created_by, created_ms)
+                 VALUES (5, 'restart', 'Machine started', 'id=abc', 'server', 5);
+                 INSERT INTO notification_channels
+                   (name, kind, target, sends_warnings, sends_critical, request_body)
+                 VALUES ('Hook', 'custom_webhook', 'https://h', TRUE, TRUE,
+                         '{\"on\": \"{{ alert.host }}\", \"id\": \"{{alert.agent_id}}\"}');
+                 INSERT INTO alert_rules
+                   (name, kind, metric, comparison, threshold, for_secs, severity, enabled)
+                 VALUES ('Too many', 'metric', 'server.agents', 'above', 99, 60, 'warning', TRUE)",
+            )
+            .await
+            .unwrap();
+
+        Migrator::up(&connection, None).await.unwrap();
+
+        let conditions = texts(&connection, "SELECT condition_expr FROM config_rules").await;
+        assert_eq!(conditions, ["trusted.host_id == \"abc\""]);
+        let filters = texts(&connection, "SELECT filter FROM silences").await;
+        assert_eq!(filters, ["hostname=web* os=linux"]);
+        let kinds = texts(
+            &connection,
+            "SELECT subject_kind FROM audit_log ORDER BY id",
+        )
+        .await;
+        assert_eq!(kinds, ["host", "annotation"]);
+        let offline = "SELECT name FROM alert_rules WHERE kind = 'offline'";
+        assert_eq!(texts(&connection, offline).await, ["Host offline"]);
+        let titles = texts(&connection, "SELECT title FROM events").await;
+        assert_eq!(titles, ["Host started"]);
+        let bodies = texts(
+            &connection,
+            "SELECT request_body FROM notification_channels",
+        )
+        .await;
+        assert_eq!(
+            bodies,
+            ["{\"on\": \"{{ alert.hostname }}\", \"id\": \"{{alert.host_id}}\"}"]
+        );
+        let metric = "SELECT metric FROM alert_rules WHERE name = 'Too many'";
+        assert_eq!(texts(&connection, metric).await, ["server.hosts"]);
+        let hosts = texts(&connection, "SELECT hostname FROM hosts ORDER BY id").await;
+        assert_eq!(hosts, ["Fleet", "MaxNines server"]);
+
+        let total = <u32 as TryFrom<usize>>::try_from(Migrator::migrations().len()).unwrap();
+        let since = total - before(&RenameAgentsToHosts);
+        Migrator::down(&connection, Some(since)).await.unwrap();
+        let filters = texts(&connection, "SELECT filter FROM silences").await;
+        assert_eq!(filters, ["host=web* os=linux"]);
+        let bodies = texts(
+            &connection,
+            "SELECT request_body FROM notification_channels",
+        )
+        .await;
+        assert_eq!(
+            bodies,
+            ["{\"on\": \"{{ alert.host }}\", \"id\": \"{{alert.agent_id}}\"}"]
+        );
+        let names = texts(&connection, "SELECT host FROM agents ORDER BY id").await;
+        assert_eq!(names, ["Fleet", "MaxNines server"]);
+    }
+
+    #[test]
+    fn only_whole_names_are_renamed() {
+        let rename = |text| rename_whole(text, "alert.host", "alert.hostname");
+        assert_eq!(rename("{{ alert.host }}"), "{{ alert.hostname }}");
+        assert_eq!(rename("{{alert.host|upper}}"), "{{alert.hostname|upper}}");
+        assert_eq!(rename("{{ alert.host_id }}"), "{{ alert.host_id }}");
+        assert_eq!(rename("{{ alert.hostname }}"), "{{ alert.hostname }}");
+        assert_eq!(rename("{{ my_alert.host }}"), "{{ my_alert.host }}");
+        let trusted = rename_whole(
+            "trusted.agent_ids == x",
+            "trusted.agent_id",
+            "trusted.host_id",
+        );
+        assert_eq!(trusted, "trusted.agent_ids == x");
+    }
+
+    #[tokio::test]
+    async fn a_rule_already_called_host_offline_keeps_both_and_the_migration_finishes() {
+        let connection = fresh().await;
+        Migrator::up(&connection, Some(before(&RenameAgentsToHosts)))
+            .await
+            .unwrap();
+        let long = format!("host=web* {}", "x".repeat(MAX_FILTER_CHARS - 10));
+        connection
+            .execute_unprepared(&format!(
+                "INSERT INTO alert_rules (name, kind, for_secs, severity, enabled)
+                 VALUES ('Host offline', 'offline', 60, 'warning', TRUE);
+                 INSERT INTO silences (filter, reason, created_by, starts_ms, ends_ms)
+                 VALUES ('{long}', 'Long', 'sam', 1, 2)"
+            ))
+            .await
+            .unwrap();
+
+        Migrator::up(&connection, None).await.unwrap();
+
+        let offline = "SELECT name FROM alert_rules WHERE kind = 'offline' ORDER BY name";
+        assert_eq!(
+            texts(&connection, offline).await,
+            ["Agent offline", "Host offline"]
+        );
+        // Growing it would overflow its column, so it's left as it was.
+        assert_eq!(
+            texts(&connection, "SELECT filter FROM silences").await,
+            [long]
+        );
     }
 }

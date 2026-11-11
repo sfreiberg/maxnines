@@ -2,7 +2,7 @@
 
 ## Main database
 
-Users, agents, alert rules, dashboards and settings are kept in the main database, which
+Users, hosts, alert rules, dashboards and settings are kept in the main database, which
 is separate from metrics. `server.hcl` chooses it with a URL:
 
 ```hcl

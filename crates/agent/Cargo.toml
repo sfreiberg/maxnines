@@ -20,7 +20,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 serde.workspace = true
 serde_json.workspace = true
 sysinfo = "0.40.1"
-# Asks the resolver for the machine's fully qualified name, as `hostname -f` does.
+# Asks the resolver for the host's fully qualified name, as `hostname -f` does.
 dns-lookup = "4"
 tokio = { version = "1.54.1", features = ["io-util", "rt", "macros", "process", "time", "signal", "sync"] }
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
@@ -53,7 +53,7 @@ vergen-gitcl = { version = "10", features = ["build"] }
 maintainer = "MaxNines <https://github.com/sfreiberg/maxnines/issues>"
 copyright = "2026 Sam Freiberg"
 license-file = ["../../LICENSE", "0"]
-extended-description = "Reports how a machine is doing to a MaxNines server. What it watches is set on\nthe server, and it keeps its key and unsent samples in /var/lib/maxnines-agent."
+extended-description = "Reports how a host is doing to a MaxNines server. What it watches is set on\nthe server, and it keeps its key and unsent samples in /var/lib/maxnines-agent."
 section = "admin"
 priority = "optional"
 # Fully static, so it needs nothing else.
@@ -68,7 +68,7 @@ maintainer-scripts = "../../packaging/linux/deb/agent"
 systemd-units = { unit-name = "maxnines-agent", unit-scripts = "../../packaging/linux", enable = false, start = false, restart-after-upgrade = true }
 
 [package.metadata.generate-rpm]
-description = "Reports how a machine is doing to a MaxNines server. What it watches is set on\nthe server, and it keeps its key and unsent samples in /var/lib/maxnines-agent."
+description = "Reports how a host is doing to a MaxNines server. What it watches is set on\nthe server, and it keeps its key and unsent samples in /var/lib/maxnines-agent."
 summary = "MaxNines monitoring agent"
 assets = [
   { source = "target/release/maxnines-agent", dest = "/usr/bin/maxnines-agent", mode = "755" },

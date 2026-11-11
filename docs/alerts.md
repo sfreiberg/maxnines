@@ -6,10 +6,10 @@ Every server starts with five alert rules:
 
 | Rule | Fires when | Severity |
 | --- | --- | --- |
-| **Agent offline** | An approved agent has been gone for 5 minutes | Critical |
+| **Host offline** | An approved host's agent has been gone for 5 minutes | Critical |
 | **Disk filling up** | A disk has been over 80% full for 5 minutes, or over 90% | Warning, then critical |
 | **Disk running out of inodes** | A disk has used over 80% of its [inodes](agents.md#disks) for 5 minutes, or over 90% | Warning, then critical |
-| **Container down** | A container has been failing for 5 minutes, on machines that report [containers](agents.md#containers) | Critical |
+| **Container down** | A container has been failing for 5 minutes, on hosts that report [containers](agents.md#containers) | Critical |
 | **Disk will be full soon** | A disk has been on course to be full within a day for half an hour, judging by the last 6 hours, or within 4 hours | Warning, then critical |
 
 Each disk alerts on its own. They tell every notification channel, including ones added later, so they start working as soon
@@ -42,7 +42,7 @@ On the rule's page, choose **A metric is on course to reach a level soon**, then
 
 Forecasts are worked out every 5 minutes. A series needs at least 10 readings, from at
 least half the time looked back over, and one in the last 10 minutes, before it has a
-forecast at all, so a new machine waits a while. A series that's already reached the
+forecast at all, so a new host waits a while. A series that's already reached the
 level counts as getting there now. When the line stops heading for the level, the
 alert clears once that's lasted the rule's **For at least** time.
 
@@ -83,19 +83,19 @@ then on of every change until it resolves:
 
 A silence stops notifications for a while, as during planned work. Press **Silence** on
 a firing alert, or start one from **Alerts > Silences**. It needs a reason and a length,
-and it can cover one rule or all of them, and some machines or all of them, using the same
-filter as the Machines list.
+and it can cover one rule or all of them, and some hosts or all of them, using the same
+filter as the Hosts list.
 
 Alerts still fire and show while they're silenced. If one is still firing when the
 silence ends, the notifications go out then, and if it ends first, nobody hears about it.
 Anyone who had already been told about an alert still hears when it ends, which keeps
 on-call services from leaving an incident open.
 
-To silence one machine, such as while it's rebooted or upgraded, use **Start maintenance**
-on its page under **Machines**. Choose how long, from 30 minutes to a day, and a reason if
-you like. It's a silence for every rule on that machine alone, so it shows under
-**Alerts > Silences** too, and **End now** on the machine's page stops it early. While
-anything holds back all of a machine's notifications, its page says what and until when,
+To silence one host, such as while it's rebooted or upgraded, use **Start maintenance**
+on its page under **Hosts**. Choose how long, from 30 minutes to a day, and a reason if
+you like. It's a silence for every rule on that host alone, so it shows under
+**Alerts > Silences** too, and **End now** on the host's page stops it early. While
+anything holds back all of a host's notifications, its page says what and until when,
 including a wider silence or a maintenance window, which are ended from their own pages.
 It takes the responder role, like any silence.
 

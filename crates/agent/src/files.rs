@@ -1,6 +1,6 @@
 //! Watches files and folders from the outside: whether they exist, how big they
 //! are and how long since they changed. Contents are never read, so the server
-//! can't use this to see inside a machine's files.
+//! can't use this to see inside a host's files.
 
 use std::fs::{self, Metadata};
 use std::path::Path;

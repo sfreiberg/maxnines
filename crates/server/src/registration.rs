@@ -18,29 +18,29 @@ use wildmatch::WildMatch;
 
 use crate::config::{RegistrationConfig, RuleAction, RuleConfig, parse_network};
 use crate::models::Database;
-use crate::remote_checks::{FLEET_AGENT_ID, LOCAL_AGENT_ID};
+use crate::remote_checks::{FLEET_HOST_ID, LOCAL_HOST_ID};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum AgentState {
+pub enum HostState {
     Pending,
     Approved,
     Revoked,
 }
 
 fn is_built_in(id: &str) -> bool {
-    id == LOCAL_AGENT_ID || id == FLEET_AGENT_ID
+    id == LOCAL_HOST_ID || id == FLEET_HOST_ID
 }
 
-impl AgentRecord {
-    /// Whether this is a built-in agent, which isn't a machine anyone registered, so
+impl HostRecord {
+    /// Whether this is a built-in agent, which isn't a host anyone registered, so
     /// it stays out of lists and can't be changed.
     pub fn is_local(&self) -> bool {
         is_built_in(&self.id)
     }
 }
 
-impl AgentState {
+impl HostState {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
@@ -62,11 +62,11 @@ impl AgentState {
 /// An agent the server has heard from, or the built-in one that holds the results
 /// of checks the server runs itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AgentRecord {
+pub struct HostRecord {
     pub id: String,
     pub public_key: String,
-    pub host: String,
-    pub state: AgentState,
+    pub hostname: String,
+    pub state: HostState,
     /// Who approved it: "admin", someone's address, or "rule:<name>".
     pub decided_by: Option<String>,
     pub first_seen_ms: u64,
@@ -86,7 +86,7 @@ pub fn short_id(id: &str) -> &str {
 pub struct Admission<'a> {
     pub id: &'a str,
     pub public_key: &'a str,
-    pub host: &'a str,
+    pub hostname: &'a str,
     pub source: IpAddr,
     pub token: Option<&'a str>,
 }
@@ -120,7 +120,7 @@ impl Rule {
         let host_matches = self
             .hostname
             .as_ref()
-            .is_none_or(|h| h.matches(request.host));
+            .is_none_or(|h| h.matches(request.hostname));
         let token_matches = self
             .token_hash
             .as_ref()
@@ -162,7 +162,7 @@ impl Rules {
 }
 
 pub struct Registry {
-    agents: Mutex<BTreeMap<String, AgentRecord>>,
+    hosts: Mutex<BTreeMap<String, HostRecord>>,
     /// When each waiting agent last tried to connect. In memory, as it asks again.
     asked_ms: std::sync::Mutex<BTreeMap<String, u64>>,
     rules: Rules,
@@ -174,13 +174,13 @@ pub struct Registry {
 
 impl Registry {
     pub fn new(
-        agents: Vec<AgentRecord>,
+        hosts: Vec<HostRecord>,
         rules: Rules,
         max_pending: usize,
         database: Database,
     ) -> Self {
         Self {
-            agents: Mutex::new(agents.into_iter().map(|a| (a.id.clone(), a)).collect()),
+            hosts: Mutex::new(hosts.into_iter().map(|a| (a.id.clone(), a)).collect()),
             asked_ms: std::sync::Mutex::default(),
             rules,
             max_pending,
@@ -190,51 +190,51 @@ impl Registry {
     }
 
     pub async fn admit(&self, request: &Admission<'_>) -> Result<RegistrationStatus> {
-        let mut agents = self.agents.lock().await;
-        let existing = agents.get(request.id).cloned();
+        let mut hosts = self.hosts.lock().await;
+        let existing = hosts.get(request.id).cloned();
 
-        match existing.as_ref().map(|agent| agent.state) {
+        match existing.as_ref().map(|host| host.state) {
             // No rule can bring back a revoked agent.
-            Some(AgentState::Revoked) => return Ok(RegistrationStatus::Rejected),
-            Some(AgentState::Approved) => {
+            Some(HostState::Revoked) => return Ok(RegistrationStatus::Rejected),
+            Some(HostState::Approved) => {
                 // Names aren't unique: the key is the identity, and a name is what
-                // the machine says it's called, which machines on different networks
+                // the host says it's called, which hosts on different networks
                 // can share.
-                let mut agent = existing.expect("state came from this record");
-                if agent.host != request.host {
-                    agent.host = request.host.to_string();
+                let mut host = existing.expect("state came from this record");
+                if host.hostname != request.hostname {
+                    host.hostname = request.hostname.to_string();
                     // An approved agent stays approved while the database is away.
                     // The old name stays in memory, so the save is tried again next time.
-                    match self.database.save_agent(&agent).await {
+                    match self.database.save_host(&host).await {
                         Ok(()) => {
-                            agents.insert(agent.id.clone(), agent);
+                            hosts.insert(host.id.clone(), host);
                         }
                         Err(error) => warn!(
-                            agent = request.id,
+                            host_id = request.id,
                             error = format!("{error:#}"),
-                            "couldn't save the agent's new hostname, trying again next time"
+                            "couldn't save the host's new hostname, trying again next time"
                         ),
                     }
                 }
                 return Ok(RegistrationStatus::Approved);
             }
-            Some(AgentState::Pending) | None => {}
+            Some(HostState::Pending) | None => {}
         }
 
         let rule = self.rules.decide(request);
         if let Some(rule) = rule.filter(|r| r.action == RuleAction::Reject) {
-            info!(agent = request.id, rule = rule.name, "rejected by rule");
+            info!(host_id = request.id, rule = rule.name, "rejected by rule");
             return Ok(RegistrationStatus::Rejected);
         }
 
-        let pending = agents
+        let pending = hosts
             .values()
-            .filter(|a| a.state == AgentState::Pending)
+            .filter(|a| a.state == HostState::Pending)
             .count();
         if existing.is_none() && pending >= self.max_pending {
             warn!(
-                agent = request.id,
-                "too many pending agents, ignoring request"
+                host_id = request.id,
+                "too many pending hosts, ignoring request"
             );
             return Ok(RegistrationStatus::Pending);
         }
@@ -243,40 +243,40 @@ impl Registry {
         }
 
         let now = now_ms();
-        let mut agent = existing.clone().unwrap_or_else(|| AgentRecord {
+        let mut host = existing.clone().unwrap_or_else(|| HostRecord {
             id: request.id.to_string(),
             public_key: request.public_key.to_string(),
-            host: request.host.to_string(),
-            state: AgentState::Pending,
+            hostname: request.hostname.to_string(),
+            state: HostState::Pending,
             decided_by: None,
             first_seen_ms: now,
             decided_ms: None,
         });
-        agent.host = request.host.to_string();
+        host.hostname = request.hostname.to_string();
 
         if let Some(rule) = rule {
-            info!(agent = request.id, rule = rule.name, "approved by rule");
-            agent.state = AgentState::Approved;
-            agent.decided_by = Some(format!("rule:{}", rule.name));
-            agent.decided_ms = Some(now);
+            info!(host_id = request.id, rule = rule.name, "approved by rule");
+            host.state = HostState::Approved;
+            host.decided_by = Some(format!("rule:{}", rule.name));
+            host.decided_ms = Some(now);
         }
 
-        let status = match agent.state {
-            AgentState::Approved => RegistrationStatus::Approved,
+        let status = match host.state {
+            HostState::Approved => RegistrationStatus::Approved,
             _ => RegistrationStatus::Pending,
         };
         if status == RegistrationStatus::Pending {
             self.note_asked(request.id);
         }
-        if existing.as_ref() != Some(&agent) {
+        if existing.as_ref() != Some(&host) {
             if existing.is_none() && status == RegistrationStatus::Pending {
                 info!(
-                    agent = request.id,
-                    host = request.host,
-                    "new agent waiting for approval"
+                    host_id = request.id,
+                    hostname = request.hostname,
+                    "new host waiting for approval"
                 );
             }
-            self.save(&mut agents, agent).await?;
+            self.save(&mut hosts, host).await?;
         }
         Ok(status)
     }
@@ -298,7 +298,7 @@ impl Registry {
     }
 
     /// A decision made through the API or the command line.
-    pub async fn decide(&self, id: &str, state: AgentState) -> Result<Option<AgentRecord>> {
+    pub async fn decide(&self, id: &str, state: HostState) -> Result<Option<HostRecord>> {
         self.decide_as(id, state, "admin").await
     }
 
@@ -306,35 +306,35 @@ impl Registry {
     pub async fn decide_as(
         &self,
         id: &str,
-        state: AgentState,
+        state: HostState,
         by: &str,
-    ) -> Result<Option<AgentRecord>> {
+    ) -> Result<Option<HostRecord>> {
         if is_built_in(id) {
             return Ok(None);
         }
-        let mut agents = self.agents.lock().await;
-        let Some(mut agent) = agents.get(id).cloned() else {
+        let mut hosts = self.hosts.lock().await;
+        let Some(mut host) = hosts.get(id).cloned() else {
             return Ok(None);
         };
 
-        agent.state = state;
-        agent.decided_by = Some(by.to_string());
-        agent.decided_ms = Some(now_ms());
-        self.save(&mut agents, agent.clone()).await?;
-        drop(agents);
+        host.state = state;
+        host.decided_by = Some(by.to_string());
+        host.decided_ms = Some(now_ms());
+        self.save(&mut hosts, host.clone()).await?;
+        drop(hosts);
         self.asked_ms
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(id);
 
-        info!(agent = id, state = state.as_str(), "admin decision");
+        info!(host_id = id, state = state.as_str(), "admin decision");
         self.revisions.send_modify(|revision| *revision += 1);
-        Ok(Some(agent))
+        Ok(Some(host))
     }
 
     /// Takes a deleted agent off the list. If it connects again, it's new.
     pub async fn forget(&self, id: &str) {
-        self.agents.lock().await.remove(id);
+        self.hosts.lock().await.remove(id);
         self.asked_ms
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -344,23 +344,23 @@ impl Registry {
 
     /// Adds an agent as if it had been loaded at startup.
     #[cfg(test)]
-    pub async fn insert_for_test(&self, agent: AgentRecord) {
-        self.agents.lock().await.insert(agent.id.clone(), agent);
+    pub async fn insert_for_test(&self, host: HostRecord) {
+        self.hosts.lock().await.insert(host.id.clone(), host);
     }
 
-    pub async fn list(&self) -> Vec<AgentRecord> {
-        self.agents.lock().await.values().cloned().collect()
+    pub async fn list(&self) -> Vec<HostRecord> {
+        self.hosts.lock().await.values().cloned().collect()
     }
 
-    pub async fn get(&self, id: &str) -> Option<AgentRecord> {
-        self.agents.lock().await.get(id).cloned()
+    pub async fn get(&self, id: &str) -> Option<HostRecord> {
+        self.hosts.lock().await.get(id).cloned()
     }
 
     pub async fn is_approved(&self, id: &str) -> bool {
-        let agents = self.agents.lock().await;
-        agents
+        let hosts = self.hosts.lock().await;
+        hosts
             .get(id)
-            .is_some_and(|a| a.state == AgentState::Approved)
+            .is_some_and(|a| a.state == HostState::Approved)
     }
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
@@ -368,13 +368,9 @@ impl Registry {
     }
 
     /// Saves first, so memory never claims something the database doesn't have.
-    async fn save(
-        &self,
-        agents: &mut BTreeMap<String, AgentRecord>,
-        agent: AgentRecord,
-    ) -> Result<()> {
-        self.database.save_agent(&agent).await?;
-        agents.insert(agent.id.clone(), agent);
+    async fn save(&self, hosts: &mut BTreeMap<String, HostRecord>, host: HostRecord) -> Result<()> {
+        self.database.save_host(&host).await?;
+        hosts.insert(host.id.clone(), host);
         Ok(())
     }
 }
@@ -403,21 +399,21 @@ mod tests {
     }
 
     async fn registry_with(body: &str, database: Database) -> Registry {
-        let mut agents = database.load_agents().await.unwrap();
-        agents.retain(|agent| !agent.is_local());
+        let mut hosts = database.load_hosts().await.unwrap();
+        hosts.retain(|host| !host.is_local());
         let (rules, max_pending) = rules(body);
-        Registry::new(agents, rules, max_pending, database)
+        Registry::new(hosts, rules, max_pending, database)
     }
 
     async fn registry(body: &str) -> Registry {
         registry_with(body, Database::for_test().await).await
     }
 
-    fn request<'a>(id: &'a str, host: &'a str, source: &str) -> Admission<'a> {
+    fn request<'a>(id: &'a str, hostname: &'a str, source: &str) -> Admission<'a> {
         Admission {
             id,
             public_key: "ab",
-            host,
+            hostname,
             source: source.parse().unwrap(),
             token: None,
         }
@@ -439,30 +435,30 @@ mod tests {
             .unwrap();
 
         assert_eq!(status, RegistrationStatus::Pending);
-        assert_eq!(registry.list().await[0].state, AgentState::Pending);
+        assert_eq!(registry.list().await[0].state, HostState::Pending);
     }
 
     #[tokio::test]
     async fn an_admin_can_approve_then_revoke() {
         let registry = registry("").await;
-        let agent = request("a", "web-1", "1.2.3.4");
-        registry.admit(&agent).await.unwrap();
+        let host = request("a", "web-1", "1.2.3.4");
+        registry.admit(&host).await.unwrap();
 
         let record = registry
-            .decide("a", AgentState::Approved)
+            .decide("a", HostState::Approved)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(record.decided_by.as_deref(), Some("admin"));
         assert!(record.decided_ms.is_some());
         assert_eq!(
-            registry.admit(&agent).await.unwrap(),
+            registry.admit(&host).await.unwrap(),
             RegistrationStatus::Approved
         );
 
-        registry.decide("a", AgentState::Revoked).await.unwrap();
+        registry.decide("a", HostState::Revoked).await.unwrap();
         assert_eq!(
-            registry.admit(&agent).await.unwrap(),
+            registry.admit(&host).await.unwrap(),
             RegistrationStatus::Rejected
         );
         assert!(!registry.is_approved("a").await);
@@ -473,7 +469,7 @@ mod tests {
         let registry = registry("").await;
         assert!(
             registry
-                .decide("nope", AgentState::Approved)
+                .decide("nope", HostState::Approved)
                 .await
                 .unwrap()
                 .is_none()
@@ -629,17 +625,17 @@ mod tests {
     #[tokio::test]
     async fn a_rule_can_not_bring_back_a_revoked_agent() {
         let registry = registry(SUBNET_RULE).await;
-        let agent = request("a", "web-1", "10.0.0.1");
-        registry.admit(&agent).await.unwrap();
-        registry.decide("a", AgentState::Revoked).await.unwrap();
+        let host = request("a", "web-1", "10.0.0.1");
+        registry.admit(&host).await.unwrap();
+        registry.decide("a", HostState::Revoked).await.unwrap();
 
         assert_eq!(
-            registry.admit(&agent).await.unwrap(),
+            registry.admit(&host).await.unwrap(),
             RegistrationStatus::Rejected
         );
     }
 
-    /// Machines on different networks can share a name, such as a caching name
+    /// Hosts on different networks can share a name, such as a caching name
     /// server in every office. The key tells them apart, not the name.
     #[tokio::test]
     async fn agents_can_share_a_hostname() {
@@ -671,7 +667,12 @@ mod tests {
             RegistrationStatus::Approved,
             "renaming onto a shared name is fine too"
         );
-        let hosts: Vec<String> = registry.list().await.into_iter().map(|a| a.host).collect();
+        let hosts: Vec<String> = registry
+            .list()
+            .await
+            .into_iter()
+            .map(|a| a.hostname)
+            .collect();
         assert_eq!(hosts, ["cache", "cache"]);
     }
 
@@ -706,17 +707,17 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         let url = format!(
             "sqlite://{}?mode=rwc",
-            folder.path().join("agents.db").display()
+            folder.path().join("hosts.db").display()
         );
-        let agent = request("a", "web-1", "1.2.3.4");
+        let host = request("a", "web-1", "1.2.3.4");
 
         let first = registry_with("", Database::connect(&url).await.unwrap()).await;
-        first.admit(&agent).await.unwrap();
-        first.decide("a", AgentState::Approved).await.unwrap();
+        first.admit(&host).await.unwrap();
+        first.decide("a", HostState::Approved).await.unwrap();
 
         let second = registry_with("", Database::connect(&url).await.unwrap()).await;
         assert_eq!(
-            second.admit(&agent).await.unwrap(),
+            second.admit(&host).await.unwrap(),
             RegistrationStatus::Approved
         );
     }
@@ -738,13 +739,13 @@ mod tests {
     async fn approved_agents_can_connect_while_the_database_is_down() {
         let database = Database::for_test().await;
         let registry = registry_with(SUBNET_RULE, database.clone()).await;
-        let agent = request("a", "web-1", "10.0.0.1");
-        registry.admit(&agent).await.unwrap();
+        let host = request("a", "web-1", "10.0.0.1");
+        registry.admit(&host).await.unwrap();
 
         database.break_for_test().await;
 
         assert_eq!(
-            registry.admit(&agent).await.unwrap(),
+            registry.admit(&host).await.unwrap(),
             RegistrationStatus::Approved
         );
     }
@@ -762,7 +763,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(registry.list().await[0].host, "new");
+        assert_eq!(registry.list().await[0].hostname, "new");
     }
 
     #[tokio::test]
@@ -784,7 +785,7 @@ mod tests {
             RegistrationStatus::Approved
         );
         assert_eq!(
-            registry.get("a").await.unwrap().host,
+            registry.get("a").await.unwrap().hostname,
             "old",
             "the name the database still has, until it can be saved"
         );

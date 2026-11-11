@@ -37,7 +37,7 @@
   <label>A line for each
     <select name="group_by">
       <option value="nothing"{% if widget.group_by == "nothing" %} selected{% endif %}>Nothing, combine everything</option>
-      <option value="host"{% if widget.group_by == "host" %} selected{% endif %}>Machine</option>
+      <option value="host"{% if widget.group_by == "host" %} selected{% endif %}>Host</option>
       <option value="series"{% if widget.group_by == "series" %} selected{% endif %}>Series, such as each disk</option>
       <option value="fact"{% if widget.group_by == "fact" %} selected{% endif %}>Value of a fact</option>
     </select>
@@ -49,9 +49,9 @@
     <span class="note">Only used for a line for each value of a fact.</span>
   </label>
 
-  <label>Machines
+  <label>Hosts
     <input type="text" name="filter" value="{{ widget.filter }}" maxlength="500" placeholder="os=linux">
-    <span class="note">The same filter as the Machines list. Leave it empty for every machine.{% if variables %} To follow a picker at the top of the dashboard, add {% for variable in variables %}<code>{{ variable }}</code>{% if not loop.last %} or {% endif %}{% endfor %} as a term on its own.{% endif %}</span>
+    <span class="note">The same filter as the Hosts list. Leave it empty for every host.{% if variables %} To follow a picker at the top of the dashboard, add {% for variable in variables %}<code>{{ variable }}</code>{% if not loop.last %} or {% endif %}{% endfor %} as a term on its own.{% endif %}</span>
   </label>
 
   <label>Title

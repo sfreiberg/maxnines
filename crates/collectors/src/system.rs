@@ -16,7 +16,7 @@ use tokio::time::timeout;
 use crate::failed_services::Failed;
 use crate::tcp::TcpStates;
 
-/// How long a system tool, like `who`, gets to answer. They're quick when the machine is
+/// How long a system tool, like `who`, gets to answer. They're quick when the host is
 /// healthy.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -602,7 +602,7 @@ pgpgin 900
     }
 
     #[test]
-    fn cpu_ticks_are_read_from_the_whole_machine_line() {
+    fn cpu_ticks_are_read_from_the_whole_host_line() {
         let ticks = CpuTicks::parse(PROC_STAT).unwrap();
         assert_eq!(ticks.user, 6168);
         assert_eq!(ticks.idle, 217_451);
@@ -766,7 +766,7 @@ pgpgin 900
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn this_linux_machine_counts_processes_and_threads_apart() {
+    fn this_linux_host_counts_processes_and_threads_apart() {
         let limits = limits();
         let processes = limits.processes.unwrap();
         let threads = limits.threads.unwrap();
@@ -802,7 +802,7 @@ pgpgin 900
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn this_machine_can_count_its_login_sessions() {
+    async fn this_host_can_count_its_login_sessions() {
         assert!(login_sessions().await.is_some());
     }
 }

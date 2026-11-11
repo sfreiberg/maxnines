@@ -111,7 +111,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Fields(&[("CPU", Reading::Field("$.usage_percent"))]),
         chart: ShowChart::Always,
     },
-    // So one busy core shows on a machine with many, where it barely moves the total.
+    // So one busy core shows on a host with many, where it barely moves the total.
     // Agents send a plain list, so each core is named by its number, from 0. A chart
     // keeps the busiest.
     Metric {
@@ -448,7 +448,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Entries(Reading::Rate("$.transmit_errors")),
         chart: ShowChart::WithData,
     },
-    // Packets with nowhere to wait, which means the machine isn't keeping up. macOS
+    // Packets with nowhere to wait, which means the host isn't keeping up. macOS
     // doesn't count sent ones.
     Metric {
         name: "network.drops.received",
@@ -865,7 +865,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Fields(&[("Failed", Reading::Field("$.failed_services"))]),
         chart: ShowChart::WithData,
     },
-    // Looked at every 15 minutes, from the machine's own package lists.
+    // Looked at every 15 minutes, from the host's own package lists.
     Metric {
         name: "system.updates",
         title: "Updates waiting",
@@ -953,14 +953,14 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::WithData,
     },
     Metric {
-        name: "server.agents",
-        title: "Agents",
+        name: "server.hosts",
+        title: "Hosts",
         unit: Unit::Number,
         collector: "server",
         source: Source::Fields(&[
-            ("Online", Reading::Field("$.agents_online")),
-            ("Approved", Reading::Field("$.agents_approved")),
-            ("Waiting", Reading::Field("$.agents_waiting")),
+            ("Online", Reading::Field("$.hosts_online")),
+            ("Approved", Reading::Field("$.hosts_approved")),
+            ("Waiting", Reading::Field("$.hosts_waiting")),
         ]),
         chart: ShowChart::WithData,
     },
@@ -1450,7 +1450,7 @@ fn step_for(range_ms: i64) -> i64 {
 
 #[derive(Debug, Clone, Copy)]
 pub struct SeriesQuery<'a> {
-    pub agent_id: &'a str,
+    pub host_id: &'a str,
     pub metric: &'static Metric,
     pub range: TimeRange,
     /// Keep this many series, starting with the highest.
@@ -1482,7 +1482,7 @@ pub struct SeriesResult {
 /// When an agent last sent anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LastSample {
-    pub agent_id: String,
+    pub host_id: String,
     pub time_ms: i64,
 }
 
@@ -1500,7 +1500,7 @@ pub struct CurrentValues {
 /// A series' newest value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewestReading {
-    pub agent_id: String,
+    pub host_id: String,
     pub series: String,
     pub time_ms: i64,
     pub value: f64,
@@ -1510,7 +1510,7 @@ pub struct NewestReading {
 /// straight line that fits its readings best.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Trend {
-    pub agent_id: String,
+    pub host_id: String,
     pub series: String,
     /// The newest reading.
     pub time_ms: i64,
@@ -1536,19 +1536,19 @@ fn current_values(
     memory: Vec<NewestReading>,
     disks: Vec<NewestReading>,
 ) -> BTreeMap<String, CurrentValues> {
-    let mut agents: BTreeMap<String, CurrentValues> = last_samples
+    let mut hosts: BTreeMap<String, CurrentValues> = last_samples
         .into_iter()
         .map(|sample| {
             let values = CurrentValues {
                 time_ms: sample.time_ms,
                 ..CurrentValues::default()
             };
-            (sample.agent_id, values)
+            (sample.host_id, values)
         })
         .collect();
 
     for reading in cpu.into_iter().filter(|cpu| cpu.series == CPU_SERIES) {
-        if let Some(values) = agents.get_mut(&reading.agent_id) {
+        if let Some(values) = hosts.get_mut(&reading.host_id) {
             values.cpu_percent = Some(reading.value);
         }
     }
@@ -1556,12 +1556,12 @@ fn current_values(
         .into_iter()
         .filter(|memory| memory.series == MEMORY_SERIES)
     {
-        if let Some(values) = agents.get_mut(&reading.agent_id) {
+        if let Some(values) = hosts.get_mut(&reading.host_id) {
             values.memory_percent = Some(reading.value);
         }
     }
     for disk in disks {
-        if let Some(values) = agents.get_mut(&disk.agent_id)
+        if let Some(values) = hosts.get_mut(&disk.host_id)
             && values
                 .disk_percent
                 .is_none_or(|fullest| disk.value > fullest)
@@ -1570,7 +1570,7 @@ fn current_values(
             values.disk_mount_point = Some(disk.series);
         }
     }
-    agents
+    hosts
 }
 
 /// Reads stored metrics. Queries run off the async threads, and a panic in one
@@ -1587,17 +1587,17 @@ impl Metrics {
 
     pub async fn series(
         &self,
-        agent_id: &str,
+        host_id: &str,
         metric: &'static Metric,
         range: TimeRange,
         max_series: usize,
     ) -> Result<SeriesResult> {
         let reader = self.reader.clone();
-        let agent_id = agent_id.to_string();
+        let host_id = host_id.to_string();
 
         let mut result = tokio::task::spawn_blocking(move || {
             reader.series(&SeriesQuery {
-                agent_id: &agent_id,
+                host_id: &host_id,
                 metric,
                 range,
                 max_series,
@@ -1646,15 +1646,15 @@ impl Metrics {
     /// What one of an agent's collectors last sent.
     pub async fn latest_output(
         &self,
-        agent_id: &str,
+        host_id: &str,
         collector: &str,
         now_ms: i64,
     ) -> Result<Option<Value>> {
         let reader = self.reader.clone();
-        let (agent_id, collector) = (agent_id.to_string(), collector.to_string());
+        let (host_id, collector) = (host_id.to_string(), collector.to_string());
         tokio::task::spawn_blocking(move || {
             reader.latest_output(
-                &agent_id,
+                &host_id,
                 &collector,
                 now_ms - CURRENT_WINDOW_MS,
                 now_ms + CLOCK_SKEW_MS,
@@ -1746,18 +1746,18 @@ mod tests {
         assert_eq!(find("disk.usage").unwrap().position("/"), None);
     }
 
-    fn reading(agent_id: &str, series: &str, value: f64) -> NewestReading {
+    fn reading(host_id: &str, series: &str, value: f64) -> NewestReading {
         NewestReading {
-            agent_id: agent_id.to_string(),
+            host_id: host_id.to_string(),
             series: series.to_string(),
             time_ms: 1,
             value,
         }
     }
 
-    fn last(agent_id: &str, time_ms: i64) -> LastSample {
+    fn last(host_id: &str, time_ms: i64) -> LastSample {
         LastSample {
-            agent_id: agent_id.to_string(),
+            host_id: host_id.to_string(),
             time_ms,
         }
     }

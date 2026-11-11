@@ -15,7 +15,7 @@ use super::rollups::{
     full_resolution_cutoff, hour_of, hours_to_redo, is_due, metric_names, tier_for,
 };
 use super::shared::{
-    MAX_NAME_BYTES, MAX_SERIES_PER_AGENT, labels_key, rebuilt_output, shortened, top_of,
+    MAX_NAME_BYTES, MAX_SERIES_PER_HOST, labels_key, rebuilt_output, shortened, top_of,
 };
 use super::{CollectorStats, MetricsReader, NewSample, Store, StoreStats};
 use crate::calculations::{Calculation, CalculationQuery, SMALLEST_STEP_MS, numbered};
@@ -46,6 +46,10 @@ const MIGRATIONS: &[Migration] = &[
         name: "0003_five_minute_rollups",
         sql: include_str!("migrations/0003_five_minute_rollups.sql"),
     },
+    Migration {
+        name: "0004_rename_agents_to_hosts",
+        sql: include_str!("migrations/0004_rename_agents_to_hosts.sql"),
+    },
 ];
 
 /// Only the bookkeeping table is created outside a migration, because it is
@@ -69,9 +73,9 @@ type SeriesKey = (i32, i32, String);
 struct Names {
     collectors: HashMap<String, i32>,
     metrics: HashMap<(i32, String), (i32, DataType)>,
-    agents: HashMap<String, i32>,
+    hosts: HashMap<String, i32>,
     series: HashMap<SeriesKey, i64>,
-    series_per_agent: HashMap<i32, usize>,
+    series_per_host: HashMap<i32, usize>,
     next_series: i64,
     /// Text that's current, so that only a change is written.
     texts: HashMap<i64, String>,
@@ -103,10 +107,10 @@ impl Names {
             names.metrics.insert(key, value);
         }
 
-        let mut statement = connection.prepare("SELECT id, agent_id FROM agents")?;
+        let mut statement = connection.prepare("SELECT id, host_id FROM hosts")?;
         for row in statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))? {
-            let (id, agent_id): (i32, String) = row?;
-            names.agents.insert(agent_id, id);
+            let (id, host_id): (i32, String) = row?;
+            names.hosts.insert(host_id, id);
         }
 
         let mut labels: HashMap<i64, Vec<(String, String)>> = HashMap::new();
@@ -126,20 +130,20 @@ impl Names {
             .map(|((collector, _), (metric, _))| (*metric, *collector))
             .collect();
         let mut owners: HashMap<i64, ((i32, i32), String)> = HashMap::new();
-        let mut statement = connection.prepare("SELECT id, metric_id, agent FROM series")?;
+        let mut statement = connection.prepare("SELECT id, metric_id, host FROM series")?;
         let rows = statement.query_map([], |row| {
             Ok((row.get::<_, i64>(0)?, row.get(1)?, row.get(2)?))
         })?;
         for row in rows {
-            let (id, metric, agent): (i64, i32, i32) = row?;
+            let (id, metric, host): (i64, i32, i32) = row?;
             let key = labels
                 .get(&id)
                 .map_or_else(String::new, |labels| labels_key(labels));
             if let Some(collector) = collector_of.get(&metric) {
-                owners.insert(id, ((agent, *collector), key.clone()));
+                owners.insert(id, ((host, *collector), key.clone()));
             }
-            names.series.insert((metric, agent, key), id);
-            *names.series_per_agent.entry(agent).or_default() += 1;
+            names.series.insert((metric, host, key), id);
+            *names.series_per_host.entry(host).or_default() += 1;
             names.next_series = names.next_series.max(id + 1);
         }
 
@@ -168,7 +172,7 @@ struct Rows {
     collectors: Vec<(i32, String)>,
     metrics: Vec<(i32, i32, String, DataType)>,
     now_float: Vec<i32>,
-    agents: Vec<(i32, String)>,
+    hosts: Vec<(i32, String)>,
     series: Vec<(i64, i32, i32)>,
     labels: Vec<(i64, String, String)>,
     numbers: Vec<(i64, i32, i64, f64)>,
@@ -188,17 +192,17 @@ impl Names {
 
     /// Numbered after the highest, as a deleted agent leaves a gap that counting
     /// them would fill with a number still in use.
-    fn agent(&mut self, agent_id: &str, rows: &mut Rows) -> i32 {
-        if let Some(id) = self.agents.get(agent_id) {
+    fn host(&mut self, host_id: &str, rows: &mut Rows) -> i32 {
+        if let Some(id) = self.hosts.get(host_id) {
             return *id;
         }
         let id = self
-            .agents
+            .hosts
             .values()
             .max()
             .map_or(1, |highest| highest.saturating_add(1));
-        self.agents.insert(agent_id.to_string(), id);
-        rows.agents.push((id, agent_id.to_string()));
+        self.hosts.insert(host_id.to_string(), id);
+        rows.hosts.push((id, host_id.to_string()));
         id
     }
 
@@ -223,20 +227,20 @@ impl Names {
     fn series(
         &mut self,
         metric: i32,
-        agent: i32,
+        host: i32,
         labels: &[(String, String)],
         rows: &mut Rows,
     ) -> Option<i64> {
-        let key = (metric, agent, labels_key(labels));
+        let key = (metric, host, labels_key(labels));
         if let Some(id) = self.series.get(&key) {
             return Some(*id);
         }
-        let count = self.series_per_agent.entry(agent).or_default();
-        if *count >= MAX_SERIES_PER_AGENT {
-            if self.over_limit.insert(agent) {
+        let count = self.series_per_host.entry(host).or_default();
+        if *count >= MAX_SERIES_PER_HOST {
+            if self.over_limit.insert(host) {
                 warn!(
-                    agent,
-                    "an agent reached the limit on series, ignoring new ones"
+                    host,
+                    "a host reached the limit on series, ignoring new ones"
                 );
             }
             return None;
@@ -245,7 +249,7 @@ impl Names {
         let id = self.next_series.max(1);
         self.next_series = id + 1;
         self.series.insert(key, id);
-        rows.series.push((id, metric, agent));
+        rows.series.push((id, metric, host));
         for (name, value) in labels {
             rows.labels.push((id, name.clone(), value.clone()));
         }
@@ -254,7 +258,7 @@ impl Names {
 
     fn add_sample(&mut self, new: &NewSample, rows: &mut Rows) -> Result<()> {
         let time = microseconds(&new.sample)?;
-        let agent = self.agent(&new.agent_id, rows);
+        let host = self.host(&new.host_id, rows);
         for (name, output) in &new.sample.metrics {
             if name.len() > MAX_NAME_BYTES {
                 continue;
@@ -277,7 +281,7 @@ impl Names {
                     Reported::Text(_) => DataType::Text,
                 };
                 let metric = self.metric(collector, &reading.metric, kind, rows);
-                let Some(series) = self.series(metric, agent, &reading.labels, rows) else {
+                let Some(series) = self.series(metric, host, &reading.labels, rows) else {
                     continue;
                 };
                 match reading.value {
@@ -288,7 +292,7 @@ impl Names {
                         if self.texts.get(&series).is_none_or(|known| known != text) {
                             self.texts.insert(series, text.to_string());
                             rows.texts.push((time, series, Some(text.to_string())));
-                            let current = self.text_series.entry((agent, collector)).or_default();
+                            let current = self.text_series.entry((host, collector)).or_default();
                             current.insert(series, item);
                         }
                     }
@@ -297,7 +301,7 @@ impl Names {
 
             // Something that was reported and isn't any more, like a check's error. A
             // sample may only cover some items, so only the ones in it can have changed.
-            if let Some(current) = self.text_series.get_mut(&(agent, collector)) {
+            if let Some(current) = self.text_series.get_mut(&(host, collector)) {
                 current.retain(|series, item| {
                     let gone = items.contains(item) && !reported.contains(series);
                     if gone {
@@ -332,17 +336,17 @@ fn write_rows(transaction: &Transaction<'_>, rows: &Rows) -> Result<()> {
         }
         appender.flush()?;
     }
-    if !rows.agents.is_empty() {
-        let mut appender = transaction.appender("agents")?;
-        for (id, agent_id) in &rows.agents {
-            appender.append_row(params![id, agent_id])?;
+    if !rows.hosts.is_empty() {
+        let mut appender = transaction.appender("hosts")?;
+        for (id, host_id) in &rows.hosts {
+            appender.append_row(params![id, host_id])?;
         }
         appender.flush()?;
     }
     if !rows.series.is_empty() {
         let mut appender = transaction.appender("series")?;
-        for (id, metric, agent) in &rows.series {
-            appender.append_row(params![id, metric, agent])?;
+        for (id, metric, host) in &rows.series {
+            appender.append_row(params![id, metric, host])?;
         }
         appender.flush()?;
     }
@@ -503,33 +507,33 @@ impl DuckDbStore {
     }
 
     /// In one transaction, so an agent is either all there or all gone.
-    fn delete_agent_rows(&mut self, agent_id: &str) -> Result<()> {
+    fn delete_host_rows(&mut self, host_id: &str) -> Result<()> {
         let transaction = self.connection.transaction()?;
-        let agent: i32 = match transaction.query_row(
-            "SELECT id FROM agents WHERE agent_id = ?",
-            params![agent_id],
+        let host: i32 = match transaction.query_row(
+            "SELECT id FROM hosts WHERE host_id = ?",
+            params![host_id],
             |row| row.get(0),
         ) {
-            Ok(agent) => agent,
+            Ok(host) => host,
             Err(duckdb::Error::QueryReturnedNoRows) => return Ok(()),
             Err(error) => return Err(error.into()),
         };
         for table in ["samples", "samples_recent", "texts", "series_labels"] {
             transaction.execute(
                 &format!(
-                    "DELETE FROM {table} WHERE series_id IN (SELECT id FROM series WHERE agent = ?)"
+                    "DELETE FROM {table} WHERE series_id IN (SELECT id FROM series WHERE host = ?)"
                 ),
-                params![agent],
+                params![host],
             )?;
         }
         for table in ["rollups_five_minute", "rollups_hour"] {
             transaction.execute(
-                &format!("DELETE FROM {table} WHERE agent = ?"),
-                params![agent],
+                &format!("DELETE FROM {table} WHERE host = ?"),
+                params![host],
             )?;
         }
-        transaction.execute("DELETE FROM series WHERE agent = ?", params![agent])?;
-        transaction.execute("DELETE FROM agents WHERE id = ?", params![agent])?;
+        transaction.execute("DELETE FROM series WHERE host = ?", params![host])?;
+        transaction.execute("DELETE FROM hosts WHERE id = ?", params![host])?;
         transaction.commit()?;
         Ok(())
     }
@@ -762,10 +766,10 @@ impl Store for DuckDbStore {
             || self.expire(now_ms)?)
     }
 
-    fn delete_agent(&mut self, agent_id: &str) -> Result<()> {
+    fn delete_host(&mut self, host_id: &str) -> Result<()> {
         let result = self
-            .delete_agent_rows(agent_id)
-            .context("deleting an agent's metrics");
+            .delete_host_rows(host_id)
+            .context("deleting a host's metrics");
         // Loaded again rather than worked out, as the agent touched most of what's
         // remembered. If that fails, the next write loads it first.
         self.names = Names::load(&self.connection).ok();
@@ -813,7 +817,7 @@ const LARGEST_VALUE: &str = "1e300";
 
 /// Which rows a reading of a metric covers. `agent` is `None` for every agent.
 struct Scope {
-    agent: Option<i32>,
+    host: Option<i32>,
     time: String,
 }
 
@@ -838,7 +842,7 @@ enum Naming<'a> {
     Label(&'a str),
 }
 
-/// One stored metric as rows of `agent_id`, `t`, `series` and `v`. Metric and agent
+/// One stored metric as rows of `host_id`, `t`, `series` and `v`. Metric and host
 /// numbers and the names here come from the catalog, never from a request or an agent.
 fn stored_values(
     connection: &Connection,
@@ -850,7 +854,7 @@ fn stored_values(
     let Some(id) = metric_id(connection, metric.collector, path)? else {
         // Nothing has reported it yet. This still takes the query's parameters.
         return Ok(format!(
-            "SELECT NULL::VARCHAR AS agent_id, 0::BIGINT AS t,
+            "SELECT NULL::VARCHAR AS host_id, 0::BIGINT AS t,
                     NULL::VARCHAR AS series, NULL::DOUBLE AS v
              FROM all_samples s WHERE false AND {}",
             scope.time
@@ -863,16 +867,16 @@ fn stored_values(
             format!("JOIN series_labels l ON l.series_id = se.id AND l.name = '{label}'"),
         ),
     };
-    let agent = scope
-        .agent
-        .map_or_else(String::new, |agent| format!("AND se.agent = {agent}"));
+    let host = scope
+        .host
+        .map_or_else(String::new, |host| format!("AND se.host = {host}"));
     Ok(format!(
-        "SELECT a.agent_id, epoch_ms(s.time) AS t, {name} AS series, s.value AS v
+        "SELECT a.host_id, epoch_ms(s.time) AS t, {name} AS series, s.value AS v
          FROM all_samples s
          JOIN series se ON se.id = s.series_id
-         JOIN agents a ON a.id = se.agent
+         JOIN hosts a ON a.id = se.host
          {label}
-         WHERE s.metric_id = {id} {agent} AND {time}",
+         WHERE s.metric_id = {id} {host} AND {time}",
         time = scope.time,
     ))
 }
@@ -889,15 +893,15 @@ fn reading_values(
             stored_values(connection, metric, path, naming, scope)
         }
         Reading::Percent { part, whole } => Ok(format!(
-            "SELECT p.agent_id, p.t, p.series, p.v / NULLIF(w.v, 0) * 100 AS v
-             FROM ({}) p JOIN ({}) w USING (agent_id, t, series)",
+            "SELECT p.host_id, p.t, p.series, p.v / NULLIF(w.v, 0) * 100 AS v
+             FROM ({}) p JOIN ({}) w USING (host_id, t, series)",
             stored_values(connection, metric, part, naming, scope)?,
             stored_values(connection, metric, whole, naming, scope)?,
         )),
     }
 }
 
-/// One row per value, as `agent_id`, `t`, `series` and `v`.
+/// One row per value, as `host_id`, `t`, `series` and `v`.
 fn readings(connection: &Connection, metric: &Metric, scope: &Scope) -> Result<String> {
     match metric.source {
         Source::Fields(fields) => {
@@ -938,13 +942,13 @@ fn is_rate(source: Source) -> bool {
 /// with counts made rates. A rate needs the sample before it, so the first is `NULL`.
 fn computed_with(connection: &Connection, metric: &Metric, scope: &Scope) -> Result<String> {
     let values = if is_rate(metric.source) {
-        "SELECT agent_id, t, series,
+        "SELECT host_id, t, series,
                 v * 1000.0 / NULLIF(
-                    t - lag(t) OVER (PARTITION BY agent_id, series ORDER BY t), 0
+                    t - lag(t) OVER (PARTITION BY host_id, series ORDER BY t), 0
                 ) AS v
          FROM readings"
     } else {
-        "SELECT agent_id, t, series, v FROM readings"
+        "SELECT host_id, t, series, v FROM readings"
     };
     Ok(format!(
         "WITH readings AS ({readings}),
@@ -956,7 +960,7 @@ fn computed_with(connection: &Connection, metric: &Metric, scope: &Scope) -> Res
 /// Parameters: from and to, both included.
 fn computed_sql(connection: &Connection, metric: &Metric) -> Result<String> {
     let scope = Scope {
-        agent: None,
+        host: None,
         time: "s.time >= epoch_ms($1::BIGINT) AND s.time <= epoch_ms($2::BIGINT)".to_string(),
     };
     computed_with(connection, metric, &scope)
@@ -976,14 +980,14 @@ fn rolled_up_until(connection: &Connection, metric: &Metric) -> Result<Option<i6
     }
 }
 
-/// Parameters: from and to. Rows of `agent_id`, `t`, `series`, `low`, `high`, `summed`
+/// Parameters: from and to. Rows of `host_id`, `t`, `series`, `low`, `high`, `summed`
 /// and `samples`: rolled up for what is, at `tier`, and each sample after that, as a
 /// row of its own. Rates read a little before the start, as each needs the sample
 /// before it.
 fn cells_sql(
     connection: &Connection,
     metric: &Metric,
-    agent: Option<i32>,
+    host: Option<i32>,
     tier: Tier,
     done: Option<i64>,
 ) -> Result<String> {
@@ -998,26 +1002,26 @@ fn cells_sql(
         0
     };
     let scope = Scope {
-        agent,
+        host,
         time: format!(
             "s.time >= epoch_ms({samples_from} - {lead}) AND s.time < epoch_ms($2::BIGINT)"
         ),
     };
     let mut cells = format!(
-        "SELECT agent_id, t, series, v AS low, v AS high, v AS summed, 1::BIGINT AS samples
+        "SELECT host_id, t, series, v AS low, v AS high, v AS summed, 1::BIGINT AS samples
          FROM ({computed} SELECT * FROM computed)
          WHERE t >= {samples_from} AND series IS NOT NULL AND abs(v) <= {LARGEST_VALUE}",
         computed = computed_with(connection, metric, &scope)?,
     );
     if let Some((table, done)) = rolled {
-        let agent = agent.map_or_else(String::new, |agent| format!("AND r.agent = {agent}"));
+        let host = host.map_or_else(String::new, |host| format!("AND r.host = {host}"));
         // The name comes from the catalog, never from a request.
         cells.push_str(&format!(
             " UNION ALL
-             SELECT a.agent_id, epoch_ms(r.time) AS t, r.series, r.low, r.high, r.summed,
+             SELECT a.host_id, epoch_ms(r.time) AS t, r.series, r.low, r.high, r.summed,
                     r.samples
-             FROM {table} r JOIN agents a ON a.id = r.agent
-             WHERE r.metric = '{name}' {agent}
+             FROM {table} r JOIN hosts a ON a.id = r.host
+             WHERE r.metric = '{name}' {host}
                AND r.time >= epoch_ms($1::BIGINT)
                AND r.time < epoch_ms(least($2::BIGINT, {done}))",
             name = metric.name,
@@ -1030,7 +1034,7 @@ fn cells_sql(
 fn series_sql(
     connection: &Connection,
     metric: &Metric,
-    agent: i32,
+    host: i32,
     tier: Tier,
     done: Option<i64>,
 ) -> Result<String> {
@@ -1055,12 +1059,12 @@ fn series_sql(
          WHERE position <= $4::BIGINT
          GROUP BY series, bucket, total
          ORDER BY series, bucket",
-        cells = cells_sql(connection, metric, Some(agent), tier, done)?,
+        cells = cells_sql(connection, metric, Some(host), tier, done)?,
     ))
 }
 
 /// Parameters: from, to, step, and how many lines to keep. A moment still filling up
-/// is left out, as it would look like machines disappearing. `members` is pairs of an
+/// is left out, as it would look like hosts disappearing. `members` is pairs of an
 /// agent's number and the number of its group, so nothing here comes from a request.
 fn calculation_sql(
     connection: &Connection,
@@ -1071,7 +1075,7 @@ fn calculation_sql(
 ) -> Result<String> {
     let members: Vec<String> = members
         .iter()
-        .map(|(agent, group)| format!("({agent}, {group})"))
+        .map(|(host, group)| format!("({host}, {group})"))
         .collect();
     let line = if query.by_series {
         "series"
@@ -1094,17 +1098,17 @@ fn calculation_sql(
     };
 
     Ok(format!(
-        "WITH members(agent, grp) AS (VALUES {members}),
+        "WITH members(host, grp) AS (VALUES {members}),
          cells AS ({cells}),
          per_series AS (
-             SELECT m.grp, u.agent_id, u.series,
+             SELECT m.grp, u.host_id, u.series,
                     u.t // $3::BIGINT * $3::BIGINT AS bucket,
                     sum(u.summed) / sum(u.samples) AS v
              FROM cells u
-             JOIN agents a ON a.agent_id = u.agent_id
-             JOIN members m ON m.agent = a.id
+             JOIN hosts a ON a.host_id = u.host_id
+             JOIN members m ON m.host = a.id
              WHERE true {only_main_line}
-             GROUP BY m.grp, u.agent_id, u.series, bucket
+             GROUP BY m.grp, u.host_id, u.series, bucket
          ),
          combined AS (
              SELECT {line} AS line, bucket, {combined} AS v
@@ -1137,7 +1141,7 @@ fn roll_up_hour(connection: &Connection, metric: &Metric, hour: i64) -> Result<(
         0
     };
     let scope = Scope {
-        agent: None,
+        host: None,
         time: format!(
             "s.time >= epoch_ms({}::BIGINT) AND s.time < epoch_ms({end}::BIGINT)",
             hour - lead
@@ -1152,12 +1156,12 @@ fn roll_up_hour(connection: &Connection, metric: &Metric, hour: i64) -> Result<(
                     min(c.v), max(c.v), sum(c.v), count(*)
              FROM (
                  {computed}
-                 SELECT agent_id, series, v,
+                 SELECT host_id, series, v,
                         t // {FIVE_MINUTES_MS} * {FIVE_MINUTES_MS} AS bucket
                  FROM computed
                  WHERE series IS NOT NULL AND abs(v) <= {LARGEST_VALUE}
                    AND t >= {hour} AND t < {end}
-             ) c JOIN agents a ON a.agent_id = c.agent_id
+             ) c JOIN hosts a ON a.host_id = c.host_id
              GROUP BY a.id, c.series, c.bucket",
                 name = metric.name,
                 computed = computed_with(connection, metric, &scope)?,
@@ -1168,11 +1172,11 @@ fn roll_up_hour(connection: &Connection, metric: &Metric, hour: i64) -> Result<(
     connection
         .execute(
             "INSERT INTO rollups_hour
-         SELECT metric, agent, series, epoch_ms($2::BIGINT)::TIMESTAMP,
+         SELECT metric, host, series, epoch_ms($2::BIGINT)::TIMESTAMP,
                 min(low), max(high), sum(summed), sum(samples)::BIGINT
          FROM rollups_five_minute
          WHERE metric = $1 AND time >= epoch_ms($2::BIGINT) AND time < epoch_ms($3::BIGINT)
-         GROUP BY metric, agent, series",
+         GROUP BY metric, host, series",
             params![metric.name, hour, end],
         )
         .with_context(|| format!("rolling up the hour of {}", metric.name))?;
@@ -1182,11 +1186,11 @@ fn roll_up_hour(connection: &Connection, metric: &Metric, hour: i64) -> Result<(
 fn newest_sql(connection: &Connection, metric: &Metric) -> Result<String> {
     Ok(format!(
         "{computed}
-         SELECT agent_id, series, max(t), arg_max(v, t)
+         SELECT host_id, series, max(t), arg_max(v, t)
          FROM computed
          WHERE series IS NOT NULL AND abs(v) <= {LARGEST_VALUE}
-         GROUP BY agent_id, series
-         ORDER BY agent_id, series",
+         GROUP BY host_id, series
+         ORDER BY host_id, series",
         computed = computed_sql(connection, metric)?,
     ))
 }
@@ -1197,22 +1201,22 @@ fn newest_sql(connection: &Connection, metric: &Metric) -> Result<String> {
 fn trends_sql(connection: &Connection, metric: &Metric) -> Result<String> {
     Ok(format!(
         "{computed}
-         SELECT agent_id, series, max(t), arg_max(v, t), min(t), count(*),
+         SELECT host_id, series, max(t), arg_max(v, t), min(t), count(*),
                 regr_slope(v, (t - $1::BIGINT)::DOUBLE)
          FROM computed
          WHERE series IS NOT NULL AND abs(v) <= {LARGEST_VALUE}
-         GROUP BY agent_id, series
+         GROUP BY host_id, series
          HAVING max(t) > min(t)
-         ORDER BY agent_id, series",
+         ORDER BY host_id, series",
         computed = computed_sql(connection, metric)?,
     ))
 }
 
 /// The number of an agent the store has heard from.
-fn agent_number(connection: &Connection, agent_id: &str) -> Result<Option<i32>> {
+fn host_number(connection: &Connection, host_id: &str) -> Result<Option<i32>> {
     let found = connection.query_row(
-        "SELECT id FROM agents WHERE agent_id = ?",
-        params![agent_id],
+        "SELECT id FROM hosts WHERE host_id = ?",
+        params![host_id],
         |row| row.get(0),
     );
     match found {
@@ -1225,14 +1229,14 @@ fn agent_number(connection: &Connection, agent_id: &str) -> Result<Option<i32>> 
 impl MetricsReader for DuckDbReader {
     fn series(&self, query: &SeriesQuery) -> Result<SeriesResult> {
         let connection = self.connection()?;
-        let Some(agent) = agent_number(&connection, query.agent_id)? else {
+        let Some(host) = host_number(&connection, query.host_id)? else {
             return Ok(SeriesResult::default());
         };
         let range = query.range;
         let tier = tier_for(range.step_ms, range.from_ms, now_ms(), &self.retention);
         let done = rolled_up_until(&connection, query.metric)?;
         let mut statement =
-            connection.prepare(&series_sql(&connection, query.metric, agent, tier, done)?)?;
+            connection.prepare(&series_sql(&connection, query.metric, host, tier, done)?)?;
         let rows = statement.query_map(
             params![
                 range.from_ms,
@@ -1271,17 +1275,17 @@ impl MetricsReader for DuckDbReader {
     fn last_samples(&self, since_ms: i64, until_ms: i64) -> Result<Vec<LastSample>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT a.agent_id, epoch_ms(newest.time)
+            "SELECT a.host_id, epoch_ms(newest.time)
              FROM (
-                 SELECT se.agent, max(s.time) AS time
+                 SELECT se.host, max(s.time) AS time
                  FROM all_samples s JOIN series se ON se.id = s.series_id
                  WHERE s.time >= epoch_ms($1::BIGINT) AND s.time <= epoch_ms($2::BIGINT)
-                 GROUP BY se.agent
-             ) newest JOIN agents a ON a.id = newest.agent",
+                 GROUP BY se.host
+             ) newest JOIN hosts a ON a.id = newest.host",
         )?;
         let rows = statement.query_map(params![since_ms, until_ms], |row| {
             Ok(LastSample {
-                agent_id: row.get(0)?,
+                host_id: row.get(0)?,
                 time_ms: row.get(1)?,
             })
         })?;
@@ -1290,13 +1294,13 @@ impl MetricsReader for DuckDbReader {
 
     fn latest_output(
         &self,
-        agent_id: &str,
+        host_id: &str,
         collector: &str,
         since_ms: i64,
         until_ms: i64,
     ) -> Result<Option<Value>> {
         let connection = self.connection()?;
-        let Some(agent) = agent_number(&connection, agent_id)? else {
+        let Some(host) = host_number(&connection, host_id)? else {
             return Ok(None);
         };
 
@@ -1306,10 +1310,10 @@ impl MetricsReader for DuckDbReader {
              JOIN metrics m ON m.id = se.metric_id
              JOIN collectors c ON c.id = m.collector_id
              LEFT JOIN series_labels l ON l.series_id = se.id
-             WHERE se.agent = ? AND c.name = ?
+             WHERE se.host = ? AND c.name = ?
              ORDER BY se.id",
         )?;
-        let rows = statement.query_map(params![agent, collector], |row| {
+        let rows = statement.query_map(params![host, collector], |row| {
             let label: Option<(String, String)> = match (row.get(3)?, row.get(4)?) {
                 (Some(name), Some(value)) => Some((name, value)),
                 _ => None,
@@ -1372,7 +1376,7 @@ impl MetricsReader for DuckDbReader {
         let mut statement = connection.prepare(&newest_sql(&connection, metric)?)?;
         let rows = statement.query_map(params![since_ms, until_ms], |row| {
             Ok(NewestReading {
-                agent_id: row.get(0)?,
+                host_id: row.get(0)?,
                 series: row.get(1)?,
                 time_ms: row.get(2)?,
                 value: row.get(3)?,
@@ -1387,7 +1391,7 @@ impl MetricsReader for DuckDbReader {
         let rows = statement.query_map(params![since_ms, until_ms], |row| {
             Ok((
                 Trend {
-                    agent_id: row.get(0)?,
+                    host_id: row.get(0)?,
                     series: row.get(1)?,
                     time_ms: row.get(2)?,
                     value: row.get(3)?,
@@ -1413,7 +1417,7 @@ impl MetricsReader for DuckDbReader {
 
     fn calculate(&self, query: &CalculationQuery) -> Result<SeriesResult> {
         let connection = self.connection()?;
-        let mut statement = connection.prepare("SELECT agent_id, id FROM agents")?;
+        let mut statement = connection.prepare("SELECT host_id, id FROM hosts")?;
         let numbers: HashMap<String, i32> = statement
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<duckdb::Result<_>>()?;
@@ -1423,7 +1427,7 @@ impl MetricsReader for DuckDbReader {
             .members
             .iter()
             .zip(places)
-            .filter_map(|(member, place)| Some((*numbers.get(&member.agent_id)?, place)))
+            .filter_map(|(member, place)| Some((*numbers.get(&member.host_id)?, place)))
             .collect();
         if members.is_empty() {
             return Ok(SeriesResult::default());
@@ -1716,9 +1720,9 @@ mod tests {
     #[test]
     fn deleting_an_agent_leaves_no_rows_of_it_in_any_table() {
         let mut store = in_memory();
-        for agent in ["gone", "kept"] {
+        for host in ["gone", "kept"] {
             let checks = json!([{ "name": "site", "kind": "http", "up": 0, "error": "no" }]);
-            write_metric(&mut store, agent, 1000, "checks", checks);
+            write_metric(&mut store, host, 1000, "checks", checks);
         }
         tidy_all(&mut store, 2 * HOUR_MS);
         write_metric(
@@ -1729,7 +1733,7 @@ mod tests {
             json!({ "usage_percent": 1 }),
         );
 
-        store.delete_agent("gone").unwrap();
+        store.delete_host("gone").unwrap();
 
         let count = |sql: &str| -> i64 {
             store
@@ -1737,9 +1741,9 @@ mod tests {
                 .query_row(sql, [], |row| row.get(0))
                 .unwrap()
         };
-        assert_eq!(count("SELECT count(*) FROM agents"), 1);
+        assert_eq!(count("SELECT count(*) FROM hosts"), 1);
         let kept = count("SELECT count(*) FROM series");
-        assert_eq!(count("SELECT count(*) FROM series WHERE agent = 2"), kept);
+        assert_eq!(count("SELECT count(*) FROM series WHERE host = 2"), kept);
         for table in ["samples", "samples_recent", "texts", "series_labels"] {
             let orphans = count(&format!(
                 "SELECT count(*) FROM {table} WHERE series_id NOT IN (SELECT id FROM series)"
@@ -1748,17 +1752,17 @@ mod tests {
         }
         assert!(
             count("SELECT count(*) FROM samples") > 0,
-            "the other agent's"
+            "the other host's"
         );
     }
 
     #[test]
     fn a_sample_sent_twice_is_stored_once_after_tidying() {
         let mut store = in_memory();
-        for agent in ["a", "a", "b"] {
+        for host in ["a", "a", "b"] {
             write_metric(
                 &mut store,
-                agent,
+                host,
                 1000,
                 "cpu",
                 json!({ "usage_percent": 5.0 }),
@@ -1820,7 +1824,7 @@ mod tests {
     #[test]
     fn stores_a_row_for_each_number_a_sample_holds() {
         let mut store = in_memory();
-        write_one(&mut store, "agent-1", "web-1", &sample()).unwrap();
+        write_one(&mut store, "host-1", "web-1", &sample()).unwrap();
         // The usage from cpu. The disk has a mount point and nothing else.
         assert_eq!(row_count(&store), 1);
     }
@@ -1937,13 +1941,13 @@ mod tests {
             .names
             .as_mut()
             .unwrap()
-            .series_per_agent
-            .insert(1, MAX_SERIES_PER_AGENT);
+            .series_per_host
+            .insert(1, MAX_SERIES_PER_HOST);
         store
             .names
             .as_mut()
             .unwrap()
-            .agents
+            .hosts
             .insert("noisy".to_string(), 1);
 
         write_metric(
@@ -1961,7 +1965,7 @@ mod tests {
             json!({ "usage_percent": 1.0 }),
         );
 
-        assert_eq!(row_count(&store), 1, "only the calm agent's");
+        assert_eq!(row_count(&store), 1, "only the calm host's");
     }
 
     #[test]
@@ -2056,7 +2060,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(series, ids, "no series was added twice");
-        assert_eq!(series, 4, "two agents, each with a number and a text");
+        assert_eq!(series, 4, "two hosts, each with a number and a text");
         assert_eq!(
             text_rows(&store).len(),
             2,
@@ -2073,7 +2077,7 @@ mod tests {
             .unwrap_or_default();
         let result = write_one(&mut store, "a", "h", &sample());
         assert!(result.is_err());
-        assert!(store.names.as_ref().unwrap().agents.is_empty());
+        assert!(store.names.as_ref().unwrap().hosts.is_empty());
     }
 
     fn sorted_count(store: &DuckDbStore) -> i64 {
@@ -2123,9 +2127,9 @@ mod tests {
     fn a_big_hour_is_tidied_in_pieces_that_keep_each_series_together() {
         let mut store = in_memory();
         for minute in 0..20 {
-            for agent in ["a", "b", "c", "d", "e"] {
+            for host in ["a", "b", "c", "d", "e"] {
                 let usage = json!({ "usage_percent": 1.0 });
-                write_metric(&mut store, agent, minute * 60_000, "cpu", usage);
+                write_metric(&mut store, host, minute * 60_000, "cpu", usage);
             }
         }
         let before = query(&store, "c", "cpu.usage", 8);
@@ -2201,14 +2205,14 @@ mod tests {
     #[test]
     fn stored_values_can_be_queried() {
         let mut store = in_memory();
-        write_one(&mut store, "agent-1", "web-1", &sample()).unwrap();
+        write_one(&mut store, "host-1", "web-1", &sample()).unwrap();
 
-        let (time, agent_id, metric, value): (String, String, String, f64) = store
+        let (time, host_id, metric, value): (String, String, String, f64) = store
             .connection
             .query_row(
-                "SELECT s.time::VARCHAR, a.agent_id, m.name, s.value FROM all_samples s
+                "SELECT s.time::VARCHAR, a.host_id, m.name, s.value FROM all_samples s
                  JOIN series se ON se.id = s.series_id
-                 JOIN agents a ON a.id = se.agent
+                 JOIN hosts a ON a.id = se.host
                  JOIN metrics m ON m.id = s.metric_id",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
@@ -2216,7 +2220,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(time, "2023-11-14 22:13:20.123");
-        assert_eq!(agent_id, "agent-1");
+        assert_eq!(host_id, "host-1");
         assert_eq!(metric, "usage_percent");
         assert_eq!(value, 12.5);
     }
@@ -2227,7 +2231,7 @@ mod tests {
         let mut bad = sample();
         bad.timestamp_ms = u64::MAX;
 
-        assert!(write_one(&mut store, "agent-1", "web-1", &bad).is_err());
+        assert!(write_one(&mut store, "host-1", "web-1", &bad).is_err());
         assert_eq!(row_count(&store), 0);
     }
 
@@ -2237,7 +2241,7 @@ mod tests {
         let mut bad = sample();
         bad.timestamp_ms = i64::MAX as u64;
 
-        assert!(write_one(&mut store, "agent-1", "web-1", &bad).is_err());
+        assert!(write_one(&mut store, "host-1", "web-1", &bad).is_err());
         assert_eq!(row_count(&store), 0);
     }
 
@@ -2249,16 +2253,16 @@ mod tests {
 
         store
             .write(&[
-                new_sample("agent-1", "web-1", &sample()),
-                new_sample("agent-2", "web-2", &second),
+                new_sample("host-1", "web-1", &sample()),
+                new_sample("host-2", "web-2", &second),
             ])
             .unwrap();
 
         let saved: Vec<(i64, String)> = store
             .connection
             .prepare(
-                "SELECT epoch_ms(s.time), a.agent_id FROM all_samples s
-                 JOIN series se ON se.id = s.series_id JOIN agents a ON a.id = se.agent
+                "SELECT epoch_ms(s.time), a.host_id FROM all_samples s
+                 JOIN series se ON se.id = s.series_id JOIN hosts a ON a.id = se.host
                  ORDER BY 1",
             )
             .unwrap()
@@ -2269,8 +2273,8 @@ mod tests {
         assert_eq!(
             saved,
             [
-                (1_700_000_000_123, "agent-1".to_string()),
-                (1_700_000_001_123, "agent-2".to_string())
+                (1_700_000_000_123, "host-1".to_string()),
+                (1_700_000_001_123, "host-2".to_string())
             ]
         );
     }
@@ -2282,8 +2286,8 @@ mod tests {
         bad.timestamp_ms = u64::MAX;
 
         let result = store.write(&[
-            new_sample("agent-1", "web-1", &sample()),
-            new_sample("agent-1", "web-1", &bad),
+            new_sample("host-1", "web-1", &sample()),
+            new_sample("host-1", "web-1", &bad),
         ]);
 
         assert!(result.is_err());
@@ -2305,7 +2309,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(write_one(&mut store, "agent-1", "web-1", &sample()).is_err());
+        assert!(write_one(&mut store, "host-1", "web-1", &sample()).is_err());
 
         let series: i64 = store
             .connection
@@ -2427,8 +2431,8 @@ mod tests {
             .filter(|metric| !query(&store, "a", metric.name, 8).series.is_empty())
             .count();
         assert!(readable > 25, "{readable}");
-        let host = latest_output(&store, "a", "host").unwrap();
-        assert_eq!(host, json!({ "uptime_secs": 90, "boot_time_secs": 10 }));
+        let output = latest_output(&store, "a", "host").unwrap();
+        assert_eq!(output, json!({ "uptime_secs": 90, "boot_time_secs": 10 }));
     }
 
     #[test]
@@ -2437,11 +2441,11 @@ mod tests {
         let path = folder.path().join("nested/maxnines.duckdb");
 
         let mut store = DuckDbStore::open(&path, "1GB", Retention::default()).unwrap();
-        write_one(&mut store, "agent-1", "web-1", &sample()).unwrap();
+        write_one(&mut store, "host-1", "web-1", &sample()).unwrap();
         drop(store);
 
         let mut reopened = DuckDbStore::open(&path, "1GB", Retention::default()).unwrap();
-        write_one(&mut reopened, "agent-1", "web-1", &sample()).unwrap();
+        write_one(&mut reopened, "host-1", "web-1", &sample()).unwrap();
         assert_eq!(row_count(&reopened), 2);
     }
 
@@ -2502,6 +2506,50 @@ mod tests {
 
         assert!(table_exists(&connection, "second"));
         assert_eq!(applied_migrations(&connection), 2);
+    }
+
+    #[test]
+    fn agents_become_hosts_keeping_every_row() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection, &MIGRATIONS[..3]).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO agents VALUES (1, 'abc');
+                 INSERT INTO collectors VALUES (3, 'server');
+                 INSERT INTO metrics VALUES (5, 3, 'agents_online', 'int');
+                 INSERT INTO rollup_progress VALUES ('server.agents', 10);
+                 INSERT INTO rollups_hour
+                 VALUES ('server.agents', 1, 'Online', TIMESTAMP '2026-11-01', 1, 2, 3, 4);
+                 INSERT INTO series VALUES (7, 1, 1);
+                 INSERT INTO rollups_hour
+                 VALUES ('cpu.usage', 1, 'CPU', TIMESTAMP '2026-11-01', 1, 2, 3, 4);
+                 INSERT INTO rollups_five_minute
+                 VALUES ('cpu.usage', 1, 'CPU', TIMESTAMP '2026-11-01', 1, 2, 3, 4);",
+            )
+            .unwrap();
+
+        migrate(&mut connection, MIGRATIONS).unwrap();
+
+        let count = |sql: &str| -> i64 { connection.query_row(sql, [], |row| row.get(0)).unwrap() };
+        assert_eq!(
+            count("SELECT count(*) FROM hosts WHERE host_id = 'abc' AND id = 1"),
+            1
+        );
+        assert_eq!(count("SELECT count(*) FROM series WHERE host = 1"), 1);
+        assert_eq!(count("SELECT count(*) FROM rollups_hour WHERE host = 1"), 2);
+        assert_eq!(
+            count("SELECT count(*) FROM rollups_five_minute WHERE host = 1"),
+            1
+        );
+        assert!(!table_exists(&connection, "agents"));
+        assert_eq!(
+            count("SELECT count(*) FROM metrics WHERE name = 'hosts_online'"),
+            1
+        );
+        let renamed = "SELECT count(*) FROM rollups_hour WHERE metric = 'server.hosts'";
+        assert_eq!(count(renamed), 1);
+        let progress = "SELECT count(*) FROM rollup_progress WHERE metric = 'server.hosts'";
+        assert_eq!(count(progress), 1);
     }
 
     #[test]

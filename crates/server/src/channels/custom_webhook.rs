@@ -37,7 +37,7 @@ const OWN_HEADERS: [&str; 5] = [
 
 /// What a new custom webhook starts with, to show what can go in one.
 pub const EXAMPLE_BODY: &str = r#"{
-  "title": "{{ alert.rule_name }} on {{ alert.host }}",
+  "title": "{{ alert.rule_name }} on {{ alert.hostname }}",
   "message": "{{ text }}",
   "severity": "{{ alert.severity }}",
   "status": "{{ event }}",
@@ -95,8 +95,8 @@ fn example_alert() -> Alert {
         rule_id: None,
         rule_name: "Test notification".to_string(),
         severity: Severity::Warning,
-        agent_id: String::new(),
-        host: "maxnines-test".to_string(),
+        host_id: String::new(),
+        hostname: "maxnines-test".to_string(),
         series: String::new(),
         value: None,
         summary: Notice::test().text,
@@ -186,8 +186,8 @@ pub fn preview(request: &WebhookRequest, web_url: Option<&str>) -> Preview {
         rule_id: Some(1),
         rule_name: "High CPU".to_string(),
         severity: Severity::Critical,
-        agent_id: "example-agent-id".to_string(),
-        host: "web-1".to_string(),
+        host_id: "example-host-id".to_string(),
+        hostname: "web-1".to_string(),
         series: String::new(),
         value: Some(97.0),
         summary: "CPU usage on web-1 is 97%, above 90%".to_string(),
@@ -418,25 +418,28 @@ mod tests {
     #[test]
     fn what_is_filled_in_cannot_break_out_of_a_json_string() {
         let mut sneaky = alert();
-        sneaky.host = "web\", \"admin\": true, \"x\": \"\n".to_string();
+        sneaky.hostname = "web\", \"admin\": true, \"x\": \"\n".to_string();
         let body = render(
             &request(
                 "application/json; charset=utf-8",
-                r#"{"host": "{{ alert.host }}"}"#,
+                r#"{"host": "{{ alert.hostname }}"}"#,
             ),
             &notice(Event::Firing, sneaky.clone()),
             None,
         )
         .unwrap();
         let body: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(body["host"], sneaky.host.as_str());
+        assert_eq!(body["host"], sneaky.hostname.as_str());
         assert_eq!(body.as_object().unwrap().len(), 1);
     }
 
     #[test]
     fn other_bodies_are_left_as_they_are() {
         let body = render(
-            &request("text/plain", "{{ alert.host }} & {{ event }}: {{ text }}"),
+            &request(
+                "text/plain",
+                "{{ alert.hostname }} & {{ event }}: {{ text }}",
+            ),
             &notice(Event::Resolved, alert()),
             None,
         )
@@ -477,7 +480,7 @@ mod tests {
         let body = render(
             &request(
                 "text/plain",
-                "{{ event }} {{ alert.host }} {{ alert.summary }}",
+                "{{ event }} {{ alert.hostname }} {{ alert.summary }}",
             ),
             &Notice::test(),
             None,

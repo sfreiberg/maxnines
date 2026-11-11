@@ -54,10 +54,10 @@ impl HostSearch {
 
     /// A filter that can't be read matches nothing, so a list is never mistaken for
     /// the filtered one someone asked for.
-    pub fn includes(&self, id: &str, host: &str) -> bool {
+    pub fn includes(&self, id: &str, hostname: &str) -> bool {
         self.filter
             .as_ref()
-            .is_some_and(|filter| filter.matches(id, host, self.facts.get(id)))
+            .is_some_and(|filter| filter.matches(id, hostname, self.facts.get(id)))
     }
 }
 
@@ -190,13 +190,13 @@ mod tests {
 
     #[test]
     fn addresses_leave_out_empty_values_and_encode_the_rest() {
-        assert_eq!(address("/agents", &[("filter", "")]), "/agents");
+        assert_eq!(address("/hosts", &[("filter", "")]), "/hosts");
         assert_eq!(
             address(
-                "/agents",
+                "/hosts",
                 &[("filter", "os=linux web"), ("page", "2"), ("view", "")]
             ),
-            "/agents?filter=os%3Dlinux+web&page=2"
+            "/hosts?filter=os%3Dlinux+web&page=2"
         );
     }
 }

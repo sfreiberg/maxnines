@@ -61,7 +61,7 @@ impl MetricsReader for Script {
 
     fn latest_output(
         &self,
-        _agent_id: &str,
+        _host_id: &str,
         _collector: &str,
         _since_ms: i64,
         _until_ms: i64,
@@ -114,7 +114,7 @@ struct Harness {
     server: TestServer,
     script: Script,
     evaluator: Evaluator,
-    agent: Identity,
+    host: Identity,
     client: Option<Client>,
     /// A time to count from. Later than any presence change in the test.
     now: i64,
@@ -127,15 +127,15 @@ impl Harness {
         let store = Box::new(crate::store::testing::MemoryStore(saved.clone()));
         let server = start_on("", store, Arc::new(script.clone()), saved, None).await;
 
-        let agent = identity();
-        let client = server.connect_approved(&agent, "web-1").await;
+        let host = identity();
+        let client = server.connect_approved(&host, "web-1").await;
         let now = now_ms() + MINUTE_MS;
         let evaluator = evaluator(&server, now - 60 * MINUTE_MS);
         Self {
             server,
             script,
             evaluator,
-            agent,
+            host,
             client: Some(client),
             now,
         }
@@ -146,12 +146,12 @@ impl Harness {
     }
 
     fn id(&self) -> String {
-        self.agent.id()
+        self.host.id()
     }
 
     fn reading(&self, series: &str, time_ms: i64, value: f64) -> NewestReading {
         NewestReading {
-            agent_id: self.id(),
+            host_id: self.id(),
             series: series.to_string(),
             time_ms,
             value,
@@ -249,7 +249,7 @@ async fn a_metric_alert_fires_once_and_resolves_when_it_clears() {
     let open = test.open().await;
     assert_eq!(open.len(), 1);
     assert_eq!(open[0].value, Some(96.5));
-    assert_eq!(open[0].host, "web-1");
+    assert_eq!(open[0].hostname, "web-1");
     assert_eq!(open[0].severity, Severity::Critical);
     assert_eq!(
         open[0].summary,
@@ -402,7 +402,7 @@ async fn a_condition_limits_which_agents_a_rule_watches() {
 
     let mut readings = vec![test.reading("CPU", test.now, 95.0)];
     readings.push(NewestReading {
-        agent_id: other.id(),
+        host_id: other.id(),
         ..test.reading("CPU", test.now, 95.0)
     });
     test.script.set(readings);
@@ -410,7 +410,7 @@ async fn a_condition_limits_which_agents_a_rule_watches() {
 
     let open = test.open().await;
     assert_eq!(open.len(), 1);
-    assert_eq!(open[0].host, "db-1");
+    assert_eq!(open[0].hostname, "db-1");
 }
 
 #[tokio::test]
@@ -487,7 +487,7 @@ async fn a_rule_that_stops_matching_closes_its_alerts() {
 
     assert_eq!(
         test.resolved().await[0].resolve_reason.as_deref(),
-        Some("The rule no longer applies to this machine")
+        Some("The rule no longer applies to this host")
     );
 }
 
@@ -505,14 +505,14 @@ async fn revoking_an_agent_closes_its_alerts() {
     test.server
         .state
         .registry
-        .decide(&id, AgentState::Revoked)
+        .decide(&id, HostState::Revoked)
         .await
         .unwrap();
     test.cpu(MINUTE_MS, 96.0).await;
 
     assert_eq!(
         test.resolved().await[0].resolve_reason.as_deref(),
-        Some("The agent is no longer approved")
+        Some("The host is no longer approved")
     );
 }
 
@@ -730,11 +730,11 @@ async fn every_server_starts_with_rules_for_agents_going_offline_and_disks_filli
     assert_eq!(
         names,
         [
-            "Agent offline",
             "Container down",
             "Disk filling up",
             "Disk running out of inodes",
-            "Disk will be full soon"
+            "Disk will be full soon",
+            "Host offline"
         ]
     );
 }
@@ -784,7 +784,7 @@ async fn a_failing_container_alerts_after_five_minutes() {
 async fn every_server_starts_with_a_rule_for_agents_going_offline() {
     let rule = built_in_offline_rule().await;
 
-    assert_eq!(rule.name, "Agent offline");
+    assert_eq!(rule.name, "Host offline");
     assert_eq!(rule.kind, RuleKind::Offline);
     assert_eq!(rule.for_secs, 300);
     assert_eq!(rule.severity, Severity::Critical);
@@ -1101,7 +1101,7 @@ async fn a_critical_alert_reaches_a_critical_only_channel_straight_away() {
 }
 
 #[tokio::test]
-async fn alerts_lead_with_the_machine_and_keep_its_id_for_hovering() {
+async fn alerts_lead_with_the_host_and_keep_its_id_for_hovering() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
         for_secs: 0,
@@ -1118,7 +1118,7 @@ async fn alerts_lead_with_the_machine_and_keep_its_id_for_hovering() {
     let alerts = browser.get(&test.server, "/alerts").await;
     assert!(
         alerts.body.contains(&format!(
-            r#"title="Agent {short}"><span class="os-icon os-linux""#
+            r#"title="Host {short}"><span class="os-icon os-linux""#
         )),
         "{}",
         alerts.body
@@ -1126,16 +1126,16 @@ async fn alerts_lead_with_the_machine_and_keep_its_id_for_hovering() {
     assert!(
         !alerts
             .body
-            .contains(&format!(r#"<span class="agent-id">{short}"#))
+            .contains(&format!(r#"<span class="host-id">{short}"#))
     );
 
     let overview = browser.get(&test.server, "/").await;
-    let host = overview
+    let hostname = overview
         .body
         .find(r#"class="host-name problem-host""#)
         .unwrap();
     let summary = overview.body.find("CPU usage on web-1 is 95%").unwrap();
-    assert!(host < summary, "{}", overview.body);
+    assert!(hostname < summary, "{}", overview.body);
     assert!(overview.body.contains("os-linux"));
 }
 
@@ -1163,7 +1163,7 @@ async fn an_agent_coming_back_resolves_after_the_wait() {
     assert_eq!(test.open().await.len(), 1);
 
     let mut client = test.server.connect().await;
-    let status = handshake(&mut client, &test.agent, "web-1", None).await;
+    let status = handshake(&mut client, &test.host, "web-1", None).await;
     assert_eq!(status, RegistrationStatus::Approved);
     test.server.wait_for_online(&test.id(), true).await;
     let back = test.server.state.presence.get(&test.id()).unwrap().since_ms as i64;
@@ -1184,15 +1184,15 @@ async fn a_restart_does_not_look_like_the_fleet_going_down() {
 
     // As after a restart: nothing has connected yet, as far as this knows.
     let server = start().await;
-    let agent = identity();
+    let host = identity();
     server
         .state
         .database
         .create_alert_rule(&offline_rule())
         .await
         .unwrap();
-    server.connect_approved(&agent, "web-1").await;
-    server.wait_for_online(&agent.id(), false).await;
+    server.connect_approved(&host, "web-1").await;
+    server.wait_for_online(&host.id(), false).await;
 
     let started = now_ms() + MINUTE_MS;
     let mut restarted = evaluator(&server, started);
@@ -1234,13 +1234,13 @@ async fn an_open_offline_alert_survives_the_grace_period_after_a_restart() {
 #[tokio::test]
 async fn an_agent_never_seen_since_a_restart_counts_as_offline() {
     let server = start().await;
-    let agent = identity();
+    let host = identity();
     let mut client = server.connect().await;
     assert_eq!(
-        handshake(&mut client, &agent, "quiet-1", None).await,
+        handshake(&mut client, &host, "quiet-1", None).await,
         RegistrationStatus::Pending
     );
-    server.approve(&agent).await;
+    server.approve(&host).await;
     drop(client);
 
     // A fresh presence table, as after a restart, for an agent that stays away.
@@ -1265,14 +1265,14 @@ async fn an_agent_never_seen_since_a_restart_counts_as_offline() {
 
     let open = state.database.open_alerts().await.unwrap();
     assert_eq!(open.len(), 1);
-    assert_eq!(open[0].host, "quiet-1");
+    assert_eq!(open[0].hostname, "quiet-1");
 }
 
 #[tokio::test]
 async fn a_stopped_process_alerts_from_what_an_agent_really_sends() {
     let server = start_with_metrics().await;
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
     let rule = AlertRuleInput {
         name: "nginx down".to_string(),
         metric: Some("process.count".to_string()),
@@ -1381,13 +1381,13 @@ async fn process_charts_only_appear_for_agents_that_report_processes() {
 
     let mut browser = Browser::default();
     let page = browser
-        .get(&server, &format!("/agents/{}/metrics", plain.id()))
+        .get(&server, &format!("/hosts/{}/metrics", plain.id()))
         .await;
     assert!(page.body.contains("CPU usage"));
     assert!(!page.body.contains("Running processes"), "{}", page.body);
 
     let page = browser
-        .get(&server, &format!("/agents/{}/metrics", watching.id()))
+        .get(&server, &format!("/hosts/{}/metrics", watching.id()))
         .await;
     assert!(page.body.contains("Running processes"), "{}", page.body);
     assert!(page.body.contains("Process CPU usage"));
@@ -1397,8 +1397,8 @@ async fn process_charts_only_appear_for_agents_that_report_processes() {
 #[tokio::test]
 async fn a_metric_for_alerts_only_gets_no_chart_but_can_still_be_read() {
     let server = start_with_metrics().await;
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
     let time = now_ms() - 1000;
     let sample = AgentMessage::Sample(Sample {
         timestamp_ms: time as u64,
@@ -1424,16 +1424,16 @@ async fn a_metric_for_alerts_only_gets_no_chart_but_can_still_be_read() {
     }
 
     let page = Browser::default()
-        .get(&server, &format!("/agents/{}/metrics", agent.id()))
+        .get(&server, &format!("/hosts/{}/metrics", host.id()))
         .await;
     assert!(!page.body.contains("Network link up"), "{}", page.body);
 }
 
 #[tokio::test]
-async fn an_agents_page_shows_how_its_checks_last_went() {
+async fn an_hosts_page_shows_how_its_checks_last_went() {
     let server = start_with_metrics().await;
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
     let time = now_ms() - 1000;
     let sample = AgentMessage::Sample(Sample {
         timestamp_ms: time as u64,
@@ -1471,7 +1471,7 @@ async fn an_agents_page_shows_how_its_checks_last_went() {
     }
 
     let page = Browser::default()
-        .get(&server, &format!("/agents/{}/metrics", agent.id()))
+        .get(&server, &format!("/hosts/{}/metrics", host.id()))
         .await;
     assert_eq!(page.status, 200, "{}", page.body);
     assert!(page.body.contains("Latest checks"));
@@ -1483,10 +1483,10 @@ async fn an_agents_page_shows_how_its_checks_last_went() {
 }
 
 #[tokio::test]
-async fn an_agents_page_shows_its_custom_metrics_without_trusting_them() {
+async fn an_hosts_page_shows_its_custom_metrics_without_trusting_them() {
     let server = start_with_metrics().await;
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
     let sample = AgentMessage::Sample(Sample {
         timestamp_ms: (now_ms() - 1000) as u64,
         metrics: BTreeMap::from([(
@@ -1518,7 +1518,7 @@ async fn an_agents_page_shows_its_custom_metrics_without_trusting_them() {
     }
 
     let page = Browser::default()
-        .get(&server, &format!("/agents/{}/metrics", agent.id()))
+        .get(&server, &format!("/hosts/{}/metrics", host.id()))
         .await;
     assert_eq!(page.status, 200, "{}", page.body);
     assert!(page.body.contains("Latest custom metrics"));
@@ -1530,10 +1530,10 @@ async fn an_agents_page_shows_its_custom_metrics_without_trusting_them() {
 }
 
 #[tokio::test]
-async fn a_windows_machines_page_shows_its_performance_counters() {
+async fn a_windows_hosts_page_shows_its_performance_counters() {
     let server = start_with_metrics().await;
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, "win-1").await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "win-1").await;
     let sample = AgentMessage::Sample(Sample {
         timestamp_ms: (now_ms() - 1000) as u64,
         metrics: BTreeMap::from([(
@@ -1572,7 +1572,7 @@ async fn a_windows_machines_page_shows_its_performance_counters() {
     );
 
     let page = Browser::default()
-        .get(&server, &format!("/agents/{}/metrics", agent.id()))
+        .get(&server, &format!("/hosts/{}/metrics", host.id()))
         .await;
     assert_eq!(page.status, 200, "{}", page.body);
     assert!(page.body.contains("Latest performance counters"));
@@ -1633,10 +1633,10 @@ async fn a_rule_can_choose_custom_metrics_by_name_but_not_commands() {
 #[tokio::test]
 async fn charts_keep_the_catalog_order_however_their_queries_finish() {
     let server = start_with_metrics().await;
-    let (agent, _client) = report_samples(&server, "/").await;
+    let (host, _client) = report_samples(&server, "/").await;
 
     let page = Browser::default()
-        .get(&server, &format!("/agents/{}/metrics", agent.id()))
+        .get(&server, &format!("/hosts/{}/metrics", host.id()))
         .await;
     let position = |title: &str| page.body.find(&format!("<h2>{title}</h2>")).unwrap();
     assert!(position("CPU usage") < position("Load average"));
@@ -1749,7 +1749,7 @@ async fn a_webhook_hears_about_an_alert_starting_and_ending_once_each() {
 
     let received = hook.received.lock().unwrap();
     assert_eq!(received[0]["version"], 1);
-    assert_eq!(received[0]["alert"]["host"], "web-1");
+    assert_eq!(received[0]["alert"]["hostname"], "web-1");
     assert_eq!(received[0]["alert"]["severity"], "critical");
     assert_eq!(received[0]["text"], "CPU usage on web-1 is 95%, above 90%");
     assert_eq!(
@@ -2141,7 +2141,7 @@ async fn an_alert_opens_and_closes_in_alertops() {
     assert_eq!(events[0]["subject"], "High CPU");
     assert_eq!(events[0]["message"], "CPU usage on web-1 is 95%, above 90%");
     assert_eq!(events[0]["severity"], "critical");
-    assert_eq!(events[0]["host"], "web-1");
+    assert_eq!(events[0]["hostname"], "web-1");
     assert_eq!(events[0]["link"], "https://monitor.example.com/alerts");
     assert_eq!(events[1]["status"], "closed");
     assert_eq!(events[1]["alert_id"], events[0]["alert_id"]);
@@ -2840,7 +2840,7 @@ async fn silencing_from_slack_covers_just_that_alert_for_an_hour() {
     assert_eq!(silence.rule_id, test.open().await[0].rule_id);
     assert_eq!(
         silence.filter,
-        format!("id={}", test.open().await[0].agent_id),
+        format!("id={}", test.open().await[0].host_id),
         "by ID, as another machine could share the name"
     );
     assert_eq!(silence.created_by, SLACK_MEMBER);
@@ -3414,8 +3414,8 @@ async fn a_channel_that_is_down_does_not_hold_up_the_others() {
         rule_id: rule,
         rule_name: "Disk full".to_string(),
         severity: Severity::Critical,
-        agent_id: test.id(),
-        host: "web-1".to_string(),
+        host_id: test.id(),
+        hostname: "web-1".to_string(),
         series: series.to_string(),
         value: Some(99.0),
         summary: format!("{series} on web-1 is 99% full"),
@@ -3634,7 +3634,7 @@ fn mail_channel(port: u16) -> ChannelInput {
         mail: Some(Mail {
             from: "MaxNines <alerts@example.com>".to_string(),
             server: Some(MailServer {
-                host: "127.0.0.1".to_string(),
+                hostname: "127.0.0.1".to_string(),
                 port: Some(port),
                 security: MailSecurity::None,
                 username: None,
@@ -3954,7 +3954,7 @@ async fn an_alert_rule_can_be_created_changed_and_deleted_from_the_form() {
         "{}",
         list.body
     );
-    assert!(list.body.contains("Every machine"));
+    assert!(list.body.contains("Every host"));
 
     let mut fields = ALERT_RULE_FIELDS.to_vec();
     fields[4] = ("critical_threshold", "75.5");
@@ -4524,9 +4524,9 @@ async fn the_alerts_page_shows_what_is_firing_and_what_ended() {
 #[tokio::test]
 async fn names_from_agents_are_escaped_on_the_alerts_page() {
     let server = start_with("").await;
-    let agent = identity();
-    let host = "<script>alert(1)</script>";
-    let _client = server.connect_approved(&agent, host).await;
+    let host = identity();
+    let hostname = "<script>alert(1)</script>";
+    let _client = server.connect_approved(&host, hostname).await;
     let rule_id = server
         .state
         .database
@@ -4544,11 +4544,11 @@ async fn names_from_agents_are_escaped_on_the_alerts_page() {
                 rule_id,
                 rule_name: "<b>rule</b>".to_string(),
                 severity: Severity::Warning,
-                agent_id: agent.id(),
-                host: host.to_string(),
+                host_id: host.id(),
+                hostname: hostname.to_string(),
                 series: "<i>series</i>".to_string(),
                 value: None,
-                summary: format!("{host} is offline"),
+                summary: format!("{hostname} is offline"),
                 started_ms: 1000,
             },
             &[],
@@ -4633,8 +4633,8 @@ async fn deleting_an_agent_takes_everything_about_it_once_it_is_revoked() {
         test.database().create_location_rule(&place).await.unwrap();
     }
     let mut browser = Browser::default();
-    let page = format!("/agents/{id}");
-    let api_path = format!("/api/v1/agents/{id}");
+    let page = format!("/hosts/{id}");
+    let api_path = format!("/api/v1/hosts/{id}");
 
     // Only once it's revoked.
     let response = browser
@@ -4643,7 +4643,7 @@ async fn deleting_an_agent_takes_everything_about_it_once_it_is_revoked() {
     assert_eq!(response.status, 409);
     let (status, body) = api(&test.server, "DELETE", &api_path, &Value::Null).await;
     assert_eq!(status, 409);
-    assert_eq!(body["error"], "Revoke the agent before deleting it");
+    assert_eq!(body["error"], "Revoke the host before deleting it");
     assert!(
         !browser
             .get(&test.server, &page)
@@ -4668,7 +4668,7 @@ async fn deleting_an_agent_takes_everything_about_it_once_it_is_revoked() {
         .await;
     assert_eq!(response.status, 303);
     assert!(
-        response.headers.contains("location: /agents\r\n"),
+        response.headers.contains("location: /hosts\r\n"),
         "{}",
         response.headers
     );
@@ -4697,9 +4697,9 @@ async fn deleting_an_agent_takes_everything_about_it_once_it_is_revoked() {
     );
     assert!(test.server.state.registry.get(&other.id()).await.is_some());
 
-    // If the machine still runs it, it's new, and waits to be approved.
+    // If the host still runs it, it's new, and waits to be approved.
     let mut again = test.server.connect().await;
-    let status = handshake(&mut again, &test.agent, "web-1", None).await;
+    let status = handshake(&mut again, &test.host, "web-1", None).await;
     assert_eq!(status, RegistrationStatus::Pending);
 }
 
@@ -4707,10 +4707,10 @@ async fn deleting_an_agent_takes_everything_about_it_once_it_is_revoked() {
 async fn the_servers_own_agents_can_not_be_deleted() {
     let server = start().await;
     for id in [
-        crate::remote_checks::LOCAL_AGENT_ID,
-        crate::remote_checks::FLEET_AGENT_ID,
+        crate::remote_checks::LOCAL_HOST_ID,
+        crate::remote_checks::FLEET_HOST_ID,
     ] {
-        let path = format!("/api/v1/agents/{id}");
+        let path = format!("/api/v1/hosts/{id}");
         assert_eq!(
             api(&server, "DELETE", &path, &Value::Null).await.0,
             404,
@@ -4900,14 +4900,14 @@ fn events_read_back_as_written() {
 
 mod remote {
     use super::*;
-    use crate::remote_checks::{LOCAL_AGENT_ID, RemoteCheckInput, Scheduler};
+    use crate::remote_checks::{LOCAL_HOST_ID, RemoteCheckInput, Scheduler};
     use maxnines_protocol::{Check, CheckKind};
 
     /// A server that knows about its built-in agent, as a real one does.
     async fn server() -> TestServer {
         let server = start_with_metrics().await;
-        let local = server.state.database.load_agents().await.unwrap();
-        let local = local.into_iter().find(|a| a.id == LOCAL_AGENT_ID).unwrap();
+        let local = server.state.database.load_hosts().await.unwrap();
+        let local = local.into_iter().find(|a| a.id == LOCAL_HOST_ID).unwrap();
         server.state.registry.insert_for_test(local).await;
         server
     }
@@ -5046,7 +5046,7 @@ mod remote {
         evaluator.evaluate(now_ms()).await.unwrap();
         let open = server.state.database.open_alerts().await.unwrap();
         assert_eq!(open.len(), 1);
-        assert_eq!(open[0].agent_id, LOCAL_AGENT_ID);
+        assert_eq!(open[0].host_id, LOCAL_HOST_ID);
         assert_eq!(
             open[0].summary,
             "Checks passing (db) on MaxNines server is 0, below 1"
@@ -5081,28 +5081,28 @@ mod remote {
         let server = server().await;
         let mut browser = Browser::default();
 
-        for path in ["/agents", "/metrics"] {
+        for path in ["/hosts", "/metrics"] {
             let page = browser.get(&server, path).await;
             assert!(!page.body.contains("MaxNines server"), "{path}");
         }
-        let page = browser.get(&server, "/agents/server").await;
+        let page = browser.get(&server, "/hosts/server").await;
         assert_eq!(page.status, 404);
-        let page = browser.get(&server, "/agents/server/metrics").await;
+        let page = browser.get(&server, "/hosts/server/metrics").await;
         assert_eq!(page.status, 200, "{}", page.body);
-        assert!(!page.body.contains("Machine details"));
+        assert!(!page.body.contains("Host details"));
 
         let response = server
-            .http("GET", "/api/v1/agents", Some(&server.api_key))
+            .http("GET", "/api/v1/hosts", Some(&server.api_key))
             .await;
         assert!(!response.contains("MaxNines server"));
 
         let revoked = server
             .state
             .registry
-            .decide(LOCAL_AGENT_ID, AgentState::Revoked)
+            .decide(LOCAL_HOST_ID, HostState::Revoked)
             .await;
         assert_eq!(revoked.unwrap(), None);
-        assert!(server.state.registry.is_approved(LOCAL_AGENT_ID).await);
+        assert!(server.state.registry.is_approved(LOCAL_HOST_ID).await);
     }
 
     const FIELDS: [(&str, &str); 6] = [
@@ -5227,7 +5227,7 @@ mod remote {
     }
 
     #[tokio::test]
-    async fn results_show_on_the_checks_page_and_agent_page() {
+    async fn results_show_on_the_checks_page_and_host_page() {
         let server = server().await;
         let target = CLOSED_ADDRESS.to_string();
         let input = tcp_input("<b>db</b>", &target);
@@ -5240,7 +5240,7 @@ mod remote {
         run_due(&mut scheduler(&server), now_ms()).await;
 
         let mut browser = Browser::default();
-        for path in ["/checks", "/agents/server/metrics"] {
+        for path in ["/checks", "/hosts/server/metrics"] {
             let page = browser.get(&server, path).await;
             assert_eq!(page.status, 200, "{path}");
             assert!(page.body.contains("Down"), "{path}: {}", page.body);
@@ -6301,13 +6301,13 @@ mod pages {
     use super::*;
     use crate::alerting::NewAlert;
 
-    fn alert(rule_id: i64, agent: &Identity, severity: Severity, summary: &str) -> NewAlert {
+    fn alert(rule_id: i64, host: &Identity, severity: Severity, summary: &str) -> NewAlert {
         NewAlert {
             rule_id,
             rule_name: "Rule".to_string(),
             severity,
-            agent_id: agent.id(),
-            host: "web-1".to_string(),
+            host_id: host.id(),
+            hostname: "web-1".to_string(),
             series: String::new(),
             value: None,
             summary: summary.to_string(),
@@ -6325,9 +6325,9 @@ mod pages {
             .unwrap();
         let (warning, critical) = ("Disk is filling up", "Everything is on fire");
         // Newest comes first otherwise, so this has to be sorted to pass.
-        let new = alert(rule, &test.agent, Severity::Critical, critical);
+        let new = alert(rule, &test.host, Severity::Critical, critical);
         test.database().fire_alert(&new, &[]).await.unwrap();
-        let new = alert(rule, &test.agent, Severity::Warning, warning);
+        let new = alert(rule, &test.host, Severity::Warning, warning);
         test.database().fire_alert(&new, &[]).await.unwrap();
 
         let page = Browser::default().get(&test.server, "/").await;
@@ -6350,7 +6350,7 @@ mod pages {
             .create_alert_rule(&cpu_rule())
             .await
             .unwrap();
-        let new = alert(rule, &test.agent, Severity::Warning, "Disk is filling up");
+        let new = alert(rule, &test.host, Severity::Warning, "Disk is filling up");
         test.database().fire_alert(&new, &[]).await.unwrap();
 
         let page = Browser::default().get(&test.server, "/").await;
@@ -6388,7 +6388,7 @@ mod pages {
         assert!(page.body.contains("site"), "{}", page.body);
         assert!(page.body.contains("Waiting"), "{}", page.body);
         assert!(
-            page.body.contains("1 agent is waiting for approval"),
+            page.body.contains("1 host is waiting for approval"),
             "{}",
             page.body
         );
@@ -6410,7 +6410,7 @@ mod pages {
 
         for (path, link) in [
             ("/", r#"class="rail-link on" href="/""#),
-            ("/agents", r#"class="rail-link on" href="/agents""#),
+            ("/hosts", r#"class="rail-link on" href="/hosts""#),
             ("/metrics", r#"class="rail-link on" href="/metrics""#),
             ("/checks", r#"class="rail-link on" href="/checks""#),
             ("/alerts", r#"class="rail-link on" href="/alerts""#),
@@ -6447,7 +6447,7 @@ mod pages {
         test.server.wait_for_online(&other.id(), false).await;
         let mut browser = Browser::default();
 
-        let page = browser.get(&test.server, "/agents").await;
+        let page = browser.get(&test.server, "/hosts").await;
         assert!(page.body.contains("1 of 2 online"), "{}", page.body);
         for state in ["Online", "Offline"] {
             let dot =
@@ -6458,15 +6458,15 @@ mod pages {
         assert!(page.body.contains("All 2"), "{}", page.body);
         assert!(page.body.contains("class=\"tile"), "{}", page.body);
 
-        let page = browser.get(&test.server, "/agents?status=offline").await;
+        let page = browser.get(&test.server, "/hosts?status=offline").await;
         assert!(page.body.contains("db-1"));
         assert!(!page.body.contains("web-1"), "{}", page.body);
 
-        let page = browser.get(&test.server, "/agents?status=online").await;
+        let page = browser.get(&test.server, "/hosts?status=online").await;
         assert!(page.body.contains("web-1"));
         assert!(!page.body.contains("db-1"), "{}", page.body);
 
-        let page = browser.get(&test.server, "/agents?view=table").await;
+        let page = browser.get(&test.server, "/hosts?view=table").await;
         assert!(page.body.contains("<table"), "{}", page.body);
         assert!(
             page.body.contains(r#"aria-label="Online""#),
@@ -6486,26 +6486,26 @@ mod pages {
         let id = newcomer.id();
 
         let mut browser = Browser::default();
-        let page = browser.get(&server, "/agents").await;
+        let page = browser.get(&server, "/hosts").await;
         assert!(page.body.contains("Waiting for approval"), "{}", page.body);
-        assert!(page.body.contains(&format!("/agents/{id}/approve")));
-        assert!(page.body.contains(&format!("/agents/{id}/revoke")));
+        assert!(page.body.contains(&format!("/hosts/{id}/approve")));
+        assert!(page.body.contains(&format!("/hosts/{id}/revoke")));
 
         let page = browser
-            .submit(&server, "/agents", &format!("/agents/{id}/approve"), &[])
+            .submit(&server, "/hosts", &format!("/hosts/{id}/approve"), &[])
             .await;
         assert_eq!(page.status, 303, "{}", page.body);
         assert!(server.state.registry.is_approved(&id).await);
 
-        let page = browser.get(&server, "/agents").await;
+        let page = browser.get(&server, "/hosts").await;
         assert!(!page.body.contains("Waiting for approval"), "{}", page.body);
     }
 
     #[tokio::test]
-    async fn an_agents_page_shows_uptime_facts_and_firing_alerts() {
+    async fn an_hosts_page_shows_uptime_facts_and_firing_alerts() {
         let server = start_with_metrics().await;
-        let agent = identity();
-        let mut client = server.connect_approved(&agent, "web-1").await;
+        let host = identity();
+        let mut client = server.connect_approved(&host, "web-1").await;
         let sample = AgentMessage::Sample(Sample {
             timestamp_ms: now_ms() as u64 - 1000,
             metrics: BTreeMap::from([
@@ -6528,7 +6528,7 @@ mod pages {
         server
             .state
             .database
-            .record_facts(&agent.id(), &facts, now_ms() as u64)
+            .record_facts(&host.id(), &facts, now_ms() as u64)
             .await
             .unwrap();
         let rule = server
@@ -6537,7 +6537,7 @@ mod pages {
             .create_alert_rule(&cpu_rule())
             .await
             .unwrap();
-        let new = alert(rule, &agent, Severity::Warning, "Disk is filling up");
+        let new = alert(rule, &host, Severity::Warning, "Disk is filling up");
         server.state.database.fire_alert(&new, &[]).await.unwrap();
 
         let metric = crate::metrics::find("host.uptime").unwrap();
@@ -6555,7 +6555,7 @@ mod pages {
         }
 
         let page = Browser::default()
-            .get(&server, &format!("/agents/{}", agent.id()))
+            .get(&server, &format!("/hosts/{}", host.id()))
             .await;
         for text in [
             "53 days, 6 hours",
@@ -6573,8 +6573,8 @@ mod pages {
     #[tokio::test]
     async fn a_reboot_can_be_alerted_on() {
         let server = start_with_metrics().await;
-        let agent = identity();
-        let mut client = server.connect_approved(&agent, "web-1").await;
+        let host = identity();
+        let mut client = server.connect_approved(&host, "web-1").await;
         let rule = AlertRuleInput {
             name: "Rebooted".to_string(),
             metric: Some("host.uptime".to_string()),
@@ -6620,8 +6620,8 @@ mod pages {
     #[tokio::test]
     async fn an_agent_that_keeps_restarting_can_be_alerted_on() {
         let server = start_with_metrics().await;
-        let agent = identity();
-        let mut client = server.connect_approved(&agent, "web-1").await;
+        let host = identity();
+        let mut client = server.connect_approved(&host, "web-1").await;
         let rule = AlertRuleInput {
             name: "Agent restarted".to_string(),
             metric: Some("agent.uptime".to_string()),
@@ -6718,23 +6718,23 @@ mod pages {
     #[tokio::test]
     async fn names_from_agents_are_escaped_on_every_new_page() {
         let server = start_with_metrics().await;
-        let agent = identity();
-        let host = "<script>alert(1)</script>";
-        let _client = server.connect_approved(&agent, host).await;
-        let facts = FlatFacts::from([("os.name".to_string(), json!(host))]);
+        let host = identity();
+        let hostname = "<script>alert(1)</script>";
+        let _client = server.connect_approved(&host, hostname).await;
+        let facts = FlatFacts::from([("os.name".to_string(), json!(hostname))]);
         server
             .state
             .database
-            .record_facts(&agent.id(), &facts, now_ms() as u64)
+            .record_facts(&host.id(), &facts, now_ms() as u64)
             .await
             .unwrap();
         let mut browser = Browser::default();
 
         for path in [
             "/".to_string(),
-            "/agents".to_string(),
-            "/agents?view=table".to_string(),
-            format!("/agents/{}", agent.id()),
+            "/hosts".to_string(),
+            "/hosts?view=table".to_string(),
+            format!("/hosts/{}", host.id()),
             "/metrics".to_string(),
         ] {
             let page = browser.get(&server, &path).await;
@@ -6753,13 +6753,13 @@ mod server_page {
     #[tokio::test]
     async fn the_server_keeps_a_history_of_its_own_numbers() {
         let server = start_with_metrics().await;
-        let local = server.state.database.load_agents().await.unwrap();
+        let local = server.state.database.load_hosts().await.unwrap();
         let local = local
             .into_iter()
-            .find(|agent| agent.id == crate::remote_checks::LOCAL_AGENT_ID)
+            .find(|host| host.id == crate::remote_checks::LOCAL_HOST_ID)
             .unwrap();
         server.state.registry.insert_for_test(local).await;
-        let (_agent, client) = report_samples(&server, "/").await;
+        let (_host, client) = report_samples(&server, "/").await;
         // Reading answers heartbeats, as an agent would, however long this takes.
         let (_sender, receiver) = client.split();
         tokio::spawn(receiver.for_each(|_| async {}));
@@ -6771,7 +6771,7 @@ mod server_page {
         let deadline = Instant::now() + Duration::from_secs(5);
         let page = loop {
             let page = Browser::default()
-                .get(&server, "/agents/server/metrics")
+                .get(&server, "/hosts/server/metrics")
                 .await;
             if page.body.contains("Server memory") || Instant::now() > deadline {
                 break page;
@@ -6781,19 +6781,19 @@ mod server_page {
 
         assert_eq!(page.status, 200);
         assert!(page.body.contains("Server memory"), "{}", page.body);
-        assert!(page.body.contains("Agents"), "{}", page.body);
+        assert!(page.body.contains("Hosts"), "{}", page.body);
         // Charts for what the server doesn't report would only be empty.
         assert!(!page.body.contains("CPU usage"), "{}", page.body);
         assert!(page.body.contains(r#"href="/server""#));
 
-        let metric = crate::metrics::find("server.agents").unwrap();
+        let metric = crate::metrics::find("server.hosts").unwrap();
         let range = TimeRange::new(now_ms() - 60_000, now_ms() + 60_000).unwrap();
-        let agents = server
+        let hosts = server
             .state
             .metrics
             .series("server", metric, range, 8)
             .await;
-        let online = agents
+        let online = hosts
             .unwrap()
             .series
             .into_iter()
@@ -6815,7 +6815,7 @@ mod server_page {
         let page = Browser::default().get(&server, "/server").await;
         assert!(
             page.body
-                .contains(r#"href="/agents/server/metrics?range=1h""#)
+                .contains(r#"href="/hosts/server/metrics?range=1h""#)
         );
     }
 
@@ -6835,7 +6835,7 @@ mod server_page {
     #[tokio::test]
     async fn the_server_page_reports_on_everything() {
         let server = start_with_metrics().await;
-        let (_agent, _client) = report_samples(&server, "/").await;
+        let (_host, _client) = report_samples(&server, "/").await;
         evaluator(&server, now_ms())
             .evaluate(now_ms())
             .await
@@ -6852,7 +6852,7 @@ mod server_page {
             "Samples written",
             "Rows",
             "cpu",
-            "Agents",
+            "Hosts",
             "Alert rules last ran",
         ] {
             assert!(page.body.contains(text), "{text}: {}", page.body);
@@ -6944,7 +6944,7 @@ mod server_page {
     #[tokio::test]
     async fn the_dashboard_graphs_what_the_server_takes_in() {
         let server = start_with_metrics().await;
-        let (_agent, client) = report_samples(&server, "/").await;
+        let (_host, client) = report_samples(&server, "/").await;
         // Reading answers heartbeats, as an agent would, however long this takes.
         let (mut sender, receiver) = client.split();
         tokio::spawn(receiver.for_each(|_| async {}));
@@ -6982,7 +6982,7 @@ mod server_page {
             "Slowest write",
             "Series stored",
             "Database size",
-            "Agents",
+            "Hosts",
             "CPU usage",
         ] {
             assert!(page.body.contains(heading), "{heading}: {}", page.body);
@@ -6992,9 +6992,9 @@ mod server_page {
     }
 
     #[tokio::test]
-    async fn the_server_reports_on_its_own_machine() {
+    async fn the_server_reports_on_its_own_host() {
         let server = start_with_metrics().await;
-        let mut recorded = Recorded::with_machine();
+        let mut recorded = Recorded::with_host();
         record_once(&server.state, &mut recorded).await;
         sleep(Duration::from_millis(300)).await;
         record_once(&server.state, &mut recorded).await;
@@ -7052,7 +7052,7 @@ mod charts {
     /// A disk alert for what `agent` reports, told to `channels`.
     async fn disk_alert(
         server: &TestServer,
-        agent: &Identity,
+        host: &Identity,
         series: &str,
         channels: &[i64],
     ) -> Alert {
@@ -7071,8 +7071,8 @@ mod charts {
             rule_id,
             rule_name: rule.name,
             severity: Severity::Critical,
-            agent_id: agent.id(),
-            host: "web-1".to_string(),
+            host_id: host.id(),
+            hostname: "web-1".to_string(),
             series: series.to_string(),
             value: Some(95.0),
             summary: format!("Disk usage ({series}) on web-1 is 95%, above 90%"),
@@ -7130,15 +7130,15 @@ mod charts {
     #[tokio::test]
     async fn a_chart_is_drawn_from_what_the_agent_reported() {
         let server = start_with_metrics().await;
-        let (agent, _client) = report_samples(&server, "/data").await;
+        let (host, _client) = report_samples(&server, "/data").await;
         let charts = sources(&server);
         let now = now_ms();
 
-        let alert = disk_alert(&server, &agent, "/data", &[]).await;
+        let alert = disk_alert(&server, &host, "/data", &[]).await;
         let png = charts.draw(&alert, now).await.unwrap().unwrap();
         assert_eq!(&png[..8], PNG);
 
-        let missing = disk_alert(&server, &agent, "/elsewhere", &[]).await;
+        let missing = disk_alert(&server, &host, "/elsewhere", &[]).await;
         assert!(charts.draw(&missing, now).await.unwrap().is_none());
 
         let rule = server
@@ -7158,7 +7158,7 @@ mod charts {
     #[tokio::test]
     async fn discord_gets_the_chart_attached_when_an_alert_starts_but_not_ends() {
         let server = start_with_metrics().await;
-        let (agent, _client) = report_samples(&server, "/data").await;
+        let (host, _client) = report_samples(&server, "/data").await;
         let capture = Capture::default();
         let channel = ChannelInput {
             name: "Discord".to_string(),
@@ -7172,7 +7172,7 @@ mod charts {
             .create_channel(&channel)
             .await
             .unwrap();
-        let alert = disk_alert(&server, &agent, "/data", &[channel]).await;
+        let alert = disk_alert(&server, &host, "/data", &[channel]).await;
         let notifier = Notifier::new(server.state.database.clone(), Senders::default())
             .with_charts(sources(&server));
 
@@ -7200,7 +7200,7 @@ mod charts {
     #[tokio::test]
     async fn telegram_gets_a_photo_with_the_alert_as_its_caption() {
         let server = start_with_metrics().await;
-        let (agent, _client) = report_samples(&server, "/data").await;
+        let (host, _client) = report_samples(&server, "/data").await;
         let telegram = FakeTelegram::default();
         let url = telegram.start().await;
         let channel = ChannelInput {
@@ -7219,7 +7219,7 @@ mod charts {
             .create_channel(&channel)
             .await
             .unwrap();
-        disk_alert(&server, &agent, "/data", &[channel]).await;
+        disk_alert(&server, &host, "/data", &[channel]).await;
         let senders = Senders {
             telegram_api_url: Some(url),
             ..Senders::default()
@@ -7242,7 +7242,7 @@ mod charts {
     #[tokio::test]
     async fn a_message_too_long_for_a_caption_goes_first_with_the_photo_replying() {
         let server = start_with_metrics().await;
-        let (agent, _client) = report_samples(&server, "/data").await;
+        let (host, _client) = report_samples(&server, "/data").await;
         let telegram = FakeTelegram::default();
         let url = telegram.start().await;
         let channel = ChannelInput {
@@ -7262,7 +7262,7 @@ mod charts {
             .await
             .unwrap();
         let long = "/".to_string() + &"d".repeat(200);
-        let alert = disk_alert(&server, &agent, &long, &[channel]).await;
+        let alert = disk_alert(&server, &host, &long, &[channel]).await;
         let notice = crate::notifier::Notice {
             chart: Some(Arc::new(PNG.to_vec())),
             ..crate::notifier::Notice::for_alert(
@@ -7301,7 +7301,7 @@ mod charts {
     #[tokio::test]
     async fn slack_shows_the_chart_and_keeps_it_when_the_alert_resolves() {
         let server = start_with_metrics().await;
-        let (agent, _client) = report_samples(&server, "/data").await;
+        let (host, _client) = report_samples(&server, "/data").await;
         let slack = FakeSlack::default();
         let url = slack.start().await;
         let channel = ChannelInput {
@@ -7320,7 +7320,7 @@ mod charts {
             .create_channel(&channel)
             .await
             .unwrap();
-        let alert = disk_alert(&server, &agent, "/data", &[channel]).await;
+        let alert = disk_alert(&server, &host, "/data", &[channel]).await;
         let notifier = Notifier::new(
             server.state.database.clone(),
             Senders {
@@ -7357,7 +7357,7 @@ mod charts {
     #[tokio::test]
     async fn slack_still_gets_the_alert_when_the_chart_cannot_be_uploaded() {
         let server = start_with_metrics().await;
-        let (agent, _client) = report_samples(&server, "/data").await;
+        let (host, _client) = report_samples(&server, "/data").await;
         let slack = FakeSlack::default();
         let url = slack.start().await;
         slack.errors.lock().unwrap().push("missing_scope");
@@ -7377,7 +7377,7 @@ mod charts {
             .create_channel(&channel)
             .await
             .unwrap();
-        disk_alert(&server, &agent, "/data", &[channel]).await;
+        disk_alert(&server, &host, "/data", &[channel]).await;
         Notifier::new(
             server.state.database.clone(),
             Senders {
@@ -7463,7 +7463,7 @@ impl Receiver {
 }
 
 const STATUS_BOARD_BODY: &str = r#"{
-  "title": "{{ alert.rule_name }} on {{ alert.host }}",
+  "title": "{{ alert.rule_name }} on {{ alert.hostname }}",
   "state": "{% if event == "resolved" %}ok{% else %}{{ alert.severity }}{% endif %}",
   "value": {{ alert.value | json }},
   "started": "{{ alert.started }}"
@@ -7720,7 +7720,7 @@ fn disk_trend(
     per_hour: f64,
 ) -> crate::metrics::Trend {
     crate::metrics::Trend {
-        agent_id: test.id(),
+        host_id: test.id(),
         series: "/".to_string(),
         time_ms: test.now + offset_ms,
         value: percent,
@@ -7943,10 +7943,10 @@ async fn a_forecast_rule_can_be_made_on_the_form_and_through_the_api() {
     assert!(refused.to_string().contains("how far ahead"), "{refused}");
 }
 
-/// An alert about this machine, to see whether it'd be held back.
-fn alert_about(agent_id: &str, rule_id: i64) -> crate::alerting::Alert {
+/// An alert about this host, to see whether it'd be held back.
+fn alert_about(host_id: &str, rule_id: i64) -> crate::alerting::Alert {
     crate::alerting::Alert {
-        agent_id: agent_id.to_string(),
+        host_id: host_id.to_string(),
         rule_id: Some(rule_id),
         ..crate::channels::testing::alert()
     }
@@ -7960,14 +7960,14 @@ async fn held(server: &TestServer, alert: &crate::alerting::Alert) -> bool {
 }
 
 #[tokio::test]
-async fn a_machine_can_be_quieted_from_its_page_and_brought_back() {
+async fn a_host_can_be_quieted_from_its_page_and_brought_back() {
     let server = start().await;
-    let agent = identity();
-    let _client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let _client = server.connect_approved(&host, "web-1").await;
     let other = identity();
     let _other_client = server.connect_approved(&other, "web-2").await;
-    let id = agent.id();
-    let page_path = format!("/agents/{id}");
+    let id = host.id();
+    let page_path = format!("/hosts/{id}");
     let mut browser = Browser::default();
 
     let page = browser.get(&server, &page_path).await;
@@ -7982,7 +7982,7 @@ async fn a_machine_can_be_quieted_from_its_page_and_brought_back() {
         .submit(
             &server,
             &page_path,
-            &format!("/agents/{id}/maintenance"),
+            &format!("/hosts/{id}/maintenance"),
             &fields,
         )
         .await;
@@ -8008,7 +8008,7 @@ async fn a_machine_can_be_quieted_from_its_page_and_brought_back() {
     let page = browser.get(&server, &page_path).await;
     assert!(
         page.body
-            .contains("Notifications about this machine are held until"),
+            .contains("Notifications about this host are held until"),
         "{}",
         page.body
     );
@@ -8023,7 +8023,7 @@ async fn a_machine_can_be_quieted_from_its_page_and_brought_back() {
         .submit(
             &server,
             &page_path,
-            &format!("/agents/{id}/maintenance/end"),
+            &format!("/hosts/{id}/maintenance/end"),
             &[],
         )
         .await;
@@ -8043,11 +8043,11 @@ async fn a_machine_can_be_quieted_from_its_page_and_brought_back() {
 }
 
 #[tokio::test]
-async fn a_machine_page_names_a_wider_silence_but_leaves_ending_it_to_its_page() {
+async fn a_host_page_names_a_wider_silence_but_leaves_ending_it_to_its_page() {
     let server = start().await;
-    let agent = identity();
-    let _client = server.connect_approved(&agent, "web-1").await;
-    let id = agent.id();
+    let host = identity();
+    let _client = server.connect_approved(&host, "web-1").await;
+    let id = host.id();
     let everything = crate::silences::SilenceInput {
         rule_id: None,
         filter: String::new(),
@@ -8060,7 +8060,7 @@ async fn a_machine_page_names_a_wider_silence_but_leaves_ending_it_to_its_page()
         .create_silence(&everything, "ops@example.com", now_ms())
         .await
         .unwrap();
-    // One rule alone doesn't make the machine quiet, so it isn't mentioned.
+    // One rule alone doesn't make the host quiet, so it isn't mentioned.
     let rule = server
         .state
         .database
@@ -8081,7 +8081,7 @@ async fn a_machine_page_names_a_wider_silence_but_leaves_ending_it_to_its_page()
         .unwrap();
 
     let mut browser = Browser::default();
-    let page_path = format!("/agents/{id}");
+    let page_path = format!("/hosts/{id}");
     let page = browser.get(&server, &page_path).await;
     assert!(
         page.body
@@ -8093,12 +8093,12 @@ async fn a_machine_page_names_a_wider_silence_but_leaves_ending_it_to_its_page()
     assert!(!page.body.contains("End now"));
     assert!(page.body.contains(r#"href="/alerts/silences""#));
 
-    // Ending from the machine's page leaves silences it didn't start alone.
+    // Ending from the host's page leaves silences it didn't start alone.
     let page = browser
         .submit(
             &server,
             &page_path,
-            &format!("/agents/{id}/maintenance/end"),
+            &format!("/hosts/{id}/maintenance/end"),
             &[],
         )
         .await;
@@ -8120,7 +8120,7 @@ async fn a_machine_page_names_a_wider_silence_but_leaves_ending_it_to_its_page()
         .submit(
             &server,
             &page_path,
-            &format!("/agents/{id}/maintenance"),
+            &format!("/hosts/{id}/maintenance"),
             &fields,
         )
         .await;

@@ -9,10 +9,10 @@ use lettre::{Address, Message, SmtpTransport, Transport};
 use super::{ChannelType, SEND_TIMEOUT, blocking};
 use crate::alerting::{Channel, ChannelInput, Mail, MailSecurity, MailServer};
 use crate::notifier::{Notice, Senders, format_ms};
-use crate::remote_checks::FLEET_AGENT_ID;
+use crate::remote_checks::FLEET_HOST_ID;
 
 pub(crate) const MAX_RECIPIENTS: usize = 20;
-/// The longest host name DNS allows.
+/// The longest hostname DNS allows.
 const MAX_HOST_LEN: usize = 253;
 const MAX_USERNAME_LEN: usize = 255;
 
@@ -20,11 +20,11 @@ pub struct Email;
 
 /// The channel's mail server, ready to send.
 fn transport(server: &MailServer, password: Option<&str>) -> Result<SmtpTransport> {
-    let host = server.host.trim();
+    let hostname = server.hostname.trim();
     let mut builder = match server.security {
-        MailSecurity::Tls => SmtpTransport::relay(host)?,
-        MailSecurity::Starttls => SmtpTransport::starttls_relay(host)?,
-        MailSecurity::None => SmtpTransport::builder_dangerous(host),
+        MailSecurity::Tls => SmtpTransport::relay(hostname)?,
+        MailSecurity::Starttls => SmtpTransport::starttls_relay(hostname)?,
+        MailSecurity::None => SmtpTransport::builder_dangerous(hostname),
     };
     if let Some(port) = server.port {
         builder = builder.port(port);
@@ -84,11 +84,11 @@ pub(super) fn check_recipients(target: &str) -> Result<()> {
 }
 
 fn check_server(server: &MailServer, has_password: bool) -> Result<()> {
-    let host = server.host.trim();
-    ensure!(!host.is_empty(), "add the mail server's host name");
+    let hostname = server.hostname.trim();
+    ensure!(!hostname.is_empty(), "add the mail server's hostname");
     ensure!(
-        host.len() <= MAX_HOST_LEN && !host.chars().any(|c| c.is_whitespace() || c == '/'),
-        "the mail server's host should be a name like smtp.example.com, without anything else"
+        hostname.len() <= MAX_HOST_LEN && !hostname.chars().any(|c| c.is_whitespace() || c == '/'),
+        "the mail server's hostname should be a name like smtp.example.com, without anything else"
     );
     ensure!(server.port != Some(0), "the mail server's port can't be 0");
     match &server.username {
@@ -145,10 +145,10 @@ pub(super) fn text(notice: &Notice) -> String {
         String::new(),
         format!("Rule: {}", alert.rule_name),
         format!("Severity: {}", alert.severity.as_str()),
-        if alert.agent_id == FLEET_AGENT_ID {
-            format!("Machines: {}", alert.host)
+        if alert.host_id == FLEET_HOST_ID {
+            format!("Hosts: {}", alert.hostname)
         } else {
-            format!("Machine: {} ({})", alert.host, alert.agent_id)
+            format!("Host: {} ({})", alert.hostname, alert.host_id)
         },
         format!("Started: {}", format_ms(alert.started_ms)),
     ];
@@ -266,7 +266,7 @@ mod tests {
     fn an_email_with_a_chart_shows_it_beside_the_plain_text() {
         let from: Mailbox = "maxnines@example.com".parse().unwrap();
         let odd_host = Alert {
-            host: "web-<1>".to_string(),
+            hostname: "web-<1>".to_string(),
             ..alert()
         };
         let charted = Notice {
@@ -322,7 +322,7 @@ mod tests {
         };
         let body = text(&notice(Event::Resolved, alert));
         assert!(body.contains("Rule: High CPU"), "{body}");
-        assert!(body.contains("Machine: web-1 (abc)"), "{body}");
+        assert!(body.contains("Host: web-1 (abc)"), "{body}");
         assert!(body.contains("Resolved: 1970-01-01 00:01:01 UTC"), "{body}");
         assert!(body.contains("Reason: The problem cleared"), "{body}");
     }

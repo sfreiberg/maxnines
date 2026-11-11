@@ -136,7 +136,7 @@ mod windows {
 
     pub fn failed() -> Option<Failed> {
         let access = SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE;
-        // SAFETY: no names means this machine's own service database.
+        // SAFETY: no names means this host's own service database.
         let manager = unsafe { OpenSCManagerW(null(), null(), access) };
         if manager.is_null() {
             return None;
@@ -226,7 +226,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn this_machine_can_list_its_failed_units() {
+    async fn this_host_can_list_its_failed_units() {
         if std::path::Path::new("/run/systemd/system").exists() {
             assert!(failed_services().await.is_some());
         }
@@ -234,7 +234,7 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn this_machine_can_list_its_services() {
+    async fn this_host_can_list_its_services() {
         assert!(failed_services().await.is_some());
     }
 }

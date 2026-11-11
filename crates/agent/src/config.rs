@@ -17,7 +17,7 @@ const MAX_FACT_NAME_LEN: usize = 255 - "custom.".len();
 
 /// Only what's needed to reach the server. What to monitor comes from the
 /// server, and custom facts stay here because the server's rules match on them.
-/// Custom metrics stay here so that the server can't choose what a machine runs.
+/// Custom metrics stay here so that the server can't choose what a host runs.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {

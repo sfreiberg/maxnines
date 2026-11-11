@@ -1,6 +1,6 @@
 //! Packets each network interface dropped, as running totals by interface name. A
 //! drop is a packet that arrived or was ready to go but had nowhere to wait, which is
-//! a sign the machine can't keep up, where an error is a damaged packet.
+//! a sign the host can't keep up, where an error is a damaged packet.
 //!
 //! macOS only counts received packets it dropped, so sent ones are left out there.
 
@@ -155,7 +155,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
-    fn this_machines_interfaces_count_received_drops() {
+    fn this_hosts_interfaces_count_received_drops() {
         let totals = totals();
         assert!(!totals.is_empty());
         assert!(

@@ -445,7 +445,7 @@ mod tests {
 
     #[test]
     fn signing_in_only_ever_leads_to_this_site() {
-        assert_eq!(safe_next(Some("/agents?view=table")), "/agents?view=table");
+        assert_eq!(safe_next(Some("/hosts?view=table")), "/hosts?view=table");
         for outside in [
             "https://evil.example",
             "//evil.example",

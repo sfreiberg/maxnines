@@ -27,8 +27,8 @@ use crate::facts::unflatten;
 use crate::metrics::{self, Metrics, NewestReading, TimeRange, Trend, now_ms};
 use crate::models::Database;
 use crate::presence::Presence;
-use crate::registration::{AgentRecord, AgentState, Registry};
-use crate::remote_checks::{FLEET_AGENT_ID, FLEET_HOST};
+use crate::registration::{HostRecord, HostState, Registry};
+use crate::remote_checks::{FLEET_HOST_ID, FLEET_HOSTNAME};
 use crate::rule_engine;
 use crate::server_stats::ServerStatus;
 
@@ -40,10 +40,10 @@ const INTERVAL: Duration = Duration::from_secs(15);
 const STARTUP_GRACE_MS: i64 = 120_000;
 
 /// An agent can report as many disks or interfaces as it likes, and each series
-/// can be its own alert. No real machine needs more than this.
-const MAX_SERIES_PER_AGENT: usize = 64;
+/// can be its own alert. No real host needs more than this.
+const MAX_SERIES_PER_HOST: usize = 64;
 
-/// A calculation can have a line for every machine, and each can be its own alert.
+/// A calculation can have a line for every host, and each can be its own alert.
 const MAX_CALCULATION_LINES: usize = 500;
 
 /// How often forecasts read their metrics again. Reading hours of every disk is
@@ -63,13 +63,13 @@ type TrendKey = (&'static str, u64);
 #[derive(Clone)]
 struct Trends {
     read_ms: i64,
-    by_agent: Arc<BTreeMap<String, Vec<Trend>>>,
+    by_host: Arc<BTreeMap<String, Vec<Trend>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Key {
     rule_id: i64,
-    agent_id: String,
+    host_id: String,
     series: String,
 }
 
@@ -77,7 +77,7 @@ impl Key {
     fn of(alert: &Alert) -> Option<Self> {
         Some(Self {
             rule_id: alert.rule_id?,
-            agent_id: alert.agent_id.clone(),
+            host_id: alert.host_id.clone(),
             series: alert.series.clone(),
         })
     }
@@ -191,7 +191,7 @@ struct Snapshot {
     now_ms: i64,
     in_grace: bool,
     rules: BTreeMap<i64, AlertRule>,
-    agents: BTreeMap<String, AgentRecord>,
+    hosts: BTreeMap<String, HostRecord>,
     facts: BTreeMap<String, Value>,
     /// By metric and agent. A metric that couldn't be read is missing, which
     /// says nothing about whether anything is wrong.
@@ -202,12 +202,12 @@ struct Snapshot {
 
 impl Snapshot {
     /// A condition that can't be evaluated doesn't match, as with config rules.
-    fn rule_applies(&self, rule: &AlertRule, agent_id: &str) -> bool {
+    fn rule_applies(&self, rule: &AlertRule, host_id: &str) -> bool {
         let Some(condition) = &rule.rule.condition else {
             return true;
         };
-        let facts = self.facts.get(agent_id).unwrap_or(&Value::Null);
-        rule_engine::evaluate(condition, facts, agent_id).unwrap_or(false)
+        let facts = self.facts.get(host_id).unwrap_or(&Value::Null);
+        rule_engine::evaluate(condition, facts, host_id).unwrap_or(false)
     }
 
     /// Why an open alert that nothing checked this time should end, if it should.
@@ -226,11 +226,11 @@ impl Snapshot {
         if rule.rule.kind == RuleKind::Calculation {
             return None;
         }
-        if !self.agents.contains_key(&alert.agent_id) {
-            return Some("The agent is no longer approved");
+        if !self.hosts.contains_key(&alert.host_id) {
+            return Some("The host is no longer approved");
         }
-        if !self.rule_applies(rule, &alert.agent_id) {
-            return Some("The rule no longer applies to this machine");
+        if !self.rule_applies(rule, &alert.host_id) {
+            return Some("The rule no longer applies to this host");
         }
         match rule.rule.kind {
             RuleKind::Offline if self.in_grace => None,
@@ -242,12 +242,12 @@ impl Snapshot {
                 let metric = rule.rule.metric()?;
                 let reported = if rule.rule.kind == RuleKind::Forecast {
                     let trends = self.trends.get(&(metric.name, rule.rule.window()))?;
-                    let trends = trends.by_agent.get(&alert.agent_id)?;
+                    let trends = trends.by_host.get(&alert.host_id)?;
                     trends
                         .iter()
                         .any(|trend| clean(&trend.series) == alert.series)
                 } else {
-                    let readings = self.readings.get(metric.name)?.get(&alert.agent_id)?;
+                    let readings = self.readings.get(metric.name)?.get(&alert.host_id)?;
                     readings
                         .iter()
                         .any(|reading| clean(&reading.series) == alert.series)
@@ -330,13 +330,13 @@ impl Evaluator {
             .map(|rule| (rule.id, rule))
             .collect();
 
-        let agents = self
+        let hosts = self
             .registry
             .list()
             .await
             .into_iter()
-            .filter(|agent| agent.state == AgentState::Approved)
-            .map(|agent| (agent.id.clone(), agent))
+            .filter(|host| host.state == HostState::Approved)
+            .map(|host| (host.id.clone(), host))
             .collect();
 
         let active = || rules.values().filter(|rule| rule.rule.enabled);
@@ -345,7 +345,7 @@ impl Evaluator {
         let facts = if needs_facts {
             let all = self.database.all_current_facts().await?;
             all.iter()
-                .map(|(agent, facts)| (agent.clone(), unflatten(facts)))
+                .map(|(host, facts)| (host.clone(), unflatten(facts)))
                 .collect()
         } else {
             BTreeMap::new()
@@ -361,11 +361,11 @@ impl Evaluator {
             let metric = metrics::find(name).context("unknown metric")?;
             match self.metrics.newest(metric, now_ms).await {
                 Ok(rows) => {
-                    let mut by_agent: BTreeMap<String, Vec<NewestReading>> = BTreeMap::new();
+                    let mut by_host: BTreeMap<String, Vec<NewestReading>> = BTreeMap::new();
                     for row in rows {
-                        by_agent.entry(row.agent_id.clone()).or_default().push(row);
+                        by_host.entry(row.host_id.clone()).or_default().push(row);
                     }
-                    readings.insert(name, by_agent);
+                    readings.insert(name, by_host);
                 }
                 Err(error) => {
                     error!(
@@ -390,7 +390,7 @@ impl Evaluator {
             now_ms,
             in_grace: now_ms - self.started_ms < STARTUP_GRACE_MS,
             rules,
-            agents,
+            hosts,
             facts,
             readings,
             trends: self.trends.clone(),
@@ -416,13 +416,13 @@ impl Evaluator {
             .await
         {
             Ok(rows) => {
-                let mut by_agent: BTreeMap<String, Vec<Trend>> = BTreeMap::new();
+                let mut by_host: BTreeMap<String, Vec<Trend>> = BTreeMap::new();
                 for row in rows {
-                    by_agent.entry(row.agent_id.clone()).or_default().push(row);
+                    by_host.entry(row.host_id.clone()).or_default().push(row);
                 }
                 let trends = Trends {
                     read_ms: now_ms,
-                    by_agent: Arc::new(by_agent),
+                    by_host: Arc::new(by_host),
                 };
                 self.trends.insert(key, trends);
             }
@@ -463,22 +463,22 @@ impl Evaluator {
                 }
                 continue;
             }
-            for agent in snapshot.agents.values() {
-                if !snapshot.rule_applies(rule, &agent.id) {
+            for host in snapshot.hosts.values() {
+                if !snapshot.rule_applies(rule, &host.id) {
                     continue;
                 }
                 match rule.rule.kind {
-                    RuleKind::Offline if snapshot.in_grace || agent.is_local() => {}
+                    RuleKind::Offline if snapshot.in_grace || host.is_local() => {}
                     RuleKind::Offline => {
-                        self.check_offline(rule, agent, &snapshot, &mut open, &mut checked)
+                        self.check_offline(rule, host, &snapshot, &mut open, &mut checked)
                             .await?;
                     }
                     RuleKind::Metric => {
-                        self.check_metric(rule, agent, &snapshot, &mut open, &mut checked)
+                        self.check_metric(rule, host, &snapshot, &mut open, &mut checked)
                             .await?;
                     }
                     RuleKind::Forecast => {
-                        self.check_forecast(rule, agent, &snapshot, &mut open, &mut checked)
+                        self.check_forecast(rule, host, &snapshot, &mut open, &mut checked)
                             .await?;
                     }
                     RuleKind::Calculation => {}
@@ -509,21 +509,21 @@ impl Evaluator {
     async fn check_offline(
         &mut self,
         rule: &AlertRule,
-        agent: &AgentRecord,
+        host: &HostRecord,
         snapshot: &Snapshot,
         open: &mut HashMap<Key, Alert>,
         checked: &mut HashSet<Key>,
     ) -> Result<()> {
         let key = Key {
             rule_id: rule.id,
-            agent_id: agent.id.clone(),
+            host_id: host.id.clone(),
             series: String::new(),
         };
         checked.insert(key.clone());
 
         // An agent that hasn't connected since the start has been gone at least
         // that long, and may have been offline before it.
-        let presence = self.presence.get(&agent.id);
+        let presence = self.presence.get(&host.id);
         let online = presence.is_some_and(|p| p.online);
         let since = presence.map_or(self.started_ms, |p| p.since_ms as i64);
 
@@ -540,9 +540,9 @@ impl Evaluator {
         let current = open.get(&key).map(|alert| alert.severity);
         let change = tracker.observe(&levels, snapshot.now_ms, hold_ms(rule), current);
 
-        let host = clean(&agent.host);
-        let summary = rule.rule.offline_summary(&host);
-        self.apply(change, rule, &host, key, None, summary, snapshot, open)
+        let hostname = clean(&host.hostname);
+        let summary = rule.rule.offline_summary(&hostname);
+        self.apply(change, rule, &hostname, key, None, summary, snapshot, open)
             .await
     }
 
@@ -579,7 +579,7 @@ impl Evaluator {
                 Some((clean(&series.name), value))
             })
             .collect();
-        // Nothing reporting is exactly what a rule counting machines is there to catch.
+        // Nothing reporting is exactly what a rule counting hosts is there to catch.
         if lines.is_empty()
             && question.calculation == Calculation::Count
             && question.grouping == Grouping::Nothing
@@ -619,7 +619,7 @@ impl Evaluator {
 
         let key_of = |line: &str| Key {
             rule_id: rule.id,
-            agent_id: FLEET_AGENT_ID.to_string(),
+            host_id: FLEET_HOST_ID.to_string(),
             series: line.to_string(),
         };
         for (line, value) in &lines {
@@ -640,7 +640,7 @@ impl Evaluator {
             self.apply(
                 change,
                 rule,
-                FLEET_HOST,
+                FLEET_HOSTNAME,
                 key,
                 Some(*value),
                 summary,
@@ -671,7 +671,7 @@ impl Evaluator {
     async fn check_metric(
         &mut self,
         rule: &AlertRule,
-        agent: &AgentRecord,
+        host: &HostRecord,
         snapshot: &Snapshot,
         open: &mut HashMap<Key, Alert>,
         checked: &mut HashSet<Key>,
@@ -684,7 +684,7 @@ impl Evaluator {
         let Some(readings) = snapshot
             .readings
             .get(metric.name)
-            .and_then(|by_agent| by_agent.get(&agent.id))
+            .and_then(|by_host| by_host.get(&host.id))
         else {
             return Ok(());
         };
@@ -693,12 +693,12 @@ impl Evaluator {
             .iter()
             .map(|reading| (clean(&reading.series), reading))
             .filter(|(series, _)| rule.rule.watches_series(series))
-            .take(MAX_SERIES_PER_AGENT);
+            .take(MAX_SERIES_PER_HOST);
 
         for (series, reading) in watched {
             let key = Key {
                 rule_id: rule.id,
-                agent_id: agent.id.clone(),
+                host_id: host.id.clone(),
                 series: series.clone(),
             };
             checked.insert(key.clone());
@@ -712,18 +712,18 @@ impl Evaluator {
             let change = tracker.observe(&levels, snapshot.now_ms, hold_ms(rule), current);
             tracker.last_sample_ms = Some(reading.time_ms);
 
-            let host = clean(&agent.host);
+            let hostname = clean(&host.hostname);
             let summary = match change.as_ref().and_then(Change::severity) {
                 Some(severity) => {
                     rule.rule
-                        .metric_summary(metric, &host, &series, reading.value, severity)?
+                        .metric_summary(metric, &hostname, &series, reading.value, severity)?
                 }
                 None => String::new(),
             };
             self.apply(
                 change,
                 rule,
-                &host,
+                &hostname,
                 key,
                 Some(reading.value),
                 summary,
@@ -738,7 +738,7 @@ impl Evaluator {
     async fn check_forecast(
         &mut self,
         rule: &AlertRule,
-        agent: &AgentRecord,
+        host: &HostRecord,
         snapshot: &Snapshot,
         open: &mut HashMap<Key, Alert>,
         checked: &mut HashSet<Key>,
@@ -750,20 +750,20 @@ impl Evaluator {
         let Some(trends) = snapshot.trends.get(&(metric.name, rule.rule.window())) else {
             return Ok(());
         };
-        let Some(agent_trends) = trends.by_agent.get(&agent.id) else {
+        let Some(host_trends) = trends.by_host.get(&host.id) else {
             return Ok(());
         };
         let window_ms = i64::try_from(rule.rule.window()).unwrap_or(i64::MAX / 1000) * 1000;
-        let watched = agent_trends
+        let watched = host_trends
             .iter()
             .map(|trend| (clean(&trend.series), trend))
             .filter(|(series, _)| rule.rule.watches_series(series))
-            .take(MAX_SERIES_PER_AGENT);
+            .take(MAX_SERIES_PER_HOST);
 
         for (series, trend) in watched {
             let key = Key {
                 rule_id: rule.id,
-                agent_id: agent.id.clone(),
+                host_id: host.id.clone(),
                 series: series.clone(),
             };
             checked.insert(key.clone());
@@ -785,11 +785,11 @@ impl Evaluator {
             let change = tracker.observe(&levels, snapshot.now_ms, hold_ms(rule), current);
             tracker.last_sample_ms = Some(trend.time_ms);
 
-            let host = clean(&agent.host);
+            let hostname = clean(&host.hostname);
             let summary = match (change.as_ref().and_then(Change::severity), eta) {
                 (Some(_), Some(eta)) => rule.rule.forecast_summary(
                     metric,
-                    &host,
+                    &hostname,
                     &series,
                     trend.value,
                     trend.slope_per_ms,
@@ -800,7 +800,7 @@ impl Evaluator {
             self.apply(
                 change,
                 rule,
-                &host,
+                &hostname,
                 key,
                 Some(trend.value),
                 summary,
@@ -817,7 +817,7 @@ impl Evaluator {
         &self,
         change: Option<Change>,
         rule: &AlertRule,
-        host: &str,
+        hostname: &str,
         key: Key,
         value: Option<f64>,
         summary: String,
@@ -848,7 +848,7 @@ impl Evaluator {
                 if self.database.change_severity(&change, &channels).await? {
                     info!(
                         rule = rule.rule.name,
-                        host,
+                        hostname,
                         severity = severity.as_str(),
                         "alert changed severity"
                     );
@@ -860,8 +860,8 @@ impl Evaluator {
                     rule_id: rule.id,
                     rule_name: rule.rule.name.clone(),
                     severity,
-                    agent_id: key.agent_id,
-                    host: host.to_string(),
+                    host_id: key.host_id,
+                    hostname: hostname.to_string(),
                     series: key.series,
                     value,
                     summary,
@@ -869,7 +869,7 @@ impl Evaluator {
                 };
                 let channels = self.channels_for(rule).await?;
                 self.database.fire_alert(&new, &channels).await?;
-                info!(rule = rule.rule.name, host, "alert fired");
+                info!(rule = rule.rule.name, hostname, "alert fired");
                 Ok(())
             }
         }
@@ -891,7 +891,7 @@ impl Evaluator {
             .await?;
         info!(
             rule = alert.rule_name,
-            agent = alert.agent_id,
+            host = alert.host_id,
             reason,
             "alert resolved"
         );
@@ -1103,7 +1103,7 @@ mod tests {
 
     fn trend(value: f64, per_hour: f64, time_ms: i64) -> Trend {
         Trend {
-            agent_id: "a".to_string(),
+            host_id: "a".to_string(),
             series: "/".to_string(),
             time_ms,
             value,

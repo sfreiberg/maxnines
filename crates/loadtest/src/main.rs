@@ -91,10 +91,10 @@ async fn register_all(options: &Options, server: &Server, identities: &[Identity
     let results: Vec<Result<()>> = stream::iter(identities.iter().enumerate())
         .map(|(index, identity)| {
             let (url, server) = (options.url.clone(), server.clone());
-            let host = host_name(&options.host_prefix, index);
+            let hostname = host_name(&options.host_prefix, index);
             let id = identity.id();
             async move {
-                match register(&url, identity, &host).await? {
+                match register(&url, identity, &hostname).await? {
                     RegistrationStatus::Approved => Ok(()),
                     RegistrationStatus::Pending => {
                         tokio::task::spawn_blocking(move || server.approve(&id))
@@ -102,7 +102,7 @@ async fn register_all(options: &Options, server: &Server, identities: &[Identity
                             .context("approving an agent")?
                     }
                     RegistrationStatus::Rejected => bail!(
-                        "the server rejected {host}, probably after an earlier --revoke. Use a \
+                        "the server rejected {hostname}, probably after an earlier --revoke. Use a \
                          new --keys-file"
                     ),
                 }
@@ -147,8 +147,8 @@ impl Measurements {
     }
 }
 
-/// How much of this machine the load generator is using, to tell whether the results
-/// show the server's limits or this machine's.
+/// How much of this host the load generator is using, to tell whether the results
+/// show the server's limits or this host's.
 struct OwnCpu {
     system: System,
     pid: Pid,
@@ -194,12 +194,12 @@ fn watch_server(
     }
 }
 
-fn pages_to_view(agent_id: &str) -> Vec<(String, String)> {
+fn pages_to_view(host_id: &str) -> Vec<(String, String)> {
     let mut pages: Vec<(String, String)> = [
         "/",
-        "/agents",
-        "/agents?view=table",
-        "/agents?q=os%3Dlinux",
+        "/hosts",
+        "/hosts?view=table",
+        "/hosts?filter=os%3Dlinux",
         "/metrics",
         "/alerts",
         "/server",
@@ -207,10 +207,10 @@ fn pages_to_view(agent_id: &str) -> Vec<(String, String)> {
     .iter()
     .map(|path| ((*path).to_string(), (*path).to_string()))
     .collect();
-    pages.push(("/agents/:id".to_string(), format!("/agents/{agent_id}")));
+    pages.push(("/hosts/:id".to_string(), format!("/hosts/{host_id}")));
     pages.push((
-        "/agents/:id/metrics".to_string(),
-        format!("/agents/{agent_id}/metrics"),
+        "/hosts/:id/metrics".to_string(),
+        format!("/hosts/{host_id}/metrics"),
     ));
     pages
 }
@@ -411,7 +411,7 @@ fn server_summary(stats: &Value) -> ServerSummary {
         commit: text(&stats["commit"]),
         os: text(&stats["os"]),
         cores: stats["process"]["cores"].as_u64().unwrap_or_default(),
-        memory_gb: stats["process"]["machine_memory_total_bytes"]
+        memory_gb: stats["process"]["host_memory_total_bytes"]
             .as_f64()
             .unwrap_or_default()
             / 1e9,
@@ -524,8 +524,8 @@ async fn run(options: Options) -> Result<Outcome> {
 
     let mut agents = Vec::with_capacity(options.agents);
     for (index, identity) in identities.into_iter().enumerate() {
-        let host = host_name(&options.host_prefix, index);
-        let agent = SimulatedAgent::new(index, identity, host, &plan);
+        let hostname = host_name(&options.host_prefix, index);
+        let agent = SimulatedAgent::new(index, identity, hostname, &plan);
         let start_after = options.ramp.mul_f64(index as f64 / options.agents as f64);
         agents.push(tokio::spawn(agent.run(
             plan.clone(),
@@ -750,7 +750,7 @@ mod tests {
     fn pages_hide_the_agent_in_their_labels() {
         let pages = pages_to_view("abc");
         let (label, path) = pages.last().unwrap();
-        assert_eq!(label, "/agents/:id/metrics");
-        assert_eq!(path, "/agents/abc/metrics");
+        assert_eq!(label, "/hosts/:id/metrics");
+        assert_eq!(path, "/hosts/abc/metrics");
     }
 }

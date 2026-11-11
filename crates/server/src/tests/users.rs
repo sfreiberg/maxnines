@@ -58,8 +58,8 @@ async fn every_page_needs_someone_signed_in() {
     let server = start().await;
     for path in [
         "/",
-        "/agents",
-        "/agents/nope",
+        "/hosts",
+        "/hosts/nope",
         "/metrics",
         "/checks",
         "/alerts",
@@ -120,28 +120,28 @@ async fn what_signing_in_needs_stays_open() {
 #[tokio::test]
 async fn the_api_still_answers_to_its_own_tokens() {
     let server = start().await;
-    let page = Browser::anonymous().get(&server, "/api/v1/agents").await;
+    let page = Browser::anonymous().get(&server, "/api/v1/hosts").await;
     assert_eq!(page.status, 401);
     assert_eq!(
-        api(&server, "GET", "/api/v1/agents", &Value::Null).await.0,
+        api(&server, "GET", "/api/v1/hosts", &Value::Null).await.0,
         200
     );
     // A session isn't a key.
-    let page = Browser::default().get(&server, "/api/v1/agents").await;
+    let page = Browser::default().get(&server, "/api/v1/hosts").await;
     assert_eq!(page.status, 401);
 }
 
 #[tokio::test]
 async fn a_page_updating_itself_leaves_for_the_sign_in_page() {
     let server = start().await;
-    let request = "GET /agents HTTP/1.1\r\nHost: x\r\nHX-Request: true\r\n\
+    let request = "GET /hosts HTTP/1.1\r\nHost: x\r\nHX-Request: true\r\n\
                    Connection: close\r\n\r\n";
     let page = Browser::anonymous()
         .send(&server, request.to_string())
         .await;
 
     assert_eq!(page.status, 401);
-    assert_eq!(page.header("hx-redirect"), Some("/login?next=%2Fagents"));
+    assert_eq!(page.header("hx-redirect"), Some("/login?next=%2Fhosts"));
     assert!(!page.body.contains("<form"));
 }
 
@@ -161,12 +161,12 @@ async fn signing_in_opens_the_page_that_was_wanted() {
     person(&server, "a@example.com").await;
     let mut browser = Browser::anonymous();
 
-    let to = browser.get(&server, "/agents?view=table").await;
+    let to = browser.get(&server, "/hosts?view=table").await;
     let to = to.header("location").unwrap().to_string();
     let form = browser.get(&server, &to).await;
     assert!(
         form.body
-            .contains(r#"name="next" value="/agents?view=table""#)
+            .contains(r#"name="next" value="/hosts?view=table""#)
     );
     let page = browser
         .post(
@@ -176,14 +176,14 @@ async fn signing_in_opens_the_page_that_was_wanted() {
                 ("authenticity_token", &form.token()),
                 ("email", "A@Example.com "),
                 ("password", PASSWORD),
-                ("next", "/agents?view=table"),
+                ("next", "/hosts?view=table"),
             ],
         )
         .await;
 
     assert_eq!(page.status, 303, "{}", page.body);
-    assert_eq!(page.header("location"), Some("/agents?view=table"));
-    assert_eq!(browser.get(&server, "/agents").await.status, 200);
+    assert_eq!(page.header("location"), Some("/hosts?view=table"));
+    assert_eq!(browser.get(&server, "/hosts").await.status, 200);
 }
 
 #[tokio::test]
@@ -322,7 +322,7 @@ async fn signing_out_ends_the_session_on_the_server() {
     // Even someone who kept a copy of the cookie is out.
     let mut thief = Browser::anonymous();
     thief.cookies.insert("maxnines_session".to_string(), stolen);
-    assert_eq!(thief.get(&server, "/agents").await.status, 303);
+    assert_eq!(thief.get(&server, "/hosts").await.status, 303);
 }
 
 #[tokio::test]
@@ -408,7 +408,7 @@ async fn someone_new_sets_their_own_password_from_a_link() {
     let good = [("password", PASSWORD), ("confirm", PASSWORD)];
     let page = newcomer.submit(&server, &path, &path, &good).await;
     assert_eq!(page.status, 303, "{}", page.body);
-    assert_eq!(newcomer.get(&server, "/agents").await.status, 200);
+    assert_eq!(newcomer.get(&server, "/hosts").await.status, 200);
 
     // It only works once.
     let page = Browser::anonymous().get(&server, &path).await;
@@ -459,7 +459,7 @@ async fn a_new_link_replaces_the_old_one_and_resets_a_password() {
     assert_eq!(page.status, 404);
 
     // The old password still works until the link is used.
-    assert_eq!(browser.get(&server, "/agents").await.status, 200);
+    assert_eq!(browser.get(&server, "/hosts").await.status, 200);
 
     let path = format!("/setup/{second}");
     let new = "a completely new password";
@@ -469,7 +469,7 @@ async fn a_new_link_replaces_the_old_one_and_resets_a_password() {
         .await;
     assert_eq!(page.status, 303);
 
-    assert_eq!(browser.get(&server, "/agents").await.status, 303);
+    assert_eq!(browser.get(&server, "/hosts").await.status, 303);
     let page = sign_in(
         &server,
         &mut Browser::anonymous(),
@@ -487,7 +487,7 @@ async fn disabling_someone_signs_them_out_at_once() {
     let server = start().await;
     let id = person(&server, "a@example.com").await;
     let mut browser = signed_in(&server, "a@example.com").await;
-    assert_eq!(browser.get(&server, "/agents").await.status, 200);
+    assert_eq!(browser.get(&server, "/hosts").await.status, 200);
 
     let page = Browser::default()
         .submit(
@@ -499,7 +499,7 @@ async fn disabling_someone_signs_them_out_at_once() {
         .await;
     assert_eq!(page.status, 303);
 
-    assert_eq!(browser.get(&server, "/agents").await.status, 303);
+    assert_eq!(browser.get(&server, "/hosts").await.status, 303);
     let page = sign_in(
         &server,
         &mut Browser::anonymous(),
@@ -565,7 +565,7 @@ async fn nobody_can_disable_themselves() {
     let page = browser.submit(&server, "/settings/users", &path, &[]).await;
 
     assert_eq!(page.status, 422);
-    assert_eq!(browser.get(&server, "/agents").await.status, 200);
+    assert_eq!(browser.get(&server, "/hosts").await.status, 200);
 }
 
 #[tokio::test]
@@ -610,7 +610,7 @@ async fn changing_a_password_signs_out_everywhere_else() {
         .await;
     assert_eq!(page.status, 422);
     assert!(page.body.contains("current password"));
-    assert_eq!(elsewhere.get(&server, "/agents").await.status, 200);
+    assert_eq!(elsewhere.get(&server, "/hosts").await.status, 200);
 
     let fields = [("current", PASSWORD), ("password", new), ("confirm", new)];
     let page = here
@@ -618,8 +618,8 @@ async fn changing_a_password_signs_out_everywhere_else() {
         .await;
     assert_eq!(page.status, 200, "{}", page.body);
 
-    assert_eq!(here.get(&server, "/agents").await.status, 200);
-    assert_eq!(elsewhere.get(&server, "/agents").await.status, 303);
+    assert_eq!(here.get(&server, "/hosts").await.status, 200);
+    assert_eq!(elsewhere.get(&server, "/hosts").await.status, 303);
     let page = sign_in(&server, &mut Browser::anonymous(), "a@example.com", new).await;
     assert_eq!(page.status, 303);
 }
@@ -630,7 +630,7 @@ async fn a_theme_belongs_to_a_person_and_needs_no_scripts() {
     person(&server, "a@example.com").await;
     let mut browser = signed_in(&server, "a@example.com").await;
 
-    let page = browser.get(&server, "/agents").await;
+    let page = browser.get(&server, "/hosts").await;
     assert!(page.body.contains(r#"data-theme="carbon""#));
 
     let fields = [("theme", "paper")];
@@ -640,16 +640,16 @@ async fn a_theme_belongs_to_a_person_and_needs_no_scripts() {
     assert_eq!(page.status, 303);
 
     // Right from the server, so the page never draws in the wrong colours.
-    let page = browser.get(&server, "/agents").await;
+    let page = browser.get(&server, "/hosts").await;
     assert!(
         page.body
             .contains(r#"<html lang="en" data-choice="paper" data-theme="paper">"#)
     );
-    let page = Browser::default().get(&server, "/agents").await;
+    let page = Browser::default().get(&server, "/hosts").await;
     assert!(page.body.contains(r#"data-theme="carbon""#), "someone else");
 
     let mut other_device = signed_in(&server, "a@example.com").await;
-    let page = other_device.get(&server, "/agents").await;
+    let page = other_device.get(&server, "/hosts").await;
     assert!(page.body.contains(r#"data-theme="paper""#));
 
     let page = browser
@@ -661,7 +661,7 @@ async fn a_theme_belongs_to_a_person_and_needs_no_scripts() {
         )
         .await;
     assert_eq!(page.status, 303);
-    let page = browser.get(&server, "/agents").await;
+    let page = browser.get(&server, "/hosts").await;
     assert!(
         page.body.contains(r#"data-choice="system">"#),
         "the browser decides"
@@ -749,18 +749,16 @@ async fn names_are_only_ever_text() {
 #[tokio::test]
 async fn an_approval_records_who_made_it() {
     let test = start().await;
-    let agent = identity();
+    let host = identity();
     let mut socket = test.connect().await;
-    handshake(&mut socket, &agent, "new-1", None).await;
+    handshake(&mut socket, &host, "new-1", None).await;
 
-    let path = format!("/agents/{}/approve", agent.id());
-    let page = Browser::default()
-        .submit(&test, "/agents", &path, &[])
-        .await;
+    let path = format!("/hosts/{}/approve", host.id());
+    let page = Browser::default().submit(&test, "/hosts", &path, &[]).await;
 
     assert_eq!(page.status, 303, "{}", page.body);
     let list = test.state.registry.list().await;
-    let approved = list.iter().find(|record| record.id == agent.id()).unwrap();
+    let approved = list.iter().find(|record| record.id == host.id()).unwrap();
     assert_eq!(approved.decided_by.as_deref(), Some("test@example.com"));
 }
 
@@ -781,7 +779,7 @@ async fn an_api_key_reads_pages_as_its_owner_but_cannot_submit_forms() {
     let mut browser = Browser::anonymous();
 
     let request = format!(
-        "GET /agents HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {key}\r\n\
+        "GET /hosts HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {key}\r\n\
          Connection: close\r\n\r\n"
     );
     let page = browser.send(&server, request).await;

@@ -52,7 +52,7 @@ struct ChannelForm {
     /// Who email comes from, for email and Resend.
     mail_from: String,
     /// An email channel's mail server. Its password is the credential.
-    mail_host: String,
+    mail_hostname: String,
     mail_port: String,
     mail_security: String,
     mail_username: String,
@@ -82,7 +82,7 @@ impl ChannelForm {
             sends_warnings: true,
             sends_critical: true,
             mail_from: String::new(),
-            mail_host: String::new(),
+            mail_hostname: String::new(),
             mail_port: String::new(),
             mail_security: MailSecurity::default().as_str().to_string(),
             mail_username: String::new(),
@@ -119,7 +119,9 @@ impl ChannelForm {
             sends_warnings: channel.severities.contains(&Severity::Warning),
             sends_critical: channel.severities.contains(&Severity::Critical),
             mail_from: mail.map(|mail| mail.from.clone()).unwrap_or_default(),
-            mail_host: server.map(|server| server.host.clone()).unwrap_or_default(),
+            mail_hostname: server
+                .map(|server| server.hostname.clone())
+                .unwrap_or_default(),
             mail_port: server
                 .and_then(|server| server.port)
                 .map(|port| port.to_string())
@@ -163,7 +165,7 @@ impl ChannelForm {
             sends_warnings: fields.contains_key("sends_warnings"),
             sends_critical: fields.contains_key("sends_critical"),
             mail_from: text("mail_from"),
-            mail_host: text("mail_host"),
+            mail_hostname: text("mail_hostname"),
             mail_port: text("mail_port"),
             mail_security: text("mail_security"),
             mail_username: text("mail_username"),
@@ -213,8 +215,8 @@ impl ChannelForm {
         if from.is_empty() {
             return Ok(None);
         }
-        let host = self.mail_host.trim();
-        let server = if kind == ChannelKind::Email && !host.is_empty() {
+        let hostname = self.mail_hostname.trim();
+        let server = if kind == ChannelKind::Email && !hostname.is_empty() {
             let port = self.mail_port.trim();
             let port = if port.is_empty() {
                 None
@@ -225,7 +227,7 @@ impl ChannelForm {
             };
             let username = self.mail_username.trim();
             Some(MailServer {
-                host: host.to_string(),
+                hostname: hostname.to_string(),
                 port,
                 security: MailSecurity::parse(self.mail_security.trim())?,
                 username: (!username.is_empty()).then(|| username.to_string()),
@@ -579,7 +581,7 @@ mod tests {
             mail: Some(Mail {
                 from: "MaxNines <alerts@example.com>".to_string(),
                 server: Some(MailServer {
-                    host: "smtp.example.com".to_string(),
+                    hostname: "smtp.example.com".to_string(),
                     port: Some(2525),
                     security: MailSecurity::Tls,
                     username: Some("alerts".to_string()),
@@ -595,7 +597,7 @@ mod tests {
         let form = ChannelForm::from_channel(&saved);
         assert_eq!(form.credential, "");
         assert!(form.has_credential);
-        assert_eq!(form.mail_host, "smtp.example.com");
+        assert_eq!(form.mail_hostname, "smtp.example.com");
         assert_eq!(form.mail_port, "2525");
         assert_eq!(form.mail_security, "tls");
         assert_eq!(form.to_channel(Some(&saved)).unwrap(), saved);

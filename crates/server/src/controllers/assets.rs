@@ -12,7 +12,7 @@ pub fn routes() -> Router<AppState> {
 }
 
 /// Only files embedded in the binary exist here, so a path can't reach anything
-/// else on the machine.
+/// else on the host.
 async fn show(Path(path): Path<String>) -> Response {
     match StaticFiles::get(&path) {
         Some(file) => {

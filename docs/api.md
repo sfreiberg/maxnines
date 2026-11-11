@@ -11,15 +11,15 @@ Make a key, then send it as a bearer token with every request:
 export MAXNINES_URL=http://localhost:9000
 export MAXNINES_API_KEY=$(maxnines-server api-keys create "My script" --user you@example.com --expires-in 30d)
 
-curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/agents"
+curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/hosts"
 ```
 
-The examples below use those two variables. Where one needs an agent, it uses
-`$AGENT_ID`, which you can set like this:
+The examples below use those two variables. Where one needs a host, it uses
+`$HOST_ID`, which you can set like this:
 
 ```sh
-export AGENT_ID=$(curl -s -H "Authorization: Bearer $MAXNINES_API_KEY" \
-  "$MAXNINES_URL/api/v1/agents" | jq -r '.[0].id')
+export HOST_ID=$(curl -s -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  "$MAXNINES_URL/api/v1/hosts" | jq -r '.[0].id')
 ```
 
 ## How the API works
@@ -32,14 +32,14 @@ they're disabled. Give each tool its own key. Without a valid key, the answer is
 
 **Roles.** A key has a [role](users.md#roles), its owner's or lower, and can do
 what that role can: reading needs a viewer, acknowledging and silencing a responder,
-changing the setup an editor, and users, the audit log and deleting agents an admin. Anything else gives `403`. Keys are made on the Settings page, through this API, or with
+changing the setup an editor, and users, the audit log and deleting hosts an admin. Anything else gives `403`. Keys are made on the Settings page, through this API, or with
 `maxnines-server api-keys create --user <email>`, which writes to the main database
 directly, so it works while the server is stopped. For a script that isn't anyone's,
 add a user for it, such as `ci@example.com`, which never needs a password.
 
 **Encryption.** Use the server's own TLS, either your certificates or automatic ones
 through ACME, or put it behind a proxy that terminates TLS. Anywhere beyond one
-machine, keys shouldn't cross the network in the clear.
+host, keys shouldn't cross the network in the clear.
 
 **Requests and responses.** Requests with a body are JSON, with
 `Content-Type: application/json`. Responses are JSON unless noted.
@@ -73,23 +73,23 @@ Where there's an explanation, it's in an `error` field:
 { "error": "A key needs a name." }
 ```
 
-## Agents
+## Hosts
 
-An agent is a machine reporting to this server. An agent's `state` is `pending`,
+A host is a computer whose agent reports to this server. A host's `state` is `pending`,
 `approved` or `revoked`. Its `health` is `critical`, `warning`, `offline` or `online`,
 and problems outrank being online.
 
-### List agents
+### List hosts
 
-`GET /api/v1/agents`
+`GET /api/v1/hosts`
 
 | Parameter | Description |
 | --- | --- |
-| `filter` | Only machines matching this [filter](#filters) |
+| `filter` | Only hosts matching this [filter](#filters) |
 
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
-  "$MAXNINES_URL/api/v1/agents?filter=os%3Dlinux"
+  "$MAXNINES_URL/api/v1/hosts?filter=os%3Dlinux"
 ```
 
 ```json
@@ -97,7 +97,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
   {
     "id": "22ad9264b6eb708ffdbedcd5cc073e5c",
     "public_key": "912e3122b606a9c2776e065d87dc31eefacde1d7dcad18e1cf88349eb32db35f",
-    "host": "web-1",
+    "hostname": "web-1",
     "state": "approved",
     "decided_by": "you@example.com",
     "first_seen_ms": 1793940264215,
@@ -109,73 +109,73 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 ]
 ```
 
-### Get an agent
+### Get a host
 
-`GET /api/v1/agents/{id}`
+`GET /api/v1/hosts/{id}`
 
-Gives one agent, as above.
+Gives one host, as above.
 
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
-  "$MAXNINES_URL/api/v1/agents/$AGENT_ID"
+  "$MAXNINES_URL/api/v1/hosts/$HOST_ID"
 ```
 
-### Approve an agent
+### Approve a host
 
-`POST /api/v1/agents/{id}/approve`
+`POST /api/v1/hosts/{id}/approve`
 
-Lets an agent connect, and gives back the agent's record.
+Lets a host's agent connect, and gives back the host's record.
 
 ```sh
 curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
-  "$MAXNINES_URL/api/v1/agents/$AGENT_ID/approve"
+  "$MAXNINES_URL/api/v1/hosts/$HOST_ID/approve"
 ```
 
-### Revoke an agent
+### Revoke a host
 
-`POST /api/v1/agents/{id}/revoke`
+`POST /api/v1/hosts/{id}/revoke`
 
-Stops an agent connecting and drops it if it's connected, and gives back the agent's
-record. This is the same for rejecting a waiting agent. The agent can't be approved
+Stops a host's agent connecting and drops it if it's connected, and gives back the
+host's record. This is the same for rejecting a waiting host. The host can't be approved
 by a rule afterwards.
 
 ```sh
 curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
-  "$MAXNINES_URL/api/v1/agents/REVOKED_AGENT_ID/revoke"
+  "$MAXNINES_URL/api/v1/hosts/REVOKED_HOST_ID/revoke"
 ```
 
-### Delete an agent
+### Delete a host
 
-`DELETE /api/v1/agents/{id}`
+`DELETE /api/v1/hosts/{id}`
 
-Deletes a revoked agent with all its metrics, facts and alerts, and its place on the
-map if it has one of its own. It can't be undone. An agent that isn't revoked gives
+Deletes a revoked host with all its metrics, facts and alerts, and its place on the
+map if it has one of its own. It can't be undone. A host that isn't revoked gives
 `409`, so it always takes two steps.
 
-If the machine still runs the agent, it comes back as a new agent waiting to be
+If the host still runs the agent, it comes back as a new host waiting to be
 approved, and a rule can approve it like any other.
 
 ```sh
 curl -X DELETE -H "Authorization: Bearer $MAXNINES_API_KEY" \
-  "$MAXNINES_URL/api/v1/agents/REVOKED_AGENT_ID"
+  "$MAXNINES_URL/api/v1/hosts/REVOKED_HOST_ID"
 ```
 
-### Get an agent's facts
+### Get a host's facts
 
-`GET /api/v1/agents/{id}/facts`
+`GET /api/v1/hosts/{id}/facts`
 
 `trusted` is what the server knows for itself. `reported` is only what the agent
 claims, so don't use it for anything to do with security.
 
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
-  "$MAXNINES_URL/api/v1/agents/$AGENT_ID/facts"
+  "$MAXNINES_URL/api/v1/hosts/$HOST_ID/facts"
 ```
 
 ```json
 {
   "trusted": {
-    "agent_id": "22ad9264b6eb708ffdbedcd5cc073e5c",
+    "host_id": "22ad9264b6eb708ffdbedcd5cc073e5c",
     "state": "approved",
     "decided_by": "you@example.com",
     "online": true,
@@ -189,15 +189,15 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 }
 ```
 
-### Get the history of an agent's facts
+### Get the history of a host's facts
 
-`GET /api/v1/agents/{id}/facts/history`
+`GET /api/v1/hosts/{id}/facts/history`
 
 Every value each fact has had, oldest first. `valid_to_ms` is empty for current values.
 
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
-  "$MAXNINES_URL/api/v1/agents/$AGENT_ID/facts/history"
+  "$MAXNINES_URL/api/v1/hosts/$HOST_ID/facts/history"
 ```
 
 ```json
@@ -211,16 +211,16 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 ]
 ```
 
-### Get an agent's config
+### Get a host's config
 
-`GET /api/v1/agents/{id}/config`
+`GET /api/v1/hosts/{id}/config`
 
-`desired` is what the [config rules](#config-rules) come to for this agent. `reported`
-is what it last said it's running, with `error` set if it refused the config.
+`desired` is what the [config rules](#config-rules) come to for this host. `reported`
+is what its agent last said it's running, with `error` set if it refused the config.
 
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
-  "$MAXNINES_URL/api/v1/agents/$AGENT_ID/config"
+  "$MAXNINES_URL/api/v1/hosts/$HOST_ID/config"
 ```
 
 ```json
@@ -243,9 +243,9 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 }
 ```
 
-### Get an agent's metric
+### Get a host's metric
 
-`GET /api/v1/agents/{id}/metrics/{metric}`
+`GET /api/v1/hosts/{id}/metrics/{metric}`
 
 One metric from the [catalog](#list-metrics) over a period of time. The server
 chooses `step_ms` to suit the period. Each point covers one step: `avg` is the average
@@ -261,7 +261,7 @@ have several series, such as one for each disk, and `hidden` says how many were 
 
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
-  "$MAXNINES_URL/api/v1/agents/$AGENT_ID/metrics/cpu.usage"
+  "$MAXNINES_URL/api/v1/hosts/$HOST_ID/metrics/cpu.usage"
 ```
 
 ```json
@@ -285,23 +285,23 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 ## Filters
 
-Filters find machines the same way as the box on the Machines page. Separate terms with
+Filters find hosts the same way as the box on the Hosts page. Separate terms with
 spaces, and every term has to match. Remember to URL-encode them, so `os=linux`
 becomes `os%3Dlinux`. With curl, `-G --data-urlencode` does this for you.
 
 | Filter | Finds |
 | --- | --- |
-| `web` | Host names containing "web" |
-| `hostname=web*` | Host names starting with "web" |
-| `id=3f2a1c9d*` | The agent whose ID starts like that, as names needn't be unique |
+| `web` | Hostnames containing "web" |
+| `hostname=web*` | Hostnames starting with "web" |
+| `id=3f2a1c9d*` | The host whose ID starts like that, as hostnames needn't be unique |
 | `os=linux` | That operating system family. `os` is short for `os.family` |
-| `networking.addresses=10.0.*` | Any of the machine's IP addresses. Loopback and link-local addresses aren't listed |
-| `networking.fqdn=*.leeds.example.com` | The machine's fully qualified name, as its resolver gives it. `networking.hostname` is the short name and `networking.domain` the rest |
-| `os!=windows` | Everything else, including machines that haven't said |
+| `networking.addresses=10.0.*` | Any of the host's IP addresses. Loopback and link-local addresses aren't listed |
+| `networking.fqdn=*.leeds.example.com` | The host's fully qualified name, as its resolver gives it. `networking.hostname` is the short name and `networking.domain` the rest |
+| `os!=windows` | Everything else, including hosts that haven't said |
 | `cpu.logical_cores=8` | Any fact by its full name |
 | `custom.tags=eu` | A list containing that value |
 | `os.long_version="Ubuntu 24*"` | A value with spaces, in double quotes |
-| `os=linux custom.role=web` | Machines matching both |
+| `os=linux custom.role=web` | Hosts matching both |
 
 Values ignore case, and can use `*` for anything and `?` for one character. Facts from
 an agent's own config are under `custom.`, so `role` in its config is `custom.role`.
@@ -309,14 +309,14 @@ an agent's own config are under `custom.`, so `role` in its config is `custom.ro
 ```sh
 curl -G -H "Authorization: Bearer $MAXNINES_API_KEY" \
   --data-urlencode 'q=os=linux hostname=web*' \
-  "$MAXNINES_URL/api/v1/agents"
+  "$MAXNINES_URL/api/v1/hosts"
 ```
 
 A filter that can't be read gets a `400` saying why.
 
 ### Get filter suggestions
 
-`GET /api/v1/agents/filter-options`
+`GET /api/v1/hosts/filter-options`
 
 What the filter box offers for the word being typed: fact names, or values once there's
 an `=`. Put `text` in place of the word.
@@ -328,7 +328,7 @@ an `=`. Put `text` in place of the word.
 ```sh
 curl -G -H "Authorization: Bearer $MAXNINES_API_KEY" \
   --data-urlencode 'term=os=' \
-  "$MAXNINES_URL/api/v1/agents/filter-options"
+  "$MAXNINES_URL/api/v1/hosts/filter-options"
 ```
 
 ```json
@@ -366,7 +366,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/metrics"
 
 `GET /api/v1/metrics/current`
 
-The latest headline numbers from every machine, by agent ID. Machines with nothing in the
+The latest headline numbers from every host, by host ID. Hosts with nothing in the
 last 5 minutes are left out.
 
 ```sh
@@ -388,14 +388,14 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 ## Config rules
 
-Config rules decide what each agent monitors. Every rule matching an agent applies,
+Config rules decide what each host's agent monitors. Every rule matching a host applies,
 lowest priority first, so higher priorities win.
 
 | Field | Description |
 | --- | --- |
 | `name` | Required |
 | `priority` | Required. Higher priorities apply later |
-| `condition` | A [CEL](https://cel.dev) expression over `facts`. Empty matches every machine |
+| `condition` | A [CEL](https://cel.dev) expression over `facts`. Empty matches every host |
 | `enabled` | Defaults to `true` |
 | `settings` | Required. What to apply, as below |
 
@@ -411,7 +411,7 @@ lowest priority first, so higher priorities win.
 | `names` | `processes`, `services`, `custom`, `counters` | What to watch. Custom metrics must be defined in the agent's own config, and counters are Windows performance counter paths, such as `\Memory\Available MBytes` |
 | `paths` | `files` | The files and folders to watch |
 | `checks` | `checks` | What to try reaching, as in [remote checks](#remote-checks) |
-| `urls` | `apache`, `nginx`, `php_fpm` | The status pages to read. Leave it out for the usual page on the machine itself |
+| `urls` | `apache`, `nginx`, `php_fpm` | The status pages to read. Leave it out for the usual page on the host itself |
 
 The collectors are `apache`, `checks`, `containers`, `counters`, `cpu`, `custom`, `disk`, `files`, `host`,
 `memory`, `network`, `nginx`, `php_fpm`, `processes`, `sensors`, `services`,
@@ -468,9 +468,9 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "total": 1,
   "matching": 1,
   "changing": 1,
-  "agents": [
+  "hosts": [
     {
-      "host": "web-1",
+      "hostname": "web-1",
       "online": true,
       "matches": true,
       "changes": ["Sample interval: 15s → 60s"],
@@ -550,8 +550,8 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/alerts"
       "rule_id": 1,
       "rule_name": "High CPU",
       "severity": "warning",
-      "agent_id": "22ad9264b6eb708ffdbedcd5cc073e5c",
-      "host": "web-1",
+      "host_id": "22ad9264b6eb708ffdbedcd5cc073e5c",
+      "hostname": "web-1",
       "series": "",
       "value": 97.2,
       "summary": "High CPU on web-1",
@@ -621,14 +621,14 @@ already told about an alert still hears when it ends.
 | Field | Meaning |
 |---|---|
 | `rule_id` | The alert rule it covers. Leave it out for every rule. |
-| `filter` | Which machines it covers, written as in [Filters](#filters). Leave it out for every machine. Alerts about a group of machines have no single machine, so a filter leaves them out. |
+| `filter` | Which hosts it covers, written as in [Filters](#filters). Leave it out for every host. Alerts about a group of hosts have no single host, so a filter leaves them out. |
 | `reason` | Why, which is required. |
 | `duration_secs` | How long it lasts from now, up to 30 days. |
 
 Deleting a rule deletes its silences too.
 
-**Start maintenance** on a machine's page is a silence with no `rule_id` and the filter
-`id=` followed by the agent's ID, so the same request does it through the API:
+**Start maintenance** on a host's page is a silence with no `rule_id` and the filter
+`id=` followed by the host ID, so the same request does it through the API:
 
 ```sh
 curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
@@ -690,7 +690,7 @@ isn't running.
 
 ## Annotations
 
-Deploys, upgrades and notes, marked on the charts of the machines their filter picks.
+Deploys, upgrades and notes, marked on the charts of the hosts their filter picks.
 See [Annotations](annotations.md). Adding and deleting them needs the responder role.
 
 | Field | Meaning |
@@ -699,7 +699,7 @@ See [Annotations](annotations.md). Adding and deleting them needs the responder 
 | `title` | What happened, which is required. Up to 200 characters. |
 | `detail` | More about it, up to 2,000 characters. |
 | `time_ms` | When it happened, from a year ago to now. Defaults to now. |
-| `filter` | Which machines, written as in [Filters](#filters). Leave it out for every machine. It's matched against each machine whenever a chart is drawn, so a machine added later shows it too, and one that matches nothing yet is fine. |
+| `filter` | Which hosts, written as in [Filters](#filters). Leave it out for every host. It's matched against each host whenever a chart is drawn, so a host added later shows it too, and one that matches nothing yet is fine. |
 
 ### Add an annotation
 
@@ -744,11 +744,11 @@ given, and `limit` how many, which is 200 unless given, up to 1,000.
 
 Returns `204`, or `404` if there's no such annotation.
 
-### Get a machine's events
+### Get a host's events
 
-`GET /api/v1/agents/{id}/events`
+`GET /api/v1/hosts/{id}/events`
 
-Everything that happened to one machine, newest first, as its page shows them: the
+Everything that happened to one host, newest first, as its page shows them: the
 annotations whose filter matches it, restarts, config changes, alerts starting
 (`alert`) and ending (`resolved`), and updates. `from_ms` and `to_ms` choose the period,
 which is the last 24 hours unless given. Only what was recorded has an `id`, and `created_by` is
@@ -759,7 +759,7 @@ who added an annotation, or `null` for what the server worked out.
   {
     "time_ms": 1793940279545,
     "kind": "restart",
-    "title": "Machine started",
+    "title": "Host started",
     "detail": null,
     "created_by": null,
     "id": 15
@@ -784,7 +784,7 @@ times in the window's time zone, so it keeps its place in the day when the clock
 |---|---|
 | `name` | Required. |
 | `rule_id` | The alert rule it covers. Leave it out for every rule. |
-| `filter` | Which machines it covers, as for a [silence](#silences). |
+| `filter` | Which hosts it covers, as for a [silence](#silences). |
 | `days` | Required. The days it starts on: `mon`, `tue`, `wed`, `thu`, `fri`, `sat` or `sun`. |
 | `start_time` | Required. When it starts, like `02:00`. |
 | `duration_secs` | Required. How long it lasts, in whole minutes up to 7 days, so a multiple of 60. |
@@ -842,13 +842,13 @@ Returns `204`.
 | `warning_threshold` | Optional, for a critical metric or calculation rule. Where it's a warning first, before `threshold`. One alert covers both, at the worse of the two, as in [warning, then critical](alerts.md#warning-then-critical) |
 | `for_secs` | Required. How long a problem lasts before firing, and how long it has to stay gone before resolving |
 | `severity` | Required. `warning` or `critical`, for crossing `threshold` |
-| `condition` | A CEL expression limiting which agents this covers |
+| `condition` | A CEL expression limiting which hosts this covers |
 | `enabled` | Defaults to `true` |
 | `channels` | IDs of the [channels](#notification-channels) to tell. With none, an alert only shows in the web interface |
 | `all_channels` | `true` to tell every channel instead, including ones added later. Leave `channels` empty with it. Defaults to `false` |
-| `calculation` | For calculation rules, `avg`, `sum`, `min`, `max` or `count`, as in [a query](#ask-about-many-machines-at-once) |
+| `calculation` | For calculation rules, `avg`, `sum`, `min`, `max` or `count`, as in [a query](#ask-about-many-hosts-at-once) |
 | `group_by` | For calculation rules, what's watched separately: `nothing`, `host`, `series` or `fact:<name>` |
-| `filter` | For calculation rules, which machines, as on the Machines list. It takes the place of `condition` |
+| `filter` | For calculation rules, which hosts, as on the Hosts list. It takes the place of `condition` |
 | `window_secs` | For calculation rules, how far back to look, from 60 to 86400. Defaults to 300. For a forecast, how far back the line is drawn through, from 3600 to 86400. Defaults to 21600 |
 | `forecast_secs` | Required for a forecast. How soon the metric has to be on course to reach `threshold`, for `severity`, from 60 to 2592000 |
 | `warning_forecast_secs` | Optional, for a critical forecast. A longer time ahead that's a warning first, as in [forecasts](alerts.md#forecasts) |
@@ -877,11 +877,11 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "$MAXNINES_URL/api/v1/alert-rules"
 ```
 
-A calculation rule watches something across machines, such as the average CPU of every
-Linux host, and gives one alert for the group rather than one per machine. `min` and
+A calculation rule watches something across hosts, such as the average CPU of every
+Linux host, and gives one alert for the group rather than one per host. `min` and
 `max` use the lowest or highest moment in the window, and the rest use the average over
-it. An alert about a group has the `agent_id` `fleet`, and its `series` says which group.
-A `count` that finds nothing reporting counts as 0, so a rule can catch machines going
+it. An alert about a group has the `host_id` `fleet`, and its `series` says which group.
+A `count` that finds nothing reporting counts as 0, so a rule can catch hosts going
 quiet. Rules wait out the first two minutes after a server starts, while agents
 reconnect.
 
@@ -1015,7 +1015,7 @@ Email and Resend channels have `mail`:
 | --- | --- |
 | `from` | Required. Who the email comes from, like `MaxNines <alerts@example.com>`. For Resend, on a domain verified there |
 | `server` | Email only, and required for it. The mail server it goes through |
-| `server.host` | Required. Like `smtp.example.com` |
+| `server.hostname` | Required. Like `smtp.example.com` |
 | `server.port` | The usual port for `security` if left out: 587 for `starttls`, 465 for `tls`, 25 for `none` |
 | `server.security` | `starttls`, the default, `tls`, or `none` for a relay on a trusted network |
 | `server.username` | For a server that asks you to sign in. The password goes in `credential`, and needs `starttls` or `tls` |
@@ -1038,7 +1038,7 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
        "target": "https://status.example.com/api/events",
        "credential": "Authorization: Bearer abc123",
        "request": {"method": "POST", "content_type": "application/json",
-                   "body": "{\"title\": \"{{ alert.rule_name }} on {{ alert.host }}\", \"status\": \"{{ event }}\"}"}}' \
+                   "body": "{\"title\": \"{{ alert.rule_name }} on {{ alert.hostname }}\", \"status\": \"{{ event }}\"}"}}' \
   "$MAXNINES_URL/api/v1/notification-channels"
 ```
 
@@ -1048,7 +1048,7 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
   -d '{"name": "Ops email", "kind": "email", "target": "ops@example.com",
        "credential": "the password",
        "mail": {"from": "MaxNines <alerts@example.com>",
-                "server": {"host": "smtp.example.com", "username": "alerts@example.com"}}}' \
+                "server": {"hostname": "smtp.example.com", "username": "alerts@example.com"}}}' \
   "$MAXNINES_URL/api/v1/notification-channels"
 ```
 
@@ -1227,16 +1227,16 @@ curl -X DELETE -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 ## Map
 
-The map puts machines in places with location rules. Each rule has a filter, in the
-same form as the Machines list, and a point on the map. Where several rules match a
-machine, the one with the highest `priority` decides, and of two with the same
-priority the older one. A machine placed from its own page is a rule whose filter is
-`id=` and its agent ID, at priority 100.
+The map puts hosts in places with location rules. Each rule has a filter, in the
+same form as the Hosts list, and a point on the map. Where several rules match a
+host, the one with the highest `priority` decides, and of two with the same
+priority the older one. A host placed from its own page is a rule whose filter is
+`id=` and its host ID, at priority 100.
 
 | Field | Meaning |
 |---|---|
-| `name` | Required. What the map calls the machines the rule covers, such as `Leeds office`. |
-| `filter` | Which machines, as in the Machines list. Leave it out for every machine. |
+| `name` | Required. What the map calls the hosts the rule covers, such as `Leeds office`. |
+| `filter` | Which hosts, as in the Hosts list. Leave it out for every host. |
 | `place` | Where it is in words, such as `Leeds, England, United Kingdom`. |
 | `latitude` | Required. From -90 to 90. |
 | `longitude` | Required. From -180 to 180. |
@@ -1246,8 +1246,8 @@ priority the older one. A machine placed from its own page is a rule whose filte
 
 `GET /api/v1/map`
 
-Every place with machines in it, those most in need of attention first, and the
-approved machines no rule places. A place's `health` is that of its worst machine:
+Every place with hosts in it, those most in need of attention first, and the
+approved hosts no rule places. A place's `health` is that of its worst host:
 `critical`, `warning`, `offline` or `online`.
 
 ```sh
@@ -1265,8 +1265,8 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/map"
       "longitude": -1.54785,
       "health": "warning",
       "counts": { "critical": 0, "warning": 1, "offline": 0, "online": 3 },
-      "machines": [
-        { "id": "8c1f…", "short_id": "8c1f02ab", "host": "web-1", "health": "warning" }
+      "hosts": [
+        { "id": "8c1f…", "short_id": "8c1f02ab", "hostname": "web-1", "health": "warning" }
       ]
     }
   ],
@@ -1369,7 +1369,7 @@ The listed place closest to the point given by the `lat` and `lon` parameters, i
 
 How the server is doing, including its CPU, memory, databases and activity. Each part
 is read on its own, so one that's unavailable is empty and the rest still answer.
-`cpu_percent` is a share of the whole machine, and empty on the first request after a
+`cpu_percent` is a share of the whole host, and empty on the first request after a
 start. `memory_bytes` can read high on macOS, which counts memory that's been freed
 until something else needs it.
 
@@ -1389,8 +1389,8 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/server"
     "memory_bytes": 53641216,
     "cpu_percent": 5.2,
     "open_files": 17,
-    "machine_memory_total_bytes": 51539607552,
-    "machine_memory_used_bytes": 39138967552,
+    "host_memory_total_bytes": 51539607552,
+    "host_memory_used_bytes": 39138967552,
     "cores": 12
   },
   "disk": {
@@ -1419,14 +1419,14 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/server"
     "size_bytes": 28397568,
     "response_ms": 0.03,
     "latest_migration": "m20261105_000008_create_api_keys",
-    "tables": [{ "name": "Agents", "rows": 5001 }],
+    "tables": [{ "name": "Hosts", "rows": 5001 }],
     "notifications_waiting": 0,
     "notifications_failed": 0
   },
   "activity": {
-    "agents_online": 5000,
-    "agents_approved": 5000,
-    "agents_waiting": 0,
+    "hosts_online": 5000,
+    "hosts_approved": 5000,
+    "hosts_waiting": 0,
     "samples_written": 119757,
     "samples_failed": 0,
     "samples_queued": 0,
@@ -1439,17 +1439,17 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/server"
 
 ### Get the server's own history
 
-The server records its own numbers every 15 seconds as the built-in agent `server`,
-along with `cpu`, `memory`, `disk` and `network` for the machine it's on. Nothing has
-to be installed for this. They work like any agent's metrics, including in alert
+The server records its own numbers every 15 seconds as the built-in host `server`,
+along with `cpu`, `memory`, `disk` and `network` for the host it's on. Nothing has
+to be installed for this. They work like any host's metrics, including in alert
 rules. Read them with the same route, using metrics such as `server.metrics` (metrics
 stored per second), `server.samples`, `server.write_queue`, `server.write_time`,
-`server.agents`, `server.alerts`, `server.database_size`, `server.series`,
+`server.hosts`, `server.alerts`, `server.database_size`, `server.series`,
 `server.memory`, `server.cpu`, `server.open_files` and `cpu.usage`:
 
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
-  "$MAXNINES_URL/api/v1/agents/server/metrics/server.memory"
+  "$MAXNINES_URL/api/v1/hosts/server/metrics/server.memory"
 ```
 
 ## Health
@@ -1478,13 +1478,13 @@ send that.
 
 ## Calculations
 
-### Ask about many machines at once
+### Ask about many hosts at once
 
 `GET /api/v1/query`
 
-Combines a metric across machines, the same way dashboards do. Each series is averaged
-within a moment first, so a machine reporting more often doesn't count for more. Only
-approved machines count, and the server itself isn't one of them. Machines are combined
+Combines a metric across hosts, the same way dashboards do. Each series is averaged
+within a moment first, so a host reporting more often doesn't count for more. Only
+approved hosts count, and the server itself isn't one of them. Hosts are combined
 over whole minutes, leaving out the one still filling up. A metric that measures several
 things, like memory and swap, uses the first unless `group_by` is `series`.
 
@@ -1493,10 +1493,10 @@ things, like memory and swap, uses the first unless `group_by` is `series`.
 | `metric` | Required. A name from `GET /api/v1/metrics`. |
 | `calculation` | `avg`, `sum`, `min`, `max` or `count`, which is how many series are reporting. Defaults to `avg`. |
 | `group_by` | What gets a line of its own: `nothing`, `host`, `series` or `fact:<name>`. Defaults to `nothing`. |
-| `filter` | Which machines, in the same form as the Machines list, such as `os=linux hostname=web*`. Defaults to all of them. |
+| `filter` | Which hosts, in the same form as the Hosts list, such as `os=linux hostname=web*`. Defaults to all of them. |
 | `from_ms`, `to_ms` | The time range. Defaults to the last hour. |
 
-The result has the same shape as an agent's metric. The highest 100 lines are kept, and
+The result has the same shape as a host's metric. The highest 100 lines are kept, and
 `hidden` says how many more there were. A question that makes no sense gets a `422`.
 
 ```sh
@@ -1509,7 +1509,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 Everyone signed in shares dashboards. A widget sits on a grid 12 columns wide, and
 asks one question, using the same `metric`, `calculation`, `group_by` and `filter` as
 `GET /api/v1/query`. A widget's filter can also use the dashboard's
-[variables](#get-or-update-variables), as terms like `$machine`.
+[variables](#get-or-update-variables), as terms like `$host`.
 
 | Widget field | Meaning |
 | --- | --- |
@@ -1582,12 +1582,12 @@ The widget's answer, as `GET /api/v1/query` gives it, with its `title`, its `kin
 and its `filter` with variables filled in. `from_ms` and `to_ms` pick the time, and
 default to the last hour. Each variable is picked with `var-<name>`, as the
 dashboard's address does: a value that isn't offered is the same as none, which is
-the first machine for a machine variable and every value for a fact. A machine
-variable with no machine to offer is refused with 422.
+the first host for a host variable and every value for a fact. A host
+variable with no host to offer is refused with 422.
 
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
-  "$MAXNINES_URL/api/v1/dashboards/1/widgets/2?var-machine=5e8e7eb8dd45b90e77472cee36541d9b"
+  "$MAXNINES_URL/api/v1/dashboards/1/widgets/2?var-host=5e8e7eb8dd45b90e77472cee36541d9b"
 ```
 
 ### Get or update variables
@@ -1605,13 +1605,13 @@ variable that would be gone.
 | --- | --- |
 | `name` | Written as `$name` in a widget's filter or title. Letters, digits and `_`, starting with a letter, up to 32. |
 | `label` | What the picker is called. Empty uses the name. |
-| `kind` | `machine` picks one machine. `fact` picks a value of a fact, or all of them. |
+| `kind` | `host` picks one host. `fact` picks a value of a fact, or all of them. |
 | `fact` | Which fact's values a `fact` variable offers. |
-| `filter` | Which machines it offers, or whose values it offers. Empty for every machine. |
+| `filter` | Which hosts it offers, or whose values it offers. Empty for every host. |
 
 ```sh
 curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \
-  -d '[{"name": "machine", "label": "Machine", "kind": "machine", "filter": "os=windows"}]' \
+  -d '[{"name": "host", "label": "Host", "kind": "host", "filter": "os=windows"}]' \
   "$MAXNINES_URL/api/v1/dashboards/1/variables"
 ```
 
@@ -1921,8 +1921,8 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 | Kind | Who |
 | --- | --- |
 | `person` | A user. `name` is their email address |
-| `command_line` | A `maxnines-server` command run on the server's machine |
-| `maxnines` | The server itself, like a registration rule approving an agent |
+| `command_line` | A `maxnines-server` command run on the server's host |
+| `maxnines` | The server itself, like a registration rule approving a host |
 | `nobody` | Someone who isn't signed in, like a failed sign in |
 
 `via` says how a person acted when it wasn't on the pages: `api_key`, with the key's
@@ -1931,9 +1931,9 @@ email address.
 
 `action` is `created`, `changed`, `deleted`, `signed_in`, `sign_in_failed`,
 `signed_out`, `new_setup_link`, `acknowledged` or `unacknowledged`. `subject.kind` is
-`user`, `api_key`, `agent`, `config_rule`, `alert_rule`, `notification_channel`,
-`alert`, `silence`, `maintenance_window`, `remote_check`, `location_rule` or
-`dashboard`. Names are as they were at the time.
+`user`, `api_key`, `host`, `config_rule`, `alert_rule`, `notification_channel`,
+`alert`, `silence`, `maintenance_window`, `remote_check`, `location_rule`,
+`dashboard`, `annotation` or `setting`. Names are as they were at the time.
 
 `source` is the address the request came from, which is empty for changes that
 didn't come from a request. Behind a proxy, it's the address the proxy passed on, if

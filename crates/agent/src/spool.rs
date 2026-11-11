@@ -705,7 +705,7 @@ mod tests {
         assert_eq!(drain(&spool), ["2", "1"]);
     }
 
-    /// On a paused clock, so a busy machine can't make the wait look longer or shorter.
+    /// On a paused clock, so a busy host can't make the wait look longer or shorter.
     #[tokio::test(start_paused = true)]
     async fn the_backlog_goes_at_a_steady_pace() {
         let (_parent, path) = folder();
@@ -1001,7 +1001,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
             drop(first);
         });
-        // Waits far longer than it needs to, as a busy machine can take its time
+        // Waits far longer than it needs to, as a busy host can take its time
         // letting go, and the point is that it's taken once it is.
         let second = Spool::with_limits(
             &path,

@@ -15,19 +15,19 @@ use crate::custom::Definitions;
 /// Asks for the canonical name. The value is the same on every platform we build for.
 const AI_CANONNAME: i32 = 2;
 
-/// How long the resolver gets before the machine is left with its short name.
+/// How long the resolver gets before the host is left with its short name.
 const FQDN_LOOKUP_LIMIT: Duration = Duration::from_secs(2);
 
-/// The part of a hostname before the first dot, which is what machines are called.
+/// The part of a hostname before the first dot, which is what hosts are called.
 pub fn short_name(hostname: &str) -> &str {
     hostname.split('.').next().unwrap_or(hostname)
 }
 
-/// What the resolver calls this machine, as `hostname -f` finds out. It can hang on a
+/// What the resolver calls this host, as `hostname -f` finds out. It can hang on a
 /// broken resolver, so it gets its own thread and a time limit.
 fn canonical_name(hostname: &str) -> Option<String> {
     let (sender, receiver) = mpsc::channel();
-    let host = hostname.to_string();
+    let hostname = hostname.to_string();
     std::thread::spawn(move || {
         let hints = AddrInfoHints {
             flags: AI_CANONNAME,
@@ -35,7 +35,7 @@ fn canonical_name(hostname: &str) -> Option<String> {
             socktype: 0,
             protocol: 0,
         };
-        let found = getaddrinfo(Some(&host), None, Some(hints))
+        let found = getaddrinfo(Some(&hostname), None, Some(hints))
             .ok()
             .and_then(|mut found| found.find_map(|info| info.ok()?.canonname));
         sender.send(found).ok();
@@ -43,7 +43,7 @@ fn canonical_name(hostname: &str) -> Option<String> {
     receiver.recv_timeout(FQDN_LOOKUP_LIMIT).ok().flatten()
 }
 
-/// The machine's names, as facter calls them: `hostname` is the short name, `fqdn` the
+/// The host's names, as facter calls them: `hostname` is the short name, `fqdn` the
 /// name with its domain, and `domain` the rest. Without a resolver answer, a hostname
 /// that already has dots in it is its own fully qualified name.
 fn name_facts(hostname: Option<&str>, canonical: Option<&str>) -> Value {
@@ -74,9 +74,9 @@ fn reachable(address: IpAddr) -> bool {
     !address.is_loopback() && !link_local
 }
 
-/// Every address this machine has, and where each one is. `addresses` is a plain list so
+/// Every address this host has, and where each one is. `addresses` is a plain list so
 /// that a host filter can match any of them. Addresses that only mean something on the
-/// machine or its own link are left out, along with any interface that has nothing else.
+/// host or its own link are left out, along with any interface that has nothing else.
 fn network_facts<'a>(
     interfaces: impl Iterator<Item = (String, MacAddr, &'a [IpNetwork])>,
 ) -> Value {
@@ -103,7 +103,7 @@ fn network_facts<'a>(
     })
 }
 
-/// Gathers what this machine is, as opposed to what it's doing. Everything here
+/// Gathers what this host is, as opposed to what it's doing. Everything here
 /// should rarely change, because each change is kept as history. That's why
 /// swap size, which some systems resize on demand, isn't included.
 pub fn gather(custom: &BTreeMap<String, Value>, metrics: &Definitions) -> Result<Value> {
@@ -112,7 +112,7 @@ pub fn gather(custom: &BTreeMap<String, Value>, metrics: &Definitions) -> Result
     gather_named(custom, metrics, hostname.as_deref(), canonical.as_deref())
 }
 
-/// Everything but asking the resolver what the machine is called.
+/// Everything but asking the resolver what the host is called.
 fn gather_named(
     custom: &BTreeMap<String, Value>,
     metrics: &Definitions,
@@ -158,7 +158,7 @@ fn gather_named(
             "total_bytes": system.total_memory(),
         },
         "networking": networking,
-        // Virtual machines and missing rights leave some of these out.
+        // Virtual hosts and missing rights leave some of these out.
         "hardware": {
             "vendor": Product::vendor_name().ok(),
             "product": Product::name().ok(),
@@ -172,7 +172,7 @@ fn gather_named(
             "commit": build.commit,
             "built_at": build.built_at,
             "collectors": collector::supported(),
-            // Only the names. What they run stays on this machine.
+            // Only the names. What they run stays on this host.
             "custom_metrics": metrics.keys().collect::<Vec<_>>(),
         },
         "custom": custom,
@@ -227,7 +227,7 @@ mod tests {
             json!({ "hostname": "web-1", "fqdn": "web-1", "domain": null })
         );
 
-        // The resolver knows the machine by another name, which isn't its domain.
+        // The resolver knows the host by another name, which isn't its domain.
         let names = name_facts(Some("web-1"), Some("alias.example.net."));
         assert_eq!(
             names,

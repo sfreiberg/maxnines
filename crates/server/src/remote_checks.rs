@@ -20,12 +20,12 @@ use crate::models::Database;
 use crate::store::{NewSample, WriterCommand};
 
 /// The built-in agent's ID. See the migration that creates it.
-pub const LOCAL_AGENT_ID: &str = "server";
+pub const LOCAL_HOST_ID: &str = "server";
 
-pub const LOCAL_HOST: &str = "MaxNines server";
-/// The built-in agent alerts about a group of machines belong to.
-pub const FLEET_AGENT_ID: &str = "fleet";
-pub const FLEET_HOST: &str = "Fleet";
+pub const LOCAL_HOSTNAME: &str = "MaxNines server";
+/// The built-in agent alerts about a group of hosts belong to.
+pub const FLEET_HOST_ID: &str = "fleet";
+pub const FLEET_HOSTNAME: &str = "Fleet";
 
 /// How often to look for checks that are due.
 const TICK: Duration = Duration::from_secs(5);
@@ -176,8 +176,8 @@ async fn save(writer: &mpsc::Sender<WriterCommand>, result: Value) {
         metrics: BTreeMap::from([("checks".to_string(), json!([result]))]),
     };
     let command = WriterCommand::Save(NewSample {
-        agent_id: LOCAL_AGENT_ID.to_string(),
-        host: LOCAL_HOST.to_string(),
+        host_id: LOCAL_HOST_ID.to_string(),
+        hostname: LOCAL_HOSTNAME.to_string(),
         sample,
     });
     if writer.send(command).await.is_err() {

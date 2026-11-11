@@ -14,12 +14,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::error;
 
-use super::agents::suggestions;
 use super::fleet::Health;
 use super::host_list::HostSearch;
+use super::hosts::suggestions;
 use super::users::{refusal, setup_url};
 use crate::alerting::{Alert, AlertRuleInput, ChannelInput, ChannelKind};
-use crate::app_state::{AgentDeletion, AppState, EventRefusal};
+use crate::app_state::{AppState, EventRefusal, HostDeletion};
 use crate::audit::Via;
 use crate::calculations::{self, Calculation, Question};
 use crate::dashboard_variables::{self, Picks, Variable};
@@ -34,8 +34,8 @@ use crate::models::{
     ConfigStatus, RuleInput, UserChange, check_api_key_name, check_new_user, expiry_after, is_theme,
 };
 use crate::notifier::{self, Notice};
-use crate::presence::AgentPresence;
-use crate::registration::{AgentRecord, AgentState};
+use crate::presence::HostPresence;
+use crate::registration::{HostRecord, HostState};
 use crate::remote_checks::{RemoteCheck, RemoteCheckInput};
 use crate::roles::Role;
 use crate::rule_engine::{self, ResolvedConfig};
@@ -44,9 +44,9 @@ use crate::times::zone_named;
 
 /// An agent as admins see it.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct AgentView {
+pub struct HostView {
     #[serde(flatten)]
-    pub agent: AgentRecord,
+    pub host: HostRecord,
     pub online: bool,
     pub health: Health,
     pub last_seen_ms: Option<u64>,
@@ -64,8 +64,8 @@ pub struct FactsView {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TrustedFacts {
-    agent_id: String,
-    state: AgentState,
+    host_id: String,
+    state: HostState,
     decided_by: Option<String>,
     online: bool,
     /// Where the latest connection came from, since the server started.
@@ -77,12 +77,12 @@ pub const BASE_PATH: &str = "/api/v1";
 
 pub fn routes(state: AppState) -> Router<AppState> {
     Router::new()
-        .route("/agents", get(list))
-        .route("/agents/{id}", get(show_agent).delete(delete_agent))
-        .route("/agents/{id}/facts", get(facts))
-        .route("/agents/{id}/facts/history", get(facts_history))
-        .route("/agents/{id}/config", get(agent_config))
-        .route("/agents/{id}/metrics/{metric}", get(agent_metric))
+        .route("/hosts", get(list))
+        .route("/hosts/{id}", get(show_host).delete(delete_host))
+        .route("/hosts/{id}/facts", get(facts))
+        .route("/hosts/{id}/facts/history", get(facts_history))
+        .route("/hosts/{id}/config", get(agent_config))
+        .route("/hosts/{id}/metrics/{metric}", get(host_metric))
         .route("/metrics", get(metric_catalog))
         .route("/metrics/current", get(current_metrics))
         .route("/query", get(query))
@@ -115,7 +115,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/alerts/{id}/unacknowledge", post(unacknowledge_alert))
         .route("/annotations", get(list_events).post(create_event))
         .route("/annotations/{id}", get(show_event).delete(delete_event))
-        .route("/agents/{id}/events", get(agent_events))
+        .route("/hosts/{id}/events", get(host_events))
         .route("/silences", get(list_silences).post(create_silence))
         .route("/silences/{id}", get(show_silence))
         .route("/silences/{id}/end", post(end_silence))
@@ -173,9 +173,9 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/api-keys", get(list_api_keys).post(create_api_key))
         .route("/audit-log", get(audit_log))
         .route("/api-keys/{id}", delete(revoke_api_key))
-        .route("/agents/filter-options", get(filter_options))
-        .route("/agents/{id}/approve", post(approve))
-        .route("/agents/{id}/revoke", post(revoke))
+        .route("/hosts/filter-options", get(filter_options))
+        .route("/hosts/{id}/approve", post(approve))
+        .route("/hosts/{id}/revoke", post(revoke))
         .route("/rules/preview", post(preview_rule))
         .route("/notification-channels/{id}/test", post(test_channel))
         .route("/users", get(list_users).post(create_user))
@@ -494,7 +494,7 @@ async fn audit_log(State(state): State<AppState>, Query(params): Query<AuditPara
 
 #[derive(Deserialize)]
 struct ListParams {
-    /// A filter, written as in the box on the Machines page.
+    /// A filter, written as in the box on the Hosts page.
     filter: Option<String>,
 }
 
@@ -513,46 +513,46 @@ async fn list(State(state): State<AppState>, Query(params): Query<ListParams>) -
     }
     let mut alerts: BTreeMap<&str, Vec<&Alert>> = BTreeMap::new();
     for alert in &open {
-        alerts.entry(&alert.agent_id).or_default().push(alert);
+        alerts.entry(&alert.host_id).or_default().push(alert);
     }
 
-    let views: Vec<AgentView> = state
+    let views: Vec<HostView> = state
         .registry
         .list()
         .await
         .into_iter()
-        .filter(|agent| !agent.is_local() && search.includes(&agent.id, &agent.host))
-        .map(|agent| {
-            let presence: Option<AgentPresence> = state.presence.get(&agent.id);
+        .filter(|host| !host.is_local() && search.includes(&host.id, &host.hostname))
+        .map(|host| {
+            let presence: Option<HostPresence> = state.presence.get(&host.id);
             let online = presence.as_ref().is_some_and(|p| p.online);
-            let mine = alerts.get(agent.id.as_str()).map_or(&[][..], Vec::as_slice);
-            AgentView {
+            let mine = alerts.get(host.id.as_str()).map_or(&[][..], Vec::as_slice);
+            HostView {
                 online,
                 health: Health::of(online, mine),
                 last_seen_ms: presence.map(|p| p.last_seen_ms),
-                agent,
+                host,
             }
         })
         .collect();
     Json(views).into_response()
 }
 
-async fn show_agent(State(state): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
-    let Some(agent) = state.registry.get(&id).await.filter(|a| !a.is_local()) else {
+async fn show_host(State(state): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
+    let Some(host) = state.registry.get(&id).await.filter(|a| !a.is_local()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let open = match state.database.open_alerts().await {
         Ok(open) => open,
         Err(error) => return server_error(&error),
     };
-    let mine: Vec<&Alert> = open.iter().filter(|alert| alert.agent_id == id).collect();
+    let mine: Vec<&Alert> = open.iter().filter(|alert| alert.host_id == id).collect();
     let presence = state.presence.get(&id);
     let online = presence.as_ref().is_some_and(|p| p.online);
-    Json(AgentView {
+    Json(HostView {
         online,
         health: Health::of(online, &mine),
         last_seen_ms: presence.map(|p| p.last_seen_ms),
-        agent,
+        host,
     })
     .into_response()
 }
@@ -573,7 +573,7 @@ async fn filter_options(
 }
 
 async fn facts(State(state): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
-    let Some(agent) = state.registry.get(&id).await else {
+    let Some(host) = state.registry.get(&id).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
@@ -585,9 +585,9 @@ async fn facts(State(state): State<AppState>, UrlPath(id): UrlPath<String>) -> R
     let presence = state.presence.get(&id);
     Json(FactsView {
         trusted: TrustedFacts {
-            agent_id: agent.id,
-            state: agent.state,
-            decided_by: agent.decided_by,
+            host_id: host.id,
+            state: host.state,
+            decided_by: host.decided_by,
             online: presence.is_some_and(|p| p.online),
             source_address: presence.map(|p| p.source),
         },
@@ -630,7 +630,7 @@ async fn agent_config(State(state): State<AppState>, UrlPath(id): UrlPath<String
 /// How much a query covers unless it says otherwise.
 const DEFAULT_RANGE_MS: i64 = 3_600_000;
 
-/// Enough for any real machine, while an agent inventing names can't make a
+/// Enough for any real host, while an agent inventing names can't make a
 /// response huge.
 const MAX_SERIES: usize = 100;
 
@@ -662,12 +662,12 @@ struct MetricView {
     result: SeriesResult,
 }
 
-async fn agent_metric(
+async fn host_metric(
     State(state): State<AppState>,
     UrlPath((id, name)): UrlPath<(String, String)>,
     Query(params): Query<MetricParams>,
 ) -> Response {
-    let (Some(agent), Some(metric)) = (state.registry.get(&id).await, metrics::find(&name)) else {
+    let (Some(host), Some(metric)) = (state.registry.get(&id).await, metrics::find(&name)) else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
@@ -681,7 +681,7 @@ async fn agent_metric(
 
     match state
         .metrics
-        .series(&agent.id, metric, range, MAX_SERIES)
+        .series(&host.id, metric, range, MAX_SERIES)
         .await
     {
         Ok(result) => Json(MetricView {
@@ -1269,8 +1269,8 @@ async fn delete_event(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) 
     }
 }
 
-/// Everything that happened to one machine, newest first: a day's worth unless asked.
-async fn agent_events(
+/// Everything that happened to one host, newest first: a day's worth unless asked.
+async fn host_events(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
     Query(params): Query<EventParams>,
@@ -1401,7 +1401,7 @@ async fn delete_location_rule(
     }
 }
 
-/// Every site on the map with its machines, and the machines no rule places.
+/// Every site on the map with its hosts, and the hosts no rule places.
 async fn map(State(state): State<AppState>) -> Response {
     match super::map::map_data(&state).await {
         Ok(data) => Json(data).into_response(),
@@ -1633,31 +1633,31 @@ fn server_error(error: &anyhow::Error) -> Response {
 }
 
 async fn approve(State(state): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
-    decide(&state, &id, AgentState::Approved).await
+    decide(&state, &id, HostState::Approved).await
 }
 
 async fn revoke(State(state): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
-    decide(&state, &id, AgentState::Revoked).await
+    decide(&state, &id, HostState::Revoked).await
 }
 
-async fn delete_agent(State(state): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
-    match state.delete_agent(&id).await {
-        Ok(AgentDeletion::Deleted) => StatusCode::NO_CONTENT.into_response(),
-        Ok(AgentDeletion::NoSuchAgent) => StatusCode::NOT_FOUND.into_response(),
-        Ok(AgentDeletion::NotRevoked) => {
-            failed(StatusCode::CONFLICT, "Revoke the agent before deleting it")
+async fn delete_host(State(state): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
+    match state.delete_host(&id).await {
+        Ok(HostDeletion::Deleted) => StatusCode::NO_CONTENT.into_response(),
+        Ok(HostDeletion::NoSuchHost) => StatusCode::NOT_FOUND.into_response(),
+        Ok(HostDeletion::NotRevoked) => {
+            failed(StatusCode::CONFLICT, "Revoke the host before deleting it")
         }
         Err(error) => server_error(&error),
     }
 }
 
 /// Recorded as the key's owner, as a decision on the pages is.
-async fn decide(state: &AppState, id: &str, decision: AgentState) -> Response {
+async fn decide(state: &AppState, id: &str, decision: HostState) -> Response {
     let Some(owner) = super::signed_in_user() else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
     match state.registry.decide_as(id, decision, &owner.email).await {
-        Ok(Some(agent)) => Json(agent).into_response(),
+        Ok(Some(host)) => Json(host).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),
     }

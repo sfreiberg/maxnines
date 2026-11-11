@@ -76,11 +76,11 @@ impl Server {
     }
 
     pub fn approve(&self, id: &str) -> Result<()> {
-        self.post(&format!("/api/v1/agents/{id}/approve"))
+        self.post(&format!("/api/v1/hosts/{id}/approve"))
     }
 
     pub fn revoke(&self, id: &str) -> Result<()> {
-        self.post(&format!("/api/v1/agents/{id}/revoke"))
+        self.post(&format!("/api/v1/hosts/{id}/revoke"))
     }
 
     /// The first config rule, for changing and putting back.

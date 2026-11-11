@@ -11,8 +11,8 @@ use sea_orm::{
 use serde::Serialize;
 
 use super::{
-    Database, agent, agent_fact, alert, alert_rule, config_rule, notification,
-    notification_channel, remote_check,
+    Database, alert, alert_rule, config_rule, host, host_fact, notification, notification_channel,
+    remote_check,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -87,7 +87,7 @@ impl Database {
     /// Whether the database answers a real question, as a closed connection pool or a
     /// missing table can still answer a ping.
     pub async fn is_reachable(&self) -> bool {
-        agent::Entity::find().one(&self.connection).await.is_ok()
+        host::Entity::find().one(&self.connection).await.is_ok()
     }
 
     pub async fn stats(&self) -> Result<DatabaseStats> {
@@ -108,12 +108,12 @@ impl Database {
         };
         let tables = vec![
             TableCount {
-                name: "Agents",
-                rows: agent::Entity::find().count(connection).await?,
+                name: "Hosts",
+                rows: host::Entity::find().count(connection).await?,
             },
             TableCount {
                 name: "Facts",
-                rows: agent_fact::Entity::find().count(connection).await?,
+                rows: host_fact::Entity::find().count(connection).await?,
             },
             TableCount {
                 name: "Config rules",

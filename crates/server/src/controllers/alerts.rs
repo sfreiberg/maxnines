@@ -12,7 +12,7 @@ use crate::alerting::{Alert, DeliveryProblem};
 use crate::app_state::AppState;
 use crate::metrics::now_ms;
 use crate::registration::short_id;
-use crate::remote_checks::{FLEET_AGENT_ID, LOCAL_AGENT_ID};
+use crate::remote_checks::{FLEET_HOST_ID, LOCAL_HOST_ID};
 use crate::silences::{self, ActiveSilences};
 
 /// How many ended alerts the page shows.
@@ -32,10 +32,10 @@ pub fn routes() -> Router<AppState> {
 struct AlertRow {
     id: i64,
     acknowledged_by: Option<String>,
-    agent_id: String,
+    host_id: String,
     /// Empty for the fleet and the server, which are one of a kind.
     short_id: String,
-    host: String,
+    hostname: String,
     os_family: Option<OsFamily>,
     rule_name: String,
     severity: &'static str,
@@ -73,13 +73,13 @@ impl From<Alert> for AlertRow {
             started: local_time(alert.started_ms),
             resolved: alert.resolved_ms.map(local_time),
             reason: alert.resolve_reason,
-            short_id: if alert.agent_id == FLEET_AGENT_ID || alert.agent_id == LOCAL_AGENT_ID {
+            short_id: if alert.host_id == FLEET_HOST_ID || alert.host_id == LOCAL_HOST_ID {
                 String::new()
             } else {
-                short_id(&alert.agent_id).to_string()
+                short_id(&alert.host_id).to_string()
             },
-            agent_id: alert.agent_id,
-            host: alert.host,
+            host_id: alert.host_id,
+            hostname: alert.hostname,
             os_family: None,
             rule_name: alert.rule_name,
             summary: alert.summary,
@@ -127,14 +127,14 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
     let ids: Vec<&str> = open
         .iter()
         .chain(&resolved)
-        .map(|alert| alert.agent_id.as_str())
+        .map(|alert| alert.host_id.as_str())
         .collect();
     let facts = match state.database.facts_of(&ids).await {
         Ok(facts) => facts,
         Err(error) => return server_error(&error),
     };
     let row = |alert: Alert| AlertRow {
-        os_family: facts.get(&alert.agent_id).and_then(OsFamily::of),
+        os_family: facts.get(&alert.host_id).and_then(OsFamily::of),
         ..AlertRow::from(alert)
     };
 

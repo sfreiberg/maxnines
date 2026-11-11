@@ -118,7 +118,7 @@ impl ChartSources {
                 };
                 let result = self
                     .metrics
-                    .series(&alert.agent_id, metric, range, MAX_SERIES)
+                    .series(&alert.host_id, metric, range, MAX_SERIES)
                     .await?;
                 Ok(Some((metric, metric.unit, result)))
             }
@@ -168,7 +168,7 @@ fn heading(alert: &Alert, metric: &Metric) -> String {
         _ if alert.series.is_empty() => metric.title.to_string(),
         _ => format!("{} ({})", metric.title, alert.series),
     };
-    format!("{watched} on {}", alert.host)
+    format!("{watched} on {}", alert.hostname)
 }
 
 fn severity_colour(severity: Severity) -> &'static str {
@@ -365,8 +365,8 @@ mod tests {
             rule_id: Some(1),
             rule_name: "Disk filling up".to_string(),
             severity: Severity::Warning,
-            agent_id: "abc".to_string(),
-            host: "web-<1>".to_string(),
+            host_id: "abc".to_string(),
+            hostname: "web-<1>".to_string(),
             series: "/".to_string(),
             value: Some(85.0),
             summary: String::new(),

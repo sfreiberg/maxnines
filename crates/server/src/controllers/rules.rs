@@ -17,7 +17,7 @@ use crate::app_state::AppState;
 use crate::condition_builder::Builder;
 use crate::facts::unflatten;
 use crate::models::RuleInput;
-use crate::registration::AgentState;
+use crate::registration::HostState;
 use crate::rule_engine;
 use crate::rule_preview::Preview;
 
@@ -367,7 +367,7 @@ struct RuleRow {
     enabled: bool,
     summary: String,
     /// How many approved agents it applies to.
-    agents: usize,
+    hosts: usize,
 }
 
 /// Describes what a rule sets in a few words.
@@ -407,19 +407,19 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
         Ok(facts) => facts,
         Err(error) => return server_error(&error),
     };
-    let agents: Vec<(String, Value)> = state
+    let hosts: Vec<(String, Value)> = state
         .registry
         .list()
         .await
         .into_iter()
-        .filter(|agent| agent.state == AgentState::Approved && !agent.is_local())
-        .map(|agent| {
+        .filter(|host| host.state == HostState::Approved && !host.is_local())
+        .map(|host| {
             // No facts yet is an empty set, as it is when a config is worked out,
             // or `has()` in a condition would fail here and pass there.
             let shape = facts
-                .get(&agent.id)
+                .get(&host.id)
                 .map_or_else(|| Value::Object(Map::new()), unflatten);
-            (agent.id, shape)
+            (host.id, shape)
         })
         .collect();
 
@@ -427,7 +427,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
         .into_iter()
         .map(|rule| RuleRow {
             id: rule.id,
-            agents: agents
+            hosts: hosts
                 .iter()
                 .filter(|(id, facts)| rule_engine::matches(&rule.rule, facts, id))
                 .count(),

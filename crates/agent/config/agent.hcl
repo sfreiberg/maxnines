@@ -9,7 +9,7 @@
 # The agent won't start if a variable with no default isn't set.
 
 server {
-  # Use wss:// for anything beyond this machine.
+  # Use wss:// for anything beyond this host.
   url = "ws://127.0.0.1:9000/ws"
 
   # Enrollment token, for servers with automatic approval rules.

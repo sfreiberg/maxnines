@@ -8,7 +8,7 @@ Set up the server first, as agents report to it.
 
 The `.deb` and `.rpm` packages install each program as a systemd service that runs
 as a `maxnines` user, with its config in `/etc/maxnines` and its data in `/var/lib`.
-Download the ones for your machine, then install them:
+Download the ones for your system, then install them:
 
 ```sh
 sudo apt install ./maxnines-server_0.1.0-1_amd64.deb    # Debian and Ubuntu
@@ -28,7 +28,7 @@ sudo -u maxnines maxnines-server --config /etc/maxnines/server.hcl \
 ```
 
 For an agent, set the server's address in `/etc/maxnines/agent.hcl`, start it, and
-approve it on the server's Machines page:
+approve its host on the server's Hosts page:
 
 ```sh
 sudo systemctl enable --now maxnines-agent

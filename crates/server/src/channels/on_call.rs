@@ -50,8 +50,8 @@ pub fn severity(notice: &Notice) -> &'static str {
         .map_or("info", |a| a.severity.as_str())
 }
 
-pub fn host(notice: &Notice) -> &str {
-    notice.alert.as_ref().map_or("MaxNines", |a| &a.host)
+pub fn hostname(notice: &Notice) -> &str {
+    notice.alert.as_ref().map_or("MaxNines", |a| &a.hostname)
 }
 
 /// A URL from an on-call service, which has a secret after `path`. `complaint` is

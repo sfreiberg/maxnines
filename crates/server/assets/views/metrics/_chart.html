@@ -1,7 +1,7 @@
   <section class="chart-card">
     <div class="chart-heading">
       <h2>{{ chart.title }}</h2>
-      {% if chart.has_data %}<a href="/agents/{{ agent_id }}/metrics/{{ chart.name }}?range={{ range }}">View data</a>{% endif %}
+      {% if chart.has_data %}<a href="/hosts/{{ host_id }}/metrics/{{ chart.name }}?range={{ range }}">View data</a>{% endif %}
     </div>
     {% include "metrics/_chart_drawing.html" %}
     {% if chart.has_data %}

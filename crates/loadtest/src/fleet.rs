@@ -108,14 +108,14 @@ async fn read(socket: &mut Socket) -> Option<ServerMessage> {
 async fn introduce(
     socket: &mut Socket,
     identity: &Identity,
-    host: &str,
+    hostname: &str,
     url: &str,
 ) -> Result<RegistrationStatus> {
     let Some(ServerMessage::Challenge { nonce }) = read(socket).await else {
         bail!("no challenge from the server");
     };
     let hello = AgentMessage::Hello {
-        host: host.to_string(),
+        hostname: hostname.to_string(),
         public_key: identity.public_key(),
         signature: identity.sign(url, &nonce),
         token: None,
@@ -130,13 +130,20 @@ async fn introduce(
 }
 
 /// Connects once, so the server knows about an agent and it can be approved.
-pub async fn register(url: &str, identity: &Identity, host: &str) -> Result<RegistrationStatus> {
+pub async fn register(
+    url: &str,
+    identity: &Identity,
+    hostname: &str,
+) -> Result<RegistrationStatus> {
     let (mut socket, _) = connect_async(url)
         .await
         .with_context(|| format!("connecting to {url}"))?;
-    timeout(HANDSHAKE_LIMIT, introduce(&mut socket, identity, host, url))
-        .await
-        .context("the server didn't finish the handshake")?
+    timeout(
+        HANDSHAKE_LIMIT,
+        introduce(&mut socket, identity, hostname, url),
+    )
+    .await
+    .context("the server didn't finish the handshake")?
 }
 
 /// A sample that's yet to reach the server.
@@ -160,7 +167,7 @@ impl Waiting {
 pub struct SimulatedAgent {
     index: usize,
     identity: Identity,
-    host: String,
+    hostname: String,
     readings: Readings,
     ticker: Interval,
     last_sample: Instant,
@@ -176,7 +183,7 @@ pub struct SimulatedAgent {
 }
 
 impl SimulatedAgent {
-    pub fn new(index: usize, identity: Identity, host: String, plan: &Plan) -> Self {
+    pub fn new(index: usize, identity: Identity, hostname: String, plan: &Plan) -> Self {
         let first = Instant::now() + plan.interval.mul_f64(rand::random());
         let mut ticker = interval_at(first, plan.interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -186,7 +193,7 @@ impl SimulatedAgent {
         Self {
             index,
             identity,
-            host,
+            hostname,
             readings: Readings::new(shape, chance(plan.hot_percent)),
             ticker,
             last_sample: Instant::now(),
@@ -214,7 +221,7 @@ impl SimulatedAgent {
     }
 
     fn facts_text(&self) -> Result<String> {
-        let facts = facts(self.index, &self.host, self.build);
+        let facts = facts(self.index, &self.hostname, self.build);
         Ok(serde_json::to_string(&AgentMessage::Facts { facts })?)
     }
 
@@ -330,7 +337,7 @@ impl SimulatedAgent {
 
         let connected = timeout(HANDSHAKE_LIMIT, async {
             let (mut socket, _) = connect_async(&plan.url).await?;
-            let status = introduce(&mut socket, &self.identity, &self.host, &plan.url).await?;
+            let status = introduce(&mut socket, &self.identity, &self.hostname, &plan.url).await?;
             anyhow::Ok((socket, status))
         })
         .await;

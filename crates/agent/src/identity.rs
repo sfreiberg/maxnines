@@ -26,8 +26,8 @@ pub fn generate(path: &Path, force: bool) -> Result<Identity> {
     if path.exists() {
         if !force {
             bail!(
-                "key file {} already exists. Replacing it creates a new agent identity that \
-                 must be approved again. Use --force to replace it.",
+                "key file {} already exists. Replacing it makes this a new host that must be \
+                 approved again. Use --force to replace it.",
                 path.display()
             );
         }

@@ -9,7 +9,7 @@ use super::{ChannelType, alerts_link, blocking, post_json, url_preview};
 use crate::alerting::{Channel, ChannelInput, Event, Severity};
 use crate::notifier::{Notice, Senders, format_ms};
 use crate::registration::short_id;
-use crate::remote_checks::FLEET_AGENT_ID;
+use crate::remote_checks::FLEET_HOST_ID;
 
 /// Keeps a message well inside what Teams takes, which counts the card's markup too.
 const MAX_CHARS: usize = 3000;
@@ -49,11 +49,11 @@ fn body(notice: &Notice, web_url: Option<&str>) -> Value {
     if let Some(alert) = &notice.alert {
         let mut facts = vec![
             json!({ "title": "Rule", "value": unlinked(&alert.rule_name) }),
-            if alert.agent_id == FLEET_AGENT_ID {
-                json!({ "title": "Machines", "value": unlinked(&alert.host) })
+            if alert.host_id == FLEET_HOST_ID {
+                json!({ "title": "Hosts", "value": unlinked(&alert.hostname) })
             } else {
-                let agent = format!("{} ({})", alert.host, short_id(&alert.agent_id));
-                json!({ "title": "Machine", "value": unlinked(&agent) })
+                let host = format!("{} ({})", alert.hostname, short_id(&alert.host_id));
+                json!({ "title": "Host", "value": unlinked(&host) })
             },
             json!({ "title": "Started", "value": format_ms(alert.started_ms) }),
         ];
@@ -100,10 +100,10 @@ impl ChannelType for Teams {
             .trim()
             .parse()
             .map_err(|_| anyhow!("{complaint}"))?;
-        let host = uri.host().unwrap_or_default();
+        let hostname = uri.host().unwrap_or_default();
         ensure!(
             uri.scheme_str() == Some("https")
-                && HOSTS.iter().any(|end| host.ends_with(end))
+                && HOSTS.iter().any(|end| hostname.ends_with(end))
                 && uri.path().contains("/workflows/"),
             "{complaint}"
         );
@@ -159,7 +159,7 @@ mod tests {
         );
         let facts = card["body"][2]["facts"].as_array().unwrap();
         assert_eq!(facts[0], json!({ "title": "Rule", "value": "High CPU" }));
-        assert_eq!(facts[1]["title"], "Machine");
+        assert_eq!(facts[1]["title"], "Host");
         assert_eq!(card["actions"][0]["url"], "https://m.example.com/alerts");
 
         let warning = Alert {
@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn a_host_cannot_add_a_link_to_a_teams_card() {
         let alert = Alert {
-            host: "[click](https://evil.example)".to_string(),
+            hostname: "[click](https://evil.example)".to_string(),
             summary: "Disk on [click](https://evil.example) is full".to_string(),
             ..alert()
         };

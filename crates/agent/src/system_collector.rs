@@ -14,7 +14,7 @@ use crate::collector::Collector;
 /// there are updates, and whether a restart is waiting, are looked at this often.
 const UPDATES_EVERY: Duration = Duration::from_secs(15 * 60);
 
-/// How close the machine is to its limits, how many people are on it, its TCP
+/// How close the host is to its limits, how many people are on it, its TCP
 /// connections, services that failed, and whether it has updates or a restart waiting.
 pub struct SystemCollector {
     background: Background,

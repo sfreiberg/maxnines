@@ -517,7 +517,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
-    fn this_machine_measures_its_disks_from_the_second_look() {
+    fn this_host_measures_its_disks_from_the_second_look() {
         let disks = sysinfo::Disks::new_with_refreshed_list().unwrap();
         let disks: Vec<&Disk> = disks
             .iter()
@@ -527,7 +527,7 @@ mod tests {
         activity.measure(&disks);
         std::thread::sleep(std::time::Duration::from_millis(200));
         let measured = activity.measure(&disks);
-        // A virtual machine's disks may not say, but the first real disk does.
+        // A virtual host's disks may not say, but the first real disk does.
         let any = measured.values().next();
         if cfg!(not(target_os = "linux")) || std::path::Path::new("/proc/diskstats").exists() {
             assert!(any.is_some(), "{disks:?}");

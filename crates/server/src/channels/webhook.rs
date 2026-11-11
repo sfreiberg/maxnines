@@ -66,7 +66,7 @@ mod tests {
         assert_eq!(body["event"], "firing");
         assert_eq!(body["text"], "CPU usage on web-1 is 97%, above 90%");
         assert_eq!(body["alert"]["severity"], "critical");
-        assert_eq!(body["alert"]["agent_id"], "abc");
+        assert_eq!(body["alert"]["host_id"], "abc");
         assert_eq!(
             super::body(&notice(Event::Escalated, alert()))["event"],
             "escalated"

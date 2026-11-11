@@ -11,7 +11,7 @@ use crate::app_state::AppState;
 use crate::facts::FlatFacts;
 use crate::metric_charts::format_value;
 use crate::metrics::{CurrentValues, Unit, now_ms};
-use crate::registration::{AgentRecord, AgentState, short_id};
+use crate::registration::{HostRecord, HostState, short_id};
 
 /// A disk this full is drawn in the warning color.
 const FULL_DISK_PERCENT: f64 = 90.0;
@@ -85,7 +85,7 @@ impl OsFamily {
 pub struct FleetRow {
     pub id: String,
     pub short_id: String,
-    pub host: String,
+    pub hostname: String,
     pub os_family: Option<OsFamily>,
     pub online: bool,
     pub health: Health,
@@ -99,12 +99,12 @@ pub struct FleetRow {
 
 fn row(
     state: &AppState,
-    agent: AgentRecord,
+    host: HostRecord,
     values: CurrentValues,
     facts: Option<&FlatFacts>,
     alerts: &[&Alert],
 ) -> FleetRow {
-    let online = state.presence.get(&agent.id).is_some_and(|p| p.online);
+    let online = state.presence.get(&host.id).is_some_and(|p| p.online);
     FleetRow {
         os_family: facts.and_then(OsFamily::of),
         online,
@@ -117,9 +117,9 @@ fn row(
         updated: Some(values.time_ms)
             .filter(|time| *time > 0)
             .map(local_time),
-        short_id: short_id(&agent.id).to_string(),
-        id: agent.id,
-        host: agent.host,
+        short_id: short_id(&host.id).to_string(),
+        id: host.id,
+        hostname: host.hostname,
     }
 }
 
@@ -129,29 +129,33 @@ pub async fn rows(state: &AppState) -> Result<Vec<FleetRow>> {
     let open = state.database.open_alerts().await?;
     let mut alerts: BTreeMap<&str, Vec<&Alert>> = BTreeMap::new();
     for alert in &open {
-        alerts.entry(&alert.agent_id).or_default().push(alert);
+        alerts.entry(&alert.host_id).or_default().push(alert);
     }
 
-    let agents: Vec<AgentRecord> = state
+    let hosts: Vec<HostRecord> = state
         .registry
         .list()
         .await
         .into_iter()
-        .filter(|agent| agent.state == AgentState::Approved && !agent.is_local())
+        .filter(|host| host.state == HostState::Approved && !host.is_local())
         .collect();
-    let ids: Vec<&str> = agents.iter().map(|agent| agent.id.as_str()).collect();
+    let ids: Vec<&str> = hosts.iter().map(|host| host.id.as_str()).collect();
     let facts = state.database.facts_of(&ids).await?;
 
-    let mut rows: Vec<FleetRow> = agents
+    let mut rows: Vec<FleetRow> = hosts
         .into_iter()
-        .map(|agent| {
-            let values = current.remove(&agent.id).unwrap_or_default();
-            let mine = alerts.get(agent.id.as_str()).map_or(&[][..], Vec::as_slice);
-            let known = facts.get(&agent.id);
-            row(state, agent, values, known, mine)
+        .map(|host| {
+            let values = current.remove(&host.id).unwrap_or_default();
+            let mine = alerts.get(host.id.as_str()).map_or(&[][..], Vec::as_slice);
+            let known = facts.get(&host.id);
+            row(state, host, values, known, mine)
         })
         .collect();
-    rows.sort_by(|a, b| a.health.cmp(&b.health).then_with(|| a.host.cmp(&b.host)));
+    rows.sort_by(|a, b| {
+        a.health
+            .cmp(&b.health)
+            .then_with(|| a.hostname.cmp(&b.hostname))
+    });
     Ok(rows)
 }
 

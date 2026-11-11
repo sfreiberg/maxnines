@@ -1,32 +1,32 @@
 {% extends "layouts/live.html" %}
-{% block title %}{{ agent.host }} · MaxNines{% endblock title %}
+{% block title %}{{ host.hostname }} · MaxNines{% endblock title %}
 {% block content %}
-<p class="breadcrumb"><a href="/agents">Machines</a></p>
+<p class="breadcrumb"><a href="/hosts">Hosts</a></p>
 <div class="title-row">
   <div>
-    <h1>{{ agent.host }}</h1>
-    {% if os %}<p class="subtitle host-name">{% include "agents/_os_icon.html" %}{{ os }}</p>{% endif %}
+    <h1>{{ host.hostname }}</h1>
+    {% if os %}<p class="subtitle host-name">{% include "hosts/_os_icon.html" %}{{ os }}</p>{% endif %}
   </div>
   <div class="actions">
-    {% include "agents/_version.html" %}
-    {% include "agents/_health.html" %}
-    <a class="button secondary" href="/agents/{{ agent.id }}/metrics">View metrics</a>
+    {% include "hosts/_version.html" %}
+    {% include "hosts/_health.html" %}
+    <a class="button secondary" href="/hosts/{{ host.id }}/metrics">View metrics</a>
     {% if can_edit %}
-    {% if agent.state != "approved" %}
-    <form method="post" action="/agents/{{ agent.id }}/approve">
+    {% if host.state != "approved" %}
+    <form method="post" action="/hosts/{{ host.id }}/approve">
       <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
       <button type="submit">Approve</button>
     </form>
     {% endif %}
-    {% if agent.state != "revoked" %}
-    <form method="post" action="/agents/{{ agent.id }}/revoke">
+    {% if host.state != "revoked" %}
+    <form method="post" action="/hosts/{{ host.id }}/revoke">
       <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
       <button type="submit" class="danger">Revoke</button>
     </form>
     {% elif is_admin %}
-    <form method="post" action="/agents/{{ agent.id }}/delete">
+    <form method="post" action="/hosts/{{ host.id }}/delete">
       <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
-      <button type="submit" class="danger" title="Deletes this machine with its metrics, facts and alerts, for good">Delete</button>
+      <button type="submit" class="danger" title="Deletes this host with its metrics, facts and alerts, for good">Delete</button>
     </form>
     {% endif %}
     {% endif %}
@@ -45,14 +45,14 @@
 </section>
 {% endif %}
 
-{% if agent.state == "approved" %}
+{% if host.state == "approved" %}
 <section id="maintenance" class="card maintenance">
   {% if maintenance %}
   <div class="problem">
     <span class="badge warn">Silenced</span>
-    <span class="text">Notifications about this machine are held until {{ maintenance.until }}{% if maintenance.window %}, by the {{ maintenance.why }} maintenance window{% else %}: {{ maintenance.why }}{% if maintenance.by %}, started by {{ maintenance.by }}{% endif %}{% endif %}. Alerts still show here and on the Alerts page, and any still firing then are sent when it ends.</span>
+    <span class="text">Notifications about this host are held until {{ maintenance.until }}{% if maintenance.window %}, by the {{ maintenance.why }} maintenance window{% else %}: {{ maintenance.why }}{% if maintenance.by %}, started by {{ maintenance.by }}{% endif %}{% endif %}. Alerts still show here and on the Alerts page, and any still firing then are sent when it ends.</span>
     {% if maintenance.just_this_one and can_respond %}
-    <form method="post" action="/agents/{{ agent.id }}/maintenance/end" hx-post="/agents/{{ agent.id }}/maintenance/end" hx-target="#maintenance" hx-select="#maintenance" hx-swap="morph:outerHTML">
+    <form method="post" action="/hosts/{{ host.id }}/maintenance/end" hx-post="/hosts/{{ host.id }}/maintenance/end" hx-target="#maintenance" hx-select="#maintenance" hx-swap="morph:outerHTML">
       <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
       <button type="submit" class="secondary">End now</button>
     </form>
@@ -63,9 +63,9 @@
     {% endif %}
   </div>
   {% elif can_respond %}
-  <form method="post" action="/agents/{{ agent.id }}/maintenance" hx-post="/agents/{{ agent.id }}/maintenance" hx-target="#maintenance" hx-select="#maintenance" hx-swap="morph:outerHTML" class="maintenance-form">
+  <form method="post" action="/hosts/{{ host.id }}/maintenance" hx-post="/hosts/{{ host.id }}/maintenance" hx-target="#maintenance" hx-select="#maintenance" hx-swap="morph:outerHTML" class="maintenance-form">
     <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
-    <label>Silence this machine for
+    <label>Silence this host for
       <select name="duration_secs">
         {% for choice in maintenance_choices %}
         <option value="{{ choice.secs }}"{% if choice.chosen %} selected{% endif %}>{{ choice.label }}</option>
@@ -73,11 +73,11 @@
       </select>
     </label>
     <label>Reason
-      <input type="text" name="reason" maxlength="255" placeholder="Maintenance on {{ agent.host }}" autocomplete="off">
+      <input type="text" name="reason" maxlength="255" placeholder="Maintenance on {{ host.hostname }}" autocomplete="off">
     </label>
     <button type="submit" class="secondary">Start maintenance</button>
   </form>
-  <p class="hint">Holds back every notification about this machine, such as while it's rebooted or upgraded. Alerts still show, and any still firing when it ends are sent then.</p>
+  <p class="hint">Holds back every notification about this host, such as while it's rebooted or upgraded. Alerts still show, and any still firing when it ends are sent then.</p>
   {% endif %}
 </section>
 {% endif %}
@@ -86,22 +86,22 @@
   <section class="card">
     <h2>Status</h2>
     <dl class="summary">
-      <dt>Status</dt><dd>{{ agent.state }}{% if decided_by %} by {{ decided_by }}{% endif %}</dd>
-      <dt>Online</dt><dd>{% if agent.online %}Yes{% else %}No{% endif %}{% if agent.seen %}, seen {{ agent.seen }}{% endif %}</dd>
+      <dt>Status</dt><dd>{{ host.state }}{% if decided_by %} by {{ decided_by }}{% endif %}</dd>
+      <dt>Online</dt><dd>{% if host.online %}Yes{% else %}No{% endif %}{% if host.seen %}, seen {{ host.seen }}{% endif %}</dd>
       {% if uptime %}<dt>Uptime</dt><dd>{{ uptime }}</dd>{% endif %}
       {% if agent_uptime %}<dt>Agent uptime</dt><dd>{{ agent_uptime }}</dd>{% endif %}
       {% if own_memory %}<dt>Agent memory</dt><dd>{{ own_memory }}</dd>{% endif %}
-      {% if agent.state == "approved" %}<dt>Location</dt><dd>{% if location %}<a href="/map/rules/{{ location.rule_id }}/edit">{{ location.name }}</a>{% if location.place and location.place != location.name %}, {{ location.place }}{% endif %}{% if not location.just_this_one %} · <a href="/map/rules/new?agent={{ agent.id }}">Place it by itself</a>{% endif %}{% else %}Not on the map · <a href="/map/rules/new?agent={{ agent.id }}">Place it</a>{% endif %}</dd>{% endif %}
+      {% if host.state == "approved" %}<dt>Location</dt><dd>{% if location %}<a href="/map/rules/{{ location.rule_id }}/edit">{{ location.name }}</a>{% if location.place and location.place != location.name %}, {{ location.place }}{% endif %}{% if not location.just_this_one %} · <a href="/map/rules/new?host={{ host.id }}">Place it by itself</a>{% endif %}{% else %}Not on the map · <a href="/map/rules/new?host={{ host.id }}">Place it</a>{% endif %}</dd>{% endif %}
       {% if source %}<dt>Connected from</dt><dd><code>{{ source }}</code></dd>{% endif %}
-      {% if agent.version %}<dt>Agent version</dt><dd>{{ agent.version }}{% if agent_commit %}, commit <code>{{ agent_commit }}</code>{% endif %}{% if agent.version_state == "outdated" %}. The newest is {{ newest_agent_version }}.{% elif agent.version_state == "newer_than_server" %}, newer than the server. Upgrade the server first.{% endif %}</dd>{% endif %}
-      <dt>Agent ID</dt><dd><code>{{ agent.id }}</code></dd>
+      {% if host.version %}<dt>Agent version</dt><dd>{{ host.version }}{% if agent_commit %}, commit <code>{{ agent_commit }}</code>{% endif %}{% if host.version_state == "outdated" %}. The newest is {{ newest_agent_version }}.{% elif host.version_state == "newer_than_server" %}, newer than the server. Upgrade the server first.{% endif %}</dd>{% endif %}
+      <dt>Host ID</dt><dd><code>{{ host.id }}</code></dd>
     </dl>
   </section>
 
   <section class="card">
     <h2>Config</h2>
-    <p class="hint"><span class="badge {{ agent.config.class }}">{{ agent.config.label }}</span>
-      {% if matched_rules %}from {{ matched_rules | join(sep=", ") }}{% else %}No rules match this machine.{% endif %}</p>
+    <p class="hint"><span class="badge {{ host.config.class }}">{{ host.config.label }}</span>
+      {% if matched_rules %}from {{ matched_rules | join(sep=", ") }}{% else %}No rules match this host.{% endif %}</p>
     {% if reported and reported.error %}
     <p class="error">The agent rejected its config: {{ reported.error }}</p>
     {% endif %}

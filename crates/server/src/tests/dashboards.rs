@@ -1,4 +1,4 @@
-//! Dashboards, and asking about many machines at once.
+//! Dashboards, and asking about many hosts at once.
 
 use super::*;
 
@@ -12,26 +12,26 @@ async fn api(server: &TestServer, method: &str, path: &str, body: &Value) -> (u1
     (status, serde_json::from_str(text).unwrap_or(Value::Null))
 }
 
-/// When every machine's reading was taken: the middle of a minute that's over, as the
-/// one still filling up isn't counted. It's the same for every machine, as one taking
+/// When every host's reading was taken: the middle of a minute that's over, as the
+/// one still filling up isn't counted. It's the same for every host, as one taking
 /// its own time could land in the next minute and be counted apart.
 static READING_TIME: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
     let minute = MINUTE_MS as u64;
     (now_ms() as u64 / minute - 2) * minute + minute / 2
 });
 
-/// An approved machine reporting a CPU reading, with these facts.
-async fn machine(server: &TestServer, host: &str, usage: f64, facts: Value) -> (Identity, Client) {
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, host).await;
+/// An approved host reporting a CPU reading, with these facts.
+async fn host(server: &TestServer, hostname: &str, usage: f64, facts: Value) -> (Identity, Client) {
+    let host = identity();
+    let mut client = server.connect_approved(&host, hostname).await;
     send(&mut client, &AgentMessage::Facts { facts }).await;
     let sample = AgentMessage::Sample(Sample {
         timestamp_ms: *READING_TIME,
         metrics: BTreeMap::from([("cpu".to_string(), json!({ "usage_percent": usage }))]),
     });
     send(&mut client, &sample).await;
-    server.wait_for_facts(&agent.id(), 1).await;
-    (agent, client)
+    server.wait_for_facts(&host.id(), 1).await;
+    (host, client)
 }
 
 /// Asks until the samples have been written, which happens in the background.
@@ -53,11 +53,11 @@ fn newest(series: &Value) -> f64 {
     points.last().unwrap()["avg"].as_f64().unwrap()
 }
 
-async fn three_machines(server: &TestServer) -> Vec<(Identity, Client)> {
+async fn three_hosts(server: &TestServer) -> Vec<(Identity, Client)> {
     vec![
-        machine(server, "web-1", 10.0, json!({ "role": "web" })).await,
-        machine(server, "web-2", 30.0, json!({ "role": "web" })).await,
-        machine(server, "db-1", 80.0, json!({ "role": "db" })).await,
+        host(server, "web-1", 10.0, json!({ "role": "web" })).await,
+        host(server, "web-2", 30.0, json!({ "role": "web" })).await,
+        host(server, "db-1", 80.0, json!({ "role": "db" })).await,
     ]
 }
 
@@ -78,9 +78,9 @@ mod query_api {
     use super::*;
 
     #[tokio::test]
-    async fn machines_can_be_combined() {
+    async fn hosts_can_be_combined() {
         let server = start_with_metrics().await;
-        let _machines = three_machines(&server).await;
+        let _hosts = three_hosts(&server).await;
         wait_for_all_three(&server).await;
 
         let result = query(&server, "/api/v1/query?metric=cpu.usage&calculation=avg").await;
@@ -90,9 +90,9 @@ mod query_api {
     }
 
     #[tokio::test]
-    async fn machines_can_be_grouped_by_a_fact() {
+    async fn hosts_can_be_grouped_by_a_fact() {
         let server = start_with_metrics().await;
-        let _machines = three_machines(&server).await;
+        let _hosts = three_hosts(&server).await;
         wait_for_all_three(&server).await;
 
         let path = "/api/v1/query?metric=cpu.usage&calculation=sum&group_by=fact:role";
@@ -105,9 +105,9 @@ mod query_api {
     }
 
     #[tokio::test]
-    async fn a_filter_picks_the_machines() {
+    async fn a_filter_picks_the_hosts() {
         let server = start_with_metrics().await;
-        let _machines = three_machines(&server).await;
+        let _hosts = three_hosts(&server).await;
         wait_for_all_three(&server).await;
 
         let path = "/api/v1/query?metric=cpu.usage&calculation=sum&filter=role%3Dweb";
@@ -117,9 +117,9 @@ mod query_api {
     }
 
     #[tokio::test]
-    async fn a_line_can_be_given_to_each_machine() {
+    async fn a_line_can_be_given_to_each_host() {
         let server = start_with_metrics().await;
-        let _machines = three_machines(&server).await;
+        let _hosts = three_hosts(&server).await;
         wait_for_all_three(&server).await;
 
         let path = "/api/v1/query?metric=cpu.usage&group_by=host";
@@ -134,13 +134,13 @@ mod query_api {
         assert_eq!(names, ["db-1", "web-1", "web-2"]);
     }
 
-    /// Two machines can share a name, and still each get a line of their own.
+    /// Two hosts can share a name, and still each get a line of their own.
     #[tokio::test]
-    async fn machines_sharing_a_name_each_keep_their_own_line() {
+    async fn hosts_sharing_a_name_each_keep_their_own_line() {
         let server = start_with_metrics().await;
-        let (first, _one) = machine(&server, "cache", 10.0, json!({ "role": "cache" })).await;
-        let (second, _two) = machine(&server, "cache", 30.0, json!({ "role": "cache" })).await;
-        let (_lone, _three) = machine(&server, "web-1", 50.0, json!({ "role": "web" })).await;
+        let (first, _one) = host(&server, "cache", 10.0, json!({ "role": "cache" })).await;
+        let (second, _two) = host(&server, "cache", 30.0, json!({ "role": "cache" })).await;
+        let (_lone, _three) = host(&server, "web-1", 50.0, json!({ "role": "web" })).await;
 
         let path = "/api/v1/query?metric=cpu.usage&group_by=host";
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -176,8 +176,8 @@ mod query_api {
     async fn the_server_is_not_part_of_the_fleet() {
         let server = start_with_metrics().await;
         let facts = json!({ "role": "web" });
-        let (_agent, _client) = machine(&server, "web-1", 10.0, facts).await;
-        let mut recorded = crate::server_stats::Recorded::with_machine();
+        let (_host, _client) = host(&server, "web-1", 10.0, facts).await;
+        let mut recorded = crate::server_stats::Recorded::with_host();
         crate::server_stats::record_once(&server.state, &mut recorded).await;
         sleep(Duration::from_millis(300)).await;
         crate::server_stats::record_once(&server.state, &mut recorded).await;
@@ -372,13 +372,13 @@ mod dashboard_pages {
         ("calculation", "avg"),
         ("group_by", "host"),
         ("filter", ""),
-        ("title", "Busy machines"),
+        ("title", "Busy hosts"),
     ];
 
     #[tokio::test]
     async fn a_dashboard_can_be_built_on_the_pages() {
         let server = start_with_metrics().await;
-        let _machines = three_machines(&server).await;
+        let _hosts = three_hosts(&server).await;
         wait_for_all_three(&server).await;
         let mut browser = Browser::default();
         let id = built(&server, &mut browser).await;
@@ -405,7 +405,7 @@ mod dashboard_pages {
         let path = format!("/dashboards/{id}/widgets/{}", widget.widgets[0].id);
         let drawn = browser.get(&server, &path).await;
         assert_eq!(drawn.status, 200);
-        assert!(drawn.body.contains("Busy machines"), "{}", drawn.body);
+        assert!(drawn.body.contains("Busy hosts"), "{}", drawn.body);
         assert!(
             drawn.body.contains(r#"<svg class="chart""#),
             "{}",
@@ -467,14 +467,14 @@ mod dashboard_pages {
 
         assert_eq!(page.status, 200);
         assert!(page.body.contains(r#"class="error""#), "{}", page.body);
-        assert!(page.body.contains("Busy machines"), "{}", page.body);
+        assert!(page.body.contains("Busy hosts"), "{}", page.body);
     }
 
     #[tokio::test]
     async fn what_agents_report_is_never_treated_as_html() {
         let server = start_with_metrics().await;
         let hostile = "<script>alert(1)</script>";
-        let (_agent, _client) = machine(&server, "web-1", 10.0, json!({ "role": hostile })).await;
+        let (_host, _client) = host(&server, "web-1", 10.0, json!({ "role": hostile })).await;
         query(&server, "/api/v1/query?metric=cpu.usage&calculation=count").await;
         let mut browser = Browser::default();
         let id = built(&server, &mut browser).await;
@@ -502,8 +502,8 @@ mod dashboard_pages {
         let saved = Saved::default();
         let store = Box::new(MemoryStore(saved.clone()));
         let server = start_on("", store, Arc::new(FailingReader), saved, None).await;
-        let (agent, _client) = (identity(), ());
-        server.connect_approved(&agent, "web-1").await;
+        let (host, _client) = (identity(), ());
+        server.connect_approved(&host, "web-1").await;
         let mut browser = Browser::default();
         let id = built(&server, &mut browser).await;
         add_widget(&server, &mut browser, id, &CHART).await;
@@ -558,7 +558,7 @@ mod variables {
             server,
             "POST",
             "/api/v1/dashboards",
-            &json!({ "name": "Machine" }),
+            &json!({ "name": "Host" }),
         )
         .await;
         assert_eq!(status, 201, "{created}");
@@ -572,33 +572,33 @@ mod variables {
         (id, created["id"].as_i64().unwrap())
     }
 
-    fn machine_variable() -> Value {
-        json!([{ "name": "machine", "label": "Machine", "kind": "machine" }])
+    fn host_variable() -> Value {
+        json!([{ "name": "host", "label": "Host", "kind": "host" }])
     }
 
-    fn per_machine_widget() -> Value {
+    fn per_host_widget() -> Value {
         json!({
             "metric": "cpu.usage", "group_by": "host",
-            "filter": "$machine", "title": "CPU on $machine",
+            "filter": "$host", "title": "CPU on $host",
         })
     }
 
     #[tokio::test]
-    async fn a_machine_picker_shows_one_machine_at_a_time() {
+    async fn a_host_picker_shows_one_host_at_a_time() {
         let server = start_with_metrics().await;
-        let machines = three_machines(&server).await;
+        let hosts = three_hosts(&server).await;
         wait_for_all_three(&server).await;
-        let web_2 = machines[1].0.id();
-        let (id, widget) = dashboard_with(&server, machine_variable(), per_machine_widget()).await;
+        let web_2 = hosts[1].0.id();
+        let (id, widget) = dashboard_with(&server, host_variable(), per_host_widget()).await;
         let mut browser = Browser::default();
 
         let page = browser.get(&server, &format!("/dashboards/{id}")).await;
         assert_eq!(page.status, 200, "{}", page.body);
-        assert!(page.body.contains(r#"name="var-machine""#), "{}", page.body);
+        assert!(page.body.contains(r#"name="var-host""#), "{}", page.body);
         let db_first = page.body.find(">db-1<").unwrap() < page.body.find(">web-1<").unwrap();
         assert!(db_first, "machines are in order: {}", page.body);
 
-        let path = format!("/dashboards/{id}/widgets/{widget}?var-machine={web_2}");
+        let path = format!("/dashboards/{id}/widgets/{widget}?var-host={web_2}");
         let drawn = browser.get(&server, &path).await;
         assert!(drawn.body.contains("CPU on web-2"), "{}", drawn.body);
         assert!(!drawn.body.contains("db-1"), "{}", drawn.body);
@@ -615,15 +615,15 @@ mod variables {
     #[tokio::test]
     async fn the_range_and_what_is_picked_are_kept_together() {
         let server = start_with_metrics().await;
-        let machines = three_machines(&server).await;
+        let hosts = three_hosts(&server).await;
         wait_for_all_three(&server).await;
-        let web_2 = machines[1].0.id();
-        let (id, _) = dashboard_with(&server, machine_variable(), per_machine_widget()).await;
+        let web_2 = hosts[1].0.id();
+        let (id, _) = dashboard_with(&server, host_variable(), per_host_widget()).await;
 
-        let path = format!("/dashboards/{id}?range=6h&var-machine={web_2}");
+        let path = format!("/dashboards/{id}?range=6h&var-host={web_2}");
         let page = Browser::default().get(&server, &path).await;
 
-        let kept = format!("?range=24h&amp;var-machine={web_2}");
+        let kept = format!("?range=24h&amp;var-host={web_2}");
         assert!(
             page.body.contains(&kept),
             "range links keep the pick: {}",
@@ -641,7 +641,7 @@ mod variables {
     #[tokio::test]
     async fn a_fact_picker_offers_each_value_and_all_of_them() {
         let server = start_with_metrics().await;
-        let _machines = three_machines(&server).await;
+        let _hosts = three_hosts(&server).await;
         wait_for_all_three(&server).await;
         let variables = json!([{ "name": "role", "kind": "fact", "fact": "role" }]);
         let widget = json!({ "metric": "cpu.usage", "kind": "number", "filter": "$role" });
@@ -671,7 +671,7 @@ mod variables {
     #[tokio::test]
     async fn only_what_a_picker_offers_reaches_a_filter() {
         let server = start_with_metrics().await;
-        let _machines = three_machines(&server).await;
+        let _hosts = three_hosts(&server).await;
         wait_for_all_three(&server).await;
         let variables = json!([{ "name": "role", "kind": "fact", "fact": "role" }]);
         let widget = json!({ "metric": "cpu.usage", "kind": "number", "filter": "$role" });
@@ -684,12 +684,12 @@ mod variables {
     }
 
     #[tokio::test]
-    async fn a_picker_offers_only_the_machines_its_filter_picks() {
+    async fn a_picker_offers_only_the_hosts_its_filter_picks() {
         let server = start_with_metrics().await;
-        let _machines = three_machines(&server).await;
+        let _hosts = three_hosts(&server).await;
         wait_for_all_three(&server).await;
-        let variables = json!([{ "name": "machine", "kind": "machine", "filter": "role=web" }]);
-        let (id, _) = dashboard_with(&server, variables, per_machine_widget()).await;
+        let variables = json!([{ "name": "host", "kind": "host", "filter": "role=web" }]);
+        let (id, _) = dashboard_with(&server, variables, per_host_widget()).await;
 
         let path = format!("/api/v1/dashboards/{id}/variables");
         let (_, listed) = api(&server, "GET", &path, &Value::Null).await;
@@ -703,17 +703,17 @@ mod variables {
     }
 
     #[tokio::test]
-    async fn with_no_machine_to_pick_a_widget_says_so() {
+    async fn with_no_host_to_pick_a_widget_says_so() {
         let server = start().await;
-        let (id, widget) = dashboard_with(&server, machine_variable(), per_machine_widget()).await;
+        let (id, widget) = dashboard_with(&server, host_variable(), per_host_widget()).await;
         let mut browser = Browser::default();
 
         let page = browser.get(&server, &format!("/dashboards/{id}")).await;
-        assert!(page.body.contains("No machines"), "{}", page.body);
+        assert!(page.body.contains("No hosts"), "{}", page.body);
         let path = format!("/dashboards/{id}/widgets/{widget}");
         let drawn = browser.get(&server, &path).await;
         assert!(
-            drawn.body.contains("no machine to pick for Machine"),
+            drawn.body.contains("no host to pick for Host"),
             "{}",
             drawn.body
         );
@@ -735,11 +735,11 @@ mod variables {
         let id = created["id"].as_i64().unwrap();
 
         let path = format!("/api/v1/dashboards/{id}/widgets");
-        let (status, answer) = api(&server, "POST", &path, &per_machine_widget()).await;
+        let (status, answer) = api(&server, "POST", &path, &per_host_widget()).await;
         assert_eq!(status, 422);
         assert_eq!(
             answer["error"],
-            "This dashboard has no variable called $machine."
+            "This dashboard has no variable called $host."
         );
 
         let mut browser = Browser::default();
@@ -753,13 +753,13 @@ mod variables {
                     ("metric", "cpu.usage"),
                     ("calculation", "avg"),
                     ("group_by", "host"),
-                    ("filter", "$machine"),
+                    ("filter", "$host"),
                 ],
             )
             .await;
         assert_eq!(page.status, 200);
         assert!(
-            page.body.contains("no variable called $machine"),
+            page.body.contains("no variable called $host"),
             "{}",
             page.body
         );
@@ -768,13 +768,13 @@ mod variables {
     #[tokio::test]
     async fn a_variable_a_widget_uses_can_not_be_removed() {
         let server = start().await;
-        let (id, _) = dashboard_with(&server, machine_variable(), per_machine_widget()).await;
+        let (id, _) = dashboard_with(&server, host_variable(), per_host_widget()).await;
 
         let path = format!("/api/v1/dashboards/{id}/variables");
         let (status, answer) = api(&server, "PUT", &path, &json!([])).await;
         assert_eq!(status, 422);
         assert!(
-            answer["error"].as_str().unwrap().contains("uses $machine"),
+            answer["error"].as_str().unwrap().contains("uses $host"),
             "{answer}"
         );
 
@@ -783,12 +783,12 @@ mod variables {
             .submit(
                 &server,
                 &format!("/dashboards/{id}/edit"),
-                &format!("/dashboards/{id}/variables/machine/delete"),
+                &format!("/dashboards/{id}/variables/host/delete"),
                 &[],
             )
             .await;
         assert_eq!(page.status, 200);
-        assert!(page.body.contains("uses $machine"), "{}", page.body);
+        assert!(page.body.contains("uses $host"), "{}", page.body);
         let kept = server
             .state
             .database
@@ -869,11 +869,11 @@ mod variables {
     }
 
     #[tokio::test]
-    async fn machine_names_in_a_picker_are_never_markup() {
+    async fn host_names_in_a_picker_are_never_markup() {
         let server = start_with_metrics().await;
         let hostile = "<b>web</b>";
-        let (_agent, _client) = machine(&server, hostile, 10.0, json!({ "role": "web" })).await;
-        let (id, _) = dashboard_with(&server, machine_variable(), per_machine_widget()).await;
+        let (_host, _client) = host(&server, hostile, 10.0, json!({ "role": "web" })).await;
+        let (id, _) = dashboard_with(&server, host_variable(), per_host_widget()).await;
 
         let page = Browser::default()
             .get(&server, &format!("/dashboards/{id}"))
@@ -886,7 +886,7 @@ mod variables {
     #[tokio::test]
     async fn deleting_a_dashboard_takes_its_variables_with_it() {
         let server = start().await;
-        let (id, _) = dashboard_with(&server, machine_variable(), per_machine_widget()).await;
+        let (id, _) = dashboard_with(&server, host_variable(), per_host_widget()).await;
 
         let path = format!("/api/v1/dashboards/{id}");
         assert_eq!(api(&server, "DELETE", &path, &Value::Null).await.0, 204);
@@ -900,7 +900,7 @@ mod variables {
     #[tokio::test]
     async fn a_variable_that_does_not_exist_is_not_found() {
         let server = start().await;
-        let (id, _) = dashboard_with(&server, machine_variable(), per_machine_widget()).await;
+        let (id, _) = dashboard_with(&server, host_variable(), per_host_widget()).await;
         let mut browser = Browser::default();
         for path in [
             "/dashboards/99/variables/new".to_string(),
@@ -964,9 +964,9 @@ mod calculation_alerts {
     }
 
     #[tokio::test]
-    async fn an_average_across_machines_fires_one_alert() {
+    async fn an_average_across_hosts_fires_one_alert() {
         let server = start_with_metrics().await;
-        let _machines = three_machines(&server).await;
+        let _hosts = three_hosts(&server).await;
         wait_for_all_three(&server).await;
         let database = &server.state.database;
         let firing = rule(Calculation::Avg, Comparison::Above, 35.0);
@@ -983,8 +983,8 @@ mod calculation_alerts {
             1,
             "one alert for the group, not one per machine"
         );
-        assert_eq!(alerts[0].agent_id, "fleet");
-        assert_eq!(alerts[0].host, "Fleet");
+        assert_eq!(alerts[0].host_id, "fleet");
+        assert_eq!(alerts[0].hostname, "Fleet");
         assert_eq!(alerts[0].value, Some(40.0));
         assert!(
             alerts[0].summary.contains("Average of CPU usage is 40%"),
@@ -994,7 +994,7 @@ mod calculation_alerts {
     }
 
     #[tokio::test]
-    async fn the_rules_list_says_which_machines_a_calculation_covers() {
+    async fn the_rules_list_says_which_hosts_a_calculation_covers() {
         let server = start().await;
         let mut narrowed = rule(Calculation::Avg, Comparison::Above, 90.0);
         narrowed.name = "Web fleet".to_string();
@@ -1012,7 +1012,7 @@ mod calculation_alerts {
     #[tokio::test]
     async fn staying_under_the_threshold_fires_nothing() {
         let server = start_with_metrics().await;
-        let _machines = three_machines(&server).await;
+        let _hosts = three_hosts(&server).await;
         wait_for_all_three(&server).await;
         let quiet = rule(Calculation::Avg, Comparison::Above, 90.0);
         server
@@ -1033,7 +1033,7 @@ mod calculation_alerts {
     #[tokio::test]
     async fn each_group_can_have_its_own_alert() {
         let server = start_with_metrics().await;
-        let _machines = three_machines(&server).await;
+        let _hosts = three_hosts(&server).await;
         wait_for_all_three(&server).await;
         let mut grouped = rule(Calculation::Avg, Comparison::Above, 50.0);
         grouped.group_by = Some("fact:role".to_string());
@@ -1055,9 +1055,9 @@ mod calculation_alerts {
     }
 
     #[tokio::test]
-    async fn a_filter_limits_the_machines_a_rule_watches() {
+    async fn a_filter_limits_the_hosts_a_rule_watches() {
         let server = start_with_metrics().await;
-        let _machines = three_machines(&server).await;
+        let _hosts = three_hosts(&server).await;
         wait_for_all_three(&server).await;
         let mut filtered = rule(Calculation::Max, Comparison::Above, 50.0);
         filtered.filter = Some("role=web".to_string());
@@ -1080,10 +1080,10 @@ mod calculation_alerts {
     }
 
     #[tokio::test]
-    async fn no_machines_reporting_at_all_is_caught_by_a_count() {
+    async fn no_hosts_reporting_at_all_is_caught_by_a_count() {
         let server = start_with_metrics().await;
-        let (agent, _client) = (identity(), ());
-        server.connect_approved(&agent, "web-1").await;
+        let (host, _client) = (identity(), ());
+        server.connect_approved(&host, "web-1").await;
         let counting = rule(Calculation::Count, Comparison::Below, 1.0);
         server
             .state
@@ -1124,7 +1124,7 @@ mod calculation_alerts {
     #[tokio::test]
     async fn an_alert_resolves_when_the_calculation_recovers() {
         let server = start_with_metrics().await;
-        let _machines = three_machines(&server).await;
+        let _hosts = three_hosts(&server).await;
         wait_for_all_three(&server).await;
         let database = &server.state.database;
         let id = database
@@ -1148,8 +1148,8 @@ mod calculation_alerts {
         let saved = Saved::default();
         let store = Box::new(MemoryStore(saved.clone()));
         let server = start_on("", store, Arc::new(FailingReader), saved, None).await;
-        let agent = identity();
-        server.connect_approved(&agent, "web-1").await;
+        let host = identity();
+        server.connect_approved(&host, "web-1").await;
         let counting = rule(Calculation::Count, Comparison::Below, 1.0);
         server
             .state
@@ -1170,23 +1170,20 @@ mod calculation_alerts {
     }
 
     #[tokio::test]
-    async fn the_fleet_is_not_a_machine_anyone_can_see_or_change() {
+    async fn the_fleet_is_not_a_host_anyone_can_see_or_change() {
         let server = start().await;
         let database = &server.state.database;
-        let agents = database.load_agents().await.unwrap();
-        let fleet = agents
-            .into_iter()
-            .find(|agent| agent.id == "fleet")
-            .unwrap();
+        let hosts = database.load_hosts().await.unwrap();
+        let fleet = hosts.into_iter().find(|host| host.id == "fleet").unwrap();
         server.state.registry.insert_for_test(fleet).await;
 
-        let list = Browser::default().get(&server, "/agents").await;
-        assert!(!list.body.contains("/agents/fleet"), "{}", list.body);
+        let list = Browser::default().get(&server, "/hosts").await;
+        assert!(!list.body.contains("/hosts/fleet"), "{}", list.body);
 
         let revoked = server
             .state
             .registry
-            .decide("fleet", AgentState::Revoked)
+            .decide("fleet", HostState::Revoked)
             .await
             .unwrap();
         assert!(revoked.is_none());
@@ -1274,7 +1271,7 @@ impl MetricsReader for FailingReader {
 
     fn latest_output(
         &self,
-        _agent_id: &str,
+        _host_id: &str,
         _collector: &str,
         _since_ms: i64,
         _until_ms: i64,

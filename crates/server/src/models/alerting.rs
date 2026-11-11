@@ -130,7 +130,7 @@ fn channel_row(input: &ChannelInput) -> notification_channel::ActiveModel {
         sends_warnings: Set(input.severities.contains(&Severity::Warning)),
         sends_critical: Set(input.severities.contains(&Severity::Critical)),
         mail_from: Set(mail.map(|mail| mail.from.trim().to_string())),
-        mail_host: Set(server.map(|server| server.host.trim().to_string())),
+        mail_hostname: Set(server.map(|server| server.hostname.trim().to_string())),
         mail_port: Set(server.and_then(|server| server.port).map(i32::from)),
         mail_security: Set(server.map(|server| server.security.as_str().to_string())),
         mail_username: Set(server.and_then(|server| server.username.clone())),
@@ -147,10 +147,10 @@ fn to_mail(row: &notification_channel::Model) -> Result<Option<Mail>> {
     let Some(from) = row.mail_from.clone() else {
         return Ok(None);
     };
-    let server = match &row.mail_host {
+    let server = match &row.mail_hostname {
         None => None,
-        Some(host) => Some(MailServer {
-            host: host.clone(),
+        Some(hostname) => Some(MailServer {
+            hostname: hostname.clone(),
             port: row
                 .mail_port
                 .map(u16::try_from)
@@ -210,8 +210,8 @@ fn to_alert(row: alert::Model) -> Result<Alert> {
         rule_id: row.rule_id,
         rule_name: row.rule_name,
         severity: Severity::parse(&row.severity)?,
-        agent_id: row.agent_id,
-        host: row.host,
+        host_id: row.host_id,
+        hostname: row.hostname,
         series: row.series,
         value: row.value,
         summary: row.summary,
@@ -550,12 +550,12 @@ async fn record_channel<C: ConnectionTrait>(
     .await
 }
 
-/// An alert, named by its rule and machine as the alerts page shows it.
+/// An alert, named by its rule and host as the alerts page shows it.
 fn alert_subject(row: &alert::Model) -> Subject {
     Subject::new(
         Kind::Alert,
         row.id,
-        format!("{} on {}", row.rule_name, row.host),
+        format!("{} on {}", row.rule_name, row.hostname),
     )
 }
 
@@ -639,8 +639,8 @@ impl Database {
             rule_id: Set(Some(new.rule_id)),
             rule_name: Set(new.rule_name.clone()),
             severity: Set(new.severity.as_str().to_string()),
-            agent_id: Set(new.agent_id.clone()),
-            host: Set(new.host.clone()),
+            host_id: Set(new.host_id.clone()),
+            hostname: Set(new.hostname.clone()),
             series: Set(new.series.clone()),
             value: Set(new.value),
             summary: Set(new.summary.clone()),

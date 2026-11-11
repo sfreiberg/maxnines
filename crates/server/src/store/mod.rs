@@ -27,7 +27,7 @@ use tracing::{error, warn};
 use crate::calculations::CalculationQuery;
 use crate::config::{MetricsConfig, RetentionConfig};
 use crate::metrics::{LastSample, Metric, NewestReading, SeriesQuery, SeriesResult, Trend, now_ms};
-use crate::remote_checks::LOCAL_AGENT_ID;
+use crate::remote_checks::LOCAL_HOST_ID;
 use rollups::Retention;
 
 /// Samples waiting to be written. When this fills up, connections stop reading
@@ -60,7 +60,7 @@ const GATHER_EVERY: Duration = Duration::from_millis(10);
 
 /// Enough to cover what an agent can have waiting to hear about: it keeps 64 samples
 /// in memory, and sends its backlog one at a time.
-const RECENT_SAMPLES_PER_AGENT: usize = 80;
+const RECENT_SAMPLES_PER_HOST: usize = 80;
 
 /// Somewhere samples are saved.
 pub trait Store: Send {
@@ -85,7 +85,7 @@ pub trait Store: Send {
 
     /// Forgets an agent: everything it ever sent, and anything kept in memory about
     /// it. If it sends again, it starts afresh.
-    fn delete_agent(&mut self, agent_id: &str) -> Result<()>;
+    fn delete_host(&mut self, host_id: &str) -> Result<()>;
 
     /// Called once at shutdown, after the last write.
     fn close(&mut self) -> Result<()>;
@@ -105,7 +105,7 @@ pub trait MetricsReader: Send + Sync {
     /// `None`, and so is a collector the store doesn't know.
     fn latest_output(
         &self,
-        agent_id: &str,
+        host_id: &str,
         collector: &str,
         since_ms: i64,
         until_ms: i64,
@@ -127,7 +127,7 @@ pub trait MetricsReader: Send + Sync {
     /// How many separate series have been stored, which is what storage grows with.
     fn series_count(&self) -> Result<u64>;
 
-    /// Combines a metric across machines. Lines are sorted by name, and each point's
+    /// Combines a metric across hosts. Lines are sorted by name, and each point's
     /// `avg`, `min` and `max` are all the calculated value.
     fn calculate(&self, query: &CalculationQuery) -> Result<SeriesResult>;
 }
@@ -190,8 +190,8 @@ pub fn open(config: &MetricsConfig, retention: RetentionConfig) -> Result<Box<dy
 }
 
 pub struct NewSample {
-    pub agent_id: String,
-    pub host: String,
+    pub host_id: String,
+    pub hostname: String,
     pub sample: Sample,
 }
 
@@ -205,8 +205,8 @@ pub enum WriterCommand {
     },
     /// Deletes everything an agent sent, after anything queued before this is saved.
     /// `done` hears whether that worked.
-    DeleteAgent {
-        agent_id: String,
+    DeleteHost {
+        host_id: String,
         done: oneshot::Sender<Result<(), String>>,
     },
     /// Finish queued work and close the database cleanly.
@@ -214,10 +214,10 @@ pub enum WriterCommand {
 }
 
 /// Deletes everything an agent sent, once the writer gets to it.
-pub async fn delete_agent(writer: &mpsc::Sender<WriterCommand>, agent_id: &str) -> Result<()> {
+pub async fn delete_host(writer: &mpsc::Sender<WriterCommand>, host_id: &str) -> Result<()> {
     let (done, finished) = oneshot::channel();
-    let command = WriterCommand::DeleteAgent {
-        agent_id: agent_id.to_string(),
+    let command = WriterCommand::DeleteHost {
+        host_id: host_id.to_string(),
         done,
     };
     writer
@@ -226,8 +226,8 @@ pub async fn delete_agent(writer: &mpsc::Sender<WriterCommand>, agent_id: &str) 
         .map_err(|_| anyhow::anyhow!("the metrics writer has stopped"))?;
     match finished.await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => anyhow::bail!("deleting the agent's metrics failed: {error}"),
-        Err(_) => anyhow::bail!("the metrics writer stopped before deleting the agent's metrics"),
+        Ok(Err(error)) => anyhow::bail!("deleting the host's metrics failed: {error}"),
+        Err(_) => anyhow::bail!("the metrics writer stopped before deleting the host's metrics"),
     }
 }
 
@@ -240,17 +240,17 @@ struct RecentSamples(HashMap<String, VecDeque<u64>>);
 
 impl RecentSamples {
     /// Notes a sample, and returns whether it's already been seen.
-    fn seen(&mut self, agent_id: &str, timestamp_ms: u64) -> bool {
-        if !self.0.contains_key(agent_id) {
-            self.0.insert(agent_id.to_string(), VecDeque::new());
+    fn seen(&mut self, host_id: &str, timestamp_ms: u64) -> bool {
+        if !self.0.contains_key(host_id) {
+            self.0.insert(host_id.to_string(), VecDeque::new());
         }
-        let Some(recent) = self.0.get_mut(agent_id) else {
+        let Some(recent) = self.0.get_mut(host_id) else {
             return false;
         };
         if recent.contains(&timestamp_ms) {
             return true;
         }
-        if recent.len() == RECENT_SAMPLES_PER_AGENT {
+        if recent.len() == RECENT_SAMPLES_PER_HOST {
             recent.pop_front();
         }
         recent.push_back(timestamp_ms);
@@ -258,15 +258,15 @@ impl RecentSamples {
     }
 
     /// For a sample that couldn't be stored, which needs to be let in next time.
-    fn forget(&mut self, agent_id: &str, timestamp_ms: u64) {
-        if let Some(recent) = self.0.get_mut(agent_id) {
+    fn forget(&mut self, host_id: &str, timestamp_ms: u64) {
+        if let Some(recent) = self.0.get_mut(host_id) {
             recent.retain(|time| *time != timestamp_ms);
         }
     }
 
     /// For an agent that's been deleted, whose samples have gone with it.
-    fn forget_agent(&mut self, agent_id: &str) {
-        self.0.remove(agent_id);
+    fn forget_host(&mut self, host_id: &str) {
+        self.0.remove(host_id);
     }
 }
 
@@ -312,7 +312,7 @@ fn run_writer(
         // came after is written after it.
         let end = queued
             .iter()
-            .position(|command| matches!(command, WriterCommand::DeleteAgent { .. }))
+            .position(|command| matches!(command, WriterCommand::DeleteHost { .. }))
             .map_or(queued.len(), |delete| delete + 1);
         for command in queued.drain(..end) {
             match command {
@@ -322,10 +322,10 @@ fn run_writer(
                 }
                 WriterCommand::SaveAndAck { sample, acks: ack } => {
                     let time = sample.sample.timestamp_ms;
-                    let key = (sample.agent_id.clone(), time);
+                    let key = (sample.host_id.clone(), time);
                     if let Some(&index) = in_batch.get(&key) {
                         acks[index].push(ack);
-                    } else if recent.seen(&sample.agent_id, time) {
+                    } else if recent.seen(&sample.host_id, time) {
                         answered.push((ack, time));
                     } else {
                         in_batch.insert(key, samples.len());
@@ -333,7 +333,7 @@ fn run_writer(
                         acks.push(vec![ack]);
                     }
                 }
-                WriterCommand::DeleteAgent { agent_id, done } => deletion = Some((agent_id, done)),
+                WriterCommand::DeleteHost { host_id, done } => deletion = Some((host_id, done)),
                 WriterCommand::Stop => {
                     stopping = true;
                     break;
@@ -348,7 +348,7 @@ fn run_writer(
                 if saved {
                     answered.extend(acks.into_iter().map(|ack| (ack, time)));
                 } else if !acks.is_empty() {
-                    recent.forget(&new.agent_id, time);
+                    recent.forget(&new.host_id, time);
                 }
             }
         }
@@ -357,10 +357,10 @@ fn run_writer(
             ack.try_send(time).ok();
         }
         // After the batch, so nothing the agent sent before this is left behind.
-        if let Some((agent_id, done)) = deletion {
-            let result = delete_from(store.as_mut(), &agent_id);
+        if let Some((host_id, done)) = deletion {
+            let result = delete_from(store.as_mut(), &host_id);
             if result.is_ok() {
-                recent.forget_agent(&agent_id);
+                recent.forget_host(&host_id);
             }
             done.send(result).ok();
         }
@@ -397,21 +397,18 @@ fn gather_until(
 }
 
 /// Deletes an agent's samples, or says why that didn't work.
-fn delete_from(store: &mut dyn Store, agent_id: &str) -> Result<(), String> {
-    match catch_unwind(AssertUnwindSafe(|| store.delete_agent(agent_id))) {
+fn delete_from(store: &mut dyn Store, host_id: &str) -> Result<(), String> {
+    match catch_unwind(AssertUnwindSafe(|| store.delete_host(host_id))) {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => {
             let error = format!("{error:#}");
-            error!(
-                agent = agent_id,
-                error, "deleting an agent's metrics failed"
-            );
+            error!(host_id = host_id, error, "deleting a host's metrics failed");
             Err(error)
         }
         Err(_) => {
             error!(
-                agent = agent_id,
-                "the store panicked deleting an agent's metrics"
+                host_id = host_id,
+                "the store panicked deleting a host's metrics"
             );
             Err("the store panicked".to_string())
         }
@@ -443,11 +440,11 @@ fn write_batch(
     match catch_unwind(AssertUnwindSafe(|| store.write(samples))) {
         Ok(Ok(())) => {
             // From agents, as the server recording itself isn't ingesting anything.
-            let from_agents = || samples.iter().filter(|new| new.agent_id != LOCAL_AGENT_ID);
+            let from_hosts = || samples.iter().filter(|new| new.host_id != LOCAL_HOST_ID);
             counts
                 .written
-                .fetch_add(from_agents().count() as u64, Ordering::Relaxed);
-            let values = from_agents().flat_map(|new| new.sample.metrics.values());
+                .fetch_add(from_hosts().count() as u64, Ordering::Relaxed);
+            let values = from_hosts().flat_map(|new| new.sample.metrics.values());
             counts
                 .values
                 .fetch_add(values.map(count_values).sum(), Ordering::Relaxed);
@@ -478,13 +475,13 @@ fn save(store: &mut dyn Store, samples: &[NewSample], counts: &WriteCounts) -> b
         }
     }
     // From agents, as the saved count is, so the two add up.
-    let from_agents = samples
+    let from_hosts = samples
         .iter()
-        .filter(|new| new.agent_id != LOCAL_AGENT_ID)
+        .filter(|new| new.host_id != LOCAL_HOST_ID)
         .count();
     counts
         .failed
-        .fetch_add(from_agents as u64, Ordering::Relaxed);
+        .fetch_add(from_hosts as u64, Ordering::Relaxed);
     error!(error, samples = samples.len(), "write failed, not saved");
     false
 }
@@ -537,7 +534,7 @@ pub mod testing {
 
         fn latest_output(
             &self,
-            _agent_id: &str,
+            _host_id: &str,
             _collector: &str,
             _since_ms: i64,
             _until_ms: i64,
@@ -580,7 +577,7 @@ pub mod testing {
                 thread::sleep(Duration::from_millis(1));
             }
             for new in samples {
-                match new.host.as_str() {
+                match new.hostname.as_str() {
                     "fail" => bail!("deliberate test failure"),
                     "panic" => panic!("deliberate test panic"),
                     _ => {}
@@ -593,8 +590,8 @@ pub mod testing {
                 .unwrap()
                 .extend(samples.iter().map(|new| {
                     (
-                        new.agent_id.clone(),
-                        new.host.clone(),
+                        new.host_id.clone(),
+                        new.hostname.clone(),
                         new.sample.timestamp_ms,
                     )
                 }));
@@ -606,13 +603,13 @@ pub mod testing {
         }
 
         /// Fails for an agent called "fail".
-        fn delete_agent(&mut self, agent_id: &str) -> Result<()> {
-            if agent_id == "fail" {
+        fn delete_host(&mut self, host_id: &str) -> Result<()> {
+            if host_id == "fail" {
                 bail!("deliberate test failure");
             }
             let mut samples = self.0.samples.lock().unwrap();
-            samples.retain(|(agent, _, _)| agent != agent_id);
-            self.0.deleted.lock().unwrap().push(agent_id.to_string());
+            samples.retain(|(host, _, _)| host != host_id);
+            self.0.deleted.lock().unwrap().push(host_id.to_string());
             Ok(())
         }
 
@@ -630,11 +627,11 @@ mod tests {
     use super::testing::{MemoryStore, Saved};
     use super::*;
 
-    fn from_agent(host: &str, timestamp_ms: u64, acks: &mpsc::Sender<u64>) -> WriterCommand {
+    fn from_host(hostname: &str, timestamp_ms: u64, acks: &mpsc::Sender<u64>) -> WriterCommand {
         WriterCommand::SaveAndAck {
             sample: NewSample {
-                agent_id: "agent-1".to_string(),
-                host: host.to_string(),
+                host_id: "host-1".to_string(),
+                hostname: hostname.to_string(),
                 sample: Sample {
                     timestamp_ms,
                     metrics: BTreeMap::new(),
@@ -670,14 +667,14 @@ mod tests {
     #[test]
     fn a_sample_is_acknowledged_once_it_is_stored() {
         let (stored, acked) =
-            run(|acks| vec![from_agent("web", 1, acks), from_agent("web", 2, acks)]);
+            run(|acks| vec![from_host("web", 1, acks), from_host("web", 2, acks)]);
         assert_eq!(stored, [1, 2]);
         assert_eq!(acked, [1, 2]);
     }
 
     #[test]
     fn a_sample_that_could_not_be_stored_is_not_acknowledged() {
-        let (stored, acked) = run(|acks| vec![from_agent("fail", 1, acks)]);
+        let (stored, acked) = run(|acks| vec![from_host("fail", 1, acks)]);
         assert!(stored.is_empty());
         assert!(acked.is_empty());
     }
@@ -689,9 +686,9 @@ mod tests {
         let (writer, thread) = spawn_writer(store, Arc::default());
         let (acks, mut acked) = mpsc::channel(16);
 
-        writer.blocking_send(from_agent("web", 1, &acks)).unwrap();
+        writer.blocking_send(from_host("web", 1, &acks)).unwrap();
         assert_eq!(acked.blocking_recv(), Some(1));
-        writer.blocking_send(from_agent("web", 1, &acks)).unwrap();
+        writer.blocking_send(from_host("web", 1, &acks)).unwrap();
         assert_eq!(acked.blocking_recv(), Some(1));
 
         writer.blocking_send(WriterCommand::Stop).unwrap();
@@ -703,9 +700,9 @@ mod tests {
     fn a_sample_sent_twice_in_one_batch_is_stored_once_and_answered_twice() {
         let (stored, acked) = run(|acks| {
             vec![
-                from_agent("web", 1, acks),
-                from_agent("web", 1, acks),
-                from_agent("web", 2, acks),
+                from_host("web", 1, acks),
+                from_host("web", 1, acks),
+                from_host("web", 2, acks),
             ]
         });
         assert_eq!(stored, [1, 2]);
@@ -719,9 +716,9 @@ mod tests {
     fn a_repeat_in_a_failed_batch_is_not_acknowledged() {
         let (stored, acked) = run(|acks| {
             vec![
-                from_agent("fail", 1, acks),
-                from_agent("fail", 1, acks),
-                from_agent("fail", 2, acks),
+                from_host("fail", 1, acks),
+                from_host("fail", 1, acks),
+                from_host("fail", 2, acks),
             ]
         });
         assert!(stored.is_empty());
@@ -736,9 +733,9 @@ mod tests {
         let (writer, thread) = spawn_writer(store, counts.clone());
         let (acks, mut acked) = mpsc::channel(16);
 
-        writer.blocking_send(from_agent("fail", 1, &acks)).unwrap();
+        writer.blocking_send(from_host("fail", 1, &acks)).unwrap();
         wait_for_failures(&counts, 1);
-        writer.blocking_send(from_agent("web", 1, &acks)).unwrap();
+        writer.blocking_send(from_host("web", 1, &acks)).unwrap();
         assert_eq!(acked.blocking_recv(), Some(1));
 
         writer.blocking_send(WriterCommand::Stop).unwrap();
@@ -778,7 +775,7 @@ mod tests {
             Ok(Arc::new(super::testing::EmptyReader))
         }
 
-        fn delete_agent(&mut self, _agent_id: &str) -> Result<()> {
+        fn delete_host(&mut self, _host_id: &str) -> Result<()> {
             Ok(())
         }
 
@@ -790,8 +787,8 @@ mod tests {
     fn batch(size: u64) -> Vec<NewSample> {
         (0..size)
             .map(|time| NewSample {
-                agent_id: "agent-1".to_string(),
-                host: "web".to_string(),
+                host_id: "host-1".to_string(),
+                hostname: "web".to_string(),
                 sample: Sample {
                     timestamp_ms: time,
                     metrics: BTreeMap::new(),
@@ -830,7 +827,7 @@ mod tests {
             Ok(Arc::new(super::testing::EmptyReader))
         }
 
-        fn delete_agent(&mut self, _agent_id: &str) -> Result<()> {
+        fn delete_host(&mut self, _host_id: &str) -> Result<()> {
             Ok(())
         }
 
@@ -859,7 +856,7 @@ mod tests {
         assert_eq!(sizes.iter().sum::<usize>(), 20);
         assert!(sizes.len() < 20, "nothing was gathered: {sizes:?}");
         // Each write waits the store's time after the one before, however the
-        // machine schedules the threads. The time is counted from just before the
+        // host schedules the threads. The time is counted from just before the
         // previous write starts, so a sliver of it can be spent getting there.
         for pair in writes.windows(2) {
             let gap = pair[1].1 - pair[0].1;
@@ -946,19 +943,19 @@ mod tests {
     #[test]
     fn only_the_latest_samples_are_remembered() {
         let mut recent = RecentSamples::default();
-        for time in 0..RECENT_SAMPLES_PER_AGENT as u64 + 1 {
+        for time in 0..RECENT_SAMPLES_PER_HOST as u64 + 1 {
             assert!(!recent.seen("a", time));
         }
 
         assert!(recent.seen("a", 1));
         assert!(!recent.seen("a", 0), "pushed out by newer samples");
-        assert!(!recent.seen("b", 1), "each agent has its own");
+        assert!(!recent.seen("b", 1), "each host has its own");
     }
 
-    fn save(host: &str, timestamp_ms: u64) -> WriterCommand {
+    fn save(hostname: &str, timestamp_ms: u64) -> WriterCommand {
         WriterCommand::Save(NewSample {
-            agent_id: "agent-1".to_string(),
-            host: host.to_string(),
+            host_id: "host-1".to_string(),
+            hostname: hostname.to_string(),
             sample: Sample {
                 timestamp_ms,
                 metrics: BTreeMap::new(),
@@ -982,10 +979,10 @@ mod tests {
         saved.samples.lock().unwrap().iter().map(|s| s.2).collect()
     }
 
-    fn delete(agent_id: &str) -> (WriterCommand, oneshot::Receiver<Result<(), String>>) {
+    fn delete(host_id: &str) -> (WriterCommand, oneshot::Receiver<Result<(), String>>) {
         let (done, finished) = oneshot::channel();
-        let command = WriterCommand::DeleteAgent {
-            agent_id: agent_id.to_string(),
+        let command = WriterCommand::DeleteHost {
+            host_id: host_id.to_string(),
             done,
         };
         (command, finished)
@@ -993,12 +990,12 @@ mod tests {
 
     #[test]
     fn an_agent_is_deleted_after_what_was_queued_before_it() {
-        let (deletion, mut finished) = delete("agent-1");
+        let (deletion, mut finished) = delete("host-1");
         let (saved, _) = run_with(vec![save("a", 1), deletion, WriterCommand::Stop]);
 
         assert_eq!(finished.try_recv().unwrap(), Ok(()));
         assert!(timestamps(&saved).is_empty());
-        assert_eq!(*saved.deleted.lock().unwrap(), ["agent-1"]);
+        assert_eq!(*saved.deleted.lock().unwrap(), ["host-1"]);
     }
 
     #[test]
@@ -1013,8 +1010,8 @@ mod tests {
     #[test]
     fn a_deleted_agent_sending_the_same_moment_again_is_stored_again() {
         let (stored, acked) = run(|acks| {
-            let (deletion, _) = delete("agent-1");
-            vec![from_agent("a", 1, acks), deletion, from_agent("a", 1, acks)]
+            let (deletion, _) = delete("host-1");
+            vec![from_host("a", 1, acks), deletion, from_host("a", 1, acks)]
         });
 
         assert_eq!(stored, [1]);

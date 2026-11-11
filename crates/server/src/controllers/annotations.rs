@@ -1,6 +1,6 @@
 //! Annotations on the pages: the Annotations tab under Metrics, which lists them and
-//! records one for any filter, and the quick form on a machine's charts, for that
-//! machine alone.
+//! records one for any filter, and the quick form on a host's charts, for that
+//! host alone.
 
 use axum::Router;
 use axum::extract::{Path, Query, State};
@@ -30,7 +30,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/metrics/annotations", get(index).post(create))
         .route("/metrics/annotations/{id}/delete", post(delete))
-        .route("/agents/{id}/annotations", post(create_for_machine))
+        .route("/hosts/{id}/annotations", post(create_for_host))
 }
 
 /// What the form holds, given back as it was when it's refused.
@@ -58,7 +58,7 @@ struct AnnotationRow {
 
 #[derive(Deserialize, Default)]
 struct IndexParams {
-    /// A filter to start the form with, as from a machine's page.
+    /// A filter to start the form with, as from a host's page.
     filter: Option<String>,
 }
 
@@ -158,9 +158,9 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
     }
 }
 
-/// Back to a machine's charts, at the range they were on. A refusal goes along to be
+/// Back to a host's charts, at the range they were on. A refusal goes along to be
 /// shown above the form.
-fn back_to(agent_id: &str, form: &CsrfForm, refusal: Option<&str>) -> String {
+fn back_to(host_id: &str, form: &CsrfForm, refusal: Option<&str>) -> String {
     let params = RangeParams {
         range: form.fields.get("range").cloned(),
     };
@@ -170,20 +170,20 @@ fn back_to(agent_id: &str, form: &CsrfForm, refusal: Option<&str>) -> String {
         query.push(("event_error", refusal));
     }
     let query = serde_urlencoded::to_string(query).unwrap_or_default();
-    format!("/agents/{agent_id}/metrics?{query}#events")
+    format!("/hosts/{host_id}/metrics?{query}#events")
 }
 
-/// A note or a deploy for one machine, happening now, from its charts.
-async fn create_for_machine(
+/// A note or a deploy for one host, happening now, from its charts.
+async fn create_for_host(
     State(state): State<AppState>,
     Path(id): Path<String>,
     form: CsrfForm,
 ) -> Response {
-    let Some(agent) = state
+    let Some(host) = state
         .registry
         .get(&id)
         .await
-        .filter(|agent| !agent.is_local())
+        .filter(|host| !host.is_local())
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -193,36 +193,36 @@ async fn create_for_machine(
         title: text("title").unwrap_or_default(),
         detail: text("detail"),
         time_ms: None,
-        filter: Some(host_filter::only(&agent.id)),
+        filter: Some(host_filter::only(&host.id)),
     };
     match state.record_event(input, &recorded_by(), now_ms()).await {
         Ok(_) => {
-            let target = back_to(&agent.id, &form, None);
+            let target = back_to(&host.id, &form, None);
             (form.token, Redirect::to(&target)).into_response()
         }
         Err(EventRefusal::Invalid(message)) => {
-            let target = back_to(&agent.id, &form, Some(&message));
+            let target = back_to(&host.id, &form, Some(&message));
             (form.token, Redirect::to(&target)).into_response()
         }
         Err(EventRefusal::Failed(error)) => server_error(&error),
     }
 }
 
-/// Deletes an annotation, then goes back to the machine it was deleted from, or to the
+/// Deletes an annotation, then goes back to the host it was deleted from, or to the
 /// Annotations tab.
 async fn delete(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfForm) -> Response {
-    let machine = match form.fields.get("agent_id") {
-        Some(agent) => match state.registry.get(agent).await {
-            Some(agent) => Some(agent),
+    let page_host = match form.fields.get("host_id") {
+        Some(host) => match state.registry.get(host).await {
+            Some(host) => Some(host),
             None => return StatusCode::NOT_FOUND.into_response(),
         },
         None => None,
     };
     match state.database.delete_event(id).await {
         Ok(true) => {
-            let target = machine.map_or_else(
+            let target = page_host.map_or_else(
                 || "/metrics/annotations".to_string(),
-                |agent| back_to(&agent.id, &form, None),
+                |host| back_to(&host.id, &form, None),
             );
             (form.token, Redirect::to(&target)).into_response()
         }

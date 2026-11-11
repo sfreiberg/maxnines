@@ -1,7 +1,7 @@
 # Windows services
 
-The agent and the server can both run as Windows services, which start with the
-machine and restart after a failure. Everything below is for the agent, and works the
+The agent and the server can both run as Windows services, which start with
+Windows and restart after a failure. Everything below is for the agent, and works the
 same for the server with `maxnines-server.exe`, `server.hcl` and `MaxNinesServer`.
 
 Put the program somewhere permanent, because the service runs it from where it was when

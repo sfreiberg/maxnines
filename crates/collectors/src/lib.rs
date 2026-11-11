@@ -1,11 +1,11 @@
-//! Reading what a machine is doing, for anything that runs on one.
+//! Reading what a host is doing, for anything that runs on one.
 
 pub mod counters;
 pub mod disk_activity;
 pub mod failed_services;
 mod file_systems;
+pub mod host;
 pub mod interface_drops;
-pub mod machine;
 pub mod system;
 pub mod tcp;
 pub mod updates;

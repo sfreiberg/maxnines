@@ -21,8 +21,8 @@
     <label>Kind
       <select name="kind">
         <option value="metric"{% if rule.kind == "metric" %} selected{% endif %}>A metric crosses a threshold</option>
-        <option value="offline"{% if rule.kind == "offline" %} selected{% endif %}>An agent goes offline</option>
-        <option value="calculation"{% if rule.kind == "calculation" %} selected{% endif %}>A calculation across machines crosses a threshold</option>
+        <option value="offline"{% if rule.kind == "offline" %} selected{% endif %}>A host goes offline</option>
+        <option value="calculation"{% if rule.kind == "calculation" %} selected{% endif %}>A calculation across hosts crosses a threshold</option>
         <option value="forecast"{% if rule.kind == "forecast" %} selected{% endif %}>A metric is on course to reach a level soon, like a disk filling up</option>
       </select>
     </label>
@@ -72,27 +72,27 @@
 
         <label>Judging by the last (hours)
           <input type="text" name="forecast_window_hours" value="{{ rule.forecast_window_hours }}" inputmode="decimal" spellcheck="false">
-          <small>Draws the straight line that best fits this much of each series, and carries it on. Between 1 and 24 hours. A forecast needs readings from at least half of it, so a new machine waits that long.</small>
+          <small>Draws the straight line that best fits this much of each series, and carries it on. Between 1 and 24 hours. A forecast needs readings from at least half of it, so a new host waits that long.</small>
         </label>
       </div>
 
-      <label>Combine machines using
+      <label>Combine hosts using
         <select name="calculation">
           {% for calculation in calculations %}
           <option value="{{ calculation.value }}"{% if calculation.value == rule.calculation %} selected{% endif %}>{{ calculation.label }}</option>
           {% endfor %}
         </select>
-        <small>Only for a calculation across machines.</small>
+        <small>Only for a calculation across hosts.</small>
       </label>
 
       <label>Watch separately
         <select name="group_by">
           <option value="nothing"{% if rule.group_by == "nothing" %} selected{% endif %}>Nothing, combine everything</option>
-          <option value="host"{% if rule.group_by == "host" %} selected{% endif %}>Each machine</option>
+          <option value="host"{% if rule.group_by == "host" %} selected{% endif %}>Each host</option>
           <option value="series"{% if rule.group_by == "series" %} selected{% endif %}>Each series, such as each disk</option>
           <option value="fact"{% if rule.group_by == "fact" %} selected{% endif %}>Each value of a fact</option>
         </select>
-        <small>Only for a calculation across machines. Metrics that measure several things, like memory and swap, use the first unless you watch each series.</small>
+        <small>Only for a calculation across hosts. Metrics that measure several things, like memory and swap, use the first unless you watch each series.</small>
       </label>
 
       <label>Fact
@@ -100,9 +100,9 @@
         <small>Only for watching each value of a fact.</small>
       </label>
 
-      <label>Machines
+      <label>Hosts
         <input type="text" name="filter" value="{{ rule.filter }}" maxlength="500" spellcheck="false" placeholder="os=linux">
-        <small>Only for a calculation. The same filter as the Machines list. Leave empty for every machine.</small>
+        <small>Only for a calculation. The same filter as the Hosts list. Leave empty for every host.</small>
       </label>
 
       <label>Looking back (seconds)
@@ -131,7 +131,7 @@
         <option value="warning"{% if rule.severity == "warning" %} selected{% endif %}>Warning</option>
         <option value="critical"{% if rule.severity == "critical" %} selected{% endif %}>Critical</option>
       </select>
-      <small>Only for an agent going offline. A metric or calculation takes its severity from the thresholds, and a forecast from how soon.</small>
+      <small>Only for a host going offline. A metric or calculation takes its severity from the thresholds, and a forecast from how soon.</small>
     </label>
   </fieldset>
 

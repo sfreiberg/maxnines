@@ -1,7 +1,7 @@
 {
   "name": "MaxNines",
   "short_name": "MaxNines",
-  "description": "Monitoring for your machines and sites.",
+  "description": "Monitoring for your hosts and sites.",
   "id": "/",
   "start_url": "/",
   "scope": "/",

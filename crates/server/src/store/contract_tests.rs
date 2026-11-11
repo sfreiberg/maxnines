@@ -6,26 +6,26 @@ fn names(result: &SeriesResult) -> Vec<&str> {
 }
 
 
-fn new_sample(agent_id: &str, host: &str, sample: &Sample) -> NewSample {
+fn new_sample(host_id: &str, hostname: &str, sample: &Sample) -> NewSample {
     NewSample {
-        agent_id: agent_id.to_string(),
-        host: host.to_string(),
+        host_id: host_id.to_string(),
+        hostname: hostname.to_string(),
         sample: sample.clone(),
     }
 }
 
 fn write_one(
     store: &mut TestStore,
-    agent_id: &str,
-    host: &str,
+    host_id: &str,
+    hostname: &str,
     sample: &Sample,
 ) -> Result<()> {
-    store.write(&[new_sample(agent_id, host, sample)])
+    store.write(&[new_sample(host_id, hostname, sample)])
 }
 
 fn write_metric(
     store: &mut TestStore,
-    agent: &str,
+    host: &str,
     time_ms: u64,
     collector: &str,
     data: Value,
@@ -34,15 +34,15 @@ fn write_metric(
         timestamp_ms: time_ms,
         metrics: BTreeMap::from([(collector.to_string(), data)]),
     };
-    write_one(store, agent, "host", &sample).unwrap();
+    write_one(store, host, "host", &sample).unwrap();
 }
 
-fn query(store: &TestStore, agent_id: &str, metric: &str, max_series: usize) -> SeriesResult {
+fn query(store: &TestStore, host_id: &str, metric: &str, max_series: usize) -> SeriesResult {
     store
         .reader()
         .unwrap()
         .series(&SeriesQuery {
-            agent_id,
+            host_id,
             metric: find(metric).unwrap(),
             range: TimeRange::new(0, HOUR_MS).unwrap(),
             max_series,
@@ -54,9 +54,9 @@ fn averages(series: &Series) -> Vec<f64> {
     series.points.iter().map(|point| point.avg).collect()
 }
 
-fn latest_output(store: &TestStore, agent: &str, collector: &str) -> Option<Value> {
+fn latest_output(store: &TestStore, host: &str, collector: &str) -> Option<Value> {
     let reader = store.reader().unwrap();
-    reader.latest_output(agent, collector, 0, 9000).unwrap()
+    reader.latest_output(host, collector, 0, 9000).unwrap()
 }
 
 fn newest(store: &TestStore, metric: &str, since: i64, until: i64) -> Vec<NewestReading> {
@@ -70,7 +70,7 @@ fn newest(store: &TestStore, metric: &str, since: i64, until: i64) -> Vec<Newest
 fn values(readings: &[NewestReading]) -> Vec<(&str, &str, i64, f64)> {
     readings
         .iter()
-        .map(|r| (r.agent_id.as_str(), r.series.as_str(), r.time_ms, r.value))
+        .map(|r| (r.host_id.as_str(), r.series.as_str(), r.time_ms, r.value))
         .collect()
 }
 
@@ -87,8 +87,8 @@ fn calculate(
         calculation,
         members: members
             .iter()
-            .map(|(agent_id, group)| Member {
-                agent_id: agent_id.to_string(),
+            .map(|(host_id, group)| Member {
+                host_id: host_id.to_string(),
                 group: group.to_string(),
             })
             .collect(),
@@ -102,13 +102,13 @@ fn line(series: &Series) -> Vec<f64> {
     series.points.iter().map(|point| point.avg).collect()
 }
 
-/// Two machines at 10% and 30%, and a third at 80% on its own.
-fn three_machines() -> TestStore {
+/// Two hosts at 10% and 30%, and a third at 80% on its own.
+fn three_hosts() -> TestStore {
     let mut store = in_memory();
-    for (agent, usage) in [("a", 10.0), ("b", 30.0), ("c", 80.0)] {
+    for (host, usage) in [("a", 10.0), ("b", 30.0), ("c", 80.0)] {
         write_metric(
             &mut store,
-            agent,
+            host,
             1000,
             "cpu",
             json!({ "usage_percent": usage }),
@@ -461,17 +461,17 @@ fn last_samples_give_each_agents_newest_time_from_any_collector() {
     write_metric(&mut store, "b", 1500, "cpu", cpu());
 
     let mut last = store.reader().unwrap().last_samples(0, 5000).unwrap();
-    last.sort_by_key(|sample| sample.agent_id.clone());
+    last.sort_by_key(|sample| sample.host_id.clone());
 
     assert_eq!(
         last,
         [
             LastSample {
-                agent_id: "a".to_string(),
+                host_id: "a".to_string(),
                 time_ms: 2000
             },
             LastSample {
-                agent_id: "b".to_string(),
+                host_id: "b".to_string(),
                 time_ms: 1500
             },
         ]
@@ -489,7 +489,7 @@ fn last_samples_ignore_what_is_outside_their_window() {
     let last = store.reader().unwrap().last_samples(2000, 8000).unwrap();
 
     assert_eq!(last.len(), 1);
-    assert_eq!(last[0].agent_id, "now");
+    assert_eq!(last[0].host_id, "now");
 }
 
 #[test]
@@ -931,8 +931,8 @@ fn every_metric_can_be_read_across_agents() {
 
 
 #[test]
-fn machines_are_combined_into_one_line() {
-    let store = three_machines();
+fn hosts_are_combined_into_one_line() {
+    let store = three_hosts();
     let everyone = [("a", "All"), ("b", "All"), ("c", "All")];
 
     for (calculation, expected) in [
@@ -950,8 +950,8 @@ fn machines_are_combined_into_one_line() {
 }
 
 #[test]
-fn machines_can_be_grouped_into_a_line_each() {
-    let store = three_machines();
+fn hosts_can_be_grouped_into_a_line_each() {
+    let store = three_hosts();
     let members = [("a", "web"), ("b", "web"), ("c", "db")];
 
     let result = calculate(&store, "cpu.usage", Calculation::Avg, &members, false);
@@ -963,15 +963,15 @@ fn machines_can_be_grouped_into_a_line_each() {
 }
 
 #[test]
-fn only_the_machines_asked_for_count() {
-    let store = three_machines();
+fn only_the_hosts_asked_for_count() {
+    let store = three_hosts();
     let result = calculate(&store, "cpu.usage", Calculation::Sum, &[("a", "x")], false);
     assert_eq!(line(&result.series[0]), [10.0]);
 }
 
 #[test]
-fn a_machine_nothing_has_been_heard_from_is_left_out() {
-    let store = three_machines();
+fn a_host_nothing_has_been_heard_from_is_left_out() {
+    let store = three_hosts();
     let result = calculate(
         &store,
         "cpu.usage",
@@ -1020,12 +1020,12 @@ fn a_metrics_different_measures_are_not_mixed_together() {
 }
 
 #[test]
-fn machines_reporting_at_different_moments_still_add_up() {
+fn hosts_reporting_at_different_moments_still_add_up() {
     let mut store = in_memory();
-    for (agent, time, usage) in [("a", 10_000, 10.0), ("b", 40_000, 30.0)] {
+    for (host, time, usage) in [("a", 10_000, 10.0), ("b", 40_000, 30.0)] {
         write_metric(
             &mut store,
-            agent,
+            host,
             time,
             "cpu",
             json!({ "usage_percent": usage }),
@@ -1043,10 +1043,10 @@ fn machines_reporting_at_different_moments_still_add_up() {
 #[test]
 fn a_moment_still_filling_up_is_left_out() {
     let mut store = in_memory();
-    for agent in ["a", "b"] {
+    for host in ["a", "b"] {
         write_metric(
             &mut store,
-            agent,
+            host,
             10_000,
             "cpu",
             json!({ "usage_percent": 10.0 }),
@@ -1066,8 +1066,8 @@ fn a_moment_still_filling_up_is_left_out() {
         calculation: Calculation::Sum,
         members: ["a", "b"]
             .iter()
-            .map(|agent_id| Member {
-                agent_id: agent_id.to_string(),
+            .map(|host_id| Member {
+                host_id: host_id.to_string(),
                 group: "All".to_string(),
             })
             .collect(),
@@ -1082,7 +1082,7 @@ fn a_moment_still_filling_up_is_left_out() {
 
 #[test]
 fn a_sample_stored_twice_does_not_change_a_sum() {
-    let mut store = three_machines();
+    let mut store = three_hosts();
     write_metric(
         &mut store,
         "a",
@@ -1102,15 +1102,15 @@ fn the_highest_lines_are_kept_when_there_are_too_many() {
     let mut store = in_memory();
     let mut members = Vec::new();
     for number in 0..10 {
-        let (agent, usage) = (format!("agent-{number}"), f64::from(number));
+        let (host, usage) = (format!("host-{number}"), f64::from(number));
         write_metric(
             &mut store,
-            &agent,
+            &host,
             1000,
             "cpu",
             json!({ "usage_percent": usage }),
         );
-        members.push(agent);
+        members.push(host);
     }
 
     let members: Vec<(&str, &str)> = members.iter().map(|a| (a.as_str(), a.as_str())).collect();
@@ -1118,16 +1118,16 @@ fn the_highest_lines_are_kept_when_there_are_too_many() {
 
     assert_eq!(result.series.len(), 8);
     assert_eq!(result.hidden, 2);
-    assert!(!result.series.iter().any(|series| series.name == "agent-0"));
+    assert!(!result.series.iter().any(|series| series.name == "host-0"));
 }
 
 #[test]
-fn rates_are_worked_out_per_machine_before_being_combined() {
+fn rates_are_worked_out_per_host_before_being_combined() {
     let mut store = in_memory();
-    for (agent, per_sample) in [("a", 10.0), ("b", 30.0)] {
+    for (host, per_sample) in [("a", 10.0), ("b", 30.0)] {
         for time in [10_000, 20_000] {
             let eth = json!({ "eth0": { "received_bytes": per_sample } });
-            write_metric(&mut store, agent, time, "network", eth);
+            write_metric(&mut store, host, time, "network", eth);
         }
     }
 
@@ -1199,42 +1199,42 @@ fn names_with_quotes_in_them_come_back_unharmed() {
 #[test]
 fn deleting_an_agent_removes_everything_it_sent_and_nothing_else() {
     let mut store = in_memory();
-    for agent in ["gone", "kept"] {
-        write_metric(&mut store, agent, 1000, "cpu", json!({ "usage_percent": 5.0 }));
+    for host in ["gone", "kept"] {
+        write_metric(&mut store, host, 1000, "cpu", json!({ "usage_percent": 5.0 }));
         let checks = json!([{ "name": "site", "kind": "http", "up": 0, "error": "refused" }]);
-        write_metric(&mut store, agent, 2000, "checks", checks);
+        write_metric(&mut store, host, 2000, "checks", checks);
     }
     // Into the sorted table too, for a store that has one, as the hour is over.
     while store.tidy(2 * HOUR_MS).unwrap() {}
     write_metric(&mut store, "gone", HOUR_MS as u64 + 1000, "cpu", json!({ "usage_percent": 6.0 }));
 
-    store.delete_agent("gone").unwrap();
+    store.delete_host("gone").unwrap();
 
     assert!(query(&store, "gone", "cpu.usage", 8).series.is_empty());
     assert_eq!(latest_output(&store, "gone", "checks"), None);
     let reader = store.reader().unwrap();
-    let agents: Vec<String> = reader
+    let hosts: Vec<String> = reader
         .last_samples(0, 9000)
         .unwrap()
         .into_iter()
-        .map(|last| last.agent_id)
+        .map(|last| last.host_id)
         .collect();
-    assert_eq!(agents, ["kept"]);
+    assert_eq!(hosts, ["kept"]);
     assert_eq!(averages(&query(&store, "kept", "cpu.usage", 8).series[0]), [5.0]);
     assert!(latest_output(&store, "kept", "checks").is_some());
 
     // Deleting what isn't there does nothing.
-    store.delete_agent("gone").unwrap();
-    store.delete_agent("never-here").unwrap();
+    store.delete_host("gone").unwrap();
+    store.delete_host("never-here").unwrap();
 }
 
 #[test]
 fn a_deleted_agent_starts_afresh_and_new_agents_keep_to_themselves() {
     let mut store = in_memory();
-    for agent in ["gone", "kept"] {
-        write_metric(&mut store, agent, 1000, "cpu", json!({ "usage_percent": 5.0 }));
+    for host in ["gone", "kept"] {
+        write_metric(&mut store, host, 1000, "cpu", json!({ "usage_percent": 5.0 }));
     }
-    store.delete_agent("gone").unwrap();
+    store.delete_host("gone").unwrap();
 
     write_metric(&mut store, "new", 2000, "cpu", json!({ "usage_percent": 7.0 }));
     write_metric(&mut store, "gone", 3000, "cpu", json!({ "usage_percent": 9.0 }));
@@ -1284,7 +1284,7 @@ fn trends_fit_a_line_through_each_series() {
         .iter()
         .map(|t| {
             let value = (t.value * 1e6).round() / 1e6;
-            (t.agent_id.as_str(), t.series.as_str(), t.time_ms, value, t.first_ms, t.samples)
+            (t.host_id.as_str(), t.series.as_str(), t.time_ms, value, t.first_ms, t.samples)
         })
         .collect();
     assert_eq!(
@@ -1315,7 +1315,7 @@ fn trends_need_two_readings_at_different_times_inside_the_window() {
     assert!(trends(&store, "cpu.usage", 0, 1500).is_empty());
     let found = trends(&store, "cpu.usage", 1500, HOUR_MS);
     assert_eq!(found.len(), 1);
-    assert_eq!((found[0].agent_id.as_str(), found[0].samples), ("b", 2));
+    assert_eq!((found[0].host_id.as_str(), found[0].samples), ("b", 2));
     assert!((found[0].slope_per_ms - 0.07).abs() < 1e-9, "{found:?}");
 }
 
@@ -1344,7 +1344,7 @@ fn retention(full_days: i64, five_minute_days: i64, hour_days: Option<i64>) -> R
 /// A chart of one agent, at a step chosen rather than worked out from the range.
 fn chart_of(
     store: &TestStore,
-    agent_id: &str,
+    host_id: &str,
     metric: &str,
     (from_ms, to_ms): (i64, i64),
     step_ms: i64,
@@ -1353,7 +1353,7 @@ fn chart_of(
         .reader()
         .unwrap()
         .series(&SeriesQuery {
-            agent_id,
+            host_id,
             metric: find(metric).unwrap(),
             range: TimeRange {
                 from_ms,
@@ -1368,7 +1368,7 @@ fn chart_of(
 /// CPU every 15 seconds for `minutes`, at `percent` except where `spikes` say.
 fn cpu_from(
     store: &mut TestStore,
-    agent: &str,
+    host: &str,
     start_ms: i64,
     minutes: i64,
     percent: f64,
@@ -1380,7 +1380,7 @@ fn cpu_from(
             .iter()
             .find(|(at, _)| *at == time)
             .map_or(percent, |(_, spike)| *spike);
-        write_metric(store, agent, time as u64, "cpu", json!({ "usage_percent": value }));
+        write_metric(store, host, time as u64, "cpu", json!({ "usage_percent": value }));
     }
 }
 
@@ -1476,7 +1476,7 @@ fn deleting_an_agent_deletes_its_rollups() {
     cpu_from(&mut store, "kept", start, 60, 20.0, &[]);
     settle(&mut store, crate::metrics::now_ms());
 
-    store.delete_agent("gone").unwrap();
+    store.delete_host("gone").unwrap();
 
     let range = (start, start + HOUR_MS);
     assert!(chart_of(&store, "gone", "cpu.usage", range, HOUR_MS).series.is_empty());
@@ -1502,7 +1502,7 @@ fn rollups_go_once_they_are_older_than_they_are_kept() {
 }
 
 #[test]
-fn machines_are_combined_from_their_rollups() {
+fn hosts_are_combined_from_their_rollups() {
     let mut store = with_retention(Retention::KEEP_EVERYTHING);
     let start = hours_ago(5);
     cpu_from(&mut store, "a", start, 60, 10.0, &[]);
@@ -1519,8 +1519,8 @@ fn machines_are_combined_from_their_rollups() {
         calculation: Calculation::Avg,
         members: ["a", "b"]
             .iter()
-            .map(|agent_id| Member {
-                agent_id: agent_id.to_string(),
+            .map(|host_id| Member {
+                host_id: host_id.to_string(),
                 group: "all".to_string(),
             })
             .collect(),

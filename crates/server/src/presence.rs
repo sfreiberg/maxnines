@@ -9,7 +9,7 @@ use serde::Serialize;
 use tokio::sync::Notify;
 
 /// How often one agent may connect. A real agent reconnects a few times after a
-/// network blip; two machines sharing a key knock each other off far faster.
+/// network blip; two hosts sharing a key knock each other off far faster.
 const CONNECTIONS_PER_MINUTE: NonZeroU32 = NonZeroU32::new(10).unwrap();
 
 /// Facts arrive once per connection and then every `facts_interval_secs`, which is
@@ -23,7 +23,7 @@ const MAX_REMEMBERED_KEYS: usize = 100_000;
 
 /// Whether an agent is connected right now.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
-pub struct AgentPresence {
+pub struct HostPresence {
     pub online: bool,
     /// When `online` last changed.
     pub since_ms: u64,
@@ -34,7 +34,7 @@ pub struct AgentPresence {
 }
 
 struct Entry {
-    presence: AgentPresence,
+    presence: HostPresence,
     /// Only the newest connection may mark the agent offline.
     connection: u64,
     /// Told when a newer connection takes over, so the older one can end.
@@ -62,7 +62,7 @@ impl Default for Presence {
 #[cfg(test)]
 impl Presence {
     /// The same allowances, given back by the hour, so a test that uses them up isn't
-    /// handed another by a slow machine taking longer than expected.
+    /// handed another by a slow host taking longer than expected.
     pub fn refilling_slowly() -> Self {
         Self {
             state: Mutex::default(),
@@ -74,13 +74,13 @@ impl Presence {
 
 #[derive(Default)]
 struct State {
-    agents: BTreeMap<String, Entry>,
+    hosts: BTreeMap<String, Entry>,
     next_connection: u64,
 }
 
 pub struct Connected {
     pub connection: u64,
-    /// The agent was already online, which can mean two machines share a key.
+    /// The agent was already online, which can mean two hosts share a key.
     pub already_online: bool,
     /// Fires when a newer connection for the same agent takes over.
     pub replaced: Arc<Notify>,
@@ -93,8 +93,8 @@ impl Presence {
         let connection = state.next_connection;
         let now = now_ms();
 
-        let entry = state.agents.entry(id.to_string()).or_insert(Entry {
-            presence: AgentPresence {
+        let entry = state.hosts.entry(id.to_string()).or_insert(Entry {
+            presence: HostPresence {
                 online: false,
                 since_ms: now,
                 last_seen_ms: now,
@@ -143,14 +143,14 @@ impl Presence {
     }
 
     pub fn seen(&self, id: &str) {
-        if let Some(entry) = self.state.lock().unwrap().agents.get_mut(id) {
+        if let Some(entry) = self.state.lock().unwrap().hosts.get_mut(id) {
             entry.presence.last_seen_ms = now_ms();
         }
     }
 
     /// Ignored if the agent has already reconnected on a newer connection.
     pub fn disconnected(&self, id: &str, connection: u64) {
-        if let Some(entry) = self.state.lock().unwrap().agents.get_mut(id)
+        if let Some(entry) = self.state.lock().unwrap().hosts.get_mut(id)
             && entry.connection == connection
         {
             entry.presence.online = false;
@@ -160,12 +160,12 @@ impl Presence {
 
     /// For an agent that's been deleted.
     pub fn forget(&self, id: &str) {
-        self.state.lock().unwrap().agents.remove(id);
+        self.state.lock().unwrap().hosts.remove(id);
     }
 
-    pub fn get(&self, id: &str) -> Option<AgentPresence> {
+    pub fn get(&self, id: &str) -> Option<HostPresence> {
         let state = self.state.lock().unwrap();
-        state.agents.get(id).map(|entry| entry.presence)
+        state.hosts.get(id).map(|entry| entry.presence)
     }
 }
 
@@ -220,7 +220,7 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(50), other.replaced.notified())
                 .await
                 .is_err(),
-            "other agents aren't touched"
+            "other hosts aren't touched"
         );
     }
 
@@ -231,7 +231,7 @@ mod tests {
             assert!(presence.allow_connection("a"));
         }
         assert!(!presence.allow_connection("a"));
-        assert!(presence.allow_connection("b"), "each agent has its own");
+        assert!(presence.allow_connection("b"), "each host has its own");
     }
 
     #[test]

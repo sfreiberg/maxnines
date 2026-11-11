@@ -21,7 +21,7 @@ fn event(notice: &Notice, step: Incident, web_url: Option<&str>) -> Value {
         "Title": on_call::title(notice),
         "Message": notice.text,
         "Severity": on_call::severity(notice),
-        "Host": on_call::host(notice),
+        "Hostname": on_call::hostname(notice),
         "X-S4-ExternalID": id,
         "X-S4-Status": "new",
         "X-S4-SourceSystem": "MaxNines",

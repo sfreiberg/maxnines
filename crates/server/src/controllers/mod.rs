@@ -5,7 +5,6 @@
 //! learns of a new build in `update_notice`.
 
 pub mod agent_socket;
-mod agents;
 mod alert_rules;
 mod alerts;
 mod annotations;
@@ -19,6 +18,7 @@ mod docs;
 mod fleet;
 mod health;
 pub mod host_list;
+mod hosts;
 mod maintenance_windows;
 pub mod map;
 mod metrics;
@@ -189,7 +189,7 @@ pub fn app(state: AppState) -> Router {
         .merge(api_keys::routes())
         .merge(audit_log::routes())
         .merge(users::routes())
-        .merge(agents::routes())
+        .merge(hosts::routes())
         .merge(alerts::routes())
         .merge(silences::routes())
         .merge(annotations::routes())
@@ -257,7 +257,7 @@ async fn security_headers(request: Request, next: Next) -> Response {
 fn section_of(template: &str) -> &'static str {
     match template.split('/').next().unwrap_or_default() {
         "overview" => "overview",
-        "agents" => "agents",
+        "hosts" => "hosts",
         "metrics" => "metrics",
         "remote_checks" => "checks",
         "alerts" | "silences" | "maintenance_windows" => "alerts",

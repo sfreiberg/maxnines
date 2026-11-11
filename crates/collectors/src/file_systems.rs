@@ -1,4 +1,4 @@
-//! Which mounted file systems hold data of their own on a machine's storage.
+//! Which mounted file systems hold data of their own on a host's storage.
 //!
 //! Disk images, loop devices, container layers and the like are mounted like disks,
 //! but they're files on another disk, memory, or another file system seen again. A
@@ -236,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn the_machine_has_a_real_file_system() {
+    fn the_host_has_a_real_file_system() {
         let disks = sysinfo::Disks::new_with_refreshed_list().unwrap();
         assert!(disks.iter().any(is_real), "{disks:?}");
     }
@@ -245,7 +245,7 @@ mod tests {
     #[test]
     fn the_start_up_disk_is_not_a_disk_image() {
         let device = mounted_from(Path::new("/")).unwrap();
-        // A virtual machine's disk may not say how it's connected at all.
+        // A virtual host's disk may not say how it's connected at all.
         let interconnect = macos::interconnect(device.strip_prefix("/dev/").unwrap());
         assert_ne!(interconnect.as_deref(), Some(macos::DISK_IMAGE));
     }

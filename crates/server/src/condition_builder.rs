@@ -503,7 +503,7 @@ mod tests {
     }
 
     fn matches(clause: Clause) -> bool {
-        evaluate(&expression(vec![clause]), &facts(), "agent-1").unwrap()
+        evaluate(&expression(vec![clause]), &facts(), "host-1").unwrap()
     }
 
     #[test]
@@ -556,7 +556,7 @@ mod tests {
                 .to_expression(&BTreeMap::new())
                 .unwrap()
                 .unwrap();
-            evaluate(&written, &facts(), "agent-1").unwrap()
+            evaluate(&written, &facts(), "host-1").unwrap()
         };
 
         assert!(!check(MatchMode::All));
@@ -582,16 +582,10 @@ mod tests {
             r#"\\" || true || "#,
         ] {
             let written = expression(vec![text("os.family", Operator::Equals, attack)]);
-            assert!(
-                !evaluate(&written, &facts(), "agent-1").unwrap(),
-                "{attack}"
-            );
+            assert!(!evaluate(&written, &facts(), "host-1").unwrap(), "{attack}");
 
             let written = expression(vec![text("host.name", Operator::Contains, attack)]);
-            assert!(
-                !evaluate(&written, &facts(), "agent-1").unwrap(),
-                "{attack}"
-            );
+            assert!(!evaluate(&written, &facts(), "host-1").unwrap(), "{attack}");
         }
     }
 
@@ -743,7 +737,7 @@ mod tests {
             r#"facts.a=="x""#,
             r#"facts.a.size() > 1"#,
             r#"facts.a == facts.b"#,
-            r#"trusted.agent_id == "x""#,
+            r#"trusted.host_id == "x""#,
             r#"facts.a.matches("x.*")"#,
             r#"facts.a in ["x", "y"]"#,
             r#"facts.a == "x" && "#,

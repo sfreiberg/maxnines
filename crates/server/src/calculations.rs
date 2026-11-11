@@ -1,4 +1,4 @@
-//! Questions about a whole group of machines rather than one, such as the average CPU
+//! Questions about a whole group of hosts rather than one, such as the average CPU
 //! of every Linux host. Dashboards ask these, and so do alert rules.
 
 use std::collections::{BTreeSet, HashMap};
@@ -11,11 +11,11 @@ use crate::controllers::host_list::HostSearch;
 use crate::host_filter::HostFilter;
 use crate::metrics::{Metric, Metrics, Point, SeriesResult, TimeRange, Unit, find};
 use crate::models::Database;
-use crate::registration::{AgentRecord, AgentState, Registry, short_id};
+use crate::registration::{HostRecord, HostState, Registry, short_id};
 
-/// What a line stands for when a machine hasn't reported the fact it's grouped by.
+/// What a line stands for when a host hasn't reported the fact it's grouped by.
 const NO_VALUE: &str = "(none)";
-/// The shortest moment machines are combined over. Agents report at their own times,
+/// The shortest moment hosts are combined over. Agents report at their own times,
 /// so a shorter one would only hold some of them, and a sum or count would jump around.
 pub const SMALLEST_STEP_MS: i64 = 60_000;
 const FACT_PREFIX: &str = "fact:";
@@ -23,7 +23,7 @@ const MAX_FACT_NAME_LEN: usize = 200;
 const MAX_FILTER_LEN: usize = 500;
 
 /// How values are combined. Each series is averaged within a moment first, so a
-/// machine reporting more often doesn't count for more, and a sample stored twice
+/// host reporting more often doesn't count for more, and a sample stored twice
 /// changes nothing. A metric with differently named lines, such as memory and swap,
 /// uses its first unless each series has a line of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,21 +101,21 @@ impl Grouping {
     }
 }
 
-/// A machine, and which line it counts towards.
+/// A host, and which line it counts towards.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Member {
-    pub agent_id: String,
+    pub host_id: String,
     pub group: String,
 }
 
-/// A calculation with its machines worked out, for the metrics store to answer.
+/// A calculation with its hosts worked out, for the metrics store to answer.
 #[derive(Debug, Clone)]
 pub struct CalculationQuery {
     pub metric: &'static Metric,
     pub range: TimeRange,
     pub calculation: Calculation,
     pub members: Vec<Member>,
-    /// A line per series, instead of a line per group of machines.
+    /// A line per series, instead of a line per group of hosts.
     pub by_series: bool,
     /// Keep this many lines, starting with the highest.
     pub max_lines: usize,
@@ -127,7 +127,7 @@ pub struct Question {
     pub metric: &'static Metric,
     pub calculation: Calculation,
     pub grouping: Grouping,
-    /// Which machines, in the same form as the filter on the Machines list.
+    /// Which hosts, in the same form as the filter on the Hosts list.
     pub filter: String,
 }
 
@@ -172,7 +172,7 @@ fn fact_text(value: &Value) -> String {
     }
 }
 
-/// The approved machines a filter picks, each with its line. The server itself isn't
+/// The approved hosts a filter picks, each with its line. The server itself isn't
 /// one of them, as it isn't part of the fleet.
 async fn members(sources: &Sources<'_>, question: &Question) -> Result<Vec<Member>> {
     let search = HostSearch::from_database(sources.database, Some(&question.filter)).await?;
@@ -184,44 +184,44 @@ async fn members(sources: &Sources<'_>, question: &Question) -> Result<Vec<Membe
         _ => None,
     };
 
-    let agents = sources.registry.list().await;
-    let chosen: Vec<AgentRecord> = agents
+    let hosts = sources.registry.list().await;
+    let chosen: Vec<HostRecord> = hosts
         .into_iter()
-        .filter(|agent| {
-            agent.state == AgentState::Approved
-                && !agent.is_local()
-                && search.includes(&agent.id, &agent.host)
+        .filter(|host| {
+            host.state == HostState::Approved
+                && !host.is_local()
+                && search.includes(&host.id, &host.hostname)
         })
         .collect();
-    // Names needn't be unique, so machines sharing one are told apart by ID
+    // Names needn't be unique, so hosts sharing one are told apart by ID
     // rather than merged into one line.
     let mut named = HashMap::new();
-    for agent in &chosen {
-        *named.entry(agent.host.as_str()).or_insert(0) += 1;
+    for host in &chosen {
+        *named.entry(host.hostname.as_str()).or_insert(0) += 1;
     }
-    let host_label = |agent: &AgentRecord| {
+    let host_label = |host: &HostRecord| {
         if named
-            .get(agent.host.as_str())
+            .get(host.hostname.as_str())
             .is_some_and(|count| *count > 1)
         {
-            format!("{} ({})", agent.host, short_id(&agent.id))
+            format!("{} ({})", host.hostname, short_id(&host.id))
         } else {
-            agent.host.clone()
+            host.hostname.clone()
         }
     };
     Ok(chosen
         .iter()
-        .map(|agent| {
+        .map(|host| {
             let group = match (&question.grouping, &facts) {
-                (Grouping::Host, _) => host_label(agent),
+                (Grouping::Host, _) => host_label(host),
                 (_, Some((name, facts))) => facts
-                    .get(&agent.id)
+                    .get(&host.id)
                     .and_then(|facts| facts.get(*name))
                     .map_or_else(|| NO_VALUE.to_string(), fact_text),
                 _ => question.metric.title.to_string(),
             };
             Member {
-                agent_id: agent.id.clone(),
+                host_id: host.id.clone(),
                 group,
             }
         })
@@ -357,7 +357,7 @@ mod tests {
     #[test]
     fn groups_are_numbered_once_each() {
         let member = |group: &str| Member {
-            agent_id: "a".to_string(),
+            host_id: "a".to_string(),
             group: group.to_string(),
         };
 

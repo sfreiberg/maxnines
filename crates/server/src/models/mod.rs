@@ -2,10 +2,6 @@
 //! The URL picks the database, and SeaORM handles the differences between them.
 //! Schema changes live in [`crate::migrations`].
 
-mod agent;
-mod agent_boot;
-mod agent_config_status;
-mod agent_fact;
 mod alert;
 mod alert_rule;
 mod alert_rule_channel;
@@ -21,6 +17,10 @@ mod dashboard_widget;
 mod dashboards;
 mod event;
 mod events;
+mod host;
+mod host_boot;
+mod host_config_status;
+mod host_fact;
 mod location_rule;
 mod location_rules;
 mod maintenance_window;
@@ -73,7 +73,7 @@ use crate::facts::{FlatFacts, decode, encode, flatten, unflatten};
 use crate::host_filter;
 use crate::migrations::Migrator;
 use crate::registration::hash_token;
-use crate::registration::{AgentRecord, AgentState};
+use crate::registration::{HostRecord, HostState};
 use crate::roles::Role;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -168,100 +168,100 @@ impl Database {
         })
     }
 
-    pub async fn load_agents(&self) -> Result<Vec<AgentRecord>> {
-        let rows = agent::Entity::find()
+    pub async fn load_hosts(&self) -> Result<Vec<HostRecord>> {
+        let rows = host::Entity::find()
             .all(&self.connection)
             .await
-            .context("loading agents")?;
+            .context("loading hosts")?;
         rows.into_iter().map(to_record).collect()
     }
 
     /// Creates or replaces an agent's record.
-    pub async fn save_agent(&self, record: &AgentRecord) -> Result<()> {
-        let row = agent::ActiveModel {
+    pub async fn save_host(&self, record: &HostRecord) -> Result<()> {
+        let row = host::ActiveModel {
             id: Set(record.id.clone()),
             public_key: Set(record.public_key.clone()),
-            host: Set(record.host.clone()),
+            hostname: Set(record.hostname.clone()),
             state: Set(record.state.as_str().to_string()),
             decided_by: Set(record.decided_by.clone()),
             first_seen_ms: Set(record.first_seen_ms as i64),
             decided_ms: Set(record.decided_ms.map(|ms| ms as i64)),
         };
 
-        let on_conflict = OnConflict::column(agent::Column::Id)
+        let on_conflict = OnConflict::column(host::Column::Id)
             .update_columns([
-                agent::Column::PublicKey,
-                agent::Column::Host,
-                agent::Column::State,
-                agent::Column::DecidedBy,
-                agent::Column::FirstSeenMs,
-                agent::Column::DecidedMs,
+                host::Column::PublicKey,
+                host::Column::Hostname,
+                host::Column::State,
+                host::Column::DecidedBy,
+                host::Column::FirstSeenMs,
+                host::Column::DecidedMs,
             ])
             .to_owned();
 
-        let transaction = self.connection.begin().await.context("saving agent")?;
-        let before = agent::Entity::find_by_id(&record.id)
+        let transaction = self.connection.begin().await.context("saving host")?;
+        let before = host::Entity::find_by_id(&record.id)
             .one(&transaction)
             .await
-            .context("loading agent")?;
-        agent::Entity::insert(row)
+            .context("loading host")?;
+        host::Entity::insert(row)
             .on_conflict(on_conflict)
             .exec_without_returning(&transaction)
             .await
-            .context("saving agent")?;
-        let before = before.as_ref().map(agent_snapshot);
-        let after = agent_snapshot_of(record);
+            .context("saving host")?;
+        let before = before.as_ref().map(host_snapshot);
+        let after = host_snapshot_of(record);
         record_change(
             &transaction,
-            Kind::Agent,
+            Kind::Host,
             &record.id,
             before.as_ref(),
             Some(&after),
             None,
         )
         .await?;
-        transaction.commit().await.context("saving agent")?;
+        transaction.commit().await.context("saving host")?;
         Ok(())
     }
 
     /// Deletes an agent and everything kept about it: its facts, what it said about
     /// its config, its alerts with their notifications, events about it alone, and a
     /// place on the map made for it alone. All or nothing. Returns false if there was no such agent.
-    pub async fn delete_agent(&self, id: &str) -> Result<bool> {
+    pub async fn delete_host(&self, id: &str) -> Result<bool> {
         let _only_writer = self.facts_lock.lock().await;
-        let transaction = self.connection.begin().await.context("deleting an agent")?;
-        let before = agent::Entity::find_by_id(id)
+        let transaction = self.connection.begin().await.context("deleting a host")?;
+        let before = host::Entity::find_by_id(id)
             .one(&transaction)
             .await
-            .context("loading agent")?;
+            .context("loading host")?;
         // Their notifications go with them.
         alert::Entity::delete_many()
-            .filter(alert::Column::AgentId.eq(id))
+            .filter(alert::Column::HostId.eq(id))
             .exec(&transaction)
             .await
-            .context("deleting an agent's alerts")?;
-        agent_fact::Entity::delete_many()
-            .filter(agent_fact::Column::AgentId.eq(id))
+            .context("deleting a host's alerts")?;
+        host_fact::Entity::delete_many()
+            .filter(host_fact::Column::HostId.eq(id))
             .exec(&transaction)
             .await
-            .context("deleting an agent's facts")?;
-        agent_config_status::Entity::delete_by_id(id)
+            .context("deleting a host's facts")?;
+        host_config_status::Entity::delete_by_id(id)
             .exec(&transaction)
             .await
-            .context("deleting an agent's config status")?;
-        events::delete_agent_events(&transaction, id).await?;
+            .context("deleting a host's config status")?;
+        events::delete_host_events(&transaction, id).await?;
         location_rule::Entity::delete_many()
             .filter(location_rule::Column::Filter.eq(host_filter::only(id)))
             .exec(&transaction)
             .await
-            .context("deleting an agent's place on the map")?;
-        let deleted = agent::Entity::delete_by_id(id)
+            .context("deleting a host's place on the map")?;
+        let deleted = host::Entity::delete_by_id(id)
             .exec(&transaction)
             .await
-            .context("deleting an agent")?;
-        let before = before.as_ref().map(agent_snapshot);
-        record_change(&transaction, Kind::Agent, id, before.as_ref(), None, None).await?;
-        transaction.commit().await.context("deleting an agent")?;
+            .context("deleting a host")?;
+        let before = before.as_ref().map(host_snapshot);
+        record_change(&transaction, Kind::Host, id, before.as_ref(), None, None).await?;
+        transaction.commit().await.context("deleting a host")?;
         Ok(deleted.rows_affected > 0)
     }
 }
@@ -271,16 +271,16 @@ impl Database {
     /// one transaction. Returns whether anything changed.
     pub async fn record_facts(
         &self,
-        agent_id: &str,
+        host_id: &str,
         facts: &FlatFacts,
         now_ms: u64,
     ) -> Result<bool> {
         let _only_writer = self.facts_lock.lock().await;
         let transaction = self.connection.begin().await.context("saving facts")?;
 
-        let current = agent_fact::Entity::find()
-            .filter(agent_fact::Column::AgentId.eq(agent_id))
-            .filter(agent_fact::Column::ValidToMs.is_null())
+        let current = host_fact::Entity::find()
+            .filter(host_fact::Column::HostId.eq(host_id))
+            .filter(host_fact::Column::ValidToMs.is_null())
             .all(&transaction)
             .await
             .context("loading facts")?;
@@ -299,13 +299,13 @@ impl Database {
             }
         }
 
-        let added: Vec<agent_fact::ActiveModel> = facts
+        let added: Vec<host_fact::ActiveModel> = facts
             .iter()
             .filter(|(name, _)| !unchanged.contains(*name))
             .map(|(name, value)| {
                 let (text, value_type) = encode(value);
-                agent_fact::ActiveModel {
-                    agent_id: Set(agent_id.to_string()),
+                host_fact::ActiveModel {
+                    host_id: Set(host_id.to_string()),
                     name: Set(name.clone()),
                     value: Set(text),
                     value_type: Set(value_type.to_string()),
@@ -319,15 +319,15 @@ impl Database {
         let changed = !closed.is_empty() || !added.is_empty();
 
         if !closed.is_empty() {
-            agent_fact::Entity::update_many()
-                .col_expr(agent_fact::Column::ValidToMs, Expr::value(now_ms as i64))
-                .filter(agent_fact::Column::Id.is_in(closed))
+            host_fact::Entity::update_many()
+                .col_expr(host_fact::Column::ValidToMs, Expr::value(now_ms as i64))
+                .filter(host_fact::Column::Id.is_in(closed))
                 .exec(&transaction)
                 .await
                 .context("closing old facts")?;
         }
         if !added.is_empty() {
-            agent_fact::Entity::insert_many(added)
+            host_fact::Entity::insert_many(added)
                 .exec_without_returning(&transaction)
                 .await
                 .context("saving facts")?;
@@ -337,11 +337,11 @@ impl Database {
         Ok(changed)
     }
 
-    pub async fn current_facts(&self, agent_id: &str) -> Result<Vec<FactVersion>> {
-        let rows = agent_fact::Entity::find()
-            .filter(agent_fact::Column::AgentId.eq(agent_id))
-            .filter(agent_fact::Column::ValidToMs.is_null())
-            .order_by_asc(agent_fact::Column::Name)
+    pub async fn current_facts(&self, host_id: &str) -> Result<Vec<FactVersion>> {
+        let rows = host_fact::Entity::find()
+            .filter(host_fact::Column::HostId.eq(host_id))
+            .filter(host_fact::Column::ValidToMs.is_null())
+            .order_by_asc(host_fact::Column::Name)
             .all(&self.connection)
             .await
             .context("loading facts")?;
@@ -351,43 +351,43 @@ impl Database {
     /// Every agent's current facts, in one query so that looking across all
     /// agents doesn't cost a query each.
     pub async fn all_current_facts(&self) -> Result<BTreeMap<String, FlatFacts>> {
-        let rows = agent_fact::Entity::find()
-            .filter(agent_fact::Column::ValidToMs.is_null())
+        let rows = host_fact::Entity::find()
+            .filter(host_fact::Column::ValidToMs.is_null())
             .all(&self.connection)
             .await
             .context("loading facts")?;
-        by_agent(rows)
+        by_host(rows)
     }
 
     /// The current facts of some agents, for when a page only shows those.
-    pub async fn facts_of(&self, agent_ids: &[&str]) -> Result<BTreeMap<String, FlatFacts>> {
-        let rows = agent_fact::Entity::find()
-            .filter(agent_fact::Column::ValidToMs.is_null())
-            .filter(agent_fact::Column::AgentId.is_in(agent_ids.iter().copied()))
+    pub async fn facts_of(&self, host_ids: &[&str]) -> Result<BTreeMap<String, FlatFacts>> {
+        let rows = host_fact::Entity::find()
+            .filter(host_fact::Column::ValidToMs.is_null())
+            .filter(host_fact::Column::HostId.is_in(host_ids.iter().copied()))
             .all(&self.connection)
             .await
             .context("loading facts")?;
-        by_agent(rows)
+        by_host(rows)
     }
 
     /// Every agent's current values of some facts, including the items of lists.
     pub async fn facts_named(&self, names: &[&str]) -> Result<BTreeMap<String, FlatFacts>> {
-        let rows = agent_fact::Entity::find()
-            .filter(agent_fact::Column::ValidToMs.is_null())
+        let rows = host_fact::Entity::find()
+            .filter(host_fact::Column::ValidToMs.is_null())
             .filter(fact_or_its_items(names))
             .all(&self.connection)
             .await
             .context("loading facts")?;
-        by_agent(rows)
+        by_host(rows)
     }
 
     /// The names facts are reported under, with a list appearing under its own name.
     pub async fn fact_names(&self) -> Result<Vec<String>> {
-        let names: Vec<String> = agent_fact::Entity::find()
+        let names: Vec<String> = host_fact::Entity::find()
             .select_only()
-            .column(agent_fact::Column::Name)
+            .column(host_fact::Column::Name)
             .distinct()
-            .filter(agent_fact::Column::ValidToMs.is_null())
+            .filter(host_fact::Column::ValidToMs.is_null())
             .into_tuple()
             .all(&self.connection)
             .await
@@ -398,14 +398,14 @@ impl Database {
 
     /// Different values a fact has containing some text, in order.
     pub async fn fact_values(&self, name: &str, text: &str, limit: u64) -> Result<Vec<String>> {
-        agent_fact::Entity::find()
+        host_fact::Entity::find()
             .select_only()
-            .column(agent_fact::Column::Value)
+            .column(host_fact::Column::Value)
             .distinct()
-            .filter(agent_fact::Column::ValidToMs.is_null())
+            .filter(host_fact::Column::ValidToMs.is_null())
             .filter(fact_or_its_items(&[name]))
-            .filter(agent_fact::Column::Value.contains(text))
-            .order_by_asc(agent_fact::Column::Value)
+            .filter(host_fact::Column::Value.contains(text))
+            .order_by_asc(host_fact::Column::Value)
             .limit(limit)
             .into_tuple()
             .all(&self.connection)
@@ -416,8 +416,8 @@ impl Database {
     /// Every fact name in use and how its values are written, for offering in
     /// forms. A list appears once under its own name, as a list item's type.
     pub async fn known_facts(&self) -> Result<BTreeMap<String, String>> {
-        let rows = agent_fact::Entity::find()
-            .filter(agent_fact::Column::ValidToMs.is_null())
+        let rows = host_fact::Entity::find()
+            .filter(host_fact::Column::ValidToMs.is_null())
             .all(&self.connection)
             .await
             .context("loading fact names")?;
@@ -433,10 +433,10 @@ impl Database {
 
     /// Every value each fact has had, oldest first. Rows are ordered by ID, not
     /// time, because two reports can share a timestamp and clocks can go back.
-    pub async fn facts_history(&self, agent_id: &str) -> Result<Vec<FactVersion>> {
-        let rows = agent_fact::Entity::find()
-            .filter(agent_fact::Column::AgentId.eq(agent_id))
-            .order_by_asc(agent_fact::Column::Id)
+    pub async fn facts_history(&self, host_id: &str) -> Result<Vec<FactVersion>> {
+        let rows = host_fact::Entity::find()
+            .filter(host_fact::Column::HostId.eq(host_id))
+            .order_by_asc(host_fact::Column::Id)
             .all(&self.connection)
             .await
             .context("loading facts history")?;
@@ -808,22 +808,22 @@ impl Database {
         Ok(deleted.rows_affected > 0)
     }
 
-    pub async fn save_config_status(&self, agent_id: &str, status: &ConfigStatus) -> Result<()> {
-        let row = agent_config_status::ActiveModel {
-            agent_id: Set(agent_id.to_string()),
+    pub async fn save_config_status(&self, host_id: &str, status: &ConfigStatus) -> Result<()> {
+        let row = host_config_status::ActiveModel {
+            host_id: Set(host_id.to_string()),
             version: Set(status.version.clone()),
             error: Set(status.error.clone()),
             reported_ms: Set(status.reported_ms as i64),
         };
-        let on_conflict = OnConflict::column(agent_config_status::Column::AgentId)
+        let on_conflict = OnConflict::column(host_config_status::Column::HostId)
             .update_columns([
-                agent_config_status::Column::Version,
-                agent_config_status::Column::Error,
-                agent_config_status::Column::ReportedMs,
+                host_config_status::Column::Version,
+                host_config_status::Column::Error,
+                host_config_status::Column::ReportedMs,
             ])
             .to_owned();
 
-        agent_config_status::Entity::insert(row)
+        host_config_status::Entity::insert(row)
             .on_conflict(on_conflict)
             .exec_without_returning(&self.connection)
             .await
@@ -831,8 +831,8 @@ impl Database {
         Ok(())
     }
 
-    pub async fn config_status(&self, agent_id: &str) -> Result<Option<ConfigStatus>> {
-        let row = agent_config_status::Entity::find_by_id(agent_id)
+    pub async fn config_status(&self, host_id: &str) -> Result<Option<ConfigStatus>> {
+        let row = host_config_status::Entity::find_by_id(host_id)
             .one(&self.connection)
             .await
             .context("loading config status")?;
@@ -950,25 +950,22 @@ fn simple_fact_name(name: String) -> Option<String> {
 fn fact_or_its_items(names: &[&str]) -> Condition {
     names.iter().fold(Condition::any(), |wanted, name| {
         wanted
-            .add(agent_fact::Column::Name.eq(*name))
-            .add(agent_fact::Column::Name.starts_with(format!("{name}[")))
+            .add(host_fact::Column::Name.eq(*name))
+            .add(host_fact::Column::Name.starts_with(format!("{name}[")))
     })
 }
 
-fn by_agent(rows: Vec<agent_fact::Model>) -> Result<BTreeMap<String, FlatFacts>> {
-    let mut agents: BTreeMap<String, FlatFacts> = BTreeMap::new();
+fn by_host(rows: Vec<host_fact::Model>) -> Result<BTreeMap<String, FlatFacts>> {
+    let mut hosts: BTreeMap<String, FlatFacts> = BTreeMap::new();
     for row in rows {
-        let agent = row.agent_id.clone();
+        let host = row.host_id.clone();
         let fact = to_fact_version(row)?;
-        agents
-            .entry(agent)
-            .or_default()
-            .insert(fact.name, fact.value);
+        hosts.entry(host).or_default().insert(fact.name, fact.value);
     }
-    Ok(agents)
+    Ok(hosts)
 }
 
-fn to_fact_version(row: agent_fact::Model) -> Result<FactVersion> {
+fn to_fact_version(row: host_fact::Model) -> Result<FactVersion> {
     Ok(FactVersion {
         value: decode(&row.value, &row.value_type)
             .with_context(|| format!("fact {} has an invalid value", row.name))?,
@@ -980,34 +977,34 @@ fn to_fact_version(row: agent_fact::Model) -> Result<FactVersion> {
 
 /// An agent as the audit log compares them: what it's called and whether it's
 /// allowed in. Its ID is its key, so neither can change.
-fn agent_snapshot(row: &agent::Model) -> Snapshot {
-    agent_fields(&row.host, &row.state, row.decided_by.as_deref())
+fn host_snapshot(row: &host::Model) -> Snapshot {
+    host_fields(&row.hostname, &row.state, row.decided_by.as_deref())
 }
 
-fn agent_snapshot_of(record: &AgentRecord) -> Snapshot {
-    agent_fields(
-        &record.host,
+fn host_snapshot_of(record: &HostRecord) -> Snapshot {
+    host_fields(
+        &record.hostname,
         record.state.as_str(),
         record.decided_by.as_deref(),
     )
 }
 
-fn agent_fields(host: &str, state: &str, decided_by: Option<&str>) -> Snapshot {
+fn host_fields(hostname: &str, state: &str, decided_by: Option<&str>) -> Snapshot {
     let fields = serde_json::json!({
-        "host": host,
+        "hostname": hostname,
         "state": state,
         "decided_by": decided_by,
     });
-    Snapshot::new(host, fields)
+    Snapshot::new(hostname, fields)
 }
 
-fn to_record(row: agent::Model) -> Result<AgentRecord> {
-    Ok(AgentRecord {
-        state: AgentState::parse(&row.state)
-            .with_context(|| format!("agent {} has unknown state {:?}", row.id, row.state))?,
+fn to_record(row: host::Model) -> Result<HostRecord> {
+    Ok(HostRecord {
+        state: HostState::parse(&row.state)
+            .with_context(|| format!("host {} has unknown state {:?}", row.id, row.state))?,
         id: row.id,
         public_key: row.public_key,
-        host: row.host,
+        hostname: row.hostname,
         decided_by: row.decided_by,
         first_seen_ms: row.first_seen_ms as u64,
         decided_ms: row.decided_ms.map(|ms| ms as u64),
@@ -1067,8 +1064,8 @@ async fn fresh_test_database(server: &str) -> String {
         .await
         .unwrap();
     connection.close().await.unwrap();
-    let (host, _) = server.rsplit_once('/').unwrap();
-    format!("{host}/{name}")
+    let (hostname, _) = server.rsplit_once('/').unwrap();
+    format!("{hostname}/{name}")
 }
 
 #[cfg(test)]
@@ -1098,10 +1095,10 @@ impl Database {
         }
     }
 
-    /// Makes every later query about agents fail, while signing in still works.
+    /// Makes every later query about hosts fail, while signing in still works.
     pub async fn break_for_test(&self) {
         use sea_orm::ConnectionTrait;
-        for table in ["agent_config_status", "agent_facts", "agents"] {
+        for table in ["host_config_status", "host_facts", "hosts"] {
             self.connection
                 .execute_unprepared(&format!("ALTER TABLE {table} RENAME TO {table}_gone"))
                 .await
@@ -1112,11 +1109,11 @@ impl Database {
     async fn clear_for_test(&self) {
         use sea_orm::ConnectionTrait;
         self.connection
-            .execute_unprepared("DELETE FROM agent_config_status")
+            .execute_unprepared("DELETE FROM host_config_status")
             .await
             .unwrap();
         self.connection
-            .execute_unprepared("DELETE FROM agent_facts")
+            .execute_unprepared("DELETE FROM host_facts")
             .await
             .unwrap();
         self.connection
@@ -1128,7 +1125,7 @@ impl Database {
             .await
             .unwrap();
         self.connection
-            .execute_unprepared("DELETE FROM agents WHERE id <> 'server'")
+            .execute_unprepared("DELETE FROM hosts WHERE id <> 'server'")
             .await
             .unwrap();
     }
@@ -1141,12 +1138,12 @@ mod tests {
     use super::*;
     use crate::facts::flatten;
 
-    fn record(id: &str) -> AgentRecord {
-        AgentRecord {
+    fn record(id: &str) -> HostRecord {
+        HostRecord {
             id: id.to_string(),
             public_key: "ab".repeat(32),
-            host: "web-1".to_string(),
-            state: AgentState::Pending,
+            hostname: "web-1".to_string(),
+            state: HostState::Pending,
             decided_by: None,
             first_seen_ms: 1_789_000_000_123,
             decided_ms: None,
@@ -1154,13 +1151,13 @@ mod tests {
     }
 
     /// Everything but the built-in agent, which every database starts with.
-    async fn machines(database: &Database) -> Vec<AgentRecord> {
-        let mut agents = database.load_agents().await.unwrap();
-        agents.retain(|agent| !agent.is_local());
-        agents
+    async fn hosts(database: &Database) -> Vec<HostRecord> {
+        let mut hosts = database.load_hosts().await.unwrap();
+        hosts.retain(|host| !host.is_local());
+        hosts
     }
 
-    fn sorted(mut records: Vec<AgentRecord>) -> Vec<AgentRecord> {
+    fn sorted(mut records: Vec<HostRecord>) -> Vec<HostRecord> {
         records.sort_by(|a, b| a.id.cmp(&b.id));
         records
     }
@@ -1534,41 +1531,41 @@ mod tests {
     async fn exercise(url: &str) {
         let database = Database::connect(url).await.unwrap();
         database.clear_for_test().await;
-        assert!(machines(&database).await.is_empty());
+        assert!(hosts(&database).await.is_empty());
 
         // Creating.
-        let pending = record("agent-1");
-        database.save_agent(&pending).await.unwrap();
-        assert_eq!(machines(&database).await, vec![pending.clone()]);
+        let pending = record("host-1");
+        database.save_host(&pending).await.unwrap();
+        assert_eq!(hosts(&database).await, vec![pending.clone()]);
 
         // Saving identical data, which MySQL reports as zero rows changed.
-        database.save_agent(&pending).await.unwrap();
-        assert_eq!(machines(&database).await, vec![pending.clone()]);
+        database.save_host(&pending).await.unwrap();
+        assert_eq!(hosts(&database).await, vec![pending.clone()]);
 
         // Replacing, including going from NULL to a value.
-        let approved = AgentRecord {
-            state: AgentState::Approved,
+        let approved = HostRecord {
+            state: HostState::Approved,
             decided_by: Some("rule:production-subnet".to_string()),
             decided_ms: Some(1_789_000_000_456),
             ..pending.clone()
         };
-        database.save_agent(&approved).await.unwrap();
-        assert_eq!(machines(&database).await, vec![approved.clone()]);
+        database.save_host(&approved).await.unwrap();
+        assert_eq!(hosts(&database).await, vec![approved.clone()]);
 
         // The largest hostname allowed, non-ASCII text, and a long rule name.
-        let unusual = AgentRecord {
-            host: "x".repeat(255),
+        let unusual = HostRecord {
+            hostname: "x".repeat(255),
             decided_by: Some(format!("rule:{}", "é🚀".repeat(200))),
-            ..record("agent-2")
+            ..record("host-2")
         };
-        database.save_agent(&unusual).await.unwrap();
-        let unicode = AgentRecord {
-            host: "сервер-🚀".to_string(),
-            ..record("agent-3")
+        database.save_host(&unusual).await.unwrap();
+        let unicode = HostRecord {
+            hostname: "сервер-🚀".to_string(),
+            ..record("host-3")
         };
-        database.save_agent(&unicode).await.unwrap();
+        database.save_host(&unicode).await.unwrap();
         assert_eq!(
-            sorted(machines(&database).await),
+            sorted(hosts(&database).await),
             [approved.clone(), unusual.clone(), unicode.clone()]
         );
 
@@ -1578,10 +1575,7 @@ mod tests {
 
         // A second connection sees it all, and migrating again changes nothing.
         let reopened = Database::connect(url).await.unwrap();
-        assert_eq!(
-            sorted(machines(&reopened).await),
-            [approved, unusual, unicode]
-        );
+        assert_eq!(sorted(hosts(&reopened).await), [approved, unusual, unicode]);
 
         database.clear_for_test().await;
     }
@@ -1619,15 +1613,15 @@ mod tests {
     #[tokio::test]
     async fn known_facts_lists_each_name_once_with_its_type() {
         let database = Database::for_test().await;
-        database.save_agent(&record("agent-1")).await.unwrap();
-        database.save_agent(&record("agent-2")).await.unwrap();
+        database.save_host(&record("host-1")).await.unwrap();
+        database.save_host(&record("host-2")).await.unwrap();
         let facts = flatten(&json!({
             "os": { "family": "linux" },
             "custom": { "tags": ["a", "b"], "rack": 12, "disks": [{ "mount": "/" }] },
         }))
         .unwrap();
-        database.record_facts("agent-1", &facts, 1).await.unwrap();
-        database.record_facts("agent-2", &facts, 1).await.unwrap();
+        database.record_facts("host-1", &facts, 1).await.unwrap();
+        database.record_facts("host-2", &facts, 1).await.unwrap();
 
         let known = database.known_facts().await.unwrap();
 
@@ -1700,34 +1694,34 @@ mod tests {
         assert_eq!(database.list_rules().await.unwrap().len(), 1);
     }
 
-    async fn exercise_config_status(database: &Database, agent: &str) {
-        assert_eq!(database.config_status(agent).await.unwrap(), None);
+    async fn exercise_config_status(database: &Database, host: &str) {
+        assert_eq!(database.config_status(host).await.unwrap(), None);
 
         let failed = ConfigStatus {
             version: "v1".to_string(),
             error: Some("unknown collector".to_string()),
             reported_ms: 100,
         };
-        database.save_config_status(agent, &failed).await.unwrap();
+        database.save_config_status(host, &failed).await.unwrap();
         assert_eq!(
-            database.config_status(agent).await.unwrap(),
+            database.config_status(host).await.unwrap(),
             Some(failed.clone())
         );
 
         // Saving identical data, which MySQL reports as zero rows changed.
-        database.save_config_status(agent, &failed).await.unwrap();
+        database.save_config_status(host, &failed).await.unwrap();
 
         let applied = ConfigStatus {
             version: "v2".to_string(),
             error: None,
             reported_ms: 200,
         };
-        database.save_config_status(agent, &applied).await.unwrap();
-        assert_eq!(database.config_status(agent).await.unwrap(), Some(applied));
+        database.save_config_status(host, &applied).await.unwrap();
+        assert_eq!(database.config_status(host).await.unwrap(), Some(applied));
     }
 
-    async fn exercise_facts(database: &Database, agent: &str, other: &str) {
-        assert!(database.current_facts(agent).await.unwrap().is_empty());
+    async fn exercise_facts(database: &Database, host: &str, other: &str) {
+        assert!(database.current_facts(host).await.unwrap().is_empty());
 
         // Every value type, and non-ASCII text.
         let first = flat(&[
@@ -1737,10 +1731,10 @@ mod tests {
             ("custom.enabled", json!(true)),
             ("custom.note", json!("сервер-🚀")),
         ]);
-        assert!(database.record_facts(agent, &first, 100).await.unwrap());
-        assert!(!database.record_facts(agent, &first, 200).await.unwrap());
+        assert!(database.record_facts(host, &first, 100).await.unwrap());
+        assert!(!database.record_facts(host, &first, 200).await.unwrap());
 
-        let facts = database.current_facts(agent).await.unwrap();
+        let facts = database.current_facts(host).await.unwrap();
         assert_eq!(facts.len(), 5);
         let value = |name: &str| {
             let fact = facts.iter().find(|f| f.name == name).unwrap();
@@ -1758,9 +1752,9 @@ mod tests {
             ("custom.enabled", json!(true)),
             ("custom.role", json!("web")),
         ]);
-        assert!(database.record_facts(agent, &second, 300).await.unwrap());
+        assert!(database.record_facts(host, &second, 300).await.unwrap());
 
-        let history = database.facts_history(agent).await.unwrap();
+        let history = database.facts_history(host).await.unwrap();
         assert_eq!(history.len(), 7);
         let family = history.iter().find(|f| f.name == "os.family").unwrap();
         assert_eq!((family.valid_from_ms, family.valid_to_ms), (100, None));
@@ -1770,13 +1764,13 @@ mod tests {
         assert_eq!((new.valid_from_ms, new.valid_to_ms), (300, None));
         let gone = history.iter().find(|f| f.name == "custom.note").unwrap();
         assert_eq!(gone.valid_to_ms, Some(300));
-        assert_eq!(database.current_facts(agent).await.unwrap().len(), 5);
+        assert_eq!(database.current_facts(host).await.unwrap().len(), 5);
         assert_eq!(current(&history).len(), 5);
 
         // Going back to earlier values is a change too: os.version and
         // custom.note return, so two more rows.
-        assert!(database.record_facts(agent, &first, 400).await.unwrap());
-        assert_eq!(database.facts_history(agent).await.unwrap().len(), 9);
+        assert!(database.record_facts(host, &first, 400).await.unwrap());
+        assert_eq!(database.facts_history(host).await.unwrap().len(), 9);
 
         // A value keeps its type: 1 and "1" are different facts.
         let number = flat(&[("custom.level", json!(1))]);
@@ -1789,7 +1783,7 @@ mod tests {
         assert_eq!(
             database.all_current_facts().await.unwrap(),
             BTreeMap::from([
-                (agent.to_string(), first.clone()),
+                (host.to_string(), first.clone()),
                 (other.to_string(), text.clone())
             ])
         );
@@ -1848,9 +1842,9 @@ mod tests {
         );
 
         // Each agent has its own facts.
-        assert_eq!(database.current_facts(agent).await.unwrap().len(), 5);
+        assert_eq!(database.current_facts(host).await.unwrap().len(), 5);
 
-        exercise_alerting(database, agent).await;
+        exercise_alerting(database, host).await;
         exercise_remote_checks(database).await;
 
         let secret = database.server_secret("csrf_key").await.unwrap();
@@ -1860,17 +1854,17 @@ mod tests {
         let stats = database.stats().await.unwrap();
         assert!(stats.size_bytes.unwrap_or(0) > 0, "{stats:?}");
         assert!(stats.latest_migration.is_some());
-        assert_eq!(stats.tables[0].name, "Agents");
+        assert_eq!(stats.tables[0].name, "Hosts");
         assert!(stats.tables[0].rows > 0);
     }
 
     async fn exercise_remote_checks(database: &Database) {
         use maxnines_protocol::{Check, CheckKind};
 
-        use crate::remote_checks::{LOCAL_AGENT_ID, RemoteCheckInput};
+        use crate::remote_checks::{LOCAL_HOST_ID, RemoteCheckInput};
 
-        let agents = database.load_agents().await.unwrap();
-        assert!(agents.iter().any(|agent| agent.id == LOCAL_AGENT_ID));
+        let hosts = database.load_hosts().await.unwrap();
+        assert!(hosts.iter().any(|host| host.id == LOCAL_HOST_ID));
 
         let name = format!("site {}", crate::metrics::now_ms());
         let mut check = Check::new(&name, CheckKind::Http, "https://example.com/");
@@ -1901,7 +1895,7 @@ mod tests {
     }
 
     /// Names are unique per run, because real databases keep their rows.
-    async fn exercise_alerting(database: &Database, agent: &str) {
+    async fn exercise_alerting(database: &Database, host: &str) {
         use crate::alerting::{
             AlertRuleInput, ChannelInput, ChannelKind, Comparison, Event, NewAlert, RuleKind,
             Severity,
@@ -1961,8 +1955,8 @@ mod tests {
             rule_id: rule,
             rule_name: input.name.clone(),
             severity: input.severity,
-            agent_id: agent.to_string(),
-            host: "é".repeat(255),
+            host_id: host.to_string(),
+            hostname: "é".repeat(255),
             series: "é".repeat(255),
             value: Some(91.5),
             summary: "x".repeat(5000),
@@ -1971,7 +1965,7 @@ mod tests {
         let alert = database.fire_alert(&new, &[channel]).await.unwrap();
         let open = database.open_alerts().await.unwrap();
         let saved = open.iter().find(|a| a.id == alert).unwrap();
-        assert_eq!(saved.host, new.host);
+        assert_eq!(saved.hostname, new.hostname);
         assert_eq!(saved.value, Some(91.5));
 
         let due = database.due_deliveries(started_ms, 500).await.unwrap();
@@ -2035,27 +2029,24 @@ mod tests {
         use sea_orm::ConnectionTrait;
 
         let database = Database::for_test().await;
-        database.save_agent(&record("agent-1")).await.unwrap();
+        database.save_host(&record("host-1")).await.unwrap();
         let before = flat(&[("os.version", json!("24.04"))]);
-        database
-            .record_facts("agent-1", &before, 100)
-            .await
-            .unwrap();
+        database.record_facts("host-1", &before, 100).await.unwrap();
 
         // The old value is closed first, then adding the new one fails.
         let trigger = match database.connection.get_database_backend() {
             sea_orm::DatabaseBackend::Postgres => {
                 "CREATE FUNCTION block_new_version() RETURNS trigger AS
                  $$ BEGIN RAISE EXCEPTION 'blocked'; END $$ LANGUAGE plpgsql;
-                 CREATE TRIGGER block_new_version BEFORE INSERT ON agent_facts
+                 CREATE TRIGGER block_new_version BEFORE INSERT ON host_facts
                  FOR EACH ROW EXECUTE FUNCTION block_new_version()"
             }
             sea_orm::DatabaseBackend::MySql => {
-                "CREATE TRIGGER block_new_version BEFORE INSERT ON agent_facts
+                "CREATE TRIGGER block_new_version BEFORE INSERT ON host_facts
                  FOR EACH ROW SIGNAL SQLSTATE '45000'"
             }
             _ => {
-                "CREATE TRIGGER block_new_version BEFORE INSERT ON agent_facts
+                "CREATE TRIGGER block_new_version BEFORE INSERT ON host_facts
                  BEGIN SELECT RAISE(ABORT, 'blocked'); END"
             }
         };
@@ -2066,9 +2057,9 @@ mod tests {
             .unwrap();
 
         let after = flat(&[("os.version", json!("24.10"))]);
-        assert!(database.record_facts("agent-1", &after, 200).await.is_err());
+        assert!(database.record_facts("host-1", &after, 200).await.is_err());
 
-        let facts = database.current_facts("agent-1").await.unwrap();
+        let facts = database.current_facts("host-1").await.unwrap();
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].value, json!("24.04"));
     }
@@ -2076,26 +2067,26 @@ mod tests {
     #[tokio::test]
     async fn concurrent_reports_never_leave_two_current_values() {
         let database = Database::for_test().await;
-        database.save_agent(&record("agent-1")).await.unwrap();
+        database.save_host(&record("host-1")).await.unwrap();
 
         let reports = (0..20).map(|n| {
             let database = database.clone();
             tokio::spawn(async move {
                 let facts = flat(&[("os.version", json!(n))]);
-                database.record_facts("agent-1", &facts, n).await.unwrap();
+                database.record_facts("host-1", &facts, n).await.unwrap();
             })
         });
         for report in reports.collect::<Vec<_>>() {
             report.await.unwrap();
         }
 
-        assert_eq!(database.current_facts("agent-1").await.unwrap().len(), 1);
+        assert_eq!(database.current_facts("host-1").await.unwrap().len(), 1);
     }
 
     #[tokio::test]
     async fn works_on_sqlite() {
         let folder = tempfile::tempdir().unwrap();
-        let path = folder.path().join("nested/folder/agents.db");
+        let path = folder.path().join("nested/folder/hosts.db");
         exercise(&format!("sqlite://{}?mode=rwc", path.display())).await;
     }
 
@@ -2119,13 +2110,13 @@ mod tests {
         database
             .connection
             .execute_unprepared(
-                "INSERT INTO agents (id, public_key, host, state, first_seen_ms)
+                "INSERT INTO hosts (id, public_key, hostname, state, first_seen_ms)
                  VALUES ('a', 'b', 'c', 'trusted', 1)",
             )
             .await
             .unwrap();
 
-        assert!(database.load_agents().await.is_err());
+        assert!(database.load_hosts().await.is_err());
     }
 
     #[tokio::test]
@@ -2147,19 +2138,19 @@ mod tests {
         );
 
         Migrator::up(connection, None).await.unwrap();
-        let agents = database.load_agents().await.unwrap();
-        assert_eq!(agents.len(), 2, "both built-in agents are back: {agents:?}");
+        let hosts = database.load_hosts().await.unwrap();
+        assert_eq!(hosts.len(), 2, "both built-in hosts are back: {hosts:?}");
     }
 
     #[tokio::test]
     async fn starting_again_changes_nothing_and_keeps_what_was_saved() {
         let database = Database::for_test().await;
-        database.save_agent(&record("agent-1")).await.unwrap();
+        database.save_host(&record("host-1")).await.unwrap();
 
         Migrator::up(&database.connection, None).await.unwrap();
 
-        let agents = database.load_agents().await.unwrap();
-        assert!(agents.iter().any(|agent| agent.id == "agent-1"));
+        let hosts = database.load_hosts().await.unwrap();
+        assert!(hosts.iter().any(|host| host.id == "host-1"));
     }
 
     #[tokio::test]

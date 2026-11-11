@@ -23,7 +23,7 @@ use super::rollups::{
     full_resolution_cutoff, hour_of, hours_to_redo, is_due, metric_names, tier_for,
 };
 use super::shared::{
-    MAX_NAME_BYTES, MAX_SERIES_PER_AGENT, StoredSeries, labels_key, rebuilt_output, shortened,
+    MAX_NAME_BYTES, MAX_SERIES_PER_HOST, StoredSeries, labels_key, rebuilt_output, shortened,
     top_of,
 };
 use super::{CollectorStats, LATEST_SAMPLE_MS, MetricsReader, NewSample, Store, StoreStats};
@@ -38,7 +38,7 @@ const LARGEST_VALUE: &str = "1e300";
 
 const BATCH_EVERY: Duration = Duration::from_secs(1);
 
-/// Picking machines lists them all, which can be longer than ClickHouse's default.
+/// Picking hosts lists them all, which can be longer than ClickHouse's default.
 const MAX_QUERY_BYTES: &str = "67108864";
 
 /// Tables are made here, as ClickHouse has no transactions to make them all at once,
@@ -169,6 +169,116 @@ const MIGRATIONS: &[(&str, &[&str])] = &[
             "DROP TABLE IF EXISTS rollups_minute",
         ],
     ),
+    (
+        "0004_rename_agents_to_hosts",
+        &[
+            // The computer being watched is a host everywhere, so the column that said
+            // agent says host. ClickHouse can't rename a column in a table's sort order,
+            // so each table is copied into one made the new way, column for column, and
+            // the two swapped. Each table's steps can run again from the start: the copy
+            // is dropped first, which before the swap is a partial copy and after it is
+            // the old table, whose rows are already in the new one.
+            "DROP TABLE IF EXISTS samples_hosts",
+            "CREATE TABLE samples_hosts (
+             metric String,
+             host   String,
+             labels Map(String, String),
+             time   DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
+             value  Float64 CODEC(Gorilla, ZSTD(1)),
+             kind   String
+         )
+         ENGINE = ReplacingMergeTree
+         PARTITION BY toStartOfMonth(time)
+         ORDER BY (metric, toStartOfHour(time), host, labels, time)",
+            "INSERT INTO samples_hosts
+             SELECT * REPLACE (multiIf(metric = 'server.agents_online', 'server.hosts_online', metric = 'server.agents_approved', 'server.hosts_approved', metric = 'server.agents_waiting', 'server.hosts_waiting', metric) AS metric)
+             FROM samples SETTINGS max_partitions_per_insert_block = 0",
+            "EXCHANGE TABLES samples AND samples_hosts",
+            "DROP TABLE samples_hosts",
+            "DROP TABLE IF EXISTS texts_hosts",
+            "CREATE TABLE texts_hosts (
+             metric String,
+             host   String,
+             labels Map(String, String),
+             time   DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
+             value  Nullable(String)
+         )
+         ENGINE = ReplacingMergeTree
+         PARTITION BY toStartOfMonth(time)
+         ORDER BY (host, metric, labels, time)",
+            "INSERT INTO texts_hosts SELECT * FROM texts SETTINGS max_partitions_per_insert_block = 0",
+            "EXCHANGE TABLES texts AND texts_hosts",
+            "DROP TABLE texts_hosts",
+            "DROP TABLE IF EXISTS series_hosts",
+            "CREATE TABLE series_hosts (
+             host   String,
+             metric String,
+             labels Map(String, String)
+         )
+         ENGINE = ReplacingMergeTree
+         ORDER BY (host, metric, labels)",
+            "INSERT INTO series_hosts
+             SELECT * REPLACE (multiIf(metric = 'server.agents_online', 'server.hosts_online', metric = 'server.agents_approved', 'server.hosts_approved', metric = 'server.agents_waiting', 'server.hosts_waiting', metric) AS metric)
+             FROM series SETTINGS max_partitions_per_insert_block = 0",
+            "EXCHANGE TABLES series AND series_hosts",
+            "DROP TABLE series_hosts",
+            "DROP TABLE IF EXISTS reports_hosts",
+            "CREATE TABLE reports_hosts (
+             time DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
+             host String
+         )
+         ENGINE = ReplacingMergeTree
+         PARTITION BY toStartOfMonth(time)
+         ORDER BY (time, host)",
+            "INSERT INTO reports_hosts SELECT * FROM reports SETTINGS max_partitions_per_insert_block = 0",
+            "EXCHANGE TABLES reports AND reports_hosts",
+            "DROP TABLE reports_hosts",
+            "DROP TABLE IF EXISTS rollups_five_minute_hosts",
+            "CREATE TABLE rollups_five_minute_hosts (
+                 metric  LowCardinality(String),
+                 host    String,
+                 series  String,
+                 time    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
+                 low     Float64,
+                 high    Float64,
+                 summed  Float64,
+                 samples UInt64,
+                 version UInt64
+             )
+             ENGINE = ReplacingMergeTree(version)
+             PARTITION BY toStartOfMonth(time)
+             ORDER BY (metric, host, series, time)",
+            "INSERT INTO rollups_five_minute_hosts
+             SELECT * REPLACE (if(metric = 'server.agents', 'server.hosts', metric) AS metric)
+             FROM rollups_five_minute SETTINGS max_partitions_per_insert_block = 0",
+            "EXCHANGE TABLES rollups_five_minute AND rollups_five_minute_hosts",
+            "DROP TABLE rollups_five_minute_hosts",
+            "DROP TABLE IF EXISTS rollups_hour_hosts",
+            "CREATE TABLE rollups_hour_hosts (
+                 metric  LowCardinality(String),
+                 host    String,
+                 series  String,
+                 time    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
+                 low     Float64,
+                 high    Float64,
+                 summed  Float64,
+                 samples UInt64,
+                 version UInt64
+             )
+             ENGINE = ReplacingMergeTree(version)
+             PARTITION BY toStartOfYear(time)
+             ORDER BY (metric, host, series, time)",
+            "INSERT INTO rollups_hour_hosts
+             SELECT * REPLACE (if(metric = 'server.agents', 'server.hosts', metric) AS metric)
+             FROM rollups_hour SETTINGS max_partitions_per_insert_block = 0",
+            "EXCHANGE TABLES rollups_hour AND rollups_hour_hosts",
+            "DROP TABLE rollups_hour_hosts",
+            // The server's own count of hosts keeps its rollups and how far they got.
+            "INSERT INTO rollup_progress
+             SELECT 'server.hosts', done_until_ms, version FROM rollup_progress FINAL
+             WHERE metric = 'server.agents'",
+        ],
+    ),
 ];
 
 /// One runtime for every store, as the client is async and stores aren't. It's never
@@ -200,7 +310,7 @@ type Labels = BTreeMap<String, String>;
 #[derive(Row, Serialize)]
 struct SampleRow {
     metric: String,
-    agent: String,
+    host: String,
     labels: Labels,
     time: i64,
     value: f64,
@@ -210,7 +320,7 @@ struct SampleRow {
 #[derive(Row, Serialize)]
 struct TextRow {
     metric: String,
-    agent: String,
+    host: String,
     labels: Labels,
     time: i64,
     value: Option<String>,
@@ -218,7 +328,7 @@ struct TextRow {
 
 #[derive(Row, Serialize, Deserialize)]
 struct SeriesRow {
-    agent: String,
+    host: String,
     metric: String,
     labels: Labels,
 }
@@ -226,7 +336,7 @@ struct SeriesRow {
 #[derive(Row, Serialize)]
 struct ReportRow {
     time: i64,
-    agent: String,
+    host: String,
 }
 
 /// What a batch of samples adds, gathered first so it can be written in one go.
@@ -243,7 +353,7 @@ struct Rows {
 /// Something remembered for a batch that may never reach the database.
 enum Undo {
     Series {
-        agent: String,
+        host: String,
         print: u64,
     },
     Text {
@@ -259,9 +369,9 @@ enum Undo {
 }
 
 /// A series, as a number for this server's own bookkeeping. It's never stored.
-fn fingerprint(agent: &str, metric: &str, labels: &str) -> u64 {
+fn fingerprint(host: &str, metric: &str, labels: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
-    (agent, metric, labels).hash(&mut hasher);
+    (host, metric, labels).hash(&mut hasher);
     hasher.finish()
 }
 
@@ -290,15 +400,15 @@ fn labelled(labels: &[(String, String)]) -> Labels {
 
 impl Memory {
     /// For an agent whose rows have been deleted.
-    fn forget(&mut self, agent: &str) {
+    fn forget(&mut self, host: &str) {
         let texts = self
             .text_series
             .iter()
-            .filter(|((owner, _), _)| owner == agent)
+            .filter(|((owner, _), _)| owner == host)
             .flat_map(|(_, series)| series.keys().copied());
         let prints: Vec<u64> = self
             .series
-            .remove(agent)
+            .remove(host)
             .unwrap_or_default()
             .into_iter()
             .chain(texts)
@@ -306,39 +416,39 @@ impl Memory {
         for print in prints {
             self.texts.remove(&print);
         }
-        self.text_series.retain(|(owner, _), _| owner != agent);
-        self.over_limit.remove(agent);
+        self.text_series.retain(|(owner, _), _| owner != host);
+        self.over_limit.remove(host);
     }
 
     /// False once an agent has as many series as it's allowed.
     fn allow(
         &mut self,
-        agent: &str,
+        host: &str,
         metric: &str,
         labels: &[(String, String)],
         rows: &mut Rows,
     ) -> bool {
-        let print = fingerprint(agent, metric, &labels_key(labels));
-        let known = self.series.entry(agent.to_string()).or_default();
+        let print = fingerprint(host, metric, &labels_key(labels));
+        let known = self.series.entry(host.to_string()).or_default();
         if known.contains(&print) {
             return true;
         }
-        if known.len() >= MAX_SERIES_PER_AGENT {
-            if self.over_limit.insert(agent.to_string()) {
+        if known.len() >= MAX_SERIES_PER_HOST {
+            if self.over_limit.insert(host.to_string()) {
                 warn!(
-                    agent,
-                    "an agent reached the limit on series, ignoring new ones"
+                    host,
+                    "a host reached the limit on series, ignoring new ones"
                 );
             }
             return false;
         }
         known.insert(print);
         rows.undo.push(Undo::Series {
-            agent: agent.to_string(),
+            host: host.to_string(),
             print,
         });
         rows.series.push(SeriesRow {
-            agent: agent.to_string(),
+            host: host.to_string(),
             metric: metric.to_string(),
             labels: labelled(labels),
         });
@@ -350,10 +460,10 @@ impl Memory {
             .ok()
             .filter(|_| new.sample.timestamp_ms <= LATEST_SAMPLE_MS)
             .context("timestamp out of range")?;
-        let agent = new.agent_id.as_str();
+        let host = new.host_id.as_str();
         rows.reports.push(ReportRow {
             time,
-            agent: agent.to_string(),
+            host: host.to_string(),
         });
 
         for (collector, output) in &new.sample.metrics {
@@ -373,13 +483,13 @@ impl Memory {
                 let item = labels_key(&reading.labels);
                 items.insert(item.clone());
                 let metric = format!("{collector}.{}", reading.metric);
-                if !self.allow(agent, &metric, &reading.labels, rows) {
+                if !self.allow(host, &metric, &reading.labels, rows) {
                     continue;
                 }
                 match reading.value {
                     Reported::Number(value, kind) => rows.samples.push(SampleRow {
                         metric,
-                        agent: agent.to_string(),
+                        host: host.to_string(),
                         labels: labelled(&reading.labels),
                         time,
                         value,
@@ -387,7 +497,7 @@ impl Memory {
                     }),
                     Reported::Text(text) => {
                         let text = shortened(text);
-                        let print = fingerprint(agent, &metric, &item);
+                        let print = fingerprint(host, &metric, &item);
                         reported.insert(print);
                         if self.texts.get(&print).is_none_or(|known| known != text) {
                             let previous = self.texts.insert(print, text.to_string());
@@ -395,13 +505,13 @@ impl Memory {
                             let labels = labelled(&reading.labels);
                             rows.texts.push(TextRow {
                                 metric: metric.clone(),
-                                agent: agent.to_string(),
+                                host: host.to_string(),
                                 labels: labels.clone(),
                                 time,
                                 value: Some(text.to_string()),
                             });
                             self.text_series
-                                .entry((agent.to_string(), collector.clone()))
+                                .entry((host.to_string(), collector.clone()))
                                 .or_default()
                                 .insert(
                                     print,
@@ -418,7 +528,7 @@ impl Memory {
 
             // Something that was reported and isn't any more, like a check's error. A
             // sample may only cover some items, so only the ones in it can have changed.
-            let key = (agent.to_string(), collector.clone());
+            let key = (host.to_string(), collector.clone());
             if let Some(current) = self.text_series.get_mut(&key) {
                 current.retain(|print, series| {
                     let gone = items.contains(&series.item) && !reported.contains(print);
@@ -431,7 +541,7 @@ impl Memory {
                         });
                         rows.texts.push(TextRow {
                             metric: series.metric.clone(),
-                            agent: agent.to_string(),
+                            host: host.to_string(),
                             labels: series.labels.clone(),
                             time,
                             value: None,
@@ -450,8 +560,8 @@ impl Memory {
     fn take_back(&mut self, undo: Vec<Undo>) {
         for step in undo.into_iter().rev() {
             match step {
-                Undo::Series { agent, print } => {
-                    if let Some(known) = self.series.get_mut(&agent) {
+                Undo::Series { host, print } => {
+                    if let Some(known) = self.series.get_mut(&host) {
                         known.remove(&print);
                     }
                 }
@@ -484,7 +594,7 @@ impl Memory {
 
 #[derive(Row, Deserialize)]
 struct CurrentText {
-    agent: String,
+    host: String,
     metric: String,
     labels: Labels,
     value: String,
@@ -503,24 +613,20 @@ fn labels_of(labels: &Labels) -> Vec<(String, String)> {
 async fn load_memory(client: &Client) -> Result<Memory> {
     let mut memory = Memory::default();
     let series: Vec<SeriesRow> = client
-        .query("SELECT agent, metric, labels FROM series FINAL")
+        .query("SELECT host, metric, labels FROM series FINAL")
         .fetch_all()
         .await
         .context("loading series")?;
     for row in series {
-        let print = fingerprint(
-            &row.agent,
-            &row.metric,
-            &labels_key(&labels_of(&row.labels)),
-        );
-        memory.series.entry(row.agent).or_default().insert(print);
+        let print = fingerprint(&row.host, &row.metric, &labels_key(&labels_of(&row.labels)));
+        memory.series.entry(row.host).or_default().insert(print);
     }
 
     let texts: Vec<CurrentText> = client
         .query(
-            "SELECT agent, metric, labels, assumeNotNull(newest) AS value FROM (
-                 SELECT agent, metric, labels, argMax(tuple(value), time).1 AS newest
-                 FROM texts GROUP BY agent, metric, labels
+            "SELECT host, metric, labels, assumeNotNull(newest) AS value FROM (
+                 SELECT host, metric, labels, argMax(tuple(value), time).1 AS newest
+                 FROM texts GROUP BY host, metric, labels
              ) WHERE newest IS NOT NULL",
         )
         .fetch_all()
@@ -528,7 +634,7 @@ async fn load_memory(client: &Client) -> Result<Memory> {
         .context("loading text")?;
     for row in texts {
         let item = labels_key(&labels_of(&row.labels));
-        let print = fingerprint(&row.agent, &row.metric, &item);
+        let print = fingerprint(&row.host, &row.metric, &item);
         let collector = row.metric.split('.').next().unwrap_or_default().to_string();
         memory.texts.insert(print, row.value);
         let series = TextSeries {
@@ -538,7 +644,7 @@ async fn load_memory(client: &Client) -> Result<Memory> {
         };
         memory
             .text_series
-            .entry((row.agent, collector))
+            .entry((row.host, collector))
             .or_default()
             .insert(print, series);
     }
@@ -689,7 +795,7 @@ impl ClickHouseStore {
 
     /// Samples first and the list of series last, so a delete that fails partway
     /// still knows what's left to delete when it's tried again.
-    async fn delete_rows(&self, agent_id: &str) -> Result<()> {
+    async fn delete_rows(&self, host_id: &str) -> Result<()> {
         let tables = [
             "samples",
             "texts",
@@ -700,11 +806,11 @@ impl ClickHouseStore {
         ];
         for table in tables {
             self.client
-                .query(&format!("DELETE FROM {table} WHERE agent = ?"))
-                .bind(agent_id)
+                .query(&format!("DELETE FROM {table} WHERE host = ?"))
+                .bind(host_id)
                 .execute()
                 .await
-                .with_context(|| format!("deleting an agent's {table}"))?;
+                .with_context(|| format!("deleting a host's {table}"))?;
         }
         Ok(())
     }
@@ -760,15 +866,15 @@ impl ClickHouseStore {
         let name = quoted(metric.name);
         let sql = format!(
             "INSERT INTO rollups_five_minute
-                 (metric, agent, series, time, low, high, summed, samples, version)
-             SELECT {name}, agent, series,
+                 (metric, host, series, time, low, high, summed, samples, version)
+             SELECT {name}, host, series,
                     fromUnixTimestamp64Milli(
                         toInt64(intDiv(t, {FIVE_MINUTES_MS}) * {FIVE_MINUTES_MS}), 'UTC'
                     ) AS span,
                     min(v), max(v), sum(v), count(), {version}
              FROM ({values})
              WHERE t >= {hour} AND t < {end}
-             GROUP BY agent, series, span",
+             GROUP BY host, series, span",
             values = computed(metric, &time_between(hour - lead, end, "<")),
         );
         self.client
@@ -778,12 +884,12 @@ impl ClickHouseStore {
             .with_context(|| format!("rolling up 5 minutes of {}", metric.name))?;
         let sql = format!(
             "INSERT INTO rollups_hour
-                 (metric, agent, series, time, low, high, summed, samples, version)
-             SELECT metric, agent, series, fromUnixTimestamp64Milli(toInt64({hour}), 'UTC'),
+                 (metric, host, series, time, low, high, summed, samples, version)
+             SELECT metric, host, series, fromUnixTimestamp64Milli(toInt64({hour}), 'UTC'),
                     min(low), max(high), sum(summed), sum(samples), {version}
              FROM rollups_five_minute FINAL
              WHERE metric = {name} AND {}
-             GROUP BY metric, agent, series",
+             GROUP BY metric, host, series",
             time_between(hour, end, "<"),
         );
         self.client
@@ -895,9 +1001,9 @@ impl ClickHouseStore {
             statements.push(format!("DELETE FROM reports WHERE {before}"));
             statements.push(format!(
                 "DELETE FROM texts WHERE {before}
-                 AND (agent, metric, labels, time) NOT IN (
-                     SELECT agent, metric, labels, max(time) FROM texts
-                     GROUP BY agent, metric, labels
+                 AND (host, metric, labels, time) NOT IN (
+                     SELECT host, metric, labels, max(time) FROM texts
+                     GROUP BY host, metric, labels
                  )"
             ));
         }
@@ -975,9 +1081,9 @@ impl Store for ClickHouseStore {
         Ok(self.redo_next()? || self.roll_up_next(now_ms)? || self.expire(now_ms)?)
     }
 
-    fn delete_agent(&mut self, agent_id: &str) -> Result<()> {
-        wait(self.delete_rows(agent_id))?;
-        self.memory.forget(agent_id);
+    fn delete_host(&mut self, host_id: &str) -> Result<()> {
+        wait(self.delete_rows(host_id))?;
+        self.memory.forget(host_id);
         Ok(())
     }
 
@@ -1020,7 +1126,7 @@ fn reading_values(metric: &Metric, reading: Reading, naming: &Naming<'_>, scope:
     let filter = naming.filter();
     match reading {
         Reading::Field(path) | Reading::Rate(path) => format!(
-            "SELECT agent, toUnixTimestamp64Milli(time) AS t, {series} AS series, value AS v
+            "SELECT host, toUnixTimestamp64Milli(time) AS t, {series} AS series, value AS v
              FROM samples WHERE metric = {name} {filter} AND {scope}",
             name = quoted(&stored_name(metric, path)),
         ),
@@ -1028,10 +1134,10 @@ fn reading_values(metric: &Metric, reading: Reading, naming: &Naming<'_>, scope:
             let part = quoted(&stored_name(metric, part));
             let whole = quoted(&stored_name(metric, whole));
             format!(
-                "SELECT agent, toUnixTimestamp64Milli(time) AS t, {series} AS series,
+                "SELECT host, toUnixTimestamp64Milli(time) AS t, {series} AS series,
                         avgIf(value, metric = {part}) / nullIf(avgIf(value, metric = {whole}), 0) * 100 AS v
                  FROM samples WHERE metric IN ({part}, {whole}) {filter} AND {scope}
-                 GROUP BY agent, t, series
+                 GROUP BY host, t, series
                  HAVING countIf(metric = {part}) > 0 AND countIf(metric = {whole}) > 0"
             )
         }
@@ -1073,15 +1179,15 @@ fn computed(metric: &Metric, scope: &str) -> String {
     let readings = readings(metric, scope);
     let value = if is_rate(metric.source) {
         "v * 1000.0 / nullIf(t - lagInFrame(toNullable(t)) OVER (
-             PARTITION BY agent, series ORDER BY t
+             PARTITION BY host, series ORDER BY t
              ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
          ), 0)"
     } else {
         "v"
     };
     format!(
-        "SELECT agent, t, series, toFloat64(assumeNotNull(v2)) AS v FROM (
-             SELECT agent, t, series, {value} AS v2 FROM ({readings})
+        "SELECT host, t, series, toFloat64(assumeNotNull(v2)) AS v FROM (
+             SELECT host, t, series, {value} AS v2 FROM ({readings})
          ) WHERE v2 IS NOT NULL AND abs(v2) <= {LARGEST_VALUE}"
     )
 }
@@ -1113,13 +1219,13 @@ struct LineRow {
 
 #[derive(Row, Deserialize)]
 struct LastRow {
-    agent: String,
+    host: String,
     time_ms: i64,
 }
 
 #[derive(Row, Deserialize)]
 struct NewestRow {
-    agent: String,
+    host: String,
     series: String,
     time_ms: i64,
     value: f64,
@@ -1127,7 +1233,7 @@ struct NewestRow {
 
 #[derive(Row, Deserialize)]
 struct TrendRow {
-    agent: String,
+    host: String,
     series: String,
     time_ms: i64,
     value: f64,
@@ -1195,7 +1301,7 @@ impl ClickHouseReader {
 /// before the start, as each needs the sample before it.
 fn cells(
     metric: &Metric,
-    agents: &str,
+    hosts: &str,
     (from_ms, to_ms): (i64, i64),
     tier: Tier,
     done: Option<i64>,
@@ -1208,21 +1314,21 @@ fn cells(
         0
     };
     let scope = format!(
-        "{agents} AND {}",
+        "{hosts} AND {}",
         time_between(samples_from - lead, to_ms, "<")
     );
     let mut cells = format!(
-        "SELECT agent, t, series, v AS low, v AS high, v AS summed, toUInt64(1) AS samples
+        "SELECT host, t, series, v AS low, v AS high, v AS summed, toUInt64(1) AS samples
          FROM ({values}) WHERE t >= {samples_from}",
         values = computed(metric, &scope),
     );
     if let Some((table, done)) = rolled {
         cells.push_str(&format!(
             " UNION ALL
-             SELECT agent, toInt64(toUnixTimestamp64Milli(time)) AS t, series, low, high,
+             SELECT host, toInt64(toUnixTimestamp64Milli(time)) AS t, series, low, high,
                     summed, samples
              FROM {table} FINAL
-             WHERE metric = {name} AND {agents} AND {}",
+             WHERE metric = {name} AND {hosts} AND {}",
             time_between(from_ms, to_ms.min(done), "<"),
             name = quoted(metric.name),
         ));
@@ -1235,7 +1341,7 @@ impl MetricsReader for ClickHouseReader {
         let range = query.range;
         let tier = tier_for(range.step_ms, range.from_ms, now_ms(), &self.retention);
         let done = self.rolled_up_until(query.metric)?;
-        let agent = format!("agent = {}", quoted(query.agent_id));
+        let host = format!("host = {}", quoted(query.host_id));
         // An idle interface says nothing, but a CPU at 0% does.
         let having = if is_rate(query.metric.source) {
             "WHERE peak > 0"
@@ -1269,7 +1375,7 @@ impl MetricsReader for ClickHouseReader {
              ORDER BY series, bucket",
             cells = cells(
                 query.metric,
-                &agent,
+                &host,
                 (range.from_ms, range.to_ms),
                 tier,
                 done
@@ -1303,15 +1409,15 @@ impl MetricsReader for ClickHouseReader {
 
     fn last_samples(&self, since_ms: i64, until_ms: i64) -> Result<Vec<LastSample>> {
         let sql = format!(
-            "SELECT agent, toInt64(toUnixTimestamp64Milli(max(time))) AS time_ms
-             FROM reports WHERE {} GROUP BY agent",
+            "SELECT host, toInt64(toUnixTimestamp64Milli(max(time))) AS time_ms
+             FROM reports WHERE {} GROUP BY host",
             time_between(since_ms, until_ms, "<=")
         );
         let rows: Vec<LastRow> = wait(self.client.query_raw(&sql).fetch_all())?;
         Ok(rows
             .into_iter()
             .map(|row| LastSample {
-                agent_id: row.agent,
+                host_id: row.host,
                 time_ms: row.time_ms,
             })
             .collect())
@@ -1319,16 +1425,16 @@ impl MetricsReader for ClickHouseReader {
 
     fn latest_output(
         &self,
-        agent_id: &str,
+        host_id: &str,
         collector: &str,
         since_ms: i64,
         until_ms: i64,
     ) -> Result<Option<Value>> {
-        let agent = quoted(agent_id);
+        let host = quoted(host_id);
         let prefix = quoted(&format!("{collector}."));
         let sql = format!(
             "SELECT metric, labels FROM series FINAL
-             WHERE agent = {agent} AND startsWith(metric, {prefix}) ORDER BY metric"
+             WHERE host = {host} AND startsWith(metric, {prefix}) ORDER BY metric"
         );
         let known: Vec<KnownSeries> = wait(self.client.query_raw(&sql).fetch_all())?;
         if known.is_empty() {
@@ -1343,7 +1449,7 @@ impl MetricsReader for ClickHouseReader {
             .join(", ");
 
         let scope = format!(
-            "metric IN ({metrics}) AND agent = {agent} AND {}",
+            "metric IN ({metrics}) AND host = {host} AND {}",
             time_between(since_ms, until_ms, "<=")
         );
         let sql = format!(
@@ -1357,7 +1463,7 @@ impl MetricsReader for ClickHouseReader {
 
         let sql = format!(
             "SELECT metric, labels, argMax(tuple(value), time).1 AS value FROM texts
-             WHERE agent = {agent} AND startsWith(metric, {prefix})
+             WHERE host = {host} AND startsWith(metric, {prefix})
                AND time <= fromUnixTimestamp64Milli(toInt64({until_ms}), 'UTC')
              GROUP BY metric, labels"
         );
@@ -1406,17 +1512,17 @@ impl MetricsReader for ClickHouseReader {
     fn newest(&self, metric: &Metric, since_ms: i64, until_ms: i64) -> Result<Vec<NewestReading>> {
         let scope = time_between(since_ms, until_ms, "<=");
         let sql = format!(
-            "SELECT agent, series, toInt64(max(t)) AS time_ms, argMax(v, t) AS value
+            "SELECT host, series, toInt64(max(t)) AS time_ms, argMax(v, t) AS value
              FROM ({values})
-             GROUP BY agent, series
-             ORDER BY agent, series",
+             GROUP BY host, series
+             ORDER BY host, series",
             values = computed(metric, &scope),
         );
         let rows: Vec<NewestRow> = wait(self.client.query_raw(&sql).fetch_all())?;
         Ok(rows
             .into_iter()
             .map(|row| NewestReading {
-                agent_id: row.agent,
+                host_id: row.host,
                 series: row.series,
                 time_ms: row.time_ms,
                 value: row.value,
@@ -1429,13 +1535,13 @@ impl MetricsReader for ClickHouseReader {
     fn trends(&self, metric: &Metric, since_ms: i64, until_ms: i64) -> Result<Vec<Trend>> {
         let scope = time_between(since_ms, until_ms, "<=");
         let sql = format!(
-            "SELECT agent, series, toInt64(max(t)) AS time_ms, argMax(v, t) AS value,
+            "SELECT host, series, toInt64(max(t)) AS time_ms, argMax(v, t) AS value,
                     toInt64(min(t)) AS first_ms, count() AS samples,
                     tupleElement(simpleLinearRegression(toFloat64(t - {since_ms}), v), 1) AS slope
              FROM ({values})
-             GROUP BY agent, series
+             GROUP BY host, series
              HAVING time_ms > first_ms
-             ORDER BY agent, series",
+             ORDER BY host, series",
             values = computed(metric, &scope),
         );
         let rows: Vec<TrendRow> = wait(self.client.query_raw(&sql).fetch_all())?;
@@ -1443,7 +1549,7 @@ impl MetricsReader for ClickHouseReader {
             .into_iter()
             .filter(|row| row.slope.is_finite())
             .map(|row| Trend {
-                agent_id: row.agent,
+                host_id: row.host,
                 series: row.series,
                 time_ms: row.time_ms,
                 value: row.value,
@@ -1459,18 +1565,18 @@ impl MetricsReader for ClickHouseReader {
             return Ok(SeriesResult::default());
         }
         let (groups, places) = numbered(&query.members);
-        let agents: Vec<String> = query
+        let hosts: Vec<String> = query
             .members
             .iter()
-            .map(|member| quoted(&member.agent_id))
+            .map(|member| quoted(&member.host_id))
             .collect();
-        let agents = agents.join(", ");
+        let hosts = hosts.join(", ");
 
         let range = query.range;
         let step = range.step_ms.max(SMALLEST_STEP_MS);
         let tier = tier_for(step, range.from_ms, now_ms(), &self.retention);
         let done = self.rolled_up_until(query.metric)?;
-        // The list of machines is by far the longest part of the query, so it's only
+        // The list of hosts is by far the longest part of the query, so it's only
         // written once, and the list of groups only if there's more than one.
         let (places, line) = if query.by_series {
             (String::new(), "series".to_string())
@@ -1480,7 +1586,7 @@ impl MetricsReader for ClickHouseReader {
             let places: Vec<String> = places.iter().map(ToString::to_string).collect();
             (
                 format!(", [{}] AS places", places.join(", ")),
-                "toString(transform(agent, chosen, places, 0))".to_string(),
+                "toString(transform(host, chosen, places, 0))".to_string(),
             )
         };
         // Named lines measure different things, like memory and swap, so they can't be
@@ -1500,7 +1606,7 @@ impl MetricsReader for ClickHouseReader {
         };
         // Ranked in one pass, as ClickHouse would work a `WITH` out again for each use.
         let sql = format!(
-            "WITH [{agents}] AS chosen{places}
+            "WITH [{hosts}] AS chosen{places}
              SELECT line, toInt64(bucket) AS bucket, toFloat64(combined) AS value,
                     toUInt64(lines) AS total
              FROM (
@@ -1510,12 +1616,12 @@ impl MetricsReader for ClickHouseReader {
                          SELECT *, avg(combined) OVER (PARTITION BY line) AS overall
                          FROM (
                              SELECT line, bucket, {combined} AS combined FROM (
-                                 SELECT {line} AS line, agent, series,
+                                 SELECT {line} AS line, host, series,
                                         intDiv(t, {step}) * {step} AS bucket,
                                         sum(summed) / sum(samples) AS v
                                  FROM ({cells})
                                  WHERE 1 {only_main_line}
-                                 GROUP BY line, agent, series, bucket
+                                 GROUP BY line, host, series, bucket
                              )
                              WHERE bucket + {step} <= {to_ms}
                              GROUP BY line, bucket
@@ -1527,7 +1633,7 @@ impl MetricsReader for ClickHouseReader {
              ORDER BY line, bucket",
             cells = cells(
                 query.metric,
-                "has(chosen, agent)",
+                "has(chosen, host)",
                 (range.from_ms, range.to_ms),
                 tier,
                 done
@@ -1573,7 +1679,7 @@ impl MetricsReader for ClickHouseReader {
     fn series_count(&self) -> Result<u64> {
         let count = self
             .client
-            .query("SELECT count() FROM (SELECT DISTINCT agent, metric, labels FROM series)")
+            .query("SELECT count() FROM (SELECT DISTINCT host, metric, labels FROM series)")
             .fetch_one();
         Ok(wait(count)?)
     }
@@ -1697,6 +1803,82 @@ mod tests {
         wait(store.client.query(sql).fetch_one()).unwrap()
     }
 
+    const HOST_TABLES: [&str; 6] = [
+        "samples",
+        "texts",
+        "series",
+        "reports",
+        "rollups_hour",
+        "rollups_five_minute",
+    ];
+
+    #[test]
+    fn agents_become_hosts_keeping_every_row_even_after_stopping_part_way() {
+        let database = new_database();
+        let client = Client::default().with_url(url());
+        let (_, rename) = MIGRATIONS[3];
+        // Stopped just after the first table was swapped, before its old one went.
+        let swapped = rename
+            .iter()
+            .position(|statement| statement.starts_with("EXCHANGE"))
+            .unwrap();
+        wait(async {
+            client
+                .query_raw(&format!("CREATE DATABASE IF NOT EXISTS `{database}`"))
+                .execute()
+                .await?;
+            let client = client.clone().with_database(&database);
+            migrate(&client, &MIGRATIONS[..3]).await?;
+            let time = "fromUnixTimestamp64Milli(toInt64(60000), 'UTC')";
+            for sql in [
+                format!("INSERT INTO samples VALUES ('cpu.usage', 'a', map(), {time}, 1, 'n')"),
+                format!("INSERT INTO texts VALUES ('os', 'a', map(), {time}, 'Linux')"),
+                "INSERT INTO series VALUES ('a', 'cpu.usage', map())".to_string(),
+                format!("INSERT INTO reports VALUES ({time}, 'a')"),
+                format!("INSERT INTO rollups_hour VALUES ('cpu.usage', 'a', 'CPU', {time}, 1, 2, 3, 4, 1)"),
+                format!(
+                    "INSERT INTO rollups_five_minute VALUES ('cpu.usage', 'a', 'CPU', {time}, 1, 2, 3, 4, 1)"
+                ),
+                format!("INSERT INTO samples VALUES ('server.agents_online', 'server', map(), {time}, 1, 'n')"),
+                format!("INSERT INTO rollups_hour VALUES ('server.agents', 'server', 'Online', {time}, 1, 2, 3, 4, 1)"),
+                "INSERT INTO rollup_progress VALUES ('server.agents', 60000, 1)".to_string(),
+            ] {
+                client.query_raw(&sql).execute().await?;
+            }
+            for statement in &rename[..=swapped] {
+                client.query_raw(statement).execute().await?;
+            }
+            anyhow::Ok(())
+        })
+        .unwrap();
+
+        let store = opened(&database);
+
+        for table in HOST_TABLES {
+            let sql = format!("SELECT count() FROM {table} WHERE host = 'a'");
+            assert_eq!(count(&store, &sql), 1, "{table}");
+        }
+        let left = count(
+            &store,
+            "SELECT count() FROM system.columns
+             WHERE database = currentDatabase() AND name = 'agent'",
+        );
+        assert_eq!(left, 0, "no table still has the old column");
+        for sql in [
+            "SELECT count() FROM samples WHERE metric = 'server.hosts_online'",
+            "SELECT count() FROM rollups_hour WHERE metric = 'server.hosts'",
+            "SELECT count() FROM rollup_progress FINAL WHERE metric = 'server.hosts'",
+        ] {
+            assert_eq!(count(&store, sql), 1, "{sql}");
+        }
+        let copies = count(
+            &store,
+            "SELECT count() FROM system.tables
+             WHERE database = currentDatabase() AND name LIKE '%_hosts'",
+        );
+        assert_eq!(copies, 0);
+    }
+
     #[test]
     fn minute_rollups_become_exactly_the_five_minute_ones() {
         let database = new_database();
@@ -1753,9 +1935,9 @@ mod tests {
     #[test]
     fn a_sample_sent_twice_is_stored_once_after_merging() {
         let mut store = in_memory();
-        for agent in ["a", "a", "b"] {
+        for host in ["a", "a", "b"] {
             let cpu = json!({ "usage_percent": 5.0 });
-            write_metric(&mut store, agent, 1000, "cpu", cpu);
+            write_metric(&mut store, host, 1000, "cpu", cpu);
         }
 
         wait(store.client.query("OPTIMIZE TABLE samples FINAL").execute()).unwrap();
@@ -1766,18 +1948,18 @@ mod tests {
     #[test]
     fn deleting_an_agent_forgets_it_in_memory_and_in_every_table() {
         let mut store = in_memory();
-        for agent in ["gone", "kept"] {
+        for host in ["gone", "kept"] {
             let checks = json!([{ "name": "site", "kind": "http", "up": 0, "error": "no" }]);
-            write_metric(&mut store, agent, 1000, "checks", checks);
+            write_metric(&mut store, host, 1000, "checks", checks);
         }
         store.memory.over_limit.insert("gone".to_string());
 
-        store.delete_agent("gone").unwrap();
+        store.delete_host("gone").unwrap();
 
         for table in ["samples", "texts", "series", "reports"] {
-            let sql = format!("SELECT count() FROM {table} WHERE agent = 'gone'");
+            let sql = format!("SELECT count() FROM {table} WHERE host = 'gone'");
             assert_eq!(count(&store, &sql), 0, "{table}");
-            let sql = format!("SELECT count() FROM {table} WHERE agent = 'kept'");
+            let sql = format!("SELECT count() FROM {table} WHERE host = 'kept'");
             assert!(count(&store, &sql) > 0, "{table}");
         }
         assert!(!store.memory.series.contains_key("gone"));
@@ -1787,7 +1969,7 @@ mod tests {
                 .memory
                 .text_series
                 .keys()
-                .all(|(agent, _)| agent == "kept")
+                .all(|(host, _)| host == "kept")
         );
         let kept_texts: usize = store.memory.text_series.values().map(HashMap::len).sum();
         assert_eq!(store.memory.texts.len(), kept_texts);
@@ -1797,12 +1979,12 @@ mod tests {
     #[test]
     fn one_agent_cannot_flood_the_store() {
         let mut store = in_memory();
-        let full: HashSet<u64> = (0..MAX_SERIES_PER_AGENT as u64).collect();
+        let full: HashSet<u64> = (0..MAX_SERIES_PER_HOST as u64).collect();
         store.memory.series.insert("noisy".to_string(), full);
 
-        for agent in ["noisy", "calm"] {
+        for host in ["noisy", "calm"] {
             let cpu = json!({ "usage_percent": 1.0 });
-            write_metric(&mut store, agent, 1000, "cpu", cpu);
+            write_metric(&mut store, host, 1000, "cpu", cpu);
         }
 
         assert_eq!(count(&store, "SELECT count() FROM samples"), 1);

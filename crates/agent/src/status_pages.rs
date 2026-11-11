@@ -20,7 +20,7 @@ use serde_json::{Map, Value, json};
 use crate::background::{Background, probe_all};
 use crate::collector::Collector;
 
-/// A status page is a few lines served by the machine itself, so anything slower
+/// A status page is a few lines served by the host itself, so anything slower
 /// than this is a server in trouble.
 const TIMEOUT: Duration = Duration::from_secs(10);
 

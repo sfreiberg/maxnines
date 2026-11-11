@@ -50,9 +50,9 @@ impl Role {
                 "Also acknowledges and silences alerts, and adds and deletes annotations"
             }
             Self::Editor => {
-                "Also changes rules, channels, checks and dashboards, and approves agents"
+                "Also changes rules, channels, checks and dashboards, and approves hosts"
             }
-            Self::Admin => "Also manages users, reads the audit log and deletes machines",
+            Self::Admin => "Also manages users, reads the audit log and deletes hosts",
         }
     }
 
@@ -82,9 +82,9 @@ const OWN: [&str; 4] = ["/profile", "/logout", "/settings/api-keys", "/api-keys"
 
 /// Dealing with alerts as they happen: acknowledging them and silencing them.
 const RESPONDING: [&str; 14] = [
-    "/agents/{id}/annotations",
-    "/agents/{id}/maintenance",
-    "/agents/{id}/maintenance/end",
+    "/hosts/{id}/annotations",
+    "/hosts/{id}/maintenance",
+    "/hosts/{id}/maintenance/end",
     "/alerts/{id}/acknowledge",
     "/alerts/{id}/unacknowledge",
     "/alerts/silences",
@@ -110,10 +110,10 @@ pub fn required(method: &Method, route: &str) -> Role {
     if ADMIN_ONLY.iter().any(|prefix| starts(route, prefix)) {
         return Role::Admin;
     }
-    // Deleting a machine takes its history with it.
-    let deletes_agent =
-        (method == Method::DELETE && route == "/agents/{id}") || route == "/agents/{id}/delete";
-    if deletes_agent {
+    // Deleting a host takes its history with it.
+    let deletes_host =
+        (method == Method::DELETE && route == "/hosts/{id}") || route == "/hosts/{id}/delete";
+    if deletes_host {
         return Role::Admin;
     }
     if OWN.iter().any(|prefix| starts(route, prefix)) {
@@ -156,7 +156,7 @@ mod tests {
     fn reading_needs_a_viewer_and_changing_needs_an_editor() {
         for route in [
             "/",
-            "/agents",
+            "/hosts",
             "/alerts",
             "/alerts/rules",
             "/alerts/rules/{id}/edit",
@@ -170,7 +170,7 @@ mod tests {
             (Method::POST, "/alerts/rules"),
             (Method::PUT, "/alert-rules/{id}"),
             (Method::DELETE, "/dashboards/{id}"),
-            (Method::POST, "/agents/{id}/approve"),
+            (Method::POST, "/hosts/{id}/approve"),
             (Method::POST, "/notification-channels/{id}/test"),
             (Method::GET, "/alerts/rules/new"),
             (Method::GET, "/dashboards/{id}/edit"),
@@ -198,7 +198,7 @@ mod tests {
         );
         assert_eq!(required(&Method::GET, "/alerts/silences"), Role::Viewer);
         for (method, route) in [
-            (Method::POST, "/agents/{id}/annotations"),
+            (Method::POST, "/hosts/{id}/annotations"),
             (Method::POST, "/annotations"),
             (Method::DELETE, "/annotations/{id}"),
             (Method::POST, "/metrics/annotations"),
@@ -212,7 +212,7 @@ mod tests {
         }
         assert_eq!(required(&Method::GET, "/annotations"), Role::Viewer);
         assert_eq!(required(&Method::GET, "/metrics/annotations"), Role::Viewer);
-        assert_eq!(required(&Method::GET, "/agents/{id}/events"), Role::Viewer);
+        assert_eq!(required(&Method::GET, "/hosts/{id}/events"), Role::Viewer);
         assert_eq!(required(&Method::GET, "/silences"), Role::Viewer);
     }
 
@@ -225,8 +225,8 @@ mod tests {
             (Method::PUT, "/users/{id}"),
             (Method::GET, "/settings/audit-log"),
             (Method::GET, "/audit-log"),
-            (Method::DELETE, "/agents/{id}"),
-            (Method::POST, "/agents/{id}/delete"),
+            (Method::DELETE, "/hosts/{id}"),
+            (Method::POST, "/hosts/{id}/delete"),
         ] {
             assert_eq!(required(&method, route), Role::Admin, "{method} {route}");
         }

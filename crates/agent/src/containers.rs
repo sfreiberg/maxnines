@@ -1,4 +1,4 @@
-//! Containers on the machine, through Docker's API, which Podman offers too. Reading
+//! Containers on the host, through Docker's API, which Podman offers too. Reading
 //! it needs the agent's user to be allowed Docker's socket, which is as good as root,
 //! so the collector is off until a rule turns it on.
 //!
@@ -27,7 +27,7 @@ use tracing::warn;
 use crate::background::Background;
 use crate::collector::Collector;
 
-/// No machine needs more than this many charted, and each one is its own series.
+/// No host needs more than this many charted, and each one is its own series.
 const MAX_CONTAINERS: usize = 64;
 
 /// How long one call to Docker can take, in seconds.
@@ -39,7 +39,7 @@ const SOCKETS: [&str; 2] = ["/var/run/docker.sock", "/run/podman/podman.sock"];
 
 pub struct ContainerCollector {
     background: Background,
-    /// Each container's CPU time and the machine's when last read, to measure use
+    /// Each container's CPU time and the host's when last read, to measure use
     /// from one sample to the next.
     cpu: HashMap<String, (u64, u64)>,
 }

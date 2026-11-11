@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use crate::audit::{self, Acting, Actor};
 use crate::config::Config;
-use crate::controllers::api::{AgentView, BASE_PATH};
+use crate::controllers::api::{BASE_PATH, HostView};
 use crate::fact_history::describe_history;
 use crate::metrics::now_ms;
 use crate::models::{
@@ -66,14 +66,14 @@ fn api_key() -> Result<String> {
         })
 }
 
-/// Where this machine reaches the server, even if it listens on all addresses. With
+/// Where this host reaches the server, even if it listens on all addresses. With
 /// HTTPS that's its public name, as that's what its certificate says.
 fn server_url(config: &Config) -> String {
     if config.tls.is_some() {
         let audience = config.audience();
-        let host = audience.strip_prefix("wss://").unwrap_or(&audience);
-        let host = host.split('/').next().unwrap_or(host);
-        return format!("https://{host}");
+        let hostname = audience.strip_prefix("wss://").unwrap_or(&audience);
+        let hostname = hostname.split('/').next().unwrap_or(hostname);
+        return format!("https://{hostname}");
     }
     let listen = config.listen;
     let mut address = listen;
@@ -113,7 +113,7 @@ fn explain(error: ureq::Error, url: &str) -> anyhow::Error {
         ureq::Error::StatusCode(401) => {
             anyhow::anyhow!("the server refused the API key in {API_KEY_VARIABLE}")
         }
-        ureq::Error::StatusCode(404) => anyhow::anyhow!("no agent with that ID"),
+        ureq::Error::StatusCode(404) => anyhow::anyhow!("no host with that ID"),
         ureq::Error::StatusCode(code) => anyhow::anyhow!("the server returned status {code}"),
         other => anyhow::Error::new(other).context(format!("is the server running at {url}?")),
     }
@@ -131,12 +131,12 @@ fn get_json(config: &Config, path: &str) -> Result<String> {
     Ok(response.body_mut().read_to_string()?)
 }
 
-pub fn print_agents(config: &Config) -> Result<()> {
-    let body = get_json(config, &format!("{BASE_PATH}/agents"))?;
-    let agents: Vec<AgentView> = serde_json::from_str(&body).context("invalid server response")?;
+pub fn print_hosts(config: &Config) -> Result<()> {
+    let body = get_json(config, &format!("{BASE_PATH}/hosts"))?;
+    let hosts: Vec<HostView> = serde_json::from_str(&body).context("invalid server response")?;
 
-    if agents.is_empty() {
-        println!("no agents yet");
+    if hosts.is_empty() {
+        println!("no hosts yet");
         return Ok(());
     }
 
@@ -144,29 +144,29 @@ pub fn print_agents(config: &Config) -> Result<()> {
         "{:<32}  {:<9} {:<8} {:<24} HOST",
         "ID", "STATE", "ONLINE", "DECIDED BY"
     );
-    for view in agents {
-        let agent = view.agent;
+    for view in hosts {
+        let host = view.host;
         println!(
             "{:<32}  {:<9} {:<8} {:<24} {}",
-            agent.id,
-            agent.state.as_str(),
+            host.id,
+            host.state.as_str(),
             if view.online { "yes" } else { "no" },
-            agent.decided_by.as_deref().unwrap_or("-"),
-            agent.host,
+            host.decided_by.as_deref().unwrap_or("-"),
+            host.hostname,
         );
     }
     Ok(())
 }
 
 pub fn print_facts(config: &Config, id: &str) -> Result<()> {
-    let body = get_json(config, &format!("{BASE_PATH}/agents/{id}/facts"))?;
+    let body = get_json(config, &format!("{BASE_PATH}/hosts/{id}/facts"))?;
     let view: Value = serde_json::from_str(&body).context("invalid server response")?;
     println!("{}", serde_json::to_string_pretty(&view)?);
     Ok(())
 }
 
 pub fn print_facts_history(config: &Config, id: &str) -> Result<()> {
-    let body = get_json(config, &format!("{BASE_PATH}/agents/{id}/facts/history"))?;
+    let body = get_json(config, &format!("{BASE_PATH}/hosts/{id}/facts/history"))?;
     let history: Vec<FactVersion> =
         serde_json::from_str(&body).context("invalid server response")?;
 
@@ -182,12 +182,12 @@ pub fn print_facts_history(config: &Config, id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn change_agent(config: &Config, id: &str, action: &str) -> Result<()> {
+pub fn change_host(config: &Config, id: &str, action: &str) -> Result<()> {
     let base = server_url(config);
     let key = api_key()?;
 
     let result = client(config)?
-        .post(format!("{base}{BASE_PATH}/agents/{id}/{action}"))
+        .post(format!("{base}{BASE_PATH}/hosts/{id}/{action}"))
         .header("Authorization", format!("Bearer {key}"))
         .send_empty();
     match result {
@@ -199,12 +199,12 @@ pub fn change_agent(config: &Config, id: &str, action: &str) -> Result<()> {
     }
 }
 
-pub fn delete_agent(config: &Config, id: &str) -> Result<()> {
+pub fn delete_host(config: &Config, id: &str) -> Result<()> {
     let base = server_url(config);
     let key = api_key()?;
 
     let result = client(config)?
-        .delete(format!("{base}{BASE_PATH}/agents/{id}"))
+        .delete(format!("{base}{BASE_PATH}/hosts/{id}"))
         .header("Authorization", format!("Bearer {key}"))
         .call();
     match result {
@@ -213,7 +213,7 @@ pub fn delete_agent(config: &Config, id: &str) -> Result<()> {
             Ok(())
         }
         Err(ureq::Error::StatusCode(409)) => {
-            bail!("revoke the agent before deleting it: maxnines-server agents revoke {id}")
+            bail!("revoke the host before deleting it: maxnines-server hosts revoke {id}")
         }
         Err(error) => bail!(explain(error, &base)),
     }
@@ -413,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn a_server_on_every_address_is_reached_on_this_machine() {
+    fn a_server_on_every_address_is_reached_on_this_host() {
         assert_eq!(
             url_for(r#"listen = "0.0.0.0:9000""#),
             "http://127.0.0.1:9000"

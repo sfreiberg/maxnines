@@ -432,7 +432,7 @@ async fn confirm_two_factor(State(state): State<AppState>, form: CsrfForm) -> Re
         }
         Ok(None) => {
             let problem = "That code isn't right. Check the app shows a code for MaxNines, and \
-                           that this machine's clock and your phone's are right.";
+                           that the server's clock and your phone's are right.";
             let notes = ProfileNotes {
                 setting_up: true,
                 ..two_factor_problem(problem)

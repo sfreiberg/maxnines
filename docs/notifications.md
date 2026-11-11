@@ -3,10 +3,10 @@
 ## Charts
 
 When an alert starts, or a warning becomes critical, Discord, Telegram, Slack, email and
-Resend get a chart with it: the last hour of what the alert watches, on that machine or for that
+Resend get a chart with it: the last hour of what the alert watches, on that host or for that
 calculation, with the rule's thresholds and the moment the alert started. Times on it are
 in UTC, like the rest of the message. Other notifications, and other channels, are text
-only. An alert about an agent going offline has nothing to chart.
+only. An alert about a host going offline has nothing to chart.
 
 The chart is drawn inside the server, so nothing else needs to be installed. If one
 can't be drawn or sent, the notification goes without it, and the server's log says why.
@@ -66,7 +66,7 @@ A new custom webhook starts with this body:
 
 ```text
 {
-  "title": "{{ alert.rule_name }} on {{ alert.host }}",
+  "title": "{{ alert.rule_name }} on {{ alert.hostname }}",
   "message": "{{ text }}",
   "severity": "{{ alert.severity }}",
   "status": "{{ event }}",
@@ -76,7 +76,7 @@ A new custom webhook starts with this body:
 ```
 
 When the content type is JSON, anything filled in with `{{ }}` is escaped to fit inside
-a JSON string, so a quote in a host name can't break the body. Add `| json` for a whole
+a JSON string, so a quote in a hostname can't break the body. Add `| json` for a whole
 value with its quotes, such as a number, a list, or `null` for something missing. Other
 content types are filled in as they are.
 
@@ -90,7 +90,7 @@ What a template can use:
 | `link` | The alerts page, when the server knows the address people reach it at |
 | `alert.id`, `alert.rule_id`, `alert.rule_name` | The alert, and the rule that started it |
 | `alert.severity` | `warning` or `critical` |
-| `alert.host`, `alert.agent_id` | The machine |
+| `alert.hostname`, `alert.host_id` | The host |
 | `alert.series` | The disk, container or other series it's about, if any |
 | `alert.value`, `alert.summary` | The reading that started it, and what's wrong in words |
 | `alert.started`, `alert.resolved` | Times like `2026-11-10T14:03:00Z`, with `alert.started_ms` and `alert.resolved_ms` in milliseconds |
@@ -98,7 +98,7 @@ What a template can use:
 | `alert.acknowledged_by`, `alert.acknowledged` | Who acknowledged it, if anyone, and `alert.acknowledged_ms` |
 
 Templates can also use Tera's `if` and `for`, and its filters, like
-`{{ alert.host | upper }}`.
+`{{ alert.hostname | upper }}`.
 
 There are three ways to check a template works before an alert depends on it:
 
@@ -137,7 +137,7 @@ Alerts go to a Teams channel through a workflow that posts whatever is sent to i
    doesn't show it again, but Power Automate does, under the workflow's **When a
    Teams webhook request is received** step.
 
-Each notification is a card with the alert, its rule, the machine and when it started,
+Each notification is a card with the alert, its rule, the host and when it started,
 and a **View alerts** link when the server knows its own address. Teams messages have
 no chart and no buttons, as a workflow can only post. The URL works like a password,
 so it's never shown again once saved.
@@ -196,7 +196,7 @@ mapping to do. Custom integrations may depend on your AlertOps plan.
    ```json
    {
      "alert_id": "maxnines-test",
-     "host": "MaxNines",
+     "hostname": "MaxNines",
      "link": "https://maxnines.example.com/alerts",
      "message": "This is a test notification from MaxNines.",
      "severity": "info",

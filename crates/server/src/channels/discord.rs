@@ -66,10 +66,10 @@ impl ChannelType for Discord {
             .trim()
             .parse()
             .map_err(|_| anyhow!("the Discord webhook URL isn't valid"))?;
-        let host = uri.host().unwrap_or_default();
+        let hostname = uri.host().unwrap_or_default();
         ensure!(
             uri.scheme_str() == Some("https")
-                && HOSTS.contains(&host)
+                && HOSTS.contains(&hostname)
                 && uri.path().starts_with("/api/webhooks/"),
             "that doesn't look like a Discord webhook URL, which starts with \
              https://discord.com/api/webhooks/"

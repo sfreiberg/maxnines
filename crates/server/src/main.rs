@@ -68,7 +68,7 @@ use models::Database;
 use notifier::{Notifier, Senders, web_url};
 use presence::Presence;
 use registration::{Registry, Rules};
-use remote_checks::{LOCAL_AGENT_ID, LatestResults, Scheduler};
+use remote_checks::{LOCAL_HOST_ID, LatestResults, Scheduler};
 use server_stats::ServerStatus;
 use store::WriterCommand;
 use views::Views;
@@ -96,9 +96,9 @@ struct Cli {
 enum Command {
     /// Run the server (the default)
     Run,
-    /// Manage registered agents on the running server, with MAXNINES_API_KEY set
+    /// Manage registered hosts on the running server, with MAXNINES_API_KEY set
     #[command(subcommand)]
-    Agents(AgentsCommand),
+    Hosts(HostsCommand),
     /// Manage keys for the API, in the main database
     #[command(subcommand)]
     ApiKeys(ApiKeysCommand),
@@ -166,21 +166,21 @@ enum ApiKeysCommand {
 }
 
 #[derive(Debug, PartialEq, Subcommand)]
-enum AgentsCommand {
-    /// List agents and their status
+enum HostsCommand {
+    /// List hosts and their status
     List,
-    /// Show what is known about an agent
+    /// Show what is known about a host
     Facts {
         id: String,
         /// Show every change instead of the current facts
         #[arg(long)]
         history: bool,
     },
-    /// Let an agent connect
+    /// Approve a host, so its agent can connect
     Approve { id: String },
-    /// Stop an agent from connecting, and drop it if it's connected
+    /// Revoke a host, so its agent can no longer connect, and drop it if it is
     Revoke { id: String },
-    /// Delete a revoked agent with its metrics, facts and alerts, for good
+    /// Delete a revoked host with its metrics, facts and alerts, for good
     Delete { id: String },
 }
 
@@ -235,17 +235,15 @@ fn main() -> Result<()> {
                 ApiKeysCommand::Revoke { id } => cli::revoke_api_key(&config, id),
             }
         }
-        Command::Agents(command) => {
+        Command::Hosts(command) => {
             let config = Config::load(&cli.config)?;
             match command {
-                AgentsCommand::List => cli::print_agents(&config),
-                AgentsCommand::Facts { id, history: false } => cli::print_facts(&config, &id),
-                AgentsCommand::Facts { id, history: true } => {
-                    cli::print_facts_history(&config, &id)
-                }
-                AgentsCommand::Approve { id } => cli::change_agent(&config, &id, "approve"),
-                AgentsCommand::Revoke { id } => cli::change_agent(&config, &id, "revoke"),
-                AgentsCommand::Delete { id } => cli::delete_agent(&config, &id),
+                HostsCommand::List => cli::print_hosts(&config),
+                HostsCommand::Facts { id, history: false } => cli::print_facts(&config, &id),
+                HostsCommand::Facts { id, history: true } => cli::print_facts_history(&config, &id),
+                HostsCommand::Approve { id } => cli::change_host(&config, &id, "approve"),
+                HostsCommand::Revoke { id } => cli::change_host(&config, &id, "revoke"),
+                HostsCommand::Delete { id } => cli::delete_host(&config, &id),
             }
         }
     }
@@ -259,7 +257,7 @@ async fn serve(path: &Path) -> Result<()> {
     let database = Database::connect(&config.database.resolve_url()?).await?;
     let secure_site = config.audience().starts_with("wss://");
     let csrf = csrf::config(&database, secure_site).await?;
-    let agents = database.load_agents().await.context("loading agents")?;
+    let hosts = database.load_hosts().await.context("loading hosts")?;
     let store = store::open(&config.metrics, config.retention)?;
     let metrics = Metrics::new(store.reader()?);
     let status = Arc::new(ServerStatus::new(
@@ -271,7 +269,7 @@ async fn serve(path: &Path) -> Result<()> {
     let state = AppState {
         presence: Arc::new(Presence::default()),
         registry: Arc::new(Registry::new(
-            agents,
+            hosts,
             rules,
             config.registration.max_pending,
             database.clone(),
@@ -333,7 +331,7 @@ async fn serve(path: &Path) -> Result<()> {
     // The server is always online to itself, so nothing reads it as missing.
     state
         .presence
-        .connected(LOCAL_AGENT_ID, IpAddr::from([127, 0, 0, 1]));
+        .connected(LOCAL_HOST_ID, IpAddr::from([127, 0, 0, 1]));
 
     let mut stop = StopSignal::listen().context("listening for being asked to stop")?;
     let service = controllers::app(state).into_make_service_with_connect_info::<SocketAddr>();

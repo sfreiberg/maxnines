@@ -13,10 +13,11 @@ and there's no way to change or delete them from MaxNines.
   person's theme and time zone
 - Two-factor being made required for everyone, or optional again
 - API keys being created and revoked, and deleted with their owner
-- Agents being approved, revoked, renamed by their machine, and deleted, and new agents
+- Hosts being approved, revoked and deleted, their hostnames changing, and new hosts
   asking to join
 - Config rules, alert rules, notification channels, silences, maintenance windows,
   remote checks, location rules and dashboards being created, changed and deleted
+- Annotations being added and deleted
 - Alerts being acknowledged and unacknowledged, on the pages or in Slack
 
 Saving something without changing it doesn't add an entry. Alerts starting and
@@ -31,7 +32,7 @@ Each entry says who acted:
   the entry names, or by pressing an alert's buttons in Slack, matched to them by
   email address
 - the command line, with the system account that ran `maxnines-server`
-- MaxNines itself, like a registration rule approving an agent
+- MaxNines itself, like a registration rule approving a host
 - someone not signed in, for a failed sign in
 
 It also keeps the address each request came from. Behind a reverse proxy, that's

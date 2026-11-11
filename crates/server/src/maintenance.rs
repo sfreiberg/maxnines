@@ -32,7 +32,7 @@ pub struct MaintenanceWindowInput {
     /// Every rule, if empty.
     #[serde(default)]
     pub rule_id: Option<i64>,
-    /// Which machines, in the same form as the Machines list. Every machine, if empty.
+    /// Which hosts, in the same form as the Hosts list. Every host, if empty.
     #[serde(default)]
     pub filter: String,
     /// The days it starts on, like `sun`.

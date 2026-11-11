@@ -6,7 +6,7 @@
     <h1>Server</h1>
     <p class="subtitle">Running for {{ server.uptime }}. This page updates by itself.</p>
   </div>
-  <a class="button secondary" href="/agents/{{ agent_id }}/metrics?range={{ range }}">All charts</a>
+  <a class="button secondary" href="/hosts/{{ host_id }}/metrics?range={{ range }}">All charts</a>
 </div>
 
 {% if server.alert_rules_stalled %}
@@ -22,10 +22,10 @@
     <span class="stats-value">{{ metrics_per_second }}</span>
     <span class="stats-note">{{ samples_per_second }} samples</span>
   </div>
-  <a class="stats-cell" href="/agents">
-    <span class="label">Machines checking in</span>
-    <span class="stats-value{% if server.agents_online < server.agents_approved %} warn{% endif %}">{{ server.agents_online }} / {{ server.agents_approved }}</span>
-    <span class="stats-note">{% if server.agents_waiting > 0 %}{{ server.agents_waiting }} waiting for approval{% elif server.agents_online < server.agents_approved %}{{ server.agents_approved - server.agents_online }} offline{% else %}All online{% endif %}</span>
+  <a class="stats-cell" href="/hosts">
+    <span class="label">Hosts checking in</span>
+    <span class="stats-value{% if server.hosts_online < server.hosts_approved %} warn{% endif %}">{{ server.hosts_online }} / {{ server.hosts_approved }}</span>
+    <span class="stats-note">{% if server.hosts_waiting > 0 %}{{ server.hosts_waiting }} waiting for approval{% elif server.hosts_online < server.hosts_approved %}{{ server.hosts_approved - server.hosts_online }} offline{% else %}All online{% endif %}</span>
   </a>
   <div class="stats-cell">
     <span class="label">Metrics database</span>
@@ -77,14 +77,14 @@
     <h2>Resources</h2>
     <dl class="summary">
       {% if server.process_memory %}<dt>Server memory</dt><dd>{{ server.process_memory }}</dd>{% endif %}
-      {% if server.process_cpu %}<dt>Server CPU</dt><dd>{{ server.process_cpu }} of this machine{% if server.cores %}, {{ server.cores }} cores{% endif %}</dd>{% endif %}
+      {% if server.process_cpu %}<dt>Server CPU</dt><dd>{{ server.process_cpu }} of this host{% if server.cores %}, {{ server.cores }} cores{% endif %}</dd>{% endif %}
       {% if server.open_files %}<dt>Open files</dt><dd>{{ server.open_files }}</dd>{% endif %}
     </dl>
-    {% if server.machine_memory %}
+    {% if server.host_memory %}
     <div class="stacked-field">
-      <span>Machine memory</span>
-      <svg class="meter" aria-hidden="true"><rect class="track" width="100%" height="7" rx="3.5"/><rect class="fill" width="{{ server.machine_memory.width }}%" height="7" rx="3.5"/></svg>
-      <span class="note">{{ server.machine_memory.text }}</span>
+      <span>Host memory</span>
+      <svg class="meter" aria-hidden="true"><rect class="track" width="100%" height="7" rx="3.5"/><rect class="fill" width="{{ server.host_memory.width }}%" height="7" rx="3.5"/></svg>
+      <span class="note">{{ server.host_memory.text }}</span>
     </div>
     {% endif %}
     {% if server.disk %}
@@ -100,7 +100,7 @@
 <section class="card">
   <h2>Activity</h2>
   <dl class="summary">
-    <dt>Agents</dt><dd>{{ server.agents_online }} of {{ server.agents_approved }} online{% if server.agents_waiting > 0 %}, {{ server.agents_waiting }} waiting for approval{% endif %}</dd>
+    <dt>Hosts</dt><dd>{{ server.hosts_online }} of {{ server.hosts_approved }} online{% if server.hosts_waiting > 0 %}, {{ server.hosts_waiting }} waiting for approval{% endif %}</dd>
     <dt>Samples written</dt><dd>{{ server.samples_written }} since the server started</dd>
     <dt>Write queue</dt><dd>{{ server.samples_queued }} of {{ server.queue_capacity }}</dd>
     <dt>Open alerts</dt><dd>{{ server.alerts_open }}</dd>

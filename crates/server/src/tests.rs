@@ -37,12 +37,12 @@ use crate::facts::FlatFacts;
 use crate::metrics::{Metrics, TimeRange, now_ms};
 use crate::models::{Database, FactVersion, RuleInput};
 use crate::presence::Presence;
-use crate::registration::{AgentState, Registry, Rules};
+use crate::registration::{HostState, Registry, Rules};
 use crate::server_stats::ServerStatus;
 use crate::store::testing::{MemoryStore, Saved};
 use crate::store::{self, MetricsReader, Store, WRITE_QUEUE_SIZE, spawn_writer};
 use crate::views::Views;
-use crate::{AgentsCommand, Cli, Command};
+use crate::{Cli, Command, HostsCommand};
 
 const AUDIENCE: &str = "wss://monitor.example.com/ws";
 
@@ -85,7 +85,7 @@ async fn start_with(config: &str) -> TestServer {
 }
 
 /// Pings often, so tests about pings needn't wait, and gives up on a quiet client only
-/// after a long time. Most tests hold clients they don't read, and a busy machine
+/// after a long time. Most tests hold clients they don't read, and a busy host
 /// running every test at once can leave a test unable to read for seconds.
 const TEST_HEARTBEAT: Heartbeat = Heartbeat {
     interval: Duration::from_millis(50),
@@ -225,27 +225,27 @@ impl TestServer {
     }
 
     /// Connects an already approved agent.
-    async fn connect_approved(&self, agent: &Identity, host: &str) -> Client {
+    async fn connect_approved(&self, host: &Identity, hostname: &str) -> Client {
         let mut client = self.connect().await;
         assert_eq!(
-            handshake(&mut client, agent, host, None).await,
+            handshake(&mut client, host, hostname, None).await,
             RegistrationStatus::Pending
         );
-        self.approve(agent).await;
+        self.approve(host).await;
 
         let mut client = self.connect().await;
         assert_eq!(
-            handshake(&mut client, agent, host, None).await,
+            handshake(&mut client, host, hostname, None).await,
             RegistrationStatus::Approved
         );
-        self.wait_for_online(&agent.id(), true).await;
+        self.wait_for_online(&host.id(), true).await;
         client
     }
 
-    async fn approve(&self, agent: &Identity) {
-        let id = agent.id();
+    async fn approve(&self, host: &Identity) {
+        let id = host.id();
         let registry = &self.state.registry;
-        registry.decide(&id, AgentState::Approved).await.unwrap();
+        registry.decide(&id, HostState::Approved).await.unwrap();
     }
 
     /// Returns as soon as it's so, so a long deadline costs nothing.
@@ -318,10 +318,10 @@ async fn send(client: &mut Client, message: &AgentMessage) {
     client.send(Message::text(text)).await.unwrap();
 }
 
-fn hello(agent: &Identity, host: &str, signature: String, token: Option<&str>) -> AgentMessage {
+fn hello(host: &Identity, hostname: &str, signature: String, token: Option<&str>) -> AgentMessage {
     AgentMessage::Hello {
-        host: host.to_string(),
-        public_key: agent.public_key(),
+        hostname: hostname.to_string(),
+        public_key: host.public_key(),
         signature,
         token: token.map(String::from),
     }
@@ -329,13 +329,13 @@ fn hello(agent: &Identity, host: &str, signature: String, token: Option<&str>) -
 
 async fn handshake(
     client: &mut Client,
-    agent: &Identity,
-    host: &str,
+    host: &Identity,
+    hostname: &str,
     token: Option<&str>,
 ) -> RegistrationStatus {
     let nonce = read_nonce(client).await;
-    let signature = agent.sign(AUDIENCE, &nonce);
-    send(client, &hello(agent, host, signature, token)).await;
+    let signature = host.sign(AUDIENCE, &nonce);
+    send(client, &hello(host, hostname, signature, token)).await;
     read_status(client).await
 }
 
@@ -366,22 +366,22 @@ async fn is_closed(client: &mut Client) -> bool {
 #[tokio::test]
 async fn a_new_agent_is_pending_and_disconnected() {
     let server = start().await;
-    let agent = identity();
+    let host = identity();
     let mut client = server.connect().await;
 
-    let status = handshake(&mut client, &agent, "web-1", None).await;
+    let status = handshake(&mut client, &host, "web-1", None).await;
 
     assert_eq!(status, RegistrationStatus::Pending);
     assert!(is_closed(&mut client).await);
-    assert!(server.state.presence.get(&agent.id()).is_none());
+    assert!(server.state.presence.get(&host.id()).is_none());
 }
 
 #[tokio::test]
 async fn a_pending_agent_can_not_send_samples() {
     let server = start().await;
-    let agent = identity();
+    let host = identity();
     let mut client = server.connect().await;
-    handshake(&mut client, &agent, "web-1", None).await;
+    handshake(&mut client, &host, "web-1", None).await;
 
     let _ = client
         .send(Message::text(serde_json::to_string(&sample(1)).unwrap()))
@@ -394,33 +394,33 @@ async fn a_pending_agent_can_not_send_samples() {
 #[tokio::test]
 async fn an_approved_agent_is_accepted_and_its_samples_are_attributed() {
     let server = start().await;
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
 
     send(&mut client, &sample(42)).await;
 
     assert_eq!(
         server.wait_for_sample().await,
-        (agent.id(), "web-1".to_string(), 42)
+        (host.id(), "web-1".to_string(), 42)
     );
 }
 
 #[tokio::test]
 async fn revoking_a_connected_agent_drops_it_and_keeps_it_out() {
     let server = start().await;
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
 
-    let id = agent.id();
+    let id = host.id();
     let registry = &server.state.registry;
-    registry.decide(&id, AgentState::Revoked).await.unwrap();
+    registry.decide(&id, HostState::Revoked).await.unwrap();
 
     assert!(is_closed(&mut client).await);
-    server.wait_for_online(&agent.id(), false).await;
+    server.wait_for_online(&host.id(), false).await;
 
     let mut client = server.connect().await;
     assert_eq!(
-        handshake(&mut client, &agent, "web-1", None).await,
+        handshake(&mut client, &host, "web-1", None).await,
         RegistrationStatus::Rejected
     );
 }
@@ -442,12 +442,12 @@ async fn approving_one_agent_does_not_disturb_another() {
 #[tokio::test]
 async fn a_signature_for_another_server_is_rejected() {
     let server = start().await;
-    let agent = identity();
+    let host = identity();
     let mut client = server.connect().await;
 
     let nonce = read_nonce(&mut client).await;
-    let signature = agent.sign("wss://evil.example.com/ws", &nonce);
-    send(&mut client, &hello(&agent, "web-1", signature, None)).await;
+    let signature = host.sign("wss://evil.example.com/ws", &nonce);
+    send(&mut client, &hello(&host, "web-1", signature, None)).await;
 
     assert_eq!(read_status(&mut client).await, RegistrationStatus::Rejected);
     assert!(server.state.registry.list().await.is_empty());
@@ -456,18 +456,18 @@ async fn a_signature_for_another_server_is_rejected() {
 #[tokio::test]
 async fn a_replayed_signature_is_rejected() {
     let server = start().await;
-    let agent = identity();
+    let host = identity();
 
     let mut first = server.connect().await;
     let nonce = read_nonce(&mut first).await;
-    let captured = agent.sign(AUDIENCE, &nonce);
-    send(&mut first, &hello(&agent, "web-1", captured.clone(), None)).await;
+    let captured = host.sign(AUDIENCE, &nonce);
+    send(&mut first, &hello(&host, "web-1", captured.clone(), None)).await;
     read_status(&mut first).await;
-    server.approve(&agent).await;
+    server.approve(&host).await;
 
     let mut second = server.connect().await;
     read_nonce(&mut second).await;
-    send(&mut second, &hello(&agent, "web-1", captured, None)).await;
+    send(&mut second, &hello(&host, "web-1", captured, None)).await;
 
     assert_eq!(read_status(&mut second).await, RegistrationStatus::Rejected);
 }
@@ -475,14 +475,14 @@ async fn a_replayed_signature_is_rejected() {
 #[tokio::test]
 async fn an_approved_agents_public_key_is_useless_without_its_private_key() {
     let server = start().await;
-    let agent = identity();
-    server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    server.connect_approved(&host, "web-1").await;
 
     let attacker = identity();
     let mut client = server.connect().await;
     let nonce = read_nonce(&mut client).await;
     let forged = attacker.sign(AUDIENCE, &nonce);
-    send(&mut client, &hello(&agent, "web-1", forged, None)).await;
+    send(&mut client, &hello(&host, "web-1", forged, None)).await;
 
     assert_eq!(read_status(&mut client).await, RegistrationStatus::Rejected);
 }
@@ -502,14 +502,14 @@ async fn a_sample_before_the_handshake_ends_the_connection() {
 #[tokio::test]
 async fn an_oversized_hostname_ends_the_connection() {
     let server = start().await;
-    let agent = identity();
+    let host = identity();
     let mut client = server.connect().await;
 
     let nonce = read_nonce(&mut client).await;
-    let signature = agent.sign(AUDIENCE, &nonce);
+    let signature = host.sign(AUDIENCE, &nonce);
     send(
         &mut client,
-        &hello(&agent, &"x".repeat(256), signature, None),
+        &hello(&host, &"x".repeat(256), signature, None),
     )
     .await;
 
@@ -529,42 +529,42 @@ async fn a_huge_message_ends_the_connection_before_and_after_the_handshake() {
     let _ = client.send(Message::text(huge.clone())).await;
     assert!(is_closed(&mut client).await);
 
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
     let _ = client.send(Message::text(huge)).await;
     assert!(is_closed(&mut client).await);
     assert!(server.saved.samples.lock().unwrap().is_empty());
 }
 
-/// One key, one connection: a second machine with the same key would otherwise
+/// One key, one connection: a second host with the same key would otherwise
 /// share the agent's identity quietly.
 #[tokio::test]
 async fn a_newer_connection_replaces_the_older_one() {
     let server = start().await;
-    let agent = identity();
-    let mut first = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let mut first = server.connect_approved(&host, "web-1").await;
 
     let mut second = server.connect().await;
     assert_eq!(
-        handshake(&mut second, &agent, "web-1", None).await,
+        handshake(&mut second, &host, "web-1", None).await,
         RegistrationStatus::Approved
     );
 
     assert!(is_closed(&mut first).await);
-    assert!(server.state.presence.get(&agent.id()).unwrap().online);
+    assert!(server.state.presence.get(&host.id()).unwrap().online);
 }
 
 #[tokio::test]
 async fn an_agent_connecting_too_often_is_told_to_wait() {
     let server = start().await;
-    let agent = identity();
-    let _first = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let _first = server.connect_approved(&host, "web-1").await;
 
     let mut clients = Vec::new();
     for _ in 1..10 {
         let mut client = server.connect().await;
         assert_eq!(
-            handshake(&mut client, &agent, "web-1", None).await,
+            handshake(&mut client, &host, "web-1", None).await,
             RegistrationStatus::Approved
         );
         clients.push(client);
@@ -572,7 +572,7 @@ async fn an_agent_connecting_too_often_is_told_to_wait() {
 
     let mut client = server.connect().await;
     assert_eq!(
-        handshake(&mut client, &agent, "web-1", None).await,
+        handshake(&mut client, &host, "web-1", None).await,
         RegistrationStatus::Pending
     );
     assert!(is_closed(&mut client).await);
@@ -581,8 +581,8 @@ async fn an_agent_connecting_too_often_is_told_to_wait() {
 #[tokio::test]
 async fn facts_reported_too_often_are_dropped() {
     let server = start().await;
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
 
     for version in 0..8 {
         send(&mut client, &facts(&format!("24.{version}"))).await;
@@ -605,7 +605,7 @@ async fn facts_reported_too_often_are_dropped() {
         .unwrap();
 
     // The family once, and each version kept.
-    let history = server.wait_for_facts(&agent.id(), 6).await;
+    let history = server.wait_for_facts(&host.id(), 6).await;
     let versions: Vec<&str> = history
         .iter()
         .filter(|fact| fact.name == "os.version")
@@ -615,13 +615,13 @@ async fn facts_reported_too_often_are_dropped() {
 }
 
 #[tokio::test]
-async fn the_agents_page_says_when_a_waiting_agent_last_asked() {
+async fn the_hosts_page_says_when_a_waiting_agent_last_asked() {
     let server = start().await;
-    let agent = identity();
+    let host = identity();
     let mut client = server.connect().await;
-    handshake(&mut client, &agent, "new-box", None).await;
+    handshake(&mut client, &host, "new-box", None).await;
 
-    let page = Browser::default().get(&server, "/agents").await;
+    let page = Browser::default().get(&server, "/hosts").await;
 
     assert!(page.body.contains("Waiting for approval"), "{}", page.body);
     assert!(page.body.contains("asked "), "{}", page.body);
@@ -636,11 +636,11 @@ async fn the_online_count_is_out_of_approved_agents_only() {
     server
         .state
         .registry
-        .decide(&revoked.id(), AgentState::Revoked)
+        .decide(&revoked.id(), HostState::Revoked)
         .await
         .unwrap();
 
-    let page = Browser::default().get(&server, "/agents").await;
+    let page = Browser::default().get(&server, "/hosts").await;
 
     assert!(page.body.contains("1 of 1 online"), "{}", page.body);
 }
@@ -709,12 +709,12 @@ async fn a_forged_forwarded_header_does_not_match_a_source_rule() {
 #[tokio::test]
 async fn a_clean_close_marks_the_agent_offline() {
     let server = start().await;
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
 
     client.close(None).await.unwrap();
 
-    server.wait_for_online(&agent.id(), false).await;
+    server.wait_for_online(&host.id(), false).await;
 }
 
 /// Reads in the background as an agent would, counting the server's pings.
@@ -737,7 +737,7 @@ fn count_pings(receiver: futures_util::stream::SplitStream<Client>) -> Arc<Atomi
 /// held without listening is refused on Linux but ignored on macOS until it times out.
 const CLOSED_ADDRESS: &str = "127.0.0.1:0";
 
-/// Waits for another ping to arrive, however long the machine takes.
+/// Waits for another ping to arrive, however long the host takes.
 async fn more_pings(pings: &AtomicU64) {
     let before = pings.load(Ordering::Relaxed);
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -864,8 +864,8 @@ mod health {
 #[tokio::test]
 async fn a_sample_with_an_impossible_time_is_answered_but_never_stored() {
     let server = start().await;
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
 
     send(&mut client, &sample(u64::MAX)).await;
     loop {
@@ -886,8 +886,8 @@ async fn a_sample_with_an_impossible_time_is_answered_but_never_stored() {
 #[tokio::test]
 async fn a_stalled_database_does_not_hold_up_samples_or_heartbeats() {
     let server = start().await;
-    let agent = identity();
-    let client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let client = server.connect_approved(&host, "web-1").await;
     let (mut sender, receiver) = client.split();
     let pings = count_pings(receiver);
     let stalled = server.state.database.stall_for_test().await;
@@ -904,15 +904,15 @@ async fn a_stalled_database_does_not_hold_up_samples_or_heartbeats() {
     more_pings(&pings).await;
 
     drop(stalled);
-    let facts = server.wait_for_facts(&agent.id(), 1).await;
+    let facts = server.wait_for_facts(&host.id(), 1).await;
     assert_eq!(facts[0].name, "os");
 }
 
 #[tokio::test]
 async fn a_full_write_queue_stops_reading_but_not_the_heartbeat() {
     let server = start_quick_to_drop().await;
-    let agent = identity();
-    let client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let client = server.connect_approved(&host, "web-1").await;
     let (mut sender, receiver) = client.split();
     let pings = count_pings(receiver);
     server.saved.paused.store(true, Ordering::Relaxed);
@@ -927,7 +927,7 @@ async fn a_full_write_queue_stops_reading_but_not_the_heartbeat() {
     // Long enough to be taken for dead, had the wait counted as silence.
     sleep(server.state.heartbeat.timeout + Duration::from_millis(500)).await;
     more_pings(&pings).await;
-    assert!(server.state.presence.get(&agent.id()).unwrap().online);
+    assert!(server.state.presence.get(&host.id()).unwrap().online);
 
     server.saved.paused.store(false, Ordering::Relaxed);
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -940,29 +940,29 @@ async fn a_full_write_queue_stops_reading_but_not_the_heartbeat() {
 #[tokio::test]
 async fn a_dropped_connection_marks_the_agent_offline() {
     let server = start().await;
-    let agent = identity();
-    let client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let client = server.connect_approved(&host, "web-1").await;
 
     drop(client);
 
-    server.wait_for_online(&agent.id(), false).await;
+    server.wait_for_online(&host.id(), false).await;
 }
 
 #[tokio::test]
 async fn an_agent_that_stops_responding_goes_offline() {
     let server = start_quick_to_drop().await;
-    let agent = identity();
+    let host = identity();
     // Held open but never read, like a hung agent or a dead network.
-    let _client = server.connect_approved(&agent, "web-1").await;
+    let _client = server.connect_approved(&host, "web-1").await;
 
-    server.wait_for_online(&agent.id(), false).await;
+    server.wait_for_online(&host.id(), false).await;
 }
 
 #[tokio::test]
 async fn an_agent_answering_pings_stays_online() {
     let server = start_quick_to_drop().await;
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
 
     // Past the point where a quiet agent counts as gone. Reading is what answers
     // the pings.
@@ -970,7 +970,7 @@ async fn an_agent_answering_pings_stays_online() {
     // Stops at the deadline, or when the server closes the connection.
     while let Ok(Some(Ok(_))) = tokio::time::timeout_at(deadline, client.next()).await {}
 
-    assert!(server.state.presence.get(&agent.id()).unwrap().online);
+    assert!(server.state.presence.get(&host.id()).unwrap().online);
 }
 
 #[tokio::test]
@@ -1009,14 +1009,14 @@ fn facts(version: &str) -> AgentMessage {
 #[tokio::test]
 async fn facts_are_stored_with_their_history() {
     let server = start().await;
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
 
     send(&mut client, &facts("24.04")).await;
     send(&mut client, &facts("24.04")).await;
     send(&mut client, &facts("24.10")).await;
 
-    let history = server.wait_for_facts(&agent.id(), 3).await;
+    let history = server.wait_for_facts(&host.id(), 3).await;
 
     // os.family stayed the same, so only os.version has a second row.
     let versions: Vec<_> = history.iter().filter(|f| f.name == "os.version").collect();
@@ -1029,9 +1029,9 @@ async fn facts_are_stored_with_their_history() {
 #[tokio::test]
 async fn custom_fact_names_with_dots_are_shown_nested() {
     let server = start().await;
-    let agent = identity();
-    let id = agent.id();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let id = host.id();
+    let mut client = server.connect_approved(&host, "web-1").await;
 
     let dotted = AgentMessage::Facts {
         facts: json!({ "os": { "family": "linux" }, "custom": { "one.thing": "x" } }),
@@ -1042,7 +1042,7 @@ async fn custom_fact_names_with_dots_are_shown_nested() {
     let response = server
         .http(
             "GET",
-            &format!("/api/v1/agents/{id}/facts"),
+            &format!("/api/v1/hosts/{id}/facts"),
             Some(&server.api_key),
         )
         .await;
@@ -1056,9 +1056,9 @@ async fn custom_fact_names_with_dots_are_shown_nested() {
 #[tokio::test]
 async fn list_items_are_stored_under_indexed_names() {
     let server = start().await;
-    let agent = identity();
-    let id = agent.id();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let id = host.id();
+    let mut client = server.connect_approved(&host, "web-1").await;
 
     let tagged = AgentMessage::Facts {
         facts: json!({ "custom": { "tags": ["web", "prod", "eu"] } }),
@@ -1069,7 +1069,7 @@ async fn list_items_are_stored_under_indexed_names() {
     let response = server
         .http(
             "GET",
-            &format!("/api/v1/agents/{id}/facts"),
+            &format!("/api/v1/hosts/{id}/facts"),
             Some(&server.api_key),
         )
         .await;
@@ -1092,9 +1092,9 @@ async fn list_items_are_stored_under_indexed_names() {
 #[tokio::test]
 async fn values_come_back_with_the_type_they_went_in_with() {
     let server = start().await;
-    let agent = identity();
-    let id = agent.id();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let id = host.id();
+    let mut client = server.connect_approved(&host, "web-1").await;
 
     let typed = AgentMessage::Facts {
         facts: json!({
@@ -1113,7 +1113,7 @@ async fn values_come_back_with_the_type_they_went_in_with() {
     let response = server
         .http(
             "GET",
-            &format!("/api/v1/agents/{id}/facts"),
+            &format!("/api/v1/hosts/{id}/facts"),
             Some(&server.api_key),
         )
         .await;
@@ -1131,8 +1131,8 @@ async fn values_come_back_with_the_type_they_went_in_with() {
 #[tokio::test]
 async fn invalid_facts_are_skipped_without_ending_the_connection() {
     let server = start().await;
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
 
     let not_an_object = AgentMessage::Facts { facts: json!([1]) };
     send(&mut client, &not_an_object).await;
@@ -1146,7 +1146,7 @@ async fn invalid_facts_are_skipped_without_ending_the_connection() {
     send(&mut client, &oversized).await;
     send(&mut client, &facts("24.04")).await;
 
-    let history = server.wait_for_facts(&agent.id(), 2).await;
+    let history = server.wait_for_facts(&host.id(), 2).await;
     assert_eq!(history.len(), 2);
     assert!(history.iter().any(|f| f.value == "24.04"));
 }
@@ -1154,28 +1154,28 @@ async fn invalid_facts_are_skipped_without_ending_the_connection() {
 #[tokio::test]
 async fn a_pending_agent_can_not_report_facts() {
     let server = start().await;
-    let agent = identity();
+    let host = identity();
     let mut client = server.connect().await;
-    handshake(&mut client, &agent, "web-1", None).await;
+    handshake(&mut client, &host, "web-1", None).await;
 
     let text = serde_json::to_string(&facts("24.04")).unwrap();
     let _ = client.send(Message::text(text)).await;
     sleep(Duration::from_millis(100)).await;
 
-    let history = server.state.database.facts_history(&agent.id()).await;
+    let history = server.state.database.facts_history(&host.id()).await;
     assert!(history.unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn the_admin_api_separates_trusted_and_reported_facts() {
     let server = start().await;
-    let agent = identity();
-    let id = agent.id();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let id = host.id();
+    let mut client = server.connect_approved(&host, "web-1").await;
 
     // An agent claiming to be approved or to have another ID changes nothing.
     let lying = AgentMessage::Facts {
-        facts: json!({ "trusted": { "state": "revoked" }, "agent_id": "someone-else" }),
+        facts: json!({ "trusted": { "state": "revoked" }, "host_id": "someone-else" }),
     };
     send(&mut client, &lying).await;
     server.wait_for_facts(&id, 2).await;
@@ -1183,39 +1183,39 @@ async fn the_admin_api_separates_trusted_and_reported_facts() {
     let response = server
         .http(
             "GET",
-            &format!("/api/v1/agents/{id}/facts"),
+            &format!("/api/v1/hosts/{id}/facts"),
             Some(&server.api_key),
         )
         .await;
     let body = response.split("\r\n\r\n").nth(1).unwrap();
     let view: serde_json::Value = serde_json::from_str(body).unwrap();
 
-    assert_eq!(view["trusted"]["agent_id"], json!(id));
+    assert_eq!(view["trusted"]["host_id"], json!(id));
     assert_eq!(view["trusted"]["state"], "approved");
     assert_eq!(view["trusted"]["decided_by"], "admin");
     assert_eq!(view["trusted"]["online"], true);
     assert_eq!(view["trusted"]["source_address"], "127.0.0.1");
-    assert_eq!(view["reported"]["agent_id"], "someone-else");
+    assert_eq!(view["reported"]["host_id"], "someone-else");
     assert_eq!(view["reported"]["trusted"]["state"], "revoked");
 }
 
 #[tokio::test]
 async fn the_facts_api_needs_the_token_and_a_known_agent() {
     let server = start().await;
-    let agent = identity();
-    server.connect_approved(&agent, "web-1").await;
-    let id = agent.id();
+    let host = identity();
+    server.connect_approved(&host, "web-1").await;
+    let id = host.id();
 
     for path in [
-        format!("/api/v1/agents/{id}/facts"),
-        format!("/api/v1/agents/{id}/facts/history"),
+        format!("/api/v1/hosts/{id}/facts"),
+        format!("/api/v1/hosts/{id}/facts/history"),
     ] {
         let response = server.http("GET", &path, None).await;
         assert!(response.starts_with("HTTP/1.1 401"), "{response}");
     }
     for path in [
-        "/api/v1/agents/nope/facts",
-        "/api/v1/agents/nope/facts/history",
+        "/api/v1/hosts/nope/facts",
+        "/api/v1/hosts/nope/facts/history",
     ] {
         let response = server.http("GET", path, Some(&server.api_key)).await;
         assert!(response.starts_with("HTTP/1.1 404"), "{response}");
@@ -1225,14 +1225,14 @@ async fn the_facts_api_needs_the_token_and_a_known_agent() {
 #[tokio::test]
 async fn the_history_api_returns_every_change_in_order() {
     let server = start().await;
-    let agent = identity();
-    let id = agent.id();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let id = host.id();
+    let mut client = server.connect_approved(&host, "web-1").await;
     send(&mut client, &facts("24.04")).await;
     send(&mut client, &facts("24.10")).await;
     server.wait_for_facts(&id, 3).await;
 
-    let path = format!("/api/v1/agents/{id}/facts/history");
+    let path = format!("/api/v1/hosts/{id}/facts/history");
     let response = server.http("GET", &path, Some(&server.api_key)).await;
     let body = response.split("\r\n\r\n").nth(1).unwrap();
     let history: Vec<FactVersion> = serde_json::from_str(body).unwrap();
@@ -1356,8 +1356,8 @@ async fn an_unchanged_config_is_not_sent_again() {
 #[tokio::test]
 async fn an_agent_is_only_sent_collectors_it_supports() {
     let server = start().await;
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
     TestServer::next_config(&mut client).await;
 
     let older = AgentMessage::Facts {
@@ -1373,9 +1373,9 @@ async fn an_agent_is_only_sent_collectors_it_supports() {
 #[tokio::test]
 async fn an_agents_config_result_is_recorded_and_shown() {
     let server = start().await;
-    let agent = identity();
-    let id = agent.id();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let id = host.id();
+    let mut client = server.connect_approved(&host, "web-1").await;
     let (version, _) = TestServer::next_config(&mut client).await;
 
     let result = AgentMessage::ConfigResult {
@@ -1395,7 +1395,7 @@ async fn an_agents_config_result_is_recorded_and_shown() {
     assert_eq!(status.version, version);
     assert_eq!(status.error.unwrap().len(), 1000);
 
-    let path = format!("/api/v1/agents/{id}/config");
+    let path = format!("/api/v1/hosts/{id}/config");
     let response = server.request("GET", &path, "").await;
     let body = response.split("\r\n\r\n").nth(1).unwrap();
     let view: Value = serde_json::from_str(body).unwrap();
@@ -1636,8 +1636,8 @@ const RULE_FIELDS: [(&str, &str); 7] = [
 #[tokio::test]
 async fn every_page_renders() {
     let server = start().await;
-    let agent = identity();
-    server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    server.connect_approved(&host, "web-1").await;
     let rule = server.state.database.list_rules().await.unwrap()[0].id;
     let mut browser = Browser::default();
 
@@ -1645,15 +1645,15 @@ async fn every_page_renders() {
         "/".to_string(),
         "/settings".to_string(),
         "/settings/audit-log".to_string(),
-        "/agents".to_string(),
-        format!("/agents/{}", agent.id()),
+        "/hosts".to_string(),
+        format!("/hosts/{}", host.id()),
         "/rules".to_string(),
         "/rules/new".to_string(),
         format!("/rules/{rule}/edit"),
         "/map".to_string(),
         "/map/rules".to_string(),
         "/map/rules/new".to_string(),
-        format!("/map/rules/new?agent={}", agent.id()),
+        format!("/map/rules/new?host={}", host.id()),
     ] {
         let page = browser.get(&server, &path).await;
         assert_eq!(page.status, 200, "{path}: {}", page.body);
@@ -1675,7 +1675,7 @@ async fn unknown_pages_are_a_friendly_not_found() {
     let server = start().await;
     let mut browser = Browser::default();
 
-    for path in ["/nope", "/agents/nope", "/rules/9999/edit"] {
+    for path in ["/nope", "/hosts/nope", "/rules/9999/edit"] {
         let page = browser.get(&server, path).await;
         assert_eq!(page.status, 404, "{path}");
         assert!(page.body.contains("Page not found"), "{path}");
@@ -1842,7 +1842,7 @@ fn everyone_can_choose_every_theme() {
 #[tokio::test]
 async fn pages_load_the_theme_before_they_draw() {
     let server = start().await;
-    let page = Browser::default().get(&server, "/agents").await;
+    let page = Browser::default().get(&server, "/hosts").await;
 
     let theme = page.body.find(r#"<script src="/assets/js/theme.js">"#);
     assert!(theme.unwrap() < page.body.find("<body").unwrap());
@@ -1910,7 +1910,7 @@ async fn only_pages_that_update_themselves_say_they_are_live() {
     let server = start().await;
     let mut browser = Browser::default();
 
-    for path in ["/", "/agents", "/alerts", "/server"] {
+    for path in ["/", "/hosts", "/alerts", "/server"] {
         let page = browser.get(&server, path).await;
         assert!(page.body.contains(r#"id="live-status""#), "{path}");
     }
@@ -1923,7 +1923,7 @@ async fn only_pages_that_update_themselves_say_they_are_live() {
 #[tokio::test]
 async fn pages_carry_security_headers() {
     let server = start().await;
-    let page = Browser::default().get(&server, "/agents").await;
+    let page = Browser::default().get(&server, "/hosts").await;
 
     let policy = page.header("content-security-policy").unwrap();
     assert!(policy.contains("default-src 'none'"), "{policy}");
@@ -1935,14 +1935,14 @@ async fn pages_carry_security_headers() {
 #[tokio::test]
 async fn a_rule_created_in_the_browser_is_stored_and_reaches_agents() {
     let server = start().await;
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
     TestServer::next_config(&mut client).await;
     let role = AgentMessage::Facts {
         facts: json!({ "custom": { "role": "web" } }),
     };
     send(&mut client, &role).await;
-    server.wait_for_facts(&agent.id(), 1).await;
+    server.wait_for_facts(&host.id(), 1).await;
 
     let mut browser = Browser::default();
     let page = browser
@@ -1969,8 +1969,8 @@ async fn a_rule_created_in_the_browser_is_stored_and_reaches_agents() {
 #[tokio::test]
 async fn the_rules_page_counts_agents_without_facts_the_same_as_their_config() {
     let server = start().await;
-    let agent = identity();
-    let _client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let _client = server.connect_approved(&host, "web-1").await;
     server
         .create_rule(
             "Needs setup",
@@ -1979,7 +1979,7 @@ async fn the_rules_page_counts_agents_without_facts_the_same_as_their_config() {
             json!({ "interval_secs": 5 }),
         )
         .await;
-    let config = server.state.config_for(&agent.id()).await.unwrap();
+    let config = server.state.config_for(&host.id()).await.unwrap();
     assert!(
         config.matched_rules.contains(&"Needs setup".to_string()),
         "{:?}",
@@ -2095,12 +2095,12 @@ async fn an_invalid_rule_shows_why_and_keeps_what_was_typed() {
 #[tokio::test]
 async fn agents_can_be_approved_and_revoked_in_the_browser() {
     let server = start().await;
-    let agent = identity();
-    let id = agent.id();
+    let host = identity();
+    let id = host.id();
     let mut client = server.connect().await;
-    handshake(&mut client, &agent, "web-1", None).await;
+    handshake(&mut client, &host, "web-1", None).await;
 
-    let path = format!("/agents/{id}");
+    let path = format!("/hosts/{id}");
     let mut browser = Browser::default();
 
     let page = browser
@@ -2119,18 +2119,18 @@ async fn agents_can_be_approved_and_revoked_in_the_browser() {
 #[tokio::test]
 async fn every_form_refuses_a_missing_or_wrong_csrf_token() {
     let server = start().await;
-    let agent = identity();
-    let id = agent.id();
+    let host = identity();
+    let id = host.id();
     let mut client = server.connect().await;
-    handshake(&mut client, &agent, "web-1", None).await;
+    handshake(&mut client, &host, "web-1", None).await;
     let rule = server.state.database.list_rules().await.unwrap()[0].id;
 
     let paths = [
         "/rules".to_string(),
         format!("/rules/{rule}"),
         format!("/rules/{rule}/delete"),
-        format!("/agents/{id}/approve"),
-        format!("/agents/{id}/revoke"),
+        format!("/hosts/{id}/approve"),
+        format!("/hosts/{id}/revoke"),
     ];
     let mut browser = Browser::default();
     browser.get(&server, "/rules/new").await;
@@ -2178,9 +2178,9 @@ async fn a_token_from_another_browser_is_refused() {
 async fn agent_reported_text_can_not_inject_html() {
     let server = start().await;
     let attack = "<script>alert(1)</script>";
-    let agent = identity();
-    let id = agent.id();
-    let mut client = server.connect_approved(&agent, attack).await;
+    let host = identity();
+    let id = host.id();
+    let mut client = server.connect_approved(&host, attack).await;
     let facts = AgentMessage::Facts {
         facts: json!({ "custom": { "note": attack } }),
     };
@@ -2206,7 +2206,7 @@ async fn agent_reported_text_can_not_inject_html() {
     }
 
     let mut browser = Browser::default();
-    for path in ["/agents".to_string(), format!("/agents/{id}")] {
+    for path in ["/hosts".to_string(), format!("/hosts/{id}")] {
         let page = browser.get(&server, &path).await;
         assert_eq!(page.status, 200, "{path}");
         assert!(page.has_only_our_scripts(), "{path}: {}", page.body);
@@ -2391,13 +2391,13 @@ async fn saving_a_complex_rule_from_its_form_leaves_the_expression_unchanged() {
 #[tokio::test]
 async fn the_builder_suggests_facts_agents_have_reported() {
     let server = start().await;
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
     let reported = AgentMessage::Facts {
         facts: json!({ "custom": { "tags": ["a", "b"] }, "os": { "family": "linux" } }),
     };
     send(&mut client, &reported).await;
-    server.wait_for_facts(&agent.id(), 3).await;
+    server.wait_for_facts(&host.id(), 3).await;
 
     let page = Browser::default().get(&server, "/rules/new").await;
 
@@ -2417,14 +2417,14 @@ async fn the_builder_suggests_facts_agents_have_reported() {
 #[tokio::test]
 async fn a_number_fact_is_compared_as_a_number() {
     let server = start().await;
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
     TestServer::next_config(&mut client).await;
     let reported = AgentMessage::Facts {
         facts: json!({ "custom": { "rack": 12 } }),
     };
     send(&mut client, &reported).await;
-    server.wait_for_facts(&agent.id(), 1).await;
+    server.wait_for_facts(&host.id(), 1).await;
 
     let fields = [
         ("name", "Rack 12"),
@@ -2465,8 +2465,8 @@ async fn a_quote_in_a_value_stays_a_value_all_the_way_through() {
     assert_eq!(page.status, 303, "{}", page.body);
 
     // It matches nothing, instead of everything.
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
     let (_, config) = TestServer::next_config(&mut client).await;
     assert_eq!(config.interval_secs, 15);
 
@@ -2514,13 +2514,13 @@ async fn bad_conditions_are_explained_on_the_form() {
 #[tokio::test]
 async fn the_admin_api_needs_the_token() {
     let server = start().await;
-    let agent = identity();
+    let host = identity();
     let mut client = server.connect().await;
-    handshake(&mut client, &agent, "web-1", None).await;
-    let approve = format!("/api/v1/agents/{}/approve", agent.id());
+    handshake(&mut client, &host, "web-1", None).await;
+    let approve = format!("/api/v1/hosts/{}/approve", host.id());
 
     for token in [None, Some("wrong")] {
-        let list = server.http("GET", "/api/v1/agents", token).await;
+        let list = server.http("GET", "/api/v1/hosts", token).await;
         assert!(list.starts_with("HTTP/1.1 401"), "{list}");
 
         let change = server.http("POST", &approve, token).await;
@@ -2529,32 +2529,32 @@ async fn the_admin_api_needs_the_token() {
 
     assert_eq!(
         server.state.registry.list().await[0].state,
-        AgentState::Pending
+        HostState::Pending
     );
 }
 
 #[tokio::test]
 async fn the_admin_api_lists_approves_and_revokes() {
     let server = start().await;
-    let agent = identity();
-    let id = agent.id();
+    let host = identity();
+    let id = host.id();
     let mut client = server.connect().await;
-    handshake(&mut client, &agent, "web-1", None).await;
+    handshake(&mut client, &host, "web-1", None).await;
 
     let list = server
-        .http("GET", "/api/v1/agents", Some(&server.api_key))
+        .http("GET", "/api/v1/hosts", Some(&server.api_key))
         .await;
     assert!(list.starts_with("HTTP/1.1 200"), "{list}");
     assert!(list.contains(&id), "{list}");
     assert!(list.contains(r#""state":"pending""#), "{list}");
     assert!(list.contains(r#""online":false"#), "{list}");
 
-    let path = format!("/api/v1/agents/{id}/approve");
+    let path = format!("/api/v1/hosts/{id}/approve");
     let response = server.http("POST", &path, Some(&server.api_key)).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert!(server.state.registry.is_approved(&id).await);
 
-    let path = format!("/api/v1/agents/{id}/revoke");
+    let path = format!("/api/v1/hosts/{id}/revoke");
     let response = server.http("POST", &path, Some(&server.api_key)).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert!(!server.state.registry.is_approved(&id).await);
@@ -2564,7 +2564,7 @@ async fn the_admin_api_lists_approves_and_revokes() {
 async fn approving_an_unknown_agent_is_not_found() {
     let server = start().await;
     let response = server
-        .http("POST", "/api/v1/agents/nope/approve", Some(&server.api_key))
+        .http("POST", "/api/v1/hosts/nope/approve", Some(&server.api_key))
         .await;
     assert!(response.starts_with("HTTP/1.1 404"), "{response}");
 }
@@ -2587,10 +2587,10 @@ fn parses_commands() {
     assert_eq!(cli.command, None);
     assert_eq!(cli.config.to_str(), Some("server.hcl"));
 
-    let cli = parse("agents approve abc --config my.hcl").unwrap();
+    let cli = parse("hosts approve abc --config my.hcl").unwrap();
     assert_eq!(
         cli.command,
-        Some(Command::Agents(AgentsCommand::Approve {
+        Some(Command::Hosts(HostsCommand::Approve {
             id: "abc".to_string()
         }))
     );
@@ -2599,13 +2599,13 @@ fn parses_commands() {
     assert_eq!(parse("version").unwrap().command, Some(Command::Version));
 
     assert_eq!(
-        parse("agents delete abc").unwrap().command,
-        Some(Command::Agents(AgentsCommand::Delete {
+        parse("hosts delete abc").unwrap().command,
+        Some(Command::Hosts(HostsCommand::Delete {
             id: "abc".to_string()
         }))
     );
-    assert!(parse("agents approve").is_err());
-    assert!(parse("agents delete").is_err());
+    assert!(parse("hosts approve").is_err());
+    assert!(parse("hosts delete").is_err());
 
     // A key always has an owner.
     assert!(parse("api-keys create ci").is_err());
@@ -2634,23 +2634,23 @@ async fn report_version(server: &TestServer, client: &mut Client, id: &str, vers
 }
 
 #[tokio::test]
-async fn the_agents_page_shows_which_agents_have_an_update() {
+async fn the_hosts_page_shows_which_agents_have_an_update() {
     let server = start().await;
     let newest = crate::agent_versions::NEWEST_AGENT_VERSION;
     let (old, current, newer) = (identity(), identity(), identity());
     let mut clients = Vec::new();
-    for (agent, host, version) in [
+    for (host, hostname, version) in [
         (&old, "old-1", "0.0.1"),
         (&current, "current-1", newest),
         (&newer, "newer-1", "999.0.0"),
     ] {
-        let mut client = server.connect_approved(agent, host).await;
-        report_version(&server, &mut client, &agent.id(), version).await;
+        let mut client = server.connect_approved(host, hostname).await;
+        report_version(&server, &mut client, &host.id(), version).await;
         clients.push(client);
     }
     let mut browser = Browser::default();
 
-    let page = browser.get(&server, "/agents?view=table").await;
+    let page = browser.get(&server, "/hosts?view=table").await;
     assert!(page.body.contains("<th>Version</th>"), "{}", page.body);
     assert_eq!(page.body.matches(">Update available</span>").count(), 1);
     assert!(page.body.contains(&format!(
@@ -2662,14 +2662,14 @@ async fn the_agents_page_shows_which_agents_have_an_update() {
             .contains(&format!(r#"<td class="nowrap">{newest} "#))
     );
 
-    let page = browser.get(&server, "/agents").await;
+    let page = browser.get(&server, "/hosts").await;
     assert_eq!(page.body.matches(">Update available</span>").count(), 1);
 
-    let page = browser.get(&server, &format!("/agents/{}", old.id())).await;
+    let page = browser.get(&server, &format!("/hosts/{}", old.id())).await;
     assert!(page.body.contains(">Update available</span>"));
     assert!(page.body.contains(&format!("The newest is {newest}.")));
     let page = browser
-        .get(&server, &format!("/agents/{}", current.id()))
+        .get(&server, &format!("/hosts/{}", current.id()))
         .await;
     assert!(!page.body.contains(">Update available</span>"));
     assert!(!page.body.contains(">Newer than server</span>"));
@@ -2782,7 +2782,7 @@ async fn a_preview_only_covers_approved_agents_but_includes_offline_ones() {
     server
         .state
         .registry
-        .decide(&revoked.id(), AgentState::Revoked)
+        .decide(&revoked.id(), HostState::Revoked)
         .await
         .unwrap();
 
@@ -2808,7 +2808,7 @@ async fn a_rule_can_be_previewed_before_it_has_a_name() {
         .await;
 
     assert_eq!(page.status, 200, "{}", page.body);
-    assert!(page.body.contains("no approved agents"), "{}", page.body);
+    assert!(page.body.contains("no approved hosts"), "{}", page.body);
 }
 
 #[tokio::test]
@@ -2867,8 +2867,8 @@ async fn a_preview_needs_a_csrf_token() {
 async fn text_from_an_agent_can_not_inject_html_into_a_preview() {
     let server = start().await;
     let attack = identity();
-    let host = "<script>alert(1)</script>";
-    let mut client = server.connect_approved(&attack, host).await;
+    let hostname = "<script>alert(1)</script>";
+    let mut client = server.connect_approved(&attack, hostname).await;
     TestServer::next_config(&mut client).await;
     let facts = AgentMessage::Facts {
         facts: json!({ "custom": { "role": "<script>alert(2)</script>" } }),
@@ -2898,7 +2898,7 @@ async fn every_page_shows_which_build_of_the_server_is_running() {
     let build = maxnines_protocol::build_info!();
 
     let mut browser = Browser::default();
-    for path in ["/agents", "/rules", "/rules/new", "/nope"] {
+    for path in ["/hosts", "/rules", "/rules/new", "/nope"] {
         let page = browser.get(&server, path).await;
         assert!(page.body.contains(&build.version), "{path}: {}", page.body);
         assert!(page.body.contains(&build.commit), "{path}: {}", page.body);
@@ -2958,8 +2958,8 @@ async fn report_samples(server: &TestServer, mount_point: &str) -> (Identity, Cl
 /// Connects an agent, sends four samples made by `sample` and waits until they
 /// can be read back.
 async fn report(server: &TestServer, sample: impl Fn(u64) -> AgentMessage) -> (Identity, Client) {
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
 
     let now = now_ms() as u64;
     for seconds_ago in [60, 45, 30, 15] {
@@ -2970,10 +2970,10 @@ async fn report(server: &TestServer, sample: impl Fn(u64) -> AgentMessage) -> (I
     while Instant::now() < deadline {
         let current = server.state.metrics.current(now_ms()).await.unwrap();
         if current
-            .get(&agent.id())
+            .get(&host.id())
             .is_some_and(|v| v.time_ms >= (now - 15_000) as i64)
         {
-            return (agent, client);
+            return (host, client);
         }
         // Reading answers heartbeats, or the server would drop a client this quiet.
         tokio::time::timeout(Duration::from_millis(10), client.next())
@@ -2986,15 +2986,12 @@ async fn report(server: &TestServer, sample: impl Fn(u64) -> AgentMessage) -> (I
 #[tokio::test]
 async fn samples_from_an_agent_reach_the_fleet_page() {
     let server = start_with_metrics().await;
-    let (agent, _client) = report_samples(&server, "/data").await;
+    let (host, _client) = report_samples(&server, "/data").await;
 
     let page = Browser::default().get(&server, "/metrics").await;
 
     assert_eq!(page.status, 200, "{}", page.body);
-    assert!(
-        page.body
-            .contains(&format!("/agents/{}/metrics", agent.id()))
-    );
+    assert!(page.body.contains(&format!("/hosts/{}/metrics", host.id())));
     assert!(page.body.contains("web-1"));
     for value in ["42.5%", "25%", "60%", "/data"] {
         assert!(page.body.contains(value), "{value}: {}", page.body);
@@ -3004,10 +3001,10 @@ async fn samples_from_an_agent_reach_the_fleet_page() {
 #[tokio::test]
 async fn samples_from_an_agent_reach_its_charts() {
     let server = start_with_metrics().await;
-    let (agent, _client) = report_samples(&server, "/data").await;
+    let (host, _client) = report_samples(&server, "/data").await;
 
     let page = Browser::default()
-        .get(&server, &format!("/agents/{}/metrics", agent.id()))
+        .get(&server, &format!("/hosts/{}/metrics", host.id()))
         .await;
 
     assert_eq!(page.status, 200, "{}", page.body);
@@ -3040,12 +3037,12 @@ async fn samples_from_an_agent_reach_its_charts() {
 }
 
 #[tokio::test]
-async fn a_machine_without_a_load_average_gets_no_load_average_chart() {
+async fn a_host_without_a_load_average_gets_no_load_average_chart() {
     let server = start_with_metrics().await;
-    let (agent, _client) = report(&server, |time_ms| windows_sample(time_ms, "C:\\")).await;
+    let (host, _client) = report(&server, |time_ms| windows_sample(time_ms, "C:\\")).await;
 
     let page = Browser::default()
-        .get(&server, &format!("/agents/{}/metrics", agent.id()))
+        .get(&server, &format!("/hosts/{}/metrics", host.id()))
         .await;
 
     assert_eq!(page.status, 200, "{}", page.body);
@@ -3060,8 +3057,8 @@ async fn a_machine_without_a_load_average_gets_no_load_average_chart() {
 #[tokio::test]
 async fn the_range_links_change_what_is_shown() {
     let server = start_with_metrics().await;
-    let (agent, _client) = report_samples(&server, "/data").await;
-    let path = format!("/agents/{}/metrics", agent.id());
+    let (host, _client) = report_samples(&server, "/data").await;
+    let path = format!("/hosts/{}/metrics", host.id());
     let mut browser = Browser::default();
 
     let page = browser.get(&server, &format!("{path}?range=7d")).await;
@@ -3091,19 +3088,19 @@ async fn the_range_links_change_what_is_shown() {
 #[tokio::test]
 async fn pages_of_data_update_in_place() {
     let server = start_with_metrics().await;
-    let (agent, _client) = report_samples(&server, "/").await;
+    let (host, _client) = report_samples(&server, "/").await;
     let mut browser = Browser::default();
 
     for (path, every) in [
         ("/".to_string(), "15s"),
-        ("/agents".to_string(), "15s"),
-        (format!("/agents/{}", agent.id()), "15s"),
+        ("/hosts".to_string(), "15s"),
+        (format!("/hosts/{}", host.id()), "15s"),
         ("/alerts".to_string(), "15s"),
         ("/checks".to_string(), "15s"),
         ("/metrics".to_string(), "15s"),
         ("/server".to_string(), "15s"),
-        (format!("/agents/{}/metrics", agent.id()), "60s"),
-        (format!("/agents/{}/metrics/cpu.usage", agent.id()), "60s"),
+        (format!("/hosts/{}/metrics", host.id()), "60s"),
+        (format!("/hosts/{}/metrics/cpu.usage", host.id()), "60s"),
     ] {
         let page = browser.get(&server, &path).await;
         assert_eq!(page.status, 200, "{path}");
@@ -3127,11 +3124,11 @@ async fn pages_of_data_update_in_place() {
 #[tokio::test]
 async fn metric_pages_and_assets_are_gzipped_for_browsers_that_accept_it() {
     let server = start_with_metrics().await;
-    let (agent, _client) = report_samples(&server, "/").await;
+    let (host, _client) = report_samples(&server, "/").await;
     let mut browser = Browser::default();
 
     for path in [
-        format!("/agents/{}/metrics", agent.id()),
+        format!("/hosts/{}/metrics", host.id()),
         "/metrics".to_string(),
         "/assets/js/htmx.min.js".to_string(),
         "/assets/css/application.css".to_string(),
@@ -3152,7 +3149,7 @@ async fn pages_with_a_csrf_token_and_fonts_are_never_gzipped() {
     let mut browser = Browser::default();
 
     for path in [
-        "/agents",
+        "/hosts",
         "/rules/new",
         "/checks/new",
         "/settings",
@@ -3229,7 +3226,7 @@ async fn a_form_still_works_after_the_page_has_updated_around_it() {
     let token = opened.token();
 
     for _ in 0..3 {
-        browser.get(&server, "/agents").await;
+        browser.get(&server, "/hosts").await;
     }
 
     let mut fields = vec![("authenticity_token", token.as_str())];
@@ -3239,11 +3236,11 @@ async fn a_form_still_works_after_the_page_has_updated_around_it() {
 }
 
 /// How many samples of `metric` are stored in a range around now.
-async fn stored_points(server: &TestServer, agent: &Identity) -> usize {
+async fn stored_points(server: &TestServer, host: &Identity) -> usize {
     let now = now_ms();
     let range = TimeRange::new(now - 3_600_000, now + 3_600_000).unwrap();
     let metric = crate::metrics::find("cpu.usage").unwrap();
-    let id = agent.id();
+    let id = host.id();
     let result = server.state.metrics.series(&id, metric, range, 8);
     let result = result.await.unwrap();
     result
@@ -3252,9 +3249,9 @@ async fn stored_points(server: &TestServer, agent: &Identity) -> usize {
         .map_or(0, |series| series.points.len())
 }
 
-async fn wait_for_points(server: &TestServer, agent: &Identity, count: usize) {
+async fn wait_for_points(server: &TestServer, host: &Identity, count: usize) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while stored_points(server, agent).await < count {
+    while stored_points(server, host).await < count {
         assert!(Instant::now() < deadline, "the samples never arrived");
         sleep(Duration::from_millis(10)).await;
     }
@@ -3263,8 +3260,8 @@ async fn wait_for_points(server: &TestServer, agent: &Identity, count: usize) {
 #[tokio::test]
 async fn only_recent_samples_count_as_current() {
     let server = start_with_metrics().await;
-    let agent = identity();
-    let client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let client = server.connect_approved(&host, "web-1").await;
     // Reading in the background answers heartbeats, as an agent would, however long
     // the checks below take. The server would drop a client that went quiet.
     let (mut sender, mut receiver) = client.split();
@@ -3276,27 +3273,27 @@ async fn only_recent_samples_count_as_current() {
     };
 
     report(now - 600_000).await;
-    wait_for_points(&server, &agent, 1).await;
+    wait_for_points(&server, &host, 1).await;
     let current = server.state.metrics.current(now_ms()).await.unwrap();
-    assert!(!current.contains_key(&agent.id()), "ten minutes old");
+    assert!(!current.contains_key(&host.id()), "ten minutes old");
 
     report(now + 1_800_000).await;
-    wait_for_points(&server, &agent, 2).await;
+    wait_for_points(&server, &host, 2).await;
     let current = server.state.metrics.current(now_ms()).await.unwrap();
-    assert!(!current.contains_key(&agent.id()), "from the future");
+    assert!(!current.contains_key(&host.id()), "from the future");
 
     report(now - 240_000).await;
-    wait_for_points(&server, &agent, 3).await;
+    wait_for_points(&server, &host, 3).await;
     let current = server.state.metrics.current(now_ms()).await.unwrap();
-    assert!(current.contains_key(&agent.id()), "four minutes old");
+    assert!(current.contains_key(&host.id()), "four minutes old");
 }
 
 #[tokio::test]
 async fn a_charts_numbers_can_be_read_as_a_table() {
     let server = start_with_metrics().await;
-    let (agent, _client) = report_samples(&server, "/data").await;
+    let (host, _client) = report_samples(&server, "/data").await;
 
-    let path = format!("/agents/{}/metrics/memory.usage?range=6h", agent.id());
+    let path = format!("/hosts/{}/metrics/memory.usage?range=6h", host.id());
     let page = Browser::default().get(&server, &path).await;
 
     assert_eq!(page.status, 200, "{}", page.body);
@@ -3316,13 +3313,13 @@ async fn a_charts_numbers_can_be_read_as_a_table() {
 #[tokio::test]
 async fn names_from_agents_are_escaped_on_metric_pages() {
     let server = start_with_metrics().await;
-    let (agent, _client) = report_samples(&server, "<script>alert(1)</script>").await;
+    let (host, _client) = report_samples(&server, "<script>alert(1)</script>").await;
     let mut browser = Browser::default();
 
     for path in [
         "/metrics".to_string(),
-        format!("/agents/{}/metrics", agent.id()),
-        format!("/agents/{}/metrics/disk.usage", agent.id()),
+        format!("/hosts/{}/metrics", host.id()),
+        format!("/hosts/{}/metrics/disk.usage", host.id()),
     ] {
         let page = browser.get(&server, &path).await;
         assert_eq!(page.status, 200, "{path}");
@@ -3338,16 +3335,16 @@ async fn names_from_agents_are_escaped_on_metric_pages() {
 #[tokio::test]
 async fn host_names_from_agents_are_escaped_on_metric_pages() {
     let server = start().await;
-    let agent = identity();
-    let host = "<script>alert(2)</script>";
-    let _client = server.connect_approved(&agent, host).await;
-    let id = agent.id();
+    let host = identity();
+    let hostname = "<script>alert(2)</script>";
+    let _client = server.connect_approved(&host, hostname).await;
+    let id = host.id();
     let mut browser = Browser::default();
 
     for path in [
         "/metrics".to_string(),
-        format!("/agents/{id}/metrics"),
-        format!("/agents/{id}/metrics/cpu.usage"),
+        format!("/hosts/{id}/metrics"),
+        format!("/hosts/{id}/metrics/cpu.usage"),
     ] {
         let page = browser.get(&server, &path).await;
         assert_eq!(page.status, 200, "{path}");
@@ -3363,9 +3360,9 @@ async fn host_names_from_agents_are_escaped_on_metric_pages() {
 #[tokio::test]
 async fn fixed_series_are_listed_in_their_natural_order() {
     let server = start_with_metrics().await;
-    let (agent, _client) = report_samples(&server, "/").await;
+    let (host, _client) = report_samples(&server, "/").await;
 
-    let path = format!("/agents/{}/metrics", agent.id());
+    let path = format!("/hosts/{}/metrics", host.id());
     let page = Browser::default().get(&server, &path).await;
 
     // Sorted by name, 15 minutes would come before 5 minutes.
@@ -3380,9 +3377,9 @@ async fn fixed_series_are_listed_in_their_natural_order() {
 #[tokio::test]
 async fn metric_pages_need_nothing_the_security_policy_blocks() {
     let server = start_with_metrics().await;
-    let (agent, _client) = report_samples(&server, "/").await;
+    let (host, _client) = report_samples(&server, "/").await;
 
-    let path = format!("/agents/{}/metrics", agent.id());
+    let path = format!("/hosts/{}/metrics", host.id());
     let page = Browser::default().get(&server, &path).await;
 
     assert_eq!(
@@ -3405,15 +3402,15 @@ async fn metric_pages_need_nothing_the_security_policy_blocks() {
 #[tokio::test]
 async fn an_agent_with_no_metrics_gets_empty_charts() {
     let server = start_with_metrics().await;
-    let agent = identity();
-    let _client = server.connect_approved(&agent, "quiet").await;
+    let host = identity();
+    let _client = server.connect_approved(&host, "quiet").await;
     let mut browser = Browser::default();
 
     let page = browser
-        .get(&server, &format!("/agents/{}/metrics", agent.id()))
+        .get(&server, &format!("/hosts/{}/metrics", host.id()))
         .await;
     assert_eq!(page.status, 200, "{}", page.body);
-    // Load average waits for data, since Windows machines never send one.
+    // Load average waits for data, since Windows hosts never send one.
     assert_eq!(page.body.matches("No data in this range").count(), 5);
 
     let page = browser.get(&server, "/metrics").await;
@@ -3441,15 +3438,15 @@ async fn only_approved_agents_are_on_the_fleet_page() {
 #[tokio::test]
 async fn unknown_agents_and_metrics_are_not_found() {
     let server = start().await;
-    let agent = identity();
-    let _client = server.connect_approved(&agent, "web-1").await;
-    let id = agent.id();
+    let host = identity();
+    let _client = server.connect_approved(&host, "web-1").await;
+    let id = host.id();
     let mut browser = Browser::default();
 
     for path in [
-        "/agents/nope/metrics".to_string(),
-        "/agents/nope/metrics/cpu.usage".to_string(),
-        format!("/agents/{id}/metrics/nonsense"),
+        "/hosts/nope/metrics".to_string(),
+        "/hosts/nope/metrics/cpu.usage".to_string(),
+        format!("/hosts/{id}/metrics/nonsense"),
     ] {
         assert_eq!(browser.get(&server, &path).await.status, 404, "{path}");
     }
@@ -3458,19 +3455,16 @@ async fn unknown_agents_and_metrics_are_not_found() {
 #[tokio::test]
 async fn the_agent_and_metric_pages_link_to_each_other() {
     let server = start().await;
-    let agent = identity();
-    let _client = server.connect_approved(&agent, "web-1").await;
-    let id = agent.id();
+    let host = identity();
+    let _client = server.connect_approved(&host, "web-1").await;
+    let id = host.id();
     let mut browser = Browser::default();
 
-    let page = browser.get(&server, &format!("/agents/{id}")).await;
-    assert!(
-        page.body
-            .contains(&format!("href=\"/agents/{id}/metrics\""))
-    );
+    let page = browser.get(&server, &format!("/hosts/{id}")).await;
+    assert!(page.body.contains(&format!("href=\"/hosts/{id}/metrics\"")));
 
-    let page = browser.get(&server, &format!("/agents/{id}/metrics")).await;
-    assert!(page.body.contains(&format!("href=\"/agents/{id}\"")));
+    let page = browser.get(&server, &format!("/hosts/{id}/metrics")).await;
+    assert!(page.body.contains(&format!("href=\"/hosts/{id}\"")));
     assert!(page.body.contains("href=\"/metrics\""));
 }
 
@@ -3480,7 +3474,7 @@ async fn the_metrics_api_needs_an_api_key() {
     for path in [
         "/api/v1/metrics",
         "/api/v1/metrics/current",
-        "/api/v1/agents/x/metrics/cpu.usage",
+        "/api/v1/hosts/x/metrics/cpu.usage",
     ] {
         let response = server.http("GET", path, None).await;
         assert!(response.starts_with("HTTP/1.1 401"), "{path}: {response}");
@@ -3514,10 +3508,10 @@ async fn the_metrics_api_lists_what_can_be_asked_for() {
 #[tokio::test]
 async fn the_metrics_api_returns_series_and_current_values() {
     let server = start_with_metrics().await;
-    let (agent, _client) = report_samples(&server, "/data").await;
-    let id = agent.id();
+    let (host, _client) = report_samples(&server, "/data").await;
+    let id = host.id();
 
-    let path = format!("/api/v1/agents/{id}/metrics/cpu.usage");
+    let path = format!("/api/v1/hosts/{id}/metrics/cpu.usage");
     let body = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
 
     assert_eq!(body["metric"], "cpu.usage");
@@ -3542,9 +3536,9 @@ async fn the_metrics_api_returns_series_and_current_values() {
 #[tokio::test]
 async fn the_metrics_api_can_be_given_a_time_range() {
     let server = start_with_metrics().await;
-    let (agent, _client) = report_samples(&server, "/").await;
+    let (host, _client) = report_samples(&server, "/").await;
     let now = now_ms();
-    let base = format!("/api/v1/agents/{}/metrics/cpu.usage", agent.id());
+    let base = format!("/api/v1/hosts/{}/metrics/cpu.usage", host.id());
 
     let path = format!(
         "{base}?from_ms={}&to_ms={}",
@@ -3563,12 +3557,12 @@ async fn the_metrics_api_can_be_given_a_time_range() {
 #[tokio::test]
 async fn the_metrics_api_refuses_what_it_can_not_answer() {
     let server = start().await;
-    let agent = identity();
-    let _client = server.connect_approved(&agent, "web-1").await;
-    let id = agent.id();
+    let host = identity();
+    let _client = server.connect_approved(&host, "web-1").await;
+    let id = host.id();
     let token = Some(server.api_key.as_str());
 
-    let metric = format!("/api/v1/agents/{id}/metrics/cpu.usage");
+    let metric = format!("/api/v1/hosts/{id}/metrics/cpu.usage");
     for query in [
         "from_ms=5&to_ms=1",
         "from_ms=-1&to_ms=5",
@@ -3588,8 +3582,8 @@ async fn the_metrics_api_refuses_what_it_can_not_answer() {
     );
 
     for path in [
-        format!("/api/v1/agents/{id}/metrics/nonsense"),
-        "/api/v1/agents/nope/metrics/cpu.usage".to_string(),
+        format!("/api/v1/hosts/{id}/metrics/nonsense"),
+        "/api/v1/hosts/nope/metrics/cpu.usage".to_string(),
     ] {
         let response = server.http("GET", &path, token).await;
         assert!(response.starts_with("HTTP/1.1 404"), "{path}: {response}");
@@ -3617,7 +3611,7 @@ impl MetricsReader for BrokenReader {
 
     fn latest_output(
         &self,
-        _agent_id: &str,
+        _host_id: &str,
         _collector: &str,
         _since_ms: i64,
         _until_ms: i64,
@@ -3664,26 +3658,26 @@ async fn a_failing_metrics_query_only_fails_that_request() {
     let saved = Saved::default();
     let store = Box::new(MemoryStore(saved.clone()));
     let server = start_on("", store, Arc::new(BrokenReader), saved, None).await;
-    let agent = identity();
-    let _client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let _client = server.connect_approved(&host, "web-1").await;
     let mut browser = Browser::default();
 
-    let path = format!("/agents/{}/metrics", agent.id());
+    let path = format!("/hosts/{}/metrics", host.id());
     assert_eq!(browser.get(&server, &path).await.status, 500, "a panic");
 
     let page = browser.get(&server, "/metrics").await;
     assert_eq!(page.status, 500, "an error");
     assert!(!page.body.contains("secret"), "{}", page.body);
 
-    assert_eq!(browser.get(&server, "/agents").await.status, 200);
+    assert_eq!(browser.get(&server, "/hosts").await.status, 200);
 }
 
 #[tokio::test]
 async fn containers_become_charts_of_each_one() {
     let server = start_with_metrics().await;
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, "web-1").await;
-    let id = agent.id();
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
+    let id = host.id();
 
     // As the agent sends them: a failing container has no figures to give.
     let now = now_ms() as u64;
@@ -3705,7 +3699,7 @@ async fn containers_become_charts_of_each_one() {
         send(&mut client, &message).await;
     }
 
-    let series = |metric: &str| format!("/api/v1/agents/{id}/metrics/{metric}?range=1h");
+    let series = |metric: &str| format!("/api/v1/hosts/{id}/metrics/{metric}?range=1h");
     let read = async |metric: &str| {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -3738,7 +3732,7 @@ async fn containers_become_charts_of_each_one() {
     assert_eq!(received["series"][0]["name"], "web");
 
     let page = Browser::default()
-        .get(&server, &format!("/agents/{id}/metrics"))
+        .get(&server, &format!("/hosts/{id}/metrics"))
         .await;
     assert!(page.body.contains("Containers up"), "{}", page.body);
     assert!(page.body.contains("Container CPU usage"));
@@ -3747,9 +3741,9 @@ async fn containers_become_charts_of_each_one() {
 #[tokio::test]
 async fn web_server_status_pages_become_charts() {
     let server = start_with_metrics().await;
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, "web-1").await;
-    let id = agent.id();
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
+    let id = host.id();
     let apache_page = "http://localhost/server-status";
     let pool = "http://localhost/status-www";
 
@@ -3779,7 +3773,7 @@ async fn web_server_status_pages_become_charts() {
         send(&mut client, &message).await;
     }
 
-    let series = |metric: &str| format!("/api/v1/agents/{id}/metrics/{metric}?range=1h");
+    let series = |metric: &str| format!("/api/v1/hosts/{id}/metrics/{metric}?range=1h");
     let deadline = Instant::now() + Duration::from_secs(5);
     let requests = loop {
         let body = json_body(
@@ -3830,13 +3824,13 @@ async fn web_server_status_pages_become_charts() {
 
 // ---- finding hosts
 
-async fn report_facts(server: &TestServer, host: &str, facts: Value) -> (Identity, Client) {
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, host).await;
+async fn report_facts(server: &TestServer, hostname: &str, facts: Value) -> (Identity, Client) {
+    let host = identity();
+    let mut client = server.connect_approved(&host, hostname).await;
     let count = crate::facts::flatten(&facts).unwrap().len();
     send(&mut client, &AgentMessage::Facts { facts }).await;
-    server.wait_for_facts(&agent.id(), count).await;
-    (agent, client)
+    server.wait_for_facts(&host.id(), count).await;
+    (host, client)
 }
 
 /// One Linux web server and one macOS database server.
@@ -3863,7 +3857,7 @@ async fn each_host_shows_an_icon_for_its_system() {
     let _odd = report_facts(&server, "odd-1", odd).await;
     let mut browser = Browser::default();
 
-    for path in ["/", "/agents", "/agents?view=table", "/metrics"] {
+    for path in ["/", "/hosts", "/hosts?view=table", "/metrics"] {
         let page = browser.get(&server, path).await;
         assert_eq!(page.status, 200, "{path}: {}", page.body);
         assert!(
@@ -3879,9 +3873,9 @@ async fn each_host_shows_an_icon_for_its_system() {
         assert_eq!(page.body.matches("class=\"os-icon ").count(), 2, "{path}");
         assert!(!page.body.contains("plan9</b>"), "{path}");
     }
-    let page = browser.get(&server, &format!("/agents/{}", web.id())).await;
+    let page = browser.get(&server, &format!("/hosts/{}", web.id())).await;
     assert!(page.body.contains("aria-label=\"Linux\""), "{}", page.body);
-    let page = browser.get(&server, &format!("/agents/{}", db.id())).await;
+    let page = browser.get(&server, &format!("/hosts/{}", db.id())).await;
     assert!(page.body.contains("aria-label=\"macOS\""), "{}", page.body);
 }
 
@@ -3902,7 +3896,7 @@ async fn hosts_can_be_filtered_by_their_facts() {
         ("?filter=os%3Dlinux+hostname%3Ddb%2A", false, false),
         ("?filter=custom.rack%3Da1", false, false),
     ] {
-        let found = hosts_on(&server, &format!("/agents{query}")).await;
+        let found = hosts_on(&server, &format!("/hosts{query}")).await;
         assert_eq!(found, (web, db), "{query}");
     }
 }
@@ -3919,7 +3913,7 @@ async fn the_fleet_metrics_page_filters_the_same_way() {
     let page = Browser::default()
         .get(&server, "/metrics?filter=nothing")
         .await;
-    assert!(page.body.contains("No machines match this filter."));
+    assert!(page.body.contains("No hosts match this filter."));
 }
 
 #[tokio::test]
@@ -3927,24 +3921,19 @@ async fn a_filter_that_cannot_be_read_says_why_and_shows_nothing() {
     let server = start().await;
     let _hosts = two_hosts(&server).await;
 
-    let page = Browser::default()
-        .get(&server, "/agents?filter=os%3D")
-        .await;
+    let page = Browser::default().get(&server, "/hosts?filter=os%3D").await;
 
     assert!(page.body.contains("os needs a value"), "{}", page.body);
     assert!(!page.body.contains(">web-1"));
 }
 
 #[tokio::test]
-async fn links_on_the_agents_page_keep_the_filter() {
+async fn links_on_the_hosts_page_keep_the_filter() {
     let server = start().await;
     let _hosts = two_hosts(&server).await;
 
     let page = Browser::default()
-        .get(
-            &server,
-            "/agents?status=online&view=table&filter=os%3Dlinux",
-        )
+        .get(&server, "/hosts?status=online&view=table&filter=os%3Dlinux")
         .await;
 
     assert!(page.body.contains(r#"value="os=linux""#), "{}", page.body);
@@ -3962,7 +3951,7 @@ async fn a_table_shows_each_hosts_config_state() {
     let server = start().await;
     let _hosts = two_hosts(&server).await;
 
-    let page = Browser::default().get(&server, "/agents?view=table").await;
+    let page = Browser::default().get(&server, "/hosts?view=table").await;
 
     assert!(page.body.contains("Not reported"), "{}", page.body);
 }
@@ -3972,7 +3961,7 @@ async fn what_is_typed_into_a_filter_is_never_markup() {
     let server = start().await;
     let hostile = "%22%3E%3Cscript%3Ealert(1)%3C%2Fscript%3E";
 
-    for path in ["/agents", "/metrics"] {
+    for path in ["/hosts", "/metrics"] {
         let page = Browser::default()
             .get(&server, &format!("{path}?filter={hostile}"))
             .await;
@@ -3984,14 +3973,14 @@ async fn what_is_typed_into_a_filter_is_never_markup() {
 async fn long_lists_are_split_into_pages() {
     let server = start().await;
     for number in 0..PAGE_SIZE + 1 {
-        let agent = identity();
+        let host = identity();
         server
-            .connect_approved(&agent, &format!("host-{number:03}"))
+            .connect_approved(&host, &format!("host-{number:03}"))
             .await;
     }
 
-    let first = Browser::default().get(&server, "/agents").await;
-    let second = Browser::default().get(&server, "/agents?page=2").await;
+    let first = Browser::default().get(&server, "/hosts").await;
+    let second = Browser::default().get(&server, "/hosts?page=2").await;
 
     assert!(first.body.contains("host-000"));
     assert!(!first.body.contains(&format!("host-{PAGE_SIZE:03}")));
@@ -4007,7 +3996,7 @@ async fn long_lists_are_split_into_pages() {
 }
 
 async fn options(server: &TestServer, term: &str) -> Vec<Value> {
-    let path = format!("/agents/filter-options?term={term}");
+    let path = format!("/hosts/filter-options?term={term}");
     let page = Browser::default().get(server, &path).await;
     assert_eq!(page.status, 200, "{}", page.body);
     serde_json::from_str(&page.body).unwrap()
@@ -4075,7 +4064,7 @@ fn hosts_in(response: &str) -> Vec<String> {
         .as_array()
         .unwrap()
         .iter()
-        .map(|agent| agent["host"].as_str().unwrap().to_string())
+        .map(|host| host["hostname"].as_str().unwrap().to_string())
         .collect();
     hosts.sort();
     hosts
@@ -4120,8 +4109,8 @@ fn every_api_route_is_documented() {
 async fn the_api_lives_under_its_version() {
     let server = start().await;
 
-    let versioned = server.request("GET", "/api/v1/agents", "").await;
-    let old = server.request("GET", "/admin/agents", "").await;
+    let versioned = server.request("GET", "/api/v1/hosts", "").await;
+    let old = server.request("GET", "/admin/hosts", "").await;
 
     assert_eq!(status_of(&versioned), "200", "{versioned}");
     assert_eq!(status_of(&old), "404", "{old}");
@@ -4141,12 +4130,12 @@ async fn an_unknown_api_address_answers_in_json() {
 async fn the_api_still_needs_the_token() {
     let server = start().await;
 
-    let page = Browser::default().get(&server, "/api/v1/agents").await;
+    let page = Browser::default().get(&server, "/api/v1/hosts").await;
 
     assert_eq!(page.status, 401, "{}", page.body);
 }
 
-/// Names needn't be unique, so the ID is the one way to mean a single machine.
+/// Names needn't be unique, so the ID is the one way to mean a single host.
 #[tokio::test]
 async fn the_filter_can_pick_an_agent_by_id() {
     let server = start().await;
@@ -4154,17 +4143,17 @@ async fn the_filter_can_pick_an_agent_by_id() {
     let web = hosts[0].0.id();
 
     let by_id = server
-        .request("GET", &format!("/api/v1/agents?filter=id%3D{web}"), "")
+        .request("GET", &format!("/api/v1/hosts?filter=id%3D{web}"), "")
         .await;
     assert_eq!(hosts_in(&by_id), ["web-1"]);
 
     let prefix = &web[..8];
     assert_eq!(
-        hosts_on(&server, &format!("/agents?filter=id%3D{prefix}*")).await,
+        hosts_on(&server, &format!("/hosts?filter=id%3D{prefix}*")).await,
         (true, false)
     );
     assert_eq!(
-        hosts_on(&server, &format!("/agents?filter=id!%3D{prefix}*")).await,
+        hosts_on(&server, &format!("/hosts?filter=id!%3D{prefix}*")).await,
         (false, true)
     );
 }
@@ -4187,9 +4176,9 @@ async fn the_filter_suggests_agents_by_name_for_an_id() {
 async fn pages_show_the_start_of_each_agents_id_beside_its_name() {
     let server = start().await;
     let hosts = two_hosts(&server).await;
-    let marker = format!(r#"<span class="agent-id">{}</span>"#, &hosts[0].0.id()[..8]);
+    let marker = format!(r#"<span class="host-id">{}</span>"#, &hosts[0].0.id()[..8]);
 
-    for path in ["/agents", "/agents?view=table", "/", "/metrics"] {
+    for path in ["/hosts", "/hosts?view=table", "/", "/metrics"] {
         let page = Browser::default().get(&server, path).await;
         assert!(page.body.contains(&marker), "{path}: {}", page.body);
     }
@@ -4200,9 +4189,9 @@ async fn the_api_filters_hosts_the_same_way_as_the_pages() {
     let server = start().await;
     let _hosts = two_hosts(&server).await;
 
-    let all = server.request("GET", "/api/v1/agents", "").await;
+    let all = server.request("GET", "/api/v1/hosts", "").await;
     let linux = server
-        .request("GET", "/api/v1/agents?filter=os%3Dlinux", "")
+        .request("GET", "/api/v1/hosts?filter=os%3Dlinux", "")
         .await;
 
     assert_eq!(hosts_in(&all), ["db-1", "web-1"]);
@@ -4217,11 +4206,11 @@ async fn the_api_shows_one_agent() {
     let id = hosts[0].0.id();
 
     let found = server
-        .request("GET", &format!("/api/v1/agents/{id}"), "")
+        .request("GET", &format!("/api/v1/hosts/{id}"), "")
         .await;
-    let missing = server.request("GET", "/api/v1/agents/nope", "").await;
+    let missing = server.request("GET", "/api/v1/hosts/nope", "").await;
 
-    assert_eq!(body_of(&found)["host"], "web-1", "{found}");
+    assert_eq!(body_of(&found)["hostname"], "web-1", "{found}");
     assert_eq!(body_of(&found)["health"], "online");
     assert_eq!(status_of(&missing), "404", "{missing}");
 }
@@ -4231,7 +4220,7 @@ async fn the_api_explains_a_filter_it_cannot_read() {
     let server = start().await;
 
     let response = server
-        .request("GET", "/api/v1/agents?filter=os%3D", "")
+        .request("GET", "/api/v1/hosts?filter=os%3D", "")
         .await;
 
     assert_eq!(status_of(&response), "400", "{response}");
@@ -4249,7 +4238,7 @@ async fn the_api_suggests_what_the_filter_box_does() {
     let _hosts = two_hosts(&server).await;
 
     let response = server
-        .request("GET", "/api/v1/agents/filter-options?term=os%3D", "")
+        .request("GET", "/api/v1/hosts/filter-options?term=os%3D", "")
         .await;
 
     assert_eq!(body_of(&response)[0]["text"], "os=linux", "{response}");
@@ -4337,14 +4326,14 @@ async fn a_key_from_the_api_opens_the_api_until_it_is_revoked() {
     let key = created["key"].as_str().unwrap();
     assert!(key.starts_with("mxn_"));
 
-    let using = request_with_key(&server, key, "/api/v1/agents").await;
+    let using = request_with_key(&server, key, "/api/v1/hosts").await;
     assert_eq!(status_of(&using), "200", "{using}");
 
     let path = format!("/api/v1/api-keys/{}", created["id"]);
     let revoked = server.request("DELETE", &path, "").await;
     assert_eq!(status_of(&revoked), "204", "{revoked}");
 
-    let refused = request_with_key(&server, key, "/api/v1/agents").await;
+    let refused = request_with_key(&server, key, "/api/v1/hosts").await;
     assert_eq!(status_of(&refused), "401", "{refused}");
 }
 
@@ -4352,7 +4341,7 @@ async fn a_key_from_the_api_opens_the_api_until_it_is_revoked() {
 async fn a_made_up_key_is_refused() {
     let server = start().await;
 
-    let response = request_with_key(&server, "mxn_nope", "/api/v1/agents").await;
+    let response = request_with_key(&server, "mxn_nope", "/api/v1/hosts").await;
 
     assert_eq!(status_of(&response), "401", "{response}");
 }
@@ -4403,7 +4392,7 @@ async fn a_key_that_has_run_out_is_refused() {
         .await
         .unwrap();
 
-    let response = request_with_key(&server, &key, "/api/v1/agents").await;
+    let response = request_with_key(&server, &key, "/api/v1/hosts").await;
 
     assert_eq!(status_of(&response), "401", "{response}");
 }
@@ -4515,7 +4504,7 @@ async fn a_key_can_be_revoked_from_its_page() {
         )
         .await;
 
-    let response = request_with_key(&server, key, "/api/v1/agents").await;
+    let response = request_with_key(&server, key, "/api/v1/hosts").await;
     assert_eq!(status_of(&response), "401", "{response}");
     let page = browser.get(&server, "/settings/api-keys").await;
     assert!(page.body.contains("Revoked"), "{}", page.body);
@@ -4533,7 +4522,7 @@ const LEEDS: [(&str, &str); 6] = [
 ];
 
 #[tokio::test]
-async fn the_map_puts_machines_where_their_rules_say() {
+async fn the_map_puts_hosts_where_their_rules_say() {
     let server = start().await;
     let web = identity();
     let db = identity();
@@ -4549,12 +4538,12 @@ async fn the_map_puts_machines_where_their_rules_say() {
     let page = browser.get(&server, "/map").await;
     assert_eq!(page.status, 200, "{}", page.body);
     assert!(page.body.contains("Leeds office"), "{}", page.body);
-    assert!(page.body.contains("1 site · 2 machines"), "{}", page.body);
-    // The machine no rule covers is listed to be placed.
-    let place_db = format!("/map/rules/new?agent={}", db.id());
+    assert!(page.body.contains("1 site · 2 hosts"), "{}", page.body);
+    // The host no rule covers is listed to be placed.
+    let place_db = format!("/map/rules/new?host={}", db.id());
     assert!(page.body.contains(&place_db), "{}", page.body);
     assert!(
-        !page.body.contains(&format!("agent={}", web.id())),
+        !page.body.contains(&format!("host={}", web.id())),
         "{}",
         page.body
     );
@@ -4562,16 +4551,16 @@ async fn the_map_puts_machines_where_their_rules_say() {
     let map = body_of(&server.request("GET", "/api/v1/map", "").await);
     assert_eq!(map["sites"][0]["name"], "Leeds office");
     assert_eq!(map["sites"][0]["counts"]["online"], 1);
-    assert_eq!(map["sites"][0]["machines"][0]["host"], "web-1");
-    assert_eq!(map["sites"][0]["machines"][0]["short_id"], &web.id()[..8]);
-    assert_eq!(map["unplaced"][0]["host"], "db-1");
+    assert_eq!(map["sites"][0]["hosts"][0]["hostname"], "web-1");
+    assert_eq!(map["sites"][0]["hosts"][0]["short_id"], &web.id()[..8]);
+    assert_eq!(map["unplaced"][0]["hostname"], "db-1");
 
     let rules = browser.get(&server, "/map/rules").await;
     assert!(rules.body.contains("hostname=web*"), "{}", rules.body);
 }
 
 #[tokio::test]
-async fn a_machine_placed_from_its_page_outranks_a_broader_rule() {
+async fn a_host_placed_from_its_page_outranks_a_broader_rule() {
     let server = start().await;
     let web = identity();
     server.connect_approved(&web, "web-1").await;
@@ -4580,12 +4569,12 @@ async fn a_machine_placed_from_its_page_outranks_a_broader_rule() {
         .submit(&server, "/map/rules/new", "/map/rules", &LEEDS)
         .await;
 
-    let agent_page = format!("/agents/{}", web.id());
-    let page = browser.get(&server, &agent_page).await;
+    let host_page = format!("/hosts/{}", web.id());
+    let page = browser.get(&server, &host_page).await;
     assert!(page.body.contains("Leeds office"), "{}", page.body);
     assert!(page.body.contains("Place it by itself"), "{}", page.body);
 
-    let form = format!("/map/rules/new?agent={}", web.id());
+    let form = format!("/map/rules/new?host={}", web.id());
     let page = browser.get(&server, &form).await;
     let filter = format!("id={}", web.id());
     assert!(page.body.contains(&filter), "{}", page.body);
@@ -4612,7 +4601,7 @@ async fn a_machine_placed_from_its_page_outranks_a_broader_rule() {
         .await;
     assert_eq!(saved.status, 303, "{}", saved.body);
 
-    let page = browser.get(&server, &agent_page).await;
+    let page = browser.get(&server, &host_page).await;
     assert!(page.body.contains("Rack 4"), "{}", page.body);
     assert!(!page.body.contains("Place it by itself"), "{}", page.body);
     let map = body_of(&server.request("GET", "/api/v1/map", "").await);
@@ -4773,8 +4762,8 @@ async fn places_can_be_looked_up_from_the_form_and_the_api() {
 #[tokio::test]
 async fn names_on_the_map_stay_text() {
     let server = start().await;
-    let agent = identity();
-    server.connect_approved(&agent, "<i>web</i>").await;
+    let host = identity();
+    server.connect_approved(&host, "<i>web</i>").await;
     let mut browser = Browser::default();
     let mut fields = LEEDS.to_vec();
     fields[0] = ("name", "<b>Leeds</b>");
@@ -4788,8 +4777,6 @@ async fn names_on_the_map_stay_text() {
     assert!(!page.body.contains("<b>Leeds"), "{}", page.body);
     assert!(!page.body.contains("<i>web"), "{}", page.body);
     assert!(page.has_only_our_scripts(), "{}", page.body);
-    let page = browser
-        .get(&server, &format!("/agents/{}", agent.id()))
-        .await;
+    let page = browser.get(&server, &format!("/hosts/{}", host.id())).await;
     assert!(!page.body.contains("<b>Leeds"), "{}", page.body);
 }

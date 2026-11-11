@@ -1,7 +1,7 @@
 //! Your own metrics, from commands defined in the agent's config file.
 //!
 //! The commands stay in that file on purpose. The server only chooses which names
-//! to collect, so it can never make a machine run anything new, even if someone
+//! to collect, so it can never make a host run anything new, even if someone
 //! takes it over. Commands run directly, without a shell.
 //!
 //! A command prints one number, or a JSON object of names and numbers so that one
@@ -533,7 +533,7 @@ mod tests {
                 file = file.display()
             );
 
-            // Long enough for a busy machine to start the shell and what it starts.
+            // Long enough for a busy host to start the shell and what it starts.
             let stuck = metric(&["/bin/sh", "-c", &script]);
             let result = measure("m", &stuck, Duration::from_secs(2)).await;
 

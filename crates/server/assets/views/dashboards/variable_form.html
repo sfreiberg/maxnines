@@ -22,19 +22,19 @@
 
   <label>Picks
     <select name="kind">
-      <option value="machine"{% if variable.kind == "machine" %} selected{% endif %}>One machine</option>
+      <option value="host"{% if variable.kind == "host" %} selected{% endif %}>One host</option>
       <option value="fact"{% if variable.kind == "fact" %} selected{% endif %}>A value of a fact, or all of them</option>
     </select>
   </label>
 
   <label>Fact
     <input type="text" name="fact" value="{{ variable.fact }}" maxlength="200" placeholder="os.name">
-    <span class="note">Only used for a value of a fact. The picker offers the values the machines have.</span>
+    <span class="note">Only used for a value of a fact. The picker offers the values the hosts have.</span>
   </label>
 
-  <label>Machines
+  <label>Hosts
     <input type="text" name="filter" value="{{ variable.filter }}" maxlength="500" placeholder="os=windows">
-    <span class="note">Which machines it offers, or whose values it offers, in the same filter as the Machines list. Leave it empty for every machine.</span>
+    <span class="note">Which hosts it offers, or whose values it offers, in the same filter as the Hosts list. Leave it empty for every host.</span>
   </label>
 
   <button type="submit">{% if name %}Save{% else %}Add variable{% endif %}</button>

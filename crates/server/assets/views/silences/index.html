@@ -11,7 +11,7 @@
 {% if active %}
 <div class="tablebox"><table>
   <thead>
-    <tr><th>Reason</th><th>Rule</th><th>Machines</th><th>Until</th><th>Added by</th><th></th></tr>
+    <tr><th>Reason</th><th>Rule</th><th>Hosts</th><th>Until</th><th>Added by</th><th></th></tr>
   </thead>
   <tbody>
     {% for silence in active %}
@@ -45,7 +45,7 @@
 {% if windows %}
 <div class="tablebox"><table>
   <thead>
-    <tr><th>Name</th><th>When</th><th>Rule</th><th>Machines</th><th></th></tr>
+    <tr><th>Name</th><th>When</th><th>Rule</th><th>Hosts</th><th></th></tr>
   </thead>
   <tbody>
     {% for window in windows %}
@@ -69,7 +69,7 @@
 <h2>Ended</h2>
 <div class="tablebox"><table>
   <thead>
-    <tr><th>Reason</th><th>Rule</th><th>Machines</th><th>From</th><th>Until</th><th>Added by</th></tr>
+    <tr><th>Reason</th><th>Rule</th><th>Hosts</th><th>From</th><th>Until</th><th>Added by</th></tr>
   </thead>
   <tbody>
     {% for silence in ended %}

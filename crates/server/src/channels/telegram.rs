@@ -10,7 +10,7 @@ use super::{
 use crate::alerting::{Channel, ChannelInput, Event};
 use crate::notifier::{Notice, Senders, format_ms};
 use crate::registration::short_id;
-use crate::remote_checks::FLEET_AGENT_ID;
+use crate::remote_checks::FLEET_HOST_ID;
 
 /// Where Telegram's bot API lives.
 pub const API_URL: &str = "https://api.telegram.org";
@@ -59,13 +59,13 @@ fn text(notice: &Notice, web_url: Option<&str>) -> String {
         notice.label(),
         escape(clip_utf16(&alert.summary, MAX_SUMMARY))
     )];
-    let place = if alert.agent_id == FLEET_AGENT_ID {
-        format!("Machines: {}", clip(&alert.host))
+    let place = if alert.host_id == FLEET_HOST_ID {
+        format!("Hosts: {}", clip(&alert.hostname))
     } else {
         format!(
-            "Machine: {} ({})",
-            clip(&alert.host),
-            short_id(&alert.agent_id)
+            "Host: {} ({})",
+            clip(&alert.hostname),
+            short_id(&alert.host_id)
         )
     };
     lines.push(format!(
@@ -295,7 +295,7 @@ mod tests {
         assert_eq!(
             text,
             "<b>CRITICAL</b> CPU usage on web-1 is 97%, above 90%\n\
-             Rule: High CPU · Machine: web-1 (abc) · Started: 1970-01-01 00:00:01 UTC\n\
+             Rule: High CPU · Host: web-1 (abc) · Started: 1970-01-01 00:00:01 UTC\n\
              <a href=\"https://m.example.com/alerts\">View alerts</a>"
         );
         assert_eq!(
@@ -320,7 +320,7 @@ mod tests {
     fn a_host_cannot_add_markup_to_a_telegram_message() {
         let alert = Alert {
             summary: "<a href=\"http://evil\">click</a> & <b>".to_string(),
-            host: "<i>web</i>".to_string(),
+            hostname: "<i>web</i>".to_string(),
             ..alert()
         };
         let text = text(&notice(Event::Firing, alert), None);
@@ -328,14 +328,14 @@ mod tests {
             text.contains("&lt;a href=&quot;http://evil&quot;&gt;click&lt;/a&gt; &amp; &lt;b&gt;"),
             "{text}"
         );
-        assert!(text.contains("Machine: &lt;i&gt;web&lt;/i&gt;"), "{text}");
+        assert!(text.contains("Host: &lt;i&gt;web&lt;/i&gt;"), "{text}");
     }
 
     #[test]
     fn a_long_telegram_message_fits_the_limit() {
         let alert = Alert {
             summary: "😀".repeat(5000),
-            host: "&".repeat(5000),
+            hostname: "&".repeat(5000),
             rule_name: "r".repeat(255),
             ..alert()
         };

@@ -14,7 +14,7 @@ use crate::facts::FlatFacts;
 use crate::host_filter::HostFilter;
 use crate::maintenance::MaintenanceWindow;
 use crate::models::Database;
-use crate::remote_checks::FLEET_AGENT_ID;
+use crate::remote_checks::FLEET_HOST_ID;
 
 const MAX_REASON_CHARS: usize = 255;
 const MAX_FILTER_CHARS: usize = 500;
@@ -25,7 +25,7 @@ pub struct Silence {
     pub id: i64,
     /// Every rule, if empty.
     pub rule_id: Option<i64>,
-    /// Which machines, in the same form as the Machines list. Every machine, if empty.
+    /// Which hosts, in the same form as the Hosts list. Every host, if empty.
     pub filter: String,
     pub reason: String,
     pub created_by: String,
@@ -43,13 +43,13 @@ pub struct SilenceInput {
     pub duration_secs: u64,
 }
 
-/// A silence covering just this alert: its rule, on its machine, by ID, as names
-/// needn't be unique. An alert about the fleet has no machine, so its rule alone.
+/// A silence covering just this alert: its rule, on its host, by ID, as names
+/// needn't be unique. An alert about the fleet has no host, so its rule alone.
 pub fn silence_for(alert: &Alert, reason: &str, duration_secs: u64) -> SilenceInput {
-    let filter = if alert.agent_id == FLEET_AGENT_ID {
+    let filter = if alert.host_id == FLEET_HOST_ID {
         String::new()
     } else {
-        crate::host_filter::only(&alert.agent_id)
+        crate::host_filter::only(&alert.host_id)
     };
     SilenceInput {
         rule_id: alert.rule_id,
@@ -176,15 +176,15 @@ impl ActiveSilences {
         Ok(Self { quiet, facts })
     }
 
-    /// Whatever holds back every alert about a machine for longest, whichever rule
+    /// Whatever holds back every alert about a host for longest, whichever rule
     /// it's from.
-    pub fn covering_machine(&self, agent_id: &str, host: &str) -> Option<Cover> {
+    pub fn covering_host(&self, host_id: &str, hostname: &str) -> Option<Cover> {
         let covers = |entry: &&Quiet| {
             entry.rule_id.is_none()
                 && entry
                     .filter
                     .as_ref()
-                    .is_none_or(|filter| filter.matches(agent_id, host, self.facts.get(agent_id)))
+                    .is_none_or(|filter| filter.matches(host_id, hostname, self.facts.get(host_id)))
         };
         self.quiet.iter().find(covers).map(|entry| entry.cover)
     }
@@ -194,15 +194,15 @@ impl ActiveSilences {
     pub fn covering(&self, alert: &Alert) -> Option<Cover> {
         let covers = |entry: &&Quiet| {
             let rule = entry.rule_id.is_none_or(|id| alert.rule_id == Some(id));
-            let host = entry.filter.as_ref().is_none_or(|filter| {
-                alert.agent_id != FLEET_AGENT_ID
+            let hostname = entry.filter.as_ref().is_none_or(|filter| {
+                alert.host_id != FLEET_HOST_ID
                     && filter.matches(
-                        &alert.agent_id,
-                        &alert.host,
-                        self.facts.get(&alert.agent_id),
+                        &alert.host_id,
+                        &alert.hostname,
+                        self.facts.get(&alert.host_id),
                     )
             });
-            rule && host
+            rule && hostname
         };
         self.quiet.iter().find(covers).map(|entry| entry.cover)
     }

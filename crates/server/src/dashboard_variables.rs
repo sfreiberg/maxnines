@@ -1,6 +1,6 @@
-//! Variables let one dashboard show any machine, or any value of a fact, picked at
+//! Variables let one dashboard show any host, or any value of a fact, picked at
 //! the top of the page. A widget's filter uses one as a term on its own, like
-//! `$machine`, and its title can mention one the same way.
+//! `$host`, and its title can mention one the same way.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -11,7 +11,7 @@ use crate::calculations::Sources;
 use crate::controllers::host_list::HostSearch;
 use crate::facts::fact_text;
 use crate::host_filter::{self, HostFilter, term_spans, written_value};
-use crate::registration::{AgentRecord, AgentState, short_id};
+use crate::registration::{HostRecord, HostState, short_id};
 
 pub const MAX_VARIABLES: usize = 10;
 const MAX_NAME_LEN: usize = 32;
@@ -31,8 +31,8 @@ const NONE_LABEL: &str = "none";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VariableKind {
-    /// One machine, written into a filter as `id=`.
-    Machine,
+    /// One host, written into a filter as `id=`.
+    Host,
     /// A value of a fact, or every value.
     Fact,
 }
@@ -40,14 +40,14 @@ pub enum VariableKind {
 impl VariableKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Machine => "machine",
+            Self::Host => "host",
             Self::Fact => "fact",
         }
     }
 
     pub fn parse(text: &str) -> Option<Self> {
         match text {
-            "machine" => Some(Self::Machine),
+            "host" => Some(Self::Host),
             "fact" => Some(Self::Fact),
             _ => None,
         }
@@ -65,18 +65,18 @@ pub struct Variable {
     /// The fact whose values are offered, for a fact variable.
     #[serde(default)]
     pub fact: String,
-    /// Which machines are offered, or whose values are, in the Machines list's filter.
+    /// Which hosts are offered, or whose values are, in the Hosts list's filter.
     #[serde(default)]
     pub filter: String,
 }
 
 impl Variable {
-    /// Trims what was typed, and drops a fact a machine variable has no use for.
+    /// Trims what was typed, and drops a fact a host variable has no use for.
     pub fn tidy(mut self) -> Self {
         self.name = self.name.trim().trim_start_matches('$').to_string();
         self.label = self.label.trim().to_string();
         self.fact = match self.kind {
-            VariableKind::Machine => String::new(),
+            VariableKind::Host => String::new(),
             VariableKind::Fact => self.fact.trim().to_string(),
         };
         self.filter = self.filter.trim().to_string();
@@ -121,7 +121,7 @@ impl Variable {
             ));
         }
         if !uses(&self.filter).is_empty() {
-            return Err("Which machines a variable offers can't depend on a variable.".to_string());
+            return Err("Which hosts a variable offers can't depend on a variable.".to_string());
         }
         HostFilter::parse(&self.filter).map(|_| ())
     }
@@ -161,7 +161,7 @@ pub fn check_variables(variables: &[Variable]) -> Result<(), String> {
     Ok(())
 }
 
-/// The variables a filter uses, as terms on their own like `$machine`.
+/// The variables a filter uses, as terms on their own like `$host`.
 pub fn uses(filter: &str) -> Vec<&str> {
     term_spans(filter)
         .into_iter()
@@ -189,10 +189,10 @@ pub struct Choice {
 /// What a variable stands for at the moment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pick {
-    /// Every machine, so its term is left out.
+    /// Every host, so its term is left out.
     All,
     One(Choice),
-    /// A machine variable with no machines to offer, so there's nothing to show.
+    /// A host variable with no hosts to offer, so there's nothing to show.
     Nothing,
 }
 
@@ -215,42 +215,42 @@ impl Pick {
     }
 }
 
-/// The approved machines in the fleet, as dashboards see it: the server isn't one.
-fn fleet(agents: Vec<AgentRecord>) -> impl Iterator<Item = AgentRecord> {
-    agents
+/// The approved hosts in the fleet, as dashboards see it: the server isn't one.
+fn fleet(hosts: Vec<HostRecord>) -> impl Iterator<Item = HostRecord> {
+    hosts
         .into_iter()
-        .filter(|agent| agent.state == AgentState::Approved && !agent.is_local())
+        .filter(|host| host.state == HostState::Approved && !host.is_local())
 }
 
 /// What a variable's picker offers, in order. A fact variable also offers All,
 /// which isn't in the list.
 pub async fn choices(sources: &Sources<'_>, variable: &Variable) -> Result<Vec<Choice>> {
     let search = HostSearch::from_database(sources.database, Some(&variable.filter)).await?;
-    let agents: Vec<AgentRecord> = fleet(sources.registry.list().await)
-        .filter(|agent| search.includes(&agent.id, &agent.host))
+    let hosts: Vec<HostRecord> = fleet(sources.registry.list().await)
+        .filter(|host| search.includes(&host.id, &host.hostname))
         .collect();
     let mut choices = match variable.kind {
-        VariableKind::Machine => machines(&agents),
-        VariableKind::Fact => fact_values(sources, variable, &agents).await?,
+        VariableKind::Host => host_choices(&hosts),
+        VariableKind::Fact => fact_values(sources, variable, &hosts).await?,
     };
     choices.truncate(MAX_CHOICES);
     Ok(choices)
 }
 
-/// By name. Names needn't be unique, so machines sharing one are told apart by ID.
-fn machines(agents: &[AgentRecord]) -> Vec<Choice> {
+/// By name. Names needn't be unique, so hosts sharing one are told apart by ID.
+fn host_choices(hosts: &[HostRecord]) -> Vec<Choice> {
     let mut named: HashMap<&str, usize> = HashMap::new();
-    for agent in agents {
-        *named.entry(agent.host.as_str()).or_default() += 1;
+    for host in hosts {
+        *named.entry(host.hostname.as_str()).or_default() += 1;
     }
-    let mut choices: Vec<Choice> = agents
+    let mut choices: Vec<Choice> = hosts
         .iter()
-        .map(|agent| Choice {
-            value: agent.id.clone(),
-            label: if named[agent.host.as_str()] > 1 {
-                format!("{} ({})", agent.host, short_id(&agent.id))
+        .map(|host| Choice {
+            value: host.id.clone(),
+            label: if named[host.hostname.as_str()] > 1 {
+                format!("{} ({})", host.hostname, short_id(&host.id))
             } else {
-                agent.host.clone()
+                host.hostname.clone()
             },
         })
         .collect();
@@ -263,11 +263,11 @@ fn machines(agents: &[AgentRecord]) -> Vec<Choice> {
     choices
 }
 
-/// The different values the machines have, a list counting each of its items.
+/// The different values the hosts have, a list counting each of its items.
 async fn fact_values(
     sources: &Sources<'_>,
     variable: &Variable,
-    agents: &[AgentRecord],
+    hosts: &[HostRecord],
 ) -> Result<Vec<Choice>> {
     let fact = host_filter::fact_name(&variable.fact);
     let facts = sources.database.facts_named(&[fact]).await?;
@@ -280,8 +280,8 @@ async fn fact_values(
                 .is_some_and(|index| index.parse::<usize>().is_ok())
     };
     let mut values = BTreeSet::new();
-    for agent in agents {
-        let Some(facts) = facts.get(&agent.id) else {
+    for host in hosts {
+        let Some(facts) = facts.get(&host.id) else {
             continue;
         };
         for (name, value) in facts {
@@ -301,15 +301,15 @@ async fn fact_values(
 }
 
 /// What's picked, given what was asked for in the address and what's on offer. A
-/// value that isn't offered, such as a machine that's since been removed, falls back
-/// to the first machine, or to All.
+/// value that isn't offered, such as a host that's since been removed, falls back
+/// to the first host, or to All.
 pub fn pick(variable: &Variable, choices: &[Choice], asked: Option<&str>) -> Pick {
     if let Some(choice) = asked.and_then(|asked| choices.iter().find(|c| c.value == asked)) {
         return Pick::One(choice.clone());
     }
     match variable.kind {
         VariableKind::Fact => Pick::All,
-        VariableKind::Machine => choices.first().cloned().map_or(Pick::Nothing, Pick::One),
+        VariableKind::Host => choices.first().cloned().map_or(Pick::Nothing, Pick::One),
     }
 }
 
@@ -318,7 +318,7 @@ pub fn pick(variable: &Variable, choices: &[Choice], asked: Option<&str>) -> Pic
 pub struct Picker {
     pub param: String,
     pub title: String,
-    /// A fact variable can show every machine at once.
+    /// A fact variable can show every host at once.
     pub offers_all: bool,
     pub choices: Vec<Choice>,
     /// What's picked: empty for All, and nothing when there's nothing to pick.
@@ -409,16 +409,13 @@ impl Picks {
             match pick {
                 Pick::All => {}
                 Pick::One(choice) => filled.push(match variable.kind {
-                    VariableKind::Machine => host_filter::only(&choice.value),
+                    VariableKind::Host => host_filter::only(&choice.value),
                     VariableKind::Fact => {
                         format!("{}={}", variable.fact, written_value(&choice.value))
                     }
                 }),
                 Pick::Nothing => {
-                    return Err(format!(
-                        "There's no machine to pick for {}.",
-                        variable.title()
-                    ));
+                    return Err(format!("There's no host to pick for {}.", variable.title()));
                 }
             }
         }
@@ -426,7 +423,7 @@ impl Picks {
     }
 
     /// A title with each variable's name replaced by what's picked. Longer names go
-    /// first, so `$machine` is never mistaken for `$machine_two`.
+    /// first, so `$host` is never mistaken for `$host_two`.
     pub fn fill_title(&self, title: &str) -> String {
         let mut names: Vec<&String> = self.0.keys().collect();
         names.sort_by_key(|name| std::cmp::Reverse(name.len()));
@@ -443,11 +440,11 @@ impl Picks {
 mod tests {
     use super::*;
 
-    fn machine() -> Variable {
+    fn host() -> Variable {
         Variable {
-            name: "machine".to_string(),
+            name: "host".to_string(),
             label: String::new(),
-            kind: VariableKind::Machine,
+            kind: VariableKind::Host,
             fact: String::new(),
             filter: String::new(),
         }
@@ -475,12 +472,12 @@ mod tests {
         let named = |name: &str| {
             Variable {
                 name: name.to_string(),
-                ..machine()
+                ..host()
             }
             .tidy()
             .check()
         };
-        assert!(named("machine").is_ok());
+        assert!(named("host").is_ok());
         assert!(named("$web_2").is_ok(), "a $ typed in front is dropped");
         assert!(named("2web").is_err());
         assert!(named("web-2").is_err());
@@ -489,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fact_variable_needs_a_fact_and_a_machine_variable_drops_one() {
+    fn a_fact_variable_needs_a_fact_and_a_host_variable_drops_one() {
         let mut variable = environment();
         variable.fact = " ".to_string();
         assert!(variable.tidy().check().is_err());
@@ -497,14 +494,14 @@ mod tests {
         variable.fact = "os name".to_string();
         assert!(variable.check().is_err());
 
-        let mut variable = machine();
+        let mut variable = host();
         variable.fact = "anything".to_string();
         assert_eq!(variable.tidy().fact, "");
     }
 
     #[test]
     fn what_a_variable_offers_cant_depend_on_another() {
-        let mut variable = machine();
+        let mut variable = host();
         variable.filter = "os=windows".to_string();
         assert!(variable.check().is_ok());
         variable.filter = "$env".to_string();
@@ -515,12 +512,12 @@ mod tests {
 
     #[test]
     fn a_dashboard_has_each_name_once_and_not_too_many() {
-        assert!(check_variables(&[machine(), environment()]).is_ok());
-        assert!(check_variables(&[machine(), machine()]).is_err());
+        assert!(check_variables(&[host(), environment()]).is_ok());
+        assert!(check_variables(&[host(), host()]).is_err());
         let many: Vec<Variable> = (0..11)
             .map(|n| Variable {
                 name: format!("v{n}"),
-                ..machine()
+                ..host()
             })
             .collect();
         assert!(check_variables(&many).is_err());
@@ -528,100 +525,97 @@ mod tests {
 
     #[test]
     fn a_filter_can_only_use_variables_the_dashboard_has() {
-        assert_eq!(uses("os=linux $machine \"$quoted text\""), ["machine"]);
-        assert!(check_uses("$machine os=linux", &[machine()]).is_ok());
+        assert_eq!(uses("os=linux $host \"$quoted text\""), ["host"]);
+        assert!(check_uses("$host os=linux", &[host()]).is_ok());
         assert_eq!(
-            check_uses("$host", &[machine()]),
-            Err("This dashboard has no variable called $host.".to_string())
+            check_uses("$other", &[host()]),
+            Err("This dashboard has no variable called $other.".to_string())
         );
     }
 
     #[test]
     fn a_pick_falls_back_when_what_was_asked_for_is_not_offered() {
-        let machines = [choice("aa", "db-1"), choice("bb", "web-1")];
+        let hosts = [choice("aa", "db-1"), choice("bb", "web-1")];
         assert_eq!(
-            pick(&machine(), &machines, Some("bb")),
+            pick(&host(), &hosts, Some("bb")),
             Pick::One(choice("bb", "web-1"))
         );
         assert_eq!(
-            pick(&machine(), &machines, Some("gone")),
+            pick(&host(), &hosts, Some("gone")),
             Pick::One(choice("aa", "db-1"))
         );
-        assert_eq!(pick(&machine(), &[], None), Pick::Nothing);
-        assert_eq!(pick(&environment(), &machines, Some("")), Pick::All);
-        assert_eq!(pick(&environment(), &machines, None), Pick::All);
+        assert_eq!(pick(&host(), &[], None), Pick::Nothing);
+        assert_eq!(pick(&environment(), &hosts, Some("")), Pick::All);
+        assert_eq!(pick(&environment(), &hosts, None), Pick::All);
     }
 
     #[test]
     fn picks_are_written_into_filters_and_titles() {
         let picks = Picks::new([
-            (machine(), Pick::One(choice("ab12", "web-1"))),
+            (host(), Pick::One(choice("ab12", "web-1"))),
             (environment(), Pick::One(choice("live east", "live east"))),
         ]);
         assert_eq!(
-            picks.fill_filter("$machine os=linux $env").unwrap(),
+            picks.fill_filter("$host os=linux $env").unwrap(),
             "id=ab12 os=linux environment=\"live east\""
         );
         assert_eq!(
-            picks.fill_title("CPU on $machine in $env"),
+            picks.fill_title("CPU on $host in $env"),
             "CPU on web-1 in live east"
         );
 
-        let picks = Picks::new([(environment(), Pick::All), (machine(), Pick::Nothing)]);
+        let picks = Picks::new([(environment(), Pick::All), (host(), Pick::Nothing)]);
         assert_eq!(picks.fill_filter("$env os=linux").unwrap(), "os=linux");
         assert_eq!(picks.fill_title("CPU in $env"), "CPU in All");
-        assert!(picks.fill_filter("$machine").is_err());
+        assert!(picks.fill_filter("$host").is_err());
         assert!(picks.fill_filter("$other").is_err());
     }
 
     #[test]
     fn a_longer_name_is_filled_before_one_it_starts_with() {
         let two = Variable {
-            name: "machine_two".to_string(),
-            ..machine()
+            name: "host_two".to_string(),
+            ..host()
         };
         let picks = Picks::new([
-            (machine(), Pick::One(choice("a", "web-1"))),
+            (host(), Pick::One(choice("a", "web-1"))),
             (two, Pick::One(choice("b", "web-2"))),
         ]);
-        assert_eq!(
-            picks.fill_title("$machine vs $machine_two"),
-            "web-1 vs web-2"
-        );
+        assert_eq!(picks.fill_title("$host vs $host_two"), "web-1 vs web-2");
     }
 
     #[test]
     fn the_address_keeps_what_is_picked() {
         let picks = Picks::new([
-            (machine(), Pick::One(choice("ab12", "web-1"))),
+            (host(), Pick::One(choice("ab12", "web-1"))),
             (environment(), Pick::All),
         ]);
         assert_eq!(
             picks.params(),
             [
                 ("var-env".to_string(), String::new()),
-                ("var-machine".to_string(), "ab12".to_string()),
+                ("var-host".to_string(), "ab12".to_string()),
             ]
         );
-        let none = Picks::new([(machine(), Pick::Nothing)]);
+        let none = Picks::new([(host(), Pick::Nothing)]);
         assert!(none.params().is_empty());
     }
 
     #[test]
-    fn machines_sharing_a_name_are_told_apart() {
-        let agent = |id: &str, host: &str| AgentRecord {
+    fn hosts_sharing_a_name_are_told_apart() {
+        let host = |id: &str, hostname: &str| HostRecord {
             id: id.to_string(),
             public_key: String::new(),
-            host: host.to_string(),
-            state: AgentState::Approved,
+            hostname: hostname.to_string(),
+            state: HostState::Approved,
             decided_by: None,
             first_seen_ms: 0,
             decided_ms: None,
         };
-        let choices = machines(&[
-            agent("ffff00001111", "web"),
-            agent("aaaa00001111", "web"),
-            agent("bbbb00001111", "db"),
+        let choices = host_choices(&[
+            host("ffff00001111", "web"),
+            host("aaaa00001111", "web"),
+            host("bbbb00001111", "db"),
         ]);
         let labels: Vec<&str> = choices.iter().map(|c| c.label.as_str()).collect();
         assert_eq!(labels, ["db", "web (aaaa0000)", "web (ffff0000)"]);

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use maxnines_collectors::{Collector, WARMUP, machine};
+use maxnines_collectors::{Collector, WARMUP, host};
 use maxnines_protocol::Sample;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -21,8 +21,8 @@ use tracing::{error, warn};
 use crate::app_state::AppState;
 use crate::metrics::now_ms;
 use crate::models::DatabaseStats;
-use crate::registration::{AgentRecord, AgentState};
-use crate::remote_checks::{LOCAL_AGENT_ID, LOCAL_HOST};
+use crate::registration::{HostRecord, HostState};
+use crate::remote_checks::{LOCAL_HOST_ID, LOCAL_HOSTNAME};
 use crate::store::{NewSample, StoreStats, WriteCounts, WriterCommand};
 
 const HOUR_MS: i64 = 3_600_000;
@@ -86,16 +86,16 @@ pub struct Recorded {
     written: u64,
     failed: u64,
     values: u64,
-    /// What's read about the machine, as an agent would. Nothing needs installing, as
+    /// What's read about the host, as an agent would. Nothing needs installing, as
     /// that makes no sense everywhere a server can run, and each keeps state between
     /// reads, which is why these stay here.
     collectors: Vec<Box<dyn Collector + Send>>,
 }
 
 impl Recorded {
-    /// Also reads the machine, rather than only the server.
-    pub fn with_machine() -> Self {
-        match machine::all() {
+    /// Also reads the host, rather than only the server.
+    pub fn with_host() -> Self {
+        match host::all() {
             Ok(collectors) => Self {
                 collectors,
                 ..Self::default()
@@ -104,7 +104,7 @@ impl Recorded {
                 let error = format!("{error:#}");
                 warn!(
                     error,
-                    "can't read the server's machine, so its charts will be empty"
+                    "can't read the server's own host, so its charts will be empty"
                 );
                 Self::default()
             }
@@ -112,9 +112,9 @@ impl Recorded {
     }
 }
 
-/// Reads the machine, off the async threads as it can be slow. One failing only
+/// Reads the host, off the async threads as it can be slow. One failing only
 /// leaves that one out.
-async fn read_machine(recorded: &mut Recorded) -> BTreeMap<String, Value> {
+async fn read_host(recorded: &mut Recorded) -> BTreeMap<String, Value> {
     let mut collectors = std::mem::take(&mut recorded.collectors);
     let read = tokio::task::spawn_blocking(move || {
         let mut readings = BTreeMap::new();
@@ -126,7 +126,7 @@ async fn read_machine(recorded: &mut Recorded) -> BTreeMap<String, Value> {
                 Ok(Err(error)) => warn!(
                     collector = collector.name(),
                     error = format!("{error:#}"),
-                    "reading the server's machine failed"
+                    "reading the server's own host failed"
                 ),
                 Err(_) => error!(collector = collector.name(), "collector panicked"),
             }
@@ -158,9 +158,9 @@ async fn own_numbers(state: &AppState, recorded: &mut Recorded) -> Value {
     recorded.failed = failed;
     recorded.values = values;
 
-    let agents = state.registry.list().await;
-    let real = || agents.iter().filter(|agent| !agent.is_local());
-    let online = |agent: &&AgentRecord| state.presence.get(&agent.id).is_some_and(|p| p.online);
+    let hosts = state.registry.list().await;
+    let real = || hosts.iter().filter(|host| !host.is_local());
+    let online = |host: &&HostRecord| state.presence.get(&host.id).is_some_and(|p| p.online);
     json!({
         "memory_bytes": process.as_ref().map(|process| process.memory_bytes),
         "cpu_percent": process.as_ref().and_then(|process| process.cpu_percent),
@@ -171,12 +171,12 @@ async fn own_numbers(state: &AppState, recorded: &mut Recorded) -> Value {
         "slowest_write_ms": status.writes.slowest_write_ms.swap(0, Ordering::Relaxed),
         "series": state.metrics.series_count().await.ok(),
         "write_queue": state.writer.max_capacity() - state.writer.capacity(),
-        "agents_online": real().filter(online).count(),
-        "agents_approved": real()
-            .filter(|agent| agent.state == AgentState::Approved)
+        "hosts_online": real().filter(online).count(),
+        "hosts_approved": real()
+            .filter(|host| host.state == HostState::Approved)
             .count(),
-        "agents_waiting": real()
-            .filter(|agent| agent.state == AgentState::Pending)
+        "hosts_waiting": real()
+            .filter(|host| host.state == HostState::Pending)
             .count(),
         "alerts_firing": status.firing.load(Ordering::Relaxed),
         "metrics_database_bytes": metrics_bytes,
@@ -186,15 +186,15 @@ async fn own_numbers(state: &AppState, recorded: &mut Recorded) -> Value {
 }
 
 pub async fn record_once(state: &AppState, recorded: &mut Recorded) {
-    let mut metrics = read_machine(recorded).await;
+    let mut metrics = read_host(recorded).await;
     metrics.insert("server".to_string(), own_numbers(state, recorded).await);
     let sample = Sample {
         timestamp_ms: now_ms() as u64,
         metrics,
     };
     let command = WriterCommand::Save(NewSample {
-        agent_id: LOCAL_AGENT_ID.to_string(),
-        host: LOCAL_HOST.to_string(),
+        host_id: LOCAL_HOST_ID.to_string(),
+        hostname: LOCAL_HOSTNAME.to_string(),
         sample,
     });
     if state.writer.send(command).await.is_err() {
@@ -206,7 +206,7 @@ pub async fn record_once(state: &AppState, recorded: &mut Recorded) {
 /// charts and alert rules like everything else.
 pub fn spawn_recorder(state: AppState) {
     tokio::spawn(async move {
-        let mut recorded = tokio::task::spawn_blocking(Recorded::with_machine)
+        let mut recorded = tokio::task::spawn_blocking(Recorded::with_host)
             .await
             .unwrap_or_default();
         tokio::time::sleep(WARMUP).await;
@@ -223,11 +223,11 @@ pub fn spawn_recorder(state: AppState) {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProcessStats {
     pub memory_bytes: u64,
-    /// As a share of the whole machine. Empty on the first look since a start.
+    /// As a share of the whole host. Empty on the first look since a start.
     pub cpu_percent: Option<f64>,
     pub open_files: Option<usize>,
-    pub machine_memory_total_bytes: u64,
-    pub machine_memory_used_bytes: u64,
+    pub host_memory_total_bytes: u64,
+    pub host_memory_used_bytes: u64,
     pub cores: usize,
 }
 
@@ -240,9 +240,9 @@ pub struct DiskStats {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Activity {
-    pub agents_online: usize,
-    pub agents_approved: usize,
-    pub agents_waiting: usize,
+    pub hosts_online: usize,
+    pub hosts_approved: usize,
+    pub hosts_waiting: usize,
     pub samples_written: u64,
     pub samples_failed: u64,
     pub samples_queued: usize,
@@ -291,8 +291,8 @@ fn process_stats(status: &ServerStatus) -> Option<ProcessStats> {
         memory_bytes: process.memory(),
         cpu_percent: elapsed.map(|_| f64::from(process.cpu_usage()) / cores as f64),
         open_files: process.open_files(),
-        machine_memory_total_bytes: system.total_memory(),
-        machine_memory_used_bytes: system.used_memory(),
+        host_memory_total_bytes: system.total_memory(),
+        host_memory_used_bytes: system.used_memory(),
         cores,
     })
 }
@@ -347,8 +347,8 @@ pub async fn gather(state: &AppState) -> ServerStats {
         error!(error = format!("{error:#}"), "reading server stats failed");
     }
 
-    let agents = state.registry.list().await;
-    let real = || agents.iter().filter(|agent| !agent.is_local());
+    let hosts = state.registry.list().await;
+    let real = || hosts.iter().filter(|host| !host.is_local());
     let last_pass = status.last_alert_pass_ms.load(Ordering::Relaxed);
     let capacity = state.writer.max_capacity();
 
@@ -364,14 +364,14 @@ pub async fn gather(state: &AppState) -> ServerStats {
         metrics: metrics.ok(),
         database: database.ok(),
         activity: Activity {
-            agents_online: real()
-                .filter(|agent| state.presence.get(&agent.id).is_some_and(|p| p.online))
+            hosts_online: real()
+                .filter(|host| state.presence.get(&host.id).is_some_and(|p| p.online))
                 .count(),
-            agents_approved: real()
-                .filter(|agent| agent.state == AgentState::Approved)
+            hosts_approved: real()
+                .filter(|host| host.state == HostState::Approved)
                 .count(),
-            agents_waiting: real()
-                .filter(|agent| agent.state == AgentState::Pending)
+            hosts_waiting: real()
+                .filter(|host| host.state == HostState::Pending)
                 .count(),
             samples_written: status.writes.written.load(Ordering::Relaxed),
             samples_failed: status.writes.failed.load(Ordering::Relaxed),
@@ -393,7 +393,7 @@ mod tests {
         let stats = process_stats(&status).unwrap();
 
         assert!(stats.memory_bytes > 0);
-        assert!(stats.machine_memory_total_bytes >= stats.machine_memory_used_bytes);
+        assert!(stats.host_memory_total_bytes >= stats.host_memory_used_bytes);
         assert_eq!(
             stats.cpu_percent, None,
             "the first look has nothing to compare"

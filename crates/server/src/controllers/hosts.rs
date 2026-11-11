@@ -15,7 +15,7 @@ use super::host_list::{HostSearch, address, page_number, paginate};
 use super::{CsrfForm, Page, recorded_by, server_error, viewer_zone};
 use crate::agent_versions::{self, NEWEST_AGENT_VERSION, VersionState};
 use crate::alerting::Alert;
-use crate::app_state::{AgentDeletion, AppState};
+use crate::app_state::{AppState, HostDeletion};
 use crate::fact_history::describe_history;
 use crate::facts::{FlatFacts, fact_text, unflatten};
 use crate::host_filter::{self, MAX_SUGGESTIONS, PartialValue, Suggestion, suggest_names};
@@ -24,28 +24,28 @@ use crate::metric_charts::format_value;
 use crate::metrics::Unit;
 use crate::metrics::now_ms;
 use crate::models::ConfigStatus;
-use crate::registration::{AgentRecord, AgentState, short_id};
+use crate::registration::{HostRecord, HostState, short_id};
 use crate::rule_engine;
 use crate::silences::{ActiveSilences, Cover, SilenceInput};
 use crate::times::format_time;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/agents", get(index))
-        .route("/agents/filter-options", get(filter_options))
-        .route("/agents/{id}", get(show))
-        .route("/agents/{id}/approve", post(approve))
-        .route("/agents/{id}/revoke", post(revoke))
-        .route("/agents/{id}/delete", post(delete))
-        .route("/agents/{id}/maintenance", post(start_maintenance))
-        .route("/agents/{id}/maintenance/end", post(end_maintenance))
+        .route("/hosts", get(index))
+        .route("/hosts/filter-options", get(filter_options))
+        .route("/hosts/{id}", get(show))
+        .route("/hosts/{id}/approve", post(approve))
+        .route("/hosts/{id}/revoke", post(revoke))
+        .route("/hosts/{id}/delete", post(delete))
+        .route("/hosts/{id}/maintenance", post(start_maintenance))
+        .route("/hosts/{id}/maintenance/end", post(end_maintenance))
 }
 
 #[derive(Serialize)]
-struct AgentRow {
+struct HostRow {
     id: String,
     short_id: String,
-    host: String,
+    hostname: String,
     state: &'static str,
     online: bool,
     health: Health,
@@ -168,15 +168,10 @@ pub fn format_uptime(secs: u64) -> String {
 }
 
 /// Everything shown about an agent except its config, which takes more working out.
-fn row(
-    state: &AppState,
-    agent: AgentRecord,
-    facts: Option<&FlatFacts>,
-    health: Health,
-) -> AgentRow {
-    let presence = state.presence.get(&agent.id);
+fn row(state: &AppState, host: HostRecord, facts: Option<&FlatFacts>, health: Health) -> HostRow {
+    let presence = state.presence.get(&host.id);
     let version = facts.and_then(|facts| text_fact(facts, "agent.version"));
-    AgentRow {
+    HostRow {
         version_state: version.as_deref().and_then(agent_versions::compare),
         version,
         online: presence.as_ref().is_some_and(|p| p.online),
@@ -185,10 +180,10 @@ fn row(
         os_family: facts.and_then(OsFamily::of),
         seen: presence.map(|p| ago(p.last_seen_ms, now_ms() as u64)),
         config: None,
-        state: agent.state.as_str(),
-        short_id: short_id(&agent.id).to_string(),
-        id: agent.id,
-        host: agent.host,
+        state: host.state.as_str(),
+        short_id: short_id(&host.id).to_string(),
+        id: host.id,
+        hostname: host.hostname,
     }
 }
 
@@ -211,15 +206,15 @@ struct FilterTab {
 }
 
 #[derive(Serialize)]
-struct WaitingAgent {
+struct WaitingHost {
     id: String,
-    host: String,
+    hostname: String,
     seen: Option<String>,
 }
 
 /// An agent in the list, with only what it takes to sort and count them all.
 struct Listed {
-    agent: AgentRecord,
+    host: HostRecord,
     online: bool,
     health: Health,
 }
@@ -228,15 +223,15 @@ struct Listed {
 fn matches(filter: &str, listed: &Listed) -> bool {
     match filter {
         "online" => listed.online,
-        "offline" => !listed.online && listed.agent.state == AgentState::Approved,
-        "revoked" => listed.agent.state == AgentState::Revoked,
+        "offline" => !listed.online && listed.host.state == HostState::Approved,
+        "revoked" => listed.host.state == HostState::Revoked,
         _ => true,
     }
 }
 
 /// Works out the rows being shown, which is far fewer than the agents there can be.
-async fn page_rows(state: &AppState, listed: Vec<Listed>, as_table: bool) -> Result<Vec<AgentRow>> {
-    let ids: Vec<&str> = listed.iter().map(|item| item.agent.id.as_str()).collect();
+async fn page_rows(state: &AppState, listed: Vec<Listed>, as_table: bool) -> Result<Vec<HostRow>> {
+    let ids: Vec<&str> = listed.iter().map(|item| item.host.id.as_str()).collect();
     let facts = state.database.facts_of(&ids).await?;
     let rules = if as_table {
         state.database.list_rules().await?
@@ -246,9 +241,9 @@ async fn page_rows(state: &AppState, listed: Vec<Listed>, as_table: bool) -> Res
 
     let mut rows = Vec::with_capacity(listed.len());
     for item in listed {
-        let id = item.agent.id.clone();
+        let id = item.host.id.clone();
         let mine = facts.get(&id);
-        let mut row = row(state, item.agent, mine, item.health);
+        let mut row = row(state, item.host, mine, item.health);
         if as_table {
             let flat = mine.cloned().unwrap_or_default();
             let desired = rule_engine::resolve(&rules, &unflatten(&flat), &id).ok();
@@ -279,32 +274,32 @@ async fn index(
     };
     let mut alerts: BTreeMap<&str, Vec<&Alert>> = BTreeMap::new();
     for alert in &open {
-        alerts.entry(&alert.agent_id).or_default().push(alert);
+        alerts.entry(&alert.host_id).or_default().push(alert);
     }
 
     let mut waiting = Vec::new();
     let mut listed = Vec::new();
-    for agent in state.registry.list().await {
-        if agent.is_local() {
+    for host in state.registry.list().await {
+        if host.is_local() {
             continue;
         }
-        let presence = state.presence.get(&agent.id);
-        if agent.state == AgentState::Pending {
+        let presence = state.presence.get(&host.id);
+        if host.state == HostState::Pending {
             // Waiting agents never get as far as presence, so the registry remembers.
-            let asked = state.registry.last_asked_ms(&agent.id);
-            waiting.push(WaitingAgent {
+            let asked = state.registry.last_asked_ms(&host.id);
+            waiting.push(WaitingHost {
                 seen: asked.map(|ms| ago(ms, now_ms() as u64)),
-                id: agent.id,
-                host: agent.host,
+                id: host.id,
+                hostname: host.hostname,
             });
-        } else if search.includes(&agent.id, &agent.host) {
+        } else if search.includes(&host.id, &host.hostname) {
             // A revoked agent's connection closes a moment after it's revoked, and it
             // doesn't count as online in the meantime.
-            let online = agent.state == AgentState::Approved && presence.is_some_and(|p| p.online);
-            let mine = alerts.get(agent.id.as_str()).map_or(&[][..], Vec::as_slice);
+            let online = host.state == HostState::Approved && presence.is_some_and(|p| p.online);
+            let mine = alerts.get(host.id.as_str()).map_or(&[][..], Vec::as_slice);
             let health = Health::of(online, mine);
             listed.push(Listed {
-                agent,
+                host,
                 online,
                 health,
             });
@@ -313,7 +308,7 @@ async fn index(
     listed.sort_by(|a, b| {
         a.health
             .cmp(&b.health)
-            .then_with(|| a.agent.host.cmp(&b.agent.host))
+            .then_with(|| a.host.hostname.cmp(&b.host.hostname))
     });
 
     let as_table = params.view.as_deref() == Some("table");
@@ -333,7 +328,7 @@ async fn index(
         count: listed.iter().filter(|item| matches(key, item)).count(),
         selected: key == selected,
         href: address(
-            "/agents",
+            "/hosts",
             &[
                 ("status", if key == "all" { "" } else { key }),
                 ("view", view),
@@ -346,13 +341,13 @@ async fn index(
     let online = listed.iter().filter(|item| item.online).count();
     let total = listed
         .iter()
-        .filter(|item| item.agent.state == AgentState::Approved)
+        .filter(|item| item.host.state == HostState::Approved)
         .count();
     listed.retain(|item| matches(selected, item));
 
     let pages = paginate(&mut listed, page_number(params.page.as_deref()), |page| {
         address(
-            "/agents",
+            "/hosts",
             &[
                 ("status", tab),
                 ("view", view),
@@ -361,13 +356,13 @@ async fn index(
             ],
         )
     });
-    let agents = match page_rows(&state, listed, as_table).await {
-        Ok(agents) => agents,
+    let hosts = match page_rows(&state, listed, as_table).await {
+        Ok(hosts) => hosts,
         Err(error) => return server_error(&error),
     };
 
-    Page::new(&state, &token, "agents/index.html")
-        .with("agents", &agents)
+    Page::new(&state, &token, "hosts/index.html")
+        .with("hosts", &hosts)
         .with("waiting", &waiting)
         .with("filters", &filters)
         .with("online_count", &online)
@@ -376,16 +371,16 @@ async fn index(
         .with("newest_agent_version", NEWEST_AGENT_VERSION)
         .with("pages", &pages)
         .with("search", &search)
-        .with("search_path", "/agents")
+        .with("search_path", "/hosts")
         .with("keep_tab", tab)
         .with(
             "tiles_href",
-            &address("/agents", &[("status", tab), ("filter", text)]),
+            &address("/hosts", &[("status", tab), ("filter", text)]),
         )
         .with(
             "table_href",
             &address(
-                "/agents",
+                "/hosts",
                 &[("status", tab), ("view", "table"), ("filter", text)],
             ),
         )
@@ -420,8 +415,8 @@ pub async fn suggestions(state: &AppState, term: &str) -> anyhow::Result<Vec<Sug
             .list()
             .await
             .into_iter()
-            .filter(|agent| !agent.is_local() && agent.host.to_lowercase().contains(&wanted))
-            .map(|agent| agent.host)
+            .filter(|host| !host.is_local() && host.hostname.to_lowercase().contains(&wanted))
+            .map(|host| host.hostname)
             .collect();
         hosts.sort();
         hosts.truncate(MAX_SUGGESTIONS);
@@ -429,24 +424,24 @@ pub async fn suggestions(state: &AppState, term: &str) -> anyhow::Result<Vec<Sug
     } else if value.is_id() {
         // By the start of the ID or by name, shown as the name so it can be picked.
         let wanted = value.partial.to_lowercase();
-        let mut agents: Vec<AgentRecord> = state
+        let mut hosts: Vec<HostRecord> = state
             .registry
             .list()
             .await
             .into_iter()
-            .filter(|agent| {
-                !agent.is_local()
-                    && (agent.id.starts_with(&wanted)
-                        || agent.host.to_lowercase().contains(&wanted))
+            .filter(|host| {
+                !host.is_local()
+                    && (host.id.starts_with(&wanted)
+                        || host.hostname.to_lowercase().contains(&wanted))
             })
             .collect();
-        agents.sort_by(|a, b| a.host.cmp(&b.host).then_with(|| a.id.cmp(&b.id)));
-        agents.truncate(MAX_SUGGESTIONS);
-        return Ok(agents
+        hosts.sort_by(|a, b| a.hostname.cmp(&b.hostname).then_with(|| a.id.cmp(&b.id)));
+        hosts.truncate(MAX_SUGGESTIONS);
+        return Ok(hosts
             .iter()
-            .map(|agent| {
-                let label = format!("{} ({})", agent.host, short_id(&agent.id));
-                value.labelled(&agent.id, label)
+            .map(|host| {
+                let label = format!("{} ({})", host.hostname, short_id(&host.id));
+                value.labelled(&host.id, label)
             })
             .collect());
     } else {
@@ -472,7 +467,7 @@ struct HistoryEntry {
     changes: Vec<String>,
 }
 
-/// Where the map puts a machine, and whether it's by a rule of its own.
+/// Where the map puts a host, and whether it's by a rule of its own.
 #[derive(Serialize)]
 struct Location {
     rule_id: i64,
@@ -483,7 +478,7 @@ struct Location {
 
 async fn show(State(state): State<AppState>, Path(id): Path<String>, token: CsrfToken) -> Response {
     let found = state.registry.get(&id).await;
-    let Some(agent) = found.filter(|agent| !agent.is_local()) else {
+    let Some(host) = found.filter(|host| !host.is_local()) else {
         let page = Page::new(&state, &token, "errors/not_found.html");
         return page.with_status(StatusCode::NOT_FOUND).render();
     };
@@ -491,7 +486,7 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         Ok(open) => open,
         Err(error) => return server_error(&error),
     };
-    let alerts: Vec<&Alert> = open.iter().filter(|a| a.agent_id == id).collect();
+    let alerts: Vec<&Alert> = open.iter().filter(|a| a.host_id == id).collect();
 
     let current = match state.database.current_facts(&id).await {
         Ok(current) => current,
@@ -522,7 +517,7 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         .and_then(|agent| agent["memory_bytes"].as_f64());
     let own_uptime = own.as_ref().and_then(|agent| agent["uptime_secs"].as_u64());
     let uptime = match state.metrics.latest_output(&id, "host", now_ms()).await {
-        Ok(output) => output.and_then(|host| host["uptime_secs"].as_u64()),
+        Ok(output) => output.and_then(|output| output["uptime_secs"].as_u64()),
         Err(error) => return server_error(&error),
     };
     let locator = match Locator::load(&state.database).await {
@@ -530,13 +525,13 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         Err(error) => return server_error(&error),
     };
     let own_filter = host_filter::only(&id);
-    let location = locator.locate(&id, &agent.host).map(|rule| Location {
+    let location = locator.locate(&id, &host.hostname).map(|rule| Location {
         rule_id: rule.id,
         name: rule.rule.name.clone(),
         place: rule.rule.place.clone(),
         just_this_one: rule.rule.filter == own_filter,
     });
-    let maintenance = match maintenance_of(&state, &agent).await {
+    let maintenance = match maintenance_of(&state, &host).await {
         Ok(maintenance) => maintenance,
         Err(error) => return server_error(&error),
     };
@@ -563,7 +558,7 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
     let online = state.presence.get(&id).is_some_and(|p| p.online);
     let mut row = row(
         &state,
-        agent.clone(),
+        host.clone(),
         Some(&flat),
         Health::of(online, &alerts),
     );
@@ -571,9 +566,9 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         Some(desired.version.as_str()),
         reported.as_ref(),
     ));
-    Page::new(&state, &token, "agents/show.html")
-        .with("agent", &row)
-        .with("decided_by", &agent.decided_by)
+    Page::new(&state, &token, "hosts/show.html")
+        .with("host", &row)
+        .with("decided_by", &host.decided_by)
         .with("has_facts", &!flat.is_empty())
         .with("alerts", &alerts)
         .with("uptime", &uptime.map(format_uptime))
@@ -600,7 +595,7 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         .render()
 }
 
-/// How long maintenance can be started for from a machine's page, in seconds, with
+/// How long maintenance can be started for from a host's page, in seconds, with
 /// what the page calls each. Anything else goes through Silences.
 const MAINTENANCE_CHOICES: [(u64, &str); 6] = [
     (1800, "30 minutes"),
@@ -612,14 +607,14 @@ const MAINTENANCE_CHOICES: [(u64, &str); 6] = [
 ];
 const DEFAULT_MAINTENANCE_SECS: u64 = 3600;
 
-/// What's holding back this machine's notifications, for its page.
+/// What's holding back this host's notifications, for its page.
 #[derive(Serialize)]
 struct Maintenance {
     until: String,
     /// The silence's reason, or the maintenance window's name.
     why: String,
     by: Option<String>,
-    /// Started for this machine alone, so its page can end it.
+    /// Started for this host alone, so its page can end it.
     just_this_one: bool,
     window: bool,
 }
@@ -631,12 +626,12 @@ struct MaintenanceChoice {
     chosen: bool,
 }
 
-/// What's keeping all of this machine's alerts quiet, if anything is. A silence
-/// for some rules only doesn't count, as the machine isn't quiet.
-async fn maintenance_of(state: &AppState, agent: &AgentRecord) -> Result<Option<Maintenance>> {
+/// What's keeping all of this host's alerts quiet, if anything is. A silence
+/// for some rules only doesn't count, as the host isn't quiet.
+async fn maintenance_of(state: &AppState, host: &HostRecord) -> Result<Option<Maintenance>> {
     let now = now_ms();
     let active = ActiveSilences::load(&state.database, now).await?;
-    let Some(cover) = active.covering_machine(&agent.id, &agent.host) else {
+    let Some(cover) = active.covering_host(&host.id, &host.hostname) else {
         return Ok(None);
     };
     let until = super::local_time(cover.ends_ms());
@@ -648,7 +643,7 @@ async fn maintenance_of(state: &AppState, agent: &AgentRecord) -> Result<Option<
                 .find(|silence| silence.id == id)
                 .map(|silence| Maintenance {
                     until,
-                    just_this_one: silence.filter == host_filter::only(&agent.id),
+                    just_this_one: silence.filter == host_filter::only(&host.id),
                     why: silence.reason,
                     by: Some(silence.created_by),
                     window: false,
@@ -670,18 +665,18 @@ async fn maintenance_of(state: &AppState, agent: &AgentRecord) -> Result<Option<
     })
 }
 
-/// Holds back every notification about this machine for a while, with a silence
+/// Holds back every notification about this host for a while, with a silence
 /// of its own, so the Silences page shows it like any other.
 async fn start_maintenance(
     State(state): State<AppState>,
     Path(id): Path<String>,
     form: CsrfForm,
 ) -> Response {
-    let Some(agent) = state
+    let Some(host) = state
         .registry
         .get(&id)
         .await
-        .filter(|agent| !agent.is_local())
+        .filter(|host| !host.is_local())
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -696,11 +691,11 @@ async fn start_maintenance(
     let reason = form.fields.get("reason").map(|reason| reason.trim());
     let reason = match reason {
         Some(reason) if !reason.is_empty() => reason.to_string(),
-        _ => format!("Maintenance on {}", agent.host),
+        _ => format!("Maintenance on {}", host.hostname),
     };
     let input = SilenceInput {
         rule_id: None,
-        filter: host_filter::only(&agent.id),
+        filter: host_filter::only(&host.id),
         reason,
         duration_secs,
     };
@@ -709,12 +704,12 @@ async fn start_maintenance(
     }
     let by = recorded_by();
     match state.database.create_silence(&input, &by, now_ms()).await {
-        Ok(_) => (form.token, Redirect::to(&format!("/agents/{id}"))).into_response(),
+        Ok(_) => (form.token, Redirect::to(&format!("/hosts/{id}"))).into_response(),
         Err(error) => server_error(&error),
     }
 }
 
-/// Ends the silences started for this machine alone. Wider ones, and maintenance
+/// Ends the silences started for this host alone. Wider ones, and maintenance
 /// windows, are left to their own pages.
 async fn end_maintenance(
     State(state): State<AppState>,
@@ -735,26 +730,26 @@ async fn end_maintenance(
             return server_error(&error);
         }
     }
-    (form.token, Redirect::to(&format!("/agents/{id}"))).into_response()
+    (form.token, Redirect::to(&format!("/hosts/{id}"))).into_response()
 }
 
 async fn approve(state: State<AppState>, id: Path<String>, form: CsrfForm) -> Response {
-    decide(state, id, form, AgentState::Approved).await
+    decide(state, id, form, HostState::Approved).await
 }
 
 async fn revoke(state: State<AppState>, id: Path<String>, form: CsrfForm) -> Response {
-    decide(state, id, form, AgentState::Revoked).await
+    decide(state, id, form, HostState::Revoked).await
 }
 
 async fn decide(
     State(state): State<AppState>,
     Path(id): Path<String>,
     form: CsrfForm,
-    decision: AgentState,
+    decision: HostState,
 ) -> Response {
     let by = recorded_by();
     match state.registry.decide_as(&id, decision, &by).await {
-        Ok(Some(_)) => (form.token, Redirect::to(&format!("/agents/{id}"))).into_response(),
+        Ok(Some(_)) => (form.token, Redirect::to(&format!("/hosts/{id}"))).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),
     }
@@ -762,11 +757,11 @@ async fn decide(
 
 /// Only a revoked agent offers this, so it always takes two steps.
 async fn delete(State(state): State<AppState>, Path(id): Path<String>, form: CsrfForm) -> Response {
-    match state.delete_agent(&id).await {
-        Ok(AgentDeletion::Deleted) => (form.token, Redirect::to("/agents")).into_response(),
-        Ok(AgentDeletion::NoSuchAgent) => StatusCode::NOT_FOUND.into_response(),
-        Ok(AgentDeletion::NotRevoked) => {
-            (StatusCode::CONFLICT, "Revoke the agent before deleting it.").into_response()
+    match state.delete_host(&id).await {
+        Ok(HostDeletion::Deleted) => (form.token, Redirect::to("/hosts")).into_response(),
+        Ok(HostDeletion::NoSuchHost) => StatusCode::NOT_FOUND.into_response(),
+        Ok(HostDeletion::NotRevoked) => {
+            (StatusCode::CONFLICT, "Revoke the host before deleting it.").into_response()
         }
         Err(error) => server_error(&error),
     }

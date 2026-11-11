@@ -12,7 +12,7 @@ use sysinfo::{
 };
 
 use maxnines_collectors::counters::CounterCollector;
-use maxnines_collectors::machine::{
+use maxnines_collectors::host::{
     CpuCollector, DiskCollector, HostCollector, MemoryCollector, NetworkCollector,
 };
 pub use maxnines_collectors::{Collector, WARMUP};
@@ -109,13 +109,13 @@ fn build(
 }
 
 /// Some sensors report raw values that aren't temperatures, such as -9200 on
-/// Apple hardware. Nothing a machine can survive falls outside this.
+/// Apple hardware. Nothing a host can survive falls outside this.
 fn is_plausible(celsius: f32) -> bool {
     (-60.0..=200.0).contains(&celsius)
 }
 
-/// Reads temperatures. What's available depends heavily on the machine: virtual
-/// machines usually have none, and some readings need extra rights.
+/// Reads temperatures. What's available depends heavily on the host: virtual
+/// hosts usually have none, and some readings need extra rights.
 struct SensorCollector {
     components: Components,
 }
@@ -228,7 +228,7 @@ fn refresh_processes(system: &mut System) {
 }
 
 /// What's running, without threads or what has exited. A process's usage is per
-/// core, so it's scaled to match the CPU chart, where 100% is the whole machine.
+/// core, so it's scaled to match the CPU chart, where 100% is the whole host.
 fn running(system: &System) -> Vec<RunningProcess<'_>> {
     let cores = system.cpus().len().max(1) as f64;
     system
@@ -449,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn a_machine_reporting_no_memory_does_not_divide_by_zero() {
+    fn a_host_reporting_no_memory_does_not_divide_by_zero() {
         let tally = tally(&watching(&["nginx"]), &[process("nginx", None)], 0);
         assert_eq!(tally[0]["memory_percent"], 10_000.0);
     }
@@ -544,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn the_top_processes_are_this_machines_own() {
+    fn the_top_processes_are_this_hosts_own() {
         let mut collector = TopProcessCollector::new().unwrap();
         let output = collector.collect().unwrap();
         let top = output.as_array().unwrap();

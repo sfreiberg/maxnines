@@ -23,8 +23,8 @@ Each person has a role, and each role adds to the one before:
 | --- | --- |
 | Viewer | Sees every page except Users and the audit log, and can open a rule or channel to read it. Changes their own profile and makes their own API keys |
 | Responder | Acknowledges alerts and starts and ends silences, on the pages and from Slack's buttons, and adds and deletes [annotations](annotations.md) |
-| Editor | Changes the setup: config rules, alert rules, notification channels, maintenance windows, checks, dashboards and the map. Approves and revokes agents |
-| Admin | Adds, disables and deletes users and changes their roles. Reads the audit log, sees everyone's API keys, and deletes machines |
+| Editor | Changes the setup: config rules, alert rules, notification channels, maintenance windows, checks, dashboards and the map. Approves and revokes hosts |
+| Admin | Adds, disables and deletes users and changes their roles. Reads the audit log, sees everyone's API keys, and deletes hosts |
 
 An admin sets roles on the Users page under Settings, or with the API. There's always
 at least one admin who can sign in: the last one can't be given a lower role or

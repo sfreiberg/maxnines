@@ -72,7 +72,7 @@ async fn a_viewer_sees_the_pages_but_changes_nothing() {
 
     for path in [
         "/",
-        "/agents",
+        "/hosts",
         "/alerts",
         "/alerts/rules",
         "/rules",
@@ -103,8 +103,8 @@ async fn a_viewer_sees_the_pages_but_changes_nothing() {
         "/alerts/rules",
         "/dashboards",
         "/settings/users",
-        "/agents/abc/approve",
-        "/agents/abc/delete",
+        "/hosts/abc/approve",
+        "/hosts/abc/delete",
     ] {
         assert_eq!(
             viewer.post(&server, path, &token).await.status,
@@ -198,7 +198,7 @@ async fn an_editor_changes_the_setup_but_not_people() {
     assert_eq!(editor.get(&server, "/settings/audit-log").await.status, 403);
     let token = editor.get(&server, "/profile").await.token();
     let token = [("authenticity_token", token.as_str())];
-    let page = editor.post(&server, "/agents/abc/delete", &token).await;
+    let page = editor.post(&server, "/hosts/abc/delete", &token).await;
     assert_eq!(page.status, 403);
 }
 
@@ -210,7 +210,7 @@ async fn the_api_asks_the_same_of_a_key() {
     let (_, editor) = key_as(&server, Role::Editor).await;
 
     assert_eq!(
-        api(&server, &viewer, "GET", "/api/v1/agents", "").await.0,
+        api(&server, &viewer, "GET", "/api/v1/hosts", "").await.0,
         200
     );
     let (status, body) = api(
@@ -234,7 +234,7 @@ async fn the_api_asks_the_same_of_a_key() {
         );
     }
     assert_eq!(
-        api(&server, &editor, "DELETE", "/api/v1/agents/abc", "")
+        api(&server, &editor, "DELETE", "/api/v1/hosts/abc", "")
             .await
             .0,
         403
@@ -384,7 +384,7 @@ async fn people_see_and_revoke_only_their_own_keys_unless_they_are_admins() {
     let path = format!("/api/v1/api-keys/{}", theirs.unwrap()["id"]);
     assert_eq!(api(&server, &viewer, "DELETE", &path, "").await.0, 404);
     assert_eq!(
-        api(&server, &editor, "GET", "/api/v1/agents", "").await.0,
+        api(&server, &editor, "GET", "/api/v1/hosts", "").await.0,
         200
     );
     assert_eq!(
@@ -392,7 +392,7 @@ async fn people_see_and_revoke_only_their_own_keys_unless_they_are_admins() {
         204
     );
     assert_eq!(
-        api(&server, &editor, "GET", "/api/v1/agents", "").await.0,
+        api(&server, &editor, "GET", "/api/v1/hosts", "").await.0,
         401
     );
 }
@@ -559,13 +559,13 @@ async fn the_pages_only_offer_what_a_role_allows() {
 }
 
 #[tokio::test]
-async fn only_a_responder_can_quiet_a_machine() {
+async fn only_a_responder_can_quiet_a_host() {
     let server = start().await;
-    let agent = identity();
-    let _client = server.connect_approved(&agent, "web-1").await;
-    let id = agent.id();
-    let page_path = format!("/agents/{id}");
-    let start_path = format!("/agents/{id}/maintenance");
+    let host = identity();
+    let _client = server.connect_approved(&host, "web-1").await;
+    let id = host.id();
+    let page_path = format!("/hosts/{id}");
+    let start_path = format!("/hosts/{id}/maintenance");
     let fields = [("duration_secs", "3600"), ("reason", "Rebooting")];
 
     let mut viewer = browser_as(&server, Role::Viewer).await;

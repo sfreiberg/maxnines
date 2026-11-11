@@ -57,7 +57,7 @@ impl Collector for OwnUsageCollector {
             .map_or(0, |now| now.as_secs().saturating_sub(process.start_time()));
         Ok(json!({
             "memory_bytes": process.memory(),
-            // As a share of the whole machine, as other CPU figures are.
+            // As a share of the whole host, as other CPU figures are.
             "cpu_percent": f64::from(process.cpu_usage()) / self.cores as f64,
             "uptime_secs": uptime_secs,
         }))
@@ -78,7 +78,7 @@ mod tests {
         assert!(output["memory_bytes"].as_u64().unwrap() > 0, "{output}");
         let cpu = output["cpu_percent"].as_f64().unwrap();
         assert!((0.0..=100.0).contains(&cpu), "{output}");
-        // This test process started moments ago, not when the machine did.
+        // This test process started moments ago, not when the host did.
         let uptime = output["uptime_secs"].as_u64().unwrap();
         assert!(uptime < 3600, "{output}");
     }

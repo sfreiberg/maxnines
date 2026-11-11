@@ -1,6 +1,6 @@
 # Running an agent
 
-Without a package, an agent is one file you copy to a machine and start yourself. On
+Without a package, an agent is one file you copy to a host and start yourself. On
 Windows, [run it as a service](windows-services.md) instead. Download it
 from a [release](https://github.com/sfreiberg/maxnines/releases), or build it with
 `cargo build --release -p maxnines-agent`.
@@ -27,12 +27,12 @@ Then start it:
 ./maxnines-agent
 ```
 
-It creates a key in `state`, logs its agent ID, and waits to be approved. Approve it
-on the Machines page, or from the command line with an API key:
+It creates a key in `state`, logs its host ID, and waits to be approved. Approve it
+on the Hosts page, or from the command line with an API key:
 
 ```sh
 export MAXNINES_API_KEY=$(maxnines-server api-keys create "Admin" --user you@example.com)
-maxnines-server agents approve <agent-id>
+maxnines-server hosts approve <host-id>
 ```
 
 It starts reporting within a few seconds, and from then on it reconnects by itself.
@@ -40,37 +40,37 @@ It stops with Ctrl+C or when the terminal closes, so use `nohup` or `tmux` to ke
 running after you log out. Samples are kept in `state` while the server can't be
 reached, and sent when it's back.
 
-- **One key per machine.** Copy the program and `agent.hcl` to another machine, but
-  never `state`. The key inside it is the agent's identity, so a copy looks like the
-  same machine. If two machines do share a key, each connection knocks the other off,
-  and the Machines page shows the agent reconnecting over and over.
-- **Names aren't unique.** The key is the agent's identity, so two machines can share
-  a name, such as a caching name server in every office, and a renamed machine
-  simply reports under its new name.
+- **One key per host.** Copy the program and `agent.hcl` to another host, but
+  never `state`. The key inside it is the host's identity, so a copy looks like the
+  same host. If two hosts do share a key, each connection knocks the other off,
+  and the Hosts page shows the host reconnecting over and over.
+- **Hostnames aren't unique.** The key is the host's identity, so two hosts can share
+  a hostname, such as a caching name server in every office, and a renamed host
+  simply reports under its new hostname.
 - **Only administrators should be able to change `agent.hcl`.** Custom metrics in it
   are commands the agent runs, so anyone who can edit the file can run commands as
   the agent. Keep it owned by the agent's user or root and not writable by others.
 - **Upgrade the server first.** Older agents work with a newer server, but a newer
-  agent may need things an older server doesn't have. The Machines page marks agents
+  agent may need things an older server doesn't have. The Hosts page marks agents
   older than the one released with the server **Update available**, and any newer
   than the server **Newer than server**.
 - **macOS and downloads:** a file that came through a browser or AirDrop is blocked
   until you run `xattr -d com.apple.quarantine maxnines-agent`.
 - **Other commands:** `./maxnines-agent facts` prints what it reports about the
-  machine, and `./maxnines-agent identity show` prints its ID once it's been started.
+  host, and `./maxnines-agent identity show` prints its ID once it's been started.
   Use `-c` to point any of them at a config file somewhere else.
 
 ## CPU
 
-Besides the machine's total, an agent reports each core's usage, so one core stuck at
-100% shows up on a machine with many, where it barely moves the total. Cores are
+Besides the host's total, an agent reports each core's usage, so one core stuck at
+100% shows up on a host with many, where it barely moves the total. Cores are
 numbered from 0. The **CPU usage by core** chart shows the 8 busiest, and an alert
 rule on it alerts on each core that crosses its threshold.
 
 ## Disks
 
 An agent reports how full each disk is, and how much is read and written, for every
-file system on the machine's own storage. Mounts that are really files, memory or
+file system on the host's own storage. Mounts that are really files, memory or
 another file system seen again aren't reported at all:
 
 - **macOS:** disk images, such as a mounted installer, network shares, and the system's hidden
@@ -117,14 +117,14 @@ processes by memory**. Only program names are reported, never what they were sta
 with, which can hold passwords.
 
 It's off unless a config rule turns it on, under **Collectors**, as it says what's
-running on a machine. The `processes` collector, by contrast, only answers about the
+running on a host. The `processes` collector, by contrast, only answers about the
 names it's given.
 
 ## Network
 
 Each network interface reports what it received and sent, in bytes and packets, the
 packets it found damaged, and the packets it dropped, which had nowhere to wait because
-the machine wasn't keeping up. macOS only counts received packets it dropped.
+the host wasn't keeping up. macOS only counts received packets it dropped.
 
 ## Processes and logins
 
@@ -133,7 +133,7 @@ there are, how many files are open and its TCP connections, each against the sys
 limit where it has one. They come from the `system` collector, which the Default config rule turns on.
 
 - **Processes** are counted the same way on every system, without their threads.
-  Linux limits threads rather than processes, so a Linux machine also reports its
+  Linux limits threads rather than processes, so a Linux host also reports its
   threads, against that limit.
 - **Login sessions** come from `who`, and from `quser` on Windows. Each session counts,
   so someone with three terminals open counts three times. Windows Home editions
@@ -146,9 +146,9 @@ limit where it has one. They come from the `system` collector, which the Default
   services that start automatically and stopped with an error. Many of Windows' own
   stop by design once they've done their job, and those stop cleanly, so they don't
   count. macOS and FreeBSD have no such state, so they don't report this.
-- **Updates waiting**, and how many are security fixes, from the machine's own package
+- **Updates waiting**, and how many are security fixes, from the host's own package
   lists: `apt-get` on Debian and Ubuntu, `dnf` or `yum` on Red Hat and Fedora, and
-  `pkg` on FreeBSD. Nothing is fetched, so they're as current as the machine's own
+  `pkg` on FreeBSD. Nothing is fetched, so they're as current as the host's own
   update schedule keeps them. FreeBSD doesn't say which are security fixes, and
   Windows and macOS don't report these yet.
 - **Restart needed**, as 1 when an update is waiting for one: on Debian and Ubuntu
@@ -176,26 +176,26 @@ rule under **Windows performance counters**, one per line, by their English path
 ```
 
 - **Names are in English** whatever language Windows is in, so one rule works on every
-  machine. Windows' `typeperf -q` lists what a machine has, in its own language.
+  host. Windows' `typeperf -q` lists what a host has, in its own language.
 - **`(*)` reports every instance,** such as each disk or each processor, as a series of its
   own, up to 64 for one path. Programs sharing a name are numbered as Windows numbers
   them, like `svchost#1`.
 - **Rates are worked out by Windows** between one sample and the next, so a counter like
   `Disk Reads/sec` has a value from the first sample.
-- **A path a machine doesn't have** is shown as failing on its page, and looked for again
+- **A path a host doesn't have** is shown as failing on its page, and looked for again
   on every sample, as software adds its own counters once it's installed.
 
-Each machine's page charts the busiest counters together and lists the latest value of
+Each host's page charts the busiest counters together and lists the latest value of
 each. An alert rule on **Performance counters** can watch one of them by its path.
-Counters are only ever read, never changed, and only on the machine itself.
+Counters are only ever read, never changed, and only on the host itself.
 
 ## Containers
 
-On Linux, an agent can report on every Docker or Podman container on its machine:
+On Linux, an agent can report on every Docker or Podman container on its host:
 whether it's up, its CPU, memory, network and disk use, and how often it has
 restarted. Turn on the `containers` collector in a config rule. It's off until then,
 because reading containers needs the agent's user to be allowed Docker's socket, and
-that's as good as root on the machine:
+that's as good as root on the host:
 
 ```sh
 sudo usermod -aG docker maxnines-agent
@@ -216,16 +216,16 @@ or a service stopped on purpose.
 Other systems run containers inside a Linux virtual machine, as Docker Desktop does on
 macOS and Windows, so only the Linux agent reads them.
 
-## Removing an agent
+## Removing a host
 
-When a machine is gone for good, revoke its agent on its page, then delete it. That
+When a host is gone for good, revoke it on its page, then delete it. That
 takes its metrics, facts and alerts with it, and can't be undone. From the command
 line:
 
 ```sh
-maxnines-server agents revoke <agent-id>
-maxnines-server agents delete <agent-id>
+maxnines-server hosts revoke <host-id>
+maxnines-server hosts delete <host-id>
 ```
 
-Stop the agent on the machine first, if it's still there. Otherwise it comes back as
-a new agent waiting to be approved, and an approval rule may let it straight in.
+Stop the agent on the host first, if it's still there. Otherwise it comes back as
+a new host waiting to be approved, and an approval rule may let it straight in.

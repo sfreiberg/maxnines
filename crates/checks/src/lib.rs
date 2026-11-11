@@ -578,7 +578,7 @@ async fn check_http(check: &Check, findings: &mut Findings) -> Result<()> {
     Ok(())
 }
 
-/// Without a server, this asks the system, as anything on the machine would.
+/// Without a server, this asks the system, as anything on the host would.
 async fn check_dns(check: &Check, findings: &mut Findings) -> Result<()> {
     let Some(server) = &check.server else {
         let addresses = resolve(&check.target, 0, findings).await?;
@@ -1466,7 +1466,7 @@ mod tests {
     }
 
     #[test]
-    fn ping_reaches_this_machine_and_reports_loss() {
+    fn ping_reaches_this_host_and_reports_loss() {
         let output = run(&Check {
             count: Some(2),
             ..check(CheckKind::Ping, "127.0.0.1")

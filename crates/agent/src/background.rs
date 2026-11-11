@@ -322,7 +322,7 @@ mod tests {
     }
 
     /// The tests that measure time run on a paused clock, which only moves when
-    /// everything is waiting, so a busy machine can't change what they measure.
+    /// everything is waiting, so a busy host can't change what they measure.
     #[tokio::test(start_paused = true)]
     async fn items_start_at_different_times_in_the_first_half_of_the_interval() {
         let interval = Duration::from_secs(1);

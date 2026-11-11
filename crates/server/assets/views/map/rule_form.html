@@ -15,12 +15,12 @@
 
     <label>Name
       <input type="text" name="name" value="{{ rule.name }}" required maxlength="255" placeholder="Leeds office">
-      <small>What the map calls these machines.</small>
+      <small>What the map calls these hosts.</small>
     </label>
 
-    <label>Machines
+    <label>Hosts
       <input type="text" name="filter" value="{{ rule.filter }}" maxlength="500" spellcheck="false" placeholder="networking.addresses=10.1.*">
-      <small>The same filter as the Machines list, such as <code>networking.fqdn=*.leeds.example.com</code> or <code>id=…</code> for one machine. Leave empty for every machine.</small>
+      <small>The same filter as the Hosts list, such as <code>networking.fqdn=*.leeds.example.com</code> or <code>id=…</code> for one host. Leave empty for every host.</small>
     </label>
 
     <div class="stacked-field place-search">
@@ -43,7 +43,7 @@
 
     <label>Priority
       <input type="number" name="priority" value="{{ rule.priority }}" step="1">
-      <small>Where several rules match a machine, the highest wins. A machine placed from its own page gets {{ one_machine_priority }}.</small>
+      <small>Where several rules match a host, the highest wins. A host placed from its own page gets {{ one_host_priority }}.</small>
     </label>
 
     <div class="actions">

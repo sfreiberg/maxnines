@@ -4,7 +4,7 @@
 //! next. English names are looked up whatever language Windows is in, so one config
 //! works everywhere. `(*)` in a path reads every instance, each as a series of its own.
 //!
-//! A path that isn't on a machine is reported as failing, with a fixed message, and
+//! A path that isn't on a host is reported as failing, with a fixed message, and
 //! looked for again on the next sample, as some only appear once their software runs.
 
 use std::collections::{BTreeMap, HashMap};
@@ -18,7 +18,7 @@ use crate::Collector;
 /// program running and each is a series on the server.
 pub const MAX_INSTANCES: usize = 64;
 
-pub const NOT_FOUND: &str = "not found on this machine";
+pub const NOT_FOUND: &str = "not found on this host";
 pub const NOT_READ: &str = "couldn't be read";
 pub const NOT_WINDOWS: &str = "performance counters are only on Windows";
 
@@ -130,7 +130,7 @@ pub(crate) mod pdh {
 
     use super::{MAX_INSTANCES, NOT_FOUND, NOT_READ, Reading, instance_path, numbered};
 
-    /// Percentages of processor time can pass 100 on a machine with several cores.
+    /// Percentages of processor time can pass 100 on a host with several cores.
     const NO_CAP_AT_100: u32 = 0x8000;
     const FORMAT: u32 = PDH_FMT_DOUBLE | NO_CAP_AT_100;
 
@@ -242,7 +242,7 @@ pub(crate) mod pdh {
     impl Counters {
         pub fn new(paths: Vec<String>) -> Self {
             let mut query: PDH_HQUERY = null_mut();
-            // SAFETY: no data source means this machine, live, and the handle has
+            // SAFETY: no data source means this host, live, and the handle has
             // somewhere to go.
             let opened = unsafe { PdhOpenQueryW(null(), 0, &mut query) } == 0;
             let query = opened.then_some(query);
@@ -414,7 +414,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn this_machine_reports_its_counters() {
+    fn this_host_reports_its_counters() {
         let mut collector = CounterCollector::new(vec![
             r"\Memory\Available MBytes".into(),
             r"\Processor(*)\% Processor Time".into(),

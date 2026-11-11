@@ -1,7 +1,7 @@
 Operating system logos
 
 These are the projects' own logos, which remain their owners' trademarks. They are
-shown only to say which system a machine runs. data/fetch_os_icons.py fetches them.
+shown only to say which system a host runs. data/fetch_os_icons.py fetches them.
 
 macos.svg, linux.svg, freebsd.svg, openbsd.svg
   From Simple Icons 16.37.0, https://simpleicons.org

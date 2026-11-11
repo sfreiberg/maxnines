@@ -187,7 +187,7 @@ pub struct Chart {
     /// Further than this is a gap in its lines, so it has nothing to show for it.
     pub reach_ms: i64,
     pub summary: Vec<Summary>,
-    /// What happened to the machine while the chart covers.
+    /// What happened to the host while the chart covers.
     pub markers: Vec<Marker>,
 }
 
@@ -465,9 +465,9 @@ fn gap_limit_ms(series: &Series, range: TimeRange) -> f64 {
 }
 
 /// Which colour each series gets. A metric with named fields gives each of its
-/// first few fields a colour of its own, the same on every machine, whichever
-/// other fields a machine reports. Fields beyond the colours there are, as in
-/// the memory breakdown, take whichever colours the machine's other fields leave
+/// first few fields a colour of its own, the same on every host, whichever
+/// other fields a host reports. Fields beyond the colours there are, as in
+/// the memory breakdown, take whichever colours the host's other fields leave
 /// free, so no line is drawn in a colour that doesn't exist. Other metrics colour
 /// their series in order.
 fn colour_slots(metric: &Metric, series: &[Series]) -> Vec<usize> {
@@ -1110,14 +1110,14 @@ mod tests {
         let chart = build_as(
             find("cpu.usage").unwrap(),
             Unit::Percent,
-            "Busy machines",
+            "Busy hosts",
             frame,
             &result,
             range(),
             Tz::UTC,
         );
 
-        assert_eq!(chart.title, "Busy machines");
+        assert_eq!(chart.title, "Busy hosts");
         assert_eq!((chart.width, chart.height), (1000.0, 400.0));
         assert_eq!(chart.bottom, 376.0);
         assert_eq!(chart.columns[0].rows[0].dot.y, 376.0);

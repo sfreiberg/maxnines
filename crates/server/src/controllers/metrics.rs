@@ -30,8 +30,8 @@ const RANGES: [(&str, &str, i64); 5] = [
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/metrics", get(index))
-        .route("/agents/{id}/metrics", get(show))
-        .route("/agents/{id}/metrics/{metric}", get(data))
+        .route("/hosts/{id}/metrics", get(show))
+        .route("/hosts/{id}/metrics/{metric}", get(data))
 }
 
 #[derive(Deserialize)]
@@ -47,23 +47,23 @@ async fn index(
 ) -> Response {
     let data = async {
         let search = HostSearch::load(&state, params.filter.as_deref()).await?;
-        let agents = fleet::rows(&state).await?;
-        anyhow::Ok((search, agents))
+        let hosts = fleet::rows(&state).await?;
+        anyhow::Ok((search, hosts))
     };
-    let (search, mut agents) = match data.await {
+    let (search, mut hosts) = match data.await {
         Ok(data) => data,
         Err(error) => return server_error(&error),
     };
 
-    agents.retain(|agent| search.includes(&agent.id, &agent.host));
-    let pages = paginate(&mut agents, page_number(params.page.as_deref()), |page| {
+    hosts.retain(|host| search.includes(&host.id, &host.hostname));
+    let pages = paginate(&mut hosts, page_number(params.page.as_deref()), |page| {
         address(
             "/metrics",
             &[("filter", &search.text), ("page", &page.to_string())],
         )
     });
     Page::new(&state, &token, "metrics/index.html")
-        .with("agents", &agents)
+        .with("hosts", &hosts)
         .with("pages", &pages)
         .with("search", &search)
         .with("search_path", "/metrics")
@@ -135,14 +135,14 @@ pub(super) struct RangeParams {
     pub(super) range: Option<String>,
 }
 
-/// What the machine page's address can say: its range, and why a note was refused.
+/// What the host page's address can say: its range, and why a note was refused.
 #[derive(Deserialize, Default)]
 pub(super) struct ShowParams {
     range: Option<String>,
     event_error: Option<String>,
 }
 
-/// One line of a machine's Events list.
+/// One line of a host's Events list.
 #[derive(Serialize)]
 struct EventRow {
     id: Option<i64>,
@@ -188,14 +188,14 @@ pub(super) fn time_range(length_ms: i64) -> Option<TimeRange> {
 
 async fn chart(
     state: &AppState,
-    agent_id: &str,
+    host_id: &str,
     metric: &'static Metric,
     range: TimeRange,
     zone: Tz,
 ) -> anyhow::Result<Chart> {
     let result = state
         .metrics
-        .series(agent_id, metric, range, MAX_SERIES)
+        .series(host_id, metric, range, MAX_SERIES)
         .await?;
     Ok(metric_charts::build(metric, &result, range, zone))
 }
@@ -216,20 +216,16 @@ pub(super) fn range_links(selected: &str) -> Vec<RangeLink> {
 /// own query, so they run together rather than in turn.
 pub(super) async fn charts_for(
     state: &AppState,
-    agent_id: &str,
+    host_id: &str,
     metrics: &[&'static Metric],
     range: TimeRange,
     zone: Tz,
 ) -> anyhow::Result<Vec<Chart>> {
     let mut queries = JoinSet::new();
     for (position, metric) in metrics.iter().copied().enumerate() {
-        let (state, agent_id) = (state.clone(), agent_id.to_string());
-        queries.spawn(async move {
-            (
-                position,
-                chart(&state, &agent_id, metric, range, zone).await,
-            )
-        });
+        let (state, host_id) = (state.clone(), host_id.to_string());
+        queries
+            .spawn(async move { (position, chart(&state, &host_id, metric, range, zone).await) });
     }
 
     let mut charts = Vec::with_capacity(metrics.len());
@@ -252,7 +248,7 @@ async fn show(
     Query(params): Query<ShowParams>,
     token: CsrfToken,
 ) -> Response {
-    let Some(agent) = state.registry.get(&id).await else {
+    let Some(host) = state.registry.get(&id).await else {
         return not_found(&state, &token);
     };
     let range_params = RangeParams {
@@ -267,11 +263,11 @@ async fn show(
         .iter()
         .filter(|metric| metric.chart != ShowChart::Never)
         .collect();
-    let charts = match charts_for(&state, &agent.id, &shown, range, viewer_zone()).await {
+    let charts = match charts_for(&state, &host.id, &shown, range, viewer_zone()).await {
         Ok(charts) => charts,
         Err(error) => return server_error(&error),
     };
-    let events = match state.timeline(&agent.id, range.from_ms, range.to_ms).await {
+    let events = match state.timeline(&host.id, range.from_ms, range.to_ms).await {
         Ok(events) => events,
         Err(error) => return server_error(&error),
     };
@@ -280,7 +276,7 @@ async fn show(
         .into_iter()
         .zip(shown)
         .filter(|(chart, metric)| {
-            chart.has_data || (metric.chart == ShowChart::Always && !agent.is_local())
+            chart.has_data || (metric.chart == ShowChart::Always && !host.is_local())
         })
         .map(|(mut chart, _)| {
             metric_charts::mark(&mut chart, &events, range, zone);
@@ -292,12 +288,12 @@ async fn show(
     let ranges = range_links(selected);
 
     // The server saves its checks one at a time, so no one sample has them all.
-    let latest = if agent.is_local() {
+    let latest = if host.is_local() {
         Ok(state.check_results.all().into_values().collect())
     } else {
         let output = state
             .metrics
-            .latest_output(&agent.id, "checks", now_ms())
+            .latest_output(&host.id, "checks", now_ms())
             .await;
         output.map(|output| match output {
             Some(Value::Array(checks)) => checks,
@@ -314,7 +310,7 @@ async fn show(
     for collector in ["custom", "counters"] {
         match state
             .metrics
-            .latest_output(&agent.id, collector, now_ms())
+            .latest_output(&host.id, collector, now_ms())
             .await
         {
             Ok(Some(Value::Array(items))) => {
@@ -331,9 +327,9 @@ async fn show(
         .with("checks", &checks)
         .with("custom_metrics", &custom_metrics)
         .with("counters", &counters)
-        .with("is_local", &agent.is_local())
-        .with("agent_id", &agent.id)
-        .with("host", &agent.host)
+        .with("is_local", &host.is_local())
+        .with("host_id", &host.id)
+        .with("hostname", &host.hostname)
         .with("charts", &charts)
         .with("events", &events)
         .with("event_error", &params.event_error)
@@ -349,7 +345,7 @@ async fn data(
     Query(params): Query<RangeParams>,
     token: CsrfToken,
 ) -> Response {
-    let (Some(agent), Some(metric)) = (state.registry.get(&id).await, metrics::find(&name)) else {
+    let (Some(host), Some(metric)) = (state.registry.get(&id).await, metrics::find(&name)) else {
         return not_found(&state, &token);
     };
     let (selected, label, length_ms) = selected_range(&params);
@@ -357,10 +353,10 @@ async fn data(
         return not_found(&state, &token);
     };
 
-    match chart(&state, &agent.id, metric, range, viewer_zone()).await {
+    match chart(&state, &host.id, metric, range, viewer_zone()).await {
         Ok(chart) => Page::new(&state, &token, "metrics/data.html")
-            .with("agent_id", &agent.id)
-            .with("host", &agent.host)
+            .with("host_id", &host.id)
+            .with("hostname", &host.hostname)
             .with("chart", &chart)
             .with("range", selected)
             .with("range_label", label)

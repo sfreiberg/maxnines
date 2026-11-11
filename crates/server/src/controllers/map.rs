@@ -1,4 +1,4 @@
-//! The map: where machines are, coloured by how they're doing, and the location
+//! The map: where hosts are, coloured by how they're doing, and the location
 //! rules that put them there.
 
 use std::collections::BTreeMap;
@@ -19,10 +19,10 @@ use crate::app_state::AppState;
 use crate::host_filter;
 use crate::locations::{LocationRule, LocationRuleInput, Locator, check_rule};
 use crate::places::{self, CREDIT, Found, MAX_RESULTS};
-use crate::registration::{AgentState, short_id};
+use crate::registration::{HostState, short_id};
 
-/// What a rule for one machine gets, so it outranks the broader rules it sits among.
-pub const ONE_MACHINE_PRIORITY: i32 = 100;
+/// What a rule for one host gets, so it outranks the broader rules it sits among.
+pub const ONE_HOST_PRIORITY: i32 = 100;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -36,12 +36,12 @@ pub fn routes() -> Router<AppState> {
         .route("/map/rules/{id}/delete", post(delete))
 }
 
-/// A machine on the map, or waiting for a place on it.
+/// A host on the map, or waiting for a place on it.
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Machine {
+pub struct MapHost {
     pub id: String,
     pub short_id: String,
-    pub host: String,
+    pub hostname: String,
     pub health: Health,
 }
 
@@ -81,7 +81,7 @@ impl Counts {
     }
 }
 
-/// The machines one rule puts in one place.
+/// The hosts one rule puts in one place.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Site {
     pub rule_id: i64,
@@ -91,7 +91,7 @@ pub struct Site {
     pub longitude: f64,
     pub health: Health,
     pub counts: Counts,
-    pub machines: Vec<Machine>,
+    pub hosts: Vec<MapHost>,
 }
 
 /// Everything the map shows.
@@ -99,48 +99,51 @@ pub struct Site {
 pub struct MapData {
     /// Those most in need of attention first.
     pub sites: Vec<Site>,
-    /// Approved machines no rule places.
-    pub unplaced: Vec<Machine>,
+    /// Approved hosts no rule places.
+    pub unplaced: Vec<MapHost>,
 }
 
-/// Where every approved machine is, and how it's doing.
+/// Where every approved host is, and how it's doing.
 pub async fn map_data(state: &AppState) -> Result<MapData> {
     let locator = Locator::load(&state.database).await?;
     let open = state.database.open_alerts().await?;
     let mut alerts: BTreeMap<&str, Vec<&Alert>> = BTreeMap::new();
     for alert in &open {
-        alerts.entry(&alert.agent_id).or_default().push(alert);
+        alerts.entry(&alert.host_id).or_default().push(alert);
     }
 
     let mut sites: BTreeMap<i64, Site> = BTreeMap::new();
     let mut unplaced = Vec::new();
-    for agent in state.registry.list().await {
-        if agent.state != AgentState::Approved || agent.is_local() {
+    for host in state.registry.list().await {
+        if host.state != HostState::Approved || host.is_local() {
             continue;
         }
-        let online = state.presence.get(&agent.id).is_some_and(|p| p.online);
-        let mine = alerts.get(agent.id.as_str()).map_or(&[][..], Vec::as_slice);
-        let machine = Machine {
-            short_id: short_id(&agent.id).to_string(),
+        let online = state.presence.get(&host.id).is_some_and(|p| p.online);
+        let mine = alerts.get(host.id.as_str()).map_or(&[][..], Vec::as_slice);
+        let pin = MapHost {
+            short_id: short_id(&host.id).to_string(),
             health: Health::of(online, mine),
-            host: agent.host.clone(),
-            id: agent.id.clone(),
+            hostname: host.hostname.clone(),
+            id: host.id.clone(),
         };
-        let Some(rule) = locator.locate(&agent.id, &agent.host) else {
-            unplaced.push(machine);
+        let Some(rule) = locator.locate(&host.id, &host.hostname) else {
+            unplaced.push(pin);
             continue;
         };
         let site = sites.entry(rule.id).or_insert_with(|| site_for(rule));
-        site.counts.add(machine.health);
-        site.machines.push(machine);
+        site.counts.add(pin.health);
+        site.hosts.push(pin);
     }
 
     let mut sites: Vec<Site> = sites
         .into_values()
         .map(|mut site| {
             site.health = site.counts.health();
-            site.machines
-                .sort_by(|a, b| a.health.cmp(&b.health).then_with(|| a.host.cmp(&b.host)));
+            site.hosts.sort_by(|a, b| {
+                a.health
+                    .cmp(&b.health)
+                    .then_with(|| a.hostname.cmp(&b.hostname))
+            });
             site
         })
         .collect();
@@ -150,7 +153,7 @@ pub async fn map_data(state: &AppState) -> Result<MapData> {
             .then_with(|| b.counts.total().cmp(&a.counts.total()))
             .then_with(|| a.name.cmp(&b.name))
     });
-    unplaced.sort_by(|a, b| a.host.cmp(&b.host));
+    unplaced.sort_by(|a, b| a.hostname.cmp(&b.hostname));
     Ok(MapData { sites, unplaced })
 }
 
@@ -163,7 +166,7 @@ fn site_for(rule: &LocationRule) -> Site {
         longitude: rule.rule.longitude,
         health: Health::Online,
         counts: Counts::default(),
-        machines: Vec::new(),
+        hosts: Vec::new(),
     }
 }
 
@@ -209,7 +212,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
             breakdown: breakdown(&site.counts),
         })
         .collect();
-    let machines: usize = data
+    let hosts: usize = data
         .sites
         .iter()
         .map(|site| site.counts.total())
@@ -229,7 +232,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
         .with("site_count", &rows.len())
         .with("sites", &rows)
         .with("unplaced", &data.unplaced)
-        .with("machine_count", &machines)
+        .with("host_count", &hosts)
         .with("attention", &attention)
         .with("map_json", &json)
         .with("credit", CREDIT)
@@ -286,18 +289,18 @@ struct RuleRow {
     place: String,
     filter: String,
     priority: i32,
-    machines: usize,
+    hosts: usize,
 }
 
 async fn rules(State(state): State<AppState>, token: CsrfToken) -> Response {
     let data = async {
         let locator = Locator::load(&state.database).await?;
         let mut counts: BTreeMap<i64, usize> = BTreeMap::new();
-        for agent in state.registry.list().await {
-            if agent.state != AgentState::Approved || agent.is_local() {
+        for host in state.registry.list().await {
+            if host.state != HostState::Approved || host.is_local() {
                 continue;
             }
-            if let Some(rule) = locator.locate(&agent.id, &agent.host) {
+            if let Some(rule) = locator.locate(&host.id, &host.hostname) {
                 *counts.entry(rule.id).or_default() += 1;
             }
         }
@@ -309,7 +312,7 @@ async fn rules(State(state): State<AppState>, token: CsrfToken) -> Response {
                 place: rule.rule.place.clone(),
                 filter: rule.rule.filter.clone(),
                 priority: rule.rule.priority,
-                machines: counts.get(&rule.id).copied().unwrap_or_default(),
+                hosts: counts.get(&rule.id).copied().unwrap_or_default(),
             })
             .collect();
         anyhow::Ok(rows)
@@ -390,7 +393,7 @@ impl RuleForm {
 #[derive(Deserialize, Default)]
 struct NewRule {
     #[serde(default)]
-    agent: Option<String>,
+    host: Option<String>,
 }
 
 fn form_page(
@@ -403,7 +406,7 @@ fn form_page(
     let mut page = Page::new(state, token, "map/rule_form.html")
         .with("rule", rule)
         .with("credit", CREDIT)
-        .with("one_machine_priority", &ONE_MACHINE_PRIORITY);
+        .with("one_host_priority", &ONE_HOST_PRIORITY);
     if let Some(id) = id {
         page = page.with("id", &id);
     }
@@ -416,7 +419,7 @@ fn form_page(
     }
 }
 
-/// Opened from an agent's page, the form is for that one machine.
+/// Opened from an agent's page, the form is for that one host.
 async fn new(
     State(state): State<AppState>,
     Query(query): Query<NewRule>,
@@ -426,18 +429,18 @@ async fn new(
         priority: "0".to_string(),
         ..RuleForm::default()
     };
-    if let Some(id) = query.agent {
+    if let Some(id) = query.host {
         let found = state
             .registry
             .get(&id)
             .await
-            .filter(|agent| !agent.is_local());
-        let Some(agent) = found else {
+            .filter(|host| !host.is_local());
+        let Some(host) = found else {
             return StatusCode::NOT_FOUND.into_response();
         };
-        rule.name = agent.host;
-        rule.filter = host_filter::only(&agent.id);
-        rule.priority = ONE_MACHINE_PRIORITY.to_string();
+        rule.name = host.hostname;
+        rule.filter = host_filter::only(&host.id);
+        rule.priority = ONE_HOST_PRIORITY.to_string();
     }
     form_page(&state, &token, None, &rule, None)
 }
@@ -494,7 +497,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_site_shows_its_worst_machine() {
+    fn a_site_shows_its_worst_host() {
         let mut counts = Counts::default();
         counts.add(Health::Online);
         assert_eq!(counts.health(), Health::Online);

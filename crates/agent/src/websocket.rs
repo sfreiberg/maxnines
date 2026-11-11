@@ -62,7 +62,7 @@ pub struct ServerLink {
 
 struct Connection {
     url: String,
-    host: String,
+    hostname: String,
     identity: Identity,
     token: Option<String>,
     connector: Connector,
@@ -74,22 +74,22 @@ struct Connection {
 }
 
 impl ServerLink {
-    pub fn start(config: &Config, host: &str, identity: Identity) -> Result<Self> {
+    pub fn start(config: &Config, hostname: &str, identity: Identity) -> Result<Self> {
         let url = config.server.url.clone();
         if url.starts_with("ws://") {
             warn!(
                 url,
-                "connection is not encrypted, use wss:// beyond this machine"
+                "connection is not encrypted, use wss:// beyond this host"
             );
         }
-        info!(agent_id = identity.id(), "agent identity loaded");
+        info!(host_id = identity.id(), "agent identity loaded");
 
         let (facts_every, facts_every_receiver) = watch::channel(DEFAULT_FACTS_INTERVAL);
         let (config_sender, configs) = mpsc::channel(CONFIG_QUEUE_SIZE);
         let spool = Arc::new(Spool::open(&config.sample_queue_folder()));
         let connection = Connection {
             url,
-            host: host.to_string(),
+            hostname: hostname.to_string(),
             identity,
             token: config
                 .server
@@ -306,7 +306,7 @@ async fn authenticate(socket: &mut Socket, connection: &Connection) -> Result<()
     };
 
     let hello = AgentMessage::Hello {
-        host: connection.host.clone(),
+        hostname: connection.hostname.clone(),
         public_key: connection.identity.public_key(),
         signature: connection.identity.sign(&connection.url, &nonce),
         token: connection.token.clone(),
@@ -374,7 +374,7 @@ mod tests {
         }
     }
 
-    /// Waits for something the agent does in its own time, however slow the machine.
+    /// Waits for something the agent does in its own time, however slow the host.
     async fn until(done: impl Fn() -> bool) {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !done() {
@@ -450,7 +450,7 @@ mod tests {
         let url = format!("ws://{address}/ws");
 
         let agent = identity();
-        let agent_id = agent.id();
+        let host_id = agent.id();
         let link = ServerLink::start(&config(&url), "web-1", agent).unwrap();
         link.send_sample(&sample()).unwrap();
 
@@ -461,7 +461,7 @@ mod tests {
         let (stream, _) = listener.accept().await.unwrap();
         let mut socket = accept_async(stream).await.unwrap();
 
-        assert_eq!(accept_agent(&mut socket, &url).await, agent_id);
+        assert_eq!(accept_agent(&mut socket, &url).await, host_id);
 
         assert!(matches!(
             next_message(&mut socket).await,

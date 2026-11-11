@@ -117,7 +117,7 @@ fn default_clickhouse_database() -> String {
 }
 
 impl MetricsConfig {
-    /// Where the metrics are kept, if it's on this machine.
+    /// Where the metrics are kept, if it's on this host.
     pub fn path(&self) -> Option<&Path> {
         match self {
             Self::Duckdb { path, .. } => Some(path),

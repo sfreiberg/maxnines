@@ -13,7 +13,7 @@ pub struct Model {
     pub sends_warnings: bool,
     pub sends_critical: bool,
     pub mail_from: Option<String>,
-    pub mail_host: Option<String>,
+    pub mail_hostname: Option<String>,
     pub mail_port: Option<i32>,
     pub mail_security: Option<String>,
     pub mail_username: Option<String>,

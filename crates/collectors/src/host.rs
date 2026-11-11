@@ -1,5 +1,5 @@
-//! What can be read about a machine from inside it, which needs nothing installed.
-//! Agents report these, and so does the server about the machine it's on.
+//! What can be read about a host from inside it, which needs nothing installed.
+//! Agents report these, and so does the server about the host it's on.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -303,7 +303,7 @@ fn link_up(state: InterfaceOperationalState) -> Option<u8> {
     }
 }
 
-/// Everything here that needs no settings, for reporting on the machine as a whole.
+/// Everything here that needs no settings, for reporting on the host as a whole.
 pub fn all() -> Result<Vec<Box<dyn Collector + Send>>> {
     Ok(vec![
         Box::new(HostCollector),
@@ -432,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn everything_on_a_machine_can_be_read() {
+    fn everything_on_a_host_can_be_read() {
         for mut collector in all().unwrap() {
             collector.collect().unwrap();
         }

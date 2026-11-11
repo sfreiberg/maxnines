@@ -209,13 +209,16 @@ fn url_host(url: &str) -> Result<String> {
         matches!(scheme, "http" | "https"),
         "the webhook URL must start with http:// or https://"
     );
-    let host = uri.host().context("the webhook URL needs a host")?;
-    Ok(format!("{scheme}://{host}"))
+    let hostname = uri.host().context("the webhook URL needs a host")?;
+    Ok(format!("{scheme}://{hostname}"))
 }
 
 /// A URL that works like a password, shown as no more than where it goes.
 fn url_preview(url: &str) -> String {
-    url_host(url).map_or_else(|_| "Unknown".to_string(), |host| format!("{host}/…"))
+    url_host(url).map_or_else(
+        |_| "Unknown".to_string(),
+        |hostname| format!("{hostname}/…"),
+    )
 }
 
 #[cfg(test)]
@@ -229,8 +232,8 @@ pub(crate) mod testing {
             rule_id: Some(1),
             rule_name: "High CPU".to_string(),
             severity: Severity::Critical,
-            agent_id: "abc".to_string(),
-            host: "web-1".to_string(),
+            host_id: "abc".to_string(),
+            hostname: "web-1".to_string(),
             series: "CPU".to_string(),
             value: Some(97.0),
             summary: "CPU usage on web-1 is 97%, above 90%".to_string(),

@@ -1,4 +1,4 @@
-//! Events marked on machines' charts: annotations people and scripts add, and what the
+//! Events marked on hosts' charts: annotations people and scripts add, and what the
 //! server notices.
 
 use super::*;
@@ -12,16 +12,16 @@ async fn api(server: &TestServer, method: &str, path: &str, body: &Value) -> (u1
     (status, serde_json::from_str(text).unwrap_or(Value::Null))
 }
 
-async fn machine(server: &TestServer, host: &str, facts: Value) -> (Identity, Client) {
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, host).await;
+async fn connect_host(server: &TestServer, hostname: &str, facts: Value) -> (Identity, Client) {
+    let host = identity();
+    let mut client = server.connect_approved(&host, hostname).await;
     send(&mut client, &AgentMessage::Facts { facts }).await;
-    server.wait_for_facts(&agent.id(), 1).await;
-    (agent, client)
+    server.wait_for_facts(&host.id(), 1).await;
+    (host, client)
 }
 
-async fn timeline(server: &TestServer, agent: &Identity) -> Vec<Value> {
-    let path = format!("/api/v1/agents/{}/events", agent.id());
+async fn timeline(server: &TestServer, host: &Identity) -> Vec<Value> {
+    let path = format!("/api/v1/hosts/{}/events", host.id());
     let (status, events) = api(server, "GET", &path, &Value::Null).await;
     assert_eq!(status, 200, "{events}");
     events.as_array().unwrap().clone()
@@ -34,11 +34,11 @@ fn titles(events: &[Value]) -> Vec<&str> {
         .collect()
 }
 
-/// Waits until the machine's timeline has an event of this kind.
-async fn wait_for_kind(server: &TestServer, agent: &Identity, kind: &str) -> Vec<Value> {
+/// Waits until the host's timeline has an event of this kind.
+async fn wait_for_kind(server: &TestServer, host: &Identity, kind: &str) -> Vec<Value> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let events = timeline(server, agent).await;
+        let events = timeline(server, host).await;
         if events.iter().any(|event| event["kind"] == kind) {
             return events;
         }
@@ -58,10 +58,10 @@ fn with_boot(boot_secs: i64) -> AgentMessage {
 }
 
 #[tokio::test]
-async fn a_deploy_is_marked_on_the_machines_its_filter_picks() {
+async fn a_deploy_is_marked_on_the_hosts_its_filter_picks() {
     let server = start().await;
-    let (web, _web_client) = machine(&server, "web-1", json!({ "role": "web" })).await;
-    let (db, _db_client) = machine(&server, "db-1", json!({ "role": "db" })).await;
+    let (web, _web_client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
+    let (db, _db_client) = connect_host(&server, "db-1", json!({ "role": "db" })).await;
 
     let deploy = json!({ "kind": "deploy", "title": "Shop v2.3", "detail": "Build 812", "filter": "role=web" });
     let (status, event) = api(&server, "POST", "/api/v1/annotations", &deploy).await;
@@ -79,10 +79,10 @@ async fn a_deploy_is_marked_on_the_machines_its_filter_picks() {
 }
 
 #[tokio::test]
-async fn an_event_without_a_filter_is_for_every_machine() {
+async fn an_event_without_a_filter_is_for_every_host() {
     let server = start().await;
-    let (web, _web_client) = machine(&server, "web-1", json!({ "role": "web" })).await;
-    let (db, _db_client) = machine(&server, "db-1", json!({ "role": "db" })).await;
+    let (web, _web_client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
+    let (db, _db_client) = connect_host(&server, "db-1", json!({ "role": "db" })).await;
 
     let (status, event) = api(
         &server,
@@ -105,7 +105,7 @@ async fn an_event_without_a_filter_is_for_every_machine() {
 #[tokio::test]
 async fn an_annotation_of_the_servers_own_kind_or_with_a_broken_filter_is_refused() {
     let server = start().await;
-    let _machine = machine(&server, "web-1", json!({ "role": "web" })).await;
+    let _host = connect_host(&server, "web-1", json!({ "role": "web" })).await;
 
     for body in [
         json!({ "title": "Broken", "filter": "role=\"unclosed" }),
@@ -127,7 +127,7 @@ async fn an_annotation_of_the_servers_own_kind_or_with_a_broken_filter_is_refuse
 #[tokio::test]
 async fn an_event_can_be_dated_when_it_happened() {
     let server = start().await;
-    let (web, _client) = machine(&server, "web-1", json!({ "role": "web" })).await;
+    let (web, _client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
     let earlier = now_ms() - 2 * 3_600_000;
 
     let body = json!({ "title": "Deployed before lunch", "kind": "deploy", "time_ms": earlier });
@@ -140,9 +140,9 @@ async fn an_event_can_be_dated_when_it_happened() {
 }
 
 #[tokio::test]
-async fn deleting_an_event_takes_it_off_every_machine_and_is_audited() {
+async fn deleting_an_event_takes_it_off_every_host_and_is_audited() {
     let server = start().await;
-    let (web, _client) = machine(&server, "web-1", json!({ "role": "web" })).await;
+    let (web, _client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
     let (_, event) = api(
         &server,
         "POST",
@@ -163,7 +163,7 @@ async fn deleting_an_event_takes_it_off_every_machine_and_is_audited() {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|entry| entry["subject"]["kind"] == "event")
+        .filter(|entry| entry["subject"]["kind"] == "annotation")
         .map(|entry| entry["action"].as_str().unwrap())
         .collect();
     assert_eq!(actions, ["deleted", "created"]);
@@ -172,21 +172,21 @@ async fn deleting_an_event_takes_it_off_every_machine_and_is_audited() {
 #[tokio::test]
 async fn a_restart_is_noticed_from_the_boot_time_and_a_backlog_is_not_one() {
     let server = start().await;
-    let (agent, mut client) = machine(&server, "web-1", json!({ "n": 1 })).await;
+    let (host, mut client) = connect_host(&server, "web-1", json!({ "n": 1 })).await;
     let first_boot = now_ms() / 1000 - 86_400;
 
     // The first boot time the server hears of is no restart.
     send(&mut client, &with_boot(first_boot)).await;
     let deadline = Instant::now() + Duration::from_secs(10);
-    while server.state.database.boot_time(&agent.id()).await.unwrap() != Some(first_boot * 1000) {
+    while server.state.database.boot_time(&host.id()).await.unwrap() != Some(first_boot * 1000) {
         assert!(Instant::now() < deadline, "the boot time wasn't saved");
         sleep(Duration::from_millis(20)).await;
     }
-    assert!(timeline(&server, &agent).await.is_empty());
+    assert!(timeline(&server, &host).await.is_empty());
 
     let second_boot = now_ms() / 1000 - 120;
     send(&mut client, &with_boot(second_boot)).await;
-    let events = wait_for_kind(&server, &agent, "restart").await;
+    let events = wait_for_kind(&server, &host, "restart").await;
     assert_eq!(events[0]["time_ms"], second_boot * 1000);
     assert_eq!(events[0]["created_by"], Value::Null);
 
@@ -199,8 +199,8 @@ async fn a_restart_is_noticed_from_the_boot_time_and_a_backlog_is_not_one() {
         },
     )
     .await;
-    server.wait_for_facts(&agent.id(), 2).await;
-    let restarts = timeline(&server, &agent)
+    server.wait_for_facts(&host.id(), 2).await;
+    let restarts = timeline(&server, &host)
         .await
         .into_iter()
         .filter(|event| event["kind"] == "restart")
@@ -211,15 +211,15 @@ async fn a_restart_is_noticed_from_the_boot_time_and_a_backlog_is_not_one() {
 #[tokio::test]
 async fn a_restart_while_disconnected_is_noticed_on_reconnecting() {
     let server = start().await;
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
     let first_boot = now_ms() / 1000 - 86_400;
     send(&mut client, &with_boot(first_boot)).await;
     let deadline = Instant::now() + Duration::from_secs(10);
     while server
         .state
         .database
-        .boot_time(&agent.id())
+        .boot_time(&host.id())
         .await
         .unwrap()
         .is_none()
@@ -230,18 +230,18 @@ async fn a_restart_while_disconnected_is_noticed_on_reconnecting() {
     drop(client);
 
     let mut client = server.connect().await;
-    let status = handshake(&mut client, &agent, "web-1", None).await;
+    let status = handshake(&mut client, &host, "web-1", None).await;
     assert_eq!(status, RegistrationStatus::Approved);
     send(&mut client, &with_boot(now_ms() / 1000 - 30)).await;
 
-    wait_for_kind(&server, &agent, "restart").await;
+    wait_for_kind(&server, &host, "restart").await;
 }
 
 #[tokio::test]
 async fn a_new_config_is_marked_but_not_the_first() {
     let server = start().await;
-    let agent = identity();
-    let mut client = server.connect_approved(&agent, "web-1").await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
     let (first, _) = TestServer::next_config(&mut client).await;
     let applied = |version: String| AgentMessage::ConfigResult {
         version,
@@ -252,7 +252,7 @@ async fn a_new_config_is_marked_but_not_the_first() {
     while server
         .state
         .database
-        .config_status(&agent.id())
+        .config_status(&host.id())
         .await
         .unwrap()
         .is_none()
@@ -268,7 +268,7 @@ async fn a_new_config_is_marked_but_not_the_first() {
     assert_ne!(first, second);
     send(&mut client, &applied(second)).await;
 
-    let events = wait_for_kind(&server, &agent, "config").await;
+    let events = wait_for_kind(&server, &host, "config").await;
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(events[0]["title"], "Config changed");
     assert_eq!(events[0]["detail"], "From rules: Default, Slower.");
@@ -277,8 +277,8 @@ async fn a_new_config_is_marked_but_not_the_first() {
 #[tokio::test]
 async fn alerts_and_updates_are_on_the_timeline_too() {
     let server = start().await;
-    let (agent, mut client) =
-        machine(&server, "web-1", json!({ "agent": { "version": "0.1.0" } })).await;
+    let (host, mut client) =
+        connect_host(&server, "web-1", json!({ "agent": { "version": "0.1.0" } })).await;
     send(
         &mut client,
         &AgentMessage::Facts {
@@ -286,7 +286,7 @@ async fn alerts_and_updates_are_on_the_timeline_too() {
         },
     )
     .await;
-    server.wait_for_facts(&agent.id(), 2).await;
+    server.wait_for_facts(&host.id(), 2).await;
 
     let rule = server
         .state
@@ -299,8 +299,8 @@ async fn alerts_and_updates_are_on_the_timeline_too() {
         rule_id: rule,
         rule_name: "Disk filling up".into(),
         severity: Severity::Warning,
-        agent_id: agent.id(),
-        host: "web-1".into(),
+        host_id: host.id(),
+        hostname: "web-1".into(),
         series: "/".into(),
         value: Some(85.0),
         summary: "Disk usage of / is 85%".into(),
@@ -314,7 +314,7 @@ async fn alerts_and_updates_are_on_the_timeline_too() {
         .await
         .unwrap();
 
-    let events = timeline(&server, &agent).await;
+    let events = timeline(&server, &host).await;
     let kinds: Vec<&str> = events
         .iter()
         .map(|event| event["kind"].as_str().unwrap())
@@ -329,10 +329,10 @@ async fn alerts_and_updates_are_on_the_timeline_too() {
 }
 
 #[tokio::test]
-async fn a_note_from_the_machine_page_shows_in_its_events() {
+async fn a_note_from_the_host_page_shows_in_its_events() {
     let server = start().await;
-    let (agent, _client) = machine(&server, "web-1", json!({ "role": "web" })).await;
-    let page = format!("/agents/{}/metrics?range=6h", agent.id());
+    let (host, _client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
+    let page = format!("/hosts/{}/metrics?range=6h", host.id());
     let mut browser = Browser::default();
 
     let fields = [
@@ -344,7 +344,7 @@ async fn a_note_from_the_machine_page_shows_in_its_events() {
         .submit(
             &server,
             &page,
-            &format!("/agents/{}/annotations", agent.id()),
+            &format!("/hosts/{}/annotations", host.id()),
             &fields,
         )
         .await;
@@ -367,15 +367,15 @@ async fn a_note_from_the_machine_page_shows_in_its_events() {
 #[tokio::test]
 async fn a_refused_note_says_why_on_the_page() {
     let server = start().await;
-    let (agent, _client) = machine(&server, "web-1", json!({ "role": "web" })).await;
-    let page = format!("/agents/{}/metrics", agent.id());
+    let (host, _client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
+    let page = format!("/hosts/{}/metrics", host.id());
     let mut browser = Browser::default();
 
     let posted = browser
         .submit(
             &server,
             &page,
-            &format!("/agents/{}/annotations", agent.id()),
+            &format!("/hosts/{}/annotations", host.id()),
             &[("title", "  ")],
         )
         .await;
@@ -392,7 +392,7 @@ async fn a_refused_note_says_why_on_the_page() {
 #[tokio::test]
 async fn a_note_can_be_deleted_from_the_page() {
     let server = start().await;
-    let (agent, _client) = machine(&server, "web-1", json!({ "role": "web" })).await;
+    let (host, _client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
     let (_, event) = api(
         &server,
         "POST",
@@ -400,10 +400,10 @@ async fn a_note_can_be_deleted_from_the_page() {
         &json!({ "title": "Mistake" }),
     )
     .await;
-    let page = format!("/agents/{}/metrics", agent.id());
+    let page = format!("/hosts/{}/metrics", host.id());
     let mut browser = Browser::default();
 
-    let fields = [("agent_id", agent.id()), ("range", "1h".to_string())];
+    let fields = [("host_id", host.id()), ("range", "1h".to_string())];
     let fields: Vec<(&str, &str)> = fields
         .iter()
         .map(|(name, value)| (*name, value.as_str()))
@@ -418,13 +418,13 @@ async fn a_note_can_be_deleted_from_the_page() {
         .await;
 
     assert_eq!(posted.status, 303);
-    assert!(timeline(&server, &agent).await.is_empty());
+    assert!(timeline(&server, &host).await.is_empty());
 }
 
 #[tokio::test]
-async fn deleting_a_machine_keeps_annotations_for_others_and_forgets_its_own() {
+async fn deleting_a_host_keeps_annotations_for_others_and_forgets_its_own() {
     let server = start().await;
-    let (agent, client) = machine(&server, "web-1", json!({ "role": "web" })).await;
+    let (host, client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
     let (_, event) = api(
         &server,
         "POST",
@@ -432,17 +432,17 @@ async fn deleting_a_machine_keeps_annotations_for_others_and_forgets_its_own() {
         &json!({ "title": "Kept" }),
     )
     .await;
-    let own = json!({ "title": "Gone", "filter": format!("id={}", agent.id()) });
+    let own = json!({ "title": "Gone", "filter": format!("id={}", host.id()) });
     let (_, own) = api(&server, "POST", "/api/v1/annotations", &own).await;
     drop(client);
     server
         .state
         .registry
-        .decide(&agent.id(), AgentState::Revoked)
+        .decide(&host.id(), HostState::Revoked)
         .await
         .unwrap();
 
-    server.state.delete_agent(&agent.id()).await.unwrap();
+    server.state.delete_host(&host.id()).await.unwrap();
 
     let path = format!("/api/v1/annotations/{}", event["id"]);
     let (status, _) = api(&server, "GET", &path, &Value::Null).await;
@@ -450,13 +450,13 @@ async fn deleting_a_machine_keeps_annotations_for_others_and_forgets_its_own() {
     let own = format!("/api/v1/annotations/{}", own["id"]);
     assert_eq!(api(&server, "GET", &own, &Value::Null).await.0, 404);
     assert_eq!(
-        server.state.database.boot_time(&agent.id()).await.unwrap(),
+        server.state.database.boot_time(&host.id()).await.unwrap(),
         None
     );
 }
 
 #[tokio::test]
-async fn an_annotation_follows_its_filter_to_machines_added_and_changed_later() {
+async fn an_annotation_follows_its_filter_to_hosts_added_and_changed_later() {
     let server = start().await;
     let body = json!({ "kind": "deploy", "title": "Shop v2.4", "filter": "role=web" });
 
@@ -464,7 +464,7 @@ async fn an_annotation_follows_its_filter_to_machines_added_and_changed_later() 
     let (status, _) = api(&server, "POST", "/api/v1/annotations", &body).await;
     assert_eq!(status, 201);
 
-    let (late, mut client) = machine(&server, "web-9", json!({ "role": "web" })).await;
+    let (late, mut client) = connect_host(&server, "web-9", json!({ "role": "web" })).await;
     assert_eq!(titles(&timeline(&server, &late).await), ["Shop v2.4"]);
 
     send(

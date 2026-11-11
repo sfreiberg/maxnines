@@ -63,7 +63,7 @@ async fn rows(state: &AppState, silences: Vec<Silence>) -> anyhow::Result<Vec<Si
                 rule_name(id).unwrap_or_default()
             }),
             hosts: if silence.filter.is_empty() {
-                "Every machine".to_string()
+                "Every host".to_string()
             } else {
                 silence.filter
             },
@@ -106,7 +106,7 @@ async fn window_rows(
                 .rule_id
                 .map_or("Every rule".to_string(), rule_name),
             hosts: if window.window.filter.is_empty() {
-                "Every machine".to_string()
+                "Every host".to_string()
             } else {
                 window.window.filter
             },

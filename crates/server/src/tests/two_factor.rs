@@ -41,16 +41,12 @@ async fn with_two_factor(server: &TestServer, id: i64, email: &str) -> (String, 
 }
 
 async fn give_password(server: &TestServer, browser: &mut Browser, email: &str) -> Page {
-    let fields = [
-        ("email", email),
-        ("password", PASSWORD),
-        ("next", "/agents"),
-    ];
+    let fields = [("email", email), ("password", PASSWORD), ("next", "/hosts")];
     browser.submit(server, "/login", "/login", &fields).await
 }
 
 async fn give_code(server: &TestServer, browser: &mut Browser, code: &str) -> Page {
-    let fields = [("code", code), ("next", "/agents")];
+    let fields = [("code", code), ("next", "/hosts")];
     browser
         .submit(server, "/login/code", "/login/code", &fields)
         .await
@@ -74,7 +70,7 @@ async fn signing_in_with_two_factor_takes_a_code_after_the_password() {
     assert_eq!(page.status, 303);
     assert!(page.header("location").unwrap().starts_with("/login/code"));
     assert!(!has_session(&browser), "a password alone signs nobody in");
-    assert_eq!(browser.get(&server, "/agents").await.status, 303);
+    assert_eq!(browser.get(&server, "/hosts").await.status, 303);
 
     let wrong = give_code(&server, &mut browser, "000000").await;
     assert_eq!(wrong.status, 401, "{}", wrong.body);
@@ -83,9 +79,9 @@ async fn signing_in_with_two_factor_takes_a_code_after_the_password() {
 
     let page = give_code(&server, &mut browser, &code_at(&secret, EMAIL, secs())).await;
     assert_eq!(page.status, 303, "{}", page.body);
-    assert_eq!(page.header("location"), Some("/agents"));
+    assert_eq!(page.header("location"), Some("/hosts"));
     assert!(has_session(&browser));
-    assert_eq!(browser.get(&server, "/agents").await.status, 200);
+    assert_eq!(browser.get(&server, "/hosts").await.status, 200);
 }
 
 #[tokio::test]
@@ -343,14 +339,14 @@ async fn an_admin_can_require_it_for_everyone() {
     person(&server, EMAIL).await;
     let mut other = Browser::anonymous();
     give_password(&server, &mut other, EMAIL).await;
-    let page = other.get(&server, "/agents").await;
+    let page = other.get(&server, "/hosts").await;
     assert_eq!(page.status, 303);
     assert_eq!(page.header("location"), Some("/profile"));
     let page = other.get(&server, "/profile").await;
     assert_eq!(page.status, 200);
     assert!(page.body.contains("required for everyone"));
     // The admin, who has it, carries on.
-    assert_eq!(browser.get(&server, "/agents").await.status, 200);
+    assert_eq!(browser.get(&server, "/hosts").await.status, 200);
     // And it can't be turned off while it's required.
     let page = browser
         .submit(

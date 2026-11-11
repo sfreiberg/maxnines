@@ -16,10 +16,10 @@ const MAX_TERMS: usize = 20;
 /// How many suggestions to offer at once.
 pub const MAX_SUGGESTIONS: usize = 12;
 
-/// Short names for what people look for most. The host name isn't a fact, as agents
-/// are listed before they've reported any.
-const HOST_NAMES: [&str; 2] = ["hostname", "host"];
-/// Picks out one machine whatever it's called, as names needn't be unique.
+/// The name people look for most. The hostname isn't a fact, as hosts are listed
+/// before their agents have reported any.
+const HOSTNAME: &str = "hostname";
+/// Picks out one host whatever it's called, as names needn't be unique.
 const ID_NAME: &str = "id";
 const OS_NAME: &str = "os";
 const OS_FACT: &str = "os.family";
@@ -93,7 +93,7 @@ fn parse_term(text: &str) -> Result<Term, String> {
         return Err(format!("{name} needs a value, like {name}=web*."));
     }
     let pattern = value.to_string();
-    Ok(if HOST_NAMES.contains(&name) {
+    Ok(if name == HOSTNAME {
         Term::Host { pattern, negated }
     } else if name == ID_NAME {
         Term::Id { pattern, negated }
@@ -136,10 +136,10 @@ impl HostFilter {
             .collect()
     }
 
-    pub fn matches(&self, id: &str, host: &str, facts: Option<&FlatFacts>) -> bool {
+    pub fn matches(&self, id: &str, hostname: &str, facts: Option<&FlatFacts>) -> bool {
         self.terms.iter().all(|term| match term {
-            Term::Text(text) => host.to_lowercase().contains(text),
-            Term::Host { pattern, negated } => matches(pattern, host) != *negated,
+            Term::Text(text) => hostname.to_lowercase().contains(text),
+            Term::Host { pattern, negated } => matches(pattern, hostname) != *negated,
             Term::Id { pattern, negated } => matches(pattern, id) != *negated,
             Term::Fact {
                 name,
@@ -192,7 +192,7 @@ impl<'a> PartialValue<'a> {
     }
 
     pub fn is_host(&self) -> bool {
-        HOST_NAMES.contains(&self.written_name)
+        self.written_name == HOSTNAME
     }
 
     pub fn is_id(&self) -> bool {
@@ -260,9 +260,9 @@ pub fn term_spans(text: &str) -> Vec<Range<usize>> {
     spans
 }
 
-/// The filter for one machine alone, by its ID, as names needn't be unique.
-pub fn only(agent_id: &str) -> String {
-    format!("{ID_NAME}={agent_id}")
+/// The filter for one host alone, by its ID, as names needn't be unique.
+pub fn only(host_id: &str) -> String {
+    format!("{ID_NAME}={host_id}")
 }
 
 /// Names matching what's been typed, those starting with it first.
@@ -270,7 +270,7 @@ pub fn suggest_names(term: &str, facts: impl IntoIterator<Item = String>) -> Vec
     let term = term.to_lowercase();
     let mut names: BTreeSet<String> = facts.into_iter().collect();
     names.extend([
-        HOST_NAMES[0].to_string(),
+        HOSTNAME.to_string(),
         ID_NAME.to_string(),
         OS_NAME.to_string(),
     ]);
@@ -294,12 +294,12 @@ pub fn suggest_names(term: &str, facts: impl IntoIterator<Item = String>) -> Vec
 mod tests {
     #[test]
     fn terms_are_found_where_they_are_written() {
-        let text = r#" os=linux  hostname="web 1" $machine"#;
+        let text = r#" os=linux  hostname="web 1" $host"#;
         let terms: Vec<&str> = term_spans(text)
             .into_iter()
             .map(|span| &text[span])
             .collect();
-        assert_eq!(terms, ["os=linux", r#"hostname="web 1""#, "$machine"]);
+        assert_eq!(terms, ["os=linux", r#"hostname="web 1""#, "$host"]);
         assert!(term_spans("   ").is_empty());
     }
 
@@ -335,9 +335,9 @@ mod tests {
             .matches(ID, "Web-01.example.com", Some(&facts()))
     }
 
-    /// Names needn't be unique, so the ID is how to mean one machine.
+    /// Names needn't be unique, so the ID is how to mean one host.
     #[test]
-    fn an_id_picks_out_one_machine() {
+    fn an_id_picks_out_one_host() {
         assert!(found(&format!("id={ID}")));
         assert!(found("id=3f2a1c9d*"));
         assert!(found("id!=abcdef*"));
@@ -364,7 +364,9 @@ mod tests {
     #[test]
     fn host_names_can_use_wildcards() {
         assert!(found("hostname=web*"));
-        assert!(found("host=web-??.example.com"));
+        assert!(found("hostname=web-??.example.com"));
+        // `host` is only ever a fact, never the hostname.
+        assert!(!found("host=web*"));
         assert!(!found("hostname=web"));
         assert!(!found("hostname=db*"));
     }

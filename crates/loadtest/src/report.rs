@@ -288,7 +288,7 @@ pub fn judge(
             BUSY_GENERATOR_PERCENT,
             f64::MAX,
         ),
-        detail: format!("it averaged {generator_average_cpu_percent:.0}% of this machine's CPU"),
+        detail: format!("it averaged {generator_average_cpu_percent:.0}% of this host's CPU"),
     });
 
     checks
@@ -438,7 +438,7 @@ mod tests {
 
     fn page(p95_ms: f64) -> PageResult {
         PageResult {
-            path: "/agents".to_string(),
+            path: "/hosts".to_string(),
             loads: 10,
             errors: 0,
             bytes: 1,

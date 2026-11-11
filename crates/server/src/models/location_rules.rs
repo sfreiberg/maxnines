@@ -1,4 +1,4 @@
-//! Location rules, which say where machines are for the map.
+//! Location rules, which say where hosts are for the map.
 
 use anyhow::{Context, Result};
 use sea_orm::{ConnectionTrait, EntityTrait, QueryOrder, Set, TransactionTrait};

@@ -130,7 +130,7 @@ fn main() -> Result<()> {
 }
 
 fn print_identity(identity: &Identity) {
-    println!("agent id:   {}", identity.id());
+    println!("host id:    {}", identity.id());
     println!("public key: {}", identity.public_key());
 }
 

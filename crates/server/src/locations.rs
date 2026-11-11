@@ -1,6 +1,6 @@
-//! Where machines are, for the map. A location rule says which machines are where,
-//! with the same filter as the Machines list, and when several match a machine the one
-//! with the highest priority decides. A machine put somewhere by hand is a rule whose
+//! Where hosts are, for the map. A location rule says which hosts are where,
+//! with the same filter as the Hosts list, and when several match a host the one
+//! with the highest priority decides. A host put somewhere by hand is a rule whose
 //! filter is its ID, so there's one way of saying where things are, not two.
 
 use std::collections::BTreeMap;
@@ -18,9 +18,9 @@ const MAX_PLACE_CHARS: usize = 255;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LocationRuleInput {
-    /// What the map calls the machines it covers, such as "Leeds office".
+    /// What the map calls the hosts it covers, such as "Leeds office".
     pub name: String,
-    /// Which machines, in the same form as the Machines list. Every machine, if empty.
+    /// Which hosts, in the same form as the Hosts list. Every host, if empty.
     #[serde(default)]
     pub filter: String,
     /// Where it is in words, such as "Leeds, England, United Kingdom".
@@ -28,7 +28,7 @@ pub struct LocationRuleInput {
     pub place: String,
     pub latitude: f64,
     pub longitude: f64,
-    /// When several rules match a machine, the highest wins.
+    /// When several rules match a host, the highest wins.
     #[serde(default)]
     pub priority: i32,
 }
@@ -60,7 +60,7 @@ pub fn check_rule(input: &LocationRuleInput) -> Result<()> {
     Ok(())
 }
 
-/// Every rule, ready to say where machines are. Loaded fresh for each page, as rules
+/// Every rule, ready to say where hosts are. Loaded fresh for each page, as rules
 /// and facts change.
 pub struct Locator {
     /// Highest priority first, and the older of two equal ones first, so a result
@@ -100,11 +100,11 @@ impl Locator {
         Ok(Self { rules, facts })
     }
 
-    /// The rule that says where a machine is, if any does.
-    pub fn locate(&self, id: &str, host: &str) -> Option<&LocationRule> {
+    /// The rule that says where a host is, if any does.
+    pub fn locate(&self, id: &str, hostname: &str) -> Option<&LocationRule> {
         self.rules
             .iter()
-            .find(|(_, filter)| filter.matches(id, host, self.facts.get(id)))
+            .find(|(_, filter)| filter.matches(id, hostname, self.facts.get(id)))
             .map(|(rule, _)| rule)
     }
 
@@ -180,15 +180,18 @@ mod tests {
         ])
         .await;
 
-        let name =
-            |id: &str, host: &str| locator.locate(id, host).map(|rule| rule.rule.name.as_str());
+        let name = |id: &str, hostname: &str| {
+            locator
+                .locate(id, hostname)
+                .map(|rule| rule.rule.name.as_str())
+        };
         assert_eq!(name("abc", "web-1"), Some("This one"));
         assert_eq!(name("def", "web-2"), Some("Web servers"));
         assert_eq!(name("ghi", "db-1"), Some("Everywhere"));
     }
 
     #[tokio::test]
-    async fn a_machine_no_rule_matches_has_no_location() {
+    async fn a_host_no_rule_matches_has_no_location() {
         let (locator, _) = locator(&[input("Web servers", "hostname=web*", 0)]).await;
         assert!(locator.locate("abc", "db-1").is_none());
     }

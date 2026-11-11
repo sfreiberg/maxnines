@@ -9,13 +9,13 @@ use chrono_tz::Tz;
 use serde::Serialize;
 use tracing::warn;
 
-use super::agents::format_uptime;
+use super::hosts::format_uptime;
 use super::metrics::{RangeParams, charts_for, not_found, range_links, selected_range, time_range};
 use super::{Page, local_time, viewer_zone};
 use crate::app_state::AppState;
 use crate::metric_charts::{Chart, format_value};
 use crate::metrics::{self, Metric, Unit, now_ms};
-use crate::remote_checks::LOCAL_AGENT_ID;
+use crate::remote_checks::LOCAL_HOST_ID;
 use crate::server_stats::{self, ServerStats};
 use crate::store::StoreStats;
 
@@ -33,13 +33,13 @@ const SECTIONS: [(&str, &[&str]); 4] = [
             "server.write_time",
         ],
     ),
-    ("Fleet", &["server.agents", "server.alerts"]),
+    ("Fleet", &["server.hosts", "server.alerts"]),
     (
         "Storage",
         &["server.database_size", "server.series", "disk.usage"],
     ),
     (
-        "This machine",
+        "This host",
         &[
             "cpu.usage",
             "memory.usage",
@@ -73,7 +73,7 @@ async fn sections(
         let wanted: Vec<&'static Metric> = names.iter().filter_map(|n| metrics::find(n)).collect();
         sections.push(Section {
             title,
-            charts: charts_for(state, LOCAL_AGENT_ID, &wanted, range, zone).await?,
+            charts: charts_for(state, LOCAL_HOST_ID, &wanted, range, zone).await?,
         });
     }
     Ok(sections)
@@ -150,7 +150,7 @@ struct ServerPage {
     process_memory: Option<String>,
     process_cpu: Option<String>,
     open_files: Option<usize>,
-    machine_memory: Option<Bar>,
+    host_memory: Option<Bar>,
     cores: Option<usize>,
     disk: Option<Bar>,
     disk_mount_point: Option<String>,
@@ -169,9 +169,9 @@ struct ServerPage {
     samples_failed: u64,
     samples_queued: usize,
     queue_capacity: usize,
-    agents_online: usize,
-    agents_approved: usize,
-    agents_waiting: usize,
+    hosts_online: usize,
+    hosts_approved: usize,
+    hosts_waiting: usize,
     alerts_open: usize,
     last_alert_pass: Option<String>,
     alert_rules_stalled: bool,
@@ -205,10 +205,10 @@ fn server_page(stats: ServerStats, now_ms: i64) -> ServerPage {
             .and_then(|p| p.cpu_percent)
             .map(|cpu| format_value(Unit::Percent, cpu)),
         open_files: process.and_then(|p| p.open_files),
-        machine_memory: process.map(|p| {
+        host_memory: process.map(|p| {
             share(
-                p.machine_memory_used_bytes as f64,
-                p.machine_memory_total_bytes as f64,
+                p.host_memory_used_bytes as f64,
+                p.host_memory_total_bytes as f64,
             )
         }),
         cores: process.map(|p| p.cores),
@@ -252,9 +252,9 @@ fn server_page(stats: ServerStats, now_ms: i64) -> ServerPage {
         samples_failed: activity.samples_failed,
         samples_queued: activity.samples_queued,
         queue_capacity: activity.queue_capacity,
-        agents_online: activity.agents_online,
-        agents_approved: activity.agents_approved,
-        agents_waiting: activity.agents_waiting,
+        hosts_online: activity.hosts_online,
+        hosts_approved: activity.hosts_approved,
+        hosts_waiting: activity.hosts_waiting,
         alerts_open: activity.alerts_open,
         last_alert_pass: last_pass.map(local_time),
         alert_rules_stalled: last_pass.is_some_and(|ms| now_ms - ms > ALERT_PASS_STALE_MS),
@@ -296,7 +296,7 @@ async fn show(
         .with("series", &latest(&sections, "server.series"))
         .with("sections", &sections)
         .with("charts_failed", &charts_failed)
-        .with("agent_id", LOCAL_AGENT_ID)
+        .with("host_id", LOCAL_HOST_ID)
         .with("ranges", &range_links(selected))
         .with("range", selected)
         .render()

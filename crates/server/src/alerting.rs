@@ -42,7 +42,7 @@ const MAX_FORECAST_SECS: u64 = 30 * 86_400;
 pub enum RuleKind {
     Metric,
     Offline,
-    /// Something worked out across a group of machines, such as their average CPU.
+    /// Something worked out across a group of hosts, such as their average CPU.
     Calculation,
     /// A metric heading for a level soon, such as a disk filling up, judged by the
     /// line through its recent readings.
@@ -170,13 +170,13 @@ pub struct AlertRuleInput {
     /// Tell every channel instead, including ones added later.
     #[serde(default)]
     pub all_channels: bool,
-    /// How to combine machines, for calculation rules.
+    /// How to combine hosts, for calculation rules.
     #[serde(default)]
     pub calculation: Option<Calculation>,
     /// What's watched separately, for calculation rules, as in a dashboard widget.
     #[serde(default)]
     pub group_by: Option<String>,
-    /// Which machines, for calculation rules, as on the Machines list. Empty is all.
+    /// Which hosts, for calculation rules, as on the Hosts list. Empty is all.
     #[serde(default)]
     pub filter: Option<String>,
     /// How far back a calculation rule looks, so one busy moment isn't a problem.
@@ -248,7 +248,7 @@ pub fn check_rule(rule: &AlertRuleInput) -> Result<()> {
             );
             ensure!(
                 rule.condition.is_none() && rule.series.is_none(),
-                "a calculation picks its machines with a filter"
+                "a calculation picks its hosts with a filter"
             );
         }
         RuleKind::Offline => {
@@ -489,7 +489,7 @@ impl AlertRuleInput {
     pub fn metric_summary(
         &self,
         metric: &Metric,
-        host: &str,
+        hostname: &str,
         series: &str,
         value: f64,
         severity: Severity,
@@ -501,7 +501,7 @@ impl AlertRuleInput {
             _ => format!("{} ({series})", metric.title),
         };
         let mut summary = format!(
-            "{name} on {host} is {}, {} {}",
+            "{name} on {hostname} is {}, {} {}",
             format_value(metric.unit, value),
             comparison.as_str(),
             format_value(metric.unit, threshold)
@@ -547,7 +547,7 @@ impl AlertRuleInput {
     pub fn forecast_summary(
         &self,
         metric: &Metric,
-        host: &str,
+        hostname: &str,
         series: &str,
         value: f64,
         slope_per_ms: f64,
@@ -563,7 +563,7 @@ impl AlertRuleInput {
         let goal = format_value(metric.unit, level);
         if eta_secs == 0 {
             return Ok(format!(
-                "{name} on {host} is {now}, already {} {goal}",
+                "{name} on {hostname} is {now}, already {} {goal}",
                 comparison.as_str()
             ));
         }
@@ -574,16 +574,16 @@ impl AlertRuleInput {
             "falling"
         };
         Ok(format!(
-            "{name} on {host} is {now} and {direction} by {per_hour} an hour, so it reaches {goal} in about {}",
+            "{name} on {hostname} is {now} and {direction} by {per_hour} an hour, so it reaches {goal} in about {}",
             format_eta(eta_secs)
         ))
     }
 
     /// What an offline alert says when it fires.
-    pub fn offline_summary(&self, host: &str) -> String {
+    pub fn offline_summary(&self, hostname: &str) -> String {
         match self.for_secs {
-            0 => format!("{host} is offline"),
-            secs => format!("{host} has been offline for {}", format_duration(secs)),
+            0 => format!("{hostname} is offline"),
+            secs => format!("{hostname} has been offline for {}", format_duration(secs)),
         }
     }
 }
@@ -787,7 +787,7 @@ pub struct Mail {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MailServer {
-    pub host: String,
+    pub hostname: String,
     /// The usual port for `security` if empty.
     #[serde(default)]
     pub port: Option<u16>,
@@ -806,7 +806,7 @@ pub enum MailSecurity {
     /// Upgrades to encryption after connecting, usually on port 587.
     #[default]
     Starttls,
-    /// No encryption, which only suits a relay on the same machine or network.
+    /// No encryption, which only suits a relay on the same host or network.
     None,
 }
 
@@ -878,8 +878,8 @@ pub struct Alert {
     pub rule_id: Option<i64>,
     pub rule_name: String,
     pub severity: Severity,
-    pub agent_id: String,
-    pub host: String,
+    pub host_id: String,
+    pub hostname: String,
     /// Empty for alerts about the agent as a whole.
     pub series: String,
     /// The reading that started the alert.
@@ -899,8 +899,8 @@ pub struct NewAlert {
     pub rule_id: i64,
     pub rule_name: String,
     pub severity: Severity,
-    pub agent_id: String,
-    pub host: String,
+    pub host_id: String,
+    pub hostname: String,
     pub series: String,
     pub value: Option<f64>,
     pub summary: String,
@@ -1038,7 +1038,7 @@ mod tests {
             mail: Some(Mail {
                 from: "MaxNines <alerts@example.com>".to_string(),
                 server: Some(MailServer {
-                    host: "smtp.example.com".to_string(),
+                    hostname: "smtp.example.com".to_string(),
                     port: None,
                     security: MailSecurity::Starttls,
                     username: None,
@@ -1056,10 +1056,17 @@ mod tests {
         let mut channel = email("a@example.com");
         channel.mail.as_mut().unwrap().server = None;
         assert!(format!("{:#}", check_channel(&channel).unwrap_err()).contains("mail server"));
-        for host in ["", "smtp.example.com/x", "smtp example.com"] {
+        for hostname in ["", "smtp.example.com/x", "smtp example.com"] {
             let mut channel = email("a@example.com");
-            channel.mail.as_mut().unwrap().server.as_mut().unwrap().host = host.to_string();
-            assert!(check_channel(&channel).is_err(), "{host:?}");
+            channel
+                .mail
+                .as_mut()
+                .unwrap()
+                .server
+                .as_mut()
+                .unwrap()
+                .hostname = hostname.to_string();
+            assert!(check_channel(&channel).is_err(), "{hostname:?}");
         }
     }
 

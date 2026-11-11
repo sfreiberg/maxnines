@@ -53,7 +53,7 @@ impl Readings {
             ("memory".to_string(), self.memory()),
             ("disk".to_string(), self.disk()),
             ("network".to_string(), self.network()),
-            ("host".to_string(), self.host()),
+            ("host".to_string(), self.host_output()),
         ])
     }
 
@@ -160,13 +160,13 @@ impl Readings {
         Value::Object(interfaces)
     }
 
-    fn host(&self) -> Value {
+    fn host_output(&self) -> Value {
         json!({ "uptime_secs": self.uptime_secs, "boot_time_secs": 1_700_000_000 })
     }
 }
 
 /// Facts that differ between agents, so filters and rules have something to match.
-pub fn facts(index: usize, host: &str, build: u64) -> Value {
+pub fn facts(index: usize, hostname: &str, build: u64) -> Value {
     let (family, name, version) = match index % 10 {
         0 => ("windows", "Windows Server", "2022"),
         1 => ("freebsd", "FreeBSD", "14.1"),
@@ -181,7 +181,7 @@ pub fn facts(index: usize, host: &str, build: u64) -> Value {
             "version": version,
             "long_version": format!("{name} {version}"),
         },
-        "host": { "name": host, "arch": "x86_64" },
+        "host": { "name": hostname, "arch": "x86_64" },
         "cpu": { "model": "Simulated CPU", "logical_cores": 8 },
         "memory": { "total_bytes": 32 * GIB },
         "agent": { "version": "loadtest", "collectors": COLLECTORS },

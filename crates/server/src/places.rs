@@ -1,6 +1,6 @@
-//! Where towns and cities are, for putting a machine on the map by name. The list is
+//! Where towns and cities are, for putting a host on the map by name. The list is
 //! every place GeoNames knows of with 1,000 people or more, built into the server so
-//! that looking one up never leaves the machine. It's read the first time someone
+//! that looking one up never leaves the host. It's read the first time someone
 //! looks, as it takes some memory, and kept from then on.
 
 use std::collections::BTreeMap;

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use super::metrics::{CheckRow, check_row};
 use super::{CsrfForm, Page, server_error};
 use crate::app_state::AppState;
-use crate::remote_checks::{LOCAL_AGENT_ID, RemoteCheckInput};
+use crate::remote_checks::{LOCAL_HOST_ID, RemoteCheckInput};
 
 const KINDS: [CheckKind; 5] = [
     CheckKind::Http,
@@ -215,7 +215,7 @@ async fn index(
     Page::new(&state, &token, "remote_checks/index.html")
         .with("checks", &rows)
         .with("filters", &filters)
-        .with("agent_id", LOCAL_AGENT_ID)
+        .with("host_id", LOCAL_HOST_ID)
         .render()
 }
 

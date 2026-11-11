@@ -1,9 +1,9 @@
 {% extends "layouts/live.html" %}
-{% block title %}{{ chart.title }} on {{ host }} · MaxNines{% endblock title %}
+{% block title %}{{ chart.title }} on {{ hostname }} · MaxNines{% endblock title %}
 {% block main_class %} class="narrow"{% endblock main_class %}
 {% block refresh_every %}60s{% endblock refresh_every %}
 {% block content %}
-<p class="breadcrumb"><a href="/agents/{{ agent_id }}/metrics?range={{ range }}">{{ host }}</a></p>
+<p class="breadcrumb"><a href="/hosts/{{ host_id }}/metrics?range={{ range }}">{{ hostname }}</a></p>
 <h1>{{ chart.title }}</h1>
 <p class="hint">The last {{ range_label }}, as shown on the chart. Each value is an average for that period.</p>
 {% if chart.has_data %}

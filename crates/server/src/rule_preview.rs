@@ -17,16 +17,16 @@ const MAX_SHOWN: usize = 100;
 const NEW_RULE_ID: i64 = i64::MAX;
 
 /// An agent to try a rule against, with its facts in their natural shape.
-pub struct PreviewAgent {
+pub struct PreviewHost {
     pub id: String,
-    pub host: String,
+    pub hostname: String,
     pub online: bool,
     pub facts: Value,
 }
 
 #[derive(Debug, Serialize)]
-pub struct AgentPreview {
-    pub host: String,
+pub struct HostPreview {
+    pub hostname: String,
     pub online: bool,
     /// Whether the condition matches, even if the rule is turned off.
     pub matches: bool,
@@ -41,7 +41,7 @@ pub struct Preview {
     pub total: usize,
     pub matching: usize,
     pub changing: usize,
-    pub agents: Vec<AgentPreview>,
+    pub hosts: Vec<HostPreview>,
     /// How many agents were left out of `agents`.
     pub hidden: usize,
 }
@@ -52,21 +52,23 @@ pub fn preview(
     rules: &[ConfigRule],
     id: Option<i64>,
     rule: &RuleInput,
-    agents: &[PreviewAgent],
+    hosts: &[PreviewHost],
 ) -> Preview {
     let proposed = with_rule(rules, id, rule);
-    let mut previews: Vec<AgentPreview> = agents
+    let mut previews: Vec<HostPreview> = hosts
         .iter()
-        .map(|agent| preview_agent(rules, &proposed, rule, agent))
+        .map(|host| preview_host(rules, &proposed, rule, host))
         .collect();
 
     previews.sort_by(|a, b| {
-        let rank = |agent: &AgentPreview| (agent.changes.is_empty(), !agent.matches);
-        rank(a).cmp(&rank(b)).then_with(|| a.host.cmp(&b.host))
+        let rank = |host: &HostPreview| (host.changes.is_empty(), !host.matches);
+        rank(a)
+            .cmp(&rank(b))
+            .then_with(|| a.hostname.cmp(&b.hostname))
     });
 
     let total = previews.len();
-    let matching = previews.iter().filter(|agent| agent.matches).count();
+    let matching = previews.iter().filter(|host| host.matches).count();
     let changing = previews.iter().filter(|a| !a.changes.is_empty()).count();
     previews.truncate(MAX_SHOWN);
 
@@ -76,7 +78,7 @@ pub fn preview(
         matching,
         changing,
         hidden: total - previews.len(),
-        agents: previews,
+        hosts: previews,
     }
 }
 
@@ -95,27 +97,27 @@ fn with_rule(rules: &[ConfigRule], id: Option<i64>, rule: &RuleInput) -> Vec<Con
     proposed
 }
 
-fn preview_agent(
+fn preview_host(
     rules: &[ConfigRule],
     proposed: &[ConfigRule],
     rule: &RuleInput,
-    agent: &PreviewAgent,
-) -> AgentPreview {
+    host: &PreviewHost,
+) -> HostPreview {
     let check = match &rule.condition {
-        Some(condition) => rule_engine::evaluate(condition, &agent.facts, &agent.id),
+        Some(condition) => rule_engine::evaluate(condition, &host.facts, &host.id),
         None => Ok(true),
     };
     let matches = *check.as_ref().unwrap_or(&false);
 
-    let reported = agent.facts.as_object().is_some_and(|f| !f.is_empty());
+    let reported = host.facts.as_object().is_some_and(|f| !f.is_empty());
     let mut note = match check {
         _ if !reported => Some("Hasn't reported any facts yet".to_string()),
         Ok(_) => None,
-        Err(error) => Some(format!("Couldn't check this machine: {error:#}")),
+        Err(error) => Some(format!("Couldn't check this host: {error:#}")),
     };
 
-    let before = rule_engine::resolve(rules, &agent.facts, &agent.id);
-    let after = rule_engine::resolve(proposed, &agent.facts, &agent.id);
+    let before = rule_engine::resolve(rules, &host.facts, &host.id);
+    let after = rule_engine::resolve(proposed, &host.facts, &host.id);
     let changes = match (before, after) {
         (Ok(before), Ok(after)) => describe_changes(&before, &after),
         (_, Err(error)) | (Err(error), _) => {
@@ -124,9 +126,9 @@ fn preview_agent(
         }
     };
 
-    AgentPreview {
-        host: agent.host.clone(),
-        online: agent.online,
+    HostPreview {
+        hostname: host.hostname.clone(),
+        online: host.online,
         matches,
         changes,
         note,
@@ -324,10 +326,10 @@ mod tests {
         )
     }
 
-    fn agent(host: &str, role: &str) -> PreviewAgent {
-        PreviewAgent {
-            id: format!("id-{host}"),
-            host: host.to_string(),
+    fn host(hostname: &str, role: &str) -> PreviewHost {
+        PreviewHost {
+            id: format!("id-{hostname}"),
+            hostname: hostname.to_string(),
             online: true,
             facts: json!({ "custom": { "role": role } }),
         }
@@ -335,35 +337,35 @@ mod tests {
 
     const WEB: Option<&str> = Some(r#"facts.custom.role == "web""#);
 
-    fn only(preview: &Preview) -> &AgentPreview {
-        assert_eq!(preview.agents.len(), 1, "{preview:?}");
-        &preview.agents[0]
+    fn only(preview: &Preview) -> &HostPreview {
+        assert_eq!(preview.hosts.len(), 1, "{preview:?}");
+        &preview.hosts[0]
     }
 
     #[test]
     fn a_new_rule_shows_who_it_matches_and_what_changes() {
         let rule = input("fast", 100, WEB, json!({ "interval_secs": 5 }));
-        let agents = [agent("web-1", "web"), agent("db-1", "db")];
+        let hosts = [host("web-1", "web"), host("db-1", "db")];
 
-        let preview = preview(&[default_rule()], None, &rule, &agents);
+        let preview = preview(&[default_rule()], None, &rule, &hosts);
 
         assert_eq!(
             (preview.total, preview.matching, preview.changing),
             (2, 1, 1)
         );
-        assert_eq!(preview.agents[0].host, "web-1");
-        assert!(preview.agents[0].matches);
-        assert_eq!(preview.agents[0].changes, ["Sample interval: 15s → 5s"]);
-        assert!(!preview.agents[1].matches);
-        assert!(preview.agents[1].changes.is_empty());
+        assert_eq!(preview.hosts[0].hostname, "web-1");
+        assert!(preview.hosts[0].matches);
+        assert_eq!(preview.hosts[0].changes, ["Sample interval: 15s → 5s"]);
+        assert!(!preview.hosts[1].matches);
+        assert!(preview.hosts[1].changes.is_empty());
     }
 
     #[test]
     fn a_rule_with_no_condition_matches_everyone() {
         let rule = input("all", 100, None, json!({}));
-        let agents = [agent("web-1", "web"), agent("db-1", "db")];
+        let hosts = [host("web-1", "web"), host("db-1", "db")];
 
-        assert_eq!(preview(&[default_rule()], None, &rule, &agents).matching, 2);
+        assert_eq!(preview(&[default_rule()], None, &rule, &hosts).matching, 2);
     }
 
     #[test]
@@ -374,7 +376,7 @@ mod tests {
         ];
         let edited = input("fast", 100, None, json!({ "interval_secs": 5 }));
 
-        let preview = preview(&rules, Some(2), &edited, &[agent("web-1", "web")]);
+        let preview = preview(&rules, Some(2), &edited, &[host("web-1", "web")]);
 
         // The saved setting goes away, rather than the two versions adding up.
         assert_eq!(
@@ -394,7 +396,7 @@ mod tests {
         ];
         let narrowed = input("fast", 100, WEB, json!({ "interval_secs": 5 }));
 
-        let preview = preview(&rules, Some(2), &narrowed, &[agent("db-1", "db")]);
+        let preview = preview(&rules, Some(2), &narrowed, &[host("db-1", "db")]);
 
         assert!(!only(&preview).matches);
         assert_eq!(only(&preview).changes, ["Sample interval: 5s → 15s"]);
@@ -409,7 +411,7 @@ mod tests {
         ];
         let rule = input("fast", 100, None, json!({ "interval_secs": 5 }));
 
-        let preview = preview(&rules, None, &rule, &[agent("web-1", "web")]);
+        let preview = preview(&rules, None, &rule, &[host("web-1", "web")]);
 
         assert!(only(&preview).matches);
         assert!(only(&preview).changes.is_empty());
@@ -423,7 +425,7 @@ mod tests {
         ];
         let rule = input("fast", 100, None, json!({ "interval_secs": 5 }));
 
-        let preview = preview(&rules, None, &rule, &[agent("web-1", "web")]);
+        let preview = preview(&rules, None, &rule, &[host("web-1", "web")]);
 
         assert_eq!(only(&preview).changes, ["Sample interval: 60s → 5s"]);
     }
@@ -437,7 +439,7 @@ mod tests {
         ];
         let moved = input("a", 300, None, json!({ "interval_secs": 5 }));
 
-        let preview = preview(&rules, Some(2), &moved, &[agent("web-1", "web")]);
+        let preview = preview(&rules, Some(2), &moved, &[host("web-1", "web")]);
 
         assert_eq!(only(&preview).changes, ["Sample interval: 60s → 5s"]);
     }
@@ -447,7 +449,7 @@ mod tests {
         let mut rule = input("fast", 100, WEB, json!({ "interval_secs": 5 }));
         rule.enabled = false;
 
-        let preview = preview(&[default_rule()], None, &rule, &[agent("web-1", "web")]);
+        let preview = preview(&[default_rule()], None, &rule, &[host("web-1", "web")]);
 
         assert!(!preview.enabled);
         assert!(only(&preview).matches);
@@ -463,7 +465,7 @@ mod tests {
         let mut rule = rules[1].rule.clone();
         rule.enabled = false;
 
-        let preview = preview(&rules, Some(2), &rule, &[agent("web-1", "web")]);
+        let preview = preview(&rules, Some(2), &rule, &[host("web-1", "web")]);
 
         assert_eq!(only(&preview).changes, ["Sample interval: 5s → 15s"]);
     }
@@ -481,7 +483,7 @@ mod tests {
             } }),
         );
 
-        let preview = preview(&[default_rule()], None, &rule, &[agent("web-1", "web")]);
+        let preview = preview(&[default_rule()], None, &rule, &[host("web-1", "web")]);
 
         assert_eq!(
             only(&preview).changes,
@@ -503,7 +505,7 @@ mod tests {
             json!({ "collectors": { "disk": { "mount_points": ["/"] } } }),
         );
 
-        let preview = preview(&rules, None, &rule, &[agent("web-1", "web")]);
+        let preview = preview(&rules, None, &rule, &[host("web-1", "web")]);
 
         assert_eq!(
             only(&preview).changes,
@@ -519,7 +521,7 @@ mod tests {
             None,
             json!({ "collectors": { "memory": { "enabled": true } } }),
         );
-        let mut limited = agent("web-1", "web");
+        let mut limited = host("web-1", "web");
         limited.facts = json!({ "agent": { "collectors": ["cpu", "disk"] } });
 
         let preview = preview(&[default_rule()], None, &rule, &[limited]);
@@ -534,7 +536,7 @@ mod tests {
     fn a_missing_fact_is_explained() {
         let rule = input("r", 100, Some(r#"facts.os.family == "linux""#), json!({}));
 
-        let preview = preview(&[default_rule()], None, &rule, &[agent("web-1", "web")]);
+        let preview = preview(&[default_rule()], None, &rule, &[host("web-1", "web")]);
 
         let note = only(&preview).note.as_deref().unwrap();
         assert!(note.contains("os"), "{note}");
@@ -545,7 +547,7 @@ mod tests {
     fn a_plain_mismatch_needs_no_explanation() {
         let rule = input("r", 100, WEB, json!({}));
 
-        let preview = preview(&[default_rule()], None, &rule, &[agent("db-1", "db")]);
+        let preview = preview(&[default_rule()], None, &rule, &[host("db-1", "db")]);
 
         assert_eq!(only(&preview).note, None);
     }
@@ -553,7 +555,7 @@ mod tests {
     #[test]
     fn an_agent_with_no_facts_says_so() {
         let rule = input("r", 100, WEB, json!({}));
-        let mut new = agent("new-1", "");
+        let mut new = host("new-1", "");
         new.facts = json!({});
 
         let preview = preview(&[default_rule()], None, &rule, &[new]);
@@ -582,33 +584,33 @@ mod tests {
             Some(r#"facts.custom.role != "db""#),
             json!({ "interval_secs": 5 }),
         );
-        let agents = [
-            agent("a-db", "db"),
-            agent("b-pinned", "pinned"),
-            agent("d-web", "web"),
-            agent("c-web", "web"),
+        let hosts = [
+            host("a-db", "db"),
+            host("b-pinned", "pinned"),
+            host("d-web", "web"),
+            host("c-web", "web"),
         ];
 
-        let preview = preview(&rules, None, &rule, &agents);
+        let preview = preview(&rules, None, &rule, &hosts);
 
-        let hosts: Vec<&str> = preview.agents.iter().map(|a| a.host.as_str()).collect();
+        let hosts: Vec<&str> = preview.hosts.iter().map(|a| a.hostname.as_str()).collect();
         assert_eq!(hosts, ["c-web", "d-web", "b-pinned", "a-db"]);
     }
 
     #[test]
     fn counts_cover_agents_that_are_not_shown() {
         let rule = input("r", 100, WEB, json!({ "interval_secs": 5 }));
-        let mut agents: Vec<PreviewAgent> = (0..MAX_SHOWN + 5)
-            .map(|index| agent(&format!("web-{index:03}"), "web"))
+        let mut hosts: Vec<PreviewHost> = (0..MAX_SHOWN + 5)
+            .map(|index| host(&format!("web-{index:03}"), "web"))
             .collect();
-        agents.push(agent("db-1", "db"));
+        hosts.push(host("db-1", "db"));
 
-        let preview = preview(&[default_rule()], None, &rule, &agents);
+        let preview = preview(&[default_rule()], None, &rule, &hosts);
 
         assert_eq!(preview.total, MAX_SHOWN + 6);
         assert_eq!(preview.matching, MAX_SHOWN + 5);
         assert_eq!(preview.changing, MAX_SHOWN + 5);
-        assert_eq!(preview.agents.len(), MAX_SHOWN);
+        assert_eq!(preview.hosts.len(), MAX_SHOWN);
         assert_eq!(preview.hidden, 6);
     }
 
@@ -624,7 +626,7 @@ mod tests {
             WEB,
             json!({ "interval_secs": 5, "facts_interval_secs": 30 }),
         );
-        let web = agent("web-1", "web");
+        let web = host("web-1", "web");
 
         let proposed = with_rule(&rules, None, &rule);
         let resolved = rule_engine::resolve(&proposed, &web.facts, &web.id).unwrap();

@@ -207,7 +207,7 @@ impl Action {
 pub enum Kind {
     User,
     ApiKey,
-    Agent,
+    Host,
     ConfigRule,
     AlertRule,
     Channel,
@@ -218,7 +218,7 @@ pub enum Kind {
     LocationRule,
     Dashboard,
     /// A deploy or note marked on charts.
-    Event,
+    Annotation,
     /// A setting for the whole server.
     Setting,
 }
@@ -227,7 +227,7 @@ impl Kind {
     pub const ALL: [Self; 14] = [
         Self::User,
         Self::ApiKey,
-        Self::Agent,
+        Self::Host,
         Self::ConfigRule,
         Self::AlertRule,
         Self::Channel,
@@ -237,7 +237,7 @@ impl Kind {
         Self::RemoteCheck,
         Self::LocationRule,
         Self::Dashboard,
-        Self::Event,
+        Self::Annotation,
         Self::Setting,
     ];
 
@@ -245,7 +245,7 @@ impl Kind {
         match self {
             Self::User => "user",
             Self::ApiKey => "api_key",
-            Self::Agent => "agent",
+            Self::Host => "host",
             Self::ConfigRule => "config_rule",
             Self::AlertRule => "alert_rule",
             Self::Channel => "notification_channel",
@@ -255,7 +255,7 @@ impl Kind {
             Self::RemoteCheck => "remote_check",
             Self::LocationRule => "location_rule",
             Self::Dashboard => "dashboard",
-            Self::Event => "event",
+            Self::Annotation => "annotation",
             Self::Setting => "setting",
         }
     }
@@ -264,7 +264,7 @@ impl Kind {
         match self {
             Self::User => "User",
             Self::ApiKey => "API key",
-            Self::Agent => "Agent",
+            Self::Host => "Host",
             Self::ConfigRule => "Config rule",
             Self::AlertRule => "Alert rule",
             Self::Channel => "Notification channel",
@@ -274,7 +274,7 @@ impl Kind {
             Self::RemoteCheck => "Remote check",
             Self::LocationRule => "Location rule",
             Self::Dashboard => "Dashboard",
-            Self::Event => "Event",
+            Self::Annotation => "Annotation",
             Self::Setting => "Setting",
         }
     }

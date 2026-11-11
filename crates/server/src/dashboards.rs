@@ -254,7 +254,7 @@ pub struct WidgetView {
     /// Lines left out because there are too many to show.
     pub hidden: usize,
     pub failed: bool,
-    /// Why there's nothing to show, such as no machine to pick.
+    /// Why there's nothing to show, such as no host to pick.
     pub missing: Option<String>,
 }
 
@@ -431,11 +431,11 @@ mod tests {
         assert!(check_name(&"x".repeat(101)).is_err());
     }
 
-    fn machine() -> Variable {
+    fn host() -> Variable {
         Variable {
-            name: "machine".to_string(),
+            name: "host".to_string(),
             label: String::new(),
-            kind: crate::dashboard_variables::VariableKind::Machine,
+            kind: crate::dashboard_variables::VariableKind::Host,
             fact: String::new(),
             filter: String::new(),
         }
@@ -444,11 +444,11 @@ mod tests {
     #[test]
     fn a_widget_can_only_use_the_dashboards_variables() {
         let mut widget = input();
-        widget.filter = "$machine os=linux".to_string();
-        assert!(widget.check(&[machine()]).is_ok());
+        widget.filter = "$host os=linux".to_string();
+        assert!(widget.check(&[host()]).is_ok());
         assert_eq!(
             widget.check(&[]),
-            Err("This dashboard has no variable called $machine.".to_string())
+            Err("This dashboard has no variable called $host.".to_string())
         );
     }
 
@@ -456,23 +456,20 @@ mod tests {
     fn a_variable_a_widget_uses_stays() {
         let mut widget = input();
         widget.title = "Busy".to_string();
-        widget.filter = "$machine".to_string();
+        widget.filter = "$host".to_string();
         let dashboard = Dashboard {
             id: 1,
-            name: "Machine".to_string(),
-            variables: vec![machine()],
+            name: "Host".to_string(),
+            variables: vec![host()],
             widgets: vec![Widget {
                 id: 1,
                 input: widget,
             }],
         };
-        assert!(dashboard.check_variables(&[machine()]).is_ok());
+        assert!(dashboard.check_variables(&[host()]).is_ok());
         assert_eq!(
             dashboard.check_variables(&[]),
-            Err(
-                "The widget \u{201c}Busy\u{201d} uses $machine. Change its filter first."
-                    .to_string()
-            )
+            Err("The widget \u{201c}Busy\u{201d} uses $host. Change its filter first.".to_string())
         );
     }
 

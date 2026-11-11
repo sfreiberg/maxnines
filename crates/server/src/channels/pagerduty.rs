@@ -48,7 +48,7 @@ fn event(notice: &Notice, step: Incident, key: &str, web_url: Option<&str>) -> V
         "client": "MaxNines",
         "payload": {
             "summary": summary,
-            "source": on_call::host(notice),
+            "source": on_call::hostname(notice),
             "severity": on_call::severity(notice),
             "custom_details": details,
         },

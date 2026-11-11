@@ -34,7 +34,7 @@
 
 <section class="dashboard-variables">
   <h2>Variables</h2>
-  <p class="note">Each one is a picker at the top of the dashboard. A widget follows it when its filter has the variable as a term on its own, such as <code>$machine</code>, and a title can mention it the same way.</p>
+  <p class="note">Each one is a picker at the top of the dashboard. A widget follows it when its filter has the variable as a term on its own, such as <code>$host</code>, and a title can mention it the same way.</p>
   {% if dashboard.variables %}
   <div class="tablebox"><table>
     <thead><tr><th>Variable</th><th>Picker</th><th>Picks</th><th>Offers</th><th></th></tr></thead>
@@ -43,8 +43,8 @@
       <tr>
         <td><code>${{ variable.name }}</code></td>
         <td>{% if variable.label %}{{ variable.label }}{% else %}{{ variable.name }}{% endif %}</td>
-        <td>{% if variable.kind == "machine" %}A machine{% else %}A value of <code>{{ variable.fact }}</code>, or all{% endif %}</td>
-        <td>{% if variable.filter %}<code>{{ variable.filter }}</code>{% else %}Every machine{% endif %}</td>
+        <td>{% if variable.kind == "host" %}A host{% else %}A value of <code>{{ variable.fact }}</code>, or all{% endif %}</td>
+        <td>{% if variable.filter %}<code>{{ variable.filter }}</code>{% else %}Every host{% endif %}</td>
         <td><a href="/dashboards/{{ dashboard.id }}/variables/{{ variable.name }}/edit">Edit</a></td>
       </tr>
       {% endfor %}
@@ -65,7 +65,7 @@
         {% for choice in picker.choices %}
         <option value="{{ choice.value }}"{% if picker.selected == choice.value %} selected{% endif %}>{{ choice.label }}</option>
         {% endfor %}
-        {% if not picker.choices and not picker.offers_all %}<option>No machines</option>{% endif %}
+        {% if not picker.choices and not picker.offers_all %}<option>No hosts</option>{% endif %}
       </select>
     </label>
     {% endfor %}
