@@ -107,11 +107,17 @@ A disk that runs out of them can't take new files however much space it has left
 which the built-in **Disk running out of inodes** rule warns about. Windows file
 systems don't have inodes.
 
+## Network
+
+Each network interface reports what it received and sent, in bytes and packets, the
+packets it found damaged, and the packets it dropped, which had nowhere to wait because
+the machine wasn't keeping up. macOS only counts received packets it dropped.
+
 ## Processes and logins
 
 Every agent also reports how many processes are running, how many login sessions
-there are and how many files are open, each against the system's limit where it has
-one. They come from the `system` collector, which the Default config rule turns on.
+there are, how many files are open and its TCP connections, each against the system's
+limit where it has one. They come from the `system` collector, which the Default config rule turns on.
 
 - **Processes** are counted the same way on every system, without their threads.
   Linux limits threads rather than processes, so a Linux machine also reports its
@@ -119,8 +125,12 @@ one. They come from the `system` collector, which the Default config rule turns 
 - **Login sessions** come from `who`, and from `quser` on Windows. Each session counts,
   so someone with three terminals open counts three times. Windows Home editions
   don't have `quser`, so they don't report sessions.
-- **Windows** has no system-wide limits like these, so it reports processes and
-  sessions only.
+- **TCP connections** are counted by state: established, listening, and two that pile up
+  when something's wrong. Thousands in `TIME_WAIT` can use up the ports for new
+  connections, and ones in `CLOSE_WAIT` are usually a program that never closed them.
+  macOS and FreeBSD count them with `netstat`.
+- **Windows** has no system-wide limits like these, so it reports processes, sessions
+  and connections only.
 
 ## Windows performance counters
 

@@ -3262,6 +3262,7 @@ name = "maxnines-collectors"
 version = "0.1.0-alpha.3"
 dependencies = [
  "anyhow",
+ "libc",
  "objc2-core-foundation",
  "objc2-io-kit",
  "rustix 1.1.6",

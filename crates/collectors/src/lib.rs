@@ -3,8 +3,10 @@
 pub mod counters;
 pub mod disk_activity;
 mod file_systems;
+pub mod interface_drops;
 pub mod machine;
 pub mod system;
+pub mod tcp;
 
 use std::time::Duration;
 

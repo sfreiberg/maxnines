@@ -227,6 +227,25 @@ fn each_disk_reports_how_hard_it_is_working() {
 }
 
 #[test]
+fn drops_and_tcp_connections_read_what_the_agent_sends() {
+    let mut store = in_memory();
+    let interfaces = |dropped: u64| json!({ "en0": { "receive_drops": dropped } });
+    write_metric(&mut store, "a", 0, "network", interfaces(0));
+    write_metric(&mut store, "a", 10_000, "network", interfaces(30));
+    let tcp = json!({ "tcp_established": 12, "tcp_listening": 4, "tcp_time_wait": 300,
+                      "tcp_close_wait": 2, "tcp_connections": 318 });
+    write_metric(&mut store, "a", 10_000, "system", tcp);
+
+    // 30 dropped over 10 seconds.
+    let drops = query(&store, "a", "network.drops.received", 8);
+    assert_eq!(names(&drops), ["en0"]);
+    assert_eq!(averages(&drops.series[0]), [3.0]);
+    let tcp = query(&store, "a", "system.tcp", 8);
+    assert_eq!(names(&tcp), ["Close wait", "Established", "Listening", "Time wait"]);
+    assert_eq!(averages(&tcp.series[3]), [300.0]);
+}
+
+#[test]
 fn each_core_is_a_series_named_by_its_number() {
     let mut store = in_memory();
     let cpu = json!({ "usage_percent": 40.0, "per_core_percent": [10.0, 90.0, 20.0] });

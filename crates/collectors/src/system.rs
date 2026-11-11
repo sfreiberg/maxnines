@@ -13,8 +13,11 @@ use systemstat::{Platform, System};
 use tokio::process::Command;
 use tokio::time::timeout;
 
-/// Listing logins is quick when the machine is healthy.
-const SESSIONS_TIMEOUT: Duration = Duration::from_secs(10);
+use crate::tcp::TcpStates;
+
+/// How long a system tool, like `who`, gets to answer. They're quick when the machine is
+/// healthy.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Running totals from the kernel, which only ever go up.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -481,18 +484,20 @@ fn count_quser(output: &str) -> u64 {
         .count() as u64
 }
 
-async fn run_quietly(program: &str) -> Option<std::process::Output> {
+/// Runs a system tool for what it prints, giving up if it takes too long.
+pub(crate) async fn run_quietly(program: &str, args: &[&str]) -> Option<std::process::Output> {
     let run = Command::new(program)
+        .args(args)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .output();
-    timeout(SESSIONS_TIMEOUT, run).await.ok()?.ok()
+    timeout(COMMAND_TIMEOUT, run).await.ok()?.ok()
 }
 
 #[cfg(unix)]
 pub async fn login_sessions() -> Option<u64> {
-    let output = run_quietly("who").await?;
+    let output = run_quietly("who", &[]).await?;
     output
         .status
         .success()
@@ -503,12 +508,12 @@ pub async fn login_sessions() -> Option<u64> {
 /// an error when nobody is logged in, so its exit code says nothing.
 #[cfg(windows)]
 pub async fn login_sessions() -> Option<u64> {
-    let output = run_quietly("quser").await?;
+    let output = run_quietly("quser", &[]).await?;
     Some(count_quser(&String::from_utf8_lossy(&output.stdout)))
 }
 
-pub fn report(limits: &Limits, sessions: Option<u64>) -> Value {
-    json!({
+pub fn report(limits: &Limits, sessions: Option<u64>, tcp: Option<TcpStates>) -> Value {
+    let mut report = json!({
         "max_open_files": limits.max_open_files,
         "open_files": limits.open_files,
         "max_processes": limits.max_processes,
@@ -516,7 +521,11 @@ pub fn report(limits: &Limits, sessions: Option<u64>) -> Value {
         "max_threads": limits.max_threads,
         "threads": limits.threads,
         "login_sessions": sessions,
-    })
+    });
+    for (name, value) in TcpStates::report(tcp) {
+        report[name] = value;
+    }
+    report
 }
 
 #[cfg(test)]
@@ -707,7 +716,7 @@ pgpgin 900
 
     #[test]
     fn nothing_is_reported_as_zero_when_a_platform_lacks_it() {
-        let report = report(&Limits::default(), None);
+        let report = report(&Limits::default(), None, None);
         assert_eq!(report["max_open_files"], Value::Null);
         assert_eq!(report["login_sessions"], Value::Null);
     }

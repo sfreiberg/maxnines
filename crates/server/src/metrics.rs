@@ -425,6 +425,24 @@ pub const METRICS: &[Metric] = &[
         source: Source::Entries(Reading::Rate("$.transmit_errors")),
         chart: ShowChart::WithData,
     },
+    // Packets with nowhere to wait, which means the machine isn't keeping up. macOS
+    // doesn't count sent ones.
+    Metric {
+        name: "network.drops.received",
+        title: "Received packets dropped",
+        unit: Unit::PerSecond,
+        collector: "network",
+        source: Source::Entries(Reading::Rate("$.receive_drops")),
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "network.drops.transmitted",
+        title: "Sent packets dropped",
+        unit: Unit::PerSecond,
+        collector: "network",
+        source: Source::Entries(Reading::Rate("$.transmit_drops")),
+        chart: ShowChart::WithData,
+    },
     Metric {
         name: "network.link",
         title: "Network link up",
@@ -772,6 +790,29 @@ pub const METRICS: &[Metric] = &[
         collector: "system",
         source: Source::Fields(&[("Sessions", Reading::Field("$.login_sessions"))]),
         chart: ShowChart::WithData,
+    },
+    // Connections piling up in TIME_WAIT use up ports, and ones in CLOSE_WAIT are
+    // usually a program that never closed them.
+    Metric {
+        name: "system.tcp",
+        title: "TCP connections",
+        unit: Unit::Number,
+        collector: "system",
+        source: Source::Fields(&[
+            ("Established", Reading::Field("$.tcp_established")),
+            ("Listening", Reading::Field("$.tcp_listening")),
+            ("Time wait", Reading::Field("$.tcp_time_wait")),
+            ("Close wait", Reading::Field("$.tcp_close_wait")),
+        ]),
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "system.tcp_total",
+        title: "All TCP connections",
+        unit: Unit::Number,
+        collector: "system",
+        source: Source::Fields(&[("Connections", Reading::Field("$.tcp_connections"))]),
+        chart: ShowChart::Never,
     },
     Metric {
         name: "server.metrics",

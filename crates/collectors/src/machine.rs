@@ -1,6 +1,7 @@
 //! What can be read about a machine from inside it, which needs nothing installed.
 //! Agents report these, and so does the server about the machine it's on.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::Result;
@@ -11,6 +12,7 @@ use systemstat::Platform;
 use crate::Collector;
 use crate::disk_activity::DiskActivity;
 use crate::file_systems;
+use crate::interface_drops::{self, Drops};
 use crate::system::{self, Change, CpuTime};
 
 pub struct HostCollector;
@@ -230,12 +232,15 @@ fn inodes(_mount_point: &Path) -> Option<(u64, u64)> {
 
 pub struct NetworkCollector {
     networks: Networks,
+    /// Drops at the last sample, as the system keeps running totals.
+    drops: HashMap<String, Drops>,
 }
 
 impl NetworkCollector {
     pub fn new() -> Result<Self> {
         Ok(Self {
             networks: Networks::new_with_refreshed_list()?,
+            drops: interface_drops::totals(),
         })
     }
 }
@@ -247,12 +252,13 @@ impl Collector for NetworkCollector {
 
     fn collect(&mut self) -> Result<Value> {
         self.networks.refresh(true);
+        let drops = interface_drops::totals();
 
         let interfaces: serde_json::Map<String, Value> = self
             .networks
             .iter()
             .map(|(name, data)| {
-                let stats = json!({
+                let mut stats = json!({
                     "received_bytes": data.received(),
                     "transmitted_bytes": data.transmitted(),
                     "packets_received": data.packets_received(),
@@ -265,9 +271,23 @@ impl Collector for NetworkCollector {
                     "total_transmit_errors": data.total_errors_on_transmitted(),
                     "link_up": link_up(data.operational_state()),
                 });
-                (name.to_string_lossy().into_owned(), stats)
+                let name = name.to_string_lossy().into_owned();
+                let (before, after) = (self.drops.get(&name), drops.get(&name));
+                if let (Some(before), Some(after), Some(fields)) =
+                    (before, after, stats.as_object_mut())
+                {
+                    let received = interface_drops::change(before.received, after.received);
+                    let sent = interface_drops::change(before.transmitted, after.transmitted);
+                    for (field, value) in [("receive_drops", received), ("transmit_drops", sent)] {
+                        if let Some(value) = value {
+                            fields.insert(field.into(), json!(value));
+                        }
+                    }
+                }
+                (name, stats)
             })
             .collect();
+        self.drops = drops;
 
         Ok(Value::Object(interfaces))
     }
