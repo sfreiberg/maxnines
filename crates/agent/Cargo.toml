@@ -60,7 +60,9 @@ priority = "optional"
 depends = ""
 assets = [
   ["target/release/maxnines-agent", "usr/bin/", "755"],
-  ["../../packaging/linux/agent.hcl", "etc/maxnines/agent.hcl", "640"],
+  # Only the default. postinst copies it to /etc/maxnines when there's no config,
+  # as a file in /etc would be a conffile, which dpkg asks about on upgrades.
+  ["../../packaging/linux/agent.hcl", "usr/share/maxnines/agent.hcl", "644"],
   ["../../README.md", "usr/share/doc/maxnines-agent/README.md", "644"],
 ]
 maintainer-scripts = "../../packaging/linux/deb/agent"

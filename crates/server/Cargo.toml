@@ -99,7 +99,9 @@ priority = "optional"
 depends = "libc6 (>= 2.34), libgcc-s1, libstdc++6 (>= 11)"
 assets = [
   ["target/release/maxnines-server", "usr/bin/", "755"],
-  ["../../packaging/linux/server.hcl", "etc/maxnines/server.hcl", "640"],
+  # Only the default. postinst copies it to /etc/maxnines when there's no config,
+  # as a file in /etc would be a conffile, which dpkg asks about on upgrades.
+  ["../../packaging/linux/server.hcl", "usr/share/maxnines/server.hcl", "644"],
   ["../../README.md", "usr/share/doc/maxnines-server/README.md", "644"],
 ]
 maintainer-scripts = "../../packaging/linux/deb/server"

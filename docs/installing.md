@@ -35,7 +35,10 @@ sudo systemctl enable --now maxnines-agent
 ```
 
 Both log to the journal, as in `journalctl -u maxnines-agent`. Installing a newer
-package restarts a running service and keeps your changes to its config.
+package restarts a running service and never changes its config or asks about it.
+To compare yours with the newest default, look in `/usr/share/maxnines` on Debian
+and Ubuntu, or for a `.rpmnew` file next to yours on the others. `apt purge` deletes
+the config as well.
 
 ## Docker
 

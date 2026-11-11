@@ -1,0 +1,9 @@
+#!/bin/sh
+# Purging deletes the config, as dpkg would if the package owned it, and the
+# folder if nothing else is left in it.
+set -e
+if [ "$1" = "purge" ]; then
+  rm -f /etc/maxnines/agent.hcl
+  rmdir /etc/maxnines 2>/dev/null || true
+fi
+#DEBHELPER#

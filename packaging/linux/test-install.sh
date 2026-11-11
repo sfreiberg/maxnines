@@ -26,4 +26,26 @@ as_service() {
 as_service maxnines-agent --config /etc/maxnines/agent.hcl facts >/dev/null
 # Creates the main database and runs every migration.
 as_service maxnines-server --config /etc/maxnines/server.hcl users list
+
+# Upgrading keeps an edited config without asking: Debian doesn't track it at all,
+# and RPM keeps it as noreplace.
+for config in server agent; do
+  echo "# Edited" >>"/etc/maxnines/$config.hcl"
+done
+if command -v apt-get >/dev/null; then
+  test -z "$(dpkg-query -W -f='${Conffiles}' maxnines-server maxnines-agent)"
+  apt-get install -y -qq --reinstall ./packages/*.deb </dev/null
+else
+  dnf reinstall -y -q ./packages/*.rpm </dev/null
+fi
+for config in server agent; do
+  test "$(tail -n 1 "/etc/maxnines/$config.hcl")" = "# Edited"
+  test "$(stat -c '%U:%G %a' "/etc/maxnines/$config.hcl")" = "root:maxnines 640"
+done
+
+# Purging deletes the configs and their folder.
+if command -v apt-get >/dev/null; then
+  apt-get purge -y -qq maxnines-server maxnines-agent </dev/null
+  test ! -e /etc/maxnines
+fi
 echo "Installed and ran on $(. /etc/os-release && echo "$PRETTY_NAME")"
