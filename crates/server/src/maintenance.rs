@@ -87,7 +87,7 @@ fn is_day(text: &str) -> bool {
 
 /// A wall clock time as a real moment. When the clocks go back it happens twice, and
 /// this is the first. When they go forward it may not happen at all, so it's an hour on.
-fn moment(zone: Tz, date: NaiveDate, time: NaiveTime) -> Option<i64> {
+pub fn moment(zone: Tz, date: NaiveDate, time: NaiveTime) -> Option<i64> {
     let local = date.and_time(time);
     let found = zone.from_local_datetime(&local).earliest().or_else(|| {
         let later = local.checked_add_signed(TimeDelta::hours(1))?;

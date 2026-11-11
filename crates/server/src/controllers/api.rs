@@ -113,8 +113,8 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/alerts/delivery-problems", get(list_delivery_problems))
         .route("/alerts/{id}/acknowledge", post(acknowledge_alert))
         .route("/alerts/{id}/unacknowledge", post(unacknowledge_alert))
-        .route("/events", get(list_events).post(create_event))
-        .route("/events/{id}", get(show_event).delete(delete_event))
+        .route("/annotations", get(list_events).post(create_event))
+        .route("/annotations/{id}", get(show_event).delete(delete_event))
         .route("/agents/{id}/events", get(agent_events))
         .route("/silences", get(list_silences).post(create_silence))
         .route("/silences/{id}", get(show_silence))
@@ -1234,19 +1234,14 @@ async fn list_events(State(state): State<AppState>, Query(params): Query<EventPa
 }
 
 async fn create_event(State(state): State<AppState>, Json(input): Json<EventInput>) -> Response {
-    let by = super::events::recorded_by();
-    let id = match state.record_event(input, &by, now_ms()).await {
-        Ok(id) => id,
+    let by = super::annotations::recorded_by();
+    match state.record_event(input, &by, now_ms()).await {
+        Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
         Err(EventRefusal::Invalid(message)) => {
             let body = Json(json!({ "error": message }));
-            return (StatusCode::UNPROCESSABLE_ENTITY, body).into_response();
+            (StatusCode::UNPROCESSABLE_ENTITY, body).into_response()
         }
-        Err(EventRefusal::Failed(error)) => return server_error(&error),
-    };
-    match state.database.get_event(id).await {
-        Ok(Some(event)) => (StatusCode::CREATED, Json(event)).into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(error) => server_error(&error),
+        Err(EventRefusal::Failed(error)) => server_error(&error),
     }
 }
 
@@ -1276,7 +1271,7 @@ async fn agent_events(
         return StatusCode::NOT_FOUND.into_response();
     }
     let (from_ms, to_ms) = params.span(24 * 3_600_000);
-    match state.database.timeline(&id, from_ms, to_ms).await {
+    match state.timeline(&id, from_ms, to_ms).await {
         Ok(events) => Json(events).into_response(),
         Err(error) => server_error(&error),
     }

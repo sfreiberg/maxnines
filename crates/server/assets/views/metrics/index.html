@@ -6,6 +6,7 @@
   <h1>Metrics</h1>
   <p class="subtitle">Current values from each agent. Choose one to see its charts.</p>
 </div>
+{% set metrics_tab = "machines" %}{% include "metrics/_tabs.html" %}
 {% include "agents/_filter.html" %}
 {% if agents %}
 <div class="tablebox"><table>

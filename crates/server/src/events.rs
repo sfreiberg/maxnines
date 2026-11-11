@@ -1,7 +1,8 @@
 //! Things that happened to machines, marked on their charts so a change in a graph can
-//! be matched to what caused it. Deploys and notes come from people and their scripts.
-//! The server records restarts and config changes itself, and alerts and updates come
-//! from what's already kept about them.
+//! be matched to what caused it. Annotations, deploys and notes, come from people and
+//! their scripts, for the machines a filter picks whenever a chart is drawn. The
+//! server records restarts and config changes itself, and alerts and updates come from
+//! what's already kept about them.
 
 use serde::{Deserialize, Serialize};
 
@@ -88,7 +89,8 @@ pub struct EventInput {
     /// When it happened. Defaults to now.
     #[serde(default)]
     pub time_ms: Option<i64>,
-    /// Which machines, as a host filter. Empty means every machine.
+    /// Which machines, as a host filter, matched whenever a chart is drawn. Empty means
+    /// every machine.
     #[serde(default)]
     pub filter: Option<String>,
 }
@@ -151,7 +153,7 @@ impl EventInput {
     }
 }
 
-/// An event as it was recorded, and how many machines it's for.
+/// An annotation as it was recorded.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Event {
     pub id: i64,
@@ -162,7 +164,6 @@ pub struct Event {
     pub filter: String,
     pub created_by: String,
     pub created_ms: i64,
-    pub machines: u64,
 }
 
 /// One thing on a machine's timeline, from wherever it came from. Only those that were

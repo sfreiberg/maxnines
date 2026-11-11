@@ -1,37 +1,42 @@
-//! Events marked on charts: those recorded by people and by the server, and a machine's
-//! whole timeline, which adds its alerts and updates from what's kept about them.
+//! Events marked on charts: annotations, recorded by people and their scripts, what the
+//! server noticed itself, and a machine's whole timeline, which adds its alerts and
+//! updates from what's kept about them. An annotation keeps its filter, so it shows on
+//! whichever machines that picks when a chart is drawn.
 
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use sea_orm::sea_query::{Expr, ExprTrait, OnConflict};
+use sea_orm::sea_query::OnConflict;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use serde_json::json;
 
 use super::audit::record_change;
-use super::{Database, agent_boot, agent_fact, alert, event, event_agent, to_fact_version};
+use super::{Database, agent_boot, agent_fact, alert, event, to_fact_version};
 use crate::audit::{self, Kind, Snapshot};
 use crate::events::{Event, EventKind, SERVER, TimelineEvent, UPDATE_FACTS};
+use crate::host_filter;
 
 /// The most of a machine's events a timeline holds, newest first.
 pub const MAX_TIMELINE: u64 = 500;
+/// How many annotations in a range are looked at to find a machine's, as each one's
+/// filter is checked against it.
+const MAX_CANDIDATES: u64 = 10_000;
 
-fn snapshot(row: &event::Model, machines: usize) -> Snapshot {
+fn snapshot(row: &event::Model) -> Snapshot {
     let fields = json!({
         "kind": row.kind,
         "title": row.title,
         "detail": row.detail,
         "time": audit::time(row.time_ms),
         "filter": row.filter,
-        "machines": machines,
     });
     Snapshot::new(&row.title, fields)
 }
 
-fn to_event(row: event::Model, machines: u64) -> Event {
+fn to_event(row: event::Model) -> Event {
     Event {
         id: row.id,
         time_ms: row.time_ms,
@@ -41,7 +46,6 @@ fn to_event(row: event::Model, machines: u64) -> Event {
         filter: row.filter,
         created_by: row.created_by,
         created_ms: row.created_ms,
-        machines,
     }
 }
 
@@ -59,8 +63,8 @@ pub struct NewEvent<'a> {
     pub time_ms: i64,
     pub title: &'a str,
     pub detail: Option<&'a str>,
+    /// Which machines it's for, as a host filter. Empty for every machine.
     pub filter: &'a str,
-    pub agents: &'a [String],
 }
 
 async fn insert_event<C: ConnectionTrait>(
@@ -79,35 +83,22 @@ async fn insert_event<C: ConnectionTrait>(
         created_ms: Set(now_ms),
         ..Default::default()
     };
-    let row = row.insert(connection).await.context("saving event")?;
-    // In pieces, as databases limit how much one statement can hold.
-    for agents in new.agents.chunks(500) {
-        let links = agents.iter().map(|agent_id| event_agent::ActiveModel {
-            event_id: Set(row.id),
-            agent_id: Set(agent_id.clone()),
-        });
-        event_agent::Entity::insert_many(links)
-            .exec_without_returning(connection)
-            .await
-            .context("saving which machines an event is for")?;
-    }
-    Ok(row)
+    row.insert(connection).await.context("saving event")
 }
 
 impl Database {
-    /// Saves what someone recorded, for the machines given, with the change in the
-    /// audit log.
+    /// Saves an annotation, with the change in the audit log.
     pub async fn record_event(&self, new: &NewEvent<'_>, by: &str, now_ms: i64) -> Result<i64> {
         let transaction = self.connection.begin().await.context("saving event")?;
         let row = insert_event(&transaction, new, by, now_ms).await?;
-        let after = snapshot(&row, new.agents.len());
+        let after = snapshot(&row);
         record_change(&transaction, Kind::Event, row.id, None, Some(&after), None).await?;
         transaction.commit().await.context("saving event")?;
         Ok(row.id)
     }
 
-    /// Saves something the server noticed about one machine. These aren't changes
-    /// anyone made, so they stay out of the audit log.
+    /// Saves something the server noticed about one machine, for that machine alone.
+    /// These aren't changes anyone made, so they stay out of the audit log.
     pub async fn record_server_event(
         &self,
         kind: EventKind,
@@ -117,31 +108,24 @@ impl Database {
         detail: Option<&str>,
         now_ms: i64,
     ) -> Result<()> {
-        let agents = [agent_id.to_string()];
+        let filter = host_filter::only(agent_id);
         let new = NewEvent {
             kind,
             time_ms,
             title,
             detail,
-            filter: "",
-            agents: &agents,
+            filter: &filter,
         };
-        let transaction = self.connection.begin().await.context("saving event")?;
-        insert_event(&transaction, &new, SERVER, now_ms).await?;
-        transaction.commit().await.context("saving event")?;
+        insert_event(&self.connection, &new, SERVER, now_ms).await?;
         Ok(())
     }
 
     pub async fn get_event(&self, id: i64) -> Result<Option<Event>> {
-        let Some(row) = event::Entity::find_by_id(id)
+        let row = event::Entity::find_by_id(id)
             .one(&self.connection)
             .await
-            .context("loading event")?
-        else {
-            return Ok(None);
-        };
-        let machines = self.machine_counts(&[id]).await?;
-        Ok(Some(to_event(row, machines.get(&id).copied().unwrap_or(0))))
+            .context("loading event")?;
+        Ok(row.map(to_event))
     }
 
     /// Returns false if there was no such event.
@@ -154,47 +138,17 @@ impl Database {
         else {
             return Ok(false);
         };
-        let machines = event_agent::Entity::find()
-            .filter(event_agent::Column::EventId.eq(id))
-            .count(&transaction)
-            .await
-            .context("counting an event's machines")?;
-        event_agent::Entity::delete_many()
-            .filter(event_agent::Column::EventId.eq(id))
-            .exec(&transaction)
-            .await
-            .context("deleting event")?;
         event::Entity::delete_by_id(id)
             .exec(&transaction)
             .await
             .context("deleting event")?;
-        let before = snapshot(&before, machines as usize);
+        let before = snapshot(&before);
         record_change(&transaction, Kind::Event, id, Some(&before), None, None).await?;
         transaction.commit().await.context("deleting event")?;
         Ok(true)
     }
 
-    async fn machine_counts(&self, ids: &[i64]) -> Result<HashMap<i64, u64>> {
-        if ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let counts: Vec<(i64, i64)> = event_agent::Entity::find()
-            .select_only()
-            .column(event_agent::Column::EventId)
-            .column_as(Expr::col(event_agent::Column::AgentId).count(), "machines")
-            .filter(event_agent::Column::EventId.is_in(ids.iter().copied()))
-            .group_by(event_agent::Column::EventId)
-            .into_tuple()
-            .all(&self.connection)
-            .await
-            .context("counting events' machines")?;
-        Ok(counts
-            .into_iter()
-            .map(|(id, machines)| (id, u64::try_from(machines).unwrap_or(0)))
-            .collect())
-    }
-
-    /// What people recorded between two times, newest first.
+    /// Annotations people and their scripts recorded between two times, newest first.
     pub async fn list_events(&self, from_ms: i64, to_ms: i64, limit: u64) -> Result<Vec<Event>> {
         let rows = event::Entity::find()
             .filter(event::Column::TimeMs.gte(from_ms))
@@ -206,50 +160,43 @@ impl Database {
             .all(&self.connection)
             .await
             .context("loading events")?;
-        let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
-        let counts = self.machine_counts(&ids).await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| {
-                let machines = counts.get(&row.id).copied().unwrap_or(0);
-                to_event(row, machines)
-            })
-            .collect())
+        Ok(rows.into_iter().map(to_event).collect())
     }
 
-    /// Everything that happened to a machine between two times, newest first: what was
-    /// recorded for it, its alerts starting and ending, and its agent, OS and kernel
-    /// being updated.
+    /// Everything that happened to a machine between two times, newest first: the events
+    /// whose filter `picks`, its alerts starting and ending, and its agent, OS and
+    /// kernel being updated.
     pub async fn timeline(
         &self,
         agent_id: &str,
         from_ms: i64,
         to_ms: i64,
+        picks: impl Fn(&str) -> bool,
     ) -> Result<Vec<TimelineEvent>> {
         let mut timeline = Vec::new();
 
-        let linked = event_agent::Entity::find()
-            .select_only()
-            .column(event_agent::Column::EventId)
-            .filter(event_agent::Column::AgentId.eq(agent_id))
-            .into_query();
         let recorded = event::Entity::find()
-            .filter(event::Column::Id.in_subquery(linked))
             .filter(event::Column::TimeMs.gte(from_ms))
             .filter(event::Column::TimeMs.lt(to_ms))
             .order_by_desc(event::Column::TimeMs)
-            .limit(MAX_TIMELINE)
+            .limit(MAX_CANDIDATES)
             .all(&self.connection)
             .await
-            .context("loading a machine's events")?;
-        timeline.extend(recorded.into_iter().map(|row| TimelineEvent {
-            time_ms: row.time_ms,
-            kind: EventKind::parse(&row.kind).unwrap_or(EventKind::Note),
-            title: row.title,
-            detail: row.detail,
-            by: (row.created_by != SERVER).then_some(row.created_by),
-            id: Some(row.id),
-        }));
+            .context("loading events")?;
+        timeline.extend(
+            recorded
+                .into_iter()
+                .filter(|row| picks(&row.filter))
+                .take(MAX_TIMELINE as usize)
+                .map(|row| TimelineEvent {
+                    time_ms: row.time_ms,
+                    kind: EventKind::parse(&row.kind).unwrap_or(EventKind::Note),
+                    title: row.title,
+                    detail: row.detail,
+                    by: (row.created_by != SERVER).then_some(row.created_by),
+                    id: Some(row.id),
+                }),
+        );
 
         let in_range = |column: alert::Column| {
             Condition::all()
@@ -370,14 +317,13 @@ impl Database {
             .await
             .context("saving a boot time")?;
         if restarted {
-            let agents = [agent_id.to_string()];
+            let filter = host_filter::only(agent_id);
             let new = NewEvent {
                 kind: EventKind::Restart,
                 time_ms: boot_ms,
                 title: "Machine started",
                 detail: None,
-                filter: "",
-                agents: &agents,
+                filter: &filter,
             };
             insert_event(&transaction, &new, SERVER, now_ms).await?;
         }
@@ -386,13 +332,14 @@ impl Database {
     }
 }
 
-/// Forgets a machine's part in events and when it started, as part of deleting it.
+/// Forgets what was recorded about one machine alone, and when it started, as part of
+/// deleting it. Events for many machines stay.
 pub(super) async fn delete_agent_events<C: ConnectionTrait>(
     connection: &C,
     agent_id: &str,
 ) -> Result<()> {
-    event_agent::Entity::delete_many()
-        .filter(event_agent::Column::AgentId.eq(agent_id))
+    event::Entity::delete_many()
+        .filter(event::Column::Filter.eq(host_filter::only(agent_id)))
         .exec(connection)
         .await
         .context("deleting an agent's events")?;

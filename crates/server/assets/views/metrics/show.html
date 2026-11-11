@@ -44,10 +44,10 @@
 {% if not is_local %}
 <section id="events" class="card events">
   <h2>Events</h2>
-  <p class="hint">What happened to this machine in the range shown, also marked on each chart: deploys and notes, restarts, config changes, alerts and updates.</p>
+  <p class="hint">What happened to this machine in the range shown, also marked on each chart: annotations, restarts, config changes, alerts and updates. Annotations for many hosts at once are under <a href="/metrics/annotations">Metrics &gt; Annotations</a>.</p>
   {% if can_respond %}
   {% if event_error %}<p class="error" role="alert">{{ event_error }}</p>{% endif %}
-  <form id="event-form" method="post" action="/agents/{{ agent_id }}/events" class="event-form">
+  <form id="event-form" method="post" action="/agents/{{ agent_id }}/annotations" class="event-form">
     <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
     <input type="hidden" name="range" value="{{ range }}">
     <label>Kind
@@ -62,7 +62,7 @@
     <label>Detail
       <input type="text" name="detail" maxlength="2000" autocomplete="off" placeholder="Optional">
     </label>
-    <button type="submit" class="secondary">Add event</button>
+    <button type="submit" class="secondary">Add annotation</button>
   </form>
   {% endif %}
   {% if events %}
@@ -77,7 +77,7 @@
         <td>{% if event.by %}{{ event.by }}{% else %}<span class="hint">Server</span>{% endif %}</td>
         {% if can_respond %}
         <td>{% if event.id %}
-          <form method="post" action="/events/{{ event.id }}/delete">
+          <form method="post" action="/metrics/annotations/{{ event.id }}/delete">
             <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
             <input type="hidden" name="agent_id" value="{{ agent_id }}">
             <input type="hidden" name="range" value="{{ range }}">

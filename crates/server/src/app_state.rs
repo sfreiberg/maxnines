@@ -9,9 +9,9 @@ use tokio::sync::{mpsc, watch};
 
 use crate::alerting::{self, AlertRuleInput, ChannelInput};
 use crate::calculations::Sources;
-use crate::controllers::host_list::HostSearch;
-use crate::events::EventInput;
+use crate::events::{EventInput, TimelineEvent};
 use crate::facts::{FlatFacts, unflatten};
+use crate::host_filter::HostFilter;
 use crate::maintenance::{self, MaintenanceWindowInput};
 use crate::metrics::Metrics;
 use crate::models::{Database, NewEvent, RuleInput};
@@ -85,8 +85,8 @@ pub enum EventRefusal {
 }
 
 impl AppState {
-    /// Records a deploy or a note for the approved machines its filter picks then, as
-    /// `by`. A filter that picks none is refused, as it's most likely a mistake.
+    /// Records an annotation, as `by`. Its filter is kept as it is, and matched against each
+    /// machine when a chart is drawn, so one that picks nothing yet is fine.
     pub async fn record_event(
         &self,
         mut input: EventInput,
@@ -96,41 +96,41 @@ impl AppState {
         input.tidy();
         let kind = input.check(now_ms).map_err(EventRefusal::Invalid)?;
         let filter = input.filter.clone().unwrap_or_default();
-        let search = HostSearch::from_database(&self.database, Some(&filter))
-            .await
-            .map_err(EventRefusal::Failed)?;
-        if let Some(error) = search.error {
-            return Err(EventRefusal::Invalid(error));
-        }
-        let agents: Vec<String> = self
-            .registry
-            .list()
-            .await
-            .into_iter()
-            .filter(|agent| {
-                agent.state == AgentState::Approved
-                    && !agent.is_local()
-                    && search.includes(&agent.id, &agent.host)
-            })
-            .map(|agent| agent.id)
-            .collect();
-        if agents.is_empty() {
-            return Err(EventRefusal::Invalid(
-                "No machine matches that filter.".into(),
-            ));
-        }
         let new = NewEvent {
             kind,
             time_ms: input.time_ms.unwrap_or(now_ms),
             title: &input.title,
             detail: input.detail.as_deref(),
             filter: &filter,
-            agents: &agents,
         };
         self.database
             .record_event(&new, by, now_ms)
             .await
             .map_err(EventRefusal::Failed)
+    }
+
+    /// Everything that happened to a machine between two times, newest first, with the
+    /// annotations whose filters pick it by its current facts.
+    pub async fn timeline(
+        &self,
+        agent_id: &str,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Vec<TimelineEvent>> {
+        let host = self
+            .registry
+            .get(agent_id)
+            .await
+            .map(|agent| agent.host)
+            .unwrap_or_default();
+        let facts = self.database.facts_of(&[agent_id]).await?;
+        let facts = facts.get(agent_id);
+        let picks = |filter: &str| {
+            HostFilter::parse(filter).is_ok_and(|filter| filter.matches(agent_id, &host, facts))
+        };
+        self.database
+            .timeline(agent_id, from_ms, to_ms, picks)
+            .await
     }
 
     /// Deletes a revoked agent and everything kept about it. Metrics go first: if

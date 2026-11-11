@@ -8,6 +8,7 @@ pub mod agent_socket;
 mod agents;
 mod alert_rules;
 mod alerts;
+mod annotations;
 pub mod api;
 mod api_keys;
 mod assets;
@@ -15,7 +16,6 @@ mod audit_log;
 mod condition_form;
 mod dashboards;
 mod docs;
-mod events;
 mod fleet;
 mod health;
 pub mod host_list;
@@ -186,7 +186,7 @@ pub fn app(state: AppState) -> Router {
         .merge(agents::routes())
         .merge(alerts::routes())
         .merge(silences::routes())
-        .merge(events::routes())
+        .merge(annotations::routes())
         .merge(maintenance_windows::routes())
         .merge(alert_rules::routes())
         .merge(notification_channels::routes())

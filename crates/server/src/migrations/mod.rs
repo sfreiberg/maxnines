@@ -38,6 +38,7 @@ impl MigratorTrait for Migrator {
             Box::new(TurnOnSystemCollector),
             Box::new(AddBuiltInInodeAlert),
             Box::new(CreateEvents),
+            Box::new(UnresolveEventFilters),
         ]
     }
 }
@@ -2880,6 +2881,77 @@ impl MigrationTrait for CreateEvents {
     }
 }
 
+// ---- Annotations follow their filters
+
+struct UnresolveEventFilters;
+
+impl MigrationName for UnresolveEventFilters {
+    fn name(&self) -> &str {
+        "m20261110_000027_unresolve_event_filters"
+    }
+}
+
+/// An event shows on whichever machines its filter picks when a chart is drawn,
+/// rather than those it picked when it was recorded, so the list of those goes. What
+/// the server recorded about one machine, like a restart, gets a filter for that
+/// machine alone, as people's events already had one.
+#[async_trait::async_trait]
+impl MigrationTrait for UnresolveEventFilters {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let connection = manager.get_connection();
+        let links = Query::select()
+            .columns([EventAgents::EventId, EventAgents::AgentId])
+            .from(EventAgents::Table)
+            .and_where(
+                Expr::col(EventAgents::EventId).in_subquery(
+                    Query::select()
+                        .column(Events::Id)
+                        .from(Events::Table)
+                        .and_where(Expr::col(Events::CreatedBy).eq("server"))
+                        .to_owned(),
+                ),
+            )
+            .to_owned();
+        for row in connection.query_all(&links).await? {
+            let event: i64 = row.try_get("", "event_id")?;
+            let agent: String = row.try_get("", "agent_id")?;
+            let update = Query::update()
+                .table(Events::Table)
+                .value(Events::Filter, format!("id={agent}"))
+                .and_where(Expr::col(Events::Id).eq(event))
+                .to_owned();
+            manager.exec_stmt(update).await?;
+        }
+        drop_tables(manager, &["event_agents"]).await
+    }
+
+    /// The machines each was for can't be known again, so they're left out.
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(EventAgents::Table)
+                    .col(
+                        ColumnDef::new(EventAgents::EventId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(EventAgents::AgentId)
+                            .string_len(32)
+                            .not_null(),
+                    )
+                    .primary_key(
+                        Index::create()
+                            .col(EventAgents::EventId)
+                            .col(EventAgents::AgentId),
+                    )
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
@@ -3128,6 +3200,37 @@ mod tests {
         Migrator::up(&connection, None).await.unwrap();
 
         assert!(system_settings(&connection).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_servers_own_events_get_a_filter_for_their_machine() {
+        let connection = fresh().await;
+        Migrator::up(&connection, Some(before(&UnresolveEventFilters)))
+            .await
+            .unwrap();
+        connection
+            .execute_unprepared(
+                "INSERT INTO events (id, time_ms, kind, title, filter, created_by, created_ms)
+                 VALUES (1, 5, 'restart', 'Machine started', '', 'server', 5),
+                        (2, 6, 'deploy', 'Shop v2', 'role=web', 'sam@example.com', 6);
+                 INSERT INTO event_agents (event_id, agent_id)
+                 VALUES (1, 'abc123'), (2, 'web1'), (2, 'web2')",
+            )
+            .await
+            .unwrap();
+
+        Migrator::up(&connection, None).await.unwrap();
+
+        let query = Statement::from_string(
+            connection.get_database_backend(),
+            "SELECT filter FROM events ORDER BY id",
+        );
+        let rows = connection.query_all_raw(query).await.unwrap();
+        let filters: Vec<String> = rows
+            .iter()
+            .map(|row| row.try_get("", "filter").unwrap())
+            .collect();
+        assert_eq!(filters, ["id=abc123", "role=web"]);
     }
 
     #[tokio::test]

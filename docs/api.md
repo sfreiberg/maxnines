@@ -688,11 +688,10 @@ Returns `201` with the new `id`.
 Ends it now, and keeps it in the list of ended silences. Returns `204`, or `404` if it
 isn't running.
 
-## Events
+## Annotations
 
-What happened to machines, marked on their charts. People and their scripts record
-deploys and notes, and the server records restarts and config changes itself. See
-[Events](events.md). Recording and deleting them needs the responder role.
+Deploys, upgrades and notes, marked on the charts of the machines their filter picks.
+See [Annotations](annotations.md). Adding and deleting them needs the responder role.
 
 | Field | Meaning |
 |---|---|
@@ -700,20 +699,20 @@ deploys and notes, and the server records restarts and config changes itself. Se
 | `title` | What happened, which is required. Up to 200 characters. |
 | `detail` | More about it, up to 2,000 characters. |
 | `time_ms` | When it happened, from a year ago to now. Defaults to now. |
-| `filter` | Which machines, written as in [Filters](#filters). Leave it out for every machine. The machines it picks then are the ones it's for, and a filter that picks none is refused with `422`. |
+| `filter` | Which machines, written as in [Filters](#filters). Leave it out for every machine. It's matched against each machine whenever a chart is drawn, so a machine added later shows it too, and one that matches nothing yet is fine. |
 
-### Record an event
+### Add an annotation
 
-`POST /api/v1/events`
+`POST /api/v1/annotations`
 
 ```sh
 curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"kind": "deploy", "title": "Shop v2.3", "detail": "Build 812", "filter": "role=web"}' \
-  "$MAXNINES_URL/api/v1/events"
+  "$MAXNINES_URL/api/v1/annotations"
 ```
 
-Returns `201` with the event, and `machines` saying how many it's for:
+Returns `201` with the new `id`. Reading it back gives:
 
 ```json
 {
@@ -724,38 +723,36 @@ Returns `201` with the event, and `machines` saying how many it's for:
   "detail": "Build 812",
   "filter": "role=web",
   "created_by": "deploy@example.com",
-  "created_ms": 1793940279545,
-  "machines": 12
+  "created_ms": 1793940279545
 }
 ```
 
-### List events
+### List annotations
 
-`GET /api/v1/events`
+`GET /api/v1/annotations`
 
-What people recorded, newest first. `from_ms` and `to_ms` choose the period, which is the
-last 7 days unless given, and `limit` how many, which is 200 unless given, up to 1,000.
+Newest first. `from_ms` and `to_ms` choose the period, which is the last 7 days unless
+given, and `limit` how many, which is 200 unless given, up to 1,000.
 
-### Get an event
+### Get an annotation
 
-`GET /api/v1/events/{id}`
+`GET /api/v1/annotations/{id}`
 
-### Delete an event
+### Delete an annotation
 
-`DELETE /api/v1/events/{id}`
+`DELETE /api/v1/annotations/{id}`
 
-Deletes it from every machine it was for. Returns `204`, or `404` if there's no such
-event.
+Returns `204`, or `404` if there's no such annotation.
 
 ### A machine's events
 
 `GET /api/v1/agents/{id}/events`
 
-Everything that happened to one machine, newest first, as its page shows them: what was
-recorded for it, restarts, config changes, alerts starting (`alert`) and ending
-(`resolved`), and updates. `from_ms` and `to_ms` choose the period, which is the last 24
-hours unless given. Only recorded events have an `id`, and `by` is who recorded one, or
-`null` for what the server worked out.
+Everything that happened to one machine, newest first, as its page shows them: the
+annotations whose filter matches it, restarts, config changes, alerts starting
+(`alert`) and ending (`resolved`), and updates. `from_ms` and `to_ms` choose the period,
+which is the last 24 hours unless given. Only what was recorded has an `id`, and `by` is
+who added an annotation, or `null` for what the server worked out.
 
 ```json
 [

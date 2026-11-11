@@ -20,7 +20,6 @@ mod dashboard_variable;
 mod dashboard_widget;
 mod dashboards;
 mod event;
-mod event_agent;
 mod events;
 mod location_rule;
 mod location_rules;
@@ -226,7 +225,7 @@ impl Database {
     }
 
     /// Deletes an agent and everything kept about it: its facts, what it said about
-    /// its config, its alerts with their notifications, its part in events, and a
+    /// its config, its alerts with their notifications, events about it alone, and a
     /// place on the map made for it alone. All or nothing. Returns false if there was no such agent.
     pub async fn delete_agent(&self, id: &str) -> Result<bool> {
         let _only_writer = self.facts_lock.lock().await;

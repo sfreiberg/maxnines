@@ -271,11 +271,7 @@ async fn show(
         Ok(charts) => charts,
         Err(error) => return server_error(&error),
     };
-    let events = match state
-        .database
-        .timeline(&agent.id, range.from_ms, range.to_ms)
-        .await
-    {
+    let events = match state.timeline(&agent.id, range.from_ms, range.to_ms).await {
         Ok(events) => events,
         Err(error) => return server_error(&error),
     };

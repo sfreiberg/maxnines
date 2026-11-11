@@ -1,4 +1,5 @@
-//! Events marked on machines' charts: what people record, and what the server notices.
+//! Events marked on machines' charts: annotations people and scripts add, and what the
+//! server notices.
 
 use super::*;
 use crate::alerting::{NewAlert, Severity};
@@ -63,11 +64,12 @@ async fn a_deploy_is_marked_on_the_machines_its_filter_picks() {
     let (db, _db_client) = machine(&server, "db-1", json!({ "role": "db" })).await;
 
     let deploy = json!({ "kind": "deploy", "title": "Shop v2.3", "detail": "Build 812", "filter": "role=web" });
-    let (status, event) = api(&server, "POST", "/api/v1/events", &deploy).await;
+    let (status, event) = api(&server, "POST", "/api/v1/annotations", &deploy).await;
 
     assert_eq!(status, 201, "{event}");
+    let path = format!("/api/v1/annotations/{}", event["id"]);
+    let (_, event) = api(&server, "GET", &path, &Value::Null).await;
     assert_eq!(event["kind"], "deploy");
-    assert_eq!(event["machines"], 1);
     assert_eq!(event["filter"], "role=web");
     let events = timeline(&server, &web).await;
     assert_eq!(titles(&events), ["Shop v2.3"]);
@@ -85,39 +87,40 @@ async fn an_event_without_a_filter_is_for_every_machine() {
     let (status, event) = api(
         &server,
         "POST",
-        "/api/v1/events",
+        "/api/v1/annotations",
         &json!({ "title": "Network change" }),
     )
     .await;
 
     assert_eq!(status, 201, "{event}");
+    let path = format!("/api/v1/annotations/{}", event["id"]);
     assert_eq!(
-        (event["kind"].as_str(), event["machines"].as_u64()),
-        (Some("note"), Some(2))
+        api(&server, "GET", &path, &Value::Null).await.1["kind"],
+        "note"
     );
     assert_eq!(titles(&timeline(&server, &web).await), ["Network change"]);
     assert_eq!(titles(&timeline(&server, &db).await), ["Network change"]);
 }
 
 #[tokio::test]
-async fn an_event_for_no_machine_or_of_the_servers_own_kind_is_refused() {
+async fn an_annotation_of_the_servers_own_kind_or_with_a_broken_filter_is_refused() {
     let server = start().await;
     let _machine = machine(&server, "web-1", json!({ "role": "web" })).await;
 
     for body in [
-        json!({ "title": "Nobody", "filter": "role=nothing" }),
+        json!({ "title": "Broken", "filter": "role=\"unclosed" }),
         json!({ "title": "Fake", "kind": "restart" }),
         json!({ "title": "" }),
         json!({ "title": "Old", "time_ms": 1000 }),
         json!({ "title": "Typo", "unknown": true }),
     ] {
-        let (status, refusal) = api(&server, "POST", "/api/v1/events", &body).await;
+        let (status, refusal) = api(&server, "POST", "/api/v1/annotations", &body).await;
         assert!(
             matches!(status, 400 | 422),
             "{body} gave {status} {refusal}"
         );
     }
-    let (_, events) = api(&server, "GET", "/api/v1/events", &Value::Null).await;
+    let (_, events) = api(&server, "GET", "/api/v1/annotations", &Value::Null).await;
     assert_eq!(events, json!([]));
 }
 
@@ -128,11 +131,11 @@ async fn an_event_can_be_dated_when_it_happened() {
     let earlier = now_ms() - 2 * 3_600_000;
 
     let body = json!({ "title": "Deployed before lunch", "kind": "deploy", "time_ms": earlier });
-    let (status, _) = api(&server, "POST", "/api/v1/events", &body).await;
+    let (status, _) = api(&server, "POST", "/api/v1/annotations", &body).await;
 
     assert_eq!(status, 201);
     assert_eq!(timeline(&server, &web).await[0]["time_ms"], earlier);
-    let (_, listed) = api(&server, "GET", "/api/v1/events", &Value::Null).await;
+    let (_, listed) = api(&server, "GET", "/api/v1/annotations", &Value::Null).await;
     assert_eq!(listed[0]["time_ms"], earlier);
 }
 
@@ -143,11 +146,11 @@ async fn deleting_an_event_takes_it_off_every_machine_and_is_audited() {
     let (_, event) = api(
         &server,
         "POST",
-        "/api/v1/events",
+        "/api/v1/annotations",
         &json!({ "title": "Oops" }),
     )
     .await;
-    let path = format!("/api/v1/events/{}", event["id"]);
+    let path = format!("/api/v1/annotations/{}", event["id"]);
 
     let (status, _) = api(&server, "DELETE", &path, &Value::Null).await;
 
@@ -341,7 +344,7 @@ async fn a_note_from_the_machine_page_shows_in_its_events() {
         .submit(
             &server,
             &page,
-            &format!("/agents/{}/events", agent.id()),
+            &format!("/agents/{}/annotations", agent.id()),
             &fields,
         )
         .await;
@@ -372,7 +375,7 @@ async fn a_refused_note_says_why_on_the_page() {
         .submit(
             &server,
             &page,
-            &format!("/agents/{}/events", agent.id()),
+            &format!("/agents/{}/annotations", agent.id()),
             &[("title", "  ")],
         )
         .await;
@@ -393,7 +396,7 @@ async fn a_note_can_be_deleted_from_the_page() {
     let (_, event) = api(
         &server,
         "POST",
-        "/api/v1/events",
+        "/api/v1/annotations",
         &json!({ "title": "Mistake" }),
     )
     .await;
@@ -409,7 +412,7 @@ async fn a_note_can_be_deleted_from_the_page() {
         .submit(
             &server,
             &page,
-            &format!("/events/{}/delete", event["id"]),
+            &format!("/metrics/annotations/{}/delete", event["id"]),
             &fields,
         )
         .await;
@@ -419,16 +422,18 @@ async fn a_note_can_be_deleted_from_the_page() {
 }
 
 #[tokio::test]
-async fn deleting_a_machine_takes_it_out_of_its_events() {
+async fn deleting_a_machine_keeps_annotations_for_others_and_forgets_its_own() {
     let server = start().await;
     let (agent, client) = machine(&server, "web-1", json!({ "role": "web" })).await;
     let (_, event) = api(
         &server,
         "POST",
-        "/api/v1/events",
+        "/api/v1/annotations",
         &json!({ "title": "Kept" }),
     )
     .await;
+    let own = json!({ "title": "Gone", "filter": format!("id={}", agent.id()) });
+    let (_, own) = api(&server, "POST", "/api/v1/annotations", &own).await;
     drop(client);
     server
         .state
@@ -439,12 +444,125 @@ async fn deleting_a_machine_takes_it_out_of_its_events() {
 
     server.state.delete_agent(&agent.id()).await.unwrap();
 
-    let path = format!("/api/v1/events/{}", event["id"]);
-    let (status, kept) = api(&server, "GET", &path, &Value::Null).await;
+    let path = format!("/api/v1/annotations/{}", event["id"]);
+    let (status, _) = api(&server, "GET", &path, &Value::Null).await;
     assert_eq!(status, 200);
-    assert_eq!(kept["machines"], 0);
+    let own = format!("/api/v1/annotations/{}", own["id"]);
+    assert_eq!(api(&server, "GET", &own, &Value::Null).await.0, 404);
     assert_eq!(
         server.state.database.boot_time(&agent.id()).await.unwrap(),
         None
     );
+}
+
+#[tokio::test]
+async fn an_annotation_follows_its_filter_to_machines_added_and_changed_later() {
+    let server = start().await;
+    let body = json!({ "kind": "deploy", "title": "Shop v2.4", "filter": "role=web" });
+
+    // Nothing matches yet, which is fine.
+    let (status, _) = api(&server, "POST", "/api/v1/annotations", &body).await;
+    assert_eq!(status, 201);
+
+    let (late, mut client) = machine(&server, "web-9", json!({ "role": "web" })).await;
+    assert_eq!(titles(&timeline(&server, &late).await), ["Shop v2.4"]);
+
+    send(
+        &mut client,
+        &AgentMessage::Facts {
+            facts: json!({ "role": "db" }),
+        },
+    )
+    .await;
+    server.wait_for_facts(&late.id(), 2).await;
+    assert!(timeline(&server, &late).await.is_empty());
+}
+
+#[tokio::test]
+async fn the_annotations_tab_adds_one_for_a_filter_at_a_time_given() {
+    let server = start().await;
+    let zone = chrono_tz::America::Chicago;
+    let user = server.user_id().await;
+    server
+        .state
+        .database
+        .set_time_zone(user, zone)
+        .await
+        .unwrap();
+    let mut browser = Browser::default();
+    let listing = browser.get(&server, "/metrics").await;
+    assert!(listing.body.contains(r#"href="/metrics/annotations""#));
+
+    let fields = [
+        ("kind", "deploy"),
+        ("title", "Upgraded Postgres to 17"),
+        ("detail", ""),
+        ("filter", "role=web"),
+        ("when", "2026-11-10T09:30"),
+    ];
+    let posted = browser
+        .submit(
+            &server,
+            "/metrics/annotations",
+            "/metrics/annotations",
+            &fields,
+        )
+        .await;
+
+    assert_eq!(posted.status, 303, "{}", posted.body);
+    let page = browser.get(&server, "/metrics/annotations").await;
+    assert!(
+        page.body.contains("Upgraded Postgres to 17"),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains("<code>role=web</code>"));
+    let (_, listed) = api(
+        &server,
+        "GET",
+        "/api/v1/annotations?from_ms=0",
+        &Value::Null,
+    )
+    .await;
+    // 09:30 in Chicago, where the person adding it is.
+    let expected = chrono::TimeZone::from_local_datetime(
+        &zone,
+        &chrono::NaiveDate::from_ymd_opt(2026, 11, 10)
+            .unwrap()
+            .and_hms_opt(9, 30, 0)
+            .unwrap(),
+    )
+    .earliest()
+    .unwrap()
+    .timestamp_millis();
+    assert_eq!(listed[0]["time_ms"], expected);
+}
+
+#[tokio::test]
+async fn the_annotations_tab_keeps_what_was_typed_when_it_refuses() {
+    let server = start().await;
+    let mut browser = Browser::default();
+
+    let fields = [
+        ("kind", "note"),
+        ("title", "Kept title"),
+        ("filter", "role=\"oops"),
+        ("when", ""),
+    ];
+    let refused = browser
+        .submit(
+            &server,
+            "/metrics/annotations",
+            "/metrics/annotations",
+            &fields,
+        )
+        .await;
+
+    assert_eq!(refused.status, 422);
+    assert!(
+        refused.body.contains(r#"value="Kept title""#),
+        "{}",
+        refused.body
+    );
+    assert!(refused.body.contains(r#"class="error""#));
 }
