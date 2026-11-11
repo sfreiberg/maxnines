@@ -35,6 +35,10 @@ use crate::server_stats::ServerStatus;
 /// How often rules are checked. Matches the default sample interval.
 const INTERVAL: Duration = Duration::from_secs(15);
 
+/// How long after an agent reconnects to check rules, so its offline alert
+/// resolves within moments rather than at the next pass.
+const RECONNECT_SETTLE: Duration = Duration::from_secs(1);
+
 /// Nobody is connected just after a start, and agents take a moment to come
 /// back. Without this, every restart would look like the whole fleet going down.
 const STARTUP_GRACE_MS: i64 = 120_000;
@@ -301,12 +305,21 @@ impl Evaluator {
     /// Runs until the server stops. Each pass is its own task, so a panic costs
     /// that pass and the next one starts as usual.
     pub fn spawn(self) -> JoinHandle<()> {
+        let presence = self.presence.clone();
         let evaluator = Arc::new(Mutex::new(self));
         tokio::spawn(async move {
             let mut timer = tokio::time::interval(INTERVAL);
             timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
-                timer.tick().await;
+                tokio::select! {
+                    _ = timer.tick() => {}
+                    () = presence.came_online.notified() => {
+                        // Agents come back together after a network blip or a
+                        // restart, so one pass covers all that arrive meanwhile.
+                        tokio::time::sleep(RECONNECT_SETTLE).await;
+                        timer.reset();
+                    }
+                }
                 let evaluator = evaluator.clone();
                 let pass =
                     tokio::spawn(async move { evaluator.lock().await.evaluate(now_ms()).await });
@@ -468,7 +481,7 @@ impl Evaluator {
                     continue;
                 }
                 match rule.rule.kind {
-                    RuleKind::Offline if snapshot.in_grace || host.is_local() => {}
+                    RuleKind::Offline if host.is_local() => {}
                     RuleKind::Offline => {
                         self.check_offline(rule, host, &snapshot, &mut open, &mut checked)
                             .await?;
@@ -526,6 +539,11 @@ impl Evaluator {
         let presence = self.presence.get(&host.id);
         let online = presence.is_some_and(|p| p.online);
         let since = presence.map_or(self.started_ms, |p| p.since_ms as i64);
+        // Just after a start, an agent that isn't back yet may only be slow to
+        // reconnect, so it's left as it was. One that is back is certainly online.
+        if snapshot.in_grace && !online {
+            return Ok(());
+        }
 
         let tracker = self.trackers.entry(key.clone()).or_default();
         let hold = tracker.only_hold();
@@ -536,9 +554,12 @@ impl Evaluator {
             hold.clear_since = None;
             hold.breached_since = Some(since);
         }
+        // Unlike a reading near a threshold, a connection can't hover, so being
+        // back resolves the alert at once instead of after the rule's wait.
+        let hold_ms = if online { 0 } else { hold_ms(rule) };
         let levels = [(rule.rule.severity, !online)];
         let current = open.get(&key).map(|alert| alert.severity);
-        let change = tracker.observe(&levels, snapshot.now_ms, hold_ms(rule), current);
+        let change = tracker.observe(&levels, snapshot.now_ms, hold_ms, current);
 
         let hostname = clean(&host.hostname);
         let summary = rule.rule.offline_summary(&hostname);

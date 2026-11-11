@@ -12,7 +12,8 @@ Every server starts with five alert rules:
 | **Container down** | A container has been failing for 5 minutes, on hosts that report [containers](agents.md#containers) | Critical |
 | **Disk will be full soon** | A disk has been on course to be full within a day for half an hour, judging by the last 6 hours, or within 4 hours | Warning, then critical |
 
-Each disk alerts on its own. They tell every notification channel, including ones added later, so they start working as soon
+Each disk alerts on its own. A Host offline alert resolves within moments of the agent
+reconnecting, even just after the server restarts. They tell every notification channel, including ones added later, so they start working as soon
 as there's a channel to tell. Until then they show on the Alerts page and the overview.
 
 They're ordinary rules from then on: change them, turn them off or delete them under

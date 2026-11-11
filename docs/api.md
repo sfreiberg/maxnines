@@ -841,7 +841,7 @@ Returns `204`.
 | `comparison` | For metric and calculation rules, `above` or `below`. For a forecast, `above` means rising to `threshold` and `below` falling to it |
 | `threshold` | For metric and calculation rules, the value to compare with. For a forecast, the level it's heading for |
 | `warning_threshold` | Optional, for a critical metric or calculation rule. Where it's a warning first, before `threshold`. One alert covers both, at the worse of the two, as in [warning, then critical](alerts.md#warning-then-critical) |
-| `for_secs` | Required. How long a problem lasts before firing, and how long it has to stay gone before resolving |
+| `for_secs` | Required. How long a problem lasts before firing, and how long it has to stay gone before resolving. An offline rule resolves as soon as the agent reconnects |
 | `severity` | Required. `warning` or `critical`, for crossing `threshold` |
 | `condition` | A CEL expression limiting which hosts this covers |
 | `enabled` | Defaults to `true` |

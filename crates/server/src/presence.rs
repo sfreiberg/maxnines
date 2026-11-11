@@ -47,6 +47,9 @@ pub struct Presence {
     state: Mutex<State>,
     connections: DefaultKeyedRateLimiter<String>,
     facts: DefaultKeyedRateLimiter<String>,
+    /// Told when an agent that was offline connects, so its offline alert can
+    /// resolve without waiting for the next pass.
+    pub came_online: Notify,
 }
 
 impl Default for Presence {
@@ -55,6 +58,7 @@ impl Default for Presence {
             state: Mutex::default(),
             connections: RateLimiter::keyed(Quota::per_minute(CONNECTIONS_PER_MINUTE)),
             facts: RateLimiter::keyed(Quota::per_minute(FACTS_PER_MINUTE).allow_burst(FACTS_BURST)),
+            came_online: Notify::new(),
         }
     }
 }
@@ -68,6 +72,7 @@ impl Presence {
             state: Mutex::default(),
             connections: RateLimiter::keyed(Quota::per_hour(CONNECTIONS_PER_MINUTE)),
             facts: RateLimiter::keyed(Quota::per_hour(FACTS_PER_MINUTE).allow_burst(FACTS_BURST)),
+            came_online: Notify::new(),
         }
     }
 }
@@ -117,6 +122,7 @@ impl Presence {
         if !already_online {
             entry.presence.online = true;
             entry.presence.since_ms = now;
+            self.came_online.notify_one();
         }
 
         Connected {
@@ -257,5 +263,24 @@ mod tests {
 
         presence.disconnected("a", new.connection);
         assert!(!is_online(&presence, "a"));
+    }
+
+    #[tokio::test]
+    async fn says_when_an_agent_comes_online_but_not_when_it_reconnects() {
+        let presence = Presence::default();
+        // A notification waits for whoever asks next, so each is there at once.
+        let told = || tokio::time::timeout(Duration::ZERO, presence.came_online.notified());
+
+        let first = presence.connected("a", SOURCE);
+        assert!(told().await.is_ok());
+
+        let replacing = presence.connected("a", SOURCE);
+        assert!(replacing.already_online);
+        assert!(told().await.is_err());
+
+        presence.disconnected("a", first.connection);
+        presence.disconnected("a", replacing.connection);
+        presence.connected("a", SOURCE);
+        assert!(told().await.is_ok());
     }
 }

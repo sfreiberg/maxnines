@@ -1206,7 +1206,7 @@ async fn a_rule_can_not_have_every_channel_and_some_of_them() {
 }
 
 #[tokio::test]
-async fn an_agent_coming_back_resolves_after_the_wait() {
+async fn an_agent_coming_back_resolves_at_once() {
     let mut test = Harness::start().await;
     test.database()
         .create_alert_rule(&offline_rule())
@@ -1223,10 +1223,67 @@ async fn an_agent_coming_back_resolves_after_the_wait() {
     test.server.wait_for_online(&test.id(), true).await;
     let back = test.server.state.presence.get(&test.id()).unwrap().since_ms as i64;
 
-    test.evaluator.evaluate(back + 59_000).await.unwrap();
-    assert_eq!(test.open().await.len(), 1);
-    test.evaluator.evaluate(back + 60_000).await.unwrap();
+    test.evaluator.evaluate(back).await.unwrap();
     assert!(test.open().await.is_empty());
+    assert_eq!(test.resolved().await.len(), 1);
+}
+
+#[tokio::test]
+async fn an_agent_coming_back_just_after_a_restart_resolves_at_once() {
+    let mut test = Harness::start().await;
+    test.database()
+        .create_alert_rule(&offline_rule())
+        .await
+        .unwrap();
+    test.go_offline().await;
+    let gone = test.server.state.presence.get(&test.id()).unwrap().since_ms as i64;
+    test.evaluator.evaluate(gone + 60_000).await.unwrap();
+    assert_eq!(test.open().await.len(), 1);
+
+    let mut client = test.server.connect().await;
+    handshake(&mut client, &test.host, "web-1", None).await;
+    test.server.wait_for_online(&test.id(), true).await;
+    let back = test.server.state.presence.get(&test.id()).unwrap().since_ms as i64;
+
+    // Still within the grace period after the restart.
+    let mut restarted = evaluator(&test.server, back);
+    restarted.evaluate(back + 1000).await.unwrap();
+    assert!(test.open().await.is_empty());
+}
+
+#[tokio::test]
+async fn the_running_evaluator_resolves_a_reconnected_agent_within_moments() {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    let mut test = Harness::start().await;
+    test.database()
+        .create_alert_rule(&offline_rule())
+        .await
+        .unwrap();
+    test.go_offline().await;
+    let gone = test.server.state.presence.get(&test.id()).unwrap().since_ms as i64;
+    test.evaluator.evaluate(gone + 60_000).await.unwrap();
+    assert_eq!(test.open().await.len(), 1);
+
+    // Its first pass runs at once. After that only the agent coming back can make
+    // it check again before the next pass, 15 seconds later.
+    let status = test.server.state.status.clone();
+    let before = status.last_alert_pass_ms.load(Ordering::Relaxed);
+    let running = evaluator(&test.server, gone - 10 * MINUTE_MS).spawn();
+    while status.last_alert_pass_ms.load(Ordering::Relaxed) == before {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(test.open().await.len(), 1);
+
+    let mut client = test.server.connect().await;
+    handshake(&mut client, &test.host, "web-1", None).await;
+    let back = Instant::now();
+    while !test.open().await.is_empty() {
+        assert!(back.elapsed() < Duration::from_secs(10), "still open");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    running.abort();
 }
 
 #[tokio::test]
