@@ -10,7 +10,7 @@
     {% endfor %}
     <label>Expression
       <input type="text" name="condition" value="{{ rule.condition }}" spellcheck="false" placeholder='facts.os.family == "linux"'>
-      <small>Leave empty for every agent. Facts are available as <code>facts</code>, such as <code>facts.custom.role == "web"</code>.</small>
+      <small>Leave empty for every machine. Facts are available as <code>facts</code>, such as <code>facts.custom.role == "web"</code>.</small>
     </label>
     <div class="actions">
       <button type="submit" name="form_action" value="use_builder" class="secondary" formnovalidate>Use the builder</button>
@@ -47,7 +47,7 @@
     </datalist>
     <input type="hidden" name="condition" value="{{ rule.condition }}">
 
-    <small class="hint">With no conditions, this applies to every agent.</small>
+    <small class="hint">With no conditions, this applies to every machine.</small>
     <div class="actions">
       <button type="submit" name="form_action" value="add_clause" class="secondary" formnovalidate>Add condition</button>
       <button type="submit" name="form_action" value="use_expression" class="secondary" formnovalidate>Write an expression</button>

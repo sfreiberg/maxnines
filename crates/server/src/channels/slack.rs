@@ -123,7 +123,7 @@ fn text(notice: &Notice, web_url: Option<&str>) -> String {
             format!("Machines: {}", escape(&alert.host))
         } else {
             format!(
-                "Agent: {} ({})",
+                "Machine: {} ({})",
                 escape(&alert.host),
                 short_id(&alert.agent_id)
             )
@@ -574,7 +574,7 @@ mod tests {
         );
         assert!(text.starts_with("*CRITICAL* CPU usage on web-1"), "{text}");
         assert!(text.contains("Rule: High CPU"), "{text}");
-        assert!(text.contains("Agent: web-1"), "{text}");
+        assert!(text.contains("Machine: web-1"), "{text}");
         assert!(
             text.contains("<https://m.example.com/alerts|View alerts>"),
             "{text}"

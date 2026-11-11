@@ -10,14 +10,14 @@
 {% if rules %}
 <div class="tablebox"><table>
   <thead>
-    <tr><th class="number">Priority</th><th>Name</th><th>Applies to</th><th>Sets</th><th class="number">Agents</th><th></th></tr>
+    <tr><th class="number">Priority</th><th>Name</th><th>Applies to</th><th>Sets</th><th class="number">Machines</th><th></th></tr>
   </thead>
   <tbody>
     {% for rule in rules %}
     <tr{% if not rule.enabled %} class="disabled"{% endif %}>
       <td class="number">{{ rule.priority }}</td>
       <td><a href="/rules/{{ rule.id }}/edit">{{ rule.name }}</a></td>
-      <td>{% if rule.description %}{{ rule.description }}{% elif rule.condition %}<code>{{ rule.condition }}</code>{% else %}Every agent{% endif %}</td>
+      <td>{% if rule.description %}{{ rule.description }}{% elif rule.condition %}<code>{{ rule.condition }}</code>{% else %}Every machine{% endif %}</td>
       <td>{{ rule.summary }}</td>
       <td class="number">{{ rule.agents }}</td>
       <td>{% if not rule.enabled %}<span class="badge neutral">Disabled</span>{% endif %}</td>

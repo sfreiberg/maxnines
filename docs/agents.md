@@ -28,7 +28,7 @@ Then start it:
 ```
 
 It creates a key in `state`, logs its agent ID, and waits to be approved. Approve it
-on the Agents page, or from the command line with an API key:
+on the Machines page, or from the command line with an API key:
 
 ```sh
 export MAXNINES_API_KEY=$(maxnines-server api-keys create "Admin" --user you@example.com)
@@ -43,7 +43,7 @@ reached, and sent when it's back.
 - **One key per machine.** Copy the program and `agent.hcl` to another machine, but
   never `state`. The key inside it is the agent's identity, so a copy looks like the
   same machine. If two machines do share a key, each connection knocks the other off,
-  and the Agents page shows the agent reconnecting over and over.
+  and the Machines page shows the agent reconnecting over and over.
 - **Names aren't unique.** The key is the agent's identity, so two machines can share
   a name, such as a caching name server in every office, and a renamed machine
   simply reports under its new name.
@@ -51,7 +51,7 @@ reached, and sent when it's back.
   are commands the agent runs, so anyone who can edit the file can run commands as
   the agent. Keep it owned by the agent's user or root and not writable by others.
 - **Upgrade the server first.** Older agents work with a newer server, but a newer
-  agent may need things an older server doesn't have. The Agents page marks agents
+  agent may need things an older server doesn't have. The Machines page marks agents
   older than the one released with the server **Update available**, and any newer
   than the server **Newer than server**.
 - **macOS and downloads:** a file that came through a browser or AirDrop is blocked

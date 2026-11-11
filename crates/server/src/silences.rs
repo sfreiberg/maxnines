@@ -25,7 +25,7 @@ pub struct Silence {
     pub id: i64,
     /// Every rule, if empty.
     pub rule_id: Option<i64>,
-    /// Which hosts, in the same form as the host list. Every host, if empty.
+    /// Which machines, in the same form as the Machines list. Every machine, if empty.
     pub filter: String,
     pub reason: String,
     pub created_by: String,

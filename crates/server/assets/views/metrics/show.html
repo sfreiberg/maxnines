@@ -5,7 +5,7 @@
 <p class="breadcrumb">{% if is_local %}<a href="/server">Server</a>{% else %}<a href="/metrics">Metrics</a>{% endif %}</p>
 <div class="title-row">
   <h1>{{ host }}</h1>
-  {% if not is_local %}<a class="button secondary" href="/agents/{{ agent_id }}">Agent details</a>{% endif %}
+  {% if not is_local %}<a class="button secondary" href="/agents/{{ agent_id }}">Machine details</a>{% endif %}
 </div>
 
 <nav class="tabs" aria-label="Time range">
@@ -44,7 +44,7 @@
 {% if not is_local %}
 <section id="events" class="card events">
   <h2>Events</h2>
-  <p class="hint">What happened to this machine in the range shown, also marked on each chart: annotations, restarts, config changes, alerts and updates. Annotations for many hosts at once are under <a href="/metrics/annotations">Metrics &gt; Annotations</a>.</p>
+  <p class="hint">What happened to this machine in the range shown, also marked on each chart: annotations, restarts, config changes, alerts and updates. Annotations for many machines at once are under <a href="/metrics/annotations">Metrics &gt; Annotations</a>.</p>
   {% if can_respond %}
   {% if event_error %}<p class="error" role="alert">{{ event_error }}</p>{% endif %}
   <form id="event-form" method="post" action="/agents/{{ agent_id }}/annotations" class="event-form">

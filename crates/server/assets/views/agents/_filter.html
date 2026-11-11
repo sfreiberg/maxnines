@@ -2,7 +2,7 @@
   {% if keep_tab %}<input type="hidden" name="filter" value="{{ keep_tab }}">{% endif %}
   {% if as_table %}<input type="hidden" name="view" value="table">{% endif %}
   <div class="host-filter-box">
-    <input type="text" name="q" value="{{ search.text }}" aria-label="Filter hosts" placeholder="os=linux hostname=web*" autocomplete="off" spellcheck="false" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="host-filter-options">
+    <input type="text" name="q" value="{{ search.text }}" aria-label="Filter machines" placeholder="os=linux hostname=web*" autocomplete="off" spellcheck="false" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="host-filter-options">
     <ul id="host-filter-options" role="listbox" aria-label="Suggestions" hidden></ul>
   </div>
   <button type="submit">Filter</button>

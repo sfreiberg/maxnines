@@ -2,7 +2,7 @@
 
 A dashboard is a grid of widgets that everyone signed in shares. Each widget asks one
 question about the fleet: a metric, how to combine machines' values, what gets a line
-of its own, and which machines, using the same filter as the host list. A widget can
+of its own, and which machines, using the same filter as the Machines list. A widget can
 be a chart, a single number or a table with the highest first.
 
 Make one under **Dashboards**, then **Edit** it to add widgets and drag them around.

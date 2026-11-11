@@ -3917,7 +3917,7 @@ async fn the_fleet_metrics_page_filters_the_same_way() {
         (true, false)
     );
     let page = Browser::default().get(&server, "/metrics?q=nothing").await;
-    assert!(page.body.contains("No agents match this filter."));
+    assert!(page.body.contains("No machines match this filter."));
 }
 
 #[tokio::test]

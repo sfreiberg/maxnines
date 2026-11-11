@@ -230,7 +230,7 @@ impl Snapshot {
             return Some("The agent is no longer approved");
         }
         if !self.rule_applies(rule, &alert.agent_id) {
-            return Some("The rule no longer applies to this agent");
+            return Some("The rule no longer applies to this machine");
         }
         match rule.rule.kind {
             RuleKind::Offline if self.in_grace => None,

@@ -63,7 +63,7 @@ fn text(notice: &Notice, web_url: Option<&str>) -> String {
         format!("Machines: {}", clip(&alert.host))
     } else {
         format!(
-            "Agent: {} ({})",
+            "Machine: {} ({})",
             clip(&alert.host),
             short_id(&alert.agent_id)
         )
@@ -295,7 +295,7 @@ mod tests {
         assert_eq!(
             text,
             "<b>CRITICAL</b> CPU usage on web-1 is 97%, above 90%\n\
-             Rule: High CPU · Agent: web-1 (abc) · Started: 1970-01-01 00:00:01 UTC\n\
+             Rule: High CPU · Machine: web-1 (abc) · Started: 1970-01-01 00:00:01 UTC\n\
              <a href=\"https://m.example.com/alerts\">View alerts</a>"
         );
         assert_eq!(
@@ -328,7 +328,7 @@ mod tests {
             text.contains("&lt;a href=&quot;http://evil&quot;&gt;click&lt;/a&gt; &amp; &lt;b&gt;"),
             "{text}"
         );
-        assert!(text.contains("Agent: &lt;i&gt;web&lt;/i&gt;"), "{text}");
+        assert!(text.contains("Machine: &lt;i&gt;web&lt;/i&gt;"), "{text}");
     }
 
     #[test]

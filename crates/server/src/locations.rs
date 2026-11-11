@@ -1,5 +1,5 @@
 //! Where machines are, for the map. A location rule says which machines are where,
-//! with the same filter as the host list, and when several match a machine the one
+//! with the same filter as the Machines list, and when several match a machine the one
 //! with the highest priority decides. A machine put somewhere by hand is a rule whose
 //! filter is its ID, so there's one way of saying where things are, not two.
 
@@ -20,7 +20,7 @@ const MAX_PLACE_CHARS: usize = 255;
 pub struct LocationRuleInput {
     /// What the map calls the machines it covers, such as "Leeds office".
     pub name: String,
-    /// Which machines, in the same form as the host list. Every machine, if empty.
+    /// Which machines, in the same form as the Machines list. Every machine, if empty.
     #[serde(default)]
     pub filter: String,
     /// Where it is in words, such as "Leeds, England, United Kingdom".

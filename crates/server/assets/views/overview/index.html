@@ -13,7 +13,7 @@
 
 <section class="stats" aria-label="At a glance">
   <a class="stats-cell" href="/agents">
-    <span class="label">Agents online</span>
+    <span class="label">Machines online</span>
     <span class="stats-value{% if online_count < agent_count %} warn{% endif %}">{{ online_count }} / {{ agent_count }}</span>
     <span class="stats-note">{% if online_count < agent_count %}{{ agent_count - online_count }} offline{% elif agent_count > 0 %}All online{% else %}None yet{% endif %}</span>
   </a>
@@ -52,7 +52,7 @@
 {% endif %}
 
 <section>
-  <div class="section-title"><h2>Agents</h2><a href="/agents">All {{ agent_count }} agent{% if agent_count != 1 %}s{% endif %}</a></div>
+  <div class="section-title"><h2>Machines</h2><a href="/agents">All {{ agent_count }} machine{% if agent_count != 1 %}s{% endif %}</a></div>
   {% if agents %}
   <div class="wall">
     {% for agent in agents %}

@@ -65,7 +65,7 @@ pub struct Variable {
     /// The fact whose values are offered, for a fact variable.
     #[serde(default)]
     pub fact: String,
-    /// Which machines are offered, or whose values are, in the host list's filter.
+    /// Which machines are offered, or whose values are, in the Machines list's filter.
     #[serde(default)]
     pub filter: String,
 }

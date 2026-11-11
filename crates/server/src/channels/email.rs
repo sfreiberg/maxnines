@@ -148,7 +148,7 @@ pub(super) fn text(notice: &Notice) -> String {
         if alert.agent_id == FLEET_AGENT_ID {
             format!("Machines: {}", alert.host)
         } else {
-            format!("Agent: {} ({})", alert.host, alert.agent_id)
+            format!("Machine: {} ({})", alert.host, alert.agent_id)
         },
         format!("Started: {}", format_ms(alert.started_ms)),
     ];
@@ -322,7 +322,7 @@ mod tests {
         };
         let body = text(&notice(Event::Resolved, alert));
         assert!(body.contains("Rule: High CPU"), "{body}");
-        assert!(body.contains("Agent: web-1 (abc)"), "{body}");
+        assert!(body.contains("Machine: web-1 (abc)"), "{body}");
         assert!(body.contains("Resolved: 1970-01-01 00:01:01 UTC"), "{body}");
         assert!(body.contains("Reason: The problem cleared"), "{body}");
     }

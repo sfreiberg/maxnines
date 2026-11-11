@@ -16,7 +16,7 @@ the range shown, newest first.
 ## Adding an annotation
 
 Under **Metrics > Annotations**, say what happened, choose Deploy or Note,
-and give a filter for which machines it's for, written as in the host list, such as
+and give a filter for which machines it's for, written as in the Machines list, such as
 `role=web`. Leave the filter empty for every machine, and the time empty for now. The
 list below has the last 30 days of them, and each can be deleted.
 

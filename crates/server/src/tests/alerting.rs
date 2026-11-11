@@ -487,7 +487,7 @@ async fn a_rule_that_stops_matching_closes_its_alerts() {
 
     assert_eq!(
         test.resolved().await[0].resolve_reason.as_deref(),
-        Some("The rule no longer applies to this agent")
+        Some("The rule no longer applies to this machine")
     );
 }
 
@@ -3954,7 +3954,7 @@ async fn an_alert_rule_can_be_created_changed_and_deleted_from_the_form() {
         "{}",
         list.body
     );
-    assert!(list.body.contains("Every agent"));
+    assert!(list.body.contains("Every machine"));
 
     let mut fields = ALERT_RULE_FIELDS.to_vec();
     fields[4] = ("critical_threshold", "75.5");
@@ -5089,7 +5089,7 @@ mod remote {
         assert_eq!(page.status, 404);
         let page = browser.get(&server, "/agents/server/metrics").await;
         assert_eq!(page.status, 200, "{}", page.body);
-        assert!(!page.body.contains("Agent details"));
+        assert!(!page.body.contains("Machine details"));
 
         let response = server
             .http("GET", "/api/v1/agents", Some(&server.api_key))

@@ -28,7 +28,7 @@ sudo -u maxnines maxnines-server --config /etc/maxnines/server.hcl \
 ```
 
 For an agent, set the server's address in `/etc/maxnines/agent.hcl`, start it, and
-approve it on the server's Agents page:
+approve it on the server's Machines page:
 
 ```sh
 sudo systemctl enable --now maxnines-agent

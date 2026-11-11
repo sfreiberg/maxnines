@@ -126,7 +126,7 @@
 <section id="preview" class="preview">
   <h2>Preview</h2>
   <p class="hint">Nothing has been saved. This shows what saving the form above would do, compared with the rules saved now.</p>
-  {% if not preview.enabled %}<p class="notice">This rule isn't enabled, so it won't apply to any agent. The table still shows who its condition matches.</p>{% endif %}
+  {% if not preview.enabled %}<p class="notice">This rule isn't enabled, so it won't apply to any machine. The table still shows who its condition matches.</p>{% endif %}
 
   {% if preview.total == 0 %}
   <p class="empty">There are no approved agents to try this rule on yet.</p>
@@ -138,7 +138,7 @@
   </dl>
   <div class="tablebox"><table>
     <thead>
-      <tr><th>Agent</th><th>Status</th><th>Condition</th><th>What changes</th></tr>
+      <tr><th>Machine</th><th>Status</th><th>Condition</th><th>What changes</th></tr>
     </thead>
     <tbody>
       {% for agent in preview.agents %}
@@ -160,7 +160,7 @@
       {% endfor %}
     </tbody>
   </table></div>
-  {% if preview.hidden > 0 %}<p class="hint">{{ preview.hidden }} more not shown. Agents that change are listed first.</p>{% endif %}
+  {% if preview.hidden > 0 %}<p class="hint">{{ preview.hidden }} more not shown. Machines that change are listed first.</p>{% endif %}
   {% endif %}
 </section>
 {% endif %}

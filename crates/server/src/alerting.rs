@@ -176,7 +176,7 @@ pub struct AlertRuleInput {
     /// What's watched separately, for calculation rules, as in a dashboard widget.
     #[serde(default)]
     pub group_by: Option<String>,
-    /// Which machines, for calculation rules, as on the host list. Empty is all.
+    /// Which machines, for calculation rules, as on the Machines list. Empty is all.
     #[serde(default)]
     pub filter: Option<String>,
     /// How far back a calculation rule looks, so one busy moment isn't a problem.

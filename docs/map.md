@@ -2,7 +2,7 @@
 
 The **Map** page shows where machines are, coloured by how they're doing. A location
 rule puts the machines its filter matches in one place, using the same filter as the
-host list. Add rules under **Map > Location rules**:
+Machines list. Add rules under **Map > Location rules**:
 
 - One rule for each office or data centre, with a filter such as
   `networking.addresses=10.1.*` or `networking.domain=leeds.example.com`.

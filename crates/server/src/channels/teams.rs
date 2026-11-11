@@ -53,7 +53,7 @@ fn body(notice: &Notice, web_url: Option<&str>) -> Value {
                 json!({ "title": "Machines", "value": unlinked(&alert.host) })
             } else {
                 let agent = format!("{} ({})", alert.host, short_id(&alert.agent_id));
-                json!({ "title": "Agent", "value": unlinked(&agent) })
+                json!({ "title": "Machine", "value": unlinked(&agent) })
             },
             json!({ "title": "Started", "value": format_ms(alert.started_ms) }),
         ];
@@ -159,7 +159,7 @@ mod tests {
         );
         let facts = card["body"][2]["facts"].as_array().unwrap();
         assert_eq!(facts[0], json!({ "title": "Rule", "value": "High CPU" }));
-        assert_eq!(facts[1]["title"], "Agent");
+        assert_eq!(facts[1]["title"], "Machine");
         assert_eq!(card["actions"][0]["url"], "https://m.example.com/alerts");
 
         let warning = Alert {

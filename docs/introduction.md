@@ -14,7 +14,7 @@ It's two programs:
 
 To get started, [install](installing.md) the server, add the first
 [user](users.md), then install an agent on each machine and approve it on the
-Agents page.
+Machines page.
 
 This documentation comes with the server, on its Docs page, so it always describes
 the version you're running.

@@ -111,7 +111,7 @@ fn preview_agent(
     let mut note = match check {
         _ if !reported => Some("Hasn't reported any facts yet".to_string()),
         Ok(_) => None,
-        Err(error) => Some(format!("Couldn't check this agent: {error:#}")),
+        Err(error) => Some(format!("Couldn't check this machine: {error:#}")),
     };
 
     let before = rule_engine::resolve(rules, &agent.facts, &agent.id);

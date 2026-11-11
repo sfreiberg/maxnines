@@ -4,14 +4,14 @@
 <div>
   <p class="eyebrow">Latest samples</p>
   <h1>Metrics</h1>
-  <p class="subtitle">Current values from each agent. Choose one to see its charts.</p>
+  <p class="subtitle">Current values from each machine. Choose one to see its charts.</p>
 </div>
 {% set metrics_tab = "machines" %}{% include "metrics/_tabs.html" %}
 {% include "agents/_filter.html" %}
 {% if agents %}
 <div class="tablebox"><table>
   <thead>
-    <tr><th>Agent</th><th>Status</th><th>CPU</th><th>Memory</th><th>Fullest disk</th><th>Last sample</th></tr>
+    <tr><th>Machine</th><th>Status</th><th>CPU</th><th>Memory</th><th>Fullest disk</th><th>Last sample</th></tr>
   </thead>
   <tbody>
     {% for agent in agents %}
@@ -28,7 +28,7 @@
 </table></div>
 {% include "agents/_pages.html" %}
 {% elif search.text %}
-<p class="empty">No agents match this filter.</p>
+<p class="empty">No machines match this filter.</p>
 {% else %}
 <p class="empty">There are no approved agents yet.</p>
 {% endif %}

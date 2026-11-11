@@ -285,7 +285,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 ## Filters
 
-Filters find hosts the same way as the box on the agents page. Separate terms with
+Filters find machines the same way as the box on the Machines page. Separate terms with
 spaces, and every term has to match. Remember to URL-encode them, so `os=linux`
 becomes `os%3Dlinux`. With curl, `-G --data-urlencode` does this for you.
 
@@ -297,11 +297,11 @@ becomes `os%3Dlinux`. With curl, `-G --data-urlencode` does this for you.
 | `os=linux` | That operating system family. `os` is short for `os.family` |
 | `networking.addresses=10.0.*` | Any of the machine's IP addresses. Loopback and link-local addresses aren't listed |
 | `networking.fqdn=*.leeds.example.com` | The machine's fully qualified name, as its resolver gives it. `networking.hostname` is the short name and `networking.domain` the rest |
-| `os!=windows` | Everything else, including hosts that haven't said |
+| `os!=windows` | Everything else, including machines that haven't said |
 | `cpu.logical_cores=8` | Any fact by its full name |
 | `custom.tags=eu` | A list containing that value |
 | `os.long_version="Ubuntu 24*"` | A value with spaces, in double quotes |
-| `os=linux custom.role=web` | Hosts matching both |
+| `os=linux custom.role=web` | Machines matching both |
 
 Values ignore case, and can use `*` for anything and `?` for one character. Facts from
 an agent's own config are under `custom.`, so `role` in its config is `custom.role`.
@@ -366,7 +366,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/metrics"
 
 `GET /api/v1/metrics/current`
 
-The latest headline numbers from every agent, by agent ID. Agents with nothing in the
+The latest headline numbers from every machine, by agent ID. Machines with nothing in the
 last 5 minutes are left out.
 
 ```sh
@@ -395,7 +395,7 @@ lowest priority first, so higher priorities win.
 | --- | --- |
 | `name` | Required |
 | `priority` | Required. Higher priorities apply later |
-| `condition` | A [CEL](https://cel.dev) expression over `facts`. Empty matches every agent |
+| `condition` | A [CEL](https://cel.dev) expression over `facts`. Empty matches every machine |
 | `enabled` | Defaults to `true` |
 | `settings` | Required. What to apply, as below |
 
@@ -621,7 +621,7 @@ already told about an alert still hears when it ends.
 | Field | Meaning |
 |---|---|
 | `rule_id` | The alert rule it covers. Leave it out for every rule. |
-| `filter` | Which hosts it covers, written as in [Filters](#filters). Leave it out for every host. Alerts about a group of machines have no host, so a filter leaves them out. |
+| `filter` | Which machines it covers, written as in [Filters](#filters). Leave it out for every machine. Alerts about a group of machines have no single machine, so a filter leaves them out. |
 | `reason` | Why, which is required. |
 | `duration_secs` | How long it lasts from now, up to 30 days. |
 
@@ -784,7 +784,7 @@ times in the window's time zone, so it keeps its place in the day when the clock
 |---|---|
 | `name` | Required. |
 | `rule_id` | The alert rule it covers. Leave it out for every rule. |
-| `filter` | Which hosts it covers, as for a [silence](#silences). |
+| `filter` | Which machines it covers, as for a [silence](#silences). |
 | `days` | Required. The days it starts on: `mon`, `tue`, `wed`, `thu`, `fri`, `sat` or `sun`. |
 | `start_time` | Required. When it starts, like `02:00`. |
 | `duration_minutes` | Required. How long it lasts, up to 7 days. |
@@ -848,7 +848,7 @@ Returns `204`.
 | `all_channels` | `true` to tell every channel instead, including ones added later. Leave `channels` empty with it. Defaults to `false` |
 | `calculation` | For calculation rules, `avg`, `sum`, `min`, `max` or `count`, as in [a query](#ask-about-many-machines-at-once) |
 | `group_by` | For calculation rules, what's watched separately: `nothing`, `host`, `series` or `fact:<name>` |
-| `filter` | For calculation rules, which machines, as on the host list. It takes the place of `condition` |
+| `filter` | For calculation rules, which machines, as on the Machines list. It takes the place of `condition` |
 | `window_secs` | For calculation rules, how far back to look, from 60 to 86400. Defaults to 300. For a forecast, how far back the line is drawn through, from 3600 to 86400. Defaults to 21600 |
 | `forecast_secs` | Required for a forecast. How soon the metric has to be on course to reach `threshold`, for `severity`, from 60 to 2592000 |
 | `warning_forecast_secs` | Optional, for a critical forecast. A longer time ahead that's a warning first, as in [forecasts](alerts.md#forecasts) |
@@ -1228,7 +1228,7 @@ curl -X DELETE -H "Authorization: Bearer $MAXNINES_API_KEY" \
 ## Map
 
 The map puts machines in places with location rules. Each rule has a filter, in the
-same form as the host list, and a point on the map. Where several rules match a
+same form as the Machines list, and a point on the map. Where several rules match a
 machine, the one with the highest `priority` decides, and of two with the same
 priority the older one. A machine placed from its own page is a rule whose filter is
 `id=` and its agent ID, at priority 100.
@@ -1236,7 +1236,7 @@ priority the older one. A machine placed from its own page is a rule whose filte
 | Field | Meaning |
 |---|---|
 | `name` | Required. What the map calls the machines the rule covers, such as `Leeds office`. |
-| `filter` | Which machines, as in the host list. Leave it out for every machine. |
+| `filter` | Which machines, as in the Machines list. Leave it out for every machine. |
 | `place` | Where it is in words, such as `Leeds, England, United Kingdom`. |
 | `latitude` | Required. From -90 to 90. |
 | `longitude` | Required. From -180 to 180. |
@@ -1493,7 +1493,7 @@ things, like memory and swap, uses the first unless `group_by` is `series`.
 | `metric` | Required. A name from `GET /api/v1/metrics`. |
 | `calculation` | `avg`, `sum`, `min`, `max` or `count`, which is how many series are reporting. Defaults to `avg`. |
 | `group_by` | What gets a line of its own: `nothing`, `host`, `series` or `fact:<name>`. Defaults to `nothing`. |
-| `filter` | Which machines, in the same form as the host list, such as `os=linux hostname=web*`. Defaults to all of them. |
+| `filter` | Which machines, in the same form as the Machines list, such as `os=linux hostname=web*`. Defaults to all of them. |
 | `from_ms`, `to_ms` | The time range. Defaults to the last hour. |
 
 The result has the same shape as an agent's metric. The highest 100 lines are kept, and

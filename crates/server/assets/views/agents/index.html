@@ -1,10 +1,10 @@
 {% extends "layouts/live.html" %}
-{% block title %}Agents · MaxNines{% endblock title %}
+{% block title %}Machines · MaxNines{% endblock title %}
 {% block content %}
 <div class="title-row">
   <div>
     <p class="eyebrow">{{ online_count }} of {{ total }} online</p>
-    <h1>Agents</h1>
+    <h1>Machines</h1>
   </div>
   <nav class="tabs" aria-label="View">
     <a href="{{ tiles_href }}"{% if not as_table %} class="selected" aria-current="true"{% endif %}>Tiles</a>
@@ -75,7 +75,7 @@
   {% endfor %}
 </div>
 {% elif search.text or total > 0 %}
-<p class="empty">No agents match this filter.</p>
+<p class="empty">No machines match this filter.</p>
 {% elif not waiting %}
 <p class="empty">No agents have connected yet.</p>
 {% endif %}

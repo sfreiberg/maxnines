@@ -83,8 +83,8 @@ then on of every change until it resolves:
 
 A silence stops notifications for a while, as during planned work. Press **Silence** on
 a firing alert, or start one from **Alerts > Silences**. It needs a reason and a length,
-and it can cover one rule or all of them, and some hosts or all of them, using the same
-filter as the host list.
+and it can cover one rule or all of them, and some machines or all of them, using the same
+filter as the Machines list.
 
 Alerts still fire and show while they're silenced. If one is still firing when the
 silence ends, the notifications go out then, and if it ends first, nobody hears about it.
@@ -92,7 +92,7 @@ Anyone who had already been told about an alert still hears when it ends, which 
 on-call services from leaving an incident open.
 
 To quiet one machine, such as while it's rebooted or upgraded, use **Start maintenance**
-on its page under **Agents**. Choose how long, from 30 minutes to a day, and a reason if
+on its page under **Machines**. Choose how long, from 30 minutes to a day, and a reason if
 you like. It's a silence for every rule on that machine alone, so it shows under
 **Alerts > Silences** too, and **End now** on the machine's page stops it early. While
 anything holds back all of a machine's notifications, its page says what and until when,

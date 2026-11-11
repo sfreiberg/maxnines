@@ -49,8 +49,10 @@ impl Role {
             Self::Responder => {
                 "Also acknowledges and silences alerts, and adds and deletes annotations"
             }
-            Self::Editor => "Also changes rules, channels, checks, dashboards and agents",
-            Self::Admin => "Also manages users, reads the audit log and deletes agents",
+            Self::Editor => {
+                "Also changes rules, channels, checks and dashboards, and approves agents"
+            }
+            Self::Admin => "Also manages users, reads the audit log and deletes machines",
         }
     }
 

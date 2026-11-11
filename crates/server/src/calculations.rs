@@ -127,7 +127,7 @@ pub struct Question {
     pub metric: &'static Metric,
     pub calculation: Calculation,
     pub grouping: Grouping,
-    /// Which machines, in the same form as the filter on the host list.
+    /// Which machines, in the same form as the filter on the Machines list.
     pub filter: String,
 }
 

@@ -26,9 +26,9 @@
     <label>Detail
       <input type="text" name="detail" value="{{ annotation.detail }}" maxlength="2000" autocomplete="off" placeholder="Optional">
     </label>
-    <label>Hosts
+    <label>Machines
       <input type="text" name="filter" value="{{ annotation.filter }}" maxlength="500" spellcheck="false" autocomplete="off" placeholder="role=web">
-      <small>The same filter as the host list. Leave empty for every host. It picks hosts by their facts whenever a chart is drawn, so one added later shows it too.</small>
+      <small>The same filter as the Machines list. Leave empty for every machine. It picks machines by their facts whenever a chart is drawn, so one added later shows it too.</small>
     </label>
     <label>When
       <input type="datetime-local" name="when" value="{{ annotation.when }}">
@@ -43,14 +43,14 @@
   <h2>The last {{ list_days }} days</h2>
   {% if annotations %}
   <div class="tablebox"><table class="event-list">
-    <thead><tr><th>When</th><th>Kind</th><th>What</th><th>Hosts</th><th>By</th>{% if can_respond %}<th aria-label="Delete"></th>{% endif %}</tr></thead>
+    <thead><tr><th>When</th><th>Kind</th><th>What</th><th>Machines</th><th>By</th>{% if can_respond %}<th aria-label="Delete"></th>{% endif %}</tr></thead>
     <tbody>
       {% for annotation in annotations %}
       <tr>
         <td class="nowrap">{{ annotation.time }}</td>
         <td><span class="event-kind k-{{ annotation.kind }}">{{ annotation.kind_label }}</span></td>
         <td>{{ annotation.title }}{% if annotation.detail %}<div class="hint">{{ annotation.detail }}</div>{% endif %}</td>
-        <td>{% if annotation.filter %}<code>{{ annotation.filter }}</code>{% else %}<span class="hint">Every host</span>{% endif %}</td>
+        <td>{% if annotation.filter %}<code>{{ annotation.filter }}</code>{% else %}<span class="hint">Every machine</span>{% endif %}</td>
         <td>{{ annotation.by }}</td>
         {% if can_respond %}
         <td>
