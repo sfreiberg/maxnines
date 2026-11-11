@@ -1232,3 +1232,215 @@ fn trends_need_two_readings_at_different_times_inside_the_window() {
     assert_eq!((found[0].agent_id.as_str(), found[0].samples), ("b", 2));
     assert!((found[0].slope_per_ms - 0.07).abs() < 1e-9, "{found:?}");
 }
+
+// ---- Rollups and how long things are kept
+
+const RECENT_DAY_MS: i64 = 86_400_000;
+
+/// The start of an hour this many hours before the current one, so charts read it
+/// as they would any recent data.
+fn hours_ago(hours: i64) -> i64 {
+    crate::store::rollups::hour_of(crate::metrics::now_ms()) - hours * HOUR_MS
+}
+
+fn settle(store: &mut TestStore, now_ms: i64) {
+    while store.tidy(now_ms).unwrap() {}
+}
+
+fn retention(full_days: i64, minute_days: i64, hour_days: Option<i64>) -> Retention {
+    Retention {
+        full_ms: full_days * RECENT_DAY_MS,
+        minute_ms: minute_days * RECENT_DAY_MS,
+        hour_ms: hour_days.map(|days| days * RECENT_DAY_MS),
+    }
+}
+
+/// A chart of one agent, at a step chosen rather than worked out from the range.
+fn chart_of(
+    store: &TestStore,
+    agent_id: &str,
+    metric: &str,
+    (from_ms, to_ms): (i64, i64),
+    step_ms: i64,
+) -> SeriesResult {
+    store
+        .reader()
+        .unwrap()
+        .series(&SeriesQuery {
+            agent_id,
+            metric: find(metric).unwrap(),
+            range: TimeRange {
+                from_ms,
+                to_ms,
+                step_ms,
+            },
+            max_series: 8,
+        })
+        .unwrap()
+}
+
+/// CPU every 15 seconds for `minutes`, at `percent` except where `spikes` say.
+fn cpu_from(
+    store: &mut TestStore,
+    agent: &str,
+    start_ms: i64,
+    minutes: i64,
+    percent: f64,
+    spikes: &[(i64, f64)],
+) {
+    for index in 0..minutes * 4 {
+        let time = start_ms + index * 15_000;
+        let value = spikes
+            .iter()
+            .find(|(at, _)| *at == time)
+            .map_or(percent, |(_, spike)| *spike);
+        write_metric(store, agent, time as u64, "cpu", json!({ "usage_percent": value }));
+    }
+}
+
+fn high_avg_low(point: &Point) -> (f64, f64, f64) {
+    (point.max, point.avg, point.min)
+}
+
+#[test]
+fn a_spike_outlasts_its_samples_in_the_rollups() {
+    let mut store = with_retention(retention(2, 4, None));
+    let start = hours_ago(72);
+    let spike = start + 30 * 60_000;
+    cpu_from(&mut store, "a", start, 120, 10.0, &[(spike, 100.0)]);
+
+    settle(&mut store, crate::metrics::now_ms());
+
+    // The samples themselves are gone, as they're older than two days.
+    assert!(newest(&store, "cpu.usage", start, start + 2 * HOUR_MS).is_empty());
+    let hours = chart_of(&store, "a", "cpu.usage", (start, start + 2 * HOUR_MS), HOUR_MS);
+    let points = &hours.series[0].points;
+    assert_eq!(points.len(), 2);
+    let (high, avg, low) = high_avg_low(&points[0]);
+    assert_eq!((high, low), (100.0, 10.0));
+    assert!((avg - (239.0 * 10.0 + 100.0) / 240.0).abs() < 1e-9, "{avg}");
+    assert_eq!(high_avg_low(&points[1]), (10.0, 10.0, 10.0));
+
+    // Minutes are still kept, so a close look finds the minute it happened in.
+    let minutes = chart_of(&store, "a", "cpu.usage", (start, start + HOUR_MS), 15_000);
+    let points = &minutes.series[0].points;
+    assert_eq!(points.len(), 60);
+    let peak = points.iter().find(|point| point.max == 100.0).unwrap();
+    assert_eq!(peak.time_ms, spike);
+    assert_eq!(peak.avg, (3.0 * 10.0 + 100.0) / 4.0);
+}
+
+#[test]
+fn a_burst_keeps_its_peak_rate_once_rolled_up() {
+    let mut store = with_retention(retention(2, 4, None));
+    let start = hours_ago(72);
+    for index in 0..240 {
+        let time = start + index * 15_000;
+        // 100 bytes a second, and ten seconds' worth at 10 kB a second once.
+        let bytes = if index == 100 { 150_000 } else { 1_500 };
+        let interfaces = json!({ "en0": { "received_bytes": bytes } });
+        write_metric(&mut store, "a", time as u64, "network", interfaces);
+    }
+
+    settle(&mut store, crate::metrics::now_ms());
+
+    let hours = chart_of(&store, "a", "network.received", (start, start + HOUR_MS), HOUR_MS);
+    let (high, _, low) = high_avg_low(&hours.series[0].points[0]);
+    assert_eq!((high, low), (10_000.0, 100.0));
+}
+
+#[test]
+fn the_newest_hour_is_charted_before_it_is_rolled_up() {
+    let mut store = with_retention(Retention::KEEP_EVERYTHING);
+    let start = hours_ago(2);
+    for (hour, percent) in [(0, 10.0), (1, 20.0), (2, 30.0)] {
+        cpu_from(&mut store, "a", start + hour * HOUR_MS, 10, percent, &[]);
+    }
+
+    // The two finished hours are rolled up, and the current one can't be yet.
+    settle(&mut store, start + 2 * HOUR_MS + 30 * 60_000);
+
+    let chart = chart_of(&store, "a", "cpu.usage", (start, start + 3 * HOUR_MS), HOUR_MS);
+    assert_eq!(averages(&chart.series[0]), [10.0, 20.0, 30.0]);
+}
+
+#[test]
+fn a_sample_that_arrives_late_is_rolled_up_too() {
+    let mut store = with_retention(Retention::KEEP_EVERYTHING);
+    let start = hours_ago(5);
+    cpu_from(&mut store, "a", start, 60, 10.0, &[]);
+    settle(&mut store, crate::metrics::now_ms());
+    let range = (start, start + HOUR_MS);
+    assert_eq!(chart_of(&store, "a", "cpu.usage", range, HOUR_MS).series[0].points[0].max, 10.0);
+
+    // As from an agent that was cut off and sends what it kept once it's back.
+    write_metric(&mut store, "a", (start + 20 * 60_000 + 5_000) as u64, "cpu", json!({ "usage_percent": 90.0 }));
+    settle(&mut store, crate::metrics::now_ms());
+
+    let point = chart_of(&store, "a", "cpu.usage", range, HOUR_MS).series[0].points[0];
+    assert_eq!(point.max, 90.0);
+    assert!((point.avg - (240.0 * 10.0 + 90.0) / 241.0).abs() < 1e-9, "{point:?}");
+}
+
+#[test]
+fn deleting_an_agent_deletes_its_rollups() {
+    let mut store = with_retention(Retention::KEEP_EVERYTHING);
+    let start = hours_ago(5);
+    cpu_from(&mut store, "gone", start, 60, 10.0, &[]);
+    cpu_from(&mut store, "kept", start, 60, 20.0, &[]);
+    settle(&mut store, crate::metrics::now_ms());
+
+    store.delete_agent("gone").unwrap();
+
+    let range = (start, start + HOUR_MS);
+    assert!(chart_of(&store, "gone", "cpu.usage", range, HOUR_MS).series.is_empty());
+    assert_eq!(averages(&chart_of(&store, "kept", "cpu.usage", range, HOUR_MS).series[0]), [20.0]);
+}
+
+#[test]
+fn rollups_go_once_they_are_older_than_they_are_kept() {
+    let mut store = with_retention(retention(2, 3, Some(4)));
+    let five_days_ago = hours_ago(120);
+    let three_and_a_half_days_ago = hours_ago(84);
+    cpu_from(&mut store, "a", five_days_ago, 60, 10.0, &[]);
+    cpu_from(&mut store, "a", three_and_a_half_days_ago, 60, 20.0, &[]);
+
+    settle(&mut store, crate::metrics::now_ms());
+
+    let gone = (five_days_ago, five_days_ago + HOUR_MS);
+    assert!(chart_of(&store, "a", "cpu.usage", gone, HOUR_MS).series.is_empty());
+    // Its minutes are past three days, but its hour is still kept.
+    let kept = (three_and_a_half_days_ago, three_and_a_half_days_ago + HOUR_MS);
+    let close_look = chart_of(&store, "a", "cpu.usage", kept, 15_000);
+    assert_eq!(averages(&close_look.series[0]), [20.0]);
+}
+
+#[test]
+fn machines_are_combined_from_their_rollups() {
+    let mut store = with_retention(Retention::KEEP_EVERYTHING);
+    let start = hours_ago(5);
+    cpu_from(&mut store, "a", start, 60, 10.0, &[]);
+    cpu_from(&mut store, "b", start, 60, 30.0, &[]);
+    settle(&mut store, crate::metrics::now_ms());
+
+    let query = CalculationQuery {
+        metric: find("cpu.usage").unwrap(),
+        range: TimeRange {
+            from_ms: start,
+            to_ms: start + 2 * HOUR_MS,
+            step_ms: HOUR_MS,
+        },
+        calculation: Calculation::Avg,
+        members: ["a", "b"]
+            .iter()
+            .map(|agent_id| Member {
+                agent_id: agent_id.to_string(),
+                group: "all".to_string(),
+            })
+            .collect(),
+        by_series: false,
+        max_lines: 8,
+    };
+    let result = store.reader().unwrap().calculate(&query).unwrap();
+    assert_eq!(averages(&result.series[0]), [20.0]);
+}

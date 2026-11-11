@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -10,14 +10,18 @@ use serde_json::Value;
 use tracing::warn;
 
 use super::flatten::{DataType, ENTRY_LABEL, Reported, flatten};
+use super::rollups::{
+    EXPIRE_EVERY_MS, HOUR_MS, MINUTE_MS, RATE_LEAD_MS, Retention, Tier, full_resolution_cutoff,
+    hour_of, hours_to_redo, is_due, metric_names, tier_for,
+};
 use super::shared::{
     MAX_NAME_BYTES, MAX_SERIES_PER_AGENT, labels_key, rebuilt_output, shortened, top_of,
 };
 use super::{CollectorStats, MetricsReader, NewSample, Store, StoreStats};
 use crate::calculations::{Calculation, CalculationQuery, SMALLEST_STEP_MS, numbered};
 use crate::metrics::{
-    LastSample, Metric, NewestReading, Point, Reading, Series, SeriesQuery, SeriesResult, Source,
-    Trend,
+    LastSample, METRICS, Metric, NewestReading, Point, Reading, Series, SeriesQuery, SeriesResult,
+    Source, Trend, now_ms,
 };
 
 /// A schema change. SeaORM doesn't support DuckDB, so this mirrors how its
@@ -29,10 +33,16 @@ struct Migration {
 
 /// Every schema change, in order. Applied ones are recorded in the database, so
 /// never edit one that has shipped: add a new one instead.
-const MIGRATIONS: &[Migration] = &[Migration {
-    name: "0001_create_tables",
-    sql: include_str!("migrations/0001_create_tables.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        name: "0001_create_tables",
+        sql: include_str!("migrations/0001_create_tables.sql"),
+    },
+    Migration {
+        name: "0002_create_rollups",
+        sql: include_str!("migrations/0002_create_rollups.sql"),
+    },
+];
 
 /// Only the bookkeeping table is created outside a migration, because it is
 /// what records them.
@@ -42,8 +52,6 @@ const CREATE_MIGRATIONS_TABLE: &str = "
         applied_at TIMESTAMP NOT NULL
     );
 ";
-
-const HOUR_MS: i64 = 3_600_000;
 
 /// The most rows sorted at once, so that sorting fits in memory on any size of fleet.
 const MAX_TIDY_ROWS: i64 = 250_000;
@@ -384,10 +392,17 @@ pub struct DuckDbStore {
     /// failed, so that the next write loads it afresh rather than trusting names
     /// the rolled-back write added, which would leave samples pointing nowhere.
     names: Option<Names>,
+    retention: Retention,
+    /// How far each metric is rolled up, as kept in `rollup_progress`.
+    progress: HashMap<String, i64>,
+    /// Hours to roll up again, as kept in `rollup_redo`.
+    redo: BTreeSet<i64>,
+    /// When to next look for old data to delete.
+    next_expiry_ms: i64,
 }
 
 impl DuckDbStore {
-    pub fn open(path: &Path, memory_limit: &str) -> Result<Self> {
+    pub fn open(path: &Path, memory_limit: &str, retention: Retention) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating folder {}", parent.display()))?;
@@ -397,15 +412,29 @@ impl DuckDbStore {
             .with_context(|| format!("invalid DuckDB memory_limit {memory_limit:?}"))?;
         let connection = Connection::open_with_flags(path, config)
             .with_context(|| format!("opening DuckDB database {}", path.display()))?;
-        Self::with_connection(connection)
+        Self::with_connection(connection, retention)
     }
 
-    fn with_connection(mut connection: Connection) -> Result<Self> {
+    fn with_connection(mut connection: Connection, retention: Retention) -> Result<Self> {
         migrate(&mut connection, MIGRATIONS)?;
         let names = Names::load(&connection).context("loading metric names")?;
+        let mut statement =
+            connection.prepare("SELECT metric, done_until_ms FROM rollup_progress")?;
+        let progress = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<duckdb::Result<_>>()?;
+        let mut statement = connection.prepare("SELECT hour_ms FROM rollup_redo")?;
+        let redo = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<duckdb::Result<_>>()?;
+        drop(statement);
         Ok(Self {
             connection,
             names: Some(names),
+            retention,
+            progress,
+            redo,
+            next_expiry_ms: 0,
         })
     }
 
@@ -489,6 +518,12 @@ impl DuckDbStore {
                 params![agent],
             )?;
         }
+        for table in ["rollups_minute", "rollups_hour"] {
+            transaction.execute(
+                &format!("DELETE FROM {table} WHERE agent = ?"),
+                params![agent],
+            )?;
+        }
         transaction.execute("DELETE FROM series WHERE agent = ?", params![agent])?;
         transaction.execute("DELETE FROM agents WHERE id = ?", params![agent])?;
         transaction.commit()?;
@@ -505,10 +540,164 @@ impl DuckDbStore {
         for new in samples {
             names.add_sample(new, &mut rows)?;
         }
+        let late = self.late_hours(&rows);
         let transaction = self.connection.transaction()?;
         write_rows(&transaction, &rows)?;
+        for hour in &late {
+            transaction.execute("INSERT INTO rollup_redo VALUES (?)", params![hour])?;
+        }
         transaction.commit()?;
+        self.redo.extend(late);
         Ok(())
+    }
+
+    /// Hours these rows land in that are already rolled up, and not yet waiting to be
+    /// rolled up again.
+    fn late_hours(&self, rows: &Rows) -> BTreeSet<i64> {
+        let Some(rolled_up_until) = self.progress.values().max().copied() else {
+            return BTreeSet::new();
+        };
+        let times = rows.numbers.iter().map(|(time, ..)| time.div_euclid(1000));
+        let full_since = now_ms() - self.retention.full_ms;
+        let mut hours = hours_to_redo(times, rolled_up_until, full_since);
+        hours.retain(|hour| !self.redo.contains(hour));
+        hours
+    }
+
+    /// Every catalog metric is rolled up this far, or `None` if one hasn't started.
+    fn rolled_up_until(&self) -> Option<i64> {
+        metric_names()
+            .map(|name| self.progress.get(name).copied())
+            .min()
+            .flatten()
+    }
+
+    /// Rolls up the next finished hour for every metric that's reached it, in one
+    /// transaction with their progress. Hours without a single sample are skipped
+    /// over, so a gap costs nothing.
+    fn roll_up_next(&mut self, now_ms: i64) -> Result<bool> {
+        let start = metric_names()
+            .map(|name| self.progress.get(name).copied().unwrap_or(i64::MIN))
+            .min()
+            .unwrap_or(i64::MIN);
+        let first: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT epoch_ms(min(time)) FROM all_samples WHERE time >= epoch_ms($1::BIGINT)",
+                params![start.max(0)],
+                |row| row.get(0),
+            )
+            .context("finding the first sample to roll up")?;
+        let Some(first) = first else {
+            return Ok(false);
+        };
+        let hour = start.max(hour_of(first));
+        if !is_due(hour, now_ms) {
+            return Ok(false);
+        }
+        let due: Vec<&'static Metric> = METRICS
+            .iter()
+            .filter(|metric| {
+                self.progress
+                    .get(metric.name)
+                    .is_none_or(|done| *done <= hour)
+            })
+            .collect();
+
+        let transaction = self.connection.transaction()?;
+        for metric in &due {
+            roll_up_hour(&transaction, metric, hour)?;
+            transaction.execute(
+                "DELETE FROM rollup_progress WHERE metric = ?",
+                params![metric.name],
+            )?;
+            transaction.execute(
+                "INSERT INTO rollup_progress VALUES (?, ?)",
+                params![metric.name, hour + HOUR_MS],
+            )?;
+        }
+        transaction.commit()?;
+        for metric in due {
+            self.progress
+                .insert(metric.name.to_string(), hour + HOUR_MS);
+        }
+        Ok(true)
+    }
+
+    /// Rolls up the earliest hour that got samples after it was rolled up, again.
+    fn redo_next(&mut self) -> Result<bool> {
+        let Some(hour) = self.redo.first().copied() else {
+            return Ok(false);
+        };
+        let transaction = self.connection.transaction()?;
+        for metric in METRICS {
+            if self
+                .progress
+                .get(metric.name)
+                .is_some_and(|done| *done > hour)
+            {
+                for table in ["rollups_minute", "rollups_hour"] {
+                    transaction.execute(
+                        &format!(
+                            "DELETE FROM {table} WHERE metric = ?
+                             AND time >= epoch_ms($2::BIGINT) AND time < epoch_ms($3::BIGINT)"
+                        ),
+                        params![metric.name, hour, hour + HOUR_MS],
+                    )?;
+                }
+                roll_up_hour(&transaction, metric, hour)?;
+            }
+        }
+        transaction.execute("DELETE FROM rollup_redo WHERE hour_ms = ?", params![hour])?;
+        transaction.commit()?;
+        self.redo.remove(&hour);
+        Ok(true)
+    }
+
+    /// Deletes what's older than it's kept for, once an hour. Samples go only once
+    /// they're rolled up, and text only once something newer replaced it, as text is
+    /// only saved when it changes.
+    fn expire(&mut self, now_ms: i64) -> Result<bool> {
+        if now_ms < self.next_expiry_ms {
+            return Ok(false);
+        }
+        let cutoff = full_resolution_cutoff(
+            now_ms,
+            &self.retention,
+            self.rolled_up_until(),
+            self.redo.first().copied(),
+        );
+        let transaction = self.connection.transaction()?;
+        // Nothing is from before 1970, and a time much further back can't be compared.
+        if let Some(cutoff) = cutoff.filter(|cutoff| *cutoff > 0) {
+            for table in ["samples", "samples_recent"] {
+                transaction.execute(
+                    &format!("DELETE FROM {table} WHERE time < epoch_ms($1::BIGINT)"),
+                    params![cutoff],
+                )?;
+            }
+            transaction.execute(
+                "DELETE FROM texts WHERE time < epoch_ms($1::BIGINT)
+                 AND (series_id, time) NOT IN (SELECT series_id, max(time) FROM texts GROUP BY series_id)",
+                params![cutoff],
+            )?;
+        }
+        let kept = [
+            ("rollups_minute", Some(self.retention.minute_ms)),
+            ("rollups_hour", self.retention.hour_ms),
+        ];
+        for (table, kept_ms) in kept {
+            let cutoff = kept_ms.map(|kept_ms| now_ms.saturating_sub(kept_ms));
+            if let Some(cutoff) = cutoff.filter(|cutoff| *cutoff > 0) {
+                transaction.execute(
+                    &format!("DELETE FROM {table} WHERE time < epoch_ms($1::BIGINT)"),
+                    params![cutoff],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        self.next_expiry_ms = now_ms + EXPIRE_EVERY_MS;
+        Ok(false)
     }
 }
 
@@ -556,11 +745,17 @@ impl Store for DuckDbStore {
     fn reader(&self) -> Result<Arc<dyn MetricsReader>> {
         Ok(Arc::new(DuckDbReader {
             connection: Mutex::new(self.connection.try_clone()?),
+            retention: self.retention,
         }))
     }
 
+    /// Sorting comes first, as it keeps up with what's arriving. Then hours to roll up
+    /// again, as charts are wrong until they are, then new hours, then deleting.
     fn tidy(&mut self, now_ms: i64) -> Result<bool> {
-        self.tidy_up_to(now_ms, MAX_TIDY_ROWS)
+        Ok(self.tidy_up_to(now_ms, MAX_TIDY_ROWS)?
+            || self.redo_next()?
+            || self.roll_up_next(now_ms)?
+            || self.expire(now_ms)?)
     }
 
     fn delete_agent(&mut self, agent_id: &str) -> Result<()> {
@@ -594,6 +789,7 @@ fn microseconds(sample: &Sample) -> Result<i64> {
 /// queries don't wait for each other.
 struct DuckDbReader {
     connection: Mutex<Connection>,
+    retention: Retention,
 }
 
 impl DuckDbReader {
@@ -614,7 +810,7 @@ const LARGEST_VALUE: &str = "1e300";
 /// Which rows a reading of a metric covers. `agent` is `None` for every agent.
 struct Scope {
     agent: Option<i32>,
-    time: &'static str,
+    time: String,
 }
 
 /// The number of a stored metric, which is what the sorted samples are found by.
@@ -734,44 +930,128 @@ fn is_rate(source: Source) -> bool {
     }
 }
 
-/// Parameters: from, to, step, and how many series to keep.
-fn series_sql(connection: &Connection, metric: &Metric, agent: i32) -> Result<String> {
-    let rate = is_rate(metric.source);
-    // Each value covers the time since the sample before it. The first in the
-    // range has nothing to compare with, so it's dropped.
-    let values = if rate {
-        "SELECT t, series,
-                v * 1000.0 / NULLIF(t - lag(t) OVER (PARTITION BY series ORDER BY t), 0) AS v
+/// Each reading of a metric as a `computed` table of agent, time, series and value,
+/// with counts made rates. A rate needs the sample before it, so the first is `NULL`.
+fn computed_with(connection: &Connection, metric: &Metric, scope: &Scope) -> Result<String> {
+    let values = if is_rate(metric.source) {
+        "SELECT agent_id, t, series,
+                v * 1000.0 / NULLIF(
+                    t - lag(t) OVER (PARTITION BY agent_id, series ORDER BY t), 0
+                ) AS v
          FROM readings"
     } else {
-        "SELECT t, series, v FROM readings"
+        "SELECT agent_id, t, series, v FROM readings"
     };
-    // An idle interface says nothing, but a CPU at 0% does.
-    let having = if rate { "HAVING max(v) > 0" } else { "" };
-    let scope = Scope {
-        agent: Some(agent),
-        time: "s.time >= epoch_ms($1::BIGINT) AND s.time < epoch_ms($2::BIGINT)",
-    };
-
     Ok(format!(
         "WITH readings AS ({readings}),
-         computed AS ({values}),
-         usable AS (
-             SELECT t, series, v FROM computed
-             WHERE series IS NOT NULL AND abs(v) <= {LARGEST_VALUE}
-         ),
+         computed AS ({values})",
+        readings = readings(connection, metric, scope)?,
+    ))
+}
+
+/// Parameters: from and to, both included.
+fn computed_sql(connection: &Connection, metric: &Metric) -> Result<String> {
+    let scope = Scope {
+        agent: None,
+        time: "s.time >= epoch_ms($1::BIGINT) AND s.time <= epoch_ms($2::BIGINT)".to_string(),
+    };
+    computed_with(connection, metric, &scope)
+}
+
+/// How far a metric is rolled up, if it's started.
+fn rolled_up_until(connection: &Connection, metric: &Metric) -> Result<Option<i64>> {
+    let found = connection.query_row(
+        "SELECT done_until_ms FROM rollup_progress WHERE metric = ?",
+        params![metric.name],
+        |row| row.get(0),
+    );
+    match found {
+        Ok(done) => Ok(Some(done)),
+        Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Parameters: from and to. Rows of `agent_id`, `t`, `series`, `low`, `high`, `summed`
+/// and `samples`: rolled up for what is, at `tier`, and each sample after that, as a
+/// row of its own. Rates read a little before the start, as each needs the sample
+/// before it.
+fn cells_sql(
+    connection: &Connection,
+    metric: &Metric,
+    agent: Option<i32>,
+    tier: Tier,
+    done: Option<i64>,
+) -> Result<String> {
+    let rolled = tier.table().zip(done);
+    let samples_from = match rolled {
+        Some((_, done)) => format!("greatest($1::BIGINT, {done})"),
+        None => "$1::BIGINT".to_string(),
+    };
+    let lead = if is_rate(metric.source) {
+        RATE_LEAD_MS
+    } else {
+        0
+    };
+    let scope = Scope {
+        agent,
+        time: format!(
+            "s.time >= epoch_ms({samples_from} - {lead}) AND s.time < epoch_ms($2::BIGINT)"
+        ),
+    };
+    let mut cells = format!(
+        "SELECT agent_id, t, series, v AS low, v AS high, v AS summed, 1::BIGINT AS samples
+         FROM ({computed} SELECT * FROM computed)
+         WHERE t >= {samples_from} AND series IS NOT NULL AND abs(v) <= {LARGEST_VALUE}",
+        computed = computed_with(connection, metric, &scope)?,
+    );
+    if let Some((table, done)) = rolled {
+        let agent = agent.map_or_else(String::new, |agent| format!("AND r.agent = {agent}"));
+        // The name comes from the catalog, never from a request.
+        cells.push_str(&format!(
+            " UNION ALL
+             SELECT a.agent_id, epoch_ms(r.time) AS t, r.series, r.low, r.high, r.summed,
+                    r.samples
+             FROM {table} r JOIN agents a ON a.id = r.agent
+             WHERE r.metric = '{name}' {agent}
+               AND r.time >= epoch_ms($1::BIGINT)
+               AND r.time < epoch_ms(least($2::BIGINT, {done}))",
+            name = metric.name,
+        ));
+    }
+    Ok(cells)
+}
+
+/// Parameters: from, to, step, and how many series to keep.
+fn series_sql(
+    connection: &Connection,
+    metric: &Metric,
+    agent: i32,
+    tier: Tier,
+    done: Option<i64>,
+) -> Result<String> {
+    // An idle interface says nothing, but a CPU at 0% does.
+    let having = if is_rate(metric.source) {
+        "HAVING max(high) > 0"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "WITH cells AS ({cells}),
          ranked AS (
              SELECT series,
-                    row_number() OVER (ORDER BY avg(v) DESC, series) AS position,
+                    row_number() OVER (ORDER BY sum(summed) / sum(samples) DESC, series)
+                        AS position,
                     count(*) OVER () AS total
-             FROM usable GROUP BY series {having}
+             FROM cells GROUP BY series {having}
          )
-         SELECT series, t // $3::BIGINT * $3::BIGINT AS bucket, avg(v), min(v), max(v), total
-         FROM usable JOIN ranked USING (series)
+         SELECT series, t // $3::BIGINT * $3::BIGINT AS bucket,
+                sum(summed) / sum(samples), min(low), max(high), total
+         FROM cells JOIN ranked USING (series)
          WHERE position <= $4::BIGINT
          GROUP BY series, bucket, total
          ORDER BY series, bucket",
-        readings = readings(connection, metric, &scope)?,
+        cells = cells_sql(connection, metric, Some(agent), tier, done)?,
     ))
 }
 
@@ -782,20 +1062,9 @@ fn calculation_sql(
     connection: &Connection,
     query: &CalculationQuery,
     members: &[(i32, usize)],
+    tier: Tier,
+    done: Option<i64>,
 ) -> Result<String> {
-    let values = if is_rate(query.metric.source) {
-        "SELECT agent_id, t, series,
-                v * 1000.0 / NULLIF(
-                    t - lag(t) OVER (PARTITION BY agent_id, series ORDER BY t), 0
-                ) AS v
-         FROM readings"
-    } else {
-        "SELECT agent_id, t, series, v FROM readings"
-    };
-    let scope = Scope {
-        agent: None,
-        time: "s.time >= epoch_ms($1::BIGINT) AND s.time < epoch_ms($2::BIGINT)",
-    };
     let members: Vec<String> = members
         .iter()
         .map(|(agent, group)| format!("({agent}, {group})"))
@@ -822,18 +1091,15 @@ fn calculation_sql(
 
     Ok(format!(
         "WITH members(agent, grp) AS (VALUES {members}),
-         readings AS ({readings}),
-         computed AS ({values}),
-         usable AS (
-             SELECT agent_id, t, series, v FROM computed
-             WHERE series IS NOT NULL AND abs(v) <= {LARGEST_VALUE} {only_main_line}
-         ),
+         cells AS ({cells}),
          per_series AS (
              SELECT m.grp, u.agent_id, u.series,
-                    u.t // $3::BIGINT * $3::BIGINT AS bucket, avg(u.v) AS v
-             FROM usable u
+                    u.t // $3::BIGINT * $3::BIGINT AS bucket,
+                    sum(u.summed) / sum(u.samples) AS v
+             FROM cells u
              JOIN agents a ON a.agent_id = u.agent_id
              JOIN members m ON m.agent = a.id
+             WHERE true {only_main_line}
              GROUP BY m.grp, u.agent_id, u.series, bucket
          ),
          combined AS (
@@ -853,32 +1119,59 @@ fn calculation_sql(
          WHERE position <= $4::BIGINT
          ORDER BY line, bucket",
         members = members.join(", "),
-        readings = readings(connection, query.metric, &scope)?,
+        cells = cells_sql(connection, query.metric, None, tier, done)?,
     ))
 }
 
-/// Parameters: from and to.
-/// Each reading of a metric across every agent between `$1` and `$2`, as a
-/// `computed` table of agent, time, series and value, with counts made rates.
-fn computed_sql(connection: &Connection, metric: &Metric) -> Result<String> {
-    let values = if is_rate(metric.source) {
-        "SELECT agent_id, t, series,
-                v * 1000.0 / NULLIF(
-                    t - lag(t) OVER (PARTITION BY agent_id, series ORDER BY t), 0
-                ) AS v
-         FROM readings"
+/// Rolls up one hour of a metric: each minute from the samples, and then the hour from
+/// its minutes. Reads from a little before the hour, for the first rate's sample before.
+fn roll_up_hour(connection: &Connection, metric: &Metric, hour: i64) -> Result<()> {
+    let end = hour + HOUR_MS;
+    let lead = if is_rate(metric.source) {
+        RATE_LEAD_MS
     } else {
-        "SELECT agent_id, t, series, v FROM readings"
+        0
     };
     let scope = Scope {
         agent: None,
-        time: "s.time >= epoch_ms($1::BIGINT) AND s.time <= epoch_ms($2::BIGINT)",
+        time: format!(
+            "s.time >= epoch_ms({}::BIGINT) AND s.time < epoch_ms({end}::BIGINT)",
+            hour - lead
+        ),
     };
-    Ok(format!(
-        "WITH readings AS ({readings}),
-         computed AS ({values})",
-        readings = readings(connection, metric, &scope)?,
-    ))
+    // The name comes from the catalog, never from a request.
+    connection
+        .execute(
+            &format!(
+                "INSERT INTO rollups_minute
+             SELECT '{name}', a.id, c.series, epoch_ms(c.minute)::TIMESTAMP,
+                    min(c.v), max(c.v), sum(c.v), count(*)
+             FROM (
+                 {computed}
+                 SELECT agent_id, series, v, t // {MINUTE_MS} * {MINUTE_MS} AS minute
+                 FROM computed
+                 WHERE series IS NOT NULL AND abs(v) <= {LARGEST_VALUE}
+                   AND t >= {hour} AND t < {end}
+             ) c JOIN agents a ON a.agent_id = c.agent_id
+             GROUP BY a.id, c.series, c.minute",
+                name = metric.name,
+                computed = computed_with(connection, metric, &scope)?,
+            ),
+            [],
+        )
+        .with_context(|| format!("rolling up minutes of {}", metric.name))?;
+    connection
+        .execute(
+            "INSERT INTO rollups_hour
+         SELECT metric, agent, series, epoch_ms($2::BIGINT)::TIMESTAMP,
+                min(low), max(high), sum(summed), sum(samples)::BIGINT
+         FROM rollups_minute
+         WHERE metric = $1 AND time >= epoch_ms($2::BIGINT) AND time < epoch_ms($3::BIGINT)
+         GROUP BY metric, agent, series",
+            params![metric.name, hour, end],
+        )
+        .with_context(|| format!("rolling up the hour of {}", metric.name))?;
+    Ok(())
 }
 
 fn newest_sql(connection: &Connection, metric: &Metric) -> Result<String> {
@@ -930,8 +1223,11 @@ impl MetricsReader for DuckDbReader {
         let Some(agent) = agent_number(&connection, query.agent_id)? else {
             return Ok(SeriesResult::default());
         };
-        let mut statement = connection.prepare(&series_sql(&connection, query.metric, agent)?)?;
         let range = query.range;
+        let tier = tier_for(range.step_ms, range.from_ms, now_ms(), &self.retention);
+        let done = rolled_up_until(&connection, query.metric)?;
+        let mut statement =
+            connection.prepare(&series_sql(&connection, query.metric, agent, tier, done)?)?;
         let rows = statement.query_map(
             params![
                 range.from_ms,
@@ -1128,15 +1424,14 @@ impl MetricsReader for DuckDbReader {
             return Ok(SeriesResult::default());
         }
 
-        let mut statement = connection.prepare(&calculation_sql(&connection, query, &members)?)?;
         let range = query.range;
+        let step = range.step_ms.max(SMALLEST_STEP_MS);
+        let tier = tier_for(step, range.from_ms, now_ms(), &self.retention);
+        let done = rolled_up_until(&connection, query.metric)?;
+        let mut statement =
+            connection.prepare(&calculation_sql(&connection, query, &members, tier, done)?)?;
         let rows = statement.query_map(
-            params![
-                range.from_ms,
-                range.to_ms,
-                range.step_ms.max(SMALLEST_STEP_MS),
-                query.max_lines as i64
-            ],
+            params![range.from_ms, range.to_ms, step, query.max_lines as i64],
             |row| {
                 let line: String = row.get(0)?;
                 let time_ms: i64 = row.get(1)?;
@@ -1312,8 +1607,16 @@ mod tests {
         assert!(error.to_string().contains("Out of Memory"), "{error}");
     }
 
+    fn with_retention(retention: Retention) -> DuckDbStore {
+        DuckDbStore::with_connection(Connection::open_in_memory().unwrap(), retention).unwrap()
+    }
+
     fn in_memory() -> DuckDbStore {
-        DuckDbStore::with_connection(Connection::open_in_memory().unwrap()).unwrap()
+        DuckDbStore::with_connection(
+            Connection::open_in_memory().unwrap(),
+            Retention::KEEP_EVERYTHING,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1348,7 +1651,9 @@ mod tests {
     #[test]
     fn a_catalog_that_could_not_be_reloaded_is_loaded_again_before_the_next_write() {
         let folder = tempfile::tempdir().unwrap();
-        let mut store = DuckDbStore::open(&folder.path().join("m.duckdb"), "1GB").unwrap();
+        let mut store =
+            DuckDbStore::open(&folder.path().join("m.duckdb"), "1GB", Retention::default())
+                .unwrap();
         write_one(&mut store, "a", "h", &sample()).unwrap();
         let newcomer = Sample {
             timestamp_ms: 1_700_000_001_000,
@@ -1377,7 +1682,7 @@ mod tests {
     fn closing_saves_recent_writes_even_with_a_reader_open() {
         let folder = tempfile::tempdir().unwrap();
         let path = folder.path().join("m.duckdb");
-        let mut store = DuckDbStore::open(&path, "1GB").unwrap();
+        let mut store = DuckDbStore::open(&path, "1GB", Retention::default()).unwrap();
         let reader = store.reader().unwrap();
         write_one(&mut store, "a", "h", &sample()).unwrap();
         assert!(path.with_extension("duckdb.wal").exists());
@@ -1706,13 +2011,13 @@ mod tests {
         let failing = json!([{ "name": "site", "up": 0, "error": "refused" }]);
         let working = json!([{ "name": "site", "up": 1 }]);
 
-        let mut store = DuckDbStore::open(&path, "1GB").unwrap();
+        let mut store = DuckDbStore::open(&path, "1GB", Retention::default()).unwrap();
         write_metric(&mut store, "a", 1000, "checks", failing.clone());
         write_metric(&mut store, "a", 2000, "checks", working.clone());
         store.close().unwrap();
         drop(store);
 
-        let mut store = DuckDbStore::open(&path, "1GB").unwrap();
+        let mut store = DuckDbStore::open(&path, "1GB", Retention::default()).unwrap();
         write_metric(&mut store, "a", 3000, "checks", working);
         assert_eq!(text_rows(&store).len(), 2, "nothing new to say");
         write_metric(&mut store, "a", 4000, "checks", failing);
@@ -1726,12 +2031,12 @@ mod tests {
         let path = folder.path().join("m.duckdb");
         let service = |state| json!([{ "name": "nginx", "running": 1, "state": state }]);
 
-        let mut store = DuckDbStore::open(&path, "1GB").unwrap();
+        let mut store = DuckDbStore::open(&path, "1GB", Retention::default()).unwrap();
         write_metric(&mut store, "a", 1000, "services", service("active"));
         store.close().unwrap();
         drop(store);
 
-        let mut store = DuckDbStore::open(&path, "1GB").unwrap();
+        let mut store = DuckDbStore::open(&path, "1GB", Retention::default()).unwrap();
         write_metric(&mut store, "a", 2000, "services", service("active"));
         write_metric(&mut store, "b", 2000, "services", service("active"));
 
@@ -2126,11 +2431,11 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         let path = folder.path().join("nested/maxnines.duckdb");
 
-        let mut store = DuckDbStore::open(&path, "1GB").unwrap();
+        let mut store = DuckDbStore::open(&path, "1GB", Retention::default()).unwrap();
         write_one(&mut store, "agent-1", "web-1", &sample()).unwrap();
         drop(store);
 
-        let mut reopened = DuckDbStore::open(&path, "1GB").unwrap();
+        let mut reopened = DuckDbStore::open(&path, "1GB", Retention::default()).unwrap();
         write_one(&mut reopened, "agent-1", "web-1", &sample()).unwrap();
         assert_eq!(row_count(&reopened), 2);
     }
@@ -2214,8 +2519,8 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         let path = folder.path().join("db");
 
-        DuckDbStore::open(&path, "1GB").unwrap();
-        let store = DuckDbStore::open(&path, "1GB").unwrap();
+        DuckDbStore::open(&path, "1GB", Retention::default()).unwrap();
+        let store = DuckDbStore::open(&path, "1GB", Retention::default()).unwrap();
 
         assert_eq!(
             applied_migrations(&store.connection),
@@ -2226,7 +2531,8 @@ mod tests {
     #[test]
     fn applies_the_memory_limit() {
         let folder = tempfile::tempdir().unwrap();
-        let store = DuckDbStore::open(&folder.path().join("db"), "512MB").unwrap();
+        let store =
+            DuckDbStore::open(&folder.path().join("db"), "512MB", Retention::default()).unwrap();
 
         let limit: String = store
             .connection
@@ -2241,6 +2547,8 @@ mod tests {
     #[test]
     fn rejects_an_invalid_memory_limit() {
         let folder = tempfile::tempdir().unwrap();
-        assert!(DuckDbStore::open(&folder.path().join("db"), "lots").is_err());
+        assert!(
+            DuckDbStore::open(&folder.path().join("db"), "lots", Retention::default()).is_err()
+        );
     }
 }

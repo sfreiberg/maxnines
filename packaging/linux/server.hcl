@@ -16,6 +16,13 @@ metrics "duckdb" {
   path = "/var/lib/maxnines-server/metrics.duckdb"
 }
 
+# How long metrics are kept, in days: every sample, then each minute and each hour as
+# their lowest, highest and average value. Leave hour_days out to keep hours for good.
+retention {
+  full_resolution_days = 30
+  minute_days          = 365
+}
+
 database {
   url = "sqlite:///var/lib/maxnines-server/maxnines.sqlite?mode=rwc"
 }

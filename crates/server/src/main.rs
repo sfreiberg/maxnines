@@ -259,7 +259,7 @@ async fn serve(path: &Path) -> Result<()> {
     let secure_site = config.audience().starts_with("wss://");
     let csrf = csrf::config(&database, secure_site).await?;
     let agents = database.load_agents().await.context("loading agents")?;
-    let store = store::open(&config.metrics)?;
+    let store = store::open(&config.metrics, config.retention)?;
     let metrics = Metrics::new(store.reader()?);
     let status = Arc::new(ServerStatus::new(
         config.metrics.path().map(Path::to_path_buf),

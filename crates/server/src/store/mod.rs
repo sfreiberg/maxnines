@@ -6,6 +6,7 @@
 mod clickhouse;
 mod duckdb;
 mod flatten;
+pub mod rollups;
 mod shared;
 
 use std::collections::{HashMap, VecDeque};
@@ -24,9 +25,10 @@ use tokio::sync::oneshot;
 use tracing::{error, warn};
 
 use crate::calculations::CalculationQuery;
-use crate::config::MetricsConfig;
+use crate::config::{MetricsConfig, RetentionConfig};
 use crate::metrics::{LastSample, Metric, NewestReading, SeriesQuery, SeriesResult, Trend, now_ms};
 use crate::remote_checks::LOCAL_AGENT_ID;
+use rollups::Retention;
 
 /// Samples waiting to be written. When this fills up, connections stop reading
 /// from their agents until the database catches up.
@@ -166,10 +168,11 @@ pub struct WriteCounts {
     pub slowest_write_ms: AtomicU64,
 }
 
-pub fn open(config: &MetricsConfig) -> Result<Box<dyn Store>> {
+pub fn open(config: &MetricsConfig, retention: RetentionConfig) -> Result<Box<dyn Store>> {
+    let retention = Retention::from(retention);
     Ok(match config {
         MetricsConfig::Duckdb { path, memory_limit } => {
-            Box::new(duckdb::DuckDbStore::open(path, memory_limit)?)
+            Box::new(duckdb::DuckDbStore::open(path, memory_limit, retention)?)
         }
         MetricsConfig::Clickhouse {
             url,
@@ -181,6 +184,7 @@ pub fn open(config: &MetricsConfig) -> Result<Box<dyn Store>> {
             database,
             user.as_deref(),
             password_file.as_deref(),
+            retention,
         )?),
     })
 }

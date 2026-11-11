@@ -1,9 +1,9 @@
 //! Metrics in ClickHouse, for fleets too big for DuckDB. Everything's kept by name
 //! rather than by number, because ClickHouse compresses sorted repeats to almost
 //! nothing and works best without joins. It sorts and drops repeated samples itself
-//! when it merges, so there's no upkeep to do here.
+//! when it merges, so the only upkeep is rolling up and deleting what's too old.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
@@ -18,6 +18,10 @@ use tokio::runtime::{Builder, Runtime};
 use tracing::warn;
 
 use super::flatten::{DataType, ENTRY_LABEL, Reported, flatten};
+use super::rollups::{
+    EXPIRE_EVERY_MS, HOUR_MS, MINUTE_MS, RATE_LEAD_MS, Retention, Tier, full_resolution_cutoff,
+    hour_of, hours_to_redo, is_due, metric_names, tier_for,
+};
 use super::shared::{
     MAX_NAME_BYTES, MAX_SERIES_PER_AGENT, StoredSeries, labels_key, rebuilt_output, shortened,
     top_of,
@@ -25,8 +29,8 @@ use super::shared::{
 use super::{CollectorStats, LATEST_SAMPLE_MS, MetricsReader, NewSample, Store, StoreStats};
 use crate::calculations::{Calculation, CalculationQuery, SMALLEST_STEP_MS, numbered};
 use crate::metrics::{
-    LastSample, Metric, NewestReading, Point, Reading, Series, SeriesQuery, SeriesResult, Source,
-    Trend,
+    LastSample, METRICS, Metric, NewestReading, Point, Reading, Series, SeriesQuery, SeriesResult,
+    Source, Trend, now_ms,
 };
 
 /// Anything beyond this is skipped, as in the other stores.
@@ -41,10 +45,11 @@ const MAX_QUERY_BYTES: &str = "67108864";
 /// so each statement can safely run again. Months keep partitions to a number that
 /// can't grow out of hand, whatever times agents send. The hour in the sort order lets
 /// a query for what's recent skip everything older.
-const MIGRATIONS: &[(&str, &[&str])] = &[(
-    "0001_create_tables",
-    &[
-        "CREATE TABLE IF NOT EXISTS samples (
+const MIGRATIONS: &[(&str, &[&str])] = &[
+    (
+        "0001_create_tables",
+        &[
+            "CREATE TABLE IF NOT EXISTS samples (
              metric String,
              agent  String,
              labels Map(String, String),
@@ -55,8 +60,8 @@ const MIGRATIONS: &[(&str, &[&str])] = &[(
          ENGINE = ReplacingMergeTree
          PARTITION BY toStartOfMonth(time)
          ORDER BY (metric, toStartOfHour(time), agent, labels, time)",
-        // Text, only when it changes. Nothing means it stopped being reported.
-        "CREATE TABLE IF NOT EXISTS texts (
+            // Text, only when it changes. Nothing means it stopped being reported.
+            "CREATE TABLE IF NOT EXISTS texts (
              metric String,
              agent  String,
              labels Map(String, String),
@@ -66,24 +71,74 @@ const MIGRATIONS: &[(&str, &[&str])] = &[(
          ENGINE = ReplacingMergeTree
          PARTITION BY toStartOfMonth(time)
          ORDER BY (agent, metric, labels, time)",
-        // What exists, to limit what an agent can create without reading the samples.
-        "CREATE TABLE IF NOT EXISTS series (
+            // What exists, to limit what an agent can create without reading the samples.
+            "CREATE TABLE IF NOT EXISTS series (
              agent  String,
              metric String,
              labels Map(String, String)
          )
          ENGINE = ReplacingMergeTree
          ORDER BY (agent, metric, labels)",
-        // When each agent reported, so asking who's current doesn't read the samples.
-        "CREATE TABLE IF NOT EXISTS reports (
+            // When each agent reported, so asking who's current doesn't read the samples.
+            "CREATE TABLE IF NOT EXISTS reports (
              time  DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
              agent String
          )
          ENGINE = ReplacingMergeTree
          PARTITION BY toStartOfMonth(time)
          ORDER BY (time, agent)",
-    ],
-)];
+        ],
+    ),
+    (
+        "0002_create_rollups",
+        &[
+            // What each chart in the catalog showed, a minute and an hour at a time, as
+            // the lowest, highest and total value and how many there were. An hour
+            // rolled up again is written again with a higher version, which replaces
+            // the old rows when ClickHouse merges them, and reads say FINAL until then.
+            "CREATE TABLE IF NOT EXISTS rollups_minute (
+                 metric  LowCardinality(String),
+                 agent   String,
+                 series  String,
+                 time    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
+                 low     Float64,
+                 high    Float64,
+                 summed  Float64,
+                 samples UInt64,
+                 version UInt64
+             )
+             ENGINE = ReplacingMergeTree(version)
+             PARTITION BY toStartOfMonth(time)
+             ORDER BY (metric, agent, series, time)",
+            "CREATE TABLE IF NOT EXISTS rollups_hour (
+                 metric  LowCardinality(String),
+                 agent   String,
+                 series  String,
+                 time    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
+                 low     Float64,
+                 high    Float64,
+                 summed  Float64,
+                 samples UInt64,
+                 version UInt64
+             )
+             ENGINE = ReplacingMergeTree(version)
+             PARTITION BY toStartOfYear(time)
+             ORDER BY (metric, agent, series, time)",
+            // How far each metric is rolled up: every hour before this, in milliseconds.
+            "CREATE TABLE IF NOT EXISTS rollup_progress (
+                 metric        String,
+                 done_until_ms Int64,
+                 version       UInt64
+             )
+             ENGINE = ReplacingMergeTree(version)
+             ORDER BY metric",
+            // Hours that got samples after they were rolled up, to roll up again.
+            "CREATE TABLE IF NOT EXISTS rollup_redo (hour_ms Int64)
+             ENGINE = ReplacingMergeTree
+             ORDER BY hour_ms",
+        ],
+    ),
+];
 
 /// One runtime for every store, as the client is async and stores aren't. It's never
 /// shut down, because that isn't allowed from the async code a store can be dropped in.
@@ -499,6 +554,33 @@ async fn migrate(client: &Client) -> Result<()> {
 pub struct ClickHouseStore {
     client: Client,
     memory: Memory,
+    retention: Retention,
+    /// How far each metric is rolled up, as kept in `rollup_progress`.
+    progress: HashMap<String, i64>,
+    /// Hours to roll up again, as kept in `rollup_redo`.
+    redo: BTreeSet<i64>,
+    /// When to next look for old data to delete.
+    next_expiry_ms: i64,
+    /// The last version rollups were written with, as each has to be higher.
+    version: u64,
+}
+
+#[derive(Row, Deserialize)]
+struct ProgressRow {
+    metric: String,
+    done_until_ms: i64,
+}
+
+#[derive(Row, Serialize, Deserialize)]
+struct RedoRow {
+    hour_ms: i64,
+}
+
+#[derive(Row, Serialize)]
+struct NewProgress {
+    metric: String,
+    done_until_ms: i64,
+    version: u64,
 }
 
 impl ClickHouseStore {
@@ -508,6 +590,7 @@ impl ClickHouseStore {
         database: &str,
         user: Option<&str>,
         password_file: Option<&Path>,
+        retention: Retention,
     ) -> Result<Self> {
         let mut client = Client::default().with_url(url);
         if let Some(user) = user {
@@ -530,7 +613,26 @@ impl ClickHouseStore {
                     let client = client.clone().with_database(&database);
                     migrate(&client).await?;
                     let memory = load_memory(&client).await?;
-                    anyhow::Ok(Self { client, memory })
+                    let progress: Vec<ProgressRow> = client
+                        .query("SELECT metric, done_until_ms FROM rollup_progress FINAL")
+                        .fetch_all()
+                        .await?;
+                    let redo: Vec<RedoRow> = client
+                        .query("SELECT hour_ms FROM rollup_redo FINAL")
+                        .fetch_all()
+                        .await?;
+                    anyhow::Ok(Self {
+                        client,
+                        memory,
+                        retention,
+                        progress: progress
+                            .into_iter()
+                            .map(|row| (row.metric, row.done_until_ms))
+                            .collect(),
+                        redo: redo.into_iter().map(|row| row.hour_ms).collect(),
+                        next_expiry_ms: 0,
+                        version: 0,
+                    })
                 })
             });
             opening
@@ -557,7 +659,15 @@ impl ClickHouseStore {
     /// Samples first and the list of series last, so a delete that fails partway
     /// still knows what's left to delete when it's tried again.
     async fn delete_rows(&self, agent_id: &str) -> Result<()> {
-        for table in ["samples", "texts", "reports", "series"] {
+        let tables = [
+            "samples",
+            "texts",
+            "reports",
+            "rollups_minute",
+            "rollups_hour",
+            "series",
+        ];
+        for table in tables {
             self.client
                 .query(&format!("DELETE FROM {table} WHERE agent = ?"))
                 .bind(agent_id)
@@ -576,6 +686,217 @@ impl ClickHouseStore {
     }
 }
 
+impl ClickHouseStore {
+    /// Higher than any before, so a rollup written again replaces the old one.
+    fn next_version(&mut self) -> u64 {
+        self.version = self
+            .version
+            .saturating_add(1)
+            .max(u64::try_from(now_ms()).unwrap_or(0));
+        self.version
+    }
+
+    /// Hours these rows land in that are already rolled up, and not yet waiting to be
+    /// rolled up again.
+    fn late_hours(&self, rows: &Rows) -> BTreeSet<i64> {
+        let Some(rolled_up_until) = self.progress.values().max().copied() else {
+            return BTreeSet::new();
+        };
+        let times = rows.samples.iter().map(|row| row.time);
+        let full_since = now_ms() - self.retention.full_ms;
+        let mut hours = hours_to_redo(times, rolled_up_until, full_since);
+        hours.retain(|hour| !self.redo.contains(hour));
+        hours
+    }
+
+    /// Every catalog metric is rolled up this far, or `None` if one hasn't started.
+    fn rolled_up_until(&self) -> Option<i64> {
+        metric_names()
+            .map(|name| self.progress.get(name).copied())
+            .min()
+            .flatten()
+    }
+
+    /// Rolls up one hour of a metric: each minute from the samples, and then the hour
+    /// from its minutes.
+    async fn roll_up_hour(&self, metric: &Metric, hour: i64, version: u64) -> Result<()> {
+        let end = hour + HOUR_MS;
+        let lead = if is_rate(metric.source) {
+            RATE_LEAD_MS
+        } else {
+            0
+        };
+        let name = quoted(metric.name);
+        let sql = format!(
+            "INSERT INTO rollups_minute
+                 (metric, agent, series, time, low, high, summed, samples, version)
+             SELECT {name}, agent, series,
+                    fromUnixTimestamp64Milli(toInt64(intDiv(t, {MINUTE_MS}) * {MINUTE_MS}), 'UTC')
+                        AS minute,
+                    min(v), max(v), sum(v), count(), {version}
+             FROM ({values})
+             WHERE t >= {hour} AND t < {end}
+             GROUP BY agent, series, minute",
+            values = computed(metric, &time_between(hour - lead, end, "<")),
+        );
+        self.client
+            .query_raw(&sql)
+            .execute()
+            .await
+            .with_context(|| format!("rolling up minutes of {}", metric.name))?;
+        let sql = format!(
+            "INSERT INTO rollups_hour
+                 (metric, agent, series, time, low, high, summed, samples, version)
+             SELECT metric, agent, series, fromUnixTimestamp64Milli(toInt64({hour}), 'UTC'),
+                    min(low), max(high), sum(summed), sum(samples), {version}
+             FROM rollups_minute FINAL
+             WHERE metric = {name} AND {}
+             GROUP BY metric, agent, series",
+            time_between(hour, end, "<"),
+        );
+        self.client
+            .query_raw(&sql)
+            .execute()
+            .await
+            .with_context(|| format!("rolling up the hour of {}", metric.name))
+    }
+
+    /// Rolls up the next finished hour for every metric that's reached it. Hours
+    /// without a single sample are skipped over, so a gap costs nothing. Without
+    /// transactions, a rollup that stops partway is simply done again.
+    fn roll_up_next(&mut self, now_ms: i64) -> Result<bool> {
+        let start = metric_names()
+            .map(|name| self.progress.get(name).copied().unwrap_or(i64::MIN))
+            .min()
+            .unwrap_or(i64::MIN);
+        let sql = format!(
+            "SELECT toUnixTimestamp64Milli(minOrNull(time))
+             FROM samples WHERE time >= fromUnixTimestamp64Milli(toInt64({}), 'UTC')",
+            start.max(0)
+        );
+        let first: Option<i64> = wait(self.client.query_raw(&sql).fetch_one())
+            .context("finding the first sample to roll up")?;
+        let Some(first) = first else {
+            return Ok(false);
+        };
+        let hour = start.max(hour_of(first));
+        if !is_due(hour, now_ms) {
+            return Ok(false);
+        }
+        let due: Vec<&'static Metric> = METRICS
+            .iter()
+            .filter(|metric| {
+                self.progress
+                    .get(metric.name)
+                    .is_none_or(|done| *done <= hour)
+            })
+            .collect();
+        let version = self.next_version();
+        let progress: Vec<NewProgress> = due
+            .iter()
+            .map(|metric| NewProgress {
+                metric: metric.name.to_string(),
+                done_until_ms: hour + HOUR_MS,
+                version,
+            })
+            .collect();
+        wait(async {
+            for metric in &due {
+                self.roll_up_hour(metric, hour, version).await?;
+            }
+            self.insert("rollup_progress", &progress).await
+        })?;
+        for metric in due {
+            self.progress
+                .insert(metric.name.to_string(), hour + HOUR_MS);
+        }
+        Ok(true)
+    }
+
+    /// Rolls up the earliest hour that got samples after it was rolled up, again.
+    fn redo_next(&mut self) -> Result<bool> {
+        let Some(hour) = self.redo.first().copied() else {
+            return Ok(false);
+        };
+        let version = self.next_version();
+        let done: Vec<&'static Metric> = METRICS
+            .iter()
+            .filter(|metric| {
+                self.progress
+                    .get(metric.name)
+                    .is_some_and(|done| *done > hour)
+            })
+            .collect();
+        wait(async {
+            for metric in done {
+                self.roll_up_hour(metric, hour, version).await?;
+            }
+            self.client
+                .query("DELETE FROM rollup_redo WHERE hour_ms = ?")
+                .bind(hour)
+                .execute()
+                .await
+                .context("noting an hour was rolled up again")
+        })?;
+        self.redo.remove(&hour);
+        Ok(true)
+    }
+
+    /// Deletes what's older than it's kept for, once an hour. Samples go only once
+    /// they're rolled up, and text only once something newer replaced it, as text is
+    /// only saved when it changes.
+    fn expire(&mut self, now_ms: i64) -> Result<bool> {
+        if now_ms < self.next_expiry_ms {
+            return Ok(false);
+        }
+        let cutoff = full_resolution_cutoff(
+            now_ms,
+            &self.retention,
+            self.rolled_up_until(),
+            self.redo.first().copied(),
+        );
+        let mut statements = Vec::new();
+        // Nothing is from before 1970, and a time much further back can't be compared.
+        if let Some(cutoff) = cutoff.filter(|cutoff| *cutoff > 0) {
+            let before = format!("time < fromUnixTimestamp64Milli(toInt64({cutoff}), 'UTC')");
+            statements.push(format!("DELETE FROM samples WHERE {before}"));
+            statements.push(format!("DELETE FROM reports WHERE {before}"));
+            statements.push(format!(
+                "DELETE FROM texts WHERE {before}
+                 AND (agent, metric, labels, time) NOT IN (
+                     SELECT agent, metric, labels, max(time) FROM texts
+                     GROUP BY agent, metric, labels
+                 )"
+            ));
+        }
+        let kept = [
+            ("rollups_minute", Some(self.retention.minute_ms)),
+            ("rollups_hour", self.retention.hour_ms),
+        ];
+        for (table, kept_ms) in kept {
+            let cutoff = kept_ms.map(|kept_ms| now_ms.saturating_sub(kept_ms));
+            if let Some(cutoff) = cutoff.filter(|cutoff| *cutoff > 0) {
+                statements.push(format!(
+                    "DELETE FROM {table}
+                     WHERE time < fromUnixTimestamp64Milli(toInt64({cutoff}), 'UTC')"
+                ));
+            }
+        }
+        wait(async {
+            for statement in &statements {
+                self.client
+                    .query_raw(statement)
+                    .execute()
+                    .await
+                    .context("deleting old metrics")?;
+            }
+            anyhow::Ok(())
+        })?;
+        self.next_expiry_ms = now_ms + EXPIRE_EVERY_MS;
+        Ok(false)
+    }
+}
+
 impl Store for ClickHouseStore {
     /// ClickHouse wants few, large inserts, about one a second.
     fn batch_every(&self) -> Duration {
@@ -590,6 +911,17 @@ impl Store for ClickHouseStore {
                 return Err(error);
             }
         }
+        // Noted first, so an hour can't be left out: if the samples then fail, the hour
+        // is only rolled up again with nothing new.
+        let late = self.late_hours(&rows);
+        if !late.is_empty() {
+            let redo: Vec<RedoRow> = late.iter().map(|hour| RedoRow { hour_ms: *hour }).collect();
+            if let Err(error) = wait(self.insert("rollup_redo", &redo)) {
+                self.memory.take_back(rows.undo);
+                return Err(error);
+            }
+            self.redo.extend(late);
+        }
         let result = wait(self.write_rows(&rows));
         if result.is_err() {
             // None of it may have reached the database, so it all has to go again.
@@ -601,7 +933,14 @@ impl Store for ClickHouseStore {
     fn reader(&self) -> Result<Arc<dyn MetricsReader>> {
         Ok(Arc::new(ClickHouseReader {
             client: self.client.clone(),
+            retention: self.retention,
         }))
+    }
+
+    /// Hours to roll up again come first, as charts are wrong until they are, then new
+    /// hours, then deleting.
+    fn tidy(&mut self, now_ms: i64) -> Result<bool> {
+        Ok(self.redo_next()? || self.roll_up_next(now_ms)? || self.expire(now_ms)?)
     }
 
     fn delete_agent(&mut self, agent_id: &str) -> Result<()> {
@@ -802,16 +1141,69 @@ struct SizeRow {
 
 struct ClickHouseReader {
     client: Client,
+    retention: Retention,
+}
+
+impl ClickHouseReader {
+    /// How far a metric is rolled up, if it's started.
+    fn rolled_up_until(&self, metric: &Metric) -> Result<Option<i64>> {
+        let found: Vec<i64> = wait(
+            self.client
+                .query("SELECT done_until_ms FROM rollup_progress FINAL WHERE metric = ?")
+                .bind(metric.name)
+                .fetch_all(),
+        )?;
+        Ok(found.first().copied())
+    }
+}
+
+/// Rows of `agent`, `t`, `series`, `low`, `high`, `summed` and `samples` between two
+/// times: rolled up for what is, at `tier`, and each sample after that, as a row of its
+/// own. `agents` narrows them down, and is always worked out here. Rates read a little
+/// before the start, as each needs the sample before it.
+fn cells(
+    metric: &Metric,
+    agents: &str,
+    (from_ms, to_ms): (i64, i64),
+    tier: Tier,
+    done: Option<i64>,
+) -> String {
+    let rolled = tier.table().zip(done);
+    let samples_from = rolled.map_or(from_ms, |(_, done)| from_ms.max(done));
+    let lead = if is_rate(metric.source) {
+        RATE_LEAD_MS
+    } else {
+        0
+    };
+    let scope = format!(
+        "{agents} AND {}",
+        time_between(samples_from - lead, to_ms, "<")
+    );
+    let mut cells = format!(
+        "SELECT agent, t, series, v AS low, v AS high, v AS summed, toUInt64(1) AS samples
+         FROM ({values}) WHERE t >= {samples_from}",
+        values = computed(metric, &scope),
+    );
+    if let Some((table, done)) = rolled {
+        cells.push_str(&format!(
+            " UNION ALL
+             SELECT agent, toInt64(toUnixTimestamp64Milli(time)) AS t, series, low, high,
+                    summed, samples
+             FROM {table} FINAL
+             WHERE metric = {name} AND {agents} AND {}",
+            time_between(from_ms, to_ms.min(done), "<"),
+            name = quoted(metric.name),
+        ));
+    }
+    cells
 }
 
 impl MetricsReader for ClickHouseReader {
     fn series(&self, query: &SeriesQuery) -> Result<SeriesResult> {
         let range = query.range;
-        let scope = format!(
-            "agent = {} AND {}",
-            quoted(query.agent_id),
-            time_between(range.from_ms, range.to_ms, "<")
-        );
+        let tier = tier_for(range.step_ms, range.from_ms, now_ms(), &self.retention);
+        let done = self.rolled_up_until(query.metric)?;
+        let agent = format!("agent = {}", quoted(query.agent_id));
         // An idle interface says nothing, but a CPU at 0% does.
         let having = if is_rate(query.metric.source) {
             "WHERE peak > 0"
@@ -832,9 +1224,10 @@ impl MetricsReader for ClickHouseReader {
                                 max(high_v) OVER (PARTITION BY series) AS peak
                          FROM (
                              SELECT series, toInt64(intDiv(t, {step}) * {step}) AS bucket,
-                                    avg(v) AS mean_v, min(v) AS low_v, max(v) AS high_v,
-                                    sum(v) AS sum_v, count() AS rows_v
-                             FROM ({values})
+                                    sum(summed) / sum(samples) AS mean_v,
+                                    min(low) AS low_v, max(high) AS high_v,
+                                    sum(summed) AS sum_v, sum(samples) AS rows_v
+                             FROM ({cells})
                              GROUP BY series, bucket
                          )
                      ) {having}
@@ -842,7 +1235,13 @@ impl MetricsReader for ClickHouseReader {
              )
              WHERE position <= {max_series}
              ORDER BY series, bucket",
-            values = computed(query.metric, &scope),
+            cells = cells(
+                query.metric,
+                &agent,
+                (range.from_ms, range.to_ms),
+                tier,
+                done
+            ),
             step = range.step_ms,
             max_series = query.max_series,
         );
@@ -1037,10 +1436,8 @@ impl MetricsReader for ClickHouseReader {
 
         let range = query.range;
         let step = range.step_ms.max(SMALLEST_STEP_MS);
-        let scope = format!(
-            "has(chosen, agent) AND {}",
-            time_between(range.from_ms, range.to_ms, "<")
-        );
+        let tier = tier_for(step, range.from_ms, now_ms(), &self.retention);
+        let done = self.rolled_up_until(query.metric)?;
         // The list of machines is by far the longest part of the query, so it's only
         // written once, and the list of groups only if there's more than one.
         let (places, line) = if query.by_series {
@@ -1082,8 +1479,9 @@ impl MetricsReader for ClickHouseReader {
                          FROM (
                              SELECT line, bucket, {combined} AS combined FROM (
                                  SELECT {line} AS line, agent, series,
-                                        intDiv(t, {step}) * {step} AS bucket, avg(v) AS v
-                                 FROM ({values})
+                                        intDiv(t, {step}) * {step} AS bucket,
+                                        sum(summed) / sum(samples) AS v
+                                 FROM ({cells})
                                  WHERE 1 {only_main_line}
                                  GROUP BY line, agent, series, bucket
                              )
@@ -1095,7 +1493,13 @@ impl MetricsReader for ClickHouseReader {
              )
              WHERE position <= {max_lines}
              ORDER BY line, bucket",
-            values = computed(query.metric, &scope),
+            cells = cells(
+                query.metric,
+                "has(chosen, agent)",
+                (range.from_ms, range.to_ms),
+                tier,
+                done
+            ),
             to_ms = range.to_ms,
             max_lines = query.max_lines,
         );
@@ -1244,7 +1648,11 @@ mod tests {
     }
 
     fn opened(database: &str) -> TestStore {
-        ClickHouseStore::open(&url(), database, None, None).unwrap()
+        ClickHouseStore::open(&url(), database, None, None, Retention::KEEP_EVERYTHING).unwrap()
+    }
+
+    fn with_retention(retention: Retention) -> TestStore {
+        ClickHouseStore::open(&url(), &new_database(), None, None, retention).unwrap()
     }
 
     fn in_memory() -> TestStore {
@@ -1447,16 +1855,23 @@ mod tests {
         let path = folder.path().join("password");
         std::fs::write(&path, "hunter2-not-in-logs\n").unwrap();
 
-        let error = ClickHouseStore::open(&url(), "x", Some("nobody"), Some(&path))
-            .err()
-            .expect("that user doesn't exist");
+        let error = ClickHouseStore::open(
+            &url(),
+            "x",
+            Some("nobody"),
+            Some(&path),
+            Retention::default(),
+        )
+        .err()
+        .expect("that user doesn't exist");
 
         assert!(!format!("{error:#}").contains("hunter2"), "{error:#}");
     }
 
     #[test]
     fn a_server_that_can_not_be_reached_says_so() {
-        let result = ClickHouseStore::open("http://127.0.0.1:1", "x", None, None);
+        let result =
+            ClickHouseStore::open("http://127.0.0.1:1", "x", None, None, Retention::default());
         let error = result.err().expect("nothing's listening there");
         assert!(
             format!("{error:#}").contains("reaching ClickHouse"),

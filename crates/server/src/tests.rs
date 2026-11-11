@@ -108,7 +108,8 @@ async fn start_with_metrics() -> TestServer {
     let folder = tempfile::tempdir().unwrap();
     let path = folder.path().join("metrics.duckdb");
     let text = format!("metrics \"duckdb\" {{\n  path = {path:?}\n}}\n");
-    let store = store::open(&Config::parse(&text).unwrap().metrics).unwrap();
+    let config = Config::parse(&text).unwrap();
+    let store = store::open(&config.metrics, config.retention).unwrap();
     let reader = store.reader().unwrap();
     start_on("", store, reader, Saved::default(), Some(folder)).await
 }

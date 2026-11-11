@@ -26,6 +26,9 @@ pub struct Config {
     pub heartbeat_timeout_secs: u64,
     /// Where samples are saved.
     pub metrics: MetricsConfig,
+    /// How long samples are kept, at full resolution and rolled up.
+    #[serde(default)]
+    pub retention: RetentionConfig,
     /// Where everything else is saved, such as registered agents.
     #[serde(default)]
     pub database: DatabaseConfig,
@@ -120,6 +123,78 @@ impl MetricsConfig {
             Self::Duckdb { path, .. } => Some(path),
             Self::Clickhouse { .. } => None,
         }
+    }
+}
+
+/// How long metrics are kept, in days. Every sample is kept at full resolution for a
+/// while, and each minute and each hour for longer, as the lowest, highest and average
+/// value. That's what long charts read, so a spike still shows once the samples are
+/// gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionConfig {
+    #[serde(default = "default_full_resolution_days")]
+    pub full_resolution_days: u32,
+    #[serde(default = "default_minute_days")]
+    pub minute_days: u32,
+    /// Left out, hours are kept for good.
+    #[serde(default)]
+    pub hour_days: Option<u32>,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            full_resolution_days: default_full_resolution_days(),
+            minute_days: default_minute_days(),
+            hour_days: None,
+        }
+    }
+}
+
+/// Alerts look back up to a day at full resolution, and an hour is only rolled up
+/// once it's over, so less than this would leave them short.
+pub const MIN_FULL_RESOLUTION_DAYS: u32 = 2;
+
+fn default_full_resolution_days() -> u32 {
+    30
+}
+
+fn default_minute_days() -> u32 {
+    365
+}
+
+/// A century, which is far more than anything needs and keeps times in range.
+const MAX_RETENTION_DAYS: u32 = 36_500;
+
+impl RetentionConfig {
+    fn validate(&self) -> Result<()> {
+        let longest = [self.full_resolution_days, self.minute_days]
+            .into_iter()
+            .chain(self.hour_days)
+            .max()
+            .unwrap_or(0);
+        ensure!(
+            longest <= MAX_RETENTION_DAYS,
+            "retention can be at most {MAX_RETENTION_DAYS} days; leave hour_days out to keep \
+             hours for good"
+        );
+        ensure!(
+            self.full_resolution_days >= MIN_FULL_RESOLUTION_DAYS,
+            "full_resolution_days must be at least {MIN_FULL_RESOLUTION_DAYS}, as alerts look \
+             back up to a day"
+        );
+        ensure!(
+            self.minute_days >= self.full_resolution_days,
+            "minute_days can't be shorter than full_resolution_days"
+        );
+        if let Some(hours) = self.hour_days {
+            ensure!(
+                hours >= self.minute_days,
+                "hour_days can't be shorter than minute_days"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -243,6 +318,7 @@ impl Config {
              after {AGENT_SILENCE_LIMIT_SECS} seconds without hearing from the server"
         );
         config.trusted_networks()?;
+        config.retention.validate().context("retention block")?;
         if let Some(tls) = &config.tls {
             tls.validate().context("tls block")?;
             ensure!(
@@ -495,6 +571,58 @@ mod tests {
 
     fn with_registration(body: &str) -> Result<Config> {
         parse(&format!("{STORAGE}registration {{\n{body}\n}}\n"))
+    }
+
+    fn with_retention(body: &str) -> Result<RetentionConfig> {
+        parse(&format!("{STORAGE}retention {{\n{body}\n}}\n")).map(|config| config.retention)
+    }
+
+    #[test]
+    fn retention_defaults_to_a_month_a_year_and_for_good() {
+        let config = parse(STORAGE).unwrap();
+        assert_eq!(
+            config.retention,
+            RetentionConfig {
+                full_resolution_days: 30,
+                minute_days: 365,
+                hour_days: None,
+            }
+        );
+    }
+
+    #[test]
+    fn each_resolution_can_be_kept_longer() {
+        let retention =
+            with_retention("full_resolution_days = 90\nminute_days = 400\nhour_days = 3650")
+                .unwrap();
+        assert_eq!(retention.full_resolution_days, 90);
+        assert_eq!(retention.minute_days, 400);
+        assert_eq!(retention.hour_days, Some(3650));
+    }
+
+    #[test]
+    fn full_resolution_has_to_cover_what_alerts_look_back_on() {
+        let error = with_retention("full_resolution_days = 1").unwrap_err();
+        assert!(format!("{error:#}").contains("at least 2"), "{error:#}");
+        assert!(with_retention("full_resolution_days = 2").is_ok());
+    }
+
+    #[test]
+    fn a_coarser_resolution_is_never_kept_for_less_time() {
+        assert!(with_retention("full_resolution_days = 400").is_err());
+        assert!(with_retention("minute_days = 30\nhour_days = 20").is_err());
+        assert!(with_retention("full_resolution_days = 365").is_ok());
+    }
+
+    #[test]
+    fn retention_beyond_a_century_is_refused() {
+        assert!(with_retention("hour_days = 40000").is_err());
+        assert!(with_retention("hour_days = 36500").is_ok());
+    }
+
+    #[test]
+    fn an_unknown_retention_setting_is_refused() {
+        assert!(with_retention("raw_days = 5").is_err());
     }
 
     #[test]
