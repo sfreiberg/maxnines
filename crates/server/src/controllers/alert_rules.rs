@@ -491,9 +491,14 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
             RuleRow {
                 id: rule.id,
                 watches: rule.rule.describe(),
-                applies_to: match rule.rule.condition.as_deref() {
-                    None => "Every agent".to_string(),
-                    Some(condition) => Builder::from_expression(condition)
+                applies_to: match (rule.rule.kind, rule.rule.condition.as_deref()) {
+                    // A calculation picks its machines with a filter, not a condition.
+                    (RuleKind::Calculation, _) => match rule.rule.filter.as_deref() {
+                        None | Some("") => "Every agent".to_string(),
+                        Some(filter) => filter.to_string(),
+                    },
+                    (_, None) => "Every agent".to_string(),
+                    (_, Some(condition)) => Builder::from_expression(condition)
                         .map_or_else(|| condition.to_string(), |builder| builder.describe()),
                 },
                 severities: {

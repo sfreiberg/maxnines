@@ -994,6 +994,22 @@ mod calculation_alerts {
     }
 
     #[tokio::test]
+    async fn the_rules_list_says_which_machines_a_calculation_covers() {
+        let server = start().await;
+        let mut narrowed = rule(Calculation::Avg, Comparison::Above, 90.0);
+        narrowed.name = "Web fleet".to_string();
+        narrowed.filter = Some("role=web".to_string());
+        let database = &server.state.database;
+        database.create_alert_rule(&narrowed).await.unwrap();
+
+        let list = Browser::default().get(&server, "/alerts/rules").await;
+        let row = list.body.split("Web fleet").nth(1).unwrap();
+        let row = row.split("</tr>").next().unwrap();
+        assert!(row.contains("role=web"), "{row}");
+        assert!(!row.contains("Every"), "{row}");
+    }
+
+    #[tokio::test]
     async fn staying_under_the_threshold_fires_nothing() {
         let server = start_with_metrics().await;
         let _machines = three_machines(&server).await;
