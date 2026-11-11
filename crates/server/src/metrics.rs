@@ -829,6 +829,16 @@ pub const METRICS: &[Metric] = &[
         ]),
         chart: ShowChart::WithData,
     },
+    // Services that should be running but stopped with an error, on Linux and Windows,
+    // without having to name them first.
+    Metric {
+        name: "system.failed_services",
+        title: "Failed services",
+        unit: Unit::Number,
+        collector: "system",
+        source: Source::Fields(&[("Failed", Reading::Field("$.failed_services"))]),
+        chart: ShowChart::WithData,
+    },
     Metric {
         name: "system.tcp_total",
         title: "All TCP connections",

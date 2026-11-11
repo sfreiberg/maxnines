@@ -13,6 +13,7 @@ use systemstat::{Platform, System};
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use crate::failed_services::Failed;
 use crate::tcp::TcpStates;
 
 /// How long a system tool, like `who`, gets to answer. They're quick when the machine is
@@ -512,7 +513,12 @@ pub async fn login_sessions() -> Option<u64> {
     Some(count_quser(&String::from_utf8_lossy(&output.stdout)))
 }
 
-pub fn report(limits: &Limits, sessions: Option<u64>, tcp: Option<TcpStates>) -> Value {
+pub fn report(
+    limits: &Limits,
+    sessions: Option<u64>,
+    tcp: Option<TcpStates>,
+    failed: Option<Failed>,
+) -> Value {
     let mut report = json!({
         "max_open_files": limits.max_open_files,
         "open_files": limits.open_files,
@@ -524,6 +530,10 @@ pub fn report(limits: &Limits, sessions: Option<u64>, tcp: Option<TcpStates>) ->
     });
     for (name, value) in TcpStates::report(tcp) {
         report[name] = value;
+    }
+    if let Some(failed) = failed {
+        report["failed_services"] = json!(failed.count());
+        report["failed_service_names"] = json!(failed.listed());
     }
     report
 }
@@ -716,7 +726,7 @@ pgpgin 900
 
     #[test]
     fn nothing_is_reported_as_zero_when_a_platform_lacks_it() {
-        let report = report(&Limits::default(), None, None);
+        let report = report(&Limits::default(), None, None, None);
         assert_eq!(report["max_open_files"], Value::Null);
         assert_eq!(report["login_sessions"], Value::Null);
     }

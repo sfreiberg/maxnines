@@ -261,6 +261,17 @@ fn the_top_processes_are_each_a_series_by_name() {
 }
 
 #[test]
+fn failed_services_are_counted_and_named() {
+    let mut store = in_memory();
+    let system = json!({ "failed_services": 2, "failed_service_names": "backup.timer, nginx.service" });
+    write_metric(&mut store, "a", 1000, "system", system);
+
+    assert_eq!(averages(&query(&store, "a", "system.failed_services", 8).series[0]), [2.0]);
+    let latest = latest_output(&store, "a", "system").unwrap();
+    assert_eq!(latest["failed_service_names"], "backup.timer, nginx.service");
+}
+
+#[test]
 fn each_core_is_a_series_named_by_its_number() {
     let mut store = in_memory();
     let cpu = json!({ "usage_percent": 40.0, "per_core_percent": [10.0, 90.0, 20.0] });

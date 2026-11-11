@@ -2,6 +2,7 @@
 
 pub mod counters;
 pub mod disk_activity;
+pub mod failed_services;
 mod file_systems;
 pub mod interface_drops;
 pub mod machine;

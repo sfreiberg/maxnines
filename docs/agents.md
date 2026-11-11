@@ -137,6 +137,11 @@ limit where it has one. They come from the `system` collector, which the Default
 - **Login sessions** come from `who`, and from `quser` on Windows. Each session counts,
   so someone with three terminals open counts three times. Windows Home editions
   don't have `quser`, so they don't report sessions.
+- **Failed services** are counted, and named, without listing them first: on Linux, the
+  units systemd says have failed, as `systemctl --failed` lists them, and on Windows,
+  services that start automatically and stopped with an error. Many of Windows' own
+  stop by design once they've done their job, and those stop cleanly, so they don't
+  count. macOS and FreeBSD have no such state, so they don't report this.
 - **TCP connections** are counted by state: established, listening, and two that pile up
   when something's wrong. Thousands in `TIME_WAIT` can use up the ports for new
   connections, and ones in `CLOSE_WAIT` are usually a program that never closed them.
