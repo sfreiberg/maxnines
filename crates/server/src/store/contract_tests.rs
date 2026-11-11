@@ -1247,10 +1247,10 @@ fn settle(store: &mut TestStore, now_ms: i64) {
     while store.tidy(now_ms).unwrap() {}
 }
 
-fn retention(full_days: i64, minute_days: i64, hour_days: Option<i64>) -> Retention {
+fn retention(full_days: i64, five_minute_days: i64, hour_days: Option<i64>) -> Retention {
     Retention {
         full_ms: full_days * RECENT_DAY_MS,
-        minute_ms: minute_days * RECENT_DAY_MS,
+        five_minute_ms: five_minute_days * RECENT_DAY_MS,
         hour_ms: hour_days.map(|days| days * RECENT_DAY_MS),
     }
 }
@@ -1321,13 +1321,13 @@ fn a_spike_outlasts_its_samples_in_the_rollups() {
     assert!((avg - (239.0 * 10.0 + 100.0) / 240.0).abs() < 1e-9, "{avg}");
     assert_eq!(high_avg_low(&points[1]), (10.0, 10.0, 10.0));
 
-    // Minutes are still kept, so a close look finds the minute it happened in.
-    let minutes = chart_of(&store, "a", "cpu.usage", (start, start + HOUR_MS), 15_000);
-    let points = &minutes.series[0].points;
-    assert_eq!(points.len(), 60);
+    // Every 5 minutes is still kept, so a close look finds when it happened.
+    let spans = chart_of(&store, "a", "cpu.usage", (start, start + HOUR_MS), 15_000);
+    let points = &spans.series[0].points;
+    assert_eq!(points.len(), 12);
     let peak = points.iter().find(|point| point.max == 100.0).unwrap();
     assert_eq!(peak.time_ms, spike);
-    assert_eq!(peak.avg, (3.0 * 10.0 + 100.0) / 4.0);
+    assert_eq!(peak.avg, (19.0 * 10.0 + 100.0) / 20.0);
 }
 
 #[test]
@@ -1409,7 +1409,7 @@ fn rollups_go_once_they_are_older_than_they_are_kept() {
 
     let gone = (five_days_ago, five_days_ago + HOUR_MS);
     assert!(chart_of(&store, "a", "cpu.usage", gone, HOUR_MS).series.is_empty());
-    // Its minutes are past three days, but its hour is still kept.
+    // Its 5 minute spans are past three days, but its hour is still kept.
     let kept = (three_and_a_half_days_ago, three_and_a_half_days_ago + HOUR_MS);
     let close_look = chart_of(&store, "a", "cpu.usage", kept, 15_000);
     assert_eq!(averages(&close_look.series[0]), [20.0]);

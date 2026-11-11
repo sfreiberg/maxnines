@@ -11,8 +11,8 @@ use tracing::warn;
 
 use super::flatten::{DataType, ENTRY_LABEL, Reported, flatten};
 use super::rollups::{
-    EXPIRE_EVERY_MS, HOUR_MS, MINUTE_MS, RATE_LEAD_MS, Retention, Tier, full_resolution_cutoff,
-    hour_of, hours_to_redo, is_due, metric_names, tier_for,
+    EXPIRE_EVERY_MS, FIVE_MINUTES_MS, HOUR_MS, RATE_LEAD_MS, Retention, Tier,
+    full_resolution_cutoff, hour_of, hours_to_redo, is_due, metric_names, tier_for,
 };
 use super::shared::{
     MAX_NAME_BYTES, MAX_SERIES_PER_AGENT, labels_key, rebuilt_output, shortened, top_of,
@@ -41,6 +41,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         name: "0002_create_rollups",
         sql: include_str!("migrations/0002_create_rollups.sql"),
+    },
+    Migration {
+        name: "0003_five_minute_rollups",
+        sql: include_str!("migrations/0003_five_minute_rollups.sql"),
     },
 ];
 
@@ -518,7 +522,7 @@ impl DuckDbStore {
                 params![agent],
             )?;
         }
-        for table in ["rollups_minute", "rollups_hour"] {
+        for table in ["rollups_five_minute", "rollups_hour"] {
             transaction.execute(
                 &format!("DELETE FROM {table} WHERE agent = ?"),
                 params![agent],
@@ -636,7 +640,7 @@ impl DuckDbStore {
                 .get(metric.name)
                 .is_some_and(|done| *done > hour)
             {
-                for table in ["rollups_minute", "rollups_hour"] {
+                for table in ["rollups_five_minute", "rollups_hour"] {
                     transaction.execute(
                         &format!(
                             "DELETE FROM {table} WHERE metric = ?
@@ -683,7 +687,7 @@ impl DuckDbStore {
             )?;
         }
         let kept = [
-            ("rollups_minute", Some(self.retention.minute_ms)),
+            ("rollups_five_minute", Some(self.retention.five_minute_ms)),
             ("rollups_hour", self.retention.hour_ms),
         ];
         for (table, kept_ms) in kept {
@@ -1123,8 +1127,8 @@ fn calculation_sql(
     ))
 }
 
-/// Rolls up one hour of a metric: each minute from the samples, and then the hour from
-/// its minutes. Reads from a little before the hour, for the first rate's sample before.
+/// Rolls up one hour of a metric: each 5 minutes from the samples, and then the hour
+/// from those. Reads from a little before the hour, for the first rate's sample before.
 fn roll_up_hour(connection: &Connection, metric: &Metric, hour: i64) -> Result<()> {
     let end = hour + HOUR_MS;
     let lead = if is_rate(metric.source) {
@@ -1143,29 +1147,30 @@ fn roll_up_hour(connection: &Connection, metric: &Metric, hour: i64) -> Result<(
     connection
         .execute(
             &format!(
-                "INSERT INTO rollups_minute
-             SELECT '{name}', a.id, c.series, epoch_ms(c.minute)::TIMESTAMP,
+                "INSERT INTO rollups_five_minute
+             SELECT '{name}', a.id, c.series, epoch_ms(c.bucket)::TIMESTAMP,
                     min(c.v), max(c.v), sum(c.v), count(*)
              FROM (
                  {computed}
-                 SELECT agent_id, series, v, t // {MINUTE_MS} * {MINUTE_MS} AS minute
+                 SELECT agent_id, series, v,
+                        t // {FIVE_MINUTES_MS} * {FIVE_MINUTES_MS} AS bucket
                  FROM computed
                  WHERE series IS NOT NULL AND abs(v) <= {LARGEST_VALUE}
                    AND t >= {hour} AND t < {end}
              ) c JOIN agents a ON a.agent_id = c.agent_id
-             GROUP BY a.id, c.series, c.minute",
+             GROUP BY a.id, c.series, c.bucket",
                 name = metric.name,
                 computed = computed_with(connection, metric, &scope)?,
             ),
             [],
         )
-        .with_context(|| format!("rolling up minutes of {}", metric.name))?;
+        .with_context(|| format!("rolling up 5 minutes of {}", metric.name))?;
     connection
         .execute(
             "INSERT INTO rollups_hour
          SELECT metric, agent, series, epoch_ms($2::BIGINT)::TIMESTAMP,
                 min(low), max(high), sum(summed), sum(samples)::BIGINT
-         FROM rollups_minute
+         FROM rollups_five_minute
          WHERE metric = $1 AND time >= epoch_ms($2::BIGINT) AND time < epoch_ms($3::BIGINT)
          GROUP BY metric, agent, series",
             params![metric.name, hour, end],
@@ -2497,6 +2502,54 @@ mod tests {
 
         assert!(table_exists(&connection, "second"));
         assert_eq!(applied_migrations(&connection), 2);
+    }
+
+    #[test]
+    fn minute_rollups_become_exactly_the_five_minute_ones() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection, &MIGRATIONS[..2]).unwrap();
+        // Six minutes: five in the first span, with a spike, and one in the next.
+        for minute in 0..6i64 {
+            let high = if minute == 2 { 100.0 } else { 20.0 };
+            connection
+                .execute(
+                    "INSERT INTO rollups_minute
+                     VALUES ('cpu.usage', 1, 'CPU', epoch_ms($1::BIGINT)::TIMESTAMP,
+                             10.0, $2, $3, 4)",
+                    params![minute * 60_000, high, 4.0 * 15.0 + minute as f64],
+                )
+                .unwrap();
+        }
+
+        migrate(&mut connection, MIGRATIONS).unwrap();
+
+        assert!(!table_exists(&connection, "rollups_minute"));
+        let mut statement = connection
+            .prepare(
+                "SELECT epoch_ms(time), low, high, summed, samples FROM rollups_five_minute
+                 ORDER BY time",
+            )
+            .unwrap();
+        let spans: Vec<(i64, f64, f64, f64, i64)> = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<duckdb::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            spans,
+            [
+                (0, 10.0, 100.0, 5.0 * 60.0 + 10.0, 20),
+                (300_000, 10.0, 20.0, 65.0, 4),
+            ]
+        );
     }
 
     #[test]

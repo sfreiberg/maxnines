@@ -251,7 +251,7 @@ One metric from the [catalog](#list-metrics) over a period of time. The server
 chooses `step_ms` to suit the period. Each point covers one step: `avg` is the average
 of what was reported in it, and `min` and `max` the lowest and highest, so a short spike
 shows in `max` however long the step. Long periods are read from what's
-[kept](databases.md#how-long-metrics-are-kept) a minute or an hour at a time. A metric can
+[kept](databases.md#how-long-metrics-are-kept) 5 minutes or an hour at a time. A metric can
 have several series, such as one for each disk, and `hidden` says how many were left out.
 
 | Parameter | Description |

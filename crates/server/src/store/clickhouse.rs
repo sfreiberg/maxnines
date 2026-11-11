@@ -19,8 +19,8 @@ use tracing::warn;
 
 use super::flatten::{DataType, ENTRY_LABEL, Reported, flatten};
 use super::rollups::{
-    EXPIRE_EVERY_MS, HOUR_MS, MINUTE_MS, RATE_LEAD_MS, Retention, Tier, full_resolution_cutoff,
-    hour_of, hours_to_redo, is_due, metric_names, tier_for,
+    EXPIRE_EVERY_MS, FIVE_MINUTES_MS, HOUR_MS, RATE_LEAD_MS, Retention, Tier,
+    full_resolution_cutoff, hour_of, hours_to_redo, is_due, metric_names, tier_for,
 };
 use super::shared::{
     MAX_NAME_BYTES, MAX_SERIES_PER_AGENT, StoredSeries, labels_key, rebuilt_output, shortened,
@@ -136,6 +136,37 @@ const MIGRATIONS: &[(&str, &[&str])] = &[
             "CREATE TABLE IF NOT EXISTS rollup_redo (hour_ms Int64)
              ENGINE = ReplacingMergeTree
              ORDER BY hour_ms",
+        ],
+    ),
+    (
+        "0003_five_minute_rollups",
+        &[
+            // Rollups of 5 minutes instead of 1, which are as fine as a chart of 20 hours
+            // or more can show and take a fifth of the space. Made from the minutes
+            // already rolled up, which gives exactly what rolling up the samples again
+            // would. Each statement can run again: the minutes are only dropped last,
+            // and an empty table stands in for them if that's already happened.
+            "CREATE TABLE IF NOT EXISTS rollups_five_minute (
+                 metric  LowCardinality(String),
+                 agent   String,
+                 series  String,
+                 time    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
+                 low     Float64,
+                 high    Float64,
+                 summed  Float64,
+                 samples UInt64,
+                 version UInt64
+             )
+             ENGINE = ReplacingMergeTree(version)
+             PARTITION BY toStartOfMonth(time)
+             ORDER BY (metric, agent, series, time)",
+            "CREATE TABLE IF NOT EXISTS rollups_minute AS rollups_five_minute",
+            "INSERT INTO rollups_five_minute
+             SELECT metric, agent, series, toStartOfFiveMinutes(time) AS span,
+                    min(low), max(high), sum(summed), sum(samples), max(version)
+             FROM rollups_minute FINAL
+             GROUP BY metric, agent, series, span",
+            "DROP TABLE IF EXISTS rollups_minute",
         ],
     ),
 ];
@@ -514,7 +545,7 @@ async fn load_memory(client: &Client) -> Result<Memory> {
     Ok(memory)
 }
 
-async fn migrate(client: &Client) -> Result<()> {
+async fn migrate(client: &Client, migrations: &[(&str, &[&str])]) -> Result<()> {
     client
         .query(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -526,7 +557,7 @@ async fn migrate(client: &Client) -> Result<()> {
         .await
         .context("creating the migrations table")?;
 
-    for (name, statements) in MIGRATIONS {
+    for (name, statements) in migrations {
         let applied: u64 = client
             .query("SELECT count() FROM schema_migrations WHERE name = ?")
             .bind(*name)
@@ -611,7 +642,7 @@ impl ClickHouseStore {
                         .await
                         .context("reaching ClickHouse")?;
                     let client = client.clone().with_database(&database);
-                    migrate(&client).await?;
+                    migrate(&client, MIGRATIONS).await?;
                     let memory = load_memory(&client).await?;
                     let progress: Vec<ProgressRow> = client
                         .query("SELECT metric, done_until_ms FROM rollup_progress FINAL")
@@ -663,7 +694,7 @@ impl ClickHouseStore {
             "samples",
             "texts",
             "reports",
-            "rollups_minute",
+            "rollups_five_minute",
             "rollups_hour",
             "series",
         ];
@@ -717,8 +748,8 @@ impl ClickHouseStore {
             .flatten()
     }
 
-    /// Rolls up one hour of a metric: each minute from the samples, and then the hour
-    /// from its minutes.
+    /// Rolls up one hour of a metric: each 5 minutes from the samples, and then the hour
+    /// from those.
     async fn roll_up_hour(&self, metric: &Metric, hour: i64, version: u64) -> Result<()> {
         let end = hour + HOUR_MS;
         let lead = if is_rate(metric.source) {
@@ -728,28 +759,29 @@ impl ClickHouseStore {
         };
         let name = quoted(metric.name);
         let sql = format!(
-            "INSERT INTO rollups_minute
+            "INSERT INTO rollups_five_minute
                  (metric, agent, series, time, low, high, summed, samples, version)
              SELECT {name}, agent, series,
-                    fromUnixTimestamp64Milli(toInt64(intDiv(t, {MINUTE_MS}) * {MINUTE_MS}), 'UTC')
-                        AS minute,
+                    fromUnixTimestamp64Milli(
+                        toInt64(intDiv(t, {FIVE_MINUTES_MS}) * {FIVE_MINUTES_MS}), 'UTC'
+                    ) AS span,
                     min(v), max(v), sum(v), count(), {version}
              FROM ({values})
              WHERE t >= {hour} AND t < {end}
-             GROUP BY agent, series, minute",
+             GROUP BY agent, series, span",
             values = computed(metric, &time_between(hour - lead, end, "<")),
         );
         self.client
             .query_raw(&sql)
             .execute()
             .await
-            .with_context(|| format!("rolling up minutes of {}", metric.name))?;
+            .with_context(|| format!("rolling up 5 minutes of {}", metric.name))?;
         let sql = format!(
             "INSERT INTO rollups_hour
                  (metric, agent, series, time, low, high, summed, samples, version)
              SELECT metric, agent, series, fromUnixTimestamp64Milli(toInt64({hour}), 'UTC'),
                     min(low), max(high), sum(summed), sum(samples), {version}
-             FROM rollups_minute FINAL
+             FROM rollups_five_minute FINAL
              WHERE metric = {name} AND {}
              GROUP BY metric, agent, series",
             time_between(hour, end, "<"),
@@ -870,7 +902,7 @@ impl ClickHouseStore {
             ));
         }
         let kept = [
-            ("rollups_minute", Some(self.retention.minute_ms)),
+            ("rollups_five_minute", Some(self.retention.five_minute_ms)),
             ("rollups_hour", self.retention.hour_ms),
         ];
         for (table, kept_ms) in kept {
@@ -1663,6 +1695,59 @@ mod tests {
 
     fn count(store: &TestStore, sql: &str) -> u64 {
         wait(store.client.query(sql).fetch_one()).unwrap()
+    }
+
+    #[test]
+    fn minute_rollups_become_exactly_the_five_minute_ones() {
+        let database = new_database();
+        let client = Client::default().with_url(url());
+        wait(async {
+            client
+                .query_raw(&format!("CREATE DATABASE IF NOT EXISTS `{database}`"))
+                .execute()
+                .await?;
+            let client = client.clone().with_database(&database);
+            migrate(&client, &MIGRATIONS[..2]).await?;
+            // Six minutes: five in the first span, with a spike, and one in the next.
+            for minute in 0..6i64 {
+                let high = if minute == 2 { 100.0 } else { 20.0 };
+                let sql = format!(
+                    "INSERT INTO rollups_minute VALUES ('cpu.usage', 'a', 'CPU',
+                     fromUnixTimestamp64Milli(toInt64({}), 'UTC'), 10, {high}, {}, 4, 1)",
+                    minute * 60_000,
+                    60 + minute
+                );
+                client.query_raw(&sql).execute().await?;
+            }
+            anyhow::Ok(())
+        })
+        .unwrap();
+
+        let store = opened(&database);
+
+        let spans: Vec<(i64, f64, f64, f64, u64)> = wait(
+            store
+                .client
+                .query(
+                    "SELECT toInt64(toUnixTimestamp64Milli(time)), low, high, summed, samples
+                     FROM rollups_five_minute FINAL ORDER BY time",
+                )
+                .fetch_all(),
+        )
+        .unwrap();
+        assert_eq!(
+            spans,
+            [
+                (0, 10.0, 100.0, 5.0 * 60.0 + 10.0, 20),
+                (300_000, 10.0, 20.0, 65.0, 4),
+            ]
+        );
+        let left = count(
+            &store,
+            "SELECT count() FROM system.tables
+             WHERE database = currentDatabase() AND name = 'rollups_minute'",
+        );
+        assert_eq!(left, 0);
     }
 
     #[test]

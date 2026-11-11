@@ -2,10 +2,10 @@
 //! which one a chart reads, and when an hour is ready to roll up.
 //!
 //! Rollups are made from what charts show, a metric from the catalog at a time, with
-//! percentages and rates already worked out. So a minute or an hour keeps the lowest,
+//! percentages and rates already worked out. So 5 minutes or an hour keeps the lowest,
 //! highest and total of the values a chart would have drawn, and a spike in a rate
 //! survives as well as one in a percentage. An hour is rolled up once it's over: its
-//! minutes from the samples, and the hour itself from its minutes.
+//! 5 minute spans from the samples, and the hour itself from those.
 
 use std::collections::BTreeSet;
 
@@ -13,6 +13,10 @@ use crate::config::RetentionConfig;
 use crate::metrics::METRICS;
 
 pub const MINUTE_MS: i64 = 60_000;
+/// The finer of the two rollups. A chart has at most 240 points, so this is as fine
+/// as one of 20 hours or more can show, and a year of it takes a fifth of the space of
+/// minutes.
+pub const FIVE_MINUTES_MS: i64 = 5 * MINUTE_MS;
 pub const HOUR_MS: i64 = 3_600_000;
 const DAY_MS: i64 = 86_400_000;
 
@@ -32,7 +36,7 @@ pub const EXPIRE_EVERY_MS: i64 = HOUR_MS;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
     Full,
-    Minute,
+    FiveMinutes,
     Hour,
 }
 
@@ -41,7 +45,7 @@ impl Tier {
     pub fn table(self) -> Option<&'static str> {
         match self {
             Self::Full => None,
-            Self::Minute => Some("rollups_minute"),
+            Self::FiveMinutes => Some("rollups_five_minute"),
             Self::Hour => Some("rollups_hour"),
         }
     }
@@ -51,7 +55,7 @@ impl Tier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Retention {
     pub full_ms: i64,
-    pub minute_ms: i64,
+    pub five_minute_ms: i64,
     pub hour_ms: Option<i64>,
 }
 
@@ -60,7 +64,7 @@ impl From<RetentionConfig> for Retention {
         let days = |days: u32| i64::from(days) * DAY_MS;
         Self {
             full_ms: days(config.full_resolution_days),
-            minute_ms: days(config.minute_days),
+            five_minute_ms: days(config.five_minute_days),
             hour_ms: config.hour_days.map(days),
         }
     }
@@ -71,7 +75,7 @@ impl Retention {
     #[cfg(test)]
     pub const KEEP_EVERYTHING: Self = Self {
         full_ms: i64::MAX / 4,
-        minute_ms: i64::MAX / 4,
+        five_minute_ms: i64::MAX / 4,
         hour_ms: None,
     };
 }
@@ -88,15 +92,15 @@ impl Default for Retention {
 pub fn tier_for(step_ms: i64, from_ms: i64, now_ms: i64, retention: &Retention) -> Tier {
     let mut tier = if step_ms % HOUR_MS == 0 {
         Tier::Hour
-    } else if step_ms % MINUTE_MS == 0 {
-        Tier::Minute
+    } else if step_ms % FIVE_MINUTES_MS == 0 {
+        Tier::FiveMinutes
     } else {
         Tier::Full
     };
     if tier == Tier::Full && from_ms < now_ms.saturating_sub(retention.full_ms) {
-        tier = Tier::Minute;
+        tier = Tier::FiveMinutes;
     }
-    if tier == Tier::Minute && from_ms < now_ms.saturating_sub(retention.minute_ms) {
+    if tier == Tier::FiveMinutes && from_ms < now_ms.saturating_sub(retention.five_minute_ms) {
         tier = Tier::Hour;
     }
     tier
@@ -162,7 +166,7 @@ mod tests {
     fn retention() -> Retention {
         Retention {
             full_ms: 30 * DAY_MS,
-            minute_ms: 365 * DAY_MS,
+            five_minute_ms: 365 * DAY_MS,
             hour_ms: None,
         }
     }
@@ -172,8 +176,15 @@ mod tests {
         let recent = NOW - HOUR_MS;
         assert_eq!(tier_for(15_000, recent, NOW, &retention()), Tier::Full);
         assert_eq!(tier_for(30_000, recent, NOW, &retention()), Tier::Full);
-        assert_eq!(tier_for(120_000, recent, NOW, &retention()), Tier::Minute);
-        assert_eq!(tier_for(900_000, recent, NOW, &retention()), Tier::Minute);
+        assert_eq!(tier_for(120_000, recent, NOW, &retention()), Tier::Full);
+        assert_eq!(
+            tier_for(300_000, recent, NOW, &retention()),
+            Tier::FiveMinutes
+        );
+        assert_eq!(
+            tier_for(900_000, recent, NOW, &retention()),
+            Tier::FiveMinutes
+        );
         assert_eq!(tier_for(3 * HOUR_MS, recent, NOW, &retention()), Tier::Hour);
     }
 
@@ -182,7 +193,7 @@ mod tests {
         let two_months_ago = NOW - 60 * DAY_MS;
         assert_eq!(
             tier_for(15_000, two_months_ago, NOW, &retention()),
-            Tier::Minute
+            Tier::FiveMinutes
         );
         let two_years_ago = NOW - 730 * DAY_MS;
         assert_eq!(
@@ -251,11 +262,11 @@ mod tests {
     fn retention_comes_from_days() {
         let retention = Retention::from(RetentionConfig {
             full_resolution_days: 2,
-            minute_days: 3,
+            five_minute_days: 3,
             hour_days: Some(4),
         });
         assert_eq!(retention.full_ms, 2 * DAY_MS);
-        assert_eq!(retention.minute_ms, 3 * DAY_MS);
+        assert_eq!(retention.five_minute_ms, 3 * DAY_MS);
         assert_eq!(retention.hour_ms, Some(4 * DAY_MS));
     }
 }

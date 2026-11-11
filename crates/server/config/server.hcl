@@ -74,12 +74,12 @@ metrics "duckdb" {
 # }
 
 # How long metrics are kept, in days. Every sample is kept for full_resolution_days.
-# Each minute and each hour are kept longer, as their lowest, highest and average
+# Each 5 minutes and each hour are kept longer, as their lowest, highest and average
 # value, which is what charts of long ranges read, so a spike still shows. These are
 # the defaults. Leave hour_days out to keep hours for good.
 retention {
   full_resolution_days = 30
-  minute_days          = 365
+  five_minute_days     = 365
   # hour_days          = 1825
 }
 

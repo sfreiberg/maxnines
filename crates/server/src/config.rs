@@ -127,7 +127,7 @@ impl MetricsConfig {
 }
 
 /// How long metrics are kept, in days. Every sample is kept at full resolution for a
-/// while, and each minute and each hour for longer, as the lowest, highest and average
+/// while, and each 5 minutes and each hour for longer, as the lowest, highest and average
 /// value. That's what long charts read, so a spike still shows once the samples are
 /// gone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -135,8 +135,8 @@ impl MetricsConfig {
 pub struct RetentionConfig {
     #[serde(default = "default_full_resolution_days")]
     pub full_resolution_days: u32,
-    #[serde(default = "default_minute_days")]
-    pub minute_days: u32,
+    #[serde(default = "default_five_minute_days")]
+    pub five_minute_days: u32,
     /// Left out, hours are kept for good.
     #[serde(default)]
     pub hour_days: Option<u32>,
@@ -146,7 +146,7 @@ impl Default for RetentionConfig {
     fn default() -> Self {
         Self {
             full_resolution_days: default_full_resolution_days(),
-            minute_days: default_minute_days(),
+            five_minute_days: default_five_minute_days(),
             hour_days: None,
         }
     }
@@ -160,7 +160,7 @@ fn default_full_resolution_days() -> u32 {
     30
 }
 
-fn default_minute_days() -> u32 {
+fn default_five_minute_days() -> u32 {
     365
 }
 
@@ -169,7 +169,7 @@ const MAX_RETENTION_DAYS: u32 = 36_500;
 
 impl RetentionConfig {
     fn validate(&self) -> Result<()> {
-        let longest = [self.full_resolution_days, self.minute_days]
+        let longest = [self.full_resolution_days, self.five_minute_days]
             .into_iter()
             .chain(self.hour_days)
             .max()
@@ -185,13 +185,13 @@ impl RetentionConfig {
              back up to a day"
         );
         ensure!(
-            self.minute_days >= self.full_resolution_days,
-            "minute_days can't be shorter than full_resolution_days"
+            self.five_minute_days >= self.full_resolution_days,
+            "five_minute_days can't be shorter than full_resolution_days"
         );
         if let Some(hours) = self.hour_days {
             ensure!(
-                hours >= self.minute_days,
-                "hour_days can't be shorter than minute_days"
+                hours >= self.five_minute_days,
+                "hour_days can't be shorter than five_minute_days"
             );
         }
         Ok(())
@@ -584,7 +584,7 @@ mod tests {
             config.retention,
             RetentionConfig {
                 full_resolution_days: 30,
-                minute_days: 365,
+                five_minute_days: 365,
                 hour_days: None,
             }
         );
@@ -593,10 +593,10 @@ mod tests {
     #[test]
     fn each_resolution_can_be_kept_longer() {
         let retention =
-            with_retention("full_resolution_days = 90\nminute_days = 400\nhour_days = 3650")
+            with_retention("full_resolution_days = 90\nfive_minute_days = 400\nhour_days = 3650")
                 .unwrap();
         assert_eq!(retention.full_resolution_days, 90);
-        assert_eq!(retention.minute_days, 400);
+        assert_eq!(retention.five_minute_days, 400);
         assert_eq!(retention.hour_days, Some(3650));
     }
 
@@ -610,7 +610,7 @@ mod tests {
     #[test]
     fn a_coarser_resolution_is_never_kept_for_less_time() {
         assert!(with_retention("full_resolution_days = 400").is_err());
-        assert!(with_retention("minute_days = 30\nhour_days = 20").is_err());
+        assert!(with_retention("five_minute_days = 30\nhour_days = 20").is_err());
         assert!(with_retention("full_resolution_days = 365").is_ok());
     }
 
