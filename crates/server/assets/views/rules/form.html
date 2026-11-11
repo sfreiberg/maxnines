@@ -82,6 +82,11 @@
       <small>One name per line, from the <code>custom_metric</code> blocks in each agent's own config. The commands stay on the agent, so a name that isn't defined there just reports a problem.</small>
     </label>
 
+    <label>Windows performance counters
+      <textarea name="counter_names" rows="3" spellcheck="false" placeholder="\Processor(_Total)\% Processor Time">{{ rule.counter_names }}</textarea>
+      <small>One per line, by its English path, such as <code>\Memory\Available MBytes</code>. Use <code>(*)</code> for every instance, such as each disk in <code>\PhysicalDisk(*)\Disk Reads/sec</code>. Only Windows agents report these.</small>
+    </label>
+
     <label>Files and folders
       <textarea name="file_paths" rows="3" spellcheck="false">{{ rule.file_paths }}</textarea>
       <small>One path per line. This reports whether each exists, its size and how long since it changed. Contents are never read.</small>

@@ -43,6 +43,7 @@ struct RuleForm {
     mount_points: String,
     process_names: String,
     custom_names: String,
+    counter_names: String,
     service_names: String,
     file_paths: String,
     apache_urls: String,
@@ -94,6 +95,7 @@ impl RuleForm {
             mount_points: lines(&rule.settings["collectors"]["disk"]["mount_points"]),
             process_names: lines(&rule.settings["collectors"]["processes"]["names"]),
             custom_names: lines(&rule.settings["collectors"]["custom"]["names"]),
+            counter_names: lines(&rule.settings["collectors"]["counters"]["names"]),
             service_names: lines(&rule.settings["collectors"]["services"]["names"]),
             file_paths: lines(&rule.settings["collectors"]["files"]["paths"]),
             apache_urls: lines(&rule.settings["collectors"]["apache"]["urls"]),
@@ -124,6 +126,7 @@ impl RuleForm {
             mount_points: text("mount_points"),
             process_names: text("process_names"),
             custom_names: text("custom_names"),
+            counter_names: text("counter_names"),
             service_names: text("service_names"),
             file_paths: text("file_paths"),
             apache_urls: text("apache_urls"),
@@ -165,6 +168,7 @@ impl RuleForm {
                 "disk" => Some(("mount_points", &self.mount_points)),
                 "processes" => Some(("names", &self.process_names)),
                 "custom" => Some(("names", &self.custom_names)),
+                "counters" => Some(("names", &self.counter_names)),
                 "services" => Some(("names", &self.service_names)),
                 "files" => Some(("paths", &self.file_paths)),
                 "apache" => Some(("urls", &self.apache_urls)),
@@ -702,6 +706,10 @@ mod tests {
                 "processes": { "enabled": true, "names": ["nginx", "postgres"] },
                 "services": { "enabled": true, "names": ["nginx.service"] },
                 "custom": { "enabled": true, "names": ["queue", "disk.temp"] },
+                "counters": {
+                    "enabled": true,
+                    "names": ["\\Memory\\Available MBytes", "\\PhysicalDisk(*)\\Disk Reads/sec"]
+                },
                 "files": { "enabled": true, "paths": ["/var/backup/latest.tar"] },
                 "apache": { "urls": ["http://localhost/server-status?auto"] },
                 "php_fpm": {

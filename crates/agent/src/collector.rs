@@ -10,6 +10,7 @@ use sysinfo::{
     ProcessesToUpdate, System, UpdateKind,
 };
 
+use maxnines_collectors::counters::CounterCollector;
 use maxnines_collectors::machine::{
     CpuCollector, DiskCollector, HostCollector, MemoryCollector, NetworkCollector,
 };
@@ -24,12 +25,15 @@ use crate::system_collector::SystemCollector;
 
 /// Only Linux runs containers for real, so that's the only agent that reads them.
 const LINUX_ONLY: [&str; 1] = ["containers"];
+/// Performance counters are part of Windows.
+const WINDOWS_ONLY: [&str; 1] = ["counters"];
 
 /// What this agent can run, reported to the server as a fact.
 pub fn supported() -> Vec<&'static str> {
     COLLECTORS
         .into_iter()
         .filter(|name| cfg!(target_os = "linux") || !LINUX_ONLY.contains(name))
+        .filter(|name| cfg!(windows) || !WINDOWS_ONLY.contains(name))
         .collect()
 }
 
@@ -68,6 +72,9 @@ fn build(
         "disk" => Box::new(DiskCollector::new(config.mount_points.clone())?),
         "network" => Box::new(NetworkCollector::new()?),
         "processes" => Box::new(ProcessCollector::new(config.names.clone())?),
+        "counters" => Box::new(CounterCollector::new(
+            config.names.clone().unwrap_or_default(),
+        )),
         "sensors" => Box::new(SensorCollector::new()?),
         "system" => Box::new(SystemCollector::new(interval)),
         "checks" => {

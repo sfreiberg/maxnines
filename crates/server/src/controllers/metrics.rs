@@ -313,19 +313,28 @@ async fn show(
         Err(error) => return server_error(&error),
     };
 
-    let custom_metrics: Vec<CustomRow> = match state
-        .metrics
-        .latest_output(&agent.id, "custom", now_ms())
-        .await
-    {
-        Ok(Some(Value::Array(metrics))) => metrics.iter().filter_map(custom_row).collect(),
-        Ok(_) => Vec::new(),
-        Err(error) => return server_error(&error),
-    };
+    // Counters say what they read the same way custom metrics do.
+    let mut readings = Vec::new();
+    for collector in ["custom", "counters"] {
+        match state
+            .metrics
+            .latest_output(&agent.id, collector, now_ms())
+            .await
+        {
+            Ok(Some(Value::Array(items))) => {
+                readings.push(items.iter().filter_map(custom_row).collect::<Vec<_>>());
+            }
+            Ok(_) => readings.push(Vec::new()),
+            Err(error) => return server_error(&error),
+        }
+    }
+    let counters = readings.pop().unwrap_or_default();
+    let custom_metrics = readings.pop().unwrap_or_default();
 
     Page::new(&state, &token, "metrics/show.html")
         .with("checks", &checks)
         .with("custom_metrics", &custom_metrics)
+        .with("counters", &counters)
         .with("is_local", &agent.is_local())
         .with("agent_id", &agent.id)
         .with("host", &agent.host)

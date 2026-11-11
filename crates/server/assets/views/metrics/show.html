@@ -23,7 +23,15 @@
 
 {% if custom_metrics %}
 <section>
-{% include "metrics/_custom.html" %}
+{% set readings_title = "Latest custom metrics" %}{% set readings_name = "Metric" %}{% set readings = custom_metrics %}
+{% include "metrics/_readings.html" %}
+</section>
+{% endif %}
+
+{% if counters %}
+<section>
+{% set readings_title = "Latest performance counters" %}{% set readings_name = "Counter" %}{% set readings = counters %}
+{% include "metrics/_readings.html" %}
 </section>
 {% endif %}
 

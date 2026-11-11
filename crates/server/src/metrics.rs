@@ -1115,6 +1115,30 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
+    // Windows performance counters, each by its path. They measure all sorts of things,
+    // so they're numbers here, and the busiest are charted together.
+    Metric {
+        name: "counters.value",
+        title: "Performance counters",
+        unit: Unit::Number,
+        collector: "counters",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.value"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "counters.ok",
+        title: "Performance counter working",
+        unit: Unit::Number,
+        collector: "counters",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.ok"),
+        },
+        chart: ShowChart::Never,
+    },
     Metric {
         name: "file.exists",
         title: "File exists",

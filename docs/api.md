@@ -408,12 +408,12 @@ lowest priority first, so higher priorities win.
 | Collector option | For | Description |
 | --- | --- | --- |
 | `mount_points` | `disk` | Only these disks, even ones left out by default, like disk images |
-| `names` | `processes`, `services`, `custom` | What to watch. Custom metrics must be defined in the agent's own config |
+| `names` | `processes`, `services`, `custom`, `counters` | What to watch. Custom metrics must be defined in the agent's own config, and counters are Windows performance counter paths, such as `\Memory\Available MBytes` |
 | `paths` | `files` | The files and folders to watch |
 | `checks` | `checks` | What to try reaching, as in [remote checks](#remote-checks) |
 | `urls` | `apache`, `nginx`, `php_fpm` | The status pages to read. Leave it out for the usual page on the machine itself |
 
-The collectors are `apache`, `checks`, `containers`, `cpu`, `custom`, `disk`, `files`, `host`,
+The collectors are `apache`, `checks`, `containers`, `counters`, `cpu`, `custom`, `disk`, `files`, `host`,
 `memory`, `network`, `nginx`, `php_fpm`, `processes`, `sensors`, `services` and
 `system`.
 

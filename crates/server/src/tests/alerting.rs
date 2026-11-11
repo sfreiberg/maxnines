@@ -1530,6 +1530,90 @@ async fn an_agents_page_shows_its_custom_metrics_without_trusting_them() {
 }
 
 #[tokio::test]
+async fn a_windows_machines_page_shows_its_performance_counters() {
+    let server = start_with_metrics().await;
+    let agent = identity();
+    let mut client = server.connect_approved(&agent, "win-1").await;
+    let sample = AgentMessage::Sample(Sample {
+        timestamp_ms: (now_ms() - 1000) as u64,
+        metrics: BTreeMap::from([(
+            "counters".to_string(),
+            json!([
+                { "name": r"\Memory\Available MBytes", "ok": 1, "value": 2048.0 },
+                { "name": r"\PhysicalDisk(*)\Disk Reads/sec", "ok": 1 },
+                { "name": r"\PhysicalDisk(0 C:)\Disk Reads/sec", "value": 7.5 },
+                { "name": r"\No Such\Thing", "ok": 0, "error": "not found on this machine" },
+            ]),
+        )]),
+    });
+    send(&mut client, &sample).await;
+
+    let metric = crate::metrics::find("counters.value").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let newest = loop {
+        let newest = server.state.metrics.newest(metric, now_ms()).await.unwrap();
+        if !newest.is_empty() {
+            break newest;
+        }
+        assert!(Instant::now() < deadline, "the sample never arrived");
+        sleep(Duration::from_millis(10)).await;
+    };
+    let mut series: Vec<&str> = newest
+        .iter()
+        .map(|reading| reading.series.as_str())
+        .collect();
+    series.sort_unstable();
+    assert_eq!(
+        series,
+        [
+            r"\Memory\Available MBytes",
+            r"\PhysicalDisk(0 C:)\Disk Reads/sec"
+        ]
+    );
+
+    let page = Browser::default()
+        .get(&server, &format!("/agents/{}/metrics", agent.id()))
+        .await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("Latest performance counters"));
+    assert!(
+        page.body.contains("<h2>Performance counters</h2>"),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains(">2048<"), "{}", page.body);
+    assert!(page.body.contains("not found on this machine"));
+    assert!(!page.body.contains("Latest custom metrics"));
+}
+
+#[tokio::test]
+async fn a_rule_can_only_choose_counters_by_their_paths() {
+    let server = start().await;
+    let rule = |names: Value| {
+        json!({
+            "name": "Windows",
+            "priority": 100,
+            "settings": { "collectors": { "counters": { "names": names } } },
+        })
+    };
+    let (status, body) = api(
+        &server,
+        "POST",
+        "/api/v1/rules",
+        &rule(json!([r"\Memory\Available MBytes"])),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    for names in [
+        json!(["Memory"]),
+        json!([r"\\server\Memory\Available MBytes"]),
+    ] {
+        let (status, body) = api(&server, "POST", "/api/v1/rules", &rule(names)).await;
+        assert!((400..500).contains(&status), "{status}: {body}");
+    }
+}
+
+#[tokio::test]
 async fn a_rule_can_choose_custom_metrics_by_name_but_not_commands() {
     let server = start().await;
     for settings in [

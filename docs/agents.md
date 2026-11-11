@@ -108,6 +108,32 @@ one. They come from the `system` collector, which the Default config rule turns 
 - **Windows** has no system-wide limits like these, so it reports processes and
   sessions only.
 
+## Windows performance counters
+
+A Windows agent can report any of Windows' performance counters. List them in a config
+rule under **Windows performance counters**, one per line, by their English path:
+
+```text
+\Processor(_Total)\% Processor Time
+\Memory\Available MBytes
+\PhysicalDisk(*)\Avg. Disk sec/Read
+\SQLServer:Buffer Manager\Page life expectancy
+```
+
+- **Names are in English** whatever language Windows is in, so one rule works on every
+  machine. Windows' `typeperf -q` lists what a machine has, in its own language.
+- **`(*)` reports every instance,** such as each disk or each processor, as a series of its
+  own, up to 64 for one path. Programs sharing a name are numbered as Windows numbers
+  them, like `svchost#1`.
+- **Rates are worked out by Windows** between one sample and the next, so a counter like
+  `Disk Reads/sec` has a value from the first sample.
+- **A path a machine doesn't have** is shown as failing on its page, and looked for again
+  on every sample, as software adds its own counters once it's installed.
+
+Each machine's page charts the busiest counters together and lists the latest value of
+each. An alert rule on **Performance counters** can watch one of them by its path.
+Counters are only ever read, never changed, and only on the machine itself.
+
 ## Containers
 
 On Linux, an agent can report on every Docker or Podman container on its machine:

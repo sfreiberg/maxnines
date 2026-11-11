@@ -17,10 +17,11 @@ use serde_json::Value;
 
 /// Every collector the project knows about. An agent reports the ones it can
 /// run in its facts, because older agents may not have them all.
-pub const COLLECTORS: [&str; 16] = [
+pub const COLLECTORS: [&str; 17] = [
     "apache",
     "checks",
     "containers",
+    "counters",
     "cpu",
     "custom",
     "disk",
@@ -177,9 +178,10 @@ pub struct CollectorSettings {
     /// Disk collector only: limit output to these mount points.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mount_points: Option<Vec<String>>,
-    /// Processes, services and custom collectors only: the names to watch. Nothing
-    /// else about what's running on a machine is reported. For custom metrics these
-    /// pick from what the agent's own config defines.
+    /// Processes, services, custom and counters collectors only: the names to watch.
+    /// Nothing else about what's running on a machine is reported. For custom metrics
+    /// these pick from what the agent's own config defines, and for counters they're
+    /// Windows performance counter paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub names: Option<Vec<String>>,
     /// Files collector only: the files and folders to watch.
@@ -301,6 +303,25 @@ impl CheckKind {
             _ => None,
         }
     }
+}
+
+/// A Windows performance counter, by its English path, like
+/// `\Processor(_Total)\% Processor Time` or `\PhysicalDisk(*)\Disk Reads/sec`. It's
+/// only ever read, and only on the machine itself, so a path naming another computer,
+/// starting `\\computer`, isn't one.
+pub fn is_counter_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix('\\') else {
+        return false;
+    };
+    let mut parts = rest.split('\\');
+    let (Some(object), Some(counter), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    path.len() <= MAX_SETTING_LEN
+        && !object.is_empty()
+        && !object.starts_with('(')
+        && !counter.trim().is_empty()
+        && !path.chars().any(char::is_control)
 }
 
 /// Goes on a command line, so it can't be anything an option could look like.
@@ -529,6 +550,11 @@ impl CollectorSettings {
                 collector != "custom" || is_custom_metric_name(name),
                 "{name:?} isn't a valid custom metric name"
             );
+            ensure!(
+                collector != "counters" || is_counter_path(name),
+                "{name:?} isn't a performance counter path, which looks like \
+                 \\Processor(_Total)\\% Processor Time"
+            );
         }
 
         let paths = self.paths.as_deref().unwrap_or_default();
@@ -752,6 +778,33 @@ mod tests {
             json!(too_many),
         ] {
             assert!(watching(names.clone()).validate().is_err(), "{names}");
+        }
+    }
+
+    #[test]
+    fn counter_paths_are_checked() {
+        for path in [
+            r"\Processor(_Total)\% Processor Time",
+            r"\PhysicalDisk(*)\Avg. Disk sec/Read",
+            r"\Memory\Available MBytes",
+            r"\Network Interface(Intel[R] Ethernet)\Bytes Total/sec",
+        ] {
+            assert!(is_counter_path(path), "{path}");
+            with("counters", json!({ "names": [path] }))
+                .validate()
+                .unwrap();
+        }
+        for path in [
+            "Memory\\Available MBytes",
+            r"\Memory",
+            r"\\server\Memory\Available MBytes",
+            r"\(x)\Count",
+            r"\Memory\ ",
+            "\\Memory\\Avail\nable",
+        ] {
+            assert!(!is_counter_path(path), "{path}");
+            let config = with("counters", json!({ "names": [path] }));
+            assert!(config.validate().is_err(), "{path}");
         }
     }
 
