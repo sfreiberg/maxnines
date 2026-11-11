@@ -9,10 +9,12 @@ use tokio::sync::{mpsc, watch};
 
 use crate::alerting::{self, AlertRuleInput, ChannelInput};
 use crate::calculations::Sources;
+use crate::controllers::host_list::HostSearch;
+use crate::events::EventInput;
 use crate::facts::{FlatFacts, unflatten};
 use crate::maintenance::{self, MaintenanceWindowInput};
 use crate::metrics::Metrics;
-use crate::models::{Database, RuleInput};
+use crate::models::{Database, NewEvent, RuleInput};
 use crate::notifier::Senders;
 use crate::passwords::SignInThrottle;
 use crate::presence::Presence;
@@ -76,7 +78,61 @@ impl FromRef<AppState> for CsrfConfig {
     }
 }
 
+/// Why an event couldn't be recorded, in words for whoever sent it, or a failure.
+pub enum EventRefusal {
+    Invalid(String),
+    Failed(anyhow::Error),
+}
+
 impl AppState {
+    /// Records a deploy or a note for the approved machines its filter picks then, as
+    /// `by`. A filter that picks none is refused, as it's most likely a mistake.
+    pub async fn record_event(
+        &self,
+        mut input: EventInput,
+        by: &str,
+        now_ms: i64,
+    ) -> Result<i64, EventRefusal> {
+        input.tidy();
+        let kind = input.check(now_ms).map_err(EventRefusal::Invalid)?;
+        let filter = input.filter.clone().unwrap_or_default();
+        let search = HostSearch::from_database(&self.database, Some(&filter))
+            .await
+            .map_err(EventRefusal::Failed)?;
+        if let Some(error) = search.error {
+            return Err(EventRefusal::Invalid(error));
+        }
+        let agents: Vec<String> = self
+            .registry
+            .list()
+            .await
+            .into_iter()
+            .filter(|agent| {
+                agent.state == AgentState::Approved
+                    && !agent.is_local()
+                    && search.includes(&agent.id, &agent.host)
+            })
+            .map(|agent| agent.id)
+            .collect();
+        if agents.is_empty() {
+            return Err(EventRefusal::Invalid(
+                "No machine matches that filter.".into(),
+            ));
+        }
+        let new = NewEvent {
+            kind,
+            time_ms: input.time_ms.unwrap_or(now_ms),
+            title: &input.title,
+            detail: input.detail.as_deref(),
+            filter: &filter,
+            agents: &agents,
+        };
+        self.database
+            .record_event(&new, by, now_ms)
+            .await
+            .map_err(EventRefusal::Failed)
+    }
+
     /// Deletes a revoked agent and everything kept about it. Metrics go first: if
     /// anything fails, the agent is still listed, revoked, to try again.
     pub async fn delete_agent(&self, id: &str) -> Result<AgentDeletion> {

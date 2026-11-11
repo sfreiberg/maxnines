@@ -3,6 +3,7 @@
 //! Schema changes live in [`crate::migrations`].
 
 mod agent;
+mod agent_boot;
 mod agent_config_status;
 mod agent_fact;
 mod alert;
@@ -18,6 +19,9 @@ mod dashboard;
 mod dashboard_variable;
 mod dashboard_widget;
 mod dashboards;
+mod event;
+mod event_agent;
+mod events;
 mod location_rule;
 mod location_rules;
 mod maintenance_window;
@@ -58,6 +62,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use self::audit::record_change;
+pub use self::events::NewEvent;
 pub use self::stats::DatabaseStats;
 pub use self::two_factor::CHALLENGE_LIFETIME_MS;
 pub use self::users::{
@@ -221,8 +226,8 @@ impl Database {
     }
 
     /// Deletes an agent and everything kept about it: its facts, what it said about
-    /// its config, its alerts with their notifications, and a place on the map made
-    /// for it alone. All or nothing. Returns false if there was no such agent.
+    /// its config, its alerts with their notifications, its part in events, and a
+    /// place on the map made for it alone. All or nothing. Returns false if there was no such agent.
     pub async fn delete_agent(&self, id: &str) -> Result<bool> {
         let _only_writer = self.facts_lock.lock().await;
         let transaction = self.connection.begin().await.context("deleting an agent")?;
@@ -245,6 +250,7 @@ impl Database {
             .exec(&transaction)
             .await
             .context("deleting an agent's config status")?;
+        events::delete_agent_events(&transaction, id).await?;
         location_rule::Entity::delete_many()
             .filter(location_rule::Column::Filter.eq(host_filter::only(id)))
             .exec(&transaction)

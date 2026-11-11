@@ -8,6 +8,7 @@ use chrono::{DateTime, TimeZone};
 use chrono_tz::Tz;
 use serde::Serialize;
 
+use crate::events::TimelineEvent;
 use crate::metrics::{Metric, Point, Series, SeriesResult, TimeRange, Unit};
 use crate::times::format_time;
 
@@ -156,6 +157,15 @@ pub struct Summary {
     pub peak: String,
 }
 
+/// Something that happened, as a line down the chart where it happened.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Marker {
+    pub x: f64,
+    pub kind: &'static str,
+    /// When and what, for hovering over it.
+    pub label: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Chart {
     pub name: &'static str,
@@ -177,6 +187,8 @@ pub struct Chart {
     /// Further than this is a gap in its lines, so it has nothing to show for it.
     pub reach_ms: i64,
     pub summary: Vec<Summary>,
+    /// What happened to the machine while the chart covers.
+    pub markers: Vec<Marker>,
 }
 
 /// A chart with its times in `zone`.
@@ -290,7 +302,30 @@ fn chart_on(
             .zip(&slots)
             .map(|(series, slot)| summary(unit, series, *slot))
             .collect(),
+        markers: Vec::new(),
     }
+}
+
+/// Marks what happened on a chart, leaving out anything outside its range.
+pub fn mark(chart: &mut Chart, events: &[TimelineEvent], range: TimeRange, zone: Tz) {
+    let frame = Frame {
+        width: chart.width,
+        height: chart.height,
+    };
+    chart.markers = events
+        .iter()
+        .filter(|event| (range.from_ms..=range.to_ms).contains(&event.time_ms))
+        .map(|event| Marker {
+            x: x_for(event.time_ms, range, frame),
+            kind: event.kind.as_str(),
+            label: format!(
+                "{} · {}: {}",
+                format_time(u64::try_from(event.time_ms).unwrap_or(0), zone),
+                event.kind.label(),
+                event.title
+            ),
+        })
+        .collect();
 }
 
 fn x_for(time_ms: i64, range: TimeRange, frame: Frame) -> f64 {
@@ -952,6 +987,37 @@ mod tests {
             corners
                 .iter()
                 .all(|(_, y)| (TOP..=Frame::STANDARD.bottom()).contains(y))
+        );
+    }
+
+    #[test]
+    fn events_are_marked_where_they_happened_and_only_in_range() {
+        use crate::events::{EventKind, TimelineEvent};
+        let event = |time_ms: i64, kind: EventKind| TimelineEvent {
+            time_ms,
+            kind,
+            title: "Deployed".into(),
+            detail: None,
+            by: None,
+            id: None,
+        };
+        let mut chart = chart("cpu.usage", vec![series("CPU", &steady(20))]);
+        let events = [
+            event(HOUR_MS / 2, EventKind::Deploy),
+            event(HOUR_MS * 2, EventKind::Restart),
+        ];
+
+        mark(&mut chart, &events, range(), Tz::UTC);
+
+        assert_eq!(chart.markers.len(), 1);
+        let marker = &chart.markers[0];
+        let middle = f64::midpoint(LEFT, Frame::STANDARD.right());
+        assert!((marker.x - middle).abs() < 0.5, "{}", marker.x);
+        assert_eq!(marker.kind, "deploy");
+        assert!(
+            marker.label.ends_with("Deploy: Deployed"),
+            "{}",
+            marker.label
         );
     }
 

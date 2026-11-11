@@ -37,6 +37,7 @@ impl MigratorTrait for Migrator {
             Box::new(CreateDashboardVariables),
             Box::new(TurnOnSystemCollector),
             Box::new(AddBuiltInInodeAlert),
+            Box::new(CreateEvents),
         ]
     }
 }
@@ -2746,6 +2747,136 @@ impl MigrationTrait for AddBuiltInInodeAlert {
     /// The rule is left, as it may have been changed since.
     async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
         Ok(())
+    }
+}
+
+// ---- Events, marked on charts
+
+struct CreateEvents;
+
+impl MigrationName for CreateEvents {
+    fn name(&self) -> &str {
+        "m20261110_000026_create_events"
+    }
+}
+
+#[derive(Iden)]
+enum Events {
+    Table,
+    Id,
+    /// When it happened, which needn't be when it was recorded.
+    TimeMs,
+    /// `deploy`, `note`, `restart` or `config`.
+    Kind,
+    Title,
+    Detail,
+    /// Which machines it was for, as a host filter. Empty for every machine.
+    Filter,
+    /// Who recorded it, or `server` for what the server noticed itself.
+    CreatedBy,
+    CreatedMs,
+}
+
+/// Which machines an event is for, worked out when it's recorded, so a machine added
+/// later doesn't get events from before it existed.
+#[derive(Iden)]
+enum EventAgents {
+    Table,
+    EventId,
+    AgentId,
+}
+
+/// When each machine last started, from the boot time its agent reports, so a
+/// restart can be noticed whenever the agent next connects.
+#[derive(Iden)]
+enum AgentBoots {
+    Table,
+    AgentId,
+    BootMs,
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for CreateEvents {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(Events::Table)
+                    .col(id(Events::Id))
+                    .col(ColumnDef::new(Events::TimeMs).big_integer().not_null())
+                    .col(ColumnDef::new(Events::Kind).string_len(16).not_null())
+                    .col(ColumnDef::new(Events::Title).string_len(200).not_null())
+                    .col(ColumnDef::new(Events::Detail).text())
+                    .col(ColumnDef::new(Events::Filter).string_len(500).not_null())
+                    .col(ColumnDef::new(Events::CreatedBy).string_len(255).not_null())
+                    .col(ColumnDef::new(Events::CreatedMs).big_integer().not_null())
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_events_time")
+                    .table(Events::Table)
+                    .col(Events::TimeMs)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(EventAgents::Table)
+                    .col(
+                        ColumnDef::new(EventAgents::EventId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(EventAgents::AgentId)
+                            .string_len(32)
+                            .not_null(),
+                    )
+                    .primary_key(
+                        Index::create()
+                            .col(EventAgents::EventId)
+                            .col(EventAgents::AgentId),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(EventAgents::Table, EventAgents::EventId)
+                            .to(Events::Table, Events::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_event_agents_agent")
+                    .table(EventAgents::Table)
+                    .col(EventAgents::AgentId)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(AgentBoots::Table)
+                    .col(
+                        ColumnDef::new(AgentBoots::AgentId)
+                            .string_len(32)
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(AgentBoots::BootMs).big_integer().not_null())
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        drop_tables(manager, &["agent_boots", "event_agents", "events"]).await
     }
 }
 

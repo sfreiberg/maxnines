@@ -194,7 +194,7 @@ fn evaluator(server: &TestServer, started_ms: i64) -> Evaluator {
     )
 }
 
-fn cpu_rule() -> AlertRuleInput {
+pub(super) fn cpu_rule() -> AlertRuleInput {
     AlertRuleInput {
         name: "High CPU".to_string(),
         kind: RuleKind::Metric,

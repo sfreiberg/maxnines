@@ -18,6 +18,7 @@ use tokio::time::{Instant, MissedTickBehavior, interval, timeout};
 use tracing::{info, warn};
 
 use crate::app_state::AppState;
+use crate::events::{BOOT_TIME_SLACK_MS, EventKind, restarted};
 use crate::facts::flatten;
 use crate::models::ConfigStatus;
 use crate::presence::Presence;
@@ -224,6 +225,8 @@ enum Job {
         version: String,
         error: Option<String>,
     },
+    /// When the machine started, in milliseconds, as a sample said.
+    Boot(i64),
 }
 
 /// Reads from the agent and pings it until the connection ends, returning why.
@@ -244,6 +247,7 @@ async fn serve(
     ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_heard = Instant::now();
     let mut waiting_sample = None;
+    let mut last_boot = None;
 
     let (jobs, job_queue) = mpsc::channel(JOB_QUEUE_SIZE);
     let (config_sender, mut configs) = mpsc::channel(1);
@@ -297,7 +301,8 @@ async fn serve(
 
                 match message {
                     Some(Ok(Message::Text(text))) => {
-                        waiting_sample = receive(&text, &agent, state, &jobs, &ack_sender);
+                        waiting_sample =
+                            receive(&text, &agent, state, &jobs, &ack_sender, &mut last_boot);
                     }
                     Some(Ok(Message::Close(_))) | None => return "connection closed",
                     Some(Ok(_)) => {}
@@ -321,6 +326,7 @@ async fn do_jobs(
     let mut changes = state.registry.subscribe();
     let mut config_changes = state.config_changes.subscribe();
     let mut sent_version = None;
+    let mut known_boot = None;
 
     send_config(&configs, agent, state, &mut sent_version).await;
     loop {
@@ -341,6 +347,9 @@ async fn do_jobs(
                 }
                 Some(Job::ConfigResult { version, error }) => {
                     save_config_result(version, error, agent, state).await;
+                }
+                Some(Job::Boot(boot_ms)) => {
+                    save_boot(boot_ms, agent, state, &mut known_boot).await;
                 }
                 None => return "connection closed",
             }
@@ -402,6 +411,7 @@ fn receive(
     state: &AppState,
     jobs: &mpsc::Sender<Job>,
     acks: &mpsc::Sender<u64>,
+    last_boot: &mut Option<i64>,
 ) -> Option<WriterCommand> {
     let job = match serde_json::from_str(text) {
         Ok(AgentMessage::Sample(sample)) if sample.timestamp_ms > LATEST_SAMPLE_MS => {
@@ -411,6 +421,7 @@ fn receive(
             return None;
         }
         Ok(AgentMessage::Sample(sample)) => {
+            note_boot(&sample, agent, jobs, last_boot);
             let command = WriterCommand::SaveAndAck {
                 sample: NewSample {
                     agent_id: agent.id.clone(),
@@ -457,6 +468,71 @@ fn receive(
     None
 }
 
+/// Passes on when the machine started, only when it's a later start than this
+/// connection has already passed on. An agent sends samples it kept from before a
+/// restart after its live ones, and those mustn't look like another restart.
+fn note_boot(
+    sample: &maxnines_protocol::Sample,
+    agent: &Agent,
+    jobs: &mpsc::Sender<Job>,
+    last_boot: &mut Option<i64>,
+) {
+    let Some(boot_ms) = sample
+        .metrics
+        .get("host")
+        .and_then(|host| host.get("boot_time_secs"))
+        .and_then(Value::as_i64)
+        .and_then(|secs| secs.checked_mul(1000))
+    else {
+        return;
+    };
+    let later = last_boot.is_none_or(|known| boot_ms > known + BOOT_TIME_SLACK_MS);
+    if later && jobs.try_send(Job::Boot(boot_ms)).is_ok() {
+        *last_boot = Some(boot_ms);
+    } else if later {
+        warn!(
+            id = agent.id,
+            "too much waiting on the database, skipping a boot time"
+        );
+    }
+}
+
+/// Notes when the machine started, and marks a restart when it's later than the start
+/// the server last knew of. `known` is loaded the first time.
+async fn save_boot(boot_ms: i64, agent: &Agent, state: &AppState, known: &mut Option<Option<i64>>) {
+    let previous = match known {
+        Some(previous) => *previous,
+        None => match state.database.boot_time(&agent.id).await {
+            Ok(previous) => previous,
+            Err(error) => {
+                warn!(
+                    id = agent.id,
+                    error = format!("{error:#}"),
+                    "loading boot time failed"
+                );
+                return;
+            }
+        },
+    };
+    let restarted = restarted(previous, boot_ms) && previous.is_some_and(|known| boot_ms > known);
+    if previous.is_some() && !restarted {
+        *known = Some(previous);
+        return;
+    }
+    match state
+        .database
+        .save_boot_time(&agent.id, boot_ms, restarted, now_ms() as i64)
+        .await
+    {
+        Ok(()) => *known = Some(Some(boot_ms)),
+        Err(error) => warn!(
+            id = agent.id,
+            error = format!("{error:#}"),
+            "saving boot time failed"
+        ),
+    }
+}
+
 async fn save_config_result(
     version: String,
     error: Option<String>,
@@ -471,6 +547,21 @@ async fn save_config_result(
         return;
     }
 
+    // A config that took over from a different one is a change worth marking. The first
+    // an agent ever applies isn't, and nor is one it turned down.
+    let changed = match state.database.config_status(&agent.id).await {
+        Ok(previous) => {
+            error.is_none() && previous.is_some_and(|previous| previous.version != version)
+        }
+        Err(error) => {
+            warn!(
+                id = agent.id,
+                error = format!("{error:#}"),
+                "loading config status failed"
+            );
+            false
+        }
+    };
     let status = ConfigStatus {
         version,
         error: error.map(|error| error.chars().take(MAX_ERROR_LEN).collect()),
@@ -481,6 +572,39 @@ async fn save_config_result(
             id = agent.id,
             error = format!("{error:#}"),
             "saving config status failed"
+        );
+        return;
+    }
+    if changed {
+        record_config_change(agent, state, status.reported_at_ms as i64).await;
+    }
+}
+
+/// Marks a new config on the machine's charts, saying which rules it came from.
+async fn record_config_change(agent: &Agent, state: &AppState, now_ms: i64) {
+    let rules = match state.config_for(&agent.id).await {
+        Ok(resolved) => Some(format!(
+            "From rules: {}.",
+            resolved.matched_rules.join(", ")
+        )),
+        Err(_) => None,
+    };
+    let saved = state
+        .database
+        .record_server_event(
+            EventKind::Config,
+            &agent.id,
+            now_ms,
+            "Config changed",
+            rules.as_deref(),
+            now_ms,
+        )
+        .await;
+    if let Err(error) = saved {
+        warn!(
+            id = agent.id,
+            error = format!("{error:#}"),
+            "recording a config change failed"
         );
     }
 }

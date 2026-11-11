@@ -4,6 +4,7 @@ mod alerting;
 mod audit;
 mod dashboards;
 mod docs;
+mod events;
 mod roles;
 mod two_factor;
 mod users;

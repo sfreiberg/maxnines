@@ -217,12 +217,14 @@ pub enum Kind {
     RemoteCheck,
     LocationRule,
     Dashboard,
+    /// A deploy or note marked on charts.
+    Event,
     /// A setting for the whole server.
     Setting,
 }
 
 impl Kind {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::User,
         Self::ApiKey,
         Self::Agent,
@@ -235,6 +237,7 @@ impl Kind {
         Self::RemoteCheck,
         Self::LocationRule,
         Self::Dashboard,
+        Self::Event,
         Self::Setting,
     ];
 
@@ -252,6 +255,7 @@ impl Kind {
             Self::RemoteCheck => "remote_check",
             Self::LocationRule => "location_rule",
             Self::Dashboard => "dashboard",
+            Self::Event => "event",
             Self::Setting => "setting",
         }
     }
@@ -270,6 +274,7 @@ impl Kind {
             Self::RemoteCheck => "Remote check",
             Self::LocationRule => "Location rule",
             Self::Dashboard => "Dashboard",
+            Self::Event => "Event",
             Self::Setting => "Setting",
         }
     }

@@ -6,6 +6,7 @@
       {% for tick in chart.x_ticks %}
       <text class="tick" x="{{ tick.position }}" y="{{ chart.bottom + 18 }}" text-anchor="middle">{{ tick.label }}</text>
       {% endfor %}
+      {% for marker in chart.markers %}<line class="event-line k-{{ marker.kind }}" x1="{{ marker.x }}" x2="{{ marker.x }}" y1="{{ chart.top }}" y2="{{ chart.bottom }}"/>{% endfor %}
       {% for line in chart.lines %}
       {% for band in line.bands %}<polygon class="band s{{ line.slot }}" points="{{ band }}"/>{% endfor %}
       {% for whisker in line.whiskers %}<line class="whisker s{{ line.slot }}" x1="{{ whisker.x }}" x2="{{ whisker.x }}" y1="{{ whisker.top }}" y2="{{ whisker.bottom }}"/>{% endfor %}
@@ -29,4 +30,5 @@
         </g>
       </g>
       {% endfor %}
+      {% for marker in chart.markers %}<circle class="event-dot k-{{ marker.kind }}" cx="{{ marker.x }}" cy="{{ chart.top + 4 }}" r="4"><title>{{ marker.label }}</title></circle>{% endfor %}
     </svg>

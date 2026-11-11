@@ -14,6 +14,7 @@ mod csrf;
 mod dashboard_variables;
 mod dashboards;
 mod docs;
+mod events;
 mod fact_history;
 mod facts;
 mod host_filter;

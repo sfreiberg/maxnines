@@ -10,8 +10,9 @@ use serde_json::Value;
 use tokio::task::JoinSet;
 
 use super::host_list::{HostSearch, address, page_number, paginate};
-use super::{Page, fleet, server_error, viewer_zone};
+use super::{Page, fleet, local_time, server_error, viewer_zone};
 use crate::app_state::AppState;
+use crate::events::TimelineEvent;
 use crate::metric_charts::{self, Chart, MAX_SERIES};
 use crate::metrics::{self, METRICS, Metric, ShowChart, TimeRange, Unit, now_ms};
 
@@ -134,6 +135,37 @@ pub(super) struct RangeParams {
     pub(super) range: Option<String>,
 }
 
+/// What the machine page's address can say: its range, and why a note was refused.
+#[derive(Deserialize, Default)]
+pub(super) struct ShowParams {
+    range: Option<String>,
+    event_error: Option<String>,
+}
+
+/// One line of a machine's Events list.
+#[derive(Serialize)]
+struct EventRow {
+    id: Option<i64>,
+    time: String,
+    kind: &'static str,
+    kind_label: &'static str,
+    title: String,
+    detail: Option<String>,
+    by: Option<String>,
+}
+
+fn event_row(event: TimelineEvent) -> EventRow {
+    EventRow {
+        id: event.id,
+        time: local_time(event.time_ms),
+        kind: event.kind.as_str(),
+        kind_label: event.kind.label(),
+        title: event.title,
+        detail: event.detail,
+        by: event.by,
+    }
+}
+
 #[derive(Serialize)]
 pub(super) struct RangeLink {
     key: &'static str,
@@ -217,13 +249,16 @@ pub(super) fn not_found(state: &AppState, token: &CsrfToken) -> Response {
 async fn show(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(params): Query<RangeParams>,
+    Query(params): Query<ShowParams>,
     token: CsrfToken,
 ) -> Response {
     let Some(agent) = state.registry.get(&id).await else {
         return not_found(&state, &token);
     };
-    let (selected, _, length_ms) = selected_range(&params);
+    let range_params = RangeParams {
+        range: params.range.clone(),
+    };
+    let (selected, _, length_ms) = selected_range(&range_params);
     let Some(range) = time_range(length_ms) else {
         return not_found(&state, &token);
     };
@@ -236,14 +271,27 @@ async fn show(
         Ok(charts) => charts,
         Err(error) => return server_error(&error),
     };
+    let events = match state
+        .database
+        .timeline(&agent.id, range.from_ms, range.to_ms)
+        .await
+    {
+        Ok(events) => events,
+        Err(error) => return server_error(&error),
+    };
+    let zone = viewer_zone();
     let charts: Vec<Chart> = charts
         .into_iter()
         .zip(shown)
         .filter(|(chart, metric)| {
             chart.has_data || (metric.chart == ShowChart::Always && !agent.is_local())
         })
-        .map(|(chart, _)| chart)
+        .map(|(mut chart, _)| {
+            metric_charts::mark(&mut chart, &events, range, zone);
+            chart
+        })
         .collect();
+    let events: Vec<EventRow> = events.into_iter().map(event_row).collect();
 
     let ranges = range_links(selected);
 
@@ -282,6 +330,8 @@ async fn show(
         .with("agent_id", &agent.id)
         .with("host", &agent.host)
         .with("charts", &charts)
+        .with("events", &events)
+        .with("event_error", &params.event_error)
         .with("ranges", &ranges)
         .with("range", selected)
         .render()

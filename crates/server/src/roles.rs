@@ -1,7 +1,7 @@
 //! What each person may do. Roles build on each other: a viewer sees everything,
-//! a responder can also acknowledge and silence alerts, an editor can also change
-//! the setup, and an admin can also manage people, read the audit log and delete
-//! agents.
+//! a responder can also acknowledge and silence alerts and mark events on charts, an
+//! editor can also change the setup, and an admin can also manage people, read the
+//! audit log and delete agents.
 //!
 //! [`required`] is the one place that says what a request needs, and every request
 //! from a person or an API key passes through it before its handler runs. Anything
@@ -46,7 +46,7 @@ impl Role {
     pub fn describe(self) -> &'static str {
         match self {
             Self::Viewer => "Sees everything except users and the audit log",
-            Self::Responder => "Also acknowledges and silences alerts",
+            Self::Responder => "Also acknowledges and silences alerts, and records events",
             Self::Editor => "Also changes rules, channels, checks, dashboards and agents",
             Self::Admin => "Also manages users, reads the audit log and deletes agents",
         }
@@ -77,7 +77,8 @@ const ADMIN_ONLY: [&str; 4] = [
 const OWN: [&str; 4] = ["/profile", "/logout", "/settings/api-keys", "/api-keys"];
 
 /// Dealing with alerts as they happen: acknowledging them and silencing them.
-const RESPONDING: [&str; 9] = [
+const RESPONDING: [&str; 13] = [
+    "/agents/{id}/events",
     "/agents/{id}/maintenance",
     "/agents/{id}/maintenance/end",
     "/alerts/{id}/acknowledge",
@@ -85,6 +86,9 @@ const RESPONDING: [&str; 9] = [
     "/alerts/silences",
     "/alerts/silences/new",
     "/alerts/silences/{id}/end",
+    "/events",
+    "/events/{id}",
+    "/events/{id}/delete",
     "/silences",
     "/silences/{id}/end",
 ];
@@ -188,6 +192,20 @@ mod tests {
             Role::Responder
         );
         assert_eq!(required(&Method::GET, "/alerts/silences"), Role::Viewer);
+        for (method, route) in [
+            (Method::POST, "/agents/{id}/events"),
+            (Method::POST, "/events"),
+            (Method::DELETE, "/events/{id}"),
+            (Method::POST, "/events/{id}/delete"),
+        ] {
+            assert_eq!(
+                required(&method, route),
+                Role::Responder,
+                "{method} {route}"
+            );
+        }
+        assert_eq!(required(&Method::GET, "/events"), Role::Viewer);
+        assert_eq!(required(&Method::GET, "/agents/{id}/events"), Role::Viewer);
         assert_eq!(required(&Method::GET, "/silences"), Role::Viewer);
     }
 

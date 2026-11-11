@@ -19,11 +19,12 @@ use super::fleet::Health;
 use super::host_list::HostSearch;
 use super::users::{refusal, setup_url};
 use crate::alerting::{Alert, AlertRuleInput, ChannelInput, ChannelKind};
-use crate::app_state::{AgentDeletion, AppState};
+use crate::app_state::{AgentDeletion, AppState, EventRefusal};
 use crate::audit::Via;
 use crate::calculations::{self, Calculation, Question};
 use crate::dashboard_variables::{self, Picks, Variable};
 use crate::dashboards::{Placed, WidgetInput, check_layout, check_name};
+use crate::events::EventInput;
 use crate::facts::unflatten;
 use crate::locations::{LocationRuleInput, check_rule};
 use crate::maintenance::MaintenanceWindowInput;
@@ -112,6 +113,9 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/alerts/delivery-problems", get(list_delivery_problems))
         .route("/alerts/{id}/acknowledge", post(acknowledge_alert))
         .route("/alerts/{id}/unacknowledge", post(unacknowledge_alert))
+        .route("/events", get(list_events).post(create_event))
+        .route("/events/{id}", get(show_event).delete(delete_event))
+        .route("/agents/{id}/events", get(agent_events))
         .route("/silences", get(list_silences).post(create_silence))
         .route("/silences/{id}", get(show_silence))
         .route("/silences/{id}/end", post(end_silence))
@@ -1193,6 +1197,87 @@ async fn widget_data(
             },
         })
         .into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// How long a list of events covers unless asked.
+const DEFAULT_EVENTS_MS: i64 = 7 * 24 * 3_600_000;
+/// The most events a list returns.
+const MAX_EVENTS: u64 = 1000;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EventParams {
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+    limit: Option<u64>,
+}
+
+impl EventParams {
+    fn span(&self, default_ms: i64) -> (i64, i64) {
+        let to_ms = self.to_ms.unwrap_or_else(now_ms);
+        let from_ms = self
+            .from_ms
+            .unwrap_or_else(|| to_ms.saturating_sub(default_ms));
+        (from_ms, to_ms)
+    }
+}
+
+async fn list_events(State(state): State<AppState>, Query(params): Query<EventParams>) -> Response {
+    let (from_ms, to_ms) = params.span(DEFAULT_EVENTS_MS);
+    let limit = params.limit.unwrap_or(200).min(MAX_EVENTS);
+    match state.database.list_events(from_ms, to_ms, limit).await {
+        Ok(events) => Json(events).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn create_event(State(state): State<AppState>, Json(input): Json<EventInput>) -> Response {
+    let by = super::events::recorded_by();
+    let id = match state.record_event(input, &by, now_ms()).await {
+        Ok(id) => id,
+        Err(EventRefusal::Invalid(message)) => {
+            let body = Json(json!({ "error": message }));
+            return (StatusCode::UNPROCESSABLE_ENTITY, body).into_response();
+        }
+        Err(EventRefusal::Failed(error)) => return server_error(&error),
+    };
+    match state.database.get_event(id).await {
+        Ok(Some(event)) => (StatusCode::CREATED, Json(event)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn show_event(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.get_event(id).await {
+        Ok(Some(event)) => Json(event).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn delete_event(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.delete_event(id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// Everything that happened to one machine, newest first: a day's worth unless asked.
+async fn agent_events(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Query(params): Query<EventParams>,
+) -> Response {
+    if state.registry.get(&id).await.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let (from_ms, to_ms) = params.span(24 * 3_600_000);
+    match state.database.timeline(&id, from_ms, to_ms).await {
+        Ok(events) => Json(events).into_response(),
         Err(error) => server_error(&error),
     }
 }

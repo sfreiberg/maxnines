@@ -32,4 +32,58 @@
   {% include "metrics/_chart.html" %}
   {% endfor %}
 </div>
+
+{% if not is_local %}
+<section id="events" class="card events">
+  <h2>Events</h2>
+  <p class="hint">What happened to this machine in the range shown, also marked on each chart: deploys and notes, restarts, config changes, alerts and updates.</p>
+  {% if can_respond %}
+  {% if event_error %}<p class="error" role="alert">{{ event_error }}</p>{% endif %}
+  <form id="event-form" method="post" action="/agents/{{ agent_id }}/events" class="event-form">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <input type="hidden" name="range" value="{{ range }}">
+    <label>Kind
+      <select name="kind">
+        <option value="note">Note</option>
+        <option value="deploy">Deploy</option>
+      </select>
+    </label>
+    <label>What happened
+      <input type="text" name="title" maxlength="200" required autocomplete="off" placeholder="Upgraded nginx to 1.27">
+    </label>
+    <label>Detail
+      <input type="text" name="detail" maxlength="2000" autocomplete="off" placeholder="Optional">
+    </label>
+    <button type="submit" class="secondary">Add event</button>
+  </form>
+  {% endif %}
+  {% if events %}
+  <table class="event-list">
+    <thead><tr><th>When</th><th>Kind</th><th>What</th><th>By</th>{% if can_respond %}<th aria-label="Delete"></th>{% endif %}</tr></thead>
+    <tbody>
+      {% for event in events %}
+      <tr>
+        <td class="nowrap">{{ event.time }}</td>
+        <td><span class="event-kind k-{{ event.kind }}">{{ event.kind_label }}</span></td>
+        <td>{{ event.title }}{% if event.detail %}<div class="hint">{{ event.detail }}</div>{% endif %}</td>
+        <td>{% if event.by %}{{ event.by }}{% else %}<span class="hint">Server</span>{% endif %}</td>
+        {% if can_respond %}
+        <td>{% if event.id %}
+          <form method="post" action="/events/{{ event.id }}/delete">
+            <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+            <input type="hidden" name="agent_id" value="{{ agent_id }}">
+            <input type="hidden" name="range" value="{{ range }}">
+            <button type="submit" class="danger">Delete</button>
+          </form>
+        {% endif %}</td>
+        {% endif %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">Nothing in this range.</p>
+  {% endif %}
+</section>
+{% endif %}
 {% endblock content %}

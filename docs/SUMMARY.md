@@ -11,6 +11,7 @@
 - [Alerts](alerts.md)
 - [Notification channels](notifications.md)
 - [Dashboards](dashboards.md)
+- [Events](events.md)
 - [Web servers](web-servers.md)
 - [Map](map.md)
 - [Installing as an app](app.md)
