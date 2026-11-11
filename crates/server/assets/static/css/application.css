@@ -528,6 +528,10 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
   .problem .button { margin-left: auto; }
   .site-footer { padding: 8px 16px 16px; }
   .clause { grid-template-columns: 1fr; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
+  /* Too narrow for names beside values, so each name sits above its value. */
+  .summary { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+  .summary dt { overflow-wrap: anywhere; }
+  .summary dd + dt { margin-top: 10px; }
   /* What changes matters most, so each agent stacks rather than scrolling it away. */
   .preview thead { display: none; }
   .preview tbody { display: block; }

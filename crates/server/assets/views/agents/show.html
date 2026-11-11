@@ -119,7 +119,7 @@
   <h2>Facts</h2>
   {% if has_facts %}
   <dl class="summary">
-    {% for fact in facts %}<dt>{{ fact.name }}</dt><dd>{{ fact.value }}</dd>{% endfor %}
+    {% for fact in facts %}<dt>{{ fact.name }}</dt><dd{% if fact.exact %} title="{{ fact.exact }} bytes"{% endif %}>{{ fact.value }}</dd>{% endfor %}
   </dl>
   {% else %}
   <p class="empty">This agent hasn't reported any facts yet.</p>

@@ -113,6 +113,7 @@ fn fact_rows(prefix: &str, value: &Value, rows: &mut Vec<FactRow>) {
             rows.push(FactRow {
                 name: prefix.to_string(),
                 value: items.join(", "),
+                exact: None,
             });
         }
         Value::Array(items) => {
@@ -122,9 +123,17 @@ fn fact_rows(prefix: &str, value: &Value, rows: &mut Vec<FactRow>) {
         }
         scalar => rows.push(FactRow {
             name: prefix.to_string(),
-            value: fact_text(scalar),
+            value: readable(prefix, scalar).unwrap_or_else(|| fact_text(scalar)),
+            exact: readable(prefix, scalar).map(|_| fact_text(scalar)),
         }),
     }
+}
+
+/// A size in bytes, as a person would write it, like a memory total. The exact number
+/// is still there to hover over.
+fn readable(name: &str, value: &Value) -> Option<String> {
+    let bytes = value.as_f64().filter(|_| name.ends_with("_bytes"))?;
+    Some(format_value(Unit::Bytes, bytes))
 }
 
 /// In the largest unit that makes sense, as "3 minutes ago" reads better than a
@@ -451,6 +460,8 @@ pub async fn suggestions(state: &AppState, term: &str) -> anyhow::Result<Vec<Sug
 struct FactRow {
     name: String,
     value: String,
+    /// The value as reported, where it's shown another way.
+    exact: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -769,6 +780,27 @@ mod tests {
             error: error.map(String::from),
             reported_at_ms: 1,
         }
+    }
+
+    #[test]
+    fn sizes_in_bytes_read_as_sizes_with_the_exact_number_kept() {
+        let facts = serde_json::json!({
+            "memory": { "total_bytes": 17_179_869_184u64 },
+            "cpu": { "logical_cores": 8 },
+        });
+        let mut rows = Vec::new();
+        fact_rows("", &facts, &mut rows);
+        let shown: Vec<(&str, &str, Option<&str>)> = rows
+            .iter()
+            .map(|row| (row.name.as_str(), row.value.as_str(), row.exact.as_deref()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("cpu.logical_cores", "8", None),
+                ("memory.total_bytes", "17.2 GB", Some("17179869184")),
+            ]
+        );
     }
 
     #[test]
