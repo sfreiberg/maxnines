@@ -98,7 +98,8 @@ doing small random reads is flat out long before it moves many bytes:
 | **Disk read latency**, **Disk write latency** | How long each took, on average |
 | **Disk queue length** | How many were waiting or under way, on average |
 
-They're worked out from one sample to the next, so they start with the second. On a
+On Linux and macOS they're worked out from one sample to the next, so they start with
+the second. On a
 Mac, each volume reports its whole physical disk, and there's no busy time or queue
 length. FreeBSD doesn't report these yet.
 

@@ -380,13 +380,17 @@ mod tests {
     fn disks_say_how_hard_they_are_working_from_the_second_sample() {
         let mut collector = DiskCollector::new(None).unwrap();
         let first = collector.collect().unwrap();
-        assert!(
-            first
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|disk| disk["read_ops_per_sec"].is_null())
-        );
+        // Linux and macOS keep running totals, so the first sample has nothing to
+        // compare with. Windows' counters take their first look when they're set up.
+        if cfg!(not(windows)) {
+            assert!(
+                first
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|disk| disk["read_ops_per_sec"].is_null())
+            );
+        }
 
         std::thread::sleep(Duration::from_millis(200));
         let output = collector.collect().unwrap();
