@@ -27,8 +27,8 @@ use slack_morphism::{
 use tracing::warn;
 
 use super::{CHART_FILE, ChannelType};
-use crate::alerting::{Channel, ChannelInput, Event, Severity};
-use crate::notifier::{Notice, Senders, format_ms};
+use crate::alerting::{Channel, ChannelInput, Event};
+use crate::notifier::{Notice, Senders, Tone, format_ms};
 use crate::registration::short_id;
 use crate::remote_checks::FLEET_HOST_ID;
 
@@ -100,15 +100,11 @@ fn escape(text: &str) -> String {
 }
 
 fn color(notice: &Notice) -> &'static str {
-    match (notice.event, &notice.alert) {
-        (Event::Escalated, _) => "#b3261e",
-        (Event::Eased, _) => "#b87a00",
-        (Event::Firing | Event::Reminder, Some(alert)) if alert.severity == Severity::Critical => {
-            "#b3261e"
-        }
-        (Event::Firing | Event::Reminder, Some(_)) => "#b87a00",
-        (Event::Resolved, _) => "#0b6b4b",
-        _ => "#6b7280",
+    match notice.tone() {
+        Tone::Critical => "#b3261e",
+        Tone::Warning => "#b87a00",
+        Tone::Clear => "#0b6b4b",
+        Tone::Neutral => "#6b7280",
     }
 }
 
@@ -584,7 +580,7 @@ mod tests {
     #[test]
     fn slack_colors_follow_severity_and_state() {
         let warning = Alert {
-            severity: Severity::Warning,
+            severity: crate::alerting::Severity::Warning,
             ..alert()
         };
         assert_eq!(color(&notice(Event::Firing, alert())), "#b3261e");

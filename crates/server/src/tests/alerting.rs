@@ -1908,7 +1908,7 @@ async fn a_discord_channel_gets_discords_message_format() {
     assert_eq!(
         received[0],
         json!({
-            "content": "**CRITICAL** CPU usage on web-1 is 95%, above 90%",
+            "content": "🔴 **CRITICAL** CPU usage on web-1 is 95%, above 90%",
             "allowed_mentions": { "parse": [] },
         })
     );

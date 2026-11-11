@@ -18,6 +18,11 @@ can't be drawn or sent, the notification goes without it, and the server's log s
   message first with the photo as a reply.
 - **Email** and **Resend** show the chart under the text, for mail apps that show HTML.
 
+## Discord
+
+Each Discord message starts with a circle in the colours Slack's messages use: 🔴 for
+critical, 🟡 for a warning and 🟢 when the alert resolves. Test messages have none.
+
 ## Email
 
 An email channel sends through a mail server you choose for it, on its page under

@@ -7,7 +7,7 @@ use ureq::unversioned::multipart::{Form, Part};
 
 use super::{ChannelType, accepted, blocking, chart_part, post_form, post_json, url_preview};
 use crate::alerting::{Channel, ChannelInput};
-use crate::notifier::{Notice, Senders};
+use crate::notifier::{Notice, Senders, Tone};
 
 /// The longest message Discord accepts.
 const MAX_CHARS: usize = 2000;
@@ -22,6 +22,16 @@ const HOSTS: [&str; 4] = [
 
 pub struct Discord;
 
+/// A circle in the colour Slack's messages use, so how bad it is shows at a glance.
+fn circle(tone: Tone) -> &'static str {
+    match tone {
+        Tone::Critical => "🔴 ",
+        Tone::Warning => "🟡 ",
+        Tone::Clear => "🟢 ",
+        Tone::Neutral => "",
+    }
+}
+
 /// Mentions are turned off, as agents choose their own names and one called
 /// `@everyone` would otherwise ping a whole server.
 fn body(notice: &Notice) -> Value {
@@ -29,7 +39,8 @@ fn body(notice: &Notice) -> Value {
         .alert
         .as_ref()
         .map_or(notice.text.as_str(), |a| &a.summary);
-    let content: String = format!("**{}** {summary}", notice.label())
+    let circle = circle(notice.tone());
+    let content: String = format!("{circle}**{}** {summary}", notice.label())
         .chars()
         .take(MAX_CHARS)
         .collect();
@@ -114,16 +125,37 @@ mod tests {
     fn discord_messages_lead_with_what_happened() {
         assert_eq!(
             body(&notice(Event::Firing, alert()))["content"],
-            "**CRITICAL** CPU usage on web-1 is 97%, above 90%"
+            "🔴 **CRITICAL** CPU usage on web-1 is 97%, above 90%"
         );
         assert_eq!(
             body(&notice(Event::Resolved, alert()))["content"],
-            "**RESOLVED** CPU usage on web-1 is 97%, above 90%"
+            "🟢 **RESOLVED** CPU usage on web-1 is 97%, above 90%"
         );
         assert_eq!(
             body(&notice(Event::Escalated, alert()))["content"],
-            "**NOW CRITICAL** CPU usage on web-1 is 97%, above 90%"
+            "🔴 **NOW CRITICAL** CPU usage on web-1 is 97%, above 90%"
         );
+    }
+
+    #[test]
+    fn discord_messages_show_how_bad_it_is_as_a_circle() {
+        let warning = Alert {
+            severity: crate::alerting::Severity::Warning,
+            ..alert()
+        };
+        let starts = |notice: Notice| {
+            body(&notice)["content"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .next()
+                .unwrap()
+        };
+        assert_eq!(starts(notice(Event::Firing, warning.clone())), '🟡');
+        assert_eq!(starts(notice(Event::Reminder, warning.clone())), '🟡');
+        assert_eq!(starts(notice(Event::Eased, warning)), '🟡');
+        assert_eq!(starts(notice(Event::Reminder, alert())), '🔴');
+        assert_eq!(starts(Notice::test()), '*');
     }
 
     #[test]

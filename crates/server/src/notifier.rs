@@ -16,7 +16,7 @@ use tokio::time::{MissedTickBehavior, timeout};
 use tracing::{error, info, warn};
 
 use crate::alert_charts::ChartSources;
-use crate::alerting::{Alert, Channel, Delivery, Event};
+use crate::alerting::{Alert, Channel, Delivery, Event, Severity};
 use crate::channels::{self, pagerduty, resend, telegram};
 use crate::metrics::now_ms;
 use crate::models::Database;
@@ -104,6 +104,22 @@ impl Notice {
         format!("The last hour: {summary}")
     }
 
+    /// How bad things are now, for channels that show it as a colour.
+    pub(crate) fn tone(&self) -> Tone {
+        match (self.event, &self.alert) {
+            (Event::Escalated, _) => Tone::Critical,
+            (Event::Eased, _) => Tone::Warning,
+            (Event::Firing | Event::Reminder, Some(alert))
+                if alert.severity == Severity::Critical =>
+            {
+                Tone::Critical
+            }
+            (Event::Firing | Event::Reminder, Some(_)) => Tone::Warning,
+            (Event::Resolved, _) => Tone::Clear,
+            _ => Tone::Neutral,
+        }
+    }
+
     /// What happened, in a word or two, which every message starts with.
     pub(crate) fn label(&self) -> String {
         match (self.event, &self.alert) {
@@ -115,6 +131,15 @@ impl Notice {
             _ => "TEST".to_string(),
         }
     }
+}
+
+/// How bad a notification is: red, yellow, green, or grey for a test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tone {
+    Critical,
+    Warning,
+    Clear,
+    Neutral,
 }
 
 pub fn format_ms(ms: i64) -> String {
