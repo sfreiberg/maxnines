@@ -94,7 +94,7 @@ impl TlsConfig {
 pub enum MetricsConfig {
     Duckdb {
         path: PathBuf,
-        /// How much memory DuckDB may use, such as "1GB" or "512MB".
+        /// How much memory DuckDB may use, such as "1GiB" or "512MB".
         #[serde(default = "default_duckdb_memory_limit")]
         memory_limit: String,
     },
@@ -278,7 +278,7 @@ fn default_heartbeat_timeout_secs() -> u64 {
 }
 
 fn default_duckdb_memory_limit() -> String {
-    "1GB".to_string()
+    "1GiB".to_string()
 }
 
 fn default_max_pending() -> usize {
@@ -632,7 +632,7 @@ mod tests {
             config.metrics,
             MetricsConfig::Duckdb {
                 path: "data.nosync/maxnines.duckdb".into(),
-                memory_limit: "1GB".to_string(),
+                memory_limit: "1GiB".to_string(),
             }
         );
         assert_eq!(config.audience(), "ws://127.0.0.1:9000/ws");
@@ -649,7 +649,7 @@ mod tests {
             config.metrics,
             MetricsConfig::Duckdb {
                 path: "/var/lib/maxnines-server/metrics.duckdb".into(),
-                memory_limit: "1GB".to_string(),
+                memory_limit: "1GiB".to_string(),
             }
         );
         assert_eq!(
@@ -670,7 +670,7 @@ mod tests {
             config.metrics,
             MetricsConfig::Duckdb {
                 path: "/var/lib/maxnines-server/metrics.duckdb".into(),
-                memory_limit: "1GB".to_string(),
+                memory_limit: "1GiB".to_string(),
             }
         );
     }
@@ -721,24 +721,24 @@ mod tests {
     }
 
     #[test]
-    fn memory_limit_defaults_to_1gb() {
+    fn memory_limit_defaults_to_1gib() {
         assert_eq!(
             parse(STORAGE).unwrap().metrics,
             MetricsConfig::Duckdb {
                 path: "x".into(),
-                memory_limit: "1GB".to_string(),
+                memory_limit: "1GiB".to_string(),
             }
         );
     }
 
     #[test]
     fn memory_limit_can_be_set() {
-        let text = "metrics \"duckdb\" {\n  path = \"x\"\n  memory_limit = \"256MB\"\n}\n";
+        let text = "metrics \"duckdb\" {\n  path = \"x\"\n  memory_limit = \"256MiB\"\n}\n";
         assert_eq!(
             parse(text).unwrap().metrics,
             MetricsConfig::Duckdb {
                 path: "x".into(),
-                memory_limit: "256MB".to_string(),
+                memory_limit: "256MiB".to_string(),
             }
         );
     }

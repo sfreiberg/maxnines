@@ -2585,7 +2585,7 @@ mod tests {
     fn applies_the_memory_limit() {
         let folder = tempfile::tempdir().unwrap();
         let store =
-            DuckDbStore::open(&folder.path().join("db"), "512MB", Retention::default()).unwrap();
+            DuckDbStore::open(&folder.path().join("db"), "512MiB", Retention::default()).unwrap();
 
         let limit: String = store
             .connection
@@ -2594,7 +2594,7 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(limit, "488.2 MiB");
+        assert_eq!(limit, "512.0 MiB");
     }
 
     #[test]

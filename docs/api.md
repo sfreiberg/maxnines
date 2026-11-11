@@ -481,7 +481,7 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
 }
 ```
 
-### Create a config rule
+### Add a config rule
 
 `POST /api/v1/rules`
 
@@ -744,7 +744,7 @@ given, and `limit` how many, which is 200 unless given, up to 1,000.
 
 Returns `204`, or `404` if there's no such annotation.
 
-### A machine's events
+### Get a machine's events
 
 `GET /api/v1/agents/{id}/events`
 
@@ -800,7 +800,7 @@ Deleting a rule deletes its windows too.
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/maintenance-windows"
 ```
 
-### Create a maintenance window
+### Add a maintenance window
 
 `POST /api/v1/maintenance-windows`
 
@@ -911,7 +911,7 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/alert-rules"
 ```
 
-### Create an alert rule
+### Add an alert rule
 
 `POST /api/v1/alert-rules`
 
@@ -1026,7 +1026,7 @@ Custom webhooks have `request`, as in [custom webhooks](notifications.md#custom-
 | --- | --- |
 | `method` | `POST`, the default, `PUT` or `PATCH` |
 | `content_type` | Required. Like `application/json`, which has what's filled in escaped for JSON |
-| `body` | Required. A Tera template, up to 16 KB. It's checked when saved, and a JSON body has to come out as valid JSON |
+| `body` | Required. A Tera template, up to 16 KiB. It's checked when saved, and a JSON body has to come out as valid JSON |
 
 Reading a custom webhook back gives `header_names`, the names of its headers, but never
 their values.
@@ -1061,7 +1061,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "$MAXNINES_URL/api/v1/notification-channels"
 ```
 
-### Create a notification channel
+### Add a notification channel
 
 `POST /api/v1/notification-channels`
 
@@ -1164,7 +1164,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "$MAXNINES_URL/api/v1/remote-checks"
 ```
 
-### Create a remote check
+### Add a remote check
 
 `POST /api/v1/remote-checks`
 
@@ -1284,7 +1284,7 @@ Highest priority first.
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/location-rules"
 ```
 
-### Create a location rule
+### Add a location rule
 
 `POST /api/v1/location-rules`
 
@@ -1437,7 +1437,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/server"
 }
 ```
 
-### The server's own history
+### Get the server's own history
 
 The server records its own numbers every 15 seconds as the built-in agent `server`,
 along with `cpu`, `memory`, `disk` and `network` for the machine it's on. Nothing has
@@ -1509,7 +1509,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 Everyone signed in shares dashboards. A widget sits on a grid 12 columns wide, and
 asks one question, using the same `metric`, `calculation`, `group_by` and `filter` as
 `GET /api/v1/query`. A widget's filter can also use the dashboard's
-[variables](#variables), as terms like `$machine`.
+[variables](#get-or-update-variables), as terms like `$machine`.
 
 | Widget field | Meaning |
 | --- | --- |
@@ -1523,7 +1523,7 @@ asks one question, using the same `metric`, `calculation`, `group_by` and `filte
 
 Each dashboard's `id`, `name` and how many `widgets` it has, sorted by name.
 
-### Create a dashboard
+### Add a dashboard
 
 `POST /api/v1/dashboards`
 
@@ -1560,7 +1560,7 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "$MAXNINES_URL/api/v1/dashboards/1/widgets"
 ```
 
-### Change or remove a widget
+### Update or delete a widget
 
 `PUT /api/v1/dashboards/{id}/widgets/{widget}`
 
@@ -1574,7 +1574,7 @@ Changing a widget replaces all of it, including where it sits.
 
 Takes a list of widgets' `id`, `x`, `y`, `w` and `h`, and saves them together.
 
-### What a widget shows
+### Get what a widget shows
 
 `GET /api/v1/dashboards/{id}/widgets/{widget}`
 
@@ -1590,7 +1590,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "$MAXNINES_URL/api/v1/dashboards/1/widgets/2?var-machine=5e8e7eb8dd45b90e77472cee36541d9b"
 ```
 
-### Variables
+### Get or update variables
 
 `GET /api/v1/dashboards/{id}/variables`
 
@@ -1652,7 +1652,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/api-keys
 
 `last_used_ms` is accurate to about a minute.
 
-### Create an API key
+### Add an API key
 
 `POST /api/v1/api-keys`
 
@@ -1772,7 +1772,7 @@ An address that's already in use gives `409`.
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/users/2"
 ```
 
-### Change a user's role, theme or time zone
+### Update a user's role, theme or time zone
 
 `PUT /api/v1/users/{id}`
 
@@ -1819,7 +1819,7 @@ curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "$MAXNINES_URL/api/v1/users/two-factor"
 ```
 
-### Make a new setup link
+### Add a setup link
 
 `POST /api/v1/users/{id}/setup-link`
 
@@ -1872,7 +1872,7 @@ curl -X DELETE -H "Authorization: Bearer $MAXNINES_API_KEY" \
 Who changed what, and who signed in, as on the Audit log page in Settings. See
 [Audit log](audit-log.md) for what's recorded.
 
-### Read the audit log
+### List the audit log
 
 `GET /api/v1/audit-log`
 

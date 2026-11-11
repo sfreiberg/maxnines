@@ -59,7 +59,7 @@ channel for. Choose **Custom webhook** as the type, then set:
   kept like a password and never shown again, only their names. Leave the box empty to
   keep them, or type them all again to change one. MaxNines sets `Content-Type`,
   `Content-Length` and `Host` itself.
-- **Body**: a [Tera](https://keats.github.io/tera/docs/) template, up to 16 KB, filled in
+- **Body**: a [Tera](https://keats.github.io/tera/docs/) template, up to 16 KiB, filled in
   for each notification.
 
 A new custom webhook starts with this body:
