@@ -5,7 +5,7 @@
   <p class="eyebrow">Fleet status</p>
   {% if problem_count == 0 %}
   <h1>All clear</h1>
-  <p class="subtitle">Nothing is firing.</p>
+  <p class="subtitle">No alerts are open.</p>
   {% else %}
   <h1>{{ problem_count }} problem{% if problem_count != 1 %}s{% endif %} need{% if problem_count == 1 %}s{% endif %} attention</h1>
   {% endif %}
@@ -18,9 +18,9 @@
     <span class="stats-note">{% if online_count < agent_count %}{{ agent_count - online_count }} offline{% elif agent_count > 0 %}All online{% else %}None yet{% endif %}</span>
   </a>
   <a class="stats-cell" href="/alerts">
-    <span class="label">Alerts firing</span>
+    <span class="label">Open alerts</span>
     <span class="stats-value{% if critical_count > 0 %} bad{% elif problem_count > 0 %} warn{% endif %}">{{ problem_count }}</span>
-    <span class="stats-note">{% if critical_count > 0 %}{{ critical_count }} critical{% elif problem_count > 0 %}Warnings only{% else %}Nothing firing{% endif %}</span>
+    <span class="stats-note">{% if critical_count > 0 %}{{ critical_count }} critical{% elif problem_count > 0 %}Warnings only{% else %}None open{% endif %}</span>
   </a>
   <a class="stats-cell" href="/checks">
     <span class="label">Checks up</span>

@@ -3471,7 +3471,7 @@ async fn a_delivery_is_given_up_on_after_a_day_and_says_so() {
     assert!(due(&test, test.now + 2 * day).await.is_empty());
 
     let page = Browser::default().get(&test.server, "/alerts").await;
-    assert!(page.body.contains("Gave up"), "{}", page.body);
+    assert!(page.body.contains(">Failed</span>"), "{}", page.body);
     assert!(page.body.contains("the webhook returned status 502"));
 
     // The channel never heard the alert start, so it doesn't hear it end.
@@ -4507,17 +4507,17 @@ async fn the_alerts_page_shows_what_is_firing_and_what_ended() {
     let mut browser = Browser::default();
 
     let page = browser.get(&test.server, "/alerts").await;
-    assert!(page.body.contains("Nothing is firing."), "{}", page.body);
+    assert!(page.body.contains("No alerts are open."), "{}", page.body);
 
     test.cpu(0, 95.0).await;
     let page = browser.get(&test.server, "/alerts").await;
-    assert!(!page.body.contains("Nothing is firing."));
+    assert!(!page.body.contains("No alerts are open."));
     assert!(page.body.contains("CPU usage on web-1 is 95%, above 90%"));
     assert!(page.body.contains("Critical"));
 
     test.cpu(MINUTE_MS, 10.0).await;
     let page = browser.get(&test.server, "/alerts").await;
-    assert!(page.body.contains("Nothing is firing."));
+    assert!(page.body.contains("No alerts are open."));
     assert!(page.body.contains("The problem cleared"), "{}", page.body);
 }
 

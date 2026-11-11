@@ -1431,7 +1431,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/server"
     "samples_failed": 0,
     "samples_queued": 0,
     "queue_capacity": 1024,
-    "alerts_firing": 0,
+    "alerts_open": 0,
     "last_alert_pass_ms": 1793937144561
   }
 }

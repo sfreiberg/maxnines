@@ -33,8 +33,8 @@
     <span class="stats-note">{{ series }} series</span>
   </div>
   <a class="stats-cell" href="/alerts">
-    <span class="label">Alerts firing</span>
-    <span class="stats-value{% if server.alerts_firing > 0 %} bad{% endif %}">{{ server.alerts_firing }}</span>
+    <span class="label">Open alerts</span>
+    <span class="stats-value{% if server.alerts_open > 0 %} bad{% endif %}">{{ server.alerts_open }}</span>
     <span class="stats-note">{% if server.last_alert_pass %}Last checked {{ server.last_alert_pass }}{% else %}Not checked yet{% endif %}</span>
   </a>
 </section>
@@ -103,7 +103,7 @@
     <dt>Agents</dt><dd>{{ server.agents_online }} of {{ server.agents_approved }} online{% if server.agents_waiting > 0 %}, {{ server.agents_waiting }} waiting for approval{% endif %}</dd>
     <dt>Samples written</dt><dd>{{ server.samples_written }} since the server started</dd>
     <dt>Write queue</dt><dd>{{ server.samples_queued }} of {{ server.queue_capacity }}</dd>
-    <dt>Alerts firing</dt><dd>{{ server.alerts_firing }}</dd>
+    <dt>Open alerts</dt><dd>{{ server.alerts_open }}</dd>
     <dt>Alert rules last ran</dt><dd>{% if server.last_alert_pass %}{{ server.last_alert_pass }}{% else %}Not yet{% endif %}</dd>
     {% if server.has_database %}<dt>Notifications</dt><dd>{{ server.notifications_waiting }} waiting, {{ server.notifications_failed }} given up on</dd>{% endif %}
   </dl>

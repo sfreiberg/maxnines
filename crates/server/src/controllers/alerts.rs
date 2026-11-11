@@ -92,7 +92,7 @@ struct ProblemRow {
     channel: String,
     summary: String,
     event: &'static str,
-    gave_up: bool,
+    failed: bool,
     attempts: i32,
     error: String,
     created: String,
@@ -102,7 +102,7 @@ impl From<DeliveryProblem> for ProblemRow {
     fn from(problem: DeliveryProblem) -> Self {
         Self {
             event: problem.event.as_str(),
-            gave_up: problem.state == "failed",
+            failed: problem.state == "failed",
             created: local_time(problem.created_ms),
             channel: problem.channel,
             summary: problem.summary,

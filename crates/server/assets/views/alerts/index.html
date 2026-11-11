@@ -3,7 +3,7 @@
 {% block content %}
 <div class="title-row">
   <div>
-    <p class="eyebrow">{{ firing }} firing</p>
+    <p class="eyebrow">{{ firing }} open</p>
     <h1>Alerts</h1>
   </div>
   <div class="actions">
@@ -14,7 +14,7 @@
 </div>
 
 <section class="card">
-  <h2>Firing now</h2>
+  <h2>Open</h2>
   {% if open %}
   {% for alert in open %}
   <div class="problem">
@@ -31,7 +31,7 @@
   </div>
   {% endfor %}
   {% else %}
-  <p class="empty">Nothing is firing.</p>
+  <p class="empty">No alerts are open.</p>
   {% endif %}
 </section>
 
@@ -40,7 +40,7 @@
   <h2>Notifications that haven't arrived</h2>
   {% for problem in problems %}
   <div class="problem">
-    {% if problem.gave_up %}<span class="badge bad">Gave up</span>{% else %}<span class="badge neutral">Retrying</span>{% endif %}
+    {% if problem.failed %}<span class="badge bad">Failed</span>{% else %}<span class="badge neutral">Pending</span>{% endif %}
     <span class="text">{{ problem.channel }}: {{ problem.error }}<br><span class="note">{{ problem.summary }} · {{ problem.attempts }} attempt{% if problem.attempts != 1 %}s{% endif %}</span></span>
   </div>
   {% endfor %}

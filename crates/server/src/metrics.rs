@@ -966,10 +966,10 @@ pub const METRICS: &[Metric] = &[
     },
     Metric {
         name: "server.alerts",
-        title: "Alerts firing",
+        title: "Open alerts",
         unit: Unit::Number,
         collector: "server",
-        source: Source::Fields(&[("Firing", Reading::Field("$.alerts_firing"))]),
+        source: Source::Fields(&[("Open", Reading::Field("$.alerts_firing"))]),
         chart: ShowChart::WithData,
     },
     Metric {

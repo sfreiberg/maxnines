@@ -91,7 +91,7 @@ silence ends, the notifications go out then, and if it ends first, nobody hears 
 Anyone who had already been told about an alert still hears when it ends, which keeps
 on-call services from leaving an incident open.
 
-To quiet one machine, such as while it's rebooted or upgraded, use **Start maintenance**
+To silence one machine, such as while it's rebooted or upgraded, use **Start maintenance**
 on its page under **Machines**. Choose how long, from 30 minutes to a day, and a reason if
 you like. It's a silence for every rule on that machine alone, so it shows under
 **Alerts > Silences** too, and **End now** on the machine's page stops it early. While

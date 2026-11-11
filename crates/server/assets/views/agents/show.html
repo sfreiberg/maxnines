@@ -49,7 +49,7 @@
 <section id="maintenance" class="card maintenance">
   {% if maintenance %}
   <div class="problem">
-    <span class="badge warn">Quiet</span>
+    <span class="badge warn">Silenced</span>
     <span class="text">Notifications about this machine are held until {{ maintenance.until }}{% if maintenance.window %}, by the {{ maintenance.why }} maintenance window{% else %}: {{ maintenance.why }}{% if maintenance.by %}, started by {{ maintenance.by }}{% endif %}{% endif %}. Alerts still show here and on the Alerts page, and any still firing then are sent when it ends.</span>
     {% if maintenance.just_this_one and can_respond %}
     <form method="post" action="/agents/{{ agent.id }}/maintenance/end" hx-post="/agents/{{ agent.id }}/maintenance/end" hx-target="#maintenance" hx-select="#maintenance" hx-swap="morph:outerHTML">
@@ -65,7 +65,7 @@
   {% elif can_respond %}
   <form method="post" action="/agents/{{ agent.id }}/maintenance" hx-post="/agents/{{ agent.id }}/maintenance" hx-target="#maintenance" hx-select="#maintenance" hx-swap="morph:outerHTML" class="maintenance-form">
     <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
-    <label>Quiet this machine for
+    <label>Silence this machine for
       <select name="duration_secs">
         {% for choice in maintenance_choices %}
         <option value="{{ choice.secs }}"{% if choice.chosen %} selected{% endif %}>{{ choice.label }}</option>

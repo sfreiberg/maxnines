@@ -247,7 +247,7 @@ pub struct Activity {
     pub samples_failed: u64,
     pub samples_queued: usize,
     pub queue_capacity: usize,
-    pub alerts_firing: usize,
+    pub alerts_open: usize,
     pub last_alert_pass_ms: Option<i64>,
 }
 
@@ -377,7 +377,7 @@ pub async fn gather(state: &AppState) -> ServerStats {
             samples_failed: status.writes.failed.load(Ordering::Relaxed),
             samples_queued: capacity - state.writer.capacity(),
             queue_capacity: capacity,
-            alerts_firing: status.firing.load(Ordering::Relaxed),
+            alerts_open: status.firing.load(Ordering::Relaxed),
             last_alert_pass_ms: (last_pass > 0).then_some(last_pass),
         },
     }

@@ -172,7 +172,7 @@ struct ServerPage {
     agents_online: usize,
     agents_approved: usize,
     agents_waiting: usize,
-    alerts_firing: usize,
+    alerts_open: usize,
     last_alert_pass: Option<String>,
     alert_rules_stalled: bool,
 }
@@ -255,7 +255,7 @@ fn server_page(stats: ServerStats, now_ms: i64) -> ServerPage {
         agents_online: activity.agents_online,
         agents_approved: activity.agents_approved,
         agents_waiting: activity.agents_waiting,
-        alerts_firing: activity.alerts_firing,
+        alerts_open: activity.alerts_open,
         last_alert_pass: last_pass.map(local_time),
         alert_rules_stalled: last_pass.is_some_and(|ms| now_ms - ms > ALERT_PASS_STALE_MS),
         metrics: stats.metrics,
