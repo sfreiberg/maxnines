@@ -292,6 +292,25 @@ fn svg(
         );
     }
 
+    // Each moment's lowest to highest value, behind every line, as on the pages.
+    for line in &chart.lines {
+        let paint = colour(&format!("series-{}", line.slot));
+        for band in &line.bands {
+            let _ = write!(
+                svg,
+                r#"<polygon points="{band}" fill="{paint}" fill-opacity="0.18"/>"#
+            );
+        }
+        for whisker in &line.whiskers {
+            let _ = write!(
+                svg,
+                r#"<line x1="{x}" x2="{x}" y1="{}" y2="{}" stroke="{paint}" stroke-opacity="0.35" stroke-width="2.5" stroke-linecap="round"/>"#,
+                whisker.top,
+                whisker.bottom,
+                x = whisker.x,
+            );
+        }
+    }
     for line in &chart.lines {
         let paint = colour(&format!("series-{}", line.slot));
         for segment in &line.segments {

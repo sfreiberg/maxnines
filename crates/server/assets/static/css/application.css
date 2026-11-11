@@ -340,6 +340,9 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .chart .grid { stroke: var(--grid); stroke-width: 1; }
 .chart .tick { fill: var(--muted); font-variant-numeric: tabular-nums; }
 .chart .line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+/* Each moment's lowest to highest value, behind the lines, so spikes show on long ranges. */
+.chart .band { fill-opacity: 0.18; stroke: none; }
+.chart .whisker { stroke-width: 2; stroke-opacity: 0.35; stroke-linecap: round; }
 .chart .hit { fill: transparent; }
 .chart .reading { visibility: hidden; pointer-events: none; }
 .chart .column:hover .reading, .chart .column.linked .reading { visibility: visible; }
@@ -351,14 +354,14 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .chart .tooltip-value { fill: var(--text); font-weight: 600; }
 .chart .key { stroke-width: 2; stroke-linecap: round; }
 
-.line.s1, .key.s1 { stroke: var(--series-1); } .dot.s1, .marker.s1 { fill: var(--series-1); } .key-swatch.s1 { background: var(--series-1); }
-.line.s2, .key.s2 { stroke: var(--series-2); } .dot.s2, .marker.s2 { fill: var(--series-2); } .key-swatch.s2 { background: var(--series-2); }
-.line.s3, .key.s3 { stroke: var(--series-3); } .dot.s3, .marker.s3 { fill: var(--series-3); } .key-swatch.s3 { background: var(--series-3); }
-.line.s4, .key.s4 { stroke: var(--series-4); } .dot.s4, .marker.s4 { fill: var(--series-4); } .key-swatch.s4 { background: var(--series-4); }
-.line.s5, .key.s5 { stroke: var(--series-5); } .dot.s5, .marker.s5 { fill: var(--series-5); } .key-swatch.s5 { background: var(--series-5); }
-.line.s6, .key.s6 { stroke: var(--series-6); } .dot.s6, .marker.s6 { fill: var(--series-6); } .key-swatch.s6 { background: var(--series-6); }
-.line.s7, .key.s7 { stroke: var(--series-7); } .dot.s7, .marker.s7 { fill: var(--series-7); } .key-swatch.s7 { background: var(--series-7); }
-.line.s8, .key.s8 { stroke: var(--series-8); } .dot.s8, .marker.s8 { fill: var(--series-8); } .key-swatch.s8 { background: var(--series-8); }
+.line.s1, .key.s1, .whisker.s1 { stroke: var(--series-1); } .dot.s1, .marker.s1, .band.s1 { fill: var(--series-1); } .key-swatch.s1 { background: var(--series-1); }
+.line.s2, .key.s2, .whisker.s2 { stroke: var(--series-2); } .dot.s2, .marker.s2, .band.s2 { fill: var(--series-2); } .key-swatch.s2 { background: var(--series-2); }
+.line.s3, .key.s3, .whisker.s3 { stroke: var(--series-3); } .dot.s3, .marker.s3, .band.s3 { fill: var(--series-3); } .key-swatch.s3 { background: var(--series-3); }
+.line.s4, .key.s4, .whisker.s4 { stroke: var(--series-4); } .dot.s4, .marker.s4, .band.s4 { fill: var(--series-4); } .key-swatch.s4 { background: var(--series-4); }
+.line.s5, .key.s5, .whisker.s5 { stroke: var(--series-5); } .dot.s5, .marker.s5, .band.s5 { fill: var(--series-5); } .key-swatch.s5 { background: var(--series-5); }
+.line.s6, .key.s6, .whisker.s6 { stroke: var(--series-6); } .dot.s6, .marker.s6, .band.s6 { fill: var(--series-6); } .key-swatch.s6 { background: var(--series-6); }
+.line.s7, .key.s7, .whisker.s7 { stroke: var(--series-7); } .dot.s7, .marker.s7, .band.s7 { fill: var(--series-7); } .key-swatch.s7 { background: var(--series-7); }
+.line.s8, .key.s8, .whisker.s8 { stroke: var(--series-8); } .dot.s8, .marker.s8, .band.s8 { fill: var(--series-8); } .key-swatch.s8 { background: var(--series-8); }
 
 .chart-summary { font-size: 13px; }
 .chart-summary th, .chart-summary td { padding: 4px 0; border-bottom: 0; overflow-wrap: anywhere; }

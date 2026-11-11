@@ -8,7 +8,7 @@ use chrono::{DateTime, TimeZone};
 use chrono_tz::Tz;
 use serde::Serialize;
 
-use crate::metrics::{Metric, Series, SeriesResult, TimeRange, Unit};
+use crate::metrics::{Metric, Point, Series, SeriesResult, TimeRange, Unit};
 use crate::times::format_time;
 
 /// The chart palette has this many colors, and a chart shows no more series.
@@ -92,12 +92,24 @@ pub struct Tick {
 }
 
 /// A series' line. Each segment is a run with no gaps, and a point with nothing
-/// either side is a dot, since a line needs two ends.
+/// either side is a dot, since a line needs two ends. Behind the line, a band runs
+/// from each moment's lowest value to its highest, so a spike shows even where a
+/// moment averages many samples. A dot has a whisker instead.
 #[derive(Debug, Serialize)]
 pub struct Line {
     pub slot: usize,
     pub segments: Vec<String>,
     pub dots: Vec<Dot>,
+    pub bands: Vec<String>,
+    pub whiskers: Vec<Whisker>,
+}
+
+/// From a moment's highest value down to its lowest, at one place across.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Whisker {
+    pub x: f64,
+    pub top: f64,
+    pub bottom: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -298,11 +310,12 @@ struct Axis {
 impl Axis {
     /// `include` are values the scale has to reach whatever the series do.
     fn new(unit: Unit, series: &[Series], frame: Frame, include: &[f64]) -> Self {
+        // The band reaches each moment's lowest and highest values, so the scale does too.
         let values = || {
             series
                 .iter()
                 .flat_map(|series| &series.points)
-                .map(|point| point.avg)
+                .flat_map(|point| [point.min, point.avg, point.max])
                 .chain(include.iter().copied())
                 .map(|value| value.clamp(-LARGEST_VALUE, LARGEST_VALUE))
         };
@@ -443,35 +456,58 @@ fn colour_slots(metric: &Metric, series: &[Series]) -> Vec<usize> {
 fn line(series: &Series, slot: usize, axis: &Axis, range: TimeRange) -> Line {
     let limit = gap_limit_ms(series, range);
 
-    let mut runs: Vec<Vec<Dot>> = Vec::new();
+    let mut runs: Vec<Vec<&Point>> = Vec::new();
     let mut previous = None;
     for point in &series.points {
-        let dot = Dot {
-            x: x_for(point.time_ms, range, axis.frame),
-            y: axis.y(point.avg),
-        };
         match (previous, runs.last_mut()) {
-            (Some(time), Some(run)) if (point.time_ms - time) as f64 <= limit => run.push(dot),
-            _ => runs.push(vec![dot]),
+            (Some(time), Some(run)) if (point.time_ms - time) as f64 <= limit => run.push(point),
+            _ => runs.push(vec![point]),
         }
         previous = Some(point.time_ms);
     }
 
-    let (dots, segments): (Vec<_>, Vec<_>) = runs.into_iter().partition(|run| run.len() == 1);
-    Line {
+    let x = |point: &Point| x_for(point.time_ms, range, axis.frame);
+    let joined = |points: &mut dyn Iterator<Item = (f64, f64)>| {
+        points
+            .map(|(x, y)| format!("{x:.1},{y:.1}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let spread = |point: &&Point| point.max > point.min;
+
+    let mut line = Line {
         slot,
-        dots: dots.into_iter().flatten().collect(),
-        segments: segments
-            .iter()
-            .map(|run| {
-                let points: Vec<String> = run
-                    .iter()
-                    .map(|dot| format!("{:.1},{:.1}", dot.x, dot.y))
-                    .collect();
-                points.join(" ")
-            })
-            .collect(),
+        segments: Vec::new(),
+        dots: Vec::new(),
+        bands: Vec::new(),
+        whiskers: Vec::new(),
+    };
+    for run in runs {
+        if let [point] = run[..] {
+            line.dots.push(Dot {
+                x: x(point),
+                y: axis.y(point.avg),
+            });
+            if spread(&point) {
+                line.whiskers.push(Whisker {
+                    x: x(point),
+                    top: axis.y(point.max),
+                    bottom: axis.y(point.min),
+                });
+            }
+            continue;
+        }
+        line.segments.push(joined(
+            &mut run.iter().map(|point| (x(point), axis.y(point.avg))),
+        ));
+        // Along the top from the left, then back along the bottom.
+        if run.iter().any(spread) {
+            let top = run.iter().map(|point| (x(point), axis.y(point.max)));
+            let bottom = run.iter().rev().map(|point| (x(point), axis.y(point.min)));
+            line.bands.push(joined(&mut top.chain(bottom)));
+        }
     }
+    line
 }
 
 fn short_name(name: &str) -> String {
@@ -871,6 +907,91 @@ mod tests {
 
         assert!(chart.lines[0].segments.is_empty());
         assert_eq!(chart.lines[0].dots.len(), 1);
+    }
+
+    /// A moment that averages several samples, like a long range has.
+    fn spread(time_ms: i64, min: f64, avg: f64, max: f64) -> Point {
+        Point {
+            time_ms,
+            avg,
+            min,
+            max,
+        }
+    }
+
+    #[test]
+    fn a_spike_inside_a_moment_shows_as_a_band_reaching_it() {
+        let points = vec![
+            spread(0, 10.0, 12.0, 15.0),
+            spread(15_000, 10.0, 14.0, 98.0),
+            spread(30_000, 10.0, 12.0, 15.0),
+        ];
+        let chart = chart(
+            "cpu.usage",
+            vec![Series {
+                name: "CPU".into(),
+                points,
+            }],
+        );
+
+        let line = &chart.lines[0];
+        assert_eq!(line.bands.len(), 1);
+        let corners: Vec<(f64, f64)> = line.bands[0]
+            .split(' ')
+            .map(|corner| {
+                let (x, y) = corner.split_once(',').unwrap();
+                (x.parse().unwrap(), y.parse().unwrap())
+            })
+            .collect();
+        // Along the top and back along the bottom, a corner for each end of each moment.
+        assert_eq!(corners.len(), 6);
+        let peak = corners[1].1;
+        let line_there = chart.columns[1].rows[0].dot.y;
+        assert!(peak < line_there - 50.0, "{peak} {line_there}");
+        assert!(
+            corners
+                .iter()
+                .all(|(_, y)| (TOP..=Frame::STANDARD.bottom()).contains(y))
+        );
+    }
+
+    #[test]
+    fn single_samples_have_no_band() {
+        let chart = chart("cpu.usage", vec![series("CPU", &steady(20))]);
+
+        assert!(chart.lines[0].bands.is_empty());
+        assert!(chart.lines[0].whiskers.is_empty());
+    }
+
+    #[test]
+    fn a_dot_shows_its_spread_as_a_whisker() {
+        let points = vec![spread(0, 10.0, 20.0, 90.0)];
+        let chart = chart(
+            "cpu.usage",
+            vec![Series {
+                name: "CPU".into(),
+                points,
+            }],
+        );
+
+        let whisker = chart.lines[0].whiskers[0];
+        assert!(whisker.top < whisker.bottom);
+        assert_eq!(whisker.x, chart.lines[0].dots[0].x);
+    }
+
+    #[test]
+    fn the_scale_reaches_the_highest_value_not_just_the_average() {
+        let points = vec![spread(0, 1.0, 2.0, 3.0), spread(15_000, 1.0, 2.0, 7.5)];
+        let chart = chart(
+            "cpu.load",
+            vec![Series {
+                name: "1 minute".into(),
+                points,
+            }],
+        );
+
+        let top: f64 = chart.y_ticks.last().unwrap().label.parse().unwrap();
+        assert!(top >= 7.5, "{top}");
     }
 
     #[test]

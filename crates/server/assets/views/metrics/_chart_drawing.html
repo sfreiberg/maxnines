@@ -7,6 +7,10 @@
       <text class="tick" x="{{ tick.position }}" y="{{ chart.bottom + 18 }}" text-anchor="middle">{{ tick.label }}</text>
       {% endfor %}
       {% for line in chart.lines %}
+      {% for band in line.bands %}<polygon class="band s{{ line.slot }}" points="{{ band }}"/>{% endfor %}
+      {% for whisker in line.whiskers %}<line class="whisker s{{ line.slot }}" x1="{{ whisker.x }}" x2="{{ whisker.x }}" y1="{{ whisker.top }}" y2="{{ whisker.bottom }}"/>{% endfor %}
+      {% endfor %}
+      {% for line in chart.lines %}
       {% for segment in line.segments %}<polyline class="line s{{ line.slot }}" points="{{ segment }}"/>{% endfor %}
       {% for dot in line.dots %}<circle class="dot s{{ line.slot }}" cx="{{ dot.x }}" cy="{{ dot.y }}" r="2.5"/>{% endfor %}
       {% endfor %}
