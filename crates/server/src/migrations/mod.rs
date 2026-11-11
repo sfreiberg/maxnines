@@ -41,6 +41,7 @@ impl MigratorTrait for Migrator {
             Box::new(UnresolveEventFilters),
             Box::new(RenameTimesAndDurations),
             Box::new(RenameAgentsToHosts),
+            Box::new(AddMissingForeignKeys),
         ]
     }
 }
@@ -3489,6 +3490,247 @@ fn rename_filter_term(filter: &str, (old, new): (&str, &str)) -> String {
     renamed
 }
 
+#[derive(Iden)]
+enum KeyTables {
+    #[iden = "api_keys"]
+    ApiKeys,
+    #[iden = "recovery_codes"]
+    RecoveryCodes,
+    #[iden = "sign_in_challenges"]
+    SignInChallenges,
+    #[iden = "host_boots"]
+    HostBoots,
+    #[iden = "users"]
+    Users,
+    #[iden = "hosts"]
+    Hosts,
+    Id,
+    UserId,
+    HostId,
+    Name,
+    Hint,
+    TokenHash,
+    Role,
+    CreatedMs,
+    ExpiresMs,
+    LastUsedMs,
+    RevokedMs,
+    CodeHash,
+    UsedMs,
+    BootMs,
+}
+
+struct AddMissingForeignKeys;
+
+impl MigrationName for AddMissingForeignKeys {
+    fn name(&self) -> &str {
+        "m20261111_000030_add_missing_foreign_keys"
+    }
+}
+
+/// A user's keys, recovery codes and sign in challenges, and a host's boot time, only
+/// mean something while their user or host is there, so the database says so too.
+/// Anything left from one already gone goes first. SQLite can only add a foreign key
+/// by making the table again, so there each is made again, and an API key's owner
+/// loses the default it only had because SQLite needed one to add the column.
+#[async_trait::async_trait]
+impl MigrationTrait for AddMissingForeignKeys {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let connection = manager.get_connection();
+        for (table, column, parent) in OWNED {
+            connection
+                .execute_unprepared(&format!(
+                    "DELETE FROM {table} WHERE {column} NOT IN (SELECT id FROM {parent})"
+                ))
+                .await?;
+        }
+        if manager.get_database_backend() == sea_orm::DatabaseBackend::Sqlite {
+            for (table, _, _) in OWNED {
+                remake(manager, table, owned_table(table, true)).await?;
+            }
+            return Ok(());
+        }
+        connection
+            .execute_unprepared("ALTER TABLE api_keys ALTER COLUMN user_id DROP DEFAULT")
+            .await?;
+        for (table, column, parent) in OWNED {
+            manager
+                .create_foreign_key(
+                    ForeignKey::create()
+                        .name(foreign_key_name(table, column))
+                        .from(Alias::new(table), Alias::new(column))
+                        .to(Alias::new(parent), Alias::new("id"))
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        if manager.get_database_backend() == sea_orm::DatabaseBackend::Sqlite {
+            for (table, _, _) in OWNED {
+                remake(manager, table, owned_table(table, false)).await?;
+            }
+            return Ok(());
+        }
+        for (table, column, _) in OWNED {
+            manager
+                .drop_foreign_key(
+                    ForeignKey::drop()
+                        .name(foreign_key_name(table, column))
+                        .table(Alias::new(table))
+                        .to_owned(),
+                )
+                .await?;
+        }
+        manager
+            .get_connection()
+            .execute_unprepared("ALTER TABLE api_keys ALTER COLUMN user_id SET DEFAULT 0")
+            .await?;
+        Ok(())
+    }
+}
+
+/// Each table that belongs to a user or a host, the column saying which, and whose.
+const OWNED: [(&str, &str, &str); 4] = [
+    ("api_keys", "user_id", "users"),
+    ("recovery_codes", "user_id", "users"),
+    ("sign_in_challenges", "user_id", "users"),
+    ("host_boots", "host_id", "hosts"),
+];
+
+fn foreign_key_name(table: &str, column: &str) -> String {
+    format!("fk_{table}_{column}")
+}
+
+/// One of the tables `OWNED` lists as it is with its foreign key, or as it was without.
+fn owned_table(table: &str, with_key: bool) -> TableCreateStatement {
+    use KeyTables as T;
+    let mut create = Table::create();
+    let (column, parent) = match table {
+        "api_keys" => {
+            let user = ColumnDef::new(T::UserId)
+                .big_integer()
+                .not_null()
+                .to_owned();
+            create
+                .table(T::ApiKeys)
+                .col(id(T::Id))
+                .col(ColumnDef::new(T::Name).string_len(100).not_null())
+                .col(ColumnDef::new(T::Hint).string_len(16).not_null())
+                .col(
+                    ColumnDef::new(T::TokenHash)
+                        .string_len(64)
+                        .not_null()
+                        .unique_key(),
+                )
+                .col(ColumnDef::new(T::CreatedMs).big_integer().not_null())
+                .col(ColumnDef::new(T::ExpiresMs).big_integer())
+                .col(ColumnDef::new(T::LastUsedMs).big_integer())
+                .col(ColumnDef::new(T::RevokedMs).big_integer())
+                .col(if with_key {
+                    user
+                } else {
+                    user.clone().default(0).to_owned()
+                })
+                .col(
+                    ColumnDef::new(T::Role)
+                        .string_len(16)
+                        .not_null()
+                        .default("admin"),
+                );
+            (T::UserId, T::Users)
+        }
+        "recovery_codes" => {
+            create
+                .table(T::RecoveryCodes)
+                .col(id(T::Id))
+                .col(ColumnDef::new(T::UserId).big_integer().not_null())
+                .col(ColumnDef::new(T::CodeHash).string_len(64).not_null())
+                .col(ColumnDef::new(T::UsedMs).big_integer().null());
+            (T::UserId, T::Users)
+        }
+        "sign_in_challenges" => {
+            create
+                .table(T::SignInChallenges)
+                .col(id(T::Id))
+                .col(ColumnDef::new(T::UserId).big_integer().not_null())
+                .col(
+                    ColumnDef::new(T::TokenHash)
+                        .string_len(64)
+                        .not_null()
+                        .unique_key(),
+                )
+                .col(ColumnDef::new(T::ExpiresMs).big_integer().not_null());
+            (T::UserId, T::Users)
+        }
+        _ => {
+            create
+                .table(T::HostBoots)
+                .col(
+                    ColumnDef::new(T::HostId)
+                        .string_len(32)
+                        .not_null()
+                        .primary_key(),
+                )
+                .col(ColumnDef::new(T::BootMs).big_integer().not_null());
+            (T::HostId, T::Hosts)
+        }
+    };
+    if with_key {
+        create.foreign_key(
+            ForeignKey::create()
+                .name(foreign_key_name(table, &column.to_string()))
+                .from(Alias::new(table), column)
+                .to(parent, T::Id),
+        );
+    }
+    create.to_owned()
+}
+
+/// Makes `table` again as `new` says, keeping its rows. Nothing refers to these
+/// tables, so the old one can go before the new one takes its name.
+async fn remake(
+    manager: &SchemaManager<'_>,
+    table: &str,
+    mut new: TableCreateStatement,
+) -> Result<(), DbErr> {
+    let connection = manager.get_connection();
+    let made = format!("{table}_remade");
+    new.table(Alias::new(&made));
+    manager.create_table(new).await?;
+    let columns = owned_columns(table);
+    connection
+        .execute_unprepared(&format!(
+            "INSERT INTO {made} ({columns}) SELECT {columns} FROM {table}"
+        ))
+        .await?;
+    connection
+        .execute_unprepared(&format!("DROP TABLE {table}"))
+        .await?;
+    connection
+        .execute_unprepared(&format!("ALTER TABLE {made} RENAME TO {table}"))
+        .await?;
+    Ok(())
+}
+
+fn owned_columns(table: &str) -> &'static str {
+    match table {
+        "api_keys" => {
+            "id, name, hint, token_hash, created_ms, expires_ms, last_used_ms, revoked_ms, \
+             user_id, role"
+        }
+        "recovery_codes" => "id, user_id, code_hash, used_ms",
+        "sign_in_challenges" => "id, user_id, token_hash, expires_ms",
+        _ => "host_id, boot_ms",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
@@ -3973,6 +4215,64 @@ mod tests {
         assert_eq!(
             texts(&connection, "SELECT filter FROM silences").await,
             [long]
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_codes_and_boot_times_belong_to_someone_from_now_on() {
+        let connection = fresh().await;
+        Migrator::up(&connection, Some(before(&AddMissingForeignKeys)))
+            .await
+            .unwrap();
+        connection
+            .execute_unprepared(
+                "INSERT INTO users (id, email, name, theme, created_ms, time_zone, role)
+                 VALUES (1, 'sam@example.com', 'Sam', 'carbon', 1, 'UTC', 'admin');
+                 INSERT INTO api_keys (name, hint, token_hash, created_ms, user_id, role)
+                 VALUES ('Deploy', 'mx_a', 'kept', 1, 1, 'editor'),
+                        ('Old', 'mx_b', 'gone', 1, 9, 'viewer');
+                 INSERT INTO recovery_codes (user_id, code_hash) VALUES (1, 'a'), (9, 'b');
+                 INSERT INTO sign_in_challenges (user_id, token_hash, expires_ms)
+                 VALUES (1, 'c', 5), (9, 'd', 5);
+                 INSERT INTO host_boots (host_id, boot_ms) VALUES ('server', 5), ('gone', 6)",
+            )
+            .await
+            .unwrap();
+
+        Migrator::up(&connection, None).await.unwrap();
+
+        let kept = [
+            ("SELECT token_hash FROM api_keys", "kept"),
+            ("SELECT code_hash FROM recovery_codes", "a"),
+            ("SELECT token_hash FROM sign_in_challenges", "c"),
+            ("SELECT host_id FROM host_boots", "server"),
+        ];
+        for (sql, row) in kept {
+            assert_eq!(texts(&connection, sql).await, [row], "{sql}");
+        }
+        let roles = texts(&connection, "SELECT role FROM api_keys").await;
+        assert_eq!(roles, ["editor"]);
+        for orphan in [
+            "INSERT INTO api_keys (name, hint, token_hash, created_ms, user_id, role)
+             VALUES ('X', 'mx_c', 'x', 1, 9, 'viewer')",
+            "INSERT INTO recovery_codes (user_id, code_hash) VALUES (9, 'x')",
+            "INSERT INTO sign_in_challenges (user_id, token_hash, expires_ms) VALUES (9, 'x', 5)",
+            "INSERT INTO host_boots (host_id, boot_ms) VALUES ('nobody', 5)",
+        ] {
+            assert!(
+                connection.execute_unprepared(orphan).await.is_err(),
+                "{orphan}"
+            );
+        }
+        // An owner has to be given now.
+        let ownerless = "INSERT INTO api_keys (name, hint, token_hash, created_ms, role)
+                         VALUES ('Y', 'mx_d', 'y', 1, 'viewer')";
+        assert!(connection.execute_unprepared(ownerless).await.is_err());
+
+        Migrator::down(&connection, Some(1)).await.unwrap();
+        assert_eq!(
+            texts(&connection, "SELECT token_hash FROM api_keys").await,
+            ["kept"]
         );
     }
 }

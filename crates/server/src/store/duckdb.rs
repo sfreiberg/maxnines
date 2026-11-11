@@ -50,6 +50,10 @@ const MIGRATIONS: &[Migration] = &[
         name: "0004_rename_agents_to_hosts",
         sql: include_str!("migrations/0004_rename_agents_to_hosts.sql"),
     },
+    Migration {
+        name: "0005_number_hosts",
+        sql: include_str!("migrations/0005_number_hosts.sql"),
+    },
 ];
 
 /// Only the bookkeeping table is created outside a migration, because it is
@@ -107,7 +111,7 @@ impl Names {
             names.metrics.insert(key, value);
         }
 
-        let mut statement = connection.prepare("SELECT id, host_id FROM hosts")?;
+        let mut statement = connection.prepare("SELECT number, host_id FROM hosts")?;
         for row in statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))? {
             let (id, host_id): (i32, String) = row?;
             names.hosts.insert(host_id, id);
@@ -130,7 +134,7 @@ impl Names {
             .map(|((collector, _), (metric, _))| (*metric, *collector))
             .collect();
         let mut owners: HashMap<i64, ((i32, i32), String)> = HashMap::new();
-        let mut statement = connection.prepare("SELECT id, metric_id, host FROM series")?;
+        let mut statement = connection.prepare("SELECT id, metric_id, host_number FROM series")?;
         let rows = statement.query_map([], |row| {
             Ok((row.get::<_, i64>(0)?, row.get(1)?, row.get(2)?))
         })?;
@@ -510,7 +514,7 @@ impl DuckDbStore {
     fn delete_host_rows(&mut self, host_id: &str) -> Result<()> {
         let transaction = self.connection.transaction()?;
         let host: i32 = match transaction.query_row(
-            "SELECT id FROM hosts WHERE host_id = ?",
+            "SELECT number FROM hosts WHERE host_id = ?",
             params![host_id],
             |row| row.get(0),
         ) {
@@ -521,19 +525,19 @@ impl DuckDbStore {
         for table in ["samples", "samples_recent", "texts", "series_labels"] {
             transaction.execute(
                 &format!(
-                    "DELETE FROM {table} WHERE series_id IN (SELECT id FROM series WHERE host = ?)"
+                    "DELETE FROM {table} WHERE series_id IN (SELECT id FROM series WHERE host_number = ?)"
                 ),
                 params![host],
             )?;
         }
         for table in ["rollups_five_minute", "rollups_hour"] {
             transaction.execute(
-                &format!("DELETE FROM {table} WHERE host = ?"),
+                &format!("DELETE FROM {table} WHERE host_number = ?"),
                 params![host],
             )?;
         }
-        transaction.execute("DELETE FROM series WHERE host = ?", params![host])?;
-        transaction.execute("DELETE FROM hosts WHERE id = ?", params![host])?;
+        transaction.execute("DELETE FROM series WHERE host_number = ?", params![host])?;
+        transaction.execute("DELETE FROM hosts WHERE number = ?", params![host])?;
         transaction.commit()?;
         Ok(())
     }
@@ -869,12 +873,12 @@ fn stored_values(
     };
     let host = scope
         .host
-        .map_or_else(String::new, |host| format!("AND se.host = {host}"));
+        .map_or_else(String::new, |host| format!("AND se.host_number = {host}"));
     Ok(format!(
-        "SELECT a.host_id, epoch_ms(s.time) AS t, {name} AS series, s.value AS v
+        "SELECT h.host_id, epoch_ms(s.time) AS t, {name} AS series, s.value AS v
          FROM all_samples s
          JOIN series se ON se.id = s.series_id
-         JOIN hosts a ON a.id = se.host
+         JOIN hosts h ON h.number = se.host_number
          {label}
          WHERE s.metric_id = {id} {host} AND {time}",
         time = scope.time,
@@ -1014,13 +1018,13 @@ fn cells_sql(
         computed = computed_with(connection, metric, &scope)?,
     );
     if let Some((table, done)) = rolled {
-        let host = host.map_or_else(String::new, |host| format!("AND r.host = {host}"));
+        let host = host.map_or_else(String::new, |host| format!("AND r.host_number = {host}"));
         // The name comes from the catalog, never from a request.
         cells.push_str(&format!(
             " UNION ALL
-             SELECT a.host_id, epoch_ms(r.time) AS t, r.series, r.low, r.high, r.summed,
+             SELECT h.host_id, epoch_ms(r.time) AS t, r.series, r.low, r.high, r.summed,
                     r.samples
-             FROM {table} r JOIN hosts a ON a.id = r.host
+             FROM {table} r JOIN hosts h ON h.number = r.host_number
              WHERE r.metric = '{name}' {host}
                AND r.time >= epoch_ms($1::BIGINT)
                AND r.time < epoch_ms(least($2::BIGINT, {done}))",
@@ -1098,15 +1102,15 @@ fn calculation_sql(
     };
 
     Ok(format!(
-        "WITH members(host, grp) AS (VALUES {members}),
+        "WITH members(host_number, grp) AS (VALUES {members}),
          cells AS ({cells}),
          per_series AS (
              SELECT m.grp, u.host_id, u.series,
                     u.t // $3::BIGINT * $3::BIGINT AS bucket,
                     sum(u.summed) / sum(u.samples) AS v
              FROM cells u
-             JOIN hosts a ON a.host_id = u.host_id
-             JOIN members m ON m.host = a.id
+             JOIN hosts h ON h.host_id = u.host_id
+             JOIN members m ON m.host_number = h.number
              WHERE true {only_main_line}
              GROUP BY m.grp, u.host_id, u.series, bucket
          ),
@@ -1152,7 +1156,7 @@ fn roll_up_hour(connection: &Connection, metric: &Metric, hour: i64) -> Result<(
         .execute(
             &format!(
                 "INSERT INTO rollups_five_minute
-             SELECT '{name}', a.id, c.series, epoch_ms(c.bucket)::TIMESTAMP,
+             SELECT '{name}', h.number, c.series, epoch_ms(c.bucket)::TIMESTAMP,
                     min(c.v), max(c.v), sum(c.v), count(*)
              FROM (
                  {computed}
@@ -1161,8 +1165,8 @@ fn roll_up_hour(connection: &Connection, metric: &Metric, hour: i64) -> Result<(
                  FROM computed
                  WHERE series IS NOT NULL AND abs(v) <= {LARGEST_VALUE}
                    AND t >= {hour} AND t < {end}
-             ) c JOIN hosts a ON a.host_id = c.host_id
-             GROUP BY a.id, c.series, c.bucket",
+             ) c JOIN hosts h ON h.host_id = c.host_id
+             GROUP BY h.number, c.series, c.bucket",
                 name = metric.name,
                 computed = computed_with(connection, metric, &scope)?,
             ),
@@ -1172,11 +1176,11 @@ fn roll_up_hour(connection: &Connection, metric: &Metric, hour: i64) -> Result<(
     connection
         .execute(
             "INSERT INTO rollups_hour
-         SELECT metric, host, series, epoch_ms($2::BIGINT)::TIMESTAMP,
+         SELECT metric, host_number, series, epoch_ms($2::BIGINT)::TIMESTAMP,
                 min(low), max(high), sum(summed), sum(samples)::BIGINT
          FROM rollups_five_minute
          WHERE metric = $1 AND time >= epoch_ms($2::BIGINT) AND time < epoch_ms($3::BIGINT)
-         GROUP BY metric, host, series",
+         GROUP BY metric, host_number, series",
             params![metric.name, hour, end],
         )
         .with_context(|| format!("rolling up the hour of {}", metric.name))?;
@@ -1215,7 +1219,7 @@ fn trends_sql(connection: &Connection, metric: &Metric) -> Result<String> {
 /// The number of an agent the store has heard from.
 fn host_number(connection: &Connection, host_id: &str) -> Result<Option<i32>> {
     let found = connection.query_row(
-        "SELECT id FROM hosts WHERE host_id = ?",
+        "SELECT number FROM hosts WHERE host_id = ?",
         params![host_id],
         |row| row.get(0),
     );
@@ -1275,13 +1279,13 @@ impl MetricsReader for DuckDbReader {
     fn last_samples(&self, since_ms: i64, until_ms: i64) -> Result<Vec<LastSample>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT a.host_id, epoch_ms(newest.time)
+            "SELECT h.host_id, epoch_ms(newest.time)
              FROM (
-                 SELECT se.host, max(s.time) AS time
+                 SELECT se.host_number, max(s.time) AS time
                  FROM all_samples s JOIN series se ON se.id = s.series_id
                  WHERE s.time >= epoch_ms($1::BIGINT) AND s.time <= epoch_ms($2::BIGINT)
-                 GROUP BY se.host
-             ) newest JOIN hosts a ON a.id = newest.host",
+                 GROUP BY se.host_number
+             ) newest JOIN hosts h ON h.number = newest.host_number",
         )?;
         let rows = statement.query_map(params![since_ms, until_ms], |row| {
             Ok(LastSample {
@@ -1310,7 +1314,7 @@ impl MetricsReader for DuckDbReader {
              JOIN metrics m ON m.id = se.metric_id
              JOIN collectors c ON c.id = m.collector_id
              LEFT JOIN series_labels l ON l.series_id = se.id
-             WHERE se.host = ? AND c.name = ?
+             WHERE se.host_number = ? AND c.name = ?
              ORDER BY se.id",
         )?;
         let rows = statement.query_map(params![host, collector], |row| {
@@ -1417,7 +1421,7 @@ impl MetricsReader for DuckDbReader {
 
     fn calculate(&self, query: &CalculationQuery) -> Result<SeriesResult> {
         let connection = self.connection()?;
-        let mut statement = connection.prepare("SELECT host_id, id FROM hosts")?;
+        let mut statement = connection.prepare("SELECT host_id, number FROM hosts")?;
         let numbers: HashMap<String, i32> = statement
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<duckdb::Result<_>>()?;
@@ -1743,7 +1747,10 @@ mod tests {
         };
         assert_eq!(count("SELECT count(*) FROM hosts"), 1);
         let kept = count("SELECT count(*) FROM series");
-        assert_eq!(count("SELECT count(*) FROM series WHERE host = 2"), kept);
+        assert_eq!(
+            count("SELECT count(*) FROM series WHERE host_number = 2"),
+            kept
+        );
         for table in ["samples", "samples_recent", "texts", "series_labels"] {
             let orphans = count(&format!(
                 "SELECT count(*) FROM {table} WHERE series_id NOT IN (SELECT id FROM series)"
@@ -2210,9 +2217,9 @@ mod tests {
         let (time, host_id, metric, value): (String, String, String, f64) = store
             .connection
             .query_row(
-                "SELECT s.time::VARCHAR, a.host_id, m.name, s.value FROM all_samples s
+                "SELECT s.time::VARCHAR, h.host_id, m.name, s.value FROM all_samples s
                  JOIN series se ON se.id = s.series_id
-                 JOIN hosts a ON a.id = se.host
+                 JOIN hosts h ON h.number = se.host_number
                  JOIN metrics m ON m.id = s.metric_id",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
@@ -2261,8 +2268,8 @@ mod tests {
         let saved: Vec<(i64, String)> = store
             .connection
             .prepare(
-                "SELECT epoch_ms(s.time), a.host_id FROM all_samples s
-                 JOIN series se ON se.id = s.series_id JOIN hosts a ON a.id = se.host
+                "SELECT epoch_ms(s.time), h.host_id FROM all_samples s
+                 JOIN series se ON se.id = s.series_id JOIN hosts h ON h.number = se.host_number
                  ORDER BY 1",
             )
             .unwrap()
@@ -2532,13 +2539,19 @@ mod tests {
 
         let count = |sql: &str| -> i64 { connection.query_row(sql, [], |row| row.get(0)).unwrap() };
         assert_eq!(
-            count("SELECT count(*) FROM hosts WHERE host_id = 'abc' AND id = 1"),
+            count("SELECT count(*) FROM hosts WHERE host_id = 'abc' AND number = 1"),
             1
         );
-        assert_eq!(count("SELECT count(*) FROM series WHERE host = 1"), 1);
-        assert_eq!(count("SELECT count(*) FROM rollups_hour WHERE host = 1"), 2);
         assert_eq!(
-            count("SELECT count(*) FROM rollups_five_minute WHERE host = 1"),
+            count("SELECT count(*) FROM series WHERE host_number = 1"),
+            1
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM rollups_hour WHERE host_number = 1"),
+            2
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM rollups_five_minute WHERE host_number = 1"),
             1
         );
         assert!(!table_exists(&connection, "agents"));

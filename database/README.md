@@ -14,23 +14,22 @@ MaxNines keeps its data in two places:
   [`crates/server/src/store/clickhouse.rs`](../crates/server/src/store/clickhouse.rs)
   for ClickHouse.
 
-The two only meet through a host's ID: the main database's `hosts.id` is what the
-metrics store calls a host.
+The two only meet through a host's ID: the main database's `hosts.id` is the
+metrics store's `host_id`.
 
 These diagrams have to change with every change to a table.
 
 ## Main database
 
-Solid lines are foreign keys the database enforces. Dotted lines are references
-the server keeps itself, without a foreign key. Types are shown simply: `string`
-has a length limit, `text` doesn't, and every time ending `_ms` is milliseconds
-since 1970 in UTC.
+Every line is a foreign key the database enforces. Types are shown simply:
+`string` has a length limit, `text` doesn't, and every time ending `_ms` is
+milliseconds since 1970 in UTC.
 
 ```mermaid
 erDiagram
     hosts ||--o{ host_facts : "reports"
     hosts ||--o| host_config_status : "last applied"
-    hosts ||..o| host_boots : "last booted"
+    hosts ||--o| host_boots : "last booted"
     hosts ||--o{ alerts : "has"
     alert_rules |o--o{ alerts : "raised"
     alert_rules ||--o{ alert_rule_channels : "tells"
@@ -43,9 +42,9 @@ erDiagram
     dashboards ||--o{ dashboard_widgets : "shows"
     dashboards ||--o{ dashboard_variables : "offers"
     users ||--o{ user_sessions : "signed in as"
-    users ||..o{ api_keys : "owns"
-    users ||..o{ recovery_codes : "can recover with"
-    users ||..o{ sign_in_challenges : "is asked"
+    users ||--o{ api_keys : "owns"
+    users ||--o{ recovery_codes : "can recover with"
+    users ||--o{ sign_in_challenges : "is asked"
 
     hosts {
         string id PK "from its agent's public key"
@@ -72,7 +71,7 @@ erDiagram
         int reported_ms
     }
     host_boots {
-        string host_id PK
+        string host_id PK, FK
         int boot_ms
     }
     alert_rules {
@@ -236,7 +235,7 @@ erDiagram
     }
     api_keys {
         int id PK
-        int user_id
+        int user_id FK
         string name
         string hint
         string token_hash UK
@@ -248,13 +247,13 @@ erDiagram
     }
     recovery_codes {
         int id PK
-        int user_id
+        int user_id FK
         string code_hash
         int used_ms
     }
     sign_in_challenges {
         int id PK
-        int user_id
+        int user_id FK
         string token_hash UK
         int expires_ms
     }
@@ -355,7 +354,9 @@ each host, for each thing it describes, is a series. New numbers land in
 `samples_recent` and move to `samples` once their hour is over, sorted so a
 query only reads what it needs. Rollups keep the lowest, highest, total and count
 of each chart's line, 5 minutes and an hour at a time, so long ranges are quick
-and spikes survive. There are no foreign keys, as DuckDB checks them slowly.
+and spikes survive. A host is numbered here to keep series small. The lines are
+references the server keeps: there are no foreign keys, as DuckDB checks them
+slowly.
 
 ```mermaid
 erDiagram
@@ -378,13 +379,13 @@ erDiagram
         string data_type "int, float, bool or text"
     }
     hosts {
-        int id PK
+        int number PK
         string host_id "the main database's hosts.id"
     }
     series {
         bigint id PK
         int metric_id
-        int host "hosts.id"
+        int host_number
     }
     series_labels {
         bigint series_id
@@ -410,7 +411,7 @@ erDiagram
     }
     rollups_five_minute {
         string metric "the catalog's name, like cpu.usage"
-        int host "hosts.id"
+        int host_number
         string series "the line's name"
         timestamp time
         double low
@@ -420,7 +421,7 @@ erDiagram
     }
     rollups_hour {
         string metric
-        int host "hosts.id"
+        int host_number
         string series
         timestamp time
         double low
@@ -443,7 +444,7 @@ The view `all_samples` is `samples` and `samples_recent` together, and
 ## Metrics store: ClickHouse
 
 ClickHouse keeps the same things without numbering them: each row names its
-metric, host and labels in full, which it compresses well. Tables are sorted so
+metric, host ID and labels in full, which it compresses well. Tables are sorted so
 a query reads only what it asks for, and `ReplacingMergeTree` drops repeated rows
 as it merges them.
 
@@ -451,7 +452,7 @@ as it merges them.
 erDiagram
     samples {
         string metric "collector and path, like cpu.usage_percent"
-        string host "the main database's hosts.id"
+        string host_id "the main database's hosts.id"
         map labels
         datetime time
         double value
@@ -459,23 +460,23 @@ erDiagram
     }
     texts {
         string metric
-        string host
+        string host_id
         map labels
         datetime time
         string value
     }
     series {
-        string host
+        string host_id
         string metric
         map labels
     }
     reports {
         datetime time
-        string host
+        string host_id
     }
     rollups_five_minute {
         string metric
-        string host
+        string host_id
         string series
         datetime time
         double low
@@ -486,7 +487,7 @@ erDiagram
     }
     rollups_hour {
         string metric
-        string host
+        string host_id
         string series
         datetime time
         double low
