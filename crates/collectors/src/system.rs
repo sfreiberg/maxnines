@@ -53,6 +53,10 @@ pub struct Limits {
     /// Only Linux, whose limit is on threads rather than processes.
     max_threads: Option<u64>,
     threads: Option<u64>,
+    /// Only Linux, while its firewall tracks connections: when the table is full, new
+    /// connections are dropped without a word.
+    max_conntrack: Option<u64>,
+    conntrack: Option<u64>,
 }
 
 /// Measures how CPU time is spent between one call and the next.
@@ -337,6 +341,8 @@ pub fn limits() -> Limits {
         threads: std::fs::read_to_string("/proc/loadavg")
             .ok()
             .and_then(|text| parse_thread_count(&text)),
+        max_conntrack: number("/proc/sys/net/netfilter/nf_conntrack_max"),
+        conntrack: number("/proc/sys/net/netfilter/nf_conntrack_count"),
     }
 }
 
@@ -535,6 +541,8 @@ pub fn report(
         "processes": limits.processes,
         "max_threads": limits.max_threads,
         "threads": limits.threads,
+        "max_conntrack": limits.max_conntrack,
+        "conntrack": limits.conntrack,
         "login_sessions": sessions,
     });
     for (name, value) in TcpStates::report(tcp) {
@@ -765,6 +773,17 @@ pgpgin 900
         assert!(processes > 1 && processes <= threads, "{limits:?}");
         assert!(threads < limits.max_threads.unwrap(), "{limits:?}");
         assert_eq!(limits.max_processes, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn connection_tracking_is_reported_while_the_firewall_does_it() {
+        let limits = limits();
+        let tracking = std::path::Path::new("/proc/sys/net/netfilter/nf_conntrack_max").exists();
+        assert_eq!(limits.max_conntrack.is_some(), tracking, "{limits:?}");
+        if let (Some(count), Some(max)) = (limits.conntrack, limits.max_conntrack) {
+            assert!(count <= max, "{limits:?}");
+        }
     }
 
     #[cfg(target_os = "macos")]

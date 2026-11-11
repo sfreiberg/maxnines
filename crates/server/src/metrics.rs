@@ -806,6 +806,32 @@ pub const METRICS: &[Metric] = &[
         )]),
         chart: ShowChart::WithData,
     },
+    // Linux's firewall table of connections, which drops new ones when it's full.
+    Metric {
+        name: "system.conntrack",
+        title: "Tracked connections",
+        unit: Unit::Number,
+        collector: "system",
+        source: Source::Fields(&[
+            ("Tracked", Reading::Field("$.conntrack")),
+            ("Limit", Reading::Field("$.max_conntrack")),
+        ]),
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "system.conntrack_used",
+        title: "Connection tracking table used",
+        unit: Unit::Percent,
+        collector: "system",
+        source: Source::Fields(&[(
+            "Used",
+            Reading::Percent {
+                part: "$.conntrack",
+                whole: "$.max_conntrack",
+            },
+        )]),
+        chart: ShowChart::WithData,
+    },
     Metric {
         name: "system.sessions",
         title: "Login sessions",

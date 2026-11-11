@@ -273,6 +273,15 @@ fn updates_and_a_waiting_restart_read_what_the_agent_sends() {
 }
 
 #[test]
+fn the_connection_tracking_table_is_a_share_of_its_limit() {
+    let mut store = in_memory();
+    write_metric(&mut store, "a", 1000, "system", json!({ "conntrack": 196_608, "max_conntrack": 262_144 }));
+
+    assert_eq!(averages(&query(&store, "a", "system.conntrack_used", 8).series[0]), [75.0]);
+    assert_eq!(names(&query(&store, "a", "system.conntrack", 8)), ["Limit", "Tracked"]);
+}
+
+#[test]
 fn failed_services_are_counted_and_named() {
     let mut store = in_memory();
     let system = json!({ "failed_services": 2, "failed_service_names": "backup.timer, nginx.service" });

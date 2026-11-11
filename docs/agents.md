@@ -137,6 +137,9 @@ limit where it has one. They come from the `system` collector, which the Default
 - **Login sessions** come from `who`, and from `quser` on Windows. Each session counts,
   so someone with three terminals open counts three times. Windows Home editions
   don't have `quser`, so they don't report sessions.
+- **Tracked connections**, on Linux while its firewall tracks them, against the size of
+  its table. When the table is full, new connections are dropped without a word, which
+  busy gateways and Docker hosts run into.
 - **Failed services** are counted, and named, without listing them first: on Linux, the
   units systemd says have failed, as `systemctl --failed` lists them, and on Windows,
   services that start automatically and stopped with an error. Many of Windows' own
