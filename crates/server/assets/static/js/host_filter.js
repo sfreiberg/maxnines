@@ -5,7 +5,7 @@
   const form = document.getElementById("host-filter");
   if (!form) return;
 
-  const input = form.querySelector('input[name="q"]');
+  const input = form.querySelector('input[name="filter"]');
   const list = document.getElementById("host-filter-options");
   const DELAY_MS = 120;
 

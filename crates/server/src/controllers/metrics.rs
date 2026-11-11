@@ -36,7 +36,7 @@ pub fn routes() -> Router<AppState> {
 
 #[derive(Deserialize)]
 struct FleetParams {
-    q: Option<String>,
+    filter: Option<String>,
     page: Option<String>,
 }
 
@@ -46,7 +46,7 @@ async fn index(
     token: CsrfToken,
 ) -> Response {
     let data = async {
-        let search = HostSearch::load(&state, params.q.as_deref()).await?;
+        let search = HostSearch::load(&state, params.filter.as_deref()).await?;
         let agents = fleet::rows(&state).await?;
         anyhow::Ok((search, agents))
     };
@@ -59,7 +59,7 @@ async fn index(
     let pages = paginate(&mut agents, page_number(params.page.as_deref()), |page| {
         address(
             "/metrics",
-            &[("q", &search.text), ("page", &page.to_string())],
+            &[("filter", &search.text), ("page", &page.to_string())],
         )
     });
     Page::new(&state, &token, "metrics/index.html")
@@ -151,7 +151,7 @@ struct EventRow {
     kind_label: &'static str,
     title: String,
     detail: Option<String>,
-    by: Option<String>,
+    created_by: Option<String>,
 }
 
 fn event_row(event: TimelineEvent) -> EventRow {
@@ -162,7 +162,7 @@ fn event_row(event: TimelineEvent) -> EventRow {
         kind_label: event.kind.label(),
         title: event.title,
         detail: event.detail,
-        by: event.by,
+        created_by: event.created_by,
     }
 }
 

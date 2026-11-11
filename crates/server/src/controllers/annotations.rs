@@ -12,7 +12,7 @@ use chrono::{NaiveDateTime, TimeDelta};
 use serde::{Deserialize, Serialize};
 
 use super::metrics::{RangeParams, selected_range};
-use super::{CsrfForm, Page, local_time, server_error, signed_in_user, viewer_zone};
+use super::{CsrfForm, Page, local_time, recorded_by, server_error, viewer_zone};
 use crate::app_state::{AppState, EventRefusal};
 use crate::events::EventInput;
 use crate::host_filter;
@@ -31,11 +31,6 @@ pub fn routes() -> Router<AppState> {
         .route("/metrics/annotations", get(index).post(create))
         .route("/metrics/annotations/{id}/delete", post(delete))
         .route("/agents/{id}/annotations", post(create_for_machine))
-}
-
-/// Who recorded something from a page.
-pub(super) fn recorded_by() -> String {
-    signed_in_user().map_or_else(|| "admin".to_string(), |user| user.email.clone())
 }
 
 /// What the form holds, given back as it was when it's refused.
@@ -58,7 +53,7 @@ struct AnnotationRow {
     title: String,
     detail: Option<String>,
     filter: String,
-    by: String,
+    created_by: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -93,7 +88,7 @@ async fn page(
             title: annotation.title,
             detail: annotation.detail,
             filter: annotation.filter,
-            by: annotation.created_by,
+            created_by: annotation.created_by,
         })
         .collect();
     let page = Page::new(state, token, "metrics/annotations.html")

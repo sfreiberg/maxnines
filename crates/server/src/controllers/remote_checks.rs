@@ -154,7 +154,8 @@ struct ListRow {
 
 #[derive(Deserialize)]
 struct ListParams {
-    filter: Option<String>,
+    /// Which tab: down or disabled.
+    status: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -199,7 +200,7 @@ async fn index(
         })
         .collect();
 
-    let selected = params.filter.as_deref().unwrap_or("all");
+    let selected = params.status.as_deref().unwrap_or("all");
     let filters: Vec<FilterTab> = [("all", "All"), ("down", "Down"), ("disabled", "Disabled")]
         .into_iter()
         .map(|(key, label)| FilterTab {

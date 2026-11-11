@@ -10,7 +10,7 @@ pub struct Model {
     pub filter: String,
     pub days: String,
     pub start_time: String,
-    pub duration_minutes: i64,
+    pub duration_secs: i64,
     pub time_zone: String,
 }
 

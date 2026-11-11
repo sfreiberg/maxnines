@@ -12,9 +12,9 @@
   </div>
 </div>
 <p class="hint">The server runs these itself, against remote sites. To check something from where an agent is, add it to a config rule. Alert rules cover both.</p>
-<nav class="tabs" aria-label="Filter">
+<nav class="tabs" aria-label="Status">
   {% for tab in filters %}
-  <a href="/checks?filter={{ tab.key }}"{% if tab.selected %} class="selected" aria-current="true"{% endif %}>{{ tab.label }} {{ tab.count }}</a>
+  <a href="/checks?status={{ tab.key }}"{% if tab.selected %} class="selected" aria-current="true"{% endif %}>{{ tab.label }} {{ tab.count }}</a>
   {% endfor %}
 </nav>
 {% if checks %}

@@ -70,7 +70,7 @@ pub struct AgentRecord {
     /// Who approved it: "admin", someone's address, or "rule:<name>".
     pub decided_by: Option<String>,
     pub first_seen_ms: u64,
-    pub decided_at_ms: Option<u64>,
+    pub decided_ms: Option<u64>,
 }
 
 /// Enough of an agent's ID to tell it from another with the same name, where the
@@ -250,7 +250,7 @@ impl Registry {
             state: AgentState::Pending,
             decided_by: None,
             first_seen_ms: now,
-            decided_at_ms: None,
+            decided_ms: None,
         });
         agent.host = request.host.to_string();
 
@@ -258,7 +258,7 @@ impl Registry {
             info!(agent = request.id, rule = rule.name, "approved by rule");
             agent.state = AgentState::Approved;
             agent.decided_by = Some(format!("rule:{}", rule.name));
-            agent.decided_at_ms = Some(now);
+            agent.decided_ms = Some(now);
         }
 
         let status = match agent.state {
@@ -319,7 +319,7 @@ impl Registry {
 
         agent.state = state;
         agent.decided_by = Some(by.to_string());
-        agent.decided_at_ms = Some(now_ms());
+        agent.decided_ms = Some(now_ms());
         self.save(&mut agents, agent.clone()).await?;
         drop(agents);
         self.asked_ms
@@ -454,7 +454,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(record.decided_by.as_deref(), Some("admin"));
-        assert!(record.decided_at_ms.is_some());
+        assert!(record.decided_ms.is_some());
         assert_eq!(
             registry.admit(&agent).await.unwrap(),
             RegistrationStatus::Approved

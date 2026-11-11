@@ -7,7 +7,7 @@ pub struct Model {
     pub agent_id: String,
     pub version: String,
     pub error: Option<String>,
-    pub reported_at_ms: i64,
+    pub reported_ms: i64,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

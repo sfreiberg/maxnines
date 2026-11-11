@@ -74,7 +74,7 @@ async fn a_deploy_is_marked_on_the_machines_its_filter_picks() {
     let events = timeline(&server, &web).await;
     assert_eq!(titles(&events), ["Shop v2.3"]);
     assert_eq!(events[0]["detail"], "Build 812");
-    assert_eq!(events[0]["by"], "test@example.com");
+    assert_eq!(events[0]["created_by"], "test@example.com");
     assert!(timeline(&server, &db).await.is_empty());
 }
 
@@ -188,7 +188,7 @@ async fn a_restart_is_noticed_from_the_boot_time_and_a_backlog_is_not_one() {
     send(&mut client, &with_boot(second_boot)).await;
     let events = wait_for_kind(&server, &agent, "restart").await;
     assert_eq!(events[0]["time_ms"], second_boot * 1000);
-    assert_eq!(events[0]["by"], Value::Null);
+    assert_eq!(events[0]["created_by"], Value::Null);
 
     // Samples kept from before the restart arrive after the live ones.
     send(&mut client, &with_boot(first_boot)).await;

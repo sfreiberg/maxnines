@@ -22,8 +22,8 @@ pub const DAYS: [(&str, &str); 7] = [
 ];
 
 const MAX_NAME_CHARS: usize = 255;
-const MAX_DURATION_MINUTES: u32 = 7 * 24 * 60;
-const MINUTES_IN_A_DAY: u32 = 24 * 60;
+const MAX_DURATION_SECS: u32 = 7 * SECS_IN_A_DAY;
+const SECS_IN_A_DAY: u32 = 24 * 60 * 60;
 const TIME_FORMAT: &str = "%H:%M";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,7 +39,8 @@ pub struct MaintenanceWindowInput {
     pub days: Vec<String>,
     /// When it starts, like `02:00`.
     pub start_time: String,
-    pub duration_minutes: u32,
+    /// How long it lasts.
+    pub duration_secs: u32,
     /// A name from the time zone database, like `Europe/London`.
     pub time_zone: String,
 }
@@ -69,8 +70,12 @@ pub fn check_window(input: &MaintenanceWindowInput) -> Result<()> {
     if NaiveTime::parse_from_str(&input.start_time, TIME_FORMAT).is_err() {
         bail!("The start time should look like 02:00.");
     }
-    if input.duration_minutes == 0 || input.duration_minutes > MAX_DURATION_MINUTES {
+    if input.duration_secs == 0 || input.duration_secs > MAX_DURATION_SECS {
         bail!("A maintenance window can last up to 7 days.");
+    }
+    // It starts on a minute, so it ends on one too.
+    if !input.duration_secs.is_multiple_of(60) {
+        bail!("A maintenance window lasts a whole number of minutes.");
     }
     if input.time_zone.parse::<Tz>().is_err() {
         bail!(
@@ -105,10 +110,10 @@ impl MaintenanceWindow {
         let today = DateTime::from_timestamp_millis(now_ms)?
             .with_timezone(&zone)
             .date_naive();
-        let lasts_ms = i64::from(window.duration_minutes) * 60_000;
+        let lasts_ms = i64::from(window.duration_secs) * 1000;
 
         // One that started on an earlier day may not have finished.
-        let days_back = i64::from(window.duration_minutes.div_ceil(MINUTES_IN_A_DAY)) + 1;
+        let days_back = i64::from(window.duration_secs.div_ceil(SECS_IN_A_DAY)) + 1;
         (0..=days_back)
             .filter_map(|back| today.checked_sub_signed(TimeDelta::days(back)))
             .filter(|date| {
@@ -133,7 +138,7 @@ impl MaintenanceWindow {
             "{} at {} for {}, {}",
             days.join(", "),
             window.start_time,
-            format_duration(u64::from(window.duration_minutes) * 60),
+            format_duration(u64::from(window.duration_secs)),
             window.time_zone
         )
     }
@@ -150,7 +155,7 @@ mod tests {
             filter: String::new(),
             days: vec!["sun".to_string()],
             start_time: "02:00".to_string(),
-            duration_minutes: 120,
+            duration_secs: 7200,
             time_zone: "UTC".to_string(),
         }
     }
@@ -200,7 +205,7 @@ mod tests {
     #[test]
     fn it_can_last_for_days() {
         let long = window(MaintenanceWindowInput {
-            duration_minutes: 3 * MINUTES_IN_A_DAY,
+            duration_secs: 3 * SECS_IN_A_DAY,
             ..input()
         });
 
@@ -229,7 +234,7 @@ mod tests {
     fn a_start_the_clocks_skip_moves_an_hour_on() {
         let skipped = window(MaintenanceWindowInput {
             start_time: "02:30".to_string(),
-            duration_minutes: 30,
+            duration_secs: 1800,
             time_zone: "America/New_York".to_string(),
             ..input()
         });
@@ -244,7 +249,7 @@ mod tests {
     fn a_start_the_clocks_repeat_is_the_first_one() {
         let repeated = window(MaintenanceWindowInput {
             start_time: "01:30".to_string(),
-            duration_minutes: 30,
+            duration_secs: 1800,
             time_zone: "America/New_York".to_string(),
             ..input()
         });
@@ -306,14 +311,21 @@ mod tests {
             ),
             (
                 MaintenanceWindowInput {
-                    duration_minutes: 0,
+                    duration_secs: 0,
                     ..input()
                 },
                 "up to 7 days",
             ),
             (
                 MaintenanceWindowInput {
-                    duration_minutes: MAX_DURATION_MINUTES + 1,
+                    duration_secs: 90,
+                    ..input()
+                },
+                "whole number of minutes",
+            ),
+            (
+                MaintenanceWindowInput {
+                    duration_secs: MAX_DURATION_SECS + 1,
                     ..input()
                 },
                 "up to 7 days",

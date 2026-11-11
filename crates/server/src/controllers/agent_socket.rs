@@ -565,7 +565,7 @@ async fn save_config_result(
     let status = ConfigStatus {
         version,
         error: error.map(|error| error.chars().take(MAX_ERROR_LEN).collect()),
-        reported_at_ms: now_ms(),
+        reported_ms: now_ms(),
     };
     if let Err(error) = state.database.save_config_status(&agent.id, &status).await {
         warn!(
@@ -576,7 +576,7 @@ async fn save_config_result(
         return;
     }
     if changed {
-        record_config_change(agent, state, status.reported_at_ms as i64).await;
+        record_config_change(agent, state, status.reported_ms as i64).await;
     }
 }
 

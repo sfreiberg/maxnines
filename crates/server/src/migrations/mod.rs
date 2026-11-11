@@ -39,6 +39,7 @@ impl MigratorTrait for Migrator {
             Box::new(AddBuiltInInodeAlert),
             Box::new(CreateEvents),
             Box::new(UnresolveEventFilters),
+            Box::new(RenameTimesAndDurations),
         ]
     }
 }
@@ -84,6 +85,7 @@ enum Agents {
     DecidedBy,
     FirstSeenMs,
     DecidedAtMs,
+    DecidedMs,
 }
 
 #[derive(Iden)]
@@ -105,6 +107,7 @@ enum AgentConfigStatus {
     Version,
     Error,
     ReportedAtMs,
+    ReportedMs,
 }
 
 /// Two agents that aren't machines. The server records its own checks under
@@ -686,6 +689,7 @@ enum MaintenanceWindows {
     /// "HH:MM" in the window's time zone.
     StartTime,
     DurationMinutes,
+    DurationSecs,
     TimeZone,
 }
 
@@ -1814,6 +1818,7 @@ enum AuditLog {
     Table,
     Id,
     AtMs,
+    TimeMs,
     /// `person`, `api_key`, `command_line`, `maxnines`, `slack` or `nobody`.
     ActorKind,
     ActorId,
@@ -2952,6 +2957,98 @@ impl MigrationTrait for UnresolveEventFilters {
     }
 }
 
+struct RenameTimesAndDurations;
+
+impl MigrationName for RenameTimesAndDurations {
+    fn name(&self) -> &str {
+        "m20261110_000028_rename_times_and_durations"
+    }
+}
+
+/// Every moment is named for what happened, ending `_ms`, and every length is in
+/// seconds, so the three that weren't change to match.
+#[async_trait::async_trait]
+impl MigrationTrait for RenameTimesAndDurations {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        rename(
+            manager,
+            Agents::Table,
+            Agents::DecidedAtMs,
+            Agents::DecidedMs,
+        )
+        .await?;
+        rename(
+            manager,
+            AgentConfigStatus::Table,
+            AgentConfigStatus::ReportedAtMs,
+            AgentConfigStatus::ReportedMs,
+        )
+        .await?;
+        rename(manager, AuditLog::Table, AuditLog::AtMs, AuditLog::TimeMs).await?;
+        rename(
+            manager,
+            MaintenanceWindows::Table,
+            MaintenanceWindows::DurationMinutes,
+            MaintenanceWindows::DurationSecs,
+        )
+        .await?;
+        let in_seconds = Query::update()
+            .table(MaintenanceWindows::Table)
+            .value(
+                MaintenanceWindows::DurationSecs,
+                Expr::col(MaintenanceWindows::DurationSecs).mul(60),
+            )
+            .to_owned();
+        manager.exec_stmt(in_seconds).await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let in_minutes = Query::update()
+            .table(MaintenanceWindows::Table)
+            .value(
+                MaintenanceWindows::DurationSecs,
+                Expr::col(MaintenanceWindows::DurationSecs).div(60),
+            )
+            .to_owned();
+        manager.exec_stmt(in_minutes).await?;
+        rename(
+            manager,
+            MaintenanceWindows::Table,
+            MaintenanceWindows::DurationSecs,
+            MaintenanceWindows::DurationMinutes,
+        )
+        .await?;
+        rename(manager, AuditLog::Table, AuditLog::TimeMs, AuditLog::AtMs).await?;
+        rename(
+            manager,
+            AgentConfigStatus::Table,
+            AgentConfigStatus::ReportedMs,
+            AgentConfigStatus::ReportedAtMs,
+        )
+        .await?;
+        rename(
+            manager,
+            Agents::Table,
+            Agents::DecidedMs,
+            Agents::DecidedAtMs,
+        )
+        .await
+    }
+}
+
+async fn rename(
+    manager: &SchemaManager<'_>,
+    table: impl Iden + 'static,
+    from: impl Iden + 'static,
+    to: impl Iden + 'static,
+) -> Result<(), DbErr> {
+    let statement = Table::alter()
+        .table(table)
+        .rename_column(from, to)
+        .to_owned();
+    manager.alter_table(statement).await
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
@@ -3260,5 +3357,38 @@ mod tests {
             .map(|row| row.try_get::<String>("", "name").unwrap())
             .collect();
         assert_eq!(names, ["Inodes"]);
+    }
+
+    async fn window_lengths(connection: &impl ConnectionTrait, column: &str) -> Vec<i64> {
+        let query = Statement::from_string(
+            connection.get_database_backend(),
+            format!("SELECT {column} FROM maintenance_windows ORDER BY id"),
+        );
+        let rows = connection.query_all_raw(query).await.unwrap();
+        rows.iter()
+            .map(|row| row.try_get("", column).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn maintenance_windows_keep_their_length_in_seconds_and_back() {
+        let connection = fresh().await;
+        Migrator::up(&connection, Some(before(&RenameTimesAndDurations)))
+            .await
+            .unwrap();
+        connection
+            .execute_unprepared(
+                "INSERT INTO maintenance_windows
+                   (name, filter, days, start_time, duration_minutes, time_zone)
+                 VALUES ('Patching', '', 'sun', '02:00', 120, 'UTC')",
+            )
+            .await
+            .unwrap();
+
+        Migrator::up(&connection, None).await.unwrap();
+        assert_eq!(window_lengths(&connection, "duration_secs").await, [7200]);
+
+        Migrator::down(&connection, Some(1)).await.unwrap();
+        assert_eq!(window_lengths(&connection, "duration_minutes").await, [120]);
     }
 }

@@ -37,7 +37,7 @@
 
 {% include "agents/_filter.html" %}
 
-<nav class="tabs" aria-label="Filter">
+<nav class="tabs" aria-label="Status">
   {% for tab in filters %}
   <a href="{{ tab.href }}"{% if tab.selected %} class="selected" aria-current="true"{% endif %}>{{ tab.label }} {{ tab.count }}</a>
   {% endfor %}

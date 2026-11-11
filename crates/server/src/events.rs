@@ -174,7 +174,7 @@ pub struct TimelineEvent {
     pub kind: EventKind,
     pub title: String,
     pub detail: Option<String>,
-    pub by: Option<String>,
+    pub created_by: Option<String>,
     pub id: Option<i64>,
 }
 

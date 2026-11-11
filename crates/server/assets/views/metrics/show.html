@@ -74,7 +74,7 @@
         <td class="nowrap">{{ event.time }}</td>
         <td><span class="event-kind k-{{ event.kind }}">{{ event.kind_label }}</span></td>
         <td>{{ event.title }}{% if event.detail %}<div class="hint">{{ event.detail }}</div>{% endif %}</td>
-        <td>{% if event.by %}{{ event.by }}{% else %}<span class="hint">Server</span>{% endif %}</td>
+        <td>{% if event.created_by %}{{ event.created_by }}{% else %}<span class="hint">Server</span>{% endif %}</td>
         {% if can_respond %}
         <td>{% if event.id %}
           <form method="post" action="/metrics/annotations/{{ event.id }}/delete">

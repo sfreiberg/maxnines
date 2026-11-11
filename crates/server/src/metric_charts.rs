@@ -1014,7 +1014,7 @@ mod tests {
             kind,
             title: "Deployed".into(),
             detail: None,
-            by: None,
+            created_by: None,
             id: None,
         };
         let mut chart = chart("cpu.usage", vec![series("CPU", &steady(20))]);

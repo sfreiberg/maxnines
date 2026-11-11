@@ -3892,15 +3892,15 @@ async fn hosts_can_be_filtered_by_their_facts() {
 
     for (query, web, db) in [
         ("", true, true),
-        ("?q=os%3Dlinux", true, false),
-        ("?q=os.family%3Dmacos", false, true),
-        ("?q=os%21%3Dlinux", false, true),
-        ("?q=hostname%3Dweb%2A", true, false),
-        ("?q=db", false, true),
-        ("?q=custom.tags%3Deu", true, false),
-        ("?q=os.name%3D%22Ubuntu+Linux%22", true, false),
-        ("?q=os%3Dlinux+hostname%3Ddb%2A", false, false),
-        ("?q=custom.rack%3Da1", false, false),
+        ("?filter=os%3Dlinux", true, false),
+        ("?filter=os.family%3Dmacos", false, true),
+        ("?filter=os%21%3Dlinux", false, true),
+        ("?filter=hostname%3Dweb%2A", true, false),
+        ("?filter=db", false, true),
+        ("?filter=custom.tags%3Deu", true, false),
+        ("?filter=os.name%3D%22Ubuntu+Linux%22", true, false),
+        ("?filter=os%3Dlinux+hostname%3Ddb%2A", false, false),
+        ("?filter=custom.rack%3Da1", false, false),
     ] {
         let found = hosts_on(&server, &format!("/agents{query}")).await;
         assert_eq!(found, (web, db), "{query}");
@@ -3913,10 +3913,12 @@ async fn the_fleet_metrics_page_filters_the_same_way() {
     let _hosts = two_hosts(&server).await;
 
     assert_eq!(
-        hosts_on(&server, "/metrics?q=os%3Dlinux").await,
+        hosts_on(&server, "/metrics?filter=os%3Dlinux").await,
         (true, false)
     );
-    let page = Browser::default().get(&server, "/metrics?q=nothing").await;
+    let page = Browser::default()
+        .get(&server, "/metrics?filter=nothing")
+        .await;
     assert!(page.body.contains("No machines match this filter."));
 }
 
@@ -3925,7 +3927,9 @@ async fn a_filter_that_cannot_be_read_says_why_and_shows_nothing() {
     let server = start().await;
     let _hosts = two_hosts(&server).await;
 
-    let page = Browser::default().get(&server, "/agents?q=os%3D").await;
+    let page = Browser::default()
+        .get(&server, "/agents?filter=os%3D")
+        .await;
 
     assert!(page.body.contains("os needs a value"), "{}", page.body);
     assert!(!page.body.contains(">web-1"));
@@ -3937,17 +3941,20 @@ async fn links_on_the_agents_page_keep_the_filter() {
     let _hosts = two_hosts(&server).await;
 
     let page = Browser::default()
-        .get(&server, "/agents?filter=online&view=table&q=os%3Dlinux")
+        .get(
+            &server,
+            "/agents?status=online&view=table&filter=os%3Dlinux",
+        )
         .await;
 
     assert!(page.body.contains(r#"value="os=linux""#), "{}", page.body);
-    assert!(page.body.contains(r#"name="filter" value="online""#));
+    assert!(page.body.contains(r#"name="status" value="online""#));
     assert!(page.body.contains(r#"name="view" value="table""#));
     for tab in ["Online 1", "All 1", "Offline 0"] {
         assert!(page.body.contains(tab), "{tab}: {}", page.body);
     }
     // Encoded for the address, then again for the page.
-    assert!(page.body.contains("q=os%3Dlinux"), "{}", page.body);
+    assert!(page.body.contains("filter=os%3Dlinux"), "{}", page.body);
 }
 
 #[tokio::test]
@@ -3967,7 +3974,7 @@ async fn what_is_typed_into_a_filter_is_never_markup() {
 
     for path in ["/agents", "/metrics"] {
         let page = Browser::default()
-            .get(&server, &format!("{path}?q={hostile}"))
+            .get(&server, &format!("{path}?filter={hostile}"))
             .await;
         assert!(page.has_only_our_scripts(), "{}", page.body);
     }
@@ -4147,17 +4154,17 @@ async fn the_filter_can_pick_an_agent_by_id() {
     let web = hosts[0].0.id();
 
     let by_id = server
-        .request("GET", &format!("/api/v1/agents?q=id%3D{web}"), "")
+        .request("GET", &format!("/api/v1/agents?filter=id%3D{web}"), "")
         .await;
     assert_eq!(hosts_in(&by_id), ["web-1"]);
 
     let prefix = &web[..8];
     assert_eq!(
-        hosts_on(&server, &format!("/agents?q=id%3D{prefix}*")).await,
+        hosts_on(&server, &format!("/agents?filter=id%3D{prefix}*")).await,
         (true, false)
     );
     assert_eq!(
-        hosts_on(&server, &format!("/agents?q=id!%3D{prefix}*")).await,
+        hosts_on(&server, &format!("/agents?filter=id!%3D{prefix}*")).await,
         (false, true)
     );
 }
@@ -4195,7 +4202,7 @@ async fn the_api_filters_hosts_the_same_way_as_the_pages() {
 
     let all = server.request("GET", "/api/v1/agents", "").await;
     let linux = server
-        .request("GET", "/api/v1/agents?q=os%3Dlinux", "")
+        .request("GET", "/api/v1/agents?filter=os%3Dlinux", "")
         .await;
 
     assert_eq!(hosts_in(&all), ["db-1", "web-1"]);
@@ -4223,7 +4230,9 @@ async fn the_api_shows_one_agent() {
 async fn the_api_explains_a_filter_it_cannot_read() {
     let server = start().await;
 
-    let response = server.request("GET", "/api/v1/agents?q=os%3D", "").await;
+    let response = server
+        .request("GET", "/api/v1/agents?filter=os%3D", "")
+        .await;
 
     assert_eq!(status_of(&response), "400", "{response}");
     assert!(

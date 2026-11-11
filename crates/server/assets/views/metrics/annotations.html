@@ -51,7 +51,7 @@
         <td><span class="event-kind k-{{ annotation.kind }}">{{ annotation.kind_label }}</span></td>
         <td>{{ annotation.title }}{% if annotation.detail %}<div class="hint">{{ annotation.detail }}</div>{% endif %}</td>
         <td>{% if annotation.filter %}<code>{{ annotation.filter }}</code>{% else %}<span class="hint">Every machine</span>{% endif %}</td>
-        <td>{{ annotation.by }}</td>
+        <td>{{ annotation.created_by }}</td>
         {% if can_respond %}
         <td>
           <form method="post" action="/metrics/annotations/{{ annotation.id }}/delete">

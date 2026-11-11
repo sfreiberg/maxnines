@@ -25,7 +25,7 @@ pub(super) async fn record<C: ConnectionTrait>(connection: &C, record: Record) -
     let acting = audit::current();
     let actor = record.actor.unwrap_or(acting.actor);
     let row = audit_entry::ActiveModel {
-        at_ms: Set(now_ms()),
+        time_ms: Set(now_ms()),
         actor_kind: Set(actor.kind().to_string()),
         actor_id: Set(actor.id()),
         actor_name: Set(clip(&actor.name(), MAX_NAME_CHARS)),
@@ -71,7 +71,7 @@ fn to_entry(row: audit_entry::Model) -> Entry {
     let changes: Vec<Change> = serde_json::from_str(&row.changes).unwrap_or_default();
     Entry {
         id: row.id,
-        at_ms: row.at_ms,
+        time_ms: row.time_ms,
         actor: EntryActor {
             kind: row.actor_kind,
             id: row.actor_id,

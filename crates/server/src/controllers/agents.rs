@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use super::fleet::{Health, OsFamily};
 use super::host_list::{HostSearch, address, page_number, paginate};
-use super::{CsrfForm, Page, server_error, signed_in_user, viewer_zone};
+use super::{CsrfForm, Page, recorded_by, server_error, viewer_zone};
 use crate::agent_versions::{self, NEWEST_AGENT_VERSION, VersionState};
 use crate::alerting::Alert;
 use crate::app_state::{AgentDeletion, AppState};
@@ -195,8 +195,10 @@ fn row(
 #[derive(Deserialize)]
 struct ListParams {
     view: Option<String>,
+    /// Which tab: online, offline or revoked.
+    status: Option<String>,
+    /// A host filter, as typed in the box.
     filter: Option<String>,
-    q: Option<String>,
     page: Option<String>,
 }
 
@@ -267,7 +269,7 @@ async fn index(
     token: CsrfToken,
 ) -> Response {
     let data = async {
-        let search = HostSearch::load(&state, params.q.as_deref()).await?;
+        let search = HostSearch::load(&state, params.filter.as_deref()).await?;
         let alerts = state.database.open_alerts().await?;
         anyhow::Ok((search, alerts))
     };
@@ -316,7 +318,7 @@ async fn index(
 
     let as_table = params.view.as_deref() == Some("table");
     let view = if as_table { "table" } else { "" };
-    let selected = params.filter.as_deref().unwrap_or("all");
+    let selected = params.status.as_deref().unwrap_or("all");
     let tab = if selected == "all" { "" } else { selected };
     let text = search.text.as_str();
     let filters: Vec<FilterTab> = [
@@ -333,9 +335,9 @@ async fn index(
         href: address(
             "/agents",
             &[
-                ("filter", if key == "all" { "" } else { key }),
+                ("status", if key == "all" { "" } else { key }),
                 ("view", view),
-                ("q", text),
+                ("filter", text),
             ],
         ),
     })
@@ -352,9 +354,9 @@ async fn index(
         address(
             "/agents",
             &[
-                ("filter", tab),
+                ("status", tab),
                 ("view", view),
-                ("q", text),
+                ("filter", text),
                 ("page", &page.to_string()),
             ],
         )
@@ -378,13 +380,13 @@ async fn index(
         .with("keep_tab", tab)
         .with(
             "tiles_href",
-            &address("/agents", &[("filter", tab), ("q", text)]),
+            &address("/agents", &[("status", tab), ("filter", text)]),
         )
         .with(
             "table_href",
             &address(
                 "/agents",
-                &[("filter", tab), ("view", "table"), ("q", text)],
+                &[("status", tab), ("view", "table"), ("filter", text)],
             ),
         )
         .render()
@@ -705,7 +707,7 @@ async fn start_maintenance(
     if let Err(error) = state.check_silence(&input).await {
         return (StatusCode::UNPROCESSABLE_ENTITY, format!("{error:#}")).into_response();
     }
-    let by = signed_in_user().map_or_else(|| "admin".to_string(), |user| user.email.clone());
+    let by = recorded_by();
     match state.database.create_silence(&input, &by, now_ms()).await {
         Ok(_) => (form.token, Redirect::to(&format!("/agents/{id}"))).into_response(),
         Err(error) => server_error(&error),
@@ -750,7 +752,7 @@ async fn decide(
     form: CsrfForm,
     decision: AgentState,
 ) -> Response {
-    let by = signed_in_user().map_or_else(|| "admin".to_string(), |user| user.email.clone());
+    let by = recorded_by();
     match state.registry.decide_as(&id, decision, &by).await {
         Ok(Some(_)) => (form.token, Redirect::to(&format!("/agents/{id}"))).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -778,7 +780,7 @@ mod tests {
         ConfigStatus {
             version: version.to_string(),
             error: error.map(String::from),
-            reported_at_ms: 1,
+            reported_ms: 1,
         }
     }
 

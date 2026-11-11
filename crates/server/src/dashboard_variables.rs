@@ -616,7 +616,7 @@ mod tests {
             state: AgentState::Approved,
             decided_by: None,
             first_seen_ms: 0,
-            decided_at_ms: None,
+            decided_ms: None,
         };
         let choices = machines(&[
             agent("ffff00001111", "web"),

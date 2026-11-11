@@ -513,7 +513,7 @@ pub struct EntrySubject {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Entry {
     pub id: i64,
-    pub at_ms: i64,
+    pub time_ms: i64,
     pub actor: EntryActor,
     pub via: Option<EntryVia>,
     /// The address the request came from.

@@ -402,7 +402,7 @@ async fn an_agent_asking_to_join_is_recorded_as_maxnines() {
         state: AgentState::Pending,
         decided_by: None,
         first_seen_ms: 0,
-        decided_at_ms: None,
+        decided_ms: None,
     };
 
     server.state.database.save_agent(&record).await.unwrap();

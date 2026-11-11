@@ -190,13 +190,13 @@ mod tests {
 
     #[test]
     fn addresses_leave_out_empty_values_and_encode_the_rest() {
-        assert_eq!(address("/agents", &[("q", "")]), "/agents");
+        assert_eq!(address("/agents", &[("filter", "")]), "/agents");
         assert_eq!(
             address(
                 "/agents",
-                &[("q", "os=linux web"), ("page", "2"), ("view", "")]
+                &[("filter", "os=linux web"), ("page", "2"), ("view", "")]
             ),
-            "/agents?q=os%3Dlinux+web&page=2"
+            "/agents?filter=os%3Dlinux+web&page=2"
         );
     }
 }

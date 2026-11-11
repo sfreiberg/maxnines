@@ -494,13 +494,13 @@ async fn audit_log(State(state): State<AppState>, Query(params): Query<AuditPara
 
 #[derive(Deserialize)]
 struct ListParams {
-    /// A filter, written as in the box on the agents page.
-    q: Option<String>,
+    /// A filter, written as in the box on the Machines page.
+    filter: Option<String>,
 }
 
 async fn list(State(state): State<AppState>, Query(params): Query<ListParams>) -> Response {
     let data = async {
-        let search = HostSearch::load(&state, params.q.as_deref()).await?;
+        let search = HostSearch::load(&state, params.filter.as_deref()).await?;
         let alerts = state.database.open_alerts().await?;
         anyhow::Ok((search, alerts))
     };
@@ -787,22 +787,22 @@ struct OpenAlert {
     #[serde(flatten)]
     alert: Alert,
     /// The silence keeping its notifications back, if there is one.
-    silenced_by: Option<i64>,
+    silence_id: Option<i64>,
     /// The maintenance window keeping them back, if there is one.
-    maintenance_window: Option<i64>,
+    maintenance_window_id: Option<i64>,
 }
 
 impl OpenAlert {
     fn new(alert: Alert, cover: Option<Cover>) -> Self {
-        let (silenced_by, maintenance_window) = match cover {
+        let (silence_id, maintenance_window_id) = match cover {
             Some(Cover::Silence { id, .. }) => (Some(id), None),
             Some(Cover::Window { id, .. }) => (None, Some(id)),
             None => (None, None),
         };
         Self {
             alert,
-            silenced_by,
-            maintenance_window,
+            silence_id,
+            maintenance_window_id,
         }
     }
 }
@@ -848,7 +848,11 @@ async fn list_delivery_problems(State(state): State<AppState>) -> Response {
 }
 
 async fn acknowledge_alert(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
-    match state.database.acknowledge_alert(id, "api", now_ms()).await {
+    match state
+        .database
+        .acknowledge_alert(id, &super::recorded_by(), now_ms())
+        .await
+    {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),
@@ -894,7 +898,11 @@ async fn create_silence(
     if let Err(error) = state.check_silence(&input).await {
         return refused(&error);
     }
-    match state.database.create_silence(&input, "api", now_ms()).await {
+    match state
+        .database
+        .create_silence(&input, &super::recorded_by(), now_ms())
+        .await
+    {
         Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
         Err(error) => server_error(&error),
     }
@@ -1234,7 +1242,7 @@ async fn list_events(State(state): State<AppState>, Query(params): Query<EventPa
 }
 
 async fn create_event(State(state): State<AppState>, Json(input): Json<EventInput>) -> Response {
-    let by = super::annotations::recorded_by();
+    let by = super::recorded_by();
     match state.record_event(input, &by, now_ms()).await {
         Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
         Err(EventRefusal::Invalid(message)) => {

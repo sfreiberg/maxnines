@@ -119,7 +119,7 @@ fn default_enabled() -> bool {
 pub struct ConfigStatus {
     pub version: String,
     pub error: Option<String>,
-    pub reported_at_ms: u64,
+    pub reported_ms: u64,
 }
 
 #[derive(Clone)]
@@ -185,7 +185,7 @@ impl Database {
             state: Set(record.state.as_str().to_string()),
             decided_by: Set(record.decided_by.clone()),
             first_seen_ms: Set(record.first_seen_ms as i64),
-            decided_at_ms: Set(record.decided_at_ms.map(|ms| ms as i64)),
+            decided_ms: Set(record.decided_ms.map(|ms| ms as i64)),
         };
 
         let on_conflict = OnConflict::column(agent::Column::Id)
@@ -195,7 +195,7 @@ impl Database {
                 agent::Column::State,
                 agent::Column::DecidedBy,
                 agent::Column::FirstSeenMs,
-                agent::Column::DecidedAtMs,
+                agent::Column::DecidedMs,
             ])
             .to_owned();
 
@@ -813,13 +813,13 @@ impl Database {
             agent_id: Set(agent_id.to_string()),
             version: Set(status.version.clone()),
             error: Set(status.error.clone()),
-            reported_at_ms: Set(status.reported_at_ms as i64),
+            reported_ms: Set(status.reported_ms as i64),
         };
         let on_conflict = OnConflict::column(agent_config_status::Column::AgentId)
             .update_columns([
                 agent_config_status::Column::Version,
                 agent_config_status::Column::Error,
-                agent_config_status::Column::ReportedAtMs,
+                agent_config_status::Column::ReportedMs,
             ])
             .to_owned();
 
@@ -839,7 +839,7 @@ impl Database {
         Ok(row.map(|row| ConfigStatus {
             version: row.version,
             error: row.error,
-            reported_at_ms: row.reported_at_ms as u64,
+            reported_ms: row.reported_ms as u64,
         }))
     }
 }
@@ -1010,7 +1010,7 @@ fn to_record(row: agent::Model) -> Result<AgentRecord> {
         host: row.host,
         decided_by: row.decided_by,
         first_seen_ms: row.first_seen_ms as u64,
-        decided_at_ms: row.decided_at_ms.map(|ms| ms as u64),
+        decided_ms: row.decided_ms.map(|ms| ms as u64),
     })
 }
 
@@ -1149,7 +1149,7 @@ mod tests {
             state: AgentState::Pending,
             decided_by: None,
             first_seen_ms: 1_789_000_000_123,
-            decided_at_ms: None,
+            decided_ms: None,
         }
     }
 
@@ -1549,7 +1549,7 @@ mod tests {
         let approved = AgentRecord {
             state: AgentState::Approved,
             decided_by: Some("rule:production-subnet".to_string()),
-            decided_at_ms: Some(1_789_000_000_456),
+            decided_ms: Some(1_789_000_000_456),
             ..pending.clone()
         };
         database.save_agent(&approved).await.unwrap();
@@ -1706,7 +1706,7 @@ mod tests {
         let failed = ConfigStatus {
             version: "v1".to_string(),
             error: Some("unknown collector".to_string()),
-            reported_at_ms: 100,
+            reported_ms: 100,
         };
         database.save_config_status(agent, &failed).await.unwrap();
         assert_eq!(
@@ -1720,7 +1720,7 @@ mod tests {
         let applied = ConfigStatus {
             version: "v2".to_string(),
             error: None,
-            reported_at_ms: 200,
+            reported_ms: 200,
         };
         database.save_config_status(agent, &applied).await.unwrap();
         assert_eq!(database.config_status(agent).await.unwrap(), Some(applied));

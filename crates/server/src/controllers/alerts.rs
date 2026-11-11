@@ -7,7 +7,7 @@ use axum_csrf::CsrfToken;
 use serde::Serialize;
 
 use super::fleet::OsFamily;
-use super::{CsrfForm, Page, local_time, server_error, signed_in_user};
+use super::{CsrfForm, Page, local_time, recorded_by, server_error};
 use crate::alerting::{Alert, DeliveryProblem};
 use crate::app_state::AppState;
 use crate::metrics::now_ms;
@@ -169,7 +169,7 @@ async fn acknowledge(
     Path(id): Path<i64>,
     form: CsrfForm,
 ) -> Response {
-    let by = signed_in_user().map_or_else(|| "admin".to_string(), |user| user.email.clone());
+    let by = recorded_by();
     match state.database.acknowledge_alert(id, &by, now_ms()).await {
         Ok(true) => (form.token, Redirect::to("/alerts")).into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),

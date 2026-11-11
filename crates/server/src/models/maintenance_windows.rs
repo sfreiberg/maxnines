@@ -17,7 +17,7 @@ fn to_window(row: maintenance_window::Model) -> MaintenanceWindow {
             filter: row.filter,
             days: row.days.split(',').map(String::from).collect(),
             start_time: row.start_time,
-            duration_minutes: u32::try_from(row.duration_minutes).unwrap_or_default(),
+            duration_secs: u32::try_from(row.duration_secs).unwrap_or_default(),
             time_zone: row.time_zone,
         },
     }
@@ -30,7 +30,7 @@ fn window_row(input: &MaintenanceWindowInput) -> maintenance_window::ActiveModel
         filter: Set(input.filter.trim().to_string()),
         days: Set(input.days.join(",")),
         start_time: Set(input.start_time.clone()),
-        duration_minutes: Set(i64::from(input.duration_minutes)),
+        duration_secs: Set(i64::from(input.duration_secs)),
         time_zone: Set(input.time_zone.clone()),
         ..Default::default()
     }

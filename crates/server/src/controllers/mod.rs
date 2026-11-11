@@ -74,6 +74,12 @@ fn signed_in_user() -> Option<Arc<User>> {
     SIGNED_IN.try_with(Arc::clone).ok()
 }
 
+/// Who to record as doing something: the person signed in, or the owner of the API
+/// key used.
+fn recorded_by() -> String {
+    signed_in_user().map_or_else(|| "admin".to_string(), |user| user.email.clone())
+}
+
 /// Runs a request as `user`, for the page's frame and the audit log, `via` an API
 /// key or the like if that's how they came.
 /// Nothing runs for someone whose role doesn't allow it: see [`roles::required`].

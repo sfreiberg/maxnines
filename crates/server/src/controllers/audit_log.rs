@@ -77,7 +77,7 @@ fn said(change: &Change) -> String {
 
 fn row(entry: &Entry) -> Row {
     Row {
-        at: local_time(entry.at_ms),
+        at: local_time(entry.time_ms),
         actor: entry.actor_label(),
         via: entry.via_label(),
         source: entry.source.clone(),

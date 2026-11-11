@@ -10,7 +10,7 @@ pub struct Model {
     pub state: String,
     pub decided_by: Option<String>,
     pub first_seen_ms: i64,
-    pub decided_at_ms: Option<i64>,
+    pub decided_ms: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -193,7 +193,7 @@ impl Database {
                     kind: EventKind::parse(&row.kind).unwrap_or(EventKind::Note),
                     title: row.title,
                     detail: row.detail,
-                    by: (row.created_by != SERVER).then_some(row.created_by),
+                    created_by: (row.created_by != SERVER).then_some(row.created_by),
                     id: Some(row.id),
                 }),
         );
@@ -223,7 +223,7 @@ impl Database {
                     kind: EventKind::Alert,
                     title: title.clone(),
                     detail: Some(row.summary.clone()),
-                    by: None,
+                    created_by: None,
                     id: None,
                 });
             }
@@ -236,7 +236,7 @@ impl Database {
                     kind: EventKind::Resolved,
                     title,
                     detail: row.resolve_reason.clone(),
-                    by: None,
+                    created_by: None,
                     id: None,
                 });
             }
@@ -269,7 +269,7 @@ impl Database {
                     kind: EventKind::Update,
                     title: format!("{label} updated to {}", written(&version.value)),
                     detail: Some(format!("It was {}.", written(previous))),
-                    by: None,
+                    created_by: None,
                     id: None,
                 });
             }

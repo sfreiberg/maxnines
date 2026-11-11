@@ -6,7 +6,7 @@ use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
 use serde::{Deserialize, Serialize};
 
-use super::{CsrfForm, Page, local_time, server_error, signed_in_user};
+use super::{CsrfForm, Page, local_time, recorded_by, server_error};
 use crate::app_state::AppState;
 use crate::maintenance::MaintenanceWindow;
 use crate::metrics::now_ms;
@@ -245,7 +245,7 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
         return form_page(&state, &form.token, &silence, Some(&message)).await;
     }
 
-    let by = signed_in_user().map_or_else(|| "admin".to_string(), |user| user.email.clone());
+    let by = recorded_by();
     match state.database.create_silence(&input, &by, now_ms()).await {
         Ok(_) => (form.token, Redirect::to("/alerts/silences")).into_response(),
         Err(error) => server_error(&error),

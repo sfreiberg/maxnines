@@ -50,7 +50,7 @@ impl WindowForm {
     fn from_window(window: MaintenanceWindowInput) -> Self {
         Self {
             rule_id: window.rule_id.map(|id| id.to_string()).unwrap_or_default(),
-            duration_minutes: window.duration_minutes.to_string(),
+            duration_minutes: (window.duration_secs / 60).to_string(),
             name: window.name,
             filter: window.filter,
             start_time: window.start_time,
@@ -81,7 +81,7 @@ impl WindowForm {
             "" => None,
             text => Some(text.parse().map_err(|_| "Choose a rule.".to_string())?),
         };
-        let duration_minutes = self
+        let duration_minutes: u32 = self
             .duration_minutes
             .trim()
             .parse()
@@ -92,7 +92,7 @@ impl WindowForm {
             filter: self.filter.clone(),
             days: self.days.clone(),
             start_time: self.start_time.clone(),
-            duration_minutes,
+            duration_secs: duration_minutes.saturating_mul(60),
             time_zone: self.time_zone.clone(),
         })
     }

@@ -85,11 +85,11 @@ and problems outrank being online.
 
 | Parameter | Description |
 | --- | --- |
-| `q` | Only agents matching this [filter](#filters) |
+| `filter` | Only machines matching this [filter](#filters) |
 
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
-  "$MAXNINES_URL/api/v1/agents?q=os%3Dlinux"
+  "$MAXNINES_URL/api/v1/agents?filter=os%3Dlinux"
 ```
 
 ```json
@@ -99,9 +99,9 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
     "public_key": "912e3122b606a9c2776e065d87dc31eefacde1d7dcad18e1cf88349eb32db35f",
     "host": "web-1",
     "state": "approved",
-    "decided_by": "admin",
+    "decided_by": "you@example.com",
     "first_seen_ms": 1793940264215,
-    "decided_at_ms": 1793940265752,
+    "decided_ms": 1793940265752,
     "online": true,
     "health": "online",
     "last_seen_ms": 1793940282225
@@ -177,7 +177,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "trusted": {
     "agent_id": "22ad9264b6eb708ffdbedcd5cc073e5c",
     "state": "approved",
-    "decided_by": "admin",
+    "decided_by": "you@example.com",
     "online": true,
     "source_address": "10.0.0.12"
   },
@@ -238,7 +238,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "reported": {
     "version": "3810e917a2f5c7e9",
     "error": null,
-    "reported_at_ms": 1793940267263
+    "reported_ms": 1793940267263
   }
 }
 ```
@@ -560,16 +560,16 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/alerts"
       "resolve_reason": null,
       "acknowledged_by": null,
       "acknowledged_ms": null,
-      "silenced_by": null,
-      "maintenance_window": null
+      "silence_id": null,
+      "maintenance_window_id": null
     }
   ],
   "resolved": []
 }
 ```
 
-`silenced_by` is the ID of the silence keeping an open alert's notifications back, and
-`maintenance_window` is the ID of the [window](#maintenance-windows) doing so.
+`silence_id` is the ID of the silence keeping an open alert's notifications back, and
+`maintenance_window_id` is the ID of the [window](#maintenance-windows) doing so.
 
 ### List delivery problems
 
@@ -603,7 +603,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 `POST /api/v1/alerts/{id}/acknowledge`
 
 Says someone is dealing with it, which shows on the Alerts page and stops its reminders.
-The first to acknowledge stays on it. Through the API, `acknowledged_by` is `api`. Returns
+The first to acknowledge stays on it. Through the API, `acknowledged_by` is the email of the key's owner. Returns
 `204`, or `404` if it isn't firing.
 
 ### Undo acknowledging an alert
@@ -655,7 +655,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/silences
       "rule_id": null,
       "filter": "hostname=db*",
       "reason": "Upgrading Postgres",
-      "created_by": "api",
+      "created_by": "you@example.com",
       "starts_ms": 1793940279545,
       "ends_ms": 1793947479545
     }
@@ -751,7 +751,7 @@ Returns `204`, or `404` if there's no such annotation.
 Everything that happened to one machine, newest first, as its page shows them: the
 annotations whose filter matches it, restarts, config changes, alerts starting
 (`alert`) and ending (`resolved`), and updates. `from_ms` and `to_ms` choose the period,
-which is the last 24 hours unless given. Only what was recorded has an `id`, and `by` is
+which is the last 24 hours unless given. Only what was recorded has an `id`, and `created_by` is
 who added an annotation, or `null` for what the server worked out.
 
 ```json
@@ -761,7 +761,7 @@ who added an annotation, or `null` for what the server worked out.
     "kind": "restart",
     "title": "Machine started",
     "detail": null,
-    "by": null,
+    "created_by": null,
     "id": 15
   },
   {
@@ -769,7 +769,7 @@ who added an annotation, or `null` for what the server worked out.
     "kind": "update",
     "title": "Agent updated to 0.1.0-alpha.3",
     "detail": "It was 0.1.0-alpha.2.",
-    "by": null,
+    "created_by": null,
     "id": null
   }
 ]
@@ -787,7 +787,7 @@ times in the window's time zone, so it keeps its place in the day when the clock
 | `filter` | Which machines it covers, as for a [silence](#silences). |
 | `days` | Required. The days it starts on: `mon`, `tue`, `wed`, `thu`, `fri`, `sat` or `sun`. |
 | `start_time` | Required. When it starts, like `02:00`. |
-| `duration_minutes` | Required. How long it lasts, up to 7 days. |
+| `duration_secs` | Required. How long it lasts, in whole minutes up to 7 days, so a multiple of 60. |
 | `time_zone` | Required. A time zone database name, like `Europe/London` or `UTC`. |
 
 Deleting a rule deletes its windows too.
@@ -807,7 +807,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/maintena
 ```sh
 curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"name": "Weekly patching", "filter": "env=staging", "days": ["sun"], "start_time": "02:00", "duration_minutes": 120, "time_zone": "Europe/London"}' \
+  -d '{"name": "Weekly patching", "filter": "env=staging", "days": ["sun"], "start_time": "02:00", "duration_secs": 7200, "time_zone": "Europe/London"}' \
   "$MAXNINES_URL/api/v1/maintenance-windows"
 ```
 
@@ -1892,7 +1892,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 [
   {
     "id": 42,
-    "at_ms": 1794180214377,
+    "time_ms": 1794180214377,
     "actor": { "kind": "person", "id": "1", "name": "sam@example.com" },
     "via": { "kind": "api_key", "id": "3", "name": "Deploy job" },
     "source": "192.168.0.20",
@@ -1905,7 +1905,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
   },
   {
     "id": 41,
-    "at_ms": 1794180190012,
+    "time_ms": 1794180190012,
     "actor": { "kind": "person", "id": "1", "name": "sam@example.com" },
     "via": null,
     "source": "192.168.0.20",

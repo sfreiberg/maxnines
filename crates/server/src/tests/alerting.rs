@@ -5691,7 +5691,7 @@ mod silences {
         let (status, listed) = api(server, "GET", "/api/v1/silences", &Value::Null).await;
         assert_eq!(status, 200);
         assert_eq!(listed["active"][0]["id"], id);
-        assert_eq!(listed["active"][0]["created_by"], "api");
+        assert_eq!(listed["active"][0]["created_by"], "test@example.com");
 
         let path = format!("/api/v1/silences/{id}");
         let (status, shown) = api(server, "GET", &path, &Value::Null).await;
@@ -5733,7 +5733,7 @@ mod silences {
 
         let (_, alerts) = api(&test.server, "GET", "/api/v1/alerts", &Value::Null).await;
 
-        assert_eq!(alerts["open"][0]["silenced_by"], id);
+        assert_eq!(alerts["open"][0]["silence_id"], id);
         assert_eq!(alerts["open"][0]["rule_name"], "High CPU");
     }
 }
@@ -5753,7 +5753,7 @@ mod maintenance_windows {
                 .map(String::from)
                 .to_vec(),
             start_time: "00:00".to_string(),
-            duration_minutes: 24 * 60,
+            duration_secs: 24 * 60 * 60,
             time_zone: "UTC".to_string(),
         }
     }
@@ -5842,8 +5842,8 @@ mod maintenance_windows {
         let path = format!("/api/v1/maintenance-windows/{id}");
 
         let (_, alerts) = api(server, "GET", "/api/v1/alerts", &Value::Null).await;
-        assert_eq!(alerts["open"][0]["maintenance_window"], id);
-        assert_eq!(alerts["open"][0]["silenced_by"], Value::Null);
+        assert_eq!(alerts["open"][0]["maintenance_window_id"], id);
+        assert_eq!(alerts["open"][0]["silence_id"], Value::Null);
 
         body["name"] = json!("Renamed");
         let (status, _) = api(server, "PUT", &path, &body).await;
@@ -6204,7 +6204,7 @@ mod reminders {
     }
 
     #[tokio::test]
-    async fn the_api_acknowledges_as_the_api() {
+    async fn the_api_acknowledges_as_the_keys_owner() {
         let mut test = Harness::start().await;
         let hook = FakeOnCall::default();
         firing(&mut test, &hook, ChannelKind::Webhook, "").await;
@@ -6220,7 +6220,7 @@ mod reminders {
         .await;
         assert_eq!(status, 204);
         let (_, alerts) = api(&test.server, "GET", "/api/v1/alerts", &Value::Null).await;
-        assert_eq!(alerts["open"][0]["acknowledged_by"], "api");
+        assert_eq!(alerts["open"][0]["acknowledged_by"], "test@example.com");
 
         let (status, _) = api(
             &test.server,
@@ -6458,11 +6458,11 @@ mod pages {
         assert!(page.body.contains("All 2"), "{}", page.body);
         assert!(page.body.contains("class=\"tile"), "{}", page.body);
 
-        let page = browser.get(&test.server, "/agents?filter=offline").await;
+        let page = browser.get(&test.server, "/agents?status=offline").await;
         assert!(page.body.contains("db-1"));
         assert!(!page.body.contains("web-1"), "{}", page.body);
 
-        let page = browser.get(&test.server, "/agents?filter=online").await;
+        let page = browser.get(&test.server, "/agents?status=online").await;
         assert!(page.body.contains("web-1"));
         assert!(!page.body.contains("db-1"), "{}", page.body);
 
@@ -6697,7 +6697,7 @@ mod pages {
             .unwrap();
         let mut browser = Browser::default();
 
-        let page = browser.get(&server, "/checks?filter=disabled").await;
+        let page = browser.get(&server, "/checks?status=disabled").await;
         assert!(page.body.contains("paused"), "{}", page.body);
         assert!(!page.body.contains(">on<"), "{}", page.body);
         assert!(page.body.contains("All 2"), "{}", page.body);
