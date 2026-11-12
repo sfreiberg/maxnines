@@ -177,18 +177,15 @@ impl Executor {
         Ok(found)
     }
 
-    /// Runs an action as whoever this process is, handing the built-ins that see
-    /// more as root to the privileged helper, if there is one.
+    /// Runs what `find` found as whoever this process is, handing the built-ins
+    /// that see more as root to the privileged helper, if there is one.
     async fn run_here(
         &self,
+        found: Found,
         name: &str,
         variables: &BTreeMap<String, String>,
         timeout_secs: u64,
     ) -> Ended {
-        let found = match self.find(name, variables, timeout_secs) {
-            Ok(found) => found,
-            Err(ended) => return ended,
-        };
         let limit = Duration::from_secs(timeout_secs);
         match found {
             Found::Command(command) => run_command(&command, limit).await,
@@ -279,9 +276,10 @@ impl Runner {
         timeout_secs: u64,
     ) -> Ended {
         // Checked before waiting, so a request that can't run doesn't take a place.
-        if let Err(ended) = self.executor.find(name, variables, timeout_secs) {
-            return ended;
-        }
+        let found = match self.executor.find(name, variables, timeout_secs) {
+            Ok(found) => found,
+            Err(ended) => return ended,
+        };
         if self.waiting.fetch_add(1, Ordering::Relaxed) >= MAX_WAITING {
             self.waiting.fetch_sub(1, Ordering::Relaxed);
             return Ended::refused("too many actions are already waiting to run");
@@ -291,7 +289,10 @@ impl Runner {
         let Ok(_turn) = turn else {
             return Ended::refused("the agent is stopping");
         };
-        self.executor.run_here(name, variables, timeout_secs).await
+        let executor = &self.executor;
+        executor
+            .run_here(found, name, variables, timeout_secs)
+            .await
     }
 }
 

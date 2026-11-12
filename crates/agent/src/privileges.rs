@@ -279,11 +279,32 @@ mod unix {
 
     /// How many threads this process has, where that can be read. Splitting a
     /// process with more than one leaves the new one with whatever the others
-    /// were in the middle of.
+    /// were in the middle of, and changing who it is or its environment isn't
+    /// safe while another is running.
+    #[cfg(not(target_os = "macos"))]
     fn threads() -> Option<usize> {
         let status = std::fs::read_to_string("/proc/self/status").ok()?;
         let line = status.lines().find(|line| line.starts_with("Threads:"))?;
         line.split_whitespace().nth(1)?.parse().ok()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn threads() -> Option<usize> {
+        let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
+        let size = libc::c_int::try_from(size_of::<libc::proc_taskinfo>()).ok()?;
+        // SAFETY: `info` is as big as `size` says, and is only read once the
+        // system says it filled all of it.
+        let filled = unsafe {
+            let filled = libc::proc_pidinfo(
+                libc::getpid(),
+                libc::PROC_PIDTASKINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            );
+            (filled == size).then(|| info.assume_init())
+        };
+        usize::try_from(filled?.pti_threadnum).ok()
     }
 
     /// Makes the folder the agent keeps its files in, if it isn't there, and gives
@@ -415,6 +436,10 @@ mod unix {
             return Ok(());
         };
         make_state_dir(&config.state_dir, &user)?;
+        ensure!(
+            threads().is_none_or(|threads| threads == 1),
+            "the agent had already started threads, so it can't give up root safely"
+        );
 
         if !config.privileged_helper {
             become_user(&user)?;
@@ -422,10 +447,6 @@ mod unix {
             return Ok(());
         }
 
-        ensure!(
-            threads().is_none_or(|threads| threads == 1),
-            "the agent had already started threads, so it can't split safely"
-        );
         let (agents, helpers) = StdUnixStream::pair().context("making the helper's socket")?;
         // No commands: the helper only has the built-in actions to run.
         let kept = helper_dir(Path::new(HELPER_DIR));
@@ -672,6 +693,14 @@ mod unix {
             stream.write_all(b"\n").await.unwrap();
             let ended = agents.answer_to(1).await.unwrap();
             assert_eq!(ended.error.as_deref(), Some("whole"));
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[test]
+        fn threads_are_counted() {
+            // Other tests come and go, so only that it's more than the one a
+            // test never runs on alone: this thread and the one that started it.
+            assert!(threads().unwrap() >= 2);
         }
 
         #[test]
