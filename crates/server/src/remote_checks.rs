@@ -60,6 +60,10 @@ fn default_enabled() -> bool {
 pub fn check_input(input: &RemoteCheckInput) -> Result<()> {
     input.check.validate()?;
     ensure!(
+        input.check.interval_secs.is_none(),
+        "a remote check's interval goes beside the check, as interval_secs"
+    );
+    ensure!(
         (MIN_INTERVAL_SECS..=MAX_INTERVAL_SECS).contains(&input.interval_secs),
         "the interval has to be from {MIN_INTERVAL_SECS} to {MAX_INTERVAL_SECS} seconds"
     );
@@ -205,6 +209,11 @@ mod tests {
         check_input(&input(MIN_INTERVAL_SECS)).unwrap();
         assert!(check_input(&input(MIN_INTERVAL_SECS - 1)).is_err());
         assert!(check_input(&input(MAX_INTERVAL_SECS + 1)).is_err());
+
+        // Only one place says how often it runs.
+        let mut inside = input(60);
+        inside.check.interval_secs = Some(300);
+        assert!(check_input(&inside).is_err());
     }
 
     #[test]

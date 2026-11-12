@@ -273,6 +273,7 @@ fn set_option(check: &mut Check, option: &str, line: &str) -> Result<()> {
     };
     match name {
         "timeout" => check.timeout_secs = Some(number()?),
+        "interval" => check.interval_secs = Some(number()?),
         "count" => check.count = Some(u32::try_from(number()?)?),
         "method" => check.method = Some(value.to_string()),
         "body" => check.body = Some(value.to_string()),
@@ -314,6 +315,10 @@ fn check_line(check: &Check) -> String {
     ];
     let options = [
         ("timeout", check.timeout_secs.map(|value| value.to_string())),
+        (
+            "interval",
+            check.interval_secs.map(|value| value.to_string()),
+        ),
         ("method", check.method.clone()),
         ("body", check.body.clone()),
         ("regex", check.regex.clone()),
@@ -663,9 +668,10 @@ mod tests {
 
     #[test]
     fn check_options_can_follow_the_target() {
-        let line = r#"http site https://example.com/ timeout=5 regex="Welcome \"back\"" insecure"#;
+        let line = r#"http site https://example.com/ timeout=5 interval=300 regex="Welcome \"back\"" insecure"#;
         let checks = parse_checks(line).unwrap();
         assert_eq!(checks[0].timeout_secs, Some(5));
+        assert_eq!(checks[0].interval_secs, Some(300));
         assert_eq!(checks[0].regex.as_deref(), Some(r#"Welcome "back""#));
         assert_eq!(checks[0].insecure, Some(true));
     }

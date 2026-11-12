@@ -249,6 +249,11 @@ pub struct Check {
     /// How long it gets, up to a minute. A slower answer counts as down.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    /// On an agent, how often it runs, up to a day. Without one it runs with every
+    /// sample, and it can't run more often than that. The server's own checks have
+    /// their interval beside the check instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_secs: Option<u64>,
     /// http: the method to use. Defaults to GET.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
@@ -352,6 +357,7 @@ impl Check {
             kind,
             target: target.to_string(),
             timeout_secs: None,
+            interval_secs: None,
             method: None,
             body: None,
             regex: None,
@@ -420,6 +426,12 @@ impl Check {
             ensure!(
                 (1..=MAX_CHECK_TIMEOUT_SECS).contains(&seconds),
                 "check {name:?} needs a timeout from 1 to {MAX_CHECK_TIMEOUT_SECS} seconds"
+            );
+        }
+        if let Some(seconds) = self.interval_secs {
+            ensure!(
+                (1..=MAX_INTERVAL_SECS).contains(&seconds),
+                "check {name:?} needs an interval from 1 to {MAX_INTERVAL_SECS} seconds, a day"
             );
         }
         if let Some(method) = &self.method {
@@ -960,6 +972,8 @@ mod tests {
                 json!({ "regex": "^Welcome", "insecure": true }),
             ),
             ("tls", "example.com:443", json!({ "insecure": true })),
+            ("tcp", "a:1", json!({ "interval_secs": 300 })),
+            ("ping", "example.com", json!({ "interval_secs": 86_400 })),
             (
                 "dns",
                 "example.com",
@@ -983,6 +997,8 @@ mod tests {
             ("http", url, json!({ "body": "x".repeat(256) })),
             ("http", url, json!({ "timeout_secs": 0 })),
             ("http", url, json!({ "timeout_secs": 61 })),
+            ("http", url, json!({ "interval_secs": 0 })),
+            ("http", url, json!({ "interval_secs": 86_401 })),
             ("http", url, json!({ "count": 2 })),
             ("tcp", "a:1", json!({ "regex": "x" })),
             ("tcp", "a:1", json!({ "insecure": true })),

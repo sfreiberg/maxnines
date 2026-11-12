@@ -410,7 +410,7 @@ lowest priority first, so higher priorities win.
 | `mount_points` | `disk` | Only these disks, even ones left out by default, like disk images |
 | `names` | `processes`, `services`, `custom`, `counters` | What to watch. Custom metrics must be defined in the agent's own config, and counters are Windows performance counter paths, such as `\Memory\Available MBytes` |
 | `paths` | `files` | The files and folders to watch |
-| `checks` | `checks` | What to try reaching, as in [remote checks](#remote-checks) |
+| `checks` | `checks` | What to try reaching, as in [remote checks](#remote-checks), each with its own `interval_secs` if it should run less often than every sample |
 | `urls` | `apache`, `nginx`, `php_fpm` | The status pages to read. Leave it out for the usual page on the host itself |
 
 The collectors are `apache`, `checks`, `containers`, `counters`, `cpu`, `custom`, `disk`, `files`, `host`,
@@ -1157,6 +1157,7 @@ Checks the server runs itself, against remote sites.
 | `kind` | All | Required. `tcp`, `http`, `tls`, `dns` or `ping` |
 | `target` | All | Required. `host:port` for tcp and tls, an address for http, and a host for dns and ping |
 | `timeout_secs` | All | How long it gets, up to a minute |
+| `interval_secs` | All | For a check an agent runs, how often it runs, up to a day. It runs with every sample without one, and never more often than samples are sent, as it's rounded up to whole samples. Between runs, each sample repeats its last result. A remote check's interval goes beside `check` instead |
 | `method` | http | Defaults to `GET` |
 | `body` | http | What to send, for methods like `POST` |
 | `regex` | http | A regular expression the page has to match |
