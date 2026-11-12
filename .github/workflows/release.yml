@@ -233,9 +233,30 @@ jobs:
             pkg install -y curl git
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           run: |
+            set -e
             . "$HOME/.cargo/env"
             git config --global --add safe.directory "$PWD"
             cargo build --release --locked -p maxnines-agent -p maxnines-server --target "$TARGET"
+            # Nothing else runs the agent on FreeBSD, so its tests for giving up
+            # root run here, and then the real thing: started as root, it becomes
+            # maxnines, and its helper reads what only root can.
+            cargo test --locked -p maxnines-agent --target "$TARGET" privileges
+            pw useradd maxnines -d /nonexistent -s /usr/sbin/nologin
+            cat >/tmp/agent.hcl <<'CONFIG'
+            server {
+              url = "ws://127.0.0.1:9000/ws"
+            }
+            state_dir = "/tmp/maxnines-agent"
+            action "who" {
+              command = ["/usr/bin/id", "-un"]
+            }
+            CONFIG
+            agent="target.nosync/$TARGET/release/maxnines-agent"
+            test "$("$agent" --config /tmp/agent.hcl action who)" = "maxnines"
+            install -d -m 0700 /tmp/only-root
+            head -c 4194304 /dev/zero >/tmp/only-root/file
+            "$agent" --config /tmp/agent.hcl action disk_space disk=/tmp/only-root | grep -q "/tmp/only-root"
+            test -f /var/db/maxnines-agent-helper/disk_space.json
             for program in maxnines-agent maxnines-server; do
               packaging/archive.sh "$program" "${{ needs.check.outputs.version }}" "$TARGET" dist
             done

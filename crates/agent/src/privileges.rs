@@ -281,7 +281,7 @@ mod unix {
     /// process with more than one leaves the new one with whatever the others
     /// were in the middle of, and changing who it is or its environment isn't
     /// safe while another is running.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
     fn threads() -> Option<usize> {
         let status = std::fs::read_to_string("/proc/self/status").ok()?;
         let line = status.lines().find(|line| line.starts_with("Threads:"))?;
@@ -305,6 +305,38 @@ mod unix {
             (filled == size).then(|| info.assume_init())
         };
         usize::try_from(filled?.pti_threadnum).ok()
+    }
+
+    #[cfg(target_os = "freebsd")]
+    fn threads() -> Option<usize> {
+        let mut info = std::mem::MaybeUninit::<libc::kinfo_proc>::zeroed();
+        let expected = size_of::<libc::kinfo_proc>();
+        let mut size = expected;
+        // SAFETY: `info` is as big as `size` says, and is only read once the
+        // system says it filled all of it.
+        let info = unsafe {
+            let name = [
+                libc::CTL_KERN,
+                libc::KERN_PROC,
+                libc::KERN_PROC_PID,
+                libc::getpid(),
+            ];
+            let failed = libc::sysctl(
+                name.as_ptr(),
+                name.len() as libc::c_uint,
+                info.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null(),
+                0,
+            );
+            (failed == 0 && size == expected).then(|| info.assume_init())
+        }?;
+        // The system says how big it thinks this is, which has to agree for the
+        // count to be where it's read from.
+        if usize::try_from(info.ki_structsize).ok() != Some(expected) {
+            return None;
+        }
+        usize::try_from(info.ki_numthreads).ok()
     }
 
     /// Makes the folder the agent keeps its files in, if it isn't there, and gives
@@ -695,7 +727,7 @@ mod unix {
             assert_eq!(ended.error.as_deref(), Some("whole"));
         }
 
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
         #[test]
         fn threads_are_counted() {
             // Other tests come and go, so only that it's more than the one a
