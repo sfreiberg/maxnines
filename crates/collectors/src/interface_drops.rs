@@ -2,7 +2,8 @@
 //! drop is a packet that arrived or was ready to go but had nowhere to wait, which is
 //! a sign the host can't keep up, where an error is a damaged packet.
 //!
-//! macOS only counts received packets it dropped, so sent ones are left out there.
+//! A count that can't be true is left out. The driver for a virtual machine's
+//! interface on macOS adds over a billion to its received drops with every packet.
 
 use std::collections::HashMap;
 
@@ -16,6 +17,13 @@ pub struct Drops {
 /// The change since the last totals, which an interface that was reset makes 0.
 pub fn change(before: Option<u64>, after: Option<u64>) -> Option<u64> {
     Some(after?.saturating_sub(before?))
+}
+
+/// A count of received packets dropped, if it could be true: each one dropped
+/// was first received, so there can't be more of them than that.
+#[cfg(any(target_os = "macos", target_os = "freebsd", test))]
+fn believable(dropped: u64, received: u64) -> Option<u64> {
+    (dropped <= received).then_some(dropped)
 }
 
 #[cfg(target_os = "linux")]
@@ -43,8 +51,81 @@ pub fn totals() -> HashMap<String, Drops> {
         .collect()
 }
 
+/// Every interface with its counters, as `netstat` reads them, in full-size
+/// numbers. The older list has them in 32 bits, which a busy interface overflows.
+#[cfg(target_os = "macos")]
+pub fn totals() -> HashMap<String, Drops> {
+    use std::mem::size_of;
+
+    let mut found = HashMap::new();
+    let mut name = [libc::CTL_NET, libc::PF_ROUTE, 0, 0, libc::NET_RT_IFLIST2, 0];
+    let mut ask = |into: *mut libc::c_void, size: &mut usize| {
+        // SAFETY: `into` is null, to ask how much there is, or points at `size`
+        // bytes that the kernel fills no more than.
+        unsafe {
+            libc::sysctl(
+                name.as_mut_ptr(),
+                name.len() as libc::c_uint,
+                into,
+                size,
+                std::ptr::null_mut(),
+                0,
+            ) == 0
+        }
+    };
+    let mut size = 0;
+    if !ask(std::ptr::null_mut(), &mut size) {
+        return found;
+    }
+    // An interface may appear in between, so there's room to spare.
+    let mut list = vec![0u8; size + size / 4 + 1024];
+    let mut size = list.len();
+    if !ask(list.as_mut_ptr().cast(), &mut size) {
+        return found;
+    }
+    let list = &list[..size.min(list.len())];
+
+    // One message after another, each starting with how long it is and what
+    // kind it is. Only an interface's own message has its counters.
+    let mut rest = list;
+    while rest.len() >= size_of::<libc::if_msghdr>() {
+        // SAFETY: there are at least this many bytes, and any bytes make a valid
+        // header, which is read without assuming where it starts.
+        let header: libc::if_msghdr = unsafe { std::ptr::read_unaligned(rest.as_ptr().cast()) };
+        let length = usize::from(header.ifm_msglen);
+        if length == 0 || length > rest.len() {
+            break;
+        }
+        let is_interface = i32::from(header.ifm_type) == libc::RTM_IFINFO2
+            && length >= size_of::<libc::if_msghdr2>();
+        if is_interface {
+            // SAFETY: the message is at least this long, and is read as above.
+            let interface: libc::if_msghdr2 =
+                unsafe { std::ptr::read_unaligned(rest.as_ptr().cast()) };
+            let counters = interface.ifm_data;
+            let mut called = [0 as libc::c_char; libc::IF_NAMESIZE];
+            // SAFETY: the buffer is as long as the longest name and its ending zero.
+            let named = unsafe {
+                !libc::if_indextoname(u32::from(interface.ifm_index), called.as_mut_ptr()).is_null()
+            };
+            if named {
+                // SAFETY: a name that was found ends with a zero inside the buffer.
+                let called = unsafe { std::ffi::CStr::from_ptr(called.as_ptr()) };
+                let drops = Drops {
+                    received: believable(counters.ifi_iqdrops, counters.ifi_ipackets),
+                    // What its queue for sending had no room for.
+                    transmitted: u64::try_from(interface.ifm_snd_drops).ok(),
+                };
+                found.insert(called.to_string_lossy().into_owned(), drops);
+            }
+        }
+        rest = &rest[length..];
+    }
+    found
+}
+
 /// Each interface's link-level entry carries its counters.
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+#[cfg(target_os = "freebsd")]
 pub fn totals() -> HashMap<String, Drops> {
     let mut found = HashMap::new();
     let mut first: *mut libc::ifaddrs = std::ptr::null_mut();
@@ -78,18 +159,10 @@ pub fn totals() -> HashMap<String, Drops> {
     found
 }
 
-#[cfg(target_os = "macos")]
-fn platform_drops(data: &libc::if_data) -> Drops {
-    Drops {
-        received: Some(u64::from(data.ifi_iqdrops)),
-        transmitted: None,
-    }
-}
-
 #[cfg(target_os = "freebsd")]
 fn platform_drops(data: &libc::if_data) -> Drops {
     Drops {
-        received: Some(data.ifi_iqdrops),
+        received: believable(data.ifi_iqdrops, data.ifi_ipackets),
         transmitted: Some(data.ifi_oqdrops),
     }
 }
@@ -151,6 +224,27 @@ mod tests {
         assert_eq!(change(Some(10), Some(3)), Some(0));
         assert_eq!(change(None, Some(3)), None);
         assert_eq!(change(Some(3), None), None);
+    }
+
+    #[test]
+    fn a_count_of_drops_that_cannot_be_true_is_left_out() {
+        assert_eq!(believable(0, 0), Some(0));
+        assert_eq!(believable(12, 500), Some(12));
+        assert_eq!(believable(500, 500), Some(500));
+        // What macOS says of a virtual machine's interface that took 629,707 packets.
+        assert_eq!(believable(1_723_470_159_561_422, 629_707), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn this_macs_interfaces_are_named_and_count_what_they_could_not_send() {
+        let totals = totals();
+        assert!(totals.contains_key("lo0"), "{totals:?}");
+        assert!(totals.values().all(|drops| drops.transmitted.is_some()));
+        // No interface is said to have dropped more than it could have received.
+        for (name, drops) in &totals {
+            assert!(drops.received.is_none_or(|count| count < 1 << 40), "{name}");
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]

@@ -448,8 +448,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Entries(Reading::Rate("$.transmit_errors")),
         chart: ShowChart::WithData,
     },
-    // Packets with nowhere to wait, which means the host isn't keeping up. macOS
-    // doesn't count sent ones.
+    // Packets with nowhere to wait, which means the host isn't keeping up.
     Metric {
         name: "network.drops.received",
         title: "Received packets dropped",

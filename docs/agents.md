@@ -124,7 +124,9 @@ names it's given.
 
 Each network interface reports what it received and sent, in bytes and packets, the
 packets it found damaged, and the packets it dropped, which had nowhere to wait because
-the host wasn't keeping up. macOS only counts received packets it dropped.
+the host wasn't keeping up. An interface whose count of dropped packets can't be
+true, such as more than it ever received, reports none: macOS does that for the
+interface of a virtual machine.
 
 ## Processes and logins
 
