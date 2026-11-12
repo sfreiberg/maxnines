@@ -400,6 +400,7 @@ mod tests {
             remind_every_secs: None,
             forecast_secs: None,
             warning_forecast_secs: None,
+            actions: Vec::new(),
         }
     }
 

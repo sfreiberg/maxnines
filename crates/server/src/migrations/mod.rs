@@ -9,7 +9,11 @@ pub struct Migrator;
 
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(CreateTables), Box::new(SoftDeleteRulesAndChannels)]
+        vec![
+            Box::new(CreateTables),
+            Box::new(SoftDeleteRulesAndChannels),
+            Box::new(Actions),
+        ]
     }
 }
 
@@ -2000,6 +2004,198 @@ fn notification_channels_after_soft_delete() -> TableCreateStatement {
         .to_owned()
 }
 
+struct Actions;
+
+impl MigrationName for Actions {
+    fn name(&self) -> &str {
+        "m20261111_000003_actions"
+    }
+}
+
+/// Actions: what each alert rule asks a host to run, and every time one was asked
+/// for, by an alert or by a person, with what it printed.
+#[async_trait::async_trait]
+impl MigrationTrait for Actions {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(AlertRuleActions::Table)
+                    .col(id(AlertRuleActions::Id))
+                    .col(
+                        ColumnDef::new(AlertRuleActions::RuleId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(AlertRuleActions::Action)
+                            .string_len(64)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(AlertRuleActions::RunOn)
+                            .string_len(16)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(AlertRuleActions::TimeoutSecs)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(AlertRuleActions::Position)
+                            .integer()
+                            .not_null(),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_alert_rule_actions_rule_id")
+                            .from(AlertRuleActions::Table, AlertRuleActions::RuleId)
+                            .to(AlertRules::Table, AlertRules::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_alert_rule_actions_rule")
+                    .table(AlertRuleActions::Table)
+                    .col(AlertRuleActions::RuleId)
+                    .to_owned(),
+            )
+            .await?;
+
+        // As with the audit log, MySQL's text is too small for what this holds.
+        let mut output = ColumnDef::new(ActionRuns::Output);
+        match manager.get_database_backend() {
+            sea_orm::DatabaseBackend::MySql => output.custom(Alias::new("LONGTEXT")),
+            _ => output.text(),
+        };
+        output.not_null();
+        manager
+            .create_table(
+                Table::create()
+                    .table(ActionRuns::Table)
+                    .col(id(ActionRuns::Id))
+                    .col(ColumnDef::new(ActionRuns::HostId).string_len(32).not_null())
+                    .col(ColumnDef::new(ActionRuns::AlertId).big_integer())
+                    .col(ColumnDef::new(ActionRuns::Action).string_len(64).not_null())
+                    .col(ColumnDef::new(ActionRuns::RunOn).string_len(16).not_null())
+                    .col(ColumnDef::new(ActionRuns::Variables).text().not_null())
+                    .col(ColumnDef::new(ActionRuns::RequestedBy).string_len(255))
+                    .col(
+                        ColumnDef::new(ActionRuns::RequestedMs)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ActionRuns::TimeoutSecs)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(ActionRuns::Outcome).string_len(16))
+                    .col(ColumnDef::new(ActionRuns::ExitCode).integer())
+                    .col(ColumnDef::new(ActionRuns::Error).text())
+                    .col(output)
+                    .col(ColumnDef::new(ActionRuns::Truncated).boolean().not_null())
+                    .col(ColumnDef::new(ActionRuns::DurationMs).big_integer())
+                    .col(ColumnDef::new(ActionRuns::FinishedMs).big_integer())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_action_runs_host_id")
+                            .from(ActionRuns::Table, ActionRuns::HostId)
+                            .to(Hosts::Table, Hosts::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_action_runs_alert_id")
+                            .from(ActionRuns::Table, ActionRuns::AlertId)
+                            .to(Alerts::Table, Alerts::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_action_runs_alert")
+                    .table(ActionRuns::Table)
+                    .col(ActionRuns::AlertId)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_action_runs_host")
+                    .table(ActionRuns::Table)
+                    .col(ActionRuns::HostId)
+                    .col(ActionRuns::RequestedMs)
+                    .to_owned(),
+            )
+            .await?;
+        // What's still waiting for an answer, which is looked for on every pass.
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_action_runs_finished")
+                    .table(ActionRuns::Table)
+                    .col(ActionRuns::FinishedMs)
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for table in ["action_runs", "alert_rule_actions"] {
+            manager
+                .drop_table(Table::drop().table(Alias::new(table)).to_owned())
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(DeriveIden)]
+enum AlertRuleActions {
+    Table,
+    Id,
+    RuleId,
+    Action,
+    RunOn,
+    TimeoutSecs,
+    Position,
+}
+
+#[derive(DeriveIden)]
+enum ActionRuns {
+    Table,
+    Id,
+    HostId,
+    AlertId,
+    Action,
+    RunOn,
+    Variables,
+    RequestedBy,
+    RequestedMs,
+    TimeoutSecs,
+    Outcome,
+    ExitCode,
+    Error,
+    Output,
+    Truncated,
+    DurationMs,
+    FinishedMs,
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
@@ -2119,7 +2315,8 @@ mod tests {
             "IDs carry on from where they were"
         );
 
-        Migrator::down(&connection, Some(1)).await.unwrap();
+        // The actions migration after it, then this one.
+        Migrator::down(&connection, Some(2)).await.unwrap();
         assert_eq!(
             count("SELECT target FROM notification_channels").await,
             ["https://new"]

@@ -81,7 +81,8 @@ const ADMIN_ONLY: [&str; 4] = [
 const OWN: [&str; 4] = ["/profile", "/logout", "/settings/api-keys", "/api-keys"];
 
 /// Dealing with alerts as they happen: acknowledging them and silencing them.
-const RESPONDING: [&str; 14] = [
+const RESPONDING: [&str; 15] = [
+    "/hosts/{id}/actions",
     "/hosts/{id}/annotations",
     "/hosts/{id}/maintenance",
     "/hosts/{id}/maintenance/end",
@@ -189,9 +190,11 @@ mod tests {
             "/alerts/silences",
             "/silences",
             "/silences/{id}/end",
+            "/hosts/{id}/actions",
         ] {
             assert_eq!(required(&Method::POST, route), Role::Responder, "{route}");
         }
+        assert_eq!(required(&Method::GET, "/hosts/{id}/actions"), Role::Viewer);
         assert_eq!(
             required(&Method::GET, "/alerts/silences/new"),
             Role::Responder

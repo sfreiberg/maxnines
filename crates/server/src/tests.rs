@@ -167,6 +167,7 @@ async fn start_with_heartbeat(
             config.registration.max_pending,
             database.clone(),
         )),
+        actions: crate::actions::Actions::new(database.clone()),
         database,
         config_changes: Arc::new(watch::Sender::new(0)),
         writer,

@@ -7,6 +7,7 @@ use axum_csrf::CsrfConfig;
 use ipnet::IpNet;
 use tokio::sync::{mpsc, watch};
 
+use crate::actions::Actions;
 use crate::alerting::{self, AlertRuleInput, ChannelInput};
 use crate::calculations::Sources;
 use crate::events::{EventInput, TimelineEvent};
@@ -49,6 +50,8 @@ pub struct AppState {
     pub presence: Arc<Presence>,
     pub registry: Arc<Registry>,
     pub database: Database,
+    /// Asks agents to run actions, and records how they went.
+    pub actions: Arc<Actions>,
     /// Bumped when rules change, so live connections work out their config again.
     pub config_changes: Arc<watch::Sender<u64>>,
     pub writer: mpsc::Sender<WriterCommand>,
@@ -201,6 +204,10 @@ impl AppState {
     /// saved rule it would replace.
     pub async fn check_alert_rule(&self, input: &AlertRuleInput, id: Option<i64>) -> Result<()> {
         alerting::check_rule(input)?;
+        if !input.actions.is_empty() {
+            let known = self.database.known_actions().await?;
+            crate::actions::check_against_hosts(input, &known)?;
+        }
 
         let rules = self.database.list_alert_rules().await?;
         let taken = rules

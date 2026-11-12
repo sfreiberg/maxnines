@@ -9,8 +9,11 @@ use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
 use serde::Serialize;
 
+use maxnines_protocol::actions::DEFAULT_ACTION_TIMEOUT_SECS;
+
 use super::condition_form::{ConditionForm, operators};
 use super::{CsrfForm, Page, server_error};
+use crate::actions::{RuleAction, RunOn};
 use crate::alerting::{
     AlertRuleInput, Comparison, DEFAULT_FORECAST_WINDOW_SECS, RuleKind, Severity,
 };
@@ -57,8 +60,62 @@ struct AlertRuleForm {
     warning_within_hours: String,
     critical_within_hours: String,
     forecast_window_hours: String,
+    /// What to run on the alert's host, one per line.
+    actions: String,
     #[serde(flatten)]
     applies_to: ConditionForm,
+}
+
+/// An action is typed as its name, then when it runs and how long it gets if
+/// they're not the usual: `disk_space on=critical timeout=120`.
+fn parse_actions(text: &str) -> Result<Vec<RuleAction>> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let mut words = line.split_whitespace();
+            let action = words.next().unwrap_or_default().to_string();
+            let mut wanted = RuleAction {
+                action,
+                run_on: RunOn::First,
+                timeout_secs: None,
+            };
+            for option in words {
+                match option.split_once('=') {
+                    Some(("on", when)) => {
+                        wanted.run_on = RunOn::parse(when).with_context(|| {
+                            format!("on= is first, warning or critical, in {line:?}")
+                        })?;
+                    }
+                    Some(("timeout", secs)) => {
+                        let secs = secs.parse().with_context(|| {
+                            format!("timeout= has to be a number of seconds, in {line:?}")
+                        })?;
+                        wanted.timeout_secs = Some(secs);
+                    }
+                    _ => anyhow::bail!("{option:?} isn't an option, in {line:?}"),
+                }
+            }
+            Ok(wanted)
+        })
+        .collect()
+}
+
+fn action_lines(actions: &[RuleAction]) -> String {
+    let lines: Vec<String> = actions
+        .iter()
+        .map(|wanted| {
+            let mut line = wanted.action.clone();
+            if wanted.run_on != RunOn::First {
+                line.push_str(&format!(" on={}", wanted.run_on.as_str()));
+            }
+            if wanted.timeout() != DEFAULT_ACTION_TIMEOUT_SECS {
+                line.push_str(&format!(" timeout={}", wanted.timeout()));
+            }
+            line
+        })
+        .collect();
+    lines.join("\n")
 }
 
 impl AlertRuleForm {
@@ -86,6 +143,7 @@ impl AlertRuleForm {
             warning_within_hours: "24".to_string(),
             critical_within_hours: "4".to_string(),
             forecast_window_hours: hours(DEFAULT_FORECAST_WINDOW_SECS),
+            actions: String::new(),
             applies_to: ConditionForm::blank(),
         }
     }
@@ -170,6 +228,7 @@ impl AlertRuleForm {
             enabled: rule.enabled,
             channels: rule.channels.iter().copied().collect(),
             all_channels: rule.all_channels,
+            actions: action_lines(&rule.actions),
             applies_to: ConditionForm::from_condition(rule.condition.as_deref()),
         }
     }
@@ -202,6 +261,7 @@ impl AlertRuleForm {
                 .filter_map(|name| name.strip_prefix("channel_")?.parse().ok())
                 .collect(),
             all_channels: fields.contains_key("all_channels"),
+            actions: text("actions"),
             applies_to: ConditionForm::from_fields(fields),
         }
     }
@@ -327,6 +387,7 @@ impl AlertRuleForm {
             all_channels: self.all_channels,
             forecast_secs,
             warning_forecast_secs,
+            actions: parse_actions(&self.actions)?,
         })
     }
 }
@@ -441,6 +502,17 @@ async fn form_page(
         })
         .collect();
     let known: Vec<String> = known_facts(state).await.into_keys().collect();
+    // What can be typed into the form's Actions box, with what each needs.
+    let known_actions: Vec<String> = match state.database.known_actions().await {
+        Ok(actions) => actions
+            .into_iter()
+            .map(|(name, needed)| match needed.as_slice() {
+                [] => name,
+                needed => format!("{name} (needs {{{}}})", needed.join("}, {")),
+            })
+            .collect(),
+        Err(error) => return server_error(&error),
+    };
 
     let page = Page::new(state, token, "alert_rules/form.html")
         .with("id", &id)
@@ -450,6 +522,7 @@ async fn form_page(
         .with("channels", &channels)
         .with("operators", &operators())
         .with("known_facts", &known)
+        .with("known_actions", &known_actions)
         .with("error", &error);
     match error {
         Some(_) => page.with_status(StatusCode::UNPROCESSABLE_ENTITY).render(),
@@ -652,6 +725,7 @@ mod tests {
             remind_every_secs: None,
             forecast_secs: None,
             warning_forecast_secs: None,
+            actions: Vec::new(),
         }
     }
 

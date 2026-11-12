@@ -1,3 +1,4 @@
+mod actions;
 mod agent_versions;
 mod alert_charts;
 mod alert_evaluator;
@@ -275,6 +276,7 @@ async fn serve(path: &Path) -> Result<()> {
             config.registration.max_pending,
             database.clone(),
         )),
+        actions: actions::Actions::new(database.clone()),
         database,
         config_changes: Arc::new(watch::Sender::new(0)),
         writer: writer.clone(),
@@ -311,6 +313,7 @@ async fn serve(path: &Path) -> Result<()> {
         state.presence.clone(),
         state.metrics.clone(),
         state.status.clone(),
+        state.actions.clone(),
         now_ms(),
     )
     .spawn();

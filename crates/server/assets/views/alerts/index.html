@@ -21,6 +21,7 @@
     {% if alert.severity == "critical" %}<span class="badge bad">Critical</span>{% else %}<span class="badge warn">Warning</span>{% endif %}
     <span class="text">{{ alert.summary }}<br><span class="note">{{ alert.rule_name }} · started {{ alert.started }}{% if alert.silenced_until %} · silenced until {{ alert.silenced_until }}{% endif %}{% if alert.acknowledged_by %} · acknowledged by {{ alert.acknowledged_by }}{% endif %}</span></span>
     {% if alert.host_id != "fleet" %}{% set os_family = alert.os_family %}<a class="button secondary host-button" href="/hosts/{{ alert.host_id }}{% if alert.host_id == "server" %}/metrics{% endif %}"{% if alert.short_id %} title="Host {{ alert.short_id }}"{% endif %}>{% include "hosts/_os_icon.html" %}{{ alert.hostname }}</a>{% else %}<span class="badge">{{ alert.hostname }}</span>{% endif %}
+    {% if alert.actions %}<a class="button secondary" href="/alerts/{{ alert.id }}/actions">Actions ({{ alert.actions }})</a>{% endif %}
     {% if alert.silenced_until %}<span class="badge neutral">Silenced</span>{% elif can_respond %}<a class="button secondary" href="{{ alert.silence_link }}">Silence</a>{% endif %}
     {% if can_respond %}
     <form method="post" action="/alerts/{{ alert.id }}/{% if alert.acknowledged_by %}unacknowledge{% else %}acknowledge{% endif %}">
@@ -57,7 +58,7 @@
   <tbody>
     {% for alert in resolved %}
     <tr>
-      <td>{{ alert.summary }}</td>
+      <td>{{ alert.summary }}{% if alert.actions %} <a href="/alerts/{{ alert.id }}/actions">Actions ({{ alert.actions }})</a>{% endif %}</td>
       <td class="nowrap">{% if alert.host_id != "fleet" %}{% set os_family = alert.os_family %}<span class="host-name">{% include "hosts/_os_icon.html" %}<a href="/hosts/{{ alert.host_id }}{% if alert.host_id == "server" %}/metrics{% endif %}"{% if alert.short_id %} title="Host {{ alert.short_id }}"{% endif %}>{{ alert.hostname }}</a></span>{% else %}{{ alert.hostname }}{% endif %}</td>
       <td>{{ alert.started }}</td>
       <td>{{ alert.resolved }}</td>

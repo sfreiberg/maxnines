@@ -2,8 +2,11 @@
 //! The URL picks the database, and SeaORM handles the differences between them.
 //! Schema changes live in [`crate::migrations`].
 
+mod action_run;
+mod actions;
 mod alert;
 mod alert_rule;
+mod alert_rule_action;
 mod alert_rule_channel;
 mod alerting;
 mod api_key;
@@ -1936,6 +1939,7 @@ mod tests {
             remind_every_secs: None,
             forecast_secs: None,
             warning_forecast_secs: None,
+            actions: Vec::new(),
         };
         let rule = database.create_alert_rule(&input).await.unwrap();
         assert_eq!(

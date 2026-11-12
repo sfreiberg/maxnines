@@ -13,9 +13,10 @@ use serde_json::json;
 
 use super::audit::{record, record_change};
 use super::{
-    Database, alert, alert_rule, alert_rule_channel, maintenance_window, notification,
-    notification_channel, silence,
+    Database, alert, alert_rule, alert_rule_action, alert_rule_channel, maintenance_window,
+    notification, notification_channel, silence,
 };
+use crate::actions::{RuleAction, RunOn};
 use crate::alerting::{
     Alert, AlertRule, AlertRuleInput, Channel, ChannelInput, ChannelKind, Comparison, Delivery,
     DeliveryProblem, Event, Mail, MailSecurity, MailServer, NewAlert, RULE_GONE_REASON, RuleKind,
@@ -31,7 +32,11 @@ const FAILED: &str = "failed";
 /// Kept back by a silence.
 const HELD: &str = "held";
 
-fn to_alert_rule(row: alert_rule::Model, channels: Vec<i64>) -> Result<AlertRule> {
+fn to_alert_rule(
+    row: alert_rule::Model,
+    channels: Vec<i64>,
+    actions: Vec<RuleAction>,
+) -> Result<AlertRule> {
     Ok(AlertRule {
         id: row.id,
         rule: AlertRuleInput {
@@ -75,6 +80,7 @@ fn to_alert_rule(row: alert_rule::Model, channels: Vec<i64>) -> Result<AlertRule
                 .map(u64::try_from)
                 .transpose()
                 .context("invalid forecast")?,
+            actions,
         },
     })
 }
@@ -226,6 +232,56 @@ fn to_alert(row: alert::Model) -> Result<Alert> {
     })
 }
 
+/// A rule's actions as rows, in the order they were given.
+fn action_rows(
+    rule_id: i64,
+    actions: &[RuleAction],
+) -> Result<Vec<alert_rule_action::ActiveModel>> {
+    actions
+        .iter()
+        .enumerate()
+        .map(|(position, wanted)| {
+            Ok(alert_rule_action::ActiveModel {
+                rule_id: Set(rule_id),
+                action: Set(wanted.action.clone()),
+                run_on: Set(wanted.run_on.as_str().to_string()),
+                timeout_secs: Set(i64::try_from(wanted.timeout())?),
+                position: Set(i32::try_from(position)?),
+                ..Default::default()
+            })
+        })
+        .collect()
+}
+
+fn to_rule_action(row: alert_rule_action::Model) -> Result<RuleAction> {
+    Ok(RuleAction {
+        run_on: RunOn::parse(&row.run_on).context("invalid moment for an action")?,
+        timeout_secs: Some(u64::try_from(row.timeout_secs)?),
+        action: row.action,
+    })
+}
+
+/// Replaces a rule's actions with these.
+async fn save_actions<C: ConnectionTrait>(
+    connection: &C,
+    rule_id: i64,
+    actions: &[RuleAction],
+) -> Result<()> {
+    alert_rule_action::Entity::delete_many()
+        .filter(alert_rule_action::Column::RuleId.eq(rule_id))
+        .exec(connection)
+        .await
+        .context("saving alert rule actions")?;
+    let rows = action_rows(rule_id, actions)?;
+    if !rows.is_empty() {
+        alert_rule_action::Entity::insert_many(rows)
+            .exec_without_returning(connection)
+            .await
+            .context("saving alert rule actions")?;
+    }
+    Ok(())
+}
+
 fn links(rule_id: i64, channels: &[i64]) -> Vec<alert_rule_channel::ActiveModel> {
     let unique: BTreeSet<i64> = channels.iter().copied().collect();
     unique
@@ -275,10 +331,25 @@ impl Database {
                 .push(link.channel_id);
         }
 
+        let mut actions: BTreeMap<i64, Vec<RuleAction>> = BTreeMap::new();
+        for row in alert_rule_action::Entity::find()
+            .order_by_asc(alert_rule_action::Column::Position)
+            .all(&self.connection)
+            .await
+            .context("loading alert rule actions")?
+        {
+            let rule_id = row.rule_id;
+            actions
+                .entry(rule_id)
+                .or_default()
+                .push(to_rule_action(row)?);
+        }
+
         rows.into_iter()
             .map(|row| {
                 let mine = channels.remove(&row.id).unwrap_or_default();
-                to_alert_rule(row, mine)
+                let run = actions.remove(&row.id).unwrap_or_default();
+                to_alert_rule(row, mine, run)
             })
             .collect()
     }
@@ -302,6 +373,7 @@ impl Database {
                 .await
                 .context("saving alert rule channels")?;
         }
+        save_actions(&transaction, id, &input.actions).await?;
         record_alert_rule(&transaction, id, None).await?;
         transaction.commit().await.context("saving alert rule")?;
         Ok(id)
@@ -334,6 +406,7 @@ impl Database {
                 .await
                 .context("saving alert rule channels")?;
         }
+        save_actions(&transaction, id, &input.actions).await?;
         record_alert_rule(&transaction, id, Some(&before)).await?;
         transaction.commit().await.context("saving alert rule")?;
         Ok(true)
@@ -509,7 +582,16 @@ async fn load_alert_rule<C: ConnectionTrait>(connection: &C, id: i64) -> Result<
         .await
         .context("loading alert rule channels")?;
     let channels = channels.into_iter().map(|link| link.channel_id).collect();
-    to_alert_rule(row, channels).map(Some)
+    let actions = alert_rule_action::Entity::find()
+        .filter(alert_rule_action::Column::RuleId.eq(id))
+        .order_by_asc(alert_rule_action::Column::Position)
+        .all(connection)
+        .await
+        .context("loading alert rule actions")?
+        .into_iter()
+        .map(to_rule_action)
+        .collect::<Result<_>>()?;
+    to_alert_rule(row, channels, actions).map(Some)
 }
 
 /// A rule as the audit log compares them, with its channels by name.

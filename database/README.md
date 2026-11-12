@@ -34,6 +34,9 @@ erDiagram
     alert_rules |o--o{ alerts : "raised"
     alert_rules ||--o{ alert_rule_channels : "tells"
     notification_channels ||--o{ alert_rule_channels : "told by"
+    alert_rules ||--o{ alert_rule_actions : "runs"
+    hosts ||--o{ action_runs : "ran"
+    alerts |o--o{ action_runs : "asked for"
     alerts ||--o{ notifications : "sent as"
     notification_channels ||--o{ notifications : "sends"
     alert_rules |o--o{ silences : "silenced by"
@@ -135,6 +138,32 @@ erDiagram
     alert_rule_channels {
         int rule_id PK, FK
         int channel_id PK, FK
+    }
+    alert_rule_actions {
+        int id PK
+        int rule_id FK
+        string action "a name agents report"
+        string run_on "first, warning or critical"
+        int timeout_secs
+        int position
+    }
+    action_runs {
+        int id PK
+        string host_id FK
+        int alert_id FK "empty for one a person started"
+        string action
+        string run_on "first, warning, critical or manual"
+        text variables "JSON, what it was given"
+        string requested_by
+        int requested_ms
+        int timeout_secs
+        string outcome "empty while waiting"
+        int exit_code
+        text error
+        text output "what it printed"
+        boolean truncated
+        int duration_ms
+        int finished_ms
     }
     notifications {
         int id PK
@@ -337,6 +366,8 @@ erDiagram
 | `config_rules`, `config_rule_settings` | What agents monitor, chosen by facts |
 | `alert_rules`, `alert_rule_channels` | What raises an alert, and who hears of it. A deleted rule is kept, marked by `deleted_ms`, so its alerts still name it |
 | `alerts` | Every alert, open or resolved, with the hostname it had at the time |
+| `alert_rule_actions` | The actions each rule runs on an alert's host, and when in the alert's life |
+| `action_runs` | Every time an action was asked of a host, by an alert or a person, and what it printed. They go with their alert or their host |
 | `notification_channels`, `notifications` | Where alerts are sent, and each delivery with its retries. A deleted channel is kept the same way, so what was sent through it still names it |
 | `silences`, `maintenance_windows` | When notifications are held back |
 | `events` | Annotations people and automations add, and restarts the server notices |

@@ -190,6 +190,7 @@ fn evaluator(server: &TestServer, started_ms: i64) -> Evaluator {
         server.state.presence.clone(),
         server.state.metrics.clone(),
         server.state.status.clone(),
+        server.state.actions.clone(),
         started_ms,
     )
 }
@@ -216,6 +217,7 @@ pub(super) fn cpu_rule() -> AlertRuleInput {
         remind_every_secs: None,
         forecast_secs: None,
         warning_forecast_secs: None,
+        actions: Vec::new(),
     }
 }
 
@@ -1371,6 +1373,7 @@ async fn an_agent_never_seen_since_a_restart_counts_as_offline() {
         state.presence.clone(),
         state.metrics.clone(),
         state.status.clone(),
+        state.actions.clone(),
         started,
     );
     restarted.evaluate(started + 120_000).await.unwrap();
@@ -8305,4 +8308,461 @@ async fn a_host_page_names_a_wider_silence_but_leaves_ending_it_to_its_page() {
         )
         .await;
     assert_eq!(page.status, 400, "{}", page.body);
+}
+
+mod actions {
+    use maxnines_protocol::actions::{ActionOutcome, ActionResult};
+
+    use super::*;
+    use crate::actions::{NewRun, RUN_BY_HAND, RuleAction, RunOn};
+
+    /// What an agent with the built-in actions and one of its own reports.
+    fn facts_with_actions() -> AgentMessage {
+        AgentMessage::Facts {
+            facts: json!({
+                "agent": {
+                    "actions": ["disk_space", "restart_nginx", "top_cpu"],
+                    "action_variables": { "disk_space": ["disk"] },
+                },
+            }),
+        }
+    }
+
+    fn run(action: &str, run_on: RunOn) -> RuleAction {
+        RuleAction {
+            action: action.to_string(),
+            run_on,
+            timeout_secs: None,
+        }
+    }
+
+    fn rule_running(actions: Vec<RuleAction>) -> AlertRuleInput {
+        AlertRuleInput {
+            actions,
+            ..cpu_rule()
+        }
+    }
+
+    impl Harness {
+        /// A harness whose agent has said which actions it has.
+        async fn with_actions() -> Self {
+            let mut test = Self::start().await;
+            send(test.client.as_mut().unwrap(), &facts_with_actions()).await;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while test
+                .database()
+                .host_actions(&test.id())
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                assert!(Instant::now() < deadline, "the actions never arrived");
+                sleep(Duration::from_millis(10)).await;
+            }
+            test
+        }
+
+        /// Reads what the agent is sent until it's asked to run something.
+        async fn next_request(&mut self) -> (String, String, BTreeMap<String, String>, u64) {
+            let client = self.client.as_mut().unwrap();
+            let reading = async {
+                loop {
+                    if let ServerMessage::RunAction {
+                        id,
+                        action,
+                        variables,
+                        timeout_secs,
+                    } = read_server_message(client).await
+                    {
+                        return (id, action, variables, timeout_secs);
+                    }
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(5), reading)
+                .await
+                .expect("the agent wasn't asked to run anything")
+        }
+
+        async fn answer(&mut self, id: &str, outcome: ActionOutcome, output: &str) {
+            let result = ActionResult {
+                id: id.to_string(),
+                outcome,
+                exit_code: Some(0),
+                error: None,
+                output: output.to_string(),
+                truncated: false,
+                duration_ms: 1200,
+            };
+            let client = self.client.as_mut().unwrap();
+            send(client, &AgentMessage::ActionResult(result)).await;
+        }
+
+        /// Waits for a run to have an answer.
+        async fn finished(&self, id: i64) -> crate::actions::ActionRun {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let run = self.database().get_action_run(id).await.unwrap().unwrap();
+                if run.outcome.is_some() {
+                    return run;
+                }
+                assert!(Instant::now() < deadline, "the run never finished");
+                sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        async fn fire(&mut self) -> i64 {
+            self.cpu(0, 95.0).await;
+            self.cpu(2 * MINUTE_MS, 96.0).await;
+            let open = self.open().await;
+            assert_eq!(open.len(), 1);
+            open[0].id
+        }
+    }
+
+    #[tokio::test]
+    async fn a_firing_alert_runs_its_rules_action_and_keeps_what_it_printed() {
+        let mut test = Harness::with_actions().await;
+        let rule = rule_running(vec![run("top_cpu", RunOn::First)]);
+        test.database().create_alert_rule(&rule).await.unwrap();
+
+        let alert = test.fire().await;
+        let (id, action, variables, timeout_secs) = test.next_request().await;
+        assert_eq!(action, "top_cpu");
+        assert_eq!(timeout_secs, 30);
+        // It needs nothing, so it's told nothing.
+        assert!(variables.is_empty(), "{variables:?}");
+
+        let printed = "PID  NAME\n  7  <script>alert(1)</script>\n";
+        test.answer(&id, ActionOutcome::Succeeded, printed).await;
+        let run = test.finished(id.parse().unwrap()).await;
+        assert_eq!(run.alert_id, Some(alert));
+        assert_eq!(run.host_id, test.id());
+        assert_eq!(run.run_on, "first");
+        assert_eq!(run.outcome, Some(ActionOutcome::Succeeded));
+        assert_eq!(run.output, printed);
+        assert_eq!(run.duration_ms, Some(1200));
+
+        // Checking again doesn't run it again.
+        test.cpu(3 * MINUTE_MS, 97.0).await;
+        let runs = test.database().action_runs_for_alert(alert).await.unwrap();
+        assert_eq!(runs.len(), 1);
+
+        // What a host printed is only ever text on a page.
+        let mut browser = Browser::default();
+        let page = browser
+            .get(&test.server, &format!("/alerts/{alert}/actions"))
+            .await;
+        assert_eq!(page.status, 200);
+        assert!(
+            page.body.contains("&lt;script&gt;alert(1)"),
+            "{}",
+            page.body
+        );
+        assert!(!page.body.contains("<script>alert(1)"));
+        assert!(page.body.contains("Ran when the alert started"));
+        let alerts = browser.get(&test.server, "/alerts").await;
+        assert!(alerts.body.contains(&format!("/alerts/{alert}/actions")));
+
+        let listed = test
+            .server
+            .request("GET", &format!("/api/v1/alerts/{alert}/actions"), "")
+            .await;
+        assert!(listed.contains("\"outcome\":\"succeeded\""), "{listed}");
+    }
+
+    #[tokio::test]
+    async fn an_action_is_given_what_it_needs_from_the_alert() {
+        let mut test = Harness::with_actions().await;
+        let rule = AlertRuleInput {
+            name: "Disk".to_string(),
+            metric: Some("disk.usage".to_string()),
+            actions: vec![run("disk_space", RunOn::First)],
+            ..cpu_rule()
+        };
+        test.database().create_alert_rule(&rule).await.unwrap();
+
+        let first = test.reading("/var", test.now, 95.0);
+        test.script.set(vec![first]);
+        test.evaluate(0).await;
+        let second = test.reading("/var", test.now + 2 * MINUTE_MS, 96.0);
+        test.script.set(vec![second]);
+        test.evaluate(2 * MINUTE_MS).await;
+        assert_eq!(test.open().await.len(), 1);
+
+        let (_, action, variables, _) = test.next_request().await;
+        assert_eq!(action, "disk_space");
+        // Only what it asked for leaves the server.
+        assert_eq!(
+            variables,
+            BTreeMap::from([("disk".to_string(), "/var".to_string())])
+        );
+    }
+
+    #[tokio::test]
+    async fn an_action_for_critical_waits_until_the_alert_is_critical() {
+        let mut test = Harness::with_actions().await;
+        let rule = AlertRuleInput {
+            warning_threshold: Some(80.0),
+            actions: vec![
+                run("top_cpu", RunOn::Warning),
+                run("restart_nginx", RunOn::Critical),
+            ],
+            ..cpu_rule()
+        };
+        test.database().create_alert_rule(&rule).await.unwrap();
+
+        test.cpu(0, 85.0).await;
+        test.cpu(2 * MINUTE_MS, 85.0).await;
+        let alert = test.open().await[0].id;
+        assert_eq!(test.next_request().await.1, "top_cpu");
+        let runs = test.database().action_runs_for_alert(alert).await.unwrap();
+        assert_eq!(runs.len(), 1);
+
+        test.cpu(3 * MINUTE_MS, 95.0).await;
+        test.cpu(5 * MINUTE_MS, 95.0).await;
+        assert_eq!(test.open().await[0].severity, Severity::Critical);
+        assert_eq!(test.next_request().await.1, "restart_nginx");
+        let runs = test.database().action_runs_for_alert(alert).await.unwrap();
+        let ran: Vec<(&str, &str)> = runs
+            .iter()
+            .map(|run| (run.action.as_str(), run.run_on.as_str()))
+            .collect();
+        assert_eq!(ran, [("top_cpu", "warning"), ("restart_nginx", "critical")]);
+    }
+
+    #[tokio::test]
+    async fn a_run_that_cannot_be_asked_for_says_why() {
+        let mut test = Harness::with_actions().await;
+        let (host_id, now) = (test.id(), test.now);
+        let new = |action: &str, variables: &[(&str, &str)]| NewRun {
+            host_id: host_id.clone(),
+            alert_id: None,
+            action: action.to_string(),
+            run_on: RUN_BY_HAND.to_string(),
+            variables: variables
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
+            requested_by: Some("you@example.com".to_string()),
+            requested_ms: now,
+            timeout_secs: 30,
+        };
+        let actions = test.server.state.actions.clone();
+        let database = test.database().clone();
+        let outcome = |id| {
+            let database = database.clone();
+            async move {
+                let run = database.get_action_run(id).await.unwrap().unwrap();
+                (run.outcome.unwrap(), run.error.unwrap_or_default())
+            }
+        };
+
+        let id = actions.run(new("reboot", &[])).await.unwrap();
+        assert_eq!(outcome(id).await.0, ActionOutcome::NotDefined);
+
+        let id = actions.run(new("disk_space", &[])).await.unwrap();
+        let (refused, why) = outcome(id).await;
+        assert_eq!(refused, ActionOutcome::Refused);
+        assert!(why.contains("{disk}"), "{why}");
+
+        let id = actions
+            .run(new("disk_space", &[("disk", "a\nb")]))
+            .await
+            .unwrap();
+        assert_eq!(outcome(id).await.0, ActionOutcome::Refused);
+
+        test.go_offline().await;
+        let id = actions.run(new("top_cpu", &[])).await.unwrap();
+        let (refused, why) = outcome(id).await;
+        assert_eq!(refused, ActionOutcome::Refused);
+        assert!(why.contains("isn't connected"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_can_only_answer_for_its_own_runs_and_only_once() {
+        let mut test = Harness::with_actions().await;
+        let other = identity();
+        let mut intruder = test.server.connect_approved(&other, "web-2").await;
+
+        let path = format!("/hosts/{}/actions", test.id());
+        let mut browser = Browser::default();
+        let fields = [("action", "top_cpu"), ("timeout_secs", "45")];
+        let page = browser.submit(&test.server, &path, &path, &fields).await;
+        assert_eq!(page.status, 303, "{}", page.body);
+        let (id, action, _, timeout_secs) = test.next_request().await;
+        assert_eq!((action.as_str(), timeout_secs), ("top_cpu", 45));
+
+        // Another host answering for it is ignored.
+        let forged = ActionResult {
+            id: id.clone(),
+            outcome: ActionOutcome::Succeeded,
+            exit_code: None,
+            error: None,
+            output: "forged".to_string(),
+            truncated: false,
+            duration_ms: 1,
+        };
+        send(&mut intruder, &AgentMessage::ActionResult(forged)).await;
+        // Its facts are handled after the answer, so the answer has been by then.
+        send(&mut intruder, &facts_with_actions()).await;
+        test.server.wait_for_facts(&other.id(), 1).await;
+        let run_id: i64 = id.parse().unwrap();
+        let run = test
+            .database()
+            .get_action_run(run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.outcome, None);
+        assert_eq!(run.requested_by.as_deref(), Some("test@example.com"));
+        assert_eq!(run.run_on, "manual");
+
+        test.answer(&id, ActionOutcome::Failed, "real").await;
+        assert_eq!(test.finished(run_id).await.output, "real");
+        test.answer(&id, ActionOutcome::Succeeded, "second").await;
+        send(test.client.as_mut().unwrap(), &facts_with_actions()).await;
+        sleep(Duration::from_millis(200)).await;
+        assert_eq!(test.finished(run_id).await.output, "real");
+
+        let page = Browser::default()
+            .get(&test.server, &format!("/hosts/{}/actions", test.id()))
+            .await;
+        assert!(
+            page.body.contains("Run by test@example.com"),
+            "{}",
+            page.body
+        );
+        assert!(page.body.contains("variable_disk"), "{}", page.body);
+    }
+
+    #[tokio::test]
+    async fn a_run_nobody_answers_is_given_up_on() {
+        let mut test = Harness::with_actions().await;
+        let rule = rule_running(vec![run("top_cpu", RunOn::First)]);
+        test.database().create_alert_rule(&rule).await.unwrap();
+        test.fire().await;
+        let (id, ..) = test.next_request().await;
+        let id: i64 = id.parse().unwrap();
+
+        let asked = test.now + 2 * MINUTE_MS;
+        let actions = test.server.state.actions.clone();
+        actions.give_up_on_unanswered(asked + 80_000).await.unwrap();
+        let run = test.database().get_action_run(id).await.unwrap().unwrap();
+        assert_eq!(
+            run.outcome, None,
+            "30 seconds and a minute's grace aren't up"
+        );
+
+        actions.give_up_on_unanswered(asked + 91_000).await.unwrap();
+        let run = test.database().get_action_run(id).await.unwrap().unwrap();
+        assert_eq!(run.outcome, Some(ActionOutcome::Failed));
+        assert_eq!(run.error.as_deref(), Some("the agent never answered"));
+    }
+
+    #[tokio::test]
+    async fn a_rule_is_only_saved_with_actions_its_alerts_can_run() {
+        let test = Harness::with_actions().await;
+        let save = |rule: Value| {
+            let server = &test.server;
+            async move {
+                server
+                    .request("POST", "/api/v1/alert-rules", &rule.to_string())
+                    .await
+            }
+        };
+        let cpu = |actions: Value| {
+            json!({
+                "name": "CPU", "kind": "metric", "metric": "cpu.usage", "comparison": "above",
+                "threshold": 90.0, "for_secs": 60, "severity": "critical", "actions": actions,
+            })
+        };
+
+        let unknown = save(cpu(json!([{ "action": "reboot" }]))).await;
+        assert!(unknown.starts_with("HTTP/1.1 422"), "{unknown}");
+        assert!(unknown.contains("no host has an action"), "{unknown}");
+
+        let needs_a_disk = save(cpu(json!([{ "action": "disk_space" }]))).await;
+        assert!(needs_a_disk.starts_with("HTTP/1.1 422"), "{needs_a_disk}");
+        assert!(needs_a_disk.contains("{disk}"), "{needs_a_disk}");
+
+        let too_long = save(cpu(json!([{ "action": "top_cpu", "timeout_secs": 601 }]))).await;
+        assert!(too_long.starts_with("HTTP/1.1 422"), "{too_long}");
+
+        let offline = save(json!({
+            "name": "Gone", "kind": "offline", "for_secs": 60, "severity": "critical",
+            "actions": [{ "action": "top_cpu" }],
+        }))
+        .await;
+        assert!(offline.starts_with("HTTP/1.1 422"), "{offline}");
+
+        let wanted = json!([{ "action": "top_cpu", "run_on": "critical", "timeout_secs": 60 }]);
+        let saved = save(cpu(wanted.clone())).await;
+        assert!(saved.starts_with("HTTP/1.1 201"), "{saved}");
+        let rules = test.database().list_alert_rules().await.unwrap();
+        let rule = rules.iter().find(|rule| rule.rule.name == "CPU").unwrap();
+        assert_eq!(serde_json::to_value(&rule.rule.actions).unwrap(), wanted);
+    }
+
+    #[tokio::test]
+    async fn a_rules_actions_survive_the_trip_through_its_form() {
+        let test = Harness::with_actions().await;
+        let mut browser = Browser::default();
+        let fields = [
+            ("name", "CPU"),
+            ("kind", "metric"),
+            ("metric", "cpu.usage"),
+            ("comparison", "above"),
+            ("critical_threshold", "90"),
+            ("for_secs", "60"),
+            ("severity", "critical"),
+            ("enabled", "on"),
+            (
+                "actions",
+                "top_cpu\nrestart_nginx on=critical timeout=120\n",
+            ),
+        ];
+        let new = "/alerts/rules/new";
+        let page = browser
+            .submit(&test.server, new, "/alerts/rules", &fields)
+            .await;
+        assert_eq!(page.status, 303, "{}", page.body);
+
+        let rules = test.database().list_alert_rules().await.unwrap();
+        let rule = rules.iter().find(|rule| rule.rule.name == "CPU").unwrap();
+        assert_eq!(
+            rule.rule.actions,
+            [
+                RuleAction {
+                    timeout_secs: Some(30),
+                    ..run("top_cpu", RunOn::First)
+                },
+                RuleAction {
+                    timeout_secs: Some(120),
+                    ..run("restart_nginx", RunOn::Critical)
+                },
+            ]
+        );
+        let form = browser
+            .get(&test.server, &format!("/alerts/rules/{}/edit", rule.id))
+            .await;
+        assert!(
+            form.body
+                .contains("top_cpu\nrestart_nginx on=critical timeout=120"),
+            "{}",
+            form.body
+        );
+        assert!(
+            form.body.contains("disk_space (needs {disk})"),
+            "{}",
+            form.body
+        );
+
+        let bad = [("actions", "top_cpu when=later")];
+        let fields: Vec<(&str, &str)> = fields[..8].iter().copied().chain(bad).collect();
+        let page = browser
+            .submit(&test.server, new, "/alerts/rules", &fields)
+            .await;
+        assert_eq!(page.status, 422, "{}", page.body);
+        assert!(page.body.contains("t an option, in"), "{}", page.body);
+    }
 }

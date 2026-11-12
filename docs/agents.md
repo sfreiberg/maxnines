@@ -216,6 +216,51 @@ or a service stopped on purpose.
 Other systems run containers inside a Linux virtual machine, as Docker Desktop does on
 macOS and Windows, so only the Linux agent reads them.
 
+## Actions
+
+An action is something the server can ask this host to run, by name, whose output it
+keeps: for an [alert](alerts.md#actions), or when someone presses **Run** on the
+host's Actions page. Four are built into the agent and only look: `top_cpu`,
+`top_memory`, `disk_io` and `disk_space`.
+
+Your own go in the agent's config file, which is the only place one can be added:
+
+```hcl
+action "largest_folders" {
+  command = ["/usr/bin/du", "-x", "-h", "--max-depth=2", "{disk}"]
+}
+
+action "restart_nginx" {
+  command = ["/usr/bin/sudo", "-n", "/usr/bin/systemctl", "restart", "nginx"]
+}
+```
+
+- **The server can only pick from this list**, and say how long an action gets. The
+  agent tells it the names, never the commands.
+- **A command runs directly, not through a shell,** as the agent's user. For pipes,
+  use `["/bin/sh", "-c", "..."]`.
+- **Values from the alert** go where an argument names them in braces, like `{disk}`.
+  Each stays inside its own argument whatever it holds, and can't start one with a
+  dash. The program itself can't be a variable.
+- **An action that changes something needs its own permissions**, such as a sudoers
+  rule letting the agent's user run exactly that command.
+- **What it prints goes back to the server**, standard output and then standard
+  error, up to 64 KiB. Don't print secrets.
+- **One runs at a time.** Others wait their turn, up to eight.
+
+The agent doesn't run as root, so the built-in ones see what its user can: `disk_io`
+only its own user's processes, and `disk_space` only folders it can read. They say
+what they couldn't see, and `disk_space` shows the space it couldn't account for.
+
+Try one on the host, as the agent's user, the way the server would run it:
+
+```sh
+sudo -u maxnines maxnines-agent --config /etc/maxnines/agent.hcl action disk_space disk=/var
+```
+
+To stop the server asking for the built-in ones, which name programs and folders,
+set `built_in_actions = false` in the agent's config.
+
 ## Removing a host
 
 When a host is gone for good, revoke it on its page, then delete it. That

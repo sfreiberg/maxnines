@@ -4,6 +4,7 @@
 //! `agent_socket`, signing in in `sessions`, people in `users`, and how an open page
 //! learns of a new build in `update_notice`.
 
+mod actions;
 pub mod agent_socket;
 mod alert_rules;
 mod alerts;
@@ -191,6 +192,7 @@ pub fn app(state: AppState) -> Router {
         .merge(users::routes())
         .merge(hosts::routes())
         .merge(alerts::routes())
+        .merge(actions::routes())
         .merge(silences::routes())
         .merge(annotations::routes())
         .merge(maintenance_windows::routes())

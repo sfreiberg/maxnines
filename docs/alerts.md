@@ -80,6 +80,48 @@ then on of every change until it resolves:
   critical. An alert that's critical from the start isn't sent.
 - **Both**, the default: everything.
 
+## Actions
+
+A metric or forecast rule can run actions on the alert's host, and what they print is
+kept with the alert: which processes are busiest when CPU is high, where the space
+has gone when a disk is filling up, or the result of restarting a service.
+
+In the rule's **Actions** box, list one per line by name. Each runs once per alert:
+
+| Line | Runs |
+| --- | --- |
+| `top_cpu` | When the alert starts, whatever it starts at |
+| `top_cpu on=warning` | The first time the alert is a warning |
+| `disk_space on=critical timeout=120` | The first time the alert is critical, whether it starts there or gets there, with 120 seconds to finish |
+
+An action gets 30 seconds unless `timeout=` says otherwise, up to 600. One that runs
+out of time is stopped, and what it printed until then is kept.
+
+Every agent has four built in, which only look:
+
+| Action | Prints |
+| --- | --- |
+| `top_cpu` | The 20 processes using the most CPU |
+| `top_memory` | The 20 processes using the most memory |
+| `disk_io` | The processes reading and writing the most, over a second |
+| `disk_space` | Where the space on the alert's disk is going: up to ten folders that each hold 2% or more of what's used, however deep they are, what couldn't be accounted for, and what changed since it last looked |
+
+Anything else is a command in the agent's own config file, as described under
+[agents](agents.md#actions). That's the only place an action can be added, so the
+server can only ever ask a host for something its administrator put there.
+
+An action can use values from the alert: `{disk}`, `{interface}`, `{process}`,
+`{container}` or `{check}` for what the alert is about, or `{series}` for any of them,
+and `{hostname}`, `{rule}`, `{severity}`, `{metric}`, `{value}` and `{threshold}`. A
+rule can't be saved with an action that needs something its alerts don't have, such as
+`disk_space` on a CPU rule, or with one no host has. A host that lacks an action
+other hosts have records that it couldn't run it.
+
+The **Actions** button on an alert shows what its actions printed. A host's page has
+**Actions** too, with every run on that host and a **Run** button for each action it
+has, which takes the responder role. Don't have an action print secrets: anyone who
+can sign in can read what it printed.
+
 ## Silences
 
 A silence stops notifications for a while, as during planned work. Press **Silence** on

@@ -112,6 +112,9 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/alerts", get(list_alerts))
         .route("/alerts/delivery-problems", get(list_delivery_problems))
         .route("/alerts/{id}/acknowledge", post(acknowledge_alert))
+        .route("/alerts/{id}/actions", get(alert_actions))
+        .route("/hosts/{id}/actions", get(host_actions).post(run_action))
+        .route("/action-runs/{id}", get(show_action_run))
         .route("/alerts/{id}/unacknowledge", post(unacknowledge_alert))
         .route("/annotations", get(list_events).post(create_event))
         .route("/annotations/{id}", get(show_event).delete(delete_event))
@@ -1281,6 +1284,100 @@ async fn host_events(
     let (from_ms, to_ms) = params.span(24 * 3_600_000);
     match state.timeline(&id, from_ms, to_ms).await {
         Ok(events) => Json(events).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// How many of a host's runs the API returns.
+const ACTION_RUNS: u64 = 100;
+
+async fn alert_actions(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.get_alert(id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return server_error(&error),
+    }
+    match state.database.action_runs_for_alert(id).await {
+        Ok(runs) => Json(runs).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// What a host's agent can be asked to run, and what has been.
+async fn host_actions(State(state): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
+    if state.registry.get(&id).await.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let found = async {
+        let available = state.database.host_actions(&id).await?;
+        let runs = state
+            .database
+            .action_runs_for_host(&id, ACTION_RUNS)
+            .await?;
+        anyhow::Ok((available, runs))
+    };
+    match found.await {
+        Ok((available, runs)) => {
+            let available: Vec<Value> = available
+                .into_iter()
+                .map(|(name, variables)| json!({ "name": name, "variables": variables }))
+                .collect();
+            Json(json!({ "available": available, "runs": runs })).into_response()
+        }
+        Err(error) => server_error(&error),
+    }
+}
+
+#[derive(Deserialize)]
+struct RunActionInput {
+    action: String,
+    #[serde(default)]
+    variables: BTreeMap<String, String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+/// Asks a host to run an action now. The answer is the run as it stands, which is
+/// usually still waiting: read it again at `/action-runs/{id}` for how it went.
+async fn run_action(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Json(input): Json<RunActionInput>,
+) -> Response {
+    if state.registry.get(&id).await.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let timeout_secs = input
+        .timeout_secs
+        .unwrap_or(maxnines_protocol::actions::DEFAULT_ACTION_TIMEOUT_SECS);
+    if let Err(error) = crate::actions::check_timeout(timeout_secs) {
+        return refused(&error);
+    }
+    let new = crate::actions::NewRun {
+        host_id: id,
+        alert_id: None,
+        action: input.action,
+        run_on: crate::actions::RUN_BY_HAND.to_string(),
+        variables: input.variables,
+        requested_by: Some(super::recorded_by()),
+        requested_ms: now_ms(),
+        timeout_secs,
+    };
+    let run = async {
+        let id = state.actions.run(new).await?;
+        state.database.get_action_run(id).await
+    };
+    match run.await {
+        Ok(Some(run)) => (StatusCode::CREATED, Json(run)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn show_action_run(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.get_action_run(id).await {
+        Ok(Some(run)) => Json(run).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),
     }
 }

@@ -11,6 +11,7 @@
     {% include "hosts/_version.html" %}
     {% include "hosts/_health.html" %}
     <a class="button secondary" href="/hosts/{{ host.id }}/metrics">View metrics</a>
+    <a class="button secondary" href="/hosts/{{ host.id }}/actions">Actions</a>
     {% if can_edit %}
     {% if host.state != "approved" %}
     <form method="post" action="/hosts/{{ host.id }}/approve">

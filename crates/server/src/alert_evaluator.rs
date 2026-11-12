@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info};
 
+use crate::actions::Actions;
 use crate::alerting::{
     Alert, AlertRule, NewAlert, RULE_GONE_REASON, RuleKind, Severity, SeverityChange, clean,
 };
@@ -275,6 +276,8 @@ pub struct Evaluator {
     metrics: Metrics,
     /// Told how each pass went, for the navigation and the Server page.
     status: Arc<ServerStatus>,
+    /// Runs what a rule asks for on an alert's host.
+    actions: Arc<Actions>,
     started_ms: i64,
     trackers: HashMap<Key, Tracker>,
     /// Kept between passes, as forecasts read less often than rules are checked.
@@ -288,6 +291,7 @@ impl Evaluator {
         presence: Arc<Presence>,
         metrics: Metrics,
         status: Arc<ServerStatus>,
+        actions: Arc<Actions>,
         started_ms: i64,
     ) -> Self {
         Self {
@@ -296,6 +300,7 @@ impl Evaluator {
             presence,
             metrics,
             status,
+            actions,
             started_ms,
             trackers: HashMap::new(),
             trends: HashMap::new(),
@@ -510,6 +515,7 @@ impl Evaluator {
             }
         }
 
+        self.actions.give_up_on_unanswered(now_ms).await?;
         self.trackers.retain(|key, _| checked.contains(key));
         let firing = self.database.open_alerts().await?.len();
         self.status.firing.store(firing, Ordering::Relaxed);
@@ -873,6 +879,12 @@ impl Evaluator {
                         severity = severity.as_str(),
                         "alert changed severity"
                     );
+                    let alert = Alert {
+                        severity,
+                        value: value.or(alert.value),
+                        ..alert.clone()
+                    };
+                    self.run_actions(rule, &alert, false, snapshot.now_ms).await;
                 }
                 Ok(())
             }
@@ -889,10 +901,26 @@ impl Evaluator {
                     started_ms: snapshot.now_ms,
                 };
                 let channels = self.channels_for(rule).await?;
-                self.database.fire_alert(&new, &channels).await?;
+                let id = self.database.fire_alert(&new, &channels).await?;
                 info!(rule = rule.rule.name, hostname, "alert fired");
+                if let Some(alert) = self.database.get_alert(id).await? {
+                    self.run_actions(rule, &alert, true, snapshot.now_ms).await;
+                }
                 Ok(())
             }
+        }
+    }
+
+    /// Asks the alert's host for whatever the rule runs at this point. A failure
+    /// here is logged and left, as the alert itself has already been saved.
+    async fn run_actions(&self, rule: &AlertRule, alert: &Alert, started: bool, now_ms: i64) {
+        let asked = self.actions.run_for_alert(rule, alert, started, now_ms);
+        if let Err(error) = asked.await {
+            error!(
+                rule = rule.rule.name,
+                error = format!("{error:#}"),
+                "asking for an alert's actions failed"
+            );
         }
     }
 

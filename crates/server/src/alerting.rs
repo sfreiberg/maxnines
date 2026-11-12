@@ -9,6 +9,7 @@ use cel::Program;
 use serde::{Deserialize, Serialize};
 use wildmatch::WildMatch;
 
+use crate::actions::{RuleAction, check_rule_actions};
 use crate::calculations::{Calculation, Grouping, Question};
 use crate::channels;
 use crate::metric_charts::format_value;
@@ -194,6 +195,10 @@ pub struct AlertRuleInput {
     /// covers both, as with thresholds.
     #[serde(default)]
     pub warning_forecast_secs: Option<u64>,
+    /// What to run on an alert's host, and when. Only for metric and forecast
+    /// rules, whose alerts are about one host.
+    #[serde(default)]
+    pub actions: Vec<RuleAction>,
 }
 
 fn default_enabled() -> bool {
@@ -212,6 +217,7 @@ pub fn check_rule(rule: &AlertRuleInput) -> Result<()> {
         rule.for_secs <= MAX_FOR_SECS,
         "the duration can't be longer than 7 days"
     );
+    check_rule_actions(rule)?;
     ensure!(
         rule.remind_every_secs
             .is_none_or(|secs| secs >= MIN_REMINDER_SECS),
@@ -1005,6 +1011,7 @@ mod tests {
             remind_every_secs: None,
             forecast_secs: None,
             warning_forecast_secs: None,
+            actions: Vec::new(),
         }
     }
 
@@ -1655,6 +1662,7 @@ mod tests {
 
     fn forecast() -> AlertRuleInput {
         AlertRuleInput {
+            actions: Vec::new(),
             name: "Disk".to_string(),
             kind: RuleKind::Forecast,
             metric: Some("disk.usage".to_string()),
@@ -1764,6 +1772,7 @@ mod tests {
             kind: RuleKind::Metric,
             forecast_secs: None,
             warning_forecast_secs: None,
+            actions: Vec::new(),
             window_secs: Some(3600),
             ..forecast()
         };

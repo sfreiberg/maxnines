@@ -9,6 +9,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::HeaderMap;
 use axum::response::Response;
 use ipnet::IpNet;
+use maxnines_protocol::actions::ActionResult;
 use maxnines_protocol::{AgentMessage, RegistrationStatus, ServerMessage, auth};
 use serde_json::Value;
 use tokio::sync::Notify;
@@ -17,6 +18,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{Instant, MissedTickBehavior, interval, timeout};
 use tracing::{info, warn};
 
+use crate::actions::Actions;
 use crate::app_state::AppState;
 use crate::events::{BOOT_TIME_SLACK_MS, EventKind, restarted};
 use crate::facts::flatten;
@@ -104,6 +106,19 @@ struct OnlineGuard<'a> {
 impl Drop for OnlineGuard<'_> {
     fn drop(&mut self) {
         self.presence.disconnected(self.id, self.connection);
+    }
+}
+
+/// Stops actions being asked of a connection that has ended, however it ends.
+struct ActionsGuard<'a> {
+    actions: &'a Actions,
+    id: &'a str,
+    connection: u64,
+}
+
+impl Drop for ActionsGuard<'_> {
+    fn drop(&mut self) {
+        self.actions.disconnected(self.id, self.connection);
     }
 }
 
@@ -226,6 +241,8 @@ async fn send(socket: &mut WebSocket, message: &ServerMessage) -> Result<()> {
 /// Work for the main database, which has to wait its turn without holding up samples.
 enum Job {
     Facts(Value),
+    /// How an action the server asked for went.
+    ActionResult(ActionResult),
     ConfigResult {
         version: String,
         error: Option<String>,
@@ -257,6 +274,12 @@ async fn serve(
     let (jobs, job_queue) = mpsc::channel(JOB_QUEUE_SIZE);
     let (config_sender, mut configs) = mpsc::channel(1);
     let (ack_sender, mut acks) = mpsc::channel(ACK_QUEUE_SIZE);
+    let (action_link, mut action_requests) = state.actions.connected(&agent.id);
+    let _actions = ActionsGuard {
+        actions: &state.actions,
+        id: &agent.id,
+        connection: action_link,
+    };
     let mut work = tokio::spawn(do_jobs(
         job_queue,
         config_sender,
@@ -284,6 +307,11 @@ async fn serve(
                 }
             }
             Some(text) = configs.recv() => {
+                if socket.send(Message::text(text)).await.is_err() {
+                    return "send failed";
+                }
+            }
+            Some(text) = action_requests.recv() => {
                 if socket.send(Message::text(text)).await.is_err() {
                     return "send failed";
                 }
@@ -355,6 +383,12 @@ async fn do_jobs(
                 }
                 Some(Job::Boot(boot_ms)) => {
                     save_boot(boot_ms, agent, state, &mut known_boot).await;
+                }
+                Some(Job::ActionResult(result)) => {
+                    let saved = state.actions.finished(&agent.id, result, crate::metrics::now_ms());
+                    if let Err(error) = saved.await {
+                        warn!(id = agent.id, error = format!("{error:#}"), "saving an action's result failed");
+                    }
                 }
                 None => return "connection closed",
             }
@@ -458,15 +492,7 @@ fn receive(
             warn!(id = agent.id, "ignoring repeated hello");
             return None;
         }
-        Ok(AgentMessage::ActionResult(result)) => {
-            // Nothing asks for actions yet.
-            warn!(
-                id = agent.id,
-                action_id = result.id,
-                "ignoring an action result"
-            );
-            return None;
-        }
+        Ok(AgentMessage::ActionResult(result)) => Job::ActionResult(result),
         Err(error) => {
             warn!(id = agent.id, %error, "skipping invalid message");
             return None;

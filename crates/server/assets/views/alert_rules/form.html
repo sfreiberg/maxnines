@@ -126,6 +126,11 @@
       <small>Says it's still firing until someone acknowledges it, on every channel but on-call services, which repeat for themselves. Leave empty for no reminders.</small>
     </label>
 
+    <label>Actions
+      <textarea name="actions" rows="3" spellcheck="false" placeholder="disk_space on=critical timeout=120">{{ rule.actions }}</textarea>
+      <small>Only for a metric or a forecast. What to run on the alert's host, one per line, with what it prints kept with the alert. Each runs once per alert: when it starts, or with <code>on=warning</code> or <code>on=critical</code> the first time it's that severe. It gets 30 seconds unless <code>timeout=</code> says otherwise, up to 600. {% if known_actions %}Hosts have: {% for action in known_actions %}<code>{{ action }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.{% else %}No host has reported any actions yet.{% endif %}</small>
+    </label>
+
     <label>Severity
       <select name="severity">
         <option value="warning"{% if rule.severity == "warning" %} selected{% endif %}>Warning</option>

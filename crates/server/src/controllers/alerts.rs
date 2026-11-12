@@ -45,6 +45,8 @@ struct AlertRow {
     reason: Option<String>,
     silence_link: String,
     silenced_until: Option<String>,
+    /// How many actions its rule ran for it.
+    actions: u64,
 }
 
 /// Where to start a silence for just this alert. Agents choose their own names, which
@@ -67,6 +69,7 @@ impl From<Alert> for AlertRow {
         Self {
             silence_link: silence_link(&alert),
             silenced_until: None,
+            actions: 0,
             id: alert.id,
             acknowledged_by: alert.acknowledged_by,
             severity: alert.severity.as_str(),
@@ -133,8 +136,14 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
         Ok(facts) => facts,
         Err(error) => return server_error(&error),
     };
+    let alert_ids: Vec<i64> = open.iter().chain(&resolved).map(|alert| alert.id).collect();
+    let actions = match state.database.action_run_counts(&alert_ids).await {
+        Ok(actions) => actions,
+        Err(error) => return server_error(&error),
+    };
     let row = |alert: Alert| AlertRow {
         os_family: facts.get(&alert.host_id).and_then(OsFamily::of),
+        actions: actions.get(&alert.id).copied().unwrap_or(0),
         ..AlertRow::from(alert)
     };
 

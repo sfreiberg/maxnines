@@ -939,6 +939,7 @@ mod calculation_alerts {
             remind_every_secs: None,
             forecast_secs: None,
             warning_forecast_secs: None,
+            actions: Vec::new(),
         }
     }
 
@@ -950,6 +951,7 @@ mod calculation_alerts {
             state.presence.clone(),
             state.metrics.clone(),
             state.status.clone(),
+            state.actions.clone(),
             started_ms,
         )
     }
