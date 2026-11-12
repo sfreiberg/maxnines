@@ -231,18 +231,17 @@ fn inodes(_mount_point: &Path) -> Option<(u64, u64)> {
     None
 }
 
-/// Whether an interface is worth reporting, from its addresses and how many
-/// packets it has carried since the host started. Systems list many that aren't:
+/// Whether an interface is worth reporting, from its addresses. Two kinds aren't:
 ///
 /// - Loopback, which only ever talks to the host itself.
-/// - One that has never carried a packet, like a port with nothing plugged in or
-///   a tunnel nothing uses. One that has, and then goes down, is still reported,
-///   which is how a link going down is noticed.
 /// - On macOS, one whose only addresses are link-local, which is what it makes
 ///   for itself for AirDrop and the like. Elsewhere those are kept, as a network
 ///   card that only carries VLANs or belongs to a bond often has no other.
-fn is_reported(addresses: &[IpAddr], packets: u64, macos: bool) -> bool {
-    if addresses.iter().any(IpAddr::is_loopback) || packets == 0 {
+///
+/// One that's idle, or has nothing plugged in, is reported: it may carry traffic
+/// later, and one that's missing looks like one that isn't being watched.
+fn is_reported(addresses: &[IpAddr], macos: bool) -> bool {
+    if addresses.iter().any(IpAddr::is_loopback) {
         return false;
     }
     let link_local = |address: &IpAddr| match address {
@@ -285,10 +284,7 @@ impl Collector for NetworkCollector {
                     .iter()
                     .map(|network| network.addr)
                     .collect();
-                let packets = data
-                    .total_packets_received()
-                    .saturating_add(data.total_packets_transmitted());
-                is_reported(&addresses, packets, cfg!(target_os = "macos"))
+                is_reported(&addresses, cfg!(target_os = "macos"))
             })
             .map(|(name, data)| {
                 let mut stats = json!({
@@ -458,16 +454,15 @@ mod tests {
         let link_local = [address("fe80::1"), address("169.254.3.4")];
         let loopback = [address("127.0.0.1"), address("::1")];
         for macos in [false, true] {
-            assert!(is_reported(&lan, 10, macos));
-            // A bond's or bridge's member has no address of its own.
-            assert!(is_reported(&[], 10, macos));
-            assert!(!is_reported(&lan, 0, macos), "never used");
-            assert!(!is_reported(&[], 0, macos), "nothing plugged in");
-            assert!(!is_reported(&loopback, 10, macos));
+            assert!(is_reported(&lan, macos));
+            // A bond's or bridge's member, or a port with nothing plugged in yet,
+            // has no address of its own.
+            assert!(is_reported(&[], macos));
+            assert!(!is_reported(&loopback, macos));
         }
         // What macOS makes for AirDrop, and a card that only carries VLANs.
-        assert!(!is_reported(&link_local, 10, true));
-        assert!(is_reported(&link_local, 10, false));
+        assert!(!is_reported(&link_local, true));
+        assert!(is_reported(&link_local, false));
     }
 
     #[test]
