@@ -198,7 +198,7 @@ because reading containers needs the agent's user to be allowed Docker's socket,
 that's as good as root on the host:
 
 ```sh
-sudo usermod -aG docker maxnines-agent
+sudo usermod -aG docker maxnines
 sudo systemctl restart maxnines-agent
 ```
 
