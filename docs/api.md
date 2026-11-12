@@ -32,7 +32,10 @@ they're disabled. Give each tool its own key. Without a valid key, the answer is
 
 **Roles.** A key has a [role](users.md#roles), its owner's or lower, and can do
 what that role can: reading needs a viewer, acknowledging and silencing a responder,
-changing the setup an editor, and users, the audit log and deleting hosts an admin. Anything else gives `403`. Keys are made on the Settings page, through this API, or with
+changing the setup an editor, and users, the audit log and deleting hosts an admin. Anything else gives `403`.
+Give each key the lowest role that does its job, as described under
+[API keys and roles](users.md#api-keys-and-roles): an editor key, not an admin one, for
+a tool that manages rules. Keys are made on the Settings page, through this API, or with
 `maxnines-server api-keys create --user <email>`, which writes to the main database
 directly, so it works while the server is stopped. For a script that isn't anyone's,
 add a user for it, such as `ci@example.com`, which never needs a password.
@@ -1632,7 +1635,8 @@ Keys can also be managed on the Settings page, and with `maxnines-server api-key
 Only a hash of each key is kept, so a key can only be seen when it's created. `hint` is
 the start of it, to tell keys apart. Each key acts as its owner, `user_id`, whose
 email address is `owner`, with at most its `role`. Deleting a user deletes their keys.
-Admins see and revoke everyone's keys, and everyone else only their own.
+Admins see and revoke everyone's keys, and everyone else only their own. Give each key
+the [lowest role](users.md#api-keys-and-roles) that does its job.
 
 ### List API keys
 

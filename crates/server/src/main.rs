@@ -154,7 +154,8 @@ enum ApiKeysCommand {
         #[arg(long, value_name = "EMAIL")]
         user: String,
         /// The most the key can do: viewer, responder, editor or admin. Without this
-        /// it's the user's own role
+        /// it's the user's own role. Give it the least that does the job, like editor
+        /// for a tool that manages rules, as an admin key can add users
         #[arg(long, value_parser = roles::Role::parse)]
         role: Option<roles::Role>,
         /// How long it lasts, like 1h or 30d. Without this it never expires

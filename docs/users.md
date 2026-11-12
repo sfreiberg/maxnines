@@ -26,6 +26,11 @@ Each person has a role, and each role adds to the one before:
 | Editor | Changes the setup: config rules, alert rules, notification channels, maintenance windows, checks, dashboards and the map. Approves and revokes hosts |
 | Admin | Adds, disables and deletes users and changes their roles. Reads the audit log, sees everyone's API keys, and deletes hosts |
 
+In a small team, the people who set up monitoring usually manage users too, so they
+can simply be admins. Editor is for those who should change what's monitored but not
+who can sign in, such as a contractor, and above all for
+[API keys](#api-keys-and-roles) that automate the setup.
+
 An admin sets roles on the Users page under Settings, or with the API. There's always
 at least one admin who can sign in: the last one can't be given a lower role or
 disabled. If you're locked out anyway, the command line still works:
@@ -43,10 +48,24 @@ whatever a page shows.
 
 ### API keys and roles
 
-A key acts as its owner, and has a role of its own: its owner's, or lower. A key for
-a tool that only reads, like an AI assistant, can be a Viewer however much its owner
-can do. A key never does more than its owner can now, so giving someone a lower role
-lowers their keys with them.
+A key acts as its owner, and has a role of its own: its owner's, or lower. A key never
+does more than its owner can now, so giving someone a lower role lowers their keys
+with them.
+
+Give each key the lowest role that does its job, as a key can leak from wherever a
+tool keeps it:
+
+| Role | For a key that |
+| --- | --- |
+| Viewer | Only reads, like an AI assistant, a dashboard on a wall or a report |
+| Responder | Acknowledges or silences alerts too, like a chat bot or a deploy script that silences a host while it restarts |
+| Editor | Manages the setup, like a CI job keeping alert rules, channels and dashboards in step with a repository |
+| Admin | Manages users or deletes hosts. Rarely needed by a tool |
+
+The difference matters most between Editor and Admin. A leaked Editor key can change
+rules and channels, which the [audit log](audit-log.md) records and which can be put
+back. A leaked Admin key can add a user, make them an admin and delete hosts with their
+history, handing over the whole server.
 
 ## Two-factor sign-in
 

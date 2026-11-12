@@ -4,7 +4,7 @@
 <p class="breadcrumb"><a href="/settings">Settings</a></p>
 <div>
   <h1>API keys</h1>
-  <p class="subtitle">For scripts and tools that use the API. A key acts as the person who made it, so it can do what they can, its changes are recorded as theirs, and it stops working while they're disabled. Give each tool its own, and revoke any you stop using. Choose a lower role for a tool that should do less, like Viewer for one that only reads. {% if sees_all %}As an admin you see everyone's keys. {% endif %}For a script that isn't anyone's, add a user for it.</p>
+  <p class="subtitle">For scripts and tools that use the API. A key acts as the person who made it, so it can do what they can, its changes are recorded as theirs, and it stops working while they're disabled. Give each tool its own, and revoke any you stop using. Give each key the lowest role that does its job, as a key can leak from wherever a tool keeps it: Viewer for one that only reads, Responder for one that acknowledges or silences alerts, and Editor for one that manages rules, channels or dashboards. An Admin key can add users and give them any role, so few tools need one. {% if sees_all %}As an admin you see everyone's keys. {% endif %}For a script that isn't anyone's, add a user for it.</p>
 </div>
 
 {% if new_key %}
