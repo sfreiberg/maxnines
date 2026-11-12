@@ -405,14 +405,6 @@ mod unix {
     ///
     /// Call this before anything starts a thread, which means before the runtime.
     pub fn split(config: &Config) -> Result<()> {
-        // Asked for in the config: nothing either process starts from here on can
-        // gain rights, such as through sudo. Giving up root below isn't gaining
-        // any, so it still works.
-        #[cfg(target_os = "linux")]
-        if config.no_new_privileges {
-            nix::sys::prctl::set_no_new_privs().context("giving up gaining rights")?;
-        }
-
         if !geteuid().is_root() {
             if config.run_as.is_some() {
                 warn!("run_as only applies to an agent started as root, so it's ignored");

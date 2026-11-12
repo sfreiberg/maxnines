@@ -417,7 +417,6 @@ mod tests {
             built_in_actions: false,
             run_as: None,
             privileged_helper: true,
-            no_new_privileges: false,
         }
     }
 

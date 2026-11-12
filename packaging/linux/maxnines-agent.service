@@ -7,9 +7,8 @@ After=network-online.target
 [Service]
 # Started as root, it becomes the maxnines user before it connects to anything,
 # and leaves a small helper as root for the built-in actions that need it.
-# NoNewPrivileges isn't set here, as it would stop actions using sudo. Setting
-# no_new_privileges = true in the agent's config does the same for hosts that
-# want it. Its folder for
+# NoNewPrivileges isn't set here, as it would stop actions using sudo. Its
+# folder for
 # its key, its last config and samples waiting to be sent is made by the package,
 # as systemd would hand a folder it made to root.
 ExecStart=/usr/bin/maxnines-agent --config /etc/maxnines/agent.hcl

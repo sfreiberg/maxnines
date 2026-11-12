@@ -49,17 +49,6 @@ echo 'maxnines ALL=(root) NOPASSWD: /usr/bin/id' >/etc/sudoers.d/maxnines
 chmod 0440 /etc/sudoers.d/maxnines
 test "$(agent_action who_with_sudo)" = "root"
 test "$(as_service maxnines-agent --config /etc/maxnines/agent.hcl action who_with_sudo)" = "root"
-# Unless its config stops what it starts gaining rights.
-cp /etc/maxnines/agent.hcl /tmp/agent-strict.hcl
-echo 'no_new_privileges = true' >>/tmp/agent-strict.hcl
-test "$(maxnines-agent --config /tmp/agent-strict.hcl action who)" = "maxnines"
-if maxnines-agent --config /tmp/agent-strict.hcl action who_with_sudo; then
-  exit 1
-fi
-if as_service maxnines-agent --config /tmp/agent-strict.hcl action who_with_sudo; then
-  exit 1
-fi
-rm /tmp/agent-strict.hcl
 # The helper reads what only root can, for the built-in actions that need it,
 # and keeps what it saw where only root can write.
 install -d -m 0700 /srv/only-root

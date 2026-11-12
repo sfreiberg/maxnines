@@ -263,11 +263,6 @@ Write the rule for the whole command, not just the program. A rule that takes a
 value from an alert, like `{disk}`, lets anyone who can run actions choose that
 value, so keep those to commands that are safe whatever they're given.
 
-On a Linux host whose actions don't use `sudo`, `no_new_privileges = true` in the
-agent's config stops everything the agent starts gaining rights it doesn't have,
-through `sudo` or any other setuid program. Someone who took over the agent would
-then be left with only what its user can do.
-
 ### Running as root, and giving it up
 
 The Linux packages start the agent as root, and the first thing it does, before it

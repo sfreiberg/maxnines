@@ -53,12 +53,6 @@ pub struct Config {
     #[serde(default = "enabled")]
     #[cfg_attr(not(unix), allow(dead_code))]
     pub privileged_helper: bool,
-    /// Whether, on Linux, to stop everything the agent starts gaining rights it
-    /// doesn't have, as a setuid program would. That stops an action's command
-    /// using `sudo`, so it's for hosts whose actions don't.
-    #[serde(default)]
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub no_new_privileges: bool,
 }
 
 fn enabled() -> bool {

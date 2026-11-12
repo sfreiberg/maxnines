@@ -97,7 +97,3 @@ state_dir = "data.nosync"
 #
 # run_as            = "maxnines"   # who to become. "root" stays root
 # privileged_helper = true         # false gives up root without keeping a helper
-#
-# On Linux, this stops everything the agent starts gaining rights it doesn't
-# have. It stops sudo working too, so it's for hosts whose actions don't use it:
-# no_new_privileges = true
