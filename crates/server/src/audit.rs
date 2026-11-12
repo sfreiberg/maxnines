@@ -154,10 +154,12 @@ pub enum Action {
     NewSetupLink,
     Acknowledged,
     Unacknowledged,
+    /// Someone asked a host to run one of its actions.
+    Ran,
 }
 
 impl Action {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Created,
         Self::Changed,
         Self::Deleted,
@@ -167,6 +169,7 @@ impl Action {
         Self::NewSetupLink,
         Self::Acknowledged,
         Self::Unacknowledged,
+        Self::Ran,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -180,6 +183,7 @@ impl Action {
             Self::NewSetupLink => "new_setup_link",
             Self::Acknowledged => "acknowledged",
             Self::Unacknowledged => "unacknowledged",
+            Self::Ran => "ran_action",
         }
     }
 
@@ -194,6 +198,7 @@ impl Action {
             Self::NewSetupLink => "New password link",
             Self::Acknowledged => "Acknowledged",
             Self::Unacknowledged => "Unacknowledged",
+            Self::Ran => "Ran an action",
         }
     }
 

@@ -8617,6 +8617,15 @@ mod actions {
         assert_eq!(run.requested_by.as_deref(), Some("test@example.com"));
         assert_eq!(run.run_on, "manual");
 
+        // Someone asking for one is in the audit log, with what was asked for.
+        let entry = test.database().audit_log(None, 1).await.unwrap().remove(0);
+        assert_eq!(entry.action, "ran_action");
+        assert_eq!(entry.actor.name, "test@example.com");
+        assert_eq!(entry.subject.kind, "host");
+        assert_eq!(entry.subject.id, Some(test.id()));
+        assert_eq!(entry.changes[0].field, "action");
+        assert_eq!(entry.changes[0].after, Some("top_cpu".into()));
+
         test.answer(&id, ActionOutcome::Failed, "real").await;
         assert_eq!(test.finished(run_id).await.output, "real");
         test.answer(&id, ActionOutcome::Succeeded, "second").await;

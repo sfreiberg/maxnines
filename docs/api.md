@@ -2023,7 +2023,8 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 email address.
 
 `action` is `created`, `changed`, `deleted`, `signed_in`, `sign_in_failed`,
-`signed_out`, `new_setup_link`, `acknowledged` or `unacknowledged`. `subject.kind` is
+`signed_out`, `new_setup_link`, `acknowledged`, `unacknowledged` or `ran_action`,
+which is someone running an action on a host. `subject.kind` is
 `user`, `api_key`, `host`, `config_rule`, `alert_rule`, `notification_channel`,
 `alert`, `silence`, `maintenance_window`, `remote_check`, `location_rule`,
 `dashboard`, `annotation` or `setting`. Names are as they were at the time.

@@ -19,10 +19,12 @@ and there's no way to change or delete them from MaxNines.
   remote checks, location rules and dashboards being created, changed and deleted
 - Annotations being added and deleted
 - Alerts being acknowledged and unacknowledged, on the pages or in Slack
+- Someone running an [action](agents.md#actions) on a host, with which one and what
+  it was given
 
 Saving something without changing it doesn't add an entry. Alerts starting and
-ending, and the notifications they send, aren't recorded here, as the alerts page
-already keeps their history.
+ending, the notifications they send and the actions they run aren't recorded here,
+as the alerts page already keeps their history.
 
 ## Who and where from
 

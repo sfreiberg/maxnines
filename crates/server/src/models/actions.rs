@@ -5,10 +5,15 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use maxnines_protocol::actions::ActionOutcome;
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set};
+use sea_orm::{
+    ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+};
+use serde_json::Value;
 
-use super::{Database, action_run, host_fact};
+use super::audit::record;
+use super::{Database, action_run, host, host_fact};
 use crate::actions::{ActionRun, Finished, KnownActions, NewRun};
+use crate::audit::{Action, Change, Kind, Record, Subject};
 
 /// Where an agent lists its actions among its facts, and what each needs.
 const NAMES: &str = "agent.actions[";
@@ -90,6 +95,8 @@ impl Database {
         Ok(known(facts))
     }
 
+    /// One a person asked for goes in the audit log, with what it was given. One
+    /// an alert asked for is the server's own doing, and is kept with the alert.
     pub async fn create_action_run(&self, new: &NewRun) -> Result<i64> {
         let row = action_run::ActiveModel {
             host_id: Set(new.host_id.clone()),
@@ -109,10 +116,31 @@ impl Database {
             finished_ms: Set(None),
             ..Default::default()
         };
+        let transaction = self.connection.begin().await;
+        let transaction = transaction.context("saving an action run")?;
         let saved = action_run::Entity::insert(row)
-            .exec(&self.connection)
+            .exec(&transaction)
             .await
             .context("saving an action run")?;
+        if new.requested_by.is_some() {
+            let host = host::Entity::find_by_id(&new.host_id)
+                .one(&transaction)
+                .await
+                .context("loading host")?;
+            let hostname = host.map_or_else(|| new.host_id.clone(), |host| host.hostname);
+            let given = |field: &str, value: &str| Change {
+                field: field.to_string(),
+                before: None,
+                after: Some(Value::from(value)),
+                secret: false,
+            };
+            let mut changes = vec![given("action", &new.action)];
+            changes.extend(new.variables.iter().map(|(name, value)| given(name, value)));
+            let subject = Subject::new(Kind::Host, &new.host_id, hostname);
+            let entry = Record::new(Action::Ran, subject).with_changes(changes);
+            record(&transaction, entry).await?;
+        }
+        transaction.commit().await.context("saving an action run")?;
         Ok(saved.last_insert_id)
     }
 
