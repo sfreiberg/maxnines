@@ -30,5 +30,15 @@
         </g>
       </g>
       {% endfor %}
-      {% for marker in chart.markers %}<circle class="event-dot k-{{ marker.kind }}" cx="{{ marker.x }}" cy="{{ chart.top + 4 }}" r="4"><title>{{ marker.label }}</title></circle>{% endfor %}
+      {% for marker in chart.markers %}
+      <g class="event">
+        <rect class="hit" x="{{ marker.hit_x }}" y="{{ chart.top }}" width="{{ marker.hit_width }}" height="{{ chart.bottom - chart.top }}"/>
+        <circle class="event-dot k-{{ marker.kind }}" cx="{{ marker.x }}" cy="{{ chart.top + 4 }}" r="4"/>
+        <g class="event-tip">
+          <rect class="tooltip" x="{{ marker.tooltip_x }}" y="{{ chart.top }}" width="{{ marker.tooltip_width }}" height="42" rx="4"/>
+          <text class="tooltip-time" x="{{ marker.tooltip_x + 8 }}" y="{{ chart.top + 15 }}">{{ marker.time }}</text>
+          <text class="tooltip-row" x="{{ marker.tooltip_x + 8 }}" y="{{ chart.top + 30 }}"><tspan class="tooltip-value">{{ marker.kind_label }}</tspan> {{ marker.title }}</text>
+        </g>
+      </g>
+      {% endfor %}
     </svg>

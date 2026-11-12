@@ -350,13 +350,16 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 /* Each moment's lowest to highest value, behind the lines, so spikes show on long ranges. */
 .chart .band { fill-opacity: 0.18; stroke: none; }
 .chart .whisker { stroke-width: 2; stroke-opacity: 0.35; stroke-linecap: round; }
-/* What happened to the host: a line behind the data, and a dot on top to hover. */
+/* What happened to the host: a line behind the data, and a dot on top. With the
+   pointer on either, it says what it was, in place of the readings there. */
 .chart .event-line { stroke-width: 1; stroke-dasharray: 3 3; stroke: var(--muted); }
 .chart .event-dot { fill: var(--muted); stroke: var(--surface); stroke-width: 1.5; }
 .chart .event-line.k-deploy { stroke: var(--accent); } .chart .event-dot.k-deploy { fill: var(--accent); }
 .chart .event-line.k-restart { stroke: var(--warn); } .chart .event-dot.k-restart { fill: var(--warn); }
 .chart .event-line.k-alert { stroke: var(--bad); } .chart .event-dot.k-alert { fill: var(--bad); }
 .chart .event-line.k-resolved { stroke: var(--good); } .chart .event-dot.k-resolved { fill: var(--good); }
+.chart .event-tip { visibility: hidden; pointer-events: none; }
+.chart .event:hover .event-tip { visibility: visible; }
 .chart .hit { fill: transparent; }
 .chart .reading { visibility: hidden; pointer-events: none; }
 .chart .column:hover .reading, .chart .column.linked .reading { visibility: visible; }

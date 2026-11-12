@@ -1,9 +1,10 @@
 # Annotations
 
 A host's charts mark what happened to it, so a change in a graph can be matched to
-what caused it. Each one is a dashed line down every chart, with a dot at the top to
-hover over for when and what. The **Events** list under the charts has the same for
-the range shown, newest first.
+what caused it. Each one is a dashed line down every chart, with a dot at the top.
+Put the pointer on the line or the dot and it says when it happened and what it
+was. The **Events** list under the charts has the same for the range shown, newest
+first.
 
 All of these together are the host's events. Annotations are the events people and
 automations add; the server records the rest by itself.

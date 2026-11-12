@@ -157,14 +157,27 @@ pub struct Summary {
     pub peak: String,
 }
 
-/// Something that happened, as a line down the chart where it happened.
+/// Something that happened, as a line down the chart where it happened, which
+/// says what it was when the pointer is on it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Marker {
     pub x: f64,
     pub kind: &'static str,
-    /// When and what, for hovering over it.
-    pub label: String,
+    /// When it happened.
+    pub time: String,
+    /// What kind of thing it was, in a word, like `Deploy`.
+    pub kind_label: &'static str,
+    /// What it was, shortened to fit the chart.
+    pub title: String,
+    /// Where the line takes the pointer, and where what it says goes.
+    pub hit_x: f64,
+    pub hit_width: f64,
+    pub tooltip_x: f64,
+    pub tooltip_width: f64,
 }
+
+/// How far to either side of an event's line the pointer still counts as on it.
+const MARKER_REACH: f64 = 6.0;
 
 #[derive(Debug, Serialize)]
 pub struct Chart {
@@ -312,18 +325,41 @@ pub fn mark(chart: &mut Chart, events: &[TimelineEvent], range: TimeRange, zone:
         width: chart.width,
         height: chart.height,
     };
+    // As wide as it needs, up to most of the chart, with a longer title cut.
+    let widest = (frame.right() - LEFT) * 0.75;
+    let room = ((widest - TOOLTIP_PADDING) / TOOLTIP_CHAR_WIDTH) as usize;
     chart.markers = events
         .iter()
         .filter(|event| (range.from_ms..=range.to_ms).contains(&event.time_ms))
-        .map(|event| Marker {
-            x: x_for(event.time_ms, range, frame),
-            kind: event.kind.as_str(),
-            label: format!(
-                "{} · {}: {}",
-                format_time(u64::try_from(event.time_ms).unwrap_or(0), zone),
-                event.kind.label(),
-                event.title
-            ),
+        .map(|event| {
+            let x = x_for(event.time_ms, range, frame);
+            let kind_label = event.kind.label();
+            let room = room.saturating_sub(kind_label.chars().count() + 1);
+            let mut title: String = event.title.chars().take(room).collect();
+            if title.len() < event.title.len() {
+                title.pop();
+                title.push('…');
+            }
+            let chars = kind_label.chars().count() + 1 + title.chars().count();
+            let tooltip_width = (chars as f64 * TOOLTIP_CHAR_WIDTH + TOOLTIP_PADDING)
+                .clamp(TOOLTIP_MIN_WIDTH, widest.max(TOOLTIP_MIN_WIDTH));
+            // Opens toward the middle, as a reading does.
+            let tooltip_x = if x > f64::midpoint(LEFT, frame.right()) {
+                x - TOOLTIP_GAP - tooltip_width
+            } else {
+                x + TOOLTIP_GAP
+            };
+            Marker {
+                x,
+                kind: event.kind.as_str(),
+                time: format_time(u64::try_from(event.time_ms).unwrap_or(0), zone),
+                kind_label,
+                title,
+                hit_x: x - MARKER_REACH,
+                hit_width: 2.0 * MARKER_REACH,
+                tooltip_x,
+                tooltip_width,
+            }
         })
         .collect();
 }
@@ -1030,11 +1066,47 @@ mod tests {
         let middle = f64::midpoint(LEFT, Frame::STANDARD.right());
         assert!((marker.x - middle).abs() < 0.5, "{}", marker.x);
         assert_eq!(marker.kind, "deploy");
-        assert!(
-            marker.label.ends_with("Deploy: Deployed"),
-            "{}",
-            marker.label
+        assert_eq!(
+            (marker.kind_label, marker.title.as_str()),
+            ("Deploy", "Deployed")
         );
+        assert!(marker.time.contains("00:30"), "{}", marker.time);
+        assert!(marker.hit_x < marker.x);
+    }
+
+    #[test]
+    fn what_an_event_was_fits_on_the_chart_wherever_it_happened() {
+        use crate::events::{EventKind, TimelineEvent};
+        let event = |time_ms: i64, title: &str| TimelineEvent {
+            time_ms,
+            kind: EventKind::Restart,
+            title: title.into(),
+            detail: None,
+            created_by: None,
+            id: None,
+        };
+        let mut chart = chart("cpu.usage", vec![series("CPU", &steady(20))]);
+        let long = "é".repeat(500);
+        let events = [
+            event(0, "Restarted"),
+            event(HOUR_MS, "Restarted"),
+            event(HOUR_MS, &long),
+        ];
+        mark(&mut chart, &events, range(), Tz::UTC);
+
+        for marker in &chart.markers {
+            assert!(marker.tooltip_x >= 0.0, "{marker:?}");
+            assert!(
+                marker.tooltip_x + marker.tooltip_width <= WIDTH,
+                "{marker:?}"
+            );
+        }
+        // It opens away from the edge it's nearest.
+        assert!(chart.markers[0].tooltip_x > chart.markers[0].x);
+        assert!(chart.markers[1].tooltip_x < chart.markers[1].x);
+        // A title too long to fit is cut, and says so.
+        let cut = &chart.markers[2].title;
+        assert!(cut.ends_with('…') && cut.chars().count() < 100, "{cut}");
     }
 
     #[test]
