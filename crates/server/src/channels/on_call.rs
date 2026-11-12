@@ -25,8 +25,9 @@ pub fn steps(notice: &Notice) -> &'static [Incident] {
         Event::Firing | Event::Escalated | Event::Eased => &[Incident::Open],
         Event::Resolved => &[Incident::Close],
         Event::Test => &[Incident::Open, Incident::Close],
-        // They repeat for themselves, so they're never sent these.
-        Event::Reminder => &[],
+        // They repeat for themselves, and what an action printed would only page
+        // someone again, so they're never sent these.
+        Event::Reminder | Event::Action => &[],
     }
 }
 

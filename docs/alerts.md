@@ -118,6 +118,11 @@ rule can't be saved with an action that needs something its alerts don't have, s
 `disk_space` on a CPU rule, or with one no host has. A host that lacks an action
 other hosts have records that it couldn't run it.
 
+What an action printed is sent to the channels that heard the alert start, as
+[notification channels](notifications.md#what-actions-print) describes: a reply
+under the alert's message in Slack and Telegram, and a message of its own elsewhere.
+On-call services aren't sent it.
+
 The **Actions** button on an alert shows what its actions printed. A host's page has
 **Actions** too, with every run on that host and a **Run** button for each action it
 has, which takes the responder role. Don't have an action print secrets: anyone who

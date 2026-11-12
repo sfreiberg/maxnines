@@ -3,14 +3,17 @@
 //! the notification, and the headers are kept like a password, as they usually
 //! hold a token.
 
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use axum::http::{HeaderName, HeaderValue};
+use maxnines_protocol::actions::ActionOutcome;
 use serde_json::{Map, Value, json};
 use tera::{Context, Kwargs, State, Tera};
 
 use super::{ChannelType, agent, blocking, explain_http, url_host, url_preview};
+use crate::actions::ActionRun;
 use crate::alerting::{
     Alert, Channel, ChannelInput, Event, Severity, WebhookMethod, WebhookRequest,
 };
@@ -108,6 +111,28 @@ fn example_alert() -> Alert {
     }
 }
 
+/// A run to check a template with, for one that sends what actions print.
+fn example_run() -> ActionRun {
+    ActionRun {
+        id: 0,
+        host_id: String::new(),
+        alert_id: Some(0),
+        action: "top_cpu".to_string(),
+        run_on: "first".to_string(),
+        variables: BTreeMap::new(),
+        requested_by: None,
+        requested_ms: 0,
+        timeout_secs: 30,
+        outcome: Some(ActionOutcome::Succeeded),
+        exit_code: Some(0),
+        error: None,
+        output: "PID  NAME\n  1  init\n".to_string(),
+        truncated: false,
+        duration_ms: Some(1000),
+        finished_ms: Some(1000),
+    }
+}
+
 /// What a template can use. A test has no alert, so it gets an example one, as
 /// the template is written for alerts.
 fn context(notice: &Notice, web_url: Option<&str>) -> Result<Context> {
@@ -133,6 +158,7 @@ fn context(notice: &Notice, web_url: Option<&str>) -> Result<Context> {
         "text": notice.text,
         "link": web_url.map(super::alerts_link),
         "alert": fields,
+        "action": notice.action_fields(),
     });
     Context::from_serialize(&values).context("filling in the template")
 }
@@ -296,6 +322,7 @@ impl ChannelType for CustomWebhook {
         let examples = [
             Notice::for_alert(example_alert(), Event::Firing),
             Notice::for_alert(resolved, Event::Resolved),
+            Notice::for_action(example_alert(), example_run()),
             Notice::test(),
         ];
         for notice in &examples {
@@ -307,6 +334,15 @@ impl ChannelType for CustomWebhook {
 
     fn preview(&self, target: &str) -> String {
         url_preview(target)
+    }
+
+    /// Only when its body was written with actions in mind. One written for
+    /// alerts alone would send what looks like another alert.
+    fn takes_action_output(&self, channel: &ChannelInput) -> bool {
+        channel
+            .request
+            .as_ref()
+            .is_some_and(|request| request.body.contains("action."))
     }
 
     fn hides_target(&self) -> bool {
@@ -578,6 +614,23 @@ mod tests {
             mail: None,
             request: Some(request("application/json", body)),
         }
+    }
+
+    #[test]
+    fn a_body_that_uses_what_actions_print_is_sent_it() {
+        let body = r#"{"text": "{% if action %}{{ action.name }} {{ action.outcome }}: {{ action.output }}{% else %}{{ text }}{% endif %}"}"#;
+        let written_for_actions = channel(body);
+        CustomWebhook.check(&written_for_actions).unwrap();
+        assert!(CustomWebhook.takes_action_output(&written_for_actions));
+        assert!(!CustomWebhook.takes_action_output(&channel(EXAMPLE_BODY)));
+
+        let request = request("application/json", body);
+        let ran = crate::channels::testing::action_notice("A \"quoted\"\nline\n");
+        let sent: Value = serde_json::from_str(&render(&request, &ran, None).unwrap()).unwrap();
+        assert_eq!(sent["text"], "disk_space succeeded: A \"quoted\"\nline\n");
+        let firing = render(&request, &notice(Event::Firing, alert()), None).unwrap();
+        let sent: Value = serde_json::from_str(&firing).unwrap();
+        assert_eq!(sent["text"], "CPU usage on web-1 is 97%, above 90%");
     }
 
     #[test]

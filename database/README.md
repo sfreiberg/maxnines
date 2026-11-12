@@ -38,6 +38,7 @@ erDiagram
     hosts ||--o{ action_runs : "ran"
     alerts |o--o{ action_runs : "asked for"
     alerts ||--o{ notifications : "sent as"
+    action_runs |o--o{ notifications : "printed for"
     notification_channels ||--o{ notifications : "sends"
     alert_rules |o--o{ silences : "silenced by"
     alert_rules |o--o{ maintenance_windows : "paused by"
@@ -177,6 +178,7 @@ erDiagram
         int created_ms
         int sent_ms
         string external_id
+        int action_run_id "the run it's about, for what an action printed"
     }
     silences {
         int id PK

@@ -8420,6 +8420,191 @@ mod actions {
     }
 
     #[tokio::test]
+    async fn what_an_action_printed_follows_the_alert_to_its_channel() {
+        let mut test = Harness::with_actions().await;
+        let hook = Hook::default();
+        let url = format!("{}/secret-token", hook.start().await);
+        let channel = webhook_channel(&url);
+        let channel = test.database().create_channel(&channel).await.unwrap();
+        let rule = AlertRuleInput {
+            channels: vec![channel],
+            ..rule_running(vec![run("top_cpu", RunOn::First)])
+        };
+        test.database().create_alert_rule(&rule).await.unwrap();
+        let notifier = Notifier::new(test.database().clone(), Senders::default());
+
+        let alert = test.fire().await;
+        let (id, ..) = test.next_request().await;
+        // Nothing is said about it until it's known how it went.
+        notifier
+            .deliver_due(test.now + 3 * MINUTE_MS)
+            .await
+            .unwrap();
+        notifier
+            .deliver_due(test.now + 3 * MINUTE_MS)
+            .await
+            .unwrap();
+        assert_eq!(hook.events(), ["firing"]);
+
+        let printed = "PID  NAME\n  7  init\n";
+        test.answer(&id, ActionOutcome::Succeeded, printed).await;
+        test.finished(id.parse().unwrap()).await;
+        notifier
+            .deliver_due(test.now + 3 * MINUTE_MS)
+            .await
+            .unwrap();
+        assert_eq!(hook.events(), ["firing", "action"]);
+        {
+            let received = hook.received.lock().unwrap();
+            assert_eq!(received[1]["text"], "top_cpu ran on web-1");
+            assert_eq!(received[1]["alert"]["id"], alert);
+            assert_eq!(received[1]["action"]["name"], "top_cpu");
+            assert_eq!(received[1]["action"]["outcome"], "succeeded");
+            assert_eq!(received[1]["action"]["output"], printed);
+            assert_eq!(received[0]["action"], Value::Null);
+        }
+
+        // One a person ran is theirs to read on the page, and goes nowhere.
+        let by_hand = NewRun {
+            host_id: test.id(),
+            alert_id: None,
+            action: "top_cpu".to_string(),
+            run_on: RUN_BY_HAND.to_string(),
+            variables: BTreeMap::new(),
+            requested_by: Some("you@example.com".to_string()),
+            requested_ms: test.now,
+            timeout_secs: 30,
+        };
+        test.server.state.actions.run(by_hand).await.unwrap();
+        let (id, ..) = test.next_request().await;
+        test.answer(&id, ActionOutcome::Succeeded, "more").await;
+        test.finished(id.parse().unwrap()).await;
+        notifier
+            .deliver_due(test.now + 4 * MINUTE_MS)
+            .await
+            .unwrap();
+        assert_eq!(hook.events(), ["firing", "action"]);
+    }
+
+    #[tokio::test]
+    async fn slack_shows_what_an_action_printed_under_the_alerts_message() {
+        let mut test = Harness::with_actions().await;
+        let slack = FakeSlack::default();
+        let url = slack.start().await;
+        let channel = ChannelInput {
+            name: "Slack".to_string(),
+            kind: ChannelKind::Slack,
+            target: "#alerts".to_string(),
+            credential: Some("xoxb-secret-token".to_string()),
+            ..webhook_channel("")
+        };
+        let channel = test.database().create_channel(&channel).await.unwrap();
+        let rule = AlertRuleInput {
+            channels: vec![channel],
+            ..rule_running(vec![
+                run("top_cpu", RunOn::First),
+                run("restart_nginx", RunOn::First),
+            ])
+        };
+        test.database().create_alert_rule(&rule).await.unwrap();
+        let senders = Senders {
+            web_url: Some("https://monitor.example.com".to_string()),
+            slack_api_url: Some(url),
+            ..Senders::default()
+        };
+        let notifier = Notifier::new(test.database().clone(), senders);
+
+        let alert = test.fire().await;
+        let (first, ..) = test.next_request().await;
+        let (second, ..) = test.next_request().await;
+        notifier
+            .deliver_due(test.now + 3 * MINUTE_MS)
+            .await
+            .unwrap();
+        test.answer(&first, ActionOutcome::Succeeded, "PID  NAME\n  7  init\n")
+            .await;
+        test.finished(first.parse().unwrap()).await;
+        notifier
+            .deliver_due(test.now + 3 * MINUTE_MS)
+            .await
+            .unwrap();
+
+        assert_eq!(slack.methods(), ["post", "post"]);
+        let reply = slack.calls()[1].2.clone();
+        assert_eq!(reply["channel"], "C123");
+        assert_eq!(reply["thread_ts"], "1700000000.000100");
+        let link = format!("https://monitor.example.com/alerts/{alert}/actions");
+        assert_eq!(
+            reply["text"],
+            format!(
+                "*ACTION* top_cpu ran on web-1\n```\nPID  NAME\n  7  init\n```\n\
+                 <{link}|All of what it printed>"
+            )
+        );
+
+        // If someone deleted the alert's message, it stands on its own.
+        test.answer(&second, ActionOutcome::Failed, "").await;
+        test.finished(second.parse().unwrap()).await;
+        slack.errors.lock().unwrap().push("thread_not_found");
+        notifier
+            .deliver_due(test.now + 3 * MINUTE_MS)
+            .await
+            .unwrap();
+        assert_eq!(slack.methods(), ["post", "post", "post", "post"]);
+        let alone = slack.calls()[3].2.clone();
+        assert_eq!(alone["channel"], "#alerts");
+        assert!(alone.get("thread_ts").is_none());
+        let text = alone["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("*ACTION* restart_nginx failed on web-1"),
+            "{text}"
+        );
+        let problems = test.database().delivery_problems(10).await.unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[tokio::test]
+    async fn an_on_call_service_is_not_sent_what_an_action_printed() {
+        let mut test = Harness::with_actions().await;
+        let database = test.database().clone();
+        let ops = webhook_channel("http://127.0.0.1:9/hook");
+        let ops = database.create_channel(&ops).await.unwrap();
+        let pager = ChannelInput {
+            name: "Pager".to_string(),
+            kind: ChannelKind::PagerDuty,
+            target: "abcdefghijklmnopqrstuvwxyz012345".to_string(),
+            ..webhook_channel("")
+        };
+        let pager = database.create_channel(&pager).await.unwrap();
+        let rule = AlertRuleInput {
+            channels: vec![ops, pager],
+            ..rule_running(vec![run("top_cpu", RunOn::First)])
+        };
+        database.create_alert_rule(&rule).await.unwrap();
+
+        test.fire().await;
+        let (id, ..) = test.next_request().await;
+        // A run that failed is still worth hearing about.
+        test.answer(&id, ActionOutcome::Failed, "no").await;
+        test.finished(id.parse().unwrap()).await;
+
+        // Each channel hears about the alert first.
+        let mut told = deliver_by_channel(&test).await;
+        told.sort_by_key(|(channel, _)| *channel);
+        assert_eq!(told, [(ops, Event::Firing), (pager, Event::Firing)]);
+        let due = database.due_deliveries(i64::MAX, 100).await.unwrap();
+        assert_eq!(due.len(), 1, "{due:?}");
+        assert_eq!((due[0].channel.id, due[0].event), (ops, Event::Action));
+        let run = due[0].action.as_ref().unwrap();
+        assert_eq!(
+            (run.action.as_str(), run.output.as_str()),
+            ("top_cpu", "no")
+        );
+        let notice = crate::notifier::Notice::for_delivery(&due[0]);
+        assert_eq!(notice.text, "top_cpu failed on web-1");
+    }
+
+    #[tokio::test]
     async fn a_firing_alert_runs_its_rules_action_and_keeps_what_it_printed() {
         let mut test = Harness::with_actions().await;
         let rule = rule_running(vec![run("top_cpu", RunOn::First)]);

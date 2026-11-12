@@ -18,6 +18,29 @@ can't be drawn or sent, the notification goes without it, and the server's log s
   message first with the photo as a reply.
 - **Email** and **Resend** show the chart under the text, for mail apps that show HTML.
 
+## What actions print
+
+When an alert's rule runs [actions](alerts.md#actions), each channel that heard the
+alert start gets a message once an action finishes, saying how it went, like
+`disk_space ran on web-1`, with what it printed. One that failed, ran out of time or
+couldn't be run is sent too, with why. All of it is always on the alert's **Actions**
+page, which the messages link to when the server knows its own address.
+
+| Channel | What it gets |
+| --- | --- |
+| Slack | A reply under the alert's message, with up to 3,000 characters in a block that keeps columns lined up |
+| Discord | A message with what fits in Discord's 2,000 characters, and all of it attached as a text file when that isn't everything |
+| Telegram | A reply to the alert's message, with up to 3,000 characters |
+| Email and Resend | An email with all of it, in a fixed-width font for mail apps that show HTML |
+| Microsoft Teams | A card with up to 6,000 characters in a code block |
+| Webhook | The event `action`, with the run as `action`: its `name`, `outcome`, `exit_code`, `error`, `output`, `truncated` and `duration_ms` |
+| Custom webhook | The same event, but only if its body uses `action.` somewhere, as a body written for alerts alone would send what looks like another alert |
+| PagerDuty, AlertOps and SIGNL4 | Nothing, as it would only page someone again |
+
+A message that had to cut what was printed ends at the end of a line and says so.
+What a silence holds back includes these, and they're sent with the alert when it
+ends. An action someone runs by hand from a host's page isn't sent anywhere.
+
 ## Discord
 
 Each Discord message starts with a circle in the colours Slack's messages use: 🔴 for
@@ -89,7 +112,7 @@ What a template can use:
 
 | Name | What it is |
 | --- | --- |
-| `event` | `firing`, `escalated`, `eased`, `reminder`, `resolved` or `test` |
+| `event` | `firing`, `escalated`, `eased`, `reminder`, `resolved`, `action` or `test` |
 | `text` | The notification in one line, like `Resolved: CPU usage on web-1 is 97%, above 90%` |
 | `id` | The same for every attempt at one notification, so a receiver can spot a repeat |
 | `link` | The alerts page, when the server knows the address people reach it at |
@@ -101,6 +124,9 @@ What a template can use:
 | `alert.started`, `alert.resolved` | Times like `2026-11-10T14:03:00Z`, with `alert.started_ms` and `alert.resolved_ms` in milliseconds |
 | `alert.resolve_reason` | Why it resolved, when it wasn't the reading recovering |
 | `alert.acknowledged_by`, `alert.acknowledged` | Who acknowledged it, if anyone, and `alert.acknowledged_ms` |
+| `action.name`, `action.outcome` | For the event `action`: which of the alert's [actions](#what-actions-print) ran, and `succeeded`, `failed`, `timed_out`, `not_defined` or `refused`. `action` is missing for other events, so test for it with `{% if action %}` |
+| `action.output`, `action.truncated` | What it printed, up to 64 KiB, and whether that was cut |
+| `action.exit_code`, `action.error`, `action.duration_ms` | How it ended, where there's something to say |
 
 Templates can also use Tera's `if` and `for`, and its filters, like
 `{{ alert.hostname | upper }}`.

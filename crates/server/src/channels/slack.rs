@@ -42,6 +42,10 @@ const ALT_TEXT_MAX_CHARS: usize = 2000;
 /// The most text Slack shows in one section of a message.
 const SECTION_MAX_CHARS: usize = 3000;
 
+/// How much of what an action printed goes in a message, which Slack asks to
+/// keep to a few thousand characters.
+const OUTPUT_MAX_CHARS: usize = 3000;
+
 /// Slack's own limit on a channel name, plus its leading `#`.
 const MAX_CHANNEL_LEN: usize = 81;
 
@@ -131,6 +135,23 @@ fn text(notice: &Notice, web_url: Option<&str>) -> String {
     }
     lines.push(details.join(" · "));
     lines.join("\n")
+}
+
+/// How an action went, with what it printed in a block that lines up.
+fn action_text(notice: &Notice, web_url: Option<&str>) -> String {
+    let mut text = format!("*{}* {}", notice.label(), escape(notice.summary()));
+    if let Some(printed) = notice.printed(OUTPUT_MAX_CHARS) {
+        // Three backticks would end the block early.
+        let shown = escape(&printed.text.replace("```", "'''"));
+        text.push_str(&format!("\n```\n{shown}\n```"));
+        if printed.cut {
+            text.push_str("\nCut short.");
+        }
+    }
+    if let Some(link) = web_url.and_then(|url| notice.actions_link(url)) {
+        text.push_str(&format!("\n<{link}|All of what it printed>"));
+    }
+    text
 }
 
 /// Shortens escaped text without cutting an `&amp;` in two.
@@ -371,7 +392,8 @@ fn is_invalid_blocks(error: &SlackClientError) -> bool {
 }
 
 fn is_gone(error: &SlackClientError) -> bool {
-    matches!(error, SlackClientError::ApiError(error) if error.code == "message_not_found")
+    matches!(error, SlackClientError::ApiError(error)
+        if error.code == "message_not_found" || error.code == "thread_not_found")
 }
 
 /// Posts a message, or when an alert resolves, turns the original green and adds
@@ -394,6 +416,26 @@ where
         .context("this channel has no bot token")?;
     let token = SlackApiToken::new(SlackApiTokenValue(token));
     let session = client.open_session(&token);
+    // What an action printed goes under the alert's message, as a reply.
+    if notice.action.is_some() {
+        let said = || SlackMessageContent::new().with_text(action_text(notice, web_url));
+        if let Some((message_channel, ts, _)) = reply_to.and_then(message_id) {
+            let request = post_request(message_channel, said()).with_thread_ts(ts);
+            match session.chat_post_message(&request).await {
+                Ok(_) => return Ok(None),
+                // Someone deleted the alert's message, so this stands on its own.
+                Err(error) if is_gone(&error) => {}
+                Err(error) => return Err(explain(&error)),
+            }
+        }
+        let target = SlackChannelId(channel.channel.target.trim().to_string());
+        session
+            .chat_post_message(&post_request(target, said()))
+            .await
+            .map_err(|error| explain(&error))?;
+        return Ok(None);
+    }
+
     // A resolved alert has nothing left to press.
     let controls = channel
         .channel
@@ -540,7 +582,25 @@ impl ChannelType for Slack {
 mod tests {
     use super::*;
     use crate::alerting::Alert;
-    use crate::channels::testing::{alert, notice};
+    use crate::channels::testing::{action_notice, alert, notice};
+
+    #[test]
+    fn what_an_action_printed_is_a_block_with_a_link_to_all_of_it() {
+        let notice = action_notice("FOLDER  SIZE\n<!everyone>  9 GiB\n```\n");
+        assert_eq!(
+            action_text(&notice, Some("https://m.example.com")),
+            "*ACTION* disk_space ran on web-1\n```\nFOLDER  SIZE\n&lt;!everyone&gt;  9 GiB\n'''\n```\n\
+             <https://m.example.com/alerts/7/actions|All of what it printed>"
+        );
+        let long = action_notice(&"/var/lib/something  1 GiB\n".repeat(400));
+        let text = action_text(&long, None);
+        assert!(text.ends_with("1 GiB\n```\nCut short."), "{text}");
+        assert!(text.chars().count() < OUTPUT_MAX_CHARS + 200);
+        assert_eq!(
+            action_text(&action_notice(""), None),
+            "*ACTION* disk_space ran on web-1"
+        );
+    }
 
     #[test]
     fn a_host_cannot_ping_a_slack_channel() {

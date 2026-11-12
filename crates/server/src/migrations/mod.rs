@@ -13,6 +13,7 @@ impl MigratorTrait for Migrator {
             Box::new(CreateTables),
             Box::new(SoftDeleteRulesAndChannels),
             Box::new(Actions),
+            Box::new(ActionNotifications),
         ]
     }
 }
@@ -2164,6 +2165,41 @@ impl MigrationTrait for Actions {
     }
 }
 
+struct ActionNotifications;
+
+impl MigrationName for ActionNotifications {
+    fn name(&self) -> &str {
+        "m20261112_000004_action_notifications"
+    }
+}
+
+/// A notification can be about what one of its alert's actions printed, and
+/// says which run. Both go when their alert does, so nothing else ties them.
+#[async_trait::async_trait]
+impl MigrationTrait for ActionNotifications {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Notifications::Table)
+                    .add_column(ColumnDef::new(Alias::new("action_run_id")).big_integer())
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let connection = manager.get_connection();
+        connection
+            .execute_unprepared("DELETE FROM notifications WHERE action_run_id IS NOT NULL")
+            .await?;
+        connection
+            .execute_unprepared("ALTER TABLE notifications DROP COLUMN action_run_id")
+            .await?;
+        Ok(())
+    }
+}
+
 #[derive(DeriveIden)]
 enum AlertRuleActions {
     Table,
@@ -2315,8 +2351,8 @@ mod tests {
             "IDs carry on from where they were"
         );
 
-        // The actions migration after it, then this one.
-        Migrator::down(&connection, Some(2)).await.unwrap();
+        // The two actions migrations after it, then this one.
+        Migrator::down(&connection, Some(3)).await.unwrap();
         assert_eq!(
             count("SELECT target FROM notification_channels").await,
             ["https://new"]

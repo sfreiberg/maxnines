@@ -15,6 +15,8 @@ pub struct Model {
     pub created_ms: i64,
     pub sent_ms: Option<i64>,
     pub external_id: Option<String>,
+    /// The action run whose output this sends, for an `action` notification.
+    pub action_run_id: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

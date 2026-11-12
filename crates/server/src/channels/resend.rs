@@ -19,8 +19,8 @@ const CHART_ID: &str = "chart";
 
 pub struct Resend;
 
-/// What Resend is asked to send. With a chart, there's HTML showing it beside the
-/// plain text.
+/// What Resend is asked to send. With a chart, or what an action printed, there's
+/// HTML showing it beside the plain text.
 fn body(channel: &ChannelInput, notice: &Notice) -> Result<Value> {
     let mail = channel
         .mail
@@ -36,8 +36,10 @@ fn body(channel: &ChannelInput, notice: &Notice) -> Result<Value> {
         "subject": subject(notice),
         "text": text(notice),
     });
+    if let Some(html) = html(notice) {
+        body["html"] = json!(html);
+    }
     if let Some(chart) = &notice.chart {
-        body["html"] = json!(html(notice));
         body["attachments"] = json!([{
             "filename": "chart.png",
             "content": STANDARD.encode(chart.as_slice()),

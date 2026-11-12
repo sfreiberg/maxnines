@@ -78,6 +78,12 @@ pub trait ChannelType: Send + Sync {
         false
     }
 
+    /// Whether this channel is told what an alert's actions printed. An on-call
+    /// service isn't, whatever this says, as it would only page someone again.
+    fn takes_action_output(&self, _channel: &ChannelInput) -> bool {
+        true
+    }
+
     /// Sends one notification, and gives what the service called it if that matters
     /// later, such as a message to reply to when the alert ends.
     async fn send(
@@ -223,6 +229,11 @@ fn url_preview(url: &str) -> String {
 
 #[cfg(test)]
 pub(crate) mod testing {
+    use std::collections::BTreeMap;
+
+    use maxnines_protocol::actions::ActionOutcome;
+
+    use crate::actions::ActionRun;
     use crate::alerting::{Alert, Event, Severity};
     use crate::notifier::Notice;
 
@@ -253,6 +264,33 @@ pub(crate) mod testing {
             alert: Some(alert),
             text,
             chart: None,
+            action: None,
+        }
+    }
+
+    /// A run of `disk_space` for [`alert`], which printed `output`.
+    pub fn action_notice(output: &str) -> Notice {
+        let run = ActionRun {
+            id: 12,
+            host_id: "abc".to_string(),
+            alert_id: Some(7),
+            action: "disk_space".to_string(),
+            run_on: "first".to_string(),
+            variables: BTreeMap::from([("disk".to_string(), "/var".to_string())]),
+            requested_by: None,
+            requested_ms: 2_000,
+            timeout_secs: 30,
+            outcome: Some(ActionOutcome::Succeeded),
+            exit_code: None,
+            error: None,
+            output: output.to_string(),
+            truncated: false,
+            duration_ms: Some(1_500),
+            finished_ms: Some(3_500),
+        };
+        Notice {
+            id: 4,
+            ..Notice::for_action(alert(), run)
         }
     }
 }

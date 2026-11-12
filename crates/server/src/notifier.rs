@@ -10,11 +10,14 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use futures_util::FutureExt;
+use maxnines_protocol::actions::ActionOutcome;
 use serde::Serialize;
+use serde_json::{Value, json};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{MissedTickBehavior, timeout};
 use tracing::{error, info, warn};
 
+use crate::actions::ActionRun;
 use crate::alert_charts::ChartSources;
 use crate::alerting::{Alert, Channel, Delivery, Event, Severity};
 use crate::channels::{self, pagerduty, resend, telegram};
@@ -57,13 +60,54 @@ pub struct Notice {
     /// A PNG of the last hour, for channels that show pictures.
     #[serde(skip)]
     pub chart: Option<Arc<Vec<u8>>>,
+    /// The run this is about, when it says what one of the alert's actions
+    /// printed.
+    #[serde(skip)]
+    pub action: Option<ActionRun>,
+}
+
+/// What an action printed, as much of it as a message has room for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Printed {
+    pub text: String,
+    /// Whether there was more, which the alert's Actions page has.
+    pub cut: bool,
 }
 
 impl Notice {
     pub fn for_delivery(delivery: &Delivery) -> Self {
+        let notice = match &delivery.action {
+            Some(run) => Self::for_action(delivery.alert.clone(), run.clone()),
+            None => Self::for_alert(delivery.alert.clone(), delivery.event),
+        };
         Self {
             id: delivery.id,
-            ..Self::for_alert(delivery.alert.clone(), delivery.event)
+            ..notice
+        }
+    }
+
+    /// What a message about one of an alert's actions says: how it went, in a
+    /// line, with what it printed for the channel to show as it can.
+    pub fn for_action(alert: Alert, run: ActionRun) -> Self {
+        let how = match run.outcome {
+            Some(ActionOutcome::Succeeded) => "ran",
+            Some(ActionOutcome::Failed) => "failed",
+            Some(ActionOutcome::TimedOut) => "ran out of time",
+            Some(ActionOutcome::NotDefined | ActionOutcome::Refused) | None => "wasn't run",
+        };
+        let mut text = format!("{} {how} on {}", run.action, alert.hostname);
+        match (&run.error, run.exit_code) {
+            (Some(error), _) => text.push_str(&format!(": {error}")),
+            (None, Some(code)) if code != 0 => text.push_str(&format!(": exit status {code}")),
+            _ => {}
+        }
+        Self {
+            id: 0,
+            event: Event::Action,
+            alert: Some(alert),
+            text,
+            chart: None,
+            action: Some(run),
         }
     }
 
@@ -82,6 +126,7 @@ impl Notice {
             alert: Some(alert),
             text,
             chart: None,
+            action: None,
         }
     }
 
@@ -92,7 +137,62 @@ impl Notice {
             alert: None,
             text: "This is a test notification from MaxNines.".to_string(),
             chart: None,
+            action: None,
         }
+    }
+
+    /// What it's about, in a sentence: what's wrong, or how an action went.
+    pub(crate) fn summary(&self) -> &str {
+        match (&self.action, &self.alert) {
+            (None, Some(alert)) => &alert.summary,
+            _ => &self.text,
+        }
+    }
+
+    /// What the action printed, up to `max` characters, ending at the end of a
+    /// line where it can. Nothing for other notifications, or if it printed
+    /// nothing.
+    pub(crate) fn printed(&self, max: usize) -> Option<Printed> {
+        let run = self.action.as_ref()?;
+        let all = run.output.trim_end();
+        if all.is_empty() {
+            return None;
+        }
+        let mut text: String = all.chars().take(max).collect();
+        let cut = text.len() < all.len();
+        if cut && let Some(end) = text.rfind('\n').filter(|end| *end > 0) {
+            text.truncate(end);
+        }
+        Some(Printed {
+            text,
+            cut: cut || run.truncated,
+        })
+    }
+
+    /// The run as webhooks get it, or null when this isn't about one.
+    pub(crate) fn action_fields(&self) -> Value {
+        let Some(run) = &self.action else {
+            return Value::Null;
+        };
+        json!({
+            "id": run.id,
+            "name": run.action,
+            "run_on": run.run_on,
+            "outcome": run.outcome,
+            "exit_code": run.exit_code,
+            "error": run.error,
+            "output": run.output,
+            "truncated": run.truncated,
+            "duration_ms": run.duration_ms,
+        })
+    }
+
+    /// Where all of what the action printed is, for a message that had to cut it.
+    pub(crate) fn actions_link(&self, web_url: &str) -> Option<String> {
+        let alert = self.alert.as_ref()?;
+        self.action
+            .as_ref()
+            .map(|_| format!("{web_url}/alerts/{}/actions", alert.id))
     }
 
     /// Words for whoever can't see the chart.
@@ -128,6 +228,7 @@ impl Notice {
             (Event::Eased, _) => "NOW WARNING".to_string(),
             (Event::Reminder, _) => "STILL FIRING".to_string(),
             (Event::Resolved, _) => "RESOLVED".to_string(),
+            (Event::Action, _) => "ACTION".to_string(),
             _ => "TEST".to_string(),
         }
     }
@@ -385,9 +486,10 @@ impl Notifier {
         // Each chart is drawn once a pass, however many channels it goes to.
         let mut charts: HashMap<(i64, Event), Option<Arc<Vec<u8>>>> = HashMap::new();
         for delivery in due {
+            // What an action printed is about the problem too.
             let tells_of_a_problem = matches!(
                 delivery.event,
-                Event::Firing | Event::Escalated | Event::Eased
+                Event::Firing | Event::Escalated | Event::Eased | Event::Action
             );
             if tells_of_a_problem && silences.covering(&delivery.alert).is_some() {
                 self.database.hold_delivery(&delivery).await?;

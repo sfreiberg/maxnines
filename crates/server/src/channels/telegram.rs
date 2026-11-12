@@ -19,6 +19,9 @@ pub const API_URL: &str = "https://api.telegram.org";
 /// whole fits Telegram's limit of 4096.
 const MAX_SUMMARY: usize = 3000;
 const MAX_DETAIL: usize = 300;
+/// How much of what an action printed goes in a message, beside a summary kept
+/// to [`MAX_DETAIL`].
+const MAX_OUTPUT: usize = 3000;
 
 /// The longest caption Telegram puts under a photo.
 const MAX_CAPTION: usize = 1024;
@@ -49,7 +52,33 @@ fn clip_utf16(text: &str, max: usize) -> &str {
     text
 }
 
+/// How an action went, with what it printed in a block that lines up.
+fn action_text(notice: &Notice, web_url: Option<&str>) -> String {
+    let mut lines = vec![format!(
+        "<b>{}</b> {}",
+        notice.label(),
+        escape(clip_utf16(notice.summary(), MAX_DETAIL))
+    )];
+    if let Some(printed) = notice.printed(MAX_OUTPUT) {
+        let shown = clip_utf16(&printed.text, MAX_OUTPUT);
+        lines.push(format!("<pre>{}</pre>", escape(shown)));
+        if printed.cut || shown.len() < printed.text.len() {
+            lines.push("Cut short.".to_string());
+        }
+    }
+    if let Some(link) = web_url.and_then(|url| notice.actions_link(url)) {
+        lines.push(format!(
+            "<a href=\"{}\">All of what it printed</a>",
+            escape(&link)
+        ));
+    }
+    lines.join("\n")
+}
+
 fn text(notice: &Notice, web_url: Option<&str>) -> String {
+    if notice.action.is_some() {
+        return action_text(notice, web_url);
+    }
     let Some(alert) = &notice.alert else {
         return escape(&notice.text);
     };
@@ -284,7 +313,22 @@ impl ChannelType for Telegram {
 mod tests {
     use super::*;
     use crate::alerting::Alert;
-    use crate::channels::testing::{alert, notice};
+    use crate::channels::testing::{action_notice, alert, notice};
+
+    #[test]
+    fn what_an_action_printed_is_a_block_under_how_it_went() {
+        let notice = action_notice("FOLDER  SIZE\n<b>/var</b>  9 GiB\n");
+        assert_eq!(
+            text(&notice, Some("https://m.example.com")),
+            "<b>ACTION</b> disk_space ran on web-1\n\
+             <pre>FOLDER  SIZE\n&lt;b&gt;/var&lt;/b&gt;  9 GiB</pre>\n\
+             <a href=\"https://m.example.com/alerts/7/actions\">All of what it printed</a>"
+        );
+        let long = action_notice(&"/var/lib/something  1 GiB\n".repeat(400));
+        let text = text(&long, None);
+        assert!(text.ends_with("1 GiB</pre>\nCut short."), "{text}");
+        assert!(text.encode_utf16().count() < 4096);
+    }
 
     #[test]
     fn telegram_messages_say_what_happened_and_where_to_look() {

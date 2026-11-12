@@ -11,12 +11,13 @@ use sea_orm::{
 
 use serde_json::json;
 
+use super::actions::to_run;
 use super::audit::{record, record_change};
 use super::{
-    Database, alert, alert_rule, alert_rule_action, alert_rule_channel, maintenance_window,
-    notification, notification_channel, silence,
+    Database, action_run, alert, alert_rule, alert_rule_action, alert_rule_channel,
+    maintenance_window, notification, notification_channel, silence,
 };
-use crate::actions::{RuleAction, RunOn};
+use crate::actions::{ActionRun, RuleAction, RunOn};
 use crate::alerting::{
     Alert, AlertRule, AlertRuleInput, Channel, ChannelInput, ChannelKind, Comparison, Delivery,
     DeliveryProblem, Event, Mail, MailSecurity, MailServer, NewAlert, RULE_GONE_REASON, RuleKind,
@@ -305,8 +306,64 @@ fn queued(alert_id: i64, channel_id: i64, event: Event, now_ms: i64) -> notifica
         created_ms: Set(now_ms),
         sent_ms: Set(None),
         external_id: Set(None),
+        action_run_id: Set(None),
         ..Default::default()
     }
+}
+
+/// Queues what an alert's action printed for every channel that was told about
+/// the alert, in the order they heard, so it follows the message it's about.
+/// On-call services are left out, as it would only page someone again, and so
+/// is a custom webhook whose body doesn't use it. A run a person started has no
+/// alert, and goes nowhere.
+pub(super) async fn queue_action_output<C: ConnectionTrait>(
+    connection: &C,
+    run_id: i64,
+    now_ms: i64,
+) -> Result<()> {
+    let run = action_run::Entity::find_by_id(run_id)
+        .one(connection)
+        .await
+        .context("loading an action run")?;
+    let Some(alert_id) = run.and_then(|run| run.alert_id) else {
+        return Ok(());
+    };
+    let told: BTreeSet<i64> = notification::Entity::find()
+        .filter(notification::Column::AlertId.eq(alert_id))
+        .all(connection)
+        .await
+        .context("loading notifications")?
+        .into_iter()
+        .map(|row| row.channel_id)
+        .collect();
+    let channels = notification_channel::Entity::find()
+        .filter(notification_channel::Column::Id.is_in(told))
+        .filter(notification_channel::Column::DeletedMs.is_null())
+        .order_by_asc(notification_channel::Column::Id)
+        .all(connection)
+        .await
+        .context("loading channels")?;
+    let rows: Vec<_> = channels
+        .into_iter()
+        .map(to_channel)
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|channel| {
+            let kind = channel.channel.kind;
+            !kind.is_on_call() && channels::of(kind).takes_action_output(&channel.channel)
+        })
+        .map(|channel| notification::ActiveModel {
+            action_run_id: Set(Some(run_id)),
+            ..queued(alert_id, channel.id, Event::Action, now_ms)
+        })
+        .collect();
+    if !rows.is_empty() {
+        notification::Entity::insert_many(rows)
+            .exec_without_returning(connection)
+            .await
+            .context("queueing notifications")?;
+    }
+    Ok(())
 }
 
 impl Database {
@@ -1010,6 +1067,29 @@ impl Database {
             .map(|channel| (channel.id, channel))
             .collect();
 
+        // What an action printed goes with the notification about it. One whose
+        // run has gone has nothing to say.
+        let run_ids: BTreeSet<i64> = due.iter().filter_map(|row| row.action_run_id).collect();
+        let runs: BTreeMap<i64, ActionRun> = action_run::Entity::find()
+            .filter(action_run::Column::Id.is_in(run_ids))
+            .all(&self.connection)
+            .await
+            .context("loading action runs")?
+            .into_iter()
+            .map(|row| to_run(row).map(|run| (run.id, run)))
+            .collect::<Result<_>>()?;
+        let (due, orphans): (Vec<_>, Vec<_>) = due.into_iter().partition(|row| {
+            row.action_run_id
+                .is_none_or(|run_id| runs.contains_key(&run_id))
+        });
+        if !orphans.is_empty() {
+            notification::Entity::delete_many()
+                .filter(notification::Column::Id.is_in(orphans.iter().map(|row| row.id)))
+                .exec(&self.connection)
+                .await
+                .context("dropping notifications")?;
+        }
+
         // A resolved notification may need what its firing one was called.
         let earlier: BTreeMap<(i64, i64), String> = notification::Entity::find()
             .filter(notification::Column::AlertId.is_in(due.iter().map(|row| row.alert_id)))
@@ -1034,6 +1114,10 @@ impl Database {
                         .get(&row.channel_id)
                         .context("missing channel")?
                         .clone(),
+                    action: row
+                        .action_run_id
+                        .and_then(|run_id| runs.get(&run_id))
+                        .cloned(),
                 })
             })
             .collect()

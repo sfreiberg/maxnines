@@ -129,20 +129,19 @@ pub fn recipients(target: &str) -> Result<Vec<Address>> {
 
 pub(super) fn subject(notice: &Notice) -> String {
     let label = notice.label();
-    let summary = notice
-        .alert
-        .as_ref()
-        .map_or(notice.text.as_str(), |a| &a.summary);
-    format!("[MaxNines {label}] {summary}")
+    format!("[MaxNines {label}] {}", notice.summary())
 }
 
-pub(super) fn text(notice: &Notice) -> String {
+/// Everything but what an action printed.
+fn details(notice: &Notice) -> String {
     let Some(alert) = &notice.alert else {
         return format!("{}\n", notice.text);
     };
-    let mut lines = vec![
-        notice.text.clone(),
-        String::new(),
+    let mut lines = vec![notice.text.clone(), String::new()];
+    if notice.action.is_some() {
+        lines.push(format!("Alert: {}", alert.summary));
+    }
+    lines.extend([
         format!("Rule: {}", alert.rule_name),
         format!("Severity: {}", alert.severity.as_str()),
         if alert.host_id == FLEET_HOST_ID {
@@ -151,7 +150,7 @@ pub(super) fn text(notice: &Notice) -> String {
             format!("Host: {} ({})", alert.hostname, alert.host_id)
         },
         format!("Started: {}", format_ms(alert.started_ms)),
-    ];
+    ]);
     if let Some(resolved) = alert.resolved_ms {
         lines.push(format!("Resolved: {}", format_ms(resolved)));
     }
@@ -162,6 +161,26 @@ pub(super) fn text(notice: &Notice) -> String {
     lines.join("\n")
 }
 
+/// All of what an action printed, which an email has room for.
+fn printed(notice: &Notice) -> Option<String> {
+    let printed = notice.printed(usize::MAX)?;
+    let cut = if printed.cut {
+        "\n\nCut short, as it printed more than is kept."
+    } else {
+        ""
+    };
+    Some(format!("{}{cut}\n", printed.text))
+}
+
+pub(super) fn text(notice: &Notice) -> String {
+    let mut text = details(notice);
+    if let Some(printed) = printed(notice) {
+        text.push('\n');
+        text.push_str(&printed);
+    }
+    text
+}
+
 /// For the HTML part of an email.
 fn escape_html(text: &str) -> String {
     text.replace('&', "&amp;")
@@ -170,16 +189,32 @@ fn escape_html(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// The plain text, with the chart under it.
-pub(super) fn html(notice: &Notice) -> String {
-    format!(
+/// The HTML part, for an email that needs one: the plain text with the chart
+/// under it, or with what an action printed in a font that keeps it lined up.
+pub(super) fn html(notice: &Notice) -> Option<String> {
+    let printed = printed(notice);
+    if notice.chart.is_none() && printed.is_none() {
+        return None;
+    }
+    let mut html = format!(
         "<!doctype html><html><body>\
-         <pre style=\"font-family: sans-serif; white-space: pre-wrap\">{}</pre>\
-         <img src=\"cid:chart\" alt=\"{}\" width=\"720\" style=\"max-width: 100%\">\
-         </body></html>",
-        escape_html(&text(notice)),
-        escape_html(&notice.chart_description())
-    )
+         <pre style=\"font-family: sans-serif; white-space: pre-wrap\">{}</pre>",
+        escape_html(&details(notice))
+    );
+    if let Some(printed) = printed {
+        html.push_str(&format!(
+            "<pre style=\"font-family: monospace\">{}</pre>",
+            escape_html(&printed)
+        ));
+    }
+    if notice.chart.is_some() {
+        html.push_str(&format!(
+            "<img src=\"cid:chart\" alt=\"{}\" width=\"720\" style=\"max-width: 100%\">",
+            escape_html(&notice.chart_description())
+        ));
+    }
+    html.push_str("</body></html>");
+    Some(html)
 }
 
 /// Plain text, or with a chart, plain text beside HTML that shows it.
@@ -190,12 +225,17 @@ fn message(from: &Mailbox, to: &str, notice: &Notice) -> Result<Message> {
     for address in recipients(to)? {
         message = message.to(Mailbox::new(None, address));
     }
-    let message = match &notice.chart {
-        None => message.header(ContentType::TEXT_PLAIN).body(text(notice)),
-        Some(chart) => {
+    let message = match (html(notice), &notice.chart) {
+        (None, _) => message.header(ContentType::TEXT_PLAIN).body(text(notice)),
+        (Some(html), None) => message.multipart(
+            MultiPart::alternative()
+                .singlepart(SinglePart::plain(text(notice)))
+                .singlepart(SinglePart::html(html)),
+        ),
+        (Some(html), Some(chart)) => {
             let png = ContentType::parse("image/png").context("naming the chart's type")?;
             let shown = MultiPart::related()
-                .singlepart(SinglePart::html(html(notice)))
+                .singlepart(SinglePart::html(html))
                 .singlepart(Attachment::new_inline("chart".to_string()).body(chart.to_vec(), png));
             message.multipart(
                 MultiPart::alternative()
@@ -260,7 +300,36 @@ mod tests {
 
     use super::*;
     use crate::alerting::{Alert, Event};
-    use crate::channels::testing::{alert, notice};
+    use crate::channels::testing::{action_notice, alert, notice};
+
+    #[test]
+    fn what_an_action_printed_is_in_the_email_in_a_font_that_lines_up() {
+        let ran = action_notice("FOLDER  SIZE\n<b>/var</b>  9 GiB\n");
+        assert_eq!(subject(&ran), "[MaxNines ACTION] disk_space ran on web-1");
+        let text = text(&ran);
+        assert!(
+            text.starts_with(
+                "disk_space ran on web-1\n\nAlert: CPU usage on web-1 is 97%, above 90%\n\
+                 Rule: High CPU\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("\n\nFOLDER  SIZE\n<b>/var</b>  9 GiB\n"),
+            "{text}"
+        );
+        let html = html(&ran).unwrap();
+        assert!(
+            html.contains(
+                "<pre style=\"font-family: monospace\">FOLDER  SIZE\n\
+                 &lt;b&gt;/var&lt;/b&gt;  9 GiB\n</pre>"
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("cid:chart"), "{html}");
+        // An alert without a chart is still plain text alone.
+        assert_eq!(super::html(&notice(Event::Firing, alert())), None);
+    }
 
     #[test]
     fn an_email_with_a_chart_shows_it_beside_the_plain_text() {

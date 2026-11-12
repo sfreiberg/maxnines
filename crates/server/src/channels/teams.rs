@@ -14,6 +14,9 @@ use crate::remote_checks::FLEET_HOST_ID;
 /// Keeps a message well inside what Teams takes, which counts the card's markup too.
 const MAX_CHARS: usize = 3000;
 
+/// How much of what an action printed goes in a card.
+const MAX_OUTPUT_CHARS: usize = 6000;
+
 /// Where Teams workflows take requests: Power Automate's older and newer addresses.
 const HOSTS: [&str; 2] = [".logic.azure.com", ".powerplatform.com"];
 
@@ -31,20 +34,16 @@ fn body(notice: &Notice, web_url: Option<&str>) -> Value {
     };
     let colour = match (notice.event, &notice.alert) {
         (Event::Resolved, _) => "Good",
-        (Event::Test, _) | (_, None) => "Default",
+        (Event::Test | Event::Action, _) | (_, None) => "Default",
         (Event::Escalated, _) => "Attention",
         (Event::Eased, _) => "Warning",
         (_, Some(alert)) if alert.severity == Severity::Critical => "Attention",
         (_, Some(_)) => "Warning",
     };
-    let summary = notice
-        .alert
-        .as_ref()
-        .map_or(notice.text.as_str(), |a| &a.summary);
     let mut body = vec![
         json!({ "type": "TextBlock", "text": notice.label(), "weight": "Bolder",
                 "color": colour, "wrap": true }),
-        json!({ "type": "TextBlock", "text": unlinked(summary), "wrap": true }),
+        json!({ "type": "TextBlock", "text": unlinked(notice.summary()), "wrap": true }),
     ];
     if let Some(alert) = &notice.alert {
         let mut facts = vec![
@@ -62,17 +61,32 @@ fn body(notice: &Notice, web_url: Option<&str>) -> Value {
         }
         body.push(json!({ "type": "FactSet", "facts": facts }));
     }
+    // A code block keeps what an action printed lined up, and takes it as it
+    // is, not as markup. Teams has them from version 1.5 of its cards.
+    let printed = notice.printed(MAX_OUTPUT_CHARS);
+    if let Some(printed) = &printed {
+        body.push(json!({ "type": "CodeBlock", "codeSnippet": printed.text,
+                          "language": "PlainText" }));
+        if printed.cut {
+            body.push(json!({ "type": "TextBlock", "text": "Cut short.", "wrap": true }));
+        }
+    }
     let mut card = json!({
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
         "type": "AdaptiveCard",
-        "version": "1.4",
+        "version": if printed.is_some() { "1.5" } else { "1.4" },
         "msteams": { "width": "Full" },
         "body": body,
     });
     if let Some(url) = web_url {
-        card["actions"] = json!([
-            { "type": "Action.OpenUrl", "title": "View alerts", "url": alerts_link(url) }
-        ]);
+        card["actions"] = match notice.actions_link(url) {
+            Some(link) => json!([
+                { "type": "Action.OpenUrl", "title": "All of what it printed", "url": link }
+            ]),
+            None => json!([
+                { "type": "Action.OpenUrl", "title": "View alerts", "url": alerts_link(url) }
+            ]),
+        };
     }
     json!({
         "type": "message",
@@ -173,6 +187,30 @@ mod tests {
         let resolved = card(Event::Resolved, alert());
         assert_eq!(resolved["body"][0]["color"], "Good");
         assert!(resolved.get("actions").is_none());
+    }
+
+    #[test]
+    fn what_an_action_printed_is_a_code_block_in_the_card() {
+        let ran = crate::channels::testing::action_notice("FOLDER  SIZE\n[x](y)  9 GiB\n");
+        let body = body(&ran, Some("https://m.example.com"));
+        let card = &body["attachments"][0]["content"];
+        assert_eq!(card["version"], "1.5");
+        assert_eq!(card["body"][0]["text"], "ACTION");
+        assert_eq!(card["body"][0]["color"], "Default");
+        assert_eq!(card["body"][1]["text"], "disk_space ran on web-1");
+        assert_eq!(card["body"][3]["type"], "CodeBlock");
+        // As it was printed: a code block isn't read as markup.
+        assert_eq!(
+            card["body"][3]["codeSnippet"],
+            "FOLDER  SIZE\n[x](y)  9 GiB"
+        );
+        assert_eq!(
+            card["actions"][0]["url"],
+            "https://m.example.com/alerts/7/actions"
+        );
+        // Other cards stay as they were.
+        let firing = super::body(&notice(Event::Firing, alert()), None);
+        assert_eq!(firing["attachments"][0]["content"]["version"], "1.4");
     }
 
     #[test]

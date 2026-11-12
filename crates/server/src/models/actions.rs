@@ -10,6 +10,7 @@ use sea_orm::{
 };
 use serde_json::Value;
 
+use super::alerting::queue_action_output;
 use super::audit::record;
 use super::{Database, action_run, host, host_fact};
 use crate::actions::{ActionRun, Finished, KnownActions, NewRun};
@@ -19,7 +20,7 @@ use crate::audit::{Action, Change, Kind, Record, Subject};
 const NAMES: &str = "agent.actions[";
 const VARIABLES: &str = "agent.action_variables.";
 
-fn to_run(row: action_run::Model) -> Result<ActionRun> {
+pub(super) fn to_run(row: action_run::Model) -> Result<ActionRun> {
     Ok(ActionRun {
         id: row.id,
         host_id: row.host_id,
@@ -144,8 +145,8 @@ impl Database {
         Ok(saved.last_insert_id)
     }
 
-    /// Records how a run ended, if it's that host's and still waiting. Returns
-    /// whether it was.
+    /// Records how a run ended, if it's that host's and still waiting, and queues
+    /// what it printed for the channels its alert went to. Returns whether it was.
     pub async fn finish_action_run(
         &self,
         id: i64,
@@ -154,6 +155,8 @@ impl Database {
         now_ms: i64,
     ) -> Result<bool> {
         let duration_ms = finished.duration_ms.map(i64::try_from).transpose()?;
+        let transaction = self.connection.begin().await;
+        let transaction = transaction.context("saving an action's result")?;
         let changed = action_run::Entity::update_many()
             .col_expr(
                 action_run::Column::Outcome,
@@ -180,10 +183,18 @@ impl Database {
             .filter(action_run::Column::Id.eq(id))
             .filter(action_run::Column::HostId.eq(host_id))
             .filter(action_run::Column::FinishedMs.is_null())
-            .exec(&self.connection)
+            .exec(&transaction)
             .await
             .context("saving an action's result")?;
-        Ok(changed.rows_affected > 0)
+        let recorded = changed.rows_affected > 0;
+        if recorded {
+            queue_action_output(&transaction, id, now_ms).await?;
+        }
+        transaction
+            .commit()
+            .await
+            .context("saving an action's result")?;
+        Ok(recorded)
     }
 
     pub async fn get_action_run(&self, id: i64) -> Result<Option<ActionRun>> {

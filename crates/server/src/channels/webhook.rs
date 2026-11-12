@@ -18,6 +18,7 @@ fn body(notice: &Notice) -> Value {
         "event": notice.event,
         "text": notice.text,
         "alert": notice.alert,
+        "action": notice.action_fields(),
     })
 }
 

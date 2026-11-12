@@ -9,7 +9,7 @@ use cel::Program;
 use serde::{Deserialize, Serialize};
 use wildmatch::WildMatch;
 
-use crate::actions::{RuleAction, check_rule_actions};
+use crate::actions::{ActionRun, RuleAction, check_rule_actions};
 use crate::calculations::{Calculation, Grouping, Question};
 use crate::channels;
 use crate::metric_charts::format_value;
@@ -933,6 +933,8 @@ pub enum Event {
     Eased,
     Reminder,
     Resolved,
+    /// What one of the alert's actions printed.
+    Action,
     Test,
 }
 
@@ -944,6 +946,7 @@ impl Event {
             Self::Eased => "eased",
             Self::Reminder => "reminder",
             Self::Resolved => "resolved",
+            Self::Action => "action",
             Self::Test => "test",
         }
     }
@@ -955,6 +958,7 @@ impl Event {
             "eased" => Ok(Self::Eased),
             "reminder" => Ok(Self::Reminder),
             "resolved" => Ok(Self::Resolved),
+            "action" => Ok(Self::Action),
             other => bail!("unknown event {other:?}"),
         }
     }
@@ -971,6 +975,8 @@ pub struct Delivery {
     pub created_ms: i64,
     pub alert: Alert,
     pub channel: Channel,
+    /// The run whose output this sends, for an `action` notification.
+    pub action: Option<ActionRun>,
 }
 
 /// A notification that was given up on, or is still being retried.
