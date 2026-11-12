@@ -111,6 +111,7 @@ pub fn gather(
     custom: &BTreeMap<String, Value>,
     metrics: &Definitions,
     actions: &Actions,
+    built_in_actions: bool,
 ) -> Result<Value> {
     let hostname = System::host_name().ok();
     let canonical = hostname.as_deref().and_then(canonical_name);
@@ -118,6 +119,7 @@ pub fn gather(
         custom,
         metrics,
         actions,
+        built_in_actions,
         hostname.as_deref(),
         canonical.as_deref(),
     )
@@ -128,11 +130,12 @@ fn gather_named(
     custom: &BTreeMap<String, Value>,
     metrics: &Definitions,
     actions: &Actions,
+    built_in_actions: bool,
     hostname: Option<&str>,
     canonical: Option<&str>,
 ) -> Result<Value> {
     let build = build_info!();
-    let (action_names, action_variables) = actions::facts(actions);
+    let (action_names, action_variables) = actions::facts(actions, built_in_actions);
     let mut system = System::new()?;
     system.refresh_memory();
     system.refresh_cpu_list(CpuRefreshKind::nothing());
@@ -203,7 +206,7 @@ mod tests {
 
     #[test]
     fn reports_the_built_in_facts() {
-        let facts = gather(&BTreeMap::new(), &Definitions::new(), &Actions::new()).unwrap();
+        let facts = gather(&BTreeMap::new(), &Definitions::new(), &Actions::new(), true).unwrap();
 
         assert_eq!(facts["os"]["family"], std::env::consts::OS);
         assert!(facts["host"]["arch"].is_string());
@@ -340,7 +343,7 @@ mod tests {
 
     #[test]
     fn reports_which_build_this_is() {
-        let facts = gather(&BTreeMap::new(), &Definitions::new(), &Actions::new()).unwrap();
+        let facts = gather(&BTreeMap::new(), &Definitions::new(), &Actions::new(), true).unwrap();
         let agent = &facts["agent"];
 
         let commit = agent["commit"].as_str().unwrap();
@@ -357,7 +360,7 @@ mod tests {
         let custom = BTreeMap::from([("role".to_string(), json!("web"))]);
 
         assert_eq!(
-            gather(&custom, &Definitions::new(), &Actions::new()).unwrap()["custom"]["role"],
+            gather(&custom, &Definitions::new(), &Actions::new(), true).unwrap()["custom"]["role"],
             "web"
         );
     }
@@ -371,7 +374,7 @@ mod tests {
         let actions = Actions::new();
         let named = |custom, none| {
             let canonical = Some("web-1.example.com");
-            gather_named(custom, none, &actions, Some("web-1"), canonical).unwrap()
+            gather_named(custom, none, &actions, true, Some("web-1"), canonical).unwrap()
         };
         assert_eq!(named(&custom, &none), named(&custom, &none));
     }
@@ -385,7 +388,7 @@ mod tests {
                 timeout_secs: None,
             },
         )]);
-        let facts = gather(&BTreeMap::new(), &metrics, &Actions::new()).unwrap();
+        let facts = gather(&BTreeMap::new(), &metrics, &Actions::new(), true).unwrap();
 
         assert_eq!(facts["agent"]["custom_metrics"], json!(["queue"]));
         assert!(!facts.to_string().contains("secret-tool"));
@@ -403,7 +406,7 @@ mod tests {
             ),
             ("restart_nginx".to_string(), command(&["/opt/secret-tool"])),
         ]);
-        let facts = gather(&BTreeMap::new(), &Definitions::new(), &actions).unwrap();
+        let facts = gather(&BTreeMap::new(), &Definitions::new(), &actions, false).unwrap();
 
         let agent = &facts["agent"];
         assert_eq!(agent["actions"], json!(["disk_hogs", "restart_nginx"]));

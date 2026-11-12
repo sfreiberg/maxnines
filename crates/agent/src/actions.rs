@@ -6,6 +6,7 @@
 //! stays inside the argument that names it.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, ensure};
 use maxnines_protocol::actions::{
-    ActionOutcome, ActionResult, MAX_ACTION_OUTPUT_BYTES, MAX_ACTION_TIMEOUT_SECS, fill_variables,
-    is_action_name, variables_used,
+    ActionOutcome, ActionResult, MAX_ACTION_OUTPUT_BYTES, MAX_ACTION_TIMEOUT_SECS, check_variable,
+    fill_variables, is_action_name, variables_used,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -24,9 +25,13 @@ use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tracing::info;
 
+use crate::builtin_actions::{self, Asked, BUILT_INS, BuiltIn};
 use crate::custom::stop_group;
 
 const MAX_DEFINITIONS: usize = 64;
+
+/// How long a built-in action gets to write up what it found once its time is up.
+const BUILT_IN_GRACE: Duration = Duration::from_secs(5);
 
 /// How many actions can be waiting for the one that's running. An alert storm
 /// shouldn't leave a host working through a backlog long after it's over.
@@ -53,6 +58,10 @@ pub fn check_actions(actions: &Actions) -> Result<()> {
             is_action_name(name),
             "action name {name:?} can only use letters, digits, - and _"
         );
+        ensure!(
+            builtin_actions::find(name).is_none(),
+            "action name {name:?} is already a built-in action's"
+        );
         let Some((program, _)) = action.command.split_first() else {
             anyhow::bail!("action {name:?} needs a command");
         };
@@ -66,15 +75,19 @@ pub fn check_actions(actions: &Actions) -> Result<()> {
     Ok(())
 }
 
-/// What this agent can be asked to run, for its facts: every name, and for those
-/// that use them, which variables each needs. Only names, as with custom metrics.
-pub fn facts(actions: &Actions) -> (Value, Value) {
-    let names: Vec<&String> = actions.keys().collect();
-    let variables: BTreeMap<&String, Vec<&str>> = actions
-        .iter()
-        .map(|(name, action)| (name, variables_used(&action.command)))
-        .filter(|(_, used)| !used.is_empty())
+/// What this agent can be asked to run, for its facts: every name, built in or
+/// defined here, and for those that use them, which variables each needs. Only
+/// names, as with custom metrics.
+pub fn facts(actions: &Actions, built_ins: bool) -> (Value, Value) {
+    let built_ins = BUILT_INS.iter().filter(|_| built_ins);
+    let mut variables: BTreeMap<&str, Vec<&str>> = built_ins
+        .map(|built_in| (built_in.name, built_in.variables.to_vec()))
         .collect();
+    for (name, action) in actions {
+        variables.insert(name, variables_used(&action.command));
+    }
+    let names: Vec<&str> = variables.keys().copied().collect();
+    variables.retain(|_, used| !used.is_empty());
     (json!(names), json!(variables))
 }
 
@@ -82,6 +95,10 @@ pub fn facts(actions: &Actions) -> (Value, Value) {
 /// several heavy jobs at once.
 pub struct Runner {
     actions: Actions,
+    /// Whether the actions built into the agent can be asked for.
+    built_ins: bool,
+    /// Where the agent keeps its own files.
+    state_dir: PathBuf,
     turn: Semaphore,
     waiting: AtomicUsize,
 }
@@ -106,9 +123,11 @@ impl Ended {
 }
 
 impl Runner {
-    pub fn new(actions: Actions) -> Arc<Self> {
+    pub fn new(actions: Actions, built_ins: bool, state_dir: &Path) -> Arc<Self> {
         Arc::new(Self {
             actions,
+            built_ins,
+            state_dir: state_dir.to_path_buf(),
             turn: Semaphore::new(1),
             waiting: AtomicUsize::new(0),
         })
@@ -147,10 +166,16 @@ impl Runner {
         variables: &BTreeMap<String, String>,
         timeout_secs: u64,
     ) -> Ended {
-        let Some(action) = self.actions.get(name) else {
-            return Ended::without_running(ActionOutcome::NotDefined, "not defined on this agent");
+        let built_in = builtin_actions::find(name).filter(|_| self.built_ins);
+        let command = match (self.actions.get(name), built_in) {
+            (Some(action), _) => fill_variables(&action.command, variables),
+            (None, Some(built_in)) => check_given(built_in.variables, variables).map(|()| vec![]),
+            (None, None) => {
+                let error = "not defined on this agent";
+                return Ended::without_running(ActionOutcome::NotDefined, error);
+            }
         };
-        let command = match fill_variables(&action.command, variables) {
+        let command = match command {
             Ok(command) => command,
             Err(error) => return Ended::without_running(ActionOutcome::Refused, error.to_string()),
         };
@@ -173,8 +198,64 @@ impl Runner {
         let Ok(_turn) = turn else {
             return Ended::without_running(ActionOutcome::Refused, "the agent is stopping");
         };
-        run_command(&command, Duration::from_secs(timeout_secs)).await
+        let limit = Duration::from_secs(timeout_secs);
+        match built_in {
+            Some(built_in) if command.is_empty() => {
+                self.run_built_in(built_in, variables, limit).await
+            }
+            _ => run_command(&command, limit).await,
+        }
     }
+
+    /// Built-in actions run inside the agent, on a thread of their own. They watch
+    /// the time themselves, as a thread can't be stopped from outside.
+    async fn run_built_in(
+        &self,
+        built_in: &'static BuiltIn,
+        variables: &BTreeMap<String, String>,
+        limit: Duration,
+    ) -> Ended {
+        let (variables, state_dir) = (variables.clone(), self.state_dir.clone());
+        let deadline = Instant::now() + limit;
+        let work = tokio::task::spawn_blocking(move || {
+            (built_in.run)(&Asked {
+                variables: &variables,
+                deadline,
+                state_dir: &state_dir,
+            })
+        });
+        let (outcome, error, output) = match timeout(limit + BUILT_IN_GRACE, work).await {
+            Err(_) => (ActionOutcome::TimedOut, None, String::new()),
+            Ok(Err(_)) => (
+                ActionOutcome::Failed,
+                Some("it crashed".to_string()),
+                String::new(),
+            ),
+            Ok(Ok(Err(error))) => (
+                ActionOutcome::Failed,
+                Some(format!("{error:#}")),
+                String::new(),
+            ),
+            Ok(Ok(Ok(output))) => (ActionOutcome::Succeeded, None, output),
+        };
+        Ended {
+            outcome,
+            exit_code: None,
+            error,
+            output: output.into_bytes(),
+        }
+    }
+}
+
+/// A built-in action has to be given what it needs, as a command does.
+fn check_given(needed: &[&str], variables: &BTreeMap<String, String>) -> Result<()> {
+    for name in needed {
+        let Some(value) = variables.get(*name) else {
+            anyhow::bail!("it needs {{{name}}}, which it wasn't given");
+        };
+        check_variable(name, value)?;
+    }
+    Ok(())
 }
 
 /// Reads until the end or until there's more than is kept, then lets go, so a
@@ -293,6 +374,10 @@ mod tests {
             .collect()
     }
 
+    fn runner(actions: Actions, built_ins: bool) -> Arc<Runner> {
+        Runner::new(actions, built_ins, tempfile::tempdir().unwrap().path())
+    }
+
     #[test]
     fn definitions_are_checked() {
         check_actions(&actions(&[("disk_hogs", &["du", "{disk}"])])).unwrap();
@@ -303,6 +388,7 @@ mod tests {
             ("a", &[""]),
             ("a", &["{series}"]),
             ("a", &["/bin/{process}"]),
+            ("top_cpu", &["true"]),
         ] {
             assert!(
                 check_actions(&actions(&[(name, command)])).is_err(),
@@ -317,9 +403,24 @@ mod tests {
             ("disk_hogs", &["du", "{disk}"]),
             ("restart_nginx", &["systemctl", "restart", "nginx"]),
         ]);
-        let (names, needed) = facts(&defined);
+        let (names, needed) = facts(&defined, false);
         assert_eq!(names, json!(["disk_hogs", "restart_nginx"]));
         assert_eq!(needed, json!({ "disk_hogs": ["disk"] }));
+
+        let (names, needed) = facts(&defined, true);
+        let expected = json!([
+            "disk_hogs",
+            "disk_io",
+            "disk_space",
+            "restart_nginx",
+            "top_cpu",
+            "top_memory"
+        ]);
+        assert_eq!(names, expected);
+        assert_eq!(
+            needed,
+            json!({ "disk_hogs": ["disk"], "disk_space": ["disk"] })
+        );
     }
 
     #[test]
@@ -339,11 +440,41 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_action_is_not_run() {
-        let runner = Runner::new(Actions::new());
+        let runner = runner(Actions::new(), true);
         let result = runner.run("1".into(), "nope", &variables(&[]), 5).await;
         assert_eq!(result.id, "1");
         assert_eq!(result.outcome, ActionOutcome::NotDefined);
         assert_eq!(result.output, "");
+    }
+
+    #[tokio::test]
+    async fn a_built_in_action_runs_without_being_defined() {
+        let runner = runner(Actions::new(), true);
+        let none = variables(&[]);
+        let result = runner.run("1".into(), "top_memory", &none, 30).await;
+        assert_eq!(result.outcome, ActionOutcome::Succeeded, "{result:?}");
+        assert!(result.output.contains("processes running"), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn a_built_in_action_is_refused_without_what_it_needs() {
+        let runner = runner(Actions::new(), true);
+        let none = variables(&[]);
+        let result = runner.run("1".into(), "disk_space", &none, 30).await;
+        assert_eq!(result.outcome, ActionOutcome::Refused, "{result:?}");
+        assert!(result.error.unwrap().contains("{disk}"));
+
+        let nowhere = variables(&[("disk", "/nonexistent/maxnines-test")]);
+        let result = runner.run("2".into(), "disk_space", &nowhere, 30).await;
+        assert_eq!(result.outcome, ActionOutcome::Failed, "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn built_in_actions_can_be_turned_off() {
+        let runner = runner(Actions::new(), false);
+        let none = variables(&[]);
+        let result = runner.run("1".into(), "top_cpu", &none, 30).await;
+        assert_eq!(result.outcome, ActionOutcome::NotDefined);
     }
 
     #[cfg(unix)]
@@ -351,7 +482,7 @@ mod tests {
         use super::*;
 
         async fn run(command: &[&str], given: &[(&str, &str)], secs: u64) -> ActionResult {
-            let runner = Runner::new(actions(&[("a", command)]));
+            let runner = runner(actions(&[("a", command)]), true);
             runner.run("7".into(), "a", &variables(given), secs).await
         }
 
@@ -438,7 +569,7 @@ mod tests {
             // Fails if another copy is between making and removing the folder.
             let script = "mkdir \"$1\" || exit 9; sleep 0.2; rmdir \"$1\"";
             let command = ["/bin/sh", "-c", script, "sh", lock.to_str().unwrap()];
-            let runner = Runner::new(actions(&[("a", &command)]));
+            let runner = runner(actions(&[("a", &command)]), true);
 
             let none = variables(&[]);
             let runs = (0..4).map(|i| runner.run(i.to_string(), "a", &none, 10));
@@ -449,7 +580,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_long_queue_of_actions_is_refused() {
-            let runner = Runner::new(actions(&[("a", &["/bin/sleep", "0.1"])]));
+            let runner = runner(actions(&[("a", &["/bin/sleep", "0.1"])]), true);
             let none = variables(&[]);
             let runs = (0..MAX_WAITING + 5).map(|i| runner.run(i.to_string(), "a", &none, 10));
             let results = futures_util::future::join_all(runs).await;

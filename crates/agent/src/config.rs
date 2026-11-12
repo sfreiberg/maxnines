@@ -39,6 +39,14 @@ pub struct Config {
     /// service. As with custom metrics, it can only pick from these.
     #[serde(default, rename = "action")]
     pub actions: Actions,
+    /// Whether the server can ask for the actions built into the agent, which
+    /// list what's running here and where disk space is going.
+    #[serde(default = "default_built_in_actions")]
+    pub built_in_actions: bool,
+}
+
+fn default_built_in_actions() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]

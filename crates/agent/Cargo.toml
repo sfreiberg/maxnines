@@ -28,7 +28,7 @@ tracing.workspace = true
 webpki-roots = "0.26"
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", default-features = false, features = ["process", "std"] }
+rustix = { version = "1", default-features = false, features = ["fs", "process", "std"] }
 
 # Reads containers through Docker's API, which Podman offers too. Only Linux runs
 # containers for real, so the other agents leave it out.

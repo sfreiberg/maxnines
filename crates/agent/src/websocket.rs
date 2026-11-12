@@ -71,6 +71,7 @@ struct Connection {
     custom_facts: BTreeMap<String, Value>,
     custom_metrics: Definitions,
     actions: Actions,
+    built_in_actions: bool,
     /// Runs what the server asks for, apart from the connection, so a slow action
     /// never holds up samples or the server's pings.
     runner: Arc<Runner>,
@@ -110,7 +111,12 @@ impl ServerLink {
             custom_facts: config.facts.clone(),
             custom_metrics: config.custom_metrics.clone(),
             actions: config.actions.clone(),
-            runner: Runner::new(config.actions.clone()),
+            built_in_actions: config.built_in_actions,
+            runner: Runner::new(
+                config.actions.clone(),
+                config.built_in_actions,
+                &config.state_dir,
+            ),
             outgoing: config_results.clone(),
             facts_every: facts_every_receiver,
             configs: config_sender,
@@ -321,6 +327,7 @@ async fn send_facts(socket: &mut Socket, connection: &Connection) -> Result<()> 
         &connection.custom_facts,
         &connection.custom_metrics,
         &connection.actions,
+        connection.built_in_actions,
     ) {
         Ok(facts) => facts,
         Err(error) => {
@@ -407,6 +414,7 @@ mod tests {
                         .to_vec(),
                 },
             )]),
+            built_in_actions: false,
         }
     }
 

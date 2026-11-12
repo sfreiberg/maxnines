@@ -1,11 +1,13 @@
 mod actions;
 mod background;
+mod builtin_actions;
 mod checks;
 mod collector;
 mod config;
 #[cfg(target_os = "linux")]
 mod containers;
 mod custom;
+mod disk_space;
 mod facts;
 mod files;
 mod identity;
@@ -69,6 +71,17 @@ enum Command {
     Identity(IdentityCommand),
     /// Print the facts this agent reports
     Facts,
+    /// Run one of this agent's actions as the server would, and print the result
+    Action {
+        /// The action's name, built in or from the config file
+        name: String,
+        /// Values for its variables, like disk=/var
+        #[arg(value_name = "NAME=VALUE", value_parser = parse_variable)]
+        variables: Vec<(String, String)>,
+        /// How long it gets, in seconds
+        #[arg(long, default_value_t = maxnines_protocol::actions::DEFAULT_ACTION_TIMEOUT_SECS)]
+        timeout_secs: u64,
+    },
     /// Print this agent's version, and exactly which build it is
     Version,
     /// Run the agent as a Windows service
@@ -87,6 +100,50 @@ enum IdentityCommand {
     },
     /// Show this agent's ID and public key
     Show,
+}
+
+fn parse_variable(text: &str) -> Result<(String, String), String> {
+    let (name, value) = text
+        .split_once('=')
+        .ok_or("a variable is written as name=value, like disk=/var")?;
+    Ok((name.to_string(), value.to_string()))
+}
+
+/// Runs an action exactly as it would for the server, so it can be tried out on
+/// the host, as the user the agent runs as.
+fn try_action(
+    config: &Config,
+    name: &str,
+    variables: Vec<(String, String)>,
+    secs: u64,
+) -> Result<()> {
+    let runner = actions::Runner::new(
+        config.actions.clone(),
+        config.built_in_actions,
+        &config.state_dir,
+    );
+    let variables = variables.into_iter().collect();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(runner.run("try".to_string(), name, &variables, secs));
+
+    print!("{}", result.output);
+    if result.truncated {
+        eprintln!("(the rest was cut off)");
+    }
+    let took = Duration::from_millis(result.duration_ms).as_secs_f64();
+    let outcome = result.outcome.as_str().replace('_', " ");
+    match (result.error, result.exit_code) {
+        (Some(error), _) => eprintln!("{outcome} after {took:.1}s: {error}"),
+        (None, Some(code)) => eprintln!("{outcome} after {took:.1}s, exit status {code}"),
+        (None, None) => eprintln!("{outcome} after {took:.1}s"),
+    }
+    anyhow::ensure!(
+        result.outcome == maxnines_protocol::actions::ActionOutcome::Succeeded,
+        "the action didn't succeed"
+    );
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -112,9 +169,22 @@ fn main() -> Result<()> {
         }
         Command::Facts => {
             let config = Config::load(&cli.config)?;
-            let facts = facts::gather(&config.facts, &config.custom_metrics, &config.actions)?;
+            let facts = facts::gather(
+                &config.facts,
+                &config.custom_metrics,
+                &config.actions,
+                config.built_in_actions,
+            )?;
             println!("{}", serde_json::to_string_pretty(&facts)?);
             Ok(())
+        }
+        Command::Action {
+            name,
+            variables,
+            timeout_secs,
+        } => {
+            let config = Config::load(&cli.config)?;
+            try_action(&config, &name, variables, timeout_secs)
         }
         Command::Identity(command) => {
             let config = Config::load(&cli.config)?;

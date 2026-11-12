@@ -66,6 +66,18 @@ state_dir = "data.nosync"
 # rather than through a shell, and each value stays inside its own argument. Keep
 # this file writable only by its owner, because what's here gets run.
 #
+# Every agent also has these built in, which only look and never change anything:
+#   top_cpu      the processes using the most CPU
+#   top_memory   the processes using the most memory
+#   disk_io      the processes reading and writing the most
+#   disk_space   where the space on {disk} is going
+# They name programs and folders, so turn them off if the server shouldn't be
+# able to ask for that:
+# built_in_actions = false
+#
+# Try any action as the agent's user, the way the server would run it:
+#   maxnines-agent --config agent.hcl action disk_space disk=/var
+#
 # action "largest_folders" {
 #   command = ["/usr/bin/du", "-x", "-h", "--max-depth=2", "{disk}"]
 # }
