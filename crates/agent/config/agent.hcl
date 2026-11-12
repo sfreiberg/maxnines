@@ -72,7 +72,7 @@ state_dir = "data.nosync"
 #   disk_io      the processes reading and writing the most
 #   disk_space   where the space on {disk} is going
 #   connections  the processes holding the most network connections, and the
-#                addresses they're with (not on FreeBSD)
+#                addresses they're with
 # They name programs and folders, so turn them off if the server shouldn't be
 # able to ask for that:
 # built_in_actions = false

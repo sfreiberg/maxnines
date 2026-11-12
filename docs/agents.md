@@ -221,8 +221,7 @@ macOS and Windows, so only the Linux agent reads them.
 An action is something the server can ask this host to run, by name, whose output it
 keeps: for an [alert](alerts.md#actions), or when someone presses **Run** on the
 host's Actions page. Five are built into the agent and only look: `top_cpu`,
-`top_memory`, `disk_io`, `disk_space` and `connections`, which FreeBSD's agent
-doesn't have.
+`top_memory`, `disk_io`, `disk_space` and `connections`.
 
 Your own go in the agent's config file, which is the only place one can be added:
 

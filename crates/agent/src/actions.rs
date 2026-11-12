@@ -510,7 +510,13 @@ mod tests {
             "top_memory",
         ];
         // Where the system can say which process holds a socket.
-        if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
+        let listed = cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            windows
+        ));
+        if listed {
             expected.insert(0, "connections");
         }
         assert_eq!(names, json!(expected));

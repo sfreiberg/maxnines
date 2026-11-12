@@ -66,7 +66,12 @@ pub const BUILT_INS: &[BuiltIn] = &[
         privileged: true,
         run: disk_space::report,
     },
-    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        windows
+    ))]
     BuiltIn {
         name: "connections",
         variables: &[],

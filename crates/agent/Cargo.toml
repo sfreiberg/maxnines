@@ -28,7 +28,7 @@ tracing.workspace = true
 webpki-roots = "0.26"
 
 # Lists the host's sockets and which process holds each, for the connections
-# action. It doesn't cover FreeBSD, which goes without that action.
+# action. It doesn't cover FreeBSD, which is asked through libc instead.
 [target.'cfg(any(target_os = "linux", target_os = "macos", windows))'.dependencies]
 netstat2 = "0.11"
 
