@@ -1198,12 +1198,8 @@ impl MetricsReader for ClickHouseReader {
         let tier = tier_for(range.step_ms, range.from_ms, now_ms(), &self.retention);
         let done = self.rolled_up_until(query.metric)?;
         let host = format!("host_id = {}", quoted(query.host_id));
-        // An idle interface says nothing, but a CPU at 0% does.
-        let having = if is_rate(query.metric.source) {
-            "WHERE peak > 0"
-        } else {
-            ""
-        };
+        // One that stayed at zero is still shown, after the busier ones, as a
+        // chart without it looks like it isn't being read.
         // Ranked in one pass, as ClickHouse would work a `WITH` out again for each use.
         let sql = format!(
             "SELECT series, bucket, low_v AS min, high_v AS max, mean_v AS avg,
@@ -1214,8 +1210,7 @@ impl MetricsReader for ClickHouseReader {
                      FROM (
                          SELECT *,
                                 sum(sum_v) OVER (PARTITION BY series)
-                                    / sum(rows_v) OVER (PARTITION BY series) AS overall,
-                                max(high_v) OVER (PARTITION BY series) AS peak
+                                    / sum(rows_v) OVER (PARTITION BY series) AS overall
                          FROM (
                              SELECT series, toInt64(intDiv(t, {step}) * {step}) AS bucket,
                                     sum(summed) / sum(samples) AS mean_v,
@@ -1224,7 +1219,7 @@ impl MetricsReader for ClickHouseReader {
                              FROM ({cells})
                              GROUP BY series, bucket
                          )
-                     ) {having}
+                     )
                  )
              )
              WHERE position <= {max_series}

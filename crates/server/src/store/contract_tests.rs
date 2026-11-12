@@ -332,7 +332,7 @@ fn network_counts_become_rates_using_the_time_between_samples() {
 }
 
 #[test]
-fn an_idle_interface_is_left_out_without_counting_as_hidden() {
+fn an_idle_interface_is_shown_at_zero() {
     let mut store = in_memory();
     for time_ms in [0, 15_000, 30_000] {
         let data = json!({
@@ -344,8 +344,14 @@ fn an_idle_interface_is_left_out_without_counting_as_hidden() {
 
     let result = query(&store, "a", "network.received", 8);
 
-    assert_eq!(names(&result), ["en0"]);
+    assert_eq!(names(&result), ["en0", "utun3"]);
+    assert_eq!(averages(&result.series[1]), [0.0, 0.0]);
     assert_eq!(result.hidden, 0);
+
+    // With room for only one, it's the busy one, and the other counts as hidden.
+    let result = query(&store, "a", "network.received", 1);
+    assert_eq!(names(&result), ["en0"]);
+    assert_eq!(result.hidden, 1);
 }
 
 #[test]

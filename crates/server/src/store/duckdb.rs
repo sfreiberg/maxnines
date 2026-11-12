@@ -1024,12 +1024,8 @@ fn series_sql(
     tier: Tier,
     done: Option<i64>,
 ) -> Result<String> {
-    // An idle interface says nothing, but a CPU at 0% does.
-    let having = if is_rate(metric.source) {
-        "HAVING max(high) > 0"
-    } else {
-        ""
-    };
+    // One that stayed at zero is still shown, after the busier ones, as a chart
+    // without it looks like it isn't being read.
     Ok(format!(
         "WITH cells AS ({cells}),
          ranked AS (
@@ -1037,7 +1033,7 @@ fn series_sql(
                     row_number() OVER (ORDER BY sum(summed) / sum(samples) DESC, series)
                         AS position,
                     count(*) OVER () AS total
-             FROM cells GROUP BY series {having}
+             FROM cells GROUP BY series
          )
          SELECT series, t // $3::BIGINT * $3::BIGINT AS bucket,
                 sum(summed) / sum(samples), min(low), max(high), total
