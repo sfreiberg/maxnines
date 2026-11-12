@@ -400,7 +400,6 @@ mod tests {
     fn actions_are_listed_by_name_without_their_commands() {
         let command = |parts: &[&str]| actions::Action {
             command: parts.iter().map(|part| (*part).to_string()).collect(),
-            user: None,
         };
         let actions = Actions::from([
             (

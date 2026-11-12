@@ -2,16 +2,16 @@
 //! anything else, as programs like sshd do:
 //!
 //! - The process that goes on to be the agent becomes an ordinary user for good.
-//!   It talks to the server, reads what the server sends, and collects.
+//!   It talks to the server, reads what the server sends, collects, and runs the
+//!   commands its config defines.
 //! - The process that started stays root as a small helper. It has never opened
 //!   a network connection, and only hears from the agent, over a socket made
-//!   before the split. It does two things: runs the few built-in actions that
-//!   see more as root, and runs the actions whose config says who they run as.
+//!   before the split. It does one thing: runs the few built-in actions that see
+//!   more as root, which only look.
 //!
-//! The helper reads the config for itself while it's still the only process, so
-//! it never takes the agent's word for what an action is: the agent sends a name,
-//! and the helper runs what root's own file says that name means, or refuses.
-//! Someone who took over the agent could ask for those, and nothing else.
+//! The helper never starts a program, whatever it's asked. Someone who took over
+//! the agent could ask it for those built-in actions, and nothing else. A command
+//! that needs root goes through `sudo`, under rules root wrote.
 //!
 //! An agent that isn't started as root runs as it always has, with no helper.
 
@@ -19,32 +19,41 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::actions::{Ended, RunAs};
+use crate::actions::Ended;
 
 /// What the agent asks its helper for: an action by name, and what the server
 /// gave it. Never a command.
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(not(unix), allow(dead_code))]
 struct Request {
+    /// Which question this is, so an answer that comes too late isn't taken for
+    /// the answer to the next one.
+    id: u64,
     name: String,
     variables: BTreeMap<String, String>,
     timeout_secs: u64,
 }
 
+/// How the action a request asked for went.
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(not(unix), allow(dead_code))]
+struct Answer {
+    id: u64,
+    ended: Ended,
+}
+
 #[cfg(unix)]
-pub use unix::{helper, is_current_user, look_up, split};
+pub use unix::{helper, split};
 
 #[cfg(not(unix))]
-pub use other::{helper, is_current_user, look_up};
+pub use other::helper;
 
 /// Windows services run with the system's rights already, so nothing is split.
 #[cfg(not(unix))]
 mod other {
     use std::collections::BTreeMap;
 
-    use anyhow::{Result, bail};
-
-    use super::{Ended, RunAs};
+    use super::Ended;
 
     pub struct Helper;
 
@@ -62,22 +71,18 @@ mod other {
     pub fn helper() -> Option<&'static Helper> {
         None
     }
-
-    pub fn is_current_user(_name: &str) -> bool {
-        false
-    }
-
-    pub fn look_up(name: &str) -> Result<RunAs> {
-        bail!("running as {name} isn't supported on this system")
-    }
 }
 
 #[cfg(unix)]
 mod unix {
     use std::collections::BTreeMap;
     use std::ffi::CString;
+    use std::fs::DirBuilder;
+    use std::io::ErrorKind;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     use std::os::unix::net::UnixStream as StdUnixStream;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Mutex, OnceLock, PoisonError};
     use std::time::Duration;
 
@@ -86,20 +91,31 @@ mod unix {
     use nix::sys::signal::{Signal, kill};
     use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
     use nix::unistd::{ForkResult, Gid, Pid, Uid, User, chown, fork, geteuid, setgid, setuid};
+    use serde::Serialize;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
     use tokio::signal::unix::{SignalKind, signal};
     use tokio::time::timeout;
     use tracing::{error, info, warn};
 
-    use super::{Ended, Request, RunAs};
-    use crate::actions::Executor;
+    use super::{Answer, Ended, Request};
+    use crate::actions::{Actions, Executor};
     use crate::config::Config;
 
     /// Who the agent becomes when its config doesn't say, if there's such a user.
     const DEFAULT_USER: &str = "maxnines";
 
-    /// How long past an action's own limit the agent waits for the helper's answer.
+    /// Where the helper keeps its own files, such as what `disk_space` saw last
+    /// time. Only root can write here or in the folder it's in, unlike the
+    /// agent's folder, where the agent's user could leave a link for root to
+    /// follow.
+    #[cfg(target_os = "linux")]
+    const HELPER_DIR: &str = "/var/lib/maxnines-agent-helper";
+    #[cfg(not(target_os = "linux"))]
+    const HELPER_DIR: &str = "/var/db/maxnines-agent-helper";
+
+    /// How long past an action's own limit the agent waits for the helper's answer,
+    /// and how long it waits for the helper to take a question.
     const ANSWER_GRACE: Duration = Duration::from_secs(15);
 
     /// How often the helper looks whether the agent has ended, besides being told.
@@ -116,15 +132,31 @@ mod unix {
         /// As it was made before the split. It becomes `open` on first use, as
         /// that needs the agent's runtime, which starts after the split.
         made: Mutex<Option<StdUnixStream>>,
-        open: tokio::sync::Mutex<Option<BufReader<UnixStream>>>,
+        open: tokio::sync::Mutex<Option<Lines>>,
+        /// How many questions have been asked, which numbers the next.
+        asked: AtomicU64,
+        /// Set once the helper can't be reached, which doesn't change back.
+        gone: AtomicBool,
     }
 
-    /// The helper, if this agent was started as root and split.
+    /// The helper, if this agent was started as root and split, and the helper
+    /// is still there.
     pub fn helper() -> Option<&'static Helper> {
-        HELPER.get()
+        HELPER
+            .get()
+            .filter(|helper| !helper.gone.load(Ordering::Relaxed))
     }
 
     impl Helper {
+        fn new(socket: StdUnixStream) -> Self {
+            Self {
+                made: Mutex::new(Some(socket)),
+                open: tokio::sync::Mutex::new(None),
+                asked: AtomicU64::new(0),
+                gone: AtomicBool::new(false),
+            }
+        }
+
         /// Asks the helper to run an action and waits for how it went. `None`
         /// means there's no longer a helper to ask.
         pub async fn ask(
@@ -134,93 +166,115 @@ mod unix {
             timeout_secs: u64,
         ) -> Option<Ended> {
             let mut open = self.open.lock().await;
-            if open.is_none() {
-                let made = self
-                    .made
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take()?;
-                made.set_nonblocking(true).ok()?;
-                *open = Some(BufReader::new(UnixStream::from_std(made).ok()?));
+            let made = self
+                .made
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(made) = made {
+                *open = Lines::open(made).ok();
             }
-            let stream = open.as_mut()?;
+            let Some(lines) = open.as_mut() else {
+                self.gone.store(true, Ordering::Relaxed);
+                return None;
+            };
 
             let request = Request {
+                id: self.asked.fetch_add(1, Ordering::Relaxed) + 1,
                 name: name.to_string(),
                 variables: variables.clone(),
                 timeout_secs,
             };
+            // A question the helper only half took would break every one after
+            // it, so not taking one in good time is the end of asking.
+            let sent = match timeout(ANSWER_GRACE, lines.send(&request)).await {
+                Ok(sent) => sent,
+                Err(_) => Err(anyhow::anyhow!("it stopped reading")),
+            };
             let limit = Duration::from_secs(timeout_secs.min(MAX_ACTION_TIMEOUT_SECS));
-            let answer = timeout(limit + ANSWER_GRACE, exchange(stream, &request)).await;
+            let answer = match sent {
+                Ok(()) => timeout(limit + ANSWER_GRACE, lines.answer_to(request.id)).await,
+                Err(error) => Ok(Err(error)),
+            };
             match answer {
                 Ok(Ok(ended)) => Some(ended),
-                // Whatever came next would answer the wrong question, so that's
-                // the end of asking.
                 Ok(Err(error)) => {
                     error!(
                         error = format!("{error:#}"),
-                        "the privileged helper is gone"
+                        "the privileged helper is gone, so actions see what the agent's user can"
                     );
                     *open = None;
+                    self.gone.store(true, Ordering::Relaxed);
                     None
                 }
+                // It may only be slow, on a host that's struggling. Its answer
+                // to this is passed over when it does come.
                 Err(_) => {
-                    error!("the privileged helper stopped answering");
-                    *open = None;
-                    None
+                    warn!(action = name, "the privileged helper didn't answer in time");
+                    let error = "the privileged helper didn't answer in time";
+                    Some(Ended::without_running(ActionOutcome::TimedOut, error))
                 }
             }
         }
     }
 
-    /// One question and its answer, each a line of JSON.
-    async fn exchange(stream: &mut BufReader<UnixStream>, request: &Request) -> Result<Ended> {
-        let mut line = serde_json::to_string(request)?;
-        line.push('\n');
-        stream.get_mut().write_all(line.as_bytes()).await?;
-        let answer = read_line(stream).await?.context("it closed the socket")?;
-        serde_json::from_str(&answer).context("it answered with something else")
+    /// One end of the socket, read and written a line of JSON at a time.
+    struct Lines {
+        stream: BufReader<UnixStream>,
+        /// The start of a line that hasn't all arrived. It's kept here so that
+        /// giving up waiting doesn't lose it and break the line in two.
+        partial: Vec<u8>,
     }
 
-    /// Reads one line, refusing one too long to be real. `None` is the other end
-    /// having gone.
-    async fn read_line(stream: &mut BufReader<UnixStream>) -> Result<Option<String>> {
-        let mut line = Vec::new();
-        loop {
-            let available = stream.fill_buf().await?;
-            if available.is_empty() {
-                return Ok(None);
-            }
-            let end = available.iter().position(|byte| *byte == b'\n');
-            let take = end.map_or(available.len(), |end| end + 1);
-            line.extend_from_slice(&available[..take]);
-            stream.consume(take);
-            ensure!(line.len() <= MAX_LINE, "a line was too long");
-            if end.is_some() {
-                line.pop();
-                return Ok(Some(String::from_utf8(line)?));
+    impl Lines {
+        fn open(socket: StdUnixStream) -> std::io::Result<Self> {
+            socket.set_nonblocking(true)?;
+            Ok(Self {
+                stream: BufReader::new(UnixStream::from_std(socket)?),
+                partial: Vec::new(),
+            })
+        }
+
+        /// Reads one line, refusing one too long to be real. `None` is the other
+        /// end having gone.
+        async fn next(&mut self) -> Result<Option<String>> {
+            loop {
+                let available = self.stream.fill_buf().await?;
+                if available.is_empty() {
+                    return Ok(None);
+                }
+                let end = available.iter().position(|byte| *byte == b'\n');
+                let take = end.map_or(available.len(), |end| end + 1);
+                self.partial.extend_from_slice(&available[..take]);
+                self.stream.consume(take);
+                ensure!(self.partial.len() <= MAX_LINE, "a line was too long");
+                if end.is_some() {
+                    let mut line = std::mem::take(&mut self.partial);
+                    line.pop();
+                    return Ok(Some(String::from_utf8(line)?));
+                }
             }
         }
-    }
 
-    /// Whether `name` is who this process is running as, so nothing has to change
-    /// to run as them.
-    pub fn is_current_user(name: &str) -> bool {
-        User::from_uid(geteuid())
-            .ok()
-            .flatten()
-            .is_some_and(|user| user.name == name)
-    }
+        async fn send(&mut self, message: &impl Serialize) -> Result<()> {
+            let mut line = serde_json::to_string(message)?;
+            line.push('\n');
+            self.stream.get_mut().write_all(line.as_bytes()).await?;
+            Ok(())
+        }
 
-    /// Who a user is, for running a command as them.
-    pub fn look_up(name: &str) -> Result<RunAs> {
-        let user = User::from_name(name)
-            .with_context(|| format!("looking up the user {name}"))?
-            .with_context(|| format!("there's no user called {name}"))?;
-        Ok(RunAs {
-            uid: user.uid.as_raw(),
-            gid: user.gid.as_raw(),
-        })
+        /// The helper's answer to one question, passing over answers to earlier
+        /// ones that nobody waited for.
+        async fn answer_to(&mut self, id: u64) -> Result<Ended> {
+            loop {
+                let line = self.next().await?.context("it closed the socket")?;
+                let answer: Answer =
+                    serde_json::from_str(&line).context("it answered with something else")?;
+                if answer.id == id {
+                    return Ok(answer.ended);
+                }
+            }
+        }
     }
 
     /// How many threads this process has, where that can be read. Splitting a
@@ -233,17 +287,59 @@ mod unix {
     }
 
     /// Makes the folder the agent keeps its files in, if it isn't there, and gives
-    /// that new folder to the agent's user. One that's already there is left
-    /// exactly as it is: changing who owns what's inside, as root, would follow
-    /// whatever links an earlier agent had been tricked into leaving there.
+    /// that new folder to the agent's user. One that's already there has to be
+    /// theirs already. It isn't handed over here: changing who owns what's
+    /// inside, as root, would follow whatever links were left there.
     fn make_state_dir(folder: &Path, user: &User) -> Result<()> {
-        if folder.exists() {
+        if let Ok(found) = std::fs::metadata(folder) {
+            ensure!(
+                found.uid() == user.uid.as_raw(),
+                "{folder} doesn't belong to {name}, who the agent runs as, so it couldn't keep \
+                 its key there. Give it to them with: chown -R {name}: {folder}",
+                folder = folder.display(),
+                name = user.name,
+            );
             return Ok(());
         }
         std::fs::create_dir_all(folder).with_context(|| format!("making {}", folder.display()))?;
         chown(folder, Some(user.uid), Some(user.gid))
             .with_context(|| format!("giving {} to {}", folder.display(), user.name))?;
         Ok(())
+    }
+
+    /// Makes the helper's own folder, if it isn't there, and checks nobody else
+    /// can change what's in it.
+    fn make_helper_dir(folder: &Path) -> Result<()> {
+        match DirBuilder::new().mode(0o700).create(folder) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) => bail!("making {}: {error}", folder.display()),
+        }
+        // Not following a link, as that's one of the things it could be instead.
+        let found = std::fs::symlink_metadata(folder)
+            .with_context(|| format!("looking at {}", folder.display()))?;
+        ensure!(
+            found.is_dir() && found.uid() == geteuid().as_raw() && found.mode() & 0o022 == 0,
+            "{} isn't a folder that only root can change",
+            folder.display()
+        );
+        Ok(())
+    }
+
+    /// Where the helper keeps its files, or `None`, with a warning, to keep
+    /// nothing between restarts.
+    fn helper_dir(folder: &Path) -> Option<PathBuf> {
+        match make_helper_dir(folder) {
+            Ok(()) => Some(folder.to_path_buf()),
+            Err(error) => {
+                warn!(
+                    error = format!("{error:#}"),
+                    "the privileged helper has nowhere to keep files, so disk_space won't know \
+                     what changed since before the agent restarted"
+                );
+                None
+            }
+        }
     }
 
     /// Becomes `user` for good: their groups, then their group, then them, in the
@@ -268,9 +364,6 @@ mod unix {
             setuid(Uid::from_raw(0)).is_err() && setgid(Gid::from_raw(0)).is_err(),
             "root's rights could be taken back, so they weren't really given up"
         );
-        // Nothing this starts can gain rights either, such as through sudo.
-        #[cfg(target_os = "linux")]
-        nix::sys::prctl::set_no_new_privs().context("giving up gaining rights")?;
 
         // What commands expect to find, which still said root.
         // SAFETY: this process has one thread, so nothing reads the environment
@@ -312,6 +405,13 @@ mod unix {
     ///
     /// Call this before anything starts a thread, which means before the runtime.
     pub fn split(config: &Config) -> Result<()> {
+        // Nothing either process starts from here on can gain rights, such as
+        // through sudo. Giving up root below isn't gaining any, so it still works.
+        #[cfg(target_os = "linux")]
+        if config.no_new_privileges {
+            nix::sys::prctl::set_no_new_privs().context("giving up gaining rights")?;
+        }
+
         if !geteuid().is_root() {
             if config.run_as.is_some() {
                 warn!("run_as only applies to an agent started as root, so it's ignored");
@@ -334,9 +434,9 @@ mod unix {
             "the agent had already started threads, so it can't split safely"
         );
         let (agents, helpers) = StdUnixStream::pair().context("making the helper's socket")?;
-        // The helper's copy of what can be run, taken from root's file now, so
-        // nothing the agent later says or changes can alter it.
-        let executor = Executor::new(config.actions.clone(), config.built_in_actions, None);
+        // No commands: the helper only has the built-in actions to run.
+        let kept = helper_dir(Path::new(HELPER_DIR));
+        let executor = Executor::new(Actions::new(), config.built_in_actions, kept.as_deref());
 
         // SAFETY: this process has one thread, checked above where the system can
         // say, so the new process is a whole copy with nothing half done.
@@ -344,12 +444,8 @@ mod unix {
             ForkResult::Child => {
                 drop(helpers);
                 become_user(&user)?;
-                let helper = Helper {
-                    made: Mutex::new(Some(agents)),
-                    open: tokio::sync::Mutex::new(None),
-                };
                 // Only ever set here, once.
-                let _ = HELPER.set(helper);
+                let _ = HELPER.set(Helper::new(agents));
                 info!(
                     user = user.name,
                     "gave up root, keeping a privileged helper"
@@ -422,18 +518,15 @@ mod unix {
 
     /// Answers the agent's requests, one at a time, until it closes the socket.
     async fn serve(socket: StdUnixStream, executor: Executor) {
-        let opened = socket
-            .set_nonblocking(true)
-            .and_then(|()| UnixStream::from_std(socket));
-        let mut stream = match opened {
-            Ok(stream) => BufReader::new(stream),
+        let mut lines = match Lines::open(socket) {
+            Ok(lines) => lines,
             Err(error) => {
                 error!(%error, "the privileged helper couldn't open its socket");
                 return;
             }
         };
         loop {
-            let line = match read_line(&mut stream).await {
+            let line = match lines.next().await {
                 Ok(Some(line)) => line,
                 Ok(None) => return,
                 Err(error) => {
@@ -444,7 +537,7 @@ mod unix {
                     return;
                 }
             };
-            let ended = match serde_json::from_str::<Request>(&line) {
+            let answer = match serde_json::from_str::<Request>(&line) {
                 Ok(request) => {
                     let ended = executor
                         .run_privileged(&request.name, &request.variables, request.timeout_secs)
@@ -454,15 +547,18 @@ mod unix {
                         outcome = ended.outcome.as_str(),
                         "the privileged helper ran an action"
                     );
-                    ended
+                    Answer {
+                        id: request.id,
+                        ended,
+                    }
                 }
-                Err(_) => Ended::without_running(ActionOutcome::Refused, "it wasn't a request"),
+                // The agent numbers its questions from one, so this answers none.
+                Err(_) => Answer {
+                    id: 0,
+                    ended: Ended::without_running(ActionOutcome::Refused, "it wasn't a request"),
+                },
             };
-            let Ok(mut answer) = serde_json::to_string(&ended) else {
-                return;
-            };
-            answer.push('\n');
-            if stream.get_mut().write_all(answer.as_bytes()).await.is_err() {
+            if lines.send(&answer).await.is_err() {
                 return;
             }
         }
@@ -470,46 +566,39 @@ mod unix {
 
     #[cfg(test)]
     mod tests {
-        use std::os::unix::fs::MetadataExt;
-
         use super::*;
-        use crate::actions::{Action, Actions};
-
-        fn action(command: &[&str], user: Option<&str>) -> Action {
-            Action {
-                command: command.iter().map(|part| (*part).to_string()).collect(),
-                user: user.map(str::to_string),
-            }
-        }
+        use crate::actions::Action;
 
         /// A helper serving one end of a socket, and the agent's end of it.
-        fn helper_with(actions: Actions) -> Helper {
+        fn helper_with(actions: Actions, state_dir: Option<&Path>) -> Helper {
             let (agents, helpers) = StdUnixStream::pair().unwrap();
-            tokio::spawn(serve(helpers, Executor::new(actions, true, None)));
-            Helper {
-                made: Mutex::new(Some(agents)),
-                open: tokio::sync::Mutex::new(None),
-            }
+            tokio::spawn(serve(helpers, Executor::new(actions, true, state_dir)));
+            Helper::new(agents)
         }
 
-        fn current_user() -> String {
-            User::from_uid(geteuid()).unwrap().unwrap().name
+        /// Both ends of a socket, with nothing serving either.
+        fn pair() -> (Lines, Lines) {
+            let (agents, helpers) = StdUnixStream::pair().unwrap();
+            (Lines::open(agents).unwrap(), Lines::open(helpers).unwrap())
+        }
+
+        fn answer(id: u64, error: &str) -> Answer {
+            Answer {
+                id,
+                ended: Ended::without_running(ActionOutcome::Failed, error),
+            }
         }
 
         #[tokio::test]
-        async fn the_helper_only_runs_what_needs_it() {
-            let me = current_user();
-            let actions = Actions::from([
-                ("plain".to_string(), action(&["/bin/echo", "plain"], None)),
-                (
-                    "as_me".to_string(),
-                    action(&["/bin/echo", "as", "{hostname}"], Some(&me)),
-                ),
-            ]);
-            let helper = helper_with(actions);
+        async fn the_helper_only_runs_the_built_ins_that_see_more_as_root() {
+            // The real one is given no commands at all. Even one that was
+            // wouldn't run them.
+            let plain = Action {
+                command: vec!["/bin/echo".to_string(), "plain".to_string()],
+            };
+            let helper = helper_with(Actions::from([("plain".to_string(), plain)]), None);
             let none = BTreeMap::new();
 
-            // A command with no user is the agent's own to run, however it asks.
             let plain = helper.ask("plain", &none, 5).await.unwrap();
             assert_eq!(plain.outcome, ActionOutcome::Refused);
             assert_eq!(plain.output, "");
@@ -519,42 +608,38 @@ mod unix {
             let unknown = helper.ask("reboot", &none, 5).await.unwrap();
             assert_eq!(unknown.outcome, ActionOutcome::NotDefined);
 
-            // One that names a user runs, with what it was given checked as ever.
-            let missing = helper.ask("as_me", &none, 5).await.unwrap();
+            // What it does run is checked as ever.
+            let missing = helper.ask("disk_space", &none, 5).await.unwrap();
             assert_eq!(missing.outcome, ActionOutcome::Refused);
-            let given = BTreeMap::from([("hostname".to_string(), "web-1".to_string())]);
-            let ran = helper.ask("as_me", &given, 5).await.unwrap();
-            assert_eq!(ran.outcome, ActionOutcome::Succeeded, "{ran:?}");
-            assert_eq!(ran.output, "as web-1\n");
-            let too_long = helper
-                .ask("as_me", &given, MAX_ACTION_TIMEOUT_SECS + 1)
-                .await;
-            assert_eq!(too_long.unwrap().outcome, ActionOutcome::Refused);
+            let too_long = helper.ask("disk_io", &none, MAX_ACTION_TIMEOUT_SECS + 1);
+            assert_eq!(too_long.await.unwrap().outcome, ActionOutcome::Refused);
         }
 
         #[tokio::test]
-        async fn the_helper_runs_the_built_ins_that_see_more_as_root() {
-            let helper = helper_with(Actions::new());
+        async fn the_helper_keeps_what_disk_space_saw_in_its_own_folder() {
+            let kept = tempfile::tempdir().unwrap();
+            let helper = helper_with(Actions::new(), Some(kept.path()));
             let folder = tempfile::tempdir().unwrap();
             std::fs::write(folder.path().join("file"), vec![1u8; 8192]).unwrap();
             let given = BTreeMap::from([("disk".to_string(), folder.path().display().to_string())]);
             let ran = helper.ask("disk_space", &given, 30).await.unwrap();
             assert_eq!(ran.outcome, ActionOutcome::Succeeded, "{ran:?}");
             assert!(ran.output.contains("found"), "{ran:?}");
+            assert!(kept.path().join("disk_space.json").exists());
         }
 
         #[tokio::test]
         async fn anything_that_is_not_a_request_is_refused_and_the_helper_carries_on() {
             let (agents, helpers) = StdUnixStream::pair().unwrap();
             tokio::spawn(serve(helpers, Executor::new(Actions::new(), true, None)));
-            agents.set_nonblocking(true).unwrap();
-            let mut stream = BufReader::new(UnixStream::from_std(agents).unwrap());
+            let mut lines = Lines::open(agents).unwrap();
 
             for junk in ["run rm -rf /\n", "{\"command\": [\"/bin/sh\"]}\n", "\n"] {
-                stream.get_mut().write_all(junk.as_bytes()).await.unwrap();
-                let answer = read_line(&mut stream).await.unwrap().unwrap();
-                let ended: Ended = serde_json::from_str(&answer).unwrap();
-                assert_eq!(ended.outcome, ActionOutcome::Refused, "{junk:?}");
+                let stream = lines.stream.get_mut();
+                stream.write_all(junk.as_bytes()).await.unwrap();
+                let line = lines.next().await.unwrap().unwrap();
+                let answer: Answer = serde_json::from_str(&line).unwrap();
+                assert_eq!(answer.ended.outcome, ActionOutcome::Refused, "{junk:?}");
             }
         }
 
@@ -562,26 +647,42 @@ mod unix {
         async fn a_helper_that_has_gone_is_not_asked_again() {
             let (agents, helpers) = StdUnixStream::pair().unwrap();
             drop(helpers);
-            let helper = Helper {
-                made: Mutex::new(Some(agents)),
-                open: tokio::sync::Mutex::new(None),
-            };
+            let helper = Helper::new(agents);
             let none = BTreeMap::new();
             assert_eq!(helper.ask("disk_io", &none, 5).await, None);
+            assert!(helper.gone.load(Ordering::Relaxed));
             assert_eq!(helper.ask("disk_io", &none, 5).await, None);
         }
 
-        #[test]
-        fn users_are_looked_up_by_name() {
-            let me = current_user();
-            assert!(is_current_user(&me));
-            assert!(!is_current_user("no-such-user-maxnines"));
-            assert_eq!(look_up(&me).unwrap().uid, geteuid().as_raw());
-            assert!(look_up("no-such-user-maxnines").is_err());
+        #[tokio::test]
+        async fn an_answer_that_came_too_late_is_not_taken_for_the_next() {
+            let (mut agents, mut helpers) = pair();
+            helpers.send(&answer(1, "late")).await.unwrap();
+            helpers.send(&answer(2, "wanted")).await.unwrap();
+            let ended = agents.answer_to(2).await.unwrap();
+            assert_eq!(ended.error.as_deref(), Some("wanted"));
+        }
+
+        #[tokio::test]
+        async fn giving_up_waiting_does_not_break_a_line_in_two() {
+            let (mut agents, mut helpers) = pair();
+            let line = serde_json::to_string(&answer(1, "whole")).unwrap();
+            let (start, rest) = line.split_at(10);
+            let stream = helpers.stream.get_mut();
+            stream.write_all(start.as_bytes()).await.unwrap();
+            // The rest hasn't been sent, so however long this waits it gives up.
+            let waited = timeout(Duration::from_millis(50), agents.answer_to(1)).await;
+            assert!(waited.is_err());
+
+            let stream = helpers.stream.get_mut();
+            stream.write_all(rest.as_bytes()).await.unwrap();
+            stream.write_all(b"\n").await.unwrap();
+            let ended = agents.answer_to(1).await.unwrap();
+            assert_eq!(ended.error.as_deref(), Some("whole"));
         }
 
         #[test]
-        fn a_folder_that_is_already_there_is_left_alone() {
+        fn the_agents_folder_has_to_be_its_users() {
             let folder = tempfile::tempdir().unwrap();
             let me = User::from_uid(geteuid()).unwrap().unwrap();
             let before = std::fs::metadata(folder.path()).unwrap();
@@ -592,6 +693,41 @@ mod unix {
             let new = folder.path().join("a/b");
             make_state_dir(&new, &me).unwrap();
             assert_eq!(std::fs::metadata(&new).unwrap().uid(), me.uid.as_raw());
+
+            // Someone else's is refused, saying how to hand it over.
+            let other = User {
+                uid: Uid::from_raw(me.uid.as_raw() + 1),
+                name: "someone".to_string(),
+                ..me
+            };
+            let error = make_state_dir(folder.path(), &other).unwrap_err();
+            let expected = format!("chown -R someone: {}", folder.path().display());
+            assert!(error.to_string().contains(&expected), "{error}");
+        }
+
+        #[test]
+        fn the_helpers_folder_is_only_its_own() {
+            let within = tempfile::tempdir().unwrap();
+            let folder = within.path().join("helper");
+            assert_eq!(helper_dir(&folder), Some(folder.clone()));
+            assert_eq!(std::fs::metadata(&folder).unwrap().mode() & 0o777, 0o700);
+            // And again, now that it's there.
+            assert_eq!(helper_dir(&folder), Some(folder.clone()));
+
+            // A link to somewhere else, a file, a folder others can write to, and
+            // one that can't be made are all turned down.
+            let link = within.path().join("link");
+            std::os::unix::fs::symlink(&folder, &link).unwrap();
+            assert_eq!(helper_dir(&link), None);
+            let file = within.path().join("file");
+            std::fs::write(&file, "").unwrap();
+            assert_eq!(helper_dir(&file), None);
+            let open = within.path().join("open");
+            DirBuilder::new().mode(0o777).create(&open).unwrap();
+            let all = std::os::unix::fs::PermissionsExt::from_mode(0o777);
+            std::fs::set_permissions(&open, all).unwrap();
+            assert_eq!(helper_dir(&open), None);
+            assert_eq!(helper_dir(&within.path().join("no/such/place")), None);
         }
     }
 }

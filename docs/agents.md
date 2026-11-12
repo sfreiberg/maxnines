@@ -231,39 +231,66 @@ action "largest_folders" {
 }
 
 action "restart_nginx" {
-  command = ["/usr/bin/systemctl", "restart", "nginx"]
-  user    = "root"
+  command = ["/usr/bin/sudo", "-n", "/usr/bin/systemctl", "restart", "nginx"]
 }
 ```
 
 - **The server can only pick from this list**, and say how long an action gets. The
   agent tells it the names, never the commands.
-- **A command runs directly, not through a shell,** as the agent's user unless it
-  names another with `user`. For pipes, use `["/bin/sh", "-c", "..."]`.
+- **A command runs directly, not through a shell,** and always as the agent's
+  user. For pipes, use `["/bin/sh", "-c", "..."]`.
 - **Values from the alert** go where an argument names them in braces, like `{disk}`.
   Each stays inside its own argument whatever it holds, and can't start one with a
   dash. The program itself can't be a variable.
-- **An action that needs to be someone else says so with `user`**, such as `root` to
-  restart a service. That takes an agent started as root, as below. It runs with
-  that user's own group and no others.
+- **An action that needs more than the agent's user can do uses `sudo`**, as
+  [below](#actions-that-need-root).
 - **What it prints goes back to the server**, standard output and then standard
   error, up to 64 KiB. Don't print secrets.
 - **One runs at a time.** Others wait their turn, up to eight.
+
+### Actions that need root
+
+The agent never runs your commands as root itself. A command that needs it, such as
+restarting a service, asks `sudo`, so what the agent's user may do is written in
+the system's own rules, where you already look for that. Two things make it work:
+
+1. A sudoers rule for exactly that command, in a file such as
+   `/etc/sudoers.d/maxnines`:
+
+   ```
+   maxnines ALL=(root) NOPASSWD: /usr/bin/systemctl restart nginx
+   ```
+
+2. On Linux, `no_new_privileges = false` in the agent's config. By default the
+   agent stops everything it starts from gaining rights it doesn't have, which is
+   what `sudo` does. Turning that off means a setuid program anywhere on the host
+   works for the agent's user as it would for any other user.
+
+Write the rule for the whole command, not just the program. A rule that takes a
+value from an alert, like `{disk}`, lets anyone who can run actions choose that
+value, so keep those to commands that are safe whatever they're given.
 
 ### Running as root, and giving it up
 
 The Linux packages start the agent as root, and the first thing it does, before it
 connects to anything, is stop being root:
 
-- **The agent becomes the `maxnines` user for good.** It talks to the server and
-  collects as that user, and nothing it starts can gain rights back.
+- **The agent becomes the `maxnines` user for good.** It talks to the server,
+  collects, and runs your commands as that user.
 - **A small helper stays root.** It never opens a network connection, and only
-  hears from the agent. It does two things when asked: runs `disk_io` and
-  `disk_space`, which then see every process and folder, and runs the actions whose
-  config names a `user`.
-- **The helper goes by the config file, not by the agent.** The agent sends an
-  action's name, and the helper runs what the file says that name means. Someone who
-  took over the agent could ask for those actions, and nothing more.
+  hears from the agent. It does one thing when asked: runs `disk_io` and
+  `disk_space`, which then see every process and folder.
+- **The helper never starts a program.** Those two actions only look, and they're
+  all it knows. Someone who took over the agent could ask for them, and nothing
+  more.
+
+The helper keeps what `disk_space` saw last time in `/var/lib/maxnines-agent-helper`
+(`/var/db` on macOS and FreeBSD), which only root can write to.
+
+The agent's own folder, `state_dir`, has to belong to the user it becomes. A new one
+is made that way. If one is already there and belongs to someone else, such as root
+from an agent that used to stay root, the agent says so and doesn't start, with the
+`chown` command that hands it over.
 
 Two settings in the agent's config change this: `run_as = "someone"` chooses who it
 becomes, and `privileged_helper = false` gives up root without keeping a helper.
@@ -273,8 +300,7 @@ a warning in its log.
 An agent started as any other user just runs as them, with no helper. The built-in
 actions then see what that user can: `disk_io` only its own processes, and
 `disk_space` only folders it can read. They say what they couldn't see, and
-`disk_space` shows the space it couldn't account for. An action that names another
-`user` fails, saying why.
+`disk_space` shows the space it couldn't account for.
 
 On macOS, even root can't read some folders, such as other people's Desktop and
 Mail, until the agent is given **Full Disk Access** in System Settings, under Privacy

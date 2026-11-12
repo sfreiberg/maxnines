@@ -82,19 +82,23 @@ state_dir = "data.nosync"
 #   command = ["/usr/bin/du", "-x", "-h", "--max-depth=2", "{disk}"]
 # }
 #
-# An action that needs to be someone else says who, which takes an agent that was
-# started as root (see below):
+# A command always runs as the agent's user. One that needs more uses sudo, with
+# a sudoers rule letting that user run exactly this command, and
+# no_new_privileges turned off below:
 # action "restart_nginx" {
-#   command = ["/usr/bin/systemctl", "restart", "nginx"]
-#   user    = "root"
+#   command = ["/usr/bin/sudo", "-n", "/usr/bin/systemctl", "restart", "nginx"]
 # }
 
 # An agent started as root gives that up before it connects to anything. It
 # becomes the maxnines user, if there is one, and leaves behind a small helper
-# that stays root. The helper never touches the network and only does two things
-# when the agent asks: the built-in disk_io and disk_space actions, which see
-# everything that way, and actions above that name a user. An agent started as
-# anyone else just runs as them.
+# that stays root. The helper never touches the network and never starts a
+# program. It only does the built-in disk_io and disk_space actions when the
+# agent asks, which see everything that way. An agent started as anyone else
+# just runs as them.
 #
 # run_as            = "maxnines"   # who to become. "root" stays root
 # privileged_helper = true         # false gives up root without keeping a helper
+#
+# On Linux, nothing the agent starts can gain rights it doesn't have, which is
+# what stops sudo working. Turn that off if your actions use sudo:
+# no_new_privileges = false

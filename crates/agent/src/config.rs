@@ -41,7 +41,7 @@ pub struct Config {
     pub actions: Actions,
     /// Whether the server can ask for the actions built into the agent, which
     /// list what's running here and where disk space is going.
-    #[serde(default = "default_built_in_actions")]
+    #[serde(default = "enabled")]
     pub built_in_actions: bool,
     /// Who an agent started as root becomes. Without this it's `maxnines`, if
     /// there's such a user, and otherwise it stays root.
@@ -49,17 +49,19 @@ pub struct Config {
     #[cfg_attr(not(unix), allow(dead_code))]
     pub run_as: Option<String>,
     /// Whether an agent started as root keeps a small helper that stays root, for
-    /// the built-in actions that see more that way and actions that name a user.
-    #[serde(default = "default_privileged_helper")]
+    /// the built-in actions that see more that way.
+    #[serde(default = "enabled")]
     #[cfg_attr(not(unix), allow(dead_code))]
     pub privileged_helper: bool,
+    /// Whether, on Linux, nothing the agent starts can gain rights it doesn't
+    /// have, as a setuid program would. Turning it off is what lets an action's
+    /// command use `sudo`.
+    #[serde(default = "enabled")]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub no_new_privileges: bool,
 }
 
-fn default_privileged_helper() -> bool {
-    true
-}
-
-fn default_built_in_actions() -> bool {
+fn enabled() -> bool {
     true
 }
 

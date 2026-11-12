@@ -4,6 +4,9 @@
 //! the server can only pick from what's defined here, and add a few values from the
 //! alert an action runs for. Commands run directly, without a shell, and each value
 //! stays inside the argument that names it.
+//!
+//! A command always runs as the agent's own user. One that needs more goes through
+//! `sudo`, so that what it may do is written in the system's own rules, by root.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -44,11 +47,6 @@ const MAX_WAITING: usize = 8;
 pub struct Action {
     /// The program, then its arguments, which can name variables like `{disk}`.
     pub command: Vec<String>,
-    /// Who it runs as, when that isn't the agent's own user, such as `root` for
-    /// restarting a service. It takes an agent that was started as root, which
-    /// keeps a small helper with those rights and gives up its own.
-    #[serde(default)]
-    pub user: Option<String>,
 }
 
 /// Everything the agent's config defines, by name.
@@ -77,10 +75,6 @@ pub fn check_actions(actions: &Actions) -> Result<()> {
             variables_used(std::slice::from_ref(program)).is_empty(),
             "action {name:?} can only use variables in its arguments, not its program"
         );
-        ensure!(
-            action.user.as_deref() != Some(""),
-            "action {name:?} has an empty user"
-        );
     }
     Ok(())
 }
@@ -100,10 +94,6 @@ pub fn facts(actions: &Actions, built_ins: bool) -> (Value, Value) {
     variables.retain(|_, used| !used.is_empty());
     (json!(names), json!(variables))
 }
-
-/// The built-in actions that see more as root, so they're run by the privileged
-/// helper when there is one. The others see everything as anyone.
-pub const PRIVILEGED_BUILT_INS: [&str; 2] = ["disk_io", "disk_space"];
 
 /// How a run ended, before it's given the server's `id`. This is also what the
 /// privileged helper answers with.
@@ -133,31 +123,21 @@ impl Ended {
     }
 }
 
-/// Who a command runs as, when it isn't whoever is running it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RunAs {
-    pub uid: u32,
-    pub gid: u32,
-}
-
 /// What can be run here, and how. The agent has one, and so does its privileged
-/// helper, each from the config file as root left it, so neither takes the
-/// other's word for what an action is.
+/// helper. The helper's has no commands in it: it never starts a program.
 pub struct Executor {
     actions: Actions,
     /// Whether the actions built into the agent can be asked for.
     built_ins: bool,
-    /// Where the agent keeps its own files. The helper has none, as a folder the
-    /// agent's user can write to is no place for root to write.
+    /// Where this process keeps its own files. The helper's is a folder of its
+    /// own, as one the agent's user can write to is no place for root to write.
     state_dir: Option<PathBuf>,
 }
 
 /// What was asked for, once it's been found and checked.
-enum Found<'a> {
-    Command {
-        action: &'a Action,
-        command: Vec<String>,
-    },
+enum Found {
+    /// A command from the config, with what it was given filled in.
+    Command(Vec<String>),
     BuiltIn(&'static BuiltIn),
 }
 
@@ -176,11 +156,10 @@ impl Executor {
         name: &str,
         variables: &BTreeMap<String, String>,
         timeout_secs: u64,
-    ) -> Result<Found<'_>, Ended> {
+    ) -> Result<Found, Ended> {
         let built_in = builtin_actions::find(name).filter(|_| self.built_ins);
         let found = match (self.actions.get(name), built_in) {
-            (Some(action), _) => fill_variables(&action.command, variables)
-                .map(|command| Found::Command { action, command }),
+            (Some(action), _) => fill_variables(&action.command, variables).map(Found::Command),
             (None, Some(built_in)) => {
                 check_given(built_in.variables, variables).map(|()| Found::BuiltIn(built_in))
             }
@@ -198,8 +177,8 @@ impl Executor {
         Ok(found)
     }
 
-    /// Runs an action as whoever this process is, handing what needs more to the
-    /// privileged helper, if there is one.
+    /// Runs an action as whoever this process is, handing the built-ins that see
+    /// more as root to the privileged helper, if there is one.
     async fn run_here(
         &self,
         name: &str,
@@ -211,25 +190,11 @@ impl Executor {
             Err(ended) => return ended,
         };
         let limit = Duration::from_secs(timeout_secs);
-        let helper = privileges::helper();
         match found {
-            Found::Command { action, command } => match &action.user {
-                Some(user) if !privileges::is_current_user(user) => {
-                    let asked = match helper {
-                        Some(helper) => helper.ask(name, variables, timeout_secs).await,
-                        None => None,
-                    };
-                    asked.unwrap_or_else(|| {
-                        let error =
-                            format!("it runs as {user}, which takes an agent started as root");
-                        Ended::without_running(ActionOutcome::Failed, error)
-                    })
-                }
-                _ => run_command(&command, limit, None).await,
-            },
+            Found::Command(command) => run_command(&command, limit).await,
             Found::BuiltIn(built_in) => {
-                if let Some(helper) = helper
-                    && PRIVILEGED_BUILT_INS.contains(&built_in.name)
+                if built_in.privileged
+                    && let Some(helper) = privileges::helper()
                     && let Some(ended) = helper.ask(name, variables, timeout_secs).await
                 {
                     return ended;
@@ -240,10 +205,9 @@ impl Executor {
         }
     }
 
-    /// Runs an action for the agent, as the privileged helper. Only what needs
-    /// its rights is run: a built-in that sees more as root, or a command whose
-    /// config names who it runs as. Anything else is the agent's to run itself,
-    /// so the agent can't get its own commands run as root by asking.
+    /// Runs an action for the agent, as the privileged helper. Only the built-ins
+    /// that see more as root are run. Anything else is the agent's to run itself,
+    /// so nothing the agent asks for gets a program started as root.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub async fn run_privileged(
         &self,
@@ -257,21 +221,10 @@ impl Executor {
         };
         let limit = Duration::from_secs(timeout_secs);
         match found {
-            Found::Command { action, command } => {
-                let Some(user) = &action.user else {
-                    return Ended::refused("it runs as the agent's own user");
-                };
-                match privileges::look_up(user) {
-                    Ok(run_as) => run_command(&command, limit, Some(run_as)).await,
-                    Err(error) => {
-                        Ended::without_running(ActionOutcome::Failed, format!("{error:#}"))
-                    }
-                }
+            Found::BuiltIn(built_in) if built_in.privileged => {
+                run_built_in(built_in, variables, limit, self.state_dir.clone()).await
             }
-            Found::BuiltIn(built_in) if PRIVILEGED_BUILT_INS.contains(&built_in.name) => {
-                run_built_in(built_in, variables, limit, None).await
-            }
-            Found::BuiltIn(_) => Ended::refused("it doesn't need the helper"),
+            Found::BuiltIn(_) | Found::Command(_) => Ended::refused("it's the agent's to run"),
         }
     }
 }
@@ -404,8 +357,8 @@ async fn read_some(reader: Option<impl AsyncRead + Unpin>, kept: &mut Vec<u8>) {
     }
 }
 
-/// Runs a command, as `run_as` if that's given, which only root can do.
-async fn run_command(command: &[String], limit: Duration, run_as: Option<RunAs>) -> Ended {
+/// Runs a command as whoever this process is.
+async fn run_command(command: &[String], limit: Duration) -> Ended {
     let Some((program, arguments)) = command.split_first() else {
         return Ended::without_running(ActionOutcome::Failed, "it has no command");
     };
@@ -419,17 +372,6 @@ async fn run_command(command: &[String], limit: Duration, run_as: Option<RunAs>)
     // Its own group, so that what it starts can be stopped along with it.
     #[cfg(unix)]
     starting.process_group(0);
-    // The group is set first, and with a user set the standard library also drops
-    // every other group the starting process was in.
-    #[cfg(unix)]
-    if let Some(run_as) = run_as {
-        starting.gid(run_as.gid).uid(run_as.uid);
-    }
-    #[cfg(not(unix))]
-    if run_as.is_some() {
-        let error = "running as another user isn't supported on this system";
-        return Ended::without_running(ActionOutcome::Failed, error);
-    }
 
     let mut child = match starting.spawn() {
         Ok(child) => child,
@@ -507,7 +449,6 @@ mod tests {
     fn action(command: &[&str]) -> Action {
         Action {
             command: command.iter().map(|part| (*part).to_string()).collect(),
-            user: None,
         }
     }
 

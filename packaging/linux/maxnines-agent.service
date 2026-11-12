@@ -6,7 +6,10 @@ After=network-online.target
 
 [Service]
 # Started as root, it becomes the maxnines user before it connects to anything,
-# and leaves a small helper as root for the actions that need it. Its folder for
+# and leaves a small helper as root for the built-in actions that need it. It
+# also stops what it starts gaining rights, which NoNewPrivileges would do here,
+# unless its config says no_new_privileges = false, for actions that use sudo.
+# Its folder for
 # its key, its last config and samples waiting to be sent is made by the package,
 # as systemd would hand a folder it made to root.
 ExecStart=/usr/bin/maxnines-agent --config /etc/maxnines/agent.hcl
@@ -15,7 +18,6 @@ Restart=on-failure
 RestartSec=5
 # It only reads the machine, apart from its own folder. Custom metric commands and
 # actions run with these limits too.
-NoNewPrivileges=yes
 ProtectSystem=full
 PrivateTmp=yes
 

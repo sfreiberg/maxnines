@@ -523,8 +523,7 @@ pub fn report(asked: &Asked) -> Result<String> {
     let own_line = share_of(usage.map_or(scan.root.total, |(used, _)| used));
     let held = held_open(root, asked.deadline);
 
-    // The privileged helper has no folder of its own, and mustn't write as root
-    // where the agent's user could have left a link, so it only remembers.
+    // A process with no folder of its own only remembers until it stops.
     let file = asked.state_dir.map(remembered_file);
     let mut remembered: Remembered = match &file {
         Some(file) => fs::read(file)

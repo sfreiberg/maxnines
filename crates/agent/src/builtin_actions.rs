@@ -26,7 +26,7 @@ pub struct Asked<'a> {
     pub variables: &'a BTreeMap<String, String>,
     /// When to stop and report what's been found so far.
     pub deadline: Instant,
-    /// Where the agent keeps its own files, if this process has such a place.
+    /// Where this process keeps its own files, if it has such a place.
     pub state_dir: Option<&'a Path>,
 }
 
@@ -34,6 +34,9 @@ pub struct BuiltIn {
     pub name: &'static str,
     /// The variables it has to be given.
     pub variables: &'static [&'static str],
+    /// Whether it sees more as root, so the privileged helper runs it when there
+    /// is one. The others see everything as anyone.
+    pub privileged: bool,
     pub run: fn(&Asked) -> Result<String>,
 }
 
@@ -42,21 +45,25 @@ pub const BUILT_INS: [BuiltIn; 4] = [
     BuiltIn {
         name: "top_cpu",
         variables: &[],
+        privileged: false,
         run: |_| top_processes(By::Cpu),
     },
     BuiltIn {
         name: "top_memory",
         variables: &[],
+        privileged: false,
         run: |_| top_processes(By::Memory),
     },
     BuiltIn {
         name: "disk_io",
         variables: &[],
+        privileged: true,
         run: |_| disk_io(),
     },
     BuiltIn {
         name: "disk_space",
         variables: &["disk"],
+        privileged: true,
         run: disk_space::report,
     },
 ];

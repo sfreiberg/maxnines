@@ -6,9 +6,9 @@ set -eu
 
 if command -v apt-get >/dev/null; then
   apt-get update -qq
-  apt-get install -y -qq ./packages/*.deb
+  apt-get install -y -qq sudo ./packages/*.deb
 else
-  dnf install -y -q ./packages/*.rpm
+  dnf install -y -q sudo ./packages/*.rpm
 fi
 
 id maxnines
@@ -30,34 +30,49 @@ as_service maxnines-agent --config /etc/maxnines/agent.hcl facts >/dev/null
 as_service maxnines-server --config /etc/maxnines/server.hcl users list
 
 # Started as root, as its service is, the agent gives that up and keeps a helper
-# that doesn't. An action runs as the agent's user unless its config names
-# another, and nothing the agent's user can't do gets done by asking.
+# that doesn't. An action's command always runs as the agent's user.
 cat >>/etc/maxnines/agent.hcl <<'ACTIONS'
 action "who" {
   command = ["/usr/bin/id", "-un"]
 }
-action "who_as_root" {
-  command = ["/usr/bin/id", "-un"]
-  user    = "root"
+action "who_with_sudo" {
+  command = ["/usr/bin/sudo", "-n", "/usr/bin/id", "-un"]
 }
 ACTIONS
 agent_action() {
   maxnines-agent --config /etc/maxnines/agent.hcl action "$@"
 }
 test "$(agent_action who)" = "maxnines"
-test "$(agent_action who_as_root)" = "root"
-# Not started as root, there's no helper, so an action can't be anyone else.
 test "$(as_service maxnines-agent --config /etc/maxnines/agent.hcl action who)" = "maxnines"
-if as_service maxnines-agent --config /etc/maxnines/agent.hcl action who_as_root; then
+# One that needs more uses sudo, which works only once the agent's config lets
+# what it starts gain rights, however it was started.
+echo 'maxnines ALL=(root) NOPASSWD: /usr/bin/id' >/etc/sudoers.d/maxnines
+chmod 0440 /etc/sudoers.d/maxnines
+if agent_action who_with_sudo; then
   exit 1
 fi
-# The helper reads what only root can, for the built-in actions that need it.
+if as_service maxnines-agent --config /etc/maxnines/agent.hcl action who_with_sudo; then
+  exit 1
+fi
+echo 'no_new_privileges = false' >>/etc/maxnines/agent.hcl
+test "$(agent_action who_with_sudo)" = "root"
+test "$(as_service maxnines-agent --config /etc/maxnines/agent.hcl action who_with_sudo)" = "root"
+# The helper reads what only root can, for the built-in actions that need it,
+# and keeps what it saw where only root can write.
 install -d -m 0700 /srv/only-root
 head -c 4194304 /dev/zero >/srv/only-root/file
 agent_action disk_space disk=/srv/only-root | grep -q "/srv/only-root"
+test "$(stat -c '%U %a' /var/lib/maxnines-agent-helper)" = "root 700"
+test -f /var/lib/maxnines-agent-helper/disk_space.json
 if as_service maxnines-agent --config /etc/maxnines/agent.hcl action disk_space disk=/srv/only-root; then
   exit 1
 fi
+# It won't start with a folder its user can't write to, rather than fail later.
+chown root /var/lib/maxnines-agent
+if agent_action who; then
+  exit 1
+fi
+chown maxnines /var/lib/maxnines-agent
 # And the agent itself really has stopped being root: of its two processes, the
 # one that runs actions is maxnines and the helper is root.
 test "$(agent_action top_cpu | awk '$NF == "maxnines-agent" { print $2 }' | sort -u | tr '\n' ' ')" = "maxnines root "

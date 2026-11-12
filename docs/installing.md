@@ -9,7 +9,7 @@ Set up the server first, as agents report to it.
 The `.deb` and `.rpm` packages install each program as a systemd service that runs
 as a `maxnines` user, with its config in `/etc/maxnines` and its data in `/var/lib`.
 The agent is started as root and [gives that up](agents.md#running-as-root-and-giving-it-up)
-before it connects, keeping a small helper for the actions that need it.
+before it connects, keeping a small helper for the built-in actions that need it.
 Download the ones for your system, then install them:
 
 ```sh

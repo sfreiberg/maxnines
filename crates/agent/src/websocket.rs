@@ -412,12 +412,12 @@ mod tests {
                     command: ["/bin/echo", "hello", "{hostname}"]
                         .map(str::to_string)
                         .to_vec(),
-                    user: None,
                 },
             )]),
             built_in_actions: false,
             run_as: None,
             privileged_helper: true,
+            no_new_privileges: true,
         }
     }
 
