@@ -83,8 +83,7 @@ state_dir = "data.nosync"
 # }
 #
 # A command always runs as the agent's user. One that needs more uses sudo, with
-# a sudoers rule letting that user run exactly this command, and
-# no_new_privileges turned off below:
+# a sudoers rule letting that user run exactly this command:
 # action "restart_nginx" {
 #   command = ["/usr/bin/sudo", "-n", "/usr/bin/systemctl", "restart", "nginx"]
 # }
@@ -99,6 +98,6 @@ state_dir = "data.nosync"
 # run_as            = "maxnines"   # who to become. "root" stays root
 # privileged_helper = true         # false gives up root without keeping a helper
 #
-# On Linux, nothing the agent starts can gain rights it doesn't have, which is
-# what stops sudo working. Turn that off if your actions use sudo:
-# no_new_privileges = false
+# On Linux, this stops everything the agent starts gaining rights it doesn't
+# have. It stops sudo working too, so it's for hosts whose actions don't use it:
+# no_new_privileges = true

@@ -252,23 +252,21 @@ action "restart_nginx" {
 
 The agent never runs your commands as root itself. A command that needs it, such as
 restarting a service, asks `sudo`, so what the agent's user may do is written in
-the system's own rules, where you already look for that. Two things make it work:
+the system's own rules, where you already look for that. It takes a sudoers rule
+for exactly that command, in a file such as `/etc/sudoers.d/maxnines`:
 
-1. A sudoers rule for exactly that command, in a file such as
-   `/etc/sudoers.d/maxnines`:
-
-   ```
-   maxnines ALL=(root) NOPASSWD: /usr/bin/systemctl restart nginx
-   ```
-
-2. On Linux, `no_new_privileges = false` in the agent's config. By default the
-   agent stops everything it starts from gaining rights it doesn't have, which is
-   what `sudo` does. Turning that off means a setuid program anywhere on the host
-   works for the agent's user as it would for any other user.
+```
+maxnines ALL=(root) NOPASSWD: /usr/bin/systemctl restart nginx
+```
 
 Write the rule for the whole command, not just the program. A rule that takes a
 value from an alert, like `{disk}`, lets anyone who can run actions choose that
 value, so keep those to commands that are safe whatever they're given.
+
+On a Linux host whose actions don't use `sudo`, `no_new_privileges = true` in the
+agent's config stops everything the agent starts gaining rights it doesn't have,
+through `sudo` or any other setuid program. Someone who took over the agent would
+then be left with only what its user can do.
 
 ### Running as root, and giving it up
 

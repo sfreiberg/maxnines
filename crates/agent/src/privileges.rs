@@ -405,8 +405,9 @@ mod unix {
     ///
     /// Call this before anything starts a thread, which means before the runtime.
     pub fn split(config: &Config) -> Result<()> {
-        // Nothing either process starts from here on can gain rights, such as
-        // through sudo. Giving up root below isn't gaining any, so it still works.
+        // Asked for in the config: nothing either process starts from here on can
+        // gain rights, such as through sudo. Giving up root below isn't gaining
+        // any, so it still works.
         #[cfg(target_os = "linux")]
         if config.no_new_privileges {
             nix::sys::prctl::set_no_new_privs().context("giving up gaining rights")?;
