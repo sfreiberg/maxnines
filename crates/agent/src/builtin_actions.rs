@@ -26,8 +26,8 @@ pub struct Asked<'a> {
     pub variables: &'a BTreeMap<String, String>,
     /// When to stop and report what's been found so far.
     pub deadline: Instant,
-    /// Where the agent keeps its own files.
-    pub state_dir: &'a Path,
+    /// Where the agent keeps its own files, if this process has such a place.
+    pub state_dir: Option<&'a Path>,
 }
 
 pub struct BuiltIn {

@@ -7,4 +7,8 @@ if [ "$1" = "configure" ] && [ ! -e /etc/maxnines/agent.hcl ]; then
   install -d -m 0755 /etc/maxnines
   install -m 0640 -o root -g maxnines /usr/share/maxnines/agent.hcl /etc/maxnines/agent.hcl
 fi
+# Where it keeps its key and what it hasn't sent yet. The agent's own user owns it.
+if [ "$1" = "configure" ] && [ ! -e /var/lib/maxnines-agent ]; then
+  install -d -m 0750 -o maxnines -g maxnines /var/lib/maxnines-agent
+fi
 #DEBHELPER#

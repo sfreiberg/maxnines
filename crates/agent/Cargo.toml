@@ -22,13 +22,18 @@ serde_json.workspace = true
 sysinfo = "0.40.1"
 # Asks the resolver for the host's fully qualified name, as `hostname -f` does.
 dns-lookup = "4"
-tokio = { version = "1.54.1", features = ["io-util", "rt", "macros", "process", "time", "signal", "sync"] }
+tokio = { version = "1.54.1", features = ["io-util", "net", "rt", "macros", "process", "time", "signal", "sync"] }
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 tracing.workspace = true
 webpki-roots = "0.26"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = ["fs", "process", "std"] }
+# For giving up root when started as it: changing user, splitting off the helper that
+# keeps it, and passing signals on. libc is only for setting a user's groups, which nix
+# leaves out on macOS.
+nix = { version = "0.31", default-features = false, features = ["fs", "process", "signal", "user"] }
+libc = "0.2"
 
 # Reads containers through Docker's API, which Podman offers too. Only Linux runs
 # containers for real, so the other agents leave it out.

@@ -12,6 +12,7 @@ mod facts;
 mod files;
 mod identity;
 mod own_usage;
+mod privileges;
 mod saved_config;
 mod services;
 mod spool;
@@ -117,6 +118,8 @@ fn try_action(
     variables: Vec<(String, String)>,
     secs: u64,
 ) -> Result<()> {
+    #[cfg(unix)]
+    privileges::split(config)?;
     let runner = actions::Runner::new(
         config.actions.clone(),
         config.built_in_actions,
@@ -241,9 +244,17 @@ impl Monitoring {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn run(path: PathBuf) -> Result<()> {
+/// Reads the config and, if started as root, gives that up before anything else
+/// happens. The config is read first, while it's still certain to be readable.
+fn run(path: PathBuf) -> Result<()> {
     let config = Config::load(&path)?;
+    #[cfg(unix)]
+    privileges::split(&config)?;
+    run_agent(path, config)
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn run_agent(path: PathBuf, config: Config) -> Result<()> {
     let identity = identity::load_or_create(&config.key_file())?;
     let mut link = ServerLink::start(&config, &collector::host_name(), identity)?;
     info!(config = %path.display(), "agent started");

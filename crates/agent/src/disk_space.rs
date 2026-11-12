@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, Metadata, ReadDir};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
@@ -322,18 +323,23 @@ fn held_open(_root: &Path, _deadline: Instant) -> Vec<HeldOpen> {
 }
 
 /// What the last look at each disk found, kept to say what's grown since.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct Remembered {
     #[serde(default)]
     disks: BTreeMap<String, Earlier>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct Earlier {
     at_ms: u64,
     /// Everything in each folder that had a line.
     totals: BTreeMap<String, u64>,
 }
+
+/// What a process with nowhere to save remembers, until it stops.
+static IN_MEMORY: Mutex<Remembered> = Mutex::new(Remembered {
+    disks: BTreeMap::new(),
+});
 
 fn remembered_file(state_dir: &Path) -> PathBuf {
     state_dir.join("disk_space.json")
@@ -517,11 +523,19 @@ pub fn report(asked: &Asked) -> Result<String> {
     let own_line = share_of(usage.map_or(scan.root.total, |(used, _)| used));
     let held = held_open(root, asked.deadline);
 
-    let file = remembered_file(asked.state_dir);
-    let mut remembered: Remembered = fs::read(&file)
-        .ok()
-        .and_then(|saved| serde_json::from_slice(&saved).ok())
-        .unwrap_or_default();
+    // The privileged helper has no folder of its own, and mustn't write as root
+    // where the agent's user could have left a link, so it only remembers.
+    let file = asked.state_dir.map(remembered_file);
+    let mut remembered: Remembered = match &file {
+        Some(file) => fs::read(file)
+            .ok()
+            .and_then(|saved| serde_json::from_slice(&saved).ok())
+            .unwrap_or_default(),
+        None => IN_MEMORY
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone(),
+    };
     let name = root.to_string_lossy().into_owned();
     let text = describe(
         root,
@@ -543,9 +557,14 @@ pub fn report(asked: &Asked) -> Result<String> {
             .collect();
         let at_ms = now_ms();
         remembered.disks.insert(name, Earlier { at_ms, totals });
-        // Only the comparison next time is lost if this can't be saved.
-        if let Ok(saved) = serde_json::to_vec(&remembered) {
-            let _ = fs::write(&file, saved);
+        match &file {
+            // Only the comparison next time is lost if this can't be saved.
+            Some(file) => {
+                if let Ok(saved) = serde_json::to_vec(&remembered) {
+                    let _ = fs::write(file, saved);
+                }
+            }
+            None => *IN_MEMORY.lock().unwrap_or_else(PoisonError::into_inner) = remembered,
         }
     }
     Ok(text)
@@ -731,7 +750,7 @@ mod tests {
         let asked = Asked {
             variables: &variables,
             deadline: later(),
-            state_dir: state.path(),
+            state_dir: Some(state.path()),
         };
         let first = report(&asked).unwrap();
         assert!(!first.contains("CHANGE"), "{first}");
@@ -767,7 +786,7 @@ mod tests {
             let asked = Asked {
                 variables: &variables,
                 deadline: later(),
-                state_dir: state.path(),
+                state_dir: Some(state.path()),
             };
             assert!(report(&asked).is_err(), "{disk:?}");
         }

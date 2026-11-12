@@ -43,6 +43,20 @@ pub struct Config {
     /// list what's running here and where disk space is going.
     #[serde(default = "default_built_in_actions")]
     pub built_in_actions: bool,
+    /// Who an agent started as root becomes. Without this it's `maxnines`, if
+    /// there's such a user, and otherwise it stays root.
+    #[serde(default)]
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub run_as: Option<String>,
+    /// Whether an agent started as root keeps a small helper that stays root, for
+    /// the built-in actions that see more that way and actions that name a user.
+    #[serde(default = "default_privileged_helper")]
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub privileged_helper: bool,
+}
+
+fn default_privileged_helper() -> bool {
+    true
 }
 
 fn default_built_in_actions() -> bool {

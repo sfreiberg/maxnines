@@ -17,7 +17,7 @@ use maxnines_protocol::actions::{
     ActionOutcome, ActionResult, MAX_ACTION_OUTPUT_BYTES, MAX_ACTION_TIMEOUT_SECS, check_variable,
     fill_variables, is_action_name, variables_used,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -27,6 +27,7 @@ use tracing::info;
 
 use crate::builtin_actions::{self, Asked, BUILT_INS, BuiltIn};
 use crate::custom::stop_group;
+use crate::privileges;
 
 const MAX_DEFINITIONS: usize = 64;
 
@@ -43,6 +44,11 @@ const MAX_WAITING: usize = 8;
 pub struct Action {
     /// The program, then its arguments, which can name variables like `{disk}`.
     pub command: Vec<String>,
+    /// Who it runs as, when that isn't the agent's own user, such as `root` for
+    /// restarting a service. It takes an agent that was started as root, which
+    /// keeps a small helper with those rights and gives up its own.
+    #[serde(default)]
+    pub user: Option<String>,
 }
 
 /// Everything the agent's config defines, by name.
@@ -71,6 +77,10 @@ pub fn check_actions(actions: &Actions) -> Result<()> {
             variables_used(std::slice::from_ref(program)).is_empty(),
             "action {name:?} can only use variables in its arguments, not its program"
         );
+        ensure!(
+            action.user.as_deref() != Some(""),
+            "action {name:?} has an empty user"
+        );
     }
     Ok(())
 }
@@ -91,43 +101,193 @@ pub fn facts(actions: &Actions, built_ins: bool) -> (Value, Value) {
     (json!(names), json!(variables))
 }
 
-/// Runs one action at a time, so a host that's already struggling isn't given
-/// several heavy jobs at once.
-pub struct Runner {
-    actions: Actions,
-    /// Whether the actions built into the agent can be asked for.
-    built_ins: bool,
-    /// Where the agent keeps its own files.
-    state_dir: PathBuf,
-    turn: Semaphore,
-    waiting: AtomicUsize,
-}
+/// The built-in actions that see more as root, so they're run by the privileged
+/// helper when there is one. The others see everything as anyone.
+pub const PRIVILEGED_BUILT_INS: [&str; 2] = ["disk_io", "disk_space"];
 
-/// How a run ended, before it's given the server's `id`.
-struct Ended {
-    outcome: ActionOutcome,
-    exit_code: Option<i32>,
-    error: Option<String>,
-    output: Vec<u8>,
+/// How a run ended, before it's given the server's `id`. This is also what the
+/// privileged helper answers with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ended {
+    pub outcome: ActionOutcome,
+    pub exit_code: Option<i32>,
+    pub error: Option<String>,
+    /// What it printed, cut to what's kept.
+    pub output: String,
+    pub truncated: bool,
 }
 
 impl Ended {
-    fn without_running(outcome: ActionOutcome, error: impl Into<String>) -> Self {
+    pub fn without_running(outcome: ActionOutcome, error: impl Into<String>) -> Self {
         Self {
             outcome,
             exit_code: None,
             error: Some(error.into()),
-            output: Vec::new(),
+            output: String::new(),
+            truncated: false,
         }
     }
+
+    fn refused(error: impl Into<String>) -> Self {
+        Self::without_running(ActionOutcome::Refused, error)
+    }
+}
+
+/// Who a command runs as, when it isn't whoever is running it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunAs {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// What can be run here, and how. The agent has one, and so does its privileged
+/// helper, each from the config file as root left it, so neither takes the
+/// other's word for what an action is.
+pub struct Executor {
+    actions: Actions,
+    /// Whether the actions built into the agent can be asked for.
+    built_ins: bool,
+    /// Where the agent keeps its own files. The helper has none, as a folder the
+    /// agent's user can write to is no place for root to write.
+    state_dir: Option<PathBuf>,
+}
+
+/// What was asked for, once it's been found and checked.
+enum Found<'a> {
+    Command {
+        action: &'a Action,
+        command: Vec<String>,
+    },
+    BuiltIn(&'static BuiltIn),
+}
+
+impl Executor {
+    pub fn new(actions: Actions, built_ins: bool, state_dir: Option<&Path>) -> Self {
+        Self {
+            actions,
+            built_ins,
+            state_dir: state_dir.map(Path::to_path_buf),
+        }
+    }
+
+    /// Finds an action and checks what it was asked with, or says why not.
+    fn find(
+        &self,
+        name: &str,
+        variables: &BTreeMap<String, String>,
+        timeout_secs: u64,
+    ) -> Result<Found<'_>, Ended> {
+        let built_in = builtin_actions::find(name).filter(|_| self.built_ins);
+        let found = match (self.actions.get(name), built_in) {
+            (Some(action), _) => fill_variables(&action.command, variables)
+                .map(|command| Found::Command { action, command }),
+            (None, Some(built_in)) => {
+                check_given(built_in.variables, variables).map(|()| Found::BuiltIn(built_in))
+            }
+            (None, None) => {
+                let error = "not defined on this agent";
+                return Err(Ended::without_running(ActionOutcome::NotDefined, error));
+            }
+        };
+        let found = found.map_err(|error| Ended::refused(error.to_string()))?;
+        if !(1..=MAX_ACTION_TIMEOUT_SECS).contains(&timeout_secs) {
+            let error =
+                format!("the time limit has to be from 1 to {MAX_ACTION_TIMEOUT_SECS} seconds");
+            return Err(Ended::refused(error));
+        }
+        Ok(found)
+    }
+
+    /// Runs an action as whoever this process is, handing what needs more to the
+    /// privileged helper, if there is one.
+    async fn run_here(
+        &self,
+        name: &str,
+        variables: &BTreeMap<String, String>,
+        timeout_secs: u64,
+    ) -> Ended {
+        let found = match self.find(name, variables, timeout_secs) {
+            Ok(found) => found,
+            Err(ended) => return ended,
+        };
+        let limit = Duration::from_secs(timeout_secs);
+        let helper = privileges::helper();
+        match found {
+            Found::Command { action, command } => match &action.user {
+                Some(user) if !privileges::is_current_user(user) => {
+                    let asked = match helper {
+                        Some(helper) => helper.ask(name, variables, timeout_secs).await,
+                        None => None,
+                    };
+                    asked.unwrap_or_else(|| {
+                        let error =
+                            format!("it runs as {user}, which takes an agent started as root");
+                        Ended::without_running(ActionOutcome::Failed, error)
+                    })
+                }
+                _ => run_command(&command, limit, None).await,
+            },
+            Found::BuiltIn(built_in) => {
+                if let Some(helper) = helper
+                    && PRIVILEGED_BUILT_INS.contains(&built_in.name)
+                    && let Some(ended) = helper.ask(name, variables, timeout_secs).await
+                {
+                    return ended;
+                }
+                // Without the helper it still runs, and says what it couldn't see.
+                run_built_in(built_in, variables, limit, self.state_dir.clone()).await
+            }
+        }
+    }
+
+    /// Runs an action for the agent, as the privileged helper. Only what needs
+    /// its rights is run: a built-in that sees more as root, or a command whose
+    /// config names who it runs as. Anything else is the agent's to run itself,
+    /// so the agent can't get its own commands run as root by asking.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub async fn run_privileged(
+        &self,
+        name: &str,
+        variables: &BTreeMap<String, String>,
+        timeout_secs: u64,
+    ) -> Ended {
+        let found = match self.find(name, variables, timeout_secs) {
+            Ok(found) => found,
+            Err(ended) => return ended,
+        };
+        let limit = Duration::from_secs(timeout_secs);
+        match found {
+            Found::Command { action, command } => {
+                let Some(user) = &action.user else {
+                    return Ended::refused("it runs as the agent's own user");
+                };
+                match privileges::look_up(user) {
+                    Ok(run_as) => run_command(&command, limit, Some(run_as)).await,
+                    Err(error) => {
+                        Ended::without_running(ActionOutcome::Failed, format!("{error:#}"))
+                    }
+                }
+            }
+            Found::BuiltIn(built_in) if PRIVILEGED_BUILT_INS.contains(&built_in.name) => {
+                run_built_in(built_in, variables, limit, None).await
+            }
+            Found::BuiltIn(_) => Ended::refused("it doesn't need the helper"),
+        }
+    }
+}
+
+/// Runs one action at a time, so a host that's already struggling isn't given
+/// several heavy jobs at once.
+pub struct Runner {
+    executor: Executor,
+    turn: Semaphore,
+    waiting: AtomicUsize,
 }
 
 impl Runner {
     pub fn new(actions: Actions, built_ins: bool, state_dir: &Path) -> Arc<Self> {
         Arc::new(Self {
-            actions,
-            built_ins,
-            state_dir: state_dir.to_path_buf(),
+            executor: Executor::new(actions, built_ins, Some(state_dir)),
             turn: Semaphore::new(1),
             waiting: AtomicUsize::new(0),
         })
@@ -143,7 +303,6 @@ impl Runner {
     ) -> ActionResult {
         let started = Instant::now();
         let ended = self.take_turn(name, variables, timeout_secs).await;
-        let (output, truncated) = text(ended.output);
         info!(
             action = name,
             outcome = ended.outcome.as_str(),
@@ -154,8 +313,8 @@ impl Runner {
             outcome: ended.outcome,
             exit_code: ended.exit_code,
             error: ended.error,
-            output,
-            truncated,
+            output: ended.output,
+            truncated: ended.truncated,
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         }
     }
@@ -166,84 +325,61 @@ impl Runner {
         variables: &BTreeMap<String, String>,
         timeout_secs: u64,
     ) -> Ended {
-        let built_in = builtin_actions::find(name).filter(|_| self.built_ins);
-        let command = match (self.actions.get(name), built_in) {
-            (Some(action), _) => fill_variables(&action.command, variables),
-            (None, Some(built_in)) => check_given(built_in.variables, variables).map(|()| vec![]),
-            (None, None) => {
-                let error = "not defined on this agent";
-                return Ended::without_running(ActionOutcome::NotDefined, error);
-            }
-        };
-        let command = match command {
-            Ok(command) => command,
-            Err(error) => return Ended::without_running(ActionOutcome::Refused, error.to_string()),
-        };
-        if !(1..=MAX_ACTION_TIMEOUT_SECS).contains(&timeout_secs) {
-            return Ended::without_running(
-                ActionOutcome::Refused,
-                format!("the time limit has to be from 1 to {MAX_ACTION_TIMEOUT_SECS} seconds"),
-            );
+        // Checked before waiting, so a request that can't run doesn't take a place.
+        if let Err(ended) = self.executor.find(name, variables, timeout_secs) {
+            return ended;
         }
-
         if self.waiting.fetch_add(1, Ordering::Relaxed) >= MAX_WAITING {
             self.waiting.fetch_sub(1, Ordering::Relaxed);
-            return Ended::without_running(
-                ActionOutcome::Refused,
-                "too many actions are already waiting to run",
-            );
+            return Ended::refused("too many actions are already waiting to run");
         }
         let turn = self.turn.acquire().await;
         self.waiting.fetch_sub(1, Ordering::Relaxed);
         let Ok(_turn) = turn else {
-            return Ended::without_running(ActionOutcome::Refused, "the agent is stopping");
+            return Ended::refused("the agent is stopping");
         };
-        let limit = Duration::from_secs(timeout_secs);
-        match built_in {
-            Some(built_in) if command.is_empty() => {
-                self.run_built_in(built_in, variables, limit).await
-            }
-            _ => run_command(&command, limit).await,
-        }
+        self.executor.run_here(name, variables, timeout_secs).await
     }
+}
 
-    /// Built-in actions run inside the agent, on a thread of their own. They watch
-    /// the time themselves, as a thread can't be stopped from outside.
-    async fn run_built_in(
-        &self,
-        built_in: &'static BuiltIn,
-        variables: &BTreeMap<String, String>,
-        limit: Duration,
-    ) -> Ended {
-        let (variables, state_dir) = (variables.clone(), self.state_dir.clone());
-        let deadline = Instant::now() + limit;
-        let work = tokio::task::spawn_blocking(move || {
-            (built_in.run)(&Asked {
-                variables: &variables,
-                deadline,
-                state_dir: &state_dir,
-            })
-        });
-        let (outcome, error, output) = match timeout(limit + BUILT_IN_GRACE, work).await {
-            Err(_) => (ActionOutcome::TimedOut, None, String::new()),
-            Ok(Err(_)) => (
-                ActionOutcome::Failed,
-                Some("it crashed".to_string()),
-                String::new(),
-            ),
-            Ok(Ok(Err(error))) => (
-                ActionOutcome::Failed,
-                Some(format!("{error:#}")),
-                String::new(),
-            ),
-            Ok(Ok(Ok(output))) => (ActionOutcome::Succeeded, None, output),
-        };
-        Ended {
-            outcome,
-            exit_code: None,
-            error,
-            output: output.into_bytes(),
-        }
+/// Built-in actions run inside the process, on a thread of their own. They watch
+/// the time themselves, as a thread can't be stopped from outside.
+async fn run_built_in(
+    built_in: &'static BuiltIn,
+    variables: &BTreeMap<String, String>,
+    limit: Duration,
+    state_dir: Option<PathBuf>,
+) -> Ended {
+    let variables = variables.clone();
+    let deadline = Instant::now() + limit;
+    let work = tokio::task::spawn_blocking(move || {
+        (built_in.run)(&Asked {
+            variables: &variables,
+            deadline,
+            state_dir: state_dir.as_deref(),
+        })
+    });
+    let (outcome, error, output) = match timeout(limit + BUILT_IN_GRACE, work).await {
+        Err(_) => (ActionOutcome::TimedOut, None, String::new()),
+        Ok(Err(_)) => (
+            ActionOutcome::Failed,
+            Some("it crashed".to_string()),
+            String::new(),
+        ),
+        Ok(Ok(Err(error))) => (
+            ActionOutcome::Failed,
+            Some(format!("{error:#}")),
+            String::new(),
+        ),
+        Ok(Ok(Ok(output))) => (ActionOutcome::Succeeded, None, output),
+    };
+    let (output, truncated) = text(output.into_bytes());
+    Ended {
+        outcome,
+        exit_code: None,
+        error,
+        output,
+        truncated,
     }
 }
 
@@ -268,7 +404,8 @@ async fn read_some(reader: Option<impl AsyncRead + Unpin>, kept: &mut Vec<u8>) {
     }
 }
 
-async fn run_command(command: &[String], limit: Duration) -> Ended {
+/// Runs a command, as `run_as` if that's given, which only root can do.
+async fn run_command(command: &[String], limit: Duration, run_as: Option<RunAs>) -> Ended {
     let Some((program, arguments)) = command.split_first() else {
         return Ended::without_running(ActionOutcome::Failed, "it has no command");
     };
@@ -282,6 +419,17 @@ async fn run_command(command: &[String], limit: Duration) -> Ended {
     // Its own group, so that what it starts can be stopped along with it.
     #[cfg(unix)]
     starting.process_group(0);
+    // The group is set first, and with a user set the standard library also drops
+    // every other group the starting process was in.
+    #[cfg(unix)]
+    if let Some(run_as) = run_as {
+        starting.gid(run_as.gid).uid(run_as.uid);
+    }
+    #[cfg(not(unix))]
+    if run_as.is_some() {
+        let error = "running as another user isn't supported on this system";
+        return Ended::without_running(ActionOutcome::Failed, error);
+    }
 
     let mut child = match starting.spawn() {
         Ok(child) => child,
@@ -330,11 +478,13 @@ async fn run_command(command: &[String], limit: Duration) -> Ended {
             ),
         },
     };
+    let (output, truncated) = text(printed);
     Ended {
         outcome,
         exit_code,
         error,
-        output: printed,
+        output,
+        truncated,
     }
 }
 
@@ -357,6 +507,7 @@ mod tests {
     fn action(command: &[&str]) -> Action {
         Action {
             command: command.iter().map(|part| (*part).to_string()).collect(),
+            user: None,
         }
     }
 

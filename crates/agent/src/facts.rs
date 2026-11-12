@@ -193,6 +193,8 @@ fn gather_named(
             // What the server can ask this host to run, and what each needs to
             // be told, so it can check before asking.
             "actions": action_names,
+            // Whether it was started as root and kept a helper with those rights.
+            "privileged_helper": crate::privileges::helper().is_some(),
             "action_variables": action_variables,
         },
         "custom": custom,
@@ -398,6 +400,7 @@ mod tests {
     fn actions_are_listed_by_name_without_their_commands() {
         let command = |parts: &[&str]| actions::Action {
             command: parts.iter().map(|part| (*part).to_string()).collect(),
+            user: None,
         };
         let actions = Actions::from([
             (

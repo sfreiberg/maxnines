@@ -231,32 +231,63 @@ action "largest_folders" {
 }
 
 action "restart_nginx" {
-  command = ["/usr/bin/sudo", "-n", "/usr/bin/systemctl", "restart", "nginx"]
+  command = ["/usr/bin/systemctl", "restart", "nginx"]
+  user    = "root"
 }
 ```
 
 - **The server can only pick from this list**, and say how long an action gets. The
   agent tells it the names, never the commands.
-- **A command runs directly, not through a shell,** as the agent's user. For pipes,
-  use `["/bin/sh", "-c", "..."]`.
+- **A command runs directly, not through a shell,** as the agent's user unless it
+  names another with `user`. For pipes, use `["/bin/sh", "-c", "..."]`.
 - **Values from the alert** go where an argument names them in braces, like `{disk}`.
   Each stays inside its own argument whatever it holds, and can't start one with a
   dash. The program itself can't be a variable.
-- **An action that changes something needs its own permissions**, such as a sudoers
-  rule letting the agent's user run exactly that command.
+- **An action that needs to be someone else says so with `user`**, such as `root` to
+  restart a service. That takes an agent started as root, as below. It runs with
+  that user's own group and no others.
 - **What it prints goes back to the server**, standard output and then standard
   error, up to 64 KiB. Don't print secrets.
 - **One runs at a time.** Others wait their turn, up to eight.
 
-The agent doesn't run as root, so the built-in ones see what its user can: `disk_io`
-only its own user's processes, and `disk_space` only folders it can read. They say
-what they couldn't see, and `disk_space` shows the space it couldn't account for.
+### Running as root, and giving it up
 
-Try one on the host, as the agent's user, the way the server would run it:
+The Linux packages start the agent as root, and the first thing it does, before it
+connects to anything, is stop being root:
+
+- **The agent becomes the `maxnines` user for good.** It talks to the server and
+  collects as that user, and nothing it starts can gain rights back.
+- **A small helper stays root.** It never opens a network connection, and only
+  hears from the agent. It does two things when asked: runs `disk_io` and
+  `disk_space`, which then see every process and folder, and runs the actions whose
+  config names a `user`.
+- **The helper goes by the config file, not by the agent.** The agent sends an
+  action's name, and the helper runs what the file says that name means. Someone who
+  took over the agent could ask for those actions, and nothing more.
+
+Two settings in the agent's config change this: `run_as = "someone"` chooses who it
+becomes, and `privileged_helper = false` gives up root without keeping a helper.
+Started as root where there's no `maxnines` user and no `run_as`, it stays root, with
+a warning in its log.
+
+An agent started as any other user just runs as them, with no helper. The built-in
+actions then see what that user can: `disk_io` only its own processes, and
+`disk_space` only folders it can read. They say what they couldn't see, and
+`disk_space` shows the space it couldn't account for. An action that names another
+`user` fails, saying why.
+
+On macOS, even root can't read some folders, such as other people's Desktop and
+Mail, until the agent is given **Full Disk Access** in System Settings, under Privacy
+& Security.
+
+Try one on the host, the way the server would run it:
 
 ```sh
-sudo -u maxnines maxnines-agent --config /etc/maxnines/agent.hcl action disk_space disk=/var
+sudo maxnines-agent --config /etc/maxnines/agent.hcl action disk_space disk=/var
 ```
+
+Run as root like that, it splits the way the service does. Run as `maxnines`, it
+shows what an agent without a helper would see.
 
 To stop the server asking for the built-in ones, which name programs and folders,
 set `built_in_actions = false` in the agent's config.
