@@ -1,3 +1,4 @@
+mod actions;
 mod background;
 mod checks;
 mod collector;
@@ -111,7 +112,7 @@ fn main() -> Result<()> {
         }
         Command::Facts => {
             let config = Config::load(&cli.config)?;
-            let facts = facts::gather(&config.facts, &config.custom_metrics)?;
+            let facts = facts::gather(&config.facts, &config.custom_metrics, &config.actions)?;
             println!("{}", serde_json::to_string_pretty(&facts)?);
             Ok(())
         }

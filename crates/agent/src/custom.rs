@@ -248,7 +248,7 @@ fn parse_output(name: &str, output: &[u8]) -> Option<Reading> {
 
 /// Dropping the child only stops the command, not what it started.
 #[cfg(unix)]
-fn stop_group(id: Option<u32>) {
+pub(crate) fn stop_group(id: Option<u32>) {
     use rustix::process::{Pid, Signal, kill_process_group};
 
     let group = id
@@ -261,7 +261,7 @@ fn stop_group(id: Option<u32>) {
 }
 
 #[cfg(not(unix))]
-fn stop_group(_id: Option<u32>) {}
+pub(crate) fn stop_group(_id: Option<u32>) {}
 
 #[cfg(test)]
 mod tests {

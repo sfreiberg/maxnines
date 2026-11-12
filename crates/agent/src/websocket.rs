@@ -24,6 +24,7 @@ use tokio_tungstenite::{
 };
 use tracing::{error, info, warn};
 
+use crate::actions::{Actions, Runner};
 use crate::config::Config;
 use crate::custom::Definitions;
 use crate::facts;
@@ -69,6 +70,12 @@ struct Connection {
     spool: Arc<Spool>,
     custom_facts: BTreeMap<String, Value>,
     custom_metrics: Definitions,
+    actions: Actions,
+    /// Runs what the server asks for, apart from the connection, so a slow action
+    /// never holds up samples or the server's pings.
+    runner: Arc<Runner>,
+    /// For anything to send besides samples, whichever connection is open by then.
+    outgoing: mpsc::Sender<String>,
     facts_every: watch::Receiver<Duration>,
     configs: mpsc::Sender<ConfigUpdate>,
 }
@@ -86,6 +93,7 @@ impl ServerLink {
 
         let (facts_every, facts_every_receiver) = watch::channel(DEFAULT_FACTS_INTERVAL);
         let (config_sender, configs) = mpsc::channel(CONFIG_QUEUE_SIZE);
+        let (config_results, pending) = mpsc::channel(CONFIG_QUEUE_SIZE);
         let spool = Arc::new(Spool::open(&config.sample_queue_folder()));
         let connection = Connection {
             url,
@@ -101,11 +109,13 @@ impl ServerLink {
             spool: spool.clone(),
             custom_facts: config.facts.clone(),
             custom_metrics: config.custom_metrics.clone(),
+            actions: config.actions.clone(),
+            runner: Runner::new(config.actions.clone()),
+            outgoing: config_results.clone(),
             facts_every: facts_every_receiver,
             configs: config_sender,
         };
 
-        let (config_results, pending) = mpsc::channel(CONFIG_QUEUE_SIZE);
         tokio::spawn(stay_connected(connection, pending));
         Ok(Self {
             spool,
@@ -279,6 +289,26 @@ async fn receive(text: &str, connection: &Connection) {
             }
         }
         Ok(ServerMessage::Ack { timestamp_ms }) => connection.spool.acked(timestamp_ms),
+        Ok(ServerMessage::RunAction {
+            id,
+            action,
+            variables,
+            timeout_secs,
+        }) => {
+            let (runner, outgoing) = (connection.runner.clone(), connection.outgoing.clone());
+            tokio::spawn(async move {
+                let result = runner.run(id, &action, &variables, timeout_secs).await;
+                match serde_json::to_string(&AgentMessage::ActionResult(result)) {
+                    // Waits its turn if the connection is down, and goes when it's back.
+                    Ok(text) => {
+                        if outgoing.send(text).await.is_err() {
+                            error!("an action's result was dropped, the agent has stopped");
+                        }
+                    }
+                    Err(error) => error!(%error, "an action's result couldn't be sent"),
+                }
+            });
+        }
         Ok(_) => warn!("ignoring an unexpected message from the server"),
         Err(error) => warn!(%error, "ignoring an invalid message from the server"),
     }
@@ -287,7 +317,11 @@ async fn receive(text: &str, connection: &Connection) {
 /// Sends everything each time and lets the server work out what changed, so a
 /// change can't be lost if the server couldn't save it the first time.
 async fn send_facts(socket: &mut Socket, connection: &Connection) -> Result<()> {
-    let facts = match facts::gather(&connection.custom_facts, &connection.custom_metrics) {
+    let facts = match facts::gather(
+        &connection.custom_facts,
+        &connection.custom_metrics,
+        &connection.actions,
+    ) {
         Ok(facts) => facts,
         Err(error) => {
             warn!(error = format!("{error:#}"), "gathering facts failed");
@@ -342,6 +376,7 @@ async fn read_server_message(socket: &mut Socket) -> Result<ServerMessage> {
 
 #[cfg(test)]
 mod tests {
+    use maxnines_protocol::actions::{ActionOutcome, ActionResult};
     use maxnines_protocol::auth;
     use serde_json::json;
     use tokio::net::TcpListener;
@@ -364,6 +399,14 @@ mod tests {
             state_dir: tempfile::tempdir().unwrap().keep(),
             facts: BTreeMap::from([("role".to_string(), json!("web"))]),
             custom_metrics: Definitions::new(),
+            actions: Actions::from([(
+                "greet".to_string(),
+                crate::actions::Action {
+                    command: ["/bin/echo", "hello", "{hostname}"]
+                        .map(str::to_string)
+                        .to_vec(),
+                },
+            )]),
         }
     }
 
@@ -497,6 +540,66 @@ mod tests {
             };
             assert_eq!(facts["custom"]["role"], "web");
         }
+    }
+
+    /// Facts arrive whenever they're due, so they're skipped over.
+    async fn next_action_result<S>(socket: &mut WebSocketStream<S>) -> ActionResult
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        loop {
+            if let AgentMessage::ActionResult(result) = next_message(socket).await {
+                return result;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reports_its_actions_as_facts() {
+        let (link, mut socket) = connected().await;
+        link.set_facts_interval(Duration::from_millis(50));
+        let AgentMessage::Facts { facts } = next_message(&mut socket).await else {
+            panic!("expected facts");
+        };
+        assert_eq!(facts["agent"]["actions"], json!(["greet"]));
+        assert_eq!(
+            facts["agent"]["action_variables"],
+            json!({ "greet": ["hostname"] })
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runs_an_action_the_server_asks_for_and_sends_what_it_printed() {
+        let (_link, mut socket) = connected().await;
+        let ask = ServerMessage::RunAction {
+            id: "run-1".to_string(),
+            action: "greet".to_string(),
+            variables: BTreeMap::from([("hostname".to_string(), "web-1".to_string())]),
+            timeout_secs: 5,
+        };
+        send_to_agent(&mut socket, &ask).await;
+
+        let result = next_action_result(&mut socket).await;
+        assert_eq!(result.id, "run-1");
+        assert_eq!(result.outcome, ActionOutcome::Succeeded);
+        assert_eq!(result.output, "hello web-1\n");
+    }
+
+    #[tokio::test]
+    async fn an_action_it_does_not_have_is_answered_without_running_anything() {
+        let (_link, mut socket) = connected().await;
+        let ask = ServerMessage::RunAction {
+            id: "run-2".to_string(),
+            action: "reboot".to_string(),
+            variables: BTreeMap::new(),
+            timeout_secs: 5,
+        };
+        send_to_agent(&mut socket, &ask).await;
+
+        let result = next_action_result(&mut socket).await;
+        assert_eq!(result.id, "run-2");
+        assert_eq!(result.outcome, ActionOutcome::NotDefined);
     }
 
     #[tokio::test]

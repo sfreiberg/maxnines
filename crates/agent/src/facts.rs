@@ -9,6 +9,7 @@ use maxnines_protocol::build_info;
 use serde_json::{Value, json};
 use sysinfo::{CpuRefreshKind, IpNetwork, MacAddr, Motherboard, Networks, Product, System};
 
+use crate::actions::{self, Actions};
 use crate::collector;
 use crate::custom::Definitions;
 
@@ -106,20 +107,32 @@ fn network_facts<'a>(
 /// Gathers what this host is, as opposed to what it's doing. Everything here
 /// should rarely change, because each change is kept as history. That's why
 /// swap size, which some systems resize on demand, isn't included.
-pub fn gather(custom: &BTreeMap<String, Value>, metrics: &Definitions) -> Result<Value> {
+pub fn gather(
+    custom: &BTreeMap<String, Value>,
+    metrics: &Definitions,
+    actions: &Actions,
+) -> Result<Value> {
     let hostname = System::host_name().ok();
     let canonical = hostname.as_deref().and_then(canonical_name);
-    gather_named(custom, metrics, hostname.as_deref(), canonical.as_deref())
+    gather_named(
+        custom,
+        metrics,
+        actions,
+        hostname.as_deref(),
+        canonical.as_deref(),
+    )
 }
 
 /// Everything but asking the resolver what the host is called.
 fn gather_named(
     custom: &BTreeMap<String, Value>,
     metrics: &Definitions,
+    actions: &Actions,
     hostname: Option<&str>,
     canonical: Option<&str>,
 ) -> Result<Value> {
     let build = build_info!();
+    let (action_names, action_variables) = actions::facts(actions);
     let mut system = System::new()?;
     system.refresh_memory();
     system.refresh_cpu_list(CpuRefreshKind::nothing());
@@ -174,6 +187,10 @@ fn gather_named(
             "collectors": collector::supported(),
             // Only the names. What they run stays on this host.
             "custom_metrics": metrics.keys().collect::<Vec<_>>(),
+            // What the server can ask this host to run, and what each needs to
+            // be told, so it can check before asking.
+            "actions": action_names,
+            "action_variables": action_variables,
         },
         "custom": custom,
     }))
@@ -186,7 +203,7 @@ mod tests {
 
     #[test]
     fn reports_the_built_in_facts() {
-        let facts = gather(&BTreeMap::new(), &Definitions::new()).unwrap();
+        let facts = gather(&BTreeMap::new(), &Definitions::new(), &Actions::new()).unwrap();
 
         assert_eq!(facts["os"]["family"], std::env::consts::OS);
         assert!(facts["host"]["arch"].is_string());
@@ -323,7 +340,7 @@ mod tests {
 
     #[test]
     fn reports_which_build_this_is() {
-        let facts = gather(&BTreeMap::new(), &Definitions::new()).unwrap();
+        let facts = gather(&BTreeMap::new(), &Definitions::new(), &Actions::new()).unwrap();
         let agent = &facts["agent"];
 
         let commit = agent["commit"].as_str().unwrap();
@@ -340,7 +357,7 @@ mod tests {
         let custom = BTreeMap::from([("role".to_string(), json!("web"))]);
 
         assert_eq!(
-            gather(&custom, &Definitions::new()).unwrap()["custom"]["role"],
+            gather(&custom, &Definitions::new(), &Actions::new()).unwrap()["custom"]["role"],
             "web"
         );
     }
@@ -351,8 +368,10 @@ mod tests {
         // is asked once, as it can answer one time and be too slow the next.
         let custom = BTreeMap::new();
         let none = Definitions::new();
+        let actions = Actions::new();
         let named = |custom, none| {
-            gather_named(custom, none, Some("web-1"), Some("web-1.example.com")).unwrap()
+            let canonical = Some("web-1.example.com");
+            gather_named(custom, none, &actions, Some("web-1"), canonical).unwrap()
         };
         assert_eq!(named(&custom, &none), named(&custom, &none));
     }
@@ -366,9 +385,29 @@ mod tests {
                 timeout_secs: None,
             },
         )]);
-        let facts = gather(&BTreeMap::new(), &metrics).unwrap();
+        let facts = gather(&BTreeMap::new(), &metrics, &Actions::new()).unwrap();
 
         assert_eq!(facts["agent"]["custom_metrics"], json!(["queue"]));
+        assert!(!facts.to_string().contains("secret-tool"));
+    }
+
+    #[test]
+    fn actions_are_listed_by_name_without_their_commands() {
+        let command = |parts: &[&str]| actions::Action {
+            command: parts.iter().map(|part| (*part).to_string()).collect(),
+        };
+        let actions = Actions::from([
+            (
+                "disk_hogs".to_string(),
+                command(&["/opt/secret-tool", "{disk}"]),
+            ),
+            ("restart_nginx".to_string(), command(&["/opt/secret-tool"])),
+        ]);
+        let facts = gather(&BTreeMap::new(), &Definitions::new(), &actions).unwrap();
+
+        let agent = &facts["agent"];
+        assert_eq!(agent["actions"], json!(["disk_hogs", "restart_nginx"]));
+        assert_eq!(agent["action_variables"], json!({ "disk_hogs": ["disk"] }));
         assert!(!facts.to_string().contains("secret-tool"));
     }
 }

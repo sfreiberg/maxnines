@@ -53,3 +53,25 @@ state_dir = "data.nosync"
 #   command      = ["/usr/local/bin/queue-depth", "--name", "mail"]
 #   timeout_secs = 5   # from 1 to 60, 10 if left out
 # }
+
+# Actions the server can ask this host to run, by name, such as when an alert
+# fires or someone presses Run now. What a command prints, to standard output and
+# standard error, goes back to the server, up to 64 KiB, so don't print secrets.
+#
+# The server can only pick from this list, and say how long an action gets. It
+# can pass in a few values from the alert, which a command uses by naming them in
+# braces in its arguments: {disk}, {interface}, {process}, {container}, {check}
+# or {series} for what the alert is about, and {hostname}, {rule}, {severity},
+# {metric}, {value} and {threshold}. A command runs as the agent's user, directly
+# rather than through a shell, and each value stays inside its own argument. Keep
+# this file writable only by its owner, because what's here gets run.
+#
+# action "largest_folders" {
+#   command = ["/usr/bin/du", "-x", "-h", "--max-depth=2", "{disk}"]
+# }
+#
+# An action that changes something needs whatever permissions that takes, such
+# as a sudoers rule letting the agent's user run exactly this command:
+# action "restart_nginx" {
+#   command = ["/usr/bin/sudo", "-n", "/usr/bin/systemctl", "restart", "nginx"]
+# }

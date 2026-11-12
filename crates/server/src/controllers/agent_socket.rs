@@ -458,6 +458,15 @@ fn receive(
             warn!(id = agent.id, "ignoring repeated hello");
             return None;
         }
+        Ok(AgentMessage::ActionResult(result)) => {
+            // Nothing asks for actions yet.
+            warn!(
+                id = agent.id,
+                action_id = result.id,
+                "ignoring an action result"
+            );
+            return None;
+        }
         Err(error) => {
             warn!(id = agent.id, %error, "skipping invalid message");
             return None;

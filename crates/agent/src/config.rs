@@ -7,6 +7,7 @@ use maxnines_protocol::hcl_env::config_context;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::actions::{Actions, check_actions};
 use crate::custom::{Definitions, check_definitions};
 
 const FACTS: &str = "facts";
@@ -17,7 +18,8 @@ const MAX_FACT_NAME_LEN: usize = 255 - "custom.".len();
 
 /// Only what's needed to reach the server. What to monitor comes from the
 /// server, and custom facts stay here because the server's rules match on them.
-/// Custom metrics stay here so that the server can't choose what a host runs.
+/// Custom metrics and actions stay here so that the server can't choose what a host
+/// runs.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -33,6 +35,10 @@ pub struct Config {
     /// these to collect, but can't add to them.
     #[serde(default, rename = "custom_metric")]
     pub custom_metrics: Definitions,
+    /// Commands the server can ask this host to run, by name, such as restarting a
+    /// service. As with custom metrics, it can only pick from these.
+    #[serde(default, rename = "action")]
+    pub actions: Actions,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +80,7 @@ impl Config {
         let mut config: Config = hcl::from_body(body)?;
         config.facts = facts;
         check_definitions(&config.custom_metrics)?;
+        check_actions(&config.actions)?;
         Ok(config)
     }
 }
@@ -240,6 +247,39 @@ mod env_tests {
         assert_eq!(queue.command[2], "mail");
         assert_eq!(queue.timeout_secs, Some(5));
         assert_eq!(config.custom_metrics["disk.temp"].timeout_secs, None);
+    }
+
+    #[test]
+    fn actions_are_read_from_their_blocks() {
+        let server = reachable();
+        let text = format!(
+            r#"{server}
+            action "disk_hogs" {{
+              command = ["/usr/local/bin/disk-hogs", "--top", "20", "{{disk}}"]
+            }}
+            action "restart-nginx" {{
+              command = ["sudo", "systemctl", "restart", "nginx"]
+            }}
+            "#
+        );
+        let config = Config::parse(&text).unwrap();
+
+        assert_eq!(config.actions.len(), 2);
+        assert_eq!(config.actions["disk_hogs"].command[3], "{disk}");
+        assert!(Config::parse(&reachable()).unwrap().actions.is_empty());
+    }
+
+    #[test]
+    fn broken_actions_stop_the_agent_starting() {
+        for block in [
+            "action \"a\" {\n  command = []\n}\n",
+            "action \"a.b\" {\n  command = [\"/bin/true\"]\n}\n",
+            "action \"a\" {\n  command = [\"{series}\"]\n}\n",
+            "action \"a\" {\n  command = [\"/bin/true\"]\n  shell = true\n}\n",
+        ] {
+            let text = format!("{}{block}", reachable());
+            assert!(Config::parse(&text).is_err(), "{block}");
+        }
     }
 
     #[test]

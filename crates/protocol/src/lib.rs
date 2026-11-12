@@ -1,5 +1,6 @@
 //! Types shared by the agent and the server.
 
+pub mod actions;
 pub mod auth;
 pub mod hcl_env;
 pub mod logging;
@@ -647,6 +648,8 @@ pub enum AgentMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// How an action the server asked for went.
+    ActionResult(actions::ActionResult),
 }
 
 /// What the server sends to an agent.
@@ -661,6 +664,17 @@ pub enum ServerMessage {
     Config {
         version: String,
         config: AgentConfig,
+    },
+    /// Asks the agent to run one of its actions, by name. It answers with an
+    /// [`AgentMessage::ActionResult`] carrying the same `id`.
+    RunAction {
+        id: String,
+        action: String,
+        /// Values from the alert it runs for, by variable name.
+        #[serde(default)]
+        variables: BTreeMap<String, String>,
+        /// How long it gets before it's stopped.
+        timeout_secs: u64,
     },
     /// The sample taken at this time is safely stored, so the agent can forget it.
     /// Until then it keeps the sample and sends it again if the connection ends, so
