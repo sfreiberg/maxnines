@@ -2,6 +2,7 @@
 //! Agents report these, and so does the server about the host it's on.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::Path;
 
 use anyhow::Result;
@@ -230,6 +231,27 @@ fn inodes(_mount_point: &Path) -> Option<(u64, u64)> {
     None
 }
 
+/// Whether an interface is worth reporting, from its addresses and how many
+/// packets it has carried since the host started. Systems list many that aren't:
+///
+/// - Loopback, which only ever talks to the host itself.
+/// - One that has never carried a packet, like a port with nothing plugged in or
+///   a tunnel nothing uses. One that has, and then goes down, is still reported,
+///   which is how a link going down is noticed.
+/// - On macOS, one whose only addresses are link-local, which is what it makes
+///   for itself for AirDrop and the like. Elsewhere those are kept, as a network
+///   card that only carries VLANs or belongs to a bond often has no other.
+fn is_reported(addresses: &[IpAddr], packets: u64, macos: bool) -> bool {
+    if addresses.iter().any(IpAddr::is_loopback) || packets == 0 {
+        return false;
+    }
+    let link_local = |address: &IpAddr| match address {
+        IpAddr::V4(address) => address.is_link_local(),
+        IpAddr::V6(address) => address.is_unicast_link_local(),
+    };
+    !(macos && !addresses.is_empty() && addresses.iter().all(link_local))
+}
+
 pub struct NetworkCollector {
     networks: Networks,
     /// Drops at the last sample, as the system keeps running totals.
@@ -257,6 +279,17 @@ impl Collector for NetworkCollector {
         let interfaces: serde_json::Map<String, Value> = self
             .networks
             .iter()
+            .filter(|(_, data)| {
+                let addresses: Vec<IpAddr> = data
+                    .ip_networks()
+                    .iter()
+                    .map(|network| network.addr)
+                    .collect();
+                let packets = data
+                    .total_packets_received()
+                    .saturating_add(data.total_packets_transmitted());
+                is_reported(&addresses, packets, cfg!(target_os = "macos"))
+            })
             .map(|(name, data)| {
                 let mut stats = json!({
                     "received_bytes": data.received(),
@@ -419,12 +452,32 @@ mod tests {
     }
 
     #[test]
+    fn only_interfaces_worth_watching_are_reported() {
+        let address = |text: &str| text.parse::<IpAddr>().unwrap();
+        let lan = [address("192.168.0.155"), address("fe80::1")];
+        let link_local = [address("fe80::1"), address("169.254.3.4")];
+        let loopback = [address("127.0.0.1"), address("::1")];
+        for macos in [false, true] {
+            assert!(is_reported(&lan, 10, macos));
+            // A bond's or bridge's member has no address of its own.
+            assert!(is_reported(&[], 10, macos));
+            assert!(!is_reported(&lan, 0, macos), "never used");
+            assert!(!is_reported(&[], 0, macos), "nothing plugged in");
+            assert!(!is_reported(&loopback, 10, macos));
+        }
+        // What macOS makes for AirDrop, and a card that only carries VLANs.
+        assert!(!is_reported(&link_local, 10, true));
+        assert!(is_reported(&link_local, 10, false));
+    }
+
+    #[test]
     fn interfaces_report_packets_and_errors() {
         let mut collector = NetworkCollector::new().unwrap();
         let output = collector.collect().unwrap();
         let interfaces = output.as_object().unwrap();
 
         assert!(!interfaces.is_empty());
+        assert!(!interfaces.contains_key("lo") && !interfaces.contains_key("lo0"));
         for stats in interfaces.values() {
             assert!(stats["packets_received"].is_u64(), "{stats}");
             assert!(stats["receive_errors"].is_u64(), "{stats}");

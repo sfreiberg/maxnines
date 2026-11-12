@@ -122,7 +122,13 @@ names it's given.
 
 ## Network
 
-Each network interface reports what it received and sent, in bytes and packets, the
+Interfaces that aren't worth watching are left out: loopback, any that has never
+carried a packet since the host started, such as a port with nothing plugged in, and
+on macOS those with only a link-local address, which it makes for AirDrop and the
+like. One that has carried traffic and then goes down is still reported, so its link
+going down can alert.
+
+Each other network interface reports what it received and sent, in bytes and packets, the
 packets it found damaged, and the packets it dropped, which had nowhere to wait because
 the host wasn't keeping up. An interface whose count of dropped packets can't be
 true, such as more than it ever received, reports none: macOS does that for the
