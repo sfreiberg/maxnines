@@ -27,6 +27,11 @@ tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 tracing.workspace = true
 webpki-roots = "0.26"
 
+# Lists the host's sockets and which process holds each, for the connections
+# action. It doesn't cover FreeBSD, which goes without that action.
+[target.'cfg(any(target_os = "linux", target_os = "macos", windows))'.dependencies]
+netstat2 = "0.11"
+
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = ["fs", "process", "std"] }
 # For giving up root when started as it: changing user, splitting off the helper that

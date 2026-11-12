@@ -220,8 +220,9 @@ macOS and Windows, so only the Linux agent reads them.
 
 An action is something the server can ask this host to run, by name, whose output it
 keeps: for an [alert](alerts.md#actions), or when someone presses **Run** on the
-host's Actions page. Four are built into the agent and only look: `top_cpu`,
-`top_memory`, `disk_io` and `disk_space`.
+host's Actions page. Five are built into the agent and only look: `top_cpu`,
+`top_memory`, `disk_io`, `disk_space` and `connections`, which FreeBSD's agent
+doesn't have.
 
 Your own go in the agent's config file, which is the only place one can be added:
 
@@ -271,10 +272,10 @@ connects to anything, is stop being root:
 - **The agent becomes the `maxnines` user for good.** It talks to the server,
   collects, and runs your commands as that user.
 - **A small helper stays root.** It never opens a network connection, and only
-  hears from the agent. It does one thing when asked: runs `disk_io` and
-  `disk_space`, which then see every process and folder.
-- **The helper never starts a program.** Those two actions only look, and they're
-  all it knows. Someone who took over the agent could ask for them, and nothing
+  hears from the agent. It does one thing when asked: runs `disk_io`,
+  `disk_space` and `connections`, which then see every process and folder.
+- **The helper never starts a program.** Those three actions only look, and
+  they're all it knows. Someone who took over the agent could ask for them, and nothing
   more.
 
 The helper keeps what `disk_space` saw last time in `/var/lib/maxnines-agent-helper`
@@ -291,9 +292,10 @@ Started as root where there's no `maxnines` user and no `run_as`, it stays root,
 a warning in its log.
 
 An agent started as any other user just runs as them, with no helper. The built-in
-actions then see what that user can: `disk_io` only its own processes, and
-`disk_space` only folders it can read. They say what they couldn't see, and
-`disk_space` shows the space it couldn't account for.
+actions then see what that user can: `disk_io` only its own processes,
+`connections` only which of its own processes hold sockets, and `disk_space` only
+folders it can read. They say what they couldn't see, and `disk_space` shows the
+space it couldn't account for.
 
 On macOS, even root can't read some folders, such as other people's Desktop and
 Mail, until the agent is given **Full Disk Access** in System Settings, under Privacy

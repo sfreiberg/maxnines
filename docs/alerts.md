@@ -97,7 +97,7 @@ In the rule's **Actions** box, list one per line by name. Each runs once per ale
 An action gets 30 seconds unless `timeout=` says otherwise, up to 600. One that runs
 out of time is stopped, and what it printed until then is kept.
 
-Every agent has four built in, which only look:
+Agents have these built in, which only look:
 
 | Action | Prints |
 | --- | --- |
@@ -105,6 +105,7 @@ Every agent has four built in, which only look:
 | `top_memory` | The 20 processes using the most memory |
 | `disk_io` | The processes reading and writing the most, over a second |
 | `disk_space` | Where the space on the alert's disk is going: up to ten folders that each hold 2% or more of what's used, however deep they are, what couldn't be accounted for, and what changed since it last looked |
+| `connections` | The 20 processes holding the most network connections, how many are in each state, and the ten addresses with the most. Not on FreeBSD |
 
 Anything else is a command in the agent's own config file, as described under
 [agents](agents.md#actions). That's the only place an action can be added, so the

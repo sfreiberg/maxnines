@@ -501,15 +501,19 @@ mod tests {
         assert_eq!(needed, json!({ "disk_hogs": ["disk"] }));
 
         let (names, needed) = facts(&defined, true);
-        let expected = json!([
+        let mut expected = vec![
             "disk_hogs",
             "disk_io",
             "disk_space",
             "restart_nginx",
             "top_cpu",
-            "top_memory"
-        ]);
-        assert_eq!(names, expected);
+            "top_memory",
+        ];
+        // Where the system can say which process holds a socket.
+        if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
+            expected.insert(0, "connections");
+        }
+        assert_eq!(names, json!(expected));
         assert_eq!(
             needed,
             json!({ "disk_hogs": ["disk"], "disk_space": ["disk"] })

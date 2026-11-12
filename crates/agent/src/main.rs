@@ -4,6 +4,8 @@ mod builtin_actions;
 mod checks;
 mod collector;
 mod config;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+mod connections;
 #[cfg(target_os = "linux")]
 mod containers;
 mod custom;

@@ -59,6 +59,12 @@ test -f /var/lib/maxnines-agent-helper/disk_space.json
 if as_service maxnines-agent --config /etc/maxnines/agent.hcl action disk_space disk=/srv/only-root; then
   exit 1
 fi
+# The helper also sees whose every socket is, which the agent's user can't.
+agent_action connections | grep -q "TCP connection"
+if agent_action connections | grep -q "isn't running as root"; then
+  exit 1
+fi
+as_service maxnines-agent --config /etc/maxnines/agent.hcl action connections | grep -q "isn't running as root"
 # It won't start with a folder its user can't write to, rather than fail later.
 chown root /var/lib/maxnines-agent
 if agent_action who; then

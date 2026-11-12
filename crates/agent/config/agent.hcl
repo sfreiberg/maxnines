@@ -71,6 +71,8 @@ state_dir = "data.nosync"
 #   top_memory   the processes using the most memory
 #   disk_io      the processes reading and writing the most
 #   disk_space   where the space on {disk} is going
+#   connections  the processes holding the most network connections, and the
+#                addresses they're with (not on FreeBSD)
 # They name programs and folders, so turn them off if the server shouldn't be
 # able to ask for that:
 # built_in_actions = false
@@ -91,9 +93,9 @@ state_dir = "data.nosync"
 # An agent started as root gives that up before it connects to anything. It
 # becomes the maxnines user, if there is one, and leaves behind a small helper
 # that stays root. The helper never touches the network and never starts a
-# program. It only does the built-in disk_io and disk_space actions when the
-# agent asks, which see everything that way. An agent started as anyone else
-# just runs as them.
+# program. It only does the built-in disk_io, disk_space and connections
+# actions when the agent asks, which see everything that way. An agent started
+# as anyone else just runs as them.
 #
 # run_as            = "maxnines"   # who to become. "root" stays root
 # privileged_helper = true         # false gives up root without keeping a helper

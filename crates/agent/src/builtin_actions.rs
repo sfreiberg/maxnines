@@ -41,7 +41,7 @@ pub struct BuiltIn {
 }
 
 /// Every built-in action this agent has.
-pub const BUILT_INS: [BuiltIn; 4] = [
+pub const BUILT_INS: &[BuiltIn] = &[
     BuiltIn {
         name: "top_cpu",
         variables: &[],
@@ -65,6 +65,13 @@ pub const BUILT_INS: [BuiltIn; 4] = [
         variables: &["disk"],
         privileged: true,
         run: disk_space::report,
+    },
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    BuiltIn {
+        name: "connections",
+        variables: &[],
+        privileged: true,
+        run: |_| crate::connections::report(),
     },
 ];
 
@@ -135,7 +142,7 @@ pub fn table(headings: &[&str], rows: &[Vec<String>]) -> String {
 }
 
 /// Whether the agent can see everything about other users' processes.
-fn sees_everything() -> bool {
+pub fn sees_everything() -> bool {
     #[cfg(unix)]
     {
         rustix::process::geteuid().is_root()
@@ -165,7 +172,7 @@ fn is_running(process: &Process) -> bool {
 }
 
 /// A process's user by name, or by number when the system doesn't know one.
-fn owner(process: &Process, users: &Users) -> String {
+pub fn owner(process: &Process, users: &Users) -> String {
     let Some(id) = process.user_id() else {
         return "?".to_string();
     };
@@ -175,7 +182,7 @@ fn owner(process: &Process, users: &Users) -> String {
     }
 }
 
-fn name(process: &Process) -> String {
+pub fn name(process: &Process) -> String {
     process.name().to_string_lossy().into_owned()
 }
 
