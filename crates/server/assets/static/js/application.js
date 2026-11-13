@@ -101,3 +101,11 @@ document.addEventListener("click", async (event) => {
     }
   }, 2000);
 });
+
+// The docs' contents scroll by themselves, so the page that's open is brought into
+// view: a part of a long chapter is listed well below where the list starts.
+const openDoc = document.querySelector(".docs-contents [aria-current='page']");
+if (openDoc) {
+  const contents = openDoc.closest(".docs-contents");
+  contents.scrollTop = Math.max(0, openDoc.offsetTop - 60);
+}
