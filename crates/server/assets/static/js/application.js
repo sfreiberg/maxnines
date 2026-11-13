@@ -81,9 +81,23 @@ document.addEventListener("click", async (event) => {
   if (!source) return;
   const copied = await copyText(source);
   const shortcut = /Mac|iPhone|iPad/.test(navigator.userAgent) ? "⌘C" : "Ctrl+C";
-  button.textContent = copied ? "Copied" : `Press ${shortcut}`;
+  const said = copied ? "Copied" : `Press ${shortcut}`;
+  // One that's an icon keeps its picture: it shows a tick, or says what to press,
+  // and tells a screen reader either way.
+  const status = button.querySelector(".copy-status");
+  if (status) {
+    button.dataset.state = copied ? "copied" : "manual";
+    status.textContent = said;
+  } else {
+    button.textContent = said;
+  }
   clearTimeout(button.resetLabel);
   button.resetLabel = setTimeout(() => {
-    button.textContent = "Copy";
+    if (status) {
+      delete button.dataset.state;
+      status.textContent = "";
+    } else {
+      button.textContent = "Copy";
+    }
   }, 2000);
 });

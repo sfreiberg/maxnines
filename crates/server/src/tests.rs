@@ -4568,6 +4568,18 @@ async fn the_keys_page_shows_a_new_key_once() {
 
     assert_eq!(created.status, 200, "{}", created.body);
     assert!(created.body.contains("Your new key"));
+    // With a button to copy it, which names the key it copies and stays hidden
+    // until scripts show it.
+    assert!(
+        created
+            .body
+            .contains(r#"<code class="secret" id="new-key">"#)
+    );
+    assert!(
+        created
+            .body
+            .contains(r#"data-copy="new-key" aria-label="Copy the key" title="Copy" hidden>"#)
+    );
     assert!(created.headers.to_lowercase().contains("no-store"));
     let start = created.body.find("mxn_").unwrap();
     let key: String = created.body[start..]

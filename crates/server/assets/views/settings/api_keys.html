@@ -11,7 +11,14 @@
 <section class="card">
   <h2>Your new key</h2>
   <p class="hint">Copy it now. Only a hash of it is kept, so it can't be shown again.</p>
-  <p><code class="secret">{{ new_key }}</code></p>
+  <div class="copyable inline">
+    <code class="secret" id="new-key">{{ new_key }}</code>
+    <button type="button" class="secondary copy icon" data-copy="new-key" aria-label="Copy the key" title="Copy" hidden>
+      <svg class="copy-icon" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1.8" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M10.5 3.2v-.1A1.6 1.6 0 0 0 8.9 1.5H4.1a1.6 1.6 0 0 0-1.6 1.6v4.8a1.6 1.6 0 0 0 1.6 1.6h.1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+      <svg class="copied-icon" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8.6 6.4 12 13 4.6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span class="copy-status" aria-live="polite"></span>
+    </button>
+  </div>
 </section>
 {% endif %}
 
