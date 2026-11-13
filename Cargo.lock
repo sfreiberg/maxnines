@@ -3268,7 +3268,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "maxnines-agent"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "anyhow",
  "bollard",
@@ -3299,7 +3299,7 @@ dependencies = [
 
 [[package]]
 name = "maxnines-checks"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "anyhow",
  "flate2",
@@ -3321,7 +3321,7 @@ dependencies = [
 
 [[package]]
 name = "maxnines-collectors"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "anyhow",
  "libc",
@@ -3338,7 +3338,7 @@ dependencies = [
 
 [[package]]
 name = "maxnines-loadtest"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -3359,7 +3359,7 @@ dependencies = [
 
 [[package]]
 name = "maxnines-protocol"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -3379,7 +3379,7 @@ dependencies = [
 
 [[package]]
 name = "maxnines-server"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "anyhow",
  "argon2",
