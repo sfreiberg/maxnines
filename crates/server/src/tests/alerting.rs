@@ -792,7 +792,8 @@ async fn every_server_starts_with_rules_for_agents_going_offline_and_disks_filli
             "Disk filling up",
             "Disk running out of inodes",
             "Disk will be full soon",
-            "Host offline"
+            "Host offline",
+            "Service stopped"
         ]
     );
 }

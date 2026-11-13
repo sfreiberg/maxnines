@@ -120,6 +120,41 @@ It's off unless a config rule turns it on, under **Collectors**, as it says what
 running on a host. The `processes` collector, by contrast, only answers about the
 names it's given.
 
+## Watching services and processes
+
+A config rule can name services and processes to watch, under **Collectors**, one to
+a line. Only what's named is reported.
+
+**Services** are asked of the system's own service manager, by the name it knows
+them by:
+
+| System | Asks | A name looks like |
+| --- | --- | --- |
+| Linux | systemd | `nginx.service` |
+| macOS | launchd | `com.example.orders`, its label |
+| FreeBSD | `service` | `nginx` |
+| Windows | The service manager | `W3SVC`, its service name, not its display name |
+
+Each service is charted under **Services running** as 1 while it's running and 0 while
+it isn't. One that's starting, paused or failed counts as not running, and so does a
+name the system doesn't know, so a mistyped name shows as stopped, not as missing. The
+built-in **Service stopped** rule alerts once a watched service has been down for 5
+minutes. Two services that run the same program, such as two Java ones, are told
+apart, as each has its own name.
+
+On macOS the agent sees the services of the user it runs as.
+
+**Processes** are for programs that aren't services. Each name is matched against the
+program's name, whatever it was started with, ignoring case and Windows' `.exe`. A name
+reports how many are running, and their CPU and memory use added together, charted as
+**Running processes**, **Process CPU usage** and **Process memory usage**. A name with
+nothing running reports 0, which a rule on **Running processes** below 1 alerts on.
+Programs sharing a name, such as everything run by `java`, are counted together, so
+anything that needs telling apart is better run as a service.
+
+Services stopped with an error are also counted on every Linux and Windows host
+without being named, under [Processes and logins](#processes-and-logins).
+
 ## Network
 
 Two kinds of interface are left out: loopback, and on macOS those with only a

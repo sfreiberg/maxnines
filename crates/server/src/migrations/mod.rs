@@ -15,6 +15,7 @@ impl MigratorTrait for Migrator {
             Box::new(Actions),
             Box::new(ActionNotifications),
             Box::new(ClockRule),
+            Box::new(ServiceRule),
         ]
     }
 }
@@ -2247,6 +2248,47 @@ impl MigrationTrait for ClockRule {
     }
 }
 
+/// For the services a config rule says to watch, which had no rule of their own.
+const SERVICE_RULE: BuiltInRule = BuiltInRule {
+    name: "Service stopped",
+    kind: "metric",
+    metric: Some("service.running"),
+    comparison: Some("below"),
+    threshold: Some(1.0),
+    warning_threshold: None,
+    for_secs: 300,
+    window_secs: None,
+    forecast_secs: None,
+    warning_forecast_secs: None,
+};
+
+struct ServiceRule;
+
+impl MigrationName for ServiceRule {
+    fn name(&self) -> &str {
+        "m20261112_000006_service_rule"
+    }
+}
+
+/// Every server gets a rule about watched services that aren't running.
+#[async_trait::async_trait]
+impl MigrationTrait for ServiceRule {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        add_built_in_rule(manager, &SERVICE_RULE).await
+    }
+
+    /// Only the built-in goes, by its name, as people write rules on this metric
+    /// too. Its alerts and what was sent about them go with it.
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let delete = Query::delete()
+            .from_table(AlertRules::Table)
+            .and_where(Expr::col(AlertRules::Name).eq(SERVICE_RULE.name))
+            .and_where(Expr::col(AlertRules::Metric).eq("service.running"))
+            .to_owned();
+        manager.exec_stmt(delete).await
+    }
+}
+
 #[derive(DeriveIden)]
 enum AlertRuleActions {
     Table,
@@ -2317,6 +2359,7 @@ mod tests {
                 "Disk will be full soon",
                 "Disk running out of inodes",
                 "Clock is wrong",
+                "Service stopped",
             ]
         );
         let settings = "SELECT s.name FROM config_rule_settings s
@@ -2399,8 +2442,8 @@ mod tests {
             "IDs carry on from where they were"
         );
 
-        // The three migrations after it, then this one.
-        Migrator::down(&connection, Some(4)).await.unwrap();
+        // The four migrations after it, then this one.
+        Migrator::down(&connection, Some(5)).await.unwrap();
         assert_eq!(
             count("SELECT target FROM notification_channels").await,
             ["https://new"]
