@@ -8,7 +8,7 @@
 //! that took too long is thrown away.
 //!
 //! The result is saved as a sample dated by the server, as the agent's clock is
-//! what's in question.
+//! what's in question. It says how far apart the clocks are, whichever is ahead.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -78,14 +78,12 @@ fn reading(sent_ms: i64, round_trip: Duration, host_ms: u64) -> Option<Reading> 
 }
 
 impl Reading {
-    /// As a sample from the host, dated by the server. Ahead and behind are
-    /// separate, so a rule that alerts above a number catches either, and says
-    /// which.
+    /// As a sample from the host, dated by the server. Only how far apart the
+    /// clocks are is kept, not which is ahead: either way the host's is wrong,
+    /// and one number is one thing to alert on.
     pub fn sample(self, host_id: &str, hostname: &str, now_ms: i64) -> NewSample {
-        let secs = self.offset_ms as f64 / 1000.0;
         let clock = json!({
-            "ahead_secs": secs.max(0.0),
-            "behind_secs": (-secs).max(0.0),
+            "difference_secs": self.offset_ms.unsigned_abs() as f64 / 1000.0,
             "round_trip_ms": self.round_trip_ms,
         });
         NewSample {
@@ -139,7 +137,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reading_is_saved_as_ahead_or_behind_and_dated_by_the_server() {
+    fn a_reading_is_saved_as_how_far_apart_and_dated_by_the_server() {
         let ahead = Reading {
             offset_ms: 7500,
             round_trip_ms: 12,
@@ -151,8 +149,7 @@ mod tests {
         );
         assert_eq!(saved.sample.timestamp_ms, NOON_MS as u64);
         let clock = &saved.sample.metrics["clock"];
-        assert_eq!(clock["ahead_secs"], 7.5);
-        assert_eq!(clock["behind_secs"], 0.0);
+        assert_eq!(clock["difference_secs"], 7.5);
         assert_eq!(clock["round_trip_ms"], 12);
 
         let behind = Reading {
@@ -160,7 +157,6 @@ mod tests {
             round_trip_ms: 12,
         };
         let clock = &behind.sample("abc", "web-1", NOON_MS).sample.metrics["clock"];
-        assert_eq!(clock["ahead_secs"], 0.0);
-        assert_eq!(clock["behind_secs"], 0.25);
+        assert_eq!(clock["difference_secs"], 0.25);
     }
 }

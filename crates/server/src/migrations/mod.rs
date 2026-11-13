@@ -2212,7 +2212,7 @@ impl MigrationTrait for ActionNotifications {
 const CLOCK_RULE: BuiltInRule = BuiltInRule {
     name: "Clock is wrong",
     kind: "metric",
-    metric: Some("clock.offset"),
+    metric: Some("clock.difference"),
     comparison: Some("above"),
     threshold: Some(30.0),
     warning_threshold: Some(5.0),
@@ -2241,7 +2241,7 @@ impl MigrationTrait for ClockRule {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let delete = Query::delete()
             .from_table(AlertRules::Table)
-            .and_where(Expr::col(AlertRules::Metric).eq("clock.offset"))
+            .and_where(Expr::col(AlertRules::Metric).eq("clock.difference"))
             .to_owned();
         manager.exec_stmt(delete).await
     }

@@ -142,7 +142,7 @@ server times how long the answer took: the reading can be out by half of that, s
 answer that took over a second isn't used and is asked for again a few seconds later.
 
 The difference is charted on the host's page as **Clock difference from the server**,
-with one line for ahead and one for behind, and the built-in **Clock is wrong** rule
+as how far apart the two clocks are, whichever is ahead, and the built-in **Clock is wrong** rule
 warns at 5 seconds and is critical at 30. The reading is dated by the server, as the
 host's clock is the one in question. It compares with the server's clock, so the
 server's own has to be right.
