@@ -4226,7 +4226,16 @@ fn api_routes() -> Vec<(String, String)> {
 
 #[test]
 fn every_api_route_is_documented() {
-    let docs = include_str!("../../../docs/api.md");
+    // The API's pages, which are the chapters named for it.
+    let folder = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs");
+    let mut docs = String::new();
+    for file in std::fs::read_dir(folder).unwrap() {
+        let path = file.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name == "api.md" || (name.starts_with("api-") && name.ends_with(".md")) {
+            docs.push_str(&std::fs::read_to_string(&path).unwrap());
+        }
+    }
     let routes = api_routes();
 
     assert!(routes.len() > 40, "{routes:?}");
@@ -4234,7 +4243,7 @@ fn every_api_route_is_documented() {
         let heading = format!("`{method} /api/v1{path}`");
         assert!(
             docs.contains(&heading),
-            "{method} {path} isn't in docs/api.md"
+            "{method} {path} isn't in the API's pages in docs/"
         );
     }
 }

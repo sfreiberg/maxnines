@@ -50,10 +50,9 @@ fn chapter_page<'a>(
     chapter: &Chapter,
 ) -> Page<'a> {
     Page::new(state, token, "docs/show.html")
-        .with("contents", &docs.contents())
-        .with("current", &chapter.name)
+        .with("contents", &docs.contents(&chapter.name))
         .with("query", "")
-        .with("title", &chapter.title)
+        .with("title", &docs.full_title(chapter))
         .with("html", &chapter.html)
 }
 
@@ -74,8 +73,7 @@ async fn search(
     };
     let query = params.q.trim();
     Page::new(&state, &token, "docs/search.html")
-        .with("contents", &docs.contents())
-        .with("current", "")
+        .with("contents", &docs.contents(""))
         .with("query", query)
         .with("hits", &docs.search(query))
         .render()

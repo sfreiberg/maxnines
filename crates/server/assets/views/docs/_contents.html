@@ -3,7 +3,31 @@
     <input type="search" name="q" value="{{ query }}" placeholder="Search the docs" aria-label="Search the docs">
   </form>
   <ol>
-    {% for entry in contents %}<li><a href="/docs/{{ entry.name }}"{% if entry.name == current %} aria-current="page"{% endif %}>{{ entry.title }}</a></li>
+    {% for entry in contents %}
+    <li>
+      <a href="/docs/{{ entry.name }}"{% if entry.current %} aria-current="page"{% endif %}>{{ entry.title }}</a>
+      {% if entry.outline %}
+      <ol class="docs-outline" aria-label="On this page">
+        {% for heading in entry.outline %}<li><a href="#{{ heading.anchor }}">{{ heading.heading }}</a></li>
+        {% endfor %}
+      </ol>
+      {% endif %}
+      {% if entry.parts %}
+      <ol class="docs-parts">
+        {% for part in entry.parts %}
+        <li>
+          <a href="/docs/{{ part.name }}"{% if part.current %} aria-current="page"{% endif %}>{{ part.title }}</a>
+          {% if part.outline %}
+          <ol class="docs-outline" aria-label="On this page">
+            {% for heading in part.outline %}<li><a href="#{{ heading.anchor }}">{{ heading.heading }}</a></li>
+            {% endfor %}
+          </ol>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ol>
+      {% endif %}
+    </li>
     {% endfor %}
   </ol>
 </nav>

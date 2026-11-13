@@ -11,7 +11,7 @@ automations add; the server records the rest by itself.
 
 | Kind | Where it comes from |
 | --- | --- |
-| **Deploy** and **Note** | Annotations, added by people or [through the API](api.md#annotations) |
+| **Deploy** and **Note** | Annotations, added by people or [through the API](api-annotations.md) |
 | **Restart** | The server notices when a host's boot time moves on, even if it restarted while it couldn't reach the server |
 | **Config change** | An agent applied a different config from its config rules, with which rules it came from |
 | **Alert** and **Resolved** | An alert on the host starting and ending |

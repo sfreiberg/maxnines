@@ -484,12 +484,17 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .credit { margin: 0; color: var(--muted); font-family: var(--mono); font-size: 11px; }
 .map-credit { margin-left: auto; }
 /* Documentation: the chapters beside the page, then the chapter itself. */
-.docs-layout { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 40px; align-items: start; }
-.docs-contents { position: sticky; top: 88px; display: flex; flex-direction: column; gap: 14px; }
+.docs-layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 40px; align-items: start; }
+/* It scrolls by itself, as a long chapter's parts and headings can outgrow the window. */
+.docs-contents { position: sticky; top: 88px; display: flex; flex-direction: column; gap: 14px; max-height: calc(100vh - 104px); overflow-y: auto; }
 .docs-contents ol { display: flex; flex-direction: column; gap: 2px; margin: 0; padding: 0; list-style: none; }
 .docs-contents a { display: block; padding: 6px 10px; border-radius: var(--radius-small); color: var(--muted); font-size: 14px; }
 .docs-contents a:hover { background: var(--surface); color: var(--text); }
 .docs-contents a[aria-current="page"] { background: var(--surface); color: var(--text); font-weight: 500; }
+/* A long chapter's parts, and under whichever page is open, its headings. */
+.docs-contents .docs-parts, .docs-contents .docs-outline { margin: 2px 0 6px 10px; padding-left: 8px; border-left: 1px solid var(--border); gap: 0; }
+.docs-contents .docs-parts a { padding: 5px 10px; font-size: 13.5px; }
+.docs-contents .docs-outline a { padding: 3px 10px; font-size: 13px; }
 .docs-search input { width: 100%; }
 .docs-page { max-width: 820px; min-width: 0; line-height: 1.6; }
 .docs-page h1 { margin-bottom: 20px; }
@@ -518,7 +523,7 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 
 @media (max-width: 60rem) {
   .map-layout, .location-layout, .docs-layout { grid-template-columns: minmax(0, 1fr); }
-  .docs-contents { position: static; order: 2; }
+  .docs-contents { position: static; order: 2; max-height: none; overflow-y: visible; }
   .location-picker { position: static; }
 }
 

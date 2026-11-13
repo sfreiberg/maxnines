@@ -2,7 +2,7 @@
 
 The audit log records every change to the server's setup and every sign in: who did
 it, when, where from, and each field's value before and after. Find it under
-Settings, or read it through the [API](api.md#audit-log). Entries are kept for good,
+Settings, or read it through the [API](api-audit-log.md). Entries are kept for good,
 and there's no way to change or delete them from MaxNines.
 
 ## What's recorded

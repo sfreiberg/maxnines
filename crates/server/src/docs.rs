@@ -4,6 +4,10 @@
 //! `SUMMARY.md` lists the chapters in order, as mdBook reads it, so the same files
 //! can also be built into a website. Links between chapters are written as links
 //! to their files, which works on GitHub and here alike.
+//!
+//! A chapter too long to read as one page is a chapter with others indented under
+//! it, which the contents only list while one of them is open. The contents also
+//! list the headings of the page that's open.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -45,6 +49,10 @@ pub struct Chapter {
     /// As `SUMMARY.md` lists it.
     pub title: String,
     pub html: String,
+    /// The chapter it's listed under, if it's part of a longer one.
+    parent: Option<usize>,
+    /// Its main headings, for getting around a long page.
+    outline: Vec<Heading>,
     sections: Vec<Section>,
     /// Links to other chapters, or within this one, as `chapter#anchor`.
     links: Vec<String>,
@@ -63,11 +71,24 @@ struct Section {
     words: Vec<String>,
 }
 
+/// A heading on a page, and where it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Heading {
+    pub anchor: String,
+    pub heading: String,
+}
+
 /// An entry in the contents beside every page.
 #[derive(Debug, Serialize)]
 pub struct ContentsEntry {
     pub name: String,
     pub title: String,
+    /// Whether it's the page that's open.
+    pub current: bool,
+    /// The chapters under it, listed only while it or one of them is open.
+    pub parts: Vec<ContentsEntry>,
+    /// The headings on it, listed only while it's open.
+    pub outline: Vec<Heading>,
 }
 
 /// A section that has every word searched for.
@@ -96,10 +117,16 @@ impl Docs {
         let syntaxes = two_face::syntax::extra_newlines();
         let mut chapters = Vec::new();
         let mut by_name = HashMap::new();
-        for (title, name) in parse_summary(&summary)? {
+        let mut above = None;
+        for (title, name, is_part) in parse_summary(&summary)? {
             let markdown = file(&format!("{name}.md"))?;
-            let chapter = render(&name, &title, &markdown, &syntaxes)
+            let mut chapter = render(&name, &title, &markdown, &syntaxes)
                 .with_context(|| format!("rendering docs/{name}.md"))?;
+            if is_part {
+                chapter.parent = above;
+            } else {
+                above = Some(chapters.len());
+            }
             ensure!(
                 by_name.insert(name.clone(), chapters.len()).is_none(),
                 "SUMMARY.md lists {name}.md twice"
@@ -126,14 +153,41 @@ impl Docs {
         self.by_name.get(name).map(|&index| &self.chapters[index])
     }
 
-    pub fn contents(&self) -> Vec<ContentsEntry> {
-        self.chapters
-            .iter()
-            .map(|chapter| ContentsEntry {
-                name: chapter.name.clone(),
-                title: chapter.title.clone(),
-            })
-            .collect()
+    /// The contents as they read with `current` open: every chapter, the parts of
+    /// the one it belongs to, and its own headings.
+    pub fn contents(&self, current: &str) -> Vec<ContentsEntry> {
+        let open = self.by_name.get(current).copied();
+        let family = open.map(|index| self.chapters[index].parent.unwrap_or(index));
+        let entry = |index: usize, chapter: &Chapter| ContentsEntry {
+            name: chapter.name.clone(),
+            title: chapter.title.clone(),
+            current: open == Some(index),
+            parts: Vec::new(),
+            outline: match open == Some(index) {
+                true => chapter.outline.clone(),
+                false => Vec::new(),
+            },
+        };
+        let mut contents: Vec<ContentsEntry> = Vec::new();
+        for (index, chapter) in self.chapters.iter().enumerate() {
+            match (chapter.parent, contents.last_mut()) {
+                (None, _) => contents.push(entry(index, chapter)),
+                (Some(parent), Some(above)) if family == Some(parent) => {
+                    above.parts.push(entry(index, chapter));
+                }
+                _ => {}
+            }
+        }
+        contents
+    }
+
+    /// What a chapter is called away from the contents, where one that's part of
+    /// another has to say so: `API: Hosts`.
+    pub fn full_title(&self, chapter: &Chapter) -> String {
+        match chapter.parent {
+            Some(parent) => format!("{}: {}", self.chapters[parent].title, chapter.title),
+            None => chapter.title.clone(),
+        }
     }
 
     /// Sections where each word in `query` starts a word, so "key" finds "keys".
@@ -168,7 +222,7 @@ impl Docs {
                 hits.push((
                     in_heading,
                     Hit {
-                        chapter: chapter.title.clone(),
+                        chapter: self.full_title(chapter),
                         heading: section.heading.clone(),
                         link,
                         excerpt: excerpt(&section.text, &words),
@@ -212,11 +266,13 @@ fn file(name: &str) -> Result<String> {
     String::from_utf8(file.data.into_owned()).with_context(|| format!("docs/{name} isn't text"))
 }
 
-/// The chapters `SUMMARY.md` lists, as `(title, name)`. Anything else in it is
-/// refused, so a mistake there shows up in the tests rather than as a missing page.
-fn parse_summary(summary: &str) -> Result<Vec<(String, String)>> {
-    let mut chapters = Vec::new();
+/// The chapters `SUMMARY.md` lists, as `(title, name, is part of the one above)`.
+/// One indented under another is part of it. Anything else in it is refused, so a
+/// mistake there shows up in the tests rather than as a missing page.
+fn parse_summary(summary: &str) -> Result<Vec<(String, String, bool)>> {
+    let mut chapters: Vec<(String, String, bool)> = Vec::new();
     for line in summary.lines() {
+        let is_part = line.starts_with([' ', '\t']);
         let line = line.trim();
         if line.is_empty() || line.starts_with("# ") {
             continue;
@@ -233,7 +289,11 @@ fn parse_summary(summary: &str) -> Result<Vec<(String, String)>> {
             !name.is_empty() && name.chars().all(simple) && name != "search",
             "chapter names are lowercase letters, digits and hyphens, and not search: {name}"
         );
-        chapters.push((title.to_string(), name.to_string()));
+        ensure!(
+            !is_part || !chapters.is_empty(),
+            "SUMMARY.md starts with a chapter that's part of nothing: {name}"
+        );
+        chapters.push((title.to_string(), name.to_string(), is_part));
     }
     Ok(chapters)
 }
@@ -256,6 +316,7 @@ fn render(name: &str, title: &str, markdown: &str, syntaxes: &SyntaxSet) -> Resu
     }];
     let mut links = Vec::new();
     let mut unusable_links = Vec::new();
+    let mut outline = Vec::new();
     let mut output = Vec::with_capacity(events.len());
     let mut index = 0;
     while index < events.len() {
@@ -271,6 +332,12 @@ fn render(name: &str, title: &str, markdown: &str, syntaxes: &SyntaxSet) -> Resu
                 })?;
                 let heading = plain_text(&events[index + 1..end]);
                 let anchor = anchors.add(&heading);
+                if level == HeadingLevel::H2 {
+                    outline.push(Heading {
+                        anchor: anchor.clone(),
+                        heading: heading.clone(),
+                    });
+                }
                 if level != HeadingLevel::H1 {
                     sections.push(Section {
                         anchor: anchor.clone(),
@@ -381,6 +448,8 @@ fn render(name: &str, title: &str, markdown: &str, syntaxes: &SyntaxSet) -> Resu
         name: name.to_string(),
         title: title.to_string(),
         html: page,
+        parent: None,
+        outline,
         sections,
         links,
         unusable_links,
@@ -691,8 +760,76 @@ mod tests {
     }
 
     #[test]
+    fn a_long_chapter_lists_its_parts_and_a_page_its_headings_only_while_open() {
+        let docs = docs();
+        let names = |entries: &[ContentsEntry]| -> Vec<String> {
+            entries.iter().map(|entry| entry.name.clone()).collect()
+        };
+
+        // Elsewhere, the API is one line.
+        let contents = docs.contents("alerts");
+        let api = contents.iter().find(|entry| entry.name == "api").unwrap();
+        assert!(api.parts.is_empty() && api.outline.is_empty() && !api.current);
+        assert!(!names(&contents).contains(&"api-hosts".to_string()));
+        let alerts = contents
+            .iter()
+            .find(|entry| entry.name == "alerts")
+            .unwrap();
+        assert!(alerts.current);
+        assert_eq!(alerts.outline[0].heading, "The built-in rules");
+        assert_eq!(alerts.outline[0].anchor, "the-built-in-rules");
+
+        // On it, its parts are listed, and its own headings.
+        let contents = docs.contents("api");
+        let api = contents.iter().find(|entry| entry.name == "api").unwrap();
+        assert!(api.current);
+        assert!(names(&api.parts).starts_with(&["api-hosts".to_string()]));
+        assert!(
+            api.outline
+                .iter()
+                .any(|heading| heading.anchor == "getting-started")
+        );
+
+        // On one of its parts, they still are, with that part's headings under it.
+        let contents = docs.contents("api-hosts");
+        let api = contents.iter().find(|entry| entry.name == "api").unwrap();
+        assert!(!api.current && api.outline.is_empty());
+        let hosts = &api.parts[0];
+        assert!(hosts.current);
+        assert_eq!(hosts.outline[0].heading, "List hosts");
+        assert!(api.parts[1].outline.is_empty());
+
+        // A search's results have no page open.
+        assert!(docs.contents("").iter().all(|entry| entry.parts.is_empty()));
+        // Away from the contents, a part says what it's part of.
+        let hits = docs.search("list hosts");
+        assert_eq!(hits[0].chapter, "API: Hosts", "{hits:?}");
+        assert_eq!(hits[0].link, "/docs/api-hosts#list-hosts");
+    }
+
+    #[test]
+    fn no_page_of_the_api_is_too_long_to_read() {
+        let docs = docs();
+        let api = docs.contents("api");
+        let parts = &api.iter().find(|entry| entry.name == "api").unwrap().parts;
+        assert!(parts.len() >= 20, "{}", parts.len());
+        for part in parts {
+            let lines = file(&format!("{}.md", part.name)).unwrap().lines().count();
+            assert!(lines <= 300, "{} has {lines} lines", part.name);
+        }
+    }
+
+    #[test]
     fn summary_lines_must_be_chapters() {
-        assert!(parse_summary("# Summary\n\n- [One](one.md)\n  - [Two](two.md)\n").is_ok());
+        let nested = parse_summary("# Summary\n\n- [One](one.md)\n  - [Two](two.md)\n").unwrap();
+        assert_eq!(
+            nested,
+            [
+                ("One".to_string(), "one".to_string(), false),
+                ("Two".to_string(), "two".to_string(), true)
+            ]
+        );
+        assert!(parse_summary("  - [Two](two.md)\n").is_err());
         for bad in [
             "Some text",
             "- [Up](../up.md)",
