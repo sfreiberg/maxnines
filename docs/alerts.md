@@ -6,7 +6,7 @@ Every server starts with seven alert rules:
 
 | Rule | Fires when | Severity |
 | --- | --- | --- |
-| **Host offline** | An approved host's agent has been gone for 5 minutes | Critical |
+| **Host offline** | An approved host's agent has been gone for a minute | Critical |
 | **Disk filling up** | A disk has been over 80% full for 5 minutes, or over 90% | Warning, then critical |
 | **Disk running out of inodes** | A disk has used over 80% of its [inodes](agents.md#disks) for 5 minutes, or over 90% | Warning, then critical |
 | **Container down** | A container has been failing for a minute, on hosts that report [containers](agents.md#containers) | Critical |

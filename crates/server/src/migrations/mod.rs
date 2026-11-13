@@ -1121,7 +1121,7 @@ const BUILT_IN_RULES: [BuiltInRule; 5] = [
         comparison: None,
         threshold: None,
         warning_threshold: None,
-        for_secs: 300,
+        for_secs: 60,
         window_secs: None,
         forecast_secs: None,
         warning_forecast_secs: None,

@@ -845,7 +845,7 @@ async fn every_server_starts_with_a_rule_for_agents_going_offline() {
 
     assert_eq!(rule.name, "Host offline");
     assert_eq!(rule.kind, RuleKind::Offline);
-    assert_eq!(rule.for_secs, 300);
+    assert_eq!(rule.for_secs, 60);
     assert_eq!(rule.severity, Severity::Critical);
     assert!(rule.enabled);
     assert!(rule.all_channels);
@@ -854,7 +854,7 @@ async fn every_server_starts_with_a_rule_for_agents_going_offline() {
 }
 
 #[tokio::test]
-async fn the_built_in_rule_tells_every_channel_once_an_agent_is_gone_5_minutes() {
+async fn the_built_in_rule_tells_every_channel_once_an_agent_is_gone_a_minute() {
     let mut test = Harness::start().await;
     test.database()
         .create_alert_rule(&built_in_offline_rule().await)
@@ -866,13 +866,13 @@ async fn the_built_in_rule_tells_every_channel_once_an_agent_is_gone_5_minutes()
 
     test.go_offline().await;
     let gone = test.server.state.presence.get(&test.id()).unwrap().since_ms as i64;
-    test.evaluator.evaluate(gone + 299_000).await.unwrap();
+    test.evaluator.evaluate(gone + 59_000).await.unwrap();
     assert!(test.open().await.is_empty());
 
-    test.evaluator.evaluate(gone + 300_000).await.unwrap();
+    test.evaluator.evaluate(gone + 60_000).await.unwrap();
     let open = test.open().await;
     assert_eq!(open.len(), 1);
-    assert_eq!(open[0].summary, "web-1 has been offline for 5 minutes");
+    assert_eq!(open[0].summary, "web-1 has been offline for 1 minute");
     let deliveries = test.database().due_deliveries(i64::MAX, 10).await.unwrap();
     let told: Vec<i64> = deliveries
         .iter()
