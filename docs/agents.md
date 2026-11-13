@@ -268,8 +268,8 @@ history, and an agent reports at most 64.
 
 A container is **up** while it's running and its health check, if it has one, doesn't
 call it unhealthy. One that stopped with an error, keeps restarting, or is unhealthy
-is down, and the built-in **Container down** rule alerts once it has been for 5
-minutes. One that exited cleanly isn't counted either way, as that's a job finishing
+is down, and the built-in **Container down** rule alerts once it has been for a
+minute. One that exited cleanly isn't counted either way, as that's a job finishing
 or a service stopped on purpose.
 
 Other systems run containers inside a Linux virtual machine, as Docker Desktop does on
