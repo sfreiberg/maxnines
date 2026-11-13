@@ -98,6 +98,27 @@ struct CustomRow {
     value: Option<String>,
 }
 
+/// A watched service as its host's service manager last described it.
+#[derive(Serialize)]
+struct ServiceRow {
+    name: String,
+    running: bool,
+    /// The service manager's word for it, when it isn't running.
+    state: Option<String>,
+}
+
+fn service_row(service: &Value) -> Option<ServiceRow> {
+    let running = service["running"].as_u64() == Some(1);
+    Some(ServiceRow {
+        name: service["name"].as_str()?.to_string(),
+        running,
+        state: service["state"]
+            .as_str()
+            .filter(|_| !running)
+            .map(String::from),
+    })
+}
+
 fn custom_row(metric: &Value) -> Option<CustomRow> {
     Some(CustomRow {
         name: metric["name"].as_str()?.to_string(),
@@ -322,11 +343,18 @@ async fn show(
     }
     let counters = readings.pop().unwrap_or_default();
     let custom_metrics = readings.pop().unwrap_or_default();
+    let latest = state.metrics.latest_output(&host.id, "services", now_ms());
+    let services: Vec<ServiceRow> = match latest.await {
+        Ok(Some(Value::Array(items))) => items.iter().filter_map(service_row).collect(),
+        Ok(_) => Vec::new(),
+        Err(error) => return server_error(&error),
+    };
 
     Page::new(&state, &token, "metrics/show.html")
         .with("checks", &checks)
         .with("custom_metrics", &custom_metrics)
         .with("counters", &counters)
+        .with("services", &services)
         .with("is_local", &host.is_local())
         .with("host_id", &host.id)
         .with("hostname", &host.hostname)

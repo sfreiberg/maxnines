@@ -3087,6 +3087,52 @@ async fn a_clock_reading_reaches_the_hosts_charts() {
 }
 
 #[tokio::test]
+async fn watched_services_are_listed_with_what_their_service_manager_says() {
+    let server = start_with_metrics().await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
+    let services = json!([
+        { "name": "sshd.service", "running": 1, "state": "active" },
+        { "name": "nginx.service", "running": 0, "state": "failed" },
+        { "name": "ngnix.service", "running": 0, "state": "not found" },
+    ]);
+    let sample = Sample {
+        timestamp_ms: now_ms() as u64,
+        metrics: BTreeMap::from([("services".to_string(), services)]),
+    };
+    send(&mut client, &AgentMessage::Sample(sample)).await;
+
+    let path = format!("/hosts/{}/metrics", host.id());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let page = loop {
+        let page = Browser::default().get(&server, &path).await;
+        if page.body.contains("Watched services") {
+            break page.body;
+        }
+        assert!(Instant::now() < deadline, "{}", page.body);
+        sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(
+        page.matches(r#"<span class="badge good">Running</span>"#)
+            .count(),
+        1
+    );
+    assert_eq!(
+        page.matches(r#"<span class="badge bad">Not running</span>"#)
+            .count(),
+        2
+    );
+    // Only one that isn't running says what state it's in.
+    for state in ["failed", "not found"] {
+        assert!(
+            page.contains(&format!(r#"<span class="note">{state}</span>"#)),
+            "{state}"
+        );
+    }
+    assert!(!page.contains(r#"<span class="note">active</span>"#));
+}
+
+#[tokio::test]
 async fn samples_from_an_agent_reach_its_charts() {
     let server = start_with_metrics().await;
     let (host, _client) = report_samples(&server, "/data").await;

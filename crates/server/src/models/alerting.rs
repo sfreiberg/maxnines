@@ -1005,6 +1005,19 @@ impl Database {
             .collect()
     }
 
+    /// Rewords an open alert, without telling anyone, for a detail that changed
+    /// while the problem carried on.
+    pub async fn reword_alert(&self, id: i64, summary: &str) -> Result<()> {
+        alert::Entity::update_many()
+            .col_expr(alert::Column::Summary, Expr::value(summary))
+            .filter(alert::Column::Id.eq(id))
+            .filter(alert::Column::ResolvedMs.is_null())
+            .exec(&self.connection)
+            .await
+            .context("rewording alert")?;
+        Ok(())
+    }
+
     /// Ends an alert and tells whoever was told it started, even if the rule
     /// has since changed or gone. Anyone a silence kept it from never hears of it.
     pub async fn resolve_alert(&self, id: i64, now_ms: i64, reason: &str) -> Result<()> {

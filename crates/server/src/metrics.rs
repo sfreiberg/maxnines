@@ -91,6 +91,51 @@ pub struct Metric {
     pub chart: ShowChart,
 }
 
+/// For a metric that only says whether something is working, the word its
+/// collector gives for the state it's in, which says far more than 0 does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Described {
+    /// What each series is, such as `Service`.
+    pub noun: &'static str,
+    /// Where an item's state is, and the number that says it's working.
+    pub state: &'static str,
+    pub working: &'static str,
+}
+
+/// How a metric's series describe themselves, for the few that do.
+pub fn described(metric: &Metric) -> Option<Described> {
+    let described = |noun, working| Described {
+        noun,
+        state: "state",
+        working,
+    };
+    match metric.name {
+        "service.running" => Some(described("Service", "running")),
+        "container.up" => Some(described("Container", "up")),
+        _ => None,
+    }
+}
+
+impl Described {
+    /// The state of the item called `series` in what the collector last sent,
+    /// unless it's working by now.
+    pub fn state_of(&self, output: &Value, series: &str) -> Option<String> {
+        let item = output.as_array()?.iter().find(|item| {
+            item["name"]
+                .as_str()
+                .is_some_and(|name| crate::alerting::clean(name) == series)
+        })?;
+        if item[self.working].as_u64() == Some(1) {
+            return None;
+        }
+        let state = crate::alerting::clean(item[self.state].as_str()?);
+        (!state.trim().is_empty()).then(|| state.chars().take(MAX_STATE_CHARS).collect())
+    }
+}
+
+/// A service manager's word for a state is a word or two.
+const MAX_STATE_CHARS: usize = 60;
+
 /// Whether an agent's page shows a chart for a metric.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShowChart {
@@ -1708,6 +1753,38 @@ mod tests {
     use super::*;
 
     const HOUR_MS: i64 = 3_600_000;
+
+    #[test]
+    fn a_service_or_container_that_is_down_says_what_state_it_is_in() {
+        let services = find("service.running").and_then(described).unwrap();
+        assert_eq!(services.noun, "Service");
+        let output = serde_json::json!([
+            { "name": "nginx.service", "running": 0, "state": "failed" },
+            { "name": "sshd.service", "running": 1, "state": "active" },
+            { "name": "bad.service", "running": 0, "state": "fail\ned\u{7}" },
+            { "name": "quiet.service", "running": 0 },
+            { "name": "long.service", "running": 0, "state": "x".repeat(500) },
+        ]);
+        let state = |series: &str| services.state_of(&output, series);
+        assert_eq!(state("nginx.service").as_deref(), Some("failed"));
+        // One that's working by now has nothing to say, and nor has one unheard of.
+        assert_eq!(state("sshd.service"), None);
+        assert_eq!(state("other.service"), None);
+        assert_eq!(state("quiet.service"), None);
+        // An agent chooses the word, so it loses what could forge a line.
+        assert_eq!(state("bad.service").as_deref(), Some("failed"));
+        assert_eq!(state("long.service").map(|state| state.len()), Some(60));
+        assert_eq!(services.state_of(&Value::Null, "nginx.service"), None);
+
+        let containers = find("container.up").and_then(described).unwrap();
+        let output = serde_json::json!([{ "name": "web", "up": 0, "state": "exited" }]);
+        assert_eq!(containers.noun, "Container");
+        assert_eq!(
+            containers.state_of(&output, "web").as_deref(),
+            Some("exited")
+        );
+        assert!(find("cpu.usage").and_then(described).is_none());
+    }
 
     #[test]
     fn every_metric_has_a_unique_name_and_can_be_found() {

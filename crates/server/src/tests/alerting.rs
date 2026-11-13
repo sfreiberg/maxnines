@@ -30,12 +30,19 @@ const MINUTE_MS: i64 = 60_000;
 struct Script {
     readings: Arc<Mutex<Vec<NewestReading>>>,
     trends: Arc<Mutex<Vec<crate::metrics::Trend>>>,
+    /// What each collector last sent, by its name.
+    outputs: Arc<Mutex<BTreeMap<String, serde_json::Value>>>,
     broken: Arc<Mutex<bool>>,
 }
 
 impl Script {
     fn set(&self, readings: Vec<NewestReading>) {
         *self.readings.lock().unwrap() = readings;
+    }
+
+    fn set_output(&self, collector: &str, output: serde_json::Value) {
+        let mut outputs = self.outputs.lock().unwrap();
+        outputs.insert(collector.to_string(), output);
     }
 
     fn set_broken(&self, broken: bool) {
@@ -62,11 +69,11 @@ impl MetricsReader for Script {
     fn latest_output(
         &self,
         _host_id: &str,
-        _collector: &str,
+        collector: &str,
         _since_ms: i64,
         _until_ms: i64,
     ) -> anyhow::Result<Option<serde_json::Value>> {
-        Ok(None)
+        Ok(self.outputs.lock().unwrap().get(collector).cloned())
     }
 
     fn newest(
@@ -814,7 +821,56 @@ async fn every_server_starts_with_a_rule_for_failing_containers() {
 }
 
 #[tokio::test]
-async fn a_failing_container_alerts_after_five_minutes() {
+async fn a_stopped_service_alerts_in_its_service_managers_words() {
+    let mut test = Harness::start().await;
+    let rule = built_in_rules()
+        .await
+        .into_iter()
+        .find(|rule| rule.metric.as_deref() == Some("service.running"))
+        .unwrap();
+    assert_eq!((rule.name.as_str(), rule.for_secs), ("Service stopped", 60));
+    test.database().create_alert_rule(&rule).await.unwrap();
+    let channel = webhook_channel("http://127.0.0.1:9/hook");
+    test.database().create_channel(&channel).await.unwrap();
+
+    let services = |state: &str| {
+        json!([
+            { "name": "nginx.service", "running": 0, "state": state },
+            { "name": "sshd.service", "running": 1, "state": "active" },
+        ])
+    };
+    let report = async |test: &mut Harness, minute: i64, state: &str| {
+        let offset = minute * MINUTE_MS;
+        let readings = vec![
+            test.reading("nginx.service", test.now + offset, 0.0),
+            test.reading("sshd.service", test.now + offset, 1.0),
+        ];
+        test.script.set(readings);
+        test.script.set_output("services", services(state));
+        test.evaluate(offset).await;
+        test.open().await
+    };
+
+    assert!(report(&mut test, 0, "activating").await.is_empty());
+    let open = report(&mut test, 1, "activating").await;
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(
+        open[0].summary,
+        "Service nginx.service on web-1 is activating"
+    );
+    let told = test.database().due_deliveries(i64::MAX, 10).await.unwrap();
+    assert_eq!(told.len(), 1);
+
+    // Its state changing while it's still down rewords the alert and tells nobody.
+    let open = report(&mut test, 2, "failed").await;
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].summary, "Service nginx.service on web-1 is failed");
+    let told = test.database().due_deliveries(i64::MAX, 10).await.unwrap();
+    assert_eq!(told.len(), 1);
+}
+
+#[tokio::test]
+async fn a_failing_container_alerts_after_a_minute() {
     let mut test = Harness::start().await;
     let rule = built_in_rules()
         .await

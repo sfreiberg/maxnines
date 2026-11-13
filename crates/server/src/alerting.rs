@@ -517,6 +517,12 @@ impl AlertRuleInput {
         Ok(summary)
     }
 
+    /// What an alert says about something that describes its own state, such as a
+    /// service that's `failed`.
+    pub fn state_summary(noun: &str, hostname: &str, series: &str, state: &str) -> String {
+        format!("{noun} {series} on {hostname} is {state}")
+    }
+
     /// What a calculation alert says when it fires, or reaches `severity`. `line`
     /// is what's being watched.
     pub fn calculation_summary(

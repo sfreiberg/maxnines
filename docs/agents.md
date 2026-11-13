@@ -137,9 +137,14 @@ them by:
 
 Each service is charted under **Services running** as 1 while it's running and 0 while
 it isn't. One that's starting, paused or failed counts as not running, and so does a
-name the system doesn't know, so a mistyped name shows as stopped, not as missing. The
-built-in **Service stopped** rule alerts once a watched service has been down for a
-minute. Two services that run the same program, such as two Java ones, are told
+name the system doesn't know, so a mistyped name shows as stopped, not as missing.
+
+The host's metrics page lists them under **Watched services**, each as running or
+not, and one that isn't running with its service manager's own word for why, such as
+`failed`, or `not found` for a name it doesn't know. The built-in **Service stopped**
+rule alerts once a watched service has been down for a minute, in the same words:
+*Service nginx.service on web-1 is failed*. If the word changes while the service is
+still down, the alert is reworded without telling anyone again. Two services that run the same program, such as two Java ones, are told
 apart, as each has its own name.
 
 On macOS the system's own services are looked for first, then those of the user the
@@ -271,7 +276,8 @@ history, and an agent reports at most 64.
 A container is **up** while it's running and its health check, if it has one, doesn't
 call it unhealthy. One that stopped with an error, keeps restarting, or is unhealthy
 is down, and the built-in **Container down** rule alerts once it has been for a
-minute. One that exited cleanly isn't counted either way, as that's a job finishing
+minute, saying the state the container is in, such as *Container web on web-1 is
+exited*. One that exited cleanly isn't counted either way, as that's a job finishing
 or a service stopped on purpose.
 
 Other systems run containers inside a Linux virtual machine, as Docker Desktop does on

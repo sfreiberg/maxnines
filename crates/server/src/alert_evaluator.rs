@@ -710,6 +710,9 @@ impl Evaluator {
             .map(|reading| (clean(&reading.series), reading))
             .filter(|(series, _)| rule.rule.watches_series(series))
             .take(MAX_SERIES_PER_HOST);
+        // What the collector last sent, read once and only if an alert needs its words.
+        let described = metrics::described(metric);
+        let mut output = None;
 
         for (series, reading) in watched {
             let key = Key {
@@ -729,12 +732,49 @@ impl Evaluator {
             tracker.last_sample_ms = Some(reading.time_ms);
 
             let hostname = clean(&host.hostname);
-            let summary = match change.as_ref().and_then(Change::severity) {
-                Some(severity) => {
+            // Said in the collector's own words where it has them, such as a
+            // service that's failed, both as the alert starts and while it lasts.
+            let breached = levels.iter().any(|(_, breached)| *breached);
+            let says = change.as_ref().and_then(Change::severity).is_some()
+                || (change.is_none() && current.is_some() && breached);
+            let state = match described.filter(|_| says) {
+                Some(described) => {
+                    if output.is_none() {
+                        let latest =
+                            self.metrics
+                                .latest_output(&host.id, metric.collector, snapshot.now_ms);
+                        output = Some(latest.await.ok().flatten().unwrap_or(Value::Null));
+                    }
+                    let state =
+                        described.state_of(output.as_ref().unwrap_or(&Value::Null), &series);
+                    state.map(|state| {
+                        crate::alerting::AlertRuleInput::state_summary(
+                            described.noun,
+                            &hostname,
+                            &series,
+                            &state,
+                        )
+                    })
+                }
+                None => None,
+            };
+            let summary = match (change.as_ref().and_then(Change::severity), state) {
+                (Some(_), Some(state)) => state,
+                (Some(severity), None) => {
                     rule.rule
                         .metric_summary(metric, &hostname, &series, reading.value, severity)?
                 }
-                None => String::new(),
+                // Its state changed while it stayed down, which nobody needs telling.
+                (None, Some(state)) => {
+                    if let Some(alert) = open.get_mut(&key)
+                        && alert.summary != state
+                    {
+                        self.database.reword_alert(alert.id, &state).await?;
+                        alert.summary = state;
+                    }
+                    String::new()
+                }
+                (None, None) => String::new(),
             };
             self.apply(
                 change,

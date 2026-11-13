@@ -21,6 +21,12 @@
 </section>
 {% endif %}
 
+{% if services %}
+<section>
+{% include "metrics/_services.html" %}
+</section>
+{% endif %}
+
 {% if custom_metrics %}
 <section>
 {% set readings_title = "Latest custom metrics" %}{% set readings_name = "Metric" %}{% set readings = custom_metrics %}
