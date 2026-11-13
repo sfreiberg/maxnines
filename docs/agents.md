@@ -138,8 +138,8 @@ them by:
 Each service is charted under **Services running** as 1 while it's running and 0 while
 it isn't. One that's starting, paused or failed counts as not running, and so does a
 name the system doesn't know, so a mistyped name shows as stopped, not as missing. The
-built-in **Service stopped** rule alerts once a watched service has been down for 5
-minutes. Two services that run the same program, such as two Java ones, are told
+built-in **Service stopped** rule alerts once a watched service has been down for a
+minute. Two services that run the same program, such as two Java ones, are told
 apart, as each has its own name.
 
 On macOS the agent sees the services of the user it runs as.

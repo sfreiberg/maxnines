@@ -2256,7 +2256,8 @@ const SERVICE_RULE: BuiltInRule = BuiltInRule {
     comparison: Some("below"),
     threshold: Some(1.0),
     warning_threshold: None,
-    for_secs: 300,
+    // Long enough for a restart, and no longer: a service that's down is down.
+    for_secs: 60,
     window_secs: None,
     forecast_secs: None,
     warning_forecast_secs: None,

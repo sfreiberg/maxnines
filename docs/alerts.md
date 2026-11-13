@@ -10,7 +10,7 @@ Every server starts with seven alert rules:
 | **Disk filling up** | A disk has been over 80% full for 5 minutes, or over 90% | Warning, then critical |
 | **Disk running out of inodes** | A disk has used over 80% of its [inodes](agents.md#disks) for 5 minutes, or over 90% | Warning, then critical |
 | **Container down** | A container has been failing for 5 minutes, on hosts that report [containers](agents.md#containers) | Critical |
-| **Service stopped** | A [watched service](agents.md#watching-services-and-processes) hasn't been running for 5 minutes | Critical |
+| **Service stopped** | A [watched service](agents.md#watching-services-and-processes) hasn't been running for a minute | Critical |
 | **Clock is wrong** | A host's [clock](agents.md#clock) has been over 5 seconds from the server's for 5 minutes, or over 30 seconds | Warning, then critical |
 | **Disk will be full soon** | A disk has been on course to be full within a day for half an hour, judging by the last 6 hours, or within 4 hours | Warning, then critical |
 
