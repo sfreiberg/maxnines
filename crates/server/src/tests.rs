@@ -90,7 +90,21 @@ async fn start_with(config: &str) -> TestServer {
 const TEST_HEARTBEAT: Heartbeat = Heartbeat {
     interval: Duration::from_millis(50),
     timeout: Duration::from_secs(120),
+    // Only the tests about clocks are asked, as the rest read what they expect next.
+    clock_every: Duration::from_secs(3600),
 };
+
+/// For the tests about clocks, which wait to be asked.
+async fn start_asking_the_time() -> TestServer {
+    let saved = Saved::default();
+    let store = Box::new(MemoryStore(saved.clone()));
+    let reader = store.reader().unwrap();
+    let heartbeat = Heartbeat {
+        clock_every: Duration::from_millis(50),
+        ..TEST_HEARTBEAT
+    };
+    start_with_heartbeat("", store, reader, saved, None, heartbeat).await
+}
 
 /// For the tests about giving up on a quiet client, which wait for it to happen.
 async fn start_quick_to_drop() -> TestServer {
@@ -716,6 +730,52 @@ async fn a_clean_close_marks_the_agent_offline() {
     client.close(None).await.unwrap();
 
     server.wait_for_online(&host.id(), false).await;
+}
+
+/// Reads until the server asks the time, and returns what to send back with it.
+async fn asked_the_time(client: &mut Client) -> String {
+    loop {
+        if let ServerMessage::AskTime { nonce } = read_server_message(client).await {
+            return nonce;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_hosts_clock_is_asked_for_and_saved_under_the_servers_time() {
+    let server = start_asking_the_time().await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
+    let before = now_ms() as u64;
+
+    let an_hour_ahead = now_ms() as u64 + 3_600_000;
+    let answer = |nonce: &str| AgentMessage::Time {
+        nonce: nonce.to_string(),
+        time_ms: an_hour_ahead,
+    };
+    // A busy host can be asked again before its answer arrives, and that answer
+    // then counts for nothing, so each question is answered until one has counted.
+    let mut questions = Vec::new();
+    while server.saved.samples.lock().unwrap().is_empty() {
+        let nonce = asked_the_time(&mut client).await;
+        // An answer to a question that was never asked is ignored, and so is the
+        // right answer sent a second time.
+        send(&mut client, &answer("made up")).await;
+        send(&mut client, &answer(&nonce)).await;
+        send(&mut client, &answer(&nonce)).await;
+        assert!(!questions.contains(&nonce), "the same question twice");
+        questions.push(nonce);
+    }
+
+    let saved = server.saved.samples.lock().unwrap().clone();
+    assert!(saved.len() <= questions.len(), "{saved:?}");
+    let (id, hostname, time_ms) = &saved[0];
+    assert_eq!((id, hostname.as_str()), (&host.id(), "web-1"));
+    // Dated by the server, not by the clock that's an hour out.
+    assert!(
+        (before..an_hour_ahead - 60_000).contains(time_ms),
+        "{time_ms}"
+    );
 }
 
 /// Reads in the background as an agent would, counting the server's pings.
@@ -2996,6 +3056,33 @@ async fn samples_from_an_agent_reach_the_fleet_page() {
     assert!(page.body.contains("web-1"));
     for value in ["42.5%", "25%", "60%", "/data"] {
         assert!(page.body.contains(value), "{value}: {}", page.body);
+    }
+}
+
+#[tokio::test]
+async fn a_clock_reading_reaches_the_hosts_charts() {
+    let server = start_with_metrics().await;
+    let host = identity();
+    let _client = server.connect_approved(&host, "web-1").await;
+    let reading = crate::clock::Reading {
+        offset_ms: 7500,
+        round_trip_ms: 12,
+    };
+    let sample = reading.sample(&host.id(), "web-1", now_ms());
+    let saved = store::WriterCommand::Save(sample);
+    server.state.writer.send(saved).await.unwrap();
+
+    let path = format!("/hosts/{}/metrics", host.id());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let page = Browser::default().get(&server, &path).await;
+        let charted = page.body.contains("Clock difference from the server");
+        if charted && page.body.contains("7.5 s") {
+            assert!(page.body.contains("Ahead") && page.body.contains("Behind"));
+            break;
+        }
+        assert!(Instant::now() < deadline, "{}", page.body);
+        sleep(Duration::from_millis(20)).await;
     }
 }
 

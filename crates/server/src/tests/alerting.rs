@@ -787,6 +787,7 @@ async fn every_server_starts_with_rules_for_agents_going_offline_and_disks_filli
     assert_eq!(
         names,
         [
+            "Clock is wrong",
             "Container down",
             "Disk filling up",
             "Disk running out of inodes",

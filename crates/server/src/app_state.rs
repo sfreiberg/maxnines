@@ -42,6 +42,8 @@ pub enum HostDeletion {
 pub struct Heartbeat {
     pub interval: Duration,
     pub timeout: Duration,
+    /// How often an agent is asked what its clock says.
+    pub clock_every: Duration,
 }
 
 /// What every request and connection shares.

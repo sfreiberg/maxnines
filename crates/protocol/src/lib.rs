@@ -650,6 +650,12 @@ pub enum AgentMessage {
     },
     /// How an action the server asked for went.
     ActionResult(actions::ActionResult),
+    /// The answer to [`ServerMessage::AskTime`]: what the agent's clock says, sent
+    /// the moment it's asked and never kept to send later, as it's only true then.
+    Time {
+        nonce: String,
+        time_ms: u64,
+    },
 }
 
 /// What the server sends to an agent.
@@ -680,6 +686,11 @@ pub enum ServerMessage {
     /// Until then it keeps the sample and sends it again if the connection ends, so
     /// the server ignores one it's already stored.
     Ack { timestamp_ms: u64 },
+    /// Asks what the agent's clock says, to compare with the server's. The agent
+    /// answers at once with an [`AgentMessage::Time`] carrying the same `nonce`,
+    /// and the server times how long that took, which is how far out the
+    /// comparison can be.
+    AskTime { nonce: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

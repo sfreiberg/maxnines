@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use futures_util::{FutureExt, Sink, SinkExt, StreamExt};
@@ -262,7 +262,13 @@ async fn session(connection: &Connection, pending: &mut mpsc::Receiver<String>) 
             message = socket.next() => {
                 silence.as_mut().reset(Instant::now() + SERVER_SILENCE_LIMIT);
                 match message {
-                    Some(Ok(Message::Text(text))) => receive(&text, connection).await,
+                    Some(Ok(Message::Text(text))) => {
+                        // Sent ahead of anything else that's waiting, as the server
+                        // is timing it.
+                        if let Some(answer) = receive(&text, connection).await {
+                            socket.send(Message::text(answer)).await?;
+                        }
+                    }
                     Some(Ok(Message::Close(_))) | None => bail!("server closed the connection"),
                     Some(Ok(_)) => {}
                     Some(Err(error)) => return Err(error.into()),
@@ -285,9 +291,17 @@ where
 }
 
 /// Anything unexpected is logged and ignored, so a newer server can't take down
-/// an older agent.
-async fn receive(text: &str, connection: &Connection) {
+/// an older agent. Returns an answer the server is waiting for now.
+async fn receive(text: &str, connection: &Connection) -> Option<String> {
     match serde_json::from_str(text) {
+        Ok(ServerMessage::AskTime { nonce }) => {
+            let time_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_millis() as u64);
+            return serde_json::to_string(&AgentMessage::Time { nonce, time_ms })
+                .inspect_err(|error| error!(%error, "the time couldn't be sent"))
+                .ok();
+        }
         Ok(ServerMessage::Config { version, config }) => {
             let update = ConfigUpdate { version, config };
             if connection.configs.send(update).await.is_err() {
@@ -318,6 +332,7 @@ async fn receive(text: &str, connection: &Connection) {
         Ok(_) => warn!("ignoring an unexpected message from the server"),
         Err(error) => warn!(%error, "ignoring an invalid message from the server"),
     }
+    None
 }
 
 /// Sends everything each time and lets the server work out what changed, so a
@@ -594,6 +609,31 @@ mod tests {
         assert_eq!(result.id, "run-1");
         assert_eq!(result.outcome, ActionOutcome::Succeeded);
         assert_eq!(result.output, "hello web-1\n");
+    }
+
+    #[tokio::test]
+    async fn says_what_its_clock_reads_as_soon_as_it_is_asked() {
+        let (_link, mut socket) = connected().await;
+        let now_ms = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+        };
+        let before = now_ms();
+        let ask = ServerMessage::AskTime {
+            nonce: "question-1".to_string(),
+        };
+        send_to_agent(&mut socket, &ask).await;
+
+        // Facts arrive whenever they're due, so they're skipped over.
+        let (nonce, time_ms) = loop {
+            if let AgentMessage::Time { nonce, time_ms } = next_message(&mut socket).await {
+                break (nonce, time_ms);
+            }
+        };
+        assert_eq!(nonce, "question-1");
+        assert!((before..=now_ms()).contains(&time_ms), "{time_ms}");
     }
 
     #[tokio::test]

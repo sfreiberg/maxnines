@@ -473,6 +473,19 @@ pub const METRICS: &[Metric] = &[
         source: Source::Entries(Reading::Field("$.link_up")),
         chart: ShowChart::Never,
     },
+    // Worked out by the server, which asks each agent what its clock says. Ahead
+    // and behind are separate, so one rule alerts on either and says which.
+    Metric {
+        name: "clock.offset",
+        title: "Clock difference from the server",
+        unit: Unit::Seconds,
+        collector: "clock",
+        source: Source::Fields(&[
+            ("Ahead", Reading::Field("$.ahead_secs")),
+            ("Behind", Reading::Field("$.behind_secs")),
+        ]),
+        chart: ShowChart::WithData,
+    },
     Metric {
         name: "sensor.temperature",
         title: "Temperature",

@@ -8,6 +8,7 @@ mod audit;
 mod calculations;
 mod channels;
 mod cli;
+mod clock;
 mod condition_builder;
 mod config;
 mod controllers;
@@ -287,6 +288,7 @@ async fn serve(path: &Path) -> Result<()> {
         heartbeat: Heartbeat {
             interval: Duration::from_secs(config.heartbeat_interval_secs),
             timeout: Duration::from_secs(config.heartbeat_timeout_secs),
+            clock_every: clock::ASK_EVERY,
         },
         audience: config.audience().into(),
         trusted_proxies: config.trusted_networks()?.into(),

@@ -776,6 +776,8 @@ fn format_age(value: f64, decimals: usize) -> String {
         age if age >= 86_400.0 => (86_400.0, "d"),
         age if age >= 3600.0 => (3600.0, "h"),
         age if age >= 60.0 => (60.0, "m"),
+        // A clock a few milliseconds out isn't 0 seconds out.
+        age if age > 0.0 && age < 1.0 => (0.001, "ms"),
         _ => (1.0, "s"),
     };
     format!("{} {label}", trimmed(value / divisor, decimals))
@@ -1435,6 +1437,8 @@ mod tests {
             (Unit::Bytes, 2_621_440.0, "2.5 MiB"),
             (Unit::Bytes, 51_539_607_552.0, "48 GiB"),
             (Unit::Bytes, 4.0 * 1024f64.powi(4), "4 TiB"),
+            (Unit::Seconds, 0.0, "0 s"),
+            (Unit::Seconds, 0.0125, "12.5 ms"),
             (Unit::Seconds, 45.0, "45 s"),
             (Unit::Seconds, 90.0, "1.5 m"),
             (Unit::Seconds, 7200.0, "2 h"),

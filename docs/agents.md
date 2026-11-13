@@ -133,6 +133,23 @@ the host wasn't keeping up. An interface whose count of dropped packets can't be
 true, such as more than it ever received, reports none: macOS does that for the
 interface of a virtual machine.
 
+## Clock
+
+A host whose clock is wrong fails sign-ins and certificate checks, and dates its own
+metrics wrongly. Once a minute the server asks each connected agent what its clock
+says, and compares the answer with its own clock. The agent answers at once, and the
+server times how long the answer took: the reading can be out by half of that, so an
+answer that took over a second isn't used and is asked for again a few seconds later.
+
+The difference is charted on the host's page as **Clock difference from the server**,
+with one line for ahead and one for behind, and the built-in **Clock is wrong** rule
+warns at 5 seconds and is critical at 30. The reading is dated by the server, as the
+host's clock is the one in question. It compares with the server's clock, so the
+server's own has to be right.
+
+Nothing needs turning on, and the agent needs no access to a time server. An agent
+from before this was added doesn't answer, so its host has no reading.
+
 ## Processes and logins
 
 Every agent also reports how many processes are running, how many login sessions

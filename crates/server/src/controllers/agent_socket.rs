@@ -15,11 +15,12 @@ use serde_json::Value;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::time::{Instant, MissedTickBehavior, interval, timeout};
+use tokio::time::{Instant, MissedTickBehavior, interval, interval_at, timeout};
 use tracing::{info, warn};
 
 use crate::actions::Actions;
 use crate::app_state::AppState;
+use crate::clock::Asked;
 use crate::events::{BOOT_TIME_SLACK_MS, EventKind, restarted};
 use crate::facts::flatten;
 use crate::models::ConfigStatus;
@@ -270,6 +271,12 @@ async fn serve(
     let mut last_heard = Instant::now();
     let mut waiting_sample = None;
     let mut last_boot = None;
+    let mut ask_time = interval_at(
+        Instant::now() + state.heartbeat.clock_every,
+        state.heartbeat.clock_every,
+    );
+    ask_time.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut asked = None;
 
     let (jobs, job_queue) = mpsc::channel(JOB_QUEUE_SIZE);
     let (config_sender, mut configs) = mpsc::channel(1);
@@ -306,6 +313,17 @@ async fn serve(
                     return "send failed";
                 }
             }
+            _ = ask_time.tick() => {
+                let Ok(nonce) = auth::new_nonce() else {
+                    continue;
+                };
+                // Timed from before it's sent, so a slow send counts against it.
+                let question = Asked::new(nonce.clone(), crate::metrics::now_ms());
+                if send(socket, &ServerMessage::AskTime { nonce }).await.is_err() {
+                    return "send failed";
+                }
+                asked = Some(question);
+            }
             Some(text) = configs.recv() => {
                 if socket.send(Message::text(text)).await.is_err() {
                     return "send failed";
@@ -334,8 +352,19 @@ async fn serve(
 
                 match message {
                     Some(Ok(Message::Text(text))) => {
-                        waiting_sample =
-                            receive(&text, &agent, state, &jobs, &ack_sender, &mut last_boot);
+                        let mut connection = Connection {
+                            jobs: &jobs,
+                            acks: &ack_sender,
+                            last_boot: &mut last_boot,
+                            asked: &mut asked,
+                            time_came_late: false,
+                        };
+                        waiting_sample = receive(&text, &agent, state, &mut connection);
+                        // Asked for again soon, not a whole turn later.
+                        if connection.time_came_late {
+                            let soon = state.heartbeat.interval.min(state.heartbeat.clock_every);
+                            ask_time.reset_after(soon);
+                        }
                     }
                     Some(Ok(Message::Close(_))) | None => return "connection closed",
                     Some(Ok(_)) => {}
@@ -442,17 +471,37 @@ async fn send_config(
     }
 }
 
+/// What one connection keeps between messages.
+struct Connection<'a> {
+    jobs: &'a mpsc::Sender<Job>,
+    acks: &'a mpsc::Sender<u64>,
+    last_boot: &'a mut Option<i64>,
+    /// The question about its clock that the agent hasn't answered yet.
+    asked: &'a mut Option<Asked>,
+    /// Set when its answer took too long to use.
+    time_came_late: bool,
+}
+
 /// A bad message is logged and skipped rather than ending the connection. Returns a
 /// sample the writer has no room for yet.
 fn receive(
     text: &str,
     agent: &Agent,
     state: &AppState,
-    jobs: &mpsc::Sender<Job>,
-    acks: &mpsc::Sender<u64>,
-    last_boot: &mut Option<i64>,
+    connection: &mut Connection,
 ) -> Option<WriterCommand> {
+    let Connection {
+        jobs,
+        acks,
+        last_boot,
+        asked,
+        time_came_late,
+    } = connection;
     let job = match serde_json::from_str(text) {
+        Ok(AgentMessage::Time { nonce, time_ms }) => {
+            *time_came_late = !save_time(&nonce, time_ms, agent, state, asked);
+            return None;
+        }
         Ok(AgentMessage::Sample(sample)) if sample.timestamp_ms > LATEST_SAMPLE_MS => {
             // Answered, so the agent lets go of something that can never be stored.
             warn!(id = agent.id, "skipping a sample with an impossible time");
@@ -506,6 +555,33 @@ fn receive(
         );
     }
     None
+}
+
+/// Saves how the host's clock compares with the server's, if this answers the
+/// question that's waiting. Any other answer is ignored. Returns false only for
+/// the right answer taking too long to use.
+fn save_time(
+    nonce: &str,
+    time_ms: u64,
+    agent: &Agent,
+    state: &AppState,
+    asked: &mut Option<Asked>,
+) -> bool {
+    let Some(question) = asked.take_if(|question| question.nonce == nonce) else {
+        return true;
+    };
+    let Some(reading) = question.answered(nonce, time_ms) else {
+        return false;
+    };
+    let sample = reading.sample(&agent.id, &agent.hostname, crate::metrics::now_ms());
+    // The next one is a minute away, so one the writer has no room for is let go.
+    if state.writer.try_send(WriterCommand::Save(sample)).is_err() {
+        warn!(
+            id = agent.id,
+            "no room to save a clock reading, skipping it"
+        );
+    }
+    true
 }
 
 /// Passes on when the host started, only when it's a later start than this

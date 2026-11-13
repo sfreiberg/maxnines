@@ -14,6 +14,7 @@ impl MigratorTrait for Migrator {
             Box::new(SoftDeleteRulesAndChannels),
             Box::new(Actions),
             Box::new(ActionNotifications),
+            Box::new(ClockRule),
         ]
     }
 }
@@ -1232,7 +1233,14 @@ async fn add_built_ins(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         manager.exec_stmt(setting).await?;
     }
 
-    for rule in BUILT_IN_RULES {
+    for rule in &BUILT_IN_RULES {
+        add_built_in_rule(manager, rule).await?;
+    }
+    Ok(())
+}
+
+async fn add_built_in_rule(manager: &SchemaManager<'_>, rule: &BuiltInRule) -> Result<(), DbErr> {
+    {
         let insert = Query::insert()
             .into_table(AlertRules::Table)
             .columns([
@@ -1266,9 +1274,8 @@ async fn add_built_ins(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 rule.warning_forecast_secs.into(),
             ])
             .to_owned();
-        manager.exec_stmt(insert).await?;
+        manager.exec_stmt(insert).await
     }
-    Ok(())
 }
 
 #[derive(Iden)]
@@ -2200,6 +2207,46 @@ impl MigrationTrait for ActionNotifications {
     }
 }
 
+/// Added after the first built-in rules, for the clock readings the server
+/// started taking.
+const CLOCK_RULE: BuiltInRule = BuiltInRule {
+    name: "Clock is wrong",
+    kind: "metric",
+    metric: Some("clock.offset"),
+    comparison: Some("above"),
+    threshold: Some(30.0),
+    warning_threshold: Some(5.0),
+    for_secs: 300,
+    window_secs: None,
+    forecast_secs: None,
+    warning_forecast_secs: None,
+};
+
+struct ClockRule;
+
+impl MigrationName for ClockRule {
+    fn name(&self) -> &str {
+        "m20261112_000005_clock_rule"
+    }
+}
+
+/// Every server gets a rule about hosts whose clocks are wrong.
+#[async_trait::async_trait]
+impl MigrationTrait for ClockRule {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        add_built_in_rule(manager, &CLOCK_RULE).await
+    }
+
+    /// Its alerts and what was sent about them go with it.
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let delete = Query::delete()
+            .from_table(AlertRules::Table)
+            .and_where(Expr::col(AlertRules::Metric).eq("clock.offset"))
+            .to_owned();
+        manager.exec_stmt(delete).await
+    }
+}
+
 #[derive(DeriveIden)]
 enum AlertRuleActions {
     Table,
@@ -2269,6 +2316,7 @@ mod tests {
                 "Container down",
                 "Disk will be full soon",
                 "Disk running out of inodes",
+                "Clock is wrong",
             ]
         );
         let settings = "SELECT s.name FROM config_rule_settings s
@@ -2351,8 +2399,8 @@ mod tests {
             "IDs carry on from where they were"
         );
 
-        // The two actions migrations after it, then this one.
-        Migrator::down(&connection, Some(3)).await.unwrap();
+        // The three migrations after it, then this one.
+        Migrator::down(&connection, Some(4)).await.unwrap();
         assert_eq!(
             count("SELECT target FROM notification_channels").await,
             ["https://new"]
