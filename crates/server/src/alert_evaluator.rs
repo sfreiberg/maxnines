@@ -96,31 +96,27 @@ enum Change {
     Resolve,
 }
 
-/// How long one level of a problem has lasted, or been gone.
+/// How long one level of a problem has lasted.
 #[derive(Debug, Default)]
 struct Hold {
     breached_since: Option<i64>,
-    clear_since: Option<i64>,
 }
 
 impl Hold {
     fn observe(&mut self, breached: bool, now_ms: i64) {
         if breached {
-            self.clear_since = None;
             self.breached_since.get_or_insert(now_ms);
         } else {
             self.breached_since = None;
-            self.clear_since.get_or_insert(now_ms);
         }
+    }
+
+    fn is_breached(&self) -> bool {
+        self.breached_since.is_some()
     }
 
     fn breached_for(&self, now_ms: i64, hold_ms: i64) -> bool {
         self.breached_since
-            .is_some_and(|since| now_ms - since >= hold_ms)
-    }
-
-    fn clear_for(&self, now_ms: i64, hold_ms: i64) -> bool {
-        self.clear_since
             .is_some_and(|since| now_ms - since >= hold_ms)
     }
 }
@@ -144,9 +140,10 @@ impl Tracker {
 
     /// Takes whether each of a rule's levels is crossed now, mildest first, and
     /// what the alert is at, if it's open. A level has to last `hold_ms` to count,
-    /// and be gone that long to stop counting, so something hovering around a
-    /// threshold doesn't send a stream of notifications. The alert is at the worst
-    /// level that counts, and resolves when the mildest stops counting.
+    /// so a passing moment doesn't alert, and stops counting the moment it's gone:
+    /// a recovery is said at once, and something going back and forth is seen
+    /// doing it, not hidden behind a wait. The alert is at the worst level that
+    /// counts, and resolves when the mildest is gone.
     fn observe(
         &mut self,
         levels: &[(Severity, bool)],
@@ -174,7 +171,7 @@ impl Tracker {
         if self
             .holds
             .first()
-            .is_some_and(|mildest| mildest.clear_for(now_ms, hold_ms))
+            .is_some_and(|mildest| !mildest.is_breached())
         {
             return Some(Change::Resolve);
         }
@@ -183,8 +180,8 @@ impl Tracker {
         {
             return Some(Change::Become(lasted));
         }
-        // Better, once the worse levels have been gone long enough.
-        let remaining = worst(&|hold| !hold.clear_for(now_ms, hold_ms));
+        // Better, as soon as the worse levels are gone.
+        let remaining = worst(&Hold::is_breached);
         remaining
             .filter(|remaining| *remaining < current)
             .map(Change::Become)
@@ -553,16 +550,8 @@ impl Evaluator {
 
         let tracker = self.trackers.entry(key.clone()).or_default();
         let hold = tracker.only_hold();
-        if online {
-            hold.breached_since = None;
-            hold.clear_since = Some(since);
-        } else {
-            hold.clear_since = None;
-            hold.breached_since = Some(since);
-        }
-        // Unlike a reading near a threshold, a connection can't hover, so being
-        // back resolves the alert at once instead of after the rule's wait.
-        let hold_ms = if online { 0 } else { hold_ms(rule) };
+        hold.breached_since = (!online).then_some(since);
+        let hold_ms = hold_ms(rule);
         let levels = [(rule.rule.severity, !online)];
         let current = open.get(&key).map(|alert| alert.severity);
         let change = tracker.observe(&levels, snapshot.now_ms, hold_ms, current);
@@ -1061,27 +1050,39 @@ mod tests {
     }
 
     #[test]
-    fn a_problem_has_to_stay_gone_before_it_resolves() {
+    fn a_problem_that_is_gone_resolves_at_once() {
         let mut tracker = Tracker::default();
-        assert_eq!(tracker.observe(&one(false), 0, 60, FIRING), None);
-        assert_eq!(tracker.observe(&one(false), 59, 60, FIRING), None);
+        assert_eq!(tracker.observe(&one(true), 0, 60, FIRING), None);
         assert_eq!(
-            tracker.observe(&one(false), 60, 60, FIRING),
+            tracker.observe(&one(false), 1, 60, FIRING),
             Some(Change::Resolve)
         );
     }
 
     #[test]
-    fn a_problem_coming_back_starts_the_wait_to_resolve_again() {
+    fn a_problem_that_comes_and_goes_is_said_each_time_it_lasts() {
         let mut tracker = Tracker::default();
-        tracker.observe(&one(false), 0, 60, FIRING);
-        tracker.observe(&one(true), 30, 60, FIRING);
-        assert_eq!(tracker.observe(&one(false), 40, 60, FIRING), None);
-        assert_eq!(tracker.observe(&one(false), 99, 60, FIRING), None);
+        tracker.observe(&one(true), 0, 60, None);
         assert_eq!(
-            tracker.observe(&one(false), 100, 60, FIRING),
+            tracker.observe(&one(true), 60, 60, None),
+            Some(Change::Fire(C))
+        );
+        assert_eq!(
+            tracker.observe(&one(false), 70, 60, FIRING),
             Some(Change::Resolve)
         );
+        // Back again, it has to last all over again.
+        assert_eq!(tracker.observe(&one(true), 80, 60, None), None);
+        assert_eq!(tracker.observe(&one(true), 139, 60, None), None);
+        assert_eq!(
+            tracker.observe(&one(true), 140, 60, None),
+            Some(Change::Fire(C))
+        );
+        // One that never lasts never alerts.
+        let mut tracker = Tracker::default();
+        for now in (0..600).step_by(20) {
+            assert_eq!(tracker.observe(&one(now % 40 == 0), now, 60, None), None);
+        }
     }
 
     #[test]
@@ -1116,28 +1117,29 @@ mod tests {
     }
 
     #[test]
-    fn a_critical_alert_eases_once_the_critical_level_has_been_gone_long_enough() {
+    fn a_critical_alert_eases_as_soon_as_the_critical_level_is_gone() {
         let mut tracker = Tracker::default();
         tracker.observe(&two(2), 0, 60, FIRING);
-        assert_eq!(tracker.observe(&two(1), 10, 60, FIRING), None);
-        assert_eq!(tracker.observe(&two(2), 20, 60, FIRING), None);
-        assert_eq!(tracker.observe(&two(1), 30, 60, FIRING), None);
-        assert_eq!(tracker.observe(&two(1), 89, 60, FIRING), None);
         assert_eq!(
-            tracker.observe(&two(1), 90, 60, FIRING),
+            tracker.observe(&two(1), 10, 60, FIRING),
             Some(Change::Become(W))
         );
         assert_eq!(tracker.observe(&two(1), 200, 60, Some(W)), None);
+        // Critical again has to last before it counts again.
+        assert_eq!(tracker.observe(&two(2), 210, 60, Some(W)), None);
+        assert_eq!(
+            tracker.observe(&two(2), 270, 60, Some(W)),
+            Some(Change::Become(C))
+        );
     }
 
     #[test]
-    fn an_alert_resolves_when_the_mildest_level_has_been_gone_long_enough() {
+    fn an_alert_resolves_as_soon_as_the_mildest_level_is_gone() {
         let mut tracker = Tracker::default();
         tracker.observe(&two(2), 0, 60, FIRING);
-        assert_eq!(tracker.observe(&two(0), 10, 60, FIRING), None);
         // Straight from critical, without easing first.
         assert_eq!(
-            tracker.observe(&two(0), 70, 60, FIRING),
+            tracker.observe(&two(0), 10, 60, FIRING),
             Some(Change::Resolve)
         );
     }

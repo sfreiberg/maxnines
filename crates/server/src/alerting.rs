@@ -22,8 +22,7 @@ pub const RULE_GONE_REASON: &str = "The rule was deleted or disabled";
 const MAX_NAME_LEN: usize = 255;
 const MAX_TARGET_LEN: usize = 2048;
 
-/// A rule can't wait longer than this before firing. It also limits how long a
-/// rule can take to resolve, since the two match.
+/// A rule can't wait longer than this before firing.
 const MAX_FOR_SECS: u64 = 7 * 86_400;
 
 /// A calculation needs a finished minute to look at.
@@ -156,8 +155,8 @@ pub struct AlertRuleInput {
     /// One alert covers both, at the worse of the two.
     #[serde(default)]
     pub warning_threshold: Option<f64>,
-    /// How long the problem has to last before the alert fires, and how long it
-    /// has to stay gone before the alert resolves.
+    /// How long the problem has to last before the alert fires. It resolves as
+    /// soon as the problem is gone.
     pub for_secs: u64,
     pub severity: Severity,
     /// A CEL expression over facts. An empty condition matches every agent.

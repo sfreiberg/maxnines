@@ -9,13 +9,15 @@ Every server starts with seven alert rules:
 | **Host offline** | An approved host's agent has been gone for 5 minutes | Critical |
 | **Disk filling up** | A disk has been over 80% full for 5 minutes, or over 90% | Warning, then critical |
 | **Disk running out of inodes** | A disk has used over 80% of its [inodes](agents.md#disks) for 5 minutes, or over 90% | Warning, then critical |
-| **Container down** | A container has been failing for 5 minutes, on hosts that report [containers](agents.md#containers) | Critical |
+| **Container down** | A container has been failing for a minute, on hosts that report [containers](agents.md#containers) | Critical |
 | **Service stopped** | A [watched service](agents.md#watching-services-and-processes) hasn't been running for a minute | Critical |
-| **Clock is wrong** | A host's [clock](agents.md#clock) has been over 5 seconds from the server's for 5 minutes, or over 30 seconds | Warning, then critical |
+| **Clock is wrong** | A host's [clock](agents.md#clock) has been over 5 seconds from the server's for a minute, or over 30 seconds | Warning, then critical |
 | **Disk will be full soon** | A disk has been on course to be full within a day for half an hour, judging by the last 6 hours, or within 4 hours | Warning, then critical |
 
-Each disk alerts on its own. A Host offline alert resolves within moments of the agent
-reconnecting, even just after the server restarts. They tell every notification channel, including ones added later, so they start working as soon
+Each disk alerts on its own. Every alert resolves as soon as its problem is gone,
+without waiting, so a recovery is known at once, and something that keeps failing and
+recovering shows as doing that. A Host offline alert resolves within moments of the
+agent reconnecting, even just after the server restarts. They tell every notification channel, including ones added later, so they start working as soon
 as there's a channel to tell. Until then they show on the Alerts page and the overview.
 
 They're ordinary rules from then on: change them, turn them off or delete them under
@@ -58,7 +60,7 @@ A metric or calculation rule can have a warning threshold, a critical threshold,
 both. With both, there's one alert for each thing it watches, at the worse of the two:
 a disk at 85% is a warning, and the same alert becomes critical when the disk passes
 90%. Each threshold has to be crossed for the rule's **For at least** time to count, and
-be clear that long to stop counting.
+stops counting the moment it's clear.
 
 - **Getting worse** sends a **Now critical** notification to every channel that heard
   the alert start, and clears any acknowledgement, so someone has to pick it up again.

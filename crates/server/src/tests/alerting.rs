@@ -265,15 +265,8 @@ async fn a_metric_alert_fires_once_and_resolves_when_it_clears() {
         "one alert, however long it lasts"
     );
 
+    // It resolves with the first reading that's clear, without waiting.
     test.cpu(4 * MINUTE_MS, 10.0).await;
-    test.cpu(5 * MINUTE_MS, 10.0).await;
-    assert_eq!(
-        test.open().await.len(),
-        1,
-        "it hasn't been clear long enough"
-    );
-
-    test.cpu(6 * MINUTE_MS, 10.0).await;
     assert!(test.open().await.is_empty());
     let resolved = test.resolved().await;
     assert_eq!(resolved.len(), 1);
@@ -281,7 +274,14 @@ async fn a_metric_alert_fires_once_and_resolves_when_it_clears() {
         resolved[0].resolve_reason.as_deref(),
         Some("The problem cleared")
     );
-    assert_eq!(resolved[0].resolved_ms, Some(test.now + 6 * MINUTE_MS));
+    assert_eq!(resolved[0].resolved_ms, Some(test.now + 4 * MINUTE_MS));
+
+    // Back over, it has to last all over again, and then it's a new alert.
+    test.cpu(5 * MINUTE_MS, 95.0).await;
+    assert!(test.open().await.is_empty());
+    test.cpu(7 * MINUTE_MS, 95.0).await;
+    assert_eq!(test.open().await.len(), 1);
+    assert_eq!(test.resolved().await.len(), 1);
 }
 
 #[tokio::test]
@@ -808,7 +808,7 @@ async fn every_server_starts_with_a_rule_for_failing_containers() {
     assert_eq!(rule.name, "Container down");
     assert_eq!(rule.comparison, Some(Comparison::Below));
     assert_eq!(rule.levels(), [(Severity::Critical, 1.0)]);
-    assert_eq!(rule.for_secs, 300);
+    assert_eq!(rule.for_secs, 60);
     assert!(rule.all_channels);
     check_rule(rule).unwrap();
 }
@@ -7964,10 +7964,8 @@ async fn the_built_in_forecast_warns_a_day_ahead_and_goes_critical_four_hours_ah
         "Disk usage (/) on web-1 is 92% and rising by 3% an hour, so it reaches 100% in about 3 hours"
     );
 
-    // Once it stops filling for half an hour, the alert ends.
-    assert_eq!(forecast_at(&mut test, 70, 92.0, 0.0).await.len(), 1);
-    assert_eq!(forecast_at(&mut test, 95, 92.0, 0.0).await.len(), 1);
-    assert!(forecast_at(&mut test, 100, 92.0, 0.0).await.is_empty());
+    // Once it stops filling, the alert ends.
+    assert!(forecast_at(&mut test, 70, 92.0, 0.0).await.is_empty());
     let resolved = test.resolved().await;
     assert_eq!(
         resolved[0].resolve_reason.as_deref(),
