@@ -96,6 +96,21 @@ fn parse_systemd(output: &str) -> Status {
     }
 }
 
+/// Reads `launchctl print system/<label>`, which describes one of the system's
+/// own services to any user. Its state is the line indented once: the things it
+/// listens on have states of their own, further in.
+#[cfg(any(target_os = "macos", test))]
+fn parse_launchd_system(output: &str) -> Option<Status> {
+    let state = output
+        .lines()
+        .find_map(|line| line.strip_prefix("\tstate = "))?
+        .trim();
+    Some(match state {
+        "running" => Status::running(state),
+        other => Status::stopped(other),
+    })
+}
+
 /// Reads `launchctl list <label>`, which only gives a PID while it's running.
 #[cfg(any(target_os = "macos", test))]
 fn parse_launchd(output: &str) -> Status {
@@ -142,8 +157,17 @@ async fn query(name: &str) -> Status {
     }
 }
 
+/// The system's services first, as those are the ones a host is watched for, and
+/// then the agent's own user's: `launchctl list` only ever sees the second kind.
 #[cfg(target_os = "macos")]
 async fn query(name: &str) -> Status {
+    let system = format!("system/{name}");
+    if let Ok(output) = run_command("launchctl", &["print", &system]).await
+        && output.status.success()
+        && let Some(status) = parse_launchd_system(&String::from_utf8_lossy(&output.stdout))
+    {
+        return status;
+    }
     let output = run_command("launchctl", &["list", name]).await;
     match output {
         Ok(output) if output.status.success() => {
@@ -241,6 +265,39 @@ mod tests {
     #[test]
     fn empty_systemd_output_is_not_a_guess() {
         assert_eq!(parse_systemd(""), Status::stopped(UNKNOWN));
+    }
+
+    #[test]
+    fn a_system_launchd_service_says_its_own_state() {
+        // As `launchctl print` writes it, with what it listens on further in.
+        let print = |state: &str| {
+            format!(
+                "system/com.example.orders = {{\n\tactive count = 5\n\tstate = {state}\n\n\
+                 \tendpoints = {{\n\t\t\"com.example.orders\" = {{\n\t\t\tstate = active\n\t\t}}\n\t}}\n\
+                 \tjob state = running\n}}\n"
+            )
+        };
+        assert_eq!(
+            parse_launchd_system(&print("running")),
+            Some(Status::running("running"))
+        );
+        assert_eq!(
+            parse_launchd_system(&print("not running")),
+            Some(Status::stopped("not running"))
+        );
+        assert_eq!(parse_launchd_system("Bad request.\n"), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn this_macs_own_services_are_found_without_being_root() {
+        // Every Mac runs this, and `launchctl list` can't see it as a user.
+        let found = query("com.apple.mDNSResponder.reloaded").await;
+        assert_eq!(found, Status::running("running"));
+        assert_eq!(
+            query("com.example.no-such-service").await,
+            Status::stopped("not found")
+        );
     }
 
     #[test]

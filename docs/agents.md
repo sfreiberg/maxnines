@@ -142,7 +142,9 @@ built-in **Service stopped** rule alerts once a watched service has been down fo
 minute. Two services that run the same program, such as two Java ones, are told
 apart, as each has its own name.
 
-On macOS the agent sees the services of the user it runs as.
+On macOS the system's own services are looked for first, then those of the user the
+agent runs as. launchd starts many services only when something needs them, and one of
+those counts as not running in between, so watch ones that are meant to stay up.
 
 **Processes** are for programs that aren't services. Each name is matched against the
 program's name, whatever it was started with, ignoring case and Windows' `.exe`. A name
