@@ -136,22 +136,6 @@ fn readable(name: &str, value: &Value) -> Option<String> {
     Some(format_value(Unit::Bytes, bytes))
 }
 
-/// In the largest unit that makes sense, as "3 minutes ago" reads better than a
-/// timestamp when you're only asking whether it's still there.
-fn ago(ms: u64, now_ms: u64) -> String {
-    let secs = now_ms.saturating_sub(ms) / 1000;
-    let plural = |count: u64, unit: &str| match count {
-        1 => format!("1 {unit} ago"),
-        _ => format!("{count} {unit}s ago"),
-    };
-    match secs {
-        0..60 => "just now".to_string(),
-        60..3600 => plural(secs / 60, "minute"),
-        3600..86_400 => plural(secs / 3600, "hour"),
-        _ => plural(secs / 86_400, "day"),
-    }
-}
-
 pub fn format_uptime(secs: u64) -> String {
     let part = |count: u64, unit: &str| match count {
         1 => format!("1 {unit}"),
@@ -178,7 +162,7 @@ fn row(state: &AppState, host: HostRecord, facts: Option<&FlatFacts>, health: He
         health,
         os: facts.and_then(os_of),
         os_family: facts.and_then(OsFamily::of),
-        seen: presence.map(|p| ago(p.last_seen_ms, now_ms() as u64)),
+        seen: presence.map(|p| crate::times::ago(p.last_seen_ms, now_ms() as u64)),
         config: None,
         state: host.state.as_str(),
         short_id: short_id(&host.id).to_string(),
@@ -288,7 +272,7 @@ async fn index(
             // Waiting agents never get as far as presence, so the registry remembers.
             let asked = state.registry.last_asked_ms(&host.id);
             waiting.push(WaitingHost {
-                seen: asked.map(|ms| ago(ms, now_ms() as u64)),
+                seen: asked.map(|ms| crate::times::ago(ms, now_ms() as u64)),
                 id: host.id,
                 hostname: host.hostname,
             });
@@ -798,16 +782,6 @@ mod tests {
                 ("memory.total_bytes", "16 GiB", Some("17179869184")),
             ]
         );
-    }
-
-    #[test]
-    fn times_ago_use_the_largest_unit() {
-        let now = 100 * 86_400_000;
-        assert_eq!(ago(now - 5_000, now), "just now");
-        assert_eq!(ago(now - 60_000, now), "1 minute ago");
-        assert_eq!(ago(now - 7_200_000, now), "2 hours ago");
-        assert_eq!(ago(now - 3 * 86_400_000, now), "3 days ago");
-        assert_eq!(ago(now + 5_000, now), "just now");
     }
 
     #[test]

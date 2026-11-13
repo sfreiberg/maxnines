@@ -44,18 +44,15 @@
 {% if keys %}
 <div class="tablebox"><table>
   <thead>
-    <tr><th>Name</th><th>Owner</th><th>Role</th><th>Key</th><th>Created</th><th>Expires</th><th>Last used</th><th>Status</th><th></th></tr>
+    <tr><th>Key</th><th>Owner</th><th>Created</th><th>Last used</th><th>Status</th><th></th></tr>
   </thead>
   <tbody>
     {% for key in keys %}
     <tr{% if not key.usable %} class="disabled"{% endif %}>
-      <td>{{ key.name }}</td>
-      <td>{{ key.owner }}</td>
-      <td>{{ key.role }}</td>
-      <td><code>{{ key.hint }}…</code></td>
-      <td class="nowrap">{{ key.created }}</td>
-      <td class="nowrap">{% if key.expires %}{{ key.expires }}{% else %}Never{% endif %}</td>
-      <td class="nowrap">{% if key.last_used %}{{ key.last_used }}{% else %}Never{% endif %}</td>
+      <td><strong>{{ key.name }}</strong><code class="under nowrap">{{ key.hint }}…</code></td>
+      <td>{{ key.owner }}<span class="under">{{ key.role }}</span></td>
+      <td class="nowrap"><span title="{{ key.created_at }}">{{ key.created }}</span><span class="under{% if key.expires_soon %} soon{% endif %}"{% if key.expires_at %} title="{{ key.expires_at }}"{% endif %}>{{ key.expiry }}</span></td>
+      <td class="nowrap">{% if key.last_used %}<span title="{{ key.last_used_at }}">{{ key.last_used }}</span>{% else %}Never{% endif %}</td>
       <td><span class="badge {% if key.usable %}good{% else %}neutral{% endif %}">{{ key.status }}</span></td>
       <td>{% if key.usable %}<form method="post" action="/settings/api-keys/{{ key.id }}/revoke"><input type="hidden" name="authenticity_token" value="{{ csrf_token }}"><button type="submit" class="danger">Revoke</button></form>{% endif %}</td>
     </tr>

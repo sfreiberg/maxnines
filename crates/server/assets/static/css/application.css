@@ -228,6 +228,10 @@ tr.disabled td { color: var(--muted); }
 td.number, th.number { text-align: right; white-space: nowrap; }
 td.number { font-family: var(--mono); font-size: 14px; }
 td.nowrap { white-space: nowrap; }
+/* A second, quieter line in a cell, for a detail that goes with the first. */
+td .under { display: block; margin-top: 3px; font-size: 12px; color: var(--muted); }
+td .under.nowrap { white-space: nowrap; }
+td .under.soon { color: var(--warn); }
 .audit-source, .audit-subject { display: block; }
 .role-choice { display: flex; align-items: center; gap: 8px; }
 .qr { display: block; border-radius: 8px; background: #fff; }

@@ -152,6 +152,14 @@ fn local_time(ms: i64) -> String {
     u64::try_from(ms).map_or_else(|_| String::new(), |ms| format_time(ms, viewer_zone()))
 }
 
+/// Just the day of a time, where whoever's reading is.
+fn local_date(ms: i64) -> String {
+    u64::try_from(ms).map_or_else(
+        |_| String::new(),
+        |ms| crate::times::format_date(ms, viewer_zone()),
+    )
+}
+
 /// Where a request came from: the address connecting, or for a trusted proxy, the
 /// one it says it's passing on.
 fn request_source(peer: SocketAddr, headers: &HeaderMap, trusted: &[IpNet]) -> IpAddr {

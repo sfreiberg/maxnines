@@ -141,7 +141,7 @@ async fn a_change_on_the_pages_records_who_made_it() {
     assert_eq!(owner.after, Some(json!("test@example.com")));
     let listed = Browser::default().get(&server, "/settings/api-keys").await;
     assert!(
-        listed.body.contains("<td>test@example.com</td>"),
+        listed.body.contains("<td>test@example.com<span"),
         "{}",
         listed.body
     );

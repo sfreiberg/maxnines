@@ -22,6 +22,33 @@ pub fn format_time(ms: u64, zone: Tz) -> String {
     }
 }
 
+/// Just the day, for where the time of day is more than anyone needs.
+pub fn format_date(ms: u64, zone: Tz) -> String {
+    let time = i64::try_from(ms)
+        .ok()
+        .and_then(DateTime::from_timestamp_millis);
+    match time {
+        Some(time) => time.with_timezone(&zone).format("%Y-%m-%d").to_string(),
+        None => format!("{ms} ms"),
+    }
+}
+
+/// In the largest unit that makes sense, as "3 minutes ago" reads better than a
+/// timestamp when you're only asking how recent something is.
+pub fn ago(ms: u64, now_ms: u64) -> String {
+    let secs = now_ms.saturating_sub(ms) / 1000;
+    let plural = |count: u64, unit: &str| match count {
+        1 => format!("1 {unit} ago"),
+        _ => format!("{count} {unit}s ago"),
+    };
+    match secs {
+        0..60 => "just now".to_string(),
+        60..3600 => plural(secs / 60, "minute"),
+        3600..86_400 => plural(secs / 3600, "hour"),
+        _ => plural(secs / 86_400, "day"),
+    }
+}
+
 /// The zone with this name in the time zone database, like `Europe/London`.
 pub fn zone_named(name: &str) -> Option<Tz> {
     name.parse().ok()
@@ -56,6 +83,23 @@ mod tests {
             format_time(NOV_14_2023, Tz::Asia__Kolkata),
             "2023-11-15 03:43:20 IST"
         );
+    }
+
+    #[test]
+    fn a_date_is_the_day_in_the_zone() {
+        assert_eq!(format_date(NOV_14_2023, Tz::UTC), "2023-11-14");
+        // Already the next day there.
+        assert_eq!(format_date(NOV_14_2023, Tz::Asia__Kolkata), "2023-11-15");
+    }
+
+    #[test]
+    fn times_ago_use_the_largest_unit() {
+        let now = 100 * 86_400_000;
+        assert_eq!(ago(now - 5_000, now), "just now");
+        assert_eq!(ago(now - 60_000, now), "1 minute ago");
+        assert_eq!(ago(now - 7_200_000, now), "2 hours ago");
+        assert_eq!(ago(now - 3 * 86_400_000, now), "3 days ago");
+        assert_eq!(ago(now + 5_000, now), "just now");
     }
 
     #[test]

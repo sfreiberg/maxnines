@@ -9,7 +9,7 @@ use axum_csrf::CsrfToken;
 use serde::Serialize;
 
 use super::users::role_choices;
-use super::{CsrfForm, Page, local_time, server_error, signed_in_user};
+use super::{CsrfForm, Page, local_date, local_time, server_error, signed_in_user};
 use crate::app_state::AppState;
 use crate::metrics::now_ms;
 use crate::models::{ApiKey, check_api_key_name, expiry_after};
@@ -40,12 +40,23 @@ struct KeyRow {
     owner: String,
     role: &'static str,
     hint: String,
+    /// The day it was made, and the whole time for anyone who wants it.
     created: String,
-    expires: Option<String>,
+    created_at: String,
+    /// What it says about expiring, such as `Expires 2026-11-19`.
+    expiry: String,
+    expires_at: Option<String>,
+    /// Still working, but not for much longer.
+    expires_soon: bool,
+    /// How long ago it was last used, and exactly when.
     last_used: Option<String>,
+    last_used_at: Option<String>,
     status: &'static str,
     usable: bool,
 }
+
+/// How close to expiring a key is worth pointing out.
+const EXPIRES_SOON_MS: i64 = 7 * 86_400_000;
 
 #[derive(Serialize)]
 struct Lifetime {
@@ -83,12 +94,29 @@ fn row(key: ApiKey, now_ms: i64) -> KeyRow {
     } else {
         "Active"
     };
+    let usable = status == "Active";
+    let expiry = match key.expires_ms {
+        None => "Never expires".to_string(),
+        Some(expires) if expires <= now_ms => format!("Expired {}", local_date(expires)),
+        Some(expires) => format!("Expires {}", local_date(expires)),
+    };
+    let ago = |ms: i64| {
+        let (then, now) = (u64::try_from(ms).ok()?, u64::try_from(now_ms).ok()?);
+        Some(crate::times::ago(then, now))
+    };
     KeyRow {
-        created: local_time(key.created_ms),
-        expires: key.expires_ms.map(local_time),
-        last_used: key.last_used_ms.map(local_time),
+        created: local_date(key.created_ms),
+        created_at: local_time(key.created_ms),
+        expiry,
+        expires_at: key.expires_ms.map(local_time),
+        expires_soon: usable
+            && key
+                .expires_ms
+                .is_some_and(|expires| expires - now_ms <= EXPIRES_SOON_MS),
+        last_used: key.last_used_ms.and_then(ago),
+        last_used_at: key.last_used_ms.map(local_time),
         status,
-        usable: status == "Active",
+        usable,
         id: key.id,
         name: key.name,
         owner: key.owner,
@@ -238,5 +266,38 @@ mod tests {
         assert_eq!(row(key(Some(50), None), 100).status, "Expired");
         assert_eq!(row(key(Some(50), Some(10)), 100).status, "Revoked");
         assert!(!row(key(Some(50), None), 100).usable);
+    }
+
+    #[test]
+    fn keys_say_when_they_expire_and_how_long_ago_they_were_used() {
+        const DAY_MS: i64 = 86_400_000;
+        let now = 400 * DAY_MS;
+
+        let forever = row(key(None, None), now);
+        assert_eq!(forever.created, "1970-01-01");
+        assert_eq!(forever.created_at, "1970-01-01 00:00:00 UTC");
+        assert_eq!(forever.expiry, "Never expires");
+        assert!(!forever.expires_soon);
+        assert_eq!((forever.last_used, forever.last_used_at), (None, None));
+
+        // A week or less to go is worth pointing out, while it still works.
+        let soon = row(key(Some(now + 7 * DAY_MS), None), now);
+        assert_eq!(soon.expiry, "Expires 1971-02-12");
+        assert!(soon.expires_soon);
+        assert!(!row(key(Some(now + 8 * DAY_MS), None), now).expires_soon);
+        assert!(!row(key(Some(now + DAY_MS), Some(5)), now).expires_soon);
+
+        let expired = row(key(Some(now - DAY_MS), None), now);
+        assert_eq!(expired.expiry, "Expired 1971-02-04");
+        assert!(!expired.expires_soon);
+
+        let mut used = key(None, None);
+        used.last_used_ms = Some(now - 5 * 60_000);
+        let used = row(used, now);
+        assert_eq!(used.last_used.as_deref(), Some("5 minutes ago"));
+        assert_eq!(
+            used.last_used_at.as_deref(),
+            Some("1971-02-04 23:55:00 UTC")
+        );
     }
 }

@@ -4568,6 +4568,17 @@ async fn the_keys_page_shows_a_new_key_once() {
 
     assert_eq!(created.status, 200, "{}", created.body);
     assert!(created.body.contains("Your new key"));
+    // Listed on two lines: its first characters under its name, its role under
+    // its owner, and when it expires under the day it was made, marked as it's soon.
+    for part in [
+        r#"<td><strong>Backup script</strong><code class="under nowrap">mxn_"#,
+        r#"<td>test@example.com<span class="under">Admin</span></td>"#,
+        r#"<span class="under soon" title=""#,
+        r#"<span class="under">Never expires</span>"#,
+        r#"<td class="nowrap">Never</td>"#,
+    ] {
+        assert!(created.body.contains(part), "{part}: {}", created.body);
+    }
     // With a button to copy it, which names the key it copies and stays hidden
     // until scripts show it.
     assert!(
