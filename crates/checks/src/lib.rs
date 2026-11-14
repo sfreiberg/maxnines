@@ -19,7 +19,9 @@ use hickory_proto::rr::{Name, RecordType};
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::client::conn::{http1, http2};
-use hyper::header::{ACCEPT_ENCODING, CONTENT_ENCODING, HOST, USER_AGENT};
+use hyper::header::{
+    ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, HOST, HeaderValue, USER_AGENT,
+};
 use hyper::{Method, Request, Response, Uri};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use maxnines_protocol::{Check, CheckKind};
@@ -149,13 +151,37 @@ pub async fn run(check: &Check) -> Value {
     report(check, findings, result)
 }
 
+/// A username and password for a page that asks for one, as the header that
+/// carries them.
+pub struct Login(HeaderValue);
+
+impl Login {
+    pub fn new(username: &str, password: &str) -> Result<Self> {
+        use base64::Engine;
+        let both =
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+        let mut header = HeaderValue::from_str(&format!("Basic {both}"))
+            .map_err(|_| anyhow!("invalid username or password"))?;
+        // Keeps it out of anything that prints headers.
+        header.set_sensitive(true);
+        Ok(Self(header))
+    }
+}
+
+impl std::fmt::Debug for Login {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Login")
+    }
+}
+
 /// Fetches a page for a collector to read, such as a web server's status page,
 /// and gives its text. Only a successful answer counts, and the certificate is
-/// checked as it is for a web check.
-pub async fn fetch_page(url: &str, limit: Duration) -> Result<String> {
+/// checked as it is for a web check. A login is only ever sent to the page asked
+/// for, as redirects aren't followed.
+pub async fn fetch_page(url: &str, limit: Duration, login: Option<&Login>) -> Result<String> {
     let check = Check::new("page", CheckKind::Http, url);
     let work = async {
-        let answer = request(&check, &mut Findings::default()).await?;
+        let answer = request(&check, &mut Findings::default(), login).await?;
         let status = answer.status;
         ensure!(
             (200..300).contains(&status),
@@ -421,7 +447,12 @@ where
     }
 }
 
-fn build_request(check: &Check, uri: &Uri, use_http2: bool) -> Result<Request<Full<Bytes>>> {
+fn build_request(
+    check: &Check,
+    uri: &Uri,
+    use_http2: bool,
+    login: Option<&Login>,
+) -> Result<Request<Full<Bytes>>> {
     let method = check.method.as_deref().unwrap_or("GET");
     let method = Method::from_str(method).map_err(|_| anyhow!("invalid method"))?;
     let host = uri.host().context("no host")?;
@@ -438,12 +469,16 @@ fn build_request(check: &Check, uri: &Uri, use_http2: bool) -> Result<Request<Fu
     };
 
     let body = check.body.clone().unwrap_or_default();
-    Request::builder()
+    let mut request = Request::builder()
         .method(method)
         .uri(target)
         .header(HOST, host_header)
         .header(USER_AGENT, AGENT_NAME)
-        .header(ACCEPT_ENCODING, "gzip")
+        .header(ACCEPT_ENCODING, "gzip");
+    if let Some(Login(header)) = login {
+        request = request.header(AUTHORIZATION, header);
+    }
+    request
         .body(Full::new(Bytes::from(body)))
         .map_err(|_| anyhow!("invalid request"))
 }
@@ -501,7 +536,7 @@ struct Answer {
 
 /// Makes a web request, timing each stage. Redirects aren't followed, as a second
 /// request would muddle every timing.
-async fn request(check: &Check, findings: &mut Findings) -> Result<Answer> {
+async fn request(check: &Check, findings: &mut Findings, login: Option<&Login>) -> Result<Answer> {
     let uri: Uri = check
         .target
         .parse()
@@ -524,11 +559,11 @@ async fn request(check: &Check, findings: &mut Findings) -> Result<Answer> {
         certificate_verdict(check, secured.problem)?;
         let (_, connection) = secured.stream.get_ref();
         let use_http2 = connection.alpn_protocol() == Some(b"h2");
-        let request = build_request(check, &uri, use_http2)?;
+        let request = build_request(check, &uri, use_http2, login)?;
         let sent = Instant::now();
         (sent, exchange(secured.stream, use_http2, request).await?)
     } else {
-        let request = build_request(check, &uri, false)?;
+        let request = build_request(check, &uri, false, login)?;
         let sent = Instant::now();
         (sent, exchange(socket, false, request).await?)
     };
@@ -559,7 +594,7 @@ async fn check_http(check: &Check, findings: &mut Findings) -> Result<()> {
         status,
         compressed,
         body,
-    } = request(check, findings).await?;
+    } = request(check, findings, None).await?;
 
     // Unpacking and searching a big page takes real time, so it can't run on a
     // task, where it would hold up everything else on the thread.
@@ -1037,7 +1072,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(fetch_page(url, Duration::from_secs(5)))
+            .block_on(fetch_page(url, Duration::from_secs(5), None))
     }
 
     #[test]

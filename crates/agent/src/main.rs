@@ -45,9 +45,8 @@ use tokio::time::{Instant, Interval, MissedTickBehavior, interval_at};
 use tracing::{error, info, warn};
 
 use background::jitter;
-use collector::Collector;
+use collector::{Collector, Local};
 use config::Config;
-use custom::Definitions;
 use maxnines_protocol::stopping::StopSignal;
 use own_usage::OwnUsageCollector;
 use websocket::{ConfigUpdate, ServerLink};
@@ -225,12 +224,12 @@ struct Monitoring {
 
 impl Monitoring {
     /// Fails without side effects, so a bad config leaves the old one running.
-    fn start(update: &ConfigUpdate, definitions: &Definitions) -> Result<Self> {
+    fn start(update: &ConfigUpdate, local: Local<'_>) -> Result<Self> {
         // Everything that could go wrong with a config happens in here, so a bad
         // one is refused rather than taking the agent down.
         let (collectors, ticker) = catch_unwind(AssertUnwindSafe(|| {
             update.config.validate()?;
-            let mut collectors = collector::build_all(&update.config, definitions)?;
+            let mut collectors = collector::build_all(&update.config, local)?;
             collectors.push(Box::new(OwnUsageCollector::new()?));
 
             // CPU usage is measured between refreshes, so the first sample waits. The
@@ -271,7 +270,7 @@ async fn run_agent(path: PathBuf, config: Config) -> Result<()> {
     let saved_file = config.saved_config_file();
     let mut monitoring = None;
     if let Some(update) = saved_config::load(&saved_file) {
-        match Monitoring::start(&update, &config.custom_metrics) {
+        match Monitoring::start(&update, config.local()) {
             Ok(started) => {
                 info!(version = update.version, "using the saved config");
                 link.set_facts_interval(Duration::from_secs(update.config.facts_interval_secs));
@@ -290,7 +289,7 @@ async fn run_agent(path: PathBuf, config: Config) -> Result<()> {
                 }
             }
             Some(update) = link.next_config() => {
-                apply(update, &config.custom_metrics, &mut monitoring, &link, &saved_file)?;
+                apply(update, config.local(), &mut monitoring, &link, &saved_file)?;
             }
             result = stop.wait() => {
                 result?;
@@ -315,7 +314,7 @@ async fn next_tick(monitoring: &mut Option<Monitoring>) {
 /// Swaps in a new config, or keeps the current one and tells the server why not.
 fn apply(
     update: ConfigUpdate,
-    definitions: &Definitions,
+    local: Local<'_>,
     monitoring: &mut Option<Monitoring>,
     link: &ServerLink,
     saved_file: &Path,
@@ -327,7 +326,7 @@ fn apply(
         return link.report_config(&update.version, None);
     }
 
-    match Monitoring::start(&update, definitions) {
+    match Monitoring::start(&update, local) {
         Ok(started) => {
             info!(
                 version = update.version,
@@ -504,7 +503,7 @@ mod tests {
     #[tokio::test]
     async fn the_first_sample_waits_for_a_random_part_of_the_interval() {
         let config = json!({ "interval_secs": 36_000, "collectors": { "cpu": {} } });
-        let mut started = Monitoring::start(&update("v1", config), &Definitions::new()).unwrap();
+        let mut started = Monitoring::start(&update("v1", config), Local::none()).unwrap();
 
         let first = timeout(Duration::from_secs(1), started.ticker.tick()).await;
 
@@ -514,7 +513,7 @@ mod tests {
     #[tokio::test]
     async fn a_good_config_starts_its_collectors() {
         let config = json!({ "collectors": { "cpu": {} } });
-        let started = Monitoring::start(&update("v1", config), &Definitions::new()).unwrap();
+        let started = Monitoring::start(&update("v1", config), Local::none()).unwrap();
 
         assert_eq!(started.version, "v1");
         // What was asked for, and the agent reporting on itself.
@@ -527,7 +526,7 @@ mod tests {
             json!({ "interval_secs": 0 }),
             json!({ "collectors": { "gpu": {} } }),
         ] {
-            assert!(Monitoring::start(&update("v1", config), &Definitions::new()).is_err());
+            assert!(Monitoring::start(&update("v1", config), Local::none()).is_err());
         }
     }
 }

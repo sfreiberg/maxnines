@@ -421,6 +421,7 @@ mod tests {
             state_dir: tempfile::tempdir().unwrap().keep(),
             facts: BTreeMap::from([("role".to_string(), json!("web"))]),
             custom_metrics: Definitions::new(),
+            metrics_logins: BTreeMap::new(),
             actions: Actions::from([(
                 "greet".to_string(),
                 crate::actions::Action {

@@ -8,18 +8,24 @@
 //! server expects for a rate. Histograms' buckets are left out, which leaves their
 //! sum and count, enough for an average.
 //!
+//! A page that asks for a username and password gets the ones the agent's own
+//! config gives for it, by the page's name. They never come from the server, and
+//! never go to it.
+//!
 //! A page can be any size, so what's kept of it is bounded: it's read in one pass
 //! into a short list for each series, and nothing else of it is held between
 //! rounds. The lists only become the rows that are sent when a sample is taken,
 //! as a row is several times the size.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
-use maxnines_checks::fetch_page;
+use anyhow::{Result, ensure};
+use maxnines_checks::{Login, fetch_page};
 use maxnines_protocol::metrics_page_name;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use wildmatch::WildMatch;
 
@@ -38,6 +44,61 @@ const MAX_NAME_BYTES: usize = 255;
 
 const TIMED_OUT: &str = "timed out";
 const NO_METRICS: &str = "the page has no metrics in the OpenMetrics format";
+
+/// How many pages the agent's config can give a login for.
+const MAX_LOGINS: usize = 64;
+
+/// A page's username and password, from the agent's own config:
+///
+/// ```hcl
+/// openmetrics "localhost:9100" {
+///   username = "metrics"
+///   password = env("METRICS_PASSWORD")
+/// }
+/// ```
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PageLogin {
+    username: String,
+    password: String,
+}
+
+impl fmt::Debug for PageLogin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PageLogin")
+            .field("username", &self.username)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The logins the agent's config gives, by the page's name.
+pub type Logins = BTreeMap<String, PageLogin>;
+
+pub fn check_logins(logins: &Logins) -> Result<()> {
+    ensure!(
+        logins.len() <= MAX_LOGINS,
+        "at most {MAX_LOGINS} OpenMetrics pages can have a login"
+    );
+    for (page, login) in logins {
+        // What a page is called never has these, so it could never match.
+        ensure!(
+            !page.is_empty() && !page.contains("://") && !page.contains(['?', '#', ' ']),
+            "{page:?} isn't an OpenMetrics page's name, which is its address without \
+             http://, like localhost:9100"
+        );
+        // Basic authentication ends the username at the first colon.
+        ensure!(
+            !login.username.is_empty() && !login.username.contains(':'),
+            "the login for {page:?} needs a username, without a colon"
+        );
+        ensure!(
+            !login.password.is_empty(),
+            "the login for {page:?} needs a password"
+        );
+        Login::new(&login.username, &login.password)?;
+    }
+    Ok(())
+}
 
 /// What a page's `# TYPE` line says a metric is, for the kinds that are read
 /// differently from a plain number.
@@ -63,6 +124,8 @@ struct Page {
     /// The metrics to keep, or all of them when there are none.
     wanted: Arc<[WildMatch]>,
     max_series: usize,
+    /// Sent with every request, for a page that asks who's reading.
+    login: Option<Login>,
 }
 
 impl Page {
@@ -185,7 +248,7 @@ fn read(text: &str, page: &Page) -> Result<Vec<Value>, &'static str> {
 }
 
 async fn read_page(page: Arc<Page>) -> Vec<Value> {
-    let read = match fetch_page(&page.url, TIMEOUT).await {
+    let read = match fetch_page(&page.url, TIMEOUT, page.login.as_ref()).await {
         Ok(text) => read(&text, &page).map_err(str::to_string),
         Err(error) => Err(format!("{error:#}")),
     };
@@ -203,20 +266,31 @@ pub struct OpenMetricsCollector {
 }
 
 impl OpenMetricsCollector {
-    pub fn new(urls: Vec<String>, wanted: &[String], interval: Duration) -> Self {
+    pub fn new(
+        urls: Vec<String>,
+        wanted: &[String],
+        logins: &Logins,
+        interval: Duration,
+    ) -> Result<Self> {
         let wanted: Arc<[WildMatch]> = wanted.iter().map(|name| WildMatch::new(name)).collect();
         let max_series = MAX_SERIES / urls.len().max(1);
-        let pages: Vec<Arc<Page>> = urls
+        let pages = urls
             .into_iter()
             .map(|url| {
-                Arc::new(Page {
-                    name: metrics_page_name(&url).to_string(),
+                let name = metrics_page_name(&url).to_string();
+                let login = logins
+                    .get(&name)
+                    .map(|login| Login::new(&login.username, &login.password))
+                    .transpose()?;
+                Ok(Arc::new(Page {
+                    name,
                     url,
                     wanted: wanted.clone(),
                     max_series,
-                })
+                    login,
+                }))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let background = Background::start(interval, move || {
             let pages = pages.clone();
             async move {
@@ -225,10 +299,10 @@ impl OpenMetricsCollector {
                 Value::Array(rows.into_iter().flatten().collect())
             }
         });
-        Self {
+        Ok(Self {
             background,
             totals: HashMap::new(),
-        }
+        })
     }
 
     /// Turns what's kept of the pages into the rows of a sample. A running total
@@ -327,6 +401,7 @@ jobs_created 1700000000
             name: "app:9100".to_string(),
             wanted: wanted.iter().map(|name| WildMatch::new(name)).collect(),
             max_series,
+            login: None,
         }
     }
 
@@ -406,6 +481,11 @@ jobs_created 1700000000
     /// Serves the first of `bodies` until told to move on, so what the collector
     /// reads doesn't depend on how fast it reads.
     fn serve(bodies: Vec<&'static str>) -> Served {
+        serve_to(bodies, None)
+    }
+
+    /// As [`serve`], but only to requests with this header, when there is one.
+    fn serve_to(bodies: Vec<&'static str>, header: Option<&'static str>) -> Served {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let showing = Arc::new(AtomicUsize::new(0));
@@ -423,9 +503,16 @@ jobs_created 1700000000
                         Ok(size) => request.extend_from_slice(&buffer[..size]),
                     }
                 }
-                let body = bodies[shown.load(Ordering::Relaxed).min(bodies.len() - 1)];
+                let request = String::from_utf8_lossy(&request).to_lowercase();
+                let allowed = header.is_none_or(|header| request.contains(&header.to_lowercase()));
+                let (status, body) = if allowed {
+                    let body = bodies[shown.load(Ordering::Relaxed).min(bodies.len() - 1)];
+                    ("200 OK", body)
+                } else {
+                    ("401 Unauthorized", "")
+                };
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = stream.write_all(response.as_bytes());
@@ -457,7 +544,9 @@ jobs_created 1700000000
         let served = serve(vec![first, second]);
         let address = &served.address;
         let url = format!("http://{address}/metrics");
-        let mut collector = OpenMetricsCollector::new(vec![url], &[], Duration::from_millis(200));
+        let mut collector =
+            OpenMetricsCollector::new(vec![url], &[], &Logins::new(), Duration::from_millis(200))
+                .unwrap();
         let named = |series: &str| format!("{address} {series}");
 
         let output = collect_until(&mut collector, |output| {
@@ -494,7 +583,9 @@ jobs_created 1700000000
             format!("http://{address}/metrics"),
             format!("http://{closed}/metrics"),
         ];
-        let mut collector = OpenMetricsCollector::new(urls, &[], Duration::from_millis(200));
+        let mut collector =
+            OpenMetricsCollector::new(urls, &[], &Logins::new(), Duration::from_millis(200))
+                .unwrap();
 
         let output = collect_until(&mut collector, |output| output.is_array());
 
@@ -507,9 +598,81 @@ jobs_created 1700000000
         assert!(output[1]["error"].is_string(), "{output}");
     }
 
+    fn login(username: &str, password: &str) -> PageLogin {
+        PageLogin {
+            username: username.to_string(),
+            password: password.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_page_gets_the_login_the_agent_has_for_it() {
+        // "metrics:s3cret", as basic authentication sends it.
+        let served = serve_to(
+            vec!["queue 1\n"],
+            Some("authorization: Basic bWV0cmljczpzM2NyZXQ="),
+        );
+        let address = &served.address;
+        let url = format!("http://{address}/metrics");
+        let read = |logins: Logins| {
+            let interval = Duration::from_millis(200);
+            let mut collector =
+                OpenMetricsCollector::new(vec![url.clone()], &[], &logins, interval).unwrap();
+            collect_until(&mut collector, |output| output.is_array())
+        };
+
+        let output = read(Logins::from([(
+            address.clone(),
+            login("metrics", "s3cret"),
+        )]));
+        assert_eq!(output[0]["up"], 1, "{output}");
+        assert_eq!(output[1]["value"], 1.0);
+
+        // A login for some other page isn't sent to this one.
+        let other = Logins::from([("localhost:1".to_string(), login("metrics", "s3cret"))]);
+        for logins in [Logins::new(), other] {
+            let output = read(logins);
+            assert_eq!(output[0]["up"], 0, "{output}");
+            assert_eq!(output[0]["error"], "the page returned status 401");
+        }
+    }
+
+    #[test]
+    fn logins_need_a_page_a_username_and_a_password() {
+        let one = |page: &str, username: &str, password: &str| {
+            check_logins(&Logins::from([(
+                page.to_string(),
+                login(username, password),
+            )]))
+        };
+        one("localhost:9100", "metrics", "s3cret: with a colon").unwrap();
+        one("app.example.com/internal", "metrics", "x").unwrap();
+        // Anything can be in a password, as it's encoded before it's sent.
+        one("localhost:9100", "metrics", "line\nbreak é").unwrap();
+        for (page, username, password) in [
+            ("http://localhost:9100/metrics", "metrics", "x"),
+            ("localhost:9100/metrics?a=b", "metrics", "x"),
+            ("", "metrics", "x"),
+            ("localhost:9100", "", "x"),
+            ("localhost:9100", "a:b", "x"),
+            ("localhost:9100", "metrics", ""),
+        ] {
+            assert!(one(page, username, password).is_err(), "{page} {username}");
+        }
+    }
+
+    #[test]
+    fn a_password_is_never_printed() {
+        let printed = format!("{:?}", login("metrics", "s3cret"));
+        assert!(printed.contains("metrics"), "{printed}");
+        assert!(!printed.contains("s3cret"), "{printed}");
+    }
+
     #[test]
     fn a_series_that_went_away_is_forgotten() {
-        let mut collector = OpenMetricsCollector::new(Vec::new(), &[], Duration::from_secs(3600));
+        let mut collector =
+            OpenMetricsCollector::new(Vec::new(), &[], &Logins::new(), Duration::from_secs(3600))
+                .unwrap();
         let kept = |names: &[&str]| -> Vec<Value> {
             let mut kept = vec![json!({ "name": "app:9100", "up": 1, "dropped": 0 })];
             kept.extend(names.iter().map(|name| json!([name, 5.0, true])));

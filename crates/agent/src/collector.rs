@@ -20,7 +20,7 @@ pub use maxnines_collectors::{Collector, WARMUP};
 use crate::checks::CheckCollector;
 use crate::custom::{CustomCollector, Definitions};
 use crate::files::FileCollector;
-use crate::openmetrics::OpenMetricsCollector;
+use crate::openmetrics::{Logins, OpenMetricsCollector};
 use crate::services::ServiceCollector;
 use crate::status_pages::{Software, StatusPageCollector};
 use crate::system_collector::SystemCollector;
@@ -47,24 +47,42 @@ pub fn host_name() -> String {
     )
 }
 
+/// What the agent's own config gives collectors, on top of what the server asks
+/// for. The server can pick from these by name, but never sees or changes them.
+#[derive(Clone, Copy)]
+pub struct Local<'a> {
+    pub custom_metrics: &'a Definitions,
+    pub metrics_logins: &'a Logins,
+}
+
+#[cfg(test)]
+impl Local<'static> {
+    /// A config that gives nothing.
+    pub fn none() -> Self {
+        static CUSTOM_METRICS: Definitions = Definitions::new();
+        static METRICS_LOGINS: Logins = Logins::new();
+        Self {
+            custom_metrics: &CUSTOM_METRICS,
+            metrics_logins: &METRICS_LOGINS,
+        }
+    }
+}
+
 /// Builds everything a config turns on.
-pub fn build_all(
-    config: &AgentConfig,
-    definitions: &Definitions,
-) -> Result<Vec<Box<dyn Collector>>> {
+pub fn build_all(config: &AgentConfig, local: Local<'_>) -> Result<Vec<Box<dyn Collector>>> {
     let interval = Duration::from_secs(config.interval_secs);
     config
         .collectors
         .iter()
         .filter(|(_, settings)| settings.enabled)
-        .map(|(name, settings)| build(name, settings, definitions, interval))
+        .map(|(name, settings)| build(name, settings, local, interval))
         .collect()
 }
 
 fn build(
     name: &str,
     config: &CollectorSettings,
-    definitions: &Definitions,
+    local: Local<'_>,
     interval: Duration,
 ) -> Result<Box<dyn Collector>> {
     Ok(match name {
@@ -86,7 +104,7 @@ fn build(
         }
         "custom" => {
             let names = config.names.clone().unwrap_or_default();
-            Box::new(CustomCollector::new(names, definitions, interval))
+            Box::new(CustomCollector::new(names, local.custom_metrics, interval))
         }
         "services" => {
             let names = config.names.clone().unwrap_or_default();
@@ -108,7 +126,8 @@ fn build(
         "openmetrics" => {
             let urls = config.urls.clone().unwrap_or_default();
             let wanted = config.names.as_deref().unwrap_or_default();
-            Box::new(OpenMetricsCollector::new(urls, wanted, interval))
+            let logins = local.metrics_logins;
+            Box::new(OpenMetricsCollector::new(urls, wanted, logins, interval)?)
         }
         other => bail!("unknown collector {other:?}"),
     })
@@ -368,9 +387,7 @@ mod tests {
         );
 
         assert_eq!(
-            build_all(&config(collectors), &Definitions::new())
-                .unwrap()
-                .len(),
+            build_all(&config(collectors), Local::none()).unwrap().len(),
             supported().len()
         );
     }
@@ -378,7 +395,7 @@ mod tests {
     #[test]
     fn disabled_collectors_are_left_out() {
         let collectors = json!({ "cpu": {}, "memory": { "enabled": false } });
-        let built = build_all(&config(collectors), &Definitions::new()).unwrap();
+        let built = build_all(&config(collectors), Local::none()).unwrap();
 
         assert_eq!(built.len(), 1);
         assert_eq!(built[0].name(), "cpu");
@@ -575,6 +592,6 @@ mod tests {
 
     #[test]
     fn an_unknown_collector_is_an_error() {
-        assert!(build_all(&config(json!({ "gpu": {} })), &Definitions::new()).is_err());
+        assert!(build_all(&config(json!({ "gpu": {} })), Local::none()).is_err());
     }
 }

@@ -50,6 +50,9 @@ reached, and sent when it's back.
 - **Only administrators should be able to change `agent.hcl`.** Custom metrics in it
   are commands the agent runs, so anyone who can edit the file can run commands as
   the agent. Keep it owned by the agent's user or root and not writable by others.
+  It can also hold passwords for [OpenMetrics pages](openmetrics.md#pages-that-need-signing-in),
+  so it shouldn't be readable by others either, unless those come from the
+  environment.
 - **Upgrade the server first.** Older agents work with a newer server, but a newer
   agent may need things an older server doesn't have. The Hosts page marks agents
   older than the one released with the server **Update available**, and any newer

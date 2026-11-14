@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+base64 = "0.22"
 flate2 = "1"
 hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
 http-body-util = "0.1"

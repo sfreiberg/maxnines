@@ -8,7 +8,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::actions::{Actions, check_actions};
+use crate::collector::Local;
 use crate::custom::{Definitions, check_definitions};
+use crate::openmetrics::{Logins, check_logins};
 
 const FACTS: &str = "facts";
 
@@ -39,6 +41,10 @@ pub struct Config {
     /// service. As with custom metrics, it can only pick from these.
     #[serde(default, rename = "action")]
     pub actions: Actions,
+    /// Usernames and passwords for OpenMetrics pages that ask for one, by the page's
+    /// name. The server says which pages to read, but never sees these.
+    #[serde(default, rename = "openmetrics")]
+    pub metrics_logins: Logins,
     /// Whether the server can ask for the actions built into the agent, which
     /// list what's running here and where disk space is going.
     #[serde(default = "enabled")]
@@ -82,6 +88,14 @@ impl Config {
         self.state_dir.join("config.json")
     }
 
+    /// What this file gives collectors.
+    pub fn local(&self) -> Local<'_> {
+        Local {
+            custom_metrics: &self.custom_metrics,
+            metrics_logins: &self.metrics_logins,
+        }
+    }
+
     pub fn sample_queue_folder(&self) -> PathBuf {
         self.state_dir.join("samples")
     }
@@ -99,6 +113,7 @@ impl Config {
         config.facts = facts;
         check_definitions(&config.custom_metrics)?;
         check_actions(&config.actions)?;
+        check_logins(&config.metrics_logins)?;
         Ok(config)
     }
 }
@@ -242,6 +257,41 @@ mod env_tests {
 
     fn reachable() -> String {
         with_url("\"ws://127.0.0.1:9000/ws\"")
+    }
+
+    #[test]
+    fn openmetrics_logins_are_read_from_their_blocks() {
+        let server = reachable();
+        let text = format!(
+            r#"{server}
+            openmetrics "localhost:9100" {{
+              username = "metrics"
+              password = env("MAXNINES_TEST_UNSET", "s3cret")
+            }}
+            openmetrics "app.example.com" {{
+              username = "reader"
+              password = "x"
+            }}
+            "#
+        );
+        let config = Config::parse(&text).unwrap();
+        let pages: Vec<&str> = config.metrics_logins.keys().map(String::as_str).collect();
+        assert_eq!(pages, ["app.example.com", "localhost:9100"]);
+        // Printing a config, as a log line might, leaves the passwords out.
+        assert!(!format!("{config:?}").contains("s3cret"));
+
+        let bad = format!(
+            "{server}\nopenmetrics \"http://localhost:9100/metrics\" {{\n username = \"a\"\n password = \"b\"\n}}\n"
+        );
+        let error = format!("{:#}", Config::parse(&bad).unwrap_err());
+        assert!(
+            error.contains("isn't an OpenMetrics page's name"),
+            "{error}"
+        );
+        let extra = format!(
+            "{server}\nopenmetrics \"localhost:9100\" {{\n username = \"a\"\n password = \"b\"\n token = \"c\"\n}}\n"
+        );
+        assert!(Config::parse(&extra).is_err());
     }
 
     #[test]

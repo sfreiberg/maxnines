@@ -250,7 +250,7 @@ struct Page {
 /// One row per page. Totals are kept to one side for [`StatusPageCollector`] to
 /// turn into changes.
 async fn read_page(page: Arc<Page>) -> Value {
-    let read = match fetch_page(&page.software.request_url(&page.url), TIMEOUT).await {
+    let read = match fetch_page(&page.software.request_url(&page.url), TIMEOUT, None).await {
         Ok(text) => page.software.read(&text).map_err(str::to_string),
         Err(error) => Err(format!("{error:#}")),
     };
