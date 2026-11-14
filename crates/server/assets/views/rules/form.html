@@ -107,6 +107,16 @@
       <small>One address per line, one for each pool's <code>pm.status_path</code>. Leave empty for <code>{{ default_pages.php_fpm }}</code>.</small>
     </label>
 
+    <label>OpenMetrics pages
+      <textarea name="openmetrics_urls" rows="2" spellcheck="false" placeholder="http://localhost:9100/metrics">{{ rule.openmetrics_urls }}</textarea>
+      <small>One address per line, for pages in the Prometheus or OpenMetrics text format, such as an exporter's <code>/metrics</code>. Up to 2,000 series are kept, shared equally between the pages.</small>
+    </label>
+
+    <label>OpenMetrics metrics
+      <textarea name="openmetrics_names" rows="2" spellcheck="false" placeholder="http_*">{{ rule.openmetrics_names }}</textarea>
+      <small>One name per line, with <code>*</code> and <code>?</code> for anything, such as <code>http_*</code>. Only these are kept from the pages. Leave empty for everything.</small>
+    </label>
+
     <label>Checks
       <textarea name="checks" rows="4" spellcheck="false" placeholder="tcp db db1:5432">{{ rule.checks }}</textarea>
       <small>One per line, as a kind, a name and a target: <code>tcp db db1:5432</code>, <code>http site https://example.com/</code>, <code>tls site example.com:443</code>, <code>dns resolver example.com</code> or <code>ping gateway 10.0.0.1</code>. Options can follow: <code>timeout=5</code>, <code>interval=300</code> to run less often than every sample, <code>insecure</code>, for http <code>method=POST</code>, <code>body=...</code> and <code>regex="Welcome back"</code>, for dns <code>server=8.8.8.8</code> and <code>record=MX</code>, and for ping <code>count=5</code>.</small>

@@ -20,13 +20,13 @@ lowest priority first, so higher priorities win.
 | Collector option | For | Description |
 | --- | --- | --- |
 | `mount_points` | `disk` | Only these disks, even ones left out by default, like disk images |
-| `names` | `processes`, `services`, `custom`, `counters` | What to watch. Custom metrics must be defined in the agent's own config, and counters are Windows performance counter paths, such as `\Memory\Available MBytes` |
+| `names` | `processes`, `services`, `custom`, `counters`, `openmetrics` | What to watch. Custom metrics must be defined in the agent's own config, and counters are Windows performance counter paths, such as `\Memory\Available MBytes`. For `openmetrics` they're the metrics to keep, with `*` and `?` for anything, and leaving it out keeps them all |
 | `paths` | `files` | The files and folders to watch |
 | `checks` | `checks` | What to try reaching, as in [remote checks](api-remote-checks.md), each with its own `interval_secs` if it should run less often than every sample |
-| `urls` | `apache`, `nginx`, `php_fpm` | The status pages to read. Leave it out for the usual page on the host itself |
+| `urls` | `apache`, `nginx`, `php_fpm`, `openmetrics` | The status pages to read. Leave it out for the usual page on the host itself. For `openmetrics` they're the [metrics pages](openmetrics.md) to read, which have no usual address |
 
 The collectors are `apache`, `checks`, `containers`, `counters`, `cpu`, `custom`, `disk`, `files`, `host`,
-`memory`, `network`, `nginx`, `php_fpm`, `processes`, `sensors`, `services`,
+`memory`, `network`, `nginx`, `openmetrics`, `php_fpm`, `processes`, `sensors`, `services`,
 `system` and `top_processes`.
 
 ## List config rules

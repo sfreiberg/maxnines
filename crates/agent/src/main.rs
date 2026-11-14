@@ -18,6 +18,7 @@ mod disk_space;
 mod facts;
 mod files;
 mod identity;
+mod openmetrics;
 mod own_usage;
 mod privileges;
 mod saved_config;

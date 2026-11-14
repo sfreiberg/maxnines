@@ -18,7 +18,7 @@ use serde_json::Value;
 
 /// Every collector the project knows about. An agent reports the ones it can
 /// run in its facts, because older agents may not have them all.
-pub const COLLECTORS: [&str; 18] = [
+pub const COLLECTORS: [&str; 19] = [
     "apache",
     "checks",
     "containers",
@@ -31,6 +31,7 @@ pub const COLLECTORS: [&str; 18] = [
     "memory",
     "network",
     "nginx",
+    "openmetrics",
     "php_fpm",
     "processes",
     "sensors",
@@ -183,7 +184,9 @@ pub struct CollectorSettings {
     /// Processes, services, custom and counters collectors only: the names to watch.
     /// Nothing else about what's running on a host is reported. For custom metrics
     /// these pick from what the agent's own config defines, and for counters they're
-    /// Windows performance counter paths.
+    /// Windows performance counter paths. For the OpenMetrics collector they're the
+    /// metrics to keep from its pages, with `*` and `?` as wildcards, and without any
+    /// it keeps them all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub names: Option<Vec<String>>,
     /// Files collector only: the files and folders to watch.
@@ -193,7 +196,8 @@ pub struct CollectorSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checks: Option<Vec<Check>>,
     /// Apache, nginx and PHP-FPM collectors only: the status pages to read. Without
-    /// any, the collector reads [`default_status_page`].
+    /// any, the collector reads [`default_status_page`]. For the OpenMetrics collector
+    /// they're the metrics pages to read, and it has no usual one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub urls: Option<Vec<String>>,
 }
@@ -207,6 +211,30 @@ pub fn default_status_page(collector: &str) -> Option<&'static str> {
         "php_fpm" => Some("http://localhost/status"),
         _ => None,
     }
+}
+
+/// What an OpenMetrics page is called, in front of each of its series: its address
+/// without the scheme, anything after a `?`, or a path that's only `/metrics`, like
+/// `localhost:9100`.
+pub fn metrics_page_name(url: &str) -> &str {
+    let address = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let address = address.split(['?', '#']).next().unwrap_or(address);
+    address
+        .strip_suffix("/metrics")
+        .unwrap_or(address)
+        .trim_end_matches('/')
+}
+
+/// A metric's name as OpenMetrics pages write them, where `*` and `?` stand for
+/// anything.
+fn is_metric_pattern(pattern: &str) -> bool {
+    !pattern.is_empty()
+        && pattern
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_:*?".contains(c))
 }
 
 /// A status page has to be a plain web address. A username or password in it
@@ -565,6 +593,11 @@ impl CollectorSettings {
                 "{name:?} isn't a valid custom metric name"
             );
             ensure!(
+                collector != "openmetrics" || is_metric_pattern(name),
+                "{name:?} isn't a metric's name, which has only letters, digits, _ and :, \
+                 with * and ? for anything"
+            );
+            ensure!(
                 collector != "counters" || is_counter_path(name),
                 "{name:?} isn't a performance counter path, which looks like \
                  \\Processor(_Total)\\% Processor Time"
@@ -592,6 +625,14 @@ impl CollectorSettings {
         for (index, url) in urls.iter().enumerate() {
             check_status_page(url)?;
             ensure!(!urls[..index].contains(url), "{url:?} is listed twice");
+            // Series are told apart by their page's name.
+            let name = metrics_page_name(url);
+            let same = urls[..index]
+                .iter()
+                .find(|other| collector == "openmetrics" && metrics_page_name(other) == name);
+            if let Some(other) = same {
+                anyhow::bail!("{other:?} and {url:?} would both be called {name:?}");
+            }
         }
 
         let checks = self.checks.as_deref().unwrap_or_default();
@@ -910,6 +951,47 @@ mod tests {
             .map(|i| format!("http://localhost/{i}"))
             .collect();
         assert!(pages(json!(too_many)).is_err());
+    }
+
+    #[test]
+    fn metrics_pages_are_named_by_where_they_are() {
+        for (url, name) in [
+            ("http://localhost:9100/metrics", "localhost:9100"),
+            (
+                "https://app.example.com/metrics?format=text",
+                "app.example.com",
+            ),
+            ("http://localhost:8080/app/metrics", "localhost:8080/app"),
+            (
+                "http://localhost:9115/probe?target=a",
+                "localhost:9115/probe",
+            ),
+            ("http://[::1]:9100/", "[::1]:9100"),
+        ] {
+            assert_eq!(metrics_page_name(url), name);
+        }
+    }
+
+    #[test]
+    fn openmetrics_pages_have_different_names_and_plain_metric_names() {
+        let settings = |settings: Value| with("openmetrics", settings).validate();
+        settings(json!({
+            "urls": ["http://localhost:9100/metrics", "http://localhost:9187/metrics"],
+            "names": ["http_*", "process_cpu_seconds_total", "app:latency:p9?"]
+        }))
+        .unwrap();
+        // The same page twice over, as far as its series' names go.
+        let same = json!([
+            "http://localhost:9100/metrics",
+            "https://localhost:9100/metrics?x=1"
+        ]);
+        let error = settings(json!({ "urls": same.clone() })).unwrap_err();
+        assert!(error.to_string().contains("both be called"), "{error}");
+        // Only this collector names its pages.
+        with("nginx", json!({ "urls": same })).validate().unwrap();
+        for bad in ["http_requests{code=\"200\"}", "a b", "", "näme"] {
+            assert!(settings(json!({ "names": [bad] })).is_err(), "{bad}");
+        }
     }
 
     #[test]

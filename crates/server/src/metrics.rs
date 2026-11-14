@@ -1335,6 +1335,53 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
+    // Whatever a page in the Prometheus or OpenMetrics format lists, each line a
+    // series named by its page and the line. They measure all sorts of things, so
+    // they're numbers here: levels as they are, and running totals as rates.
+    Metric {
+        name: "openmetrics.up",
+        title: "OpenMetrics page answering",
+        unit: Unit::Number,
+        collector: "openmetrics",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.up"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "openmetrics.value",
+        title: "OpenMetrics values",
+        unit: Unit::Number,
+        collector: "openmetrics",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.value"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "openmetrics.rate",
+        title: "OpenMetrics rates",
+        unit: Unit::PerSecond,
+        collector: "openmetrics",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Rate("$.change"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "openmetrics.dropped",
+        title: "OpenMetrics series over the limit",
+        unit: Unit::Number,
+        collector: "openmetrics",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.dropped"),
+        },
+        chart: ShowChart::Never,
+    },
     Metric {
         name: "custom.value",
         title: "Custom metrics",

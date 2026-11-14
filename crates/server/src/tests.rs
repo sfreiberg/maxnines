@@ -3956,6 +3956,87 @@ async fn web_server_status_pages_become_charts() {
     assert_eq!(names.len(), 2, "{up}");
 }
 
+#[tokio::test]
+async fn openmetrics_pages_become_values_and_rates() {
+    let server = start_with_metrics().await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
+    let id = host.id();
+    let requests = r#"localhost:8080 http_requests_total{code="200"}"#;
+
+    // As the agent sends them: counters as the change since the sample before.
+    let now = now_ms() as u64;
+    for seconds_ago in [45, 30, 15] {
+        let rows = json!([
+            { "name": "localhost:8080", "up": 1, "dropped": 4 },
+            { "name": "localhost:8080 queue_depth", "value": 7.5 },
+            { "name": requests, "change": 30.0 },
+            { "name": "localhost:9187", "up": 0, "error": "timed out" },
+        ]);
+        let message = AgentMessage::Sample(Sample {
+            timestamp_ms: now - seconds_ago * 1000,
+            metrics: BTreeMap::from([("openmetrics".to_string(), rows)]),
+        });
+        send(&mut client, &message).await;
+    }
+
+    let series = |metric: &str| format!("/api/v1/hosts/{id}/metrics/{metric}?range=1h");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let rates = loop {
+        let path = series("openmetrics.rate");
+        let body = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
+        if body["series"]
+            .as_array()
+            .is_some_and(|lines| !lines.is_empty())
+        {
+            break body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the samples never arrived: {body}"
+        );
+        tokio::time::timeout(Duration::from_millis(10), client.next())
+            .await
+            .ok();
+    };
+    assert_eq!(rates["unit"], "per_second");
+    assert_eq!(rates["series"].as_array().unwrap().len(), 1, "{rates}");
+    assert_eq!(rates["series"][0]["name"], requests);
+    assert_eq!(rates["series"][0]["points"][0]["avg"], 2.0);
+
+    let get = |metric: &str| {
+        let path = series(metric);
+        let server = &server;
+        async move { json_body(&server.http("GET", &path, Some(&server.api_key)).await) }
+    };
+    let values = get("openmetrics.value").await;
+    assert_eq!(values["series"].as_array().unwrap().len(), 1, "{values}");
+    assert_eq!(values["series"][0]["name"], "localhost:8080 queue_depth");
+    assert_eq!(values["series"][0]["points"][0]["avg"], 7.5);
+
+    // A page is a series of its own, whether it answered or not.
+    let up = get("openmetrics.up").await;
+    let pages: BTreeMap<&str, &Value> = up["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|line| Some((line["name"].as_str()?, &line["points"][0]["avg"])))
+        .collect();
+    assert_eq!(pages["localhost:8080"], 1.0, "{up}");
+    assert_eq!(pages["localhost:9187"], 0.0, "{up}");
+    let dropped = get("openmetrics.dropped").await;
+    assert_eq!(dropped["series"][0]["points"][0]["avg"], 4.0);
+
+    // Both charts are on the host's page, and the rule form asks for the pages.
+    let mut browser = Browser::default();
+    let page = browser.get(&server, &format!("/hosts/{id}/metrics")).await;
+    assert!(page.body.contains("OpenMetrics values"), "{}", page.body);
+    assert!(page.body.contains("OpenMetrics rates"));
+    let form = browser.get(&server, "/rules/new").await;
+    assert!(form.body.contains("name=\"openmetrics_urls\""));
+    assert!(form.body.contains("name=\"openmetrics_names\""));
+}
+
 // ---- finding hosts
 
 async fn report_facts(server: &TestServer, hostname: &str, facts: Value) -> (Identity, Client) {

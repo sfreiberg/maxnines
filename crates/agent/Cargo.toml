@@ -26,6 +26,9 @@ tokio = { version = "1.54.1", features = ["io-util", "net", "rt", "macros", "pro
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 tracing.workspace = true
 webpki-roots = "0.26"
+# Picks the metrics to keep from an OpenMetrics page, with the same wildcards the
+# server's alert rules use.
+wildmatch = "2.7.0"
 
 # Lists the host's sockets and which process holds each, for the connections
 # action. It doesn't cover FreeBSD, which is asked through libc instead.

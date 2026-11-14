@@ -13,6 +13,7 @@
 - [Dashboards](dashboards.md)
 - [Annotations](annotations.md)
 - [Web servers](web-servers.md)
+- [OpenMetrics](openmetrics.md)
 - [Map](map.md)
 - [Installing as an app](app.md)
 - [API](api.md)

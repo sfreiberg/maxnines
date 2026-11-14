@@ -49,6 +49,8 @@ struct RuleForm {
     apache_urls: String,
     nginx_urls: String,
     php_fpm_urls: String,
+    openmetrics_urls: String,
+    openmetrics_names: String,
     checks: String,
     collectors: Vec<CollectorChoice>,
 }
@@ -101,6 +103,8 @@ impl RuleForm {
             apache_urls: lines(&rule.settings["collectors"]["apache"]["urls"]),
             nginx_urls: lines(&rule.settings["collectors"]["nginx"]["urls"]),
             php_fpm_urls: lines(&rule.settings["collectors"]["php_fpm"]["urls"]),
+            openmetrics_urls: lines(&rule.settings["collectors"]["openmetrics"]["urls"]),
+            openmetrics_names: lines(&rule.settings["collectors"]["openmetrics"]["names"]),
             checks: check_lines(&rule.settings["collectors"]["checks"]["checks"]),
             collectors: choices(|name| {
                 match rule.settings["collectors"][name]["enabled"].as_bool() {
@@ -132,6 +136,8 @@ impl RuleForm {
             apache_urls: text("apache_urls"),
             nginx_urls: text("nginx_urls"),
             php_fpm_urls: text("php_fpm_urls"),
+            openmetrics_urls: text("openmetrics_urls"),
+            openmetrics_names: text("openmetrics_names"),
             checks: text("checks"),
             collectors: choices(|name| text(&format!("collector_{name}"))),
         }
@@ -164,19 +170,23 @@ impl RuleForm {
             if let Some(enabled) = enabled {
                 fields.insert("enabled".to_string(), json!(enabled));
             }
-            let list = match collector.name {
-                "disk" => Some(("mount_points", &self.mount_points)),
-                "processes" => Some(("names", &self.process_names)),
-                "custom" => Some(("names", &self.custom_names)),
-                "counters" => Some(("names", &self.counter_names)),
-                "services" => Some(("names", &self.service_names)),
-                "files" => Some(("paths", &self.file_paths)),
-                "apache" => Some(("urls", &self.apache_urls)),
-                "nginx" => Some(("urls", &self.nginx_urls)),
-                "php_fpm" => Some(("urls", &self.php_fpm_urls)),
-                _ => None,
+            let lists = match collector.name {
+                "disk" => vec![("mount_points", &self.mount_points)],
+                "processes" => vec![("names", &self.process_names)],
+                "custom" => vec![("names", &self.custom_names)],
+                "counters" => vec![("names", &self.counter_names)],
+                "services" => vec![("names", &self.service_names)],
+                "files" => vec![("paths", &self.file_paths)],
+                "apache" => vec![("urls", &self.apache_urls)],
+                "nginx" => vec![("urls", &self.nginx_urls)],
+                "php_fpm" => vec![("urls", &self.php_fpm_urls)],
+                "openmetrics" => vec![
+                    ("urls", &self.openmetrics_urls),
+                    ("names", &self.openmetrics_names),
+                ],
+                _ => Vec::new(),
             };
-            if let Some((name, text)) = list {
+            for (name, text) in lists {
                 let lines: Vec<&str> = text
                     .lines()
                     .map(str::trim)
@@ -721,6 +731,10 @@ mod tests {
                 "php_fpm": {
                     "enabled": true,
                     "urls": ["http://localhost/status-www", "http://localhost/status-api"]
+                },
+                "openmetrics": {
+                    "urls": ["http://localhost:9100/metrics", "http://localhost:9187/metrics"],
+                    "names": ["node_load*", "pg_up"]
                 },
                 "checks": { "enabled": true, "checks": [
                     { "name": "db", "kind": "tcp", "target": "db1:5432" },

@@ -20,6 +20,7 @@ pub use maxnines_collectors::{Collector, WARMUP};
 use crate::checks::CheckCollector;
 use crate::custom::{CustomCollector, Definitions};
 use crate::files::FileCollector;
+use crate::openmetrics::OpenMetricsCollector;
 use crate::services::ServiceCollector;
 use crate::status_pages::{Software, StatusPageCollector};
 use crate::system_collector::SystemCollector;
@@ -103,6 +104,11 @@ fn build(
                 Some(software) => Box::new(StatusPageCollector::new(software, urls, interval)),
                 None => bail!("unknown collector {name:?}"),
             }
+        }
+        "openmetrics" => {
+            let urls = config.urls.clone().unwrap_or_default();
+            let wanted = config.names.as_deref().unwrap_or_default();
+            Box::new(OpenMetricsCollector::new(urls, wanted, interval))
         }
         other => bail!("unknown collector {other:?}"),
     })
