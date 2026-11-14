@@ -5,6 +5,8 @@
 //!
 //! Errors only ever say what kind of failure it was, as a URL can hold a password.
 
+pub mod openmetrics;
+
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::process::Stdio;

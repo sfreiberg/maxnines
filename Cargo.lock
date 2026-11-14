@@ -3294,7 +3294,6 @@ dependencies = [
  "tracing",
  "vergen-gitcl",
  "webpki-roots 0.26.11",
- "wildmatch",
  "windows-service",
 ]
 
@@ -3318,6 +3317,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "webpki-roots 0.26.11",
+ "wildmatch",
  "x509-parser",
 ]
 
