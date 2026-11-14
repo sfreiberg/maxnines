@@ -83,6 +83,7 @@ Each part has a page of its own:
 | Part | What it covers |
 | --- | --- |
 | [Hosts](api-hosts.md) | The hosts the server knows, their facts and config, and approving, revoking and deleting them |
+| [Metrics pages](api-metrics-pages.md) | The OpenMetrics pages the server reads for hosts without an agent |
 | [Filters](api-filters.md) | How to pick hosts by their facts, as the Hosts list does |
 | [Metrics](api-metrics.md) | The catalog of metrics, and current values |
 | [Config rules](api-config-rules.md) | The rules that decide what each agent collects |

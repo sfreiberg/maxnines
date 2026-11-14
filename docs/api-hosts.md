@@ -1,8 +1,9 @@
 # Hosts API
 
-A host is a computer whose agent reports to this server. A host's `state` is `pending`,
-`approved` or `revoked`. Its `health` is `critical`, `warning`, `offline` or `online`,
-and problems outrank being online.
+A host is a computer whose agent reports to this server, or something with no agent
+that the server reads from itself. Its `kind` says which: `agent` or `agentless`. A
+host's `state` is `pending`, `approved` or `revoked`. Its `health` is `critical`,
+`warning`, `offline` or `online`, and problems outrank being online.
 
 ## List hosts
 
@@ -21,6 +22,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 [
   {
     "id": "22ad9264b6eb708ffdbedcd5cc073e5c",
+    "kind": "agent",
     "public_key": "912e3122b606a9c2776e065d87dc31eefacde1d7dcad18e1cf88349eb32db35f",
     "hostname": "web-1",
     "state": "approved",
@@ -34,6 +36,34 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 ]
 ```
 
+## Add a host without an agent
+
+`POST /api/v1/hosts`
+
+Adds a [host without an agent](agentless-hosts.md), already approved, and gives it
+back with its new `id`. Give it [metrics pages](api-metrics-pages.md) for the server
+to read. A host with an agent adds itself when its agent first connects.
+
+```sh
+curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"hostname": "orders-db"}' \
+  "$MAXNINES_URL/api/v1/hosts"
+```
+
+```json
+{
+  "id": "5f0c1d6f2a8e4b7790d3c1a2b4e6f809",
+  "kind": "agentless",
+  "public_key": "",
+  "hostname": "orders-db",
+  "state": "approved",
+  "decided_by": "you@example.com",
+  "first_seen_ms": 1793940264215,
+  "decided_ms": 1793940264215
+}
+```
+
 ## Get a host
 
 `GET /api/v1/hosts/{id}`
@@ -42,6 +72,19 @@ Gives one host, as above.
 
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  "$MAXNINES_URL/api/v1/hosts/$HOST_ID"
+```
+
+## Rename a host without an agent
+
+`PUT /api/v1/hosts/{id}`
+
+A host with an agent is called what its agent says, so renaming one gives `409`.
+
+```sh
+curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"hostname": "orders-db-eu"}' \
   "$MAXNINES_URL/api/v1/hosts/$HOST_ID"
 ```
 
@@ -75,7 +118,8 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 Deletes a revoked host with all its metrics, facts and alerts, and its place on the
 map if it has one of its own. It can't be undone. A host that isn't revoked gives
-`409`, so it always takes two steps.
+`409`, so it always takes two steps. A host without an agent has no agent to revoke,
+so it's deleted in one, along with its metrics pages.
 
 If the host still runs the agent, it comes back as a new host waiting to be
 approved, and a rule can approve it like any other.

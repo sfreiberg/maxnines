@@ -9,8 +9,17 @@
   </div>
   <div class="actions">
     {% include "hosts/_version.html" %}
+    {% if host.agentless %}<span class="badge neutral">No agent</span>{% endif %}
     {% include "hosts/_health.html" %}
     <a class="button secondary" href="/hosts/{{ host.id }}/metrics">View metrics</a>
+    {% if host.agentless %}
+    {% if is_admin %}
+    <form method="post" action="/hosts/{{ host.id }}/delete">
+      <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+      <button type="submit" class="danger" title="Deletes this host with its pages, metrics and alerts, for good">Delete</button>
+    </form>
+    {% endif %}
+    {% else %}
     <a class="button secondary" href="/hosts/{{ host.id }}/actions">Actions</a>
     {% if can_edit %}
     {% if host.state != "approved" %}
@@ -29,6 +38,7 @@
       <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
       <button type="submit" class="danger" title="Deletes this host with its metrics, facts and alerts, for good">Delete</button>
     </form>
+    {% endif %}
     {% endif %}
     {% endif %}
   </div>
@@ -83,11 +93,51 @@
 </section>
 {% endif %}
 
+{% if host.agentless %}
+<section class="card">
+  <div class="title-row">
+    <h2>Metrics pages</h2>
+    {% if can_edit %}<a class="button secondary" href="/hosts/{{ host.id }}/pages/new">Add page</a>{% endif %}
+  </div>
+  {% if pages %}
+  <table>
+    <thead>
+    <tr><th>Page</th><th>Read</th><th>Signs in</th><th>Status</th><th></th></tr>
+    </thead>
+    <tbody>
+    {% for page in pages %}
+    <tr>
+      <td><strong>{{ page.name }}</strong><code class="under">{{ page.url }}</code></td>
+      <td class="nowrap">Every {{ page.interval_secs }} s<span class="under">{% if page.keeps %}{{ page.keeps }} metric name{{ page.keeps | pluralize }}{% else %}Every metric{% endif %}</span></td>
+      <td>{% if page.username %}As {{ page.username }}<span class="under">{% if page.password_env %}Password from <code>{{ page.password_env }}</code>{% else %}Password saved{% endif %}</span>{% else %}No{% endif %}</td>
+      <td>{% if not page.enabled %}<span class="badge neutral">Off</span>{% elif not page.read %}<span class="badge neutral">Not read yet</span>{% elif page.answered %}<span class="badge good">Answering</span>{% if page.dropped %}<span class="under">{{ page.dropped }} series over the limit</span>{% endif %}{% else %}<span class="badge bad">Not answering</span>{% if page.error %}<span class="under">{{ page.error }}</span>{% endif %}{% endif %}</td>
+      <td>
+        {% if can_edit %}
+        <div class="actions row-actions">
+          <a class="button secondary" href="/hosts/{{ host.id }}/pages/{{ page.id }}/edit">Edit</a>
+          <form method="post" action="/hosts/{{ host.id }}/pages/{{ page.id }}/delete">
+            <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+            <button type="submit" class="danger">Delete</button>
+          </form>
+        </div>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">Nothing is read for this host yet. Add an OpenMetrics page, and the server will read it and chart what it says.</p>
+  {% endif %}
+  <p class="hint">The server reads these itself, as this host has no agent. The host is online while any of them answers. <a href="/docs/agentless-hosts">More about hosts without an agent</a></p>
+</section>
+{% endif %}
+
 <div class="split">
   <section class="card">
     <h2>Status</h2>
     <dl class="summary">
-      <dt>Status</dt><dd>{{ host.state }}{% if decided_by %} by {{ decided_by }}{% endif %}</dd>
+      <dt>Status</dt><dd>{% if host.agentless %}Added{% else %}{{ host.state }}{% endif %}{% if decided_by %} by {{ decided_by }}{% endif %}</dd>
       <dt>Online</dt><dd>{% if host.online %}Yes{% else %}No{% endif %}{% if host.seen %}, seen {{ host.seen }}{% endif %}</dd>
       {% if uptime %}<dt>Uptime</dt><dd>{{ uptime }}</dd>{% endif %}
       {% if agent_uptime %}<dt>Agent uptime</dt><dd>{{ agent_uptime }}</dd>{% endif %}
@@ -99,6 +149,21 @@
     </dl>
   </section>
 
+  {% if host.agentless %}
+  <section class="card">
+    <h2>Name</h2>
+    {% if can_edit %}
+    <form method="post" action="/hosts/{{ host.id }}/rename" class="stacked">
+      <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+      <label>Name
+        <input type="text" name="hostname" value="{{ host.hostname }}" required maxlength="255" autocomplete="off" spellcheck="false">
+      </label>
+      <div class="actions"><button type="submit" class="secondary">Rename</button></div>
+    </form>
+    {% endif %}
+    <p class="hint">A host with an agent is called what its agent says. This one is called whatever you choose, and keeps its history when it's renamed.</p>
+  </section>
+  {% else %}
   <section class="card">
     <h2>Config</h2>
     <p class="hint"><span class="badge {{ host.config.class }}">{{ host.config.label }}</span>
@@ -114,8 +179,10 @@
       <pre>{{ config }}</pre>
     </details>
   </section>
+  {% endif %}
 </div>
 
+{% if not host.agentless %}
 <section class="card">
   <h2>Facts</h2>
   {% if has_facts %}
@@ -126,6 +193,7 @@
   <p class="empty">This agent hasn't reported any facts yet.</p>
   {% endif %}
 </section>
+{% endif %}
 
 {% if history %}
 <section class="card">

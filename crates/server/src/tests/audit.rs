@@ -396,6 +396,7 @@ async fn an_agent_asking_to_join_is_recorded_as_maxnines() {
     let server = start().await;
     let before = mark(&server).await;
     let record = HostRecord {
+        kind: crate::registration::HostKind::Agent,
         id: "ab".repeat(16),
         public_key: "cd".repeat(32),
         hostname: "web-1".into(),

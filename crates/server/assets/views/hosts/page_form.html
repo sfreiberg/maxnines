@@ -1,0 +1,52 @@
+{% extends "layouts/application.html" %}
+{% block title %}{% if id %}Edit metrics page{% else %}Add metrics page{% endif %} · MaxNines{% endblock title %}
+{% block main_class %} class="narrow"{% endblock main_class %}
+{% block content %}
+<p class="breadcrumb"><a href="/hosts">Hosts</a> · <a href="/hosts/{{ host_id }}">{{ hostname }}</a></p>
+<h1>{% if id %}Edit metrics page{% else %}Add metrics page{% endif %}</h1>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<form method="post" action="/hosts/{{ host_id }}/pages{% if id %}/{{ id }}{% endif %}" class="stacked">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+
+  <label>Address
+    <input type="text" name="url" value="{{ page.url }}" required maxlength="255" spellcheck="false" placeholder="https://db.example.com:9187/metrics">
+    <small>A page in the Prometheus or OpenMetrics text format, such as an exporter's <code>/metrics</code>. The server reads it from where it runs.</small>
+  </label>
+
+  <label>Read every (seconds)
+    <input type="number" name="interval_secs" value="{{ page.interval_secs }}" min="10" max="86400" required>
+  </label>
+
+  <label>Metrics to keep
+    <textarea name="names" rows="3" spellcheck="false" placeholder="http_*">{{ page.names }}</textarea>
+    <small>One name per line, with <code>*</code> and <code>?</code> for anything, such as <code>http_*</code>. Leave empty for everything, up to 2,000 series.</small>
+  </label>
+
+  <label class="checkbox">
+    <input type="checkbox" name="enabled"{% if page.enabled %} checked{% endif %}> Read this page
+  </label>
+
+  <fieldset>
+    <legend>Signing in</legend>
+    <p class="hint">For a page that asks for a username and password. Leave all three empty for one that doesn't.</p>
+    <label>Username
+      <input type="text" name="username" value="{{ page.username }}" maxlength="255" autocomplete="off" spellcheck="false">
+    </label>
+    <label>Password
+      <input type="password" name="password" value="" maxlength="1024" autocomplete="new-password"{% if page.has_password %} placeholder="Saved. Leave empty to keep it"{% endif %}>
+      <small>Kept in the database and never shown again.</small>
+    </label>
+    <label>Or the environment variable that holds it
+      <input type="text" name="password_env" value="{{ page.password_env }}" maxlength="255" autocomplete="off" spellcheck="false" placeholder="{{ env_prefix }}ORDERS_DB">
+      <small>A variable in the server's own environment, read each time the page is. Its name has to start with <code>{{ env_prefix }}</code>, so that only what's been set aside for this can be sent anywhere.</small>
+    </label>
+  </fieldset>
+
+  <div class="actions">
+    {% if can_edit %}<button type="submit">Save page</button>{% else %}<span class="note">Your role lets you look at this, but not change it.</span>{% endif %}
+    <a class="button secondary" href="/hosts/{{ host_id }}">Cancel</a>
+  </div>
+</form>
+{% endblock content %}

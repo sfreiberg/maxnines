@@ -29,6 +29,7 @@ use crate::facts::unflatten;
 use crate::locations::{LocationRuleInput, check_rule};
 use crate::maintenance::MaintenanceWindowInput;
 use crate::metrics::{self, METRICS, Metric, SeriesResult, TimeRange, Unit, now_ms};
+use crate::metrics_pages::{MetricsPage, MetricsPageInput};
 use crate::models::User;
 use crate::models::{
     ConfigStatus, RuleInput, UserChange, check_api_key_name, check_new_user, expiry_after, is_theme,
@@ -77,8 +78,21 @@ pub const BASE_PATH: &str = "/api/v1";
 
 pub fn routes(state: AppState) -> Router<AppState> {
     Router::new()
-        .route("/hosts", get(list))
-        .route("/hosts/{id}", get(show_host).delete(delete_host))
+        .route("/hosts", get(list).post(create_host))
+        .route(
+            "/hosts/{id}",
+            get(show_host).put(rename_host).delete(delete_host),
+        )
+        .route(
+            "/hosts/{id}/metrics-pages",
+            get(list_metrics_pages).post(create_metrics_page),
+        )
+        .route(
+            "/metrics-pages/{id}",
+            get(show_metrics_page)
+                .put(update_metrics_page)
+                .delete(delete_metrics_page),
+        )
         .route("/hosts/{id}/facts", get(facts))
         .route("/hosts/{id}/facts/history", get(facts_history))
         .route("/hosts/{id}/config", get(agent_config))
@@ -558,6 +572,167 @@ async fn show_host(State(state): State<AppState>, UrlPath(id): UrlPath<String>) 
         host,
     })
     .into_response()
+}
+
+/// What adding a host with no agent, or renaming one, takes.
+#[derive(Deserialize)]
+struct AgentlessHostInput {
+    hostname: String,
+}
+
+/// Adds a host with no agent, for the server to read from itself. Hosts with an
+/// agent add themselves, by connecting.
+async fn create_host(
+    State(state): State<AppState>,
+    Json(input): Json<AgentlessHostInput>,
+) -> Response {
+    if let Err(error) = crate::registration::agentless_hostname(&input.hostname) {
+        return refused(&error);
+    }
+    let Some(owner) = super::signed_in_user() else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let added = state.registry.add_agentless(&input.hostname, &owner.email);
+    match added.await {
+        Ok(host) => (StatusCode::CREATED, Json(host)).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// Only a host with no agent can be renamed, as an agent says what its host is
+/// called.
+async fn rename_host(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Json(input): Json<AgentlessHostInput>,
+) -> Response {
+    if let Err(error) = crate::registration::agentless_hostname(&input.hostname) {
+        return refused(&error);
+    }
+    match state.registry.rename_agentless(&id, &input.hostname).await {
+        Ok(Some(host)) => Json(host).into_response(),
+        Ok(None) if state.registry.get(&id).await.is_some_and(|a| !a.is_local()) => failed(
+            StatusCode::CONFLICT,
+            "Only a host with no agent can be renamed",
+        ),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// A metrics page as the API shows it. Its password can be set but not read back.
+#[derive(Debug, Serialize)]
+struct MetricsPageView {
+    id: i64,
+    host_id: String,
+    /// What the page is called, which each of its series' names starts with.
+    name: String,
+    url: String,
+    names: Vec<String>,
+    interval_secs: u64,
+    enabled: bool,
+    username: Option<String>,
+    has_password: bool,
+    password_env: Option<String>,
+}
+
+impl MetricsPageView {
+    fn new(page: MetricsPage) -> Self {
+        Self {
+            id: page.id,
+            host_id: page.host_id,
+            name: page.input.name().to_string(),
+            has_password: page.input.password.is_some(),
+            url: page.input.url,
+            names: page.input.names,
+            interval_secs: page.input.interval_secs,
+            enabled: page.input.enabled,
+            username: page.input.username,
+            password_env: page.input.password_env,
+        }
+    }
+}
+
+async fn list_metrics_pages(
+    State(state): State<AppState>,
+    UrlPath(host_id): UrlPath<String>,
+) -> Response {
+    if state
+        .registry
+        .get(&host_id)
+        .await
+        .is_none_or(|a| a.is_local())
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match state.database.metrics_pages_of(&host_id).await {
+        Ok(pages) => {
+            let views: Vec<MetricsPageView> = pages.into_iter().map(MetricsPageView::new).collect();
+            Json(views).into_response()
+        }
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn show_metrics_page(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.get_metrics_page(id).await {
+        Ok(Some(page)) => Json(MetricsPageView::new(page)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn create_metrics_page(
+    State(state): State<AppState>,
+    UrlPath(host_id): UrlPath<String>,
+    Json(input): Json<MetricsPageInput>,
+) -> Response {
+    let Some(host) = state.registry.get(&host_id).await.filter(|a| !a.is_local()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if state.agentless_host(&host_id).await.is_none() {
+        let why = "Only a host with no agent has pages the server reads. An agent reads its \
+                   own, from a config rule";
+        return failed(StatusCode::CONFLICT, why);
+    }
+    let input = match state.checked_metrics_page(&host.id, None, input).await {
+        Ok(input) => input,
+        Err(error) => return refused(&error),
+    };
+    match state.database.create_metrics_page(&host.id, &input).await {
+        Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn update_metrics_page(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<i64>,
+    Json(input): Json<MetricsPageInput>,
+) -> Response {
+    let saved = match state.database.get_metrics_page(id).await {
+        Ok(Some(saved)) => saved,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return server_error(&error),
+    };
+    let checked = state.checked_metrics_page(&saved.host_id, Some(id), input);
+    let input = match checked.await {
+        Ok(input) => input,
+        Err(error) => return refused(&error),
+    };
+    match state.database.update_metrics_page(id, input).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn delete_metrics_page(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.delete_metrics_page(id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
 }
 
 #[derive(Deserialize)]

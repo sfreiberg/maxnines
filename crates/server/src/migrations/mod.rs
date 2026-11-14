@@ -16,6 +16,7 @@ impl MigratorTrait for Migrator {
             Box::new(ActionNotifications),
             Box::new(ClockRule),
             Box::new(ServiceRule),
+            Box::new(AgentlessHosts),
         ]
     }
 }
@@ -1283,6 +1284,7 @@ async fn add_built_in_rule(manager: &SchemaManager<'_>, rule: &BuiltInRule) -> R
 enum Hosts {
     Table,
     Id,
+    Kind,
     PublicKey,
     Hostname,
     State,
@@ -2290,6 +2292,119 @@ impl MigrationTrait for ServiceRule {
     }
 }
 
+struct AgentlessHosts;
+
+impl MigrationName for AgentlessHosts {
+    fn name(&self) -> &str {
+        "m20261113_000007_agentless_hosts"
+    }
+}
+
+/// Hosts with no agent, which the server reads from itself: every host says what
+/// kind it is, and an agentless one has the OpenMetrics pages to read for it.
+#[async_trait::async_trait]
+impl MigrationTrait for AgentlessHosts {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Hosts::Table)
+                    .add_column(
+                        ColumnDef::new(Hosts::Kind)
+                            .string_len(16)
+                            .not_null()
+                            .default("agent"),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        let built_in = Query::update()
+            .table(Hosts::Table)
+            .value(Hosts::Kind, "built_in")
+            .and_where(Expr::col(Hosts::Id).is_in(BUILT_IN_HOSTS.map(|(id, _)| id)))
+            .to_owned();
+        manager.exec_stmt(built_in).await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(MetricsPages::Table)
+                    .col(id(MetricsPages::Id))
+                    .col(
+                        ColumnDef::new(MetricsPages::HostId)
+                            .string_len(32)
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(MetricsPages::Url).string_len(255).not_null())
+                    .col(ColumnDef::new(MetricsPages::Names).text().not_null())
+                    .col(
+                        ColumnDef::new(MetricsPages::IntervalSecs)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(MetricsPages::Enabled).boolean().not_null())
+                    .col(ColumnDef::new(MetricsPages::Username).string_len(255))
+                    .col(ColumnDef::new(MetricsPages::Password).text())
+                    .col(ColumnDef::new(MetricsPages::PasswordEnv).string_len(255))
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_metrics_pages_host_id")
+                            .from(MetricsPages::Table, MetricsPages::HostId)
+                            .to(Hosts::Table, Hosts::Id),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_metrics_pages_host")
+                    .table(MetricsPages::Table)
+                    .col(MetricsPages::HostId)
+                    .to_owned(),
+            )
+            .await
+    }
+
+    /// Agentless hosts go with their pages, as nothing else can read from them.
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(MetricsPages::Table).to_owned())
+            .await?;
+        let agentless = Query::delete()
+            .from_table(Hosts::Table)
+            .and_where(Expr::col(Hosts::Kind).eq("agentless"))
+            .to_owned();
+        manager.exec_stmt(agentless).await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Hosts::Table)
+                    .drop_column(Hosts::Kind)
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+#[derive(DeriveIden)]
+enum MetricsPages {
+    Table,
+    Id,
+    HostId,
+    Url,
+    Names,
+    IntervalSecs,
+    Enabled,
+    Username,
+    Password,
+    PasswordEnv,
+}
+
 #[derive(DeriveIden)]
 enum AlertRuleActions {
     Table,
@@ -2444,7 +2559,7 @@ mod tests {
         );
 
         // The four migrations after it, then this one.
-        Migrator::down(&connection, Some(5)).await.unwrap();
+        Migrator::down(&connection, Some(6)).await.unwrap();
         assert_eq!(
             count("SELECT target FROM notification_channels").await,
             ["https://new"]

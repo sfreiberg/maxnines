@@ -30,6 +30,7 @@ erDiagram
     hosts ||--o{ host_facts : "reports"
     hosts ||--o| host_config_status : "last applied"
     hosts ||--o| host_boots : "last booted"
+    hosts ||--o{ metrics_pages : "is read from"
     hosts ||--o{ alerts : "has"
     alert_rules |o--o{ alerts : "raised"
     alert_rules ||--o{ alert_rule_channels : "tells"
@@ -51,13 +52,25 @@ erDiagram
     users ||--o{ sign_in_challenges : "is asked"
 
     hosts {
-        string id PK "from its agent's public key"
-        string public_key
+        string id PK "from its agent's public key, or random"
+        string kind "agent, agentless or built_in"
+        string public_key "empty without an agent"
         string hostname
         string state "pending, approved or revoked"
         text decided_by
         int first_seen_ms
         int decided_ms
+    }
+    metrics_pages {
+        int id PK
+        string host_id FK
+        string url
+        text names "the metrics to keep, one to a line"
+        int interval_secs
+        boolean enabled
+        string username
+        text password "as typed, when it was"
+        string password_env "the server's variable holding it"
     }
     host_facts {
         int id PK
@@ -361,7 +374,8 @@ erDiagram
 
 | Table | What it holds |
 | --- | --- |
-| `hosts` | Every host whose agent has asked to join, with whether it's approved. Two built-in hosts, `server` and `fleet`, stand for the server itself and for alerts about many hosts at once |
+| `hosts` | Every host whose agent has asked to join, with whether it's approved, and every host added without an agent. Two built-in hosts, `server` and `fleet`, stand for the server itself and for alerts about many hosts at once |
+| `metrics_pages` | The OpenMetrics pages the server reads for hosts without an agent, with how to sign in to each |
 | `host_facts` | What each host's agent reports about it, kept as history: a fact changing closes one row and starts another |
 | `host_config_status` | The config each host's agent last applied, and why if it refused one |
 | `host_boots` | When each host last started, to notice restarts |

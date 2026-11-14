@@ -11,6 +11,7 @@ use anyhow::{Context, Result, ensure};
 use ipnet::IpNet;
 use maxnines_protocol::RegistrationStatus;
 use ring::digest::{SHA256, digest};
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
 use tracing::{info, warn};
@@ -28,6 +29,54 @@ pub enum HostState {
     Revoked,
 }
 
+/// What a host is: one with an agent that reports on it, one the server reads
+/// from itself, or one of the two that aren't machines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostKind {
+    #[default]
+    Agent,
+    Agentless,
+    BuiltIn,
+}
+
+impl HostKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Agentless => "agentless",
+            Self::BuiltIn => "built_in",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "agent" => Some(Self::Agent),
+            "agentless" => Some(Self::Agentless),
+            "built_in" => Some(Self::BuiltIn),
+            _ => None,
+        }
+    }
+}
+
+/// How long a host's name can be, which is what the database's column holds.
+const MAX_HOSTNAME_LEN: usize = 255;
+
+/// A name someone typed for a host with no agent, tidied, or why it won't do.
+pub fn agentless_hostname(typed: &str) -> Result<String> {
+    let hostname = typed.trim();
+    ensure!(!hostname.is_empty(), "the host needs a name");
+    ensure!(
+        hostname.len() <= MAX_HOSTNAME_LEN,
+        "the name can be up to {MAX_HOSTNAME_LEN} characters"
+    );
+    ensure!(
+        !hostname.chars().any(char::is_control),
+        "the name can't hold control characters"
+    );
+    Ok(hostname.to_string())
+}
+
 fn is_built_in(id: &str) -> bool {
     id == LOCAL_HOST_ID || id == FLEET_HOST_ID
 }
@@ -37,6 +86,11 @@ impl HostRecord {
     /// it stays out of lists and can't be changed.
     pub fn is_local(&self) -> bool {
         is_built_in(&self.id)
+    }
+
+    /// Whether the server reads from this host itself, as it has no agent.
+    pub fn is_agentless(&self) -> bool {
+        self.kind == HostKind::Agentless
     }
 }
 
@@ -64,6 +118,9 @@ impl HostState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostRecord {
     pub id: String,
+    #[serde(default)]
+    pub kind: HostKind,
+    /// Empty for a host with no agent, which has no key.
     pub public_key: String,
     pub hostname: String,
     pub state: HostState,
@@ -245,6 +302,7 @@ impl Registry {
         let now = now_ms();
         let mut host = existing.clone().unwrap_or_else(|| HostRecord {
             id: request.id.to_string(),
+            kind: HostKind::Agent,
             public_key: request.public_key.to_string(),
             hostname: request.hostname.to_string(),
             state: HostState::Pending,
@@ -329,6 +387,47 @@ impl Registry {
 
         info!(host_id = id, state = state.as_str(), "admin decision");
         self.revisions.send_modify(|revision| *revision += 1);
+        Ok(Some(host))
+    }
+
+    /// Adds a host with no agent, for the server to read from itself. There's no
+    /// agent to vouch for, so whoever adds it has approved it. Its ID is random,
+    /// and looks like any other.
+    pub async fn add_agentless(&self, hostname: &str, by: &str) -> Result<HostRecord> {
+        let hostname = agentless_hostname(hostname)?;
+        let mut id = [0_u8; 16];
+        SystemRandom::new()
+            .fill(&mut id)
+            .map_err(|_| anyhow::anyhow!("no random numbers to make an ID from"))?;
+        let now = now_ms();
+        let host = HostRecord {
+            id: hex::encode(id),
+            kind: HostKind::Agentless,
+            public_key: String::new(),
+            hostname,
+            state: HostState::Approved,
+            decided_by: Some(by.to_string()),
+            first_seen_ms: now,
+            decided_ms: Some(now),
+        };
+        let mut hosts = self.hosts.lock().await;
+        self.save(&mut hosts, host.clone()).await?;
+        drop(hosts);
+        info!(host_id = host.id, "added a host with no agent");
+        self.revisions.send_modify(|revision| *revision += 1);
+        Ok(host)
+    }
+
+    /// Renames a host with no agent, as it has no agent to say what it's called.
+    /// Returns `None` for any other host, or none at all.
+    pub async fn rename_agentless(&self, id: &str, hostname: &str) -> Result<Option<HostRecord>> {
+        let hostname = agentless_hostname(hostname)?;
+        let mut hosts = self.hosts.lock().await;
+        let Some(mut host) = hosts.get(id).filter(|host| host.is_agentless()).cloned() else {
+            return Ok(None);
+        };
+        host.hostname = hostname;
+        self.save(&mut hosts, host.clone()).await?;
         Ok(Some(host))
     }
 

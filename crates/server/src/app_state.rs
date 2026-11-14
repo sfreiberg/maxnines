@@ -15,11 +15,12 @@ use crate::facts::{FlatFacts, unflatten};
 use crate::host_filter::HostFilter;
 use crate::maintenance::{self, MaintenanceWindowInput};
 use crate::metrics::Metrics;
+use crate::metrics_pages::{self, MetricsPageInput, PageReads};
 use crate::models::{Database, NewEvent, RuleInput};
 use crate::notifier::Senders;
 use crate::passwords::SignInThrottle;
 use crate::presence::Presence;
-use crate::registration::{HostState, Registry};
+use crate::registration::{HostRecord, HostState, Registry};
 use crate::remote_checks::{self, LatestResults, RemoteCheckInput};
 use crate::rule_engine::{self, ResolvedConfig};
 use crate::rule_preview::{self, Preview, PreviewHost};
@@ -62,6 +63,8 @@ pub struct AppState {
     pub senders: Senders,
     /// How the checks the server runs itself last went.
     pub check_results: Arc<LatestResults>,
+    /// How the metrics pages the server reads itself last went.
+    pub page_reads: Arc<PageReads>,
     pub status: Arc<ServerStatus>,
     pub heartbeat: Heartbeat,
     /// The URL agents must have signed.
@@ -142,7 +145,8 @@ impl AppState {
         match self.registry.get(id).await {
             None => return Ok(HostDeletion::NoSuchHost),
             Some(host) if host.is_local() => return Ok(HostDeletion::NoSuchHost),
-            Some(host) if host.state != HostState::Revoked => {
+            // Revoking stops an agent connecting, and there's none to stop.
+            Some(host) if host.state != HostState::Revoked && !host.is_agentless() => {
                 return Ok(HostDeletion::NotRevoked);
             }
             Some(_) => {}
@@ -187,7 +191,10 @@ impl AppState {
             .list()
             .await
             .into_iter()
-            .filter(|host| host.state == HostState::Approved && !host.is_local())
+            // Config rules are for agents, so a host with none never matches one.
+            .filter(|host| {
+                host.state == HostState::Approved && !host.is_local() && !host.is_agentless()
+            })
             .map(|host| PreviewHost {
                 online: self.presence.get(&host.id).is_some_and(|p| p.online),
                 facts: unflatten(&facts.remove(&host.id).unwrap_or_default()),
@@ -281,6 +288,33 @@ impl AppState {
             .any(|check| check.input.check.name == *name && Some(check.id) != id);
         ensure!(!taken, "a check named {name:?} already exists");
         Ok(())
+    }
+
+    /// A host with no agent, which is the only kind the server reads pages for.
+    pub async fn agentless_host(&self, id: &str) -> Option<HostRecord> {
+        let host = self.registry.get(id).await?;
+        (host.is_agentless() && host.state == HostState::Approved).then_some(host)
+    }
+
+    /// A metrics page as it would be saved for a host, or why it can't be. `id` is
+    /// the saved page it would replace, whose password it keeps unless given
+    /// another.
+    pub async fn checked_metrics_page(
+        &self,
+        host_id: &str,
+        id: Option<i64>,
+        input: MetricsPageInput,
+    ) -> Result<MetricsPageInput> {
+        let pages = self.database.metrics_pages_of(host_id).await?;
+        let saved = pages.iter().find(|page| Some(page.id) == id);
+        let input = match saved {
+            Some(saved) => input.keeping_password_of(&saved.input),
+            None => input,
+        };
+        metrics_pages::check_input(&input)?;
+        let others = pages.iter().filter(|page| Some(page.id) != id);
+        metrics_pages::check_names(others.map(|page| &page.input).chain([&input]))?;
+        Ok(input)
     }
 
     /// Tells live connections that rules changed.

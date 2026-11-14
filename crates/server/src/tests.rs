@@ -1,5 +1,6 @@
 //! Tests that run the real router over real sockets.
 
+mod agentless;
 mod alerting;
 mod audit;
 mod dashboards;
@@ -188,6 +189,7 @@ async fn start_with_heartbeat(
         metrics: Metrics::new(reader),
         senders: Default::default(),
         check_results: Arc::default(),
+        page_reads: Arc::default(),
         status,
         heartbeat,
         audience: AUDIENCE.into(),

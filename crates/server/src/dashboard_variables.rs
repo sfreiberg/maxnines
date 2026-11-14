@@ -604,6 +604,7 @@ mod tests {
     #[test]
     fn hosts_sharing_a_name_are_told_apart() {
         let host = |id: &str, hostname: &str| HostRecord {
+            kind: crate::registration::HostKind::Agent,
             id: id.to_string(),
             public_key: String::new(),
             hostname: hostname.to_string(),

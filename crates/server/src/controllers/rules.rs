@@ -427,7 +427,10 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
         .list()
         .await
         .into_iter()
-        .filter(|host| host.state == HostState::Approved && !host.is_local())
+        // Config rules are for agents, so a host with none never matches one.
+        .filter(|host| {
+            host.state == HostState::Approved && !host.is_local() && !host.is_agentless()
+        })
         .map(|host| {
             // No facts yet is an empty set, as it is when a config is worked out,
             // or `has()` in a condition would fail here and pass there.

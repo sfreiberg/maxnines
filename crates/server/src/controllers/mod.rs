@@ -6,6 +6,7 @@
 
 mod actions;
 pub mod agent_socket;
+mod agentless;
 mod alert_rules;
 mod alerts;
 mod annotations;

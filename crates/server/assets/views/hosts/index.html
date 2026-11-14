@@ -6,10 +6,13 @@
     <p class="eyebrow">{{ online_count }} of {{ total }} online</p>
     <h1>Hosts</h1>
   </div>
-  <nav class="tabs" aria-label="View">
-    <a href="{{ tiles_href }}"{% if not as_table %} class="selected" aria-current="true"{% endif %}>Tiles</a>
-    <a href="{{ table_href }}"{% if as_table %} class="selected" aria-current="true"{% endif %}>Table</a>
-  </nav>
+  <div class="actions">
+    {% if can_edit %}<a class="button secondary" href="/hosts/new" title="For something an agent can't be installed on, which the server reads itself">Add a host</a>{% endif %}
+    <nav class="tabs" aria-label="View">
+      <a href="{{ tiles_href }}"{% if not as_table %} class="selected" aria-current="true"{% endif %}>Tiles</a>
+      <a href="{{ table_href }}"{% if as_table %} class="selected" aria-current="true"{% endif %}>Table</a>
+    </nav>
+  </div>
 </div>
 
 {% if waiting %}
@@ -55,8 +58,8 @@
       <td><a href="/hosts/{{ host.id }}">{{ host.hostname }}</a> <span class="host-id">{{ host.short_id }}</span></td>
       <td>{% include "hosts/_health.html" %}</td>
       {% set os_family = host.os_family %}<td><span class="host-name">{% include "hosts/_os_icon.html" %}{{ host.os }}</span></td>
-      <td class="nowrap">{% if host.version %}{{ host.version }} {% endif %}{% include "hosts/_version.html" %}</td>
-      <td><span class="badge {{ host.config.class }}">{{ host.config.label }}</span></td>
+      <td class="nowrap">{% if host.agentless %}<span class="badge neutral">No agent</span>{% else %}{% if host.version %}{{ host.version }} {% endif %}{% include "hosts/_version.html" %}{% endif %}</td>
+      <td>{% if not host.agentless %}<span class="badge {{ host.config.class }}">{{ host.config.label }}</span>{% endif %}</td>
       <td class="nowrap">{{ host.seen }}</td>
     </tr>
     {% endfor %}
@@ -68,7 +71,7 @@
   <a class="tile{% if host.health == "critical" %} critical{% elif host.health == "warning" %} alert{% elif host.health == "offline" %} gone{% endif %}" href="/hosts/{{ host.id }}">
     {% set os_family = host.os_family %}<span class="tile-head"><span class="host-name">{% include "hosts/_os_icon.html" %}{{ host.hostname }}</span> {% include "hosts/_health.html" %}</span>
     <span class="host-id">{{ host.short_id }}</span>
-    {% if host.os %}<span class="note">{{ host.os }}</span>{% endif %}
+    {% if host.os %}<span class="note">{{ host.os }}</span>{% elif host.agentless %}<span class="note">No agent</span>{% endif %}
     {% if host.seen %}<span class="note">Seen {{ host.seen }}</span>{% endif %}
     {% include "hosts/_version.html" %}
   </a>

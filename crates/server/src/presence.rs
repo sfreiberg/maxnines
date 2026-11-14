@@ -148,6 +148,36 @@ impl Presence {
         self.facts.check_key(&id.to_string()).is_ok()
     }
 
+    /// For a host with no agent, which is online while the server can read from
+    /// it. It has no connection, so there's nowhere it connected from.
+    pub fn set_reachable(&self, id: &str, online: bool) {
+        let mut state = self.state.lock().unwrap();
+        state.next_connection += 1;
+        let connection = state.next_connection;
+        let now = now_ms();
+        let entry = state.hosts.entry(id.to_string()).or_insert(Entry {
+            presence: HostPresence {
+                // The opposite, so that the first read counts as a change.
+                online: !online,
+                since_ms: now,
+                last_seen_ms: now,
+                source: IpAddr::from([0, 0, 0, 0]),
+            },
+            connection,
+            replaced: Arc::new(Notify::new()),
+        });
+        if online {
+            entry.presence.last_seen_ms = now;
+        }
+        if entry.presence.online != online {
+            entry.presence.online = online;
+            entry.presence.since_ms = now;
+            if online {
+                self.came_online.notify_one();
+            }
+        }
+    }
+
     pub fn seen(&self, id: &str) {
         if let Some(entry) = self.state.lock().unwrap().hosts.get_mut(id) {
             entry.presence.last_seen_ms = now_ms();
@@ -190,6 +220,27 @@ mod tests {
     use super::*;
 
     const SOURCE: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    #[test]
+    fn a_host_with_no_agent_is_online_while_it_can_be_read() {
+        let presence = Presence::default();
+        assert!(presence.get("db").is_none());
+
+        presence.set_reachable("db", true);
+        let first = presence.get("db").unwrap();
+        assert!(first.online);
+
+        // Reading it again changes nothing about when it came online.
+        presence.set_reachable("db", true);
+        assert_eq!(presence.get("db").unwrap().since_ms, first.since_ms);
+
+        presence.set_reachable("db", false);
+        assert!(!presence.get("db").unwrap().online);
+
+        // One that couldn't be read the first time is offline from then.
+        presence.set_reachable("cache", false);
+        assert!(!presence.get("cache").unwrap().online);
+    }
 
     fn is_online(presence: &Presence, id: &str) -> bool {
         presence.get(id).is_some_and(|p| p.online)

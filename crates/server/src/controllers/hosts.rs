@@ -31,7 +31,23 @@ use crate::times::format_time;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/hosts", get(index))
+        .route("/hosts", get(index).post(super::agentless::create))
+        .route("/hosts/new", get(super::agentless::new))
+        .route("/hosts/{id}/rename", post(super::agentless::rename))
+        .route("/hosts/{id}/pages", post(super::agentless::create_page))
+        .route("/hosts/{id}/pages/new", get(super::agentless::new_page))
+        .route(
+            "/hosts/{id}/pages/{page}",
+            post(super::agentless::update_page),
+        )
+        .route(
+            "/hosts/{id}/pages/{page}/edit",
+            get(super::agentless::edit_page),
+        )
+        .route(
+            "/hosts/{id}/pages/{page}/delete",
+            post(super::agentless::delete_page),
+        )
         .route("/hosts/filter-options", get(filter_options))
         .route("/hosts/{id}", get(show))
         .route("/hosts/{id}/approve", post(approve))
@@ -47,6 +63,8 @@ struct HostRow {
     short_id: String,
     hostname: String,
     state: &'static str,
+    /// Whether the server reads from it itself, as it has no agent.
+    agentless: bool,
     online: bool,
     health: Health,
     os: Option<String>,
@@ -165,6 +183,7 @@ fn row(state: &AppState, host: HostRecord, facts: Option<&FlatFacts>, health: He
         seen: presence.map(|p| crate::times::ago(p.last_seen_ms, now_ms() as u64)),
         config: None,
         state: host.state.as_str(),
+        agentless: host.is_agentless(),
         short_id: short_id(&host.id).to_string(),
         id: host.id,
         hostname: host.hostname,
@@ -539,6 +558,10 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         })
         .collect();
 
+    let pages = match super::agentless::page_rows(&state, &id).await {
+        Ok(pages) => pages,
+        Err(error) => return server_error(&error),
+    };
     let online = state.presence.get(&id).is_some_and(|p| p.online);
     let mut row = row(
         &state,
@@ -552,6 +575,7 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
     ));
     Page::new(&state, &token, "hosts/show.html")
         .with("host", &row)
+        .with("pages", &pages)
         .with("decided_by", &host.decided_by)
         .with("has_facts", &!flat.is_empty())
         .with("alerts", &alerts)
@@ -566,7 +590,13 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         .with("maintenance_choices", &choices)
         .with("os", &os_of(&flat))
         .with("os_family", &OsFamily::of(&flat))
-        .with("source", &presence.map(|p| p.source.to_string()))
+        // A host with no agent never connected from anywhere.
+        .with(
+            "source",
+            &presence
+                .filter(|_| !host.is_agentless())
+                .map(|p| p.source.to_string()),
+        )
         .with("newest_agent_version", NEWEST_AGENT_VERSION)
         .with("agent_commit", &text_fact(&flat, "agent.commit"))
         .with("facts", &facts)

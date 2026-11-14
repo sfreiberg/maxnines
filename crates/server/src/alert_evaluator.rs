@@ -540,6 +540,11 @@ impl Evaluator {
         // An agent that hasn't connected since the start has been gone at least
         // that long, and may have been offline before it.
         let presence = self.presence.get(&host.id);
+        // A host with no agent is only as present as what the server reads from it,
+        // so one with nothing to read, or not read yet, is neither on nor off.
+        if host.is_agentless() && presence.is_none() {
+            return Ok(());
+        }
         let online = presence.is_some_and(|p| p.online);
         let since = presence.map_or(self.started_ms, |p| p.since_ms as i64);
         // Just after a start, an agent that isn't back yet may only be slow to

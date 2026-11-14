@@ -24,6 +24,7 @@ mod locations;
 mod maintenance;
 mod metric_charts;
 mod metrics;
+mod metrics_pages;
 mod migrations;
 mod models;
 mod notifier;
@@ -284,6 +285,7 @@ async fn serve(path: &Path) -> Result<()> {
         metrics,
         senders: Senders::new(web_url(config.audience())),
         check_results: Arc::new(LatestResults::default()),
+        page_reads: Arc::default(),
         status,
         heartbeat: Heartbeat {
             interval: Duration::from_secs(config.heartbeat_interval_secs),
@@ -331,6 +333,14 @@ async fn serve(path: &Path) -> Result<()> {
         state.database.clone(),
         state.writer.clone(),
         state.check_results.clone(),
+    )
+    .spawn();
+    metrics_pages::Scheduler::new(
+        state.database.clone(),
+        state.writer.clone(),
+        state.registry.clone(),
+        state.presence.clone(),
+        state.page_reads.clone(),
     )
     .spawn();
     server_stats::spawn_recorder(state.clone());

@@ -28,6 +28,8 @@ mod location_rule;
 mod location_rules;
 mod maintenance_window;
 mod maintenance_windows;
+mod metrics_page;
+mod metrics_pages;
 mod notification;
 mod notification_channel;
 mod recovery_code;
@@ -76,7 +78,7 @@ use crate::facts::{FlatFacts, decode, encode, flatten, unflatten};
 use crate::host_filter;
 use crate::migrations::Migrator;
 use crate::registration::hash_token;
-use crate::registration::{HostRecord, HostState};
+use crate::registration::{HostKind, HostRecord, HostState};
 use crate::roles::Role;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -183,6 +185,7 @@ impl Database {
     pub async fn save_host(&self, record: &HostRecord) -> Result<()> {
         let row = host::ActiveModel {
             id: Set(record.id.clone()),
+            kind: Set(record.kind.as_str().to_string()),
             public_key: Set(record.public_key.clone()),
             hostname: Set(record.hostname.clone()),
             state: Set(record.state.as_str().to_string()),
@@ -252,6 +255,11 @@ impl Database {
             .exec(&transaction)
             .await
             .context("deleting a host's config status")?;
+        metrics_page::Entity::delete_many()
+            .filter(metrics_page::Column::HostId.eq(id))
+            .exec(&transaction)
+            .await
+            .context("deleting a host's metrics pages")?;
         events::delete_host_events(&transaction, id).await?;
         location_rule::Entity::delete_many()
             .filter(location_rule::Column::Filter.eq(host_filter::only(id)))
@@ -1005,6 +1013,8 @@ fn to_record(row: host::Model) -> Result<HostRecord> {
     Ok(HostRecord {
         state: HostState::parse(&row.state)
             .with_context(|| format!("host {} has unknown state {:?}", row.id, row.state))?,
+        kind: HostKind::parse(&row.kind)
+            .with_context(|| format!("host {} has unknown kind {:?}", row.id, row.kind))?,
         id: row.id,
         public_key: row.public_key,
         hostname: row.hostname,
@@ -1143,6 +1153,7 @@ mod tests {
 
     fn record(id: &str) -> HostRecord {
         HostRecord {
+            kind: crate::registration::HostKind::Agent,
             id: id.to_string(),
             public_key: "ab".repeat(32),
             hostname: "web-1".to_string(),
@@ -1547,6 +1558,7 @@ mod tests {
 
         // Replacing, including going from NULL to a value.
         let approved = HostRecord {
+            kind: crate::registration::HostKind::Agent,
             state: HostState::Approved,
             decided_by: Some("rule:production-subnet".to_string()),
             decided_ms: Some(1_789_000_000_456),
@@ -1557,12 +1569,14 @@ mod tests {
 
         // The largest hostname allowed, non-ASCII text, and a long rule name.
         let unusual = HostRecord {
+            kind: crate::registration::HostKind::Agent,
             hostname: "x".repeat(255),
             decided_by: Some(format!("rule:{}", "é🚀".repeat(200))),
             ..record("host-2")
         };
         database.save_host(&unusual).await.unwrap();
         let unicode = HostRecord {
+            kind: crate::registration::HostKind::Agent,
             hostname: "сервер-🚀".to_string(),
             ..record("host-3")
         };

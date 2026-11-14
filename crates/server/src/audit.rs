@@ -220,6 +220,8 @@ pub enum Kind {
     Silence,
     MaintenanceWindow,
     RemoteCheck,
+    /// An OpenMetrics page the server reads for a host with no agent.
+    MetricsPage,
     LocationRule,
     Dashboard,
     /// A deploy or note marked on charts.
@@ -229,7 +231,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::User,
         Self::ApiKey,
         Self::Host,
@@ -240,6 +242,7 @@ impl Kind {
         Self::Silence,
         Self::MaintenanceWindow,
         Self::RemoteCheck,
+        Self::MetricsPage,
         Self::LocationRule,
         Self::Dashboard,
         Self::Annotation,
@@ -258,6 +261,7 @@ impl Kind {
             Self::Silence => "silence",
             Self::MaintenanceWindow => "maintenance_window",
             Self::RemoteCheck => "remote_check",
+            Self::MetricsPage => "metrics_page",
             Self::LocationRule => "location_rule",
             Self::Dashboard => "dashboard",
             Self::Annotation => "annotation",
@@ -277,6 +281,7 @@ impl Kind {
             Self::Silence => "Silence",
             Self::MaintenanceWindow => "Maintenance window",
             Self::RemoteCheck => "Remote check",
+            Self::MetricsPage => "Metrics page",
             Self::LocationRule => "Location rule",
             Self::Dashboard => "Dashboard",
             Self::Annotation => "Annotation",

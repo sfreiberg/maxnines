@@ -237,6 +237,20 @@ fn is_metric_pattern(pattern: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "_:*?".contains(c))
 }
 
+/// Whether an OpenMetrics collector could be given these pages and these metrics to
+/// keep. The server asks this of pages it reads itself, so both read the same ones.
+pub fn check_metrics_pages(urls: &[String], names: &[String]) -> Result<()> {
+    let settings = CollectorSettings {
+        enabled: true,
+        mount_points: None,
+        names: Some(names.to_vec()),
+        paths: None,
+        checks: None,
+        urls: Some(urls.to_vec()),
+    };
+    settings.validate("openmetrics")
+}
+
 /// A status page has to be a plain web address. A username or password in it
 /// would show up on every page that lists the setting, so those are refused, and
 /// status pages are normally limited to the host itself anyway.

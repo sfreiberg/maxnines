@@ -64,7 +64,7 @@ email address.
 `signed_out`, `new_setup_link`, `acknowledged`, `unacknowledged` or `ran_action`,
 which is someone running an action on a host. `subject.kind` is
 `user`, `api_key`, `host`, `config_rule`, `alert_rule`, `notification_channel`,
-`alert`, `silence`, `maintenance_window`, `remote_check`, `location_rule`,
+`alert`, `silence`, `maintenance_window`, `remote_check`, `metrics_page`, `location_rule`,
 `dashboard`, `annotation` or `setting`. Names are as they were at the time.
 
 `source` is the address the request came from, which is empty for changes that
