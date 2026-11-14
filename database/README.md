@@ -31,6 +31,7 @@ erDiagram
     hosts ||--o| host_config_status : "last applied"
     hosts ||--o| host_boots : "last booted"
     hosts ||--o{ metrics_pages : "is read from"
+    hosts ||--o{ remote_checks : "is checked by"
     hosts ||--o{ alerts : "has"
     alert_rules |o--o{ alerts : "raised"
     alert_rules ||--o{ alert_rule_channels : "tells"
@@ -332,7 +333,7 @@ erDiagram
     }
     remote_checks {
         int id PK
-        string host_id "the host it's about, or server"
+        string host_id FK "the host it's about, or server"
         string name UK
         string kind
         string target
@@ -390,7 +391,7 @@ erDiagram
 | `events` | Annotations people and automations add, and restarts the server notices |
 | `dashboards`, `dashboard_widgets`, `dashboard_variables` | Dashboards and what's on them |
 | `location_rules` | Where hosts are on the map |
-| `remote_checks` | Checks the server runs itself, each about a host without an agent or the server. `host_id` has no foreign key, as SQLite can't add one to a table that exists, so deleting a host deletes its checks |
+| `remote_checks` | Checks the server runs itself, each about a host without an agent or the server. Deleting a host deletes its checks first |
 | `users`, `user_sessions`, `api_keys`, `recovery_codes`, `sign_in_challenges` | People, how they sign in, and their keys |
 | `audit_log` | Who changed what |
 | `server_settings`, `server_secrets` | Settings for the whole server, and secrets it generates |

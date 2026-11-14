@@ -753,40 +753,7 @@ impl MigrationTrait for CreateTables {
                     .to_owned(),
             )
             .await?;
-        manager
-            .create_table(
-                Table::create()
-                    .table(RemoteChecks::Table)
-                    .col(id(RemoteChecks::Id))
-                    .col(
-                        ColumnDef::new(RemoteChecks::Name)
-                            .string_len(64)
-                            .not_null()
-                            .unique_key(),
-                    )
-                    .col(ColumnDef::new(RemoteChecks::Kind).string_len(16).not_null())
-                    .col(
-                        ColumnDef::new(RemoteChecks::Target)
-                            .string_len(255)
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(RemoteChecks::TimeoutSecs).big_integer())
-                    .col(ColumnDef::new(RemoteChecks::Method).string_len(16))
-                    .col(ColumnDef::new(RemoteChecks::Body).text())
-                    .col(ColumnDef::new(RemoteChecks::Regex).text())
-                    .col(ColumnDef::new(RemoteChecks::Insecure).boolean())
-                    .col(ColumnDef::new(RemoteChecks::Server).string_len(255))
-                    .col(ColumnDef::new(RemoteChecks::Record).string_len(16))
-                    .col(ColumnDef::new(RemoteChecks::Count).integer())
-                    .col(
-                        ColumnDef::new(RemoteChecks::IntervalSecs)
-                            .big_integer()
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(RemoteChecks::Enabled).boolean().not_null())
-                    .to_owned(),
-            )
-            .await?;
+        manager.create_table(remote_checks_before_hosts()).await?;
         manager
             .create_table(
                 Table::create()
@@ -2402,41 +2369,51 @@ impl MigrationName for ChecksOnHosts {
 }
 
 /// Each check the server runs says which host it's about: a host with no agent,
-/// or the server itself, which is where every check was before.
+/// or the server itself, which is where every check was before. SQLite can only
+/// give a table a foreign key by making it again.
 #[async_trait::async_trait]
 impl MigrationTrait for ChecksOnHosts {
-    fn use_transaction(&self) -> Option<bool> {
-        Some(true)
-    }
-
-    /// There's no foreign key, as SQLite can't add one to a table that exists.
-    /// Deleting a host deletes its checks.
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        if manager.get_database_backend() == sea_orm::DatabaseBackend::Sqlite {
+            let mut table = remote_checks_before_hosts();
+            table
+                .col(remote_checks_host_id())
+                .foreign_key(&mut remote_checks_host_key());
+            remake_on_sqlite(manager, &[("remote_checks", table, REMOTE_CHECK_COLUMNS)]).await?;
+            return manager.create_index(remote_checks_host_index()).await;
+        }
         manager
             .alter_table(
                 Table::alter()
                     .table(RemoteChecks::Table)
-                    .add_column(
-                        ColumnDef::new(RemoteChecks::HostId)
-                            .string_len(32)
-                            .not_null()
-                            .default("server"),
-                    )
+                    .add_column(remote_checks_host_id())
                     .to_owned(),
             )
             .await?;
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_remote_checks_host")
-                    .table(RemoteChecks::Table)
-                    .col(RemoteChecks::HostId)
-                    .to_owned(),
-            )
-            .await
+        manager.create_index(remote_checks_host_index()).await?;
+        manager.create_foreign_key(remote_checks_host_key()).await
     }
 
+    /// Checks about any other host go, as they'd become the server's.
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let elsewhere = Query::delete()
+            .from_table(RemoteChecks::Table)
+            .and_where(Expr::col(RemoteChecks::HostId).ne("server"))
+            .to_owned();
+        manager.exec_stmt(elsewhere).await?;
+        if manager.get_database_backend() == sea_orm::DatabaseBackend::Sqlite {
+            let table = remote_checks_before_hosts();
+            return remake_on_sqlite(manager, &[("remote_checks", table, REMOTE_CHECK_COLUMNS)])
+                .await;
+        }
+        manager
+            .drop_foreign_key(
+                ForeignKey::drop()
+                    .name(REMOTE_CHECKS_HOST_KEY)
+                    .table(RemoteChecks::Table)
+                    .to_owned(),
+            )
+            .await?;
         manager
             .drop_index(
                 Index::drop()
@@ -2454,6 +2431,70 @@ impl MigrationTrait for ChecksOnHosts {
             )
             .await
     }
+}
+
+/// The columns `remote_checks` had before it said which host, to copy across.
+const REMOTE_CHECK_COLUMNS: &str = "id, name, kind, target, timeout_secs, method, body, \
+     regex, insecure, server, record, count, interval_secs, enabled";
+
+const REMOTE_CHECKS_HOST_KEY: &str = "fk_remote_checks_host_id";
+
+/// `remote_checks` as migration 1 made it.
+fn remote_checks_before_hosts() -> TableCreateStatement {
+    Table::create()
+        .table(RemoteChecks::Table)
+        .col(id(RemoteChecks::Id))
+        .col(
+            ColumnDef::new(RemoteChecks::Name)
+                .string_len(64)
+                .not_null()
+                .unique_key(),
+        )
+        .col(ColumnDef::new(RemoteChecks::Kind).string_len(16).not_null())
+        .col(
+            ColumnDef::new(RemoteChecks::Target)
+                .string_len(255)
+                .not_null(),
+        )
+        .col(ColumnDef::new(RemoteChecks::TimeoutSecs).big_integer())
+        .col(ColumnDef::new(RemoteChecks::Method).string_len(16))
+        .col(ColumnDef::new(RemoteChecks::Body).text())
+        .col(ColumnDef::new(RemoteChecks::Regex).text())
+        .col(ColumnDef::new(RemoteChecks::Insecure).boolean())
+        .col(ColumnDef::new(RemoteChecks::Server).string_len(255))
+        .col(ColumnDef::new(RemoteChecks::Record).string_len(16))
+        .col(ColumnDef::new(RemoteChecks::Count).integer())
+        .col(
+            ColumnDef::new(RemoteChecks::IntervalSecs)
+                .big_integer()
+                .not_null(),
+        )
+        .col(ColumnDef::new(RemoteChecks::Enabled).boolean().not_null())
+        .to_owned()
+}
+
+fn remote_checks_host_id() -> ColumnDef {
+    ColumnDef::new(RemoteChecks::HostId)
+        .string_len(32)
+        .not_null()
+        .default("server")
+        .to_owned()
+}
+
+fn remote_checks_host_key() -> ForeignKeyCreateStatement {
+    ForeignKey::create()
+        .name(REMOTE_CHECKS_HOST_KEY)
+        .from(RemoteChecks::Table, RemoteChecks::HostId)
+        .to(Hosts::Table, Hosts::Id)
+        .to_owned()
+}
+
+fn remote_checks_host_index() -> IndexCreateStatement {
+    Index::create()
+        .name("idx_remote_checks_host")
+        .table(RemoteChecks::Table)
+        .col(RemoteChecks::HostId)
+        .to_owned()
 }
 
 #[derive(DeriveIden)]
@@ -2637,5 +2678,53 @@ mod tests {
             connection.execute_unprepared(twice).await.is_err(),
             "unique again"
         );
+    }
+
+    #[tokio::test]
+    async fn checks_keep_their_rows_and_must_be_about_a_host() {
+        let connection = fresh().await;
+        Migrator::up(&connection, Some(7)).await.unwrap();
+        connection
+            .execute_unprepared(
+                "INSERT INTO remote_checks (id, name, kind, target, interval_secs, enabled)
+                 VALUES (4, 'Site', 'http', 'https://example.com', 60, TRUE)",
+            )
+            .await
+            .unwrap();
+
+        Migrator::up(&connection, None).await.unwrap();
+
+        let about = "SELECT host_id FROM remote_checks WHERE name = 'Site'";
+        assert_eq!(texts(&connection, about).await, ["server"]);
+        let add = |name: &str, host: &str| {
+            let sql = format!(
+                "INSERT INTO remote_checks (name, kind, target, interval_secs, enabled, host_id)
+                 VALUES ('{name}', 'ping', 'example.com', 60, TRUE, '{host}')"
+            );
+            let connection = &connection;
+            async move { connection.execute_unprepared(&sql).await }
+        };
+        assert!(add("Nowhere", "nobody").await.is_err());
+        connection
+            .execute_unprepared(
+                "INSERT INTO hosts (id, hostname, public_key, state, first_seen_ms, kind)
+                 VALUES ('abc', 'db', '', 'approved', 1, 'agentless')",
+            )
+            .await
+            .unwrap();
+        add("Database", "abc").await.unwrap();
+        let ids = "SELECT CAST(id AS TEXT) FROM remote_checks ORDER BY id";
+        assert_eq!(
+            texts(&connection, ids).await,
+            ["4", "5"],
+            "IDs carry on from where they were"
+        );
+        let gone = "DELETE FROM hosts WHERE id = 'abc'";
+        assert!(connection.execute_unprepared(gone).await.is_err());
+
+        // Only the server's checks can go back to having no host.
+        Migrator::down(&connection, Some(1)).await.unwrap();
+        let names = "SELECT name FROM remote_checks";
+        assert_eq!(texts(&connection, names).await, ["Site"]);
     }
 }
