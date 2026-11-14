@@ -141,7 +141,10 @@ mod tests {
         assert!(own > 0);
         // macOS also charges for memory it has compressed, which isn't resident.
         if cfg!(target_os = "linux") {
-            assert!(own <= resident, "{own} is more than the {resident} resident");
+            assert!(
+                own <= resident,
+                "{own} is more than the {resident} resident"
+            );
         }
     }
 
