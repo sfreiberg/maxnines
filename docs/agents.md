@@ -283,6 +283,20 @@ or a service stopped on purpose.
 Other systems run containers inside a Linux virtual machine, as Docker Desktop does on
 macOS and Windows, so only the Linux agent reads them.
 
+## The agent itself
+
+Every agent reports its own memory and CPU use, charted as **Agent memory** and
+**Agent CPU**, so you can see that it stays small. The memory is what the system
+charges to the agent alone:
+
+- **macOS:** its physical footprint, the figure Activity Monitor shows.
+- **Linux:** its proportional share, where a page shared with other programs counts
+  as the agent's part of it.
+- **Windows and FreeBSD:** its resident size, which also counts shared pages in full.
+
+`ps` and `top` show the resident size everywhere, which on macOS is around three
+times the footprint, as it takes in the system libraries every program shares.
+
 ## Actions
 
 An action is something the server can ask this host to run, by name, whose output it

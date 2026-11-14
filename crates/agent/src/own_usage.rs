@@ -38,6 +38,46 @@ impl OwnUsageCollector {
     }
 }
 
+/// What macOS charges to the agent, which is what Activity Monitor shows. The
+/// resident size counts every page of the system's libraries the agent has touched,
+/// though they're shared with everything else running, and comes out several times
+/// larger.
+#[cfg(target_os = "macos")]
+fn own_memory() -> Option<u64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v2>::uninit();
+    // Fills in the whole struct, or fails and leaves it alone.
+    let filled = unsafe {
+        libc::proc_pid_rusage(
+            libc::getpid(),
+            libc::RUSAGE_INFO_V2,
+            usage.as_mut_ptr().cast(),
+        )
+    };
+    (filled == 0).then(|| unsafe { usage.assume_init() }.ri_phys_footprint)
+}
+
+/// The agent's share of the memory it has in use, where a page shared with other
+/// processes counts as its part of it. Kernels older than 4.14 don't say.
+#[cfg(target_os = "linux")]
+fn own_memory() -> Option<u64> {
+    proportional_bytes(&std::fs::read_to_string("/proc/self/smaps_rollup").ok()?)
+}
+
+/// Windows and FreeBSD have nothing as cheap to ask, so they report the resident
+/// size.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn own_memory() -> Option<u64> {
+    None
+}
+
+/// The `Pss:` line of `smaps_rollup`, which is in kilobytes.
+#[cfg(any(target_os = "linux", test))]
+fn proportional_bytes(rollup: &str) -> Option<u64> {
+    let line = rollup.lines().find_map(|line| line.strip_prefix("Pss:"))?;
+    let kilobytes: u64 = line.trim().strip_suffix("kB")?.trim().parse().ok()?;
+    Some(kilobytes * 1024)
+}
+
 impl Collector for OwnUsageCollector {
     fn name(&self) -> &'static str {
         "agent"
@@ -56,7 +96,7 @@ impl Collector for OwnUsageCollector {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |now| now.as_secs().saturating_sub(process.start_time()));
         Ok(json!({
-            "memory_bytes": process.memory(),
+            "memory_bytes": own_memory().unwrap_or_else(|| process.memory()),
             // As a share of the whole host, as other CPU figures are.
             "cpu_percent": f64::from(process.cpu_usage()) / self.cores as f64,
             "uptime_secs": uptime_secs,
@@ -81,5 +121,40 @@ mod tests {
         // This test process started moments ago, not when the host did.
         let uptime = output["uptime_secs"].as_u64().unwrap();
         assert!(uptime < 3600, "{output}");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn memory_leaves_out_what_is_shared_with_other_processes() {
+        let mut system = System::new().unwrap();
+        let pid = sysinfo::get_current_pid().unwrap();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing().with_memory(),
+        );
+        let resident = system.process(pid).unwrap().memory();
+        assert!(resident > 0);
+
+        let own = own_memory().unwrap();
+
+        assert!(own > 0);
+        // macOS also charges for memory it has compressed, which isn't resident.
+        if cfg!(target_os = "linux") {
+            assert!(own <= resident, "{own} is more than the {resident} resident");
+        }
+    }
+
+    #[test]
+    fn proportional_memory_is_read_from_the_rollup() {
+        let rollup = "55d0a8a00000-7ffe3a5f2000 ---p 00000000 00:00 0    [rollup]
+Rss:                5120 kB
+Pss:                3121 kB
+Pss_Dirty:          2900 kB
+Pss_Anon:           2800 kB
+";
+        assert_eq!(proportional_bytes(rollup), Some(3121 * 1024));
+        assert_eq!(proportional_bytes("Rss: 5120 kB\n"), None);
+        assert_eq!(proportional_bytes("Pss: lots kB\n"), None);
     }
 }
