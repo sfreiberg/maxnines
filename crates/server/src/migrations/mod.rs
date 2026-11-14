@@ -2,23 +2,13 @@
 //! draws. A change to a table is a new migration after this one, with the README
 //! changed to match.
 
-use sea_orm::{DbBackend, Statement};
 use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
 
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![
-            Box::new(CreateTables),
-            Box::new(SoftDeleteRulesAndChannels),
-            Box::new(Actions),
-            Box::new(ActionNotifications),
-            Box::new(ClockRule),
-            Box::new(ServiceRule),
-            Box::new(AgentlessHosts),
-            Box::new(ChecksOnHosts),
-        ]
+        vec![Box::new(CreateTables)]
     }
 }
 
@@ -36,7 +26,7 @@ struct CreateTables;
 
 impl MigrationName for CreateTables {
     fn name(&self) -> &str {
-        "m20261111_000001_create_tables"
+        "m20261114_000001_create_tables"
     }
 }
 
@@ -68,6 +58,12 @@ impl MigrationTrait for CreateTables {
                             .string_len(32)
                             .not_null()
                             .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(Hosts::Kind)
+                            .string_len(16)
+                            .not_null()
+                            .default("agent"),
                     )
                     .col(ColumnDef::new(Hosts::PublicKey).string_len(64).not_null())
                     .col(ColumnDef::new(Hosts::Hostname).string_len(255).not_null())
@@ -173,6 +169,45 @@ impl MigrationTrait for CreateTables {
                             .from(HostBoots::Table, HostBoots::HostId)
                             .to(Hosts::Table, Hosts::Id),
                     )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(MetricsPages::Table)
+                    .col(id(MetricsPages::Id))
+                    .col(
+                        ColumnDef::new(MetricsPages::HostId)
+                            .string_len(32)
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(MetricsPages::Url).string_len(255).not_null())
+                    .col(ColumnDef::new(MetricsPages::Names).text().not_null())
+                    .col(
+                        ColumnDef::new(MetricsPages::IntervalSecs)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(MetricsPages::Enabled).boolean().not_null())
+                    .col(ColumnDef::new(MetricsPages::Username).string_len(255))
+                    .col(ColumnDef::new(MetricsPages::Password).text())
+                    .col(ColumnDef::new(MetricsPages::PasswordEnv).string_len(255))
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_metrics_pages_host_id")
+                            .from(MetricsPages::Table, MetricsPages::HostId)
+                            .to(Hosts::Table, Hosts::Id),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_metrics_pages_host")
+                    .table(MetricsPages::Table)
+                    .col(MetricsPages::HostId)
                     .to_owned(),
             )
             .await?;
@@ -431,8 +466,7 @@ impl MigrationTrait for CreateTables {
                     .col(
                         ColumnDef::new(NotificationChannels::Name)
                             .string_len(255)
-                            .not_null()
-                            .unique_key(),
+                            .not_null(),
                     )
                     .col(
                         ColumnDef::new(NotificationChannels::Kind)
@@ -466,6 +500,7 @@ impl MigrationTrait for CreateTables {
                     .col(ColumnDef::new(NotificationChannels::RequestMethod).string_len(8))
                     .col(ColumnDef::new(NotificationChannels::RequestContentType).string_len(255))
                     .col(ColumnDef::new(NotificationChannels::RequestBody).text())
+                    .col(ColumnDef::new(NotificationChannels::DeletedMs).big_integer())
                     .to_owned(),
             )
             .await?;
@@ -474,12 +509,7 @@ impl MigrationTrait for CreateTables {
                 Table::create()
                     .table(AlertRules::Table)
                     .col(id(AlertRules::Id))
-                    .col(
-                        ColumnDef::new(AlertRules::Name)
-                            .string_len(255)
-                            .not_null()
-                            .unique_key(),
-                    )
+                    .col(ColumnDef::new(AlertRules::Name).string_len(255).not_null())
                     .col(ColumnDef::new(AlertRules::Kind).string_len(16).not_null())
                     .col(ColumnDef::new(AlertRules::Metric).string_len(64))
                     .col(ColumnDef::new(AlertRules::Series).string_len(255))
@@ -507,6 +537,7 @@ impl MigrationTrait for CreateTables {
                     .col(ColumnDef::new(AlertRules::RemindEverySecs).big_integer())
                     .col(ColumnDef::new(AlertRules::ForecastSecs).big_integer())
                     .col(ColumnDef::new(AlertRules::WarningForecastSecs).big_integer())
+                    .col(ColumnDef::new(AlertRules::DeletedMs).big_integer())
                     .to_owned(),
             )
             .await?;
@@ -637,6 +668,7 @@ impl MigrationTrait for CreateTables {
                     )
                     .col(ColumnDef::new(Notifications::SentMs).big_integer())
                     .col(ColumnDef::new(Notifications::ExternalId).string_len(128))
+                    .col(ColumnDef::new(Notifications::ActionRunId).big_integer())
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_notifications_alert_id")
@@ -753,7 +785,192 @@ impl MigrationTrait for CreateTables {
                     .to_owned(),
             )
             .await?;
-        manager.create_table(remote_checks_before_hosts()).await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(AlertRuleActions::Table)
+                    .col(id(AlertRuleActions::Id))
+                    .col(
+                        ColumnDef::new(AlertRuleActions::RuleId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(AlertRuleActions::Action)
+                            .string_len(64)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(AlertRuleActions::RunOn)
+                            .string_len(16)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(AlertRuleActions::TimeoutSecs)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(AlertRuleActions::Position)
+                            .integer()
+                            .not_null(),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_alert_rule_actions_rule_id")
+                            .from(AlertRuleActions::Table, AlertRuleActions::RuleId)
+                            .to(AlertRules::Table, AlertRules::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_alert_rule_actions_rule")
+                    .table(AlertRuleActions::Table)
+                    .col(AlertRuleActions::RuleId)
+                    .to_owned(),
+            )
+            .await?;
+
+        // As with the audit log, MySQL's text is too small for what this holds.
+        let mut output = ColumnDef::new(ActionRuns::Output);
+        match manager.get_database_backend() {
+            sea_orm::DatabaseBackend::MySql => output.custom(Alias::new("LONGTEXT")),
+            _ => output.text(),
+        };
+        output.not_null();
+        manager
+            .create_table(
+                Table::create()
+                    .table(ActionRuns::Table)
+                    .col(id(ActionRuns::Id))
+                    .col(ColumnDef::new(ActionRuns::HostId).string_len(32).not_null())
+                    .col(ColumnDef::new(ActionRuns::AlertId).big_integer())
+                    .col(ColumnDef::new(ActionRuns::Action).string_len(64).not_null())
+                    .col(ColumnDef::new(ActionRuns::RunOn).string_len(16).not_null())
+                    .col(ColumnDef::new(ActionRuns::Variables).text().not_null())
+                    .col(ColumnDef::new(ActionRuns::RequestedBy).string_len(255))
+                    .col(
+                        ColumnDef::new(ActionRuns::RequestedMs)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ActionRuns::TimeoutSecs)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(ActionRuns::Outcome).string_len(16))
+                    .col(ColumnDef::new(ActionRuns::ExitCode).integer())
+                    .col(ColumnDef::new(ActionRuns::Error).text())
+                    .col(output)
+                    .col(ColumnDef::new(ActionRuns::Truncated).boolean().not_null())
+                    .col(ColumnDef::new(ActionRuns::DurationMs).big_integer())
+                    .col(ColumnDef::new(ActionRuns::FinishedMs).big_integer())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_action_runs_host_id")
+                            .from(ActionRuns::Table, ActionRuns::HostId)
+                            .to(Hosts::Table, Hosts::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_action_runs_alert_id")
+                            .from(ActionRuns::Table, ActionRuns::AlertId)
+                            .to(Alerts::Table, Alerts::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_action_runs_alert")
+                    .table(ActionRuns::Table)
+                    .col(ActionRuns::AlertId)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_action_runs_host")
+                    .table(ActionRuns::Table)
+                    .col(ActionRuns::HostId)
+                    .col(ActionRuns::RequestedMs)
+                    .to_owned(),
+            )
+            .await?;
+        // What's still waiting for an answer, which is looked for on every pass.
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_action_runs_finished")
+                    .table(ActionRuns::Table)
+                    .col(ActionRuns::FinishedMs)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(RemoteChecks::Table)
+                    .col(id(RemoteChecks::Id))
+                    .col(
+                        ColumnDef::new(RemoteChecks::Name)
+                            .string_len(64)
+                            .not_null()
+                            .unique_key(),
+                    )
+                    .col(ColumnDef::new(RemoteChecks::Kind).string_len(16).not_null())
+                    .col(
+                        ColumnDef::new(RemoteChecks::Target)
+                            .string_len(255)
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(RemoteChecks::TimeoutSecs).big_integer())
+                    .col(ColumnDef::new(RemoteChecks::Method).string_len(16))
+                    .col(ColumnDef::new(RemoteChecks::Body).text())
+                    .col(ColumnDef::new(RemoteChecks::Regex).text())
+                    .col(ColumnDef::new(RemoteChecks::Insecure).boolean())
+                    .col(ColumnDef::new(RemoteChecks::Server).string_len(255))
+                    .col(ColumnDef::new(RemoteChecks::Record).string_len(16))
+                    .col(ColumnDef::new(RemoteChecks::Count).integer())
+                    .col(
+                        ColumnDef::new(RemoteChecks::IntervalSecs)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(RemoteChecks::Enabled).boolean().not_null())
+                    .col(
+                        ColumnDef::new(RemoteChecks::HostId)
+                            .string_len(32)
+                            .not_null()
+                            .default("server"),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_remote_checks_host_id")
+                            .from(RemoteChecks::Table, RemoteChecks::HostId)
+                            .to(Hosts::Table, Hosts::Id),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_remote_checks_host")
+                    .table(RemoteChecks::Table)
+                    .col(RemoteChecks::HostId)
+                    .to_owned(),
+            )
+            .await?;
         manager
             .create_table(
                 Table::create()
@@ -1024,6 +1241,8 @@ impl MigrationTrait for CreateTables {
             "dashboard_widgets",
             "dashboards",
             "remote_checks",
+            "action_runs",
+            "alert_rule_actions",
             "maintenance_windows",
             "silences",
             "notifications",
@@ -1038,6 +1257,7 @@ impl MigrationTrait for CreateTables {
             "users",
             "config_rule_settings",
             "config_rules",
+            "metrics_pages",
             "host_boots",
             "host_config_status",
             "host_facts",
@@ -1082,7 +1302,7 @@ struct BuiltInRule {
     warning_forecast_secs: Option<i64>,
 }
 
-const BUILT_IN_RULES: [BuiltInRule; 5] = [
+const BUILT_IN_RULES: [BuiltInRule; 7] = [
     BuiltInRule {
         name: "Host offline",
         kind: "offline",
@@ -1143,6 +1363,31 @@ const BUILT_IN_RULES: [BuiltInRule; 5] = [
         forecast_secs: None,
         warning_forecast_secs: None,
     },
+    BuiltInRule {
+        name: "Clock is wrong",
+        kind: "metric",
+        metric: Some("clock.difference"),
+        comparison: Some("above"),
+        threshold: Some(30.0),
+        warning_threshold: Some(5.0),
+        for_secs: 60,
+        window_secs: None,
+        forecast_secs: None,
+        warning_forecast_secs: None,
+    },
+    BuiltInRule {
+        name: "Service stopped",
+        kind: "metric",
+        metric: Some("service.running"),
+        comparison: Some("below"),
+        threshold: Some(1.0),
+        warning_threshold: None,
+        // Long enough for a restart, and no longer: a service that's down is down.
+        for_secs: 60,
+        window_secs: None,
+        forecast_secs: None,
+        warning_forecast_secs: None,
+    },
 ];
 
 async fn add_built_ins(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
@@ -1150,6 +1395,7 @@ async fn add_built_ins(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         .into_table(Hosts::Table)
         .columns([
             Hosts::Id,
+            Hosts::Kind,
             Hosts::PublicKey,
             Hosts::Hostname,
             Hosts::State,
@@ -1160,6 +1406,7 @@ async fn add_built_ins(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     for (id, hostname) in BUILT_IN_HOSTS {
         hosts.values_panic([
             id.into(),
+            "built_in".into(),
             "".into(),
             hostname.into(),
             "approved".into(),
@@ -1460,6 +1707,7 @@ enum Notifications {
     CreatedMs,
     SentMs,
     ExternalId,
+    ActionRunId,
 }
 
 #[derive(Iden)]
@@ -1603,900 +1851,6 @@ enum ServerSecrets {
     Value,
 }
 
-struct SoftDeleteRulesAndChannels;
-
-impl MigrationName for SoftDeleteRulesAndChannels {
-    fn name(&self) -> &str {
-        "m20261111_000002_soft_delete_rules_and_channels"
-    }
-}
-
-/// Alert rules and notification channels are marked deleted instead of going, so an
-/// alert still says which rule raised it and a notification where it was sent. A
-/// deleted one's name is free to use again, so the server checks names are unique
-/// among those left, not the database. SQLite can only drop a unique constraint by
-/// making the table again, and as other tables point at these two, that has to be
-/// done with foreign keys switched off, which SQLite only allows outside a
-/// transaction. Its pool has a single connection, so the switch holds for every
-/// step.
-#[async_trait::async_trait]
-impl MigrationTrait for SoftDeleteRulesAndChannels {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let connection = manager.get_connection();
-        match manager.get_database_backend() {
-            sea_orm::DatabaseBackend::Sqlite => {
-                remake_on_sqlite(
-                    manager,
-                    &[
-                        (
-                            "alert_rules",
-                            alert_rules_after_soft_delete(),
-                            ALERT_RULE_COLUMNS,
-                        ),
-                        (
-                            "notification_channels",
-                            notification_channels_after_soft_delete(),
-                            CHANNEL_COLUMNS,
-                        ),
-                    ],
-                )
-                .await
-            }
-            backend => {
-                for table in ["alert_rules", "notification_channels"] {
-                    let unique = if backend == sea_orm::DatabaseBackend::MySql {
-                        format!("ALTER TABLE {table} DROP INDEX name")
-                    } else {
-                        format!("ALTER TABLE {table} DROP CONSTRAINT {table}_name_key")
-                    };
-                    connection.execute_unprepared(&unique).await?;
-                    manager
-                        .alter_table(
-                            Table::alter()
-                                .table(Alias::new(table))
-                                .add_column(ColumnDef::new(Alias::new("deleted_ms")).big_integer())
-                                .to_owned(),
-                        )
-                        .await?;
-                }
-                Ok(())
-            }
-        }
-    }
-
-    /// Deleted ones go for good, as there's nowhere to keep them.
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let connection = manager.get_connection();
-        connection
-            .execute_unprepared(
-                "DELETE FROM alert_rule_channels WHERE rule_id IN \
-                 (SELECT id FROM alert_rules WHERE deleted_ms IS NOT NULL)",
-            )
-            .await?;
-        connection
-            .execute_unprepared(
-                "UPDATE alerts SET rule_id = NULL WHERE rule_id IN \
-                 (SELECT id FROM alert_rules WHERE deleted_ms IS NOT NULL)",
-            )
-            .await?;
-        for table in ["silences", "maintenance_windows"] {
-            connection
-                .execute_unprepared(&format!(
-                    "DELETE FROM {table} WHERE rule_id IN \
-                     (SELECT id FROM alert_rules WHERE deleted_ms IS NOT NULL)"
-                ))
-                .await?;
-        }
-        connection
-            .execute_unprepared(
-                "DELETE FROM notifications WHERE channel_id IN \
-                 (SELECT id FROM notification_channels WHERE deleted_ms IS NOT NULL)",
-            )
-            .await?;
-        for table in ["alert_rules", "notification_channels"] {
-            connection
-                .execute_unprepared(&format!("DELETE FROM {table} WHERE deleted_ms IS NOT NULL"))
-                .await?;
-        }
-        if manager.get_database_backend() == sea_orm::DatabaseBackend::Sqlite {
-            return remake_on_sqlite(
-                manager,
-                &[
-                    (
-                        "alert_rules",
-                        alert_rules_before_soft_delete(),
-                        ALERT_RULE_COLUMNS,
-                    ),
-                    (
-                        "notification_channels",
-                        notification_channels_before_soft_delete(),
-                        CHANNEL_COLUMNS,
-                    ),
-                ],
-            )
-            .await;
-        }
-        for table in ["alert_rules", "notification_channels"] {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(Alias::new(table))
-                        .drop_column(Alias::new("deleted_ms"))
-                        .to_owned(),
-                )
-                .await?;
-            let unique = if manager.get_database_backend() == sea_orm::DatabaseBackend::MySql {
-                format!("ALTER TABLE {table} ADD UNIQUE INDEX name (name)")
-            } else {
-                format!("ALTER TABLE {table} ADD CONSTRAINT {table}_name_key UNIQUE (name)")
-            };
-            connection.execute_unprepared(&unique).await?;
-        }
-        Ok(())
-    }
-}
-
-/// The columns both versions of each table have, to copy from one to the other.
-const ALERT_RULE_COLUMNS: &str = "id, name, kind, metric, series, comparison, threshold, \
-     warning_threshold, for_secs, severity, condition_expr, enabled, all_channels, \
-     calculation, group_by, filter, window_secs, remind_every_secs, forecast_secs, \
-     warning_forecast_secs";
-const CHANNEL_COLUMNS: &str = "id, name, kind, target, credential, app_token, \
-     sends_warnings, sends_critical, mail_from, mail_hostname, mail_port, mail_security, \
-     mail_username, request_method, request_content_type, request_body";
-
-/// Makes each table again as given on SQLite, keeping its rows and the next ID it
-/// would give, with foreign keys off so tables pointing at it are left alone, then
-/// checks nothing points anywhere it shouldn't before keeping the result. This is
-/// the order SQLite's own documentation gives for changes ALTER TABLE can't make.
-async fn remake_on_sqlite(
-    manager: &SchemaManager<'_>,
-    tables: &[(&str, TableCreateStatement, &str)],
-) -> Result<(), DbErr> {
-    let connection = manager.get_connection();
-    connection
-        .execute_unprepared("PRAGMA foreign_keys = OFF")
-        .await?;
-    let remade = async {
-        connection.execute_unprepared("BEGIN").await?;
-        for (table, create, columns) in tables {
-            let made = format!("{table}_remade");
-            let mut create = create.clone();
-            create.table(Alias::new(&made));
-            manager.create_table(create).await?;
-            connection
-                .execute_unprepared(&format!(
-                    "INSERT INTO {made} ({columns}) SELECT {columns} FROM {table}"
-                ))
-                .await?;
-            let next = format!("SELECT seq FROM sqlite_sequence WHERE name = '{table}'");
-            let seq: Option<i64> = connection
-                .query_one_raw(Statement::from_string(DbBackend::Sqlite, next))
-                .await?
-                .map(|row| row.try_get_by_index(0))
-                .transpose()?;
-            connection
-                .execute_unprepared(&format!("DROP TABLE {table}"))
-                .await?;
-            connection
-                .execute_unprepared(&format!("ALTER TABLE {made} RENAME TO {table}"))
-                .await?;
-            if let Some(seq) = seq {
-                connection
-                    .execute_unprepared(&format!(
-                        "UPDATE sqlite_sequence SET seq = max(seq, {seq}) WHERE name = '{table}'"
-                    ))
-                    .await?;
-            }
-        }
-        let broken = connection
-            .query_all_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "PRAGMA foreign_key_check",
-            ))
-            .await?;
-        if !broken.is_empty() {
-            return Err(DbErr::Migration(format!(
-                "{} rows would point at nothing",
-                broken.len()
-            )));
-        }
-        connection.execute_unprepared("COMMIT").await?;
-        Ok(())
-    }
-    .await;
-    if remade.is_err() {
-        connection.execute_unprepared("ROLLBACK").await.ok();
-    }
-    connection
-        .execute_unprepared("PRAGMA foreign_keys = ON")
-        .await?;
-    remade
-}
-
-/// `alert_rules` as migration 1 made it, for going back on SQLite.
-fn alert_rules_before_soft_delete() -> TableCreateStatement {
-    Table::create()
-        .table(AlertRules::Table)
-        .col(id(AlertRules::Id))
-        .col(
-            ColumnDef::new(AlertRules::Name)
-                .string_len(255)
-                .not_null()
-                .unique_key(),
-        )
-        .col(ColumnDef::new(AlertRules::Kind).string_len(16).not_null())
-        .col(ColumnDef::new(AlertRules::Metric).string_len(64))
-        .col(ColumnDef::new(AlertRules::Series).string_len(255))
-        .col(ColumnDef::new(AlertRules::Comparison).string_len(16))
-        .col(ColumnDef::new(AlertRules::Threshold).double())
-        .col(ColumnDef::new(AlertRules::WarningThreshold).double())
-        .col(ColumnDef::new(AlertRules::ForSecs).big_integer().not_null())
-        .col(
-            ColumnDef::new(AlertRules::Severity)
-                .string_len(16)
-                .not_null(),
-        )
-        .col(ColumnDef::new(AlertRules::ConditionExpr).text())
-        .col(ColumnDef::new(AlertRules::Enabled).boolean().not_null())
-        .col(
-            ColumnDef::new(AlertRules::AllChannels)
-                .boolean()
-                .not_null()
-                .default(false),
-        )
-        .col(ColumnDef::new(AlertRules::Calculation).string_len(16))
-        .col(ColumnDef::new(AlertRules::GroupBy).string_len(255))
-        .col(ColumnDef::new(AlertRules::Filter).string_len(500))
-        .col(ColumnDef::new(AlertRules::WindowSecs).big_integer())
-        .col(ColumnDef::new(AlertRules::RemindEverySecs).big_integer())
-        .col(ColumnDef::new(AlertRules::ForecastSecs).big_integer())
-        .col(ColumnDef::new(AlertRules::WarningForecastSecs).big_integer())
-        .to_owned()
-}
-
-/// `notification_channels` as migration 1 made it, for going back on SQLite.
-fn notification_channels_before_soft_delete() -> TableCreateStatement {
-    Table::create()
-        .table(NotificationChannels::Table)
-        .col(id(NotificationChannels::Id))
-        .col(
-            ColumnDef::new(NotificationChannels::Name)
-                .string_len(255)
-                .not_null()
-                .unique_key(),
-        )
-        .col(
-            ColumnDef::new(NotificationChannels::Kind)
-                .string_len(16)
-                .not_null(),
-        )
-        .col(
-            ColumnDef::new(NotificationChannels::Target)
-                .text()
-                .not_null(),
-        )
-        .col(ColumnDef::new(NotificationChannels::Credential).text())
-        .col(ColumnDef::new(NotificationChannels::AppToken).text())
-        .col(
-            ColumnDef::new(NotificationChannels::SendsWarnings)
-                .boolean()
-                .not_null()
-                .default(true),
-        )
-        .col(
-            ColumnDef::new(NotificationChannels::SendsCritical)
-                .boolean()
-                .not_null()
-                .default(true),
-        )
-        .col(ColumnDef::new(NotificationChannels::MailFrom).string_len(320))
-        .col(ColumnDef::new(NotificationChannels::MailHostname).string_len(255))
-        .col(ColumnDef::new(NotificationChannels::MailPort).integer())
-        .col(ColumnDef::new(NotificationChannels::MailSecurity).string_len(16))
-        .col(ColumnDef::new(NotificationChannels::MailUsername).string_len(255))
-        .col(ColumnDef::new(NotificationChannels::RequestMethod).string_len(8))
-        .col(ColumnDef::new(NotificationChannels::RequestContentType).string_len(255))
-        .col(ColumnDef::new(NotificationChannels::RequestBody).text())
-        .to_owned()
-}
-
-/// `alert_rules` as it is after migration 2, for making it again on SQLite.
-fn alert_rules_after_soft_delete() -> TableCreateStatement {
-    Table::create()
-        .table(AlertRules::Table)
-        .col(id(AlertRules::Id))
-        .col(ColumnDef::new(AlertRules::Name).string_len(255).not_null())
-        .col(ColumnDef::new(AlertRules::Kind).string_len(16).not_null())
-        .col(ColumnDef::new(AlertRules::Metric).string_len(64))
-        .col(ColumnDef::new(AlertRules::Series).string_len(255))
-        .col(ColumnDef::new(AlertRules::Comparison).string_len(16))
-        .col(ColumnDef::new(AlertRules::Threshold).double())
-        .col(ColumnDef::new(AlertRules::WarningThreshold).double())
-        .col(ColumnDef::new(AlertRules::ForSecs).big_integer().not_null())
-        .col(
-            ColumnDef::new(AlertRules::Severity)
-                .string_len(16)
-                .not_null(),
-        )
-        .col(ColumnDef::new(AlertRules::ConditionExpr).text())
-        .col(ColumnDef::new(AlertRules::Enabled).boolean().not_null())
-        .col(
-            ColumnDef::new(AlertRules::AllChannels)
-                .boolean()
-                .not_null()
-                .default(false),
-        )
-        .col(ColumnDef::new(AlertRules::Calculation).string_len(16))
-        .col(ColumnDef::new(AlertRules::GroupBy).string_len(255))
-        .col(ColumnDef::new(AlertRules::Filter).string_len(500))
-        .col(ColumnDef::new(AlertRules::WindowSecs).big_integer())
-        .col(ColumnDef::new(AlertRules::RemindEverySecs).big_integer())
-        .col(ColumnDef::new(AlertRules::ForecastSecs).big_integer())
-        .col(ColumnDef::new(AlertRules::WarningForecastSecs).big_integer())
-        .col(ColumnDef::new(AlertRules::DeletedMs).big_integer())
-        .to_owned()
-}
-
-/// `notification_channels` as it is after migration 2, for making it again on SQLite.
-fn notification_channels_after_soft_delete() -> TableCreateStatement {
-    Table::create()
-        .table(NotificationChannels::Table)
-        .col(id(NotificationChannels::Id))
-        .col(
-            ColumnDef::new(NotificationChannels::Name)
-                .string_len(255)
-                .not_null(),
-        )
-        .col(
-            ColumnDef::new(NotificationChannels::Kind)
-                .string_len(16)
-                .not_null(),
-        )
-        .col(
-            ColumnDef::new(NotificationChannels::Target)
-                .text()
-                .not_null(),
-        )
-        .col(ColumnDef::new(NotificationChannels::Credential).text())
-        .col(ColumnDef::new(NotificationChannels::AppToken).text())
-        .col(
-            ColumnDef::new(NotificationChannels::SendsWarnings)
-                .boolean()
-                .not_null()
-                .default(true),
-        )
-        .col(
-            ColumnDef::new(NotificationChannels::SendsCritical)
-                .boolean()
-                .not_null()
-                .default(true),
-        )
-        .col(ColumnDef::new(NotificationChannels::MailFrom).string_len(320))
-        .col(ColumnDef::new(NotificationChannels::MailHostname).string_len(255))
-        .col(ColumnDef::new(NotificationChannels::MailPort).integer())
-        .col(ColumnDef::new(NotificationChannels::MailSecurity).string_len(16))
-        .col(ColumnDef::new(NotificationChannels::MailUsername).string_len(255))
-        .col(ColumnDef::new(NotificationChannels::RequestMethod).string_len(8))
-        .col(ColumnDef::new(NotificationChannels::RequestContentType).string_len(255))
-        .col(ColumnDef::new(NotificationChannels::RequestBody).text())
-        .col(ColumnDef::new(NotificationChannels::DeletedMs).big_integer())
-        .to_owned()
-}
-
-struct Actions;
-
-impl MigrationName for Actions {
-    fn name(&self) -> &str {
-        "m20261111_000003_actions"
-    }
-}
-
-/// Actions: what each alert rule asks a host to run, and every time one was asked
-/// for, by an alert or by a person, with what it printed.
-#[async_trait::async_trait]
-impl MigrationTrait for Actions {
-    fn use_transaction(&self) -> Option<bool> {
-        Some(true)
-    }
-
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .create_table(
-                Table::create()
-                    .table(AlertRuleActions::Table)
-                    .col(id(AlertRuleActions::Id))
-                    .col(
-                        ColumnDef::new(AlertRuleActions::RuleId)
-                            .big_integer()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(AlertRuleActions::Action)
-                            .string_len(64)
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(AlertRuleActions::RunOn)
-                            .string_len(16)
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(AlertRuleActions::TimeoutSecs)
-                            .big_integer()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(AlertRuleActions::Position)
-                            .integer()
-                            .not_null(),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_alert_rule_actions_rule_id")
-                            .from(AlertRuleActions::Table, AlertRuleActions::RuleId)
-                            .to(AlertRules::Table, AlertRules::Id)
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_alert_rule_actions_rule")
-                    .table(AlertRuleActions::Table)
-                    .col(AlertRuleActions::RuleId)
-                    .to_owned(),
-            )
-            .await?;
-
-        // As with the audit log, MySQL's text is too small for what this holds.
-        let mut output = ColumnDef::new(ActionRuns::Output);
-        match manager.get_database_backend() {
-            sea_orm::DatabaseBackend::MySql => output.custom(Alias::new("LONGTEXT")),
-            _ => output.text(),
-        };
-        output.not_null();
-        manager
-            .create_table(
-                Table::create()
-                    .table(ActionRuns::Table)
-                    .col(id(ActionRuns::Id))
-                    .col(ColumnDef::new(ActionRuns::HostId).string_len(32).not_null())
-                    .col(ColumnDef::new(ActionRuns::AlertId).big_integer())
-                    .col(ColumnDef::new(ActionRuns::Action).string_len(64).not_null())
-                    .col(ColumnDef::new(ActionRuns::RunOn).string_len(16).not_null())
-                    .col(ColumnDef::new(ActionRuns::Variables).text().not_null())
-                    .col(ColumnDef::new(ActionRuns::RequestedBy).string_len(255))
-                    .col(
-                        ColumnDef::new(ActionRuns::RequestedMs)
-                            .big_integer()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(ActionRuns::TimeoutSecs)
-                            .big_integer()
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(ActionRuns::Outcome).string_len(16))
-                    .col(ColumnDef::new(ActionRuns::ExitCode).integer())
-                    .col(ColumnDef::new(ActionRuns::Error).text())
-                    .col(output)
-                    .col(ColumnDef::new(ActionRuns::Truncated).boolean().not_null())
-                    .col(ColumnDef::new(ActionRuns::DurationMs).big_integer())
-                    .col(ColumnDef::new(ActionRuns::FinishedMs).big_integer())
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_action_runs_host_id")
-                            .from(ActionRuns::Table, ActionRuns::HostId)
-                            .to(Hosts::Table, Hosts::Id)
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_action_runs_alert_id")
-                            .from(ActionRuns::Table, ActionRuns::AlertId)
-                            .to(Alerts::Table, Alerts::Id)
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_action_runs_alert")
-                    .table(ActionRuns::Table)
-                    .col(ActionRuns::AlertId)
-                    .to_owned(),
-            )
-            .await?;
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_action_runs_host")
-                    .table(ActionRuns::Table)
-                    .col(ActionRuns::HostId)
-                    .col(ActionRuns::RequestedMs)
-                    .to_owned(),
-            )
-            .await?;
-        // What's still waiting for an answer, which is looked for on every pass.
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_action_runs_finished")
-                    .table(ActionRuns::Table)
-                    .col(ActionRuns::FinishedMs)
-                    .to_owned(),
-            )
-            .await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        for table in ["action_runs", "alert_rule_actions"] {
-            manager
-                .drop_table(Table::drop().table(Alias::new(table)).to_owned())
-                .await?;
-        }
-        Ok(())
-    }
-}
-
-struct ActionNotifications;
-
-impl MigrationName for ActionNotifications {
-    fn name(&self) -> &str {
-        "m20261112_000004_action_notifications"
-    }
-}
-
-/// A notification can be about what one of its alert's actions printed, and
-/// says which run. Both go when their alert does, so nothing else ties them.
-#[async_trait::async_trait]
-impl MigrationTrait for ActionNotifications {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(Notifications::Table)
-                    .add_column(ColumnDef::new(Alias::new("action_run_id")).big_integer())
-                    .to_owned(),
-            )
-            .await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let connection = manager.get_connection();
-        connection
-            .execute_unprepared("DELETE FROM notifications WHERE action_run_id IS NOT NULL")
-            .await?;
-        connection
-            .execute_unprepared("ALTER TABLE notifications DROP COLUMN action_run_id")
-            .await?;
-        Ok(())
-    }
-}
-
-/// Added after the first built-in rules, for the clock readings the server
-/// started taking.
-const CLOCK_RULE: BuiltInRule = BuiltInRule {
-    name: "Clock is wrong",
-    kind: "metric",
-    metric: Some("clock.difference"),
-    comparison: Some("above"),
-    threshold: Some(30.0),
-    warning_threshold: Some(5.0),
-    for_secs: 60,
-    window_secs: None,
-    forecast_secs: None,
-    warning_forecast_secs: None,
-};
-
-struct ClockRule;
-
-impl MigrationName for ClockRule {
-    fn name(&self) -> &str {
-        "m20261112_000005_clock_rule"
-    }
-}
-
-/// Every server gets a rule about hosts whose clocks are wrong.
-#[async_trait::async_trait]
-impl MigrationTrait for ClockRule {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        add_built_in_rule(manager, &CLOCK_RULE).await
-    }
-
-    /// Its alerts and what was sent about them go with it.
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let delete = Query::delete()
-            .from_table(AlertRules::Table)
-            .and_where(Expr::col(AlertRules::Metric).eq("clock.difference"))
-            .to_owned();
-        manager.exec_stmt(delete).await
-    }
-}
-
-/// For the services a config rule says to watch, which had no rule of their own.
-const SERVICE_RULE: BuiltInRule = BuiltInRule {
-    name: "Service stopped",
-    kind: "metric",
-    metric: Some("service.running"),
-    comparison: Some("below"),
-    threshold: Some(1.0),
-    warning_threshold: None,
-    // Long enough for a restart, and no longer: a service that's down is down.
-    for_secs: 60,
-    window_secs: None,
-    forecast_secs: None,
-    warning_forecast_secs: None,
-};
-
-struct ServiceRule;
-
-impl MigrationName for ServiceRule {
-    fn name(&self) -> &str {
-        "m20261112_000006_service_rule"
-    }
-}
-
-/// Every server gets a rule about watched services that aren't running.
-#[async_trait::async_trait]
-impl MigrationTrait for ServiceRule {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        add_built_in_rule(manager, &SERVICE_RULE).await
-    }
-
-    /// Only the built-in goes, by its name, as people write rules on this metric
-    /// too. Its alerts and what was sent about them go with it.
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let delete = Query::delete()
-            .from_table(AlertRules::Table)
-            .and_where(Expr::col(AlertRules::Name).eq(SERVICE_RULE.name))
-            .and_where(Expr::col(AlertRules::Metric).eq("service.running"))
-            .to_owned();
-        manager.exec_stmt(delete).await
-    }
-}
-
-struct AgentlessHosts;
-
-impl MigrationName for AgentlessHosts {
-    fn name(&self) -> &str {
-        "m20261113_000007_agentless_hosts"
-    }
-}
-
-/// Hosts with no agent, which the server reads from itself: every host says what
-/// kind it is, and an agentless one has the OpenMetrics pages to read for it.
-#[async_trait::async_trait]
-impl MigrationTrait for AgentlessHosts {
-    fn use_transaction(&self) -> Option<bool> {
-        Some(true)
-    }
-
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(Hosts::Table)
-                    .add_column(
-                        ColumnDef::new(Hosts::Kind)
-                            .string_len(16)
-                            .not_null()
-                            .default("agent"),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-        let built_in = Query::update()
-            .table(Hosts::Table)
-            .value(Hosts::Kind, "built_in")
-            .and_where(Expr::col(Hosts::Id).is_in(BUILT_IN_HOSTS.map(|(id, _)| id)))
-            .to_owned();
-        manager.exec_stmt(built_in).await?;
-
-        manager
-            .create_table(
-                Table::create()
-                    .table(MetricsPages::Table)
-                    .col(id(MetricsPages::Id))
-                    .col(
-                        ColumnDef::new(MetricsPages::HostId)
-                            .string_len(32)
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(MetricsPages::Url).string_len(255).not_null())
-                    .col(ColumnDef::new(MetricsPages::Names).text().not_null())
-                    .col(
-                        ColumnDef::new(MetricsPages::IntervalSecs)
-                            .big_integer()
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(MetricsPages::Enabled).boolean().not_null())
-                    .col(ColumnDef::new(MetricsPages::Username).string_len(255))
-                    .col(ColumnDef::new(MetricsPages::Password).text())
-                    .col(ColumnDef::new(MetricsPages::PasswordEnv).string_len(255))
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_metrics_pages_host_id")
-                            .from(MetricsPages::Table, MetricsPages::HostId)
-                            .to(Hosts::Table, Hosts::Id),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_metrics_pages_host")
-                    .table(MetricsPages::Table)
-                    .col(MetricsPages::HostId)
-                    .to_owned(),
-            )
-            .await
-    }
-
-    /// Agentless hosts go with their pages, as nothing else can read from them.
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .drop_table(Table::drop().table(MetricsPages::Table).to_owned())
-            .await?;
-        let agentless = Query::delete()
-            .from_table(Hosts::Table)
-            .and_where(Expr::col(Hosts::Kind).eq("agentless"))
-            .to_owned();
-        manager.exec_stmt(agentless).await?;
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(Hosts::Table)
-                    .drop_column(Hosts::Kind)
-                    .to_owned(),
-            )
-            .await
-    }
-}
-
-struct ChecksOnHosts;
-
-impl MigrationName for ChecksOnHosts {
-    fn name(&self) -> &str {
-        "m20261114_000008_checks_on_hosts"
-    }
-}
-
-/// Each check the server runs says which host it's about: a host with no agent,
-/// or the server itself, which is where every check was before. SQLite can only
-/// give a table a foreign key by making it again.
-#[async_trait::async_trait]
-impl MigrationTrait for ChecksOnHosts {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        if manager.get_database_backend() == sea_orm::DatabaseBackend::Sqlite {
-            let mut table = remote_checks_before_hosts();
-            table
-                .col(remote_checks_host_id())
-                .foreign_key(&mut remote_checks_host_key());
-            remake_on_sqlite(manager, &[("remote_checks", table, REMOTE_CHECK_COLUMNS)]).await?;
-            return manager.create_index(remote_checks_host_index()).await;
-        }
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(RemoteChecks::Table)
-                    .add_column(remote_checks_host_id())
-                    .to_owned(),
-            )
-            .await?;
-        manager.create_index(remote_checks_host_index()).await?;
-        manager.create_foreign_key(remote_checks_host_key()).await
-    }
-
-    /// Checks about any other host go, as they'd become the server's.
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let elsewhere = Query::delete()
-            .from_table(RemoteChecks::Table)
-            .and_where(Expr::col(RemoteChecks::HostId).ne("server"))
-            .to_owned();
-        manager.exec_stmt(elsewhere).await?;
-        if manager.get_database_backend() == sea_orm::DatabaseBackend::Sqlite {
-            let table = remote_checks_before_hosts();
-            return remake_on_sqlite(manager, &[("remote_checks", table, REMOTE_CHECK_COLUMNS)])
-                .await;
-        }
-        manager
-            .drop_foreign_key(
-                ForeignKey::drop()
-                    .name(REMOTE_CHECKS_HOST_KEY)
-                    .table(RemoteChecks::Table)
-                    .to_owned(),
-            )
-            .await?;
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_remote_checks_host")
-                    .table(RemoteChecks::Table)
-                    .to_owned(),
-            )
-            .await?;
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(RemoteChecks::Table)
-                    .drop_column(RemoteChecks::HostId)
-                    .to_owned(),
-            )
-            .await
-    }
-}
-
-/// The columns `remote_checks` had before it said which host, to copy across.
-const REMOTE_CHECK_COLUMNS: &str = "id, name, kind, target, timeout_secs, method, body, \
-     regex, insecure, server, record, count, interval_secs, enabled";
-
-const REMOTE_CHECKS_HOST_KEY: &str = "fk_remote_checks_host_id";
-
-/// `remote_checks` as migration 1 made it.
-fn remote_checks_before_hosts() -> TableCreateStatement {
-    Table::create()
-        .table(RemoteChecks::Table)
-        .col(id(RemoteChecks::Id))
-        .col(
-            ColumnDef::new(RemoteChecks::Name)
-                .string_len(64)
-                .not_null()
-                .unique_key(),
-        )
-        .col(ColumnDef::new(RemoteChecks::Kind).string_len(16).not_null())
-        .col(
-            ColumnDef::new(RemoteChecks::Target)
-                .string_len(255)
-                .not_null(),
-        )
-        .col(ColumnDef::new(RemoteChecks::TimeoutSecs).big_integer())
-        .col(ColumnDef::new(RemoteChecks::Method).string_len(16))
-        .col(ColumnDef::new(RemoteChecks::Body).text())
-        .col(ColumnDef::new(RemoteChecks::Regex).text())
-        .col(ColumnDef::new(RemoteChecks::Insecure).boolean())
-        .col(ColumnDef::new(RemoteChecks::Server).string_len(255))
-        .col(ColumnDef::new(RemoteChecks::Record).string_len(16))
-        .col(ColumnDef::new(RemoteChecks::Count).integer())
-        .col(
-            ColumnDef::new(RemoteChecks::IntervalSecs)
-                .big_integer()
-                .not_null(),
-        )
-        .col(ColumnDef::new(RemoteChecks::Enabled).boolean().not_null())
-        .to_owned()
-}
-
-fn remote_checks_host_id() -> ColumnDef {
-    ColumnDef::new(RemoteChecks::HostId)
-        .string_len(32)
-        .not_null()
-        .default("server")
-        .to_owned()
-}
-
-fn remote_checks_host_key() -> ForeignKeyCreateStatement {
-    ForeignKey::create()
-        .name(REMOTE_CHECKS_HOST_KEY)
-        .from(RemoteChecks::Table, RemoteChecks::HostId)
-        .to(Hosts::Table, Hosts::Id)
-        .to_owned()
-}
-
-fn remote_checks_host_index() -> IndexCreateStatement {
-    Index::create()
-        .name("idx_remote_checks_host")
-        .table(RemoteChecks::Table)
-        .col(RemoteChecks::HostId)
-        .to_owned()
-}
-
 #[derive(DeriveIden)]
 enum MetricsPages {
     Table,
@@ -2608,94 +1962,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rules_and_channels_keep_their_rows_and_references_through_soft_delete() {
+    async fn a_check_must_be_about_a_host() {
         let connection = fresh().await;
-        Migrator::up(&connection, Some(1)).await.unwrap();
-        connection
-            .execute_unprepared(
-                "INSERT INTO notification_channels
-                   (id, name, kind, target, sends_warnings, sends_critical)
-                 VALUES (7, 'Ops', 'webhook', 'https://ops', TRUE, TRUE);
-                 INSERT INTO alert_rule_channels (rule_id, channel_id) VALUES (1, 7);
-                 INSERT INTO alerts (id, rule_id, rule_name, severity, host_id, hostname,
-                                     series, summary, started_ms)
-                 VALUES (3, 1, 'Host offline', 'critical', 'server', 'MaxNines server',
-                         '', 'Gone', 1);
-                 INSERT INTO notifications (alert_id, channel_id, event, state, attempts,
-                                            next_attempt_ms, created_ms)
-                 VALUES (3, 7, 'firing', 'sent', 1, 1, 1)",
-            )
-            .await
-            .unwrap();
-
         Migrator::up(&connection, None).await.unwrap();
-
-        let count = |sql: &'static str| {
-            let connection = &connection;
-            async move { texts(connection, sql).await }
-        };
-        assert_eq!(
-            count("SELECT name FROM notification_channels").await,
-            ["Ops"]
-        );
-        assert_eq!(
-            count("SELECT CAST(rule_id AS TEXT) FROM alerts").await,
-            ["1"]
-        );
-        assert_eq!(count("SELECT event FROM notifications").await, ["firing"]);
-        let links = "SELECT CAST(channel_id AS TEXT) FROM alert_rule_channels";
-        assert_eq!(count(links).await, ["7"]);
-        // Names needn't be unique now, and references are still checked.
-        connection
-            .execute_unprepared(
-                "UPDATE notification_channels SET deleted_ms = 5;
-                 INSERT INTO notification_channels
-                   (name, kind, target, sends_warnings, sends_critical)
-                 VALUES ('Ops', 'webhook', 'https://new', TRUE, TRUE)",
-            )
-            .await
-            .unwrap();
-        let dangling = "INSERT INTO alert_rule_channels (rule_id, channel_id) VALUES (1, 99)";
-        assert!(connection.execute_unprepared(dangling).await.is_err());
-        let next = "SELECT CAST(max(id) AS TEXT) FROM notification_channels";
-        assert_eq!(
-            count(next).await,
-            ["8"],
-            "IDs carry on from where they were"
-        );
-
-        // The four migrations after it, then this one.
-        Migrator::down(&connection, Some(7)).await.unwrap();
-        assert_eq!(
-            count("SELECT target FROM notification_channels").await,
-            ["https://new"]
-        );
-        assert!(count("SELECT event FROM notifications").await.is_empty());
-        let twice = "INSERT INTO notification_channels
-                       (name, kind, target, sends_warnings, sends_critical)
-                     VALUES ('Ops', 'webhook', 'https://x', TRUE, TRUE)";
-        assert!(
-            connection.execute_unprepared(twice).await.is_err(),
-            "unique again"
-        );
-    }
-
-    #[tokio::test]
-    async fn checks_keep_their_rows_and_must_be_about_a_host() {
-        let connection = fresh().await;
-        Migrator::up(&connection, Some(7)).await.unwrap();
-        connection
-            .execute_unprepared(
-                "INSERT INTO remote_checks (id, name, kind, target, interval_secs, enabled)
-                 VALUES (4, 'Site', 'http', 'https://example.com', 60, TRUE)",
-            )
-            .await
-            .unwrap();
-
-        Migrator::up(&connection, None).await.unwrap();
-
-        let about = "SELECT host_id FROM remote_checks WHERE name = 'Site'";
-        assert_eq!(texts(&connection, about).await, ["server"]);
         let add = |name: &str, host: &str| {
             let sql = format!(
                 "INSERT INTO remote_checks (name, kind, target, interval_secs, enabled, host_id)
@@ -2713,18 +1982,18 @@ mod tests {
             .await
             .unwrap();
         add("Database", "abc").await.unwrap();
-        let ids = "SELECT CAST(id AS TEXT) FROM remote_checks ORDER BY id";
-        assert_eq!(
-            texts(&connection, ids).await,
-            ["4", "5"],
-            "IDs carry on from where they were"
-        );
         let gone = "DELETE FROM hosts WHERE id = 'abc'";
         assert!(connection.execute_unprepared(gone).await.is_err());
 
-        // Only the server's checks can go back to having no host.
-        Migrator::down(&connection, Some(1)).await.unwrap();
-        let names = "SELECT name FROM remote_checks";
-        assert_eq!(texts(&connection, names).await, ["Site"]);
+        // One with no host given is the server's.
+        connection
+            .execute_unprepared(
+                "INSERT INTO remote_checks (name, kind, target, interval_secs, enabled)
+                 VALUES ('Site', 'http', 'https://example.com', 60, TRUE)",
+            )
+            .await
+            .unwrap();
+        let about = "SELECT host_id FROM remote_checks WHERE name = 'Site'";
+        assert_eq!(texts(&connection, about).await, ["server"]);
     }
 }

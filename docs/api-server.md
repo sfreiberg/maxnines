@@ -55,7 +55,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/server"
     "engine": "SQLite",
     "size_bytes": 28397568,
     "response_ms": 0.03,
-    "latest_migration": "m20261105_000008_create_api_keys",
+    "latest_migration": "m20261114_000001_create_tables",
     "tables": [{ "name": "Hosts", "rows": 5001 }],
     "notifications_waiting": 0,
     "notifications_failed": 0
