@@ -9,7 +9,9 @@
 //! sum and count, enough for an average.
 //!
 //! A page can be any size, so what's kept of it is bounded: it's read in one pass
-//! into the rows that are sent, and nothing else of it is held between rounds.
+//! into a short list for each series, and nothing else of it is held between
+//! rounds. The lists only become the rows that are sent when a sample is taken,
+//! as a row is several times the size.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -122,7 +124,8 @@ fn reported(metric: &str, kinds: &HashMap<&str, Kind>) -> Option<Reported> {
     }
 }
 
-/// A page's rows: one for the page itself, then one for each series kept.
+/// What's kept of a page: the row for the page itself, then each series as its
+/// name, its number and whether that's a running total.
 fn read(text: &str, page: &Page) -> Result<Vec<Value>, &'static str> {
     // Names are borrowed from the page, which outlives this.
     let mut kinds: HashMap<&str, Kind> = HashMap::new();
@@ -171,10 +174,7 @@ fn read(text: &str, page: &Page) -> Result<Vec<Value>, &'static str> {
             dropped += 1;
             continue;
         }
-        rows.push(match reported {
-            Reported::Level => json!({ "name": name, "value": number }),
-            Reported::Total => json!({ "name": name, "total": number }),
-        });
+        rows.push(json!([name, number, reported == Reported::Total]));
     }
 
     if !found {
@@ -231,35 +231,41 @@ impl OpenMetricsCollector {
         }
     }
 
-    /// Swaps each running total for its change since the last sample, and leaves
-    /// out a series seen for the first time, which has nothing to compare with. A
-    /// total that went backwards started again, which counts as no change.
+    /// Turns what's kept of the pages into the rows of a sample. A running total
+    /// becomes its change since the last sample, and one seen for the first time is
+    /// left out, as it has nothing to compare with. A total that went backwards
+    /// started again, which counts as no change.
     ///
     /// Only the totals in this sample are remembered, so a series that's gone, or
     /// a whole page that stopped answering, starts afresh if it comes back.
-    fn settle(&mut self, rows: &mut Vec<Value>) {
+    fn settle(&mut self, kept: Vec<Value>) -> Vec<Value> {
         let mut seen = HashMap::with_capacity(self.totals.len());
-        rows.retain_mut(|row| {
-            let Some(fields) = row.as_object_mut() else {
-                return false;
-            };
-            let Some(total) = fields.remove("total").and_then(|total| total.as_f64()) else {
-                return true;
-            };
-            let Some(name) = fields.get("name").and_then(Value::as_str) else {
-                return false;
-            };
-            let (name, last) = match self.totals.remove_entry(name) {
-                Some((name, last)) => (name, Some(last)),
-                None => (name.to_string(), None),
-            };
-            seen.insert(name, total);
-            if let Some(last) = last {
-                fields.insert("change".to_string(), json!((total - last).max(0.0)));
-            }
-            last.is_some()
-        });
+        let rows = kept
+            .into_iter()
+            .filter_map(|row| {
+                // A page's own row is already as it's sent.
+                let Value::Array(series) = row else {
+                    return Some(row);
+                };
+                let Ok([Value::String(name), number, Value::Bool(total)]) =
+                    <[Value; 3]>::try_from(series)
+                else {
+                    return None;
+                };
+                if !total {
+                    return Some(json!({ "name": name, "value": number }));
+                }
+                let total = number.as_f64()?;
+                let (key, last) = match self.totals.remove_entry(&name) {
+                    Some((key, last)) => (key, Some(last)),
+                    None => (name.clone(), None),
+                };
+                seen.insert(key, total);
+                Some(json!({ "name": name, "change": (total - last?).max(0.0) }))
+            })
+            .collect();
         self.totals = seen;
+        rows
     }
 }
 
@@ -269,11 +275,11 @@ impl Collector for OpenMetricsCollector {
     }
 
     fn collect(&mut self) -> Result<Value> {
-        let mut rows = self.background.latest();
-        if let Value::Array(rows) = &mut rows {
-            self.settle(rows);
-        }
-        Ok(rows)
+        Ok(match self.background.latest() {
+            Value::Array(kept) => Value::Array(self.settle(kept)),
+            // The first round hasn't finished.
+            waiting => waiting,
+        })
     }
 }
 
@@ -325,20 +331,20 @@ jobs_created 1700000000
     }
 
     #[test]
-    fn a_page_becomes_a_row_for_itself_and_one_for_each_series() {
+    fn a_page_becomes_a_row_for_itself_and_a_list_for_each_series() {
         let rows = read(PAGE, &page(&[], 100)).unwrap();
         assert_eq!(
             Value::Array(rows),
             json!([
                 { "name": "app:9100", "up": 1, "dropped": 0 },
-                { "name": r#"app:9100 http_requests_total{method="GET",code="200"}"#, "total": 1027.0 },
-                { "name": r#"app:9100 http_requests_total{method="POST",path="/a}b \"c\""}"#, "total": 3.0 },
-                { "name": "app:9100 temperature_celsius", "value": 21.5 },
-                { "name": "app:9100 request_seconds_sum", "total": 1.5 },
-                { "name": "app:9100 request_seconds_count", "total": 9.0 },
-                { "name": r#"app:9100 rpc_seconds{quantile="0.99"}"#, "value": 0.25 },
-                { "name": "app:9100 rpc_seconds_count", "total": 40.0 },
-                { "name": "app:9100 untyped_thing", "value": 4.0 },
+                [r#"app:9100 http_requests_total{method="GET",code="200"}"#, 1027.0, true],
+                [r#"app:9100 http_requests_total{method="POST",path="/a}b \"c\""}"#, 3.0, true],
+                ["app:9100 temperature_celsius", 21.5, false],
+                ["app:9100 request_seconds_sum", 1.5, true],
+                ["app:9100 request_seconds_count", 9.0, true],
+                [r#"app:9100 rpc_seconds{quantile="0.99"}"#, 0.25, false],
+                ["app:9100 rpc_seconds_count", 40.0, true],
+                ["app:9100 untyped_thing", 4.0, false],
             ])
         );
     }
@@ -346,19 +352,13 @@ jobs_created 1700000000
     #[test]
     fn a_counter_is_a_total_however_its_type_is_given() {
         let rows = read(OPENMETRICS, &page(&[], 100)).unwrap();
-        assert_eq!(
-            rows[1..],
-            [json!({ "name": "app:9100 jobs_total", "total": 12.0 })]
-        );
+        assert_eq!(rows[1..], [json!(["app:9100 jobs_total", 12.0, true])]);
     }
 
     #[test]
     fn only_wanted_metrics_are_kept() {
         let rows = read(PAGE, &page(&["http_*", "temperature_celsius"], 100)).unwrap();
-        let names: Vec<&str> = rows[1..]
-            .iter()
-            .filter_map(|row| row["name"].as_str())
-            .collect();
+        let names: Vec<&str> = rows[1..].iter().filter_map(|row| row[0].as_str()).collect();
         assert_eq!(
             names,
             [
@@ -510,20 +510,25 @@ jobs_created 1700000000
     #[test]
     fn a_series_that_went_away_is_forgotten() {
         let mut collector = OpenMetricsCollector::new(Vec::new(), &[], Duration::from_secs(3600));
-        let sample = |names: &[&str]| -> Vec<Value> {
-            names
-                .iter()
-                .map(|name| json!({ "name": name, "total": 5.0 }))
-                .collect()
+        let kept = |names: &[&str]| -> Vec<Value> {
+            let mut kept = vec![json!({ "name": "app:9100", "up": 1, "dropped": 0 })];
+            kept.extend(names.iter().map(|name| json!([name, 5.0, true])));
+            kept.push(json!(["level", 1.5, false]));
+            kept
         };
 
-        collector.settle(&mut sample(&["a", "b"]));
-        collector.settle(&mut sample(&["b"]));
+        collector.settle(kept(&["a", "b"]));
+        collector.settle(kept(&["b"]));
         assert_eq!(collector.totals.len(), 1);
 
         // Back again, with nothing to compare with.
-        let mut rows = sample(&["a", "b"]);
-        collector.settle(&mut rows);
-        assert_eq!(rows, [json!({ "name": "b", "change": 0.0 })]);
+        assert_eq!(
+            collector.settle(kept(&["a", "b"])),
+            [
+                json!({ "name": "app:9100", "up": 1, "dropped": 0 }),
+                json!({ "name": "b", "change": 0.0 }),
+                json!({ "name": "level", "value": 1.5 }),
+            ]
+        );
     }
 }
