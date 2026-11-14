@@ -428,6 +428,11 @@ async fn a_host_and_its_pages_are_added_from_the_hosts_page() {
         .await;
     assert_eq!(saved.status, 303, "{}", saved.body);
 
+    // With no agent there's no CPU to chart, so its charts aren't left empty.
+    let metrics = browser.get(&server, &format!("{host_path}/metrics")).await;
+    assert_eq!(metrics.status, 200);
+    assert!(!metrics.body.contains("CPU usage"), "{}", metrics.body);
+
     let page = browser.get(&server, &host_path).await;
     assert!(page.body.contains("db.example.com:9187"), "{}", page.body);
     assert!(page.body.contains("Every 120 s"));

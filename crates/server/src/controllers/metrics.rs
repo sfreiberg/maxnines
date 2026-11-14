@@ -297,7 +297,10 @@ async fn show(
         .into_iter()
         .zip(shown)
         .filter(|(chart, metric)| {
-            chart.has_data || (metric.chart == ShowChart::Always && !host.is_local())
+            // What every agent reports is only worth an empty chart for a host that
+            // has an agent.
+            let has_agent = !host.is_local() && !host.is_agentless();
+            chart.has_data || (metric.chart == ShowChart::Always && has_agent)
         })
         .map(|(mut chart, _)| {
             metric_charts::mark(&mut chart, &events, range, zone);
