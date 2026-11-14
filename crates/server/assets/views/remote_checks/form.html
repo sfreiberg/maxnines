@@ -1,0 +1,97 @@
+{% extends "layouts/application.html" %}
+{% block title %}{% if id %}Edit check{% else %}Add check{% endif %} · MaxNines{% endblock title %}
+{% block main_class %} class="narrow"{% endblock main_class %}
+{% block content %}
+<p class="breadcrumb"><a href="/checks">Checks</a></p>
+<h1>{% if id %}Edit check{% else %}Add check{% endif %}</h1>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<form method="post" action="{% if id %}/checks/{{ id }}{% else %}/checks{% endif %}" class="stacked remote-check">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+
+  <label>Name
+    <input type="text" name="name" value="{{ check.name }}" required maxlength="64">
+  </label>
+
+  <label>Host
+    <select name="host_id">
+      {% for host in hosts %}
+      <option value="{{ host.id }}"{% if host.id == check.host_id %} selected{% endif %}>{{ host.hostname }}</option>
+      {% endfor %}
+    </select>
+    <small>What the check is about. Its results and alerts go under that host, and a <a href="/docs/agentless-hosts">host without an agent</a> is online while any of its checks passes. Leave it as the server for a check that isn't about any one host.</small>
+  </label>
+
+  <label>Kind
+    <select name="kind">
+      {% for kind in kinds %}
+      <option value="{{ kind }}"{% if kind == check.kind %} selected{% endif %}>{% if kind == "http" %}Website (http){% elif kind == "tcp" %}Port (tcp){% elif kind == "tls" %}Certificate (tls){% elif kind == "dns" %}DNS (dns){% else %}Ping (ping){% endif %}</option>
+      {% endfor %}
+    </select>
+  </label>
+
+  <label>Target
+    <input type="text" name="target" value="{{ check.target }}" required maxlength="255" spellcheck="false">
+    <small>A web address for websites, <code>host:port</code> for ports and certificates, and a host name for DNS and ping.</small>
+  </label>
+
+  <label>Run every (seconds)
+    <input type="number" name="interval_secs" value="{{ check.interval_secs }}" min="10" max="86400" required>
+  </label>
+
+  <label>Timeout (seconds)
+    <input type="number" name="timeout_secs" value="{{ check.timeout_secs }}" min="1" max="60">
+    <small>Leave empty for 10 seconds.</small>
+  </label>
+
+  <fieldset class="for-http">
+    <legend>Website options</legend>
+    <label>Method
+      <input type="text" name="method" value="{{ check.method }}" spellcheck="false" placeholder="GET">
+    </label>
+    <label>Body
+      <input type="text" name="body" value="{{ check.body }}" spellcheck="false">
+    </label>
+    <label>Page has to match
+      <input type="text" name="regex" value="{{ check.regex }}" spellcheck="false">
+      <small>A regular expression. Leave empty to skip this.</small>
+    </label>
+  </fieldset>
+
+  <label class="checkbox for-tls">
+    <input type="checkbox" name="insecure"{% if check.insecure %} checked{% endif %}> Don't count a bad certificate as down
+  </label>
+
+  <fieldset class="for-dns">
+    <legend>DNS options</legend>
+    <label>Server
+      <input type="text" name="server" value="{{ check.server }}" spellcheck="false" placeholder="8.8.8.8">
+      <small>Leave empty to use this host's resolver.</small>
+    </label>
+    <label>Record type
+      <input type="text" name="record" value="{{ check.record }}" spellcheck="false" placeholder="A">
+    </label>
+  </fieldset>
+
+  <label class="for-ping">Packets to send
+    <input type="number" name="count" value="{{ check.count }}" min="1" max="20">
+  </label>
+
+  <label class="checkbox">
+    <input type="checkbox" name="enabled"{% if check.enabled %} checked{% endif %}> Enabled
+  </label>
+
+  <div class="actions">
+    {% if can_edit %}<button type="submit">Save check</button>{% else %}<span class="note">Your role lets you look at this, but not change it.</span>{% endif %}
+    <a class="button secondary" href="{{ back }}">Cancel</a>
+  </div>
+</form>
+
+{% if id and can_edit %}
+<form method="post" action="/checks/{{ id }}/delete" class="delete-form">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  <button type="submit" class="danger">Delete</button>
+</form>
+{% endif %}
+{% endblock content %}

@@ -1,0 +1,96 @@
+[package]
+name = "maxnines-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "MaxNines monitoring agent"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+hcl-rs.workspace = true
+maxnines-checks.workspace = true
+maxnines-collectors.workspace = true
+maxnines-protocol.workspace = true
+rand = "0.10"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde.workspace = true
+serde_json.workspace = true
+sysinfo = "0.40.1"
+# Asks the resolver for the host's fully qualified name, as `hostname -f` does.
+dns-lookup = "4"
+tokio = { version = "1.54.1", features = ["io-util", "net", "rt", "macros", "process", "time", "signal", "sync"] }
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+tracing.workspace = true
+webpki-roots = "0.26"
+
+# Lists the host's sockets and which process holds each, for the connections
+# action. It doesn't cover FreeBSD, which is asked through libc instead.
+[target.'cfg(any(target_os = "linux", target_os = "macos", windows))'.dependencies]
+netstat2 = "0.11"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["fs", "process", "std"] }
+# For giving up root when started as it: changing user, splitting off the helper that
+# keeps it, and passing signals on. libc is only for setting a user's groups, which nix
+# leaves out on macOS.
+nix = { version = "0.31", default-features = false, features = ["fs", "process", "signal", "user"] }
+libc = "0.2"
+
+# Reads containers through Docker's API, which Podman offers too. Only Linux runs
+# containers for real, so the other agents leave it out.
+[target.'cfg(target_os = "linux")'.dependencies]
+bollard = { version = "0.21", default-features = false, features = ["pipe"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+# A paused clock, so tests about waiting measure exactly what was waited.
+tokio = { version = "1.54.1", features = ["test-util"] }
+
+[build-dependencies]
+vergen-gitcl = { version = "10", features = ["build"] }
+
+# Linux packages, made by cargo-deb and cargo-generate-rpm from a binary that's
+# already built. The release workflow builds it with --target, which both tools
+# substitute into target/release.
+[package.metadata.deb]
+maintainer = "MaxNines <https://github.com/sfreiberg/maxnines/issues>"
+copyright = "2026 Sam Freiberg"
+license-file = ["../../LICENSE", "0"]
+extended-description = "Reports how a host is doing to a MaxNines server. What it watches is set on\nthe server, and it keeps its key and unsent samples in /var/lib/maxnines-agent."
+section = "admin"
+priority = "optional"
+# Fully static, so it needs nothing else.
+depends = ""
+assets = [
+  ["target/release/maxnines-agent", "usr/bin/", "755"],
+  # Only the default. postinst copies it to /etc/maxnines when there's no config,
+  # as a file in /etc would be a conffile, which dpkg asks about on upgrades.
+  ["../../packaging/linux/agent.hcl", "usr/share/maxnines/agent.hcl", "644"],
+  ["../../README.md", "usr/share/doc/maxnines-agent/README.md", "644"],
+]
+maintainer-scripts = "../../packaging/linux/deb/agent"
+# Installing doesn't start it, as it needs its config first.
+systemd-units = { unit-name = "maxnines-agent", unit-scripts = "../../packaging/linux", enable = false, start = false, restart-after-upgrade = true }
+
+[package.metadata.generate-rpm]
+description = "Reports how a host is doing to a MaxNines server. What it watches is set on\nthe server, and it keeps its key and unsent samples in /var/lib/maxnines-agent."
+summary = "MaxNines monitoring agent"
+assets = [
+  { source = "target/release/maxnines-agent", dest = "/usr/bin/maxnines-agent", mode = "755" },
+  { source = "../../packaging/linux/agent.hcl", dest = "/etc/maxnines/agent.hcl", mode = "640", config = "noreplace" },
+  { source = "../../packaging/linux/maxnines-agent.service", dest = "/usr/lib/systemd/system/maxnines-agent.service", mode = "644" },
+  { source = "../../README.md", dest = "/usr/share/doc/maxnines-agent/README.md", mode = "644", doc = true },
+  { source = "../../LICENSE", dest = "/usr/share/licenses/maxnines-agent/LICENSE", mode = "644", doc = true },
+]
+pre_install_script = "../../packaging/linux/add-user.sh"
+post_install_script = "../../packaging/linux/rpm/agent-post.sh"
+pre_uninstall_script = "../../packaging/linux/rpm/agent-preun.sh"
+post_uninstall_script = "../../packaging/linux/rpm/agent-postun.sh"
+auto-req = "no"

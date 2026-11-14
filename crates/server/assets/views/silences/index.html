@@ -1,0 +1,89 @@
+{% extends "layouts/application.html" %}
+{% block title %}Silences · MaxNines{% endblock title %}
+{% block content %}
+<p class="breadcrumb"><a href="/alerts">Alerts</a></p>
+<div class="title-row">
+  <h1>Silences</h1>
+  {% if can_respond %}<div class="actions"><a class="button" href="/alerts/silences/new">Add silence</a></div>{% endif %}
+</div>
+<p class="hint">Alerts still fire and show while they're silenced, but nobody is notified. If one is still firing when its silence ends, the notifications go out then.</p>
+
+{% if active %}
+<div class="tablebox"><table>
+  <thead>
+    <tr><th>Reason</th><th>Rule</th><th>Hosts</th><th>Until</th><th>Added by</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for silence in active %}
+    <tr>
+      <td>{{ silence.reason }}</td>
+      <td>{{ silence.rule }}</td>
+      <td>{{ silence.hosts }}</td>
+      <td class="nowrap">{{ silence.ends }}</td>
+      <td>{{ silence.created_by }}</td>
+      <td>
+        {% if can_respond %}
+        <form method="post" action="/alerts/silences/{{ silence.id }}/end">
+          <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+          <button type="submit" class="secondary">End now</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table></div>
+{% else %}
+<p class="empty">Nothing is silenced.</p>
+{% endif %}
+
+<section>
+<div class="title-row">
+  <h2>Maintenance windows</h2>
+  {% if can_edit %}<div class="actions"><a class="button secondary" href="/alerts/maintenance/new">Add window</a></div>{% endif %}
+</div>
+{% if windows %}
+<div class="tablebox"><table>
+  <thead>
+    <tr><th>Name</th><th>When</th><th>Rule</th><th>Hosts</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for window in windows %}
+    <tr>
+      <td><a href="/alerts/maintenance/{{ window.id }}/edit">{{ window.name }}</a></td>
+      <td>{{ window.schedule }}</td>
+      <td>{{ window.rule }}</td>
+      <td>{{ window.hosts }}</td>
+      <td>{% if window.running %}<span class="badge neutral">Running</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table></div>
+{% else %}
+<p class="empty">No maintenance windows. They work like a silence that comes round on a schedule.</p>
+{% endif %}
+</section>
+
+{% if ended %}
+<section>
+<h2>Ended</h2>
+<div class="tablebox"><table>
+  <thead>
+    <tr><th>Reason</th><th>Rule</th><th>Hosts</th><th>From</th><th>Until</th><th>Added by</th></tr>
+  </thead>
+  <tbody>
+    {% for silence in ended %}
+    <tr>
+      <td>{{ silence.reason }}</td>
+      <td>{{ silence.rule }}</td>
+      <td>{{ silence.hosts }}</td>
+      <td class="nowrap">{{ silence.starts }}</td>
+      <td class="nowrap">{{ silence.ends }}</td>
+      <td>{{ silence.created_by }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table></div>
+</section>
+{% endif %}
+{% endblock content %}

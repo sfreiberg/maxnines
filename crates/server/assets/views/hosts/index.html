@@ -1,0 +1,86 @@
+{% extends "layouts/live.html" %}
+{% block title %}Hosts · MaxNines{% endblock title %}
+{% block content %}
+<div class="title-row">
+  <div>
+    <p class="eyebrow">{{ online_count }} of {{ total }} online</p>
+    <h1>Hosts</h1>
+  </div>
+  <div class="actions">
+    {% if can_edit %}<a class="button secondary" href="/hosts/new" title="For something an agent can't be installed on, which the server reads itself">Add a host</a>{% endif %}
+    <nav class="tabs" aria-label="View">
+      <a href="{{ tiles_href }}"{% if not as_table %} class="selected" aria-current="true"{% endif %}>Tiles</a>
+      <a href="{{ table_href }}"{% if as_table %} class="selected" aria-current="true"{% endif %}>Table</a>
+    </nav>
+  </div>
+</div>
+
+{% if waiting %}
+<section class="card">
+  <h2>Waiting for approval</h2>
+  {% for host in waiting %}
+  <div class="problem">
+    <span class="text"><a href="/hosts/{{ host.id }}">{{ host.hostname }}</a>{% if host.seen %} <span class="note">asked {{ host.seen }}</span>{% endif %}</span>
+    {% if can_edit %}
+    <div class="actions">
+      <form method="post" action="/hosts/{{ host.id }}/approve">
+        <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+        <button type="submit">Approve</button>
+      </form>
+      <form method="post" action="/hosts/{{ host.id }}/revoke">
+        <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+        <button type="submit" class="danger">Reject</button>
+      </form>
+    </div>
+    {% endif %}
+  </div>
+  {% endfor %}
+</section>
+{% endif %}
+
+{% include "hosts/_filter.html" %}
+
+<nav class="tabs" aria-label="Status">
+  {% for tab in filters %}
+  <a href="{{ tab.href }}"{% if tab.selected %} class="selected" aria-current="true"{% endif %}>{{ tab.label }} {{ tab.count }}</a>
+  {% endfor %}
+</nav>
+
+{% set health_dot_only = true %}
+{% if hosts and as_table %}
+<div class="tablebox"><table>
+  <thead>
+    <tr><th>Host</th><th>Status</th><th>System</th><th>Version</th><th>Config</th><th>Last seen</th></tr>
+  </thead>
+  <tbody>
+    {% for host in hosts %}
+    <tr>
+      <td><a href="/hosts/{{ host.id }}">{{ host.hostname }}</a> <span class="host-id">{{ host.short_id }}</span></td>
+      <td>{% include "hosts/_health.html" %}</td>
+      {% set os_family = host.os_family %}<td><span class="host-name">{% include "hosts/_os_icon.html" %}{{ host.os }}</span></td>
+      <td class="nowrap">{% if host.agentless %}<span class="badge neutral">No agent</span>{% else %}{% if host.version %}{{ host.version }} {% endif %}{% include "hosts/_version.html" %}{% endif %}</td>
+      <td>{% if not host.agentless %}<span class="badge {{ host.config.class }}">{{ host.config.label }}</span>{% endif %}</td>
+      <td class="nowrap">{{ host.seen }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table></div>
+{% elif hosts %}
+<div class="wall">
+  {% for host in hosts %}
+  <a class="tile{% if host.health == "critical" %} critical{% elif host.health == "warning" %} alert{% elif host.health == "offline" %} gone{% endif %}" href="/hosts/{{ host.id }}">
+    {% set os_family = host.os_family %}<span class="tile-head"><span class="host-name">{% include "hosts/_os_icon.html" %}{{ host.hostname }}</span> {% include "hosts/_health.html" %}</span>
+    <span class="host-id">{{ host.short_id }}</span>
+    {% if host.os %}<span class="note">{{ host.os }}</span>{% elif host.agentless %}<span class="note">No agent</span>{% endif %}
+    {% if host.seen %}<span class="note">Seen {{ host.seen }}</span>{% endif %}
+    {% include "hosts/_version.html" %}
+  </a>
+  {% endfor %}
+</div>
+{% elif search.text or total > 0 %}
+<p class="empty">No hosts match this filter.</p>
+{% elif not waiting %}
+<p class="empty">No agents have connected yet.</p>
+{% endif %}
+{% include "hosts/_pages.html" %}
+{% endblock content %}

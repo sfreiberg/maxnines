@@ -1,0 +1,103 @@
+{% extends "layouts/live.html" %}
+{% block title %}{{ hostname }} metrics · MaxNines{% endblock title %}
+{% block refresh_every %}60s{% endblock refresh_every %}
+{% block content %}
+<p class="breadcrumb">{% if is_local %}<a href="/server">Server</a>{% else %}<a href="/metrics">Metrics</a>{% endif %}</p>
+<div class="title-row">
+  <h1>{{ hostname }}</h1>
+  {% if not is_local %}<a class="button secondary" href="/hosts/{{ host_id }}">Host details</a>{% endif %}
+</div>
+
+<nav class="tabs" aria-label="Time range">
+  {% for option in ranges %}
+  <a href="/hosts/{{ host_id }}/metrics?range={{ option.key }}"{% if option.selected %} class="selected" aria-current="true"{% endif %}>{{ option.label }}</a>
+  {% endfor %}
+</nav>
+<p class="hint">Times are in {{ time_zone }}. The charts update every minute.</p>
+
+{% if checks %}
+<section>
+{% include "metrics/_checks.html" %}
+</section>
+{% endif %}
+
+{% if services %}
+<section>
+{% include "metrics/_services.html" %}
+</section>
+{% endif %}
+
+{% if custom_metrics %}
+<section>
+{% set readings_title = "Latest custom metrics" %}{% set readings_name = "Metric" %}{% set readings = custom_metrics %}
+{% include "metrics/_readings.html" %}
+</section>
+{% endif %}
+
+{% if counters %}
+<section>
+{% set readings_title = "Latest performance counters" %}{% set readings_name = "Counter" %}{% set readings = counters %}
+{% include "metrics/_readings.html" %}
+</section>
+{% endif %}
+
+<div class="charts">
+  {% for chart in charts %}
+  {% include "metrics/_chart.html" %}
+  {% endfor %}
+</div>
+
+{% if not is_local %}
+<section id="events" class="card events">
+  <h2>Events</h2>
+  <p class="hint">What happened to this host in the range shown, also marked on each chart: annotations, restarts, config changes, alerts and updates. Annotations for many hosts at once are under <a href="/metrics/annotations">Metrics &gt; Annotations</a>.</p>
+  {% if can_respond %}
+  {% if event_error %}<p class="error" role="alert">{{ event_error }}</p>{% endif %}
+  <form id="event-form" method="post" action="/hosts/{{ host_id }}/annotations" class="event-form">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <input type="hidden" name="range" value="{{ range }}">
+    <label>Kind
+      <select name="kind">
+        <option value="note">Note</option>
+        <option value="deploy">Deploy</option>
+      </select>
+    </label>
+    <label>What happened
+      <input type="text" name="title" maxlength="200" required autocomplete="off" placeholder="Upgraded nginx to 1.27">
+    </label>
+    <label>Detail
+      <input type="text" name="detail" maxlength="2000" autocomplete="off" placeholder="Optional">
+    </label>
+    <button type="submit" class="secondary">Add annotation</button>
+  </form>
+  {% endif %}
+  {% if events %}
+  <table class="event-list">
+    <thead><tr><th>When</th><th>Kind</th><th>What</th><th>Added by</th>{% if can_respond %}<th aria-label="Delete"></th>{% endif %}</tr></thead>
+    <tbody>
+      {% for event in events %}
+      <tr>
+        <td class="nowrap">{{ event.time }}</td>
+        <td><span class="event-kind k-{{ event.kind }}">{{ event.kind_label }}</span></td>
+        <td>{{ event.title }}{% if event.detail %}<div class="hint">{{ event.detail }}</div>{% endif %}</td>
+        <td>{% if event.created_by %}{{ event.created_by }}{% else %}<span class="hint">Server</span>{% endif %}</td>
+        {% if can_respond %}
+        <td>{% if event.id %}
+          <form method="post" action="/metrics/annotations/{{ event.id }}/delete">
+            <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+            <input type="hidden" name="host_id" value="{{ host_id }}">
+            <input type="hidden" name="range" value="{{ range }}">
+            <button type="submit" class="danger">Delete</button>
+          </form>
+        {% endif %}</td>
+        {% endif %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">Nothing in this range.</p>
+  {% endif %}
+</section>
+{% endif %}
+{% endblock content %}

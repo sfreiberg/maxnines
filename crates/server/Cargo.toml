@@ -1,0 +1,130 @@
+[package]
+name = "maxnines-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "MaxNines monitoring server"
+
+[dependencies]
+# Lets each kind of notification channel send in its own way behind one trait.
+async-trait = "0.1"
+anyhow.workspace = true
+clap.workspace = true
+axum = { version = "0.8.9", features = ["ws"] }
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
+# Stay on DuckDB 1.5: 1.20000.x bundles a pre-release 2.0 with a development
+# storage format. Tilde because a minor bump changes the bundled DuckDB.
+duckdb = { version = "~1.10506.1", features = ["bundled", "json"] }
+# Unpacks the built-in place list.
+flate2 = "1"
+# Windows paths without the \\?\ that canonicalize adds, which nothing else uses.
+dunce = "1"
+hcl-rs.workspace = true
+indexmap = { version = "2.14.2", features = ["serde"] }
+hex.workspace = true
+humantime = "2.3"
+ipnet = "2.12.2"
+maxnines-checks.workspace = true
+maxnines-collectors.workspace = true
+maxnines-protocol.workspace = true
+ring.workspace = true
+sea-orm = { version = "2.0.4", default-features = false, features = ["macros", "runtime-tokio-rustls", "sqlx-mysql", "sqlx-postgres", "sqlx-sqlite"] }
+sea-orm-migration = { version = "2.0.4", default-features = false, features = ["runtime-tokio-rustls", "sqlx-mysql", "sqlx-postgres", "sqlx-sqlite"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http2", "ring", "tls12", "webpki-tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Compares agents' versions with the newest, pre-releases included.
+semver = "1"
+serde.workspace = true
+serde_urlencoded = "0.7"
+# Catches settings no agent knows when a rule is saved, as the wire format ignores them.
+serde_ignored = "0.1"
+slack-morphism = { version = "2.31", default-features = false, features = ["hyper-base"] }
+serde_json.workspace = true
+sysinfo = { version = "0.40.1", default-features = false, features = ["disk", "system"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+futures-util.workspace = true
+rustls-acme = { version = "0.15", default-features = false, features = ["axum", "ring", "tls12", "webpki-roots"] }
+tower-http = { version = "0.6", features = ["compression-gzip"] }
+tracing.workspace = true
+clickhouse = { version = "0.15", default-features = false, features = ["lz4", "rustls-tls-ring", "rustls-tls-webpki-roots"] }
+ureq = { version = "3.5.1", default-features = false, features = ["rustls", "multipart"] }
+# Draws the charts sent with alerts. Fonts are built in, not read from the machine.
+resvg = { version = "0.47", default-features = false, features = ["text"] }
+# TLS for Slack's Socket Mode connections, which slack-morphism makes with it.
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+base64 = "0.22"
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "rustls", "ring", "webpki-roots"] }
+wildmatch = "2.7.0"
+cel = "0.15"
+tera = "2.4"
+axum_csrf = "0.12"
+rust-embed = { version = "8.13", features = ["include-exclude", "mime-guess"] }
+# The documentation pages: Markdown, and colouring for the code in it. two-face adds
+# the syntaxes syntect lacks, such as HCL. The pure Rust regex engine avoids
+# building another C library on every platform.
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+syntect = { version = "5.3", default-features = false, features = ["html", "parsing", "dump-load", "regex-fancy"] }
+two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
+argon2 = "0.6.0"
+governor = "0.10.4"
+cookie = "0.18"
+totp-rs = { version = "6.0.0", features = ["qr", "gen_secret", "otpauth"] }
+
+[dev-dependencies]
+rcgen = "0.14"
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+tempfile = "3"
+
+[build-dependencies]
+vergen-gitcl = { version = "10", features = ["build"] }
+
+[features]
+# Runs the metrics store tests against a ClickHouse server as well.
+clickhouse-tests = []
+
+# Linux packages, made by cargo-deb and cargo-generate-rpm from a binary that's
+# already built. The release workflow builds it with --target, which both tools
+# substitute into target/release.
+[package.metadata.deb]
+maintainer = "MaxNines <https://github.com/sfreiberg/maxnines/issues>"
+copyright = "2026 Sam Freiberg"
+license-file = ["../../LICENSE", "0"]
+extended-description = "The server MaxNines agents report to, with the web pages, alerting and the API.\nIt keeps its data in /var/lib/maxnines-server."
+section = "admin"
+priority = "optional"
+depends = "libc6 (>= 2.34), libgcc-s1, libstdc++6 (>= 11)"
+assets = [
+  ["target/release/maxnines-server", "usr/bin/", "755"],
+  # Only the default. postinst copies it to /etc/maxnines when there's no config,
+  # as a file in /etc would be a conffile, which dpkg asks about on upgrades.
+  ["../../packaging/linux/server.hcl", "usr/share/maxnines/server.hcl", "644"],
+  ["../../README.md", "usr/share/doc/maxnines-server/README.md", "644"],
+]
+maintainer-scripts = "../../packaging/linux/deb/server"
+# Installing doesn't start it, as it needs its config first.
+systemd-units = { unit-name = "maxnines-server", unit-scripts = "../../packaging/linux", enable = false, start = false, restart-after-upgrade = true }
+
+[package.metadata.generate-rpm]
+description = "The server MaxNines agents report to, with the web pages, alerting and the API.\nIt keeps its data in /var/lib/maxnines-server."
+summary = "MaxNines monitoring server"
+assets = [
+  { source = "target/release/maxnines-server", dest = "/usr/bin/maxnines-server", mode = "755" },
+  { source = "../../packaging/linux/server.hcl", dest = "/etc/maxnines/server.hcl", mode = "640", config = "noreplace" },
+  { source = "../../packaging/linux/maxnines-server.service", dest = "/usr/lib/systemd/system/maxnines-server.service", mode = "644" },
+  { source = "../../README.md", dest = "/usr/share/doc/maxnines-server/README.md", mode = "644", doc = true },
+  { source = "../../LICENSE", dest = "/usr/share/licenses/maxnines-server/LICENSE", mode = "644", doc = true },
+]
+pre_install_script = "../../packaging/linux/add-user.sh"
+post_install_script = "../../packaging/linux/rpm/server-post.sh"
+pre_uninstall_script = "../../packaging/linux/rpm/server-preun.sh"
+post_uninstall_script = "../../packaging/linux/rpm/server-postun.sh"
+auto-req = "no"
+
+[package.metadata.generate-rpm.requires]
+glibc = ">= 2.34"
+libgcc = "*"
+"libstdc++" = "*"

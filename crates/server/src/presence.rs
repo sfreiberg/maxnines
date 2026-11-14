@@ -1,0 +1,430 @@
+use std::collections::{BTreeMap, HashSet};
+use std::net::IpAddr;
+use std::num::NonZeroU32;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
+use serde::Serialize;
+use tokio::sync::Notify;
+
+/// How often one agent may connect. A real agent reconnects a few times after a
+/// network blip; two hosts sharing a key knock each other off far faster.
+const CONNECTIONS_PER_MINUTE: NonZeroU32 = NonZeroU32::new(10).unwrap();
+
+/// Facts arrive once per connection and then every `facts_interval_secs`, which is
+/// at least a minute. A few more are allowed for a reconnect or two, and the rest
+/// are dropped, so a misbehaving agent can't fill the facts history.
+const FACTS_PER_MINUTE: NonZeroU32 = NonZeroU32::MIN;
+const FACTS_BURST: NonZeroU32 = NonZeroU32::new(5).unwrap();
+
+/// Keys are forgotten once there are this many, as they're only agent IDs.
+const MAX_REMEMBERED_KEYS: usize = 100_000;
+
+/// Whether an agent is connected right now.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct HostPresence {
+    pub online: bool,
+    /// When `online` last changed.
+    pub since_ms: u64,
+    /// When the server last heard anything from this agent.
+    pub last_seen_ms: u64,
+    /// Where the latest connection came from, as seen by the server.
+    pub source: IpAddr,
+}
+
+struct Entry {
+    presence: HostPresence,
+    /// Only the newest connection may mark the agent offline.
+    connection: u64,
+    /// Told when a newer connection takes over, so the older one can end.
+    replaced: Arc<Notify>,
+}
+
+/// Tracks live connections by agent ID. Held in memory, because a connection
+/// doesn't outlive the server.
+pub struct Presence {
+    state: Mutex<State>,
+    connections: DefaultKeyedRateLimiter<String>,
+    facts: DefaultKeyedRateLimiter<String>,
+    /// Told when an agent that was offline connects, so its offline alert can
+    /// resolve without waiting for the next pass.
+    pub came_online: Notify,
+}
+
+impl Default for Presence {
+    fn default() -> Self {
+        Self {
+            state: Mutex::default(),
+            connections: RateLimiter::keyed(Quota::per_minute(CONNECTIONS_PER_MINUTE)),
+            facts: RateLimiter::keyed(Quota::per_minute(FACTS_PER_MINUTE).allow_burst(FACTS_BURST)),
+            came_online: Notify::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Presence {
+    /// The same allowances, given back by the hour, so a test that uses them up isn't
+    /// handed another by a slow host taking longer than expected.
+    pub fn refilling_slowly() -> Self {
+        Self {
+            state: Mutex::default(),
+            connections: RateLimiter::keyed(Quota::per_hour(CONNECTIONS_PER_MINUTE)),
+            facts: RateLimiter::keyed(Quota::per_hour(FACTS_PER_MINUTE).allow_burst(FACTS_BURST)),
+            came_online: Notify::new(),
+        }
+    }
+}
+
+/// Something the server reads or tries itself, for a host with no agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Reached {
+    /// A metrics page, by its ID.
+    Page(i64),
+    /// A check, by its ID.
+    Check(i64),
+}
+
+#[derive(Default)]
+struct State {
+    hosts: BTreeMap<String, Entry>,
+    next_connection: u64,
+    /// For each host with no agent, whether each thing the server reaches it by
+    /// answered the last time.
+    reached: BTreeMap<String, BTreeMap<Reached, bool>>,
+}
+
+impl State {
+    /// Makes a host with no agent as present as what's reached of it says, and
+    /// says whether that brought it online.
+    fn settle_reached(&mut self, id: &str) -> bool {
+        let Some(reached) = self.reached.get(id).filter(|reached| !reached.is_empty()) else {
+            self.reached.remove(id);
+            self.hosts.remove(id);
+            return false;
+        };
+        let online = reached.values().any(|answered| *answered);
+        self.next_connection += 1;
+        let connection = self.next_connection;
+        let now = now_ms();
+        let entry = self.hosts.entry(id.to_string()).or_insert(Entry {
+            presence: HostPresence {
+                // The opposite, so that the first answer counts as a change.
+                online: !online,
+                since_ms: now,
+                last_seen_ms: now,
+                // It has no connection, so there's nowhere it connected from.
+                source: IpAddr::from([0, 0, 0, 0]),
+            },
+            connection,
+            replaced: Arc::new(Notify::new()),
+        });
+        if online {
+            entry.presence.last_seen_ms = now;
+        }
+        let changed = entry.presence.online != online;
+        if changed {
+            entry.presence.online = online;
+            entry.presence.since_ms = now;
+        }
+        changed && online
+    }
+}
+
+pub struct Connected {
+    pub connection: u64,
+    /// The agent was already online, which can mean two hosts share a key.
+    pub already_online: bool,
+    /// Fires when a newer connection for the same agent takes over.
+    pub replaced: Arc<Notify>,
+}
+
+impl Presence {
+    pub fn connected(&self, id: &str, source: IpAddr) -> Connected {
+        let mut state = self.state.lock().unwrap();
+        state.next_connection += 1;
+        let connection = state.next_connection;
+        let now = now_ms();
+
+        let entry = state.hosts.entry(id.to_string()).or_insert(Entry {
+            presence: HostPresence {
+                online: false,
+                since_ms: now,
+                last_seen_ms: now,
+                source,
+            },
+            connection,
+            replaced: Arc::new(Notify::new()),
+        });
+        let already_online = entry.presence.online;
+
+        // One agent, one connection: the older one is told to go.
+        if already_online {
+            entry.replaced.notify_one();
+        }
+        let replaced = Arc::new(Notify::new());
+        entry.replaced = replaced.clone();
+        entry.connection = connection;
+        entry.presence.last_seen_ms = now;
+        entry.presence.source = source;
+        if !already_online {
+            entry.presence.online = true;
+            entry.presence.since_ms = now;
+            self.came_online.notify_one();
+        }
+
+        Connected {
+            connection,
+            already_online,
+            replaced,
+        }
+    }
+
+    /// Whether this agent may connect again yet.
+    pub fn allow_connection(&self, id: &str) -> bool {
+        if self.connections.len() > MAX_REMEMBERED_KEYS {
+            self.connections.retain_recent();
+        }
+        self.connections.check_key(&id.to_string()).is_ok()
+    }
+
+    /// Whether another facts report from this agent is worth recording.
+    pub fn allow_facts(&self, id: &str) -> bool {
+        if self.facts.len() > MAX_REMEMBERED_KEYS {
+            self.facts.retain_recent();
+        }
+        self.facts.check_key(&id.to_string()).is_ok()
+    }
+
+    /// Notes whether something the server reads or tries for a host with no agent
+    /// answered. The host is online while anything does, which is all there is to
+    /// say about whether something with no agent is there.
+    pub fn reached(&self, id: &str, what: Reached, answered: bool) {
+        let mut state = self.state.lock().unwrap();
+        state
+            .reached
+            .entry(id.to_string())
+            .or_default()
+            .insert(what, answered);
+        if state.settle_reached(id) {
+            self.came_online.notify_one();
+        }
+    }
+
+    /// Forgets the pages that aren't read any more.
+    pub fn keep_pages(&self, read: &HashSet<i64>) {
+        self.keep_reached(|what| !matches!(what, Reached::Page(id) if !read.contains(id)));
+    }
+
+    /// Forgets the checks that aren't run any more.
+    pub fn keep_checks(&self, run: &HashSet<i64>) {
+        self.keep_reached(|what| !matches!(what, Reached::Check(id) if !run.contains(id)));
+    }
+
+    /// A host that loses what it had is judged by what's left, and one left with
+    /// nothing is neither online nor offline.
+    fn keep_reached(&self, keep: impl Fn(&Reached) -> bool) {
+        let mut state = self.state.lock().unwrap();
+        let mut changed = Vec::new();
+        for (id, reached) in &mut state.reached {
+            let before = reached.len();
+            reached.retain(|what, _| keep(what));
+            if reached.len() != before {
+                changed.push(id.clone());
+            }
+        }
+        for id in changed {
+            if state.settle_reached(&id) {
+                self.came_online.notify_one();
+            }
+        }
+    }
+
+    pub fn seen(&self, id: &str) {
+        if let Some(entry) = self.state.lock().unwrap().hosts.get_mut(id) {
+            entry.presence.last_seen_ms = now_ms();
+        }
+    }
+
+    /// Ignored if the agent has already reconnected on a newer connection.
+    pub fn disconnected(&self, id: &str, connection: u64) {
+        if let Some(entry) = self.state.lock().unwrap().hosts.get_mut(id)
+            && entry.connection == connection
+        {
+            entry.presence.online = false;
+            entry.presence.since_ms = now_ms();
+        }
+    }
+
+    /// For a host that's been deleted.
+    pub fn forget(&self, id: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.hosts.remove(id);
+        state.reached.remove(id);
+    }
+
+    pub fn get(&self, id: &str) -> Option<HostPresence> {
+        let state = self.state.lock().unwrap();
+        state.hosts.get(id).map(|entry| entry.presence)
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+    use std::time::Duration;
+
+    use super::*;
+
+    const SOURCE: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    #[test]
+    fn a_host_with_no_agent_is_online_while_anything_of_it_answers() {
+        let presence = Presence::default();
+        assert!(presence.get("db").is_none());
+
+        presence.reached("db", Reached::Page(1), true);
+        let first = presence.get("db").unwrap();
+        assert!(first.online);
+
+        // Answering again changes nothing about when it came online.
+        presence.reached("db", Reached::Page(1), true);
+        assert_eq!(presence.get("db").unwrap().since_ms, first.since_ms);
+
+        // A check that fails doesn't take it offline while its page answers.
+        presence.reached("db", Reached::Check(1), false);
+        assert!(presence.get("db").unwrap().online);
+        presence.reached("db", Reached::Page(1), false);
+        assert!(!presence.get("db").unwrap().online);
+        presence.reached("db", Reached::Check(1), true);
+        assert!(presence.get("db").unwrap().online);
+
+        // One that didn't answer the first time is offline from then.
+        presence.reached("cache", Reached::Check(2), false);
+        assert!(!presence.get("cache").unwrap().online);
+    }
+
+    #[test]
+    fn a_host_is_judged_by_what_is_still_reached_of_it() {
+        let presence = Presence::default();
+        presence.reached("db", Reached::Page(1), false);
+        presence.reached("db", Reached::Check(1), true);
+        presence.reached("cache", Reached::Check(2), true);
+
+        // Pages and checks are counted separately, so 1 here is only the page.
+        presence.keep_pages(&HashSet::from([1]));
+        presence.keep_checks(&HashSet::from([2]));
+
+        // What was keeping it online is gone, and its page isn't answering.
+        assert!(!presence.get("db").unwrap().online);
+        assert!(presence.get("cache").unwrap().online);
+
+        // With nothing left it's neither online nor offline.
+        presence.keep_pages(&HashSet::new());
+        assert!(presence.get("db").is_none());
+        presence.forget("cache");
+        presence.keep_checks(&HashSet::from([2]));
+        assert!(presence.get("cache").is_none());
+    }
+
+    fn is_online(presence: &Presence, id: &str) -> bool {
+        presence.get(id).is_some_and(|p| p.online)
+    }
+
+    #[test]
+    fn tracks_an_agent_going_online_and_offline() {
+        let presence = Presence::default();
+
+        let connected = presence.connected("a", SOURCE);
+        assert!(is_online(&presence, "a"));
+        assert!(!connected.already_online);
+
+        presence.disconnected("a", connected.connection);
+        assert!(!is_online(&presence, "a"));
+    }
+
+    #[tokio::test]
+    async fn a_newer_connection_tells_the_older_one_to_go() {
+        let presence = Presence::default();
+        let old = presence.connected("a", SOURCE);
+        let other = presence.connected("b", SOURCE);
+
+        let new = presence.connected("a", SOURCE);
+
+        old.replaced.notified().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), new.replaced.notified())
+                .await
+                .is_err(),
+            "the newest connection stays"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), other.replaced.notified())
+                .await
+                .is_err(),
+            "other hosts aren't touched"
+        );
+    }
+
+    #[test]
+    fn an_agent_can_only_connect_so_often() {
+        let presence = Presence::default();
+        for _ in 0..CONNECTIONS_PER_MINUTE.get() {
+            assert!(presence.allow_connection("a"));
+        }
+        assert!(!presence.allow_connection("a"));
+        assert!(presence.allow_connection("b"), "each host has its own");
+    }
+
+    #[test]
+    fn an_agent_can_only_report_facts_so_often() {
+        let presence = Presence::default();
+        for _ in 0..FACTS_BURST.get() {
+            assert!(presence.allow_facts("a"));
+        }
+        assert!(!presence.allow_facts("a"));
+        assert!(presence.allow_facts("b"));
+    }
+
+    #[test]
+    fn an_old_connection_closing_does_not_hide_a_new_one() {
+        let presence = Presence::default();
+
+        let old = presence.connected("a", SOURCE);
+        let new = presence.connected("a", SOURCE);
+        assert!(new.already_online);
+
+        presence.disconnected("a", old.connection);
+        assert!(is_online(&presence, "a"));
+
+        presence.disconnected("a", new.connection);
+        assert!(!is_online(&presence, "a"));
+    }
+
+    #[tokio::test]
+    async fn says_when_an_agent_comes_online_but_not_when_it_reconnects() {
+        let presence = Presence::default();
+        // A notification waits for whoever asks next, so each is there at once.
+        let told = || tokio::time::timeout(Duration::ZERO, presence.came_online.notified());
+
+        let first = presence.connected("a", SOURCE);
+        assert!(told().await.is_ok());
+
+        let replacing = presence.connected("a", SOURCE);
+        assert!(replacing.already_online);
+        assert!(told().await.is_err());
+
+        presence.disconnected("a", first.connection);
+        presence.disconnected("a", replacing.connection);
+        presence.connected("a", SOURCE);
+        assert!(told().await.is_ok());
+    }
+}

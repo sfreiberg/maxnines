@@ -1,0 +1,237 @@
+{% extends "layouts/application.html" %}
+{% block title %}{% if id %}Edit channel{% else %}Add channel{% endif %} · MaxNines{% endblock title %}
+{% block main_class %} class="narrow"{% endblock main_class %}
+{% block content %}
+<p class="breadcrumb"><a href="/alerts/channels">Notification channels</a></p>
+<h1>{% if id %}Edit channel{% else %}Add channel{% endif %}</h1>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<form method="post" action="{% if id %}/alerts/channels/{{ id }}{% else %}/alerts/channels{% endif %}" class="stacked channel">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+
+  <label>Name
+    <input type="text" name="name" value="{{ channel.name }}" required maxlength="255">
+  </label>
+
+  <label>Kind
+    <select name="kind">
+      {% for kind in kinds %}
+      <option value="{{ kind.value }}"{% if channel.kind == kind.value %} selected{% endif %}>{{ kind.name }}</option>
+      {% endfor %}
+    </select>
+  </label>
+
+  <details class="for-slack setup"{% if not channel.has_credential %} open{% endif %}>
+    <summary>How to set up the Slack app</summary>
+    <ol>
+      <li>
+        <a class="button secondary" href="{{ slack_manifest_link }}" target="_blank" rel="noopener">Create the Slack app</a>
+        <p>Slack opens with everything filled in. Pick your workspace, check the summary, and choose Create.</p>
+      </li>
+      <li>In the app's menu, open <strong>Install App</strong>, choose <strong>Install to</strong> your workspace, then <strong>Allow</strong>.</li>
+      <li>Open <strong>OAuth &amp; Permissions</strong> and copy the <strong>Bot User OAuth Token</strong> into the bot token box below. It starts with <code>xoxb-</code>.</li>
+      <li>For Acknowledge and Silence buttons, open <strong>Basic Information</strong> and find <strong>App-Level Tokens</strong>. Choose <strong>Generate Token and Scopes</strong>, give it any name, add the <code>connections:write</code> scope, and generate it. Copy it into the app-level token box below. It starts with <code>xapp-</code>.</li>
+      <li>Put the channel to post in, such as <code>#alerts</code>, in the box below. For a private channel, invite the app to it first with <code>/invite @maxnines</code>.</li>
+    </ol>
+    <p class="note">Buttons act as the MaxNines user with the same email address as the person pressing them, so everyone needs a MaxNines account with the email they use in Slack. Guests and people from other organizations can't use them. The server connects out to Slack for them, so it doesn't need to be reachable from the internet.</p>
+    <details>
+      <summary>Creating the app by hand instead</summary>
+      <p>At <a href="https://api.slack.com/apps">api.slack.com/apps</a>, choose Create New App, then From a manifest. Pick your workspace, choose JSON, and paste this in:</p>
+      <div class="copyable">
+<pre id="slack-manifest">{{ slack_manifest }}</pre>
+        <button type="button" class="secondary copy" data-copy="slack-manifest" aria-live="polite" hidden>Copy</button>
+      </div>
+      <p>On an Enterprise Grid org-wide install, use the channel's ID rather than its name. It's at the bottom of the channel's details in Slack.</p>
+    </details>
+  </details>
+
+  <label>Sends to
+    <input type="text" name="target" value="{{ channel.target }}" spellcheck="false" autocomplete="off"{% if channel.preview %} placeholder="{{ channel.preview }}"{% endif %}>
+    <small>{% if channel.preview %}Leave empty to keep what's saved, which isn't shown because it can work like a password.{% else %}A webhook's URL, a Discord webhook URL, a Teams workflow's URL, for email or Resend the addresses to send to, separated by commas, for Slack a channel such as <code>#alerts</code>, for PagerDuty an integration key, the URL from AlertOps or SIGNL4, or for Telegram a chat ID.{% endif %}</small>
+  </label>
+
+  <details class="for-pagerduty">
+    <summary>How to get a PagerDuty integration key</summary>
+    <ol>
+      <li>In PagerDuty, open the service that should get these alerts, then its Integrations tab.</li>
+      <li>Add an integration, and choose Events API V2.</li>
+      <li>Copy its Integration Key into the box above.</li>
+    </ol>
+    <p class="note">Sending a test opens an incident on that service and resolves it straight away, which can notify whoever is on call.</p>
+  </details>
+
+  <details class="for-alertops">
+    <summary>How to set up AlertOps</summary>
+    <ol>
+      <li>In AlertOps, go to Configuration, then Integrations. Under Inbound Integrations, choose API and add one using the Custom card, with the escalation policy you want.</li>
+      <li>Open its rules for opening and closing an alert. Keep the method as POST and the content as JSON.</li>
+      <li>Paste this in as the sample data:
+        <div class="copyable">
+<pre id="alertops-sample">{{ alertops_sample }}</pre>
+          <button type="button" class="secondary copy" data-copy="alertops-sample" aria-live="polite" hidden>Copy</button>
+        </div></li>
+      <li>Map <code>alert_id</code> to both Source Name and Source Id, so each alert stays separate. A fixed Source Name would merge them into one.</li>
+      <li>Map <code>status</code> as the status field. Open an alert when it contains <code>open</code>, and close it when it contains <code>closed</code>.</li>
+      <li>Map <code>subject</code> and <code>message</code> to the text fields you want, and <code>link</code> to Source URL.</li>
+      <li>Leave the authorization header off, then copy the integration's URL into the box above. Do this last, as changing its source changes the URL.</li>
+    </ol>
+    <p class="note">Sending a test opens an alert and closes it straight away, which can notify whoever is on call.</p>
+  </details>
+
+  <details class="for-teams">
+    <summary>How to get a Teams workflow URL</summary>
+    <ol>
+      <li>In Teams, open the channel that should get alerts, open its <strong>&middot;&middot;&middot;</strong> menu, and choose <strong>Workflows</strong>.</li>
+      <li>Choose <strong>Post to a channel when a webhook request is received</strong>, give it a name such as MaxNines, and choose <strong>Next</strong>.</li>
+      <li>Check the team and channel, then choose <strong>Add workflow</strong>.</li>
+      <li>Copy the URL it shows into the box above. Teams doesn't show it again, though Power Automate does, under the workflow's <strong>When a Teams webhook request is received</strong> step.</li>
+    </ol>
+    <p class="note">Office 365 connector URLs, on webhook.office.com, have been retired by Microsoft and no longer work. Teams messages don't include the chart, and have no Acknowledge or Silence buttons.</p>
+  </details>
+
+  <details class="for-signl4">
+    <summary>How to get a SIGNL4 webhook URL</summary>
+    <p>Put <code>https://connect.signl4.com/webhook/</code> followed by your SIGNL4 team or integration secret in the box above.</p>
+    <p class="note">Sending a test opens an alert and resolves it straight away, which can notify whoever is on call.</p>
+  </details>
+
+  <fieldset class="for-custom_webhook">
+    <legend>Request</legend>
+    <label>Method
+      <select name="request_method">
+        {% for method in methods %}
+        <option value="{{ method }}"{% if channel.request_method == method %} selected{% endif %}>{{ method }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Content type
+      <input type="text" name="request_content_type" value="{{ channel.request_content_type }}" spellcheck="false" autocomplete="off" maxlength="255">
+      <small>For JSON, such as <code>application/json</code>, whatever is filled in is escaped to fit inside a JSON string, and the body has to come out as valid JSON.</small>
+    </label>
+    <label>Headers
+      <textarea name="headers" rows="3" spellcheck="false" autocomplete="off"{% if channel.header_names %} placeholder="Saved"{% else %} placeholder="Authorization: Bearer abc123"{% endif %}>{{ channel.headers }}</textarea>
+      <small>{% if channel.header_names %}Saved: {{ channel.header_names | join(sep=", ") }}. Leave empty to keep them, as their values aren't shown, or type them all again to replace them.{% else %}Optional, one to a line, as <code>Name: value</code>. Like the URL, they're never shown again, as they usually hold a token.{% endif %}</small>
+    </label>
+    {% if channel.header_names %}
+    <label class="checkbox">
+      <input type="checkbox" name="remove_headers"{% if channel.remove_headers %} checked{% endif %}> Remove the saved headers
+    </label>
+    {% endif %}
+    <label>Body
+      <textarea name="request_body" rows="12" spellcheck="false" maxlength="16384">{{ channel.request_body }}</textarea>
+      <small>A template, filled in for each notification. Put a value in with <code>{{ "{{" }} alert.hostname {{ "}}" }}</code>, and use <code>| json</code> for a whole value with its quotes, or <code>null</code> when it's missing. See <a href="/docs/notifications#custom-webhooks">Custom webhooks</a> for everything it can use.</small>
+    </label>
+    <details>
+      <summary>What a template can use</summary>
+      <dl class="variables">
+        <dt><code>event</code></dt><dd><code>firing</code>, <code>escalated</code>, <code>eased</code>, <code>reminder</code>, <code>resolved</code> or <code>test</code></dd>
+        <dt><code>text</code></dt><dd>The notification in one line, like <q>Resolved: CPU usage on web-1 is 97%, above 90%</q></dd>
+        <dt><code>id</code></dt><dd>The same for every attempt at one notification, so a repeat can be spotted</dd>
+        <dt><code>link</code></dt><dd>The alerts page, if the server knows its own address</dd>
+        <dt><code>alert.rule_name</code>, <code>alert.hostname</code>, <code>alert.severity</code></dt><dd>The rule, the host, and <code>warning</code> or <code>critical</code></dd>
+        <dt><code>alert.summary</code>, <code>alert.value</code>, <code>alert.series</code></dt><dd>What's wrong, the reading that started it, and which disk or container, if it's about one</dd>
+        <dt><code>alert.id</code>, <code>alert.host_id</code></dt><dd>For a receiver that needs to match the alert up later</dd>
+        <dt><code>alert.started</code>, <code>alert.resolved</code></dt><dd>Times like <code>2026-11-10T14:03:00Z</code>, with <code>_ms</code> versions in milliseconds</dd>
+        <dt><code>alert.acknowledged_by</code></dt><dd>Who acknowledged it, if anyone</dd>
+      </dl>
+      <p class="note">A test fills in an example alert on <code>maxnines-test</code>, with the event <code>test</code>.</p>
+    </details>
+    <div class="actions">
+      <button type="submit" name="form_action" value="preview" class="secondary" formnovalidate formaction="{% if id %}/alerts/channels/{{ id }}{% else %}/alerts/channels{% endif %}#body-preview" hx-post="{% if id %}/alerts/channels/{{ id }}{% else %}/alerts/channels{% endif %}" hx-target="#body-preview" hx-select="#body-preview" hx-swap="morph:outerHTML">Preview the body</button>
+    </div>
+    <section id="body-preview" class="body-preview" aria-live="polite">
+      {% if preview %}
+      <h2>Preview</h2>
+      {% if preview.error %}<p class="error">{{ preview.error }}</p>{% else %}<p class="hint">What an example alert starting would send, as {{ preview.method }} with <code>{{ preview.content_type }}</code>. Nothing has been saved or sent.</p>{% endif %}
+      {% if preview.body %}<pre>{{ preview.body }}</pre>{% endif %}
+      {% endif %}
+    </section>
+  </fieldset>
+
+  <details class="for-resend setup"{% if not channel.has_credential %} open{% endif %}>
+    <summary>How to set up Resend</summary>
+    <ol>
+      <li>In Resend, open <strong>Domains</strong>, choose <strong>Add Domain</strong>, and add the DNS records it lists until the domain shows as <strong>Verified</strong>.</li>
+      <li>Open <strong>API Keys</strong> and choose <strong>Create API Key</strong>. Give it <strong>Sending access</strong>, just for that domain, and copy the key into the API key box below. It starts with <code>re_</code>.</li>
+      <li>Put an address on that domain in the From box, like <code>MaxNines &lt;alerts@example.com&gt;</code>.</li>
+    </ol>
+  </details>
+
+  <label class="for-mail">From
+    <input type="text" name="mail_from" value="{{ channel.mail_from }}" spellcheck="false" autocomplete="off" maxlength="320" placeholder="MaxNines &lt;alerts@example.com&gt;">
+    <small><span class="for-email">Who the email comes from. The mail server may only accept addresses it sends for.</span><span class="for-resend">An address on a domain verified in Resend.</span></small>
+  </label>
+
+  <fieldset class="for-email">
+    <legend>Mail server</legend>
+    <label>Hostname
+      <input type="text" name="mail_hostname" value="{{ channel.mail_hostname }}" spellcheck="false" autocomplete="off" maxlength="253" placeholder="smtp.example.com">
+    </label>
+    <label>Security
+      <select name="mail_security">
+        {% for security in securities %}
+        <option value="{{ security }}"{% if channel.mail_security == security %} selected{% endif %}>{% if security == "starttls" %}STARTTLS, usually port 587{% elif security == "tls" %}TLS, usually port 465{% else %}None, for a relay on a trusted network{% endif %}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Port
+      <input type="text" name="mail_port" value="{{ channel.mail_port }}" inputmode="numeric" autocomplete="off" maxlength="5">
+      <small>Leave empty for the usual port for the security chosen.</small>
+    </label>
+    <label>Username
+      <input type="text" name="mail_username" value="{{ channel.mail_username }}" spellcheck="false" autocomplete="off" maxlength="255">
+      <small>Leave empty for a server that doesn't ask anyone to sign in. Clearing it removes the saved password too.</small>
+    </label>
+  </fieldset>
+
+  <label class="for-token"><span class="for-bot">Bot token</span><span class="for-email">Password</span><span class="for-resend">API key</span>
+    <input type="password" name="credential" autocomplete="off" spellcheck="false"{% if channel.has_credential %} placeholder="Saved"{% endif %}>
+    <small>{% if channel.has_credential %}Leave empty to keep what's saved, which isn't shown.{% else %}<span class="for-email">The mail server's password for the username above.</span><span class="for-resend">From <strong>API Keys</strong> in Resend.</span><span class="for-slack">From <strong>OAuth &amp; Permissions</strong> in the Slack app, once it's installed. It starts with <code>xoxb-</code>.</span><span class="for-telegram">BotFather gives it out, as a number, a colon, then a long code.</span>{% endif %}</small>
+  </label>
+
+  <label class="for-slack">App-level token, for buttons
+    <input type="password" name="app_token" autocomplete="off" spellcheck="false"{% if channel.has_app_token %} placeholder="Saved"{% endif %}>
+    <small>{% if channel.has_app_token %}Leave empty to keep the saved token, which isn't shown.{% else %}Optional. From <strong>Basic Information</strong>, then <strong>App-Level Tokens</strong>, in the Slack app. It starts with <code>xapp-</code>.{% endif %}</small>
+  </label>
+  {% if channel.has_app_token %}
+  <label class="checkbox for-slack">
+    <input type="checkbox" name="remove_app_token"> Remove the app-level token, so alerts have no buttons
+  </label>
+  {% endif %}
+
+  <details class="for-telegram">
+    <summary>How to set up a Telegram bot</summary>
+    <ol>
+      <li>In Telegram, message <a href="https://t.me/BotFather">@BotFather</a>, send <code>/newbot</code>, and follow its steps. Copy the token it gives you into the box above.</li>
+      <li>Add the bot to the group that should get alerts, or send the bot a message yourself for alerts in a private chat. For a channel, make the bot an admin that can post.</li>
+      <li>To find the chat ID, open <code>https://api.telegram.org/bot</code> followed by the token and <code>/getUpdates</code> in a browser, and look for <code>"chat":{"id":</code>. Group IDs start with a minus sign. A public channel can use its <code>@username</code> instead.</li>
+    </ol>
+    <p class="note">When an alert resolves, the message replies to the one that said it started.</p>
+  </details>
+
+
+  <fieldset>
+    <legend>Alerts to send</legend>
+    <label class="checkbox">
+      <input type="checkbox" name="sends_warnings"{% if channel.sends_warnings %} checked{% endif %}> Warnings
+    </label>
+    <label class="checkbox">
+      <input type="checkbox" name="sends_critical"{% if channel.sends_critical %} checked{% endif %}> Critical alerts
+    </label>
+    <small class="hint">Leave warnings off to keep them off a pager. The channel hears of an alert once it reaches one of these, then of every change until it resolves.</small>
+  </fieldset>
+
+  <div class="actions">
+    {% if can_edit %}<button type="submit">Save channel</button>{% else %}<span class="note">Your role lets you look at this, but not change it.</span>{% endif %}
+    <a class="button secondary" href="/alerts/channels">Cancel</a>
+  </div>
+</form>
+
+{% if id and can_edit %}
+<form method="post" action="/alerts/channels/{{ id }}/delete" class="delete-form">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  <button type="submit" class="danger">Delete</button>
+</form>
+{% endif %}
+{% endblock content %}

@@ -1,0 +1,86 @@
+{% extends "layouts/live.html" %}
+{% block title %}Overview · MaxNines{% endblock title %}
+{% block content %}
+<div>
+  <p class="eyebrow">Fleet status</p>
+  {% if problem_count == 0 %}
+  <h1>All clear</h1>
+  <p class="subtitle">No alerts are open.</p>
+  {% else %}
+  <h1>{{ problem_count }} problem{% if problem_count != 1 %}s{% endif %} need{% if problem_count == 1 %}s{% endif %} attention</h1>
+  {% endif %}
+</div>
+
+<section class="stats" aria-label="At a glance">
+  <a class="stats-cell" href="/hosts">
+    <span class="label">Hosts online</span>
+    <span class="stats-value{% if online_count < host_count %} warn{% endif %}">{{ online_count }} / {{ host_count }}</span>
+    <span class="stats-note">{% if online_count < host_count %}{{ host_count - online_count }} offline{% elif host_count > 0 %}All online{% else %}None yet{% endif %}</span>
+  </a>
+  <a class="stats-cell" href="/alerts">
+    <span class="label">Open alerts</span>
+    <span class="stats-value{% if critical_count > 0 %} bad{% elif problem_count > 0 %} warn{% endif %}">{{ problem_count }}</span>
+    <span class="stats-note">{% if critical_count > 0 %}{{ critical_count }} critical{% elif problem_count > 0 %}Warnings only{% else %}None open{% endif %}</span>
+  </a>
+  <a class="stats-cell" href="/checks">
+    <span class="label">Checks up</span>
+    <span class="stats-value{% if checks_down > 0 %} bad{% endif %}">{{ checks_up }} / {{ check_count }}</span>
+    <span class="stats-note">{% if checks_down > 0 %}{{ checks_down }} down{% elif check_count == 0 %}None yet{% elif checks_up < check_count %}Waiting for results{% else %}All up{% endif %}</span>
+  </a>
+  <a class="stats-cell" href="/server">
+    <span class="label">Samples saved</span>
+    <span class="stats-value">{{ samples_written }}</span>
+    <span class="stats-note">Since the server started</span>
+  </a>
+</section>
+
+{% if problems %}
+<section class="card">
+  {% for problem in problems %}
+  <div class="problem">
+    {% if problem.critical %}<span class="badge bad">Critical</span>{% else %}<span class="badge warn">Warning</span>{% endif %}
+    {% if problem.host_id != "fleet" %}{% set os_family = problem.os_family %}<a class="host-name problem-host" href="/hosts/{{ problem.host_id }}/metrics"{% if problem.short_id %} title="Host {{ problem.short_id }}"{% endif %}>{% include "hosts/_os_icon.html" %}{{ problem.hostname }}</a>{% else %}<span class="problem-host">{{ problem.hostname }}</span>{% endif %}
+    <span class="text">{{ problem.summary }}</span>
+    <a class="button secondary" href="/alerts">View</a>
+  </div>
+  {% endfor %}
+</section>
+{% endif %}
+
+{% if waiting > 0 %}
+<p class="notice"><a href="/hosts">{{ waiting }} host{% if waiting != 1 %}s are{% else %} is{% endif %} waiting for approval.</a></p>
+{% endif %}
+
+<section>
+  <div class="section-title"><h2>Hosts</h2><a href="/hosts">All {{ host_count }} host{% if host_count != 1 %}s{% endif %}</a></div>
+  {% if hosts %}
+  <div class="wall">
+    {% for host in hosts %}
+    <a class="tile{% if host.health == "critical" %} critical{% elif host.health == "warning" %} alert{% elif host.health == "offline" %} gone{% endif %}" href="/hosts/{{ host.id }}/metrics">
+      {% set os_family = host.os_family %}{% set health_dot_only = true %}<span class="tile-head"><span class="host-name">{% include "hosts/_os_icon.html" %}{{ host.hostname }}</span> {% include "hosts/_health.html" %}</span>
+      <span class="host-id">{{ host.short_id }}</span>
+      {% if host.online %}{% include "hosts/_meters.html" %}{% else %}<span class="note">{% if host.updated %}Last sample {{ host.updated }}{% else %}No recent data{% endif %}</span>{% endif %}
+    </a>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="empty">There are no approved hosts yet.</p>
+  {% endif %}
+</section>
+
+<section>
+  <div class="section-title"><h2>Checks</h2><a href="/checks">All {{ check_count }} check{% if check_count != 1 %}s{% endif %}</a></div>
+  {% if checks %}
+  <div class="wall">
+    {% for check in checks %}
+    <a class="tile" href="/checks">
+      <span class="tile-head">{{ check.name }} {% if not check.latest %}<span class="badge neutral">Waiting</span>{% elif check.latest.up %}<span class="badge good">Up</span>{% else %}<span class="badge bad">Down</span>{% endif %}</span>
+      {% if check.latest %}<span class="stat"><span class="big">{% if check.latest.response %}{{ check.latest.response }}{% else %}–{% endif %}</span><span>{% if check.latest.error %}{{ check.latest.error }}{% elif check.latest.cert_days_left is defined and check.latest.cert_days_left is not none %}Certificate: {{ check.latest.cert_days_left }} days{% else %}{{ check.latest.kind }}{% endif %}</span></span>{% endif %}
+    </a>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="empty">There are no checks yet.{% if can_edit %} <a href="/checks/new">Add one</a>.{% endif %}</p>
+  {% endif %}
+</section>
+{% endblock content %}

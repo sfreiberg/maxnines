@@ -1,0 +1,107 @@
+{% extends "layouts/application.html" %}
+{% block title %}Profile · MaxNines{% endblock title %}
+{% block main_class %} class="narrow"{% endblock main_class %}
+{% block content %}
+<div class="title-row">
+  <div>
+    <p class="eyebrow">{{ person.email }}</p>
+    <h1>{{ person.name }}</h1>
+  </div>
+  <form method="post" action="/logout">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <button type="submit" class="secondary">Sign out</button>
+  </form>
+</div>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+{% if saved %}<p class="notice">Your password has been changed, and you've been signed out everywhere else.</p>{% endif %}
+
+<section class="card">
+  <h2>Theme</h2>
+  <form method="post" action="/profile/theme" class="theme-choices">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    {% for choice in themes %}
+    <button type="submit" name="theme" value="{{ choice.value }}" class="theme-choice" aria-pressed="{% if choice.chosen %}true{% else %}false{% endif %}">
+      {% if choice.value == "system" %}<span class="swatch"><span data-theme="carbon"></span><span data-theme="paper"></span></span>{% else %}<span class="swatch" data-theme="{{ choice.value }}"></span>{% endif %}
+      {{ choice.label }}
+    </button>
+    {% endfor %}
+  </form>
+</section>
+
+<section class="card">
+  <h2>Time zone</h2>
+  <form method="post" action="/profile/time-zone" class="stacked">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <label>Show times in
+      <input type="text" name="time_zone" value="{{ person.time_zone }}" list="time-zones" required spellcheck="false" autocomplete="off">
+      <datalist id="time-zones">
+        {% for zone in zones %}<option value="{{ zone }}"></option>{% endfor %}
+      </datalist>
+      <small>A name like Europe/London or America/New_York. The API and alert messages stay in UTC.</small>
+    </label>
+    <div class="actions"><button type="submit">Save time zone</button></div>
+  </form>
+</section>
+
+{% if person.has_password %}
+<section class="card" id="two-factor" hx-target="this" hx-select="#two-factor" hx-swap="morph:outerHTML">
+  <h2>Two-factor sign-in</h2>
+  {% if two_factor_error %}<p class="error">{{ two_factor_error }}</p>{% endif %}
+  {% if new_codes %}
+  <div class="recovery">
+    <p><strong>Your recovery codes.</strong> Keep these somewhere safe, away from your phone. Each one signs you in once if you can't use your authenticator app. They can't be shown again, and they replace any you had before.</p>
+    <ul class="recovery-codes">
+      {% for code in new_codes %}<li><code>{{ code }}</code></li>{% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+  {% if two_factor.on %}
+  <p><span class="badge good">On</span> Signing in takes your password and a code from your authenticator app. You have {{ two_factor.codes_left }} recovery code{{ two_factor.codes_left | pluralize }} left.</p>
+  <form method="post" action="/profile/two-factor/codes" hx-post="/profile/two-factor/codes" class="stacked">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <input type="text" name="username" value="{{ person.email }}" autocomplete="username" hidden>
+    <label>Current password <input type="password" name="current" autocomplete="current-password" required></label>
+    <div class="actions">
+      <button type="submit" class="secondary">New recovery codes</button>
+      {% if not two_factor.required %}<button type="submit" class="danger" formaction="/profile/two-factor/off" hx-post="/profile/two-factor/off">Turn off two-factor</button>{% endif %}
+    </div>
+    {% if two_factor.required %}<small class="hint">An admin has made two-factor required for everyone, so it can't be turned off.</small>{% endif %}
+  </form>
+  {% elif two_factor.pending_secret %}
+  <ol class="setup">
+    <li>Scan this with an authenticator app, such as Authy, Google Authenticator or 1Password.
+      <p><img class="qr" src="/profile/two-factor/qr.png" width="220" height="220" alt="QR code for your authenticator app"></p>
+      <p class="hint">Can't scan it? Type this into the app instead: <code class="secret">{{ two_factor.pending_secret }}</code></p>
+    </li>
+    <li>Type the six-digit code the app shows, to check it works.
+      <form method="post" action="/profile/two-factor/confirm" hx-post="/profile/two-factor/confirm" class="stacked">
+        <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+        <label>Code <input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="7" required></label>
+        <div class="actions"><button type="submit">Turn on two-factor</button></div>
+      </form>
+    </li>
+  </ol>
+  {% else %}
+  {% if two_factor.required %}<p class="notice">An admin has made two-factor required for everyone. Set it up here to use the rest of MaxNines.</p>{% endif %}
+  <p class="hint">Adds a second step when you sign in: a six-digit code from an authenticator app on your phone, such as Authy.</p>
+  <form method="post" action="/profile/two-factor/start" hx-post="/profile/two-factor/start">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <button type="submit">Set up two-factor</button>
+  </form>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>Password</h2>
+  <form method="post" action="/profile/password" class="stacked">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <input type="text" name="username" value="{{ person.email }}" autocomplete="username" hidden>
+    <label>Current password <input type="password" name="current" autocomplete="current-password" required></label>
+    <label>New password <input type="password" name="password" autocomplete="new-password" minlength="12" required><small>At least 12 characters. A few random words work well.</small></label>
+    <label>Confirm new password <input type="password" name="confirm" autocomplete="new-password" required></label>
+    <div class="actions"><button type="submit">Change password</button></div>
+  </form>
+</section>
+{% endif %}
+{% endblock content %}

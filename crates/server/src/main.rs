@@ -1,0 +1,373 @@
+mod actions;
+mod agent_versions;
+mod alert_charts;
+mod alert_evaluator;
+mod alerting;
+mod app_state;
+mod audit;
+mod calculations;
+mod channels;
+mod cli;
+mod clock;
+mod condition_builder;
+mod config;
+mod controllers;
+mod csrf;
+mod dashboard_variables;
+mod dashboards;
+mod docs;
+mod events;
+mod fact_history;
+mod facts;
+mod host_filter;
+mod locations;
+mod maintenance;
+mod metric_charts;
+mod metrics;
+mod metrics_pages;
+mod migrations;
+mod models;
+mod notifier;
+mod passwords;
+mod places;
+mod presence;
+mod registration;
+mod remote_checks;
+mod roles;
+mod rule_engine;
+mod rule_preview;
+mod server_stats;
+mod silences;
+mod slack_actions;
+mod store;
+mod times;
+mod tls;
+mod two_factor;
+mod views;
+
+#[cfg(test)]
+mod tests;
+
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use tokio::net::TcpListener;
+use tokio::sync::watch;
+use tracing::info;
+
+use alert_evaluator::Evaluator;
+use app_state::{AppState, Heartbeat};
+use config::Config;
+use maxnines_protocol::logging;
+#[cfg(windows)]
+use maxnines_protocol::service::{self, Service, ServiceCommand};
+use maxnines_protocol::stopping::StopSignal;
+use metrics::{Metrics, now_ms};
+use models::Database;
+use notifier::{Notifier, Senders, web_url};
+use presence::Presence;
+use registration::{Registry, Rules};
+use remote_checks::{LOCAL_HOST_ID, LatestResults, Scheduler};
+use server_stats::ServerStatus;
+use store::WriterCommand;
+use views::Views;
+
+#[cfg(windows)]
+static SERVICE: Service = Service {
+    name: "MaxNinesServer",
+    display_name: "MaxNines Server",
+    description: "Receives and stores metrics from MaxNines agents.",
+    log_name: "server",
+};
+
+#[derive(Debug, Parser)]
+#[command(version, about = "Receives and stores metrics from MaxNines agents")]
+struct Cli {
+    /// Path to the config file
+    #[arg(short, long, global = true, default_value = "server.hcl")]
+    config: PathBuf,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, PartialEq, Subcommand)]
+enum Command {
+    /// Run the server (the default)
+    Run,
+    /// Manage registered hosts on the running server, with MAXNINES_API_KEY set
+    #[command(subcommand)]
+    Hosts(HostsCommand),
+    /// Manage keys for the API, in the main database
+    #[command(subcommand)]
+    ApiKeys(ApiKeysCommand),
+    /// Manage who can sign in, in the main database
+    #[command(subcommand)]
+    Users(UsersCommand),
+    /// Print this server's version, and exactly which build it is
+    Version,
+    /// Run the server as a Windows service
+    #[cfg(windows)]
+    #[command(subcommand)]
+    Service(ServiceCommand),
+}
+
+#[derive(Debug, PartialEq, Subcommand)]
+enum UsersCommand {
+    /// List everyone who can sign in
+    List,
+    /// Add someone and print the link for them to set a password
+    Create {
+        email: String,
+        name: String,
+        /// What they may do: viewer, responder, editor or admin
+        #[arg(long, default_value = "admin", value_parser = roles::Role::parse)]
+        role: roles::Role,
+    },
+    /// Change what someone may do: viewer, responder, editor or admin
+    Role {
+        id: i64,
+        #[arg(value_parser = roles::Role::parse)]
+        role: roles::Role,
+    },
+    /// Turn off someone's two-factor sign-in, as when they've lost their phone
+    ResetTwoFactor { id: i64 },
+    /// Print a new link for someone to set a password, as when they've forgotten it
+    SetupLink { id: i64 },
+    /// Stop someone signing in, and sign them out
+    Disable { id: i64 },
+    /// Let someone sign in again
+    Enable { id: i64 },
+    /// Remove someone who's been disabled
+    Delete { id: i64 },
+}
+
+#[derive(Debug, PartialEq, Subcommand)]
+enum ApiKeysCommand {
+    /// List keys, without the keys themselves
+    List,
+    /// Make a key and print it, which is the only time it can be seen
+    Create {
+        name: String,
+        /// The email address of the user the key acts as
+        #[arg(long, value_name = "EMAIL")]
+        user: String,
+        /// The most the key can do: viewer, responder, editor or admin. Without this
+        /// it's the user's own role. Give it the least that does the job, like editor
+        /// for a tool that manages rules, as an admin key can add users
+        #[arg(long, value_parser = roles::Role::parse)]
+        role: Option<roles::Role>,
+        /// How long it lasts, like 1h or 30d. Without this it never expires
+        #[arg(long, value_name = "TIME", value_parser = humantime::parse_duration)]
+        expires_in: Option<std::time::Duration>,
+    },
+    /// Stop a key working
+    Revoke { id: i64 },
+}
+
+#[derive(Debug, PartialEq, Subcommand)]
+enum HostsCommand {
+    /// List hosts and their status
+    List,
+    /// Show what is known about a host
+    Facts {
+        id: String,
+        /// Show every change instead of the current facts
+        #[arg(long)]
+        history: bool,
+    },
+    /// Approve a host, so its agent can connect
+    Approve { id: String },
+    /// Revoke a host, so its agent can no longer connect, and drop it if it is
+    Revoke { id: String },
+    /// Delete a revoked host with its metrics, facts and alerts, for good
+    Delete { id: String },
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command.unwrap_or(Command::Run) {
+        Command::Run => {
+            logging::to_stderr();
+            serve(&cli.config)
+        }
+        #[cfg(windows)]
+        Command::Service(ServiceCommand::Install) => {
+            Config::load(&cli.config)?;
+            service::install(&SERVICE, &cli.config)
+        }
+        #[cfg(windows)]
+        Command::Service(ServiceCommand::Uninstall) => service::uninstall(&SERVICE),
+        #[cfg(windows)]
+        Command::Service(ServiceCommand::Run) => {
+            service::run(&SERVICE, &cli.config, |path| serve(&path))
+        }
+        Command::Version => {
+            let build = maxnines_protocol::build_info!();
+            println!("{}", build.describe(env!("CARGO_PKG_NAME")));
+            Ok(())
+        }
+        Command::Users(command) => {
+            let config = Config::load(&cli.config)?;
+            match command {
+                UsersCommand::List => cli::print_users(&config),
+                UsersCommand::Create { email, name, role } => {
+                    cli::create_user(&config, &email, &name, role)
+                }
+                UsersCommand::Role { id, role } => cli::set_role(&config, id, role),
+                UsersCommand::ResetTwoFactor { id } => cli::reset_two_factor(&config, id),
+                UsersCommand::SetupLink { id } => cli::print_setup_link(&config, id),
+                UsersCommand::Disable { id } => cli::change_user(&config, id, "disable"),
+                UsersCommand::Enable { id } => cli::change_user(&config, id, "enable"),
+                UsersCommand::Delete { id } => cli::delete_user(&config, id),
+            }
+        }
+        Command::ApiKeys(command) => {
+            let config = Config::load(&cli.config)?;
+            match command {
+                ApiKeysCommand::List => cli::print_api_keys(&config),
+                ApiKeysCommand::Create {
+                    name,
+                    user,
+                    role,
+                    expires_in,
+                } => cli::create_api_key(&config, &name, &user, role, expires_in),
+                ApiKeysCommand::Revoke { id } => cli::revoke_api_key(&config, id),
+            }
+        }
+        Command::Hosts(command) => {
+            let config = Config::load(&cli.config)?;
+            match command {
+                HostsCommand::List => cli::print_hosts(&config),
+                HostsCommand::Facts { id, history: false } => cli::print_facts(&config, &id),
+                HostsCommand::Facts { id, history: true } => cli::print_facts_history(&config, &id),
+                HostsCommand::Approve { id } => cli::change_host(&config, &id, "approve"),
+                HostsCommand::Revoke { id } => cli::change_host(&config, &id, "revoke"),
+                HostsCommand::Delete { id } => cli::delete_host(&config, &id),
+            }
+        }
+    }
+}
+
+#[tokio::main]
+async fn serve(path: &Path) -> Result<()> {
+    let config = Config::load(path)?;
+    let rules = Rules::compile(&config.registration)?;
+
+    let database = Database::connect(&config.database.resolve_url()?).await?;
+    let secure_site = config.audience().starts_with("wss://");
+    let csrf = csrf::config(&database, secure_site).await?;
+    let hosts = database.load_hosts().await.context("loading hosts")?;
+    let store = store::open(&config.metrics, config.retention)?;
+    let metrics = Metrics::new(store.reader()?);
+    let status = Arc::new(ServerStatus::new(
+        config.metrics.path().map(Path::to_path_buf),
+    )?);
+    let (writer, writer_thread) = store::spawn_writer(store, status.writes.clone());
+
+    let require_two_factor = database.two_factor_required().await?;
+    let state = AppState {
+        presence: Arc::new(Presence::default()),
+        registry: Arc::new(Registry::new(
+            hosts,
+            rules,
+            config.registration.max_pending,
+            database.clone(),
+        )),
+        actions: actions::Actions::new(database.clone()),
+        database,
+        config_changes: Arc::new(watch::Sender::new(0)),
+        writer: writer.clone(),
+        metrics,
+        senders: Senders::new(web_url(config.audience())),
+        check_results: Arc::new(LatestResults::default()),
+        page_reads: Arc::default(),
+        status,
+        heartbeat: Heartbeat {
+            interval: Duration::from_secs(config.heartbeat_interval_secs),
+            timeout: Duration::from_secs(config.heartbeat_timeout_secs),
+            clock_every: clock::ASK_EVERY,
+        },
+        audience: config.audience().into(),
+        trusted_proxies: config.trusted_networks()?.into(),
+        views: Arc::new(Views::load()?),
+        csrf,
+        web_url: web_url(config.audience()).unwrap_or_default().into(),
+        sign_ins: Arc::default(),
+        require_two_factor: Arc::new(require_two_factor.into()),
+    };
+
+    let listener = TcpListener::bind(config.listen)
+        .await
+        .with_context(|| format!("listening on {}", config.listen))?;
+    info!(
+        config = %path.display(),
+        listen = %config.listen,
+        public_url = %state.audience,
+        "server started"
+    );
+
+    Evaluator::new(
+        state.database.clone(),
+        state.registry.clone(),
+        state.presence.clone(),
+        state.metrics.clone(),
+        state.status.clone(),
+        state.actions.clone(),
+        now_ms(),
+    )
+    .spawn();
+    Notifier::new(state.database.clone(), state.senders.clone())
+        .with_charts(alert_charts::ChartSources {
+            database: state.database.clone(),
+            registry: state.registry.clone(),
+            metrics: state.metrics.clone(),
+        })
+        .spawn();
+    slack_actions::spawn(state.database.clone(), state.senders.web_url.clone());
+    Scheduler::new(
+        state.database.clone(),
+        state.writer.clone(),
+        state.registry.clone(),
+        state.presence.clone(),
+        state.check_results.clone(),
+    )
+    .spawn();
+    metrics_pages::Scheduler::new(
+        state.database.clone(),
+        state.writer.clone(),
+        state.registry.clone(),
+        state.presence.clone(),
+        state.page_reads.clone(),
+    )
+    .spawn();
+    server_stats::spawn_recorder(state.clone());
+    // The server is always online to itself, so nothing reads it as missing.
+    state
+        .presence
+        .connected(LOCAL_HOST_ID, IpAddr::from([127, 0, 0, 1]));
+
+    let mut stop = StopSignal::listen().context("listening for being asked to stop")?;
+    let service = controllers::app(state).into_make_service_with_connect_info::<SocketAddr>();
+    let serving = async {
+        match &config.tls {
+            Some(tls) => tls::serve(listener, tls, service).await,
+            None => Ok(axum::serve(listener, service).await?),
+        }
+    };
+    tokio::select! {
+        result = serving => result?,
+        result = stop.wait() => result?,
+    }
+
+    info!("shutting down");
+    writer.send(WriterCommand::Stop).await?;
+    tokio::task::spawn_blocking(move || writer_thread.join())
+        .await?
+        .ok();
+    Ok(())
+}

@@ -1,0 +1,215 @@
+/* Every colour on the site, one block per theme. Carbon is the default. The page
+   carries data-theme, and so does each swatch on the profile page, to show its own
+   theme's colours. Add a theme here and to THEMES in models/users.rs. A test checks
+   that each one is readable. */
+
+:root,
+[data-theme="carbon"] {
+  color-scheme: dark;
+  --background: #08090b;
+  --surface: #0f1114;
+  --sunken: #0a0b0e;
+  --raised: #1b1e24;
+  --text: #f3f5f4;
+  --muted: #9ea5ab;
+  --border: #1e2227;
+  --border-strong: #30353c;
+  --accent: #6fdc8c;
+  --accent-hover: #8ce8a4;
+  --accent-text: #06200f;
+  --accent-surface: #12291a;
+  --accent-ink: #8ce8a4;
+  --meter: #6fdc8c;
+  --meter-hot: #f0b64e;
+  --track: #22262c;
+  --good: #6fdc8c;
+  --good-surface: #102a1a;
+  --bad: #ff7b7d;
+  --bad-surface: #33161a;
+  --bad-text: #2b0507;
+  --warn: #f0b64e;
+  --warn-surface: #2f2310;
+  --neutral-surface: #1b1e24;
+  --grid: #1a1d22;
+  --code-comment: #8b949b;
+  --code-keyword: #ff9a7a;
+  --code-string: #8ce8a4;
+  --code-number: #f0b64e;
+  --code-name: #82b7ff;
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --series-4: #c98500;
+  --series-5: #d55181;
+  --series-6: #008300;
+  --series-7: #9085e9;
+  --series-8: #e66767;
+}
+
+[data-theme="midnight"] {
+  color-scheme: dark;
+  --background: #070b14;
+  --surface: #0d1322;
+  --sunken: #090e1a;
+  --raised: #1a2338;
+  --text: #eef2fb;
+  --muted: #a2aec7;
+  --border: #1c2639;
+  --border-strong: #2f3d58;
+  --accent: #6ea8ff;
+  --accent-hover: #93bfff;
+  --accent-text: #06142e;
+  --accent-surface: #12244a;
+  --accent-ink: #a3c6ff;
+  --meter: #6ea8ff;
+  --meter-hot: #f2bd5b;
+  --track: #1f2a40;
+  --good: #5fdca0;
+  --good-surface: #0e2c25;
+  --bad: #ff8585;
+  --bad-surface: #351823;
+  --bad-text: #2b0507;
+  --warn: #f2bd5b;
+  --warn-surface: #30270f;
+  --neutral-surface: #1a2338;
+  --grid: #18213a;
+  --code-comment: #8d9ab4;
+  --code-keyword: #ff9f85;
+  --code-string: #8fe3b0;
+  --code-number: #f2bd5b;
+  --code-name: #93bfff;
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --series-4: #c98500;
+  --series-5: #d55181;
+  --series-6: #008300;
+  --series-7: #9085e9;
+  --series-8: #e66767;
+}
+
+[data-theme="dusk"] {
+  color-scheme: dark;
+  --background: #0b0910;
+  --surface: #13101b;
+  --sunken: #0d0b13;
+  --raised: #231e30;
+  --text: #f3f0f9;
+  --muted: #aca4bd;
+  --border: #231e2e;
+  --border-strong: #3a3349;
+  --accent: #b79cff;
+  --accent-hover: #cdb9ff;
+  --accent-text: #1b0f3a;
+  --accent-surface: #251a42;
+  --accent-ink: #cdb9ff;
+  --meter: #b79cff;
+  --meter-hot: #f0b64e;
+  --track: #272233;
+  --good: #6fdc8c;
+  --good-surface: #122a1c;
+  --bad: #ff8596;
+  --bad-surface: #371724;
+  --bad-text: #2b0507;
+  --warn: #f0b64e;
+  --warn-surface: #2f2310;
+  --neutral-surface: #231e30;
+  --grid: #1f1a2a;
+  --code-comment: #988fab;
+  --code-keyword: #ff9fb0;
+  --code-string: #8fe3b0;
+  --code-number: #f0b64e;
+  --code-name: #cdb9ff;
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --series-4: #c98500;
+  --series-5: #d55181;
+  --series-6: #008300;
+  --series-7: #9085e9;
+  --series-8: #e66767;
+}
+
+[data-theme="paper"] {
+  color-scheme: light;
+  --background: #f4f3ef;
+  --surface: #fdfdfb;
+  --sunken: #eeede8;
+  --raised: #ffffff;
+  --text: #15181a;
+  --muted: #51585d;
+  --border: #e0dfd8;
+  --border-strong: #c9c8bf;
+  --accent: #12703c;
+  --accent-hover: #0c5a2f;
+  --accent-text: #ffffff;
+  --accent-surface: #dbf0e2;
+  --accent-ink: #0e5c31;
+  --meter: #1c8a4c;
+  --meter-hot: #b87a00;
+  --track: #e3e2db;
+  --good: #0b6b3f;
+  --good-surface: #d9f0e2;
+  --bad: #b3261e;
+  --bad-surface: #fbe4e1;
+  --bad-text: #ffffff;
+  --warn: #7a4e00;
+  --warn-surface: #fbedcf;
+  --neutral-surface: #e8e7e1;
+  --grid: #e8e7e1;
+  --code-comment: #5d6469;
+  --code-keyword: #a3361b;
+  --code-string: #0e5c31;
+  --code-number: #7a4e00;
+  --code-name: #1f5fae;
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+  --series-5: #e87ba4;
+  --series-6: #008300;
+  --series-7: #6250d6;
+  --series-8: #e34948;
+}
+
+[data-theme="contrast"] {
+  color-scheme: dark;
+  --background: #000000;
+  --surface: #000000;
+  --sunken: #0b0b0b;
+  --raised: #2b2b2b;
+  --text: #ffffff;
+  --muted: #dadada;
+  --border: #8a8a8a;
+  --border-strong: #c4c4c4;
+  --accent: #5fe3ff;
+  --accent-hover: #9aefff;
+  --accent-text: #000000;
+  --accent-surface: #00303c;
+  --accent-ink: #9aefff;
+  --meter: #5fe3ff;
+  --meter-hot: #ffd24d;
+  --track: #3a3a3a;
+  --good: #7dffa0;
+  --good-surface: #00300f;
+  --bad: #ff9c9c;
+  --bad-surface: #3d0000;
+  --bad-text: #000000;
+  --warn: #ffd24d;
+  --warn-surface: #332700;
+  --neutral-surface: #2b2b2b;
+  --grid: #333333;
+  --code-comment: #c8c8c8;
+  --code-keyword: #ffb08a;
+  --code-string: #7dffa0;
+  --code-number: #ffd24d;
+  --code-name: #9aefff;
+  --series-1: #6cb0ff;
+  --series-2: #ff9a5c;
+  --series-3: #3fe0a8;
+  --series-4: #ffd24d;
+  --series-5: #ff8fbd;
+  --series-6: #7dff6b;
+  --series-7: #b9aeff;
+  --series-8: #ff8585;
+}

@@ -1,0 +1,237 @@
+{% extends "layouts/live.html" %}
+{% block title %}{{ host.hostname }} · MaxNines{% endblock title %}
+{% block content %}
+<p class="breadcrumb"><a href="/hosts">Hosts</a></p>
+<div class="title-row">
+  <div>
+    <h1>{{ host.hostname }}</h1>
+    {% if os %}<p class="subtitle host-name">{% include "hosts/_os_icon.html" %}{{ os }}</p>{% endif %}
+  </div>
+  <div class="actions">
+    {% include "hosts/_version.html" %}
+    {% if host.agentless %}<span class="badge neutral">No agent</span>{% endif %}
+    {% include "hosts/_health.html" %}
+    <a class="button secondary" href="/hosts/{{ host.id }}/metrics">View metrics</a>
+    {% if host.agentless %}
+    {% if is_admin %}
+    <form method="post" action="/hosts/{{ host.id }}/delete">
+      <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+      <button type="submit" class="danger" title="Deletes this host with its pages, metrics and alerts, for good">Delete</button>
+    </form>
+    {% endif %}
+    {% else %}
+    <a class="button secondary" href="/hosts/{{ host.id }}/actions">Actions</a>
+    {% if can_edit %}
+    {% if host.state != "approved" %}
+    <form method="post" action="/hosts/{{ host.id }}/approve">
+      <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+      <button type="submit">Approve</button>
+    </form>
+    {% endif %}
+    {% if host.state != "revoked" %}
+    <form method="post" action="/hosts/{{ host.id }}/revoke">
+      <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+      <button type="submit" class="danger">Revoke</button>
+    </form>
+    {% elif is_admin %}
+    <form method="post" action="/hosts/{{ host.id }}/delete">
+      <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+      <button type="submit" class="danger" title="Deletes this host with its metrics, facts and alerts, for good">Delete</button>
+    </form>
+    {% endif %}
+    {% endif %}
+    {% endif %}
+  </div>
+</div>
+
+{% if alerts %}
+<section class="card">
+  {% for alert in alerts %}
+  <div class="problem">
+    {% if alert.severity == "critical" %}<span class="badge bad">Critical</span>{% else %}<span class="badge warn">Warning</span>{% endif %}
+    <span class="text">{{ alert.summary }}</span>
+    <a class="button secondary" href="/alerts">View</a>
+  </div>
+  {% endfor %}
+</section>
+{% endif %}
+
+{% if host.state == "approved" %}
+<section id="maintenance" class="card maintenance">
+  {% if maintenance %}
+  <div class="problem">
+    <span class="badge warn">Silenced</span>
+    <span class="text">Notifications about this host are held until {{ maintenance.until }}{% if maintenance.window %}, by the {{ maintenance.why }} maintenance window{% else %}: {{ maintenance.why }}{% if maintenance.by %}, started by {{ maintenance.by }}{% endif %}{% endif %}. Alerts still show here and on the Alerts page, and any still firing then are sent when it ends.</span>
+    {% if maintenance.just_this_one and can_respond %}
+    <form method="post" action="/hosts/{{ host.id }}/maintenance/end" hx-post="/hosts/{{ host.id }}/maintenance/end" hx-target="#maintenance" hx-select="#maintenance" hx-swap="morph:outerHTML">
+      <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+      <button type="submit" class="secondary">End now</button>
+    </form>
+    {% elif maintenance.window %}
+    <a class="button secondary" href="/alerts/maintenance">Maintenance windows</a>
+    {% else %}
+    <a class="button secondary" href="/alerts/silences">Silences</a>
+    {% endif %}
+  </div>
+  {% elif can_respond %}
+  <form method="post" action="/hosts/{{ host.id }}/maintenance" hx-post="/hosts/{{ host.id }}/maintenance" hx-target="#maintenance" hx-select="#maintenance" hx-swap="morph:outerHTML" class="maintenance-form">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <label>Silence this host for
+      <select name="duration_secs">
+        {% for choice in maintenance_choices %}
+        <option value="{{ choice.secs }}"{% if choice.chosen %} selected{% endif %}>{{ choice.label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Reason
+      <input type="text" name="reason" maxlength="255" placeholder="Maintenance on {{ host.hostname }}" autocomplete="off">
+    </label>
+    <button type="submit" class="secondary">Start maintenance</button>
+  </form>
+  <p class="hint">Holds back every notification about this host, such as while it's rebooted or upgraded. Alerts still show, and any still firing when it ends are sent then.</p>
+  {% endif %}
+</section>
+{% endif %}
+
+{% if host.agentless %}
+<section class="card">
+  <div class="title-row">
+    <h2>Metrics pages</h2>
+    {% if can_edit %}<a class="button secondary" href="/hosts/{{ host.id }}/pages/new">Add page</a>{% endif %}
+  </div>
+  {% if pages %}
+  <table>
+    <thead>
+    <tr><th>Page</th><th>Read</th><th>Signs in</th><th>Status</th><th></th></tr>
+    </thead>
+    <tbody>
+    {% for page in pages %}
+    <tr>
+      <td><strong>{{ page.name }}</strong><code class="under">{{ page.url }}</code></td>
+      <td class="nowrap">Every {{ page.interval_secs }} s<span class="under">{% if page.keeps %}{{ page.keeps }} metric name{{ page.keeps | pluralize }}{% else %}Every metric{% endif %}</span></td>
+      <td>{% if page.username %}As {{ page.username }}<span class="under">{% if page.password_env %}Password from <code>{{ page.password_env }}</code>{% else %}Password saved{% endif %}</span>{% else %}No{% endif %}</td>
+      <td>{% if not page.enabled %}<span class="badge neutral">Off</span>{% elif not page.read %}<span class="badge neutral">Not read yet</span>{% elif page.answered %}<span class="badge good">Answering</span>{% if page.dropped %}<span class="under">{{ page.dropped }} series over the limit</span>{% endif %}{% else %}<span class="badge bad">Not answering</span>{% if page.error %}<span class="under">{{ page.error }}</span>{% endif %}{% endif %}</td>
+      <td>
+        {% if can_edit %}
+        <div class="actions row-actions">
+          <a class="button secondary" href="/hosts/{{ host.id }}/pages/{{ page.id }}/edit">Edit</a>
+          <form method="post" action="/hosts/{{ host.id }}/pages/{{ page.id }}/delete">
+            <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+            <button type="submit" class="danger">Delete</button>
+          </form>
+        </div>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">Nothing is read for this host yet. Add an OpenMetrics page, and the server will read it and chart what it says.</p>
+  {% endif %}
+  <p class="hint">The server reads these itself, as this host has no agent. <a href="/docs/agentless-hosts">More about hosts without an agent</a></p>
+</section>
+
+<section class="card">
+  <div class="title-row">
+    <h2>Checks</h2>
+    {% if can_edit %}<a class="button secondary" href="/checks/new?host={{ host.id }}">Add check</a>{% endif %}
+  </div>
+  {% if checks %}
+  <table>
+    <thead>
+    <tr><th>Check</th><th>Run</th><th>Status</th></tr>
+    </thead>
+    <tbody>
+    {% for check in checks %}
+    <tr>
+      <td><a href="/checks/{{ check.id }}/edit"><strong>{{ check.name }}</strong></a><code class="under">{{ check.kind }} {{ check.target }}</code></td>
+      <td class="nowrap">Every {{ check.interval_secs }} s</td>
+      <td>{% if not check.enabled %}<span class="badge neutral">Disabled</span>{% elif not check.run %}<span class="badge neutral">Waiting</span>{% elif check.up %}<span class="badge good">Up</span>{% else %}<span class="badge bad">Down</span>{% if check.error %}<span class="under">{{ check.error }}</span>{% endif %}{% endif %}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">No checks are about this host yet. A check tries reaching it, as a website, a port, a certificate, a name or a ping.</p>
+  {% endif %}
+  <p class="hint">The host is online while any of its pages answers or any of its checks passes.</p>
+</section>
+{% endif %}
+
+<div class="split">
+  <section class="card">
+    <h2>Status</h2>
+    <dl class="summary">
+      <dt>Status</dt><dd>{% if host.agentless %}Added{% else %}{{ host.state }}{% endif %}{% if decided_by %} by {{ decided_by }}{% endif %}</dd>
+      <dt>Online</dt><dd>{% if host.online %}Yes{% else %}No{% endif %}{% if host.seen %}, seen {{ host.seen }}{% endif %}</dd>
+      {% if uptime %}<dt>Uptime</dt><dd>{{ uptime }}</dd>{% endif %}
+      {% if agent_uptime %}<dt>Agent uptime</dt><dd>{{ agent_uptime }}</dd>{% endif %}
+      {% if own_memory %}<dt>Agent memory</dt><dd>{{ own_memory }}</dd>{% endif %}
+      {% if host.state == "approved" %}<dt>Location</dt><dd>{% if location %}<a href="/map/rules/{{ location.rule_id }}/edit">{{ location.name }}</a>{% if location.place and location.place != location.name %}, {{ location.place }}{% endif %}{% if not location.just_this_one %} · <a href="/map/rules/new?host={{ host.id }}">Place it by itself</a>{% endif %}{% else %}Not on the map · <a href="/map/rules/new?host={{ host.id }}">Place it</a>{% endif %}</dd>{% endif %}
+      {% if source %}<dt>Connected from</dt><dd><code>{{ source }}</code></dd>{% endif %}
+      {% if host.version %}<dt>Agent version</dt><dd>{{ host.version }}{% if agent_commit %}, commit <code>{{ agent_commit }}</code>{% endif %}{% if host.version_state == "outdated" %}. The newest is {{ newest_agent_version }}.{% elif host.version_state == "newer_than_server" %}, newer than the server. Upgrade the server first.{% endif %}</dd>{% endif %}
+      <dt>Host ID</dt><dd><code>{{ host.id }}</code></dd>
+    </dl>
+  </section>
+
+  {% if host.agentless %}
+  <section class="card">
+    <h2>Name</h2>
+    {% if can_edit %}
+    <form method="post" action="/hosts/{{ host.id }}/rename" class="stacked">
+      <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+      <label>Name
+        <input type="text" name="hostname" value="{{ host.hostname }}" required maxlength="255" autocomplete="off" spellcheck="false">
+      </label>
+      <div class="actions"><button type="submit" class="secondary">Rename</button></div>
+    </form>
+    {% endif %}
+    <p class="hint">A host with an agent is called what its agent says. This one is called whatever you choose, and keeps its history when it's renamed.</p>
+  </section>
+  {% else %}
+  <section class="card">
+    <h2>Config</h2>
+    <p class="hint"><span class="badge {{ host.config.class }}">{{ host.config.label }}</span>
+      {% if matched_rules %}from {{ matched_rules | join(sep=", ") }}{% else %}No rules match this host.{% endif %}</p>
+    {% if reported and reported.error %}
+    <p class="error">The agent rejected its config: {{ reported.error }}</p>
+    {% endif %}
+    {% if skipped_collectors %}
+    <p class="notice">This agent can't run: {{ skipped_collectors | join(sep=", ") }}</p>
+    {% endif %}
+    <details>
+      <summary>Show the full config</summary>
+      <pre>{{ config }}</pre>
+    </details>
+  </section>
+  {% endif %}
+</div>
+
+{% if not host.agentless %}
+<section class="card">
+  <h2>Facts</h2>
+  {% if has_facts %}
+  <dl class="summary">
+    {% for fact in facts %}<dt>{{ fact.name }}</dt><dd{% if fact.exact %} title="{{ fact.exact }} bytes"{% endif %}>{{ fact.value }}</dd>{% endfor %}
+  </dl>
+  {% else %}
+  <p class="empty">This agent hasn't reported any facts yet.</p>
+  {% endif %}
+</section>
+{% endif %}
+
+{% if history %}
+<section class="card">
+  <h2>Fact history</h2>
+  <ul class="history">
+    {% for entry in history %}
+    <li>
+      <time>{{ entry.time }}</time>
+      <ul>{% for change in entry.changes %}<li><code>{{ change }}</code></li>{% endfor %}</ul>
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+{% endblock content %}

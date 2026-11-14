@@ -1,0 +1,14 @@
+<h2>Watched services</h2>
+<div class="tablebox"><table>
+  <thead>
+    <tr><th>Service</th><th>Status</th></tr>
+  </thead>
+  <tbody>
+    {% for service in services %}
+    <tr>
+      <td>{{ service.name }}</td>
+      <td>{% if service.running %}<span class="badge good">Running</span>{% else %}<span class="badge bad">Not running</span>{% endif %}{% if service.state %} <span class="note">{{ service.state }}</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table></div>

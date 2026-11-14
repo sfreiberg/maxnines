@@ -1,0 +1,11 @@
+<span class="meters">
+  <span>CPU</span>
+  <svg class="meter" aria-hidden="true"><rect class="track" width="100%" height="7" rx="3.5"/>{% if host.cpu %}<rect class="fill" width="{{ host.cpu.width }}%" height="7" rx="3.5"/>{% endif %}</svg>
+  <span class="value">{% if host.cpu %}{{ host.cpu.text }}{% else %}–{% endif %}</span>
+  <span>Memory</span>
+  <svg class="meter" aria-hidden="true"><rect class="track" width="100%" height="7" rx="3.5"/>{% if host.memory %}<rect class="fill" width="{{ host.memory.width }}%" height="7" rx="3.5"/>{% endif %}</svg>
+  <span class="value">{% if host.memory %}{{ host.memory.text }}{% else %}–{% endif %}</span>
+  <span>Disk</span>
+  <svg class="meter" aria-hidden="true"><rect class="track" width="100%" height="7" rx="3.5"/>{% if host.disk %}<rect class="fill{% if host.disk_is_full %} hot{% endif %}" width="{{ host.disk.width }}%" height="7" rx="3.5"/>{% endif %}</svg>
+  <span class="value">{% if host.disk %}{{ host.disk.text }}{% else %}–{% endif %}</span>
+</span>

@@ -1,0 +1,26 @@
+use sea_orm::entity::prelude::*;
+
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+#[sea_orm(table_name = "alerts")]
+pub struct Model {
+    #[sea_orm(primary_key)]
+    pub id: i64,
+    pub rule_id: Option<i64>,
+    pub rule_name: String,
+    pub severity: String,
+    pub host_id: String,
+    pub hostname: String,
+    pub series: String,
+    pub value: Option<f64>,
+    pub summary: String,
+    pub started_ms: i64,
+    pub resolved_ms: Option<i64>,
+    pub resolve_reason: Option<String>,
+    pub acknowledged_by: Option<String>,
+    pub acknowledged_ms: Option<i64>,
+}
+
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {}
+
+impl ActiveModelBehavior for ActiveModel {}

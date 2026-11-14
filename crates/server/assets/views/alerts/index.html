@@ -1,0 +1,74 @@
+{% extends "layouts/live.html" %}
+{% block title %}Alerts · MaxNines{% endblock title %}
+{% block content %}
+<div class="title-row">
+  <div>
+    <p class="eyebrow">{{ firing }} open</p>
+    <h1>Alerts</h1>
+  </div>
+  <div class="actions">
+    <a class="button secondary" href="/alerts/silences">Silences</a>
+    <a class="button secondary" href="/alerts/rules">Alert rules</a>
+    <a class="button secondary" href="/alerts/channels">Notification channels</a>
+  </div>
+</div>
+
+<section class="card">
+  <h2>Open</h2>
+  {% if open %}
+  {% for alert in open %}
+  <div class="problem">
+    {% if alert.severity == "critical" %}<span class="badge bad">Critical</span>{% else %}<span class="badge warn">Warning</span>{% endif %}
+    <span class="text">{{ alert.summary }}<br><span class="note">{{ alert.rule_name }} · started {{ alert.started }}{% if alert.silenced_until %} · silenced until {{ alert.silenced_until }}{% endif %}{% if alert.acknowledged_by %} · acknowledged by {{ alert.acknowledged_by }}{% endif %}</span></span>
+    {% if alert.host_id != "fleet" %}{% set os_family = alert.os_family %}<a class="button secondary host-button" href="/hosts/{{ alert.host_id }}{% if alert.host_id == "server" %}/metrics{% endif %}"{% if alert.short_id %} title="Host {{ alert.short_id }}"{% endif %}>{% include "hosts/_os_icon.html" %}{{ alert.hostname }}</a>{% else %}<span class="badge">{{ alert.hostname }}</span>{% endif %}
+    {% if alert.actions %}<a class="button secondary" href="/alerts/{{ alert.id }}/actions">Actions ({{ alert.actions }})</a>{% endif %}
+    {% if alert.silenced_until %}<span class="badge neutral">Silenced</span>{% elif can_respond %}<a class="button secondary" href="{{ alert.silence_link }}">Silence</a>{% endif %}
+    {% if can_respond %}
+    <form method="post" action="/alerts/{{ alert.id }}/{% if alert.acknowledged_by %}unacknowledge{% else %}acknowledge{% endif %}">
+      <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+      <button type="submit" class="secondary">{% if alert.acknowledged_by %}Undo{% else %}Acknowledge{% endif %}</button>
+    </form>
+    {% endif %}
+  </div>
+  {% endfor %}
+  {% else %}
+  <p class="empty">No alerts are open.</p>
+  {% endif %}
+</section>
+
+{% if problems %}
+<section class="card">
+  <h2>Notifications that haven't arrived</h2>
+  {% for problem in problems %}
+  <div class="problem">
+    {% if problem.failed %}<span class="badge bad">Failed</span>{% else %}<span class="badge neutral">Pending</span>{% endif %}
+    <span class="text">{{ problem.channel }}: {{ problem.error }}<br><span class="note">{{ problem.summary }} · {{ problem.attempts }} attempt{% if problem.attempts != 1 %}s{% endif %}</span></span>
+  </div>
+  {% endfor %}
+</section>
+{% endif %}
+
+<section>
+<h2>Recent</h2>
+{% if resolved %}
+<div class="tablebox"><table>
+  <thead>
+    <tr><th>Alert</th><th>Host</th><th>Started</th><th>Resolved</th><th>Why</th></tr>
+  </thead>
+  <tbody>
+    {% for alert in resolved %}
+    <tr>
+      <td>{{ alert.summary }}{% if alert.actions %} <a href="/alerts/{{ alert.id }}/actions">Actions ({{ alert.actions }})</a>{% endif %}</td>
+      <td class="nowrap">{% if alert.host_id != "fleet" %}{% set os_family = alert.os_family %}<span class="host-name">{% include "hosts/_os_icon.html" %}<a href="/hosts/{{ alert.host_id }}{% if alert.host_id == "server" %}/metrics{% endif %}"{% if alert.short_id %} title="Host {{ alert.short_id }}"{% endif %}>{{ alert.hostname }}</a></span>{% else %}{{ alert.hostname }}{% endif %}</td>
+      <td>{{ alert.started }}</td>
+      <td>{{ alert.resolved }}</td>
+      <td>{{ alert.reason }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table></div>
+{% else %}
+<p class="empty">No alerts have ended yet.</p>
+{% endif %}
+</section>
+{% endblock content %}

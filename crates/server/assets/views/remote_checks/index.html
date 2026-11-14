@@ -1,0 +1,50 @@
+{% extends "layouts/live.html" %}
+{% block title %}Checks · MaxNines{% endblock title %}
+{% block content %}
+<div class="title-row">
+  <div>
+    <p class="eyebrow">Run by this server</p>
+    <h1>Checks</h1>
+  </div>
+  <div class="actions">
+    <a class="button secondary" href="/hosts/{{ host_id }}/metrics">Charts</a>
+    {% if can_edit %}<a class="button" href="/checks/new">Add check</a>{% endif %}
+  </div>
+</div>
+<p class="hint">The server runs these itself, against remote sites. Each is about a <a href="/docs/agentless-hosts">host without an agent</a>, or the server itself. To check something from where an agent is, add it to a config rule. Alert rules cover both.</p>
+<nav class="tabs" aria-label="Status">
+  {% for tab in filters %}
+  <a href="/checks?status={{ tab.key }}"{% if tab.selected %} class="selected" aria-current="true"{% endif %}>{{ tab.label }} {{ tab.count }}</a>
+  {% endfor %}
+</nav>
+{% if checks %}
+<div class="tablebox"><table>
+  <thead>
+    <tr><th>Name</th><th>Host</th><th>Kind</th><th>Target</th><th>Status</th><th class="number">Total</th><th class="number">First byte</th><th>Response</th><th class="number">Certificate days</th></tr>
+  </thead>
+  <tbody>
+    {% for check in checks %}
+    <tr{% if not check.enabled %} class="disabled"{% endif %}>
+      <td><a href="/checks/{{ check.id }}/edit">{{ check.name }}</a></td>
+      <td>{% if check.host %}<a href="/hosts/{{ check.host.id }}">{{ check.host.hostname }}</a>{% endif %}</td>
+      <td>{{ check.kind }}</td>
+      <td>{{ check.target }}</td>
+      {% if check.latest %}
+      <td>{% if check.latest.up %}<span class="badge good">Up</span>{% else %}<span class="badge bad">Down</span>{% endif %}{% if check.latest.error %} <span class="note">{{ check.latest.error }}</span>{% endif %}</td>
+      <td class="number">{{ check.latest.response }}</td>
+      <td class="number">{{ check.latest.first_byte }}</td>
+      <td>{% if check.latest.status %}{{ check.latest.status }}{% endif %} {{ check.latest.protocol }}</td>
+      <td class="number">{% if check.latest.cert_days_left is defined and check.latest.cert_days_left is not none %}{{ check.latest.cert_days_left }}{% endif %}</td>
+      {% elif check.enabled %}
+      <td><span class="badge neutral">Waiting</span></td><td></td><td></td><td></td><td></td>
+      {% else %}
+      <td><span class="badge neutral">Disabled</span></td><td></td><td></td><td></td><td></td>
+      {% endif %}
+    </tr>
+    {% endfor %}
+  </tbody>
+</table></div>
+{% else %}
+<p class="empty">No checks here yet.</p>
+{% endif %}
+{% endblock content %}

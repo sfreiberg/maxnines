@@ -1,0 +1,7 @@
+{% extends "layouts/application.html" %}
+{% block title %}Not allowed · MaxNines{% endblock title %}
+{% block content %}
+<h1>Your role doesn't allow this</h1>
+<p class="hint">This needs the {{ needed }} role, and yours is {{ yours }}. An admin can change it under Settings, then Users.</p>
+<p><a href="/">Back to the overview</a></p>
+{% endblock content %}

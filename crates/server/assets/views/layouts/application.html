@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en" data-choice="{{ theme }}"{% if theme != "system" %} data-theme="{{ theme }}"{% endif %}>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>{% block title %}MaxNines{% endblock title %}</title>
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+  <link rel="manifest" href="/assets/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/assets/icons/apple-touch-icon.png">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="MaxNines">
+  <meta name="theme-color" content="#08090b">
+  <link rel="stylesheet" href="/assets/css/themes.css">
+  <link rel="stylesheet" href="/assets/css/application.css">
+  <meta name="htmx-config" content='{"allowEval":false,"allowScriptTags":false,"includeIndicatorStyles":false,"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"422","swap":true},{"code":"[45]..","swap":false,"error":true},{"code":"...","swap":false}]}'>
+  <script src="/assets/js/theme.js"></script>
+  <script src="/assets/js/htmx.min.js" defer></script>
+  <script src="/assets/js/idiomorph-ext.min.js" defer></script>
+  <script src="/assets/js/application.js" defer></script>
+  <script src="/assets/js/host_filter.js" defer></script>
+  <script src="/assets/js/charts.js" defer></script>
+  {% block head %}{% endblock head %}
+</head>
+<body hx-ext="morph">
+  {% block frame %}
+  <div class="shell">
+    <nav class="rail" aria-label="Main">
+      <a class="brand" href="/" aria-label="MaxNines"><span class="mark">9</span></a>
+      <a class="rail-link{% if section == "overview" %} on{% endif %}" href="/"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5"/></svg>Overview</a>
+      <a class="rail-link{% if section == "dashboards" %} on{% endif %}" href="/dashboards"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="3.5" width="17" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5"/></svg>Dashboards</a>
+      <a class="rail-link{% if section == "hosts" %} on{% endif %}" href="/hosts"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4" width="17" height="7" rx="2"/><rect x="3.5" y="13" width="17" height="7" rx="2"/><path d="M7.5 7.5h.01M7.5 16.5h.01"/></svg>Hosts</a>
+      <a class="rail-link{% if section == "metrics" %} on{% endif %}" href="/metrics"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 3.5v15a2 2 0 0 0 2 2h15"/><path d="m7.5 15 4-5 3.5 3 5-6.5"/></svg>Metrics</a>
+      <a class="rail-link{% if section == "checks" %} on{% endif %}" href="/checks"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="m8.5 12.5 2.5 2.5 4.5-5.5"/></svg>Checks</a>
+      <a id="alerts-link" class="rail-link{% if section == "alerts" %} on{% endif %}" href="/alerts"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 10a6 6 0 1 1 12 0c0 5 2 6.5 2 6.5H4S6 15 6 10Z"/><path d="M10 20a2.2 2.2 0 0 0 4 0"/></svg>Alerts{% if firing > 0 %} <span class="count">{{ firing }}</span>{% endif %}</a>
+      <a class="rail-link{% if section == "map" %} on{% endif %}" href="/map"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17"/><path d="M12 3.5c2.4 2.3 3.6 5.1 3.6 8.5s-1.2 6.2-3.6 8.5c-2.4-2.3-3.6-5.1-3.6-8.5s1.2-6.2 3.6-8.5Z"/></svg>Map</a>
+      <a class="rail-link{% if section == "server" %} on{% endif %}" href="/server"><svg viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="6" rx="7.5" ry="3"/><path d="M4.5 6v12c0 1.66 3.36 3 7.5 3s7.5-1.34 7.5-3V6"/><path d="M4.5 12c0 1.66 3.36 3 7.5 3s7.5-1.34 7.5-3"/></svg>Server</a>
+      <a class="rail-link{% if section == "settings" %} on{% endif %}" href="/settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h9M18 7h2M4 17h2M11 17h9"/><circle cx="15.5" cy="7" r="2.5"/><circle cx="8.5" cy="17" r="2.5"/></svg>Settings</a>
+      <a class="rail-link{% if section == "docs" %} on{% endif %}" href="/docs"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5A1.5 1.5 0 0 1 5.5 4H11v16H5.5A1.5 1.5 0 0 1 4 18.5Z"/><path d="M20 5.5A1.5 1.5 0 0 0 18.5 4H13v16h5.5a1.5 1.5 0 0 0 1.5-1.5Z"/></svg>Docs</a>
+      {% if user %}<a id="profile-link" class="rail-link profile{% if section == "profile" %} on{% endif %}" href="/profile" title="Connected to the server" aria-label="{{ user.name }}, connected to the server"><span class="avatar">{{ user.initial }}</span><span id="connection-label">Profile</span></a>{% endif %}
+    </nav>
+    <div class="workspace">
+      <header class="topbar">
+        <p class="crumbs"><span class="home">MaxNines</span>{% if section %}<span class="home">/</span><strong>{{ section }}</strong>{% endif %}</p>
+        {% block status %}{% endblock status %}
+      </header>
+      <div class="page-notices">
+        <div id="update-notice" role="status" hx-get="/update-notice?build={{ build_id }}" hx-trigger="every 60s, online from:window, visibilitychange from:document"></div>
+        <p id="stale-notice" class="error" role="status" hidden>This page couldn't update, so what it shows may be out of date.</p>
+      </div>
+      <main id="page"{% block main_class %}{% endblock main_class %}{% block main_attributes %}{% endblock main_attributes %}>
+        {% block content %}{% endblock content %}
+      </main>
+      <footer class="site-footer">MaxNines {{ build.version }} · {{ build.commit }} · built {{ build.built_at }}</footer>
+    </div>
+  </div>
+  {% endblock frame %}
+</body>
+</html>

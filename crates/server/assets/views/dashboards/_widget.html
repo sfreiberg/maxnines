@@ -1,0 +1,31 @@
+<div class="widget-heading">
+  <h2>{{ widget.title }}</h2>
+  {% if edit_url %}<a href="{{ edit_url }}">Edit</a>{% endif %}
+</div>
+{% if widget.missing %}
+<p class="empty">{{ widget.missing }}</p>
+{% elif widget.failed %}
+<p class="error">This widget couldn't be read. Check the server's log.</p>
+{% elif not chart.has_data %}
+<p class="empty">No data in this range.</p>
+{% elif widget.kind == "number" %}
+<p class="widget-number">{{ chart.summary[0].latest }}</p>
+{% elif widget.kind == "table" %}
+<div class="widget-table tablebox"><table>
+  <thead><tr><th>Name</th><th class="number">Latest</th><th class="number">Average</th><th class="number">Peak</th></tr></thead>
+  <tbody>
+    {% for row in chart.summary %}
+    <tr><td>{{ row.name }}</td><td class="number">{{ row.latest }}</td><td class="number">{{ row.average }}</td><td class="number">{{ row.peak }}</td></tr>
+    {% endfor %}
+  </tbody>
+</table></div>
+{% if widget.hidden > 0 %}<p class="hint">{{ widget.hidden }} more not shown. The highest are listed.</p>{% endif %}
+{% else %}
+{% include "metrics/_chart_drawing.html" %}
+<ul class="widget-legend">
+  {% for row in chart.summary %}
+  <li><span class="key-swatch s{{ row.slot }}"></span>{{ row.name }} <strong>{{ row.latest }}</strong></li>
+  {% endfor %}
+  {% if widget.hidden > 0 %}<li>{{ widget.hidden }} more not shown</li>{% endif %}
+</ul>
+{% endif %}

@@ -1,0 +1,70 @@
+{% extends "layouts/application.html" %}
+{% block title %}{% if id %}Edit location{% else %}Add location{% endif %} · MaxNines{% endblock title %}
+{% block head %}
+  <script src="/assets/js/map.js" defer></script>
+{% endblock head %}
+{% block content %}
+<p class="breadcrumb"><a href="/map/rules">Location rules</a></p>
+<h1>{% if id %}Edit location{% else %}Add location{% endif %}</h1>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<div class="location-layout">
+  <form method="post" action="{% if id %}/map/rules/{{ id }}{% else %}/map/rules{% endif %}" class="stacked location-form">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+
+    <label>Name
+      <input type="text" name="name" value="{{ rule.name }}" required maxlength="255" placeholder="Leeds office">
+      <small>What the map calls these hosts.</small>
+    </label>
+
+    <label>Hosts
+      <input type="text" name="filter" value="{{ rule.filter }}" maxlength="500" spellcheck="false" placeholder="networking.addresses=10.1.*">
+      <small>The same filter as the Hosts list, such as <code>networking.fqdn=*.leeds.example.com</code> or <code>id=…</code> for one host. Leave empty for every host.</small>
+    </label>
+
+    <div class="stacked-field place-search">
+      <label for="place-search">Town or city</label>
+      <input id="place-search" type="search" value="{{ rule.place }}" autocomplete="off" spellcheck="false" placeholder="Leeds, or Portland, Maine"
+        role="combobox" aria-expanded="false" aria-controls="place-options" aria-autocomplete="list">
+      <ul id="place-options" role="listbox" aria-label="Places" hidden></ul>
+      <small id="place-status">Search for a place, or click the map. A comma narrows it down, as in <code>portland, maine</code>.</small>
+    </div>
+    <input type="hidden" name="place" id="place" value="{{ rule.place }}">
+
+    <div class="coordinates">
+      <label>Latitude
+        <input type="text" name="latitude" id="latitude" value="{{ rule.latitude }}" inputmode="decimal" autocomplete="off" required>
+      </label>
+      <label>Longitude
+        <input type="text" name="longitude" id="longitude" value="{{ rule.longitude }}" inputmode="decimal" autocomplete="off" required>
+      </label>
+    </div>
+
+    <label>Priority
+      <input type="number" name="priority" value="{{ rule.priority }}" step="1">
+      <small>Where several rules match a host, the highest wins. A host placed from its own page gets {{ one_host_priority }}.</small>
+    </label>
+
+    <div class="actions">
+      {% if can_edit %}<button type="submit">Save location</button>{% else %}<span class="note">Your role lets you look at this, but not change it.</span>{% endif %}
+      <a class="button secondary" href="/map/rules">Cancel</a>
+    </div>
+    <p class="credit">{{ credit }}</p>
+  </form>
+
+  <section class="map-card location-picker" aria-label="Pick on the map">
+    <div id="map-picker" class="map-canvas" data-world="/assets/map/world.json">
+      <p class="hint">The map needs JavaScript. Type the coordinates instead.</p>
+    </div>
+    <p class="hint map-picker-hint">Click the map to put it there. Scroll or pinch to zoom.</p>
+  </section>
+</div>
+
+{% if id and can_edit %}
+<form method="post" action="/map/rules/{{ id }}/delete" class="delete-form">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  <button type="submit" class="danger">Delete</button>
+</form>
+{% endif %}
+{% endblock content %}

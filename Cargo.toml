@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0-alpha.5"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/sfreiberg/maxnines"
+homepage = "https://github.com/sfreiberg/maxnines"
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+hcl-rs = "0.20.0"
+hex = "0.4.3"
+maxnines-checks = { path = "crates/checks" }
+maxnines-collectors = { path = "crates/collectors" }
+maxnines-protocol = { path = "crates/protocol" }
+ring = "0.17.14"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio-tungstenite = "0.30.0"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+# Debug builds, which the tests use, keep line numbers for our own code, so a
+# panic still says where. Full debug info, mostly for dependencies, made builds
+# many times larger and slower to link.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# Keeps function names, so a panic's backtrace says how the code got there. The
+# debug info itself goes, which is what makes up most of an unstripped binary.
+strip = "debuginfo"

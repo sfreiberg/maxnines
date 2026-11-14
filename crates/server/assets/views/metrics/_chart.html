@@ -1,0 +1,25 @@
+  <section class="chart-card">
+    <div class="chart-heading">
+      <h2>{{ chart.title }}</h2>
+      {% if chart.has_data %}<a href="/hosts/{{ host_id }}/metrics/{{ chart.name }}?range={{ range }}">View data</a>{% endif %}
+    </div>
+    {% include "metrics/_chart_drawing.html" %}
+    {% if chart.has_data %}
+    <table class="chart-summary">
+      <thead><tr><th>Series</th><th class="number">Latest</th><th class="number">Average</th><th class="number">Peak</th></tr></thead>
+      <tbody>
+        {% for row in chart.summary %}
+        <tr>
+          <td><span class="key-swatch s{{ row.slot }}"></span>{{ row.name }}</td>
+          <td class="number">{{ row.latest }}</td>
+          <td class="number">{{ row.average }}</td>
+          <td class="number">{{ row.peak }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% if chart.hidden > 0 %}<p class="hint">{{ chart.hidden }} more not shown. The highest are listed.</p>{% endif %}
+    {% else %}
+    <p class="empty">No data in this range.</p>
+    {% endif %}
+  </section>

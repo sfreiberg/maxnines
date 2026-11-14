@@ -1,0 +1,20 @@
+<h2>Latest checks</h2>
+<div class="tablebox"><table>
+  <thead>
+    <tr><th>Check</th><th>Kind</th><th>Status</th><th class="number">Total</th><th class="number">First byte</th><th>Response</th><th>TLS</th><th class="number">Certificate days</th></tr>
+  </thead>
+  <tbody>
+    {% for check in checks %}
+    <tr>
+      <td>{{ check.name }}</td>
+      <td>{{ check.kind }}</td>
+      <td>{% if check.up %}<span class="badge good">Up</span>{% else %}<span class="badge bad">Down</span>{% endif %}{% if check.error %} <span class="note">{{ check.error }}</span>{% endif %}</td>
+      <td class="number">{{ check.response }}</td>
+      <td class="number">{{ check.first_byte }}</td>
+      <td>{% if check.status %}{{ check.status }}{% endif %} {{ check.protocol }}</td>
+      <td>{{ check.tls_version }}</td>
+      <td class="number">{% if check.cert_days_left is defined and check.cert_days_left is not none %}{{ check.cert_days_left }}{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table></div>
