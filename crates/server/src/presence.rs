@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
@@ -77,10 +77,59 @@ impl Presence {
     }
 }
 
+/// Something the server reads or tries itself, for a host with no agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Reached {
+    /// A metrics page, by its ID.
+    Page(i64),
+    /// A check, by its ID.
+    Check(i64),
+}
+
 #[derive(Default)]
 struct State {
     hosts: BTreeMap<String, Entry>,
     next_connection: u64,
+    /// For each host with no agent, whether each thing the server reaches it by
+    /// answered the last time.
+    reached: BTreeMap<String, BTreeMap<Reached, bool>>,
+}
+
+impl State {
+    /// Makes a host with no agent as present as what's reached of it says, and
+    /// says whether that brought it online.
+    fn settle_reached(&mut self, id: &str) -> bool {
+        let Some(reached) = self.reached.get(id).filter(|reached| !reached.is_empty()) else {
+            self.reached.remove(id);
+            self.hosts.remove(id);
+            return false;
+        };
+        let online = reached.values().any(|answered| *answered);
+        self.next_connection += 1;
+        let connection = self.next_connection;
+        let now = now_ms();
+        let entry = self.hosts.entry(id.to_string()).or_insert(Entry {
+            presence: HostPresence {
+                // The opposite, so that the first answer counts as a change.
+                online: !online,
+                since_ms: now,
+                last_seen_ms: now,
+                // It has no connection, so there's nowhere it connected from.
+                source: IpAddr::from([0, 0, 0, 0]),
+            },
+            connection,
+            replaced: Arc::new(Notify::new()),
+        });
+        if online {
+            entry.presence.last_seen_ms = now;
+        }
+        let changed = entry.presence.online != online;
+        if changed {
+            entry.presence.online = online;
+            entry.presence.since_ms = now;
+        }
+        changed && online
+    }
 }
 
 pub struct Connected {
@@ -148,31 +197,45 @@ impl Presence {
         self.facts.check_key(&id.to_string()).is_ok()
     }
 
-    /// For a host with no agent, which is online while the server can read from
-    /// it. It has no connection, so there's nowhere it connected from.
-    pub fn set_reachable(&self, id: &str, online: bool) {
+    /// Notes whether something the server reads or tries for a host with no agent
+    /// answered. The host is online while anything does, which is all there is to
+    /// say about whether something with no agent is there.
+    pub fn reached(&self, id: &str, what: Reached, answered: bool) {
         let mut state = self.state.lock().unwrap();
-        state.next_connection += 1;
-        let connection = state.next_connection;
-        let now = now_ms();
-        let entry = state.hosts.entry(id.to_string()).or_insert(Entry {
-            presence: HostPresence {
-                // The opposite, so that the first read counts as a change.
-                online: !online,
-                since_ms: now,
-                last_seen_ms: now,
-                source: IpAddr::from([0, 0, 0, 0]),
-            },
-            connection,
-            replaced: Arc::new(Notify::new()),
-        });
-        if online {
-            entry.presence.last_seen_ms = now;
+        state
+            .reached
+            .entry(id.to_string())
+            .or_default()
+            .insert(what, answered);
+        if state.settle_reached(id) {
+            self.came_online.notify_one();
         }
-        if entry.presence.online != online {
-            entry.presence.online = online;
-            entry.presence.since_ms = now;
-            if online {
+    }
+
+    /// Forgets the pages that aren't read any more.
+    pub fn keep_pages(&self, read: &HashSet<i64>) {
+        self.keep_reached(|what| !matches!(what, Reached::Page(id) if !read.contains(id)));
+    }
+
+    /// Forgets the checks that aren't run any more.
+    pub fn keep_checks(&self, run: &HashSet<i64>) {
+        self.keep_reached(|what| !matches!(what, Reached::Check(id) if !run.contains(id)));
+    }
+
+    /// A host that loses what it had is judged by what's left, and one left with
+    /// nothing is neither online nor offline.
+    fn keep_reached(&self, keep: impl Fn(&Reached) -> bool) {
+        let mut state = self.state.lock().unwrap();
+        let mut changed = Vec::new();
+        for (id, reached) in &mut state.reached {
+            let before = reached.len();
+            reached.retain(|what, _| keep(what));
+            if reached.len() != before {
+                changed.push(id.clone());
+            }
+        }
+        for id in changed {
+            if state.settle_reached(&id) {
                 self.came_online.notify_one();
             }
         }
@@ -194,9 +257,11 @@ impl Presence {
         }
     }
 
-    /// For an agent that's been deleted.
+    /// For a host that's been deleted.
     pub fn forget(&self, id: &str) {
-        self.state.lock().unwrap().hosts.remove(id);
+        let mut state = self.state.lock().unwrap();
+        state.hosts.remove(id);
+        state.reached.remove(id);
     }
 
     pub fn get(&self, id: &str) -> Option<HostPresence> {
@@ -222,24 +287,52 @@ mod tests {
     const SOURCE: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
     #[test]
-    fn a_host_with_no_agent_is_online_while_it_can_be_read() {
+    fn a_host_with_no_agent_is_online_while_anything_of_it_answers() {
         let presence = Presence::default();
         assert!(presence.get("db").is_none());
 
-        presence.set_reachable("db", true);
+        presence.reached("db", Reached::Page(1), true);
         let first = presence.get("db").unwrap();
         assert!(first.online);
 
-        // Reading it again changes nothing about when it came online.
-        presence.set_reachable("db", true);
+        // Answering again changes nothing about when it came online.
+        presence.reached("db", Reached::Page(1), true);
         assert_eq!(presence.get("db").unwrap().since_ms, first.since_ms);
 
-        presence.set_reachable("db", false);
+        // A check that fails doesn't take it offline while its page answers.
+        presence.reached("db", Reached::Check(1), false);
+        assert!(presence.get("db").unwrap().online);
+        presence.reached("db", Reached::Page(1), false);
         assert!(!presence.get("db").unwrap().online);
+        presence.reached("db", Reached::Check(1), true);
+        assert!(presence.get("db").unwrap().online);
 
-        // One that couldn't be read the first time is offline from then.
-        presence.set_reachable("cache", false);
+        // One that didn't answer the first time is offline from then.
+        presence.reached("cache", Reached::Check(2), false);
         assert!(!presence.get("cache").unwrap().online);
+    }
+
+    #[test]
+    fn a_host_is_judged_by_what_is_still_reached_of_it() {
+        let presence = Presence::default();
+        presence.reached("db", Reached::Page(1), false);
+        presence.reached("db", Reached::Check(1), true);
+        presence.reached("cache", Reached::Check(2), true);
+
+        // Pages and checks are counted separately, so 1 here is only the page.
+        presence.keep_pages(&HashSet::from([1]));
+        presence.keep_checks(&HashSet::from([2]));
+
+        // What was keeping it online is gone, and its page isn't answering.
+        assert!(!presence.get("db").unwrap().online);
+        assert!(presence.get("cache").unwrap().online);
+
+        // With nothing left it's neither online nor offline.
+        presence.keep_pages(&HashSet::new());
+        assert!(presence.get("db").is_none());
+        presence.forget("cache");
+        presence.keep_checks(&HashSet::from([2]));
+        assert!(presence.get("cache").is_none());
     }
 
     fn is_online(presence: &Presence, id: &str) -> bool {

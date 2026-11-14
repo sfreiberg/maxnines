@@ -255,6 +255,11 @@ impl Database {
             .exec(&transaction)
             .await
             .context("deleting a host's config status")?;
+        remote_check::Entity::delete_many()
+            .filter(remote_check::Column::HostId.eq(id))
+            .exec(&transaction)
+            .await
+            .context("deleting a host's checks")?;
         metrics_page::Entity::delete_many()
             .filter(metrics_page::Column::HostId.eq(id))
             .exec(&transaction)
@@ -1891,6 +1896,7 @@ mod tests {
         check.regex = Some("Welcome".to_string());
         check.insecure = Some(true);
         let mut input = RemoteCheckInput {
+            host_id: crate::remote_checks::LOCAL_HOST_ID.to_string(),
             check,
             interval_secs: 60,
             enabled: true,

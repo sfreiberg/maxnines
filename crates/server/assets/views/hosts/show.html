@@ -129,7 +129,33 @@
   {% else %}
   <p class="empty">Nothing is read for this host yet. Add an OpenMetrics page, and the server will read it and chart what it says.</p>
   {% endif %}
-  <p class="hint">The server reads these itself, as this host has no agent. The host is online while any of them answers. <a href="/docs/agentless-hosts">More about hosts without an agent</a></p>
+  <p class="hint">The server reads these itself, as this host has no agent. <a href="/docs/agentless-hosts">More about hosts without an agent</a></p>
+</section>
+
+<section class="card">
+  <div class="title-row">
+    <h2>Checks</h2>
+    {% if can_edit %}<a class="button secondary" href="/checks/new?host={{ host.id }}">Add check</a>{% endif %}
+  </div>
+  {% if checks %}
+  <table>
+    <thead>
+    <tr><th>Check</th><th>Run</th><th>Status</th></tr>
+    </thead>
+    <tbody>
+    {% for check in checks %}
+    <tr>
+      <td><a href="/checks/{{ check.id }}/edit"><strong>{{ check.name }}</strong></a><code class="under">{{ check.kind }} {{ check.target }}</code></td>
+      <td class="nowrap">Every {{ check.interval_secs }} s</td>
+      <td>{% if not check.enabled %}<span class="badge neutral">Disabled</span>{% elif not check.run %}<span class="badge neutral">Waiting</span>{% elif check.up %}<span class="badge good">Up</span>{% else %}<span class="badge bad">Down</span>{% if check.error %}<span class="under">{{ check.error }}</span>{% endif %}{% endif %}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">No checks are about this host yet. A check tries reaching it, as a website, a port, a certificate, a name or a ping.</p>
+  {% endif %}
+  <p class="hint">The host is online while any of its pages answers or any of its checks passes.</p>
 </section>
 {% endif %}
 

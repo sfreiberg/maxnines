@@ -17,6 +17,7 @@ impl MigratorTrait for Migrator {
             Box::new(ClockRule),
             Box::new(ServiceRule),
             Box::new(AgentlessHosts),
+            Box::new(ChecksOnHosts),
         ]
     }
 }
@@ -1523,6 +1524,7 @@ enum MaintenanceWindows {
 enum RemoteChecks {
     Table,
     Id,
+    HostId,
     Name,
     Kind,
     Target,
@@ -2391,6 +2393,69 @@ impl MigrationTrait for AgentlessHosts {
     }
 }
 
+struct ChecksOnHosts;
+
+impl MigrationName for ChecksOnHosts {
+    fn name(&self) -> &str {
+        "m20261114_000008_checks_on_hosts"
+    }
+}
+
+/// Each check the server runs says which host it's about: a host with no agent,
+/// or the server itself, which is where every check was before.
+#[async_trait::async_trait]
+impl MigrationTrait for ChecksOnHosts {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    /// There's no foreign key, as SQLite can't add one to a table that exists.
+    /// Deleting a host deletes its checks.
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(RemoteChecks::Table)
+                    .add_column(
+                        ColumnDef::new(RemoteChecks::HostId)
+                            .string_len(32)
+                            .not_null()
+                            .default("server"),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_remote_checks_host")
+                    .table(RemoteChecks::Table)
+                    .col(RemoteChecks::HostId)
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_index(
+                Index::drop()
+                    .name("idx_remote_checks_host")
+                    .table(RemoteChecks::Table)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(RemoteChecks::Table)
+                    .drop_column(RemoteChecks::HostId)
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
 #[derive(DeriveIden)]
 enum MetricsPages {
     Table,
@@ -2559,7 +2624,7 @@ mod tests {
         );
 
         // The four migrations after it, then this one.
-        Migrator::down(&connection, Some(6)).await.unwrap();
+        Migrator::down(&connection, Some(7)).await.unwrap();
         assert_eq!(
             count("SELECT target FROM notification_channels").await,
             ["https://new"]

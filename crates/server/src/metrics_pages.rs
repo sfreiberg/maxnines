@@ -2,8 +2,8 @@
 //! read with the same code agents use, and saved as samples from their host, so
 //! charts and alert rules treat them like anything else.
 //!
-//! An agentless host is online while any of its pages answers, which is all
-//! there is to say about whether something with no agent is there.
+//! An agentless host is online while any of its pages answers, or any check
+//! the server runs against it passes.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -23,7 +23,7 @@ use tracing::{error, warn};
 
 use crate::metrics::now_ms;
 use crate::models::Database;
-use crate::presence::Presence;
+use crate::presence::{Presence, Reached};
 use crate::registration::{HostKind, HostState, Registry};
 use crate::store::{NewSample, WriterCommand};
 
@@ -206,13 +206,9 @@ pub struct PageReads(Mutex<Reads>);
 struct Reads {
     /// Each page's running totals, by its ID.
     totals: HashMap<i64, Totals>,
-    /// How each page's last read went, with whose it is: the page's own row, which
-    /// says whether it answered and why not.
-    results: HashMap<i64, (String, Value)>,
-}
-
-fn answered(result: &Value) -> bool {
-    result["up"] == 1
+    /// How each page's last read went: the page's own row, which says whether it
+    /// answered and why not.
+    results: HashMap<i64, Value>,
 }
 
 impl PageReads {
@@ -223,10 +219,7 @@ impl PageReads {
     /// How a page's last read went, if it's been read since the server started.
     pub fn result(&self, page_id: i64) -> Option<Value> {
         let reads = self.reads();
-        reads
-            .results
-            .get(&page_id)
-            .map(|(_, result)| result.clone())
+        reads.results.get(&page_id).cloned()
     }
 
     /// Forgets pages that are gone or turned off.
@@ -236,20 +229,15 @@ impl PageReads {
         reads.results.retain(|id, _| pages.contains(id));
     }
 
-    /// Takes what was kept of a page and gives the rows to save, with whether any
-    /// of its host's pages is answering.
+    /// Takes what was kept of a page and gives the rows to save, with whether the
+    /// page answered.
     fn settle(&self, page: &MetricsPage, kept: Vec<Value>) -> (Vec<Value>, bool) {
         let mut reads = self.reads();
         let result = kept.first().cloned().unwrap_or_default();
-        reads
-            .results
-            .insert(page.id, (page.host_id.clone(), result));
-        let online = reads
-            .results
-            .values()
-            .any(|(host, result)| *host == page.host_id && answered(result));
+        let answered = result["up"] == 1;
+        reads.results.insert(page.id, result);
         let rows = reads.totals.entry(page.id).or_default().settle(kept);
-        (rows, online)
+        (rows, answered)
     }
 }
 
@@ -319,13 +307,7 @@ impl Scheduler {
         let reading: HashSet<i64> = pages.iter().map(|page| page.id).collect();
         self.next_run.retain(|id, _| reading.contains(id));
         self.reads.keep_only(&reading);
-        // A host with nothing to read is neither online nor offline.
-        let read_from: HashSet<&str> = pages.iter().map(|page| page.host_id.as_str()).collect();
-        for host_id in hostnames.keys() {
-            if !read_from.contains(host_id.as_str()) {
-                self.presence.forget(host_id);
-            }
-        }
+        self.presence.keep_pages(&reading);
 
         let mut started = Vec::new();
         for page in pages {
@@ -349,8 +331,8 @@ impl Scheduler {
                 return;
             };
             let kept = read(&page.input).await;
-            let (rows, online) = reads.settle(&page, kept);
-            presence.set_reachable(&page.host_id, online);
+            let (rows, answered) = reads.settle(&page, kept);
+            presence.reached(&page.host_id, Reached::Page(page.id), answered);
             save(&writer, page.host_id, hostname, rows).await;
         })
     }
@@ -535,10 +517,10 @@ mod tests {
     }
 
     #[test]
-    fn a_host_is_there_while_any_of_its_pages_answers() {
-        let page = |id: i64, host_id: &str| MetricsPage {
+    fn a_read_is_remembered_until_its_page_is_gone() {
+        let page = |id: i64| MetricsPage {
             id,
-            host_id: host_id.to_string(),
+            host_id: "a".to_string(),
             input: input(),
         };
         let up = || {
@@ -550,20 +532,15 @@ mod tests {
         let down = || vec![json!({ "name": "db", "up": 0, "error": "timed out" })];
         let reads = PageReads::default();
 
-        let (rows, online) = reads.settle(&page(1, "a"), up());
-        assert!(online);
+        let (rows, answered) = reads.settle(&page(1), up());
+        assert!(answered);
         assert_eq!(rows[1], json!({ "name": "db x", "value": 1.0 }));
-        assert!(reads.settle(&page(2, "a"), down()).1);
-        // Another host's page says nothing about this one.
-        assert!(!reads.settle(&page(3, "b"), down()).1);
-        assert!(!reads.settle(&page(1, "a"), down()).1);
-        assert!(reads.settle(&page(2, "a"), up()).1);
-        assert_eq!(reads.result(1).unwrap()["error"], "timed out");
+        assert!(!reads.settle(&page(2), down()).1);
+        assert_eq!(reads.result(2).unwrap()["error"], "timed out");
         assert_eq!(reads.result(9), None);
 
-        // A page that's gone stops counting.
-        reads.keep_only(&HashSet::from([1, 3]));
-        assert!(!reads.settle(&page(1, "a"), down()).1);
+        reads.keep_only(&HashSet::from([1]));
         assert_eq!(reads.result(2), None);
+        assert!(reads.result(1).is_some());
     }
 }

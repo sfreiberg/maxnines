@@ -309,8 +309,15 @@ async fn show(
     let ranges = range_links(selected);
 
     // The server saves its checks one at a time, so no one sample has them all.
-    let latest = if host.is_local() {
-        Ok(state.check_results.all().into_values().collect())
+    let latest = if host.is_local() || host.is_agentless() {
+        state.database.list_remote_checks().await.map(|checks| {
+            let mut results = state.check_results.all();
+            checks
+                .into_iter()
+                .filter(|check| check.input.host_id == host.id)
+                .filter_map(|check| results.remove(&check.input.check.name))
+                .collect()
+        })
     } else {
         let output = state
             .metrics

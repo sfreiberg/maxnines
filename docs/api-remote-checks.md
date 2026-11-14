@@ -1,9 +1,12 @@
 # Remote checks API
 
-Checks the server runs itself, against remote sites.
+Checks the server runs itself, against remote sites. Each is about a host: a
+[host without an agent](agentless-hosts.md), or the server itself. Its results and
+alerts go under that host.
 
 | Field | Description |
 | --- | --- |
+| `host_id` | The host it's about, which has to be one without an agent. Leave it out, or give `server`, for a check that isn't about any one host |
 | `check` | Required. What to check, as below |
 | `interval_secs` | Required. How often it runs |
 | `enabled` | Defaults to `true` |
@@ -62,6 +65,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 ```json
 {
   "id": 1,
+  "host_id": "server",
   "check": { "name": "Home page", "kind": "http", "target": "https://example.com" },
   "interval_secs": 60,
   "enabled": true

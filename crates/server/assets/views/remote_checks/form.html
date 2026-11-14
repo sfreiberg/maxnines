@@ -14,6 +14,15 @@
     <input type="text" name="name" value="{{ check.name }}" required maxlength="64">
   </label>
 
+  <label>Host
+    <select name="host_id">
+      {% for host in hosts %}
+      <option value="{{ host.id }}"{% if host.id == check.host_id %} selected{% endif %}>{{ host.hostname }}</option>
+      {% endfor %}
+    </select>
+    <small>What the check is about. Its results and alerts go under that host, and a <a href="/docs/agentless-hosts">host without an agent</a> is online while any of its checks passes. Leave it as the server for a check that isn't about any one host.</small>
+  </label>
+
   <label>Kind
     <select name="kind">
       {% for kind in kinds %}
@@ -75,7 +84,7 @@
 
   <div class="actions">
     {% if can_edit %}<button type="submit">Save check</button>{% else %}<span class="note">Your role lets you look at this, but not change it.</span>{% endif %}
-    <a class="button secondary" href="/checks">Cancel</a>
+    <a class="button secondary" href="{{ back }}">Cancel</a>
   </div>
 </form>
 

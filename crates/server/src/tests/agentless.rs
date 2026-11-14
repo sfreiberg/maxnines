@@ -477,3 +477,162 @@ async fn a_host_and_its_pages_are_added_from_the_hosts_page() {
     assert!(hosts.body.contains(">orders</a>"), "{}", hosts.body);
     assert!(hosts.body.contains("No agent"));
 }
+
+fn check_scheduler(server: &TestServer) -> crate::remote_checks::Scheduler {
+    let state = &server.state;
+    crate::remote_checks::Scheduler::new(
+        state.database.clone(),
+        state.writer.clone(),
+        state.registry.clone(),
+        state.presence.clone(),
+        state.check_results.clone(),
+    )
+}
+
+async fn run_due(scheduler: &mut crate::remote_checks::Scheduler, now_ms: i64) -> usize {
+    let started = scheduler.start_due(now_ms).await.unwrap();
+    let count = started.len();
+    for check in started {
+        check.await.unwrap();
+    }
+    count
+}
+
+fn tcp_check(host_id: &str, name: &str, target: &str) -> Value {
+    json!({
+        "host_id": host_id,
+        "check": { "name": name, "kind": "tcp", "target": target, "timeout_secs": 5 },
+        "interval_secs": 60
+    })
+}
+
+#[tokio::test]
+async fn a_check_about_a_host_is_saved_under_it_and_says_whether_it_is_there() {
+    let server = start_with_metrics().await;
+    let id = add_host(&server, "orders-db").await;
+    let served = serve(None).await;
+    let open = tcp_check(&id, "orders port", &served.address);
+    let (status, added) = api(&server, "POST", "/api/v1/remote-checks", &open).await;
+    assert_eq!(status, 201, "{added}");
+    let check_path = format!("/api/v1/remote-checks/{}", added["id"]);
+    let (_, saved) = api(&server, "GET", &check_path, &Value::Null).await;
+    assert_eq!(saved["host_id"], id.as_str());
+    let mut scheduler = check_scheduler(&server);
+    let now = now_ms();
+
+    assert!(server.state.presence.get(&id).is_none());
+    assert_eq!(run_due(&mut scheduler, now).await, 1);
+    assert!(server.state.presence.get(&id).unwrap().online);
+
+    // The result is the host's.
+    let path = format!("/api/v1/hosts/{id}/metrics/check.up?range=1h");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let up = loop {
+        let (_, body) = api(&server, "GET", &path, &Value::Null).await;
+        if body["series"]
+            .as_array()
+            .is_some_and(|lines| !lines.is_empty())
+        {
+            break body;
+        }
+        assert!(Instant::now() < deadline, "nothing was saved: {body}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(up["series"][0]["name"], "orders port");
+    // Nothing listens on port 1, so the only thing reaching the host fails.
+    let closed = tcp_check(&id, "orders port", "127.0.0.1:1");
+    assert_eq!(api(&server, "PUT", &check_path, &closed).await.0, 204);
+    assert_eq!(run_due(&mut scheduler, now + 60_000).await, 1);
+    assert!(!server.state.presence.get(&id).unwrap().online);
+
+    // A check that's no longer about the host says nothing about it.
+    let about_server = tcp_check("server", "orders port", "127.0.0.1:1");
+    assert_eq!(api(&server, "PUT", &check_path, &about_server).await.0, 204);
+    assert_eq!(run_due(&mut scheduler, now + 120_000).await, 1);
+    assert!(server.state.presence.get(&id).is_none());
+}
+
+#[tokio::test]
+async fn a_check_is_about_a_host_with_no_agent_or_the_server() {
+    let server = start().await;
+    let id = add_host(&server, "orders-db").await;
+    let agent = identity();
+    let _client = server.connect_approved(&agent, "web-1").await;
+
+    for about in [agent.id(), "nobody".to_string()] {
+        let check = tcp_check(&about, "port", "db.example.com:5432");
+        let (status, refused) = api(&server, "POST", "/api/v1/remote-checks", &check).await;
+        assert_eq!(status, 422, "{about}: {refused}");
+    }
+    // Left out, it's about the server, as every check used to be.
+    let own = json!({
+        "check": { "name": "site", "kind": "tcp", "target": "example.com:443" },
+        "interval_secs": 60
+    });
+    let (status, added) = api(&server, "POST", "/api/v1/remote-checks", &own).await;
+    assert_eq!(status, 201, "{added}");
+    let path = format!("/api/v1/remote-checks/{}", added["id"]);
+    assert_eq!(
+        api(&server, "GET", &path, &Value::Null).await.1["host_id"],
+        "server"
+    );
+
+    // A host's checks go with it.
+    let about_host = tcp_check(&id, "orders port", "db.example.com:5432");
+    let (_, added) = api(&server, "POST", "/api/v1/remote-checks", &about_host).await;
+    let host_path = format!("/api/v1/hosts/{id}");
+    assert_eq!(
+        api(&server, "DELETE", &host_path, &Value::Null).await.0,
+        204
+    );
+    let path = format!("/api/v1/remote-checks/{}", added["id"]);
+    assert_eq!(api(&server, "GET", &path, &Value::Null).await.0, 404);
+    let (_, left) = api(&server, "GET", "/api/v1/remote-checks", &Value::Null).await;
+    assert_eq!(left.as_array().unwrap().len(), 1, "{left}");
+}
+
+#[tokio::test]
+async fn a_hosts_checks_are_added_from_its_page() {
+    let server = start().await;
+    let id = add_host(&server, "orders-db").await;
+    let mut browser = Browser::default();
+    let host_path = format!("/hosts/{id}");
+
+    let page = browser.get(&server, &host_path).await;
+    let link = format!(r#"href="/checks/new?host={id}""#);
+    assert!(page.body.contains(&link), "{}", page.body);
+    assert!(page.body.contains("No checks are about this host yet"));
+
+    // The form starts on the host it was reached from.
+    let form_path = format!("/checks/new?host={id}");
+    let form = browser.get(&server, &form_path).await;
+    let chosen = format!(r#"<option value="{id}" selected>orders-db</option>"#);
+    assert!(form.body.contains(&chosen), "{}", form.body);
+    assert!(
+        form.body
+            .contains(r#"<option value="server">MaxNines server</option>"#)
+    );
+
+    let fields = [
+        ("host_id", id.as_str()),
+        ("name", "orders port"),
+        ("kind", "tcp"),
+        ("target", "db.example.com:5432"),
+        ("interval_secs", "60"),
+        ("enabled", "on"),
+    ];
+    let saved = browser
+        .submit(&server, &form_path, "/checks", &fields)
+        .await;
+    assert_eq!(saved.status, 303, "{}", saved.body);
+    assert_eq!(saved.header("location"), Some(host_path.as_str()));
+
+    let page = browser.get(&server, &host_path).await;
+    assert!(page.body.contains("orders port"), "{}", page.body);
+    assert!(page.body.contains("tcp db.example.com:5432"));
+    assert!(page.body.contains("Waiting"));
+    // The list of every check says whose it is.
+    let checks = browser.get(&server, "/checks").await;
+    let whose = format!(r#"<a href="/hosts/{id}">orders-db</a>"#);
+    assert!(checks.body.contains(&whose), "{}", checks.body);
+}

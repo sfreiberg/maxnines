@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use super::metrics::{CheckRow, check_row};
 use super::{CsrfForm, Page, server_error};
 use crate::app_state::AppState;
-use crate::remote_checks::{LOCAL_HOST_ID, RemoteCheckInput};
+use crate::registration::HostState;
+use crate::remote_checks::{LOCAL_HOST_ID, LOCAL_HOSTNAME, RemoteCheckInput};
 
 const KINDS: [CheckKind; 5] = [
     CheckKind::Http,
@@ -35,6 +36,8 @@ pub fn routes() -> Router<AppState> {
 /// A check as its form shows it, including whatever was just typed.
 #[derive(Serialize, Default)]
 struct CheckForm {
+    /// The host it's about: one with no agent, or the server itself.
+    host_id: String,
     name: String,
     kind: String,
     target: String,
@@ -69,6 +72,7 @@ fn number<T: std::str::FromStr>(text: &str, what: &str) -> Result<Option<T>> {
 impl CheckForm {
     fn blank() -> Self {
         Self {
+            host_id: LOCAL_HOST_ID.to_string(),
             kind: CheckKind::Http.as_str().to_string(),
             interval_secs: "60".to_string(),
             enabled: true,
@@ -80,6 +84,7 @@ impl CheckForm {
         let check = &input.check;
         let text = |value: &Option<String>| value.clone().unwrap_or_default();
         Self {
+            host_id: input.host_id.clone(),
             name: check.name.clone(),
             kind: check.kind.as_str().to_string(),
             target: check.target.clone(),
@@ -102,6 +107,8 @@ impl CheckForm {
     fn from_fields(fields: &BTreeMap<String, String>) -> Self {
         let text = |name: &str| fields.get(name).cloned().unwrap_or_default();
         Self {
+            // A form without one is from before checks had hosts.
+            host_id: optional(&text("host_id")).unwrap_or_else(|| LOCAL_HOST_ID.to_string()),
             name: text("name"),
             kind: text("kind"),
             target: text("target"),
@@ -134,6 +141,7 @@ impl CheckForm {
         let interval_secs =
             number(&self.interval_secs, "the interval")?.context("a check needs an interval")?;
         Ok(RemoteCheckInput {
+            host_id: self.host_id.clone(),
             check,
             interval_secs,
             enabled: self.enabled,
@@ -144,6 +152,8 @@ impl CheckForm {
 #[derive(Serialize)]
 struct ListRow {
     id: i64,
+    /// The host it's about, unless that's the server itself.
+    host: Option<HostChoice>,
     name: String,
     kind: &'static str,
     target: String,
@@ -184,12 +194,16 @@ async fn index(
         Err(error) => return server_error(&error),
     };
     let latest = state.check_results.all();
+    let hosts = host_choices(&state).await;
     let mut rows: Vec<ListRow> = checks
         .into_iter()
         .map(|check| {
             let input = check.input;
+            let about_server = input.host_id == LOCAL_HOST_ID;
+            let host = hosts.iter().find(|host| host.id == input.host_id);
             ListRow {
                 id: check.id,
+                host: host.filter(|_| !about_server).cloned(),
                 kind: input.check.kind.as_str(),
                 latest: latest.get(&input.check.name).and_then(check_row),
                 name: input.check.name,
@@ -219,7 +233,35 @@ async fn index(
         .render()
 }
 
-fn form_page(
+/// A host a check can be about.
+#[derive(Serialize, Clone)]
+struct HostChoice {
+    id: String,
+    hostname: String,
+}
+
+/// The server itself, then every host with no agent, by name.
+async fn host_choices(state: &AppState) -> Vec<HostChoice> {
+    let mut agentless: Vec<HostChoice> = state
+        .registry
+        .list()
+        .await
+        .into_iter()
+        .filter(|host| host.is_agentless() && host.state == HostState::Approved)
+        .map(|host| HostChoice {
+            id: host.id,
+            hostname: host.hostname,
+        })
+        .collect();
+    agentless.sort_by(|a, b| a.hostname.cmp(&b.hostname));
+    let server = HostChoice {
+        id: LOCAL_HOST_ID.to_string(),
+        hostname: LOCAL_HOSTNAME.to_string(),
+    };
+    std::iter::once(server).chain(agentless).collect()
+}
+
+async fn form_page(
     state: &AppState,
     token: &CsrfToken,
     id: Option<i64>,
@@ -230,6 +272,8 @@ fn form_page(
     let page = Page::new(state, token, "remote_checks/form.html")
         .with("id", &id)
         .with("check", form)
+        .with("hosts", &host_choices(state).await)
+        .with("back", &back_to(&form.host_id))
         .with("kinds", &kinds)
         .with("error", &error);
     match error {
@@ -238,8 +282,34 @@ fn form_page(
     }
 }
 
-async fn new(State(state): State<AppState>, token: CsrfToken) -> Response {
-    form_page(&state, &token, None, &CheckForm::blank(), None)
+/// Where a check's form goes when it's done: its host's page, or the list of
+/// checks for the server's own.
+fn back_to(host_id: &str) -> String {
+    if host_id == LOCAL_HOST_ID {
+        "/checks".to_string()
+    } else {
+        format!("/hosts/{host_id}")
+    }
+}
+
+#[derive(Deserialize)]
+struct NewParams {
+    /// The host to start with, as its page's link to here gives.
+    host: Option<String>,
+}
+
+async fn new(
+    State(state): State<AppState>,
+    Query(params): Query<NewParams>,
+    token: CsrfToken,
+) -> Response {
+    let mut form = CheckForm::blank();
+    if let Some(host) = params.host
+        && state.agentless_host(&host).await.is_some()
+    {
+        form.host_id = host;
+    }
+    form_page(&state, &token, None, &form, None).await
 }
 
 fn not_found(state: &AppState, token: &CsrfToken) -> Response {
@@ -251,7 +321,7 @@ async fn edit(State(state): State<AppState>, Path(id): Path<i64>, token: CsrfTok
     match state.database.get_remote_check(id).await {
         Ok(Some(check)) => {
             let form = CheckForm::from_input(&check.input);
-            form_page(&state, &token, Some(id), &form, None)
+            form_page(&state, &token, Some(id), &form, None).await
         }
         Ok(None) => not_found(&state, &token),
         Err(error) => server_error(&error),
@@ -270,11 +340,11 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
         Ok(input) => input,
         Err(error) => {
             let message = format!("{error:#}");
-            return form_page(&state, &form.token, None, &fields, Some(&message));
+            return form_page(&state, &form.token, None, &fields, Some(&message)).await;
         }
     };
     match state.database.create_remote_check(&input).await {
-        Ok(_) => (form.token, Redirect::to("/checks")).into_response(),
+        Ok(_) => (form.token, Redirect::to(&back_to(&input.host_id))).into_response(),
         Err(error) => server_error(&error),
     }
 }
@@ -285,19 +355,24 @@ async fn update(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfFo
         Ok(input) => input,
         Err(error) => {
             let message = format!("{error:#}");
-            return form_page(&state, &form.token, Some(id), &fields, Some(&message));
+            return form_page(&state, &form.token, Some(id), &fields, Some(&message)).await;
         }
     };
     match state.database.update_remote_check(id, &input).await {
-        Ok(true) => (form.token, Redirect::to("/checks")).into_response(),
+        Ok(true) => (form.token, Redirect::to(&back_to(&input.host_id))).into_response(),
         Ok(false) => not_found(&state, &form.token),
         Err(error) => server_error(&error),
     }
 }
 
 async fn delete(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfForm) -> Response {
+    let back = match state.database.get_remote_check(id).await {
+        Ok(Some(check)) => back_to(&check.input.host_id),
+        Ok(None) => return not_found(&state, &form.token),
+        Err(error) => return server_error(&error),
+    };
     match state.database.delete_remote_check(id).await {
-        Ok(true) => (form.token, Redirect::to("/checks")).into_response(),
+        Ok(true) => (form.token, Redirect::to(&back)).into_response(),
         Ok(false) => not_found(&state, &form.token),
         Err(error) => server_error(&error),
     }
@@ -315,6 +390,7 @@ mod tests {
         check.regex = Some("Welcome back".to_string());
         check.insecure = Some(true);
         RemoteCheckInput {
+            host_id: "5f0c1d6f2a8e4b7790d3c1a2b4e6f809".to_string(),
             check,
             interval_secs: 120,
             enabled: false,
@@ -333,6 +409,7 @@ mod tests {
         dns.server = Some("8.8.8.8".to_string());
         dns.record = Some("MX".to_string());
         let original = RemoteCheckInput {
+            host_id: crate::remote_checks::LOCAL_HOST_ID.to_string(),
             check: dns,
             interval_secs: 60,
             enabled: true,

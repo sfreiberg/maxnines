@@ -5157,12 +5157,15 @@ mod remote {
         Scheduler::new(
             server.state.database.clone(),
             server.state.writer.clone(),
+            server.state.registry.clone(),
+            server.state.presence.clone(),
             server.state.check_results.clone(),
         )
     }
 
     fn tcp_input(name: &str, target: &str) -> RemoteCheckInput {
         RemoteCheckInput {
+            host_id: crate::remote_checks::LOCAL_HOST_ID.to_string(),
             check: Check::new(name, CheckKind::Tcp, target),
             interval_secs: 60,
             enabled: true,
@@ -5209,6 +5212,7 @@ mod remote {
         let server = server().await;
         let (_listener, target) = open_port();
         let input = RemoteCheckInput {
+            host_id: crate::remote_checks::LOCAL_HOST_ID.to_string(),
             enabled: false,
             ..tcp_input("db", &target)
         };
@@ -6607,6 +6611,7 @@ mod pages {
     async fn the_overview_shows_agents_checks_and_who_is_waiting() {
         let test = Harness::start().await;
         let input = crate::remote_checks::RemoteCheckInput {
+            host_id: crate::remote_checks::LOCAL_HOST_ID.to_string(),
             check: maxnines_protocol::Check::new("site", maxnines_protocol::CheckKind::Tcp, "a:1"),
             interval_secs: 60,
             enabled: true,
@@ -6923,6 +6928,7 @@ mod pages {
     async fn checks_can_be_filtered() {
         let server = start().await;
         let input = |name: &str, enabled| crate::remote_checks::RemoteCheckInput {
+            host_id: crate::remote_checks::LOCAL_HOST_ID.to_string(),
             check: maxnines_protocol::Check::new(name, maxnines_protocol::CheckKind::Tcp, "a:1"),
             interval_secs: 60,
             enabled,

@@ -1,8 +1,9 @@
 //! Checks the server runs itself, against remote sites, with the same code agents
-//! use. Results are saved as samples from a built-in agent, so charts and alert
-//! rules treat them like anything else.
+//! use. Each is about a host: one with no agent, or the server itself, which is
+//! a built-in host. Results are saved as samples from that host, so charts and
+//! alert rules treat them like anything else.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -17,6 +18,8 @@ use tracing::{error, warn};
 
 use crate::metrics::now_ms;
 use crate::models::Database;
+use crate::presence::{Presence, Reached};
+use crate::registration::{HostState, Registry};
 use crate::store::{NewSample, WriterCommand};
 
 /// The built-in agent's ID. See the migration that creates it.
@@ -46,6 +49,9 @@ pub struct RemoteCheck {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RemoteCheckInput {
+    /// The host it's about. Left out, it's the server itself.
+    #[serde(default = "local_host_id")]
+    pub host_id: String,
     pub check: Check,
     /// How often it runs.
     pub interval_secs: u64,
@@ -55,6 +61,10 @@ pub struct RemoteCheckInput {
 
 fn default_enabled() -> bool {
     true
+}
+
+fn local_host_id() -> String {
+    LOCAL_HOST_ID.to_string()
 }
 
 pub fn check_input(input: &RemoteCheckInput) -> Result<()> {
@@ -100,6 +110,8 @@ impl LatestResults {
 pub struct Scheduler {
     database: Database,
     writer: mpsc::Sender<WriterCommand>,
+    registry: Arc<Registry>,
+    presence: Arc<Presence>,
     results: Arc<LatestResults>,
     slots: Arc<Semaphore>,
     /// When each check is next due, by ID.
@@ -110,11 +122,15 @@ impl Scheduler {
     pub fn new(
         database: Database,
         writer: mpsc::Sender<WriterCommand>,
+        registry: Arc<Registry>,
+        presence: Arc<Presence>,
         results: Arc<LatestResults>,
     ) -> Self {
         Self {
             database,
             writer,
+            registry,
+            presence,
             results,
             slots: Arc::new(Semaphore::new(MAX_RUNNING)),
             next_run: HashMap::new(),
@@ -146,42 +162,72 @@ impl Scheduler {
             .collect();
         self.results.keep_only(&names);
 
+        // A host with no agent is as present as its checks and pages say.
+        let agentless: BTreeMap<String, String> = self
+            .registry
+            .list()
+            .await
+            .into_iter()
+            .filter(|host| host.is_agentless() && host.state == HostState::Approved)
+            .map(|host| (host.id, host.hostname))
+            .collect();
+        let about_hosts: HashSet<i64> = checks
+            .iter()
+            .filter(|check| check.input.enabled && agentless.contains_key(&check.input.host_id))
+            .map(|check| check.id)
+            .collect();
+        self.presence.keep_checks(&about_hosts);
+
         let mut started = Vec::new();
-        for check in &checks {
-            let input = &check.input;
+        for check in checks {
             let due = *self.next_run.get(&check.id).unwrap_or(&now_ms);
-            if !input.enabled || due > now_ms {
+            if !check.input.enabled || due > now_ms {
                 continue;
             }
-            let interval_ms = i64::try_from(input.interval_secs)?.saturating_mul(1000);
+            let hostname = match agentless.get(&check.input.host_id) {
+                Some(hostname) => hostname.clone(),
+                None if check.input.host_id == LOCAL_HOST_ID => LOCAL_HOSTNAME.to_string(),
+                // Its host isn't one the server runs checks for any more.
+                None => continue,
+            };
+            let interval_ms = i64::try_from(check.input.interval_secs)?.saturating_mul(1000);
             self.next_run.insert(check.id, now_ms + interval_ms);
-            started.push(self.start(input.check.clone()));
+            started.push(self.start(check, hostname));
         }
         Ok(started)
     }
 
-    fn start(&self, check: Check) -> JoinHandle<()> {
+    fn start(&self, check: RemoteCheck, hostname: String) -> JoinHandle<()> {
         let (slots, writer) = (self.slots.clone(), self.writer.clone());
-        let results = self.results.clone();
+        let (results, presence) = (self.results.clone(), self.presence.clone());
         tokio::spawn(async move {
             let Ok(_slot) = slots.acquire_owned().await else {
                 return;
             };
-            let result = maxnines_checks::run(&check).await;
-            results.set(&check.name, result.clone());
-            save(&writer, result).await;
+            let host_id = check.input.host_id;
+            let result = maxnines_checks::run(&check.input.check).await;
+            results.set(&check.input.check.name, result.clone());
+            if host_id != LOCAL_HOST_ID {
+                presence.reached(&host_id, Reached::Check(check.id), result["up"] == 1);
+            }
+            save(&writer, host_id, hostname, result).await;
         })
     }
 }
 
-async fn save(writer: &mpsc::Sender<WriterCommand>, result: Value) {
+async fn save(
+    writer: &mpsc::Sender<WriterCommand>,
+    host_id: String,
+    hostname: String,
+    result: Value,
+) {
     let sample = Sample {
         timestamp_ms: now_ms() as u64,
         metrics: BTreeMap::from([("checks".to_string(), json!([result]))]),
     };
     let command = WriterCommand::Save(NewSample {
-        host_id: LOCAL_HOST_ID.to_string(),
-        hostname: LOCAL_HOSTNAME.to_string(),
+        host_id,
+        hostname,
         sample,
     });
     if writer.send(command).await.is_err() {
@@ -197,6 +243,7 @@ mod tests {
 
     fn input(interval_secs: u64) -> RemoteCheckInput {
         RemoteCheckInput {
+            host_id: crate::remote_checks::LOCAL_HOST_ID.to_string(),
             check: Check::new("a", CheckKind::Tcp, "example.com:80"),
             interval_secs,
             enabled: true,

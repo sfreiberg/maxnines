@@ -562,6 +562,10 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         Ok(pages) => pages,
         Err(error) => return server_error(&error),
     };
+    let checks = match super::agentless::check_rows(&state, &id).await {
+        Ok(checks) => checks,
+        Err(error) => return server_error(&error),
+    };
     let online = state.presence.get(&id).is_some_and(|p| p.online);
     let mut row = row(
         &state,
@@ -576,6 +580,7 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
     Page::new(&state, &token, "hosts/show.html")
         .with("host", &row)
         .with("pages", &pages)
+        .with("checks", &checks)
         .with("decided_by", &host.decided_by)
         .with("has_facts", &!flat.is_empty())
         .with("alerts", &alerts)

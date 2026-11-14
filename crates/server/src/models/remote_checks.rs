@@ -23,6 +23,7 @@ fn to_remote_check(row: remote_check::Model) -> Result<RemoteCheck> {
     Ok(RemoteCheck {
         id: row.id,
         input: RemoteCheckInput {
+            host_id: row.host_id,
             check,
             interval_secs: u64::try_from(row.interval_secs)?,
             enabled: row.enabled,
@@ -33,6 +34,7 @@ fn to_remote_check(row: remote_check::Model) -> Result<RemoteCheck> {
 fn to_row(input: &RemoteCheckInput) -> Result<remote_check::ActiveModel> {
     let check = &input.check;
     Ok(remote_check::ActiveModel {
+        host_id: Set(input.host_id.clone()),
         name: Set(check.name.clone()),
         kind: Set(check.kind.as_str().to_string()),
         target: Set(check.target.clone()),

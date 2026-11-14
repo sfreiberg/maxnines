@@ -2,9 +2,9 @@
 
 Some things can't have an agent installed: a managed database, a network device, a
 service someone else runs. They can still be hosts. The server reads their metrics
-itself, from [OpenMetrics](openmetrics.md) pages you give it, and everything that
-works for a host works for them: charts, alert rules, silences, maintenance windows,
-dashboards and the map.
+itself, from [OpenMetrics](openmetrics.md) pages you give it, and checks that they
+can be reached, and everything that works for a host works for them: charts, alert
+rules, silences, maintenance windows, dashboards and the map.
 
 ## Adding one
 
@@ -24,13 +24,25 @@ What's read is charted and named exactly as it is for a page an agent reads, whi
 [OpenMetrics](openmetrics.md#whats-reported) describes. A host can have up to 16
 pages, and two of them can't have the same name.
 
+## Checks
+
+A check tries reaching something: a website, a port, a certificate, a name in DNS or
+a ping. Press **Add check** under **Checks** on the host's page, or choose the host
+on any check's form. The check's results are the host's, so its charts are on the
+host's metrics page and an alert about it names the host.
+
+A check doesn't have to be about a host. One left on **MaxNines server** is the
+server's own, as every check was before hosts could have them, and those are all
+listed on the Checks page with the rest.
+
 ## Online and offline
 
-A host with no agent is online while any of its pages answers, so the built-in
-**Host offline** rule alerts once none of them has for a minute. A single page that
-stops answering while others carry on is an alert on **OpenMetrics page answering**
-instead. A host with no pages, or with every page turned off, is neither online nor
-offline, and nothing alerts about it.
+A host with no agent is online while any of its pages answers or any of its checks
+passes, so the built-in **Host offline** rule alerts once nothing has for a minute.
+A single page or check that fails while others carry on is an alert of its own
+instead, on **OpenMetrics page answering** or **Checks passing**. A host with no pages or
+checks, or with all of them turned off, is neither online nor offline, and nothing
+alerts about it.
 
 ## Passwords
 
@@ -58,4 +70,4 @@ on the host's clock or services. Filters that pick hosts by their facts don't ma
 them, though one can still be picked by its name or ID.
 
 Deleting a host without an agent takes one step, as there's no agent to revoke
-first, and removes its pages, metrics and alerts for good.
+first, and removes its pages, checks, metrics and alerts for good.

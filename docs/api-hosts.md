@@ -119,7 +119,7 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
 Deletes a revoked host with all its metrics, facts and alerts, and its place on the
 map if it has one of its own. It can't be undone. A host that isn't revoked gives
 `409`, so it always takes two steps. A host without an agent has no agent to revoke,
-so it's deleted in one, along with its metrics pages.
+so it's deleted in one, along with its metrics pages and checks.
 
 If the host still runs the agent, it comes back as a new host waiting to be
 approved, and a rule can approve it like any other.

@@ -281,6 +281,11 @@ impl AppState {
         id: Option<i64>,
     ) -> Result<()> {
         remote_checks::check_input(input)?;
+        let about = &input.host_id;
+        ensure!(
+            about == remote_checks::LOCAL_HOST_ID || self.agentless_host(about).await.is_some(),
+            "a check is about a host with no agent, or the server itself"
+        );
         let checks = self.database.list_remote_checks().await?;
         let name = &input.check.name;
         let taken = checks

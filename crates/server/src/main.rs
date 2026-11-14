@@ -332,6 +332,8 @@ async fn serve(path: &Path) -> Result<()> {
     Scheduler::new(
         state.database.clone(),
         state.writer.clone(),
+        state.registry.clone(),
+        state.presence.clone(),
         state.check_results.clone(),
     )
     .spawn();

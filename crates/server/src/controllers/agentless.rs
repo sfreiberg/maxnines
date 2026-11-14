@@ -328,6 +328,47 @@ pub async fn page_rows(state: &AppState, host_id: &str) -> Result<Vec<PageRow>> 
         .collect())
 }
 
+/// A check about a host, as its host's page lists it.
+#[derive(Serialize)]
+pub struct CheckRow {
+    id: i64,
+    name: String,
+    kind: &'static str,
+    target: String,
+    interval_secs: u64,
+    enabled: bool,
+    /// Whether it's run since the server started, and how that went.
+    run: bool,
+    up: bool,
+    error: Option<String>,
+}
+
+pub async fn check_rows(state: &AppState, host_id: &str) -> Result<Vec<CheckRow>> {
+    let checks = state.database.list_remote_checks().await?;
+    let latest = state.check_results.all();
+    Ok(checks
+        .into_iter()
+        .filter(|check| check.input.host_id == host_id)
+        .map(|check| {
+            let input = check.input;
+            let result = latest.get(&input.check.name);
+            CheckRow {
+                id: check.id,
+                kind: input.check.kind.as_str(),
+                run: result.is_some(),
+                up: result.is_some_and(|result| result["up"] == 1),
+                error: result
+                    .and_then(|result| result["error"].as_str())
+                    .map(String::from),
+                name: input.check.name,
+                target: input.check.target,
+                interval_secs: input.interval_secs,
+                enabled: input.enabled,
+            }
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

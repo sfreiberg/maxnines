@@ -5,6 +5,8 @@ use sea_orm::entity::prelude::*;
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i64,
+    /// The host it's about: one with no agent, or the server itself.
+    pub host_id: String,
     pub name: String,
     pub kind: String,
     pub target: String,
