@@ -207,6 +207,25 @@ pub(crate) async fn check_mysql(
         findings.server_version = Some(String::from_utf8_lossy(&greeting[1..=end]).into_owned());
         return Ok(());
     };
+    let started = Instant::now();
+    let mut connection = mysql_connection(check, credentials).await?;
+    findings.connect_ms = Some(elapsed_ms(started));
+    use mysql_async::prelude::Queryable;
+    let version: Option<String> = connection
+        .query_first("SELECT VERSION()")
+        .await
+        .map_err(short)?;
+    findings.server_version = version;
+    findings.signed_in = Some(true);
+    let _ = connection.disconnect().await;
+    Ok(())
+}
+
+/// Signs in to MySQL or MariaDB, over TLS when the check says to.
+pub(crate) async fn mysql_connection(
+    check: &Check,
+    credentials: &Credentials,
+) -> Result<mysql_async::Conn> {
     let (host, port) = host_and_port(&check.target)?;
     let username = credentials
         .username
@@ -223,18 +242,7 @@ pub(crate) async fn check_mysql(
             .with_danger_accept_invalid_certs(check.insecure == Some(true));
         options = options.ssl_opts(tls);
     }
-    let started = Instant::now();
-    let mut connection = mysql_async::Conn::new(options).await.map_err(short)?;
-    findings.connect_ms = Some(elapsed_ms(started));
-    use mysql_async::prelude::Queryable;
-    let version: Option<String> = connection
-        .query_first("SELECT VERSION()")
-        .await
-        .map_err(short)?;
-    findings.server_version = version;
-    findings.signed_in = Some(true);
-    let _ = connection.disconnect().await;
-    Ok(())
+    mysql_async::Conn::new(options).await.map_err(short)
 }
 
 pub(crate) async fn check_redis(

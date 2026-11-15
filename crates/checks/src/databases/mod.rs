@@ -8,6 +8,7 @@
 //! replication slots, named after it. Running totals in a row go under `totals`,
 //! and a [`Settle`] turns them into the change since the last sample.
 
+mod mysql;
 mod postgres;
 
 use std::collections::HashMap;
@@ -43,6 +44,7 @@ pub struct Database {
 /// A connection that's open.
 enum Open {
     Postgres(postgres::Postgres),
+    Mysql(mysql::Mysql),
 }
 
 pub struct Reader {
@@ -102,8 +104,9 @@ impl Reader {
         }
         let mut rows = Rows::new(&self.name);
         let extras = &self.extras;
-        match self.open.as_ref() {
+        match self.open.as_mut() {
             Some(Open::Postgres(open)) => open.read(&mut rows, extras).await?,
+            Some(Open::Mysql(open)) => open.read(&mut rows, extras).await?,
             None => bail!("not connected"),
         }
         Ok(rows.finish())
@@ -114,6 +117,9 @@ impl Reader {
         match check.kind {
             CheckKind::Postgres => Ok(Open::Postgres(
                 postgres::Postgres::connect(check, credentials).await?,
+            )),
+            CheckKind::Mysql => Ok(Open::Mysql(
+                mysql::Mysql::connect(check, credentials).await?,
             )),
             other => bail!("the stats of {} can't be read yet", other.as_str()),
         }

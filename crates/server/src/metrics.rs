@@ -1404,12 +1404,13 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    // PostgreSQL, from the databases an agent's config defines and a rule picks.
-    // Each is a series by the database's name, or by its name and what it's of,
-    // such as `orders standby replica1`. Running totals are rates.
+    // Databases an agent's config defines and a rule picks. Each is a series by
+    // the database's name, or by its name and what it's of, such as `orders
+    // standby replica1`. Running totals are rates. What every kind has is a
+    // database metric, so it charts every database together.
     Metric {
-        name: "postgres.up",
-        title: "PostgreSQL answering",
+        name: "database.up",
+        title: "Database answering",
         unit: Unit::Number,
         collector: "databases",
         source: Source::Items {
@@ -1419,8 +1420,8 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::Never,
     },
     Metric {
-        name: "postgres.uptime",
-        title: "PostgreSQL uptime",
+        name: "database.uptime",
+        title: "Database uptime",
         unit: Unit::Seconds,
         collector: "databases",
         source: Source::Items {
@@ -1430,8 +1431,8 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::Never,
     },
     Metric {
-        name: "postgres.connections",
-        title: "PostgreSQL connections",
+        name: "database.connections",
+        title: "Database connections",
         unit: Unit::Number,
         collector: "databases",
         source: Source::Items {
@@ -1441,8 +1442,8 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::WithData,
     },
     Metric {
-        name: "postgres.connections_used",
-        title: "PostgreSQL connections used",
+        name: "database.connections_used",
+        title: "Database connections used",
         unit: Unit::Percent,
         collector: "databases",
         source: Source::Items {
@@ -1451,6 +1452,106 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
+    Metric {
+        name: "database.oldest_transaction",
+        title: "Database oldest transaction",
+        unit: Unit::Seconds,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.oldest_transaction_secs"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "database.oldest_query",
+        title: "Database oldest query",
+        unit: Unit::Seconds,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.oldest_query_secs"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "database.rollbacks",
+        title: "Database rollbacks",
+        unit: Unit::PerSecond,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Rate("$.rollbacks"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "database.deadlocks",
+        title: "Database deadlocks",
+        unit: Unit::PerSecond,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Rate("$.deadlocks"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "database.cache_hit",
+        title: "Database cache hit rate",
+        unit: Unit::Percent,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.cache_hit"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "database.replica",
+        title: "Database is a replica",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.replica"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "database.receiving",
+        title: "Database replica receiving",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.receiving"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "database.lag",
+        title: "Database replication lag",
+        unit: Unit::Seconds,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.lag_secs"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "database.size",
+        title: "Database size",
+        unit: Unit::Bytes,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.size_bytes"),
+        },
+        chart: ShowChart::WithData,
+    },
+    // Only PostgreSQL has these.
     Metric {
         name: "postgres.active",
         title: "PostgreSQL active queries",
@@ -1485,28 +1586,6 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::WithData,
     },
     Metric {
-        name: "postgres.oldest_transaction",
-        title: "PostgreSQL oldest transaction",
-        unit: Unit::Seconds,
-        collector: "databases",
-        source: Source::Items {
-            name: "$.name",
-            reading: Reading::Field("$.oldest_transaction_secs"),
-        },
-        chart: ShowChart::WithData,
-    },
-    Metric {
-        name: "postgres.oldest_query",
-        title: "PostgreSQL oldest query",
-        unit: Unit::Seconds,
-        collector: "databases",
-        source: Source::Items {
-            name: "$.name",
-            reading: Reading::Field("$.oldest_query_secs"),
-        },
-        chart: ShowChart::WithData,
-    },
-    Metric {
         name: "postgres.oldest_idle_in_transaction",
         title: "PostgreSQL longest idle in a transaction",
         unit: Unit::Seconds,
@@ -1529,28 +1608,6 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::WithData,
     },
     Metric {
-        name: "postgres.rollbacks",
-        title: "PostgreSQL rollbacks",
-        unit: Unit::PerSecond,
-        collector: "databases",
-        source: Source::Items {
-            name: "$.name",
-            reading: Reading::Rate("$.rollbacks"),
-        },
-        chart: ShowChart::WithData,
-    },
-    Metric {
-        name: "postgres.cache_hit",
-        title: "PostgreSQL cache hit rate",
-        unit: Unit::Percent,
-        collector: "databases",
-        source: Source::Items {
-            name: "$.name",
-            reading: Reading::Field("$.cache_hit"),
-        },
-        chart: ShowChart::WithData,
-    },
-    Metric {
         name: "postgres.temp_written",
         title: "PostgreSQL temporary files written",
         unit: Unit::BytesPerSecond,
@@ -1558,17 +1615,6 @@ pub const METRICS: &[Metric] = &[
         source: Source::Items {
             name: "$.name",
             reading: Reading::Rate("$.temp_bytes"),
-        },
-        chart: ShowChart::WithData,
-    },
-    Metric {
-        name: "postgres.deadlocks",
-        title: "PostgreSQL deadlocks",
-        unit: Unit::PerSecond,
-        collector: "databases",
-        source: Source::Items {
-            name: "$.name",
-            reading: Reading::Rate("$.deadlocks"),
         },
         chart: ShowChart::WithData,
     },
@@ -1683,17 +1729,6 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::Never,
     },
     Metric {
-        name: "postgres.replica",
-        title: "PostgreSQL is a replica",
-        unit: Unit::Number,
-        collector: "databases",
-        source: Source::Items {
-            name: "$.name",
-            reading: Reading::Field("$.replica"),
-        },
-        chart: ShowChart::Never,
-    },
-    Metric {
         name: "postgres.standbys",
         title: "PostgreSQL standbys",
         unit: Unit::Number,
@@ -1716,17 +1751,6 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::Never,
     },
     Metric {
-        name: "postgres.lag",
-        title: "PostgreSQL replication lag",
-        unit: Unit::Seconds,
-        collector: "databases",
-        source: Source::Items {
-            name: "$.name",
-            reading: Reading::Field("$.lag_secs"),
-        },
-        chart: ShowChart::WithData,
-    },
-    Metric {
         name: "postgres.lag_bytes",
         title: "PostgreSQL standby lag in bytes",
         unit: Unit::Bytes,
@@ -1745,17 +1769,6 @@ pub const METRICS: &[Metric] = &[
         source: Source::Items {
             name: "$.name",
             reading: Reading::Field("$.streaming"),
-        },
-        chart: ShowChart::Never,
-    },
-    Metric {
-        name: "postgres.receiving",
-        title: "PostgreSQL replica receiving",
-        unit: Unit::Number,
-        collector: "databases",
-        source: Source::Items {
-            name: "$.name",
-            reading: Reading::Field("$.receiving"),
         },
         chart: ShowChart::Never,
     },
@@ -1913,14 +1926,400 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
+    // Only MySQL and MariaDB have these, Galera's included.
     Metric {
-        name: "postgres.database_size",
-        title: "PostgreSQL database size",
+        name: "mysql.threads_running",
+        title: "MySQL queries running",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.threads_running"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mysql.queries",
+        title: "MySQL queries",
+        unit: Unit::PerSecond,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Rate("$.queries"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mysql.slow_queries",
+        title: "MySQL slow queries",
+        unit: Unit::PerSecond,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Rate("$.slow_queries"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mysql.commits",
+        title: "MySQL commits",
+        unit: Unit::PerSecond,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Rate("$.commits"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.refused",
+        title: "MySQL connections refused at the limit",
+        unit: Unit::PerSecond,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Rate("$.refused"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.aborted_connects",
+        title: "MySQL failed connection attempts",
+        unit: Unit::PerSecond,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Rate("$.aborted_connects"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.tmp_disk_tables",
+        title: "MySQL temporary tables on disk",
+        unit: Unit::PerSecond,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Rate("$.tmp_disk_tables"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mysql.pool_dirty",
+        title: "MySQL buffer pool dirty",
+        unit: Unit::Percent,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.pool_dirty"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mysql.pool_waits",
+        title: "MySQL waits for a free buffer page",
+        unit: Unit::PerSecond,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Rate("$.pool_waits"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.lock_waits",
+        title: "MySQL row lock waits",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.lock_waits"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mysql.history_length",
+        title: "MySQL undo history length",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.history_length"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mysql.open_transactions",
+        title: "MySQL open transactions",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.open_transactions"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mysql.read_only",
+        title: "MySQL read only",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.read_only"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.super_read_only",
+        title: "MySQL super read only",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.super_read_only"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.applying",
+        title: "MySQL replica applying",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.applying"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.relay_log",
+        title: "MySQL relay log size",
         unit: Unit::Bytes,
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.size_bytes"),
+            reading: Reading::Field("$.relay_log_bytes"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.replication_errno",
+        title: "MySQL replication error code",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.replication_errno"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.semi_sync",
+        title: "MySQL semi-synchronous replication on",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.semi_sync"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.semi_sync_clients",
+        title: "MySQL semi-synchronous replicas",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.semi_sync_clients"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.semi_sync_misses",
+        title: "MySQL commits not acknowledged by a replica",
+        unit: Unit::PerSecond,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Rate("$.semi_sync_misses"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.group_members",
+        title: "MySQL group members",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.group_members"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.group_online",
+        title: "MySQL group members online",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.group_online"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mysql.member_online",
+        title: "MySQL group member online",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.member_online"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.applier_queue",
+        title: "MySQL group applier queue",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.applier_queue"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mysql.certifier_queue",
+        title: "MySQL group certifier queue",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.certifier_queue"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.group_conflicts",
+        title: "MySQL group conflicts",
+        unit: Unit::PerSecond,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Rate("$.group_conflicts"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.galera_primary",
+        title: "Galera cluster primary",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.galera_primary"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.galera_size",
+        title: "Galera cluster size",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.galera_size"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mysql.galera_ready",
+        title: "Galera node ready",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.galera_ready"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.galera_connected",
+        title: "Galera node connected",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.galera_connected"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.galera_synced",
+        title: "Galera node synced",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.galera_synced"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.galera_receive_queue",
+        title: "Galera receive queue",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.galera_receive_queue"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mysql.galera_send_queue",
+        title: "Galera send queue",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.galera_send_queue"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.galera_cert_failures",
+        title: "Galera certification failures",
+        unit: Unit::PerSecond,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Rate("$.galera_cert_failures"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.galera_flow_paused",
+        title: "Galera paused for flow control",
+        unit: Unit::Percent,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Rate("$.galera_flow_paused"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mysql.binlog_size",
+        title: "MySQL binary logs on disk",
+        unit: Unit::Bytes,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.binlog_size_bytes"),
         },
         chart: ShowChart::WithData,
     },
