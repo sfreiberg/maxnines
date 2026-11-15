@@ -32,6 +32,10 @@ pub struct Model {
     pub private_key: Option<String>,
     pub private_key_env: Option<String>,
     pub domain_expiry: Option<bool>,
+    /// For a database: whether to read its health and replication too.
+    pub read_stats: bool,
+    /// What else to read from it, separated by commas.
+    pub extras: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

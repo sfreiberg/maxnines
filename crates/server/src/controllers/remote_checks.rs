@@ -7,7 +7,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
-use maxnines_protocol::{Check, CheckKind};
+use maxnines_checks::databases::is_database;
+use maxnines_protocol::{Check, CheckKind, DATABASE_EXTRAS};
 use serde::{Deserialize, Serialize};
 
 use super::host_list::address;
@@ -80,6 +81,9 @@ struct CheckForm {
     host_key: String,
     /// Website checks look up when their domain expires unless this is off.
     domain_expiry: bool,
+    /// Database checks: whether to read its stats too, and which extras.
+    read_stats: bool,
+    extras: Vec<String>,
     /// How it signs in: none, password or key. Only that one's boxes count.
     sign_in: String,
     username: String,
@@ -145,6 +149,8 @@ impl CheckForm {
             tls: check.tls == Some(true),
             host_key: text(&check.host_key),
             domain_expiry: check.domain_expiry != Some(false),
+            read_stats: input.read_stats,
+            extras: input.extras.clone(),
             sign_in: input.sign_in.with().as_str().to_string(),
             username: text(&input.sign_in.username),
             password: String::new(),
@@ -178,6 +184,12 @@ impl CheckForm {
             tls: fields.contains_key("tls"),
             host_key: text("host_key"),
             domain_expiry: fields.contains_key("domain_expiry"),
+            read_stats: fields.contains_key("read_stats"),
+            extras: DATABASE_EXTRAS
+                .iter()
+                .filter(|extra| fields.contains_key(&format!("extra_{extra}")))
+                .map(|extra| (*extra).to_string())
+                .collect(),
             sign_in: text("sign_in"),
             username: text("username"),
             password: text("password"),
@@ -234,11 +246,19 @@ impl CheckForm {
                 ..SignIn::default()
             },
         };
+        // Only a database has stats, whatever boxes were left ticked for one.
+        let read_stats = self.read_stats && is_database(kind);
         let input = RemoteCheckInput {
             host_id: self.host_id.clone(),
             check,
             interval_secs,
             enabled: self.enabled,
+            read_stats,
+            extras: if read_stats {
+                self.extras.clone()
+            } else {
+                Vec::new()
+            },
             sign_in,
         };
         Ok((input, with))
@@ -374,6 +394,7 @@ async fn form_page(
             &id.map_or_else(|| back_to(&form.host_id), |id| format!("/checks/{id}")),
         )
         .with("kinds", &kinds)
+        .with("database_extras", &DATABASE_EXTRAS)
         .with("env_prefix", crate::metrics_pages::ENV_PREFIX)
         .with("error", &error);
     match error {
@@ -1095,6 +1116,8 @@ mod tests {
             check,
             interval_secs: 120,
             enabled: false,
+            read_stats: false,
+            extras: Vec::new(),
             sign_in: SignIn::default(),
         }
     }
@@ -1115,6 +1138,8 @@ mod tests {
             check: dns,
             interval_secs: 60,
             enabled: true,
+            read_stats: false,
+            extras: Vec::new(),
             sign_in: SignIn::default(),
         };
         assert_eq!(

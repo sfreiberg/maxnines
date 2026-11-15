@@ -1763,6 +1763,9 @@ struct RemoteCheckView {
     check: maxnines_protocol::Check,
     interval_secs: u64,
     enabled: bool,
+    read_stats: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    extras: Vec<String>,
     /// How it signs in: `none`, `password` or `key`.
     sign_in: SignInWith,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1785,6 +1788,8 @@ impl RemoteCheckView {
             check: input.check,
             interval_secs: input.interval_secs,
             enabled: input.enabled,
+            read_stats: input.read_stats,
+            extras: input.extras,
             sign_in: sign_in.with(),
             has_password: sign_in.password.is_some(),
             has_private_key: sign_in.private_key.is_some(),

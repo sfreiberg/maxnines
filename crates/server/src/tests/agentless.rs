@@ -1070,3 +1070,104 @@ async fn a_hosts_checks_are_added_from_its_page() {
     let whose = format!(r#"<a href="/hosts/{id}">orders-db</a>"#);
     assert!(checks.body.contains(&whose), "{}", checks.body);
 }
+
+#[tokio::test]
+async fn only_a_database_check_reads_stats_and_only_extras_there_are() {
+    let server = start().await;
+    let id = add_host(&server, "orders-db").await;
+    let request = |kind: &str, target: &str, more: Value| {
+        let mut request = json!({
+            "host_id": id,
+            "check": { "name": "orders", "kind": kind, "target": target },
+            "interval_secs": 60,
+            "username": "maxnines",
+        });
+        for (key, value) in more.as_object().unwrap() {
+            request[key] = value.clone();
+        }
+        request
+    };
+    for refused in [
+        request("tcp", "db:5432", json!({ "read_stats": true })),
+        request("postgres", "db:5432", json!({ "extras": ["sizes"] })),
+        request(
+            "postgres",
+            "db:5432",
+            json!({ "read_stats": true, "extras": ["tables"] }),
+        ),
+    ] {
+        let (status, body) = api(&server, "POST", "/api/v1/remote-checks", &refused).await;
+        assert_eq!(status, 422, "{refused}: {body}");
+    }
+    let wanted = request(
+        "postgres",
+        "db:5432",
+        json!({ "read_stats": true, "extras": ["sizes"] }),
+    );
+    let (status, added) = api(&server, "POST", "/api/v1/remote-checks", &wanted).await;
+    assert_eq!(status, 201, "{added}");
+    let path = format!("/api/v1/remote-checks/{}", added["id"]);
+    let (_, shown) = api(&server, "GET", &path, &Value::Null).await;
+    assert_eq!(shown["read_stats"], true);
+    assert_eq!(shown["extras"], json!(["sizes"]));
+
+    // The form keeps them too.
+    let form = Browser::default()
+        .get(&server, &format!("/checks/{}/edit", added["id"]))
+        .await;
+    assert!(
+        form.body
+            .contains(r#"<input type="checkbox" name="read_stats" checked>"#),
+        "{}",
+        form.body
+    );
+    assert!(
+        form.body
+            .contains(r#"<input type="checkbox" name="extra_sizes" checked>"#)
+    );
+}
+
+/// Reads the throwaway PostgreSQL the checks crate's tests use, named as
+/// `host:port username`, as a host with no agent.
+#[tokio::test]
+async fn a_database_check_reads_its_stats_as_the_hosts() {
+    let Ok(real) = std::env::var("MAXNINES_TEST_CHECK_POSTGRES") else {
+        return;
+    };
+    let (target, username) = real.split_once(' ').unwrap();
+    let server = start_with_metrics().await;
+    let id = add_host(&server, "orders-db").await;
+    let check = json!({
+        "host_id": id,
+        "check": { "name": "orders", "kind": "postgres", "target": target },
+        "interval_secs": 60,
+        "username": username,
+        "read_stats": true,
+        "extras": ["sizes"],
+    });
+    let (status, added) = api(&server, "POST", "/api/v1/remote-checks", &check).await;
+    assert_eq!(status, 201, "{added}");
+    let mut scheduler = check_scheduler(&server);
+    assert_eq!(run_due(&mut scheduler, now_ms()).await, 1);
+
+    // Saved as the host's, as an agent's would be.
+    for metric in ["database.up", "database.connections", "database.size"] {
+        let path = format!("/api/v1/hosts/{id}/metrics/{metric}?range=1h");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (_, body) = api(&server, "GET", &path, &Value::Null).await;
+            if body["series"]
+                .as_array()
+                .is_some_and(|lines| !lines.is_empty())
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "no {metric}: {body}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    let page = Browser::default()
+        .get(&server, &format!("/hosts/{id}/metrics"))
+        .await;
+    assert!(page.body.contains("Latest databases"), "{}", page.body);
+}

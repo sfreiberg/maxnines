@@ -31,6 +31,11 @@ fn to_remote_check(row: remote_check::Model) -> Result<RemoteCheck> {
             check,
             interval_secs: u64::try_from(row.interval_secs)?,
             enabled: row.enabled,
+            read_stats: row.read_stats,
+            extras: row
+                .extras
+                .map(|extras| extras.split(',').map(String::from).collect())
+                .unwrap_or_default(),
             sign_in: SignIn {
                 username: row.username,
                 password: row.password,
@@ -63,6 +68,8 @@ fn to_row(input: &RemoteCheckInput) -> Result<remote_check::ActiveModel> {
         tls: Set(check.tls),
         host_key: Set(check.host_key.clone()),
         domain_expiry: Set(check.domain_expiry),
+        read_stats: Set(input.read_stats),
+        extras: Set((!input.extras.is_empty()).then(|| input.extras.join(","))),
         username: Set(input.sign_in.username.clone()),
         password: Set(input.sign_in.password.clone()),
         password_env: Set(input.sign_in.password_env.clone()),

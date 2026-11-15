@@ -5170,6 +5170,8 @@ mod remote {
             check: Check::new(name, CheckKind::Tcp, target),
             interval_secs: 60,
             enabled: true,
+            read_stats: false,
+            extras: Vec::new(),
             sign_in: Default::default(),
         }
     }
@@ -6625,6 +6627,8 @@ mod pages {
             check: maxnines_protocol::Check::new("site", maxnines_protocol::CheckKind::Tcp, "a:1"),
             interval_secs: 60,
             enabled: true,
+            read_stats: false,
+            extras: Vec::new(),
             sign_in: Default::default(),
         };
         test.database().create_remote_check(&input).await.unwrap();
@@ -6943,6 +6947,8 @@ mod pages {
             check: maxnines_protocol::Check::new(name, maxnines_protocol::CheckKind::Tcp, "a:1"),
             interval_secs: 60,
             enabled,
+            read_stats: false,
+            extras: Vec::new(),
             sign_in: Default::default(),
         };
         let database = &server.state.database;

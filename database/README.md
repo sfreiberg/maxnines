@@ -359,6 +359,8 @@ erDiagram
         text private_key "ssh: as typed, when it was"
         string private_key_env "the server's variable holding it"
         boolean domain_expiry "http: false to not look it up"
+        boolean read_stats "databases: read health and replication too"
+        string extras "what else to read, comma-separated"
     }
     audit_log {
         int id PK

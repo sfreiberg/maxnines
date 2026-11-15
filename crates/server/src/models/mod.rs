@@ -1914,6 +1914,8 @@ mod tests {
             check,
             interval_secs: 60,
             enabled: true,
+            read_stats: false,
+            extras: Vec::new(),
             sign_in: Default::default(),
         };
 

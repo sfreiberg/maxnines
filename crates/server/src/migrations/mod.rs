@@ -16,6 +16,7 @@ impl MigratorTrait for Migrator {
             Box::new(SilenceSeries),
             Box::new(CheckSignIn),
             Box::new(DomainExpiry),
+            Box::new(CheckStats),
         ]
     }
 }
@@ -1726,6 +1727,8 @@ enum RemoteChecks {
     PrivateKey,
     PrivateKeyEnv,
     DomainExpiry,
+    ReadStats,
+    Extras,
 }
 
 #[derive(Iden)]
@@ -1867,6 +1870,61 @@ impl MigrationTrait for PageTokens {
                 .alter_table(
                     Table::alter()
                         .table(MetricsPages::Table)
+                        .drop_column(column)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+struct CheckStats;
+
+impl MigrationName for CheckStats {
+    fn name(&self) -> &str {
+        "m20261115_000007_check_stats"
+    }
+}
+
+/// A database check can also read the database's health and replication, with
+/// any extras it's asked for, such as sizes.
+#[async_trait::async_trait]
+impl MigrationTrait for CheckStats {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    // One column to a statement, as SQLite adds no more than that at once.
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for column in [
+            ColumnDef::new(RemoteChecks::ReadStats)
+                .boolean()
+                .not_null()
+                .default(false)
+                .to_owned(),
+            ColumnDef::new(RemoteChecks::Extras)
+                .string_len(255)
+                .to_owned(),
+        ] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(RemoteChecks::Table)
+                        .add_column(column)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for column in [RemoteChecks::Extras, RemoteChecks::ReadStats] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(RemoteChecks::Table)
                         .drop_column(column)
                         .to_owned(),
                 )

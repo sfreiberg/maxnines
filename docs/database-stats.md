@@ -72,6 +72,15 @@ address.
 
 For example, `orders sizes`.
 
+## Hosts without an agent
+
+For a database on a [host without an agent](agentless-hosts.md), such as a managed
+one, the server reads it instead. Add a PostgreSQL, MySQL or MongoDB check about the
+host on the **Checks** page, with how it signs in, and tick **Read its health and
+replication**, with any extras. Its stats are charted on the host's metrics page and
+listed under **Latest databases** there, as an agent's are, named after the check.
+The server keeps one connection open between runs, as an agent does.
+
 ## The account to sign in as
 
 Give the agent an account of its own, which can read statistics and change nothing.
