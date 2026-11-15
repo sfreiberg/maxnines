@@ -153,17 +153,32 @@ pub async fn run(check: &Check) -> Value {
     report(check, findings, result)
 }
 
-/// A username and password for a page that asks for one, as the header that
-/// carries them.
+/// What a page that asks who's reading is sent: a username and password, or a
+/// token, as the header that carries them.
 pub struct Login(HeaderValue);
 
 impl Login {
+    /// A username and password, sent as basic authentication.
     pub fn new(username: &str, password: &str) -> Result<Self> {
         use base64::Engine;
         let both =
             base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
-        let mut header = HeaderValue::from_str(&format!("Basic {both}"))
-            .map_err(|_| anyhow!("invalid username or password"))?;
+        Self::header(&format!("Basic {both}")).context("invalid username or password")
+    }
+
+    /// A token, sent as a bearer token.
+    pub fn token(token: &str) -> Result<Self> {
+        // Anything else would end the header early or never match what was issued.
+        ensure!(
+            !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_graphic()),
+            "a token can't be empty, or hold spaces or anything but plain letters, digits \
+             and punctuation"
+        );
+        Self::header(&format!("Bearer {token}"))
+    }
+
+    fn header(value: &str) -> Result<Self> {
+        let mut header = HeaderValue::from_str(value).map_err(|_| anyhow!("invalid header"))?;
         // Keeps it out of anything that prints headers.
         header.set_sensitive(true);
         Ok(Self(header))

@@ -28,9 +28,17 @@
     <input type="checkbox" name="enabled"{% if page.enabled %} checked{% endif %}> Read this page
   </label>
 
-  <fieldset>
+  <fieldset class="sign-in">
     <legend>Signing in</legend>
-    <p class="hint">For a page that asks for a username and password. Leave all three empty for one that doesn't.</p>
+    <label>Sign in with
+      <select name="sign_in">
+        <option value="none"{% if page.sign_in == "none" %} selected{% endif %}>Nothing</option>
+        <option value="password"{% if page.sign_in == "password" %} selected{% endif %}>A username and password</option>
+        <option value="token"{% if page.sign_in == "token" %} selected{% endif %}>A token</option>
+      </select>
+      <small>For a page that asks who's reading it.</small>
+    </label>
+    <div class="password-fields">
     <label>Username
       <input type="text" name="username" value="{{ page.username }}" maxlength="255" autocomplete="off" spellcheck="false">
     </label>
@@ -38,10 +46,21 @@
       <input type="password" name="password" value="" maxlength="1024" autocomplete="new-password"{% if page.has_password %} placeholder="Saved. Leave empty to keep it"{% endif %}>
       <small>Kept in the database and never shown again.</small>
     </label>
-    <label>Or the environment variable that holds it
+    <label>Or the environment variable that holds the password
       <input type="text" name="password_env" value="{{ page.password_env }}" maxlength="255" autocomplete="off" spellcheck="false" placeholder="{{ env_prefix }}ORDERS_DB">
       <small>A variable in the server's own environment, read each time the page is. Its name has to start with <code>{{ env_prefix }}</code>, so that only what's been set aside for this can be sent anywhere.</small>
     </label>
+    </div>
+    <div class="token-fields">
+    <label>Token
+      <input type="password" name="token" value="" maxlength="1024" autocomplete="off"{% if page.has_token %} placeholder="Saved. Leave empty to keep it"{% endif %}>
+      <small>Sent as a bearer token. Kept in the database and never shown again.</small>
+    </label>
+    <label>Or the environment variable that holds the token
+      <input type="text" name="token_env" value="{{ page.token_env }}" maxlength="255" autocomplete="off" spellcheck="false" placeholder="{{ env_prefix }}ORDERS_TOKEN">
+      <small>A variable in the server's own environment, read each time the page is. Its name has to start with <code>{{ env_prefix }}</code>, so that only what's been set aside for this can be sent anywhere.</small>
+    </label>
+    </div>
   </fieldset>
 
   <div class="actions">

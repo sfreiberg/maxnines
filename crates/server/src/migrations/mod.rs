@@ -8,7 +8,7 @@ pub struct Migrator;
 
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(CreateTables)]
+        vec![Box::new(CreateTables), Box::new(PageTokens)]
     }
 }
 
@@ -1851,6 +1851,58 @@ enum ServerSecrets {
     Value,
 }
 
+struct PageTokens;
+
+impl MigrationName for PageTokens {
+    fn name(&self) -> &str {
+        "m20261115_000002_page_tokens"
+    }
+}
+
+/// A metrics page can be signed in to with a token instead of a username and
+/// password, typed in or from the server's environment as a password is.
+#[async_trait::async_trait]
+impl MigrationTrait for PageTokens {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    // One column to a statement, as SQLite adds no more than that at once.
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for column in [
+            ColumnDef::new(MetricsPages::Token).text().to_owned(),
+            ColumnDef::new(MetricsPages::TokenEnv)
+                .string_len(255)
+                .to_owned(),
+        ] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(MetricsPages::Table)
+                        .add_column(column)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Pages signed in to with a token go back to not being signed in to.
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for column in [MetricsPages::TokenEnv, MetricsPages::Token] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(MetricsPages::Table)
+                        .drop_column(column)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(DeriveIden)]
 enum MetricsPages {
     Table,
@@ -1863,6 +1915,8 @@ enum MetricsPages {
     Username,
     Password,
     PasswordEnv,
+    Token,
+    TokenEnv,
 }
 
 #[derive(DeriveIden)]

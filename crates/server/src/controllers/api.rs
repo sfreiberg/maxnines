@@ -29,7 +29,7 @@ use crate::facts::unflatten;
 use crate::locations::{LocationRuleInput, check_rule};
 use crate::maintenance::MaintenanceWindowInput;
 use crate::metrics::{self, METRICS, Metric, SeriesResult, TimeRange, Unit, now_ms};
-use crate::metrics_pages::{MetricsPage, MetricsPageInput};
+use crate::metrics_pages::{MetricsPage, MetricsPageInput, SignIn};
 use crate::models::User;
 use crate::models::{
     ConfigStatus, RuleInput, UserChange, check_api_key_name, check_new_user, expiry_after, is_theme,
@@ -620,7 +620,18 @@ async fn rename_host(
     }
 }
 
-/// A metrics page as the API shows it. Its password can be set but not read back.
+/// A metrics page as a request gives it. `sign_in` says how it's signed in to,
+/// which is the only way to keep a saved token without sending it again.
+#[derive(Deserialize)]
+struct MetricsPageRequest {
+    #[serde(flatten)]
+    input: MetricsPageInput,
+    #[serde(default)]
+    sign_in: Option<SignIn>,
+}
+
+/// A metrics page as the API shows it. Its password or token can be set but not
+/// read back.
 #[derive(Debug, Serialize)]
 struct MetricsPageView {
     id: i64,
@@ -631,9 +642,12 @@ struct MetricsPageView {
     names: Vec<String>,
     interval_secs: u64,
     enabled: bool,
+    sign_in: SignIn,
     username: Option<String>,
     has_password: bool,
     password_env: Option<String>,
+    has_token: bool,
+    token_env: Option<String>,
 }
 
 impl MetricsPageView {
@@ -642,7 +656,10 @@ impl MetricsPageView {
             id: page.id,
             host_id: page.host_id,
             name: page.input.name().to_string(),
+            sign_in: page.input.sign_in(),
             has_password: page.input.password.is_some(),
+            has_token: page.input.token.is_some(),
+            token_env: page.input.token_env,
             url: page.input.url,
             names: page.input.names,
             interval_secs: page.input.interval_secs,
@@ -685,7 +702,7 @@ async fn show_metrics_page(State(state): State<AppState>, UrlPath(id): UrlPath<i
 async fn create_metrics_page(
     State(state): State<AppState>,
     UrlPath(host_id): UrlPath<String>,
-    Json(input): Json<MetricsPageInput>,
+    Json(request): Json<MetricsPageRequest>,
 ) -> Response {
     let Some(host) = state.registry.get(&host_id).await.filter(|a| !a.is_local()) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -695,7 +712,9 @@ async fn create_metrics_page(
                    own, from a config rule";
         return failed(StatusCode::CONFLICT, why);
     }
-    let input = match state.checked_metrics_page(&host.id, None, input).await {
+    let MetricsPageRequest { input, sign_in } = request;
+    let checked = state.checked_metrics_page(&host.id, None, input, sign_in);
+    let input = match checked.await {
         Ok(input) => input,
         Err(error) => return refused(&error),
     };
@@ -708,14 +727,15 @@ async fn create_metrics_page(
 async fn update_metrics_page(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<i64>,
-    Json(input): Json<MetricsPageInput>,
+    Json(request): Json<MetricsPageRequest>,
 ) -> Response {
     let saved = match state.database.get_metrics_page(id).await {
         Ok(Some(saved)) => saved,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return server_error(&error),
     };
-    let checked = state.checked_metrics_page(&saved.host_id, Some(id), input);
+    let MetricsPageRequest { input, sign_in } = request;
+    let checked = state.checked_metrics_page(&saved.host_id, Some(id), input, sign_in);
     let input = match checked.await {
         Ok(input) => input,
         Err(error) => return refused(&error),

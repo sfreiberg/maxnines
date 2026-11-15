@@ -13,9 +13,13 @@ agent reads are part of its [config rules](api-config-rules.md) instead.
 | `username` | For a page that asks who's reading. It needs one of the two below |
 | `password` | The password itself. It can be set but is never given back |
 | `password_env` | The server's environment variable that holds the password. Its name has to start with `MAXNINES_SECRET_` |
+| `token` | For a page that takes a token instead, sent as a bearer token. It can be set but is never given back |
+| `token_env` | The server's environment variable that holds the token, named as `password_env` is |
+| `sign_in` | How the page is signed in to: `none`, `password` or `token`. Left out, it's worked out from the fields above |
 
-What comes back also has the page's `id`, its `host_id`, the `name` its series
-start with, and `has_password`, which says whether a password is saved.
+A page has a username and password or a token, not both. What comes back also has
+the page's `id`, its `host_id`, the `name` its series start with, and `has_password`
+and `has_token`, which say whether one is saved.
 
 ## List a host's metrics pages
 
@@ -36,9 +40,12 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
     "names": ["pg_*"],
     "interval_secs": 60,
     "enabled": true,
+    "sign_in": "password",
     "username": "metrics",
     "has_password": false,
-    "password_env": "MAXNINES_SECRET_ORDERS_DB"
+    "password_env": "MAXNINES_SECRET_ORDERS_DB",
+    "has_token": false,
+    "token_env": null
   }
 ]
 ```
@@ -79,9 +86,12 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 `PUT /api/v1/metrics-pages/{id}`
 
-Replaces the whole page, apart from its password: one that gives a `username` but
-neither `password` nor `password_env` keeps the password it has. Leaving `username`
-out removes the login.
+Replaces the whole page, apart from its password or token:
+
+- A change that gives a `username` but neither `password` nor `password_env` keeps
+  the password it has. Leaving `username` out removes the login.
+- A change with `"sign_in": "token"` but neither `token` nor `token_env` keeps the
+  token it has. Leaving all three out removes the token.
 
 ```sh
 curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \

@@ -22,6 +22,8 @@ fn to_page(row: metrics_page::Model) -> Result<MetricsPage> {
             username: row.username,
             password: row.password,
             password_env: row.password_env,
+            token: row.token,
+            token_env: row.token_env,
         },
     })
 }
@@ -36,6 +38,8 @@ fn to_row(host_id: &str, input: &MetricsPageInput) -> Result<metrics_page::Activ
         username: Set(input.username.clone()),
         password: Set(input.password.clone()),
         password_env: Set(input.password_env.clone()),
+        token: Set(input.token.clone()),
+        token_env: Set(input.token_env.clone()),
         ..Default::default()
     })
 }
@@ -59,7 +63,7 @@ async fn of_host<C: ConnectionTrait>(connection: &C, host_id: &str) -> Result<Ve
 }
 
 /// Records how a page changed from `before`, reading it as it is now. A password
-/// only ever shows as having changed.
+/// or token only ever shows as having changed.
 async fn record<C: ConnectionTrait>(
     connection: &C,
     id: i64,
@@ -134,7 +138,7 @@ impl Database {
         let Some(before) = load(&transaction, id).await? else {
             return Ok(false);
         };
-        let input = input.keeping_password_of(&before.input);
+        let input = input.keeping_secrets_of(&before.input, None);
         let others = of_host(&transaction, &before.host_id).await?;
         let others = others.iter().filter(|page| page.id != id);
         check_names(others.map(|page| &page.input).chain([&input]))?;

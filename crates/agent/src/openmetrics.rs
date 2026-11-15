@@ -1,16 +1,16 @@
 //! Reads the OpenMetrics pages a config rule lists, with every sample. How a page
 //! is read is in [`maxnines_checks::openmetrics`], which the server shares.
 //!
-//! A page that asks for a username and password gets the ones the agent's own
-//! config gives for it, by the page's name. They never come from the server, and
-//! never go to it.
+//! A page that asks for a username and password, or a token, gets the ones the
+//! agent's own config gives for it, by the page's name. They never come from the
+//! server, and never go to it.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use maxnines_checks::Login;
 use maxnines_checks::openmetrics::{MAX_SERIES, Page, TIMED_OUT, TIMEOUT, Totals};
 use maxnines_protocol::metrics_page_name;
@@ -23,19 +23,28 @@ use crate::collector::Collector;
 /// How many pages the agent's config can give a login for.
 const MAX_LOGINS: usize = 64;
 
-/// A page's username and password, from the agent's own config:
+/// How to sign in to a page, from the agent's own config: a username and
+/// password, or a token.
 ///
 /// ```hcl
 /// openmetrics "localhost:9100" {
 ///   username = "metrics"
 ///   password = env("METRICS_PASSWORD")
 /// }
+///
+/// openmetrics "localhost:8080" {
+///   token = env("APP_METRICS_TOKEN")
+/// }
 /// ```
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PageLogin {
-    username: String,
-    password: String,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
 }
 
 impl fmt::Debug for PageLogin {
@@ -43,6 +52,28 @@ impl fmt::Debug for PageLogin {
         f.debug_struct("PageLogin")
             .field("username", &self.username)
             .finish_non_exhaustive()
+    }
+}
+
+impl PageLogin {
+    /// What to send the page, or what's wrong with what the config gives.
+    fn login(&self, page: &str) -> Result<Login> {
+        let (username, password) = (self.username.as_deref(), self.password.as_deref());
+        if let Some(token) = &self.token {
+            ensure!(
+                username.is_none() && password.is_none(),
+                "the login for {page:?} is a username and password or a token, not both"
+            );
+            return Login::token(token).with_context(|| format!("the token for {page:?}"));
+        }
+        // Basic authentication ends the username at the first colon.
+        let Some(username) = username.filter(|name| !name.is_empty() && !name.contains(':')) else {
+            bail!("the login for {page:?} needs a username, without a colon, or a token");
+        };
+        let Some(password) = password.filter(|password| !password.is_empty()) else {
+            bail!("the login for {page:?} needs a password");
+        };
+        Login::new(username, password)
     }
 }
 
@@ -61,19 +92,11 @@ pub fn check_logins(logins: &Logins) -> Result<()> {
             "{page:?} isn't an OpenMetrics page's name, which is its address without \
              http://, like localhost:9100"
         );
-        // Basic authentication ends the username at the first colon.
-        ensure!(
-            !login.username.is_empty() && !login.username.contains(':'),
-            "the login for {page:?} needs a username, without a colon"
-        );
-        ensure!(
-            !login.password.is_empty(),
-            "the login for {page:?} needs a password"
-        );
-        Login::new(&login.username, &login.password)?;
+        login.login(page)?;
     }
     Ok(())
 }
+
 pub struct OpenMetricsCollector {
     background: Background,
     totals: Totals,
@@ -90,9 +113,10 @@ impl OpenMetricsCollector {
         let pages = urls
             .into_iter()
             .map(|url| {
+                let page = metrics_page_name(&url);
                 let login = logins
-                    .get(metrics_page_name(&url))
-                    .map(|login| Login::new(&login.username, &login.password))
+                    .get(page)
+                    .map(|login| login.login(page))
                     .transpose()?;
                 Ok(Arc::new(Page::new(url, wanted, max_series, login)))
             })
@@ -267,9 +291,18 @@ mod tests {
     }
 
     fn login(username: &str, password: &str) -> PageLogin {
+        let filled = |text: &str| Some(text.to_string()).filter(|text| !text.is_empty());
         PageLogin {
-            username: username.to_string(),
-            password: password.to_string(),
+            username: filled(username),
+            password: filled(password),
+            token: None,
+        }
+    }
+
+    fn token(token: &str) -> PageLogin {
+        PageLogin {
+            token: Some(token.to_string()),
+            ..PageLogin::default()
         }
     }
 
@@ -303,6 +336,42 @@ mod tests {
             assert_eq!(output[0]["up"], 0, "{output}");
             assert_eq!(output[0]["error"], "the page returned status 401");
         }
+    }
+
+    #[test]
+    fn a_page_gets_the_token_the_agent_has_for_it() {
+        let served = serve_to(vec!["queue 1\n"], Some("authorization: Bearer abc.DEF-123"));
+        let address = &served.address;
+        let url = format!("http://{address}/metrics");
+        let read = |login: PageLogin| {
+            let logins = Logins::from([(address.clone(), login)]);
+            let interval = Duration::from_millis(200);
+            let mut collector =
+                OpenMetricsCollector::new(vec![url.clone()], &[], &logins, interval).unwrap();
+            collect_until(&mut collector, |output| output.is_array())
+        };
+
+        let output = read(token("abc.DEF-123"));
+        assert_eq!(output[0]["up"], 1, "{output}");
+        let output = read(token("another"));
+        assert_eq!(output[0]["error"], "the page returned status 401");
+    }
+
+    #[test]
+    fn a_login_is_a_username_and_password_or_a_token() {
+        let one =
+            |login: PageLogin| check_logins(&Logins::from([("localhost:9100".into(), login)]));
+        one(token("abc.DEF-123_~+/=")).unwrap();
+        for bad in ["", "two words", "line\nbreak", "caf\u{e9}"] {
+            assert!(one(token(bad)).is_err(), "{bad:?}");
+        }
+        let both = PageLogin {
+            token: Some("abc".to_string()),
+            ..login("metrics", "s3cret")
+        };
+        let error = one(both).unwrap_err().to_string();
+        assert!(error.contains("not both"), "{error}");
+        assert!(one(PageLogin::default()).is_err());
     }
 
     #[test]

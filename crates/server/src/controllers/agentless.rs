@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use super::{CsrfForm, Page, recorded_by, server_error};
 use crate::app_state::AppState;
-use crate::metrics_pages::{ENV_PREFIX, MetricsPage, MetricsPageInput};
+use crate::metrics_pages::{ENV_PREFIX, MetricsPage, MetricsPageInput, SignIn};
 use crate::registration::HostRecord;
 
 fn not_found(state: &AppState, token: &CsrfToken) -> Response {
@@ -69,18 +69,23 @@ pub async fn rename(
 }
 
 /// A page as its form shows it, including whatever was just typed. A saved
-/// password is never put back in the form.
+/// password or token is never put back in the form.
 #[derive(Serialize, Default)]
 struct PageForm {
     url: String,
     names: String,
     interval_secs: String,
     enabled: bool,
+    /// How to sign in: none, password or token. Only that one's boxes count.
+    sign_in: String,
     username: String,
     password: String,
     password_env: String,
-    /// Whether a password is saved, which leaving the box empty keeps.
+    token: String,
+    token_env: String,
+    /// Whether a password or token is saved, which leaving the box empty keeps.
     has_password: bool,
+    has_token: bool,
 }
 
 impl PageForm {
@@ -88,6 +93,7 @@ impl PageForm {
         Self {
             interval_secs: "60".to_string(),
             enabled: true,
+            sign_in: SignIn::None.as_str().to_string(),
             ..Self::default()
         }
     }
@@ -98,10 +104,14 @@ impl PageForm {
             names: input.names.join("\n"),
             interval_secs: input.interval_secs.to_string(),
             enabled: input.enabled,
+            sign_in: input.sign_in().as_str().to_string(),
             username: input.username.clone().unwrap_or_default(),
             password: String::new(),
             password_env: input.password_env.clone().unwrap_or_default(),
+            token: String::new(),
+            token_env: input.token_env.clone().unwrap_or_default(),
             has_password: input.password.is_some(),
+            has_token: input.token.is_some(),
         }
     }
 
@@ -112,30 +122,47 @@ impl PageForm {
             names: text("names"),
             interval_secs: text("interval_secs"),
             enabled: fields.contains_key("enabled"),
+            sign_in: text("sign_in"),
             username: text("username"),
             password: text("password"),
             password_env: text("password_env"),
+            token: text("token"),
+            token_env: text("token_env"),
             has_password: saved.is_some_and(|saved| saved.password.is_some()),
+            has_token: saved.is_some_and(|saved| saved.token.is_some()),
         }
     }
 
-    fn to_input(&self) -> Result<MetricsPageInput> {
+    /// The page, and how the form says to sign in to it. What's typed in the
+    /// boxes for another way of signing in is left out.
+    fn to_input(&self) -> Result<(MetricsPageInput, SignIn)> {
         let filled = |text: &str| Some(text.trim().to_string()).filter(|text| !text.is_empty());
+        let sign_in = match self.sign_in.as_str() {
+            "password" => SignIn::Password,
+            "token" => SignIn::Token,
+            _ => SignIn::None,
+        };
+        let (with_password, with_token) = (sign_in == SignIn::Password, sign_in == SignIn::Token);
         let interval_secs = self
             .interval_secs
             .trim()
             .parse()
             .context("the interval has to be a number of seconds")?;
-        Ok(MetricsPageInput {
+        let input = MetricsPageInput {
             url: self.url.trim().to_string(),
             names: self.names.lines().filter_map(filled).collect(),
             interval_secs,
             enabled: self.enabled,
-            username: filled(&self.username),
+            username: filled(&self.username).filter(|_| with_password),
             // A password is whatever was typed, spaces and all.
-            password: Some(self.password.clone()).filter(|password| !password.is_empty()),
-            password_env: filled(&self.password_env),
-        })
+            password: Some(self.password.clone())
+                .filter(|password| with_password && !password.is_empty()),
+            password_env: filled(&self.password_env).filter(|_| with_password),
+            // A token never has spaces, and a pasted one often ends with one.
+            token: filled(&self.token).filter(|_| with_token),
+            token_env: filled(&self.token_env).filter(|_| with_token),
+        };
+        Ok((input, sign_in))
     }
 }
 
@@ -211,7 +238,10 @@ pub async fn create_page(
     };
     let fields = PageForm::from_fields(&form.fields, None);
     let checked = match fields.to_input() {
-        Ok(input) => state.checked_metrics_page(&host.id, None, input).await,
+        Ok((input, sign_in)) => {
+            let checked = state.checked_metrics_page(&host.id, None, input, Some(sign_in));
+            checked.await
+        }
         Err(error) => Err(error),
     };
     let input = match checked {
@@ -239,7 +269,10 @@ pub async fn update_page(
     };
     let fields = PageForm::from_fields(&form.fields, Some(&saved.input));
     let checked = match fields.to_input() {
-        Ok(input) => state.checked_metrics_page(&host.id, Some(id), input).await,
+        Ok((input, sign_in)) => {
+            let checked = state.checked_metrics_page(&host.id, Some(id), input, Some(sign_in));
+            checked.await
+        }
         Err(error) => Err(error),
     };
     let input = match checked {
@@ -289,9 +322,11 @@ pub struct PageRow {
     enabled: bool,
     /// How many metric names it's limited to, or none for everything.
     keeps: usize,
-    /// Who it signs in as, and where the password comes from.
+    /// How it signs in: who as, and where the password or token comes from.
+    sign_in: &'static str,
     username: Option<String>,
     password_env: Option<String>,
+    token_env: Option<String>,
     /// Whether it's been read since the server started, and how that went.
     read: bool,
     answered: bool,
@@ -310,6 +345,7 @@ pub async fn page_rows(state: &AppState, host_id: &str) -> Result<Vec<PageRow>> 
                 id: page.id,
                 name: page.input.name().to_string(),
                 keeps: page.input.names.len(),
+                sign_in: page.input.sign_in().as_str(),
                 read: result.is_some(),
                 answered: result.is_some_and(|result| result["up"] == 1),
                 error: result
@@ -323,6 +359,7 @@ pub async fn page_rows(state: &AppState, host_id: &str) -> Result<Vec<PageRow>> 
                 enabled: page.input.enabled,
                 username: page.input.username,
                 password_env: page.input.password_env,
+                token_env: page.input.token_env,
             }
         })
         .collect())
@@ -382,16 +419,40 @@ mod tests {
             username: Some("metrics".to_string()),
             password: None,
             password_env: Some("MAXNINES_SECRET_DB".to_string()),
+            token: None,
+            token_env: None,
         }
     }
 
     #[test]
     fn a_page_survives_the_trip_through_its_form() {
         let original = input();
-        assert_eq!(
-            PageForm::from_input(&original).to_input().unwrap(),
-            original
-        );
+        let (again, sign_in) = PageForm::from_input(&original).to_input().unwrap();
+        assert_eq!(again, original);
+        assert_eq!(sign_in, SignIn::Password);
+    }
+
+    #[test]
+    fn a_saved_token_is_kept_until_the_form_signs_in_another_way() {
+        let saved = MetricsPageInput {
+            username: None,
+            password_env: None,
+            token: Some("abc.DEF-123".to_string()),
+            ..input()
+        };
+        let mut form = PageForm::from_input(&saved);
+        assert!(form.has_token);
+        assert_eq!((form.sign_in.as_str(), form.token.as_str()), ("token", ""));
+        let (again, sign_in) = form.to_input().unwrap();
+        assert_eq!(again.keeping_secrets_of(&saved, Some(sign_in)), saved);
+
+        // What's left in the other boxes doesn't count.
+        form.sign_in = "none".to_string();
+        form.token_env = "MAXNINES_SECRET_LEFT_BEHIND".to_string();
+        let (again, sign_in) = form.to_input().unwrap();
+        let again = again.keeping_secrets_of(&saved, Some(sign_in));
+        assert_eq!(again.sign_in(), SignIn::None);
+        assert_eq!((again.token, again.token_env), (None, None));
     }
 
     #[test]
@@ -404,8 +465,8 @@ mod tests {
         assert!(form.has_password);
         assert_eq!(form.password, "");
         // Sent back untouched, it gives no password, which keeps the saved one.
-        let again = form.to_input().unwrap().keeping_password_of(&saved);
-        assert_eq!(again, saved);
+        let (again, sign_in) = form.to_input().unwrap();
+        assert_eq!(again.keeping_secrets_of(&saved, Some(sign_in)), saved);
     }
 
     #[test]

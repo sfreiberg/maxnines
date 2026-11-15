@@ -81,16 +81,22 @@ openmetrics "localhost:9100" {
 }
 ```
 
-The block is named for the page, as its series are, and the agent sends the login
-with every request to that page and to no other. `env()` reads the password from the
-agent's environment, so it needn't be written in the file. Restart the agent after
-changing it.
+A page that takes a token instead, sent as a bearer token, gets it the same way:
 
-The server never has the password. A config rule only says which pages to read, so
+```hcl
+openmetrics "localhost:8080" {
+  token = env("APP_METRICS_TOKEN")
+}
+```
+
+The block is named for the page, as its series are, and the agent sends the login
+with every request to that page and to no other. `env()` reads the password or token
+from the agent's environment, so it needn't be written in the file. Restart the
+agent after changing it.
+
+The server never has the password or token. A config rule only says which pages to read, so
 it can be seen and changed by anyone who can edit rules without giving anything
 away, and addresses with a username or password in them aren't accepted there.
 
-A password sent to an `http://` page crosses the network in the clear. That's fine
-for a page on the host itself, and worth `https://` for one that isn't.
-
-Pages that take a token instead can't be read yet.
+A password or token sent to an `http://` page crosses the network in the clear.
+That's fine for a page on the host itself, and worth `https://` for one that isn't.

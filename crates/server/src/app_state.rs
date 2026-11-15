@@ -15,7 +15,7 @@ use crate::facts::{FlatFacts, unflatten};
 use crate::host_filter::HostFilter;
 use crate::maintenance::{self, MaintenanceWindowInput};
 use crate::metrics::Metrics;
-use crate::metrics_pages::{self, MetricsPageInput, PageReads};
+use crate::metrics_pages::{self, MetricsPageInput, PageReads, SignIn};
 use crate::models::{Database, NewEvent, RuleInput};
 use crate::notifier::Senders;
 use crate::passwords::SignInThrottle;
@@ -302,21 +302,23 @@ impl AppState {
     }
 
     /// A metrics page as it would be saved for a host, or why it can't be. `id` is
-    /// the saved page it would replace, whose password it keeps unless given
-    /// another.
+    /// the saved page it would replace, whose password or token it keeps unless
+    /// given another, and `sign_in` how the change says to sign in, when it says.
     pub async fn checked_metrics_page(
         &self,
         host_id: &str,
         id: Option<i64>,
         input: MetricsPageInput,
+        sign_in: Option<SignIn>,
     ) -> Result<MetricsPageInput> {
         let pages = self.database.metrics_pages_of(host_id).await?;
         let saved = pages.iter().find(|page| Some(page.id) == id);
         let input = match saved {
-            Some(saved) => input.keeping_password_of(&saved.input),
+            Some(saved) => input.keeping_secrets_of(&saved.input, sign_in),
             None => input,
         };
         metrics_pages::check_input(&input)?;
+        metrics_pages::check_sign_in(&input, sign_in)?;
         let others = pages.iter().filter(|page| Some(page.id) != id);
         metrics_pages::check_names(others.map(|page| &page.input).chain([&input]))?;
         Ok(input)

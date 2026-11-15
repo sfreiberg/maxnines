@@ -72,6 +72,8 @@ erDiagram
         string username
         text password "as typed, when it was"
         string password_env "the server's variable holding it"
+        text token "as typed, for a page that takes one instead"
+        string token_env "the server's variable holding it"
     }
     host_facts {
         int id PK

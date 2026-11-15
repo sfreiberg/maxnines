@@ -109,7 +109,7 @@
     <tr>
       <td><strong>{{ page.name }}</strong><code class="under">{{ page.url }}</code></td>
       <td class="nowrap">Every {{ page.interval_secs }} s<span class="under">{% if page.keeps %}{{ page.keeps }} metric name{{ page.keeps | pluralize }}{% else %}Every metric{% endif %}</span></td>
-      <td>{% if page.username %}As {{ page.username }}<span class="under">{% if page.password_env %}Password from <code>{{ page.password_env }}</code>{% else %}Password saved{% endif %}</span>{% else %}No{% endif %}</td>
+      <td>{% if page.username %}As {{ page.username }}<span class="under">{% if page.password_env %}Password from <code>{{ page.password_env }}</code>{% else %}Password saved{% endif %}</span>{% elif page.sign_in == "token" %}With a token<span class="under">{% if page.token_env %}From <code>{{ page.token_env }}</code>{% else %}Token saved{% endif %}</span>{% else %}No{% endif %}</td>
       <td>{% if not page.enabled %}<span class="badge neutral">Off</span>{% elif not page.read %}<span class="badge neutral">Not read yet</span>{% elif page.answered %}<span class="badge good">Answering</span>{% if page.dropped %}<span class="under">{{ page.dropped }} series over the limit</span>{% endif %}{% else %}<span class="badge bad">Not answering</span>{% if page.error %}<span class="under">{{ page.error }}</span>{% endif %}{% endif %}</td>
       <td>
         {% if can_edit %}

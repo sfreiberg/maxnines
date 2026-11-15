@@ -422,8 +422,8 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .map-marker.warning { color: var(--warn); }
 .map-marker.offline { color: var(--muted); }
 .map-marker.online { color: var(--good); }
-.map-fill { fill: currentColor; stroke: var(--surface); }
 .map-marker.not_read { color: var(--border-strong); }
+.map-fill { fill: currentColor; stroke: var(--surface); }
 .map-ring { fill: none; stroke: var(--text); opacity: 0; }
 .map-marker.selected .map-ring, .map-marker:focus-visible .map-ring { opacity: 1; }
 .map-count { fill: var(--surface); font-family: var(--mono); font-weight: 700; text-anchor: middle; dominant-baseline: central; pointer-events: none; }
@@ -449,8 +449,8 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .map-dot.warning { background: var(--warn); }
 .map-dot.offline { background: var(--muted); }
 .map-dot.online { background: var(--good); }
-.map-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; padding: 12px 16px; border-top: 1px solid var(--border); color: var(--muted); font-size: 13px; }
 .map-dot.not_read { background: none; box-shadow: inset 0 0 0 1.5px var(--muted); }
+.map-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; padding: 12px 16px; border-top: 1px solid var(--border); color: var(--muted); font-size: 13px; }
 .map-key { display: inline-flex; align-items: center; gap: 6px; }
 .map-sites { overflow: hidden; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
 .map-sites-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 14px 16px 10px; border-bottom: 1px solid var(--border); }
@@ -578,6 +578,10 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .alert-rule:has(select[name="kind"] option[value="offline"]:checked) .metric-fields { display: none; }
 .alert-rule:has(select[name="kind"] option[value="calculation"]:checked) .applies-to { display: none; }
 .metric-fields { display: contents; }
+/* A metrics page's form shows only the boxes for the way of signing in chosen. */
+.sign-in .password-fields, .sign-in .token-fields { display: contents; }
+.sign-in:not(:has(option[value="password"]:checked)) .password-fields,
+.sign-in:not(:has(option[value="token"]:checked)) .token-fields { display: none; }
 /* A forecast watches for a level within some hours instead of thresholds. */
 .alert-rule:not(:has(select[name="kind"] option[value="forecast"]:checked)) .forecast-fields { display: none; }
 .alert-rule:has(select[name="kind"] option[value="forecast"]:checked) .threshold-fields { display: none; }

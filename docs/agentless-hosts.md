@@ -18,7 +18,7 @@ without losing its history. Then add the pages to read, on the host's own page u
 | **Address** | A page in the Prometheus or OpenMetrics text format, such as an exporter's `/metrics`. The server reads it from where the server runs |
 | **Read every** | How often, from 10 seconds to a day |
 | **Metrics to keep** | Metric names, one to a line, with `*` and `?` for anything. Leave it empty for everything, up to 2,000 series from each page |
-| **Signing in** | A username and password, for a page that asks for them |
+| **Signing in** | A username and password, or a token, for a page that asks for one |
 
 What's read is charted and named exactly as it is for a page an agent reads, which
 [OpenMetrics](openmetrics.md#whats-reported) describes. A host can have up to 16
@@ -45,9 +45,13 @@ checks, or with all of them turned off, is neither online nor offline. It's mark
 **Not read**, left out of the counts of hosts online and offline, and nothing
 alerts about it.
 
-## Passwords
+## Passwords and tokens
 
-A page's password can be given two ways:
+Under **Signing in**, choose how the page is signed in to: with a username and
+password, sent as basic authentication, or with a token, sent as a bearer token.
+The form shows the boxes for the one chosen.
+
+A page's password or token can be given two ways:
 
 - **Typed in.** It's kept in the server's database and never shown again, on any
   page or through the API. Leaving the box empty when editing keeps the one saved.
@@ -57,11 +61,11 @@ A page's password can be given two ways:
   isn't set, the page counts as not answering, and says so.
 
 The variable's name has to start with `MAXNINES_SECRET_`, such as
-`MAXNINES_SECRET_ORDERS_DB`. Whoever adds a page chooses where its password is sent,
+`MAXNINES_SECRET_ORDERS_DB`. Whoever adds a page chooses where its password or token is sent,
 so without that rule anyone who can add one could have the server send them anything
 in its environment. This way only what you've set aside can go anywhere.
 
-A password sent to an `http://` page crosses the network in the clear, so use
+A password or token sent to an `http://` page crosses the network in the clear, so use
 `https://` for anything not on the server's own host or a network you trust.
 
 ## What they don't have

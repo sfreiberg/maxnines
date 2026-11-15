@@ -45,10 +45,10 @@ pub const MAX_PAGES: usize = 16;
 
 /// What the database's columns hold.
 const MAX_SETTING_LEN: usize = 255;
-const MAX_PASSWORD_LEN: usize = 1024;
+const MAX_SECRET_LEN: usize = 1024;
 
-/// The only environment variables a page's password can come from. Anyone who can
-/// add a page chooses where its password is sent, so without this they could have
+/// The only environment variables a page's password or token can come from. Anyone
+/// who can add a page chooses where they're sent, so without this they could have
 /// the server hand over anything in its environment, such as its database's URL.
 pub const ENV_PREFIX: &str = "MAXNINES_SECRET_";
 
@@ -79,6 +79,31 @@ pub struct MetricsPageInput {
     /// The server's environment variable that holds the password.
     #[serde(default)]
     pub password_env: Option<String>,
+    /// For a page that asks for a token instead: the token as typed in.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// The server's environment variable that holds the token.
+    #[serde(default)]
+    pub token_env: Option<String>,
+}
+
+/// How a page is signed in to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignIn {
+    None,
+    Password,
+    Token,
+}
+
+impl SignIn {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Password => "password",
+            Self::Token => "token",
+        }
+    }
 }
 
 fn default_enabled() -> bool {
@@ -94,6 +119,7 @@ impl fmt::Debug for MetricsPageInput {
             .field("enabled", &self.enabled)
             .field("username", &self.username)
             .field("password_env", &self.password_env)
+            .field("token_env", &self.token_env)
             .finish_non_exhaustive()
     }
 }
@@ -104,32 +130,55 @@ impl MetricsPageInput {
         metrics_page_name(&self.url)
     }
 
-    /// Keeps the password a page already has when a change doesn't give one, as
-    /// it's never shown to be typed again. Taking the username away takes the
-    /// password with it.
-    pub fn keeping_password_of(mut self, saved: &MetricsPageInput) -> Self {
-        let gives_one = self.password.is_some() || self.password_env.is_some();
-        if self.username.is_some() && !gives_one {
-            self.password.clone_from(&saved.password);
-            self.password_env.clone_from(&saved.password_env);
+    /// How the page is signed in to, going by what it has.
+    pub fn sign_in(&self) -> SignIn {
+        if self.username.is_some() {
+            SignIn::Password
+        } else if self.token.is_some() || self.token_env.is_some() {
+            SignIn::Token
+        } else {
+            SignIn::None
+        }
+    }
+
+    /// Keeps the password or token a page already has when a change doesn't give
+    /// one, as they're never shown to be typed again. `asked` is how the change
+    /// says to sign in, when it says, as a token has nothing else to go by.
+    /// Signing in another way, or not at all, lets go of what was saved.
+    pub fn keeping_secrets_of(mut self, saved: &MetricsPageInput, asked: Option<SignIn>) -> Self {
+        let gives_password = self.password.is_some() || self.password_env.is_some();
+        let gives_token = self.token.is_some() || self.token_env.is_some();
+        match asked.unwrap_or_else(|| self.sign_in()) {
+            SignIn::Password if !gives_password => {
+                self.password.clone_from(&saved.password);
+                self.password_env.clone_from(&saved.password_env);
+            }
+            SignIn::Token if !gives_token => {
+                self.token.clone_from(&saved.token);
+                self.token_env.clone_from(&saved.token_env);
+            }
+            _ => {}
         }
         self
     }
 
     /// The login to send, or why there isn't one to send when there should be.
     fn login(&self) -> Result<Option<Login>, String> {
-        let Some(username) = &self.username else {
-            return Ok(None);
-        };
-        let password = match (&self.password, &self.password_env) {
-            (Some(password), _) => password.clone(),
+        let secret = |typed: &Option<String>, variable: &Option<String>| match (typed, variable) {
+            (Some(typed), _) => Ok(typed.clone()),
             (None, Some(variable)) => std::env::var(variable)
-                .map_err(|_| format!("the environment variable {variable} isn't set"))?,
-            (None, None) => String::new(),
+                .map_err(|_| format!("the environment variable {variable} isn't set")),
+            (None, None) => Ok(String::new()),
         };
-        Login::new(username, &password)
-            .map(Some)
-            .map_err(|error| format!("{error:#}"))
+        let login = match self.sign_in() {
+            SignIn::None => return Ok(None),
+            SignIn::Password => {
+                let username = self.username.as_deref().unwrap_or_default();
+                Login::new(username, &secret(&self.password, &self.password_env)?)
+            }
+            SignIn::Token => Login::token(&secret(&self.token, &self.token_env)?),
+        };
+        login.map(Some).map_err(|error| format!("{error:#}"))
     }
 }
 
@@ -140,34 +189,16 @@ fn is_secret_variable(name: &str) -> bool {
         && name.len() <= MAX_SETTING_LEN
 }
 
-pub fn check_input(input: &MetricsPageInput) -> Result<()> {
-    check_metrics_pages(std::slice::from_ref(&input.url), &input.names)?;
-    ensure!(
-        (MIN_INTERVAL_SECS..=MAX_INTERVAL_SECS).contains(&input.interval_secs),
-        "the interval has to be from {MIN_INTERVAL_SECS} to {MAX_INTERVAL_SECS} seconds"
-    );
-
-    let (password, variable) = (&input.password, &input.password_env);
-    let Some(username) = &input.username else {
-        ensure!(
-            password.is_none() && variable.is_none(),
-            "a password needs a username to go with it"
-        );
-        return Ok(());
-    };
-    // Basic authentication ends the username at the first colon.
-    ensure!(
-        !username.is_empty() && !username.contains(':') && username.len() <= MAX_SETTING_LEN,
-        "the username can't be empty, hold a colon or be over {MAX_SETTING_LEN} characters"
-    );
-    match (password, variable) {
+/// A password or token, which comes from exactly one of two places.
+fn check_secret(what: &str, typed: Option<&String>, variable: Option<&String>) -> Result<()> {
+    match (typed, variable) {
         (Some(_), Some(_)) => {
-            anyhow::bail!("give the password or the environment variable that holds it, not both")
+            anyhow::bail!("give the {what} or the environment variable that holds it, not both")
         }
-        (None, None) => anyhow::bail!("a username needs a password to go with it"),
-        (Some(password), None) => ensure!(
-            !password.is_empty() && password.len() <= MAX_PASSWORD_LEN,
-            "the password can't be empty or over {MAX_PASSWORD_LEN} characters"
+        (None, None) => anyhow::bail!("signing in needs a {what}"),
+        (Some(typed), None) => ensure!(
+            !typed.is_empty() && typed.len() <= MAX_SECRET_LEN,
+            "the {what} can't be empty or over {MAX_SECRET_LEN} characters"
         ),
         (None, Some(variable)) => ensure!(
             is_secret_variable(variable),
@@ -175,6 +206,63 @@ pub fn check_input(input: &MetricsPageInput) -> Result<()> {
              letters, digits or _"
         ),
     }
+    Ok(())
+}
+
+pub fn check_input(input: &MetricsPageInput) -> Result<()> {
+    check_metrics_pages(std::slice::from_ref(&input.url), &input.names)?;
+    ensure!(
+        (MIN_INTERVAL_SECS..=MAX_INTERVAL_SECS).contains(&input.interval_secs),
+        "the interval has to be from {MIN_INTERVAL_SECS} to {MAX_INTERVAL_SECS} seconds"
+    );
+
+    let (password, password_env) = (input.password.as_ref(), input.password_env.as_ref());
+    let (token, token_env) = (input.token.as_ref(), input.token_env.as_ref());
+    let gives_token = token.is_some() || token_env.is_some();
+    let Some(username) = &input.username else {
+        ensure!(
+            password.is_none() && password_env.is_none(),
+            "a password needs a username to go with it"
+        );
+        if gives_token {
+            check_secret("token", token, token_env)?;
+        }
+        if let Some(token) = token {
+            Login::token(token)?;
+        }
+        return Ok(());
+    };
+    ensure!(
+        !gives_token,
+        "a page is signed in to with a username and password or with a token, not both"
+    );
+    // Basic authentication ends the username at the first colon.
+    ensure!(
+        !username.is_empty() && !username.contains(':') && username.len() <= MAX_SETTING_LEN,
+        "the username can't be empty, hold a colon or be over {MAX_SETTING_LEN} characters"
+    );
+    if password.is_none() && password_env.is_none() {
+        anyhow::bail!("a username needs a password to go with it");
+    }
+    check_secret("password", password, password_env)
+}
+
+/// Whether a page signs in the way its change said it would, when it said.
+pub fn check_sign_in(input: &MetricsPageInput, asked: Option<SignIn>) -> Result<()> {
+    let Some(asked) = asked else {
+        return Ok(());
+    };
+    ensure!(
+        input.sign_in() == asked,
+        match asked {
+            SignIn::None =>
+                "a page that isn't signed in to can't have a username, password or token",
+            SignIn::Password => "signing in with a password needs a username",
+            SignIn::Token =>
+                "signing in with a token needs the token, or the environment \
+                              variable that holds it",
+        }
+    );
     Ok(())
 }
 
@@ -383,6 +471,16 @@ mod tests {
             username: None,
             password: None,
             password_env: None,
+            token: None,
+            token_env: None,
+        }
+    }
+
+    fn with_token(token: Option<&str>, variable: Option<&str>) -> MetricsPageInput {
+        MetricsPageInput {
+            token: token.map(str::to_string),
+            token_env: variable.map(str::to_string),
+            ..input()
         }
     }
 
@@ -474,16 +572,72 @@ mod tests {
     fn a_change_without_a_password_keeps_the_one_saved() {
         let saved = with_login(Some("s3cret"), None);
 
-        let kept = with_login(None, None).keeping_password_of(&saved);
+        let kept = with_login(None, None).keeping_secrets_of(&saved, None);
         assert_eq!(kept.password.as_deref(), Some("s3cret"));
 
-        let replaced = with_login(None, Some("MAXNINES_SECRET_DB")).keeping_password_of(&saved);
+        let replaced =
+            with_login(None, Some("MAXNINES_SECRET_DB")).keeping_secrets_of(&saved, None);
         assert_eq!(replaced.password, None);
         assert_eq!(replaced.password_env.as_deref(), Some("MAXNINES_SECRET_DB"));
 
         // No username, no login.
-        let removed = input().keeping_password_of(&saved);
+        let removed = input().keeping_secrets_of(&saved, None);
         assert_eq!((removed.password, removed.password_env), (None, None));
+    }
+
+    #[test]
+    fn a_token_comes_from_one_place_and_is_only_kept_when_asked() {
+        check_input(&with_token(Some("abc.DEF-123"), None)).unwrap();
+        check_input(&with_token(None, Some("MAXNINES_SECRET_APP_TOKEN"))).unwrap();
+        assert!(check_input(&with_token(Some("a"), Some("MAXNINES_SECRET_A"))).is_err());
+        assert!(check_input(&with_token(Some("two words"), None)).is_err());
+        assert!(check_input(&with_token(None, Some("DATABASE_URL"))).is_err());
+        let both = MetricsPageInput {
+            token: Some("abc".to_string()),
+            ..with_login(Some("s3cret"), None)
+        };
+        let error = check_input(&both).unwrap_err().to_string();
+        assert!(error.contains("not both"), "{error}");
+
+        let saved = with_token(Some("abc"), None);
+        assert_eq!(saved.sign_in(), SignIn::Token);
+        assert!(saved.login().unwrap().is_some());
+        // Nothing says to keep it, so a change with no token has none.
+        assert_eq!(input().keeping_secrets_of(&saved, None).token, None);
+        let kept = input().keeping_secrets_of(&saved, Some(SignIn::Token));
+        assert_eq!(kept.token.as_deref(), Some("abc"));
+        let dropped = input().keeping_secrets_of(&saved, Some(SignIn::None));
+        assert_eq!(dropped.token, None);
+        // Moving to a password lets go of it, and has none of its own to keep.
+        let moved = with_login(None, None).keeping_secrets_of(&saved, Some(SignIn::Password));
+        assert_eq!(
+            (moved.token.as_ref(), moved.password.as_ref()),
+            (None, None)
+        );
+        assert!(check_input(&moved).is_err());
+
+        let unset = with_token(None, Some("MAXNINES_SECRET_NEVER_SET"));
+        assert_eq!(
+            unset.login().unwrap_err(),
+            "the environment variable MAXNINES_SECRET_NEVER_SET isn't set"
+        );
+    }
+
+    #[test]
+    fn a_change_signs_in_the_way_it_said() {
+        check_sign_in(&input(), None).unwrap();
+        check_sign_in(&input(), Some(SignIn::None)).unwrap();
+        check_sign_in(&with_token(Some("abc"), None), Some(SignIn::Token)).unwrap();
+        check_sign_in(&with_login(Some("x"), None), Some(SignIn::Password)).unwrap();
+        assert!(check_sign_in(&input(), Some(SignIn::Token)).is_err());
+        assert!(check_sign_in(&input(), Some(SignIn::Password)).is_err());
+        assert!(check_sign_in(&with_token(Some("abc"), None), Some(SignIn::None)).is_err());
+    }
+
+    #[test]
+    fn a_token_is_never_printed() {
+        let printed = format!("{:?}", with_token(Some("abc.DEF-123"), None));
+        assert!(!printed.contains("abc.DEF-123"), "{printed}");
     }
 
     #[test]

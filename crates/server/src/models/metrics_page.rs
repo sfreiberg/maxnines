@@ -16,6 +16,10 @@ pub struct Model {
     pub password: Option<String>,
     /// The server's environment variable that holds it, when one does.
     pub password_env: Option<String>,
+    /// A token as it was typed in, for a page that takes one instead.
+    pub token: Option<String>,
+    /// The server's environment variable that holds the token, when one does.
+    pub token_env: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

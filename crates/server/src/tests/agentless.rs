@@ -163,7 +163,8 @@ async fn a_pages_password_can_be_set_but_never_read_back() {
         json!({
             "id": page_id, "host_id": id, "name": "db.example.com:9187", "url": url,
             "names": ["pg_*"], "interval_secs": 60, "enabled": true,
-            "username": "metrics", "has_password": true, "password_env": null
+            "sign_in": "password", "username": "metrics", "has_password": true,
+            "password_env": null, "has_token": false, "token_env": null
         })
     );
     let list_path = format!("/api/v1/hosts/{id}/metrics-pages");
@@ -340,6 +341,70 @@ async fn a_password_that_is_wrong_or_missing_shows_as_the_page_not_answering() {
 }
 
 #[tokio::test]
+async fn a_page_is_signed_in_to_with_a_token_that_is_never_read_back() {
+    let server = start().await;
+    let id = add_host(&server, "orders-app").await;
+    let served = serve(Some("authorization: Bearer abc.DEF-123")).await;
+    let url = format!("http://{}/metrics", served.address);
+    let typed = json!({ "url": url, "interval_secs": 60, "token": "abc.DEF-123" });
+    let page_id = add_page(&server, &id, &typed).await;
+    let mut scheduler = scheduler(&server);
+    let now = now_ms();
+
+    read_due(&mut scheduler, now).await;
+    let result = server.state.page_reads.result(page_id).unwrap();
+    assert_eq!(result["up"], 1, "{result}");
+
+    let page_path = format!("/api/v1/metrics-pages/{page_id}");
+    let (_, page) = api(&server, "GET", &page_path, &Value::Null).await;
+    assert_eq!(page["sign_in"], "token");
+    assert_eq!(page["has_token"], true);
+    assert!(!page.to_string().contains("abc.DEF-123"), "{page}");
+    let (_, log) = api(&server, "GET", "/api/v1/audit-log", &Value::Null).await;
+    assert!(!log.to_string().contains("abc.DEF-123"), "{log}");
+    let saved_token = || async {
+        let saved = server.state.database.get_metrics_page(page_id).await;
+        saved.unwrap().unwrap().input.token
+    };
+
+    // Saying how it signs in keeps the token without sending it again.
+    let slower = json!({ "url": url, "interval_secs": 300, "sign_in": "token" });
+    assert_eq!(api(&server, "PUT", &page_path, &slower).await.0, 204);
+    assert_eq!(saved_token().await.as_deref(), Some("abc.DEF-123"));
+
+    // A token and a username together are refused, as is a token with spaces.
+    let both = json!({ "url": url, "interval_secs": 300, "username": "metrics", "token": "x" });
+    assert_eq!(api(&server, "PUT", &page_path, &both).await.0, 422);
+    let spaced = json!({ "url": url, "interval_secs": 300, "token": "two words" });
+    assert_eq!(api(&server, "PUT", &page_path, &spaced).await.0, 422);
+    let nothing = json!({ "url": url, "interval_secs": 300, "sign_in": "password" });
+    assert_eq!(api(&server, "PUT", &page_path, &nothing).await.0, 422);
+    assert_eq!(saved_token().await.as_deref(), Some("abc.DEF-123"));
+
+    // One from the server's environment, which nothing here sets.
+    let unset = json!({
+        "url": url, "interval_secs": 60, "token_env": "MAXNINES_SECRET_NEVER_SET"
+    });
+    assert_eq!(api(&server, "PUT", &page_path, &unset).await.0, 204);
+    assert_eq!(saved_token().await, None);
+    read_due(&mut scheduler, now + 60_000).await;
+    let result = server.state.page_reads.result(page_id).unwrap();
+    assert_eq!(
+        result["error"],
+        "the environment variable MAXNINES_SECRET_NEVER_SET isn't set"
+    );
+
+    // A change that says nothing about signing in takes it away.
+    let plain = json!({ "url": url, "interval_secs": 60 });
+    assert_eq!(api(&server, "PUT", &page_path, &plain).await.0, 204);
+    let (_, page) = api(&server, "GET", &page_path, &Value::Null).await;
+    assert_eq!(page["sign_in"], "none");
+    read_due(&mut scheduler, now + 120_000).await;
+    let result = server.state.page_reads.result(page_id).unwrap();
+    assert_eq!(result["error"], "the page returned status 401");
+}
+
+#[tokio::test]
 async fn a_host_that_stops_answering_is_offline_and_one_with_nothing_to_read_is_not() {
     let server = start().await;
     let reading = add_host(&server, "orders-db").await;
@@ -384,6 +449,28 @@ async fn a_host_that_stops_answering_is_offline_and_one_with_nothing_to_read_is_
     assert_eq!(open[0].host_id, reading);
     assert_ne!(open[0].host_id, idle);
     assert_eq!(open[0].summary, "orders-db has been offline for 1 minute");
+
+    // Nor is it listed or counted as offline, as it couldn't be online.
+    let (_, host) = api(
+        &server,
+        "GET",
+        &format!("/api/v1/hosts/{idle}"),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(
+        (&host["health"], &host["online"]),
+        (&json!("not_read"), &json!(false))
+    );
+    let mut browser = Browser::default();
+    let all = browser.get(&server, "/hosts").await;
+    assert!(all.body.contains("0 of 1 online"), "{}", all.body);
+    assert!(all.body.contains("Not read"), "{}", all.body);
+    let offline = browser.get(&server, "/hosts?status=offline").await;
+    assert!(offline.body.contains("orders-db"), "{}", offline.body);
+    assert!(!offline.body.contains("not-set-up-yet"), "{}", offline.body);
+    let overview = browser.get(&server, "/").await;
+    assert!(overview.body.contains("1 offline"), "{}", overview.body);
 }
 
 #[tokio::test]
@@ -419,9 +506,12 @@ async fn a_host_and_its_pages_are_added_from_the_hosts_page() {
         ("interval_secs", "120"),
         ("names", "pg_*\nprocess_cpu_seconds_total\n"),
         ("enabled", "on"),
+        ("sign_in", "password"),
         ("username", "metrics"),
         ("password", "s3cret"),
         ("password_env", ""),
+        // Left in the boxes for a way of signing in that wasn't chosen.
+        ("token_env", "MAXNINES_SECRET_UNUSED"),
     ];
     let saved = browser
         .submit(&server, &form, &format!("{host_path}/pages"), &fields)
@@ -449,28 +539,6 @@ async fn a_host_and_its_pages_are_added_from_the_hosts_page() {
         form.body.contains("Leave empty to keep it"),
         "{}",
         form.body
-
-    // Nor is it listed or counted as offline, as it couldn't be online.
-    let (_, host) = api(
-        &server,
-        "GET",
-        &format!("/api/v1/hosts/{idle}"),
-        &Value::Null,
-    )
-    .await;
-    assert_eq!(
-        (&host["health"], &host["online"]),
-        (&json!("not_read"), &json!(false))
-    );
-    let mut browser = Browser::default();
-    let all = browser.get(&server, "/hosts").await;
-    assert!(all.body.contains("0 of 1 online"), "{}", all.body);
-    assert!(all.body.contains("Not read"), "{}", all.body);
-    let offline = browser.get(&server, "/hosts?status=offline").await;
-    assert!(offline.body.contains("orders-db"), "{}", offline.body);
-    assert!(!offline.body.contains("not-set-up-yet"), "{}", offline.body);
-    let overview = browser.get(&server, "/").await;
-    assert!(overview.body.contains("1 offline"), "{}", overview.body);
     );
     assert!(!form.body.contains("s3cret"));
 
