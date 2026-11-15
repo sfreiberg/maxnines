@@ -3,6 +3,7 @@ mod background;
 mod builtin_actions;
 mod checks;
 mod collector;
+mod commands;
 mod config;
 #[cfg(any(
     target_os = "linux",

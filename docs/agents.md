@@ -47,8 +47,8 @@ reached, and sent when it's back.
 - **Hostnames aren't unique.** The key is the host's identity, so two hosts can share
   a hostname, such as a caching name server in every office, and a renamed host
   simply reports under its new hostname.
-- **Only administrators should be able to change `agent.hcl`.** Custom metrics in it
-  are commands the agent runs, so anyone who can edit the file can run commands as
+- **Only administrators should be able to change `agent.hcl`.** Custom metrics and
+  [check commands](check-commands.md) in it are commands the agent runs, so anyone who can edit the file can run commands as
   the agent. Keep it owned by the agent's user or root and not writable by others.
   It can also hold passwords and tokens for [OpenMetrics pages](openmetrics.md#pages-that-need-signing-in),
   so it shouldn't be readable by others either, unless those come from the

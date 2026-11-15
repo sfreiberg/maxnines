@@ -119,6 +119,38 @@ fn service_row(service: &Value) -> Option<ServiceRow> {
     })
 }
 
+/// A check command's latest result. Agents send this, so it's treated the same
+/// way as a check's.
+#[derive(Serialize)]
+struct CommandRow {
+    name: String,
+    /// OK, Warning, Critical or Unknown, as the plugin's exit said.
+    status: &'static str,
+    /// `good`, `warn`, `bad` or `neutral`, for its badge.
+    tone: &'static str,
+    message: Option<String>,
+}
+
+fn command_row(item: &Value) -> Option<CommandRow> {
+    // Values are items of their own, without a status.
+    let status = item["status"].as_u64()?;
+    let (status, tone) = match status {
+        0 => ("OK", "good"),
+        1 => ("Warning", "warn"),
+        2 => ("Critical", "bad"),
+        _ => ("Unknown", "neutral"),
+    };
+    Some(CommandRow {
+        name: item["name"].as_str()?.to_string(),
+        status,
+        tone,
+        message: item["message"]
+            .as_str()
+            .filter(|message| !message.is_empty())
+            .map(String::from),
+    })
+}
+
 fn custom_row(metric: &Value) -> Option<CustomRow> {
     Some(CustomRow {
         name: metric["name"].as_str()?.to_string(),
@@ -386,6 +418,12 @@ async fn show(
     }
     let counters = readings.pop().unwrap_or_default();
     let custom_metrics = readings.pop().unwrap_or_default();
+    let latest = state.metrics.latest_output(&host.id, "commands", now_ms());
+    let commands: Vec<CommandRow> = match latest.await {
+        Ok(Some(Value::Array(items))) => items.iter().filter_map(command_row).collect(),
+        Ok(_) => Vec::new(),
+        Err(error) => return server_error(&error),
+    };
     let latest = state.metrics.latest_output(&host.id, "services", now_ms());
     let services: Vec<ServiceRow> = match latest.await {
         Ok(Some(Value::Array(items))) => items.iter().filter_map(service_row).collect(),
@@ -396,6 +434,7 @@ async fn show(
     Page::new(&state, &token, "metrics/show.html")
         .with("checks", &checks)
         .with("custom_metrics", &custom_metrics)
+        .with("commands", &commands)
         .with("counters", &counters)
         .with("services", &services)
         .with("is_local", &host.is_local())

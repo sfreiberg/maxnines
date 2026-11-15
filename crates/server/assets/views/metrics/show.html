@@ -27,6 +27,24 @@
 </section>
 {% endif %}
 
+{% if commands %}
+<section>
+<h2>Latest check commands</h2>
+<div class="tablebox"><table>
+  <thead><tr><th>Command</th><th>Status</th><th>What it said</th></tr></thead>
+  <tbody>
+    {% for command in commands %}
+    <tr>
+      <td>{{ command.name }}</td>
+      <td><span class="badge {{ command.tone }}">{{ command.status }}</span></td>
+      <td>{% if command.message %}{{ command.message }}{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table></div>
+</section>
+{% endif %}
+
 {% if custom_metrics %}
 <section>
 {% set readings_title = "Latest custom metrics" %}{% set readings_name = "Metric" %}{% set readings = custom_metrics %}

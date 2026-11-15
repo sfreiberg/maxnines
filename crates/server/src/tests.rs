@@ -3959,6 +3959,71 @@ async fn web_server_status_pages_become_charts() {
 }
 
 #[tokio::test]
+async fn check_commands_report_their_status_message_and_values() {
+    let server = start_with_metrics().await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "db-1").await;
+    let id = host.id();
+    let rows = json!([
+        { "name": "raid", "status": 2, "ok": 0, "message": "RAID CRITICAL - md0 degraded" },
+        { "name": "raid failed_disks", "value": 1.0 },
+        { "name": "ntp", "status": 0, "ok": 1, "message": "NTP OK: offset 0.002s" },
+    ]);
+    let message = AgentMessage::Sample(Sample {
+        timestamp_ms: now_ms() as u64,
+        metrics: BTreeMap::from([("commands".to_string(), rows)]),
+    });
+    send(&mut client, &message).await;
+
+    let path = format!("/api/v1/hosts/{id}/metrics/commands.status?range=1h");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        let body = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
+        if body["series"]
+            .as_array()
+            .is_some_and(|lines| lines.len() == 2)
+        {
+            break body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the sample never arrived: {body}"
+        );
+        tokio::time::timeout(Duration::from_millis(10), client.next())
+            .await
+            .ok();
+    };
+    let raid = status["series"].as_array().unwrap().iter();
+    let raid = raid.clone().find(|line| line["name"] == "raid").unwrap();
+    assert_eq!(raid["points"][0]["avg"], 2.0);
+    let path = format!("/api/v1/hosts/{id}/metrics/commands.value?range=1h");
+    let values = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
+    assert_eq!(values["series"][0]["name"], "raid failed_disks", "{values}");
+
+    // The host's page says how each last went, in its own words.
+    let page = Browser::default()
+        .get(&server, &format!("/hosts/{id}/metrics"))
+        .await;
+    assert!(page.body.contains("Latest check commands"), "{}", page.body);
+    assert!(
+        page.body.contains("RAID CRITICAL - md0 degraded"),
+        "{}",
+        page.body
+    );
+    assert!(
+        page.body
+            .contains(r#"<span class="badge bad">Critical</span>"#),
+        "{}",
+        page.body
+    );
+    assert!(
+        page.body.contains(r#"<span class="badge good">OK</span>"#),
+        "{}",
+        page.body
+    );
+}
+
+#[tokio::test]
 async fn openmetrics_pages_become_values_and_rates() {
     let server = start_with_metrics().await;
     let host = identity();

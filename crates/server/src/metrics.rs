@@ -1404,6 +1404,41 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
+    // Monitoring plugins in the Nagios style: 0 OK, 1 warning, 2 critical, 3 unknown,
+    // and whatever performance data they give.
+    Metric {
+        name: "commands.status",
+        title: "Check command status",
+        unit: Unit::Number,
+        collector: "commands",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.status"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "commands.ok",
+        title: "Check command passing",
+        unit: Unit::Number,
+        collector: "commands",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.ok"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "commands.value",
+        title: "Check command values",
+        unit: Unit::Number,
+        collector: "commands",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.value"),
+        },
+        chart: ShowChart::WithData,
+    },
     // Windows performance counters, each by its path. They measure all sorts of things,
     // so they're numbers here, and the busiest are charted together.
     Metric {

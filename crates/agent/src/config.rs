@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use crate::actions::{Actions, check_actions};
 use crate::collector::Local;
+use crate::commands::{CheckCommands, check_commands};
 use crate::custom::{Definitions, check_definitions};
 use crate::openmetrics::{Logins, check_logins};
 
@@ -37,6 +38,10 @@ pub struct Config {
     /// these to collect, but can't add to them.
     #[serde(default, rename = "custom_metric")]
     pub custom_metrics: Definitions,
+    /// Monitoring plugins in the Nagios style, by name. As with custom metrics, the
+    /// server chooses which of these to run, but can't add to them.
+    #[serde(default, rename = "check_command")]
+    pub check_commands: CheckCommands,
     /// Commands the server can ask this host to run, by name, such as restarting a
     /// service. As with custom metrics, it can only pick from these.
     #[serde(default, rename = "action")]
@@ -92,6 +97,7 @@ impl Config {
     pub fn local(&self) -> Local<'_> {
         Local {
             custom_metrics: &self.custom_metrics,
+            check_commands: &self.check_commands,
             metrics_logins: &self.metrics_logins,
         }
     }
@@ -112,6 +118,7 @@ impl Config {
         let mut config: Config = hcl::from_body(body)?;
         config.facts = facts;
         check_definitions(&config.custom_metrics)?;
+        check_commands(&config.check_commands)?;
         check_actions(&config.actions)?;
         check_logins(&config.metrics_logins)?;
         Ok(config)

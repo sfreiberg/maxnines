@@ -18,9 +18,10 @@ use serde_json::Value;
 
 /// Every collector the project knows about. An agent reports the ones it can
 /// run in its facts, because older agents may not have them all.
-pub const COLLECTORS: [&str; 19] = [
+pub const COLLECTORS: [&str; 20] = [
     "apache",
     "checks",
+    "commands",
     "containers",
     "counters",
     "cpu",
@@ -605,8 +606,8 @@ impl CollectorSettings {
                 "{name:?} isn't a valid service name"
             );
             ensure!(
-                collector != "custom" || is_custom_metric_name(name),
-                "{name:?} isn't a valid custom metric name"
+                !matches!(collector, "custom" | "commands") || is_custom_metric_name(name),
+                "{name:?} can only use letters, digits, ., - and _"
             );
             ensure!(
                 collector != "openmetrics" || is_metric_pattern(name),

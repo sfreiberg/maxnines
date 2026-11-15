@@ -18,6 +18,7 @@ use maxnines_collectors::host::{
 pub use maxnines_collectors::{Collector, WARMUP};
 
 use crate::checks::CheckCollector;
+use crate::commands::{CheckCommands, CommandCollector};
 use crate::custom::{CustomCollector, Definitions};
 use crate::files::FileCollector;
 use crate::openmetrics::{Logins, OpenMetricsCollector};
@@ -52,6 +53,7 @@ pub fn host_name() -> String {
 #[derive(Clone, Copy)]
 pub struct Local<'a> {
     pub custom_metrics: &'a Definitions,
+    pub check_commands: &'a CheckCommands,
     pub metrics_logins: &'a Logins,
 }
 
@@ -60,9 +62,11 @@ impl Local<'static> {
     /// A config that gives nothing.
     pub fn none() -> Self {
         static CUSTOM_METRICS: Definitions = Definitions::new();
+        static CHECK_COMMANDS: CheckCommands = CheckCommands::new();
         static METRICS_LOGINS: Logins = Logins::new();
         Self {
             custom_metrics: &CUSTOM_METRICS,
+            check_commands: &CHECK_COMMANDS,
             metrics_logins: &METRICS_LOGINS,
         }
     }
@@ -105,6 +109,10 @@ fn build(
         "custom" => {
             let names = config.names.clone().unwrap_or_default();
             Box::new(CustomCollector::new(names, local.custom_metrics, interval))
+        }
+        "commands" => {
+            let names = config.names.clone().unwrap_or_default();
+            Box::new(CommandCollector::new(names, local.check_commands, interval))
         }
         "services" => {
             let names = config.names.clone().unwrap_or_default();
