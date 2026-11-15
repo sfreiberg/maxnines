@@ -312,11 +312,42 @@ pub(crate) async fn check_mongodb(
     findings: &mut Findings,
 ) -> Result<()> {
     use mongodb::bson::doc;
-    use mongodb::options::{ClientOptions, Credential, ServerAddress, Tls, TlsOptions};
 
     // Looked up and connected to as other checks do, which also fails at once
     // where nothing listens, instead of when the driver gives up looking.
     drop(open(check, findings).await?);
+    let signing_in = credentials.filter(|given| !given.is_empty());
+    let client = mongodb_client(check, signing_in)?;
+    let admin = client.database("admin");
+    // Anyone may ping, so without a login this says it answers as MongoDB, and
+    // with one, connecting has signed in.
+    let pinged = admin.run_command(doc! { "ping": 1 }).await;
+    let result = match pinged {
+        Ok(_) => {
+            // Some servers tell anyone their version, others only those signed in.
+            let built = admin.run_command(doc! { "buildInfo": 1 }).await;
+            findings.server_version = built
+                .ok()
+                .and_then(|info| info.get_str("version").ok().map(String::from));
+            if signing_in.is_some() {
+                findings.signed_in = Some(true);
+            }
+            Ok(())
+        }
+        Err(error) => Err(mongodb_error(&error)),
+    };
+    client.shutdown().await;
+    result
+}
+
+/// A client for the one server a check names, signed in to if it's given a
+/// login. Nothing's sent until it's first used.
+pub(crate) fn mongodb_client(
+    check: &Check,
+    credentials: Option<&Credentials>,
+) -> Result<mongodb::Client> {
+    use mongodb::options::{ClientOptions, Credential, ServerAddress, Tls, TlsOptions};
+
     let (host, port) = host_and_port(&check.target)?;
     let limit = crate::limit(check);
     let mut options = ClientOptions::builder()
@@ -341,8 +372,7 @@ pub(crate) async fn check_mongodb(
             .build();
         options.tls = Some(Tls::Enabled(tls));
     }
-    let signing_in = credentials.filter(|given| !given.is_empty());
-    if let Some(credentials) = signing_in {
+    if let Some(credentials) = credentials.filter(|given| !given.is_empty()) {
         let username = credentials
             .username
             .clone()
@@ -363,37 +393,22 @@ pub(crate) async fn check_mongodb(
                 .build(),
         );
     }
-    let client = mongodb::Client::with_options(options).map_err(short)?;
-    let admin = client.database("admin");
-    // Anyone may ping, so without a login this says it answers as MongoDB, and
-    // with one, connecting has signed in.
-    let pinged = admin.run_command(doc! { "ping": 1 }).await;
-    let result = match pinged {
-        Ok(_) => {
-            // Some servers tell anyone their version, others only those signed in.
-            let built = admin.run_command(doc! { "buildInfo": 1 }).await;
-            findings.server_version = built
-                .ok()
-                .and_then(|info| info.get_str("version").ok().map(String::from));
-            if signing_in.is_some() {
-                findings.signed_in = Some(true);
-            }
-            Ok(())
-        }
-        Err(error) => Err(mongodb_error(&error)),
-    };
-    client.shutdown().await;
-    result
+    mongodb::Client::with_options(options).map_err(short)
 }
 
 /// The driver's error in a few words. Not finding the server comes with a
 /// description of everything it tried, of which only the reason matters.
-fn mongodb_error(error: &mongodb::error::Error) -> anyhow::Error {
+pub(crate) fn mongodb_error(error: &mongodb::error::Error) -> anyhow::Error {
     use mongodb::error::ErrorKind;
     match &*error.kind {
         ErrorKind::Authentication { message, .. } => {
             short(format!("it didn't accept the login: {message}"))
         }
+        // The message repeats the whole command, which says nothing more.
+        ErrorKind::Command(command) if command.code == 13 => {
+            anyhow!("the account isn't allowed to ({})", command.code_name)
+        }
+        ErrorKind::Command(command) => short(&command.message),
         ErrorKind::ServerSelection { message, .. } => {
             // Such as "… Error: Kind: I/O error: Connection refused (os error
             // 61), labels: {} } ] }".

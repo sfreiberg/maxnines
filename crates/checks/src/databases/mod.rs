@@ -6,8 +6,11 @@
 //! working. Each round gives rows: one for the database itself, named as it's
 //! defined, and one for each thing it has several of, such as standbys or
 //! replication slots, named after it. Running totals in a row go under `totals`,
-//! and a [`Settle`] turns them into the change since the last sample.
+//! and a [`Settle`] turns them into the change since the last sample. A total
+//! whose name starts with `_` is only there to work out an average, and goes
+//! once it has.
 
+mod mongodb;
 mod mysql;
 mod postgres;
 
@@ -45,6 +48,7 @@ pub struct Database {
 enum Open {
     Postgres(postgres::Postgres),
     Mysql(mysql::Mysql),
+    Mongodb(mongodb::Mongodb),
 }
 
 pub struct Reader {
@@ -107,6 +111,7 @@ impl Reader {
         match self.open.as_mut() {
             Some(Open::Postgres(open)) => open.read(&mut rows, extras).await?,
             Some(Open::Mysql(open)) => open.read(&mut rows, extras).await?,
+            Some(Open::Mongodb(open)) => open.read(&mut rows, extras).await?,
             None => bail!("not connected"),
         }
         Ok(rows.finish())
@@ -121,7 +126,10 @@ impl Reader {
             CheckKind::Mysql => Ok(Open::Mysql(
                 mysql::Mysql::connect(check, credentials).await?,
             )),
-            other => bail!("the stats of {} can't be read yet", other.as_str()),
+            CheckKind::Mongodb => Ok(Open::Mongodb(
+                mongodb::Mongodb::connect(check, credentials).await?,
+            )),
+            other => bail!("{} isn't a database", other.as_str()),
         }
     }
 }
@@ -280,7 +288,7 @@ impl Settle {
                         }
                     }
                 }
-                fields.extend(changes);
+                fields.extend(changes.into_iter().filter(|(key, _)| !key.starts_with('_')));
                 row
             })
             .collect();
@@ -298,8 +306,8 @@ mod tests {
         let round = |hit: f64, asked: f64, other: f64| {
             let mut rows = Rows::new("orders");
             rows.main.total("hit", Some(hit));
-            rows.main.total("asked", Some(asked));
-            rows.main.average("hit_rate", "hit", "asked", 100.0);
+            rows.main.total("_asked", Some(asked));
+            rows.main.average("hit_rate", "hit", "_asked", 100.0);
             rows.add("standby", "b").total("sent", Some(other));
             rows.finish()
         };
@@ -311,8 +319,9 @@ mod tests {
 
         let second = settle.settle(round(180.0, 200.0, 3.0));
         assert_eq!(second[0]["hit"], 90.0);
-        assert_eq!(second[0]["asked"], 100.0);
         assert_eq!(second[0]["hit_rate"], 90.0);
+        // Only there for the average.
+        assert!(second[0].get("_asked").is_none());
         // It went backwards, so it started again.
         assert_eq!(second[1]["sent"], 0.0);
     }

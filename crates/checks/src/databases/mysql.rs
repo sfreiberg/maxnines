@@ -215,11 +215,11 @@ impl Mysql {
             get("innodb_buffer_pool_read_requests"),
             get("innodb_buffer_pool_reads"),
         );
-        main.total("pool_requests", requests);
+        main.total("_pool_requests", requests);
         if let (Some(requests), Some(reads)) = (requests, reads) {
-            main.total("pool_hits", Some((requests - reads).max(0.0)));
+            main.total("_pool_hits", Some((requests - reads).max(0.0)));
         }
-        main.average("cache_hit", "pool_hits", "pool_requests", 100.0);
+        main.average("cache_hit", "_pool_hits", "_pool_requests", 100.0);
         if let (Some(dirty), Some(total)) = (
             get("innodb_buffer_pool_pages_dirty"),
             get("innodb_buffer_pool_pages_total"),

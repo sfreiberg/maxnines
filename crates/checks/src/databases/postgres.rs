@@ -159,11 +159,11 @@ impl Postgres {
                 let main = &mut rows.main;
                 main.total("transactions", number(0));
                 main.total("rollbacks", number(1));
-                main.total("blocks_hit", number(3));
+                main.total("_blocks_hit", number(3));
                 if let (Some(read), Some(hit)) = (number(2), number(3)) {
-                    main.total("blocks_wanted", Some(read + hit));
+                    main.total("_blocks_wanted", Some(read + hit));
                 }
-                main.average("cache_hit", "blocks_hit", "blocks_wanted", 100.0);
+                main.average("cache_hit", "_blocks_hit", "_blocks_wanted", 100.0);
                 main.total("temp_bytes", number(4));
                 main.total("deadlocks", number(5));
                 main.total("conflicts", number(6));
@@ -571,9 +571,6 @@ mod tests {
         let second = settle.settle(reader.read(Duration::from_secs(10)).await);
         let main = row(&second, "main");
         assert!(main["transactions"].as_f64().unwrap() >= 0.0, "{main}");
-        assert!(
-            main["cache_hit"].is_number() || main["blocks_wanted"] == 0.0,
-            "{main}"
-        );
+        assert!(main.get("_blocks_wanted").is_none(), "{main}");
     }
 }
