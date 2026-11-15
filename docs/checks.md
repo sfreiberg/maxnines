@@ -18,6 +18,7 @@ are defined in the agent's own config, as [below](#on-an-agent).
 | **MySQL or MariaDB** (`mysql`) | `host:port` | Its version, from its greeting, or that an account can sign in |
 | **Redis** (`redis`) | `host:port` | That it answers PING, or that an account can sign in, and its version |
 | **MongoDB** (`mongodb`) | `host:port` | That it answers as MongoDB, or that an account can sign in, and its version |
+| **ClickHouse** (`clickhouse`) | `host:port`, its HTTP port | That it answers its ping, or that an account can sign in, and its version |
 | **SSH** (`ssh`) | `host:port` | Its host key and the ways it offers to sign in, or that an account can sign in |
 | **Mail sending** (`smtp`) | `host:port` | That it greets as a mail server, or that an account can sign in to send |
 | **Mailbox** (`imap`, `pop3`) | `host:port` | That it greets as one, or that an account can sign in |

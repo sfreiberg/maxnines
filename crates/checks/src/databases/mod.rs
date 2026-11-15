@@ -10,6 +10,7 @@
 //! whose name starts with `_` is only there to work out an average, and goes
 //! once it has.
 
+pub(crate) mod clickhouse;
 mod mongodb;
 mod mysql;
 mod postgres;
@@ -32,7 +33,7 @@ pub const TIMEOUT: Duration = Duration::from_secs(10);
 pub fn is_database(kind: CheckKind) -> bool {
     matches!(
         kind,
-        CheckKind::Postgres | CheckKind::Mysql | CheckKind::Mongodb
+        CheckKind::Postgres | CheckKind::Mysql | CheckKind::Mongodb | CheckKind::Clickhouse
     )
 }
 
@@ -49,6 +50,7 @@ enum Open {
     Postgres(postgres::Postgres),
     Mysql(mysql::Mysql),
     Mongodb(mongodb::Mongodb),
+    Clickhouse(clickhouse::Clickhouse),
 }
 
 pub struct Reader {
@@ -112,6 +114,7 @@ impl Reader {
             Some(Open::Postgres(open)) => open.read(&mut rows, extras).await?,
             Some(Open::Mysql(open)) => open.read(&mut rows, extras).await?,
             Some(Open::Mongodb(open)) => open.read(&mut rows, extras).await?,
+            Some(Open::Clickhouse(open)) => open.read(&mut rows, extras).await?,
             None => bail!("not connected"),
         }
         Ok(rows.finish())
@@ -129,6 +132,10 @@ impl Reader {
             CheckKind::Mongodb => Ok(Open::Mongodb(
                 mongodb::Mongodb::connect(check, credentials).await?,
             )),
+            CheckKind::Clickhouse => Ok(Open::Clickhouse(clickhouse::Clickhouse::new(
+                check,
+                credentials,
+            )?)),
             other => bail!("{} isn't a database", other.as_str()),
         }
     }

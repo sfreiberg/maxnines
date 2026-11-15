@@ -420,8 +420,8 @@ pub struct Check {
     /// database the account belongs to. Defaults to `admin`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database: Option<String>,
-    /// mysql, redis and mongodb: connect over TLS, which they don't offer on
-    /// their own.
+    /// mysql, redis, mongodb and clickhouse: connect over TLS, which they don't
+    /// offer on their own. For ClickHouse, that's HTTPS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<bool>,
     /// ssh: the host key's SHA-256 fingerprint, as `ssh-keygen -l` prints it, such
@@ -446,6 +446,7 @@ pub enum CheckKind {
     Mysql,
     Redis,
     Mongodb,
+    Clickhouse,
     Ssh,
     Smtp,
     Imap,
@@ -464,6 +465,7 @@ impl CheckKind {
             Self::Mysql => "mysql",
             Self::Redis => "redis",
             Self::Mongodb => "mongodb",
+            Self::Clickhouse => "clickhouse",
             Self::Ssh => "ssh",
             Self::Smtp => "smtp",
             Self::Imap => "imap",
@@ -479,6 +481,7 @@ impl CheckKind {
                 | Self::Mysql
                 | Self::Redis
                 | Self::Mongodb
+                | Self::Clickhouse
                 | Self::Ssh
                 | Self::Smtp
                 | Self::Imap
@@ -497,6 +500,7 @@ impl CheckKind {
             "mysql" => Some(Self::Mysql),
             "redis" => Some(Self::Redis),
             "mongodb" => Some(Self::Mongodb),
+            "clickhouse" => Some(Self::Clickhouse),
             "ssh" => Some(Self::Ssh),
             "smtp" => Some(Self::Smtp),
             "imap" => Some(Self::Imap),
@@ -590,6 +594,7 @@ impl Check {
             | CheckKind::Mysql
             | CheckKind::Redis
             | CheckKind::Mongodb
+            | CheckKind::Clickhouse
             | CheckKind::Ssh
             | CheckKind::Smtp
             | CheckKind::Imap
@@ -631,6 +636,7 @@ impl Check {
                 CheckKind::Mysql,
                 CheckKind::Redis,
                 CheckKind::Mongodb,
+                CheckKind::Clickhouse,
                 CheckKind::Smtp,
                 CheckKind::Imap,
                 CheckKind::Pop3,
@@ -648,6 +654,7 @@ impl Check {
                 CheckKind::Mysql,
                 CheckKind::Redis,
                 CheckKind::Mongodb,
+                CheckKind::Clickhouse,
                 CheckKind::Smtp,
                 CheckKind::Imap,
                 CheckKind::Pop3,

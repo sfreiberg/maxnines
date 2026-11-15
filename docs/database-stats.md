@@ -2,8 +2,8 @@
 
 An agent can read a database's health, load and replication: how many connections
 it has and how close that is to its limit, how long the oldest transaction has been
-open, how far behind a replica is, and more, from PostgreSQL, MySQL, MariaDB and
-MongoDB.
+open, how far behind a replica is, and more, from PostgreSQL, MySQL, MariaDB,
+MongoDB and ClickHouse.
 
 ## Setting one up
 
@@ -31,14 +31,21 @@ database "documents" {
   username = "maxnines"
   password = env("DOCUMENTS_DB_PASSWORD")
 }
+
+database "events" {
+  kind     = "clickhouse"
+  target   = "127.0.0.1:8123"
+  username = "maxnines"
+  password = env("EVENTS_DB_PASSWORD")
+}
 ```
 
 | Setting | Description |
 |---|---|
-| `kind` | `postgres`, `mysql` for MySQL and MariaDB, or `mongodb` |
-| `target` | `host:port` |
+| `kind` | `postgres`, `mysql` for MySQL and MariaDB, `mongodb`, or `clickhouse` |
+| `target` | `host:port`. For ClickHouse, the HTTP port, usually 8123, or 8443 for HTTPS |
 | `database` | PostgreSQL: the database to sign in to, by default `postgres`. MongoDB: the database the account was made in, by default `admin` |
-| `tls` | `true` to only connect over TLS. PostgreSQL uses TLS whenever the server offers it anyway |
+| `tls` | `true` to only connect over TLS, which for ClickHouse is HTTPS. PostgreSQL uses TLS whenever the server offers it anyway |
 | `insecure` | `true` to accept a certificate that can't be verified |
 | `username`, `password` | Who to sign in as. `env()` reads the password from the agent's environment. MongoDB can be read without them where it allows that |
 
@@ -66,6 +73,12 @@ After a database's name in a rule, list anything else to read, which costs more:
 |---|---|
 | `sizes` | Each database's size on disk. PostgreSQL adds the WAL kept, and MySQL the binary logs |
 
+ClickHouse is read over its HTTP interface, where a password goes with every
+request as basic authentication, not as a challenge as the others sign in. So
+the agent only sends one over plain HTTP to ClickHouse on its own host, at
+`127.0.0.1` or `localhost`, and anywhere else needs `tls = true`. Every request is a
+GET, which ClickHouse only lets read.
+
 A MongoDB database is read from the one server given, so give each member of a
 replica set a block of its own. It takes `host:port`, not a `mongodb+srv://`
 address.
@@ -75,7 +88,7 @@ For example, `orders sizes`.
 ## Hosts without an agent
 
 For a database on a [host without an agent](agentless-hosts.md), such as a managed
-one, the server reads it instead. Add a PostgreSQL, MySQL or MongoDB check about the
+one, the server reads it instead. Add a PostgreSQL, MySQL, MongoDB or ClickHouse check about the
 host on the **Checks** page, with how it signs in, and tick **Read its health and
 replication**, with any extras. Its stats are charted on the host's metrics page and
 listed under **Latest databases** there, as an agent's are, named after the check.
@@ -127,6 +140,15 @@ db.createUser({
 `local` the oplog's window. An account without `clusterMonitor` can only say the
 server answers and its version.
 
+### ClickHouse
+
+```sql
+CREATE USER maxnines IDENTIFIED BY 'a long random password' SETTINGS readonly = 1;
+GRANT SELECT ON system.* TO maxnines;
+```
+
+Everything it reads is in the `system` tables.
+
 ## What's read
 
 Each value is a series named after the database, such as `orders`. Things a
@@ -140,11 +162,12 @@ database has several of are named after both, such as `orders standby replica1`,
 | **Database answering**, **uptime** | Whether it could be read, and for how long it's been running |
 | **Database connections**, **connections used** | Client connections, and as a percentage of the most allowed |
 | **Database oldest transaction**, **oldest query** | How long the longest has been going. A long transaction holds back cleanup |
+| **Database queries** | Per second, for MySQL and ClickHouse |
 | **Database rollbacks**, **deadlocks** | Per second, for PostgreSQL and MySQL |
 | **Database connections refused at the limit** | Per second, for MySQL and MongoDB 6.3 and later |
 | **Database cache hit rate** | How much of what was read was already in memory, for PostgreSQL and MySQL |
 | **Database is a replica**, **replica receiving** | Its role, and whether a replica is still connected to what it replicates. Lag reads 0 when nothing's arriving, so check this too |
-| **Database replication lag** | On a replica, how far behind it is. For PostgreSQL, also each standby, as its primary sees it, and for MongoDB each member, as **MongoDB member lag** |
+| **Database replication lag** | On a replica, how far behind it is. For PostgreSQL, also each standby, as its primary sees it, and for MongoDB each member, as **MongoDB member lag**. For ClickHouse, the furthest behind of its replicated tables |
 | **Database size** | With the `sizes` extra |
 
 ### PostgreSQL
@@ -171,7 +194,7 @@ don't have. On Amazon Aurora, replicas don't report their lag this way.
 
 | Metric | What it is |
 |---|---|
-| **MySQL queries running**, **queries**, **slow queries**, **commits** | Load |
+| **MySQL queries running**, **slow queries**, **commits** | Load |
 | **MySQL failed connection attempts** | Per second |
 | **MySQL temporary tables on disk** | Queries spilling to disk |
 | **MySQL buffer pool dirty**, **waits for a free buffer page** | InnoDB's memory under pressure |
@@ -205,6 +228,18 @@ works. A delayed replica's lag leaves out its delay.
 A server's role, such as primary, secondary or standalone, is under **Latest
 databases**. Ones that aren't in a replica set leave out what's about replication.
 
+### ClickHouse
+
+| Metric | What it is |
+|---|---|
+| **ClickHouse queries running**, **selects**, **inserts**, **failed queries**, **rows inserted**, **bytes inserted** | Load |
+| **ClickHouse most parts in a partition** | Inserts are slowed at `parts_to_delay_insert` and refused at `parts_to_throw_insert`, 300 by default. Many small inserts are the usual cause |
+| **ClickHouse inserts being slowed**, **inserts slowed for too many parts**, **inserts refused for too many parts** | What that's costing |
+| **ClickHouse merges running**, **memory in use** | Background work and memory |
+| **ClickHouse replicated tables**, **replicated tables read only**, **tables that lost Keeper**, **tables missing a replica**, **replication queue**, **inserts waiting to replicate**, **read-only replicas** | Replication. A table goes read only when it loses ClickHouse Keeper or ZooKeeper |
+| **ClickHouse mutations pending**, **mutations failing** | `ALTER … UPDATE` and `DELETE` still to finish, and ones that keep failing |
+| **ClickHouse disk free**, **disk used** | For each of its disks, such as `events disk default` |
+
 ## Good things to alert on
 
 - **Database answering** at 0.
@@ -220,6 +255,10 @@ databases**. Ones that aren't in a replica set leave out what's about replicatio
 - **MongoDB replica set has a primary** at 0, or **members healthy** below the
   set's size.
 - **MongoDB oplog window** under a day.
+- **ClickHouse most parts in a partition** over 150, half of where inserts are
+  refused.
+- **ClickHouse replicated tables read only** above 0, or **mutations failing**
+  above 0.
 
 Each server reports only what it knows about itself. Comparing servers, such as
 noticing two primaries at once, is planned.

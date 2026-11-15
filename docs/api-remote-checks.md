@@ -10,7 +10,7 @@ alerts go under that host.
 | `check` | Required. What to check, as below |
 | `interval_secs` | Required. How often it runs |
 | `enabled` | Defaults to `true` |
-| `read_stats` | For a PostgreSQL, MySQL or MongoDB check: `true` also reads the database's health and replication, saved under the check's host, as described in [database stats](database-stats.md#hosts-without-an-agent) |
+| `read_stats` | For a PostgreSQL, MySQL, MongoDB or ClickHouse check: `true` also reads the database's health and replication, saved under the check's host, as described in [database stats](database-stats.md#hosts-without-an-agent) |
 | `extras` | With `read_stats`, what else to read, such as `["sizes"]` |
 | `username` | For a check that [signs in](checks.md#signing-in): who as |
 | `password` | Its password, which can be set but is never given back |

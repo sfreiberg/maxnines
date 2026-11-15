@@ -221,6 +221,33 @@ pub(crate) async fn check_mysql(
     Ok(())
 }
 
+/// ClickHouse, over its HTTP interface: whether it answers its ping, or, signed
+/// in, its version.
+pub(crate) async fn check_clickhouse(
+    check: &Check,
+    credentials: Option<&Credentials>,
+    findings: &mut Findings,
+) -> Result<()> {
+    use crate::databases::clickhouse::Clickhouse;
+
+    // Looked up and connected to as other checks do, so a closed port fails at
+    // once with the usual words.
+    drop(open(check, findings).await?);
+    match credentials.filter(|given| !given.is_empty()) {
+        None => {
+            Clickhouse::new(check, &Credentials::default())?
+                .ping()
+                .await
+        }
+        Some(credentials) => {
+            let version = Clickhouse::new(check, credentials)?.version().await?;
+            findings.server_version = Some(version);
+            findings.signed_in = Some(true);
+            Ok(())
+        }
+    }
+}
+
 /// Signs in to MySQL or MariaDB, over TLS when the check says to.
 pub(crate) async fn mysql_connection(
     check: &Check,

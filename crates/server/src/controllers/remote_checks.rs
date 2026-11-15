@@ -29,7 +29,7 @@ use crate::remote_checks::{
 };
 use crate::silences::{ActiveSilences, SilenceInput};
 
-const KINDS: [CheckKind; 13] = [
+const KINDS: [CheckKind; 14] = [
     CheckKind::Http,
     CheckKind::Tcp,
     CheckKind::Tls,
@@ -39,6 +39,7 @@ const KINDS: [CheckKind; 13] = [
     CheckKind::Mysql,
     CheckKind::Redis,
     CheckKind::Mongodb,
+    CheckKind::Clickhouse,
     CheckKind::Ssh,
     CheckKind::Smtp,
     CheckKind::Imap,
