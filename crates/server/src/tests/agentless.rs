@@ -1152,7 +1152,7 @@ async fn a_database_check_reads_its_stats_as_the_hosts() {
 
     // Saved as the host's, as an agent's would be.
     // Under its kind, as an agent's would be.
-    for metric in ["postgres.up", "postgres.connections", "postgres.size"] {
+    for metric in ["pg.up", "pg.connections", "pg.size"] {
         let path = format!("/api/v1/hosts/{id}/metrics/{metric}?range=1h");
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

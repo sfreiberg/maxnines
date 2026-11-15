@@ -162,7 +162,7 @@ control is replicated, so make it on each.
 ## What's read
 
 Each kind of database has metrics of its own, named for it, such as
-`postgres.connections` and `mysql.connections`, so a chart or alert rule is always
+`pg.connections` and `mysql.connections`, so a chart or alert rule is always
 about one kind. Each value is a series named after the database, such as `orders`.
 Things a database has several of are named after both, such as `orders standby
 replica1`, `orders slot backups` or `shop database sales`.

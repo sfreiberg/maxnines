@@ -6,8 +6,8 @@
 //! working. Each round gives rows: one for the database itself, named as it's
 //! defined, and one for each thing it has several of, such as standbys or
 //! replication slots, named after it. A sample groups rows by their database's
-//! kind, as `{"postgres": [...], "mysql": [...]}`, so each kind's values are its
-//! own, such as `postgres.connections`. Running totals in a row go under `totals`,
+//! kind, as `{"pg": [...], "mysql": [...]}`, so each kind's values are its own,
+//! such as `pg.connections`. Running totals in a row go under `totals`,
 //! and a [`Settle`] turns them into the change since the last sample. A total
 //! whose name starts with `_` is only there to work out an average, and goes
 //! once it has.
@@ -76,9 +76,9 @@ impl Reader {
         &self.name
     }
 
-    /// The kind of database, which its rows are grouped under.
+    /// What its rows are grouped under: its kind, shortened for PostgreSQL.
     pub fn kind(&self) -> &'static str {
-        self.database.check.kind.as_str()
+        namespace(self.database.check.kind)
     }
 
     /// One round of rows, which always has the database's own row, saying why
@@ -259,6 +259,15 @@ impl Rows {
     }
 }
 
+/// What a kind of database's values are kept under, which its metrics' names
+/// start with, such as `pg.connections`.
+pub fn namespace(kind: CheckKind) -> &'static str {
+    match kind {
+        CheckKind::Postgres => "pg",
+        other => other.as_str(),
+    }
+}
+
 /// A sample of rows, grouped by the kind each says it's of, which is taken out of
 /// the row. A row that doesn't say is under `unknown`.
 pub fn by_kind(rows: Vec<Value>) -> Value {
@@ -433,7 +442,7 @@ mod tests {
         let rows = reader.read(Duration::from_secs(2)).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["up"], 0);
-        assert_eq!(rows[0]["kind"], "postgres");
+        assert_eq!(rows[0]["kind"], "pg");
         assert!(rows[0]["error"].is_string(), "{rows:?}");
     }
 }

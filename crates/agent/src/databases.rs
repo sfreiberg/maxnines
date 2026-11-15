@@ -15,7 +15,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, ensure};
 use futures_util::future::join_all;
 use maxnines_checks::Credentials;
-use maxnines_checks::databases::{Database, Reader, Settle, TIMEOUT, by_kind, is_database};
+use maxnines_checks::databases::{
+    Database, Reader, Settle, TIMEOUT, by_kind, is_database, namespace,
+};
 use maxnines_protocol::{Check, CheckKind, DatabaseChoice, is_page_name};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -149,7 +151,7 @@ impl DatabaseCollector {
                         .get(name)
                         .and_then(|definition| CheckKind::parse(&definition.kind))
                         .filter(|kind| is_database(*kind))
-                        .map(CheckKind::as_str);
+                        .map(namespace);
                     missing.push(json!({
                         "name": name,
                         "kind": kind,
@@ -288,8 +290,8 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         };
         // Each under its kind, so its values are its kind's own.
-        assert_eq!(output["postgres"][0]["name"], "orders");
-        assert_eq!(output["postgres"][0]["up"], 0, "{output}");
+        assert_eq!(output["pg"][0]["name"], "orders");
+        assert_eq!(output["pg"][0]["up"], 0, "{output}");
         assert_eq!(
             output["unknown"][0],
             json!({ "name": "nowhere", "up": 0, "error": "agent.hcl has no database by that name" })
