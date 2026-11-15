@@ -1554,13 +1554,13 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::WithData,
     },
     Metric {
-        name: "pg.active",
-        title: "PostgreSQL active queries",
+        name: "pg.running_queries",
+        title: "PostgreSQL queries running",
         unit: Unit::Number,
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.pg.active"),
+            reading: Reading::Field("$.pg.running_queries"),
         },
         chart: ShowChart::WithData,
     },
@@ -1576,13 +1576,13 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::WithData,
     },
     Metric {
-        name: "pg.waiting_on_locks",
+        name: "pg.lock_waits",
         title: "PostgreSQL sessions waiting on locks",
         unit: Unit::Number,
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.pg.waiting_on_locks"),
+            reading: Reading::Field("$.pg.lock_waits"),
         },
         chart: ShowChart::WithData,
     },
@@ -2094,13 +2094,13 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::WithData,
     },
     Metric {
-        name: "mysql.threads_running",
+        name: "mysql.running_queries",
         title: "MySQL queries running",
         unit: Unit::Number,
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.mysql.threads_running"),
+            reading: Reading::Field("$.mysql.running_queries"),
         },
         chart: ShowChart::WithData,
     },
@@ -2711,13 +2711,13 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::Never,
     },
     Metric {
-        name: "mongodb.resident",
+        name: "mongodb.memory",
         title: "MongoDB memory in use",
         unit: Unit::Bytes,
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.mongodb.resident_bytes"),
+            reading: Reading::Field("$.mongodb.memory_bytes"),
         },
         chart: ShowChart::WithData,
     },
@@ -4067,7 +4067,7 @@ pub const METRICS: &[Metric] = &[
     // Monitoring plugins in the Nagios style: 0 OK, 1 warning, 2 critical, 3 unknown,
     // and whatever performance data they give.
     Metric {
-        name: "commands.status",
+        name: "command.status",
         title: "Check command status",
         unit: Unit::Number,
         collector: "commands",
@@ -4078,7 +4078,7 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::WithData,
     },
     Metric {
-        name: "commands.ok",
+        name: "command.ok",
         title: "Check command passing",
         unit: Unit::Number,
         collector: "commands",
@@ -4089,7 +4089,7 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::Never,
     },
     Metric {
-        name: "commands.value",
+        name: "command.value",
         title: "Check command values",
         unit: Unit::Number,
         collector: "commands",
@@ -4102,7 +4102,7 @@ pub const METRICS: &[Metric] = &[
     // Windows performance counters, each by its path. They measure all sorts of things,
     // so they're numbers here, and the busiest are charted together.
     Metric {
-        name: "counters.value",
+        name: "counter.value",
         title: "Performance counters",
         unit: Unit::Number,
         collector: "counters",
@@ -4113,7 +4113,7 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::WithData,
     },
     Metric {
-        name: "counters.ok",
+        name: "counter.ok",
         title: "Performance counter working",
         unit: Unit::Number,
         collector: "counters",

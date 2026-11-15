@@ -170,7 +170,7 @@ impl Mongodb {
         }
         // In megabytes.
         main.maybe(
-            "resident_bytes",
+            "memory_bytes",
             get(&["mem", "resident"]).map(|mb| mb * 1_048_576.0),
         );
         main.maybe("flow_control_lagged", get(&["flowControl", "isLagged"]));

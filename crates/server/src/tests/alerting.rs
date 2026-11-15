@@ -1722,7 +1722,7 @@ async fn a_windows_hosts_page_shows_its_performance_counters() {
     });
     send(&mut client, &sample).await;
 
-    let metric = crate::metrics::find("counters.value").unwrap();
+    let metric = crate::metrics::find("counter.value").unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     let newest = loop {
         let newest = server.state.metrics.newest(metric, now_ms()).await.unwrap();

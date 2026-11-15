@@ -132,9 +132,9 @@ impl Postgres {
         {
             main.set("connections_used", used / max * 100.0);
         }
-        main.maybe("active", number(1));
+        main.maybe("running_queries", number(1));
         main.maybe("idle_in_transaction", number(2));
-        main.maybe("waiting_on_locks", number(3));
+        main.maybe("lock_waits", number(3));
         main.maybe("oldest_transaction_secs", number(4));
         main.maybe("oldest_query_secs", number(5));
         main.maybe("oldest_idle_in_transaction_secs", number(6));

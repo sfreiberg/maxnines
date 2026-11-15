@@ -3975,7 +3975,7 @@ async fn check_commands_report_their_status_message_and_values() {
     });
     send(&mut client, &message).await;
 
-    let path = format!("/api/v1/hosts/{id}/metrics/commands.status?range=1h");
+    let path = format!("/api/v1/hosts/{id}/metrics/command.status?range=1h");
     let deadline = Instant::now() + Duration::from_secs(5);
     let status = loop {
         let body = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
@@ -3996,7 +3996,7 @@ async fn check_commands_report_their_status_message_and_values() {
     let raid = status["series"].as_array().unwrap().iter();
     let raid = raid.clone().find(|line| line["name"] == "raid").unwrap();
     assert_eq!(raid["points"][0]["avg"], 2.0);
-    let path = format!("/api/v1/hosts/{id}/metrics/commands.value?range=1h");
+    let path = format!("/api/v1/hosts/{id}/metrics/command.value?range=1h");
     let values = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
     assert_eq!(values["series"][0]["name"], "raid failed_disks", "{values}");
 

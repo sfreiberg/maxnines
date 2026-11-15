@@ -193,7 +193,7 @@ impl Mysql {
         {
             main.set("connections_used", connected / max * 100.0);
         }
-        main.maybe("threads_running", get("threads_running"));
+        main.maybe("running_queries", get("threads_running"));
         main.total("queries", get("questions"));
         main.total("slow_queries", get("slow_queries"));
         main.total("refused", get("connection_errors_max_connections"));

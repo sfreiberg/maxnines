@@ -189,7 +189,7 @@ Each of these is named for its kind, such as **PostgreSQL connections** or
 
 | Metric | What it is |
 |---|---|
-| **PostgreSQL active queries**, **sessions idle in a transaction**, **sessions waiting on locks**, **longest idle in a transaction** | Sessions by what they're doing |
+| **PostgreSQL queries running**, **sessions idle in a transaction**, **sessions waiting on locks**, **longest idle in a transaction** | Sessions by what they're doing |
 | **PostgreSQL transactions**, **temporary files written** | Per second, across every database |
 | **PostgreSQL scheduled checkpoints**, **requested checkpoints** | Many requested ones mean `max_wal_size` is too small |
 | **PostgreSQL WAL written**, **WAL on disk** | Bytes per second on version 14 and later, and with the `sizes` extra |
