@@ -4,7 +4,8 @@
 //! A check that signs in, such as one of a database or an SSH server, gets its
 //! username and password, or key, from a `check_login` block in the agent's own
 //! config, named for the check. They never come from the server, and never go to
-//! it.
+//! it. The block also names the target the login is for, as the server chooses
+//! each check's target, and a login is only ever sent to the one it names.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -13,7 +14,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use maxnines_checks::{Credentials, limit, run_signed_in, timed_out_report};
+use maxnines_checks::{Credentials, failed_report, limit, run_signed_in, timed_out_report};
 use maxnines_protocol::Check;
 use serde::Deserialize;
 use serde_json::Value;
@@ -31,11 +32,13 @@ const MAX_LOGINS: usize = 64;
 ///
 /// ```hcl
 /// check_login "orders-db" {
+///   target   = "db.example.com:5432"
 ///   username = "maxnines"
 ///   password = env("ORDERS_DB_PASSWORD")
 /// }
 ///
 /// check_login "bastion" {
+///   target           = "bastion.example.com:22"
 ///   username         = "monitor"
 ///   private_key_file = "/etc/maxnines/bastion_key"
 /// }
@@ -43,6 +46,10 @@ const MAX_LOGINS: usize = 64;
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CheckLogin {
+    /// What the login is for, exactly as the check's target is written. The
+    /// server chooses a check's target, so without this, whoever can change the
+    /// server's config rules could send the login anywhere.
+    target: String,
     #[serde(default)]
     username: Option<String>,
     #[serde(default)]
@@ -58,6 +65,7 @@ pub struct CheckLogin {
 impl fmt::Debug for CheckLogin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CheckLogin")
+            .field("target", &self.target)
             .field("username", &self.username)
             .field("private_key_file", &self.private_key_file)
             .finish_non_exhaustive()
@@ -74,6 +82,24 @@ impl CheckLogin {
     }
 }
 
+/// How a check signs in: with the login named for it, if there is one and it's
+/// for this check's target. One for another target is never sent, and the check
+/// says why it didn't run rather than quietly not signing in.
+fn sign_in_for(check: &Check, logins: &CheckLogins) -> Result<Option<Credentials>, String> {
+    // Only a kind that signs in is given one, so a login named for a web check
+    // never goes anywhere.
+    let Some(login) = logins.get(&check.name).filter(|_| check.kind.signs_in()) else {
+        return Ok(None);
+    };
+    if login.target != check.target {
+        return Err(format!(
+            "the login for {:?} in agent.hcl is for {}, not {}",
+            check.name, login.target, check.target
+        ));
+    }
+    Ok(Some(login.credentials()))
+}
+
 /// The logins the agent's config gives, by the check's name.
 pub type CheckLogins = BTreeMap<String, CheckLogin>;
 
@@ -85,6 +111,11 @@ pub fn load_check_logins(logins: &mut CheckLogins) -> Result<()> {
         "at most {MAX_LOGINS} checks can have a login"
     );
     for (name, login) in logins.iter_mut() {
+        ensure!(
+            !login.target.is_empty() && !login.target.chars().any(char::is_whitespace),
+            "the login for check {name:?} needs the target it's for, as the check's \
+             target is written, such as db.example.com:5432"
+        );
         ensure!(
             login
                 .username
@@ -115,8 +146,11 @@ pub struct CheckCollector {
 }
 
 /// A check and how often it runs, in rounds of the agent's interval.
+/// A check, with how it signs in, or why it can't run.
+type Ready = (Check, Result<Option<Credentials>, String>);
+
 struct Scheduled {
-    check: Arc<(Check, Option<Credentials>)>,
+    check: Arc<Ready>,
     every: u64,
     /// Which round of each `every` it runs in, so checks with the same interval
     /// don't all run together.
@@ -144,12 +178,7 @@ impl CheckCollector {
             .map(|check| {
                 let every = rounds(&check, interval);
                 let offset = (rand::random::<f64>() * every as f64) as u64;
-                // Only a kind that signs in is given one, so a login named for a
-                // web check never goes anywhere.
-                let credentials = logins
-                    .get(&check.name)
-                    .filter(|_| check.kind.signs_in())
-                    .map(CheckLogin::credentials);
+                let credentials = sign_in_for(&check, logins);
                 Scheduled {
                     check: Arc::new((check, credentials)),
                     every,
@@ -168,15 +197,18 @@ impl CheckCollector {
                 .filter(|&i| round % scheduled[i].every == scheduled[i].offset)
                 .collect();
             round = round.wrapping_add(1);
-            let checks: Vec<Arc<(Check, Option<Credentials>)>> =
-                due.iter().map(|&i| scheduled[i].check.clone()).collect();
+            let checks: Vec<Arc<Ready>> = due.iter().map(|&i| scheduled[i].check.clone()).collect();
             let results = results.clone();
             async move {
-                let probe = |item: Arc<(Check, Option<Credentials>)>| async move {
-                    let (check, credentials) = &*item;
-                    run_signed_in(check, credentials.as_ref()).await
+                let probe = |item: Arc<Ready>| async move {
+                    match &*item {
+                        (check, Ok(credentials)) => {
+                            run_signed_in(check, credentials.as_ref()).await
+                        }
+                        (check, Err(why)) => failed_report(check, why),
+                    }
                 };
-                let late = |item: &(Check, Option<Credentials>)| timed_out_report(&item.0);
+                let late = |item: &Ready| timed_out_report(&item.0);
                 let found = probe_all(&checks, interval, longest + GRACE, probe, late).await;
                 let mut results = results.lock().unwrap_or_else(PoisonError::into_inner);
                 for (i, result) in due.into_iter().zip(found) {
@@ -327,6 +359,7 @@ mod tests {
 
     fn login(username: Option<&str>, password: Option<&str>, key: Option<PathBuf>) -> CheckLogin {
         CheckLogin {
+            target: "db.example.com:5432".to_string(),
             username: username.map(String::from),
             password: password.map(String::from),
             private_key_file: key,
@@ -361,7 +394,12 @@ mod tests {
         );
         assert!(!format!("{:?}", logins["db"]).contains("s3cret"));
 
+        let untargeted = CheckLogin {
+            target: String::new(),
+            ..login(Some("a"), Some("b"), None)
+        };
         for bad in [
+            untargeted,
             login(None, None, None),
             login(Some("a"), Some("b"), Some(folder.path().join("key"))),
             login(Some("a"), None, Some(folder.path().join("missing"))),
@@ -369,5 +407,55 @@ mod tests {
             let mut logins = CheckLogins::from([("x".to_string(), bad)]);
             assert!(load_check_logins(&mut logins).is_err());
         }
+    }
+
+    #[test]
+    fn a_login_is_only_sent_to_the_target_it_names() {
+        let logins = CheckLogins::from([(
+            "orders".to_string(),
+            login(Some("maxnines"), Some("s3cret"), None),
+        )]);
+        let check = |target: &str| Check::new("orders", CheckKind::Postgres, target);
+
+        let given = sign_in_for(&check("db.example.com:5432"), &logins).unwrap();
+        assert_eq!(given.unwrap().password.as_deref(), Some("s3cret"));
+        // The server moved the check somewhere else.
+        let moved = sign_in_for(&check("evil.example.com:5432"), &logins).unwrap_err();
+        assert!(moved.contains("is for db.example.com:5432"), "{moved}");
+        // A kind that doesn't sign in is never given it.
+        let web = Check::new("orders", CheckKind::Tcp, "db.example.com:5432");
+        assert_eq!(sign_in_for(&web, &logins), Ok(None));
+    }
+
+    #[test]
+    fn a_check_whose_login_is_for_elsewhere_says_so_and_never_connects() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap().to_string();
+        listener.set_nonblocking(true).unwrap();
+        let logins = CheckLogins::from([(
+            "orders".to_string(),
+            login(Some("maxnines"), Some("s3cret"), None),
+        )]);
+        let checks = vec![Check::new("orders", CheckKind::Postgres, &target)];
+        let mut collector = CheckCollector::new(checks, &logins, Duration::from_millis(50));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let output = loop {
+            let output = collector.collect().unwrap();
+            if output.as_array().is_some_and(|rows| !rows.is_empty()) {
+                break output;
+            }
+            assert!(Instant::now() < deadline, "no result: {output}");
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(output[0]["up"], 0, "{output}");
+        assert!(
+            output[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("in agent.hcl is for"),
+            "{output}"
+        );
+        assert!(listener.accept().is_err(), "it connected");
     }
 }

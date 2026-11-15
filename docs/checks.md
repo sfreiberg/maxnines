@@ -62,27 +62,34 @@ and it's read each time the check runs.
 ### On an agent
 
 The server never has an agent's passwords. Instead, a `check_login` block in the
-agent's own config file, `agent.hcl`, gives them, named for the check it's for:
+agent's own config file, `agent.hcl`, gives them, named for the check it's for, with
+the target it's for written exactly as the check's target is:
 
 ```hcl
 check_login "orders db" {
+  target   = "db.example.com:5432"
   username = "maxnines"
   password = env("ORDERS_DB_PASSWORD")
 }
 
 check_login "bastion" {
+  target           = "bastion.example.com:22"
   username         = "monitor"
   private_key_file = "/etc/maxnines/bastion_key"
 }
 
 # Redis before version 6 has a password and no usernames.
 check_login "cache" {
+  target   = "127.0.0.1:6379"
   password = env("REDIS_PASSWORD")
 }
 ```
 
-A login is only ever used by a check of a kind that signs in, so one named for a
-website check is never sent anywhere. A key file is read when the agent starts, so it
+The server chooses each check's target, so a login is only sent to the target its
+block names. If a config rule gives the check a different one, the check doesn't
+run, and says that its login is for somewhere else. A login is also only ever used
+by a check of a kind that signs in, so one named for a website check is never sent
+anywhere. A key file is read when the agent starts, so it
 has to be readable by the user the agent runs as. Restart the agent after changing
 any of these.
 
