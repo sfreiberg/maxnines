@@ -38,6 +38,9 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 ]
 ```
 
+`last_seen_ms` is `null` for a host the server hasn't heard from since it started,
+which for one with no agent means none of its pages or checks has answered yet.
+
 ## Add a host without an agent
 
 `POST /api/v1/hosts`

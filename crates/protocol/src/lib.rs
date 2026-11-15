@@ -231,6 +231,8 @@ pub fn metrics_page_name(url: &str) -> &str {
 /// A metric's name as OpenMetrics pages write them, where `*` and `?` stand for
 /// anything.
 fn is_metric_pattern(pattern: &str) -> bool {
+    // A leading ! leaves out what the rest matches.
+    let pattern = pattern.strip_prefix('!').unwrap_or(pattern);
     !pattern.is_empty()
         && pattern
             .chars()
@@ -609,7 +611,7 @@ impl CollectorSettings {
             ensure!(
                 collector != "openmetrics" || is_metric_pattern(name),
                 "{name:?} isn't a metric's name, which has only letters, digits, _ and :, \
-                 with * and ? for anything"
+                 with * and ? for anything, and ! in front to leave it out"
             );
             ensure!(
                 collector != "counters" || is_counter_path(name),
@@ -991,7 +993,7 @@ mod tests {
         let settings = |settings: Value| with("openmetrics", settings).validate();
         settings(json!({
             "urls": ["http://localhost:9100/metrics", "http://localhost:9187/metrics"],
-            "names": ["http_*", "process_cpu_seconds_total", "app:latency:p9?"]
+            "names": ["http_*", "process_cpu_seconds_total", "app:latency:p9?", "!go_*"]
         }))
         .unwrap();
         // The same page twice over, as far as its series' names go.
@@ -1003,7 +1005,15 @@ mod tests {
         assert!(error.to_string().contains("both be called"), "{error}");
         // Only this collector names its pages.
         with("nginx", json!({ "urls": same })).validate().unwrap();
-        for bad in ["http_requests{code=\"200\"}", "a b", "", "näme"] {
+        for bad in [
+            "http_requests{code=\"200\"}",
+            "a b",
+            "",
+            "näme",
+            "!",
+            "!!go_*",
+            "go_!",
+        ] {
             assert!(settings(json!({ "names": [bad] })).is_err(), "{bad}");
         }
     }

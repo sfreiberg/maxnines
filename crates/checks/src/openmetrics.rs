@@ -62,18 +62,27 @@ pub struct Page {
     name: String,
     /// The metrics to keep, or all of them when there are none.
     wanted: Vec<WildMatch>,
+    /// The metrics to leave out, whatever is wanted.
+    unwanted: Vec<WildMatch>,
     max_series: usize,
     /// Sent with every request, for a page that asks who's reading.
     login: Option<Login>,
 }
 
 impl Page {
-    /// `wanted` are metric names, with `*` and `?` for anything.
+    /// `wanted` are metric names, with `*` and `?` for anything. One starting with
+    /// `!` is left out instead of kept.
     pub fn new(url: String, wanted: &[String], max_series: usize, login: Option<Login>) -> Self {
+        let (unwanted, wanted): (Vec<&String>, Vec<&String>) =
+            wanted.iter().partition(|name| name.starts_with('!'));
         Self {
             name: metrics_page_name(&url).to_string(),
             url,
             wanted: wanted.iter().map(|name| WildMatch::new(name)).collect(),
+            unwanted: unwanted
+                .iter()
+                .map(|name| WildMatch::new(&name[1..]))
+                .collect(),
             max_series,
             login,
         }
@@ -85,7 +94,8 @@ impl Page {
     }
 
     fn wants(&self, metric: &str) -> bool {
-        self.wanted.is_empty() || self.wanted.iter().any(|pattern| pattern.matches(metric))
+        let matches = |patterns: &[WildMatch]| patterns.iter().any(|p| p.matches(metric));
+        !matches(&self.unwanted) && (self.wanted.is_empty() || matches(&self.wanted))
     }
 
     /// Fetches the page and gives what's kept of it: a row for the page itself,
@@ -332,6 +342,25 @@ jobs_created 1700000000
             ]
         );
         assert_eq!(rows[0]["dropped"], 0);
+    }
+
+    #[test]
+    fn unwanted_metrics_are_left_out_of_what_is_kept() {
+        let names = |wanted: &[&str]| -> Vec<String> {
+            let rows = read(PAGE, &page(wanted, 100)).unwrap();
+            let named = rows[1..].iter().filter_map(|row| row[0].as_str());
+            named.map(String::from).collect()
+        };
+        let everything = names(&[]);
+        // On its own, it leaves everything else.
+        let without = names(&["!http_*"]);
+        assert_eq!(without.len(), everything.len() - 2);
+        assert!(!without.iter().any(|name| name.contains("http_")));
+        // With names to keep, it takes away from those.
+        assert_eq!(
+            names(&["http_*", "temperature_celsius", "!temp*"]),
+            names(&["http_*"])
+        );
     }
 
     #[test]

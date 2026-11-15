@@ -39,8 +39,9 @@ pub struct HostPresence {
     pub online: bool,
     /// When `online` last changed.
     pub since_ms: u64,
-    /// When the server last heard anything from this agent.
-    pub last_seen_ms: u64,
+    /// When the server last heard anything from this host, if it ever has. One
+    /// with no agent has been heard from once something of it answers.
+    pub last_seen_ms: Option<u64>,
     /// Where the latest connection came from, as seen by the server.
     pub source: IpAddr,
 }
@@ -125,7 +126,7 @@ impl State {
                 // The opposite, so that the first answer counts as a change.
                 online: !online,
                 since_ms: now,
-                last_seen_ms: now,
+                last_seen_ms: None,
                 // It has no connection, so there's nowhere it connected from.
                 source: IpAddr::from([0, 0, 0, 0]),
             },
@@ -133,7 +134,7 @@ impl State {
             replaced: Arc::new(Notify::new()),
         });
         if online {
-            entry.presence.last_seen_ms = now;
+            entry.presence.last_seen_ms = Some(now);
         }
         let changed = entry.presence.online != online;
         if changed {
@@ -163,7 +164,7 @@ impl Presence {
             presence: HostPresence {
                 online: false,
                 since_ms: now,
-                last_seen_ms: now,
+                last_seen_ms: Some(now),
                 source,
             },
             connection,
@@ -178,7 +179,7 @@ impl Presence {
         let replaced = Arc::new(Notify::new());
         entry.replaced = replaced.clone();
         entry.connection = connection;
-        entry.presence.last_seen_ms = now;
+        entry.presence.last_seen_ms = Some(now);
         entry.presence.source = source;
         if !already_online {
             entry.presence.online = true;
@@ -255,7 +256,7 @@ impl Presence {
 
     pub fn seen(&self, id: &str) {
         if let Some(entry) = self.state.lock().unwrap().hosts.get_mut(id) {
-            entry.presence.last_seen_ms = now_ms();
+            entry.presence.last_seen_ms = Some(now_ms());
         }
     }
 
@@ -316,6 +317,7 @@ mod tests {
         presence.reached("db", Reached::Page(1), true);
         let first = presence.get("db").unwrap();
         assert!(first.online);
+        assert!(first.last_seen_ms.is_some());
 
         // Answering again changes nothing about when it came online.
         presence.reached("db", Reached::Page(1), true);
@@ -331,7 +333,10 @@ mod tests {
 
         // One that didn't answer the first time is offline from then.
         presence.reached("cache", Reached::Check(2), false);
-        assert!(!presence.get("cache").unwrap().online);
+        let never = presence.get("cache").unwrap();
+        assert!(!never.online);
+        // Nothing of it has been heard from yet.
+        assert_eq!(never.last_seen_ms, None);
     }
 
     #[test]

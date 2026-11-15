@@ -181,7 +181,9 @@ fn row(state: &AppState, host: HostRecord, facts: Option<&FlatFacts>, health: He
         health,
         os: facts.and_then(os_of),
         os_family: facts.and_then(OsFamily::of),
-        seen: presence.map(|p| crate::times::ago(p.last_seen_ms, now_ms() as u64)),
+        seen: presence
+            .and_then(|p| p.last_seen_ms)
+            .map(|seen_ms| crate::times::ago(seen_ms, now_ms() as u64)),
         config: None,
         state: host.state.as_str(),
         agentless: host.is_agentless(),

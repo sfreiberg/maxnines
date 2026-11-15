@@ -297,6 +297,8 @@ struct Reads {
     /// How each page's last read went: the page's own row, which says whether it
     /// answered and why not.
     results: HashMap<i64, Value>,
+    /// Pages that were changed since they were last read, to read again now.
+    changed: HashSet<i64>,
 }
 
 impl PageReads {
@@ -308,6 +310,18 @@ impl PageReads {
     pub fn result(&self, page_id: i64) -> Option<Value> {
         let reads = self.reads();
         reads.results.get(&page_id).cloned()
+    }
+
+    /// Forgets how a page's last read went, as the page has been changed and that
+    /// no longer says anything about it, and has it read again at once.
+    pub fn changed(&self, page_id: i64) {
+        let mut reads = self.reads();
+        reads.results.remove(&page_id);
+        reads.changed.insert(page_id);
+    }
+
+    fn take_changed(&self) -> HashSet<i64> {
+        std::mem::take(&mut self.reads().changed)
     }
 
     /// Forgets pages that are gone or turned off.
@@ -393,7 +407,9 @@ impl Scheduler {
             .collect();
 
         let reading: HashSet<i64> = pages.iter().map(|page| page.id).collect();
-        self.next_run.retain(|id, _| reading.contains(id));
+        let changed = self.reads.take_changed();
+        self.next_run
+            .retain(|id, _| reading.contains(id) && !changed.contains(id));
         self.reads.keep_only(&reading);
         self.presence.keep_pages(&reading);
 
@@ -696,5 +712,11 @@ mod tests {
         reads.keep_only(&HashSet::from([1]));
         assert_eq!(reads.result(2), None);
         assert!(reads.result(1).is_some());
+
+        // A page that's changed is as good as not read, until it is again.
+        reads.changed(1);
+        assert_eq!(reads.result(1), None);
+        assert_eq!(reads.take_changed(), HashSet::from([1]));
+        assert!(reads.take_changed().is_empty());
     }
 }

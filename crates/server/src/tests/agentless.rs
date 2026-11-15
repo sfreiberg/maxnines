@@ -331,13 +331,20 @@ async fn a_password_that_is_wrong_or_missing_shows_as_the_page_not_answering() {
     });
     let page_path = format!("/api/v1/metrics-pages/{page_id}");
     assert_eq!(api(&server, "PUT", &page_path, &unset).await.0, 204);
-    read_due(&mut scheduler, now + 60_000).await;
+    // How the page was before says nothing about it now, so that's forgotten and
+    // it's read again without waiting out its interval.
+    assert_eq!(server.state.page_reads.result(page_id), None);
+    assert_eq!(read_due(&mut scheduler, now + 1_000).await, 1);
     let result = server.state.page_reads.result(page_id).unwrap();
     assert_eq!(
         result["error"],
         "the environment variable MAXNINES_SECRET_NEVER_SET isn't set"
     );
-    assert!(!server.state.presence.get(&id).unwrap().online);
+    let presence = server.state.presence.get(&id).unwrap();
+    assert!(!presence.online);
+    // It has never answered, so it has never been seen.
+    let (_, host) = api(&server, "GET", &format!("/api/v1/hosts/{id}"), &Value::Null).await;
+    assert_eq!(host["last_seen_ms"], Value::Null, "{host}");
 }
 
 #[tokio::test]

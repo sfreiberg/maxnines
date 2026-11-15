@@ -8,7 +8,7 @@ agent reads are part of its [config rules](api-config-rules.md) instead.
 | --- | --- |
 | `url` | Required. The page's address, starting `http://` or `https://`, with no username or password in it |
 | `interval_secs` | Required. How often it's read, from 10 to 86400 |
-| `names` | The metrics to keep, with `*` and `?` for anything. Leave it out for all of them |
+| `names` | The metrics to keep, with `*` and `?` for anything, and `!` in front to leave one out. Leave it out for all of them |
 | `enabled` | Defaults to `true` |
 | `username` | For a page that asks who's reading. It needs one of the two below |
 | `password` | The password itself. It can be set but is never given back |
@@ -86,7 +86,8 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 `PUT /api/v1/metrics-pages/{id}`
 
-Replaces the whole page, apart from its password or token:
+Replaces the whole page, apart from its password or token, and reads it again at
+once without waiting out its interval:
 
 - A change that gives a `username` but neither `password` nor `password_env` keeps
   the password it has. Leaving `username` out removes the login.

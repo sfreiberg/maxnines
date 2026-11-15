@@ -290,7 +290,10 @@ pub async fn update_page(
         }
     };
     match state.database.update_metrics_page(id, input).await {
-        Ok(true) => (form.token, Redirect::to(&format!("/hosts/{host_id}"))).into_response(),
+        Ok(true) => {
+            state.page_reads.changed(id);
+            (form.token, Redirect::to(&format!("/hosts/{host_id}"))).into_response()
+        }
         Ok(false) => not_found(&state, &form.token),
         Err(error) => server_error(&error),
     }

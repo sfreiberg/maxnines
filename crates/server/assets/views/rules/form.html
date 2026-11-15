@@ -114,7 +114,7 @@
 
     <label>OpenMetrics metrics
       <textarea name="openmetrics_names" rows="2" spellcheck="false" placeholder="http_*">{{ rule.openmetrics_names }}</textarea>
-      <small>One name per line, with <code>*</code> and <code>?</code> for anything, such as <code>http_*</code>. Only these are kept from the pages. Leave empty for everything.</small>
+      <small>One name per line, with <code>*</code> and <code>?</code> for anything, such as <code>http_*</code>. Only these are kept from the pages. Put <code>!</code> in front of one to leave it out instead, such as <code>!go_*</code>. Leave empty for everything.</small>
     </label>
 
     <label>Checks

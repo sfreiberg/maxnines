@@ -60,6 +60,16 @@ pg_stat_database_*
 Names are matched against the metric alone, without its labels. With none listed,
 everything is kept up to the limit.
 
+A name with `!` in front is left out instead. On their own, such names take away
+from everything, and alongside names to keep they take away from those:
+
+```text
+!go_*
+!promhttp_*
+```
+
+An agent older than this doesn't know the `!`, and turns down a rule that uses it.
+
 ## Alerting
 
 Two more metrics are there to alert on, and aren't charted:

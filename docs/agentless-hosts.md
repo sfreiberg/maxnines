@@ -17,7 +17,7 @@ without losing its history. Then add the pages to read, on the host's own page u
 | --- | --- |
 | **Address** | A page in the Prometheus or OpenMetrics text format, such as an exporter's `/metrics`. The server reads it from where the server runs |
 | **Read every** | How often, from 10 seconds to a day |
-| **Metrics to keep** | Metric names, one to a line, with `*` and `?` for anything. Leave it empty for everything, up to 2,000 series from each page |
+| **Metrics to keep** | Metric names, one to a line, with `*` and `?` for anything, and `!` in front to leave one out. Leave it empty for everything, up to 2,000 series from each page |
 | **Signing in** | A username and password, or a token, for a page that asks for one |
 
 What's read is charted and named exactly as it is for a page an agent reads, which

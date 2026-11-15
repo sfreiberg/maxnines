@@ -546,7 +546,7 @@ async fn list(State(state): State<AppState>, Query(params): Query<ListParams>) -
             HostView {
                 online: reach == Reach::Online,
                 health: Health::of(reach, mine),
-                last_seen_ms: presence.map(|p| p.last_seen_ms),
+                last_seen_ms: presence.and_then(|p| p.last_seen_ms),
                 host,
             }
         })
@@ -568,7 +568,7 @@ async fn show_host(State(state): State<AppState>, UrlPath(id): UrlPath<String>) 
     Json(HostView {
         online: reach == Reach::Online,
         health: Health::of(reach, &mine),
-        last_seen_ms: presence.map(|p| p.last_seen_ms),
+        last_seen_ms: presence.and_then(|p| p.last_seen_ms),
         host,
     })
     .into_response()
@@ -741,7 +741,10 @@ async fn update_metrics_page(
         Err(error) => return refused(&error),
     };
     match state.database.update_metrics_page(id, input).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            state.page_reads.changed(id);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),
     }
