@@ -24,6 +24,14 @@ webpki-roots = "0.26"
 # server's alert rules use.
 wildmatch = "2.7.0"
 x509-parser = { version = "0.18", default-features = false }
+# Signing in to databases and SSH servers, each with only what a check needs and
+# with TLS through the rustls and ring already here. What each adds to the agent
+# was measured before choosing them.
+mysql_async = { version = "0.36.2", default-features = false, features = ["minimal-rust", "rustls-tls", "ring", "tls12"] }
+redis = { version = "1.8.2", default-features = false, features = ["tokio-rustls-comp"] }
+russh = { version = "0.65.1", default-features = false, features = ["ring", "rsa"] }
+tokio-postgres = { version = "0.7.18", default-features = false, features = ["runtime"] }
+tokio-postgres-rustls = "0.13"
 
 [dev-dependencies]
 rcgen = "0.14"

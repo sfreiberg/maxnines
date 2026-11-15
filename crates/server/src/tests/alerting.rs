@@ -5170,6 +5170,7 @@ mod remote {
             check: Check::new(name, CheckKind::Tcp, target),
             interval_secs: 60,
             enabled: true,
+            sign_in: Default::default(),
         }
     }
 
@@ -5211,6 +5212,7 @@ mod remote {
         let input = RemoteCheckInput {
             host_id: crate::remote_checks::LOCAL_HOST_ID.to_string(),
             enabled: false,
+            sign_in: Default::default(),
             ..tcp_input("db", &target)
         };
         server
@@ -6623,6 +6625,7 @@ mod pages {
             check: maxnines_protocol::Check::new("site", maxnines_protocol::CheckKind::Tcp, "a:1"),
             interval_secs: 60,
             enabled: true,
+            sign_in: Default::default(),
         };
         test.database().create_remote_check(&input).await.unwrap();
         let mut waiting = test.server.connect().await;
@@ -6940,6 +6943,7 @@ mod pages {
             check: maxnines_protocol::Check::new(name, maxnines_protocol::CheckKind::Tcp, "a:1"),
             interval_secs: 60,
             enabled,
+            sign_in: Default::default(),
         };
         let database = &server.state.database;
         database

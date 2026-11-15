@@ -4,11 +4,13 @@
 //! alert rules treat them like anything else.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use anyhow::{Result, ensure};
-use maxnines_protocol::{Check, Sample};
+use anyhow::{Result, bail, ensure};
+use maxnines_checks::Credentials;
+use maxnines_protocol::{Check, CheckKind, Sample};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Semaphore, mpsc};
@@ -57,6 +59,200 @@ pub struct RemoteCheckInput {
     pub interval_secs: u64,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// How a check that signs in does so. Its secrets can be set, but are never
+    /// shown or given back.
+    #[serde(flatten)]
+    pub sign_in: SignIn,
+}
+
+/// How a check signs in: a username, and a password or, for SSH, a private key,
+/// each typed in or named as an environment variable of the server's.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SignIn {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_env: Option<String>,
+    /// In OpenSSH's format, without a passphrase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key_env: Option<String>,
+}
+
+impl fmt::Debug for SignIn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SignIn")
+            .field("username", &self.username)
+            .field("password_env", &self.password_env)
+            .field("private_key_env", &self.private_key_env)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How a check signs in, as a form or a request says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignInWith {
+    None,
+    Password,
+    Key,
+}
+
+impl SignInWith {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Password => "password",
+            Self::Key => "key",
+        }
+    }
+}
+
+/// The longest private key kept, which fits a 16,384-bit RSA key.
+const MAX_KEY_LEN: usize = 16_384;
+const MAX_PASSWORD_LEN: usize = 1024;
+const MAX_USERNAME_LEN: usize = 255;
+
+impl SignIn {
+    /// How it signs in, going by what it has.
+    pub fn with(&self) -> SignInWith {
+        if self.private_key.is_some() || self.private_key_env.is_some() {
+            SignInWith::Key
+        } else if self.username.is_some() || self.password.is_some() || self.password_env.is_some()
+        {
+            SignInWith::Password
+        } else {
+            SignInWith::None
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.with() == SignInWith::None
+    }
+
+    /// Keeps the password or key a check already has when a change doesn't give
+    /// one, as they're never shown to be typed again. `asked` is how the change
+    /// says to sign in, when it says. Signing in another way, or not at all, lets
+    /// go of what was saved.
+    pub fn keeping_secrets_of(mut self, saved: &SignIn, asked: Option<SignInWith>) -> Self {
+        let gives_password = self.password.is_some() || self.password_env.is_some();
+        let gives_key = self.private_key.is_some() || self.private_key_env.is_some();
+        match asked.unwrap_or_else(|| self.with()) {
+            SignInWith::Password if !gives_password => {
+                self.password.clone_from(&saved.password);
+                self.password_env.clone_from(&saved.password_env);
+            }
+            SignInWith::Key if !gives_key => {
+                self.private_key.clone_from(&saved.private_key);
+                self.private_key_env.clone_from(&saved.private_key_env);
+            }
+            _ => {}
+        }
+        self
+    }
+
+    /// The credentials to sign in with, read from the environment where they're
+    /// named, or why they can't be had.
+    pub fn credentials(&self) -> Result<Option<Credentials>, String> {
+        if self.is_empty() {
+            return Ok(None);
+        }
+        let secret = |typed: &Option<String>, variable: &Option<String>| match (typed, variable) {
+            (Some(typed), _) => Ok(Some(typed.clone())),
+            (None, Some(variable)) => std::env::var(variable)
+                .map(Some)
+                .map_err(|_| format!("the environment variable {variable} isn't set")),
+            (None, None) => Ok(None),
+        };
+        Ok(Some(Credentials {
+            username: self.username.clone(),
+            password: secret(&self.password, &self.password_env)?,
+            private_key: secret(&self.private_key, &self.private_key_env)?,
+        }))
+    }
+
+    fn validate(&self, kind: CheckKind) -> Result<()> {
+        if self.is_empty() {
+            return Ok(());
+        }
+        ensure!(
+            kind.signs_in(),
+            "only database, Redis and SSH checks sign in"
+        );
+        if let Some(username) = &self.username {
+            ensure!(
+                !username.is_empty()
+                    && username.len() <= MAX_USERNAME_LEN
+                    && !username.chars().any(char::is_control),
+                "the username can't be empty or over {MAX_USERNAME_LEN} characters"
+            );
+        }
+        let variable = |name: &Option<String>| -> Result<()> {
+            if let Some(name) = name {
+                ensure!(
+                    crate::metrics_pages::is_secret_variable(name),
+                    "the environment variable has to start with {}, followed by capital \
+                     letters, digits or _",
+                    crate::metrics_pages::ENV_PREFIX
+                );
+            }
+            Ok(())
+        };
+        variable(&self.password_env)?;
+        variable(&self.private_key_env)?;
+        match self.with() {
+            SignInWith::Key => {
+                ensure!(kind == CheckKind::Ssh, "only SSH checks sign in with a key");
+                ensure!(
+                    self.username.is_some(),
+                    "signing in with a key needs a username"
+                );
+                ensure!(
+                    self.password.is_none() && self.password_env.is_none(),
+                    "sign in with a password or a key, not both"
+                );
+                ensure!(
+                    !(self.private_key.is_some() && self.private_key_env.is_some()),
+                    "give the key or the environment variable that holds it, not both"
+                );
+                if let Some(key) = &self.private_key {
+                    ensure!(
+                        key.len() <= MAX_KEY_LEN && key.contains("PRIVATE KEY"),
+                        "the private key has to be in OpenSSH's format, as ssh-keygen \
+                         writes it"
+                    );
+                }
+            }
+            SignInWith::Password => {
+                ensure!(
+                    !(self.password.is_some() && self.password_env.is_some()),
+                    "give the password or the environment variable that holds it, not both"
+                );
+                if let Some(password) = &self.password {
+                    ensure!(
+                        !password.is_empty() && password.len() <= MAX_PASSWORD_LEN,
+                        "the password can't be empty or over {MAX_PASSWORD_LEN} characters"
+                    );
+                }
+                // Redis before version 6 has a password and no usernames. The rest
+                // need someone to sign in as.
+                if kind != CheckKind::Redis {
+                    ensure!(self.username.is_some(), "signing in needs a username");
+                }
+                if kind == CheckKind::Redis || kind == CheckKind::Ssh {
+                    ensure!(
+                        self.password.is_some() || self.password_env.is_some(),
+                        "signing in needs a password"
+                    );
+                }
+            }
+            SignInWith::None => bail!("nothing to sign in with"),
+        }
+        Ok(())
+    }
 }
 
 fn default_enabled() -> bool {
@@ -69,6 +265,7 @@ fn local_host_id() -> String {
 
 pub fn check_input(input: &RemoteCheckInput) -> Result<()> {
     input.check.validate()?;
+    input.sign_in.validate(input.check.kind)?;
     ensure!(
         input.check.interval_secs.is_none(),
         "a remote check's interval goes beside the check, as interval_secs"
@@ -230,7 +427,14 @@ pub async fn run(
     presence: &Presence,
 ) {
     let host_id = &check.input.host_id;
-    let result = maxnines_checks::run(&check.input.check).await;
+    // A password or key named as an environment variable is read each time, so
+    // a changed one is used without restarting.
+    let result = match check.input.sign_in.credentials() {
+        Ok(credentials) => {
+            maxnines_checks::run_signed_in(&check.input.check, credentials.as_ref()).await
+        }
+        Err(why) => maxnines_checks::failed_report(&check.input.check, &why),
+    };
     results.set(check.id, result.clone());
     // One that's turned off says nothing about whether its host is there.
     if host_id != LOCAL_HOST_ID && check.input.enabled {
@@ -271,6 +475,7 @@ mod tests {
             check: Check::new("a", CheckKind::Tcp, "example.com:80"),
             interval_secs,
             enabled: true,
+            sign_in: Default::default(),
         }
     }
 

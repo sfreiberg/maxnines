@@ -37,7 +37,7 @@ use crate::models::{
 use crate::notifier::{self, Notice};
 use crate::presence::{HostPresence, Reach};
 use crate::registration::{HostRecord, HostState};
-use crate::remote_checks::{RemoteCheck, RemoteCheckInput};
+use crate::remote_checks::{RemoteCheck, RemoteCheckInput, SignInWith};
 use crate::roles::Role;
 use crate::rule_engine::{self, ResolvedConfig};
 use crate::silences::{ActiveSilences, Cover, SilenceInput};
@@ -1755,16 +1755,70 @@ async fn delete_alert_rule(State(state): State<AppState>, UrlPath(id): UrlPath<i
     }
 }
 
+/// A check as the API shows it. Its password or key can be set but not read back.
+#[derive(Debug, Serialize)]
+struct RemoteCheckView {
+    id: i64,
+    host_id: String,
+    check: maxnines_protocol::Check,
+    interval_secs: u64,
+    enabled: bool,
+    /// How it signs in: `none`, `password` or `key`.
+    sign_in: SignInWith,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    has_password: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    password_env: Option<String>,
+    has_private_key: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    private_key_env: Option<String>,
+}
+
+impl RemoteCheckView {
+    fn new(check: RemoteCheck) -> Self {
+        let input = check.input;
+        let sign_in = input.sign_in;
+        Self {
+            id: check.id,
+            host_id: input.host_id,
+            check: input.check,
+            interval_secs: input.interval_secs,
+            enabled: input.enabled,
+            sign_in: sign_in.with(),
+            has_password: sign_in.password.is_some(),
+            has_private_key: sign_in.private_key.is_some(),
+            username: sign_in.username,
+            password_env: sign_in.password_env,
+            private_key_env: sign_in.private_key_env,
+        }
+    }
+}
+
+/// A check as a request gives it. `sign_in` says how it signs in, which is the
+/// only way to keep a saved password or key without sending it again.
+#[derive(Deserialize)]
+struct RemoteCheckRequest {
+    #[serde(flatten)]
+    input: RemoteCheckInput,
+    #[serde(default)]
+    sign_in: Option<SignInWith>,
+}
+
 async fn list_remote_checks(State(state): State<AppState>) -> Response {
     match state.database.list_remote_checks().await {
-        Ok(checks) => Json::<Vec<RemoteCheck>>(checks).into_response(),
+        Ok(checks) => {
+            let views: Vec<RemoteCheckView> =
+                checks.into_iter().map(RemoteCheckView::new).collect();
+            Json(views).into_response()
+        }
         Err(error) => server_error(&error),
     }
 }
 
 async fn show_remote_check(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
     match state.database.get_remote_check(id).await {
-        Ok(Some(check)) => Json(check).into_response(),
+        Ok(Some(check)) => Json(RemoteCheckView::new(check)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),
     }
@@ -1772,8 +1826,9 @@ async fn show_remote_check(State(state): State<AppState>, UrlPath(id): UrlPath<i
 
 async fn create_remote_check(
     State(state): State<AppState>,
-    Json(input): Json<RemoteCheckInput>,
+    Json(request): Json<RemoteCheckRequest>,
 ) -> Response {
+    let input = request.input;
     if let Err(error) = state.check_remote_check(&input, None).await {
         return refused(&error);
     }
@@ -1786,8 +1841,17 @@ async fn create_remote_check(
 async fn update_remote_check(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<i64>,
-    Json(input): Json<RemoteCheckInput>,
+    Json(request): Json<RemoteCheckRequest>,
 ) -> Response {
+    let saved = match state.database.get_remote_check(id).await {
+        Ok(Some(saved)) => saved,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return server_error(&error),
+    };
+    let mut input = request.input;
+    input.sign_in = input
+        .sign_in
+        .keeping_secrets_of(&saved.input.sign_in, request.sign_in);
     if let Err(error) = state.check_remote_check(&input, Some(id)).await {
         return refused(&error);
     }

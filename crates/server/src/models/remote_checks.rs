@@ -7,7 +7,7 @@ use sea_orm::{ConnectionTrait, EntityTrait, QueryOrder, Set, TransactionTrait};
 use super::audit::record_change;
 use super::{Database, remote_check};
 use crate::audit::{Kind, Snapshot};
-use crate::remote_checks::{RemoteCheck, RemoteCheckInput};
+use crate::remote_checks::{RemoteCheck, RemoteCheckInput, SignIn};
 
 fn to_remote_check(row: remote_check::Model) -> Result<RemoteCheck> {
     let kind = CheckKind::parse(&row.kind).context("unknown kind of check")?;
@@ -20,6 +20,9 @@ fn to_remote_check(row: remote_check::Model) -> Result<RemoteCheck> {
     check.server = row.server;
     check.record = row.record;
     check.count = row.count.map(u32::try_from).transpose()?;
+    check.database = row.database;
+    check.tls = row.tls;
+    check.host_key = row.host_key;
     Ok(RemoteCheck {
         id: row.id,
         input: RemoteCheckInput {
@@ -27,6 +30,13 @@ fn to_remote_check(row: remote_check::Model) -> Result<RemoteCheck> {
             check,
             interval_secs: u64::try_from(row.interval_secs)?,
             enabled: row.enabled,
+            sign_in: SignIn {
+                username: row.username,
+                password: row.password,
+                password_env: row.password_env,
+                private_key: row.private_key,
+                private_key_env: row.private_key_env,
+            },
         },
     })
 }
@@ -48,6 +58,14 @@ fn to_row(input: &RemoteCheckInput) -> Result<remote_check::ActiveModel> {
         count: Set(check.count.map(i32::try_from).transpose()?),
         interval_secs: Set(i64::try_from(input.interval_secs)?),
         enabled: Set(input.enabled),
+        database: Set(check.database.clone()),
+        tls: Set(check.tls),
+        host_key: Set(check.host_key.clone()),
+        username: Set(input.sign_in.username.clone()),
+        password: Set(input.sign_in.password.clone()),
+        password_env: Set(input.sign_in.password_env.clone()),
+        private_key: Set(input.sign_in.private_key.clone()),
+        private_key_env: Set(input.sign_in.private_key_env.clone()),
         ..Default::default()
     })
 }

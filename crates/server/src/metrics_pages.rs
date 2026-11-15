@@ -182,7 +182,7 @@ impl MetricsPageInput {
     }
 }
 
-fn is_secret_variable(name: &str) -> bool {
+pub(crate) fn is_secret_variable(name: &str) -> bool {
     let plain = |c: char| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_';
     name.strip_prefix(ENV_PREFIX)
         .is_some_and(|rest| !rest.is_empty() && rest.chars().all(plain))

@@ -1900,6 +1900,7 @@ mod tests {
             check,
             interval_secs: 60,
             enabled: true,
+            sign_in: Default::default(),
         };
 
         let id = database.create_remote_check(&input).await.unwrap();

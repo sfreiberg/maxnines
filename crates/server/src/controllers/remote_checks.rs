@@ -23,15 +23,21 @@ use crate::host_filter;
 use crate::metric_charts::{self, Chart, Frame};
 use crate::metrics::{self, METRICS, Metric, Series, SeriesResult, TimeRange, Unit};
 use crate::registration::HostState;
-use crate::remote_checks::{LOCAL_HOST_ID, LOCAL_HOSTNAME, RemoteCheck, RemoteCheckInput};
+use crate::remote_checks::{
+    LOCAL_HOST_ID, LOCAL_HOSTNAME, RemoteCheck, RemoteCheckInput, SignIn, SignInWith,
+};
 use crate::silences::{ActiveSilences, SilenceInput};
 
-const KINDS: [CheckKind; 5] = [
+const KINDS: [CheckKind; 9] = [
     CheckKind::Http,
     CheckKind::Tcp,
     CheckKind::Tls,
     CheckKind::Dns,
     CheckKind::Ping,
+    CheckKind::Postgres,
+    CheckKind::Mysql,
+    CheckKind::Redis,
+    CheckKind::Ssh,
 ];
 
 pub fn routes() -> Router<AppState> {
@@ -65,6 +71,19 @@ struct CheckForm {
     record: String,
     count: String,
     enabled: bool,
+    database: String,
+    tls: bool,
+    host_key: String,
+    /// How it signs in: none, password or key. Only that one's boxes count.
+    sign_in: String,
+    username: String,
+    password: String,
+    password_env: String,
+    private_key: String,
+    private_key_env: String,
+    /// Whether a password or key is saved, which leaving the box empty keeps.
+    has_password: bool,
+    has_private_key: bool,
 }
 
 /// What's left empty on a form isn't set at all.
@@ -115,10 +134,21 @@ impl CheckForm {
             record: text(&check.record),
             count: check.count.map(|c| c.to_string()).unwrap_or_default(),
             enabled: input.enabled,
+            database: text(&check.database),
+            tls: check.tls == Some(true),
+            host_key: text(&check.host_key),
+            sign_in: input.sign_in.with().as_str().to_string(),
+            username: text(&input.sign_in.username),
+            password: String::new(),
+            password_env: text(&input.sign_in.password_env),
+            private_key: String::new(),
+            private_key_env: text(&input.sign_in.private_key_env),
+            has_password: input.sign_in.password.is_some(),
+            has_private_key: input.sign_in.private_key.is_some(),
         }
     }
 
-    fn from_fields(fields: &BTreeMap<String, String>) -> Self {
+    fn from_fields(fields: &BTreeMap<String, String>, saved: Option<&SignIn>) -> Self {
         let text = |name: &str| fields.get(name).cloned().unwrap_or_default();
         Self {
             // A form without one is from before checks had hosts.
@@ -136,10 +166,23 @@ impl CheckForm {
             record: text("record"),
             count: text("count"),
             enabled: fields.contains_key("enabled"),
+            database: text("database"),
+            tls: fields.contains_key("tls"),
+            host_key: text("host_key"),
+            sign_in: text("sign_in"),
+            username: text("username"),
+            password: text("password"),
+            password_env: text("password_env"),
+            private_key: text("private_key"),
+            private_key_env: text("private_key_env"),
+            has_password: saved.is_some_and(|saved| saved.password.is_some()),
+            has_private_key: saved.is_some_and(|saved| saved.private_key.is_some()),
         }
     }
 
-    fn to_input(&self) -> Result<RemoteCheckInput> {
+    /// The check, and how the form says it signs in. What's typed in the boxes
+    /// for another way of signing in is left out.
+    fn to_input(&self) -> Result<(RemoteCheckInput, SignInWith)> {
         let Some(kind) = CheckKind::parse(&self.kind) else {
             bail!("choose a kind of check");
         };
@@ -152,14 +195,42 @@ impl CheckForm {
         check.server = optional(&self.server);
         check.record = optional(&self.record);
         check.count = number(&self.count, "the count")?;
+        check.database = optional(&self.database);
+        check.tls = self.tls.then_some(true);
+        check.host_key = optional(&self.host_key);
         let interval_secs =
             number(&self.interval_secs, "the interval")?.context("a check needs an interval")?;
-        Ok(RemoteCheckInput {
+        let with = match self.sign_in.as_str() {
+            "password" if kind.signs_in() => SignInWith::Password,
+            "key" if kind == CheckKind::Ssh => SignInWith::Key,
+            _ => SignInWith::None,
+        };
+        // A password or key is whatever was typed, spaces and all.
+        let typed = |text: &str| Some(text.to_string()).filter(|text| !text.is_empty());
+        let sign_in = match with {
+            SignInWith::None => SignIn::default(),
+            SignInWith::Password => SignIn {
+                username: optional(&self.username),
+                password: typed(&self.password),
+                password_env: optional(&self.password_env),
+                ..SignIn::default()
+            },
+            SignInWith::Key => SignIn {
+                username: optional(&self.username),
+                // Pasted keys often lose their last line break, which they need.
+                private_key: optional(&self.private_key).map(|key| format!("{key}\n")),
+                private_key_env: optional(&self.private_key_env),
+                ..SignIn::default()
+            },
+        };
+        let input = RemoteCheckInput {
             host_id: self.host_id.clone(),
             check,
             interval_secs,
             enabled: self.enabled,
-        })
+            sign_in,
+        };
+        Ok((input, with))
     }
 }
 
@@ -292,6 +363,7 @@ async fn form_page(
             &id.map_or_else(|| back_to(&form.host_id), |id| format!("/checks/{id}")),
         )
         .with("kinds", &kinds)
+        .with("env_prefix", crate::metrics_pages::ENV_PREFIX)
         .with("error", &error);
     match error {
         Some(_) => page.with_status(StatusCode::UNPROCESSABLE_ENTITY).render(),
@@ -686,6 +758,54 @@ async fn page(
                 tone: if days < 14 { "bad" } else { "" },
             });
         }
+        let username = input
+            .sign_in
+            .username
+            .as_deref()
+            .unwrap_or("the default user");
+        let signed_in = result["signed_in"].as_bool();
+        let sign_in_note = match signed_in {
+            Some(true) => format!("signed in as {username}"),
+            Some(false) => format!("couldn't sign in as {username}"),
+            None => "without signing in".to_string(),
+        };
+        if let Some(fingerprint) = result["host_key"].as_str() {
+            tiles.push(Tile {
+                label: "Host key",
+                value: if input.check.host_key.is_some() {
+                    "As expected"
+                } else {
+                    "Not pinned"
+                }
+                .to_string(),
+                note: fingerprint.to_string(),
+                tone: "",
+            });
+            let methods = result["sign_in_methods"].as_str();
+            tiles.push(Tile {
+                label: "Signing in",
+                value: match signed_in {
+                    Some(true) => "Signed in",
+                    Some(false) => "Refused",
+                    None => "Not tried",
+                }
+                .to_string(),
+                note: match (signed_in, methods) {
+                    (None, Some(methods)) => format!("offers {methods}"),
+                    _ => sign_in_note,
+                },
+                tone: if signed_in == Some(false) { "bad" } else { "" },
+            });
+        } else if input.check.kind.signs_in() {
+            tiles.push(Tile {
+                label: "Server",
+                value: result["server_version"]
+                    .as_str()
+                    .map_or("Answering".to_string(), String::from),
+                note: sign_in_note,
+                tone: "",
+            });
+        }
     }
 
     let alerts: Vec<_> = state
@@ -871,14 +991,27 @@ async fn end_maintenance(
     (form.token, Redirect::to(&format!("/checks/{id}"))).into_response()
 }
 
-async fn validate(state: &AppState, form: &CheckForm, id: Option<i64>) -> Result<RemoteCheckInput> {
-    let input = form.to_input()?;
-    state.check_remote_check(&input, id).await?;
+/// The check as it would be saved, keeping the password or key of the one it
+/// replaces unless given another, or why it can't be.
+async fn validate(
+    state: &AppState,
+    form: &CheckForm,
+    saved: Option<&RemoteCheck>,
+) -> Result<RemoteCheckInput> {
+    let (mut input, with) = form.to_input()?;
+    if let Some(saved) = saved {
+        input.sign_in = input
+            .sign_in
+            .keeping_secrets_of(&saved.input.sign_in, Some(with));
+    }
+    state
+        .check_remote_check(&input, saved.map(|saved| saved.id))
+        .await?;
     Ok(input)
 }
 
 async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
-    let fields = CheckForm::from_fields(&form.fields);
+    let fields = CheckForm::from_fields(&form.fields, None);
     let input = match validate(&state, &fields, None).await {
         Ok(input) => input,
         Err(error) => {
@@ -893,8 +1026,13 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
 }
 
 async fn update(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfForm) -> Response {
-    let fields = CheckForm::from_fields(&form.fields);
-    let input = match validate(&state, &fields, Some(id)).await {
+    let saved = match state.database.get_remote_check(id).await {
+        Ok(Some(saved)) => saved,
+        Ok(None) => return not_found(&state, &form.token),
+        Err(error) => return server_error(&error),
+    };
+    let fields = CheckForm::from_fields(&form.fields, Some(&saved.input.sign_in));
+    let input = match validate(&state, &fields, Some(&saved)).await {
         Ok(input) => input,
         Err(error) => {
             let message = format!("{error:#}");
@@ -937,6 +1075,7 @@ mod tests {
             check,
             interval_secs: 120,
             enabled: false,
+            sign_in: SignIn::default(),
         }
     }
 
@@ -944,7 +1083,7 @@ mod tests {
     fn a_check_survives_the_trip_through_its_form() {
         let original = input();
         assert_eq!(
-            CheckForm::from_input(&original).to_input().unwrap(),
+            CheckForm::from_input(&original).to_input().unwrap().0,
             original
         );
 
@@ -956,9 +1095,10 @@ mod tests {
             check: dns,
             interval_secs: 60,
             enabled: true,
+            sign_in: SignIn::default(),
         };
         assert_eq!(
-            CheckForm::from_input(&original).to_input().unwrap(),
+            CheckForm::from_input(&original).to_input().unwrap().0,
             original
         );
     }
@@ -968,7 +1108,7 @@ mod tests {
         let mut form = CheckForm::blank();
         form.name = "a".to_string();
         form.target = "https://example.com/".to_string();
-        let input = form.to_input().unwrap();
+        let (input, _) = form.to_input().unwrap();
         assert_eq!(input.check.method, None);
         assert_eq!(input.check.insecure, None);
         assert_eq!(input.check.timeout_secs, None);

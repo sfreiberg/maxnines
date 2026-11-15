@@ -350,6 +350,14 @@ erDiagram
         int count
         int interval_secs
         boolean enabled
+        string database "postgres: which one to sign in to"
+        boolean tls "mysql, redis"
+        string host_key "ssh: the fingerprint expected"
+        string username
+        text password "as typed, when it was"
+        string password_env "the server's variable holding it"
+        text private_key "ssh: as typed, when it was"
+        string private_key_env "the server's variable holding it"
     }
     audit_log {
         int id PK

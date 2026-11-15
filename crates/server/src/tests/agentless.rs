@@ -884,6 +884,109 @@ async fn a_check_is_run_paused_and_quieted_from_its_page() {
 }
 
 #[tokio::test]
+async fn a_checks_password_is_kept_but_never_given_back() {
+    let server = start().await;
+    let check = |extra: Value| {
+        let mut body = json!({
+            "check": { "name": "orders db", "kind": "postgres", "target": "127.0.0.1:1" },
+            "interval_secs": 60
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        body
+    };
+    let typed = check(json!({ "username": "maxnines", "password": "s3cret" }));
+    let (status, added) = api(&server, "POST", "/api/v1/remote-checks", &typed).await;
+    assert_eq!(status, 201, "{added}");
+    let id = added["id"].as_i64().unwrap();
+    let path = format!("/api/v1/remote-checks/{id}");
+    let (_, shown) = api(&server, "GET", &path, &Value::Null).await;
+    assert_eq!(shown["sign_in"], "password");
+    assert_eq!(shown["username"], "maxnines");
+    assert_eq!(shown["has_password"], true);
+    let (_, all) = api(&server, "GET", "/api/v1/remote-checks", &Value::Null).await;
+    let (_, log) = api(&server, "GET", "/api/v1/audit-log", &Value::Null).await;
+    for body in [&shown, &all, &log] {
+        assert!(!body.to_string().contains("s3cret"), "{body}");
+    }
+    let saved = || async {
+        let check = server.state.database.get_remote_check(id).await.unwrap();
+        check.unwrap().input.sign_in
+    };
+
+    // An edit that doesn't give it again keeps it, and saying not to sign in
+    // lets it go.
+    let slower = check(json!({ "username": "maxnines", "interval_secs": 300 }));
+    assert_eq!(api(&server, "PUT", &path, &slower).await.0, 204);
+    assert_eq!(saved().await.password.as_deref(), Some("s3cret"));
+    let plain = check(json!({ "sign_in": "none" }));
+    assert_eq!(api(&server, "PUT", &path, &plain).await.0, 204);
+    assert_eq!(saved().await, crate::remote_checks::SignIn::default());
+
+    // Only what fits the kind is taken.
+    let mut web = check(json!({ "username": "a", "password": "b" }));
+    web["check"] = json!({ "name": "site", "kind": "http", "target": "https://example.com" });
+    let key =
+        check(json!({ "username": "a", "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----" }));
+    let leaked = check(json!({ "username": "a", "password_env": "DATABASE_URL" }));
+    for refused in [web, key, leaked] {
+        let (status, body) = api(&server, "POST", "/api/v1/remote-checks", &refused).await;
+        assert_eq!(status, 422, "{refused}: {body}");
+    }
+
+    // One read from the server's environment says when it isn't there.
+    let unset = check(json!({ "username": "a", "password_env": "MAXNINES_SECRET_NEVER_SET" }));
+    assert_eq!(api(&server, "PUT", &path, &unset).await.0, 204);
+    run_due(&mut check_scheduler(&server), now_ms()).await;
+    let result = &server.state.check_results.all()[&id];
+    assert_eq!(
+        result["error"],
+        "the environment variable MAXNINES_SECRET_NEVER_SET isn't set"
+    );
+
+    // The form never has it either.
+    let typed = check(json!({ "username": "maxnines", "password": "s3cret" }));
+    assert_eq!(api(&server, "PUT", &path, &typed).await.0, 204);
+    let form = Browser::default()
+        .get(&server, &format!("/checks/{id}/edit"))
+        .await;
+    assert!(
+        form.body.contains("Saved. Leave empty to keep it"),
+        "{}",
+        form.body
+    );
+    assert!(!form.body.contains("s3cret"), "{}", form.body);
+
+    // From the form, only the boxes for the way chosen count: a password for a
+    // Redis without usernames, with a key left in the other box.
+    let fields = [
+        ("name", "cache"),
+        ("kind", "redis"),
+        ("target", "127.0.0.1:6379"),
+        ("interval_secs", "60"),
+        ("enabled", "on"),
+        ("tls", "on"),
+        ("sign_in", "password"),
+        ("password", "r3dis"),
+        ("private_key", "left behind"),
+    ];
+    let mut browser = Browser::default();
+    let added = browser
+        .submit(&server, "/checks/new", "/checks", &fields)
+        .await;
+    assert_eq!(added.status, 303, "{}", added.body);
+    let checks = server.state.database.list_remote_checks().await.unwrap();
+    let cache = checks
+        .iter()
+        .find(|c| c.input.check.name == "cache")
+        .unwrap();
+    assert_eq!(cache.input.check.tls, Some(true));
+    assert_eq!(cache.input.sign_in.password.as_deref(), Some("r3dis"));
+    assert_eq!(cache.input.sign_in.private_key, None);
+}
+
+#[tokio::test]
 async fn a_hosts_checks_are_added_from_its_page() {
     let server = start().await;
     let id = add_host(&server, "orders-db").await;

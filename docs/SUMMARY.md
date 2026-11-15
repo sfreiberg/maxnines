@@ -14,6 +14,7 @@
 - [Annotations](annotations.md)
 - [Web servers](web-servers.md)
 - [OpenMetrics](openmetrics.md)
+- [Checks](checks.md)
 - [Check commands](check-commands.md)
 - [Hosts without an agent](agentless-hosts.md)
 - [Map](map.md)

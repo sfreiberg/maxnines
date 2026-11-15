@@ -422,6 +422,7 @@ mod tests {
             facts: BTreeMap::from([("role".to_string(), json!("web"))]),
             custom_metrics: Definitions::new(),
             check_commands: BTreeMap::new(),
+            check_logins: BTreeMap::new(),
             metrics_logins: BTreeMap::new(),
             actions: Actions::from([(
                 "greet".to_string(),

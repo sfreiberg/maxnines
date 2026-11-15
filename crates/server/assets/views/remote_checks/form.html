@@ -26,14 +26,14 @@
   <label>Kind
     <select name="kind">
       {% for kind in kinds %}
-      <option value="{{ kind }}"{% if kind == check.kind %} selected{% endif %}>{% if kind == "http" %}Website (http){% elif kind == "tcp" %}Port (tcp){% elif kind == "tls" %}Certificate (tls){% elif kind == "dns" %}DNS (dns){% else %}Ping (ping){% endif %}</option>
+      <option value="{{ kind }}"{% if kind == check.kind %} selected{% endif %}>{% if kind == "http" %}Website (http){% elif kind == "tcp" %}Port (tcp){% elif kind == "tls" %}Certificate (tls){% elif kind == "dns" %}DNS (dns){% elif kind == "ping" %}Ping (ping){% elif kind == "postgres" %}PostgreSQL{% elif kind == "mysql" %}MySQL or MariaDB{% elif kind == "redis" %}Redis{% else %}SSH{% endif %}</option>
       {% endfor %}
     </select>
   </label>
 
   <label>Target
     <input type="text" name="target" value="{{ check.target }}" required maxlength="255" spellcheck="false">
-    <small>A web address for websites, <code>host:port</code> for ports and certificates, and a host name for DNS and ping.</small>
+    <small>A web address for websites, a host name for DNS and ping, and <code>host:port</code> for the rest, such as <code>db.example.com:5432</code>.</small>
   </label>
 
   <label>Run every (seconds)
@@ -59,9 +59,58 @@
     </label>
   </fieldset>
 
-  <label class="checkbox for-tls">
+  <label class="for-postgres">Database
+    <input type="text" name="database" value="{{ check.database }}" maxlength="63" spellcheck="false" placeholder="postgres">
+    <small>Which database to sign in to. Leave empty for <code>postgres</code>.</small>
+  </label>
+
+  <label class="checkbox for-tls-option">
+    <input type="checkbox" name="tls"{% if check.tls %} checked{% endif %}> Use TLS
+  </label>
+
+  <label class="checkbox for-certificate">
     <input type="checkbox" name="insecure"{% if check.insecure %} checked{% endif %}> Don't count a bad certificate as down
   </label>
+
+  <label class="for-ssh">Expected host key
+    <input type="text" name="host_key" value="{{ check.host_key }}" maxlength="100" spellcheck="false" placeholder="SHA256:…">
+    <small>Optional. A different key counts as down, as after a reinstall or with someone in the middle. The check's page shows the key it sees, to copy here.</small>
+  </label>
+
+  <fieldset class="for-sign-in">
+    <legend>Signing in</legend>
+    <p class="hint">Without signing in, a check only sees that the server answers. Give it an account that can do no more than sign in; <a href="/docs/checks#monitoring-accounts">Monitoring accounts</a> says how.</p>
+    <label>Sign in
+      <select name="sign_in">
+        <option value="none"{% if check.sign_in == "none" or not check.sign_in %} selected{% endif %}>Don't sign in</option>
+        <option value="password"{% if check.sign_in == "password" %} selected{% endif %}>With a password</option>
+        <option value="key"{% if check.sign_in == "key" %} selected{% endif %}>With a private key (SSH)</option>
+      </select>
+    </label>
+    <label class="username-field">Username
+      <input type="text" name="username" value="{{ check.username }}" maxlength="255" autocomplete="off" spellcheck="false">
+      <small>Redis before version 6 has no usernames, so leave it empty there.</small>
+    </label>
+    <div class="password-fields">
+      <label>Password
+        <input type="password" name="password" value="" maxlength="1024" autocomplete="new-password"{% if check.has_password %} placeholder="Saved. Leave empty to keep it"{% endif %}>
+        <small>Kept in the database and never shown again.</small>
+      </label>
+      <label>Or the environment variable that holds it
+        <input type="text" name="password_env" value="{{ check.password_env }}" maxlength="255" autocomplete="off" spellcheck="false" placeholder="{{ env_prefix }}ORDERS_DB">
+        <small>A variable in the server's own environment, read each time the check runs. Its name has to start with <code>{{ env_prefix }}</code>, so that only what's been set aside for this can be sent anywhere.</small>
+      </label>
+    </div>
+    <div class="key-fields">
+      <label>Private key
+        <textarea name="private_key" rows="4" spellcheck="false" autocomplete="off"{% if check.has_private_key %} placeholder="Saved. Leave empty to keep it"{% endif %}></textarea>
+        <small>In OpenSSH's format, without a passphrase. Kept in the database and never shown again.</small>
+      </label>
+      <label>Or the environment variable that holds it
+        <input type="text" name="private_key_env" value="{{ check.private_key_env }}" maxlength="255" autocomplete="off" spellcheck="false" placeholder="{{ env_prefix }}BASTION_KEY">
+      </label>
+    </div>
+  </fieldset>
 
   <fieldset class="for-dns">
     <legend>DNS options</legend>

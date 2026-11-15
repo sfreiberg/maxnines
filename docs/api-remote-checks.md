@@ -10,18 +10,32 @@ alerts go under that host.
 | `check` | Required. What to check, as below |
 | `interval_secs` | Required. How often it runs |
 | `enabled` | Defaults to `true` |
+| `username` | For a check that [signs in](checks.md#signing-in): who as |
+| `password` | Its password, which can be set but is never given back |
+| `password_env` | Or the server's environment variable that holds it. Its name has to start with `MAXNINES_SECRET_` |
+| `private_key` | For SSH instead of a password: a private key in OpenSSH's format, without a passphrase. It can be set but is never given back |
+| `private_key_env` | Or the server's environment variable that holds it, named as `password_env` is |
+| `sign_in` | How it signs in: `none`, `password` or `key`. Left out, it's worked out from the fields above |
+
+What comes back has `sign_in`, `username`, `password_env` and `private_key_env`, and
+`has_password` and `has_private_key`, which say whether one is saved. A change that
+gives none of a password, its variable, a key or its variable keeps the one saved,
+as long as `sign_in` says, or the fields given show, that it still signs in that way.
 
 | `check` field | For | Description |
 | --- | --- | --- |
 | `name` | All | Required. What it's called on charts and in alerts. Two checks about the same host can't have the same one |
-| `kind` | All | Required. `tcp`, `http`, `tls`, `dns` or `ping` |
-| `target` | All | Required. `host:port` for tcp and tls, an address for http, and a host for dns and ping |
+| `kind` | All | Required. `tcp`, `http`, `tls`, `dns`, `ping`, `postgres`, `mysql`, `redis` or `ssh` |
+| `target` | All | Required. An address for http, a host for dns and ping, and `host:port` for the rest |
 | `timeout_secs` | All | How long it gets, up to a minute |
 | `interval_secs` | All | For a check an agent runs, how often it runs, up to a day. It runs with every sample without one, and never more often than samples are sent, as it's rounded up to whole samples. Between runs, each sample repeats its last result. A remote check's interval goes beside `check` instead |
 | `method` | http | Defaults to `GET` |
 | `body` | http | What to send, for methods like `POST` |
 | `regex` | http | A regular expression the page has to match |
-| `insecure` | http, tls | Measure a site whose certificate can't be verified, without counting that as down. Without it, an HTTP check never sends its request to a server that fails the certificate check |
+| `insecure` | http, tls, postgres, mysql, redis | Measure a server whose certificate can't be verified, without counting that as down. Without it, a check never sends its request, or a password, to a server that fails the certificate check |
+| `database` | postgres | The database to sign in to. Defaults to `postgres` |
+| `tls` | mysql, redis | Connect over TLS. PostgreSQL uses TLS whenever the server offers it |
+| `host_key` | ssh | The server's host key, as `ssh-keygen -l` prints it, such as `SHA256:Dfij…`. Any other key counts as down, and nothing is signed in with |
 | `server` | dns | Ask this server instead of the system's resolver |
 | `record` | dns | The record type to ask for, with `server`. Defaults to `A` |
 | `count` | ping | How many packets to send. Defaults to 1 |

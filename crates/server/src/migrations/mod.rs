@@ -14,6 +14,7 @@ impl MigratorTrait for Migrator {
             Box::new(PageTokens),
             Box::new(CheckNamesPerHost),
             Box::new(SilenceSeries),
+            Box::new(CheckSignIn),
         ]
     }
 }
@@ -1715,6 +1716,14 @@ enum RemoteChecks {
     Count,
     IntervalSecs,
     Enabled,
+    Database,
+    Tls,
+    HostKey,
+    Username,
+    Password,
+    PasswordEnv,
+    PrivateKey,
+    PrivateKeyEnv,
 }
 
 #[derive(Iden)]
@@ -1856,6 +1865,87 @@ impl MigrationTrait for PageTokens {
                 .alter_table(
                     Table::alter()
                         .table(MetricsPages::Table)
+                        .drop_column(column)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+struct CheckSignIn;
+
+impl MigrationName for CheckSignIn {
+    fn name(&self) -> &str {
+        "m20261115_000005_check_sign_in"
+    }
+}
+
+/// Checks of databases, Redis and SSH servers: what they connect to, and how they
+/// sign in. A password or key is typed in or named as one of the server's
+/// environment variables.
+#[async_trait::async_trait]
+impl MigrationTrait for CheckSignIn {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    // One column to a statement, as SQLite adds no more than that at once.
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for column in [
+            ColumnDef::new(RemoteChecks::Database)
+                .string_len(63)
+                .to_owned(),
+            ColumnDef::new(RemoteChecks::Tls).boolean().to_owned(),
+            ColumnDef::new(RemoteChecks::HostKey)
+                .string_len(100)
+                .to_owned(),
+            ColumnDef::new(RemoteChecks::Username)
+                .string_len(255)
+                .to_owned(),
+            ColumnDef::new(RemoteChecks::Password).text().to_owned(),
+            ColumnDef::new(RemoteChecks::PasswordEnv)
+                .string_len(255)
+                .to_owned(),
+            ColumnDef::new(RemoteChecks::PrivateKey).text().to_owned(),
+            ColumnDef::new(RemoteChecks::PrivateKeyEnv)
+                .string_len(255)
+                .to_owned(),
+        ] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(RemoteChecks::Table)
+                        .add_column(column)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Checks of the kinds that came with it go too, as nothing before it knows them.
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let new_kinds = Query::delete()
+            .from_table(RemoteChecks::Table)
+            .and_where(Expr::col(RemoteChecks::Kind).is_in(["postgres", "mysql", "redis", "ssh"]))
+            .to_owned();
+        manager.exec_stmt(new_kinds).await?;
+        for column in [
+            RemoteChecks::PrivateKeyEnv,
+            RemoteChecks::PrivateKey,
+            RemoteChecks::PasswordEnv,
+            RemoteChecks::Password,
+            RemoteChecks::Username,
+            RemoteChecks::HostKey,
+            RemoteChecks::Tls,
+            RemoteChecks::Database,
+        ] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(RemoteChecks::Table)
                         .drop_column(column)
                         .to_owned(),
                 )
@@ -2314,8 +2404,9 @@ mod tests {
         let rows = "SELECT CAST(id AS TEXT) || ' ' || host_id FROM remote_checks ORDER BY id";
         assert_eq!(texts(&connection, rows).await, ["4 server", "5 abc"]);
 
-        // Going back past it, the first of each name is the one kept.
-        Migrator::down(&connection, Some(2)).await.unwrap();
+        // Going back past it, to the two before it, the first of each name is kept.
+        let after_it = Migrator::migrations().len() as u32 - 2;
+        Migrator::down(&connection, Some(after_it)).await.unwrap();
         assert_eq!(texts(&connection, rows).await, ["4 server"]);
         assert!(add("Site", "abc").await.is_err(), "unique again");
         add("Database", "abc").await.unwrap();

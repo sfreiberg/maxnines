@@ -322,6 +322,16 @@ pub struct Check {
     /// ping: how many packets to send. Defaults to 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub count: Option<u32>,
+    /// postgres: the database to sign in to. Defaults to `postgres`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
+    /// mysql and redis: connect over TLS, which they don't offer on their own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<bool>,
+    /// ssh: the host key's SHA-256 fingerprint, as `ssh-keygen -l` prints it, such
+    /// as `SHA256:Dfij…`. Any other key counts as down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,6 +342,10 @@ pub enum CheckKind {
     Tls,
     Dns,
     Ping,
+    Postgres,
+    Mysql,
+    Redis,
+    Ssh,
 }
 
 impl CheckKind {
@@ -342,7 +356,16 @@ impl CheckKind {
             Self::Tls => "tls",
             Self::Dns => "dns",
             Self::Ping => "ping",
+            Self::Postgres => "postgres",
+            Self::Mysql => "mysql",
+            Self::Redis => "redis",
+            Self::Ssh => "ssh",
         }
+    }
+
+    /// Whether it can sign in, with a username and password, or a key for ssh.
+    pub fn signs_in(self) -> bool {
+        matches!(self, Self::Postgres | Self::Mysql | Self::Redis | Self::Ssh)
     }
 
     pub fn parse(text: &str) -> Option<Self> {
@@ -352,6 +375,10 @@ impl CheckKind {
             "tls" => Some(Self::Tls),
             "dns" => Some(Self::Dns),
             "ping" => Some(Self::Ping),
+            "postgres" => Some(Self::Postgres),
+            "mysql" => Some(Self::Mysql),
+            "redis" => Some(Self::Redis),
+            "ssh" => Some(Self::Ssh),
             _ => None,
         }
     }
@@ -411,6 +438,9 @@ impl Check {
             server: None,
             record: None,
             count: None,
+            database: None,
+            tls: None,
+            host_key: None,
         }
     }
 
@@ -431,7 +461,12 @@ impl Check {
             "check {name:?} has spaces in its target"
         );
         match self.kind {
-            CheckKind::Tcp | CheckKind::Tls => ensure!(
+            CheckKind::Tcp
+            | CheckKind::Tls
+            | CheckKind::Postgres
+            | CheckKind::Mysql
+            | CheckKind::Redis
+            | CheckKind::Ssh => ensure!(
                 has_port(target),
                 "check {name:?} needs a target like host:port"
             ),
@@ -462,8 +497,43 @@ impl Check {
         only_for(
             self.insecure.is_some(),
             "insecure",
-            &[CheckKind::Http, CheckKind::Tls],
+            &[
+                CheckKind::Http,
+                CheckKind::Tls,
+                CheckKind::Postgres,
+                CheckKind::Mysql,
+                CheckKind::Redis,
+            ],
         )?;
+        only_for(self.database.is_some(), "database", &[CheckKind::Postgres])?;
+        only_for(
+            self.tls.is_some(),
+            "tls",
+            &[CheckKind::Mysql, CheckKind::Redis],
+        )?;
+        only_for(self.host_key.is_some(), "host_key", &[CheckKind::Ssh])?;
+        if let Some(database) = &self.database {
+            ensure!(
+                !database.is_empty()
+                    && database.len() <= 63
+                    && !database
+                        .chars()
+                        .any(|c| c.is_control() || c.is_whitespace()),
+                "check {name:?} needs a database name of at most 63 characters, without spaces"
+            );
+        }
+        if let Some(key) = &self.host_key {
+            let encoded = key.strip_prefix("SHA256:").unwrap_or_default();
+            ensure!(
+                !encoded.is_empty()
+                    && encoded.len() <= 64
+                    && encoded
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c)),
+                "check {name:?} needs a host key fingerprint like SHA256:Dfij…, as \
+                 ssh-keygen -l prints it"
+            );
+        }
         only_for(self.server.is_some(), "server", &[CheckKind::Dns])?;
         only_for(self.record.is_some(), "record", &[CheckKind::Dns])?;
         only_for(self.count.is_some(), "count", &[CheckKind::Ping])?;

@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::actions::{Actions, check_actions};
+use crate::checks::{CheckLogins, load_check_logins};
 use crate::collector::Local;
 use crate::commands::{CheckCommands, check_commands};
 use crate::custom::{Definitions, check_definitions};
@@ -50,6 +51,10 @@ pub struct Config {
     /// name. The server says which pages to read, but never sees these.
     #[serde(default, rename = "openmetrics")]
     pub metrics_logins: Logins,
+    /// How checks that sign in do so, by the check's name. The server says what
+    /// to check, but never sees these.
+    #[serde(default, rename = "check_login")]
+    pub check_logins: CheckLogins,
     /// Whether the server can ask for the actions built into the agent, which
     /// list what's running here and where disk space is going.
     #[serde(default = "enabled")]
@@ -99,6 +104,7 @@ impl Config {
             custom_metrics: &self.custom_metrics,
             check_commands: &self.check_commands,
             metrics_logins: &self.metrics_logins,
+            check_logins: &self.check_logins,
         }
     }
 
@@ -119,6 +125,7 @@ impl Config {
         config.facts = facts;
         check_definitions(&config.custom_metrics)?;
         check_commands(&config.check_commands)?;
+        load_check_logins(&mut config.check_logins)?;
         check_actions(&config.actions)?;
         check_logins(&config.metrics_logins)?;
         Ok(config)

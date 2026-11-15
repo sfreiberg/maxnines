@@ -20,6 +20,17 @@ pub struct Model {
     pub count: Option<i32>,
     pub interval_secs: i64,
     pub enabled: bool,
+    pub database: Option<String>,
+    pub tls: Option<bool>,
+    pub host_key: Option<String>,
+    pub username: Option<String>,
+    /// As it was typed in, when it was.
+    pub password: Option<String>,
+    /// The server's environment variable that holds it, when one does.
+    pub password_env: Option<String>,
+    /// As it was typed in, when it was.
+    pub private_key: Option<String>,
+    pub private_key_env: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

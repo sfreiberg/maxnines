@@ -6,6 +6,9 @@
 //! Errors only ever say what kind of failure it was, as a URL can hold a password.
 
 pub mod openmetrics;
+mod sign_in;
+
+pub use sign_in::Credentials;
 
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
@@ -100,6 +103,18 @@ struct Findings {
     cert_not_after: Option<i64>,
     cert_days_left: Option<i64>,
     records: Option<usize>,
+    /// postgres: whether it offers TLS, asked without signing in.
+    tls_offered: Option<bool>,
+    /// What the server says it is, such as 16.4 or 8.4.3.
+    server_version: Option<String>,
+    /// Whether it signed in, when it was given a way to.
+    signed_in: Option<bool>,
+    /// ssh: the SHA-256 fingerprint of the server's host key.
+    host_key: Option<String>,
+    /// ssh: the ways it offers to sign in, when not signing in.
+    sign_in_methods: Option<String>,
+    /// ssh: 1 if it offers signing in with a password, which an alert can watch.
+    password_sign_in: Option<u8>,
     packet_loss_percent: Option<f64>,
     rtt_min_ms: Option<f64>,
     rtt_max_ms: Option<f64>,
@@ -130,9 +145,19 @@ pub fn timed_out_report(check: &Check) -> Value {
     report(check, Findings::default(), Err(timed_out()))
 }
 
+/// What to report for a check that couldn't be run, saying why.
+pub fn failed_report(check: &Check, why: &str) -> Value {
+    report(check, Findings::default(), Err(anyhow!("{why}")))
+}
+
 /// Runs a check, until it's done or out of time. Always gives a result, and
 /// whatever was learned before running out of time is kept.
 pub async fn run(check: &Check) -> Value {
+    run_signed_in(check, None).await
+}
+
+/// As [`run`], signing in with these where the check's kind can.
+pub async fn run_signed_in(check: &Check, credentials: Option<&Credentials>) -> Value {
     let started = Instant::now();
     let mut findings = Findings::default();
     let work = async {
@@ -142,6 +167,10 @@ pub async fn run(check: &Check) -> Value {
             CheckKind::Tls => check_tls(check, &mut findings).await,
             CheckKind::Dns => check_dns(check, &mut findings).await,
             CheckKind::Ping => check_ping(check, &mut findings).await,
+            CheckKind::Postgres => sign_in::check_postgres(check, credentials, &mut findings).await,
+            CheckKind::Mysql => sign_in::check_mysql(check, credentials, &mut findings).await,
+            CheckKind::Redis => sign_in::check_redis(check, credentials, &mut findings).await,
+            CheckKind::Ssh => sign_in::check_ssh(check, credentials, &mut findings).await,
         }
     };
     let result = timeout(limit(check), work)

@@ -661,6 +661,17 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::Never,
     },
     Metric {
+        name: "check.password_sign_in",
+        title: "SSH offers password sign-in",
+        unit: Unit::Number,
+        collector: "checks",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.password_sign_in"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
         name: "check.packet_loss",
         title: "Packet loss",
         unit: Unit::Percent,
