@@ -1,5 +1,5 @@
 //! Checks of servers that are signed in to: PostgreSQL, MySQL and MariaDB, Redis,
-//! and SSH. Without a username and password, or a key for SSH, each checks only
+//! MongoDB and SSH. Without a username and password, or a key for SSH, each checks only
 //! what it can without signing in.
 //!
 //! A database's driver sends the password as part of connecting, before anything
@@ -267,6 +267,115 @@ pub(crate) async fn check_redis(
         findings.signed_in = Some(true);
     }
     Ok(())
+}
+
+pub(crate) async fn check_mongodb(
+    check: &Check,
+    credentials: Option<&Credentials>,
+    findings: &mut Findings,
+) -> Result<()> {
+    use mongodb::bson::doc;
+    use mongodb::options::{ClientOptions, Credential, ServerAddress, Tls, TlsOptions};
+
+    // Looked up and connected to as other checks do, which also fails at once
+    // where nothing listens, instead of when the driver gives up looking.
+    drop(open(check, findings).await?);
+    let (host, port) = host_and_port(&check.target)?;
+    let limit = crate::limit(check);
+    let mut options = ClientOptions::builder()
+        .hosts(vec![ServerAddress::Tcp {
+            host,
+            port: Some(port),
+        }])
+        .build();
+    // This one server, as it is, rather than whichever member of its replica set
+    // the driver would otherwise go looking for.
+    options.direct_connection = Some(true);
+    options.app_name = Some("maxnines".to_string());
+    options.connect_timeout = Some(limit);
+    // The driver waits this long for a server that answers as MongoDB, then says
+    // why it didn't, which it can only do before the check runs out of time.
+    options.server_selection_timeout = Some(limit * 4 / 5);
+    options.max_pool_size = Some(1);
+    options.retry_reads = Some(false);
+    if check.tls == Some(true) {
+        let tls = TlsOptions::builder()
+            .allow_invalid_certificates(check.insecure == Some(true))
+            .build();
+        options.tls = Some(Tls::Enabled(tls));
+    }
+    let signing_in = credentials.filter(|given| !given.is_empty());
+    if let Some(credentials) = signing_in {
+        let username = credentials
+            .username
+            .clone()
+            .context("signing in needs a username")?;
+        let password = credentials
+            .password
+            .clone()
+            .context("signing in needs a password")?;
+        let source = check
+            .database
+            .clone()
+            .unwrap_or_else(|| "admin".to_string());
+        options.credential = Some(
+            Credential::builder()
+                .username(username)
+                .password(password)
+                .source(source)
+                .build(),
+        );
+    }
+    let client = mongodb::Client::with_options(options).map_err(short)?;
+    let admin = client.database("admin");
+    // Anyone may ping, so without a login this says it answers as MongoDB, and
+    // with one, connecting has signed in.
+    let pinged = admin.run_command(doc! { "ping": 1 }).await;
+    let result = match pinged {
+        Ok(_) => {
+            // Some servers tell anyone their version, others only those signed in.
+            let built = admin.run_command(doc! { "buildInfo": 1 }).await;
+            findings.server_version = built
+                .ok()
+                .and_then(|info| info.get_str("version").ok().map(String::from));
+            if signing_in.is_some() {
+                findings.signed_in = Some(true);
+            }
+            Ok(())
+        }
+        Err(error) => Err(mongodb_error(&error)),
+    };
+    client.shutdown().await;
+    result
+}
+
+/// The driver's error in a few words. Not finding the server comes with a
+/// description of everything it tried, of which only the reason matters.
+fn mongodb_error(error: &mongodb::error::Error) -> anyhow::Error {
+    use mongodb::error::ErrorKind;
+    match &*error.kind {
+        ErrorKind::Authentication { message, .. } => {
+            short(format!("it didn't accept the login: {message}"))
+        }
+        ErrorKind::ServerSelection { message, .. } => {
+            // Such as "… Error: Kind: I/O error: Connection refused (os error
+            // 61), labels: {} } ] }".
+            let reason = message
+                .rsplit_once("Error: ")
+                .map(|(_, reason)| reason)
+                .unwrap_or(message);
+            let reason = reason
+                .trim_start_matches("Kind: ")
+                .split(", labels:")
+                .next()
+                .unwrap_or(reason);
+            if reason.contains("wire protocol") {
+                return anyhow!("it didn't answer as MongoDB does");
+            }
+            short(reason)
+        }
+        _ => short(error),
+    }
 }
 
 /// Takes whatever key the server offers, noting it, as the check compares it
@@ -644,11 +753,15 @@ mod tests {
 
     /// Real servers, where the environment says where to find them, as
     /// `host:port username`, with no password needed.
+    /// A real server named by an environment variable, as `host:port username`,
+    /// with the password after the username for servers that ask for one.
     fn real(variable: &str) -> Option<(String, Credentials)> {
         let value = std::env::var(variable).ok()?;
-        let (target, username) = value.split_once(' ')?;
+        let mut words = value.split_whitespace();
+        let (target, username) = (words.next()?, words.next()?);
         let credentials = Credentials {
             username: Some(username.to_string()),
+            password: words.next().map(String::from),
             ..Credentials::default()
         };
         Some((target.to_string(), credentials))
@@ -659,6 +772,7 @@ mod tests {
         for (variable, kind) in [
             ("MAXNINES_TEST_CHECK_POSTGRES", CheckKind::Postgres),
             ("MAXNINES_TEST_CHECK_MYSQL", CheckKind::Mysql),
+            ("MAXNINES_TEST_CHECK_MONGODB", CheckKind::Mongodb),
         ] {
             let Some((target, credentials)) = real(variable) else {
                 continue;
@@ -674,6 +788,31 @@ mod tests {
             let result = run(&check, Some(&wrong)).await;
             assert_eq!(result["up"], 0, "{variable} as nobody: {result}");
         }
+    }
+
+    #[tokio::test]
+    async fn mongodb_that_isnt_there_says_why_in_a_few_words() {
+        let check = Check::new("test", CheckKind::Mongodb, "127.0.0.1:0");
+        let result = run(&check, None).await;
+        assert_eq!(result["up"], 0, "{result}");
+        let error = result["error"].as_str().unwrap();
+        assert!(error.contains("connect"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn something_else_isnt_taken_for_mongodb() {
+        let address = serve(|mut socket| async move {
+            let _ = socket.write_all(b"SSH-2.0-OpenSSH_9.9\r\n").await;
+        })
+        .await;
+        let mut check = check(CheckKind::Mongodb, address);
+        check.timeout_secs = Some(2);
+        let result = run(&check, Some(&login("monitor", "s3cret"))).await;
+        assert_eq!(result["up"], 0, "{result}");
+        assert!(result.get("signed_in").is_none(), "{result}");
+        // Saying so, rather than running out of time.
+        let error = result["error"].as_str().unwrap();
+        assert_eq!(error, "it didn't answer as MongoDB does");
     }
 
     #[test]

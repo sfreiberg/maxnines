@@ -984,6 +984,45 @@ async fn a_checks_password_is_kept_but_never_given_back() {
     assert_eq!(cache.input.check.tls, Some(true));
     assert_eq!(cache.input.sign_in.password.as_deref(), Some("r3dis"));
     assert_eq!(cache.input.sign_in.private_key, None);
+
+    // MongoDB, with the database its account was made in.
+    let fields = [
+        ("name", "documents"),
+        ("kind", "mongodb"),
+        ("target", "127.0.0.1:27017"),
+        ("interval_secs", "60"),
+        ("enabled", "on"),
+        ("database", "monitoring"),
+        ("tls", "on"),
+        ("sign_in", "password"),
+        ("username", "maxnines"),
+        ("password", "m0ngo"),
+    ];
+    let form = browser.get(&server, "/checks/new").await;
+    assert!(
+        form.body
+            .contains(r#"<option value="mongodb">MongoDB</option>"#),
+        "{}",
+        form.body
+    );
+    let added = browser
+        .submit(&server, "/checks/new", "/checks", &fields)
+        .await;
+    assert_eq!(added.status, 303, "{}", added.body);
+    let checks = server.state.database.list_remote_checks().await.unwrap();
+    let documents = checks
+        .iter()
+        .find(|c| c.input.check.name == "documents")
+        .unwrap();
+    assert_eq!(
+        documents.input.check.kind,
+        maxnines_protocol::CheckKind::Mongodb
+    );
+    assert_eq!(
+        documents.input.check.database.as_deref(),
+        Some("monitoring")
+    );
+    assert_eq!(documents.input.sign_in.password.as_deref(), Some("m0ngo"));
 }
 
 #[tokio::test]

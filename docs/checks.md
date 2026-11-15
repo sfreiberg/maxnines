@@ -16,6 +16,7 @@ is how to check a database that only listens on its own host.
 | **PostgreSQL** (`postgres`) | `host:port` | That it answers as PostgreSQL, or that an account can sign in |
 | **MySQL or MariaDB** (`mysql`) | `host:port` | Its version, from its greeting, or that an account can sign in |
 | **Redis** (`redis`) | `host:port` | That it answers PING, or that an account can sign in, and its version |
+| **MongoDB** (`mongodb`) | `host:port` | That it answers as MongoDB, or that an account can sign in, and its version |
 | **SSH** (`ssh`) | `host:port` | Its host key and the ways it offers to sign in, or that an account can sign in |
 | **Mail sending** (`smtp`) | `host:port` | That it greets as a mail server, or that an account can sign in to send |
 | **Mailbox** (`imap`, `pop3`) | `host:port` | That it greets as one, or that an account can sign in |
@@ -87,8 +88,8 @@ any of these.
 
 ### Certificates
 
-A PostgreSQL check uses TLS whenever the server offers it, and MySQL, MariaDB and
-Redis checks when **Use TLS** is ticked. The certificate is checked as a website's
+A PostgreSQL check uses TLS whenever the server offers it, and MySQL, MariaDB,
+Redis and MongoDB checks when **Use TLS** is ticked. The certificate is checked as a website's
 is, during the handshake, so a password is never sent to a server whose certificate
 can't be trusted. For a server with a certificate from a private authority, tick
 **Don't count a bad certificate as down**.
@@ -172,10 +173,26 @@ without a username, and the check can then do anything a client can.
 On Amazon ElastiCache, users are made through its API with the same access string,
 and it needs TLS.
 
+### MongoDB
+
+```javascript
+use admin
+db.createUser({ user: "maxnines", pwd: passwordPrompt(), roles: [] })
+```
+
+A user with no roles can sign in and be told the server's version, which is all a
+check needs. Make it in `admin`, or give the database it was made in as the check's
+**Database**.
+
+A MongoDB check talks to the one server it's given, never the rest of its replica
+set or cluster, so give each member its own check. It takes `host:port`, not a
+`mongodb+srv://` address; on Atlas, use a member's host name, shown under the
+cluster's connection details, and tick **Use TLS**, which Atlas needs.
+
 ### What other tools ask for
 
 Monitoring tools that read a database's health, rather than just signing in, ask for
 more: on PostgreSQL 10 and later, membership of `pg_monitor`; on MySQL, `PROCESS`,
 `REPLICATION CLIENT` and `SELECT` on `performance_schema`; on Redis, `+info` and a
-few others. MaxNines will ask for the same once its checks read more than whether
+few others; on MongoDB, the `clusterMonitor` role. MaxNines will ask for the same once its checks read more than whether
 they can sign in.

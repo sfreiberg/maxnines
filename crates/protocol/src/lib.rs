@@ -322,10 +322,12 @@ pub struct Check {
     /// ping: how many packets to send. Defaults to 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub count: Option<u32>,
-    /// postgres: the database to sign in to. Defaults to `postgres`.
+    /// postgres: the database to sign in to. Defaults to `postgres`. mongodb: the
+    /// database the account belongs to. Defaults to `admin`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database: Option<String>,
-    /// mysql and redis: connect over TLS, which they don't offer on their own.
+    /// mysql, redis and mongodb: connect over TLS, which they don't offer on
+    /// their own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<bool>,
     /// ssh: the host key's SHA-256 fingerprint, as `ssh-keygen -l` prints it, such
@@ -349,6 +351,7 @@ pub enum CheckKind {
     Postgres,
     Mysql,
     Redis,
+    Mongodb,
     Ssh,
     Smtp,
     Imap,
@@ -366,6 +369,7 @@ impl CheckKind {
             Self::Postgres => "postgres",
             Self::Mysql => "mysql",
             Self::Redis => "redis",
+            Self::Mongodb => "mongodb",
             Self::Ssh => "ssh",
             Self::Smtp => "smtp",
             Self::Imap => "imap",
@@ -380,6 +384,7 @@ impl CheckKind {
             Self::Postgres
                 | Self::Mysql
                 | Self::Redis
+                | Self::Mongodb
                 | Self::Ssh
                 | Self::Smtp
                 | Self::Imap
@@ -397,6 +402,7 @@ impl CheckKind {
             "postgres" => Some(Self::Postgres),
             "mysql" => Some(Self::Mysql),
             "redis" => Some(Self::Redis),
+            "mongodb" => Some(Self::Mongodb),
             "ssh" => Some(Self::Ssh),
             "smtp" => Some(Self::Smtp),
             "imap" => Some(Self::Imap),
@@ -489,6 +495,7 @@ impl Check {
             | CheckKind::Postgres
             | CheckKind::Mysql
             | CheckKind::Redis
+            | CheckKind::Mongodb
             | CheckKind::Ssh
             | CheckKind::Smtp
             | CheckKind::Imap
@@ -529,18 +536,24 @@ impl Check {
                 CheckKind::Postgres,
                 CheckKind::Mysql,
                 CheckKind::Redis,
+                CheckKind::Mongodb,
                 CheckKind::Smtp,
                 CheckKind::Imap,
                 CheckKind::Pop3,
             ],
         )?;
-        only_for(self.database.is_some(), "database", &[CheckKind::Postgres])?;
+        only_for(
+            self.database.is_some(),
+            "database",
+            &[CheckKind::Postgres, CheckKind::Mongodb],
+        )?;
         only_for(
             self.tls.is_some(),
             "tls",
             &[
                 CheckKind::Mysql,
                 CheckKind::Redis,
+                CheckKind::Mongodb,
                 CheckKind::Smtp,
                 CheckKind::Imap,
                 CheckKind::Pop3,

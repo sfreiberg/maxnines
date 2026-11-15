@@ -25,7 +25,7 @@ as long as `sign_in` says, or the fields given show, that it still signs in that
 | `check` field | For | Description |
 | --- | --- | --- |
 | `name` | All | Required. What it's called on charts and in alerts. Two checks about the same host can't have the same one |
-| `kind` | All | Required. `tcp`, `http`, `tls`, `dns`, `ping`, `postgres`, `mysql`, `redis`, `ssh`, `smtp`, `imap` or `pop3` |
+| `kind` | All | Required. `tcp`, `http`, `tls`, `dns`, `ping`, `postgres`, `mysql`, `redis`, `mongodb`, `ssh`, `smtp`, `imap` or `pop3` |
 | `target` | All | Required. An address for http, a host for dns and ping, and `host:port` for the rest |
 | `timeout_secs` | All | How long it gets, up to a minute |
 | `interval_secs` | All | For a check an agent runs, how often it runs, up to a day. It runs with every sample without one, and never more often than samples are sent, as it's rounded up to whole samples. Between runs, each sample repeats its last result. A remote check's interval goes beside `check` instead |
@@ -33,9 +33,9 @@ as long as `sign_in` says, or the fields given show, that it still signs in that
 | `body` | http | What to send, for methods like `POST` |
 | `regex` | http | A regular expression the page has to match |
 | `domain_expiry` | http | `false` stops it looking up when the site's [domain](checks.md#domain-expiry) expires, which it does otherwise |
-| `insecure` | http, tls, postgres, mysql, redis, smtp, imap, pop3 | Measure a server whose certificate can't be verified, without counting that as down. Without it, a check never sends its request, or a password, to a server that fails the certificate check |
-| `database` | postgres | The database to sign in to. Defaults to `postgres` |
-| `tls` | mysql, redis, smtp, imap, pop3 | Connect over TLS from the start. PostgreSQL uses TLS whenever the server offers it, and mail checks without this upgrade with STARTTLS before signing in |
+| `insecure` | http, tls, postgres, mysql, redis, mongodb, smtp, imap, pop3 | Measure a server whose certificate can't be verified, without counting that as down. Without it, a check never sends its request, or a password, to a server that fails the certificate check |
+| `database` | postgres, mongodb | For postgres, the database to sign in to, defaulting to `postgres`. For mongodb, the database the account was made in, defaulting to `admin` |
+| `tls` | mysql, redis, mongodb, smtp, imap, pop3 | Connect over TLS from the start. PostgreSQL uses TLS whenever the server offers it, and mail checks without this upgrade with STARTTLS before signing in |
 | `host_key` | ssh | The server's host key, as `ssh-keygen -l` prints it, such as `SHA256:Dfij…`. Any other key counts as down, and nothing is signed in with |
 | `server` | dns | Ask this server instead of the system's resolver |
 | `record` | dns | The record type to ask for, with `server`. Defaults to `A` |

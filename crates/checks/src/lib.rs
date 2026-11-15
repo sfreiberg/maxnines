@@ -177,6 +177,7 @@ pub async fn run_signed_in(check: &Check, credentials: Option<&Credentials>) -> 
             CheckKind::Postgres => sign_in::check_postgres(check, credentials, &mut findings).await,
             CheckKind::Mysql => sign_in::check_mysql(check, credentials, &mut findings).await,
             CheckKind::Redis => sign_in::check_redis(check, credentials, &mut findings).await,
+            CheckKind::Mongodb => sign_in::check_mongodb(check, credentials, &mut findings).await,
             CheckKind::Ssh => sign_in::check_ssh(check, credentials, &mut findings).await,
             CheckKind::Smtp => mail::check_smtp(check, credentials, &mut findings).await,
             CheckKind::Imap => mail::check_imap(check, credentials, &mut findings).await,
