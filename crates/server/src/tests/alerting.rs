@@ -5192,19 +5192,15 @@ mod remote {
         let server = server().await;
         let (_listener, target) = open_port();
         let input = tcp_input("db", &target);
-        server
-            .state
-            .database
-            .create_remote_check(&input)
-            .await
-            .unwrap();
+        let created = server.state.database.create_remote_check(&input).await;
+        let id = created.unwrap();
         let mut scheduler = scheduler(&server);
 
         let now = now_ms();
         assert_eq!(run_due(&mut scheduler, now).await, 1);
         assert_eq!(run_due(&mut scheduler, now + 59_000).await, 0);
         assert_eq!(run_due(&mut scheduler, now + 60_000).await, 1);
-        assert_eq!(server.state.check_results.all()["db"]["up"], 1);
+        assert_eq!(server.state.check_results.all()[&id]["up"], 1);
     }
 
     #[tokio::test]

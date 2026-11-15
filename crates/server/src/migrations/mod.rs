@@ -2,13 +2,18 @@
 //! draws. A change to a table is a new migration after this one, with the README
 //! changed to match.
 
+use sea_orm::{DbBackend, Statement};
 use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
 
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(CreateTables), Box::new(PageTokens)]
+        vec![
+            Box::new(CreateTables),
+            Box::new(PageTokens),
+            Box::new(CheckNamesPerHost),
+        ]
     }
 }
 
@@ -916,52 +921,7 @@ impl MigrationTrait for CreateTables {
                     .to_owned(),
             )
             .await?;
-        manager
-            .create_table(
-                Table::create()
-                    .table(RemoteChecks::Table)
-                    .col(id(RemoteChecks::Id))
-                    .col(
-                        ColumnDef::new(RemoteChecks::Name)
-                            .string_len(64)
-                            .not_null()
-                            .unique_key(),
-                    )
-                    .col(ColumnDef::new(RemoteChecks::Kind).string_len(16).not_null())
-                    .col(
-                        ColumnDef::new(RemoteChecks::Target)
-                            .string_len(255)
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(RemoteChecks::TimeoutSecs).big_integer())
-                    .col(ColumnDef::new(RemoteChecks::Method).string_len(16))
-                    .col(ColumnDef::new(RemoteChecks::Body).text())
-                    .col(ColumnDef::new(RemoteChecks::Regex).text())
-                    .col(ColumnDef::new(RemoteChecks::Insecure).boolean())
-                    .col(ColumnDef::new(RemoteChecks::Server).string_len(255))
-                    .col(ColumnDef::new(RemoteChecks::Record).string_len(16))
-                    .col(ColumnDef::new(RemoteChecks::Count).integer())
-                    .col(
-                        ColumnDef::new(RemoteChecks::IntervalSecs)
-                            .big_integer()
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(RemoteChecks::Enabled).boolean().not_null())
-                    .col(
-                        ColumnDef::new(RemoteChecks::HostId)
-                            .string_len(32)
-                            .not_null()
-                            .default("server"),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_remote_checks_host_id")
-                            .from(RemoteChecks::Table, RemoteChecks::HostId)
-                            .to(Hosts::Table, Hosts::Id),
-                    )
-                    .to_owned(),
-            )
-            .await?;
+        manager.create_table(remote_checks_table(true)).await?;
         manager
             .create_index(
                 Index::create()
@@ -1903,6 +1863,225 @@ impl MigrationTrait for PageTokens {
     }
 }
 
+struct CheckNamesPerHost;
+
+impl MigrationName for CheckNamesPerHost {
+    fn name(&self) -> &str {
+        "m20261115_000003_check_names_per_host"
+    }
+}
+
+/// A check's name only has to differ from the others about the same host, so two
+/// hosts can each have one called the same. SQLite can only drop a column's
+/// unique constraint by making the table again, which has to be done with foreign
+/// keys switched off, and SQLite only allows that outside a transaction. Its pool
+/// has a single connection, so the switch holds for every step.
+#[async_trait::async_trait]
+impl MigrationTrait for CheckNamesPerHost {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let backend = manager.get_database_backend();
+        if backend == sea_orm::DatabaseBackend::Sqlite {
+            let tables = [(
+                "remote_checks",
+                remote_checks_table(false),
+                REMOTE_CHECK_COLUMNS,
+            )];
+            remake_on_sqlite(manager, &tables).await?;
+            // The index on the host alone went with the old table, and this one
+            // does its job.
+            return manager.create_index(check_names_index()).await;
+        }
+        let unique = if backend == sea_orm::DatabaseBackend::MySql {
+            "ALTER TABLE remote_checks DROP INDEX name"
+        } else {
+            "ALTER TABLE remote_checks DROP CONSTRAINT remote_checks_name_key"
+        };
+        manager.get_connection().execute_unprepared(unique).await?;
+        // Made first, as MySQL wants an index for the foreign key throughout.
+        manager.create_index(check_names_index()).await?;
+        manager
+            .drop_index(
+                Index::drop()
+                    .name("idx_remote_checks_host")
+                    .table(RemoteChecks::Table)
+                    .to_owned(),
+            )
+            .await
+    }
+
+    /// Of checks that share a name, only the first is kept.
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let connection = manager.get_connection();
+        connection
+            .execute_unprepared(
+                "DELETE FROM remote_checks WHERE id NOT IN \
+                 (SELECT id FROM (SELECT MIN(id) AS id FROM remote_checks GROUP BY name) firsts)",
+            )
+            .await?;
+        let host_index = Index::create()
+            .name("idx_remote_checks_host")
+            .table(RemoteChecks::Table)
+            .col(RemoteChecks::HostId)
+            .to_owned();
+        let backend = manager.get_database_backend();
+        if backend == sea_orm::DatabaseBackend::Sqlite {
+            let tables = [(
+                "remote_checks",
+                remote_checks_table(true),
+                REMOTE_CHECK_COLUMNS,
+            )];
+            remake_on_sqlite(manager, &tables).await?;
+            return manager.create_index(host_index).await;
+        }
+        manager.create_index(host_index).await?;
+        manager
+            .drop_index(
+                Index::drop()
+                    .name("idx_remote_checks_host_name")
+                    .table(RemoteChecks::Table)
+                    .to_owned(),
+            )
+            .await?;
+        let unique = if backend == sea_orm::DatabaseBackend::MySql {
+            "ALTER TABLE remote_checks ADD UNIQUE INDEX name (name)"
+        } else {
+            "ALTER TABLE remote_checks ADD CONSTRAINT remote_checks_name_key UNIQUE (name)"
+        };
+        connection.execute_unprepared(unique).await?;
+        Ok(())
+    }
+}
+
+/// Every column of `remote_checks`, to copy from one making of it to the next.
+const REMOTE_CHECK_COLUMNS: &str = "id, name, kind, target, timeout_secs, method, body, \
+     regex, insecure, server, record, count, interval_secs, enabled, host_id";
+
+fn check_names_index() -> IndexCreateStatement {
+    Index::create()
+        .name("idx_remote_checks_host_name")
+        .table(RemoteChecks::Table)
+        .col(RemoteChecks::HostId)
+        .col(RemoteChecks::Name)
+        .unique()
+        .to_owned()
+}
+
+/// `remote_checks`, with names that no two checks share, as they were at first, or
+/// that only the checks about one host don't, which an index sees to.
+fn remote_checks_table(unique_names: bool) -> TableCreateStatement {
+    let mut name = ColumnDef::new(RemoteChecks::Name);
+    name.string_len(64).not_null();
+    if unique_names {
+        name.unique_key();
+    }
+    Table::create()
+        .table(RemoteChecks::Table)
+        .col(id(RemoteChecks::Id))
+        .col(name)
+        .col(ColumnDef::new(RemoteChecks::Kind).string_len(16).not_null())
+        .col(
+            ColumnDef::new(RemoteChecks::Target)
+                .string_len(255)
+                .not_null(),
+        )
+        .col(ColumnDef::new(RemoteChecks::TimeoutSecs).big_integer())
+        .col(ColumnDef::new(RemoteChecks::Method).string_len(16))
+        .col(ColumnDef::new(RemoteChecks::Body).text())
+        .col(ColumnDef::new(RemoteChecks::Regex).text())
+        .col(ColumnDef::new(RemoteChecks::Insecure).boolean())
+        .col(ColumnDef::new(RemoteChecks::Server).string_len(255))
+        .col(ColumnDef::new(RemoteChecks::Record).string_len(16))
+        .col(ColumnDef::new(RemoteChecks::Count).integer())
+        .col(
+            ColumnDef::new(RemoteChecks::IntervalSecs)
+                .big_integer()
+                .not_null(),
+        )
+        .col(ColumnDef::new(RemoteChecks::Enabled).boolean().not_null())
+        .col(
+            ColumnDef::new(RemoteChecks::HostId)
+                .string_len(32)
+                .not_null()
+                .default("server"),
+        )
+        .foreign_key(
+            ForeignKey::create()
+                .name("fk_remote_checks_host_id")
+                .from(RemoteChecks::Table, RemoteChecks::HostId)
+                .to(Hosts::Table, Hosts::Id),
+        )
+        .to_owned()
+}
+
+/// Makes each table again as given on SQLite, keeping its rows and the next ID it
+/// would give, with foreign keys off so tables pointing at it are left alone, then
+/// checks nothing points anywhere it shouldn't before keeping the result. This is
+/// the order SQLite's own documentation gives for changes ALTER TABLE can't make.
+async fn remake_on_sqlite(
+    manager: &SchemaManager<'_>,
+    tables: &[(&str, TableCreateStatement, &str)],
+) -> Result<(), DbErr> {
+    let connection = manager.get_connection();
+    connection
+        .execute_unprepared("PRAGMA foreign_keys = OFF")
+        .await?;
+    let remade = async {
+        connection.execute_unprepared("BEGIN").await?;
+        for (table, create, columns) in tables {
+            let made = format!("{table}_remade");
+            let mut create = create.clone();
+            create.table(Alias::new(&made));
+            manager.create_table(create).await?;
+            connection
+                .execute_unprepared(&format!(
+                    "INSERT INTO {made} ({columns}) SELECT {columns} FROM {table}"
+                ))
+                .await?;
+            let next = format!("SELECT seq FROM sqlite_sequence WHERE name = '{table}'");
+            let seq: Option<i64> = connection
+                .query_one_raw(Statement::from_string(DbBackend::Sqlite, next))
+                .await?
+                .map(|row| row.try_get_by_index(0))
+                .transpose()?;
+            connection
+                .execute_unprepared(&format!("DROP TABLE {table}"))
+                .await?;
+            connection
+                .execute_unprepared(&format!("ALTER TABLE {made} RENAME TO {table}"))
+                .await?;
+            if let Some(seq) = seq {
+                connection
+                    .execute_unprepared(&format!(
+                        "UPDATE sqlite_sequence SET seq = max(seq, {seq}) WHERE name = '{table}'"
+                    ))
+                    .await?;
+            }
+        }
+        let broken = connection
+            .query_all_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "PRAGMA foreign_key_check",
+            ))
+            .await?;
+        if !broken.is_empty() {
+            return Err(DbErr::Migration(format!(
+                "{} rows would point at nothing",
+                broken.len()
+            )));
+        }
+        connection.execute_unprepared("COMMIT").await?;
+        Ok(())
+    }
+    .await;
+    if remade.is_err() {
+        connection.execute_unprepared("ROLLBACK").await.ok();
+    }
+    connection
+        .execute_unprepared("PRAGMA foreign_keys = ON")
+        .await?;
+    remade
+}
+
 #[derive(DeriveIden)]
 enum MetricsPages {
     Table,
@@ -2049,5 +2228,44 @@ mod tests {
             .unwrap();
         let about = "SELECT host_id FROM remote_checks WHERE name = 'Site'";
         assert_eq!(texts(&connection, about).await, ["server"]);
+    }
+
+    #[tokio::test]
+    async fn checks_keep_their_rows_when_names_become_a_hosts_own() {
+        let connection = fresh().await;
+        Migrator::up(&connection, Some(2)).await.unwrap();
+        let add = |name: &str, host: &str| {
+            let sql = format!(
+                "INSERT INTO remote_checks (name, kind, target, interval_secs, enabled, host_id)
+                 VALUES ('{name}', 'ping', 'example.com', 60, TRUE, '{host}')"
+            );
+            let connection = &connection;
+            async move { connection.execute_unprepared(&sql).await }
+        };
+        connection
+            .execute_unprepared(
+                "INSERT INTO hosts (id, hostname, public_key, state, first_seen_ms, kind)
+                 VALUES ('abc', 'db', '', 'approved', 1, 'agentless');
+                 INSERT INTO remote_checks (id, name, kind, target, interval_secs, enabled)
+                 VALUES (4, 'Site', 'http', 'https://example.com', 60, TRUE)",
+            )
+            .await
+            .unwrap();
+        assert!(add("Site", "abc").await.is_err(), "unique at first");
+
+        Migrator::up(&connection, None).await.unwrap();
+
+        add("Site", "abc").await.unwrap();
+        assert!(add("Site", "abc").await.is_err(), "one to a host");
+        assert!(add("Site", "server").await.is_err());
+        assert!(add("Other", "nobody").await.is_err(), "still about a host");
+        let rows = "SELECT CAST(id AS TEXT) || ' ' || host_id FROM remote_checks ORDER BY id";
+        assert_eq!(texts(&connection, rows).await, ["4 server", "5 abc"]);
+
+        // Going back, the first of each name is the one kept.
+        Migrator::down(&connection, Some(1)).await.unwrap();
+        assert_eq!(texts(&connection, rows).await, ["4 server"]);
+        assert!(add("Site", "abc").await.is_err(), "unique again");
+        add("Database", "abc").await.unwrap();
     }
 }

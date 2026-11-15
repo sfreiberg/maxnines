@@ -288,10 +288,14 @@ impl AppState {
         );
         let checks = self.database.list_remote_checks().await?;
         let name = &input.check.name;
-        let taken = checks
-            .iter()
-            .any(|check| check.input.check.name == *name && Some(check.id) != id);
-        ensure!(!taken, "a check named {name:?} already exists");
+        // Names only have to differ among the checks about one host.
+        let taken = checks.iter().any(|check| {
+            check.input.check.name == *name && check.input.host_id == *about && Some(check.id) != id
+        });
+        ensure!(
+            !taken,
+            "a check named {name:?} already exists for this host"
+        );
         Ok(())
     }
 

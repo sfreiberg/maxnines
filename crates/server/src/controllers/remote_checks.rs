@@ -205,7 +205,7 @@ async fn index(
                 id: check.id,
                 host: host.filter(|_| !about_server).cloned(),
                 kind: input.check.kind.as_str(),
-                latest: latest.get(&input.check.name).and_then(check_row),
+                latest: latest.get(&check.id).and_then(check_row),
                 name: input.check.name,
                 target: input.check.target,
                 interval_secs: input.interval_secs,

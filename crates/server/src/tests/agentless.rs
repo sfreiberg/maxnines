@@ -694,6 +694,45 @@ async fn a_check_is_about_a_host_with_no_agent_or_the_server() {
 }
 
 #[tokio::test]
+async fn two_hosts_can_each_have_a_check_of_the_same_name() {
+    let server = start().await;
+    let orders = add_host(&server, "orders-db").await;
+    let billing = add_host(&server, "billing-db").await;
+    let served = serve(None).await;
+    let add = |about: &str| {
+        let check = tcp_check(about, "port", &served.address);
+        let server = &server;
+        async move { api(server, "POST", "/api/v1/remote-checks", &check).await }
+    };
+    for about in [orders.as_str(), billing.as_str(), "server"] {
+        let (status, added) = add(about).await;
+        assert_eq!(status, 201, "{about}: {added}");
+    }
+    let (status, refused) = add(&orders).await;
+    assert_eq!(status, 422);
+    let why = refused["error"].as_str().unwrap();
+    assert!(why.contains("already exists for this host"), "{why}");
+
+    // Each has its own result, and its own row on its host's page.
+    let mut scheduler = check_scheduler(&server);
+    assert_eq!(run_due(&mut scheduler, now_ms()).await, 3);
+    assert_eq!(server.state.check_results.all().len(), 3);
+    let mut browser = Browser::default();
+    for host in [&orders, &billing] {
+        let page = browser.get(&server, &format!("/hosts/{host}")).await;
+        let row = format!("tcp {}", served.address);
+        assert_eq!(page.body.matches(&row).count(), 1, "{}", page.body);
+    }
+    // Moving one onto a host that has its name is refused too.
+    let (_, checks) = api(&server, "GET", "/api/v1/remote-checks", &Value::Null).await;
+    let mut all = checks.as_array().unwrap().iter();
+    let own = all.find(|check| check["host_id"] == "server").unwrap();
+    let path = format!("/api/v1/remote-checks/{}", own["id"]);
+    let moved = tcp_check(&billing, "port", &served.address);
+    assert_eq!(api(&server, "PUT", &path, &moved).await.0, 422);
+}
+
+#[tokio::test]
 async fn a_hosts_checks_are_added_from_its_page() {
     let server = start().await;
     let id = add_host(&server, "orders-db").await;

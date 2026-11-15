@@ -92,12 +92,9 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
     let mut tiles: Vec<CheckTile> = checks
         .into_iter()
         .filter(|check| check.input.enabled)
-        .map(|check| {
-            let name = check.input.check.name;
-            CheckTile {
-                latest: latest.get(&name).and_then(check_row),
-                name,
-            }
+        .map(|check| CheckTile {
+            latest: latest.get(&check.id).and_then(check_row),
+            name: check.input.check.name,
         })
         .collect();
     let results = || tiles.iter().filter_map(|tile| tile.latest.as_ref());

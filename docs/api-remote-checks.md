@@ -13,7 +13,7 @@ alerts go under that host.
 
 | `check` field | For | Description |
 | --- | --- | --- |
-| `name` | All | Required. What it's called on charts and in alerts |
+| `name` | All | Required. What it's called on charts and in alerts. Two checks about the same host can't have the same one |
 | `kind` | All | Required. `tcp`, `http`, `tls`, `dns` or `ping` |
 | `target` | All | Required. `host:port` for tcp and tls, an address for http, and a host for dns and ping |
 | `timeout_secs` | All | How long it gets, up to a minute |

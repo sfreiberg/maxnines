@@ -391,7 +391,7 @@ pub async fn check_rows(state: &AppState, host_id: &str) -> Result<Vec<CheckRow>
         .filter(|check| check.input.host_id == host_id)
         .map(|check| {
             let input = check.input;
-            let result = latest.get(&input.check.name);
+            let result = latest.get(&check.id);
             CheckRow {
                 id: check.id,
                 kind: input.check.kind.as_str(),

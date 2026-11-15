@@ -318,7 +318,7 @@ async fn show(
             checks
                 .into_iter()
                 .filter(|check| check.input.host_id == host.id)
-                .filter_map(|check| results.remove(&check.input.check.name))
+                .filter_map(|check| results.remove(&check.id))
                 .collect()
         })
     } else {

@@ -80,26 +80,27 @@ pub fn check_input(input: &RemoteCheckInput) -> Result<()> {
     Ok(())
 }
 
-/// How each check last went, by name. Only kept in memory, as the history is in
-/// the metrics store and this refills within one interval.
+/// How each check last went, by its ID, as two hosts can each have a check of the
+/// same name. Only kept in memory, as the history is in the metrics store and this
+/// refills within one interval.
 #[derive(Default)]
 pub struct LatestResults {
-    results: Mutex<BTreeMap<String, Value>>,
+    results: Mutex<BTreeMap<i64, Value>>,
 }
 
 impl LatestResults {
-    fn set(&self, name: &str, result: Value) {
+    fn set(&self, id: i64, result: Value) {
         let mut results = self.results.lock().unwrap_or_else(PoisonError::into_inner);
-        results.insert(name.to_string(), result);
+        results.insert(id, result);
     }
 
     /// Forgets checks that no longer exist.
-    fn keep_only(&self, names: &BTreeSet<&str>) {
+    fn keep_only(&self, ids: &BTreeSet<i64>) {
         let mut results = self.results.lock().unwrap_or_else(PoisonError::into_inner);
-        results.retain(|name, _| names.contains(name.as_str()));
+        results.retain(|id, _| ids.contains(id));
     }
 
-    pub fn all(&self) -> BTreeMap<String, Value> {
+    pub fn all(&self) -> BTreeMap<i64, Value> {
         self.results
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -156,11 +157,8 @@ impl Scheduler {
     /// loses its own run.
     pub async fn start_due(&mut self, now_ms: i64) -> Result<Vec<JoinHandle<()>>> {
         let checks = self.database.list_remote_checks().await?;
-        let names: BTreeSet<&str> = checks
-            .iter()
-            .map(|check| check.input.check.name.as_str())
-            .collect();
-        self.results.keep_only(&names);
+        let ids: BTreeSet<i64> = checks.iter().map(|check| check.id).collect();
+        self.results.keep_only(&ids);
 
         // A host with no agent is as present as its checks and pages say.
         let agentless: BTreeMap<String, String> = self
@@ -206,7 +204,7 @@ impl Scheduler {
             };
             let host_id = check.input.host_id;
             let result = maxnines_checks::run(&check.input.check).await;
-            results.set(&check.input.check.name, result.clone());
+            results.set(check.id, result.clone());
             if host_id != LOCAL_HOST_ID {
                 presence.reached(&host_id, Reached::Check(check.id), result["up"] == 1);
             }
@@ -273,10 +271,10 @@ mod tests {
     #[test]
     fn results_for_deleted_checks_are_forgotten() {
         let results = LatestResults::default();
-        results.set("a", json!(1));
-        results.set("b", json!(2));
-        results.keep_only(&BTreeSet::from(["b"]));
+        results.set(1, json!(1));
+        results.set(2, json!(2));
+        results.keep_only(&BTreeSet::from([2]));
         assert_eq!(results.all().len(), 1);
-        assert_eq!(results.all()["b"], 2);
+        assert_eq!(results.all()[&2], 2);
     }
 }
