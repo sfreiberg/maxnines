@@ -17,16 +17,19 @@ is how to check a database that only listens on its own host.
 | **MySQL or MariaDB** (`mysql`) | `host:port` | Its version, from its greeting, or that an account can sign in |
 | **Redis** (`redis`) | `host:port` | That it answers PING, or that an account can sign in, and its version |
 | **SSH** (`ssh`) | `host:port` | Its host key and the ways it offers to sign in, or that an account can sign in |
+| **Mail sending** (`smtp`) | `host:port` | That it greets as a mail server, or that an account can sign in to send |
+| **Mailbox** (`imap`, `pop3`) | `host:port` | That it greets as one, or that an account can sign in |
 
-Agents older than this version don't know the database, Redis and SSH checks. Upgrade
+Agents older than this version don't know the database, Redis, SSH and mail checks. Upgrade
 them before giving those kinds to them in a config rule.
 
 ## Signing in
 
-A database, Redis or SSH check that isn't given a way to sign in checks only what it
-can without one: that the server answers, and as what. Given a username and password,
-or for SSH a private key, it signs in, and counts as down if it can't. Nothing else is
-done once it has: no queries are run, and no commands.
+A database, Redis, SSH or mail check that isn't given a way to sign in checks only
+what it can without one: that the server answers, and as what. Given a username and
+password, or for SSH a private key, it signs in, and counts as down if it can't.
+Nothing else is done once it has: no queries are run, no commands, and no mail is
+sent or read.
 
 ### On the server
 
@@ -71,6 +74,12 @@ Redis checks when **Use TLS** is ticked. The certificate is checked as a website
 is, during the handshake, so a password is never sent to a server whose certificate
 can't be trusted. For a server with a certificate from a private authority, tick
 **Don't count a bad certificate as down**.
+
+A mail check uses TLS from the start when **Use TLS from the start** is ticked, as on
+ports 465 (SMTP), 993 (IMAP) and 995 (POP3). Otherwise it connects in the clear and,
+before signing in, upgrades with STARTTLS (STLS for POP3). A server that won't
+upgrade isn't sent the password, and the check counts as down, saying why. Use a
+mailbox set aside for the check.
 
 MySQL 8's usual way of signing in, `caching_sha2_password`, needs TLS for an
 account's first sign-in after the server restarts. Tick **Use TLS** for MySQL 8.

@@ -180,7 +180,7 @@ impl SignIn {
         }
         ensure!(
             kind.signs_in(),
-            "only database, Redis and SSH checks sign in"
+            "only database, Redis, SSH and mail checks sign in"
         );
         if let Some(username) = &self.username {
             ensure!(
@@ -242,7 +242,7 @@ impl SignIn {
                 if kind != CheckKind::Redis {
                     ensure!(self.username.is_some(), "signing in needs a username");
                 }
-                if kind == CheckKind::Redis || kind == CheckKind::Ssh {
+                if kind != CheckKind::Postgres && kind != CheckKind::Mysql {
                     ensure!(
                         self.password.is_some() || self.password_env.is_some(),
                         "signing in needs a password"

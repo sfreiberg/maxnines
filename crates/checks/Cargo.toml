@@ -32,6 +32,11 @@ redis = { version = "1.8.2", default-features = false, features = ["tokio-rustls
 russh = { version = "0.65.1", default-features = false, features = ["ring", "rsa"] }
 tokio-postgres = { version = "0.7.18", default-features = false, features = ["runtime"] }
 tokio-postgres-rustls = "0.13"
+# Signing in to mail servers, with real clients so that a check can later send
+# itself a message and read it back. POP3's only library can't upgrade to TLS
+# with STLS, so POP3 is spoken here instead.
+async-imap = { version = "0.12.0", default-features = false, features = ["runtime-tokio"] }
+lettre = { version = "0.11.23", default-features = false, features = ["tokio1", "smtp-transport", "tokio1-rustls", "ring", "webpki-roots"] }
 
 [dev-dependencies]
 rcgen = "0.14"

@@ -28,7 +28,7 @@ use crate::remote_checks::{
 };
 use crate::silences::{ActiveSilences, SilenceInput};
 
-const KINDS: [CheckKind; 9] = [
+const KINDS: [CheckKind; 12] = [
     CheckKind::Http,
     CheckKind::Tcp,
     CheckKind::Tls,
@@ -38,6 +38,9 @@ const KINDS: [CheckKind; 9] = [
     CheckKind::Mysql,
     CheckKind::Redis,
     CheckKind::Ssh,
+    CheckKind::Smtp,
+    CheckKind::Imap,
+    CheckKind::Pop3,
 ];
 
 pub fn routes() -> Router<AppState> {

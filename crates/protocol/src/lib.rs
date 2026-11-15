@@ -346,6 +346,9 @@ pub enum CheckKind {
     Mysql,
     Redis,
     Ssh,
+    Smtp,
+    Imap,
+    Pop3,
 }
 
 impl CheckKind {
@@ -360,12 +363,24 @@ impl CheckKind {
             Self::Mysql => "mysql",
             Self::Redis => "redis",
             Self::Ssh => "ssh",
+            Self::Smtp => "smtp",
+            Self::Imap => "imap",
+            Self::Pop3 => "pop3",
         }
     }
 
     /// Whether it can sign in, with a username and password, or a key for ssh.
     pub fn signs_in(self) -> bool {
-        matches!(self, Self::Postgres | Self::Mysql | Self::Redis | Self::Ssh)
+        matches!(
+            self,
+            Self::Postgres
+                | Self::Mysql
+                | Self::Redis
+                | Self::Ssh
+                | Self::Smtp
+                | Self::Imap
+                | Self::Pop3
+        )
     }
 
     pub fn parse(text: &str) -> Option<Self> {
@@ -379,6 +394,9 @@ impl CheckKind {
             "mysql" => Some(Self::Mysql),
             "redis" => Some(Self::Redis),
             "ssh" => Some(Self::Ssh),
+            "smtp" => Some(Self::Smtp),
+            "imap" => Some(Self::Imap),
+            "pop3" => Some(Self::Pop3),
             _ => None,
         }
     }
@@ -466,7 +484,10 @@ impl Check {
             | CheckKind::Postgres
             | CheckKind::Mysql
             | CheckKind::Redis
-            | CheckKind::Ssh => ensure!(
+            | CheckKind::Ssh
+            | CheckKind::Smtp
+            | CheckKind::Imap
+            | CheckKind::Pop3 => ensure!(
                 has_port(target),
                 "check {name:?} needs a target like host:port"
             ),
@@ -503,13 +524,22 @@ impl Check {
                 CheckKind::Postgres,
                 CheckKind::Mysql,
                 CheckKind::Redis,
+                CheckKind::Smtp,
+                CheckKind::Imap,
+                CheckKind::Pop3,
             ],
         )?;
         only_for(self.database.is_some(), "database", &[CheckKind::Postgres])?;
         only_for(
             self.tls.is_some(),
             "tls",
-            &[CheckKind::Mysql, CheckKind::Redis],
+            &[
+                CheckKind::Mysql,
+                CheckKind::Redis,
+                CheckKind::Smtp,
+                CheckKind::Imap,
+                CheckKind::Pop3,
+            ],
         )?;
         only_for(self.host_key.is_some(), "host_key", &[CheckKind::Ssh])?;
         if let Some(database) = &self.database {

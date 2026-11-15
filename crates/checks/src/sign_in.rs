@@ -39,7 +39,7 @@ impl fmt::Debug for Credentials {
 }
 
 impl Credentials {
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.username.is_none() && self.password.is_none() && self.private_key.is_none()
     }
 }
@@ -73,7 +73,7 @@ fn driver_tls(insecure: bool) -> Result<ClientConfig> {
 
 /// A driver's error in a few words. Some of them repeat the connection's
 /// settings, so only their own description is kept, never the whole chain.
-fn short(error: impl fmt::Display) -> anyhow::Error {
+pub(crate) fn short(error: impl fmt::Display) -> anyhow::Error {
     let text = error.to_string();
     let text = text.lines().next().unwrap_or_default();
     anyhow!("{}", text.chars().take(200).collect::<String>())
