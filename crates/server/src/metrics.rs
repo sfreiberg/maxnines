@@ -1404,165 +1404,155 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    // Databases an agent's config defines and a rule picks. Each is a series by
-    // the database's name, or by its name and what it's of, such as `orders
-    // standby replica1`. Running totals are rates. What every kind has is a
-    // database metric, so it charts every database together.
+    // Databases an agent's config defines and a rule picks, or a server check
+    // reads. Each kind's rows are grouped under it, so its values are its own,
+    // such as `postgres.connections`. Each is a series by the database's name, or
+    // by its name and what it's of, such as `orders standby replica1`. Running
+    // totals are rates.
+    // PostgreSQL.
     Metric {
-        name: "database.up",
-        title: "Database answering",
+        name: "postgres.up",
+        title: "PostgreSQL answering",
         unit: Unit::Number,
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.up"),
+            reading: Reading::Field("$.postgres.up"),
         },
         chart: ShowChart::Never,
     },
     Metric {
-        name: "database.uptime",
-        title: "Database uptime",
+        name: "postgres.uptime",
+        title: "PostgreSQL uptime",
         unit: Unit::Seconds,
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.uptime_secs"),
+            reading: Reading::Field("$.postgres.uptime_secs"),
         },
         chart: ShowChart::Never,
     },
     Metric {
-        name: "database.connections",
-        title: "Database connections",
+        name: "postgres.connections",
+        title: "PostgreSQL connections",
         unit: Unit::Number,
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.connections"),
+            reading: Reading::Field("$.postgres.connections"),
         },
         chart: ShowChart::WithData,
     },
     Metric {
-        name: "database.connections_used",
-        title: "Database connections used",
+        name: "postgres.connections_used",
+        title: "PostgreSQL connections used",
         unit: Unit::Percent,
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.connections_used"),
+            reading: Reading::Field("$.postgres.connections_used"),
         },
         chart: ShowChart::WithData,
     },
     Metric {
-        name: "database.refused",
-        title: "Database connections refused at the limit",
-        unit: Unit::PerSecond,
-        collector: "databases",
-        source: Source::Items {
-            name: "$.name",
-            reading: Reading::Rate("$.refused"),
-        },
-        chart: ShowChart::Never,
-    },
-    Metric {
-        name: "database.oldest_transaction",
-        title: "Database oldest transaction",
+        name: "postgres.oldest_transaction",
+        title: "PostgreSQL oldest transaction",
         unit: Unit::Seconds,
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.oldest_transaction_secs"),
+            reading: Reading::Field("$.postgres.oldest_transaction_secs"),
         },
         chart: ShowChart::WithData,
     },
     Metric {
-        name: "database.oldest_query",
-        title: "Database oldest query",
+        name: "postgres.oldest_query",
+        title: "PostgreSQL oldest query",
         unit: Unit::Seconds,
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.oldest_query_secs"),
+            reading: Reading::Field("$.postgres.oldest_query_secs"),
         },
         chart: ShowChart::WithData,
     },
     Metric {
-        name: "database.rollbacks",
-        title: "Database rollbacks",
+        name: "postgres.rollbacks",
+        title: "PostgreSQL rollbacks",
         unit: Unit::PerSecond,
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.rollbacks"),
+            reading: Reading::Rate("$.postgres.rollbacks"),
         },
         chart: ShowChart::WithData,
     },
     Metric {
-        name: "database.deadlocks",
-        title: "Database deadlocks",
+        name: "postgres.deadlocks",
+        title: "PostgreSQL deadlocks",
         unit: Unit::PerSecond,
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.deadlocks"),
+            reading: Reading::Rate("$.postgres.deadlocks"),
         },
         chart: ShowChart::WithData,
     },
     Metric {
-        name: "database.cache_hit",
-        title: "Database cache hit rate",
+        name: "postgres.cache_hit",
+        title: "PostgreSQL cache hit rate",
         unit: Unit::Percent,
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.cache_hit"),
+            reading: Reading::Field("$.postgres.cache_hit"),
         },
         chart: ShowChart::WithData,
     },
     Metric {
-        name: "database.replica",
-        title: "Database is a replica",
+        name: "postgres.replica",
+        title: "PostgreSQL is a replica",
         unit: Unit::Number,
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.replica"),
+            reading: Reading::Field("$.postgres.replica"),
         },
         chart: ShowChart::Never,
     },
     Metric {
-        name: "database.receiving",
-        title: "Database replica receiving",
+        name: "postgres.receiving",
+        title: "PostgreSQL replica receiving",
         unit: Unit::Number,
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.receiving"),
+            reading: Reading::Field("$.postgres.receiving"),
         },
         chart: ShowChart::Never,
     },
     Metric {
-        name: "database.lag",
-        title: "Database replication lag",
+        name: "postgres.lag",
+        title: "PostgreSQL replication lag",
         unit: Unit::Seconds,
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.lag_secs"),
+            reading: Reading::Field("$.postgres.lag_secs"),
         },
         chart: ShowChart::WithData,
     },
     Metric {
-        name: "database.size",
-        title: "Database size",
+        name: "postgres.size",
+        title: "PostgreSQL database size",
         unit: Unit::Bytes,
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.size_bytes"),
+            reading: Reading::Field("$.postgres.size_bytes"),
         },
         chart: ShowChart::WithData,
     },
-    // Only PostgreSQL has these.
     Metric {
         name: "postgres.active",
         title: "PostgreSQL active queries",
@@ -1570,7 +1560,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.active"),
+            reading: Reading::Field("$.postgres.active"),
         },
         chart: ShowChart::WithData,
     },
@@ -1581,7 +1571,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.idle_in_transaction"),
+            reading: Reading::Field("$.postgres.idle_in_transaction"),
         },
         chart: ShowChart::WithData,
     },
@@ -1592,7 +1582,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.waiting_on_locks"),
+            reading: Reading::Field("$.postgres.waiting_on_locks"),
         },
         chart: ShowChart::WithData,
     },
@@ -1603,7 +1593,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.oldest_idle_in_transaction_secs"),
+            reading: Reading::Field("$.postgres.oldest_idle_in_transaction_secs"),
         },
         chart: ShowChart::Never,
     },
@@ -1614,7 +1604,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.transactions"),
+            reading: Reading::Rate("$.postgres.transactions"),
         },
         chart: ShowChart::WithData,
     },
@@ -1625,7 +1615,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.temp_bytes"),
+            reading: Reading::Rate("$.postgres.temp_bytes"),
         },
         chart: ShowChart::WithData,
     },
@@ -1636,7 +1626,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.conflicts"),
+            reading: Reading::Rate("$.postgres.conflicts"),
         },
         chart: ShowChart::Never,
     },
@@ -1647,7 +1637,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.checksum_failures"),
+            reading: Reading::Rate("$.postgres.checksum_failures"),
         },
         chart: ShowChart::Never,
     },
@@ -1658,7 +1648,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.checkpoints_timed"),
+            reading: Reading::Rate("$.postgres.checkpoints_timed"),
         },
         chart: ShowChart::Never,
     },
@@ -1669,7 +1659,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.checkpoints_requested"),
+            reading: Reading::Rate("$.postgres.checkpoints_requested"),
         },
         chart: ShowChart::WithData,
     },
@@ -1680,7 +1670,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.wal_bytes"),
+            reading: Reading::Rate("$.postgres.wal_bytes"),
         },
         chart: ShowChart::WithData,
     },
@@ -1691,7 +1681,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.wal_size_bytes"),
+            reading: Reading::Field("$.postgres.wal_size_bytes"),
         },
         chart: ShowChart::WithData,
     },
@@ -1702,7 +1692,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.xid_age"),
+            reading: Reading::Field("$.postgres.xid_age"),
         },
         chart: ShowChart::WithData,
     },
@@ -1713,7 +1703,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.mxid_age"),
+            reading: Reading::Field("$.postgres.mxid_age"),
         },
         chart: ShowChart::Never,
     },
@@ -1724,7 +1714,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.prepared"),
+            reading: Reading::Field("$.postgres.prepared"),
         },
         chart: ShowChart::Never,
     },
@@ -1735,7 +1725,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.oldest_prepared_secs"),
+            reading: Reading::Field("$.postgres.oldest_prepared_secs"),
         },
         chart: ShowChart::Never,
     },
@@ -1746,7 +1736,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.standbys"),
+            reading: Reading::Field("$.postgres.standbys"),
         },
         chart: ShowChart::Never,
     },
@@ -1757,7 +1747,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.synchronous_standbys"),
+            reading: Reading::Field("$.postgres.synchronous_standbys"),
         },
         chart: ShowChart::Never,
     },
@@ -1768,7 +1758,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.lag_bytes"),
+            reading: Reading::Field("$.postgres.lag_bytes"),
         },
         chart: ShowChart::WithData,
     },
@@ -1779,7 +1769,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.streaming"),
+            reading: Reading::Field("$.postgres.streaming"),
         },
         chart: ShowChart::Never,
     },
@@ -1790,7 +1780,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.last_received_secs"),
+            reading: Reading::Field("$.postgres.last_received_secs"),
         },
         chart: ShowChart::Never,
     },
@@ -1801,7 +1791,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.replay_backlog_bytes"),
+            reading: Reading::Field("$.postgres.replay_backlog_bytes"),
         },
         chart: ShowChart::WithData,
     },
@@ -1812,7 +1802,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.replay_paused"),
+            reading: Reading::Field("$.postgres.replay_paused"),
         },
         chart: ShowChart::Never,
     },
@@ -1823,7 +1813,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.timeline"),
+            reading: Reading::Field("$.postgres.timeline"),
         },
         chart: ShowChart::Never,
     },
@@ -1834,7 +1824,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.in_use"),
+            reading: Reading::Field("$.postgres.in_use"),
         },
         chart: ShowChart::Never,
     },
@@ -1845,7 +1835,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.retained_bytes"),
+            reading: Reading::Field("$.postgres.retained_bytes"),
         },
         chart: ShowChart::WithData,
     },
@@ -1856,7 +1846,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.headroom_bytes"),
+            reading: Reading::Field("$.postgres.headroom_bytes"),
         },
         chart: ShowChart::Never,
     },
@@ -1867,7 +1857,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.lost"),
+            reading: Reading::Field("$.postgres.lost"),
         },
         chart: ShowChart::Never,
     },
@@ -1878,7 +1868,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.archive_failing"),
+            reading: Reading::Field("$.postgres.archive_failing"),
         },
         chart: ShowChart::Never,
     },
@@ -1889,7 +1879,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.archive_waiting"),
+            reading: Reading::Field("$.postgres.archive_waiting"),
         },
         chart: ShowChart::WithData,
     },
@@ -1900,7 +1890,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.archived"),
+            reading: Reading::Rate("$.postgres.archived"),
         },
         chart: ShowChart::Never,
     },
@@ -1911,7 +1901,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.archive_failures"),
+            reading: Reading::Rate("$.postgres.archive_failures"),
         },
         chart: ShowChart::Never,
     },
@@ -1922,7 +1912,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.running"),
+            reading: Reading::Field("$.postgres.running"),
         },
         chart: ShowChart::Never,
     },
@@ -1933,11 +1923,176 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.errors"),
+            reading: Reading::Rate("$.postgres.errors"),
         },
         chart: ShowChart::Never,
     },
-    // Only MySQL and MariaDB have these, Galera's included.
+    // MySQL.
+    Metric {
+        name: "mysql.up",
+        title: "MySQL answering",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.mysql.up"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.uptime",
+        title: "MySQL uptime",
+        unit: Unit::Seconds,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.mysql.uptime_secs"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.connections",
+        title: "MySQL connections",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.mysql.connections"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mysql.connections_used",
+        title: "MySQL connections used",
+        unit: Unit::Percent,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.mysql.connections_used"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mysql.refused",
+        title: "MySQL connections refused at the limit",
+        unit: Unit::PerSecond,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Rate("$.mysql.refused"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.queries",
+        title: "MySQL queries",
+        unit: Unit::PerSecond,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Rate("$.mysql.queries"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mysql.oldest_transaction",
+        title: "MySQL oldest transaction",
+        unit: Unit::Seconds,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.mysql.oldest_transaction_secs"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mysql.oldest_query",
+        title: "MySQL oldest query",
+        unit: Unit::Seconds,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.mysql.oldest_query_secs"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mysql.rollbacks",
+        title: "MySQL rollbacks",
+        unit: Unit::PerSecond,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Rate("$.mysql.rollbacks"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mysql.deadlocks",
+        title: "MySQL deadlocks",
+        unit: Unit::PerSecond,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Rate("$.mysql.deadlocks"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mysql.cache_hit",
+        title: "MySQL cache hit rate",
+        unit: Unit::Percent,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.mysql.cache_hit"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mysql.replica",
+        title: "MySQL is a replica",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.mysql.replica"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.receiving",
+        title: "MySQL replica receiving",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.mysql.receiving"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mysql.lag",
+        title: "MySQL replication lag",
+        unit: Unit::Seconds,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.mysql.lag_secs"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mysql.size",
+        title: "MySQL database size",
+        unit: Unit::Bytes,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.mysql.size_bytes"),
+        },
+        chart: ShowChart::WithData,
+    },
     Metric {
         name: "mysql.threads_running",
         title: "MySQL queries running",
@@ -1945,18 +2100,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.threads_running"),
-        },
-        chart: ShowChart::WithData,
-    },
-    Metric {
-        name: "database.queries",
-        title: "Database queries",
-        unit: Unit::PerSecond,
-        collector: "databases",
-        source: Source::Items {
-            name: "$.name",
-            reading: Reading::Rate("$.queries"),
+            reading: Reading::Field("$.mysql.threads_running"),
         },
         chart: ShowChart::WithData,
     },
@@ -1967,7 +2111,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.slow_queries"),
+            reading: Reading::Rate("$.mysql.slow_queries"),
         },
         chart: ShowChart::WithData,
     },
@@ -1978,7 +2122,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.commits"),
+            reading: Reading::Rate("$.mysql.commits"),
         },
         chart: ShowChart::Never,
     },
@@ -1989,7 +2133,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.aborted_connects"),
+            reading: Reading::Rate("$.mysql.aborted_connects"),
         },
         chart: ShowChart::Never,
     },
@@ -2000,7 +2144,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.tmp_disk_tables"),
+            reading: Reading::Rate("$.mysql.tmp_disk_tables"),
         },
         chart: ShowChart::WithData,
     },
@@ -2011,7 +2155,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.pool_dirty"),
+            reading: Reading::Field("$.mysql.pool_dirty"),
         },
         chart: ShowChart::WithData,
     },
@@ -2022,7 +2166,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.pool_waits"),
+            reading: Reading::Rate("$.mysql.pool_waits"),
         },
         chart: ShowChart::Never,
     },
@@ -2033,7 +2177,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.lock_waits"),
+            reading: Reading::Field("$.mysql.lock_waits"),
         },
         chart: ShowChart::WithData,
     },
@@ -2044,7 +2188,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.history_length"),
+            reading: Reading::Field("$.mysql.history_length"),
         },
         chart: ShowChart::WithData,
     },
@@ -2055,7 +2199,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.open_transactions"),
+            reading: Reading::Field("$.mysql.open_transactions"),
         },
         chart: ShowChart::WithData,
     },
@@ -2066,7 +2210,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.read_only"),
+            reading: Reading::Field("$.mysql.read_only"),
         },
         chart: ShowChart::Never,
     },
@@ -2077,7 +2221,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.super_read_only"),
+            reading: Reading::Field("$.mysql.super_read_only"),
         },
         chart: ShowChart::Never,
     },
@@ -2088,7 +2232,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.applying"),
+            reading: Reading::Field("$.mysql.applying"),
         },
         chart: ShowChart::Never,
     },
@@ -2099,7 +2243,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.relay_log_bytes"),
+            reading: Reading::Field("$.mysql.relay_log_bytes"),
         },
         chart: ShowChart::Never,
     },
@@ -2110,7 +2254,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.replication_errno"),
+            reading: Reading::Field("$.mysql.replication_errno"),
         },
         chart: ShowChart::Never,
     },
@@ -2121,7 +2265,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.semi_sync"),
+            reading: Reading::Field("$.mysql.semi_sync"),
         },
         chart: ShowChart::Never,
     },
@@ -2132,7 +2276,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.semi_sync_clients"),
+            reading: Reading::Field("$.mysql.semi_sync_clients"),
         },
         chart: ShowChart::Never,
     },
@@ -2143,7 +2287,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.semi_sync_misses"),
+            reading: Reading::Rate("$.mysql.semi_sync_misses"),
         },
         chart: ShowChart::Never,
     },
@@ -2154,7 +2298,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.group_members"),
+            reading: Reading::Field("$.mysql.group_members"),
         },
         chart: ShowChart::Never,
     },
@@ -2165,7 +2309,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.group_online"),
+            reading: Reading::Field("$.mysql.group_online"),
         },
         chart: ShowChart::WithData,
     },
@@ -2176,7 +2320,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.member_online"),
+            reading: Reading::Field("$.mysql.member_online"),
         },
         chart: ShowChart::Never,
     },
@@ -2187,7 +2331,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.applier_queue"),
+            reading: Reading::Field("$.mysql.applier_queue"),
         },
         chart: ShowChart::WithData,
     },
@@ -2198,7 +2342,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.certifier_queue"),
+            reading: Reading::Field("$.mysql.certifier_queue"),
         },
         chart: ShowChart::Never,
     },
@@ -2209,7 +2353,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.group_conflicts"),
+            reading: Reading::Rate("$.mysql.group_conflicts"),
         },
         chart: ShowChart::Never,
     },
@@ -2220,7 +2364,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.galera_primary"),
+            reading: Reading::Field("$.mysql.galera_primary"),
         },
         chart: ShowChart::Never,
     },
@@ -2231,7 +2375,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.galera_size"),
+            reading: Reading::Field("$.mysql.galera_size"),
         },
         chart: ShowChart::WithData,
     },
@@ -2242,7 +2386,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.galera_ready"),
+            reading: Reading::Field("$.mysql.galera_ready"),
         },
         chart: ShowChart::Never,
     },
@@ -2253,7 +2397,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.galera_connected"),
+            reading: Reading::Field("$.mysql.galera_connected"),
         },
         chart: ShowChart::Never,
     },
@@ -2264,7 +2408,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.galera_synced"),
+            reading: Reading::Field("$.mysql.galera_synced"),
         },
         chart: ShowChart::Never,
     },
@@ -2275,7 +2419,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.galera_receive_queue"),
+            reading: Reading::Field("$.mysql.galera_receive_queue"),
         },
         chart: ShowChart::WithData,
     },
@@ -2286,7 +2430,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.galera_send_queue"),
+            reading: Reading::Field("$.mysql.galera_send_queue"),
         },
         chart: ShowChart::Never,
     },
@@ -2297,7 +2441,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.galera_cert_failures"),
+            reading: Reading::Rate("$.mysql.galera_cert_failures"),
         },
         chart: ShowChart::Never,
     },
@@ -2308,7 +2452,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.galera_flow_paused"),
+            reading: Reading::Rate("$.mysql.galera_flow_paused"),
         },
         chart: ShowChart::WithData,
     },
@@ -2319,11 +2463,121 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.binlog_size_bytes"),
+            reading: Reading::Field("$.mysql.binlog_size_bytes"),
         },
         chart: ShowChart::WithData,
     },
-    // Only MongoDB has these.
+    // MongoDB.
+    Metric {
+        name: "mongodb.up",
+        title: "MongoDB answering",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.mongodb.up"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mongodb.uptime",
+        title: "MongoDB uptime",
+        unit: Unit::Seconds,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.mongodb.uptime_secs"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mongodb.connections",
+        title: "MongoDB connections",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.mongodb.connections"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mongodb.connections_used",
+        title: "MongoDB connections used",
+        unit: Unit::Percent,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.mongodb.connections_used"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mongodb.refused",
+        title: "MongoDB connections refused at the limit",
+        unit: Unit::PerSecond,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Rate("$.mongodb.refused"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mongodb.oldest_query",
+        title: "MongoDB oldest query",
+        unit: Unit::Seconds,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.mongodb.oldest_query_secs"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mongodb.replica",
+        title: "MongoDB is a replica",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.mongodb.replica"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mongodb.receiving",
+        title: "MongoDB replica receiving",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.mongodb.receiving"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "mongodb.lag",
+        title: "MongoDB replication lag",
+        unit: Unit::Seconds,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.mongodb.lag_secs"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "mongodb.size",
+        title: "MongoDB database size",
+        unit: Unit::Bytes,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.mongodb.size_bytes"),
+        },
+        chart: ShowChart::WithData,
+    },
     Metric {
         name: "mongodb.operations",
         title: "MongoDB operations",
@@ -2331,7 +2585,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.operations"),
+            reading: Reading::Rate("$.mongodb.operations"),
         },
         chart: ShowChart::WithData,
     },
@@ -2342,7 +2596,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.reads_latency_ms"),
+            reading: Reading::Field("$.mongodb.reads_latency_ms"),
         },
         chart: ShowChart::WithData,
     },
@@ -2353,7 +2607,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.writes_latency_ms"),
+            reading: Reading::Field("$.mongodb.writes_latency_ms"),
         },
         chart: ShowChart::WithData,
     },
@@ -2364,7 +2618,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.queued_reads"),
+            reading: Reading::Field("$.mongodb.queued_reads"),
         },
         chart: ShowChart::WithData,
     },
@@ -2375,7 +2629,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.queued_writes"),
+            reading: Reading::Field("$.mongodb.queued_writes"),
         },
         chart: ShowChart::WithData,
     },
@@ -2386,7 +2640,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.read_tickets"),
+            reading: Reading::Field("$.mongodb.read_tickets"),
         },
         chart: ShowChart::Never,
     },
@@ -2397,7 +2651,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.write_tickets"),
+            reading: Reading::Field("$.mongodb.write_tickets"),
         },
         chart: ShowChart::Never,
     },
@@ -2408,7 +2662,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.cache_used"),
+            reading: Reading::Field("$.mongodb.cache_used"),
         },
         chart: ShowChart::WithData,
     },
@@ -2419,7 +2673,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.cache_dirty"),
+            reading: Reading::Field("$.mongodb.cache_dirty"),
         },
         chart: ShowChart::WithData,
     },
@@ -2430,7 +2684,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.cursors_open"),
+            reading: Reading::Field("$.mongodb.cursors_open"),
         },
         chart: ShowChart::Never,
     },
@@ -2441,7 +2695,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.cursors_timed_out"),
+            reading: Reading::Rate("$.mongodb.cursors_timed_out"),
         },
         chart: ShowChart::Never,
     },
@@ -2452,7 +2706,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.asserts"),
+            reading: Reading::Rate("$.mongodb.asserts"),
         },
         chart: ShowChart::Never,
     },
@@ -2463,7 +2717,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.resident_bytes"),
+            reading: Reading::Field("$.mongodb.resident_bytes"),
         },
         chart: ShowChart::WithData,
     },
@@ -2474,7 +2728,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.flow_control_lagged"),
+            reading: Reading::Field("$.mongodb.flow_control_lagged"),
         },
         chart: ShowChart::Never,
     },
@@ -2485,7 +2739,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.members"),
+            reading: Reading::Field("$.mongodb.members"),
         },
         chart: ShowChart::Never,
     },
@@ -2496,7 +2750,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.members_healthy"),
+            reading: Reading::Field("$.mongodb.members_healthy"),
         },
         chart: ShowChart::WithData,
     },
@@ -2507,7 +2761,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.has_primary"),
+            reading: Reading::Field("$.mongodb.has_primary"),
         },
         chart: ShowChart::Never,
     },
@@ -2518,7 +2772,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.term"),
+            reading: Reading::Field("$.mongodb.term"),
         },
         chart: ShowChart::Never,
     },
@@ -2529,7 +2783,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.majority_lag_secs"),
+            reading: Reading::Field("$.mongodb.majority_lag_secs"),
         },
         chart: ShowChart::WithData,
     },
@@ -2540,7 +2794,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.member_healthy"),
+            reading: Reading::Field("$.mongodb.member_healthy"),
         },
         chart: ShowChart::Never,
     },
@@ -2551,7 +2805,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.member_lag_secs"),
+            reading: Reading::Field("$.mongodb.member_lag_secs"),
         },
         chart: ShowChart::WithData,
     },
@@ -2562,11 +2816,99 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.oplog_window_secs"),
+            reading: Reading::Field("$.mongodb.oplog_window_secs"),
         },
         chart: ShowChart::WithData,
     },
-    // Only ClickHouse has these.
+    // ClickHouse.
+    Metric {
+        name: "clickhouse.up",
+        title: "ClickHouse answering",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.clickhouse.up"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "clickhouse.uptime",
+        title: "ClickHouse uptime",
+        unit: Unit::Seconds,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.clickhouse.uptime_secs"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
+        name: "clickhouse.connections",
+        title: "ClickHouse connections",
+        unit: Unit::Number,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.clickhouse.connections"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "clickhouse.connections_used",
+        title: "ClickHouse connections used",
+        unit: Unit::Percent,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.clickhouse.connections_used"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "clickhouse.queries",
+        title: "ClickHouse queries",
+        unit: Unit::PerSecond,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Rate("$.clickhouse.queries"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "clickhouse.oldest_query",
+        title: "ClickHouse oldest query",
+        unit: Unit::Seconds,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.clickhouse.oldest_query_secs"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "clickhouse.lag",
+        title: "ClickHouse replication lag",
+        unit: Unit::Seconds,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.clickhouse.lag_secs"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "clickhouse.size",
+        title: "ClickHouse database size",
+        unit: Unit::Bytes,
+        collector: "databases",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.clickhouse.size_bytes"),
+        },
+        chart: ShowChart::WithData,
+    },
     Metric {
         name: "clickhouse.running_queries",
         title: "ClickHouse queries running",
@@ -2574,7 +2916,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.running_queries"),
+            reading: Reading::Field("$.clickhouse.running_queries"),
         },
         chart: ShowChart::WithData,
     },
@@ -2585,7 +2927,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.queries_used"),
+            reading: Reading::Field("$.clickhouse.queries_used"),
         },
         chart: ShowChart::WithData,
     },
@@ -2596,7 +2938,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.preempted_queries"),
+            reading: Reading::Field("$.clickhouse.preempted_queries"),
         },
         chart: ShowChart::Never,
     },
@@ -2607,7 +2949,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.interserver_connections"),
+            reading: Reading::Field("$.clickhouse.interserver_connections"),
         },
         chart: ShowChart::Never,
     },
@@ -2618,7 +2960,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.selects"),
+            reading: Reading::Rate("$.clickhouse.selects"),
         },
         chart: ShowChart::Never,
     },
@@ -2629,7 +2971,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.inserts"),
+            reading: Reading::Rate("$.clickhouse.inserts"),
         },
         chart: ShowChart::WithData,
     },
@@ -2640,7 +2982,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.failed_queries"),
+            reading: Reading::Rate("$.clickhouse.failed_queries"),
         },
         chart: ShowChart::WithData,
     },
@@ -2651,7 +2993,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.failed_selects"),
+            reading: Reading::Rate("$.clickhouse.failed_selects"),
         },
         chart: ShowChart::Never,
     },
@@ -2662,7 +3004,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.failed_inserts"),
+            reading: Reading::Rate("$.clickhouse.failed_inserts"),
         },
         chart: ShowChart::Never,
     },
@@ -2673,7 +3015,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.latency_ms"),
+            reading: Reading::Field("$.clickhouse.latency_ms"),
         },
         chart: ShowChart::WithData,
     },
@@ -2684,7 +3026,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.select_latency_ms"),
+            reading: Reading::Field("$.clickhouse.select_latency_ms"),
         },
         chart: ShowChart::Never,
     },
@@ -2695,7 +3037,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.insert_latency_ms"),
+            reading: Reading::Field("$.clickhouse.insert_latency_ms"),
         },
         chart: ShowChart::Never,
     },
@@ -2706,7 +3048,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.inserted_rows"),
+            reading: Reading::Rate("$.clickhouse.inserted_rows"),
         },
         chart: ShowChart::WithData,
     },
@@ -2717,7 +3059,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.inserted_bytes"),
+            reading: Reading::Rate("$.clickhouse.inserted_bytes"),
         },
         chart: ShowChart::Never,
     },
@@ -2728,7 +3070,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.rows_per_insert"),
+            reading: Reading::Field("$.clickhouse.rows_per_insert"),
         },
         chart: ShowChart::Never,
     },
@@ -2739,7 +3081,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.max_parts_per_partition"),
+            reading: Reading::Field("$.clickhouse.max_parts_per_partition"),
         },
         chart: ShowChart::WithData,
     },
@@ -2750,7 +3092,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.parts_used"),
+            reading: Reading::Field("$.clickhouse.parts_used"),
         },
         chart: ShowChart::WithData,
     },
@@ -2761,7 +3103,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.parts_total"),
+            reading: Reading::Field("$.clickhouse.parts_total"),
         },
         chart: ShowChart::Never,
     },
@@ -2772,7 +3114,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.delayed_inserts"),
+            reading: Reading::Field("$.clickhouse.delayed_inserts"),
         },
         chart: ShowChart::Never,
     },
@@ -2783,7 +3125,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.inserts_delayed"),
+            reading: Reading::Rate("$.clickhouse.inserts_delayed"),
         },
         chart: ShowChart::Never,
     },
@@ -2794,7 +3136,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.insert_delay_ms"),
+            reading: Reading::Rate("$.clickhouse.insert_delay_ms"),
         },
         chart: ShowChart::Never,
     },
@@ -2805,7 +3147,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.rejected_inserts"),
+            reading: Reading::Rate("$.clickhouse.rejected_inserts"),
         },
         chart: ShowChart::Never,
     },
@@ -2816,7 +3158,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.pending_async_inserts"),
+            reading: Reading::Field("$.clickhouse.pending_async_inserts"),
         },
         chart: ShowChart::Never,
     },
@@ -2827,7 +3169,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.failed_async_inserts"),
+            reading: Reading::Rate("$.clickhouse.failed_async_inserts"),
         },
         chart: ShowChart::Never,
     },
@@ -2838,7 +3180,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.async_queue_oldest_secs"),
+            reading: Reading::Field("$.clickhouse.async_queue_oldest_secs"),
         },
         chart: ShowChart::Never,
     },
@@ -2849,7 +3191,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.memory_bytes"),
+            reading: Reading::Field("$.clickhouse.memory_bytes"),
         },
         chart: ShowChart::WithData,
     },
@@ -2860,7 +3202,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.memory_used"),
+            reading: Reading::Field("$.clickhouse.memory_used"),
         },
         chart: ShowChart::WithData,
     },
@@ -2871,7 +3213,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.merge_memory_bytes"),
+            reading: Reading::Field("$.clickhouse.merge_memory_bytes"),
         },
         chart: ShowChart::Never,
     },
@@ -2882,7 +3224,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.memory_limit_exceeded"),
+            reading: Reading::Rate("$.clickhouse.memory_limit_exceeded"),
         },
         chart: ShowChart::Never,
     },
@@ -2893,7 +3235,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.overcommit_wait_ms"),
+            reading: Reading::Rate("$.clickhouse.overcommit_wait_ms"),
         },
         chart: ShowChart::Never,
     },
@@ -2904,7 +3246,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.merges_running"),
+            reading: Reading::Field("$.clickhouse.merges_running"),
         },
         chart: ShowChart::WithData,
     },
@@ -2915,7 +3257,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.pool_used"),
+            reading: Reading::Field("$.clickhouse.pool_used"),
         },
         chart: ShowChart::WithData,
     },
@@ -2926,7 +3268,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.pool_tasks"),
+            reading: Reading::Field("$.clickhouse.pool_tasks"),
         },
         chart: ShowChart::Never,
     },
@@ -2937,7 +3279,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.mutations_pending"),
+            reading: Reading::Field("$.clickhouse.mutations_pending"),
         },
         chart: ShowChart::WithData,
     },
@@ -2948,7 +3290,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.mutations_failing"),
+            reading: Reading::Field("$.clickhouse.mutations_failing"),
         },
         chart: ShowChart::Never,
     },
@@ -2959,7 +3301,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.mutations_delayed"),
+            reading: Reading::Rate("$.clickhouse.mutations_delayed"),
         },
         chart: ShowChart::Never,
     },
@@ -2970,7 +3312,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.mutations_rejected"),
+            reading: Reading::Rate("$.clickhouse.mutations_rejected"),
         },
         chart: ShowChart::Never,
     },
@@ -2981,7 +3323,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.dictionaries_failing"),
+            reading: Reading::Field("$.clickhouse.dictionaries_failing"),
         },
         chart: ShowChart::Never,
     },
@@ -2992,7 +3334,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.detached_parts"),
+            reading: Reading::Field("$.clickhouse.detached_parts"),
         },
         chart: ShowChart::Never,
     },
@@ -3003,7 +3345,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.detached_broken"),
+            reading: Reading::Field("$.clickhouse.detached_broken"),
         },
         chart: ShowChart::Never,
     },
@@ -3014,7 +3356,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.backups_failed"),
+            reading: Reading::Field("$.clickhouse.backups_failed"),
         },
         chart: ShowChart::Never,
     },
@@ -3025,7 +3367,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.error_count"),
+            reading: Reading::Rate("$.clickhouse.error_count"),
         },
         chart: ShowChart::WithData,
     },
@@ -3036,7 +3378,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.buffer_flush_errors"),
+            reading: Reading::Rate("$.clickhouse.buffer_flush_errors"),
         },
         chart: ShowChart::Never,
     },
@@ -3047,7 +3389,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.slow_reads"),
+            reading: Reading::Rate("$.clickhouse.slow_reads"),
         },
         chart: ShowChart::Never,
     },
@@ -3058,7 +3400,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.read_failures"),
+            reading: Reading::Rate("$.clickhouse.read_failures"),
         },
         chart: ShowChart::Never,
     },
@@ -3069,7 +3411,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.write_failures"),
+            reading: Reading::Rate("$.clickhouse.write_failures"),
         },
         chart: ShowChart::Never,
     },
@@ -3080,7 +3422,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.readonly_replicas"),
+            reading: Reading::Field("$.clickhouse.readonly_replicas"),
         },
         chart: ShowChart::Never,
     },
@@ -3091,7 +3433,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.replicated_tables"),
+            reading: Reading::Field("$.clickhouse.replicated_tables"),
         },
         chart: ShowChart::Never,
     },
@@ -3102,7 +3444,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.readonly_tables"),
+            reading: Reading::Field("$.clickhouse.readonly_tables"),
         },
         chart: ShowChart::Never,
     },
@@ -3113,7 +3455,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.expired_sessions"),
+            reading: Reading::Field("$.clickhouse.expired_sessions"),
         },
         chart: ShowChart::Never,
     },
@@ -3124,7 +3466,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.tables_missing_replicas"),
+            reading: Reading::Field("$.clickhouse.tables_missing_replicas"),
         },
         chart: ShowChart::Never,
     },
@@ -3135,7 +3477,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.max_log_lag"),
+            reading: Reading::Field("$.clickhouse.max_log_lag"),
         },
         chart: ShowChart::Never,
     },
@@ -3146,7 +3488,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.replication_queue"),
+            reading: Reading::Field("$.clickhouse.replication_queue"),
         },
         chart: ShowChart::WithData,
     },
@@ -3157,7 +3499,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.max_replication_queue"),
+            reading: Reading::Field("$.clickhouse.max_replication_queue"),
         },
         chart: ShowChart::Never,
     },
@@ -3168,7 +3510,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.inserts_in_queue"),
+            reading: Reading::Field("$.clickhouse.inserts_in_queue"),
         },
         chart: ShowChart::Never,
     },
@@ -3179,7 +3521,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.max_merges_in_queue"),
+            reading: Reading::Field("$.clickhouse.max_merges_in_queue"),
         },
         chart: ShowChart::Never,
     },
@@ -3190,7 +3532,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.max_future_parts"),
+            reading: Reading::Field("$.clickhouse.max_future_parts"),
         },
         chart: ShowChart::Never,
     },
@@ -3201,7 +3543,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.max_parts_to_check"),
+            reading: Reading::Field("$.clickhouse.max_parts_to_check"),
         },
         chart: ShowChart::Never,
     },
@@ -3212,7 +3554,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.oldest_queue_entry_secs"),
+            reading: Reading::Field("$.clickhouse.oldest_queue_entry_secs"),
         },
         chart: ShowChart::Never,
     },
@@ -3223,7 +3565,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.queue_stuck"),
+            reading: Reading::Field("$.clickhouse.queue_stuck"),
         },
         chart: ShowChart::Never,
     },
@@ -3234,7 +3576,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.queue_failing"),
+            reading: Reading::Field("$.clickhouse.queue_failing"),
         },
         chart: ShowChart::Never,
     },
@@ -3245,7 +3587,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.queue_update_errors"),
+            reading: Reading::Field("$.clickhouse.queue_update_errors"),
         },
         chart: ShowChart::Never,
     },
@@ -3256,7 +3598,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.relative_lag_secs"),
+            reading: Reading::Field("$.clickhouse.relative_lag_secs"),
         },
         chart: ShowChart::Never,
     },
@@ -3267,7 +3609,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.lost_parts"),
+            reading: Reading::Rate("$.clickhouse.lost_parts"),
         },
         chart: ShowChart::Never,
     },
@@ -3278,7 +3620,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.fetches_running"),
+            reading: Reading::Field("$.clickhouse.fetches_running"),
         },
         chart: ShowChart::Never,
     },
@@ -3289,7 +3631,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.longest_fetch_secs"),
+            reading: Reading::Field("$.clickhouse.longest_fetch_secs"),
         },
         chart: ShowChart::Never,
     },
@@ -3300,7 +3642,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.failed_fetches"),
+            reading: Reading::Rate("$.clickhouse.failed_fetches"),
         },
         chart: ShowChart::Never,
     },
@@ -3311,7 +3653,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.failed_part_checks"),
+            reading: Reading::Rate("$.clickhouse.failed_part_checks"),
         },
         chart: ShowChart::Never,
     },
@@ -3322,7 +3664,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.data_loss"),
+            reading: Reading::Rate("$.clickhouse.data_loss"),
         },
         chart: ShowChart::Never,
     },
@@ -3333,7 +3675,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.merge_differs"),
+            reading: Reading::Rate("$.clickhouse.merge_differs"),
         },
         chart: ShowChart::Never,
     },
@@ -3344,7 +3686,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.mutation_differs"),
+            reading: Reading::Rate("$.clickhouse.mutation_differs"),
         },
         chart: ShowChart::Never,
     },
@@ -3355,7 +3697,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.partial_shutdowns"),
+            reading: Reading::Rate("$.clickhouse.partial_shutdowns"),
         },
         chart: ShowChart::Never,
     },
@@ -3366,7 +3708,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.distributed_files"),
+            reading: Reading::Field("$.clickhouse.distributed_files"),
         },
         chart: ShowChart::WithData,
     },
@@ -3377,7 +3719,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.distributed_bytes"),
+            reading: Reading::Field("$.clickhouse.distributed_bytes"),
         },
         chart: ShowChart::Never,
     },
@@ -3388,7 +3730,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.distributed_broken_files"),
+            reading: Reading::Field("$.clickhouse.distributed_broken_files"),
         },
         chart: ShowChart::Never,
     },
@@ -3399,7 +3741,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.distributed_retries"),
+            reading: Reading::Rate("$.clickhouse.distributed_retries"),
         },
         chart: ShowChart::Never,
     },
@@ -3410,7 +3752,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.distributed_failures"),
+            reading: Reading::Rate("$.clickhouse.distributed_failures"),
         },
         chart: ShowChart::Never,
     },
@@ -3421,7 +3763,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.distributed_rejected"),
+            reading: Reading::Rate("$.clickhouse.distributed_rejected"),
         },
         chart: ShowChart::Never,
     },
@@ -3432,7 +3774,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.distributed_insert_failures"),
+            reading: Reading::Rate("$.clickhouse.distributed_insert_failures"),
         },
         chart: ShowChart::Never,
     },
@@ -3443,7 +3785,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.distribution_blocked"),
+            reading: Reading::Field("$.clickhouse.distribution_blocked"),
         },
         chart: ShowChart::Never,
     },
@@ -3454,7 +3796,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.distribution_errors"),
+            reading: Reading::Field("$.clickhouse.distribution_errors"),
         },
         chart: ShowChart::Never,
     },
@@ -3465,7 +3807,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.cluster_errors"),
+            reading: Reading::Field("$.clickhouse.cluster_errors"),
         },
         chart: ShowChart::Never,
     },
@@ -3476,7 +3818,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.keeper_connected"),
+            reading: Reading::Field("$.clickhouse.keeper_connected"),
         },
         chart: ShowChart::Never,
     },
@@ -3487,7 +3829,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.keeper_session_secs"),
+            reading: Reading::Field("$.clickhouse.keeper_session_secs"),
         },
         chart: ShowChart::Never,
     },
@@ -3498,7 +3840,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.keeper_sessions"),
+            reading: Reading::Field("$.clickhouse.keeper_sessions"),
         },
         chart: ShowChart::Never,
     },
@@ -3509,7 +3851,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.keeper_sessions_expired"),
+            reading: Reading::Field("$.clickhouse.keeper_sessions_expired"),
         },
         chart: ShowChart::Never,
     },
@@ -3520,7 +3862,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.keeper_requests"),
+            reading: Reading::Field("$.clickhouse.keeper_requests"),
         },
         chart: ShowChart::Never,
     },
@@ -3531,7 +3873,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.keeper_latency_ms"),
+            reading: Reading::Field("$.clickhouse.keeper_latency_ms"),
         },
         chart: ShowChart::WithData,
     },
@@ -3542,7 +3884,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.keeper_hardware_errors"),
+            reading: Reading::Rate("$.clickhouse.keeper_hardware_errors"),
         },
         chart: ShowChart::Never,
     },
@@ -3553,7 +3895,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Rate("$.keeper_user_errors"),
+            reading: Reading::Rate("$.clickhouse.keeper_user_errors"),
         },
         chart: ShowChart::Never,
     },
@@ -3564,7 +3906,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.keeper_leader"),
+            reading: Reading::Field("$.clickhouse.keeper_leader"),
         },
         chart: ShowChart::Never,
     },
@@ -3575,7 +3917,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.keeper_synced_followers"),
+            reading: Reading::Field("$.clickhouse.keeper_synced_followers"),
         },
         chart: ShowChart::Never,
     },
@@ -3586,7 +3928,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.keeper_memory_limit_hit"),
+            reading: Reading::Field("$.clickhouse.keeper_memory_limit_hit"),
         },
         chart: ShowChart::Never,
     },
@@ -3597,7 +3939,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.keeper_clients"),
+            reading: Reading::Field("$.clickhouse.keeper_clients"),
         },
         chart: ShowChart::Never,
     },
@@ -3608,7 +3950,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.keeper_outstanding"),
+            reading: Reading::Field("$.clickhouse.keeper_outstanding"),
         },
         chart: ShowChart::Never,
     },
@@ -3619,7 +3961,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.disk_free_bytes"),
+            reading: Reading::Field("$.clickhouse.disk_free_bytes"),
         },
         chart: ShowChart::Never,
     },
@@ -3630,7 +3972,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.disk_used"),
+            reading: Reading::Field("$.clickhouse.disk_used"),
         },
         chart: ShowChart::WithData,
     },
@@ -3641,7 +3983,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.disk_broken"),
+            reading: Reading::Field("$.clickhouse.disk_broken"),
         },
         chart: ShowChart::Never,
     },
@@ -3652,7 +3994,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.disk_read_only"),
+            reading: Reading::Field("$.clickhouse.disk_read_only"),
         },
         chart: ShowChart::Never,
     },
@@ -3663,7 +4005,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.p50_ms"),
+            reading: Reading::Field("$.clickhouse.p50_ms"),
         },
         chart: ShowChart::WithData,
     },
@@ -3674,7 +4016,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.p95_ms"),
+            reading: Reading::Field("$.clickhouse.p95_ms"),
         },
         chart: ShowChart::WithData,
     },
@@ -3685,7 +4027,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.p99_ms"),
+            reading: Reading::Field("$.clickhouse.p99_ms"),
         },
         chart: ShowChart::Never,
     },
@@ -3696,7 +4038,7 @@ pub const METRICS: &[Metric] = &[
         collector: "databases",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.failed_5m"),
+            reading: Reading::Field("$.clickhouse.failed_5m"),
         },
         chart: ShowChart::Never,
     },

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail, ensure};
 use maxnines_checks::Credentials;
-use maxnines_checks::databases::{self as stats, Reader, Settle, is_database};
+use maxnines_checks::databases::{self as stats, Reader, Settle, by_kind, is_database};
 use maxnines_protocol::{Check, CheckKind, DATABASE_EXTRAS, Sample};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -507,7 +507,7 @@ async fn read_stats(
     let (reader, settle) = &mut *reading;
     let rows = settle.settle(reader.read(limit).await);
     let host_id = check.input.host_id.clone();
-    save(writer, host_id, hostname, "databases", Value::Array(rows)).await;
+    save(writer, host_id, hostname, "databases", by_kind(rows)).await;
 }
 
 /// Runs a check once and keeps what it found: as its latest result, as what's

@@ -1151,7 +1151,8 @@ async fn a_database_check_reads_its_stats_as_the_hosts() {
     assert_eq!(run_due(&mut scheduler, now_ms()).await, 1);
 
     // Saved as the host's, as an agent's would be.
-    for metric in ["database.up", "database.connections", "database.size"] {
+    // Under its kind, as an agent's would be.
+    for metric in ["postgres.up", "postgres.connections", "postgres.size"] {
         let path = format!("/api/v1/hosts/{id}/metrics/{metric}?range=1h");
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -1170,4 +1171,10 @@ async fn a_database_check_reads_its_stats_as_the_hosts() {
         .get(&server, &format!("/hosts/{id}/metrics"))
         .await;
     assert!(page.body.contains("Latest databases"), "{}", page.body);
+    // Its row is found under its kind, and says it's up.
+    assert!(
+        page.body.contains(r#"<span class="badge good">Up</span>"#),
+        "{}",
+        page.body
+    );
 }

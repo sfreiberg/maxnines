@@ -161,24 +161,29 @@ control is replicated, so make it on each.
 
 ## What's read
 
-Each value is a series named after the database, such as `orders`. Things a
-database has several of are named after both, such as `orders standby replica1`,
-`orders slot backups` or `shop database sales`.
+Each kind of database has metrics of its own, named for it, such as
+`postgres.connections` and `mysql.connections`, so a chart or alert rule is always
+about one kind. Each value is a series named after the database, such as `orders`.
+Things a database has several of are named after both, such as `orders standby
+replica1`, `orders slot backups` or `shop database sales`.
 
-### Every kind
+### What most kinds have
+
+Each of these is named for its kind, such as **PostgreSQL connections** or
+**MongoDB replication lag**.
 
 | Metric | What it is |
 |---|---|
-| **Database answering**, **uptime** | Whether it could be read, and for how long it's been running |
-| **Database connections**, **connections used** | Client connections, and as a percentage of the most allowed |
-| **Database oldest transaction**, **oldest query** | How long the longest has been going. A long transaction holds back cleanup |
-| **Database queries** | Per second, for MySQL and ClickHouse |
-| **Database rollbacks**, **deadlocks** | Per second, for PostgreSQL and MySQL |
-| **Database connections refused at the limit** | Per second, for MySQL and MongoDB 6.3 and later |
-| **Database cache hit rate** | How much of what was read was already in memory, for PostgreSQL and MySQL |
-| **Database is a replica**, **replica receiving** | Its role, and whether a replica is still connected to what it replicates. Lag reads 0 when nothing's arriving, so check this too |
-| **Database replication lag** | On a replica, how far behind it is. For PostgreSQL, also each standby, as its primary sees it, and for MongoDB each member, as **MongoDB member lag**. For ClickHouse, the furthest behind of its replicated tables |
-| **Database size** | With the `sizes` extra |
+| **answering**, **uptime** | Whether it could be read, and for how long it's been running |
+| **connections**, **connections used** | Client connections, and as a percentage of the most allowed |
+| **oldest transaction**, **oldest query** | How long the longest has been going. A long transaction holds back cleanup. Not MongoDB's or ClickHouse's oldest transaction |
+| **queries** | Per second, for MySQL and ClickHouse |
+| **rollbacks**, **deadlocks** | Per second, for PostgreSQL and MySQL |
+| **connections refused at the limit** | Per second, for MySQL and MongoDB 6.3 and later |
+| **cache hit rate** | How much of what was read was already in memory, for PostgreSQL and MySQL |
+| **is a replica**, **replica receiving** | Its role, and whether a replica is still connected to what it replicates. Lag reads 0 when nothing's arriving, so check this too. Not ClickHouse, whose replicas all take writes |
+| **replication lag** | On a replica, how far behind it is. For PostgreSQL, also each standby, as its primary sees it, and for MongoDB each member, as **MongoDB member lag**. For ClickHouse, the furthest behind of its replicated tables |
+| **database size** | With the `sizes` extra |
 
 ### PostgreSQL
 
@@ -266,11 +271,10 @@ databases**. Ones that aren't in a replica set leave out what's about replicatio
 
 ## Good things to alert on
 
-- **Database answering** at 0.
-- **Database connections used** over 80%.
-- **Database replication lag** over a minute, and **replica receiving** at 0 on a
-  replica.
-- **Database oldest transaction** over half an hour.
+- **answering** at 0, for each kind in use, such as **PostgreSQL answering**.
+- **connections used** over 80%.
+- **replication lag** over a minute, and **replica receiving** at 0 on a replica.
+- **oldest transaction** over half an hour.
 - **PostgreSQL oldest transaction ID age** over a billion.
 - **PostgreSQL slot lost** at 1, or **WAL kept by replication slots** growing.
 - **PostgreSQL archiving failing** at 1.

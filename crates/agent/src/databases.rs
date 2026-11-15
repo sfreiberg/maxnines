@@ -15,7 +15,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, ensure};
 use futures_util::future::join_all;
 use maxnines_checks::Credentials;
-use maxnines_checks::databases::{Database, Reader, Settle, TIMEOUT, is_database};
+use maxnines_checks::databases::{Database, Reader, Settle, TIMEOUT, by_kind, is_database};
 use maxnines_protocol::{Check, CheckKind, DatabaseChoice, is_page_name};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -143,11 +143,20 @@ impl DatabaseCollector {
                 .and_then(|definition| definition.database(name));
             match found {
                 Ok(database) => readers.push(Reader::new(name, database, &choice.extras)),
-                Err(error) => missing.push(json!({
-                    "name": name,
-                    "up": 0,
-                    "error": format!("{error:#}"),
-                })),
+                Err(error) => {
+                    // Under its kind, if it says a real one.
+                    let kind = definitions
+                        .get(name)
+                        .and_then(|definition| CheckKind::parse(&definition.kind))
+                        .filter(|kind| is_database(*kind))
+                        .map(CheckKind::as_str);
+                    missing.push(json!({
+                        "name": name,
+                        "kind": kind,
+                        "up": 0,
+                        "error": format!("{error:#}"),
+                    }));
+                }
             }
         }
         // Rounds never overlap, so each reader keeps its connection between them.
@@ -180,7 +189,7 @@ impl Collector for DatabaseCollector {
             Value::Array(rows) => {
                 let mut rows = self.settle.settle(rows);
                 rows.extend(self.missing.iter().cloned());
-                Value::Array(rows)
+                by_kind(rows)
             }
             // The first round hasn't finished.
             waiting => waiting,
@@ -272,16 +281,17 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         let output = loop {
             let output = collector.collect().unwrap();
-            if output.is_array() {
+            if output.is_object() {
                 break output;
             }
             assert!(Instant::now() < deadline, "no rows");
             thread::sleep(Duration::from_millis(10));
         };
-        assert_eq!(output[0]["name"], "orders");
-        assert_eq!(output[0]["up"], 0, "{output}");
+        // Each under its kind, so its values are its kind's own.
+        assert_eq!(output["postgres"][0]["name"], "orders");
+        assert_eq!(output["postgres"][0]["up"], 0, "{output}");
         assert_eq!(
-            output[1],
+            output["unknown"][0],
             json!({ "name": "nowhere", "up": 0, "error": "agent.hcl has no database by that name" })
         );
     }

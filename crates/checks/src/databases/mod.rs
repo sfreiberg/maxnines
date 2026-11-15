@@ -5,7 +5,9 @@
 //! few queries rather than a sign-in, and opens a new one when the old one stops
 //! working. Each round gives rows: one for the database itself, named as it's
 //! defined, and one for each thing it has several of, such as standbys or
-//! replication slots, named after it. Running totals in a row go under `totals`,
+//! replication slots, named after it. A sample groups rows by their database's
+//! kind, as `{"postgres": [...], "mysql": [...]}`, so each kind's values are its
+//! own, such as `postgres.connections`. Running totals in a row go under `totals`,
 //! and a [`Settle`] turns them into the change since the last sample. A total
 //! whose name starts with `_` is only there to work out an average, and goes
 //! once it has.
@@ -74,6 +76,11 @@ impl Reader {
         &self.name
     }
 
+    /// The kind of database, which its rows are grouped under.
+    pub fn kind(&self) -> &'static str {
+        self.database.check.kind.as_str()
+    }
+
     /// One round of rows, which always has the database's own row, saying why
     /// if it couldn't be read.
     pub async fn read(&mut self, limit: Duration) -> Vec<Value> {
@@ -89,6 +96,12 @@ impl Reader {
                 vec![json!({ "name": self.name, "up": 0, "error": format!("{error:#}") })]
             }
         }
+        .into_iter()
+        .map(|mut row| {
+            row["kind"] = json!(self.kind());
+            row
+        })
+        .collect()
     }
 
     /// A connection kept from an earlier round may have been closed since, such
@@ -246,6 +259,22 @@ impl Rows {
     }
 }
 
+/// A sample of rows, grouped by the kind each says it's of, which is taken out of
+/// the row. A row that doesn't say is under `unknown`.
+pub fn by_kind(rows: Vec<Value>) -> Value {
+    let mut grouped = Map::new();
+    for mut row in rows {
+        let kind = match row.as_object_mut().and_then(|fields| fields.remove("kind")) {
+            Some(Value::String(kind)) => kind,
+            _ => "unknown".to_string(),
+        };
+        if let Value::Array(rows) = grouped.entry(kind).or_insert_with(|| json!([])) {
+            rows.push(row);
+        }
+    }
+    Value::Object(grouped)
+}
+
 /// The last total seen for each row, which turns the next into a change.
 #[derive(Default)]
 pub struct Settle(HashMap<(String, String), f64>);
@@ -356,6 +385,24 @@ mod tests {
     }
 
     #[test]
+    fn rows_are_grouped_by_their_kind() {
+        let rows = vec![
+            json!({ "name": "orders", "kind": "postgres", "connections": 3 }),
+            json!({ "name": "orders standby b", "kind": "postgres" }),
+            json!({ "name": "shop", "kind": "mysql", "connections": 5 }),
+            json!({ "name": "nowhere", "up": 0 }),
+        ];
+        assert_eq!(
+            by_kind(rows),
+            json!({
+                "postgres": [{ "name": "orders", "connections": 3 }, { "name": "orders standby b" }],
+                "mysql": [{ "name": "shop", "connections": 5 }],
+                "unknown": [{ "name": "nowhere", "up": 0 }],
+            })
+        );
+    }
+
+    #[test]
     fn what_couldnt_be_read_is_noted_without_stopping_the_rest() {
         let mut rows = Rows::new("orders");
         rows.missed(
@@ -386,6 +433,7 @@ mod tests {
         let rows = reader.read(Duration::from_secs(2)).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["up"], 0);
+        assert_eq!(rows[0]["kind"], "postgres");
         assert!(rows[0]["error"].is_string(), "{rows:?}");
     }
 }

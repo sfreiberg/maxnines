@@ -163,9 +163,20 @@ struct DatabaseRow {
     note: Option<String>,
 }
 
+/// Each value is stored under the database's kind, such as `postgres.up`, so the
+/// kind comes from whichever says whether it's up. A database the agent doesn't
+/// have is under `unknown`.
 fn database_row(item: &Value) -> Option<DatabaseRow> {
-    let up = item["up"].as_u64()?;
-    let text = |key: &str| item[key].as_str().map(String::from);
+    let fields = item.as_object()?;
+    let (kind, up) = fields
+        .iter()
+        .find_map(|(key, value)| Some((key.strip_suffix(".up")?, value.as_u64()?)))?;
+    let text = |key: &str| {
+        fields
+            .get(&format!("{kind}.{key}"))?
+            .as_str()
+            .map(String::from)
+    };
     Some(DatabaseRow {
         name: item["name"].as_str()?.to_string(),
         up: up == 1,
