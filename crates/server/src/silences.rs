@@ -18,6 +18,7 @@ use crate::remote_checks::FLEET_HOST_ID;
 
 const MAX_REASON_CHARS: usize = 255;
 const MAX_FILTER_CHARS: usize = 500;
+const MAX_SERIES_CHARS: usize = 255;
 const MAX_DURATION_SECS: u64 = 30 * 24 * 3600;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -27,6 +28,8 @@ pub struct Silence {
     pub rule_id: Option<i64>,
     /// Which hosts, in the same form as the Hosts list. Every host, if empty.
     pub filter: String,
+    /// The one series it's for, such as a check's name. Every series, if empty.
+    pub series: String,
     pub reason: String,
     pub created_by: String,
     pub starts_ms: i64,
@@ -39,6 +42,8 @@ pub struct SilenceInput {
     pub rule_id: Option<i64>,
     #[serde(default)]
     pub filter: String,
+    #[serde(default)]
+    pub series: String,
     pub reason: String,
     pub duration_secs: u64,
 }
@@ -54,6 +59,7 @@ pub fn silence_for(alert: &Alert, reason: &str, duration_secs: u64) -> SilenceIn
     SilenceInput {
         rule_id: alert.rule_id,
         filter,
+        series: String::new(),
         reason: reason.to_string(),
         duration_secs,
     }
@@ -68,6 +74,9 @@ pub fn check_silence(input: &SilenceInput) -> Result<()> {
         bail!("The reason is too long. It can be up to {MAX_REASON_CHARS} characters.");
     }
     check_filter(&input.filter)?;
+    if input.series.chars().count() > MAX_SERIES_CHARS {
+        bail!("The series is too long. It can be up to {MAX_SERIES_CHARS} characters.");
+    }
     if input.duration_secs == 0 || input.duration_secs > MAX_DURATION_SECS {
         bail!("A silence can last up to 30 days.");
     }
@@ -105,10 +114,12 @@ struct Quiet {
     rule_id: Option<i64>,
     /// Empty if it covers every host.
     filter: Option<HostFilter>,
+    /// Empty if it covers every series.
+    series: Option<String>,
 }
 
 impl Quiet {
-    fn new(cover: Cover, rule_id: Option<i64>, filter: &str) -> Option<Self> {
+    fn new(cover: Cover, rule_id: Option<i64>, filter: &str, series: &str) -> Option<Self> {
         let parsed = match HostFilter::parse(filter) {
             Ok(parsed) => parsed,
             // Filters are checked when saved, so only a change to filters gets here.
@@ -121,6 +132,7 @@ impl Quiet {
             cover,
             rule_id,
             filter: (!filter.is_empty()).then_some(parsed),
+            series: (!series.is_empty()).then(|| series.to_string()),
         })
     }
 }
@@ -150,14 +162,14 @@ impl ActiveSilences {
                 id: silence.id,
                 ends_ms: silence.ends_ms,
             };
-            Quiet::new(cover, silence.rule_id, &silence.filter)
+            Quiet::new(cover, silence.rule_id, &silence.filter, &silence.series)
         });
         let windows = windows.into_iter().filter_map(|window| {
             let cover = Cover::Window {
                 id: window.id,
                 ends_ms: window.ends_at(now_ms)?,
             };
-            Quiet::new(cover, window.window.rule_id, &window.window.filter)
+            Quiet::new(cover, window.window.rule_id, &window.window.filter, "")
         });
         let mut quiet: Vec<Quiet> = silences.chain(windows).collect();
         quiet.sort_by_key(|entry| std::cmp::Reverse(entry.cover.ends_ms()));
@@ -181,12 +193,30 @@ impl ActiveSilences {
     pub fn covering_host(&self, host_id: &str, hostname: &str) -> Option<Cover> {
         let covers = |entry: &&Quiet| {
             entry.rule_id.is_none()
-                && entry
-                    .filter
-                    .as_ref()
-                    .is_none_or(|filter| filter.matches(host_id, hostname, self.facts.get(host_id)))
+                && entry.series.is_none()
+                && self.on_host(entry, host_id, hostname)
         };
         self.quiet.iter().find(covers).map(|entry| entry.cover)
+    }
+
+    /// Whatever holds back every alert about one series of a host for longest,
+    /// such as one of its checks, whichever rule it's from. What covers the whole
+    /// host covers it too.
+    pub fn covering_series(&self, host_id: &str, hostname: &str, series: &str) -> Option<Cover> {
+        let covers = |entry: &&Quiet| {
+            entry.rule_id.is_none()
+                && entry.series.as_deref().is_none_or(|only| only == series)
+                && self.on_host(entry, host_id, hostname)
+        };
+        self.quiet.iter().find(covers).map(|entry| entry.cover)
+    }
+
+    fn on_host(&self, entry: &Quiet, host_id: &str, hostname: &str) -> bool {
+        let facts = self.facts.get(host_id);
+        entry
+            .filter
+            .as_ref()
+            .is_none_or(|filter| filter.matches(host_id, hostname, facts))
     }
 
     /// Whatever covers an alert for longest. A group's alert has no host to compare, so
@@ -202,7 +232,11 @@ impl ActiveSilences {
                         self.facts.get(&alert.host_id),
                     )
             });
-            rule && hostname
+            let series = entry
+                .series
+                .as_deref()
+                .is_none_or(|only| only == alert.series);
+            rule && hostname && series
         };
         self.quiet.iter().find(covers).map(|entry| entry.cover)
     }
@@ -216,6 +250,7 @@ mod tests {
         SilenceInput {
             rule_id: None,
             filter: "os=linux".to_string(),
+            series: String::new(),
             reason: "Upgrading Postgres".to_string(),
             duration_secs: 3600,
         }

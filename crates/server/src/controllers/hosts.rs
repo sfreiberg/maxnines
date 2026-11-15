@@ -27,7 +27,7 @@ use crate::models::ConfigStatus;
 use crate::presence::Reach;
 use crate::registration::{HostRecord, HostState, short_id};
 use crate::rule_engine;
-use crate::silences::{ActiveSilences, Cover, SilenceInput};
+use crate::silences::{ActiveSilences, Cover, Silence, SilenceInput};
 use crate::times::format_time;
 
 pub fn routes() -> Router<AppState> {
@@ -540,14 +540,7 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         Ok(maintenance) => maintenance,
         Err(error) => return server_error(&error),
     };
-    let choices: Vec<MaintenanceChoice> = MAINTENANCE_CHOICES
-        .iter()
-        .map(|(secs, label)| MaintenanceChoice {
-            secs: *secs,
-            label,
-            chosen: *secs == DEFAULT_MAINTENANCE_SECS,
-        })
-        .collect();
+    let choices = maintenance_choices();
     let presence = state.presence.get(&id);
     let config = serde_json::to_string_pretty(&desired.config).unwrap_or_default();
     let zone = viewer_zone();
@@ -623,23 +616,44 @@ const MAINTENANCE_CHOICES: [(u64, &str); 6] = [
 ];
 const DEFAULT_MAINTENANCE_SECS: u64 = 3600;
 
-/// What's holding back this host's notifications, for its page.
+/// What's holding back notifications about a host, or about one check, for its
+/// page.
 #[derive(Serialize)]
-struct Maintenance {
+pub(super) struct Maintenance {
     until: String,
     /// The silence's reason, or the maintenance window's name.
     why: String,
     by: Option<String>,
-    /// Started for this host alone, so its page can end it.
+    /// Started from that page for it alone, so the page can end it.
     just_this_one: bool,
     window: bool,
 }
 
 #[derive(Serialize)]
-struct MaintenanceChoice {
+pub(super) struct MaintenanceChoice {
     secs: u64,
     label: &'static str,
     chosen: bool,
+}
+
+/// How long maintenance can be started for from a page.
+pub(super) fn maintenance_choices() -> Vec<MaintenanceChoice> {
+    MAINTENANCE_CHOICES
+        .iter()
+        .map(|(secs, label)| MaintenanceChoice {
+            secs: *secs,
+            label,
+            chosen: *secs == DEFAULT_MAINTENANCE_SECS,
+        })
+        .collect()
+}
+
+/// How long a page's form asked for, if it's one of the choices.
+pub(super) fn maintenance_secs(form: &CsrfForm) -> Option<u64> {
+    form.fields
+        .get("duration_secs")
+        .and_then(|secs| secs.parse().ok())
+        .filter(|secs| MAINTENANCE_CHOICES.iter().any(|(choice, _)| choice == secs))
 }
 
 /// What's keeping all of this host's alerts quiet, if anything is. A silence
@@ -647,9 +661,25 @@ struct MaintenanceChoice {
 async fn maintenance_of(state: &AppState, host: &HostRecord) -> Result<Option<Maintenance>> {
     let now = now_ms();
     let active = ActiveSilences::load(&state.database, now).await?;
-    let Some(cover) = active.covering_host(&host.id, &host.hostname) else {
+    let cover = active.covering_host(&host.id, &host.hostname);
+    let own = host_filter::only(&host.id);
+    described(state, cover, |silence| {
+        silence.filter == own && silence.series.is_empty()
+    })
+    .await
+}
+
+/// What a cover is, for a page to say. `own` says whether a silence is the one
+/// the page itself starts.
+pub(super) async fn described(
+    state: &AppState,
+    cover: Option<Cover>,
+    own: impl Fn(&Silence) -> bool,
+) -> Result<Option<Maintenance>> {
+    let Some(cover) = cover else {
         return Ok(None);
     };
+    let now = now_ms();
     let until = super::local_time(cover.ends_ms());
     Ok(match cover {
         Cover::Silence { id, .. } => {
@@ -659,7 +689,7 @@ async fn maintenance_of(state: &AppState, host: &HostRecord) -> Result<Option<Ma
                 .find(|silence| silence.id == id)
                 .map(|silence| Maintenance {
                     until,
-                    just_this_one: silence.filter == host_filter::only(&host.id),
+                    just_this_one: own(&silence),
                     why: silence.reason,
                     by: Some(silence.created_by),
                     window: false,
@@ -696,12 +726,7 @@ async fn start_maintenance(
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let duration_secs = form
-        .fields
-        .get("duration_secs")
-        .and_then(|secs| secs.parse().ok())
-        .filter(|secs| MAINTENANCE_CHOICES.iter().any(|(choice, _)| choice == secs));
-    let Some(duration_secs) = duration_secs else {
+    let Some(duration_secs) = maintenance_secs(&form) else {
         return (StatusCode::BAD_REQUEST, "Choose how long from the list.").into_response();
     };
     let reason = form.fields.get("reason").map(|reason| reason.trim());
@@ -712,6 +737,7 @@ async fn start_maintenance(
     let input = SilenceInput {
         rule_id: None,
         filter: host_filter::only(&host.id),
+        series: String::new(),
         reason,
         duration_secs,
     };
@@ -741,6 +767,7 @@ async fn end_maintenance(
     for silence in silences
         .iter()
         .filter(|silence| silence.rule_id.is_none() && silence.filter == own)
+        .filter(|silence| silence.series.is_empty())
     {
         if let Err(error) = state.database.end_silence(silence.id, now).await {
             return server_error(&error);

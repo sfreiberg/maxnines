@@ -200,6 +200,7 @@ erDiagram
         int id PK
         int rule_id FK "empty for every rule"
         string filter
+        string series "the one series it's for, or empty"
         string reason
         string created_by
         int starts_ms

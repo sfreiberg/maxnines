@@ -81,7 +81,10 @@ const ADMIN_ONLY: [&str; 4] = [
 const OWN: [&str; 4] = ["/profile", "/logout", "/settings/api-keys", "/api-keys"];
 
 /// Dealing with alerts as they happen: acknowledging them and silencing them.
-const RESPONDING: [&str; 15] = [
+const RESPONDING: [&str; 18] = [
+    "/checks/{id}/run",
+    "/checks/{id}/maintenance",
+    "/checks/{id}/maintenance/end",
     "/hosts/{id}/actions",
     "/hosts/{id}/annotations",
     "/hosts/{id}/maintenance",
@@ -191,9 +194,14 @@ mod tests {
             "/silences",
             "/silences/{id}/end",
             "/hosts/{id}/actions",
+            "/checks/{id}/run",
+            "/checks/{id}/maintenance",
+            "/checks/{id}/maintenance/end",
         ] {
             assert_eq!(required(&Method::POST, route), Role::Responder, "{route}");
         }
+        // Turning a check off changes what's watched, which is an editor's to do.
+        assert_eq!(required(&Method::POST, "/checks/{id}/pause"), Role::Editor);
         assert_eq!(required(&Method::GET, "/hosts/{id}/actions"), Role::Viewer);
         assert_eq!(
             required(&Method::GET, "/alerts/silences/new"),

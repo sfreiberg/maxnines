@@ -41,6 +41,8 @@ struct SilenceRow {
     id: i64,
     rule: String,
     hosts: String,
+    /// The one series it's for, if it isn't for all of them.
+    series: Option<String>,
     reason: String,
     created_by: String,
     starts: String,
@@ -63,6 +65,7 @@ async fn rows(state: &AppState, silences: Vec<Silence>) -> anyhow::Result<Vec<Si
             } else {
                 silence.filter
             },
+            series: Some(silence.series).filter(|series| !series.is_empty()),
             reason: silence.reason,
             created_by: silence.created_by,
             starts: local_time(silence.starts_ms),
@@ -137,6 +140,8 @@ struct SilenceForm {
     rule_id: String,
     #[serde(default)]
     filter: String,
+    #[serde(default)]
+    series: String,
     #[serde(default)]
     reason: String,
     #[serde(default)]
@@ -215,6 +220,7 @@ fn input_from(silence: &SilenceForm) -> Result<SilenceInput, String> {
     Ok(SilenceInput {
         rule_id,
         filter: silence.filter.clone(),
+        series: silence.series.clone(),
         reason: silence.reason.clone(),
         duration_secs,
     })
@@ -225,6 +231,7 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
     let silence = SilenceForm {
         rule_id: text("rule_id"),
         filter: text("filter"),
+        series: text("series"),
         reason: text("reason"),
         duration_secs: text("duration_secs"),
     };

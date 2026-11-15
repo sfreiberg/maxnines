@@ -7,6 +7,7 @@ mod app_state;
 mod audit;
 mod calculations;
 mod channels;
+mod check_history;
 mod cli;
 mod clock;
 mod condition_builder;

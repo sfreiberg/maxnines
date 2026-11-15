@@ -143,6 +143,7 @@ a.stats-cell:hover { background: var(--raised); color: var(--text); }
 .stats-value { font-size: 28px; font-weight: 600; line-height: 1.2; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
 .stats-value.bad { color: var(--bad); }
 .stats-value.warn { color: var(--warn); }
+.stats-value.good { color: var(--good); }
 .stats-note { color: var(--muted); font-family: var(--mono); font-size: 13px; }
 
 /* Status */
@@ -625,3 +626,25 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .event-kind.k-alert { color: var(--bad); }
 .event-kind.k-resolved { color: var(--good); }
 .maintenance .hint { margin: 0.75rem 0 0; }
+
+/* A check's own page. */
+.check-target { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+/* The check's kind is a label, not a status, so it has no dot. */
+.check-target .badge::before { display: none; }
+.status-dot { display: inline-block; width: 12px; height: 12px; margin-right: 10px; border-radius: 50%; vertical-align: 0.12em; background: currentColor; }
+.status-dot.good { box-shadow: 0 0 0 5px var(--good-surface); }
+.status-dot.bad { box-shadow: 0 0 0 5px var(--bad-surface); }
+.check-bars { display: flex; gap: 3px; height: 40px; }
+.check-bar { flex: 1 1 0; min-width: 2px; border-radius: 4px; background: var(--track); }
+.check-bar.passed { background: var(--good); }
+.check-bar.failed { background: var(--bad); }
+.check-bars-axis { display: flex; justify-content: space-between; color: var(--muted); font-family: var(--mono); font-size: 12px; }
+.uptimes { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr)); gap: 16px 0; padding-top: 18px; border-top: 1px solid var(--border); }
+.uptime { display: flex; flex-direction: column; gap: 4px; min-width: 0; padding: 0 24px; border-left: 1px solid var(--border); }
+.uptime:first-child { padding-left: 0; border-left: 0; }
+.uptime .stats-value { font-size: 24px; }
+.check-key { justify-content: center; gap: 6px; color: var(--muted); font-family: var(--mono); font-size: 12px; }
+.check-key > span { display: flex; align-items: center; gap: 8px; }
+.check-key .check-bar { flex: none; width: 10px; height: 10px; border-radius: 3px; }
+.check-rules { display: flex; flex-direction: column; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.check-rules li { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; }

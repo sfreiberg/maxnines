@@ -79,12 +79,12 @@ pub struct CheckRow {
     name: String,
     kind: String,
     pub up: bool,
-    error: Option<String>,
-    response: Option<String>,
+    pub error: Option<String>,
+    pub response: Option<String>,
     first_byte: Option<String>,
-    status: Option<u64>,
-    protocol: Option<String>,
-    tls_version: Option<String>,
+    pub status: Option<u64>,
+    pub protocol: Option<String>,
+    pub tls_version: Option<String>,
     cert_days_left: Option<i64>,
 }
 

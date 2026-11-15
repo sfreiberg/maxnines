@@ -765,10 +765,15 @@ async fn a_check_has_a_page_of_its_own_with_only_its_charts() {
     };
     for shown in [
         "alpha-site",
-        "Latest result",
+        "Availability",
+        "Last 24 hours",
+        "100%",
+        "Last run",
+        "s ago",
         "Passing",
         "Response time",
         "Total",
+        "No rule watches this check",
     ] {
         assert!(page.body.contains(shown), "{shown}: {}", page.body);
     }
@@ -786,6 +791,96 @@ async fn a_check_has_a_page_of_its_own_with_only_its_charts() {
         assert!(list.body.contains(&link), "{}", list.body);
     }
     assert_eq!(browser.get(&server, "/checks/999999").await.status, 404);
+}
+
+#[tokio::test]
+async fn a_check_is_run_paused_and_quieted_from_its_page() {
+    let server = start_with_metrics().await;
+    let id = add_host(&server, "orders-db").await;
+    let served = serve(None).await;
+    let mut ids = Vec::new();
+    for name in ["site", "admin"] {
+        let check = tcp_check(&id, name, &served.address);
+        let (status, added) = api(&server, "POST", "/api/v1/remote-checks", &check).await;
+        assert_eq!(status, 201, "{added}");
+        ids.push(added["id"].as_i64().unwrap());
+    }
+    let path = format!("/checks/{}", ids[0]);
+    let mut browser = Browser::default();
+
+    // It hasn't run yet, until it's asked to.
+    let page = browser.get(&server, &path).await;
+    assert!(page.body.contains("Waiting"), "{}", page.body);
+    let ran = browser
+        .submit(&server, &path, &format!("{path}/run"), &[])
+        .await;
+    assert_eq!(ran.status, 303, "{}", ran.body);
+    let page = browser.get(&server, &path).await;
+    assert!(page.body.contains("s ago"), "{}", page.body);
+    assert!(
+        page.body.contains(">Up<") || page.body.contains("</span>Up"),
+        "{}",
+        page.body
+    );
+    assert!(server.state.check_results.ran_ms(ids[0]).is_some());
+    assert_eq!(server.state.check_results.ran_ms(ids[1]), None);
+
+    // Quieting it holds back alerts about it alone, not the host's other check.
+    let fields = [("duration_secs", "3600"), ("reason", "Redeploying")];
+    let quieted = browser
+        .submit(&server, &path, &format!("{path}/maintenance"), &fields)
+        .await;
+    assert_eq!(quieted.status, 303, "{}", quieted.body);
+    let about = |series: &str| crate::alerting::Alert {
+        host_id: id.clone(),
+        hostname: "orders-db".to_string(),
+        series: series.to_string(),
+        ..crate::channels::testing::alert()
+    };
+    let quiet = crate::silences::ActiveSilences::load(&server.state.database, now_ms())
+        .await
+        .unwrap();
+    assert!(quiet.covering(&about("site")).is_some());
+    assert!(quiet.covering(&about("admin")).is_none());
+    assert!(
+        quiet.covering_host(&id, "orders-db").is_none(),
+        "the host isn't quiet"
+    );
+    let page = browser.get(&server, &path).await;
+    assert!(page.body.contains("Redeploying"), "{}", page.body);
+    assert!(page.body.contains("End now"), "{}", page.body);
+    // The other check's page knows nothing of it.
+    let other = browser.get(&server, &format!("/checks/{}", ids[1])).await;
+    assert!(!other.body.contains("Redeploying"), "{}", other.body);
+    // The Silences page says which check it's for.
+    let silences = browser.get(&server, "/alerts/silences").await;
+    assert!(silences.body.contains("Only site"), "{}", silences.body);
+
+    let ended = browser
+        .submit(&server, &path, &format!("{path}/maintenance/end"), &[])
+        .await;
+    assert_eq!(ended.status, 303);
+    let quiet = crate::silences::ActiveSilences::load(&server.state.database, now_ms())
+        .await
+        .unwrap();
+    assert!(quiet.covering(&about("site")).is_none());
+
+    // Paused, it isn't run and can't be asked to; resumed, it can.
+    let paused = browser
+        .submit(&server, &path, &format!("{path}/pause"), &[])
+        .await;
+    assert_eq!(paused.status, 303);
+    let saved = server.state.database.get_remote_check(ids[0]).await;
+    assert!(!saved.unwrap().unwrap().input.enabled);
+    let page = browser.get(&server, &path).await;
+    assert!(page.body.contains("Paused"), "{}", page.body);
+    assert!(page.body.contains("Resume"), "{}", page.body);
+    assert!(!page.body.contains("Check now"), "{}", page.body);
+    browser
+        .submit(&server, &path, &format!("{path}/pause"), &[])
+        .await;
+    let saved = server.state.database.get_remote_check(ids[0]).await;
+    assert!(saved.unwrap().unwrap().input.enabled);
 }
 
 #[tokio::test]

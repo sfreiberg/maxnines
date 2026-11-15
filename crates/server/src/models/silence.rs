@@ -7,6 +7,8 @@ pub struct Model {
     pub id: i64,
     pub rule_id: Option<i64>,
     pub filter: String,
+    /// The one series it's for. Empty for every series.
+    pub series: String,
     pub reason: String,
     pub created_by: String,
     pub starts_ms: i64,

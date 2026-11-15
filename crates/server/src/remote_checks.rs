@@ -86,18 +86,30 @@ pub fn check_input(input: &RemoteCheckInput) -> Result<()> {
 #[derive(Default)]
 pub struct LatestResults {
     results: Mutex<BTreeMap<i64, Value>>,
+    /// When each last ran.
+    ran_ms: Mutex<BTreeMap<i64, i64>>,
 }
 
 impl LatestResults {
     fn set(&self, id: i64, result: Value) {
         let mut results = self.results.lock().unwrap_or_else(PoisonError::into_inner);
         results.insert(id, result);
+        let mut ran_ms = self.ran_ms.lock().unwrap_or_else(PoisonError::into_inner);
+        ran_ms.insert(id, now_ms());
+    }
+
+    /// When a check last ran, if it has since the server started.
+    pub fn ran_ms(&self, id: i64) -> Option<i64> {
+        let ran_ms = self.ran_ms.lock().unwrap_or_else(PoisonError::into_inner);
+        ran_ms.get(&id).copied()
     }
 
     /// Forgets checks that no longer exist.
     fn keep_only(&self, ids: &BTreeSet<i64>) {
         let mut results = self.results.lock().unwrap_or_else(PoisonError::into_inner);
         results.retain(|id, _| ids.contains(id));
+        let mut ran_ms = self.ran_ms.lock().unwrap_or_else(PoisonError::into_inner);
+        ran_ms.retain(|id, _| ids.contains(id));
     }
 
     pub fn all(&self) -> BTreeMap<i64, Value> {
@@ -202,15 +214,29 @@ impl Scheduler {
             let Ok(_slot) = slots.acquire_owned().await else {
                 return;
             };
-            let host_id = check.input.host_id;
-            let result = maxnines_checks::run(&check.input.check).await;
-            results.set(check.id, result.clone());
-            if host_id != LOCAL_HOST_ID {
-                presence.reached(&host_id, Reached::Check(check.id), result["up"] == 1);
-            }
-            save(&writer, host_id, hostname, result).await;
+            run(&check, hostname, &writer, &results, &presence).await;
         })
     }
+}
+
+/// Runs a check once and keeps what it found: as its latest result, as what's
+/// known of its host, and in the metrics store. The scheduler does this when a
+/// check is due, and a person can ask for it in between.
+pub async fn run(
+    check: &RemoteCheck,
+    hostname: String,
+    writer: &mpsc::Sender<WriterCommand>,
+    results: &LatestResults,
+    presence: &Presence,
+) {
+    let host_id = &check.input.host_id;
+    let result = maxnines_checks::run(&check.input.check).await;
+    results.set(check.id, result.clone());
+    // One that's turned off says nothing about whether its host is there.
+    if host_id != LOCAL_HOST_ID && check.input.enabled {
+        presence.reached(host_id, Reached::Check(check.id), result["up"] == 1);
+    }
+    save(writer, host_id.clone(), hostname, result).await;
 }
 
 async fn save(

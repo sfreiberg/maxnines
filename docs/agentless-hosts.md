@@ -36,10 +36,23 @@ server's own, as every check was before hosts could have them, and those are all
 listed on the Checks page with the rest.
 
 Every check the server runs has a page of its own, opened by its name wherever
-it's listed. It shows how the check last went, any alerts open about it, and its
-charts and nobody else's: whether it passed, its response time with where the
-time went, and whatever else its kind reports, such as a certificate's days left.
+it's listed. It shows:
+
+- how it is: up or down and for how long, when it last ran, its response time and,
+  for a site, its certificate's days left;
+- its availability: the last day as half-hour bars, and how much of the last day,
+  week and month it passed, with how often and for how long it failed;
+- any alerts open about it, and the alert rules that watch it;
+- its charts and nobody else's: whether it passed, its response time with where
+  the time went, and whatever else its kind reports.
+
 The server's own checks are charted only there, not among the server's metrics.
+
+From the page, **Check now** runs it at once, **Pause** stops running it until it's
+resumed, and **Start maintenance** holds back notifications about this check alone
+for a while, as a host's page does for the host. That's a silence for the check,
+listed on the Silences page with the rest, and a maintenance window that covers its
+host covers it too.
 
 ## Online and offline
 

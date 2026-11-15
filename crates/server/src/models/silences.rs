@@ -18,6 +18,7 @@ fn to_silence(row: silence::Model) -> Silence {
         id: row.id,
         rule_id: row.rule_id,
         filter: row.filter,
+        series: row.series,
         reason: row.reason,
         created_by: row.created_by,
         starts_ms: row.starts_ms,
@@ -30,6 +31,7 @@ fn snapshot(row: &silence::Model) -> Snapshot {
     let fields = json!({
         "rule_id": row.rule_id,
         "filter": row.filter,
+        "series": row.series,
         "reason": row.reason,
         "starts": audit::time(row.starts_ms),
         "ends": audit::time(row.ends_ms),
@@ -92,6 +94,7 @@ impl Database {
         let row = silence::ActiveModel {
             rule_id: Set(input.rule_id),
             filter: Set(input.filter.trim().to_string()),
+            series: Set(input.series.trim().to_string()),
             reason: Set(input.reason.trim().to_string()),
             created_by: Set(by.to_string()),
             starts_ms: Set(now_ms),

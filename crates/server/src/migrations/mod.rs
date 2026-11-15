@@ -13,6 +13,7 @@ impl MigratorTrait for Migrator {
             Box::new(CreateTables),
             Box::new(PageTokens),
             Box::new(CheckNamesPerHost),
+            Box::new(SilenceSeries),
         ]
     }
 }
@@ -1676,6 +1677,7 @@ enum Silences {
     Id,
     RuleId,
     Filter,
+    Series,
     Reason,
     CreatedBy,
     StartsMs,
@@ -1860,6 +1862,56 @@ impl MigrationTrait for PageTokens {
                 .await?;
         }
         Ok(())
+    }
+}
+
+struct SilenceSeries;
+
+impl MigrationName for SilenceSeries {
+    fn name(&self) -> &str {
+        "m20261115_000004_silence_series"
+    }
+}
+
+/// A silence can be for one series alone, such as one check of a host that has
+/// several, where it used to be for everything a rule watched on its hosts.
+#[async_trait::async_trait]
+impl MigrationTrait for SilenceSeries {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Silences::Table)
+                    .add_column(
+                        ColumnDef::new(Silences::Series)
+                            .string_len(255)
+                            .not_null()
+                            .default(""),
+                    )
+                    .to_owned(),
+            )
+            .await
+    }
+
+    /// Ones for a single series go, as they'd come to cover every series.
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let narrow = Query::delete()
+            .from_table(Silences::Table)
+            .and_where(Expr::col(Silences::Series).ne(""))
+            .to_owned();
+        manager.exec_stmt(narrow).await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Silences::Table)
+                    .drop_column(Silences::Series)
+                    .to_owned(),
+            )
+            .await
     }
 }
 
@@ -2262,8 +2314,8 @@ mod tests {
         let rows = "SELECT CAST(id AS TEXT) || ' ' || host_id FROM remote_checks ORDER BY id";
         assert_eq!(texts(&connection, rows).await, ["4 server", "5 abc"]);
 
-        // Going back, the first of each name is the one kept.
-        Migrator::down(&connection, Some(1)).await.unwrap();
+        // Going back past it, the first of each name is the one kept.
+        Migrator::down(&connection, Some(2)).await.unwrap();
         assert_eq!(texts(&connection, rows).await, ["4 server"]);
         assert!(add("Site", "abc").await.is_err(), "unique again");
         add("Database", "abc").await.unwrap();

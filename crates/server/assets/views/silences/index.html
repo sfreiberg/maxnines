@@ -18,7 +18,7 @@
     <tr>
       <td>{{ silence.reason }}</td>
       <td>{{ silence.rule }}</td>
-      <td>{{ silence.hosts }}</td>
+      <td>{{ silence.hosts }}{% if silence.series %}<span class="under">Only {{ silence.series }}</span>{% endif %}</td>
       <td class="nowrap">{{ silence.ends }}</td>
       <td>{{ silence.created_by }}</td>
       <td>
@@ -76,7 +76,7 @@
     <tr>
       <td>{{ silence.reason }}</td>
       <td>{{ silence.rule }}</td>
-      <td>{{ silence.hosts }}</td>
+      <td>{{ silence.hosts }}{% if silence.series %}<span class="under">Only {{ silence.series }}</span>{% endif %}</td>
       <td class="nowrap">{{ silence.starts }}</td>
       <td class="nowrap">{{ silence.ends }}</td>
       <td>{{ silence.created_by }}</td>

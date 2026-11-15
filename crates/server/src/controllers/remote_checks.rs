@@ -11,15 +11,20 @@ use maxnines_protocol::{Check, CheckKind};
 use serde::{Deserialize, Serialize};
 
 use super::host_list::address;
+use super::hosts::{described, maintenance_choices, maintenance_secs};
 use super::metrics::{
     CheckRow, RangeParams, check_row, one_series, range_links, selected_range, time_range,
 };
-use super::{CsrfForm, Page, server_error, viewer_zone};
+use super::{CsrfForm, Page, recorded_by, server_error, viewer_zone};
+use crate::alerting::RuleKind;
 use crate::app_state::AppState;
+use crate::check_history;
+use crate::host_filter;
 use crate::metric_charts::{self, Chart, Frame};
 use crate::metrics::{self, METRICS, Metric, Series, SeriesResult, TimeRange, Unit};
 use crate::registration::HostState;
-use crate::remote_checks::{LOCAL_HOST_ID, LOCAL_HOSTNAME, RemoteCheckInput};
+use crate::remote_checks::{LOCAL_HOST_ID, LOCAL_HOSTNAME, RemoteCheck, RemoteCheckInput};
+use crate::silences::{ActiveSilences, SilenceInput};
 
 const KINDS: [CheckKind; 5] = [
     CheckKind::Http,
@@ -35,6 +40,10 @@ pub fn routes() -> Router<AppState> {
         .route("/checks/new", get(new))
         .route("/checks/{id}", get(show).post(update))
         .route("/checks/{id}/edit", get(edit))
+        .route("/checks/{id}/run", post(run_now))
+        .route("/checks/{id}/pause", post(pause))
+        .route("/checks/{id}/maintenance", post(start_maintenance))
+        .route("/checks/{id}/maintenance/end", post(end_maintenance))
         .route("/checks/{id}/delete", post(delete))
 }
 
@@ -444,7 +453,106 @@ async fn charts(
     Ok(charts)
 }
 
-/// A check's own page: how it is now, and its charts and nobody else's.
+/// How many bars the last day is cut into on a check's page.
+const BARS: usize = 48;
+const DAY_MS: i64 = 86_400_000;
+
+/// One of the figures across the top of a check's page.
+#[derive(Serialize)]
+struct Tile {
+    label: &'static str,
+    value: String,
+    note: String,
+    /// `good`, `bad` or empty, for the value's colour.
+    tone: &'static str,
+}
+
+/// How much of a stretch of time a check passed for, as its page puts it.
+#[derive(Serialize)]
+struct Uptime {
+    label: &'static str,
+    percent: Option<String>,
+    note: String,
+    /// `good`, `warn` or `bad`.
+    tone: &'static str,
+}
+
+/// An alert rule that watches one of a check's metrics.
+#[derive(Serialize)]
+struct WatchingRule {
+    id: i64,
+    name: String,
+    severity: &'static str,
+    /// Whether it also has a condition on facts, which this page doesn't weigh.
+    conditional: bool,
+}
+
+fn uptime(
+    label: &'static str,
+    points: &[metrics::Point],
+    step_ms: i64,
+    ran_for_ms: Option<i64>,
+) -> Uptime {
+    let found = check_history::availability(points, step_ms, ran_for_ms);
+    let note = match found.failures {
+        0 => "never failed".to_string(),
+        1 => format!(
+            "failed once, for about {}",
+            check_history::span_text(found.down_ms)
+        ),
+        times => format!(
+            "failed {times} times, for about {}",
+            check_history::span_text(found.down_ms)
+        ),
+    };
+    let tone = match found.percent {
+        Some(percent) if percent >= 99.9 => "good",
+        Some(percent) if percent >= 99.0 => "warn",
+        Some(_) => "bad",
+        None => "",
+    };
+    Uptime {
+        label,
+        percent: found.percent.map(check_history::percent_text),
+        note: if found.percent.is_some() {
+            note
+        } else {
+            "nothing run yet".to_string()
+        },
+        tone,
+    }
+}
+
+/// The points of whether a check passed, over a stretch of time.
+async fn passing(
+    state: &AppState,
+    host_id: &str,
+    name: &str,
+    length_ms: i64,
+) -> Result<(Vec<metrics::Point>, TimeRange)> {
+    let range = time_range(length_ms).context("no such time range")?;
+    let up = metrics::find("check.up").context("the metrics checks report are missing")?;
+    let mut found = one_series(state, host_id, up, name, range).await?;
+    let points = found
+        .series
+        .pop()
+        .map(|series| series.points)
+        .unwrap_or_default();
+    Ok((points, range))
+}
+
+/// "26 s ago", finer than elsewhere, as a check runs every few seconds.
+fn ran_text(ran_ms: i64, now_ms: i64) -> String {
+    let secs = (now_ms - ran_ms).max(0) / 1000;
+    if secs < 60 {
+        format!("{secs} s ago")
+    } else {
+        crate::times::ago(ran_ms as u64, now_ms as u64)
+    }
+}
+
+/// A check's own page: how it is now, how it's been, and its charts and nobody
+/// else's.
 async fn show(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -456,45 +564,311 @@ async fn show(
         Ok(None) => return not_found(&state, &token),
         Err(error) => return server_error(&error),
     };
+    match page(&state, &token, check, &params).await {
+        Ok(page) => page,
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn page(
+    state: &AppState,
+    token: &CsrfToken,
+    check: RemoteCheck,
+    params: &RangeParams,
+) -> Result<Response> {
+    let id = check.id;
     let input = check.input;
-    let (selected, _, length_ms) = selected_range(&params);
-    let Some(range) = time_range(length_ms) else {
-        return not_found(&state, &token);
-    };
-    let charts = charts(&state, &input.host_id, &input.check.name, range, selected);
-    let charts = match charts.await {
-        Ok(charts) => charts,
-        Err(error) => return server_error(&error),
-    };
-    let alerts = match state.database.open_alerts().await {
-        Ok(alerts) => alerts,
-        Err(error) => return server_error(&error),
-    };
-    let alerts: Vec<_> = alerts
-        .into_iter()
-        .filter(|alert| alert.host_id == input.host_id && alert.series == input.check.name)
-        .collect();
-    let hosts = host_choices(&state).await;
+    let name = &input.check.name;
+    let (selected, _, length_ms) = selected_range(params);
+    let range = time_range(length_ms).context("no such time range")?;
+    let charts = charts(state, &input.host_id, name, range, selected).await?;
+    let now = metrics::now_ms();
+
+    let hosts = host_choices(state).await;
     let host = hosts
         .into_iter()
         .find(|host| host.id == input.host_id && host.id != LOCAL_HOST_ID);
-    let latest = state.check_results.all();
+    let hostname = host
+        .as_ref()
+        .map_or(LOCAL_HOSTNAME.to_string(), |host| host.hostname.clone());
+    let latest = state.check_results.all().remove(&id).and_then(|result| {
+        let row = check_row(&result)?;
+        Some((row, result))
+    });
 
-    Page::new(&state, &token, "remote_checks/show.html")
+    // How it's been: the last day in bars, then longer stretches in figures.
+    let (day, day_range) = passing(state, &input.host_id, name, DAY_MS).await?;
+    let (week, week_range) = passing(state, &input.host_id, name, 7 * DAY_MS).await?;
+    let (month, month_range) = passing(state, &input.host_id, name, 30 * DAY_MS).await?;
+    let bars = check_history::slots(&day, day_range.from_ms, day_range.to_ms, BARS);
+    // The last day is kept finest. Where it starts after the day does, the check
+    // is newer than that, and the time its points cover is how long it's run,
+    // which the longer ranges' coarser points can't tell.
+    let newer = day
+        .first()
+        .is_some_and(|first| first.time_ms > day_range.from_ms + day_range.step_ms);
+    let ran_for = newer.then(|| day.len() as i64 * day_range.step_ms);
+    let uptimes = [
+        uptime("Last 24 hours", &day, day_range.step_ms, ran_for),
+        uptime("Last 7 days", &week, week_range.step_ms, ran_for),
+        uptime("Last 30 days", &month, month_range.step_ms, ran_for),
+    ];
+
+    let mut tiles = Vec::new();
+    let streak = check_history::streak(&month, month_range.step_ms);
+    let status = match (&latest, input.enabled) {
+        (_, false) => Tile {
+            label: "Status",
+            value: "Paused".to_string(),
+            note: "isn't run until it's resumed".to_string(),
+            tone: "",
+        },
+        (None, true) => Tile {
+            label: "Status",
+            value: "Waiting".to_string(),
+            note: "hasn't run since the server started".to_string(),
+            tone: "",
+        },
+        (Some((row, _)), true) => {
+            // The latest run says how it is; the history says for how long.
+            let note = streak
+                .filter(|streak| streak.passing == row.up)
+                .map(|streak| {
+                    let span = check_history::span_text(now - streak.since_ms);
+                    let more = if streak.or_longer { " or more" } else { "" };
+                    format!("for {span}{more}")
+                })
+                .unwrap_or_else(|| row.error.clone().unwrap_or_default());
+            Tile {
+                label: "Status",
+                value: if row.up { "Up" } else { "Down" }.to_string(),
+                note,
+                tone: if row.up { "good" } else { "bad" },
+            }
+        }
+    };
+    tiles.push(status);
+    tiles.push(Tile {
+        label: "Last run",
+        value: state
+            .check_results
+            .ran_ms(id)
+            .map_or("Not yet".to_string(), |ran| ran_text(ran, now)),
+        note: format!("every {} s, from the server", input.interval_secs),
+        tone: "",
+    });
+    if let Some((row, result)) = &latest {
+        if let Some(response) = &row.response {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(status) = row.status {
+                parts.push(
+                    format!("{status} {}", row.protocol.clone().unwrap_or_default())
+                        .trim()
+                        .to_string(),
+                );
+            }
+            if let Some(tls) = &row.tls_version {
+                parts.push(tls.clone());
+            }
+            tiles.push(Tile {
+                label: "Response time",
+                value: response.clone(),
+                note: parts.join(" · "),
+                tone: "",
+            });
+        }
+        if let Some(days) = result["cert_days_left"].as_i64() {
+            let until = now + days * DAY_MS;
+            tiles.push(Tile {
+                label: "Certificate",
+                value: format!("{days} day{}", if days == 1 { "" } else { "s" }),
+                note: format!("left, until about {}", super::local_date(until)),
+                tone: if days < 14 { "bad" } else { "" },
+            });
+        }
+    }
+
+    let alerts: Vec<_> = state
+        .database
+        .open_alerts()
+        .await?
+        .into_iter()
+        .filter(|alert| alert.host_id == input.host_id && alert.series == *name)
+        .collect();
+    let rules: Vec<WatchingRule> = state
+        .database
+        .list_alert_rules()
+        .await?
+        .into_iter()
+        .filter(|rule| {
+            let input = &rule.rule;
+            input.enabled
+                && matches!(input.kind, RuleKind::Metric | RuleKind::Forecast)
+                && input
+                    .metric
+                    .as_deref()
+                    .is_some_and(|metric| metric.starts_with("check."))
+                && input.watches_series(name)
+        })
+        .map(|rule| WatchingRule {
+            id: rule.id,
+            conditional: rule
+                .rule
+                .condition
+                .as_deref()
+                .is_some_and(|c| !c.trim().is_empty()),
+            name: rule.rule.name,
+            severity: rule.rule.severity.as_str(),
+        })
+        .collect();
+
+    let quiet = ActiveSilences::load(&state.database, now).await?;
+    let cover = quiet.covering_series(&input.host_id, &hostname, name);
+    let own = host_filter::only(&input.host_id);
+    let maintenance = described(state, cover, |silence| {
+        silence.rule_id.is_none() && silence.filter == own && silence.series == *name
+    })
+    .await?;
+
+    Ok(Page::new(state, token, "remote_checks/show.html")
         .with("id", &id)
-        .with("name", &input.check.name)
+        .with("name", name)
         .with("kind", input.check.kind.as_str())
         .with("target", &input.check.target)
-        .with("interval_secs", &input.interval_secs)
         .with("enabled", &input.enabled)
         .with("host", &host)
-        .with("host_id", &input.host_id)
-        .with("latest", &latest.get(&id).and_then(check_row))
+        .with("tiles", &tiles)
+        .with("bars", &bars)
+        .with("uptimes", &uptimes)
+        .with("latest", &latest.as_ref().map(|(row, _)| row))
         .with("alerts", &alerts)
+        .with("rules", &rules)
+        .with("maintenance", &maintenance)
+        .with("maintenance_choices", &maintenance_choices())
         .with("charts", &charts)
         .with("ranges", &range_links(selected))
         .with("range", selected)
-        .render()
+        .render())
+}
+
+/// The name of the host a check is about, as its results are saved under.
+async fn hostname_of(state: &AppState, host_id: &str) -> Option<String> {
+    if host_id == LOCAL_HOST_ID {
+        return Some(LOCAL_HOSTNAME.to_string());
+    }
+    state
+        .agentless_host(host_id)
+        .await
+        .map(|host| host.hostname)
+}
+
+/// Runs a check once now, in between its usual runs, and waits for it, so the
+/// page it goes back to shows what it found.
+async fn run_now(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfForm) -> Response {
+    let check = match state.database.get_remote_check(id).await {
+        Ok(Some(check)) => check,
+        Ok(None) => return not_found(&state, &form.token),
+        Err(error) => return server_error(&error),
+    };
+    let Some(hostname) = hostname_of(&state, &check.input.host_id).await else {
+        return not_found(&state, &form.token);
+    };
+    crate::remote_checks::run(
+        &check,
+        hostname,
+        &state.writer,
+        &state.check_results,
+        &state.presence,
+    )
+    .await;
+    (form.token, Redirect::to(&format!("/checks/{id}"))).into_response()
+}
+
+/// Stops running a check, or starts it again: the same as its form's "Run this
+/// check" box.
+async fn pause(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfForm) -> Response {
+    let check = match state.database.get_remote_check(id).await {
+        Ok(Some(check)) => check,
+        Ok(None) => return not_found(&state, &form.token),
+        Err(error) => return server_error(&error),
+    };
+    let mut input = check.input;
+    input.enabled = !input.enabled;
+    match state.database.update_remote_check(id, &input).await {
+        Ok(true) => (form.token, Redirect::to(&format!("/checks/{id}"))).into_response(),
+        Ok(false) => not_found(&state, &form.token),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// Holds back every notification about this check for a while, with a silence
+/// for it alone, as a host's page does for the host.
+async fn start_maintenance(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    form: CsrfForm,
+) -> Response {
+    let check = match state.database.get_remote_check(id).await {
+        Ok(Some(check)) => check,
+        Ok(None) => return not_found(&state, &form.token),
+        Err(error) => return server_error(&error),
+    };
+    let Some(duration_secs) = maintenance_secs(&form) else {
+        return (StatusCode::BAD_REQUEST, "Choose how long from the list.").into_response();
+    };
+    let name = check.input.check.name;
+    let reason = match form.fields.get("reason").map(|reason| reason.trim()) {
+        Some(reason) if !reason.is_empty() => reason.to_string(),
+        _ => format!("Maintenance on {name}"),
+    };
+    let input = SilenceInput {
+        rule_id: None,
+        filter: host_filter::only(&check.input.host_id),
+        series: name,
+        reason,
+        duration_secs,
+    };
+    if let Err(error) = state.check_silence(&input).await {
+        return (StatusCode::UNPROCESSABLE_ENTITY, format!("{error:#}")).into_response();
+    }
+    match state
+        .database
+        .create_silence(&input, &recorded_by(), metrics::now_ms())
+        .await
+    {
+        Ok(_) => (form.token, Redirect::to(&format!("/checks/{id}"))).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// Ends the silences started for this check alone. Wider ones, and maintenance
+/// windows, are left to their own pages.
+async fn end_maintenance(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    form: CsrfForm,
+) -> Response {
+    let check = match state.database.get_remote_check(id).await {
+        Ok(Some(check)) => check,
+        Ok(None) => return not_found(&state, &form.token),
+        Err(error) => return server_error(&error),
+    };
+    let now = metrics::now_ms();
+    let silences = match state.database.active_silences(now).await {
+        Ok(silences) => silences,
+        Err(error) => return server_error(&error),
+    };
+    let own = host_filter::only(&check.input.host_id);
+    for silence in silences.iter().filter(|silence| {
+        silence.rule_id.is_none()
+            && silence.filter == own
+            && silence.series == check.input.check.name
+    }) {
+        if let Err(error) = state.database.end_silence(silence.id, now).await {
+            return server_error(&error);
+        }
+    }
+    (form.token, Redirect::to(&format!("/checks/{id}"))).into_response()
 }
 
 async fn validate(state: &AppState, form: &CheckForm, id: Option<i64>) -> Result<RemoteCheckInput> {

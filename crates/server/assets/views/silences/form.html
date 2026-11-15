@@ -28,6 +28,11 @@
     <small>The same filter as the Hosts list. Leave empty for every host. Alerts about a group of hosts only follow the rule above, so a silence with a filter leaves them out.</small>
   </label>
 
+  <label>Series
+    <input type="text" name="series" value="{{ silence.series }}" maxlength="255" spellcheck="false" placeholder="Home page">
+    <small>One series alone, named exactly, such as a check's name or a disk's mount point. Leave empty for everything the rule watches.</small>
+  </label>
+
   <label>For
     <select name="duration_secs">
       {% for duration in durations %}

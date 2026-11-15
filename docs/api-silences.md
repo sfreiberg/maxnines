@@ -8,11 +8,15 @@ already told about an alert still hears when it ends.
 |---|---|
 | `rule_id` | The alert rule it covers. Leave it out for every rule. |
 | `filter` | Which hosts it covers, written as in [Filters](api-filters.md). Leave it out for every host. Alerts about a group of hosts have no single host, so a filter leaves them out. |
+| `series` | One series alone, named exactly, such as a check's name. Leave it out for every series. |
 | `reason` | Why, which is required. |
 | `duration_secs` | How long it lasts from now, up to 30 days. |
 
 Deleting a rule deletes its silences that haven't ended. Ones that have ended stay, still
 naming the rule.
+
+**Start maintenance** on a check's page is the same with the check's name as `series`,
+which quiets that check and nothing else on its host.
 
 **Start maintenance** on a host's page is a silence with no `rule_id` and the filter
 `id=` followed by the host ID, so the same request does it through the API:
@@ -41,6 +45,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/silences
       "id": 3,
       "rule_id": null,
       "filter": "hostname=db*",
+      "series": "",
       "reason": "Upgrading Postgres",
       "created_by": "you@example.com",
       "starts_ms": 1793940279545,

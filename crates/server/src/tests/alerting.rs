@@ -465,6 +465,7 @@ async fn deleting_a_rule_closes_its_alerts_and_keeps_the_history_pointing_at_it(
     let silence = SilenceInput {
         rule_id: Some(id),
         filter: String::new(),
+        series: String::new(),
         reason: "Upgrading".to_string(),
         duration_secs: 3600,
     };
@@ -5561,6 +5562,7 @@ mod silences {
         SilenceInput {
             rule_id: None,
             filter: filter.to_string(),
+            series: String::new(),
             reason: "Upgrading".to_string(),
             duration_secs: HOUR_SECS,
         }
@@ -6387,6 +6389,7 @@ mod reminders {
         let input = SilenceInput {
             rule_id: None,
             filter: String::new(),
+            series: String::new(),
             reason: "Upgrading".to_string(),
             duration_secs: 3 * 3600,
         };
@@ -8301,6 +8304,7 @@ async fn a_host_page_names_a_wider_silence_but_leaves_ending_it_to_its_page() {
     let everything = crate::silences::SilenceInput {
         rule_id: None,
         filter: String::new(),
+        series: String::new(),
         reason: "Moving data centres".to_string(),
         duration_secs: 3600,
     };
@@ -8320,6 +8324,7 @@ async fn a_host_page_names_a_wider_silence_but_leaves_ending_it_to_its_page() {
     let one_rule = crate::silences::SilenceInput {
         rule_id: Some(rule),
         filter: crate::host_filter::only(&id),
+        series: String::new(),
         reason: "Noisy CPU rule".to_string(),
         duration_secs: 7200,
     };
