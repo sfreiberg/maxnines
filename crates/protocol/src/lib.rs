@@ -262,8 +262,9 @@ impl LocalCheck {
     }
 }
 
-/// What can be read from a database beyond what always is, each costing more.
-pub const DATABASE_EXTRAS: [&str; 1] = ["sizes"];
+/// What can be read from a database beyond what always is, each costing more:
+/// sizes on disk, and, for ClickHouse, how long queries took.
+pub const DATABASE_EXTRAS: [&str; 2] = ["sizes", "queries"];
 
 /// How many databases one agent can be asked to read.
 const MAX_DATABASES: usize = 16;

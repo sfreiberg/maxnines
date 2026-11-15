@@ -76,8 +76,8 @@
     </label>
     {% for extra in database_extras %}
     <label class="checkbox">
-      <input type="checkbox" name="extra_{{ extra }}"{% if extra in check.extras %} checked{% endif %}> Also read {% if extra == "sizes" %}sizes{% else %}{{ extra }}{% endif %}
-      {% if extra == "sizes" %}<small>Each database's size on disk, which costs more to read.</small>{% endif %}
+      <input type="checkbox" name="extra_{{ extra }}"{% if extra in check.extras %} checked{% endif %}> Also read {% if extra == "sizes" %}sizes{% elif extra == "queries" %}query latency{% else %}{{ extra }}{% endif %}
+      {% if extra == "sizes" %}<small>Each database's size on disk, which costs more to read.</small>{% elif extra == "queries" %}<small>ClickHouse only: how long queries took over the last five minutes, and how many failed, from its query log, which can be large.</small>{% endif %}
     </label>
     {% endfor %}
   </fieldset>

@@ -143,6 +143,7 @@ impl Reader {
 
 /// One row: what it's called, its values, its running totals, and averages
 /// worked out from the change in two totals.
+#[derive(Clone)]
 struct Row {
     name: String,
     fields: Map<String, Value>,
@@ -265,13 +266,16 @@ impl Settle {
                     return row;
                 };
                 let mut changes = Map::new();
+                // A row that's new since the last read, whose totals were 0 then.
+                let from_zero = fields.remove("from_zero").is_some();
                 if let Some(Value::Object(totals)) = fields.remove("totals") {
                     for (key, total) in totals {
                         let Some(total) = total.as_f64() else {
                             continue;
                         };
                         let key = (name.clone(), key);
-                        if let Some(last) = self.0.get(&key) {
+                        let last = self.0.get(&key).copied().or(from_zero.then_some(0.0));
+                        if let Some(last) = last {
                             changes.insert(key.1.clone(), json!((total - last).max(0.0)));
                         }
                         seen.insert(key, total);
@@ -331,6 +335,24 @@ mod tests {
         assert!(second[0].get("_asked").is_none());
         // It went backwards, so it started again.
         assert_eq!(second[1]["sent"], 0.0);
+    }
+
+    #[test]
+    fn a_new_row_counts_its_totals_from_zero_when_told_to() {
+        let mut settle = Settle::default();
+        let mut rows = Rows::new("events");
+        rows.main.total("seen", Some(1.0));
+        settle.settle(rows.finish());
+        let mut rows = Rows::new("events");
+        rows.main.total("seen", Some(1.0));
+        let new = rows.add("error", "TOO_MANY_PARTS");
+        new.total("error_count", Some(3.0));
+        new.set("from_zero", true);
+        let settled = settle.settle(rows.finish());
+        assert_eq!(
+            settled[1],
+            json!({ "name": "events error TOO_MANY_PARTS", "error_count": 3.0 })
+        );
     }
 
     #[test]

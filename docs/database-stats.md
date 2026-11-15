@@ -72,6 +72,7 @@ After a database's name in a rule, list anything else to read, which costs more:
 | Extra | What it adds |
 |---|---|
 | `sizes` | Each database's size on disk. PostgreSQL adds the WAL kept, and MySQL the binary logs |
+| `queries` | ClickHouse only: how long queries took over the last five minutes, as the median, 95th and 99th percentiles for each kind of query, and how many failed. It's read from `system.query_log`, which keeps everything unless it's given a time to live, so it can be slow on a busy server |
 
 ClickHouse is read over its HTTP interface, where a password goes with every
 request as basic authentication, not as a challenge as the others sign in. So
@@ -143,11 +144,20 @@ server answers and its version.
 ### ClickHouse
 
 ```sql
-CREATE USER maxnines IDENTIFIED BY 'a long random password' SETTINGS readonly = 1;
+CREATE SETTINGS PROFILE IF NOT EXISTS maxnines_monitor SETTINGS
+    readonly = 1, max_execution_time = 10, timeout_overflow_mode = 'throw',
+    max_memory_usage = 1000000000, max_result_rows = 100000,
+    result_overflow_mode = 'throw', max_threads = 2,
+    max_concurrent_queries_for_user = 4;
+CREATE USER IF NOT EXISTS maxnines IDENTIFIED WITH sha256_password BY 'a long random password'
+    HOST IP '192.0.2.10' SETTINGS PROFILE 'maxnines_monitor';
 GRANT SELECT ON system.* TO maxnines;
 ```
 
-Everything it reads is in the `system` tables.
+Everything it reads is in the `system` tables, and the grant is needed even for
+those. The profile limits what a read can cost, as an account that can only read
+can't be sent settings of its own. Users are kept on each server unless access
+control is replicated, so make it on each.
 
 ## What's read
 
@@ -232,13 +242,27 @@ databases**. Ones that aren't in a replica set leave out what's about replicatio
 
 | Metric | What it is |
 |---|---|
-| **ClickHouse queries running**, **selects**, **inserts**, **failed queries**, **rows inserted**, **bytes inserted** | Load |
-| **ClickHouse most parts in a partition** | Inserts are slowed at `parts_to_delay_insert` and refused at `parts_to_throw_insert`, 300 by default. Many small inserts are the usual cause |
-| **ClickHouse inserts being slowed**, **inserts slowed for too many parts**, **inserts refused for too many parts** | What that's costing |
-| **ClickHouse merges running**, **memory in use** | Background work and memory |
-| **ClickHouse replicated tables**, **replicated tables read only**, **tables that lost Keeper**, **tables missing a replica**, **replication queue**, **inserts waiting to replicate**, **read-only replicas** | Replication. A table goes read only when it loses ClickHouse Keeper or ZooKeeper |
-| **ClickHouse mutations pending**, **mutations failing** | `ALTER … UPDATE` and `DELETE` still to finish, and ones that keep failing |
-| **ClickHouse disk free**, **disk used** | For each of its disks, such as `events disk default` |
+| **ClickHouse queries running**, **queries running of the most allowed** | Against `max_concurrent_queries`. Inserts waiting to be batched aren't counted, as they would be from 26.3, when inserts are batched by default |
+| **ClickHouse selects**, **inserts**, **failed queries**, **failed selects**, **failed inserts**, **rows inserted**, **bytes inserted**, **rows per insert** | Load. Many inserts of few rows each make too many parts |
+| **ClickHouse average query time**, **average select time**, **average insert time** | Over each sample |
+| **ClickHouse most parts in a partition**, **of where inserts slow**, **parts in total** | Inserts are slowed at `parts_to_delay_insert` and refused at `parts_to_throw_insert`, 1000 and 3000 since 23.6, 150 and 300 before. The percentage is against the server's own setting |
+| **ClickHouse inserts being slowed**, **inserts slowed for too many parts**, **time inserts were slowed**, **inserts refused for too many parts** | What that's costing |
+| **ClickHouse inserts waiting to be batched**, **batched inserts failed**, **oldest insert waiting to be batched** | Asynchronous inserts |
+| **ClickHouse memory in use**, **memory used of its limit**, **memory used by merges and mutations**, **queries over their memory limit**, **time waiting for memory** | Its limit is worked out from `max_server_memory_usage`, its share of memory (0.9 by default) and the memory it can have, as no metric gives it |
+| **ClickHouse merges running**, **background pool used**, **background pool tasks** | Each pool, such as `events pool merges and mutations`. A full merge pool means merges fall behind and parts pile up |
+| **ClickHouse mutations pending**, **failing**, **slowed**, **refused** | `ALTER … UPDATE` and `DELETE` still to finish, and ones that keep failing |
+| **ClickHouse dictionaries failing**, **detached parts**, **parts detached as broken**, **backups and restores failed** | Read every few minutes. Detached parts on their way somewhere aren't counted |
+| **ClickHouse errors** | For each error code worth knowing about, such as `events error TOO_MANY_PARTS`, once it's happened. ClickHouse's own docs warn that other codes rise while queries succeed |
+| **ClickHouse buffer table flush failures**, **slow disk reads**, **failed disk reads**, **failed disk writes** | Trouble underneath |
+| **ClickHouse replicated tables**, **replicated tables read only**, **tables that lost Keeper**, **read-only replicas** | A table goes read only when it loses ClickHouse Keeper or ZooKeeper |
+| **ClickHouse replication queue**, **longest replication queue**, **inserts waiting to replicate**, **merges waiting to replicate**, **parts still to appear**, **parts waiting to be checked**, **oldest replication queue entry**, **replication queue entries stuck**, **entries failing**, **replicas failing to update their queue** | Replication's backlog. An entry tried over 100 times, or put off over 1000, is stuck, and the newest reason one failed is on the database's own row |
+| **ClickHouse tables missing a replica**, **replication log entries behind** | Read every few minutes, as they ask Keeper about every table |
+| **ClickHouse replica lag behind the freshest**, **parts lost**, **parts being fetched**, **longest fetch**, **failed fetches**, **failed part checks**, **data lost on a replica**, **merges and mutations that differ from a replica**, **replicated tables shut down** | The rest of replication |
+| **ClickHouse Distributed files waiting**, **bytes waiting**, **files broken**, **connections to shards retried** and **failed**, **inserts refused** and **failed**, **queues blocked**, **queue errors**, **recent errors reaching other replicas** | Distributed tables |
+| **ClickHouse connected to Keeper**, **Keeper session age**, **sessions**, **sessions expired**, **requests in flight**, **average wait**, **connection errors**, **request errors** | Its connection to ClickHouse Keeper or ZooKeeper. The connection table is from 23.5 |
+| **ClickHouse embedded Keeper is leader**, **synced followers**, **over its memory limit**, **clients**, **requests waiting** | When ClickHouse Keeper runs inside this server |
+| **ClickHouse disk free**, **disk used**, **disk broken**, **disk read only** | For each of its disks, such as `events disk default` |
+| **ClickHouse median**, **95th** and **99th percentile query time**, **queries failed in five minutes** | With the `queries` extra, for each kind of query, such as `events queries select` |
 
 ## Good things to alert on
 
@@ -255,10 +279,15 @@ databases**. Ones that aren't in a replica set leave out what's about replicatio
 - **MongoDB replica set has a primary** at 0, or **members healthy** below the
   set's size.
 - **MongoDB oplog window** under a day.
-- **ClickHouse most parts in a partition** over 150, half of where inserts are
-  refused.
-- **ClickHouse replicated tables read only** above 0, or **mutations failing**
-  above 0.
+- **ClickHouse most parts in a partition of where inserts slow** over 80%.
+- **ClickHouse inserts refused for too many parts** above 0.
+- **ClickHouse replicated tables read only** or **tables that lost Keeper** above 0,
+  and **data lost on a replica** above 0.
+- **ClickHouse memory used of its limit** over 90%, and **background pool used**
+  for merges and mutations over 90% for a quarter of an hour.
+- **ClickHouse errors** above 0 for the integrity codes, such as
+  `CHECKSUM_DOESNT_MATCH`.
+- **ClickHouse replication queue entries stuck** or **mutations failing** above 0.
 
 Each server reports only what it knows about itself. Comparing servers, such as
 noticing two primaries at once, is planned.
