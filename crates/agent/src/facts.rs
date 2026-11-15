@@ -11,7 +11,15 @@ use sysinfo::{CpuRefreshKind, IpNetwork, MacAddr, Motherboard, Networks, Product
 
 use crate::actions::{self, Actions};
 use crate::collector;
-use crate::custom::Definitions;
+
+/// What the agent's own config lets the server ask for, by name only. What each
+/// runs or reaches, and how it signs in, stays on this host.
+#[derive(Debug, Clone, Default)]
+pub struct Allowed {
+    pub custom_metrics: Vec<String>,
+    pub check_commands: Vec<String>,
+    pub checks: Vec<String>,
+}
 
 /// Asks for the canonical name. The value is the same on every platform we build for.
 const AI_CANONNAME: i32 = 2;
@@ -109,7 +117,7 @@ fn network_facts<'a>(
 /// swap size, which some systems resize on demand, isn't included.
 pub fn gather(
     custom: &BTreeMap<String, Value>,
-    metrics: &Definitions,
+    allowed: &Allowed,
     actions: &Actions,
     built_in_actions: bool,
 ) -> Result<Value> {
@@ -117,7 +125,7 @@ pub fn gather(
     let canonical = hostname.as_deref().and_then(canonical_name);
     gather_named(
         custom,
-        metrics,
+        allowed,
         actions,
         built_in_actions,
         hostname.as_deref(),
@@ -128,7 +136,7 @@ pub fn gather(
 /// Everything but asking the resolver what the host is called.
 fn gather_named(
     custom: &BTreeMap<String, Value>,
-    metrics: &Definitions,
+    allowed: &Allowed,
     actions: &Actions,
     built_in_actions: bool,
     hostname: Option<&str>,
@@ -188,8 +196,11 @@ fn gather_named(
             "commit": build.commit,
             "built_at": build.built_at,
             "collectors": collector::supported(),
-            // Only the names. What they run stays on this host.
-            "custom_metrics": metrics.keys().collect::<Vec<_>>(),
+            // Only the names, for the server to choose from. What they run or
+            // reach, and how they sign in, stays on this host.
+            "custom_metrics": allowed.custom_metrics,
+            "check_commands": allowed.check_commands,
+            "checks": allowed.checks,
             // What the server can ask this host to run, and what each needs to
             // be told, so it can check before asking.
             "actions": action_names,
@@ -204,11 +215,10 @@ fn gather_named(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::custom::CustomMetric;
 
     #[test]
     fn reports_the_built_in_facts() {
-        let facts = gather(&BTreeMap::new(), &Definitions::new(), &Actions::new(), true).unwrap();
+        let facts = gather(&BTreeMap::new(), &Allowed::default(), &Actions::new(), true).unwrap();
 
         assert_eq!(facts["os"]["family"], std::env::consts::OS);
         assert!(facts["host"]["arch"].is_string());
@@ -345,7 +355,7 @@ mod tests {
 
     #[test]
     fn reports_which_build_this_is() {
-        let facts = gather(&BTreeMap::new(), &Definitions::new(), &Actions::new(), true).unwrap();
+        let facts = gather(&BTreeMap::new(), &Allowed::default(), &Actions::new(), true).unwrap();
         let agent = &facts["agent"];
 
         let commit = agent["commit"].as_str().unwrap();
@@ -362,7 +372,7 @@ mod tests {
         let custom = BTreeMap::from([("role".to_string(), json!("web"))]);
 
         assert_eq!(
-            gather(&custom, &Definitions::new(), &Actions::new(), true).unwrap()["custom"]["role"],
+            gather(&custom, &Allowed::default(), &Actions::new(), true).unwrap()["custom"]["role"],
             "web"
         );
     }
@@ -372,7 +382,7 @@ mod tests {
         // A difference here would fill the history with false changes. The resolver
         // is asked once, as it can answer one time and be too slow the next.
         let custom = BTreeMap::new();
-        let none = Definitions::new();
+        let none = Allowed::default();
         let actions = Actions::new();
         let named = |custom, none| {
             let canonical = Some("web-1.example.com");
@@ -382,18 +392,17 @@ mod tests {
     }
 
     #[test]
-    fn custom_metrics_are_listed_by_name_without_their_commands() {
-        let metrics = Definitions::from([(
-            "queue".to_string(),
-            CustomMetric {
-                command: vec!["/usr/local/bin/secret-tool".to_string()],
-                timeout_secs: None,
-            },
-        )]);
-        let facts = gather(&BTreeMap::new(), &metrics, &Actions::new(), true).unwrap();
+    fn what_the_config_allows_is_listed_by_name() {
+        let allowed = Allowed {
+            custom_metrics: vec!["queue".to_string()],
+            check_commands: vec!["check_raid".to_string()],
+            checks: vec!["bastion".to_string()],
+        };
+        let facts = gather(&BTreeMap::new(), &allowed, &Actions::new(), true).unwrap();
 
         assert_eq!(facts["agent"]["custom_metrics"], json!(["queue"]));
-        assert!(!facts.to_string().contains("secret-tool"));
+        assert_eq!(facts["agent"]["check_commands"], json!(["check_raid"]));
+        assert_eq!(facts["agent"]["checks"], json!(["bastion"]));
     }
 
     #[test]
@@ -408,7 +417,7 @@ mod tests {
             ),
             ("restart_nginx".to_string(), command(&["/opt/secret-tool"])),
         ]);
-        let facts = gather(&BTreeMap::new(), &Definitions::new(), &actions, false).unwrap();
+        let facts = gather(&BTreeMap::new(), &Allowed::default(), &actions, false).unwrap();
 
         let agent = &facts["agent"];
         assert_eq!(agent["actions"], json!(["disk_hogs", "restart_nginx"]));

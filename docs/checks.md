@@ -3,8 +3,9 @@
 A check tries reaching something and says whether it answered, how long it took, and
 whatever else it learned on the way. The server runs the ones on the **Checks** page,
 each about a [host without an agent](agentless-hosts.md) or the server itself. An
-agent runs the ones in a [config rule](api-config-rules.md), from where it is, which
-is how to check a database that only listens on its own host.
+agent runs the ones a [config rule](api-config-rules.md) gives it, from where it is,
+which is how to check something that only listens on its own host. Ones that sign in
+are defined in the agent's own config, as [below](#on-an-agent).
 
 | Kind | Target | What it checks |
 |---|---|---|
@@ -61,37 +62,44 @@ and it's read each time the check runs.
 
 ### On an agent
 
-The server never has an agent's passwords. Instead, a `check_login` block in the
-agent's own config file, `agent.hcl`, gives them, named for the check it's for, with
-the target it's for written exactly as the check's target is:
+The server never has an agent's passwords, and never chooses where they go. A check
+that signs in is a `check` block in the agent's own config file, `agent.hcl`, with
+what it reaches and how it signs in:
 
 ```hcl
-check_login "orders db" {
-  target   = "db.example.com:5432"
-  username = "maxnines"
-  password = env("ORDERS_DB_PASSWORD")
-}
-
-check_login "bastion" {
+check "bastion" {
+  kind             = "ssh"
   target           = "bastion.example.com:22"
   username         = "monitor"
   private_key_file = "/etc/maxnines/bastion_key"
+  host_key         = "SHA256:Dfij..."
+}
+
+check "mail" {
+  kind     = "imap"
+  target   = "mail.example.com:993"
+  tls      = true
+  username = "monitor@example.com"
+  password = env("MAIL_PASSWORD")
 }
 
 # Redis before version 6 has a password and no usernames.
-check_login "cache" {
+check "cache" {
+  kind     = "redis"
   target   = "127.0.0.1:6379"
   password = env("REDIS_PASSWORD")
 }
 ```
 
-The server chooses each check's target, so a login is only sent to the target its
-block names. If a config rule gives the check a different one, the check doesn't
-run, and says that its login is for somewhere else. A login is also only ever used
-by a check of a kind that signs in, so one named for a website check is never sent
-anywhere. A key file is read when the agent starts, so it
-has to be readable by the user the agent runs as. Restart the agent after changing
-any of these.
+Each can also have `insecure = true`. The agent tells the server the names of the
+checks its config allows, never more, and a [config rule](api-config-rules.md) picks
+which of them to run and how often, under **Checks from the agent's config**. A name
+the agent doesn't have reports that it's missing. Checks with nothing to sign in
+with, such as a website's, are given whole in the config rule instead, and a `check`
+block of a kind that never signs in is refused.
+
+A key file is read when the agent starts, so it has to be readable by the user the
+agent runs as. Restart the agent after changing any of these.
 
 ### Certificates
 

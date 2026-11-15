@@ -182,7 +182,7 @@ fn main() -> Result<()> {
             let config = Config::load(&cli.config)?;
             let facts = facts::gather(
                 &config.facts,
-                &config.custom_metrics,
+                &config.allowed(),
                 &config.actions,
                 config.built_in_actions,
             )?;

@@ -79,11 +79,13 @@
 
     <label>Custom metrics
       <textarea name="custom_names" rows="3" spellcheck="false">{{ rule.custom_names }}</textarea>
+      {% if allowed.custom_metrics %}<small>Agents allow: {% for name in allowed.custom_metrics %}<code>{{ name }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.</small>{% endif %}
       <small>One name per line, from the <code>custom_metric</code> blocks in each agent's own config. The commands stay on the agent, so a name that isn't defined there just reports a problem.</small>
     </label>
 
     <label>Check commands
       <textarea name="command_names" rows="3" spellcheck="false">{{ rule.command_names }}</textarea>
+      {% if allowed.check_commands %}<small>Agents allow: {% for name in allowed.check_commands %}<code>{{ name }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.</small>{% endif %}
       <small>One name per line, from the <code>check_command</code> blocks in each agent's own config: monitoring plugins in the Nagios style, such as <code>check_raid</code>. As with custom metrics, they're only ever defined on the agent.</small>
     </label>
 
@@ -125,6 +127,12 @@
     <label>Checks
       <textarea name="checks" rows="4" spellcheck="false" placeholder="tcp db db1:5432">{{ rule.checks }}</textarea>
       <small>One per line, as a kind, a name and a target: <code>tcp db db1:5432</code>, <code>http site https://example.com/</code>, <code>tls site example.com:443</code>, <code>dns resolver example.com</code> or <code>ping gateway 10.0.0.1</code>. Options can follow: <code>timeout=5</code>, <code>interval=300</code> to run less often than every sample, <code>insecure</code>, for http <code>method=POST</code>, <code>body=...</code> and <code>regex="Welcome back"</code>, for dns <code>server=8.8.8.8</code> and <code>record=MX</code>, and for ping <code>count=5</code>.</small>
+    </label>
+
+    <label>Checks from the agent's config
+      <textarea name="local_checks" rows="3" spellcheck="false" placeholder="bastion interval=300">{{ rule.local_checks }}</textarea>
+      {% if allowed.checks %}<small>Agents allow: {% for name in allowed.checks %}<code>{{ name }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.</small>{% endif %}
+      <small>One name per line, from the <code>check</code> blocks in each agent's own config: checks that sign in, such as of an SSH or mail server. Where they reach and how they sign in stay on the agent; this picks which to run, with <code>timeout=5</code> or <code>interval=300</code> after the name if wanted. A name an agent doesn't define reports that it's missing.</small>
     </label>
 
   </fieldset>

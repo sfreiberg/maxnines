@@ -26,8 +26,8 @@ use tracing::{error, info, warn};
 
 use crate::actions::{Actions, Runner};
 use crate::config::Config;
-use crate::custom::Definitions;
 use crate::facts;
+use crate::facts::Allowed;
 use crate::spool::Spool;
 
 /// The server pings regularly, so this much silence means the connection died.
@@ -69,7 +69,7 @@ struct Connection {
     connector: Connector,
     spool: Arc<Spool>,
     custom_facts: BTreeMap<String, Value>,
-    custom_metrics: Definitions,
+    allowed: Allowed,
     actions: Actions,
     built_in_actions: bool,
     /// Runs what the server asks for, apart from the connection, so a slow action
@@ -109,7 +109,7 @@ impl ServerLink {
             connector: tls_connector(config.server.ca_file.as_deref())?,
             spool: spool.clone(),
             custom_facts: config.facts.clone(),
-            custom_metrics: config.custom_metrics.clone(),
+            allowed: config.allowed(),
             actions: config.actions.clone(),
             built_in_actions: config.built_in_actions,
             runner: Runner::new(
@@ -340,7 +340,7 @@ async fn receive(text: &str, connection: &Connection) -> Option<String> {
 async fn send_facts(socket: &mut Socket, connection: &Connection) -> Result<()> {
     let facts = match facts::gather(
         &connection.custom_facts,
-        &connection.custom_metrics,
+        &connection.allowed,
         &connection.actions,
         connection.built_in_actions,
     ) {
@@ -420,9 +420,9 @@ mod tests {
             },
             state_dir: tempfile::tempdir().unwrap().keep(),
             facts: BTreeMap::from([("role".to_string(), json!("web"))]),
-            custom_metrics: Definitions::new(),
+            custom_metrics: crate::custom::Definitions::new(),
             check_commands: BTreeMap::new(),
-            check_logins: BTreeMap::new(),
+            checks: BTreeMap::new(),
             metrics_logins: BTreeMap::new(),
             actions: Actions::from([(
                 "greet".to_string(),

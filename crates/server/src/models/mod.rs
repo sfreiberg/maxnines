@@ -447,6 +447,20 @@ impl Database {
         Ok(known)
     }
 
+    /// The names any agent lists under one of its facts, such as the checks its
+    /// own config allows, each once and in order.
+    pub async fn listed_by_agents(&self, list: &str) -> Result<Vec<String>> {
+        let rows = host_fact::Entity::find()
+            .filter(host_fact::Column::ValidToMs.is_null())
+            .filter(host_fact::Column::Name.starts_with(format!("{list}[")))
+            .all(&self.connection)
+            .await
+            .context("loading what agents list")?;
+        let names: std::collections::BTreeSet<String> =
+            rows.into_iter().map(|row| row.value).collect();
+        Ok(names.into_iter().collect())
+    }
+
     /// Every value each fact has had, oldest first. Rows are ordered by ID, not
     /// time, because two reports can share a timestamp and clocks can go back.
     pub async fn facts_history(&self, host_id: &str) -> Result<Vec<FactVersion>> {

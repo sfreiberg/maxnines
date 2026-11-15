@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
-use maxnines_protocol::{COLLECTORS, Check, CheckKind, default_status_page};
+use maxnines_protocol::{COLLECTORS, Check, CheckKind, LocalCheck, default_status_page};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
@@ -53,6 +53,7 @@ struct RuleForm {
     openmetrics_urls: String,
     openmetrics_names: String,
     checks: String,
+    local_checks: String,
     collectors: Vec<CollectorChoice>,
 }
 
@@ -108,6 +109,7 @@ impl RuleForm {
             openmetrics_urls: lines(&rule.settings["collectors"]["openmetrics"]["urls"]),
             openmetrics_names: lines(&rule.settings["collectors"]["openmetrics"]["names"]),
             checks: check_lines(&rule.settings["collectors"]["checks"]["checks"]),
+            local_checks: local_check_lines(&rule.settings["collectors"]["checks"]["local_checks"]),
             collectors: choices(|name| {
                 match rule.settings["collectors"][name]["enabled"].as_bool() {
                     Some(true) => "on",
@@ -142,6 +144,7 @@ impl RuleForm {
             openmetrics_urls: text("openmetrics_urls"),
             openmetrics_names: text("openmetrics_names"),
             checks: text("checks"),
+            local_checks: text("local_checks"),
             collectors: choices(|name| text(&format!("collector_{name}"))),
         }
     }
@@ -204,6 +207,10 @@ impl RuleForm {
                 let checks = parse_checks(&self.checks)?;
                 if !checks.is_empty() {
                     fields.insert("checks".to_string(), json!(checks));
+                }
+                let local = parse_local_checks(&self.local_checks)?;
+                if !local.is_empty() {
+                    fields.insert("local_checks".to_string(), json!(local));
                 }
             }
             if !fields.is_empty() {
@@ -351,6 +358,58 @@ fn check_line(check: &Check) -> String {
     words.join(" ")
 }
 
+/// Checks an agent's own config defines are typed one per line, by name, with
+/// `timeout=5` or `interval=300` after it if wanted.
+fn parse_local_checks(text: &str) -> Result<Vec<LocalCheck>> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let words = split_words(line)?;
+            let [name, options @ ..] = &words[..] else {
+                bail!("{line:?} should start with a check's name");
+            };
+            let mut check = LocalCheck::new(name);
+            for option in options {
+                let (key, value) = option.split_once('=').unwrap_or((option, ""));
+                let seconds = || -> Result<Option<u64>> {
+                    let seconds = value.parse().with_context(|| {
+                        format!("{key} should be a whole number of seconds, in {line:?}")
+                    })?;
+                    Ok(Some(seconds))
+                };
+                match key {
+                    "timeout" => check.timeout_secs = seconds()?,
+                    "interval" => check.interval_secs = seconds()?,
+                    other => bail!(
+                        "{other:?} isn't an option here, where only timeout and interval \
+                         are, in {line:?}"
+                    ),
+                }
+            }
+            Ok(check)
+        })
+        .collect()
+}
+
+fn local_check_lines(value: &Value) -> String {
+    let checks: Vec<LocalCheck> = serde_json::from_value(value.clone()).unwrap_or_default();
+    let lines: Vec<String> = checks
+        .iter()
+        .map(|check| {
+            let mut words = vec![quote(&check.name)];
+            if let Some(seconds) = check.timeout_secs {
+                words.push(format!("timeout={seconds}"));
+            }
+            if let Some(seconds) = check.interval_secs {
+                words.push(format!("interval={seconds}"));
+            }
+            words.join(" ")
+        })
+        .collect();
+    lines.join("\n")
+}
+
 fn check_lines(value: &Value) -> String {
     let checks: Vec<Check> = serde_json::from_value(value.clone()).unwrap_or_default();
     let lines: Vec<String> = checks.iter().map(check_line).collect();
@@ -480,8 +539,19 @@ async fn form_view<'a>(
     form: &RuleForm,
 ) -> Page<'a> {
     let known: Vec<String> = known_facts(state).await.into_keys().collect();
+    // What agents' own configs allow, to choose from. The form works without.
+    let mut allowed = BTreeMap::new();
+    for list in ["custom_metrics", "check_commands", "checks"] {
+        let names = state
+            .database
+            .listed_by_agents(&format!("agent.{list}"))
+            .await
+            .unwrap_or_default();
+        allowed.insert(list, names);
+    }
 
     Page::new(state, token, "rules/form.html")
+        .with("allowed", &allowed)
         .with("id", &id)
         .with("rule", form)
         .with("operators", &operators())
@@ -671,6 +741,22 @@ mod tests {
             condition: Some("true".to_string()),
             enabled: false,
             settings,
+        }
+    }
+
+    #[test]
+    fn checks_from_the_agents_config_are_named_with_their_timing() {
+        let checks =
+            parse_local_checks("bastion\n\n \"mail box\" interval=300 timeout=5 ").unwrap();
+        assert_eq!(checks[0], LocalCheck::new("bastion"));
+        assert_eq!(checks[1].name, "mail box");
+        assert_eq!(checks[1].interval_secs, Some(300));
+        assert_eq!(checks[1].timeout_secs, Some(5));
+        let lines = local_check_lines(&json!(checks));
+        assert_eq!(lines, "bastion\n\"mail box\" timeout=5 interval=300");
+        assert_eq!(parse_local_checks(&lines).unwrap(), checks);
+        for bad in ["bastion target=x", "bastion interval=soon"] {
+            assert!(parse_local_checks(bad).is_err(), "{bad}");
         }
     }
 

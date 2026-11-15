@@ -196,11 +196,69 @@ pub struct CollectorSettings {
     /// Checks collector only: what to try reaching.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checks: Option<Vec<Check>>,
+    /// Checks collector only: checks the agent's own config defines, with what
+    /// they sign in with, to run. The server picks from those and says how often.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_checks: Option<Vec<LocalCheck>>,
     /// Apache, nginx and PHP-FPM collectors only: the status pages to read. Without
     /// any, the collector reads [`default_status_page`]. For the OpenMetrics collector
     /// they're the metrics pages to read, and it has no usual one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub urls: Option<Vec<String>>,
+}
+
+/// A check the agent's own config defines, which a rule asks it to run. The
+/// config says what it reaches and how it signs in; this says when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalCheck {
+    pub name: String,
+    /// How long it gets. Defaults to [`DEFAULT_CHECK_TIMEOUT_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// How often it runs, if less often than every sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_secs: Option<u64>,
+}
+
+impl LocalCheck {
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            timeout_secs: None,
+            interval_secs: None,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        let name = &self.name;
+        ensure!(
+            is_check_name(name),
+            "{name:?} isn't a check's name, which is at most {MAX_CHECK_NAME_LEN} \
+             characters with no line breaks"
+        );
+        if let Some(seconds) = self.timeout_secs {
+            ensure!(
+                (1..=MAX_CHECK_TIMEOUT_SECS).contains(&seconds),
+                "check {name:?} needs a timeout from 1 to {MAX_CHECK_TIMEOUT_SECS} seconds"
+            );
+        }
+        if let Some(seconds) = self.interval_secs {
+            ensure!(
+                (1..=MAX_INTERVAL_SECS).contains(&seconds),
+                "check {name:?} needs an interval from 1 to {MAX_INTERVAL_SECS} seconds, a day"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Whether a check could be called this. It names a series, so it has to fit
+/// in a chart's labels.
+pub fn is_check_name(name: &str) -> bool {
+    !name.trim().is_empty()
+        && name.len() <= MAX_CHECK_NAME_LEN
+        && !name.chars().any(char::is_control)
 }
 
 /// Where a collector looks for a status page when it isn't told. These are the
@@ -249,6 +307,7 @@ pub fn check_metrics_pages(urls: &[String], names: &[String]) -> Result<()> {
         names: Some(names.to_vec()),
         paths: None,
         checks: None,
+        local_checks: None,
         urls: Some(urls.to_vec()),
     };
     settings.validate("openmetrics")
@@ -776,16 +835,27 @@ impl CollectorSettings {
         }
 
         let checks = self.checks.as_deref().unwrap_or_default();
+        let local = self.local_checks.as_deref().unwrap_or_default();
         ensure!(
-            checks.len() <= MAX_CHECKS,
+            checks.len() + local.len() <= MAX_CHECKS,
             "a collector can run at most {MAX_CHECKS} checks"
         );
-        for (index, check) in checks.iter().enumerate() {
+        for check in checks {
             check.validate()?;
+        }
+        for check in local {
+            check.validate()?;
+        }
+        // Each is a series, by its name, wherever it's defined.
+        let names: Vec<&str> = checks
+            .iter()
+            .map(|check| check.name.as_str())
+            .chain(local.iter().map(|check| check.name.as_str()))
+            .collect();
+        for (index, name) in names.iter().enumerate() {
             ensure!(
-                !checks[..index].iter().any(|other| other.name == check.name),
-                "two checks are named {:?}",
-                check.name
+                !names[..index].contains(name),
+                "two checks are named {name:?}"
             );
         }
         Ok(())

@@ -1,11 +1,12 @@
 //! The checks collector. The checks themselves are in `maxnines_checks`, as the
 //! server runs them too.
 //!
-//! A check that signs in, such as one of a database or an SSH server, gets its
-//! username and password, or key, from a `check_login` block in the agent's own
-//! config, named for the check. They never come from the server, and never go to
-//! it. The block also names the target the login is for, as the server chooses
-//! each check's target, and a login is only ever sent to the one it names.
+//! A config rule gives two sorts. Checks with nothing secret, such as a website's,
+//! come whole from the server. Checks that sign in, such as of an SSH or mail
+//! server, are `check` blocks in the agent's own config, with where they reach
+//! and how they sign in, and the server only picks which of those to run and how
+//! often. So a login never comes from the server, never goes to it, and is only
+//! ever sent where the agent's own config says.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -13,11 +14,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use anyhow::{Context, Result, ensure};
-use maxnines_checks::{Credentials, failed_report, limit, run_signed_in, timed_out_report};
-use maxnines_protocol::Check;
+use anyhow::{Context, Result, anyhow, ensure};
+use maxnines_checks::{Credentials, limit, run_signed_in, timed_out_report};
+use maxnines_protocol::{Check, CheckKind, LocalCheck, is_check_name};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::background::{Background, probe_all};
 use crate::collector::Collector;
@@ -25,30 +26,32 @@ use crate::collector::Collector;
 /// How long a check gets to report once its own time limit is up.
 const GRACE: Duration = Duration::from_secs(1);
 
-/// How many checks the agent's config can give a login for.
-const MAX_LOGINS: usize = 64;
+/// How many checks the agent's config can define.
+const MAX_DEFINED: usize = 64;
 
-/// How a check signs in, from the agent's own config:
+/// A check the agent's config allows, with how it signs in:
 ///
 /// ```hcl
-/// check_login "orders-db" {
-///   target   = "db.example.com:5432"
-///   username = "maxnines"
-///   password = env("ORDERS_DB_PASSWORD")
-/// }
-///
-/// check_login "bastion" {
+/// check "bastion" {
+///   kind             = "ssh"
 ///   target           = "bastion.example.com:22"
 ///   username         = "monitor"
 ///   private_key_file = "/etc/maxnines/bastion_key"
+///   host_key         = "SHA256:Dfij..."
+/// }
+///
+/// check "mail" {
+///   kind     = "imap"
+///   target   = "mail.example.com:993"
+///   tls      = true
+///   username = "monitor@example.com"
+///   password = env("MAIL_PASSWORD")
 /// }
 /// ```
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CheckLogin {
-    /// What the login is for, exactly as the check's target is written. The
-    /// server chooses a check's target, so without this, whoever can change the
-    /// server's config rules could send the login anywhere.
+pub struct CheckDefinition {
+    kind: String,
     target: String,
     #[serde(default)]
     username: Option<String>,
@@ -60,11 +63,18 @@ pub struct CheckLogin {
     /// The key itself, read when the config is.
     #[serde(skip)]
     private_key: Option<String>,
+    #[serde(default)]
+    tls: Option<bool>,
+    #[serde(default)]
+    insecure: Option<bool>,
+    #[serde(default)]
+    host_key: Option<String>,
 }
 
-impl fmt::Debug for CheckLogin {
+impl fmt::Debug for CheckDefinition {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CheckLogin")
+        f.debug_struct("CheckDefinition")
+            .field("kind", &self.kind)
             .field("target", &self.target)
             .field("username", &self.username)
             .field("private_key_file", &self.private_key_file)
@@ -72,70 +82,76 @@ impl fmt::Debug for CheckLogin {
     }
 }
 
-impl CheckLogin {
-    fn credentials(&self) -> Credentials {
-        Credentials {
+impl CheckDefinition {
+    /// The check, timed as the server asks.
+    fn check(&self, name: &str, timing: &LocalCheck) -> Result<Check> {
+        let kind = CheckKind::parse(&self.kind)
+            .with_context(|| format!("{:?} isn't a kind of check", self.kind))?;
+        let mut check = Check::new(name, kind, &self.target);
+        check.tls = self.tls;
+        check.insecure = self.insecure;
+        check.host_key = self.host_key.clone();
+        check.timeout_secs = timing.timeout_secs;
+        check.interval_secs = timing.interval_secs;
+        Ok(check)
+    }
+
+    fn credentials(&self) -> Option<Credentials> {
+        let credentials = Credentials {
             username: self.username.clone(),
             password: self.password.clone(),
             private_key: self.private_key.clone(),
-        }
+        };
+        (credentials != Credentials::default()).then_some(credentials)
     }
 }
 
-/// How a check signs in: with the login named for it, if there is one and it's
-/// for this check's target. One for another target is never sent, and the check
-/// says why it didn't run rather than quietly not signing in.
-fn sign_in_for(check: &Check, logins: &CheckLogins) -> Result<Option<Credentials>, String> {
-    // Only a kind that signs in is given one, so a login named for a web check
-    // never goes anywhere.
-    let Some(login) = logins.get(&check.name).filter(|_| check.kind.signs_in()) else {
-        return Ok(None);
-    };
-    if login.target != check.target {
-        return Err(format!(
-            "the login for {:?} in agent.hcl is for {}, not {}",
-            check.name, login.target, check.target
-        ));
-    }
-    Ok(Some(login.credentials()))
-}
+/// The checks the agent's config allows, by name.
+pub type CheckDefinitions = BTreeMap<String, CheckDefinition>;
 
-/// The logins the agent's config gives, by the check's name.
-pub type CheckLogins = BTreeMap<String, CheckLogin>;
-
-/// Checks each login, and reads any key file, so a mistake stops the agent
+/// Checks each definition, and reads any key file, so a mistake stops the agent
 /// starting rather than every check failing later.
-pub fn load_check_logins(logins: &mut CheckLogins) -> Result<()> {
+pub fn load_check_definitions(definitions: &mut CheckDefinitions) -> Result<()> {
     ensure!(
-        logins.len() <= MAX_LOGINS,
-        "at most {MAX_LOGINS} checks can have a login"
+        definitions.len() <= MAX_DEFINED,
+        "the config can define at most {MAX_DEFINED} checks"
     );
-    for (name, login) in logins.iter_mut() {
+    for (name, definition) in definitions.iter_mut() {
+        let problem = |what: &str| anyhow!("check {name:?} in agent.hcl {what}");
+        ensure!(is_check_name(name), problem("needs a shorter name"));
+        let check = definition
+            .check(name, &LocalCheck::new(name))
+            .map_err(|error| problem(&format!("has a problem: {error:#}")))?;
+        // Anything without a login is better given whole by the server.
         ensure!(
-            !login.target.is_empty() && !login.target.chars().any(char::is_whitespace),
-            "the login for check {name:?} needs the target it's for, as the check's \
-             target is written, such as db.example.com:5432"
+            check.kind.signs_in(),
+            problem("is a kind that never signs in, so give it in a config rule instead")
         );
+        check.validate()?;
         ensure!(
-            login
+            definition
                 .username
                 .as_deref()
                 .is_some_and(|username| !username.is_empty())
-                || login.password.is_some(),
-            "the login for check {name:?} needs a username or a password"
+                || definition.password.is_some(),
+            problem("needs a username or a password")
         );
         ensure!(
-            login.password.is_none() || login.private_key_file.is_none(),
-            "the login for check {name:?} has a password or a private key, not both"
+            definition.password.is_none() || definition.private_key_file.is_none(),
+            problem("has a password or a private key, not both")
         );
-        if let Some(path) = &login.private_key_file {
+        ensure!(
+            definition.private_key_file.is_none() || check.kind == CheckKind::Ssh,
+            problem("can only sign in with a private key if it's an SSH check")
+        );
+        if let Some(path) = &definition.private_key_file {
             let key = std::fs::read_to_string(path).with_context(|| {
                 format!(
                     "reading the private key for check {name:?} from {}",
                     path.display()
                 )
             })?;
-            login.private_key = Some(key);
+            definition.private_key = Some(key);
         }
     }
     Ok(())
@@ -145,10 +161,50 @@ pub struct CheckCollector {
     background: Background,
 }
 
-/// A check and how often it runs, in rounds of the agent's interval.
-/// A check, with how it signs in, or why it can't run.
-type Ready = (Check, Result<Option<Credentials>, String>);
+/// A check ready to run, or why one the server asked for can't.
+enum Ready {
+    Run(Box<Check>, Option<Credentials>),
+    Broken { name: String, why: String },
+}
 
+impl Ready {
+    fn local(choice: &LocalCheck, definitions: &CheckDefinitions) -> Self {
+        let name = &choice.name;
+        let Some(definition) = definitions.get(name) else {
+            return Self::Broken {
+                name: name.clone(),
+                why: format!("agent.hcl has no check named {name:?}"),
+            };
+        };
+        match definition.check(name, choice) {
+            Ok(check) => Self::Run(Box::new(check), definition.credentials()),
+            Err(error) => Self::Broken {
+                name: name.clone(),
+                why: format!("{error:#}"),
+            },
+        }
+    }
+
+    fn interval_secs(&self) -> Option<u64> {
+        match self {
+            Self::Run(check, _) => check.interval_secs,
+            Self::Broken { .. } => None,
+        }
+    }
+
+    fn broken(name: &str, why: &str) -> Value {
+        json!({ "name": name, "up": 0, "error": why })
+    }
+
+    fn timed_out(&self) -> Value {
+        match self {
+            Self::Run(check, _) => timed_out_report(check),
+            Self::Broken { name, why } => Self::broken(name, why),
+        }
+    }
+}
+
+/// A check and how often it runs, in rounds of the agent's interval.
 struct Scheduled {
     check: Arc<Ready>,
     every: u64,
@@ -159,8 +215,8 @@ struct Scheduled {
 
 /// A check runs with every sample unless it asks for longer, rounded up to whole
 /// samples. It never runs more often than samples are sent.
-fn rounds(check: &Check, interval: Duration) -> u64 {
-    let Some(seconds) = check.interval_secs else {
+fn rounds(interval_secs: Option<u64>, interval: Duration) -> u64 {
+    let Some(seconds) = interval_secs else {
         return 1;
     };
     let interval_ms = interval.as_millis().max(1);
@@ -171,16 +227,34 @@ fn rounds(check: &Check, interval: Duration) -> u64 {
 }
 
 impl CheckCollector {
-    pub fn new(checks: Vec<Check>, logins: &CheckLogins, interval: Duration) -> Self {
-        let longest = checks.iter().map(limit).max().unwrap_or_default();
-        let scheduled: Vec<Scheduled> = checks
+    /// `checks` come whole from the server, and never sign in. `local` picks from
+    /// the checks the agent's config defines.
+    pub fn new(
+        checks: Vec<Check>,
+        local: &[LocalCheck],
+        definitions: &CheckDefinitions,
+        interval: Duration,
+    ) -> Self {
+        let ready: Vec<Ready> = checks
             .into_iter()
-            .map(|check| {
-                let every = rounds(&check, interval);
+            .map(|check| Ready::Run(Box::new(check), None))
+            .chain(local.iter().map(|choice| Ready::local(choice, definitions)))
+            .collect();
+        let longest = ready
+            .iter()
+            .filter_map(|item| match item {
+                Ready::Run(check, _) => Some(limit(check)),
+                Ready::Broken { .. } => None,
+            })
+            .max()
+            .unwrap_or_default();
+        let scheduled: Vec<Scheduled> = ready
+            .into_iter()
+            .map(|item| {
+                let every = rounds(item.interval_secs(), interval);
                 let offset = (rand::random::<f64>() * every as f64) as u64;
-                let credentials = sign_in_for(&check, logins);
                 Scheduled {
-                    check: Arc::new((check, credentials)),
+                    check: Arc::new(item),
                     every,
                     offset: offset.min(every - 1),
                 }
@@ -202,13 +276,13 @@ impl CheckCollector {
             async move {
                 let probe = |item: Arc<Ready>| async move {
                     match &*item {
-                        (check, Ok(credentials)) => {
+                        Ready::Run(check, credentials) => {
                             run_signed_in(check, credentials.as_ref()).await
                         }
-                        (check, Err(why)) => failed_report(check, why),
+                        Ready::Broken { name, why } => Ready::broken(name, why),
                     }
                 };
-                let late = |item: &Ready| timed_out_report(&item.0);
+                let late = |item: &Ready| item.timed_out();
                 let found = probe_all(&checks, interval, longest + GRACE, probe, late).await;
                 let mut results = results.lock().unwrap_or_else(PoisonError::into_inner);
                 for (i, result) in due.into_iter().zip(found) {
@@ -237,8 +311,6 @@ mod tests {
     use std::thread;
     use std::time::Instant;
 
-    use maxnines_protocol::CheckKind;
-
     use super::*;
 
     #[test]
@@ -246,8 +318,12 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let target = listener.local_addr().unwrap().to_string();
         let check = Check::new("a", CheckKind::Tcp, &target);
-        let mut collector =
-            CheckCollector::new(vec![check], &CheckLogins::new(), Duration::from_millis(20));
+        let mut collector = CheckCollector::new(
+            vec![check],
+            &[],
+            &CheckDefinitions::new(),
+            Duration::from_millis(20),
+        );
 
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -263,16 +339,12 @@ mod tests {
     #[test]
     fn a_check_runs_every_so_many_samples() {
         let interval = Duration::from_secs(15);
-        let with = |seconds| Check {
-            interval_secs: seconds,
-            ..Check::new("a", CheckKind::Tcp, "a:1")
-        };
-        assert_eq!(rounds(&with(None), interval), 1);
-        assert_eq!(rounds(&with(Some(1)), interval), 1);
-        assert_eq!(rounds(&with(Some(15)), interval), 1);
-        assert_eq!(rounds(&with(Some(60)), interval), 4);
-        assert_eq!(rounds(&with(Some(61)), interval), 5);
-        assert_eq!(rounds(&with(Some(86_400)), interval), 5760);
+        assert_eq!(rounds(None, interval), 1);
+        assert_eq!(rounds(Some(1), interval), 1);
+        assert_eq!(rounds(Some(15), interval), 1);
+        assert_eq!(rounds(Some(60), interval), 4);
+        assert_eq!(rounds(Some(61), interval), 5);
+        assert_eq!(rounds(Some(86_400), interval), 5760);
     }
 
     /// The names of the checks in one sample.
@@ -297,7 +369,8 @@ mod tests {
         };
         let mut collector = CheckCollector::new(
             vec![fast, slow],
-            &CheckLogins::new(),
+            &[],
+            &CheckDefinitions::new(),
             Duration::from_millis(20),
         );
 
@@ -338,8 +411,12 @@ mod tests {
                 ..Check::new("slow", CheckKind::Tcp, &slow_target)
             },
         ];
-        let _collector =
-            CheckCollector::new(checks, &CheckLogins::new(), Duration::from_millis(20));
+        let _collector = CheckCollector::new(
+            checks,
+            &[],
+            &CheckDefinitions::new(),
+            Duration::from_millis(20),
+        );
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while fast.load(Relaxed) < 20 {
@@ -357,105 +434,144 @@ mod tests {
         );
     }
 
-    fn login(username: Option<&str>, password: Option<&str>, key: Option<PathBuf>) -> CheckLogin {
-        CheckLogin {
-            target: "db.example.com:5432".to_string(),
-            username: username.map(String::from),
-            password: password.map(String::from),
-            private_key_file: key,
+    fn defined(kind: &str, target: &str) -> CheckDefinition {
+        CheckDefinition {
+            kind: kind.to_string(),
+            target: target.to_string(),
+            username: Some("monitor".to_string()),
+            password: Some("s3cret".to_string()),
+            private_key_file: None,
             private_key: None,
+            tls: None,
+            insecure: None,
+            host_key: None,
         }
     }
 
     #[test]
-    fn a_login_has_one_way_to_sign_in_and_its_key_is_read_at_once() {
+    fn a_defined_check_signs_in_one_way_and_its_key_is_read_at_once() {
         let folder = tempfile::tempdir().unwrap();
         let key = folder.path().join("key");
         std::fs::write(&key, "-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
-        let mut logins = CheckLogins::from([
-            (
-                "db".to_string(),
-                login(Some("maxnines"), Some("s3cret"), None),
-            ),
+        let mut definitions = CheckDefinitions::from([
+            ("mail".to_string(), defined("imap", "mail.example.com:993")),
             (
                 "bastion".to_string(),
-                login(Some("monitor"), None, Some(key)),
+                CheckDefinition {
+                    password: None,
+                    private_key_file: Some(key.clone()),
+                    ..defined("ssh", "bastion.example.com:22")
+                },
             ),
             // Redis before version 6 has only a password.
-            ("cache".to_string(), login(None, Some("s3cret"), None)),
+            (
+                "cache".to_string(),
+                CheckDefinition {
+                    username: None,
+                    ..defined("redis", "127.0.0.1:6379")
+                },
+            ),
         ]);
-        load_check_logins(&mut logins).unwrap();
-        assert!(
-            logins["bastion"]
-                .private_key
-                .as_deref()
-                .unwrap()
-                .contains("OPENSSH")
-        );
-        assert!(!format!("{:?}", logins["db"]).contains("s3cret"));
+        load_check_definitions(&mut definitions).unwrap();
+        let read = definitions["bastion"].private_key.as_deref().unwrap();
+        assert!(read.contains("OPENSSH"));
+        assert!(!format!("{:?}", definitions["mail"]).contains("s3cret"));
 
-        let untargeted = CheckLogin {
-            target: String::new(),
-            ..login(Some("a"), Some("b"), None)
-        };
-        for bad in [
-            untargeted,
-            login(None, None, None),
-            login(Some("a"), Some("b"), Some(folder.path().join("key"))),
-            login(Some("a"), None, Some(folder.path().join("missing"))),
+        for (bad, why) in [
+            (defined("tcp", "a:1"), "never signs in"),
+            (defined("gopher", "a:1"), "isn't a kind of check"),
+            (defined("imap", "noport"), "host:port"),
+            (
+                CheckDefinition {
+                    username: None,
+                    password: None,
+                    ..defined("imap", "a:1")
+                },
+                "needs a username or a password",
+            ),
+            (
+                CheckDefinition {
+                    private_key_file: Some(key.clone()),
+                    ..defined("ssh", "a:22")
+                },
+                "not both",
+            ),
+            (
+                CheckDefinition {
+                    password: None,
+                    private_key_file: Some(folder.path().join("key")),
+                    ..defined("imap", "a:993")
+                },
+                "only sign in with a private key if it's an SSH check",
+            ),
+            (
+                CheckDefinition {
+                    password: None,
+                    private_key_file: Some(folder.path().join("missing")),
+                    ..defined("ssh", "a:22")
+                },
+                "reading the private key",
+            ),
         ] {
-            let mut logins = CheckLogins::from([("x".to_string(), bad)]);
-            assert!(load_check_logins(&mut logins).is_err());
+            let mut definitions = CheckDefinitions::from([("x".to_string(), bad)]);
+            let error = format!(
+                "{:#}",
+                load_check_definitions(&mut definitions).unwrap_err()
+            );
+            assert!(error.contains(why), "{error}");
+        }
+    }
+
+    fn collect_until(collector: &mut CheckCollector, done: impl Fn(&Value) -> bool) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let output = collector.collect().unwrap();
+            if done(&output) {
+                return output;
+            }
+            assert!(Instant::now() < deadline, "gave up waiting: {output}");
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
     #[test]
-    fn a_login_is_only_sent_to_the_target_it_names() {
-        let logins = CheckLogins::from([(
-            "orders".to_string(),
-            login(Some("maxnines"), Some("s3cret"), None),
+    fn a_rule_runs_the_checks_the_config_defines_and_only_those() {
+        let (target, reached) = counted();
+        let definitions = CheckDefinitions::from([(
+            "cache".to_string(),
+            CheckDefinition {
+                username: None,
+                ..defined("redis", &target)
+            },
         )]);
-        let check = |target: &str| Check::new("orders", CheckKind::Postgres, target);
+        let local = [
+            LocalCheck {
+                timeout_secs: Some(1),
+                ..LocalCheck::new("cache")
+            },
+            LocalCheck::new("nowhere"),
+        ];
+        let mut collector =
+            CheckCollector::new(Vec::new(), &local, &definitions, Duration::from_millis(50));
 
-        let given = sign_in_for(&check("db.example.com:5432"), &logins).unwrap();
-        assert_eq!(given.unwrap().password.as_deref(), Some("s3cret"));
-        // The server moved the check somewhere else.
-        let moved = sign_in_for(&check("evil.example.com:5432"), &logins).unwrap_err();
-        assert!(moved.contains("is for db.example.com:5432"), "{moved}");
-        // A kind that doesn't sign in is never given it.
-        let web = Check::new("orders", CheckKind::Tcp, "db.example.com:5432");
-        assert_eq!(sign_in_for(&web, &logins), Ok(None));
-    }
-
-    #[test]
-    fn a_check_whose_login_is_for_elsewhere_says_so_and_never_connects() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let target = listener.local_addr().unwrap().to_string();
-        listener.set_nonblocking(true).unwrap();
-        let logins = CheckLogins::from([(
-            "orders".to_string(),
-            login(Some("maxnines"), Some("s3cret"), None),
-        )]);
-        let checks = vec![Check::new("orders", CheckKind::Postgres, &target)];
-        let mut collector = CheckCollector::new(checks, &logins, Duration::from_millis(50));
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let output = loop {
-            let output = collector.collect().unwrap();
-            if output.as_array().is_some_and(|rows| !rows.is_empty()) {
-                break output;
-            }
-            assert!(Instant::now() < deadline, "no result: {output}");
-            thread::sleep(Duration::from_millis(10));
-        };
-        assert_eq!(output[0]["up"], 0, "{output}");
-        assert!(
-            output[0]["error"]
-                .as_str()
+        let output = collect_until(&mut collector, |output| {
+            output.as_array().is_some_and(|rows| rows.len() == 2)
+        });
+        let row = |name: &str| {
+            output
+                .as_array()
                 .unwrap()
-                .contains("in agent.hcl is for"),
-            "{output}"
+                .iter()
+                .find(|row| row["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        // It went where the config says, as a Redis check.
+        assert_eq!(row("cache")["kind"], "redis", "{output}");
+        assert!(reached.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert_eq!(
+            row("nowhere"),
+            json!({ "name": "nowhere", "up": 0, "error": "agent.hcl has no check named \"nowhere\"" })
         );
-        assert!(listener.accept().is_err(), "it connected");
     }
 }

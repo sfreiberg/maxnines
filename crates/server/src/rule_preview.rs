@@ -203,6 +203,19 @@ fn describe_changes(before: &ResolvedConfig, after: &ResolvedConfig) -> Vec<Stri
                     describe_checks(now.checks.as_ref())
                 ));
             }
+            let old_local = was.and_then(|settings| settings.local_checks.as_ref());
+            if old_local != now.local_checks.as_ref() {
+                let named = |checks: Option<&Vec<maxnines_protocol::LocalCheck>>| {
+                    let names = checks
+                        .map(|checks| checks.iter().map(|check| check.name.clone()).collect());
+                    describe_list(names.as_ref())
+                };
+                changes.push(format!(
+                    "{name} runs from the agent's config: {} → {}",
+                    named(old_local),
+                    named(now.local_checks.as_ref())
+                ));
+            }
         }
     }
 

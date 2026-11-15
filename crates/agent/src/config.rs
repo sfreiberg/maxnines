@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::actions::{Actions, check_actions};
-use crate::checks::{CheckLogins, load_check_logins};
+use crate::checks::{CheckDefinitions, load_check_definitions};
 use crate::collector::Local;
 use crate::commands::{CheckCommands, check_commands};
 use crate::custom::{Definitions, check_definitions};
@@ -51,10 +51,11 @@ pub struct Config {
     /// name. The server says which pages to read, but never sees these.
     #[serde(default, rename = "openmetrics")]
     pub metrics_logins: Logins,
-    /// How checks that sign in do so, by the check's name. The server says what
-    /// to check, but never sees these.
-    #[serde(default, rename = "check_login")]
-    pub check_logins: CheckLogins,
+    /// Checks that sign in, by name, with where they reach and how they sign in.
+    /// The server chooses which of these to run and how often, but never sees
+    /// their logins and can't add to them.
+    #[serde(default, rename = "check")]
+    pub checks: CheckDefinitions,
     /// Whether the server can ask for the actions built into the agent, which
     /// list what's running here and where disk space is going.
     #[serde(default = "enabled")]
@@ -104,7 +105,17 @@ impl Config {
             custom_metrics: &self.custom_metrics,
             check_commands: &self.check_commands,
             metrics_logins: &self.metrics_logins,
-            check_logins: &self.check_logins,
+            checks: &self.checks,
+        }
+    }
+
+    /// What this file lets the server ask for, by name.
+    pub fn allowed(&self) -> crate::facts::Allowed {
+        let names = |keys: Vec<&String>| keys.into_iter().cloned().collect();
+        crate::facts::Allowed {
+            custom_metrics: names(self.custom_metrics.keys().collect()),
+            check_commands: names(self.check_commands.keys().collect()),
+            checks: names(self.checks.keys().collect()),
         }
     }
 
@@ -125,7 +136,7 @@ impl Config {
         config.facts = facts;
         check_definitions(&config.custom_metrics)?;
         check_commands(&config.check_commands)?;
-        load_check_logins(&mut config.check_logins)?;
+        load_check_definitions(&mut config.checks)?;
         check_actions(&config.actions)?;
         check_logins(&config.metrics_logins)?;
         Ok(config)
