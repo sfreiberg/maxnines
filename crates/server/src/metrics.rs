@@ -661,6 +661,17 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::Never,
     },
     Metric {
+        name: "check.domain_days",
+        title: "Domain days left",
+        unit: Unit::Number,
+        collector: "checks",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.domain_days_left"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
         name: "check.password_sign_in",
         title: "SSH offers password sign-in",
         unit: Unit::Number,

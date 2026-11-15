@@ -31,6 +31,7 @@ pub struct Model {
     /// As it was typed in, when it was.
     pub private_key: Option<String>,
     pub private_key_env: Option<String>,
+    pub domain_expiry: Option<bool>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

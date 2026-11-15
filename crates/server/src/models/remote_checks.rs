@@ -23,6 +23,7 @@ fn to_remote_check(row: remote_check::Model) -> Result<RemoteCheck> {
     check.database = row.database;
     check.tls = row.tls;
     check.host_key = row.host_key;
+    check.domain_expiry = row.domain_expiry;
     Ok(RemoteCheck {
         id: row.id,
         input: RemoteCheckInput {
@@ -61,6 +62,7 @@ fn to_row(input: &RemoteCheckInput) -> Result<remote_check::ActiveModel> {
         database: Set(check.database.clone()),
         tls: Set(check.tls),
         host_key: Set(check.host_key.clone()),
+        domain_expiry: Set(check.domain_expiry),
         username: Set(input.sign_in.username.clone()),
         password: Set(input.sign_in.password.clone()),
         password_env: Set(input.sign_in.password_env.clone()),

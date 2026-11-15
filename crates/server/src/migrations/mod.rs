@@ -15,6 +15,7 @@ impl MigratorTrait for Migrator {
             Box::new(CheckNamesPerHost),
             Box::new(SilenceSeries),
             Box::new(CheckSignIn),
+            Box::new(DomainExpiry),
         ]
     }
 }
@@ -1724,6 +1725,7 @@ enum RemoteChecks {
     PasswordEnv,
     PrivateKey,
     PrivateKeyEnv,
+    DomainExpiry,
 }
 
 #[derive(Iden)]
@@ -1871,6 +1873,41 @@ impl MigrationTrait for PageTokens {
                 .await?;
         }
         Ok(())
+    }
+}
+
+struct DomainExpiry;
+
+impl MigrationName for DomainExpiry {
+    fn name(&self) -> &str {
+        "m20261115_000006_domain_expiry"
+    }
+}
+
+/// A website check can be told not to look up when its domain expires, which it
+/// does unless told.
+#[async_trait::async_trait]
+impl MigrationTrait for DomainExpiry {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(RemoteChecks::Table)
+                    .add_column(ColumnDef::new(RemoteChecks::DomainExpiry).boolean())
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(RemoteChecks::Table)
+                    .drop_column(RemoteChecks::DomainExpiry)
+                    .to_owned(),
+            )
+            .await
     }
 }
 

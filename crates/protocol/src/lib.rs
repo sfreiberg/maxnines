@@ -332,6 +332,10 @@ pub struct Check {
     /// as `SHA256:Dfij…`. Any other key counts as down.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_key: Option<String>,
+    /// http: whether to look up when the site's domain registration runs out.
+    /// Defaults to yes; `false` turns it off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_expiry: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -459,6 +463,7 @@ impl Check {
             database: None,
             tls: None,
             host_key: None,
+            domain_expiry: None,
         }
     }
 
@@ -542,6 +547,11 @@ impl Check {
             ],
         )?;
         only_for(self.host_key.is_some(), "host_key", &[CheckKind::Ssh])?;
+        only_for(
+            self.domain_expiry.is_some(),
+            "domain_expiry",
+            &[CheckKind::Http],
+        )?;
         if let Some(database) = &self.database {
             ensure!(
                 !database.is_empty()

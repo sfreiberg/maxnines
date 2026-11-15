@@ -77,6 +77,8 @@ struct CheckForm {
     database: String,
     tls: bool,
     host_key: String,
+    /// Website checks look up when their domain expires unless this is off.
+    domain_expiry: bool,
     /// How it signs in: none, password or key. Only that one's boxes count.
     sign_in: String,
     username: String,
@@ -112,6 +114,7 @@ impl CheckForm {
             kind: CheckKind::Http.as_str().to_string(),
             interval_secs: "60".to_string(),
             enabled: true,
+            domain_expiry: true,
             ..Self::default()
         }
     }
@@ -140,6 +143,7 @@ impl CheckForm {
             database: text(&check.database),
             tls: check.tls == Some(true),
             host_key: text(&check.host_key),
+            domain_expiry: check.domain_expiry != Some(false),
             sign_in: input.sign_in.with().as_str().to_string(),
             username: text(&input.sign_in.username),
             password: String::new(),
@@ -172,6 +176,7 @@ impl CheckForm {
             database: text("database"),
             tls: fields.contains_key("tls"),
             host_key: text("host_key"),
+            domain_expiry: fields.contains_key("domain_expiry"),
             sign_in: text("sign_in"),
             username: text("username"),
             password: text("password"),
@@ -201,6 +206,8 @@ impl CheckForm {
         check.database = optional(&self.database);
         check.tls = self.tls.then_some(true);
         check.host_key = optional(&self.host_key);
+        // Only a website check has a domain to look up, and on is how it starts.
+        check.domain_expiry = (kind == CheckKind::Http && !self.domain_expiry).then_some(false);
         let interval_secs =
             number(&self.interval_secs, "the interval")?.context("a check needs an interval")?;
         let with = match self.sign_in.as_str() {
@@ -772,6 +779,15 @@ async fn page(
             Some(false) => format!("couldn't sign in as {username}"),
             None => "without signing in".to_string(),
         };
+        if let Some(days) = result["domain_days_left"].as_i64() {
+            let until = now + days * DAY_MS;
+            tiles.push(Tile {
+                label: "Domain",
+                value: format!("{days} day{}", if days == 1 { "" } else { "s" }),
+                note: format!("left, until about {}", super::local_date(until)),
+                tone: if days < 30 { "bad" } else { "" },
+            });
+        }
         if let Some(fingerprint) = result["host_key"].as_str() {
             tiles.push(Tile {
                 label: "Host key",
@@ -1104,6 +1120,23 @@ mod tests {
             CheckForm::from_input(&original).to_input().unwrap().0,
             original
         );
+    }
+
+    #[test]
+    fn a_website_looks_up_its_domain_unless_the_box_is_cleared() {
+        let mut form = CheckForm::blank();
+        form.name = "site".to_string();
+        form.target = "https://example.com/".to_string();
+        assert!(form.domain_expiry, "on to start with");
+        assert_eq!(form.to_input().unwrap().0.check.domain_expiry, None);
+        form.domain_expiry = false;
+        let (input, _) = form.to_input().unwrap();
+        assert_eq!(input.check.domain_expiry, Some(false));
+        assert!(!CheckForm::from_input(&input).domain_expiry);
+        // Nothing else has a domain to look up.
+        form.kind = "tcp".to_string();
+        form.target = "example.com:443".to_string();
+        assert_eq!(form.to_input().unwrap().0.check.domain_expiry, None);
     }
 
     #[test]

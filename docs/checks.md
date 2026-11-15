@@ -8,7 +8,7 @@ is how to check a database that only listens on its own host.
 
 | Kind | Target | What it checks |
 |---|---|---|
-| **Website** (`http`) | An address | The page's status, timings, size and certificate, and optionally that it matches a pattern |
+| **Website** (`http`) | An address | The page's status, timings, size and certificate, when its domain registration runs out, and optionally that it matches a pattern |
 | **Port** (`tcp`) | `host:port` | That it accepts a connection |
 | **Certificate** (`tls`) | `host:port` | The certificate, and how many days it has left |
 | **DNS** (`dns`) | A host name | That it resolves, optionally from a given server |
@@ -22,6 +22,24 @@ is how to check a database that only listens on its own host.
 
 Agents older than this version don't know the database, Redis, SSH and mail checks. Upgrade
 them before giving those kinds to them in a config rule.
+
+## Domain expiry
+
+A website check also finds out when the site's domain registration runs out, from the
+domain's registry over RDAP, the successor to WHOIS, and reports it as **Domain days
+left**. IANA's list says which registry answers for each top-level domain, and the
+check asks about the site's host name and then each name above it until the registry
+recognises one, so `www.example.co.uk` finds `example.co.uk`.
+
+- Each domain is asked about at most twice a day, and IANA's list once a day, however
+  often the check runs, as registries limit how often they're asked.
+- It happens after the check's own timing and never makes the check fail. If the
+  registry can't be reached, or doesn't say, the check's result says why.
+- Addresses and names without a public registry, such as `printer.local`, are skipped,
+  and so are domains whose registry doesn't offer RDAP, such as `.io`.
+- Untick **Look up when the domain expires** on the check to turn it off.
+
+To be warned in good time, add an alert rule on **Domain days left** below 30.
 
 ## Signing in
 

@@ -7,6 +7,7 @@
 
 mod mail;
 pub mod openmetrics;
+mod rdap;
 mod sign_in;
 
 pub use sign_in::Credentials;
@@ -116,6 +117,11 @@ struct Findings {
     sign_in_methods: Option<String>,
     /// ssh: 1 if it offers signing in with a password, which an alert can watch.
     password_sign_in: Option<u8>,
+    /// http: when the site's domain registration runs out, and how many days
+    /// that leaves, or why that couldn't be found out.
+    domain_expires: Option<i64>,
+    domain_days_left: Option<i64>,
+    domain_error: Option<String>,
     packet_loss_percent: Option<f64>,
     rtt_min_ms: Option<f64>,
     rtt_max_ms: Option<f64>,
@@ -183,7 +189,37 @@ pub async fn run_signed_in(check: &Check, credentials: Option<&Credentials>) -> 
     if result.is_ok() {
         findings.response_ms = Some(elapsed_ms(started));
     }
+    // After the timing, and never counting against the check: a registry being
+    // slow or unsure says nothing about the site.
+    if check.kind == CheckKind::Http && check.domain_expiry != Some(false) {
+        domain_expiry(check, &mut findings).await;
+    }
     report(check, findings, result)
+}
+
+async fn domain_expiry(check: &Check, findings: &mut Findings) {
+    let Some(host) = Uri::from_str(&check.target)
+        .ok()
+        .and_then(|uri| uri.host().map(String::from))
+    else {
+        return;
+    };
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    // A few questions at most, each with its own limit, and all of it remembered.
+    let answer = timeout(rdap::LIMIT * 4, rdap::expiry(&host))
+        .await
+        .unwrap_or_else(|_| Err("the registry didn't answer in time".to_string()));
+    match answer {
+        Ok(Some(expires)) => {
+            findings.domain_expires = Some(expires);
+            findings.domain_days_left = Some(days_left(expires, now_secs()));
+        }
+        Ok(None) => {}
+        Err(why) => findings.domain_error = Some(why),
+    }
 }
 
 /// What a page that asks who's reading is sent: a username and password, or a

@@ -358,6 +358,7 @@ erDiagram
         string password_env "the server's variable holding it"
         text private_key "ssh: as typed, when it was"
         string private_key_env "the server's variable holding it"
+        boolean domain_expiry "http: false to not look it up"
     }
     audit_log {
         int id PK

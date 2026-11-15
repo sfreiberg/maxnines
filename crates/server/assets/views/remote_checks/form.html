@@ -57,6 +57,10 @@
       <input type="text" name="regex" value="{{ check.regex }}" spellcheck="false">
       <small>A regular expression. Leave empty to skip this.</small>
     </label>
+    <label class="checkbox">
+      <input type="checkbox" name="domain_expiry"{% if check.domain_expiry %} checked{% endif %}> Look up when the domain expires
+      <small>Asked of the domain's registry over RDAP about twice a day, never counting against the check.</small>
+    </label>
   </fieldset>
 
   <label class="for-postgres">Database

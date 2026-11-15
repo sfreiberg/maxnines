@@ -32,6 +32,7 @@ as long as `sign_in` says, or the fields given show, that it still signs in that
 | `method` | http | Defaults to `GET` |
 | `body` | http | What to send, for methods like `POST` |
 | `regex` | http | A regular expression the page has to match |
+| `domain_expiry` | http | `false` stops it looking up when the site's [domain](checks.md#domain-expiry) expires, which it does otherwise |
 | `insecure` | http, tls, postgres, mysql, redis, smtp, imap, pop3 | Measure a server whose certificate can't be verified, without counting that as down. Without it, a check never sends its request, or a password, to a server that fails the certificate check |
 | `database` | postgres | The database to sign in to. Defaults to `postgres` |
 | `tls` | mysql, redis, smtp, imap, pop3 | Connect over TLS from the start. PostgreSQL uses TLS whenever the server offers it, and mail checks without this upgrade with STARTTLS before signing in |
