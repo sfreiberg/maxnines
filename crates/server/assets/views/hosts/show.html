@@ -145,7 +145,7 @@
     <tbody>
     {% for check in checks %}
     <tr>
-      <td><a href="/checks/{{ check.id }}/edit"><strong>{{ check.name }}</strong></a><code class="under">{{ check.kind }} {{ check.target }}</code></td>
+      <td><a href="/checks/{{ check.id }}"><strong>{{ check.name }}</strong></a><code class="under">{{ check.kind }} {{ check.target }}</code></td>
       <td class="nowrap">Every {{ check.interval_secs }} s</td>
       <td>{% if not check.enabled %}<span class="badge neutral">Disabled</span>{% elif not check.run %}<span class="badge neutral">Waiting</span>{% elif check.up %}<span class="badge good">Up</span>{% else %}<span class="badge bad">Down</span>{% if check.error %}<span class="under">{{ check.error }}</span>{% endif %}{% endif %}</td>
     </tr>

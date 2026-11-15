@@ -5468,26 +5468,35 @@ mod remote {
     }
 
     #[tokio::test]
-    async fn results_show_on_the_checks_page_and_host_page() {
+    async fn results_show_on_the_checks_page_and_the_checks_own_page() {
         let server = server().await;
         let target = CLOSED_ADDRESS.to_string();
         let input = tcp_input("<b>db</b>", &target);
-        server
-            .state
-            .database
-            .create_remote_check(&input)
-            .await
-            .unwrap();
+        let created = server.state.database.create_remote_check(&input).await;
+        let id = created.unwrap();
         run_due(&mut scheduler(&server), now_ms()).await;
 
         let mut browser = Browser::default();
-        for path in ["/checks", "/hosts/server/metrics"] {
+        let own = format!("/checks/{id}");
+        for path in ["/checks", own.as_str()] {
             let page = browser.get(&server, path).await;
             assert_eq!(page.status, 200, "{path}");
             assert!(page.body.contains("Down"), "{path}: {}", page.body);
             assert!(page.body.contains("connect"), "{path}");
             assert!(!page.body.contains("<b>db"), "{path}");
         }
+
+        // The server's own charts have none of its checks, which are each on a
+        // page of their own, and a chart's numbers can be asked for one check.
+        let page = browser.get(&server, "/hosts/server/metrics").await;
+        assert_eq!(page.status, 200);
+        for gone in ["Latest checks", "Checks passing", "Down"] {
+            assert!(!page.body.contains(gone), "{gone}: {}", page.body);
+        }
+        let data = "/hosts/server/metrics/check.up?range=1h&series=nothing-called-this";
+        let page = browser.get(&server, data).await;
+        assert_eq!(page.status, 200);
+        assert!(page.body.contains("No data in this range"), "{}", page.body);
     }
 
     #[tokio::test]

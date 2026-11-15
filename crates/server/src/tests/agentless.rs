@@ -733,6 +733,62 @@ async fn two_hosts_can_each_have_a_check_of_the_same_name() {
 }
 
 #[tokio::test]
+async fn a_check_has_a_page_of_its_own_with_only_its_charts() {
+    let server = start_with_metrics().await;
+    let served = serve(None).await;
+    let mut ids = Vec::new();
+    for name in ["alpha-site", "beta-site"] {
+        let check = tcp_check("server", name, &served.address);
+        let (status, added) = api(&server, "POST", "/api/v1/remote-checks", &check).await;
+        assert_eq!(status, 201, "{added}");
+        ids.push(added["id"].as_i64().unwrap());
+    }
+    let mut scheduler = check_scheduler(&server);
+    assert_eq!(run_due(&mut scheduler, now_ms()).await, 2);
+    let mut browser = Browser::default();
+
+    // Its results are charted on its own page once they're saved.
+    let path = format!("/checks/{}", ids[0]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let page = loop {
+        let page = browser.get(&server, &path).await;
+        assert_eq!(page.status, 200, "{}", page.body);
+        if !page.body.contains("No data in this range") {
+            break page;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "nothing was charted: {}",
+            page.body
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    for shown in [
+        "alpha-site",
+        "Latest result",
+        "Passing",
+        "Response time",
+        "Total",
+    ] {
+        assert!(page.body.contains(shown), "{shown}: {}", page.body);
+    }
+    assert!(!page.body.contains("beta-site"), "{}", page.body);
+
+    // A chart's numbers are the one check's too.
+    let data = "/hosts/server/metrics/check.up?range=1h&series=alpha-site";
+    let link = data.replace('&', "&amp;");
+    assert!(page.body.contains(&link), "{}", page.body);
+
+    // The list leads to each check's page.
+    let list = browser.get(&server, "/checks").await;
+    for id in &ids {
+        let link = format!(r#"href="/checks/{id}""#);
+        assert!(list.body.contains(&link), "{}", list.body);
+    }
+    assert_eq!(browser.get(&server, "/checks/999999").await.status, 404);
+}
+
+#[tokio::test]
 async fn a_hosts_checks_are_added_from_its_page() {
     let server = start().await;
     let id = add_host(&server, "orders-db").await;

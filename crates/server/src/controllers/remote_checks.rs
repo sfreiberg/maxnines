@@ -10,9 +10,14 @@ use axum_csrf::CsrfToken;
 use maxnines_protocol::{Check, CheckKind};
 use serde::{Deserialize, Serialize};
 
-use super::metrics::{CheckRow, check_row};
-use super::{CsrfForm, Page, server_error};
+use super::host_list::address;
+use super::metrics::{
+    CheckRow, RangeParams, check_row, one_series, range_links, selected_range, time_range,
+};
+use super::{CsrfForm, Page, server_error, viewer_zone};
 use crate::app_state::AppState;
+use crate::metric_charts::{self, Chart, Frame};
+use crate::metrics::{self, METRICS, Metric, Series, SeriesResult, TimeRange, Unit};
 use crate::registration::HostState;
 use crate::remote_checks::{LOCAL_HOST_ID, LOCAL_HOSTNAME, RemoteCheckInput};
 
@@ -28,7 +33,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/checks", get(index).post(create))
         .route("/checks/new", get(new))
-        .route("/checks/{id}", post(update))
+        .route("/checks/{id}", get(show).post(update))
         .route("/checks/{id}/edit", get(edit))
         .route("/checks/{id}/delete", post(delete))
 }
@@ -229,7 +234,6 @@ async fn index(
     Page::new(&state, &token, "remote_checks/index.html")
         .with("checks", &rows)
         .with("filters", &filters)
-        .with("host_id", LOCAL_HOST_ID)
         .render()
 }
 
@@ -273,7 +277,11 @@ async fn form_page(
         .with("id", &id)
         .with("check", form)
         .with("hosts", &host_choices(state).await)
-        .with("back", &back_to(&form.host_id))
+        // A check that exists goes back to its own page.
+        .with(
+            "back",
+            &id.map_or_else(|| back_to(&form.host_id), |id| format!("/checks/{id}")),
+        )
         .with("kinds", &kinds)
         .with("error", &error);
     match error {
@@ -328,6 +336,167 @@ async fn edit(State(state): State<AppState>, Path(id): Path<i64>, token: CsrfTok
     }
 }
 
+/// What a check's response time is made of, as the lines of one chart, in the
+/// order they happen after the total.
+const PHASES: [(&str, &str); 6] = [
+    ("check.response", "Total"),
+    ("check.dns", "DNS lookup"),
+    ("check.connect", "Connecting"),
+    ("check.tls", "TLS handshake"),
+    ("check.first_byte", "First byte"),
+    ("check.download", "Download"),
+];
+
+/// A chart on a check's page.
+#[derive(Serialize)]
+struct CheckChart {
+    chart: Chart,
+    /// Where its numbers can be seen as a table, for a chart of one metric.
+    table: Option<String>,
+}
+
+/// One check's charts: whether it passed, how long it took and where the time
+/// went, then whatever else its kind reports. Each metric is its own query, so
+/// they run together rather than in turn.
+async fn charts(
+    state: &AppState,
+    host_id: &str,
+    name: &str,
+    range: TimeRange,
+    range_key: &str,
+) -> Result<Vec<CheckChart>> {
+    let about_checks: Vec<&'static Metric> = METRICS
+        .iter()
+        .filter(|metric| metric.collector == "checks")
+        .collect();
+    let mut queries = tokio::task::JoinSet::new();
+    for metric in about_checks.iter().copied() {
+        let (state, host_id, name) = (state.clone(), host_id.to_string(), name.to_string());
+        queries.spawn(async move {
+            let found = one_series(&state, &host_id, metric, &name, range).await;
+            (metric.name, found)
+        });
+    }
+    let mut found: BTreeMap<&str, SeriesResult> = BTreeMap::new();
+    while let Some(finished) = queries.join_next().await {
+        let (metric, result) = finished?;
+        found.insert(metric, result?);
+    }
+
+    let zone = viewer_zone();
+    let mut charts = Vec::new();
+    let mut add = |chart: Chart, has_table: bool| {
+        let table = has_table.then(|| {
+            let path = format!("/hosts/{host_id}/metrics/{}", chart.name);
+            address(&path, &[("range", range_key), ("series", name)])
+        });
+        charts.push(CheckChart { chart, table });
+    };
+    let (Some(up), Some(response)) = (metrics::find("check.up"), metrics::find("check.response"))
+    else {
+        bail!("the metrics checks report are missing");
+    };
+
+    // Whether it passed is always there, even with nothing to show yet.
+    let passed = found.remove(up.name).unwrap_or_default();
+    add(
+        metric_charts::build_as(
+            up,
+            up.unit,
+            "Passing",
+            Frame::STANDARD,
+            &passed,
+            range,
+            zone,
+        ),
+        true,
+    );
+
+    let phases: Vec<Series> = PHASES
+        .iter()
+        .filter_map(|(metric, label)| {
+            let series = found.remove(metric)?.series.pop()?;
+            Some(Series {
+                name: (*label).to_string(),
+                points: series.points,
+            })
+        })
+        .collect();
+    if !phases.is_empty() {
+        let phases = SeriesResult {
+            series: phases,
+            hidden: 0,
+        };
+        let frame = Frame::STANDARD;
+        let unit = Unit::Milliseconds;
+        let chart =
+            metric_charts::build_as(response, unit, "Response time", frame, &phases, range, zone);
+        add(chart, false);
+    }
+
+    for metric in about_checks {
+        if let Some(result) = found.remove(metric.name)
+            && !result.series.is_empty()
+        {
+            add(metric_charts::build(metric, &result, range, zone), true);
+        }
+    }
+    Ok(charts)
+}
+
+/// A check's own page: how it is now, and its charts and nobody else's.
+async fn show(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(params): Query<RangeParams>,
+    token: CsrfToken,
+) -> Response {
+    let check = match state.database.get_remote_check(id).await {
+        Ok(Some(check)) => check,
+        Ok(None) => return not_found(&state, &token),
+        Err(error) => return server_error(&error),
+    };
+    let input = check.input;
+    let (selected, _, length_ms) = selected_range(&params);
+    let Some(range) = time_range(length_ms) else {
+        return not_found(&state, &token);
+    };
+    let charts = charts(&state, &input.host_id, &input.check.name, range, selected);
+    let charts = match charts.await {
+        Ok(charts) => charts,
+        Err(error) => return server_error(&error),
+    };
+    let alerts = match state.database.open_alerts().await {
+        Ok(alerts) => alerts,
+        Err(error) => return server_error(&error),
+    };
+    let alerts: Vec<_> = alerts
+        .into_iter()
+        .filter(|alert| alert.host_id == input.host_id && alert.series == input.check.name)
+        .collect();
+    let hosts = host_choices(&state).await;
+    let host = hosts
+        .into_iter()
+        .find(|host| host.id == input.host_id && host.id != LOCAL_HOST_ID);
+    let latest = state.check_results.all();
+
+    Page::new(&state, &token, "remote_checks/show.html")
+        .with("id", &id)
+        .with("name", &input.check.name)
+        .with("kind", input.check.kind.as_str())
+        .with("target", &input.check.target)
+        .with("interval_secs", &input.interval_secs)
+        .with("enabled", &input.enabled)
+        .with("host", &host)
+        .with("host_id", &input.host_id)
+        .with("latest", &latest.get(&id).and_then(check_row))
+        .with("alerts", &alerts)
+        .with("charts", &charts)
+        .with("ranges", &range_links(selected))
+        .with("range", selected)
+        .render()
+}
+
 async fn validate(state: &AppState, form: &CheckForm, id: Option<i64>) -> Result<RemoteCheckInput> {
     let input = form.to_input()?;
     state.check_remote_check(&input, id).await?;
@@ -359,7 +528,7 @@ async fn update(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfFo
         }
     };
     match state.database.update_remote_check(id, &input).await {
-        Ok(true) => (form.token, Redirect::to(&back_to(&input.host_id))).into_response(),
+        Ok(true) => (form.token, Redirect::to(&format!("/checks/{id}"))).into_response(),
         Ok(false) => not_found(&state, &form.token),
         Err(error) => server_error(&error),
     }

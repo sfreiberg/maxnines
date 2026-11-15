@@ -35,6 +35,12 @@ A check doesn't have to be about a host. One left on **MaxNines server** is the
 server's own, as every check was before hosts could have them, and those are all
 listed on the Checks page with the rest.
 
+Every check the server runs has a page of its own, opened by its name wherever
+it's listed. It shows how the check last went, any alerts open about it, and its
+charts and nobody else's: whether it passed, its response time with where the
+time went, and whatever else its kind reports, such as a certificate's days left.
+The server's own checks are charted only there, not among the server's metrics.
+
 ## Online and offline
 
 A host with no agent is online while any of its pages answers or any of its checks

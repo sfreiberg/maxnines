@@ -38,6 +38,7 @@ struct Problem {
 
 #[derive(Serialize)]
 struct CheckTile {
+    id: i64,
     name: String,
     latest: Option<CheckRow>,
 }
@@ -93,6 +94,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
         .into_iter()
         .filter(|check| check.input.enabled)
         .map(|check| CheckTile {
+            id: check.id,
             latest: latest.get(&check.id).and_then(check_row),
             name: check.input.check.name,
         })

@@ -14,7 +14,7 @@ use super::{Page, fleet, local_time, server_error, viewer_zone};
 use crate::app_state::AppState;
 use crate::events::TimelineEvent;
 use crate::metric_charts::{self, Chart, MAX_SERIES};
-use crate::metrics::{self, METRICS, Metric, ShowChart, TimeRange, Unit, now_ms};
+use crate::metrics::{self, METRICS, Metric, SeriesResult, ShowChart, TimeRange, Unit, now_ms};
 
 const HOUR_MS: i64 = 3_600_000;
 
@@ -156,6 +156,33 @@ pub(super) struct RangeParams {
     pub(super) range: Option<String>,
 }
 
+/// What a chart's data page can be asked for: its range, and one series alone.
+#[derive(Deserialize, Default)]
+struct DataParams {
+    range: Option<String>,
+    series: Option<String>,
+}
+
+/// Enough to hold every series a host has of one metric, for picking one out.
+pub(super) const EVERY_SERIES: usize = 10_000;
+
+/// One series of a metric, or none if the host has no such series in the range.
+pub(super) async fn one_series(
+    state: &AppState,
+    host_id: &str,
+    metric: &'static Metric,
+    name: &str,
+    range: TimeRange,
+) -> anyhow::Result<SeriesResult> {
+    let mut result = state
+        .metrics
+        .series(host_id, metric, range, EVERY_SERIES)
+        .await?;
+    result.series.retain(|series| series.name == name);
+    result.hidden = 0;
+    Ok(result)
+}
+
 /// What the host page's address can say: its range, and why a note was refused.
 #[derive(Deserialize, Default)]
 pub(super) struct ShowParams {
@@ -280,9 +307,12 @@ async fn show(
         return not_found(&state, &token);
     };
 
+    // Each check the server runs for itself has a page of its own, so its charts
+    // aren't among the server's.
     let shown: Vec<&'static Metric> = METRICS
         .iter()
         .filter(|metric| metric.chart != ShowChart::Never)
+        .filter(|metric| !(host.is_local() && metric.collector == "checks"))
         .collect();
     let charts = match charts_for(&state, &host.id, &shown, range, viewer_zone()).await {
         Ok(charts) => charts,
@@ -312,7 +342,10 @@ async fn show(
     let ranges = range_links(selected);
 
     // The server saves its checks one at a time, so no one sample has them all.
-    let latest = if host.is_local() || host.is_agentless() {
+    // Its own are on the Checks page, each with a page to itself.
+    let latest = if host.is_local() {
+        Ok(Vec::new())
+    } else if host.is_agentless() {
         state.database.list_remote_checks().await.map(|checks| {
             let mut results = state.check_results.all();
             checks
@@ -380,18 +413,28 @@ async fn show(
 async fn data(
     State(state): State<AppState>,
     Path((id, name)): Path<(String, String)>,
-    Query(params): Query<RangeParams>,
+    Query(params): Query<DataParams>,
     token: CsrfToken,
 ) -> Response {
     let (Some(host), Some(metric)) = (state.registry.get(&id).await, metrics::find(&name)) else {
         return not_found(&state, &token);
     };
-    let (selected, label, length_ms) = selected_range(&params);
+    let range_params = RangeParams {
+        range: params.range,
+    };
+    let (selected, label, length_ms) = selected_range(&range_params);
     let Some(range) = time_range(length_ms) else {
         return not_found(&state, &token);
     };
 
-    match chart(&state, &host.id, metric, range, viewer_zone()).await {
+    let zone = viewer_zone();
+    let chart = match &params.series {
+        Some(series) => one_series(&state, &host.id, metric, series, range)
+            .await
+            .map(|result| metric_charts::build(metric, &result, range, zone)),
+        None => chart(&state, &host.id, metric, range, zone).await,
+    };
+    match chart {
         Ok(chart) => Page::new(&state, &token, "metrics/data.html")
             .with("host_id", &host.id)
             .with("hostname", &host.hostname)

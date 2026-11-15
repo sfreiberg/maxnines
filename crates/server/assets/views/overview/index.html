@@ -73,7 +73,7 @@
   {% if checks %}
   <div class="wall">
     {% for check in checks %}
-    <a class="tile" href="/checks">
+    <a class="tile" href="/checks/{{ check.id }}">
       <span class="tile-head">{{ check.name }} {% if not check.latest %}<span class="badge neutral">Waiting</span>{% elif check.latest.up %}<span class="badge good">Up</span>{% else %}<span class="badge bad">Down</span>{% endif %}</span>
       {% if check.latest %}<span class="stat"><span class="big">{% if check.latest.response %}{{ check.latest.response }}{% else %}–{% endif %}</span><span>{% if check.latest.error %}{{ check.latest.error }}{% elif check.latest.cert_days_left is defined and check.latest.cert_days_left is not none %}Certificate: {{ check.latest.cert_days_left }} days{% else %}{{ check.latest.kind }}{% endif %}</span></span>{% endif %}
     </a>
