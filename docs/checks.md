@@ -91,7 +91,8 @@ check "cache" {
 }
 ```
 
-Each can also have `insecure = true`. The agent tells the server the names of the
+Each can also have `insecure = true`. A database is a [`database` block](database-stats.md)
+instead, which reads its stats as well as whether it answers. The agent tells the server the names of the
 checks its config allows, never more, and a [config rule](api-config-rules.md) picks
 which of them to run and how often, under **Checks from the agent's config**. A name
 the agent doesn't have reports that it's missing. Checks with nothing to sign in

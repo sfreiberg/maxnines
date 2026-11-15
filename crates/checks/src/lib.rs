@@ -5,6 +5,7 @@
 //!
 //! Errors only ever say what kind of failure it was, as a URL can hold a password.
 
+pub mod databases;
 mod mail;
 pub mod openmetrics;
 mod rdap;

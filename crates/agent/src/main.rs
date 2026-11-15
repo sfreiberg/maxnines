@@ -15,6 +15,7 @@ mod connections;
 #[cfg(target_os = "linux")]
 mod containers;
 mod custom;
+mod databases;
 mod disk_space;
 mod facts;
 mod files;

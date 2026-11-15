@@ -16,6 +16,7 @@
 - [OpenMetrics](openmetrics.md)
 - [Checks](checks.md)
 - [Check commands](check-commands.md)
+- [Database stats](database-stats.md)
 - [Hosts without an agent](agentless-hosts.md)
 - [Map](map.md)
 - [Installing as an app](app.md)

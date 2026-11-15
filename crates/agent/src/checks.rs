@@ -127,6 +127,11 @@ pub fn load_check_definitions(definitions: &mut CheckDefinitions) -> Result<()> 
             check.kind.signs_in(),
             problem("is a kind that never signs in, so give it in a config rule instead")
         );
+        // Reading a database's stats says it's up and that it can be signed in to.
+        ensure!(
+            !maxnines_checks::databases::is_database(check.kind),
+            problem("is a database, so give it as a database block, which reads its stats too")
+        );
         check.validate()?;
         ensure!(
             definition

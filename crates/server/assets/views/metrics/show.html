@@ -27,6 +27,26 @@
 </section>
 {% endif %}
 
+{% if databases %}
+<section>
+<h2>Latest databases</h2>
+<div class="tablebox"><table>
+  <thead><tr><th>Database</th><th>Status</th><th>Role</th><th>Version</th><th>Note</th></tr></thead>
+  <tbody>
+    {% for database in databases %}
+    <tr>
+      <td>{{ database.name }}</td>
+      <td>{% if database.up %}<span class="badge good">Up</span>{% else %}<span class="badge bad">Down</span>{% endif %}</td>
+      <td>{% if database.role %}{{ database.role | capitalize }}{% endif %}</td>
+      <td>{% if database.version %}{{ database.version }}{% endif %}</td>
+      <td>{% if database.note %}{{ database.note }}{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table></div>
+</section>
+{% endif %}
+
 {% if commands %}
 <section>
 <h2>Latest check commands</h2>

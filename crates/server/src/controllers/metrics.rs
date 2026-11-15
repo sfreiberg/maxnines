@@ -151,6 +151,31 @@ fn command_row(item: &Value) -> Option<CommandRow> {
     })
 }
 
+/// A database's latest state, from its own row. Rows for what it has several
+/// of, such as standbys, are charted instead.
+#[derive(Serialize)]
+struct DatabaseRow {
+    name: String,
+    up: bool,
+    role: Option<String>,
+    version: Option<String>,
+    /// Why it couldn't be read, or what of it couldn't be.
+    note: Option<String>,
+}
+
+fn database_row(item: &Value) -> Option<DatabaseRow> {
+    let up = item["up"].as_u64()?;
+    let text = |key: &str| item[key].as_str().map(String::from);
+    Some(DatabaseRow {
+        name: item["name"].as_str()?.to_string(),
+        up: up == 1,
+        role: text("role"),
+        version: text("version"),
+        note: text("error")
+            .or_else(|| text("missing").map(|missing| format!("Couldn't read {missing}"))),
+    })
+}
+
 fn custom_row(metric: &Value) -> Option<CustomRow> {
     Some(CustomRow {
         name: metric["name"].as_str()?.to_string(),
@@ -424,6 +449,12 @@ async fn show(
         Ok(_) => Vec::new(),
         Err(error) => return server_error(&error),
     };
+    let latest = state.metrics.latest_output(&host.id, "databases", now_ms());
+    let databases: Vec<DatabaseRow> = match latest.await {
+        Ok(Some(Value::Array(items))) => items.iter().filter_map(database_row).collect(),
+        Ok(_) => Vec::new(),
+        Err(error) => return server_error(&error),
+    };
     let latest = state.metrics.latest_output(&host.id, "services", now_ms());
     let services: Vec<ServiceRow> = match latest.await {
         Ok(Some(Value::Array(items))) => items.iter().filter_map(service_row).collect(),
@@ -435,6 +466,7 @@ async fn show(
         .with("checks", &checks)
         .with("custom_metrics", &custom_metrics)
         .with("commands", &commands)
+        .with("databases", &databases)
         .with("counters", &counters)
         .with("services", &services)
         .with("is_local", &host.is_local())

@@ -12,6 +12,7 @@ use crate::checks::{CheckDefinitions, load_check_definitions};
 use crate::collector::Local;
 use crate::commands::{CheckCommands, check_commands};
 use crate::custom::{Definitions, check_definitions};
+use crate::databases::{DatabaseDefinitions, check_database_definitions};
 use crate::openmetrics::{PageDefinitions, check_page_definitions};
 
 const FACTS: &str = "facts";
@@ -57,6 +58,11 @@ pub struct Config {
     /// their logins and can't add to them.
     #[serde(default, rename = "check")]
     pub checks: CheckDefinitions,
+    /// Databases whose health and replication can be read, by name, with where
+    /// they are and how to sign in. The server chooses which of these to read,
+    /// but never sees their logins and can't add to them.
+    #[serde(default, rename = "database")]
+    pub databases: DatabaseDefinitions,
     /// Whether the server can ask for the actions built into the agent, which
     /// list what's running here and where disk space is going.
     #[serde(default = "enabled")]
@@ -106,6 +112,7 @@ impl Config {
             custom_metrics: &self.custom_metrics,
             check_commands: &self.check_commands,
             metrics_pages: &self.metrics_pages,
+            databases: &self.databases,
             checks: &self.checks,
         }
     }
@@ -118,6 +125,7 @@ impl Config {
             check_commands: names(self.check_commands.keys().collect()),
             checks: names(self.checks.keys().collect()),
             openmetrics: names(self.metrics_pages.keys().collect()),
+            databases: names(self.databases.keys().collect()),
         }
     }
 
@@ -141,6 +149,7 @@ impl Config {
         load_check_definitions(&mut config.checks)?;
         check_actions(&config.actions)?;
         check_page_definitions(&config.metrics_pages)?;
+        check_database_definitions(&config.databases)?;
         Ok(config)
     }
 }

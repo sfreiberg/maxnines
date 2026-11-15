@@ -79,6 +79,15 @@ pub(crate) fn short(error: impl fmt::Display) -> anyhow::Error {
     anyhow!("{}", text.chars().take(200).collect::<String>())
 }
 
+/// PostgreSQL's own words for what went wrong, which its driver keeps a level
+/// down behind "db error".
+pub(crate) fn pg_short(error: tokio_postgres::Error) -> anyhow::Error {
+    match error.as_db_error() {
+        Some(database) => short(database.message()),
+        None => short(error),
+    }
+}
+
 /// Opens a plain connection, timing the lookup and connecting as other checks do.
 async fn open(check: &Check, findings: &mut Findings) -> Result<tokio::net::TcpStream> {
     let (host, port) = host_and_port(&check.target)?;
@@ -110,6 +119,30 @@ pub(crate) async fn check_postgres(
         findings.tls_offered = Some(answer[0] == b'S');
         return Ok(());
     };
+    let started = Instant::now();
+    let (client, running) = postgres_client(check, credentials, false).await?;
+    findings.connect_ms = Some(elapsed_ms(started));
+    let version = client
+        .query_one("SHOW server_version", &[])
+        .await
+        .map_err(pg_short)?;
+    findings.server_version = version.try_get::<_, String>(0).ok();
+    findings.signed_in = Some(true);
+    drop(client);
+    let _ = running.await;
+    Ok(())
+}
+
+/// Signs in to PostgreSQL, over TLS whenever the server offers it, or only over
+/// TLS when it's `required`. The connection runs as a task of its own until the
+/// client is dropped.
+pub(crate) async fn postgres_client(
+    check: &Check,
+    credentials: &Credentials,
+    required: bool,
+) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>)> {
+    use tokio_postgres::config::SslMode;
+
     let (host, port) = host_and_port(&check.target)?;
     let username = credentials
         .username
@@ -122,25 +155,21 @@ pub(crate) async fn check_postgres(
         .user(username)
         .dbname(check.database.as_deref().unwrap_or("postgres"))
         .application_name("maxnines")
-        .ssl_mode(tokio_postgres::config::SslMode::Prefer);
+        .ssl_mode(if required {
+            SslMode::Require
+        } else {
+            SslMode::Prefer
+        });
     if let Some(password) = &credentials.password {
         config.password(password);
     }
     let tls =
         tokio_postgres_rustls::MakeRustlsConnect::new(driver_tls(check.insecure == Some(true))?);
-    let started = Instant::now();
-    let (client, connection) = config.connect(tls).await.map_err(short)?;
-    findings.connect_ms = Some(elapsed_ms(started));
-    let running = tokio::spawn(connection);
-    let version = client
-        .query_one("SHOW server_version", &[])
-        .await
-        .map_err(short)?;
-    findings.server_version = version.try_get::<_, String>(0).ok();
-    findings.signed_in = Some(true);
-    drop(client);
-    let _ = running.await;
-    Ok(())
+    let (client, connection) = config.connect(tls).await.map_err(pg_short)?;
+    let running = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    Ok((client, running))
 }
 
 pub(crate) async fn check_mysql(

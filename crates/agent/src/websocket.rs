@@ -424,6 +424,7 @@ mod tests {
             check_commands: BTreeMap::new(),
             checks: BTreeMap::new(),
             metrics_pages: BTreeMap::new(),
+            databases: BTreeMap::new(),
             actions: Actions::from([(
                 "greet".to_string(),
                 crate::actions::Action {

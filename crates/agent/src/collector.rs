@@ -20,6 +20,7 @@ pub use maxnines_collectors::{Collector, WARMUP};
 use crate::checks::{CheckCollector, CheckDefinitions};
 use crate::commands::{CheckCommands, CommandCollector};
 use crate::custom::{CustomCollector, Definitions};
+use crate::databases::{DatabaseCollector, DatabaseDefinitions};
 use crate::files::FileCollector;
 use crate::openmetrics::{OpenMetricsCollector, PageDefinitions};
 use crate::services::ServiceCollector;
@@ -56,6 +57,7 @@ pub struct Local<'a> {
     pub check_commands: &'a CheckCommands,
     pub checks: &'a CheckDefinitions,
     pub metrics_pages: &'a PageDefinitions,
+    pub databases: &'a DatabaseDefinitions,
 }
 
 #[cfg(test)]
@@ -66,11 +68,13 @@ impl Local<'static> {
         static CHECK_COMMANDS: CheckCommands = CheckCommands::new();
         static CHECKS: CheckDefinitions = CheckDefinitions::new();
         static METRICS_PAGES: PageDefinitions = PageDefinitions::new();
+        static DATABASES: DatabaseDefinitions = DatabaseDefinitions::new();
         Self {
             custom_metrics: &CUSTOM_METRICS,
             check_commands: &CHECK_COMMANDS,
             checks: &CHECKS,
             metrics_pages: &METRICS_PAGES,
+            databases: &DATABASES,
         }
     }
 }
@@ -134,6 +138,10 @@ fn build(
                 Some(software) => Box::new(StatusPageCollector::new(software, urls, interval)),
                 None => bail!("unknown collector {name:?}"),
             }
+        }
+        "databases" => {
+            let chosen = config.databases.as_deref().unwrap_or_default();
+            Box::new(DatabaseCollector::new(chosen, local.databases, interval))
         }
         "openmetrics" => {
             let urls = config.urls.clone().unwrap_or_default();
