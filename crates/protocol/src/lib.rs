@@ -200,6 +200,10 @@ pub struct CollectorSettings {
     /// they sign in with, to run. The server picks from those and says how often.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_checks: Option<Vec<LocalCheck>>,
+    /// OpenMetrics collector only: pages the agent's own config defines, with
+    /// how they sign in, by name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_pages: Option<Vec<String>>,
     /// Apache, nginx and PHP-FPM collectors only: the status pages to read. Without
     /// any, the collector reads [`default_status_page`]. For the OpenMetrics collector
     /// they're the metrics pages to read, and it has no usual one.
@@ -251,6 +255,14 @@ impl LocalCheck {
         }
         Ok(())
     }
+}
+
+/// Whether an OpenMetrics page the agent's config defines could be called this.
+/// Its series are named by it, then a space, then the metric.
+pub fn is_page_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_SETTING_LEN
+        && !name.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 /// Whether a check could be called this. It names a series, so it has to fit
@@ -308,6 +320,7 @@ pub fn check_metrics_pages(urls: &[String], names: &[String]) -> Result<()> {
         paths: None,
         checks: None,
         local_checks: None,
+        local_pages: None,
         urls: Some(urls.to_vec()),
     };
     settings.validate("openmetrics")
@@ -817,10 +830,28 @@ impl CollectorSettings {
         }
 
         let urls = self.urls.as_deref().unwrap_or_default();
+        let local_pages = self.local_pages.as_deref().unwrap_or_default();
         ensure!(
-            urls.len() <= MAX_STATUS_PAGES,
+            urls.len() + local_pages.len() <= MAX_STATUS_PAGES,
             "a collector can read at most {MAX_STATUS_PAGES} status pages"
         );
+        for (index, name) in local_pages.iter().enumerate() {
+            ensure!(
+                is_page_name(name),
+                "{name:?} isn't the name of a page in the agent's config, which has no \
+                 spaces"
+            );
+            ensure!(
+                !local_pages[..index].contains(name),
+                "{name:?} is listed twice"
+            );
+            // Series are told apart by their page's name, wherever it's defined.
+            if let Some(url) = urls.iter().find(|url| metrics_page_name(url) == name) {
+                anyhow::bail!(
+                    "{url:?} and the agent's page {name:?} would both be called {name:?}"
+                );
+            }
+        }
         for (index, url) in urls.iter().enumerate() {
             check_status_page(url)?;
             ensure!(!urls[..index].contains(url), "{url:?} is listed twice");

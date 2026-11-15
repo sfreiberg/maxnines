@@ -21,7 +21,7 @@ use crate::checks::{CheckCollector, CheckDefinitions};
 use crate::commands::{CheckCommands, CommandCollector};
 use crate::custom::{CustomCollector, Definitions};
 use crate::files::FileCollector;
-use crate::openmetrics::{Logins, OpenMetricsCollector};
+use crate::openmetrics::{OpenMetricsCollector, PageDefinitions};
 use crate::services::ServiceCollector;
 use crate::status_pages::{Software, StatusPageCollector};
 use crate::system_collector::SystemCollector;
@@ -55,7 +55,7 @@ pub struct Local<'a> {
     pub custom_metrics: &'a Definitions,
     pub check_commands: &'a CheckCommands,
     pub checks: &'a CheckDefinitions,
-    pub metrics_logins: &'a Logins,
+    pub metrics_pages: &'a PageDefinitions,
 }
 
 #[cfg(test)]
@@ -65,12 +65,12 @@ impl Local<'static> {
         static CUSTOM_METRICS: Definitions = Definitions::new();
         static CHECK_COMMANDS: CheckCommands = CheckCommands::new();
         static CHECKS: CheckDefinitions = CheckDefinitions::new();
-        static METRICS_LOGINS: Logins = Logins::new();
+        static METRICS_PAGES: PageDefinitions = PageDefinitions::new();
         Self {
             custom_metrics: &CUSTOM_METRICS,
             check_commands: &CHECK_COMMANDS,
             checks: &CHECKS,
-            metrics_logins: &METRICS_LOGINS,
+            metrics_pages: &METRICS_PAGES,
         }
     }
 }
@@ -137,9 +137,12 @@ fn build(
         }
         "openmetrics" => {
             let urls = config.urls.clone().unwrap_or_default();
+            let chosen = config.local_pages.as_deref().unwrap_or_default();
             let wanted = config.names.as_deref().unwrap_or_default();
-            let logins = local.metrics_logins;
-            Box::new(OpenMetricsCollector::new(urls, wanted, logins, interval)?)
+            let pages = local.metrics_pages;
+            Box::new(OpenMetricsCollector::new(
+                urls, chosen, wanted, pages, interval,
+            )?)
         }
         other => bail!("unknown collector {other:?}"),
     })

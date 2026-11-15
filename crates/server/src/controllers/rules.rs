@@ -52,6 +52,7 @@ struct RuleForm {
     php_fpm_urls: String,
     openmetrics_urls: String,
     openmetrics_names: String,
+    openmetrics_local: String,
     checks: String,
     local_checks: String,
     collectors: Vec<CollectorChoice>,
@@ -108,6 +109,7 @@ impl RuleForm {
             php_fpm_urls: lines(&rule.settings["collectors"]["php_fpm"]["urls"]),
             openmetrics_urls: lines(&rule.settings["collectors"]["openmetrics"]["urls"]),
             openmetrics_names: lines(&rule.settings["collectors"]["openmetrics"]["names"]),
+            openmetrics_local: lines(&rule.settings["collectors"]["openmetrics"]["local_pages"]),
             checks: check_lines(&rule.settings["collectors"]["checks"]["checks"]),
             local_checks: local_check_lines(&rule.settings["collectors"]["checks"]["local_checks"]),
             collectors: choices(|name| {
@@ -143,6 +145,7 @@ impl RuleForm {
             php_fpm_urls: text("php_fpm_urls"),
             openmetrics_urls: text("openmetrics_urls"),
             openmetrics_names: text("openmetrics_names"),
+            openmetrics_local: text("openmetrics_local"),
             checks: text("checks"),
             local_checks: text("local_checks"),
             collectors: choices(|name| text(&format!("collector_{name}"))),
@@ -189,6 +192,7 @@ impl RuleForm {
                 "php_fpm" => vec![("urls", &self.php_fpm_urls)],
                 "openmetrics" => vec![
                     ("urls", &self.openmetrics_urls),
+                    ("local_pages", &self.openmetrics_local),
                     ("names", &self.openmetrics_names),
                 ],
                 _ => Vec::new(),
@@ -541,7 +545,7 @@ async fn form_view<'a>(
     let known: Vec<String> = known_facts(state).await.into_keys().collect();
     // What agents' own configs allow, to choose from. The form works without.
     let mut allowed = BTreeMap::new();
-    for list in ["custom_metrics", "check_commands", "checks"] {
+    for list in ["custom_metrics", "check_commands", "checks", "openmetrics"] {
         let names = state
             .database
             .listed_by_agents(&format!("agent.{list}"))

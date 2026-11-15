@@ -7,7 +7,8 @@ read those pages, so anything that already has one can be charted and alerted on
 nothing added to it.
 
 Fill in **OpenMetrics pages** in a config rule, one address to a line, such as
-`http://localhost:9100/metrics`. That turns the `openmetrics` collector on for the
+`http://localhost:9100/metrics`, for pages that need no signing in; pages that do
+are [defined on the agent](#pages-that-need-signing-in). That turns the `openmetrics` collector on for the
 hosts the rule applies to, and each agent reads its pages with every sample. A page
 is usually on the agent's own host, but can be anywhere the agent can reach.
 
@@ -81,32 +82,35 @@ Two more metrics are there to alert on, and aren't charted:
 
 ## Pages that need signing in
 
-A page behind a username and password, as basic authentication, gets them from the
-agent's own config file, `agent.hcl`, on the host that reads it:
+A page behind a username and password, as basic authentication, or a token, sent as
+a bearer token, is defined in the agent's own config file, `agent.hcl`, on the host
+that reads it, with its address and its login together:
 
 ```hcl
-openmetrics "localhost:9100" {
+openmetrics "node" {
+  url      = "http://localhost:9100/metrics"
   username = "metrics"
   password = env("METRICS_PASSWORD")
 }
-```
 
-A page that takes a token instead, sent as a bearer token, gets it the same way:
-
-```hcl
-openmetrics "localhost:8080" {
+openmetrics "app" {
+  url   = "https://app.example.com/internal/metrics"
   token = env("APP_METRICS_TOKEN")
 }
 ```
 
-The block is named for the page, as its series are, and the agent sends the login
-with every request to that page and to no other. `env()` reads the password or token
-from the agent's environment, so it needn't be written in the file. Restart the
-agent after changing it.
+A config rule then picks these by name under **OpenMetrics pages from the agent's
+config**, and their series are named by the block's name, such as `node
+node_load1`. The agent lists the names it has in its `agent.openmetrics` fact, never
+the addresses or logins, so the rule form can offer them. A name an agent doesn't
+have reports that it's missing.
 
-The server never has the password or token. A config rule only says which pages to read, so
-it can be seen and changed by anyone who can edit rules without giving anything
-away, and addresses with a username or password in them aren't accepted there.
+`env()` reads the password or token from the agent's environment, so it needn't be
+written in the file. Restart the agent after changing it.
+
+The server never has the password or token, and can't choose where one is sent: it
+only ever goes to the address in the same block. Addresses with a username or
+password in them aren't accepted in a rule's pages either.
 
 A password or token sent to an `http://` page crosses the network in the clear.
 That's fine for a page on the host itself, and worth `https://` for one that isn't.

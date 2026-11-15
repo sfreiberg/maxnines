@@ -19,6 +19,7 @@ pub struct Allowed {
     pub custom_metrics: Vec<String>,
     pub check_commands: Vec<String>,
     pub checks: Vec<String>,
+    pub openmetrics: Vec<String>,
 }
 
 /// Asks for the canonical name. The value is the same on every platform we build for.
@@ -201,6 +202,7 @@ fn gather_named(
             "custom_metrics": allowed.custom_metrics,
             "check_commands": allowed.check_commands,
             "checks": allowed.checks,
+            "openmetrics": allowed.openmetrics,
             // What the server can ask this host to run, and what each needs to
             // be told, so it can check before asking.
             "actions": action_names,
@@ -397,12 +399,14 @@ mod tests {
             custom_metrics: vec!["queue".to_string()],
             check_commands: vec!["check_raid".to_string()],
             checks: vec!["bastion".to_string()],
+            openmetrics: vec!["node".to_string()],
         };
         let facts = gather(&BTreeMap::new(), &allowed, &Actions::new(), true).unwrap();
 
         assert_eq!(facts["agent"]["custom_metrics"], json!(["queue"]));
         assert_eq!(facts["agent"]["check_commands"], json!(["check_raid"]));
         assert_eq!(facts["agent"]["checks"], json!(["bastion"]));
+        assert_eq!(facts["agent"]["openmetrics"], json!(["node"]));
     }
 
     #[test]

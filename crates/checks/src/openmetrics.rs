@@ -73,10 +73,23 @@ impl Page {
     /// `wanted` are metric names, with `*` and `?` for anything. One starting with
     /// `!` is left out instead of kept.
     pub fn new(url: String, wanted: &[String], max_series: usize, login: Option<Login>) -> Self {
+        let name = metrics_page_name(&url).to_string();
+        Self::named(name, url, wanted, max_series, login)
+    }
+
+    /// As [`new`](Self::new), with its series named by `name` rather than by
+    /// where it is.
+    pub fn named(
+        name: String,
+        url: String,
+        wanted: &[String],
+        max_series: usize,
+        login: Option<Login>,
+    ) -> Self {
         let (unwanted, wanted): (Vec<&String>, Vec<&String>) =
             wanted.iter().partition(|name| name.starts_with('!'));
         Self {
-            name: metrics_page_name(&url).to_string(),
+            name,
             url,
             wanted: wanted.iter().map(|name| WildMatch::new(name)).collect(),
             unwanted: unwanted

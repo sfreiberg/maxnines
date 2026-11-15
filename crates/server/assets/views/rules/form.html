@@ -116,7 +116,13 @@
 
     <label>OpenMetrics pages
       <textarea name="openmetrics_urls" rows="2" spellcheck="false" placeholder="http://localhost:9100/metrics">{{ rule.openmetrics_urls }}</textarea>
-      <small>One address per line, for pages in the Prometheus or OpenMetrics text format, such as an exporter's <code>/metrics</code>. Up to 2,000 series are kept, shared equally between the pages.</small>
+      <small>One address per line, for pages in the Prometheus or OpenMetrics text format, such as an exporter's <code>/metrics</code>, that need no signing in. Up to 2,000 series are kept, shared equally between all the pages.</small>
+    </label>
+
+    <label>OpenMetrics pages from the agent's config
+      <textarea name="openmetrics_local" rows="2" spellcheck="false" placeholder="node">{{ rule.openmetrics_local }}</textarea>
+      {% if allowed.openmetrics %}<small>Agents allow: {% for name in allowed.openmetrics %}<code>{{ name }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.</small>{% endif %}
+      <small>One name per line, from the <code>openmetrics</code> blocks in each agent's own config: pages that need a username and password or a token. Their addresses and logins stay on the agent, and their series are named by the block's name.</small>
     </label>
 
     <label>OpenMetrics metrics

@@ -203,6 +203,14 @@ fn describe_changes(before: &ResolvedConfig, after: &ResolvedConfig) -> Vec<Stri
                     describe_checks(now.checks.as_ref())
                 ));
             }
+            let old_pages = was.and_then(|settings| settings.local_pages.as_ref());
+            if old_pages != now.local_pages.as_ref() {
+                changes.push(format!(
+                    "{name} reads from the agent's config: {} → {}",
+                    describe_list(old_pages),
+                    describe_list(now.local_pages.as_ref())
+                ));
+            }
             let old_local = was.and_then(|settings| settings.local_checks.as_ref());
             if old_local != now.local_checks.as_ref() {
                 let named = |checks: Option<&Vec<maxnines_protocol::LocalCheck>>| {

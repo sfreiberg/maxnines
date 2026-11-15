@@ -12,7 +12,7 @@ use crate::checks::{CheckDefinitions, load_check_definitions};
 use crate::collector::Local;
 use crate::commands::{CheckCommands, check_commands};
 use crate::custom::{Definitions, check_definitions};
-use crate::openmetrics::{Logins, check_logins};
+use crate::openmetrics::{PageDefinitions, check_page_definitions};
 
 const FACTS: &str = "facts";
 
@@ -47,10 +47,11 @@ pub struct Config {
     /// service. As with custom metrics, it can only pick from these.
     #[serde(default, rename = "action")]
     pub actions: Actions,
-    /// Usernames and passwords for OpenMetrics pages that ask for one, by the page's
-    /// name. The server says which pages to read, but never sees these.
+    /// OpenMetrics pages that need signing in to, by name, with their addresses
+    /// and logins. The server chooses which of these to read, but never sees their
+    /// logins and can't add to them.
     #[serde(default, rename = "openmetrics")]
-    pub metrics_logins: Logins,
+    pub metrics_pages: PageDefinitions,
     /// Checks that sign in, by name, with where they reach and how they sign in.
     /// The server chooses which of these to run and how often, but never sees
     /// their logins and can't add to them.
@@ -104,7 +105,7 @@ impl Config {
         Local {
             custom_metrics: &self.custom_metrics,
             check_commands: &self.check_commands,
-            metrics_logins: &self.metrics_logins,
+            metrics_pages: &self.metrics_pages,
             checks: &self.checks,
         }
     }
@@ -116,6 +117,7 @@ impl Config {
             custom_metrics: names(self.custom_metrics.keys().collect()),
             check_commands: names(self.check_commands.keys().collect()),
             checks: names(self.checks.keys().collect()),
+            openmetrics: names(self.metrics_pages.keys().collect()),
         }
     }
 
@@ -138,7 +140,7 @@ impl Config {
         check_commands(&config.check_commands)?;
         load_check_definitions(&mut config.checks)?;
         check_actions(&config.actions)?;
-        check_logins(&config.metrics_logins)?;
+        check_page_definitions(&config.metrics_pages)?;
         Ok(config)
     }
 }
@@ -285,38 +287,35 @@ mod env_tests {
     }
 
     #[test]
-    fn openmetrics_logins_are_read_from_their_blocks() {
+    fn openmetrics_pages_are_read_from_their_blocks() {
         let server = reachable();
         let text = format!(
             r#"{server}
-            openmetrics "localhost:9100" {{
+            openmetrics "node" {{
+              url      = "http://localhost:9100/metrics"
               username = "metrics"
               password = env("MAXNINES_TEST_UNSET", "s3cret")
             }}
-            openmetrics "app.example.com" {{
-              username = "reader"
-              password = "x"
+            openmetrics "app" {{
+              url   = "https://app.example.com/internal/metrics"
+              token = "abc"
             }}
             "#
         );
         let config = Config::parse(&text).unwrap();
-        let pages: Vec<&str> = config.metrics_logins.keys().map(String::as_str).collect();
-        assert_eq!(pages, ["app.example.com", "localhost:9100"]);
+        let pages: Vec<&str> = config.metrics_pages.keys().map(String::as_str).collect();
+        assert_eq!(pages, ["app", "node"]);
+        assert_eq!(config.allowed().openmetrics, ["app", "node"]);
         // Printing a config, as a log line might, leaves the passwords out.
         assert!(!format!("{config:?}").contains("s3cret"));
 
-        let bad = format!(
-            "{server}\nopenmetrics \"http://localhost:9100/metrics\" {{\n username = \"a\"\n password = \"b\"\n}}\n"
+        let unnamed = format!(
+            "{server}\nopenmetrics \"two words\" {{\n url = \"http://a/metrics\"\n token = \"c\"\n}}\n"
         );
-        let error = format!("{:#}", Config::parse(&bad).unwrap_err());
-        assert!(
-            error.contains("isn't an OpenMetrics page's name"),
-            "{error}"
-        );
-        let extra = format!(
-            "{server}\nopenmetrics \"localhost:9100\" {{\n username = \"a\"\n password = \"b\"\n token = \"c\"\n}}\n"
-        );
-        assert!(Config::parse(&extra).is_err());
+        let error = format!("{:#}", Config::parse(&unnamed).unwrap_err());
+        assert!(error.contains("no spaces"), "{error}");
+        let nowhere = format!("{server}\nopenmetrics \"node\" {{\n token = \"c\"\n}}\n");
+        assert!(Config::parse(&nowhere).is_err());
     }
 
     #[test]

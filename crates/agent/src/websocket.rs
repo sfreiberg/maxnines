@@ -423,7 +423,7 @@ mod tests {
             custom_metrics: crate::custom::Definitions::new(),
             check_commands: BTreeMap::new(),
             checks: BTreeMap::new(),
-            metrics_logins: BTreeMap::new(),
+            metrics_pages: BTreeMap::new(),
             actions: Actions::from([(
                 "greet".to_string(),
                 crate::actions::Action {
