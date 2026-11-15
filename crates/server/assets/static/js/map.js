@@ -188,7 +188,8 @@
     return map;
   }
 
-  const HEALTH = ["critical", "warning", "offline", "online"];
+  const HEALTH = ["critical", "warning", "offline", "online", "not_read"];
+  const healthName = (health) => health.replace("_", " ");
   const people = new Intl.NumberFormat();
 
   // ---- The Map page.
@@ -301,7 +302,7 @@
         tooltip.append(list, htmlEl("p", "map-tip-hint", "Click to zoom in."));
       } else {
         const site = group.members[0];
-        const counts = HEALTH.filter((h) => site.counts[h]).map((h) => `${site.counts[h]} ${h}`).join(" · ");
+        const counts = HEALTH.filter((h) => site.counts[h]).map((h) => `${site.counts[h]} ${healthName(h)}`).join(" · ");
         tooltip.append(htmlEl("h3", "", site.name), htmlEl("p", "", counts));
         if (site.place) tooltip.append(htmlEl("p", "map-tip-place", site.place));
         const list = htmlEl("ul");

@@ -8,6 +8,8 @@ use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
 use serde::Serialize;
 use tokio::sync::Notify;
 
+use crate::registration::{HostRecord, HostState};
+
 /// How often one agent may connect. A real agent reconnects a few times after a
 /// network blip; two hosts sharing a key knock each other off far faster.
 const CONNECTIONS_PER_MINUTE: NonZeroU32 = NonZeroU32::new(10).unwrap();
@@ -20,6 +22,16 @@ const FACTS_BURST: NonZeroU32 = NonZeroU32::new(5).unwrap();
 
 /// Keys are forgotten once there are this many, as they're only agent IDs.
 const MAX_REMEMBERED_KEYS: usize = 100_000;
+
+/// Whether a host is there, as lists and counts of hosts put it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    Online,
+    Offline,
+    /// A host with no agent and nothing being read for it, which is neither, so
+    /// it isn't counted as one that could be online.
+    NotRead,
+}
 
 /// Whether an agent is connected right now.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -267,6 +279,16 @@ impl Presence {
     pub fn get(&self, id: &str) -> Option<HostPresence> {
         let state = self.state.lock().unwrap();
         state.hosts.get(id).map(|entry| entry.presence)
+    }
+
+    /// Whether a host is there. A revoked agent's connection closes a moment after
+    /// it's revoked, and it doesn't count as online in the meantime.
+    pub fn reach(&self, host: &HostRecord) -> Reach {
+        match self.get(&host.id) {
+            Some(presence) if presence.online && host.state == HostState::Approved => Reach::Online,
+            None if host.is_agentless() => Reach::NotRead,
+            _ => Reach::Offline,
+        }
     }
 }
 

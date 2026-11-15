@@ -82,7 +82,8 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
     problems.sort_by_key(|problem| !problem.critical);
     problems.truncate(MAX_PROBLEMS);
 
-    let host_count = hosts.len();
+    // One with nothing read for it couldn't be online, so isn't one that's not.
+    let host_count = hosts.iter().filter(|host| !host.not_read).count();
     let online_count = hosts.iter().filter(|host| host.online).count();
     hosts.truncate(MAX_HOSTS);
 

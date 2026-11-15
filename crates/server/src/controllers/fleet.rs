@@ -11,6 +11,7 @@ use crate::app_state::AppState;
 use crate::facts::FlatFacts;
 use crate::metric_charts::format_value;
 use crate::metrics::{CurrentValues, Unit, now_ms};
+use crate::presence::Reach;
 use crate::registration::{HostRecord, HostState, short_id};
 
 /// A disk this full is drawn in the warning color.
@@ -40,18 +41,22 @@ pub enum Health {
     Warning,
     Offline,
     Online,
+    /// A host with no agent and nothing being read for it.
+    NotRead,
 }
 
 impl Health {
-    pub fn of(online: bool, alerts: &[&Alert]) -> Self {
+    pub fn of(reach: Reach, alerts: &[&Alert]) -> Self {
         if alerts.iter().any(|a| a.severity == Severity::Critical) {
             Self::Critical
         } else if !alerts.is_empty() {
             Self::Warning
-        } else if online {
-            Self::Online
         } else {
-            Self::Offline
+            match reach {
+                Reach::Online => Self::Online,
+                Reach::Offline => Self::Offline,
+                Reach::NotRead => Self::NotRead,
+            }
         }
     }
 }
@@ -88,6 +93,8 @@ pub struct FleetRow {
     pub hostname: String,
     pub os_family: Option<OsFamily>,
     pub online: bool,
+    /// Neither online nor offline, so left out of counts of either.
+    pub not_read: bool,
     pub health: Health,
     pub cpu: Option<Meter>,
     pub memory: Option<Meter>,
@@ -104,11 +111,12 @@ fn row(
     facts: Option<&FlatFacts>,
     alerts: &[&Alert],
 ) -> FleetRow {
-    let online = state.presence.get(&host.id).is_some_and(|p| p.online);
+    let reach = state.presence.reach(&host);
     FleetRow {
         os_family: facts.and_then(OsFamily::of),
-        online,
-        health: Health::of(online, alerts),
+        online: reach == Reach::Online,
+        not_read: reach == Reach::NotRead,
+        health: Health::of(reach, alerts),
         cpu: Meter::new(values.cpu_percent),
         memory: Meter::new(values.memory_percent),
         disk_is_full: values.disk_percent.is_some_and(|d| d >= FULL_DISK_PERCENT),
@@ -196,7 +204,9 @@ mod tests {
         assert!(Health::Critical < Health::Warning);
         assert!(Health::Warning < Health::Offline);
         assert!(Health::Offline < Health::Online);
-        assert!(Health::of(true, &[]) == Health::Online);
-        assert!(Health::of(false, &[]) == Health::Offline);
+        assert!(Health::Online < Health::NotRead);
+        assert!(Health::of(Reach::Online, &[]) == Health::Online);
+        assert!(Health::of(Reach::Offline, &[]) == Health::Offline);
+        assert!(Health::of(Reach::NotRead, &[]) == Health::NotRead);
     }
 }

@@ -51,6 +51,8 @@ pub struct Counts {
     pub warning: usize,
     pub offline: usize,
     pub online: usize,
+    #[serde(default)]
+    pub not_read: usize,
 }
 
 impl Counts {
@@ -60,11 +62,12 @@ impl Counts {
             Health::Warning => self.warning += 1,
             Health::Offline => self.offline += 1,
             Health::Online => self.online += 1,
+            Health::NotRead => self.not_read += 1,
         }
     }
 
     pub fn total(&self) -> usize {
-        self.critical + self.warning + self.offline + self.online
+        self.critical + self.warning + self.offline + self.online + self.not_read
     }
 
     /// The worst of them, which is what the site's marker shows.
@@ -75,6 +78,8 @@ impl Counts {
             Health::Warning
         } else if self.offline > 0 {
             Health::Offline
+        } else if self.online == 0 && self.not_read > 0 {
+            Health::NotRead
         } else {
             Health::Online
         }
@@ -118,11 +123,10 @@ pub async fn map_data(state: &AppState) -> Result<MapData> {
         if host.state != HostState::Approved || host.is_local() {
             continue;
         }
-        let online = state.presence.get(&host.id).is_some_and(|p| p.online);
         let mine = alerts.get(host.id.as_str()).map_or(&[][..], Vec::as_slice);
         let pin = MapHost {
             short_id: short_id(&host.id).to_string(),
-            health: Health::of(online, mine),
+            health: Health::of(state.presence.reach(&host), mine),
             hostname: host.hostname.clone(),
             id: host.id.clone(),
         };
@@ -187,6 +191,7 @@ fn breakdown(counts: &Counts) -> String {
         (counts.warning, "warning"),
         (counts.offline, "offline"),
         (counts.online, "online"),
+        (counts.not_read, "not read"),
     ]
     .into_iter()
     .filter(|(count, _)| *count > 0)
@@ -221,7 +226,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
     let attention = data
         .sites
         .iter()
-        .filter(|site| site.health != Health::Online)
+        .filter(|site| !matches!(site.health, Health::Online | Health::NotRead))
         .count();
     // Drawn by map.js. The template escapes it, so agents' names stay text.
     let json = match serde_json::to_string(&data) {
@@ -501,11 +506,25 @@ mod tests {
         let mut counts = Counts::default();
         counts.add(Health::Online);
         assert_eq!(counts.health(), Health::Online);
+        // One with nothing read for it says nothing about the site.
+        counts.add(Health::NotRead);
+        assert_eq!(counts.health(), Health::Online);
+        assert_eq!(
+            Counts {
+                not_read: 2,
+                ..Counts::default()
+            }
+            .health(),
+            Health::NotRead
+        );
         counts.add(Health::Offline);
         assert_eq!(counts.health(), Health::Offline);
         counts.add(Health::Critical);
         assert_eq!(counts.health(), Health::Critical);
-        assert_eq!(breakdown(&counts), "1 critical · 1 offline · 1 online");
+        assert_eq!(
+            breakdown(&counts),
+            "1 critical · 1 offline · 1 online · 1 not read"
+        );
     }
 
     #[test]

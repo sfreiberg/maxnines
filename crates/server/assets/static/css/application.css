@@ -155,6 +155,8 @@ a.stats-cell:hover { background: var(--raised); color: var(--text); }
 /* Online and offline in lists of hosts, where the dot says enough: the same pill
    without its word, as tall as one with a word. */
 .badge.dot-only { min-height: calc(1lh + 6px); }
+/* Neither online nor offline: a ring where the others have a dot. */
+.badge.hollow::before { background: none; box-shadow: inset 0 0 0 1.5px currentColor; }
 
 /* Buttons */
 .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
@@ -420,6 +422,7 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .map-marker.offline { color: var(--muted); }
 .map-marker.online { color: var(--good); }
 .map-fill { fill: currentColor; stroke: var(--surface); }
+.map-marker.not_read { color: var(--border-strong); }
 .map-ring { fill: none; stroke: var(--text); opacity: 0; }
 .map-marker.selected .map-ring, .map-marker:focus-visible .map-ring { opacity: 1; }
 .map-count { fill: var(--surface); font-family: var(--mono); font-weight: 700; text-anchor: middle; dominant-baseline: central; pointer-events: none; }
@@ -446,6 +449,7 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .map-dot.offline { background: var(--muted); }
 .map-dot.online { background: var(--good); }
 .map-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; padding: 12px 16px; border-top: 1px solid var(--border); color: var(--muted); font-size: 13px; }
+.map-dot.not_read { background: none; box-shadow: inset 0 0 0 1.5px var(--muted); }
 .map-key { display: inline-flex; align-items: center; gap: 6px; }
 .map-sites { overflow: hidden; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
 .map-sites-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 14px 16px 10px; border-bottom: 1px solid var(--border); }

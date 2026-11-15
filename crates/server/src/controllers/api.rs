@@ -35,7 +35,7 @@ use crate::models::{
     ConfigStatus, RuleInput, UserChange, check_api_key_name, check_new_user, expiry_after, is_theme,
 };
 use crate::notifier::{self, Notice};
-use crate::presence::HostPresence;
+use crate::presence::{HostPresence, Reach};
 use crate::registration::{HostRecord, HostState};
 use crate::remote_checks::{RemoteCheck, RemoteCheckInput};
 use crate::roles::Role;
@@ -541,11 +541,11 @@ async fn list(State(state): State<AppState>, Query(params): Query<ListParams>) -
         .filter(|host| !host.is_local() && search.includes(&host.id, &host.hostname))
         .map(|host| {
             let presence: Option<HostPresence> = state.presence.get(&host.id);
-            let online = presence.as_ref().is_some_and(|p| p.online);
+            let reach = state.presence.reach(&host);
             let mine = alerts.get(host.id.as_str()).map_or(&[][..], Vec::as_slice);
             HostView {
-                online,
-                health: Health::of(online, mine),
+                online: reach == Reach::Online,
+                health: Health::of(reach, mine),
                 last_seen_ms: presence.map(|p| p.last_seen_ms),
                 host,
             }
@@ -564,10 +564,10 @@ async fn show_host(State(state): State<AppState>, UrlPath(id): UrlPath<String>) 
     };
     let mine: Vec<&Alert> = open.iter().filter(|alert| alert.host_id == id).collect();
     let presence = state.presence.get(&id);
-    let online = presence.as_ref().is_some_and(|p| p.online);
+    let reach = state.presence.reach(&host);
     Json(HostView {
-        online,
-        health: Health::of(online, &mine),
+        online: reach == Reach::Online,
+        health: Health::of(reach, &mine),
         last_seen_ms: presence.map(|p| p.last_seen_ms),
         host,
     })

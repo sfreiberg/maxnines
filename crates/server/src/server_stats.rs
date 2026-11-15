@@ -21,6 +21,7 @@ use tracing::{error, warn};
 use crate::app_state::AppState;
 use crate::metrics::now_ms;
 use crate::models::DatabaseStats;
+use crate::presence::Reach;
 use crate::registration::{HostRecord, HostState};
 use crate::remote_checks::{LOCAL_HOST_ID, LOCAL_HOSTNAME};
 use crate::store::{NewSample, StoreStats, WriteCounts, WriterCommand};
@@ -160,7 +161,12 @@ async fn own_numbers(state: &AppState, recorded: &mut Recorded) -> Value {
 
     let hosts = state.registry.list().await;
     let real = || hosts.iter().filter(|host| !host.is_local());
-    let online = |host: &&HostRecord| state.presence.get(&host.id).is_some_and(|p| p.online);
+    let online = |host: &&HostRecord| state.presence.reach(host) == Reach::Online;
+    // One with nothing read for it couldn't be online, so isn't counted with those
+    // that could.
+    let approved = |host: &&HostRecord| {
+        host.state == HostState::Approved && state.presence.reach(host) != Reach::NotRead
+    };
     json!({
         "memory_bytes": process.as_ref().map(|process| process.memory_bytes),
         "cpu_percent": process.as_ref().and_then(|process| process.cpu_percent),
@@ -172,9 +178,7 @@ async fn own_numbers(state: &AppState, recorded: &mut Recorded) -> Value {
         "series": state.metrics.series_count().await.ok(),
         "write_queue": state.writer.max_capacity() - state.writer.capacity(),
         "hosts_online": real().filter(online).count(),
-        "hosts_approved": real()
-            .filter(|host| host.state == HostState::Approved)
-            .count(),
+        "hosts_approved": real().filter(approved).count(),
         "hosts_waiting": real()
             .filter(|host| host.state == HostState::Pending)
             .count(),
@@ -365,10 +369,13 @@ pub async fn gather(state: &AppState) -> ServerStats {
         database: database.ok(),
         activity: Activity {
             hosts_online: real()
-                .filter(|host| state.presence.get(&host.id).is_some_and(|p| p.online))
+                .filter(|host| state.presence.reach(host) == Reach::Online)
                 .count(),
             hosts_approved: real()
-                .filter(|host| host.state == HostState::Approved)
+                .filter(|host| {
+                    host.state == HostState::Approved
+                        && state.presence.reach(host) != Reach::NotRead
+                })
                 .count(),
             hosts_waiting: real()
                 .filter(|host| host.state == HostState::Pending)

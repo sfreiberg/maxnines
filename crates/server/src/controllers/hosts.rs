@@ -24,6 +24,7 @@ use crate::metric_charts::format_value;
 use crate::metrics::Unit;
 use crate::metrics::now_ms;
 use crate::models::ConfigStatus;
+use crate::presence::Reach;
 use crate::registration::{HostRecord, HostState, short_id};
 use crate::rule_engine;
 use crate::silences::{ActiveSilences, Cover, SilenceInput};
@@ -219,6 +220,8 @@ struct WaitingHost {
 struct Listed {
     host: HostRecord,
     online: bool,
+    /// Neither online nor offline, as nothing is read for it.
+    not_read: bool,
     health: Health,
 }
 
@@ -226,7 +229,7 @@ struct Listed {
 fn matches(filter: &str, listed: &Listed) -> bool {
     match filter {
         "online" => listed.online,
-        "offline" => !listed.online && listed.host.state == HostState::Approved,
+        "offline" => !listed.online && !listed.not_read && listed.host.state == HostState::Approved,
         "revoked" => listed.host.state == HostState::Revoked,
         _ => true,
     }
@@ -286,7 +289,6 @@ async fn index(
         if host.is_local() {
             continue;
         }
-        let presence = state.presence.get(&host.id);
         if host.state == HostState::Pending {
             // Waiting agents never get as far as presence, so the registry remembers.
             let asked = state.registry.last_asked_ms(&host.id);
@@ -296,15 +298,13 @@ async fn index(
                 hostname: host.hostname,
             });
         } else if search.includes(&host.id, &host.hostname) {
-            // A revoked agent's connection closes a moment after it's revoked, and it
-            // doesn't count as online in the meantime.
-            let online = host.state == HostState::Approved && presence.is_some_and(|p| p.online);
+            let reach = state.presence.reach(&host);
             let mine = alerts.get(host.id.as_str()).map_or(&[][..], Vec::as_slice);
-            let health = Health::of(online, mine);
             listed.push(Listed {
+                online: reach == Reach::Online,
+                not_read: reach == Reach::NotRead,
+                health: Health::of(reach, mine),
                 host,
-                online,
-                health,
             });
         }
     }
@@ -344,7 +344,7 @@ async fn index(
     let online = listed.iter().filter(|item| item.online).count();
     let total = listed
         .iter()
-        .filter(|item| item.host.state == HostState::Approved)
+        .filter(|item| item.host.state == HostState::Approved && !item.not_read)
         .count();
     listed.retain(|item| matches(selected, item));
 
@@ -566,13 +566,8 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         Ok(checks) => checks,
         Err(error) => return server_error(&error),
     };
-    let online = state.presence.get(&id).is_some_and(|p| p.online);
-    let mut row = row(
-        &state,
-        host.clone(),
-        Some(&flat),
-        Health::of(online, &alerts),
-    );
+    let health = Health::of(state.presence.reach(&host), &alerts);
+    let mut row = row(&state, host.clone(), Some(&flat), health);
     row.config = Some(config_state(
         Some(desired.version.as_str()),
         reported.as_ref(),

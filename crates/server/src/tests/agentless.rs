@@ -449,6 +449,28 @@ async fn a_host_and_its_pages_are_added_from_the_hosts_page() {
         form.body.contains("Leave empty to keep it"),
         "{}",
         form.body
+
+    // Nor is it listed or counted as offline, as it couldn't be online.
+    let (_, host) = api(
+        &server,
+        "GET",
+        &format!("/api/v1/hosts/{idle}"),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(
+        (&host["health"], &host["online"]),
+        (&json!("not_read"), &json!(false))
+    );
+    let mut browser = Browser::default();
+    let all = browser.get(&server, "/hosts").await;
+    assert!(all.body.contains("0 of 1 online"), "{}", all.body);
+    assert!(all.body.contains("Not read"), "{}", all.body);
+    let offline = browser.get(&server, "/hosts?status=offline").await;
+    assert!(offline.body.contains("orders-db"), "{}", offline.body);
+    assert!(!offline.body.contains("not-set-up-yet"), "{}", offline.body);
+    let overview = browser.get(&server, "/").await;
+    assert!(overview.body.contains("1 offline"), "{}", overview.body);
     );
     assert!(!form.body.contains("s3cret"));
 
