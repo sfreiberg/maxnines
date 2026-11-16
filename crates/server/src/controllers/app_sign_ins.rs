@@ -61,14 +61,33 @@ fn asked_role(fields: &Fields) -> Result<Option<Role>, ()> {
     }
 }
 
-/// What the approval page offers: the role the app asked for, or theirs, and never
-/// more than theirs.
-fn role_offer(page: Page<'_>, asked: Option<Role>) -> Page<'_> {
+/// The most the approval page offers: what the app asked for, and never more than
+/// the person's own role. An app that didn't ask can have up to their role.
+fn ceiling(asked: Option<Role>) -> Role {
     let yours = signed_in_user().map_or(Role::Viewer, |user| user.role);
-    let chosen = asked.map_or(yours, |asked| asked.min(yours));
-    page.with("roles", &role_choices(yours))
-        .with("chosen_role", chosen.as_str())
+    asked.map_or(yours, |asked| asked.min(yours))
 }
+
+/// The roles the approval page offers, with the one picked to begin with: what the app
+/// asked for, or Viewer if it didn't ask, so one click never gives more than needed.
+fn role_offer(page: Page<'_>, asked: Option<Role>) -> Page<'_> {
+    let most = ceiling(asked);
+    let picked = if asked.is_some() { most } else { Role::Viewer };
+    page.with("roles", &role_choices(most))
+        .with("chosen_role", picked.as_str())
+}
+
+/// The role chosen on the page, if it's one the page offered.
+fn chosen_role(fields: &Fields, asked: Option<Role>) -> Option<Role> {
+    signed_in_user()?;
+    Role::parse(field(fields, "chosen_role"))
+        .ok()
+        .filter(|role| *role <= ceiling(asked))
+}
+
+/// Said when Allow came with a role that can't be given, as from a page left open
+/// while the person's own role was lowered.
+const ROLE_GONE: &str = "That role isn't one you can give it now. Choose again.";
 
 /// Where the browser is sent back to with an answer.
 fn back_to(redirect_uri: &str, answer: &[(&str, &str)]) -> Response {
@@ -140,23 +159,20 @@ fn check_ask(fields: &Fields) -> Checked {
     })
 }
 
-async fn authorize_page(
-    State(state): State<AppState>,
-    token: CsrfToken,
-    Query(fields): Query<Fields>,
+/// The page where someone approves an app that will be sent back to this computer.
+fn approval_page(
+    state: &AppState,
+    token: &CsrfToken,
+    asked: &Asked,
+    error: Option<&str>,
 ) -> Response {
-    let asked = match check_ask(&fields) {
-        Checked::Asked(asked) => asked,
-        Checked::Refused(message) => return refusal_page(&state, &token, message),
-        Checked::SendBack(uri, app_state, error) => {
-            return back_to(&uri, &[("error", error), ("state", &app_state)]);
-        }
-    };
-    let page = Page::new(&state, &token, "app_sign_ins/approve.html")
+    let role = asked.role.map_or("", Role::as_str);
+    let page = Page::new(state, token, "app_sign_ins/approve.html")
         .with("action", "/oauth/authorize")
         .with("app", asked.client.name)
         .with("device", &asked.device)
         .with("email", &signed_in_user().map(|user| user.email.clone()))
+        .with("error", &error)
         .with(
             "hidden",
             &hidden(&[
@@ -167,8 +183,14 @@ async fn authorize_page(
                 ("code_challenge", &asked.challenge),
                 ("code_challenge_method", "S256"),
                 ("device", &asked.device),
+                ("role", role),
             ]),
         );
+    let page = if error.is_some() {
+        page.with_status(StatusCode::UNPROCESSABLE_ENTITY)
+    } else {
+        page
+    };
     let mut response = role_offer(page, asked.role).render();
     // The answer goes back to the app on this computer, which the page's policy has to
     // let the form lead to.
@@ -182,6 +204,20 @@ async fn authorize_page(
             .insert(header::CONTENT_SECURITY_POLICY, policy);
     }
     response
+}
+
+async fn authorize_page(
+    State(state): State<AppState>,
+    token: CsrfToken,
+    Query(fields): Query<Fields>,
+) -> Response {
+    match check_ask(&fields) {
+        Checked::Asked(asked) => approval_page(&state, &token, &asked, None),
+        Checked::Refused(message) => refusal_page(&state, &token, message),
+        Checked::SendBack(uri, app_state, error) => {
+            back_to(&uri, &[("error", error), ("state", &app_state)])
+        }
+    }
 }
 
 /// A field the approval form carries through unchanged.
@@ -201,14 +237,6 @@ fn hidden(fields: &[(&'static str, &str)]) -> Vec<Hidden> {
         .collect()
 }
 
-/// The role chosen on the page, if it's one they may give.
-fn chosen_role(fields: &Fields) -> Option<Role> {
-    let yours = signed_in_user()?.role;
-    Role::parse(field(fields, "chosen_role"))
-        .ok()
-        .filter(|role| *role <= yours)
-}
-
 async fn authorize(State(state): State<AppState>, form: CsrfForm) -> Response {
     let asked = match check_ask(&form.fields) {
         Checked::Asked(asked) => asked,
@@ -217,17 +245,14 @@ async fn authorize(State(state): State<AppState>, form: CsrfForm) -> Response {
             return back_to(&uri, &[("error", error), ("state", &app_state)]);
         }
     };
-    let deny = || {
-        back_to(
+    if field(&form.fields, "decision") != "allow" {
+        return back_to(
             &asked.redirect_uri,
             &[("error", "access_denied"), ("state", &asked.state)],
-        )
-    };
-    if field(&form.fields, "decision") != "allow" {
-        return deny();
+        );
     }
-    let (Some(user), Some(role)) = (signed_in_user(), chosen_role(&form.fields)) else {
-        return deny();
+    let (Some(user), Some(role)) = (signed_in_user(), chosen_role(&form.fields, asked.role)) else {
+        return approval_page(&state, &form.token, &asked, Some(ROLE_GONE));
     };
     let approval = Approval {
         user_id: user.id,
@@ -265,14 +290,19 @@ async fn device_page(
     if query.code.is_empty() {
         return Page::new(&state, &token, "app_sign_ins/device.html").render();
     }
-    device_approval(&state, &token, &query.code)
+    device_approval(&state, &token, &query.code, None)
 }
 
 async fn device_lookup(State(state): State<AppState>, form: CsrfForm) -> Response {
-    device_approval(&state, &form.token, field(&form.fields, "user_code"))
+    device_approval(&state, &form.token, field(&form.fields, "user_code"), None)
 }
 
-fn device_approval(state: &AppState, token: &CsrfToken, typed: &str) -> Response {
+fn device_approval(
+    state: &AppState,
+    token: &CsrfToken,
+    typed: &str,
+    error: Option<&str>,
+) -> Response {
     let Some(asking) = state.pending_sign_ins.device_asking(typed, now_ms()) else {
         return Page::new(state, token, "app_sign_ins/device.html")
             .with("code", typed)
@@ -290,26 +320,36 @@ fn device_approval(state: &AppState, token: &CsrfToken, typed: &str) -> Response
         .with("device", &asking.device)
         .with("user_code", &asking.user_code)
         .with("email", &signed_in_user().map(|user| user.email.clone()))
+        .with("error", &error)
         .with("hidden", &hidden(&[("user_code", &asking.user_code)]));
+    let page = if error.is_some() {
+        page.with_status(StatusCode::UNPROCESSABLE_ENTITY)
+    } else {
+        page
+    };
     role_offer(page, asking.role).render()
 }
 
 async fn device_decide(State(state): State<AppState>, form: CsrfForm) -> Response {
     let user_code = field(&form.fields, "user_code");
     let Some(asking) = state.pending_sign_ins.device_asking(user_code, now_ms()) else {
-        return device_approval(&state, &form.token, user_code);
+        return device_approval(&state, &form.token, user_code, None);
     };
-    let allowed = field(&form.fields, "decision") == "allow";
-    let approver = match (signed_in_user(), chosen_role(&form.fields)) {
-        (Some(user), Some(role)) if allowed => Some((user.id, role)),
-        _ => None,
+    let approver = if field(&form.fields, "decision") == "allow" {
+        let (Some(user), Some(role)) = (signed_in_user(), chosen_role(&form.fields, asking.role))
+        else {
+            return device_approval(&state, &form.token, user_code, Some(ROLE_GONE));
+        };
+        Some((user.id, role))
+    } else {
+        None
     };
     let approved = approver.is_some();
     if !state
         .pending_sign_ins
         .decide_device(user_code, approver, now_ms())
     {
-        return device_approval(&state, &form.token, user_code);
+        return device_approval(&state, &form.token, user_code, None);
     }
     Page::new(&state, &form.token, "app_sign_ins/done.html")
         .with("app", asking.client.name)
@@ -348,14 +388,20 @@ fn issued(sign_in: &AppSignIn, tokens: &AppTokens) -> Response {
     no_store(body.into_response())
 }
 
-/// Signs in the app someone approved, recorded as theirs.
+/// Signs in the app someone approved, recorded as theirs. Only someone who can't sign
+/// in any more is a final no: anything else is the server's fault, which the app can
+/// try again, and says nothing about how the server works inside.
 async fn sign_in_approved(state: &AppState, approval: Approval) -> Response {
-    let Ok(Some(user)) = state.database.user(approval.user_id).await else {
-        return oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_grant",
-            "That person can't sign in",
-        );
+    let user = match state.database.user(approval.user_id).await {
+        Ok(Some(user)) if user.disabled_ms.is_none() => user,
+        Ok(_) => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "The person who approved it can't sign in now",
+            );
+        }
+        Err(error) => return server_error(&error),
     };
     let actor = Actor::Person {
         id: user.id,
@@ -375,11 +421,7 @@ async fn sign_in_approved(state: &AppState, approval: Approval) -> Response {
     .await;
     match created {
         Ok((sign_in, tokens)) => issued(&sign_in, &tokens),
-        Err(error) => oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_grant",
-            &format!("{error:#}"),
-        ),
+        Err(error) => server_error(&error),
     }
 }
 
@@ -481,7 +523,14 @@ async fn start_device(State(state): State<AppState>, Form(fields): Form<Fields>)
         .pending_sign_ins
         .start_device(client, &device, role, now_ms())
     {
-        Ok(started) => started,
+        Ok(Some(started)) => started,
+        Ok(None) => {
+            return oauth_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily_unavailable",
+                "Too many devices are waiting to be signed in. Try again in a few minutes",
+            );
+        }
         Err(error) => return server_error(&error),
     };
     let page = format!("{}/device", state.web_url.trim_end_matches('/'));
@@ -523,27 +572,44 @@ async fn revoke_token(State(state): State<AppState>, Form(fields): Form<Fields>)
 
 // The page listing what's signed in.
 
-/// The apps whoever's signed in may see and revoke: their own, or for an admin,
-/// everyone's.
+/// Whose apps whoever's signed in may see and revoke: their own, or for an admin,
+/// everyone's, which is `None`. Nobody's, if nobody's signed in.
+fn whose() -> Option<Option<i64>> {
+    let viewer = signed_in_user()?;
+    Some((viewer.role < Role::Admin).then_some(viewer.id))
+}
+
+/// The apps whoever's signed in may see and revoke.
 pub async fn visible_sign_ins(state: &AppState) -> anyhow::Result<Vec<AppSignIn>> {
-    let Some(viewer) = signed_in_user() else {
-        return Ok(Vec::new());
-    };
-    let mut sign_ins = state.database.list_app_sign_ins().await?;
-    if viewer.role < Role::Admin {
-        sign_ins.retain(|sign_in| sign_in.user_id == viewer.id);
+    match whose() {
+        Some(whose) => state.database.list_app_sign_ins(whose).await,
+        None => Ok(Vec::new()),
     }
-    Ok(sign_ins)
+}
+
+/// How many working apps whoever's signed in may see.
+pub async fn active_sign_ins(state: &AppState) -> anyhow::Result<u64> {
+    match whose() {
+        Some(whose) => {
+            state
+                .database
+                .count_active_app_sign_ins(whose, now_ms())
+                .await
+        }
+        None => Ok(0),
+    }
 }
 
 /// Revokes a sign in if it's one they may. Returns false for any other, as if it
 /// weren't there.
 pub async fn revoke_if_allowed(state: &AppState, id: i64) -> anyhow::Result<bool> {
-    if !visible_sign_ins(state)
-        .await?
-        .iter()
-        .any(|sign_in| sign_in.id == id)
-    {
+    let Some(whose) = whose() else {
+        return Ok(false);
+    };
+    let Some(sign_in) = state.database.get_app_sign_in(id).await? else {
+        return Ok(false);
+    };
+    if whose.is_some_and(|user_id| user_id != sign_in.user_id) {
         return Ok(false);
     }
     state.database.revoke_app_sign_in(id, now_ms()).await

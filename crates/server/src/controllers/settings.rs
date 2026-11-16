@@ -22,11 +22,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
         let rules = state.database.list_rules().await?.len();
         let alert_rules = state.database.list_alert_rules().await?.len();
         let api_keys = state.database.list_api_keys().await?.len();
-        let app_sign_ins = super::app_sign_ins::visible_sign_ins(&state)
-            .await?
-            .iter()
-            .filter(|sign_in| sign_in.is_active(crate::metrics::now_ms()))
-            .count();
+        let app_sign_ins = super::app_sign_ins::active_sign_ins(&state).await?;
         let channels = state.database.list_channels().await?.len();
         let users = state.database.user_count().await?;
         anyhow::Ok((rules, alert_rules, channels, api_keys, app_sign_ins, users))

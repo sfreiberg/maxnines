@@ -192,6 +192,12 @@ pub fn hash_token(token: &str) -> Vec<u8> {
     digest(&SHA256, token.as_bytes()).as_ref().to_vec()
 }
 
+/// A secret's hash as it's kept in the database, so reading it gives nobody the
+/// secret: sessions, API keys and signed-in apps' tokens.
+pub fn hex_hash(secret: &str) -> String {
+    hex::encode(hash_token(secret))
+}
+
 fn read_token(path: &Path) -> Result<Vec<u8>> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading token file {}", path.display()))?;

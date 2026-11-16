@@ -21,7 +21,14 @@ Send the access token like a key: `Authorization: Bearer mxa_…`. Before it run
 when a request gives `401`, swap the refresh token for new tokens. Each swap gives a
 new refresh token and the old one stops working. If an old one is used again more
 than a minute after it was swapped, it's been copied, and the whole sign in is revoked.
-So an app should keep only the newest, and refresh once at a time.
+The minute counts from the swap, however often the old one is used in it. So an app
+should keep only the newest, refresh once at a time, and when an answer doesn't arrive,
+try again within the minute.
+
+A signed-in app can do what its role allows, with two exceptions: it can't make API
+keys, and it can't approve another app. Only a person signed in to the pages in a
+browser can approve an app, so neither an app nor an API key can sign in something that
+would outlast being revoked.
 
 Only these apps can sign in, as `client_id`:
 
@@ -35,7 +42,8 @@ Only these apps can sign in, as `client_id`:
 
 1. Make a random `code_verifier` of 43 to 128 characters, and its `code_challenge`: the
    SHA-256 of it in base64url without padding.
-2. Listen on a free port of `127.0.0.1` or `[::1]`. `localhost` isn't accepted.
+2. Listen on a free port of `127.0.0.1`. `localhost` and `[::1]` aren't accepted, as
+   the approval page couldn't send the browser back to an IPv6 address.
 3. Open the browser at `/oauth/authorize`:
 
 ```text
@@ -50,7 +58,7 @@ $MAXNINES_URL/oauth/authorize?response_type=code&client_id=maxnines-cli
 | `code_challenge`, `code_challenge_method` | Required. The challenge, and `S256` |
 | `state` | Sent back unchanged, to check the answer is to this request |
 | `device` | The computer's name, up to 100 characters, shown when approving and under Settings |
-| `role` | `viewer`, `responder`, `editor` or `admin`: what to offer. The person can choose lower, and never more than their own |
+| `role` | `viewer`, `responder`, `editor` or `admin`: the most to offer, and what's picked to begin with. The person can choose lower, and never more than their own. Left out, any role up to theirs is offered, with Viewer picked |
 
 The person signs in if they aren't already, and chooses **Allow** or **Deny**. The
 browser comes back to `redirect_uri` with `code` and `state`, or with
@@ -81,8 +89,10 @@ curl -X POST "$MAXNINES_URL/oauth/token" \
 ```
 
 Errors are `400` with `error` and `error_description`, as OAuth words them:
-`invalid_grant` for a code that's wrong, used or out of date, or a verifier that
-doesn't match, and `invalid_client` (`401`) for an app that isn't one of those above.
+`invalid_grant` for a code that's wrong, used or out of date, a verifier that doesn't
+match, or a person who can't sign in any more, and `invalid_client` (`401`) for an app
+that isn't one of those above. A `500` is the server's own trouble, and worth trying
+again.
 
 ## Sign in from another device
 
@@ -119,6 +129,9 @@ Until they answer, it's `400` with `authorization_pending`, or `slow_down` for a
 too often, which adds 5 seconds to the interval. Then it's the tokens, or
 `access_denied`, or `expired_token` after 10 minutes.
 
+At most 1,000 devices can be waiting at once. Beyond that, starting one is `503` with
+`temporarily_unavailable`, until some run out.
+
 ## Refresh the tokens
 
 ```sh
@@ -143,8 +156,9 @@ Either token works. It's always `200`, whether or not the token was real.
 
 `GET /api/v1/app-sign-ins`
 
-Admins see everyone's, and everyone else only their own, newest first, including
-revoked and expired ones.
+Admins see everyone's, and everyone else only their own, newest first. Revoked and
+expired ones stay listed for 90 days, then go. The [audit log](audit-log.md) keeps what
+happened to them.
 
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/app-sign-ins"

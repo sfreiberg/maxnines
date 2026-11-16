@@ -11,6 +11,8 @@ use anyhow::{Context, Result};
 use axum::http::Method;
 use serde::{Deserialize, Serialize};
 
+use crate::audit::Via;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -111,6 +113,29 @@ const RESPONDING: [&str; 18] = [
     "/silences",
     "/silences/{id}/end",
 ];
+
+/// Approving an app to act as someone, which only a person at the pages may do. An app
+/// or a key doing it would make a sign in that outlives revoking the app or the key.
+const APPROVING_APPS: [&str; 2] = ["/oauth/authorize", "/device"];
+
+/// Making API keys, which a signed-in app may not: a key it made would go on working
+/// after the app was signed out or revoked.
+const MAKING_KEYS: [&str; 2] = ["/api-keys", "/settings/api-keys"];
+
+/// Why a request isn't allowed however it came, whatever the role: not as an API key
+/// or a signed-in app, as `via` says, if that's how it came. `route` is as for
+/// [`required`].
+pub fn refused_via(via: Option<&Via>, method: &Method, route: &str) -> Option<&'static str> {
+    let via = via?;
+    if APPROVING_APPS.iter().any(|prefix| starts(route, prefix)) {
+        return Some("Only someone signed in to the pages in a browser can approve an app");
+    }
+    let changes = method != Method::GET && method != Method::HEAD;
+    if matches!(via, Via::App { .. }) && changes && MAKING_KEYS.contains(&route) {
+        return Some("An app signed in through the browser can't make API keys");
+    }
+    None
+}
 
 fn starts(path: &str, prefix: &str) -> bool {
     path.strip_prefix(prefix)
@@ -253,6 +278,35 @@ mod tests {
         }
         // Only whole path segments count.
         assert_eq!(required(&Method::GET, "/users-guide"), Role::Viewer);
+    }
+
+    #[test]
+    fn apps_and_keys_cant_approve_apps_and_apps_cant_make_keys() {
+        let key = Via::ApiKey {
+            id: 1,
+            name: "script".to_string(),
+        };
+        let app = Via::App {
+            id: 1,
+            name: "MaxNines command line".to_string(),
+        };
+        for route in ["/oauth/authorize", "/device", "/device/decide"] {
+            for method in [Method::GET, Method::POST] {
+                assert!(refused_via(Some(&key), &method, route).is_some(), "{route}");
+                assert!(refused_via(Some(&app), &method, route).is_some(), "{route}");
+                assert!(refused_via(None, &method, route).is_none(), "{route}");
+            }
+        }
+        for route in ["/api-keys", "/settings/api-keys"] {
+            assert!(refused_via(Some(&app), &Method::POST, route).is_some());
+            assert!(refused_via(Some(&app), &Method::GET, route).is_none());
+            // A key can still make a key, which can't do more than it can.
+            assert!(refused_via(Some(&key), &Method::POST, route).is_none());
+            assert!(refused_via(None, &Method::POST, route).is_none());
+        }
+        // An app can still revoke a key, or itself.
+        assert!(refused_via(Some(&app), &Method::DELETE, "/api-keys/{id}").is_none());
+        assert!(refused_via(Some(&app), &Method::DELETE, "/app-sign-ins/{id}").is_none());
     }
 
     #[test]

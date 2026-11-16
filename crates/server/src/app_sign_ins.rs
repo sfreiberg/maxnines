@@ -20,7 +20,6 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ring::digest::{SHA256, digest};
 use ring::rand::{SecureRandom, SystemRandom};
 
-use crate::registration::hash_token;
 use crate::roles::Role;
 
 /// How long an access token works.
@@ -35,6 +34,9 @@ pub const REFRESH_GRACE_MS: i64 = 60 * 1000;
 pub const PENDING_LIFETIME_MS: i64 = 10 * 60 * 1000;
 /// How often a device may ask whether it's been approved.
 pub const DEVICE_INTERVAL_SECS: i64 = 5;
+/// The most devices that can be waiting at once. Anyone can start one, so this keeps
+/// someone who starts thousands from using up the server's memory.
+pub const MAX_WAITING_DEVICES: usize = 1000;
 
 pub const ACCESS_PREFIX: &str = "mxa_";
 pub const REFRESH_PREFIX: &str = "mxr_";
@@ -85,9 +87,10 @@ pub fn check_device(device: &str) -> Result<String> {
     Ok(device.to_string())
 }
 
-/// Where a browser may be sent back to: a port on this machine's loopback address,
-/// written as an IP address, as RFC 8252 asks, since `localhost` can be made to mean
-/// somewhere else. Gives back the origin, which the page's policy has to allow.
+/// Where a browser may be sent back to: a port on 127.0.0.1, written as an IP address,
+/// as RFC 8252 asks, since `localhost` can be made to mean somewhere else. Not `[::1]`,
+/// as a page's policy can't name an IPv6 address, so the browser would refuse to go
+/// back there. Gives back the origin, which the page's policy has to allow.
 pub fn check_redirect(redirect_uri: &str) -> Result<String> {
     let Some(rest) = redirect_uri.strip_prefix("http://") else {
         bail!("an app is sent back to http:// on this computer");
@@ -100,8 +103,8 @@ pub fn check_redirect(redirect_uri: &str) -> Result<String> {
     let host_end = authority.rfind(':').unwrap_or(authority.len());
     let (host, port) = authority.split_at(host_end);
     ensure!(
-        host == "127.0.0.1" || host == "[::1]",
-        "an app is sent back to 127.0.0.1 or [::1], not {host:?}"
+        host == "127.0.0.1",
+        "an app is sent back to 127.0.0.1, not {host:?}"
     );
     let port = port.strip_prefix(':').unwrap_or_default();
     ensure!(
@@ -138,10 +141,7 @@ pub fn new_secret(prefix: &str) -> Result<String> {
     Ok(format!("{prefix}{}", maxnines_protocol::auth::new_nonce()?))
 }
 
-/// Only the hash of a secret is kept.
-pub fn secret_hash(secret: &str) -> String {
-    hex::encode(hash_token(secret))
-}
+pub use crate::registration::hex_hash as secret_hash;
 
 /// Letters that can't be mistaken for each other or spell much, as RFC 8628 suggests.
 const USER_CODE_LETTERS: &[u8] = b"BCDFGHJKLMNPQRSTVWXZ";
@@ -306,17 +306,20 @@ impl PendingSignIns {
         proven.then_some(found.approval)
     }
 
-    /// Starts a device's sign in.
+    /// Starts a device's sign in, unless too many are waiting already.
     pub fn start_device(
         &self,
         client: AppClient,
         device: &str,
         role: Option<Role>,
         now_ms: i64,
-    ) -> Result<DeviceStart> {
+    ) -> Result<Option<DeviceStart>> {
         let device_code = new_secret(DEVICE_CODE_PREFIX)?;
         let mut waiting = self.lock();
         Self::forget_expired(&mut waiting, now_ms);
+        if waiting.devices.len() >= MAX_WAITING_DEVICES {
+            return Ok(None);
+        }
         // Codes are short, so make sure this one isn't already waiting.
         let user_code = loop {
             let code = new_user_code()?;
@@ -341,10 +344,10 @@ impl PendingSignIns {
                 state: DeviceState::Waiting,
             },
         );
-        Ok(DeviceStart {
+        Ok(Some(DeviceStart {
             device_code,
             user_code,
-        })
+        }))
     }
 
     /// The device waiting under the code someone typed, if any still is.
@@ -460,13 +463,10 @@ mod tests {
             check_redirect("http://127.0.0.1:53682/callback").unwrap(),
             "http://127.0.0.1:53682"
         );
-        assert_eq!(
-            check_redirect("http://[::1]:8080").unwrap(),
-            "http://[::1]:8080"
-        );
         for bad in [
             "https://127.0.0.1:53682/",
             "http://localhost:53682/",
+            "http://[::1]:53682/",
             "http://127.0.0.1/",
             "http://127.0.0.1:0/",
             "http://evil.example.com:80/",
@@ -535,6 +535,7 @@ mod tests {
         let pending = PendingSignIns::default();
         let start = pending
             .start_device(CLIENTS[0], "build box", Some(Role::Responder), 0)
+            .unwrap()
             .unwrap();
         let code = &start.device_code;
         assert_eq!(start.user_code.len(), 9);
@@ -570,16 +571,44 @@ mod tests {
     }
 
     #[test]
+    fn only_so_many_devices_can_wait_at_once() {
+        let pending = PendingSignIns::default();
+        for _ in 0..MAX_WAITING_DEVICES {
+            assert!(
+                pending
+                    .start_device(CLIENTS[0], "", None, 0)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert!(
+            pending
+                .start_device(CLIENTS[0], "", None, 0)
+                .unwrap()
+                .is_none()
+        );
+        // Room comes back as they run out.
+        let later = pending.start_device(CLIENTS[0], "", None, PENDING_LIFETIME_MS);
+        assert!(later.unwrap().is_some());
+    }
+
+    #[test]
     fn a_device_turned_down_or_left_too_long_hears_so() {
         let pending = PendingSignIns::default();
-        let start = pending.start_device(CLIENTS[1], "", None, 0).unwrap();
+        let start = pending
+            .start_device(CLIENTS[1], "", None, 0)
+            .unwrap()
+            .unwrap();
         assert!(pending.decide_device(&start.user_code, None, 1));
         assert_eq!(
             pending.poll_device(&start.device_code, "maxnines-menubar", 2),
             DevicePoll::Denied
         );
 
-        let start = pending.start_device(CLIENTS[1], "", None, 0).unwrap();
+        let start = pending
+            .start_device(CLIENTS[1], "", None, 0)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             pending.poll_device(&start.device_code, "maxnines-menubar", PENDING_LIFETIME_MS),
             DevicePoll::Expired

@@ -213,6 +213,8 @@ async fn nothing_is_given_without_the_right_proof_or_address() {
     for elsewhere in [
         "https://evil.example.com/callback",
         "http://localhost:5555/",
+        // A page's policy can't name an IPv6 address, so the browser couldn't go back.
+        "http://[::1]:5555/",
     ] {
         let page = browser
             .get(&server, &authorize_path(elsewhere, "viewer"))
@@ -259,14 +261,28 @@ async fn an_app_never_does_more_than_its_person() {
         "{}",
         page.body
     );
-    assert!(!page.body.contains(r#"value="admin""#), "{}", page.body);
-
-    // And more can't be sent.
-    let back = approve(&mut browser, &server, "editor", "allow").await;
-    assert_eq!(
-        query_value(&back, "error").as_deref(),
-        Some("access_denied")
+    assert!(
+        !page.body.contains(r#"<option value="admin""#),
+        "{}",
+        page.body
     );
+
+    // And more can't be sent: the page says so, rather than telling the app no.
+    let page = browser
+        .submit(
+            &server,
+            &authorize_path(BACK, "admin"),
+            "/oauth/authorize",
+            &approval_fields("editor", "allow"),
+        )
+        .await;
+    assert_eq!(page.status, 422, "{}", page.body);
+    assert!(
+        page.body.contains("one you can give it now. Choose again."),
+        "{}",
+        page.body
+    );
+    assert!(page.header("location").is_none());
 }
 
 #[tokio::test]
@@ -476,4 +492,223 @@ async fn signed_in_apps_are_listed_and_revoked() {
     let page = Browser::default().get(&server, "/settings/apps").await;
     assert!(page.body.contains("Revoked"), "{}", page.body);
     assert!(!page.body.contains("/revoke\""), "{}", page.body);
+}
+
+#[tokio::test]
+async fn an_app_is_offered_no_more_than_it_asked_for_and_viewer_if_it_didnt_ask() {
+    let server = start().await;
+    let mut browser = Browser::default();
+
+    let page = browser
+        .get(&server, &authorize_path(BACK, "responder"))
+        .await;
+    assert!(
+        page.body.contains(r#"<option value="responder" selected>"#),
+        "{}",
+        page.body
+    );
+    assert!(
+        !page.body.contains(r#"<option value="editor""#),
+        "{}",
+        page.body
+    );
+
+    // Not asking isn't asking for everything: one click gives a viewer.
+    let page = browser.get(&server, &authorize_path(BACK, "")).await;
+    assert!(
+        page.body.contains(r#"<option value="viewer" selected>"#),
+        "{}",
+        page.body
+    );
+    assert!(
+        page.body.contains(r#"<option value="admin""#),
+        "{}",
+        page.body
+    );
+
+    // What it asked for is carried through, so more can't be chosen than was offered.
+    let mut fields = approval_fields("admin", "allow");
+    fields.push(("role", "responder"));
+    let page = browser
+        .submit(
+            &server,
+            &authorize_path(BACK, "responder"),
+            "/oauth/authorize",
+            &fields,
+        )
+        .await;
+    assert_eq!(page.status, 422, "{}", page.body);
+}
+
+#[tokio::test]
+async fn only_someone_at_the_pages_can_approve_an_app_and_apps_cant_make_keys() {
+    let server = start().await;
+    let back = approve(&mut Browser::default(), &server, "admin", "allow").await;
+    let (_, tokens) = swap_code(&server, &query_value(&back, "code").unwrap(), VERIFIER).await;
+    let access = tokens["access_token"].as_str().unwrap();
+
+    let (status, refused) = call_json(&server, access, "POST", "/api/v1/api-keys").await;
+    assert_eq!(status, 403);
+    assert_eq!(
+        refused["error"],
+        "An app signed in through the browser can't make API keys"
+    );
+    assert!(server.state.database.list_api_keys().await.unwrap().len() == 1);
+
+    // Neither an app nor a key can approve another app.
+    for token in [access, server.api_key.as_str()] {
+        assert_eq!(
+            call(&server, token, "GET", &authorize_path(BACK, "")).await,
+            403
+        );
+        assert_eq!(call(&server, token, "POST", "/device/decide").await, 403);
+    }
+    // A key can still make a key.
+    let mut stream = TcpStream::connect(server.address).await.unwrap();
+    let body = r#"{"name": "another"}"#;
+    let request = format!(
+        "POST /api/v1/api-keys HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        server.api_key,
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 201"), "{response}");
+}
+
+#[tokio::test]
+async fn using_a_swapped_token_again_never_stretches_its_minute() {
+    let server = start().await;
+    let database = &server.state.database;
+    let owner = database.list_users().await.unwrap()[0].id;
+    let now = now_ms();
+    let (_, first) = database
+        .create_app_sign_in(owner, "maxnines-cli", "", Role::Viewer, now)
+        .await
+        .unwrap();
+    let refresh = |token: String, at: i64| async move {
+        database
+            .refresh_app_sign_in(&token, "maxnines-cli", at)
+            .await
+            .unwrap()
+    };
+    let Refreshed::Issued(_, second) = refresh(first.refresh_token.clone(), now).await else {
+        panic!("not refreshed");
+    };
+    // Its answer was lost, so it's used again inside the minute: that works.
+    let half = now + REFRESH_GRACE_MS / 2;
+    assert!(matches!(
+        refresh(first.refresh_token.clone(), half).await,
+        Refreshed::Issued(..)
+    ));
+    // But the minute still counts from the first swap, so a copy can't be kept alive
+    // by using it again and again.
+    let after = now + REFRESH_GRACE_MS + 1;
+    assert_eq!(
+        refresh(first.refresh_token.clone(), after).await,
+        Refreshed::Reused
+    );
+    assert_eq!(
+        refresh(second.refresh_token.clone(), after).await,
+        Refreshed::Refused
+    );
+}
+
+#[tokio::test]
+async fn two_refreshes_at_once_both_get_tokens_and_the_newest_works() {
+    let server = start().await;
+    let database = &server.state.database;
+    let owner = database.list_users().await.unwrap()[0].id;
+    let now = now_ms();
+    let (_, first) = database
+        .create_app_sign_in(owner, "maxnines-cli", "", Role::Viewer, now)
+        .await
+        .unwrap();
+    let (one, two) = tokio::join!(
+        database.refresh_app_sign_in(&first.refresh_token, "maxnines-cli", now),
+        database.refresh_app_sign_in(&first.refresh_token, "maxnines-cli", now),
+    );
+    let (Refreshed::Issued(_, one), Refreshed::Issued(_, two)) = (one.unwrap(), two.unwrap())
+    else {
+        panic!("not both refreshed");
+    };
+    // Whichever was saved last is the one that works now.
+    let one_works = database
+        .accept_app_token(&one.access_token, now)
+        .await
+        .unwrap();
+    let two_works = database
+        .accept_app_token(&two.access_token, now)
+        .await
+        .unwrap();
+    assert!(one_works.is_some() != two_works.is_some());
+}
+
+#[tokio::test]
+async fn someone_who_cant_sign_in_any_more_gets_a_final_no() {
+    let server = start().await;
+    let (id, mut browser) = person(&server, "leaving@example.com", Role::Viewer).await;
+    let back = approve(&mut browser, &server, "viewer", "allow").await;
+    server
+        .state
+        .database
+        .disable_user(id, now_ms())
+        .await
+        .unwrap();
+    let (status, refused) =
+        swap_code(&server, &query_value(&back, "code").unwrap(), VERIFIER).await;
+    assert_eq!(status, 400, "{refused}");
+    assert_eq!(refused["error"], "invalid_grant");
+    assert_eq!(
+        refused["error_description"],
+        "The person who approved it can't sign in now"
+    );
+}
+
+#[tokio::test]
+async fn only_your_own_apps_can_be_revoked_and_old_ones_are_cleared_away() {
+    let server = start().await;
+    let database = &server.state.database;
+    let admin = database.list_users().await.unwrap()[0].id;
+    let now = now_ms();
+    let (theirs, _) = database
+        .create_app_sign_in(admin, "maxnines-cli", "admin's laptop", Role::Viewer, now)
+        .await
+        .unwrap();
+    let (viewer, _) = person(&server, "viewer@example.com", Role::Viewer).await;
+    let (_, key) = database
+        .create_api_key("viewer's", viewer, Role::Viewer, None, now)
+        .await
+        .unwrap();
+    let path = format!("/api/v1/app-sign-ins/{}", theirs.id);
+    assert_eq!(call(&server, &key, "DELETE", &path).await, 404);
+    let (_, listed) = call_json(&server, &key, "GET", "/api/v1/app-sign-ins").await;
+    assert_eq!(listed, json!([]));
+    assert!(
+        database
+            .get_app_sign_in(theirs.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked_ms
+            .is_none()
+    );
+
+    // Revoked long ago, it goes the next time an app signs in.
+    database.revoke_app_sign_in(theirs.id, now).await.unwrap();
+    let much_later = now + 91 * 24 * 60 * 60 * 1000;
+    database
+        .create_app_sign_in(
+            admin,
+            "maxnines-cli",
+            "new laptop",
+            Role::Viewer,
+            much_later,
+        )
+        .await
+        .unwrap();
+    assert!(database.get_app_sign_in(theirs.id).await.unwrap().is_none());
+    assert_eq!(database.list_app_sign_ins(None).await.unwrap().len(), 1);
 }

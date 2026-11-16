@@ -114,7 +114,15 @@ async fn run_as(
     } else {
         "key"
     };
+    let refused = roles::refused_via(via.as_ref(), request.method(), route);
     let answer = async {
+        if let Some(reason) = refused {
+            if is_api {
+                let body = axum::Json(json!({ "error": reason }));
+                return (StatusCode::FORBIDDEN, body).into_response();
+            }
+            return (StatusCode::FORBIDDEN, reason).into_response();
+        }
         if yours >= needed {
             return next.run(request).await;
         }

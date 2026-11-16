@@ -2,23 +2,21 @@
 
 use anyhow::{Context, Result, ensure};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter,
+    QueryOrder, Set, TransactionTrait,
 };
 use serde::Serialize;
 use serde_json::json;
 
 use super::audit::record_change;
-use super::{Database, User, app_sign_in, owner_emails, user};
+use super::users::enabled_user;
+use super::{Database, USE_ACCURACY_MS, User, app_sign_in, owner_emails, user};
 use crate::app_sign_ins::{
     ACCESS_LIFETIME_MS, ACCESS_PREFIX, REFRESH_GRACE_MS, REFRESH_LIFETIME_MS, REFRESH_PREFIX,
     client, new_secret, secret_hash,
 };
 use crate::audit::{Kind, Snapshot};
 use crate::roles::Role;
-
-/// How often a sign in's last use is written down, so every request isn't a write.
-const USE_ACCURACY_MS: i64 = 60_000;
 
 /// An app someone signed in, as the pages and the API show it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -107,20 +105,24 @@ fn snapshot(row: &app_sign_in::Model, owner: &str) -> Snapshot {
     Snapshot::new(name, fields)
 }
 
+/// How long one that's been revoked or has run out stays listed before it's deleted.
+/// The audit log keeps what happened to it.
+const KEPT_AFTER_ENDING_MS: i64 = 90 * 24 * 60 * 60 * 1000;
+
+/// The email address of the user with this ID, or nothing if they've gone.
+async fn owner_email<C: ConnectionTrait>(connection: &C, user_id: i64) -> Result<String> {
+    let row = user::Entity::find_by_id(user_id)
+        .one(connection)
+        .await
+        .context("loading a signed in app's owner")?;
+    Ok(row.map(|row| row.email).unwrap_or_default())
+}
+
 fn new_tokens() -> Result<AppTokens> {
     Ok(AppTokens {
         access_token: new_secret(ACCESS_PREFIX)?,
         refresh_token: new_secret(REFRESH_PREFIX)?,
     })
-}
-
-async fn enabled_owner<C: ConnectionTrait>(connection: &C, user_id: i64) -> Result<Option<User>> {
-    let row = user::Entity::find_by_id(user_id)
-        .filter(user::Column::DisabledMs.is_null())
-        .one(connection)
-        .await
-        .context("loading a signed in app's owner")?;
-    Ok(row.map(User::from))
 }
 
 impl Database {
@@ -139,8 +141,18 @@ impl Database {
             "there's no app called {client_id}"
         );
         let tokens = new_tokens()?;
+        // Ones that ended long ago go, so the list doesn't grow with every sign in.
+        app_sign_in::Entity::delete_many()
+            .filter(
+                sea_orm::Condition::any()
+                    .add(app_sign_in::Column::RevokedMs.lt(now_ms - KEPT_AFTER_ENDING_MS))
+                    .add(app_sign_in::Column::RefreshExpiresMs.lt(now_ms - KEPT_AFTER_ENDING_MS)),
+            )
+            .exec(&self.connection)
+            .await
+            .context("clearing old signed in apps")?;
         let transaction = self.connection.begin().await.context("signing in an app")?;
-        let owner = enabled_owner(&transaction, user_id)
+        let owner = enabled_user(&transaction, user_id)
             .await?
             .context("an app has to act as a user who isn't disabled")?;
         ensure!(role <= owner.role, "an app can't do more than its owner");
@@ -191,7 +203,7 @@ impl Database {
         let Some(row) = row.filter(|row| now_ms < row.access_expires_ms) else {
             return Ok(None);
         };
-        let Some(mut owner) = enabled_owner(&self.connection, row.user_id).await? else {
+        let Some(mut owner) = enabled_user(&self.connection, row.user_id).await? else {
             return Ok(None);
         };
         let role = Role::parse(&row.role).unwrap_or(Role::Viewer);
@@ -212,14 +224,31 @@ impl Database {
     }
 
     /// Swaps a refresh token for new tokens. The old one stops working, apart from a
-    /// moment's grace in case the answer was lost; used after that, it's been copied,
-    /// and the whole sign in is revoked.
+    /// minute's grace from when it was swapped, in case the answer was lost; used after
+    /// that, it's been copied, and the whole sign in is revoked.
     pub async fn refresh_app_sign_in(
         &self,
         refresh_token: &str,
         client_id: &str,
         now_ms: i64,
     ) -> Result<Refreshed> {
+        // Another refresh may swap the same token at the same moment. Whichever comes
+        // second finds it just swapped, and goes again as one inside the grace.
+        for _ in 0..3 {
+            if let Some(refreshed) = self.try_refresh(refresh_token, client_id, now_ms).await? {
+                return Ok(refreshed);
+            }
+        }
+        Ok(Refreshed::Refused)
+    }
+
+    /// One go at a refresh, or nothing if another changed the sign in first.
+    async fn try_refresh(
+        &self,
+        refresh_token: &str,
+        client_id: &str,
+        now_ms: i64,
+    ) -> Result<Option<Refreshed>> {
         let hash = secret_hash(refresh_token);
         let transaction = self.connection.begin().await.context("refreshing an app")?;
         let current = app_sign_in::Entity::find()
@@ -227,8 +256,8 @@ impl Database {
             .one(&transaction)
             .await
             .context("checking a refresh token")?;
-        let row = match current {
-            Some(row) => row,
+        let (row, in_grace) = match current {
+            Some(row) => (row, false),
             None => {
                 let previous = app_sign_in::Entity::find()
                     .filter(app_sign_in::Column::PreviousRefreshHash.eq(hash.as_str()))
@@ -236,7 +265,7 @@ impl Database {
                     .await
                     .context("checking a refresh token")?;
                 let Some(row) = previous else {
-                    return Ok(Refreshed::Refused);
+                    return Ok(Some(Refreshed::Refused));
                 };
                 let in_grace = row
                     .rotated_ms
@@ -245,46 +274,69 @@ impl Database {
                     if row.revoked_ms.is_none() {
                         revoke_row(&transaction, row, now_ms).await?;
                         transaction.commit().await.context("revoking an app")?;
-                        return Ok(Refreshed::Reused);
+                        return Ok(Some(Refreshed::Reused));
                     }
-                    return Ok(Refreshed::Refused);
+                    return Ok(Some(Refreshed::Refused));
                 }
-                row
+                (row, true)
             }
         };
         let usable = row.client_id == client_id
             && row.revoked_ms.is_none()
             && now_ms < row.refresh_expires_ms;
         if !usable {
-            return Ok(Refreshed::Refused);
+            return Ok(Some(Refreshed::Refused));
         }
-        let Some(owner) = enabled_owner(&transaction, row.user_id).await? else {
-            return Ok(Refreshed::Refused);
+        let Some(owner) = enabled_user(&transaction, row.user_id).await? else {
+            return Ok(Some(Refreshed::Refused));
         };
         let tokens = new_tokens()?;
-        let mut active: app_sign_in::ActiveModel = row.into();
-        active.access_hash = Set(secret_hash(&tokens.access_token));
-        active.access_expires_ms = Set(now_ms + ACCESS_LIFETIME_MS);
-        active.previous_refresh_hash = Set(Some(hash));
-        active.refresh_hash = Set(secret_hash(&tokens.refresh_token));
-        active.rotated_ms = Set(Some(now_ms));
-        active.refresh_expires_ms = Set(now_ms + REFRESH_LIFETIME_MS);
-        active.last_used_ms = Set(Some(now_ms));
-        let row = active
-            .update(&transaction)
+        let mut changes = app_sign_in::ActiveModel {
+            access_hash: Set(secret_hash(&tokens.access_token)),
+            access_expires_ms: Set(now_ms + ACCESS_LIFETIME_MS),
+            refresh_hash: Set(secret_hash(&tokens.refresh_token)),
+            refresh_expires_ms: Set(now_ms + REFRESH_LIFETIME_MS),
+            last_used_ms: Set(Some(now_ms)),
+            ..Default::default()
+        };
+        // Within the grace, the token being swapped is still the one swapped before,
+        // and its minute still counts from then, so using it again can't stretch it.
+        if !in_grace {
+            changes.previous_refresh_hash = Set(Some(hash));
+            changes.rotated_ms = Set(Some(now_ms));
+        }
+        // Only if nothing has swapped it since it was read.
+        let swapped = app_sign_in::Entity::update_many()
+            .set(changes)
+            .filter(app_sign_in::Column::Id.eq(row.id))
+            .filter(app_sign_in::Column::RefreshHash.eq(row.refresh_hash.as_str()))
+            .filter(app_sign_in::Column::RevokedMs.is_null())
+            .exec(&transaction)
             .await
             .context("refreshing an app")?;
+        if swapped.rows_affected == 0 {
+            return Ok(None);
+        }
+        let row = app_sign_in::Entity::find_by_id(row.id)
+            .one(&transaction)
+            .await
+            .context("refreshing an app")?
+            .context("a refreshed app disappeared")?;
         transaction.commit().await.context("refreshing an app")?;
-        Ok(Refreshed::Issued(
+        Ok(Some(Refreshed::Issued(
             Box::new(AppSignIn::from_row(row, owner.email)),
             tokens,
-        ))
+        )))
     }
 
-    /// Every app signed in, newest first, including revoked ones.
-    pub async fn list_app_sign_ins(&self) -> Result<Vec<AppSignIn>> {
-        let rows = app_sign_in::Entity::find()
-            .order_by_desc(app_sign_in::Column::Id)
+    /// The apps signed in, newest first, including revoked and expired ones for a
+    /// while: everyone's, or only `user_id`'s.
+    pub async fn list_app_sign_ins(&self, user_id: Option<i64>) -> Result<Vec<AppSignIn>> {
+        let mut query = app_sign_in::Entity::find().order_by_desc(app_sign_in::Column::Id);
+        if let Some(user_id) = user_id {
+            query = query.filter(app_sign_in::Column::UserId.eq(user_id));
+        }
+        let rows = query
             .all(&self.connection)
             .await
             .context("loading signed in apps")?;
@@ -296,6 +348,37 @@ impl Database {
                 AppSignIn::from_row(row, owner)
             })
             .collect())
+    }
+
+    /// One app sign in, if there is one with that ID.
+    pub async fn get_app_sign_in(&self, id: i64) -> Result<Option<AppSignIn>> {
+        let Some(row) = app_sign_in::Entity::find_by_id(id)
+            .one(&self.connection)
+            .await
+            .context("loading a signed in app")?
+        else {
+            return Ok(None);
+        };
+        let owner = owner_email(&self.connection, row.user_id).await?;
+        Ok(Some(AppSignIn::from_row(row, owner)))
+    }
+
+    /// How many apps are signed in and working now: everyone's, or only `user_id`'s.
+    pub async fn count_active_app_sign_ins(
+        &self,
+        user_id: Option<i64>,
+        now_ms: i64,
+    ) -> Result<u64> {
+        let mut query = app_sign_in::Entity::find()
+            .filter(app_sign_in::Column::RevokedMs.is_null())
+            .filter(app_sign_in::Column::RefreshExpiresMs.gt(now_ms));
+        if let Some(user_id) = user_id {
+            query = query.filter(app_sign_in::Column::UserId.eq(user_id));
+        }
+        query
+            .count(&self.connection)
+            .await
+            .context("counting signed in apps")
     }
 
     /// Signs an app out. Returns false if there's no such sign in.
@@ -342,10 +425,7 @@ async fn revoke_row<C: ConnectionTrait>(
     row: app_sign_in::Model,
     now_ms: i64,
 ) -> Result<()> {
-    let owner = owner_emails(connection)
-        .await?
-        .remove(&row.user_id)
-        .unwrap_or_default();
+    let owner = owner_email(connection, row.user_id).await?;
     let before = snapshot(&row, &owner);
     let mut active: app_sign_in::ActiveModel = row.into();
     active.revoked_ms = Set(Some(now_ms));

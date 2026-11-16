@@ -20,7 +20,6 @@ use serde_json::json;
 use super::audit::{record, record_change};
 use super::{Database, api_key, api_key_snapshot, user, user_session};
 use crate::audit::{Action, Actor, Kind, Record, Snapshot, Subject};
-use crate::registration::hash_token;
 use crate::roles::Role;
 use crate::times::{DEFAULT_TIME_ZONE, zone_named};
 
@@ -141,8 +140,20 @@ pub fn is_theme(theme: &str) -> bool {
     THEMES.iter().any(|(name, _)| *name == theme)
 }
 
-pub(super) fn token_hash(token: &str) -> String {
-    hex::encode(hash_token(token))
+pub(super) use crate::registration::hex_hash as token_hash;
+
+/// The user with this ID, if they can sign in: there, and not disabled. Anything that
+/// acts as someone, an API key or a signed-in app, only works while this finds them.
+pub(super) async fn enabled_user<C: ConnectionTrait>(
+    connection: &C,
+    id: i64,
+) -> Result<Option<User>> {
+    let row = user::Entity::find_by_id(id)
+        .filter(user::Column::DisabledMs.is_null())
+        .one(connection)
+        .await
+        .context("loading a user who can sign in")?;
+    Ok(row.map(User::from))
 }
 
 /// A user as the audit log compares them. The password is a secret, so only

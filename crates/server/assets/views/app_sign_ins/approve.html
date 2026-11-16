@@ -4,6 +4,7 @@
 {% block content %}
 <h1>Sign in {{ app }}?</h1>
 <p class="subtitle">{% if device %}{{ app }} on <strong>{{ device }}</strong>{% else %}{{ app }}{% endif %} wants to act as you, {{ email }}. It sees what you see, can do what the role below allows, and its changes are recorded as yours. It stays signed in for up to 90 days after it was last used, until you revoke it under Settings, then Signed-in apps.</p>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
 {% if user_code %}<p class="hint">Check that the device shows <code>{{ user_code }}</code> before you allow it.</p>{% endif %}
 
 <form method="post" action="{{ action }}" class="stacked">

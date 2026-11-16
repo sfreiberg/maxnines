@@ -80,7 +80,6 @@ use crate::audit::{Kind, Snapshot};
 use crate::facts::{FlatFacts, decode, encode, flatten, unflatten};
 use crate::host_filter;
 use crate::migrations::Migrator;
-use crate::registration::hash_token;
 use crate::registration::{HostKind, HostRecord, HostState};
 use crate::roles::Role;
 
@@ -481,8 +480,9 @@ impl Database {
 const MAX_API_KEY_NAME_LEN: usize = 100;
 /// How much of a key is kept to tell it apart, which is `mxn_` and 8 of its 64 digits.
 const API_KEY_HINT_LEN: usize = 12;
-/// How current "last used" stays, so using a key doesn't write on every request.
-const API_KEY_USE_ACCURACY_MS: i64 = 60_000;
+/// How current "last used" stays, so using a key or a signed-in app doesn't write on
+/// every request.
+const USE_ACCURACY_MS: i64 = 60_000;
 
 /// A key for the API, without the key itself, which only exists when it's created.
 /// It acts as the person who owns it.
@@ -570,9 +570,7 @@ fn api_key_snapshot(row: &api_key::Model, owner: &str) -> Snapshot {
     Snapshot::new(row.name.clone(), fields)
 }
 
-fn api_key_hash(key: &str) -> String {
-    hex::encode(hash_token(key))
-}
+use crate::registration::hex_hash as api_key_hash;
 
 impl Database {
     /// The token that protects the admin API, created the first time it's asked
@@ -689,12 +687,7 @@ impl Database {
         else {
             return Ok(None);
         };
-        let owner = user::Entity::find_by_id(row.user_id)
-            .filter(user::Column::DisabledMs.is_null())
-            .one(&self.connection)
-            .await
-            .context("loading an API key's owner")?;
-        let Some(mut owner) = owner.map(User::from) else {
+        let Some(mut owner) = users::enabled_user(&self.connection, row.user_id).await? else {
             return Ok(None);
         };
         // The key acts as its owner, with whichever of their roles is less.
@@ -702,7 +695,7 @@ impl Database {
         owner.role = owner.role.min(key_role);
         let stale = row
             .last_used_ms
-            .is_none_or(|used| now_ms - used >= API_KEY_USE_ACCURACY_MS);
+            .is_none_or(|used| now_ms - used >= USE_ACCURACY_MS);
         let row = if stale {
             let mut row: api_key::ActiveModel = row.into();
             row.last_used_ms = Set(Some(now_ms));
