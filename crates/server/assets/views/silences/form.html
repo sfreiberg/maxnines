@@ -33,6 +33,11 @@
     <small>One series alone, named exactly, such as a check's name or a disk's mount point. Leave empty for everything the rule watches.</small>
   </label>
 
+  <label class="checkbox">
+    <input type="checkbox" name="all_alerts" aria-describedby="all-alerts-note"{% if silence.all_alerts %} checked{% endif %}> Every alert, on every host
+  </label>
+  <small id="all-alerts-note">Instead of a rule, hosts or a series, so nobody is told about anything until it ends.</small>
+
   <label>For
     <select name="duration_secs">
       {% for duration in durations %}

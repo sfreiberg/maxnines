@@ -738,6 +738,7 @@ async fn start_maintenance(
         rule_id: None,
         filter: host_filter::only(&host.id),
         series: String::new(),
+        all_alerts: false,
         reason,
         duration_secs,
     };

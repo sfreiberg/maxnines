@@ -9,7 +9,12 @@ already told about an alert still hears when it ends.
 | `rule_id` | The alert rule it covers. Leave it out for every rule. |
 | `filter` | Which hosts it covers, written as in [Filters](api-filters.md). Leave it out for every host. Alerts about a group of hosts have no single host, so a filter leaves them out. |
 | `series` | One series alone, named exactly, such as a check's name. Leave it out for every series. |
+| `all_alerts` | `true` for every alert on every host. Leave out `rule_id`, `filter` and `series` with it. Defaults to `false` |
 | `reason` | Why, which is required. |
+
+A silence has to name at least one of `rule_id`, `filter` and `series`, or say
+`"all_alerts": true`. Leaving all of them out is refused, so a request that forgets them
+can't quiet everything by accident.
 | `duration_secs` | How long it lasts from now, up to 30 days. |
 
 Deleting a rule deletes its silences that haven't ended. Ones that have ended stay, still
@@ -46,6 +51,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/silences
       "rule_id": null,
       "filter": "hostname=db*",
       "series": "",
+      "all_alerts": false,
       "reason": "Upgrading Postgres",
       "created_by": "you@example.com",
       "starts_ms": 1793940279545,

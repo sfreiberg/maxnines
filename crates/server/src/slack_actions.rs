@@ -224,7 +224,9 @@ impl SlackActions {
         if quiet.covering(&alert).is_some() {
             return Ok(());
         }
-        let input = silences::silence_for(&alert, SILENCE_REASON, SILENCE_SECS);
+        let Some(input) = silences::silence_for(&alert, SILENCE_REASON, SILENCE_SECS) else {
+            return Ok(());
+        };
         silences::check_silence(&input)?;
         self.database.create_silence(&input, by, now).await?;
         Ok(())

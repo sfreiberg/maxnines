@@ -13,6 +13,7 @@ fn to_window(row: maintenance_window::Model) -> MaintenanceWindow {
         id: row.id,
         window: MaintenanceWindowInput {
             name: row.name,
+            all_alerts: row.rule_id.is_none() && row.filter.is_empty(),
             rule_id: row.rule_id,
             filter: row.filter,
             days: row.days.split(',').map(String::from).collect(),

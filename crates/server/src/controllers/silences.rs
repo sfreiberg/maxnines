@@ -143,6 +143,8 @@ struct SilenceForm {
     #[serde(default)]
     series: String,
     #[serde(default)]
+    all_alerts: bool,
+    #[serde(default)]
     reason: String,
     #[serde(default)]
     duration_secs: String,
@@ -221,6 +223,7 @@ fn input_from(silence: &SilenceForm) -> Result<SilenceInput, String> {
         rule_id,
         filter: silence.filter.clone(),
         series: silence.series.clone(),
+        all_alerts: silence.all_alerts,
         reason: silence.reason.clone(),
         duration_secs,
     })
@@ -232,6 +235,7 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
         rule_id: text("rule_id"),
         filter: text("filter"),
         series: text("series"),
+        all_alerts: form.fields.contains_key("all_alerts"),
         reason: text("reason"),
         duration_secs: text("duration_secs"),
     };

@@ -16,6 +16,7 @@ use crate::silences::{Silence, SilenceInput};
 fn to_silence(row: silence::Model) -> Silence {
     Silence {
         id: row.id,
+        all_alerts: row.rule_id.is_none() && row.filter.is_empty() && row.series.is_empty(),
         rule_id: row.rule_id,
         filter: row.filter,
         series: row.series,

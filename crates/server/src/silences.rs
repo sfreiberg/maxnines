@@ -30,6 +30,8 @@ pub struct Silence {
     pub filter: String,
     /// The one series it's for, such as a check's name. Every series, if empty.
     pub series: String,
+    /// Whether it covers every alert there is, having no rule, filter or series.
+    pub all_alerts: bool,
     pub reason: String,
     pub created_by: String,
     pub starts_ms: i64,
@@ -44,25 +46,62 @@ pub struct SilenceInput {
     pub filter: String,
     #[serde(default)]
     pub series: String,
+    /// Has to be said to cover every alert, with no rule, filter or series, so that
+    /// leaving them out never does by accident.
+    #[serde(default)]
+    pub all_alerts: bool,
     pub reason: String,
     pub duration_secs: u64,
 }
 
 /// A silence covering just this alert: its rule, on its host, by ID, as names
-/// needn't be unique. An alert about the fleet has no host, so its rule alone.
-pub fn silence_for(alert: &Alert, reason: &str, duration_secs: u64) -> SilenceInput {
+/// needn't be unique, for its series. An alert about the fleet has no host, and a
+/// filter would leave it out, so it has none. One whose rule has been deleted has
+/// nothing to name, and none.
+pub fn silence_for(alert: &Alert, reason: &str, duration_secs: u64) -> Option<SilenceInput> {
     let filter = if alert.host_id == FLEET_HOST_ID {
         String::new()
     } else {
         crate::host_filter::only(&alert.host_id)
     };
-    SilenceInput {
-        rule_id: alert.rule_id,
+    Some(SilenceInput {
+        rule_id: Some(alert.rule_id?),
         filter,
-        series: String::new(),
+        series: alert.series.clone(),
+        all_alerts: false,
         reason: reason.to_string(),
         duration_secs,
+    })
+}
+
+/// Whether what a silence or maintenance window covers is said plainly: every alert
+/// only when asked for by name, and never by leaving everything out. A maintenance
+/// window has no series to name.
+pub fn check_covers(
+    what: &str,
+    rule_id: Option<i64>,
+    filter: &str,
+    series: Option<&str>,
+    all_alerts: bool,
+) -> Result<()> {
+    let names_nothing = rule_id.is_none()
+        && filter.trim().is_empty()
+        && series.is_none_or(|series| series.trim().is_empty());
+    let choices = if series.is_some() {
+        "a rule, hosts or a series"
+    } else {
+        "a rule or hosts"
+    };
+    if names_nothing && !all_alerts {
+        bail!(
+            "Choose what the {what} covers: {choices}. To cover every alert on every host, \
+             choose every alert."
+        );
     }
+    if all_alerts && !names_nothing {
+        bail!("A {what} for every alert can't also name {choices}.");
+    }
+    Ok(())
 }
 
 /// Whether a silence makes sense, apart from whether its rule exists.
@@ -80,7 +119,13 @@ pub fn check_silence(input: &SilenceInput) -> Result<()> {
     if input.duration_secs == 0 || input.duration_secs > MAX_DURATION_SECS {
         bail!("A silence can last up to 30 days.");
     }
-    Ok(())
+    check_covers(
+        "silence",
+        input.rule_id,
+        &input.filter,
+        Some(&input.series),
+        input.all_alerts,
+    )
 }
 
 /// Whether a filter can be saved for a silence or a maintenance window.
@@ -251,6 +296,7 @@ mod tests {
             rule_id: None,
             filter: "os=linux".to_string(),
             series: String::new(),
+            all_alerts: false,
             reason: "Upgrading Postgres".to_string(),
             duration_secs: 3600,
         }
@@ -259,6 +305,42 @@ mod tests {
     #[test]
     fn a_good_silence_passes() {
         check_silence(&input()).unwrap();
+    }
+
+    #[test]
+    fn every_alert_is_only_silenced_when_asked_for() {
+        let everything = SilenceInput {
+            filter: "  ".to_string(),
+            all_alerts: true,
+            ..input()
+        };
+        check_silence(&everything).unwrap();
+        // Leaving out what it covers isn't asking for everything.
+        let error = check_silence(&SilenceInput {
+            all_alerts: false,
+            ..everything.clone()
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("a rule, hosts or a series"), "{error}");
+        // Naming any of them means it isn't everything.
+        for named in [
+            SilenceInput {
+                rule_id: Some(1),
+                ..everything.clone()
+            },
+            SilenceInput {
+                series: "/var".to_string(),
+                ..everything.clone()
+            },
+            SilenceInput {
+                filter: "os=linux".to_string(),
+                ..everything.clone()
+            },
+        ] {
+            let error = check_silence(&named).unwrap_err().to_string();
+            assert!(error.contains("can't also name"), "{error}");
+        }
     }
 
     #[test]

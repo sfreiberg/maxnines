@@ -8,7 +8,7 @@ use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
 use crate::alerting::format_duration;
-use crate::silences::check_filter;
+use crate::silences::{check_covers, check_filter};
 
 /// The days a window can run on, in the order they're shown.
 pub const DAYS: [(&str, &str); 7] = [
@@ -35,6 +35,10 @@ pub struct MaintenanceWindowInput {
     /// Which hosts, in the same form as the Hosts list. Every host, if empty.
     #[serde(default)]
     pub filter: String,
+    /// Has to be said to cover every alert, with no rule or filter, so that leaving
+    /// them out never does by accident.
+    #[serde(default)]
+    pub all_alerts: bool,
     /// The days it starts on, like `sun`.
     pub days: Vec<String>,
     /// When it starts, like `02:00`.
@@ -83,7 +87,13 @@ pub fn check_window(input: &MaintenanceWindowInput) -> Result<()> {
             input.time_zone
         );
     }
-    Ok(())
+    check_covers(
+        "maintenance window",
+        input.rule_id,
+        &input.filter,
+        None,
+        input.all_alerts,
+    )
 }
 
 fn is_day(text: &str) -> bool {
@@ -153,6 +163,7 @@ mod tests {
             name: "Patching".to_string(),
             rule_id: None,
             filter: String::new(),
+            all_alerts: true,
             days: vec!["sun".to_string()],
             start_time: "02:00".to_string(),
             duration_secs: 7200,

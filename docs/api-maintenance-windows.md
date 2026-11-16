@@ -8,10 +8,15 @@ times in the window's time zone, so it keeps its place in the day when the clock
 | `name` | Required. |
 | `rule_id` | The alert rule it covers. Leave it out for every rule. |
 | `filter` | Which hosts it covers, as for a [silence](api-silences.md). |
+| `all_alerts` | `true` for every alert on every host. Leave out `rule_id` and `filter` with it. Defaults to `false` |
 | `days` | Required. The days it starts on: `mon`, `tue`, `wed`, `thu`, `fri`, `sat` or `sun`. |
 | `start_time` | Required. When it starts, like `02:00`. |
 | `duration_secs` | Required. How long it lasts, in whole minutes up to 7 days, so a multiple of 60. |
 | `time_zone` | Required. A time zone database name, like `Europe/London` or `UTC`. |
+
+A window has to name a rule or hosts, or say `"all_alerts": true`, as for a
+[silence](api-silences.md). Getting a window shows `all_alerts` too, so what comes back
+can be sent back with `PUT`.
 
 Deleting a rule deletes its windows too.
 

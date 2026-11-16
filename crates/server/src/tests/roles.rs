@@ -148,7 +148,7 @@ async fn a_responder_silences_but_does_not_change_rules() {
         200
     );
     let fields = [
-        ("filter", ""),
+        ("filter", "hostname=web*"),
         ("reason", "Deploying"),
         ("duration_secs", "3600"),
     ];
@@ -240,7 +240,7 @@ async fn the_api_asks_the_same_of_a_key() {
         403
     );
 
-    let silence = r#"{"reason":"Deploying","duration_secs":3600}"#;
+    let silence = r#"{"filter":"hostname=web*","reason":"Deploying","duration_secs":3600}"#;
     assert_eq!(
         api(&server, &viewer, "POST", "/api/v1/silences", silence)
             .await

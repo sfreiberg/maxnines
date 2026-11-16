@@ -51,6 +51,11 @@
     <small>The same filter as the Hosts list. Leave empty for every host. Alerts about a group of hosts only follow the rule above, so a window with a filter leaves them out.</small>
   </label>
 
+  <label class="checkbox">
+    <input type="checkbox" name="all_alerts" aria-describedby="all-alerts-note"{% if window.all_alerts %} checked{% endif %}> Every alert, on every host
+  </label>
+  <small id="all-alerts-note">Instead of a rule or hosts, so nobody is told about anything while it runs.</small>
+
   <div class="actions">
     {% if can_edit %}<button type="submit">Save window</button>{% else %}<span class="note">Your role lets you look at this, but not change it.</span>{% endif %}
     <a class="button secondary" href="/alerts/silences">Cancel</a>

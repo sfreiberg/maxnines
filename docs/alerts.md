@@ -137,7 +137,13 @@ can sign in can read what it printed.
 A silence stops notifications for a while, as during planned work. Press **Silence** on
 a firing alert, or start one from **Alerts > Silences**. It needs a reason and a length,
 and it can cover one rule or all of them, and some hosts or all of them, using the same
-filter as the Hosts list.
+filter as the Hosts list. To cover every alert on every host, choose **Every alert, on
+every host**: leaving the rule, hosts and series empty isn't enough, so a silence can't
+quiet everything by accident. Maintenance windows work the same way.
+
+**Silence** on a firing alert covers that alert alone: its rule, on its host, and only
+the series it's about, such as one disk or one container. An alert whose rule has been
+deleted has no **Silence**, as there's no rule left to name.
 
 Alerts still fire and show while they're silenced. If one is still firing when the
 silence ends, the notifications go out then, and if it ends first, nobody hears about it.

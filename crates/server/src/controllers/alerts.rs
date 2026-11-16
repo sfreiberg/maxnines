@@ -43,7 +43,8 @@ struct AlertRow {
     started: String,
     resolved: Option<String>,
     reason: Option<String>,
-    silence_link: String,
+    /// None when its rule has been deleted, leaving a silence nothing to name.
+    silence_link: Option<String>,
     silenced_until: Option<String>,
     /// How many actions its rule ran for it.
     actions: u64,
@@ -51,8 +52,8 @@ struct AlertRow {
 
 /// Where to start a silence for just this alert. Agents choose their own names, which
 /// is fine here because it only fills in a form for someone to read.
-fn silence_link(alert: &Alert) -> String {
-    let silence = silences::silence_for(alert, "", 0);
+fn silence_link(alert: &Alert) -> Option<String> {
+    let silence = silences::silence_for(alert, "", 0)?;
     let mut fields = Vec::new();
     if let Some(id) = silence.rule_id {
         fields.push(("rule_id", id.to_string()));
@@ -60,8 +61,11 @@ fn silence_link(alert: &Alert) -> String {
     if !silence.filter.is_empty() {
         fields.push(("filter", silence.filter));
     }
+    if !silence.series.is_empty() {
+        fields.push(("series", silence.series));
+    }
     let query = serde_urlencoded::to_string(fields).unwrap_or_default();
-    format!("/alerts/silences/new?{query}")
+    Some(format!("/alerts/silences/new?{query}"))
 }
 
 impl From<Alert> for AlertRow {

@@ -465,6 +465,7 @@ async fn deleting_a_rule_closes_its_alerts_and_keeps_the_history_pointing_at_it(
     let silence = SilenceInput {
         rule_id: Some(id),
         filter: String::new(),
+        all_alerts: false,
         series: String::new(),
         reason: "Upgrading".to_string(),
         duration_secs: 3600,
@@ -483,6 +484,7 @@ async fn deleting_a_rule_closes_its_alerts_and_keeps_the_history_pointing_at_it(
         name: "Patching".to_string(),
         rule_id: Some(id),
         filter: String::new(),
+        all_alerts: false,
         days: vec!["sun".to_string()],
         start_time: "02:00".to_string(),
         duration_secs: 3600,
@@ -5566,6 +5568,7 @@ mod silences {
         SilenceInput {
             rule_id: None,
             filter: filter.to_string(),
+            all_alerts: filter.is_empty(),
             series: String::new(),
             reason: "Upgrading".to_string(),
             duration_secs: HOUR_SECS,
@@ -5977,6 +5980,111 @@ mod silences {
     }
 
     #[tokio::test]
+    async fn a_silence_for_every_alert_has_to_say_so() {
+        let test = Harness::start().await;
+        let server = &test.server;
+
+        // Leaving everything out doesn't silence everything.
+        let body = json!({ "reason": "Moving data centres", "duration_secs": 3600 });
+        let (status, refused) = api(server, "POST", "/api/v1/silences", &body).await;
+        assert_eq!(status, 422, "{refused}");
+        let error = refused["error"].as_str().unwrap();
+        assert!(error.contains("Choose what the silence covers"), "{error}");
+        assert!(
+            test.database()
+                .active_silences(now_ms())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Saying so does.
+        let body =
+            json!({ "all_alerts": true, "reason": "Moving data centres", "duration_secs": 3600 });
+        let (status, created) = api(server, "POST", "/api/v1/silences", &body).await;
+        assert_eq!(status, 201, "{created}");
+        let path = format!("/api/v1/silences/{}", created["id"]);
+        let (_, shown) = api(server, "GET", &path, &Value::Null).await;
+        assert_eq!(shown["all_alerts"], true, "{shown}");
+
+        // One that names something isn't for every alert, and can't say it is.
+        let body = json!({
+            "all_alerts": true,
+            "filter": "hostname=web*",
+            "reason": "Upgrading",
+            "duration_secs": 3600
+        });
+        let (status, refused) = api(server, "POST", "/api/v1/silences", &body).await;
+        assert_eq!(status, 422, "{refused}");
+        let error = refused["error"].as_str().unwrap();
+        assert!(error.contains("can't also name"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_form_silences_everything_only_when_every_alert_is_chosen() {
+        let test = Harness::start().await;
+        let mut browser = Browser::default();
+        let form = "/alerts/silences/new";
+        let mut fields = vec![
+            ("reason", "Moving data centres"),
+            ("rule_id", ""),
+            ("filter", ""),
+            ("series", ""),
+            ("duration_secs", "3600"),
+        ];
+
+        let page = browser
+            .submit(&test.server, form, "/alerts/silences", &fields)
+            .await;
+        assert_eq!(page.status, 422);
+        assert!(page.body.contains("choose every alert"), "{}", page.body);
+        assert!(
+            test.database()
+                .active_silences(now_ms())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        fields.push(("all_alerts", "on"));
+        let page = browser
+            .submit(&test.server, form, "/alerts/silences", &fields)
+            .await;
+        assert_eq!(page.status, 303, "{}", page.body);
+        let silences = test.database().active_silences(now_ms()).await.unwrap();
+        assert_eq!(silences.len(), 1);
+        assert!(silences[0].all_alerts);
+    }
+
+    #[tokio::test]
+    async fn the_alerts_page_offers_a_silence_for_just_that_series() {
+        let test = Harness::start().await;
+        let database = test.database();
+        let rule = database.create_alert_rule(&cpu_rule()).await.unwrap();
+        let new = crate::alerting::NewAlert {
+            rule_id: rule,
+            rule_name: "Service stopped".to_string(),
+            severity: crate::alerting::Severity::Critical,
+            host_id: crate::remote_checks::FLEET_HOST_ID.to_string(),
+            hostname: "Fleet".to_string(),
+            series: "nginx.service".to_string(),
+            value: Some(0.0),
+            summary: "Service nginx.service is failed".to_string(),
+            started_ms: now_ms() - 30_000,
+        };
+        database.fire_alert(&new, &[]).await.unwrap();
+
+        let page = Browser::default().get(&test.server, "/alerts").await;
+        assert!(
+            page.body.contains(&format!(
+                "/alerts/silences/new?rule_id={rule}&amp;series=nginx.service"
+            )),
+            "{}",
+            page.body
+        );
+    }
+
+    #[tokio::test]
     async fn the_api_says_which_silence_covers_an_alert() {
         let mut test = Harness::start().await;
         let hook = FakeOnCall::default();
@@ -6005,6 +6113,7 @@ mod maintenance_windows {
             name: "Patching".to_string(),
             rule_id: None,
             filter: String::new(),
+            all_alerts: true,
             days: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
                 .map(String::from)
                 .to_vec(),
@@ -6110,6 +6219,19 @@ mod maintenance_windows {
         let (_, listed) = api(server, "GET", "/api/v1/maintenance-windows", &Value::Null).await;
         assert_eq!(listed[0]["id"], id);
 
+        // It covers every alert, said so when it was made and when it's shown, so what
+        // comes back can be sent back.
+        assert_eq!(shown["all_alerts"], true, "{shown}");
+        body["all_alerts"] = json!(false);
+        let (status, refused) = api(server, "PUT", &path, &body).await;
+        assert_eq!(status, 422, "{refused}");
+        let error = refused["error"].as_str().unwrap();
+        assert!(
+            error.contains("Choose what the maintenance window covers"),
+            "{error}"
+        );
+        body["all_alerts"] = json!(true);
+
         body["time_zone"] = json!("Mars/Olympus");
         let (status, _) = api(server, "PUT", &path, &body).await;
         assert_eq!(status, 422);
@@ -6168,6 +6290,7 @@ mod maintenance_windows {
 
         let changed = [
             ("name", "Monthly"),
+            ("filter", "env=staging"),
             ("day_mon", "on"),
             ("start_time", "03:00"),
             ("duration_minutes", "60"),
@@ -6393,6 +6516,7 @@ mod reminders {
         let input = SilenceInput {
             rule_id: None,
             filter: String::new(),
+            all_alerts: true,
             series: String::new(),
             reason: "Upgrading".to_string(),
             duration_secs: 3 * 3600,
@@ -8314,6 +8438,7 @@ async fn a_host_page_names_a_wider_silence_but_leaves_ending_it_to_its_page() {
     let everything = crate::silences::SilenceInput {
         rule_id: None,
         filter: String::new(),
+        all_alerts: true,
         series: String::new(),
         reason: "Moving data centres".to_string(),
         duration_secs: 3600,
@@ -8334,6 +8459,7 @@ async fn a_host_page_names_a_wider_silence_but_leaves_ending_it_to_its_page() {
     let one_rule = crate::silences::SilenceInput {
         rule_id: Some(rule),
         filter: crate::host_filter::only(&id),
+        all_alerts: false,
         series: String::new(),
         reason: "Noisy CPU rule".to_string(),
         duration_secs: 7200,
