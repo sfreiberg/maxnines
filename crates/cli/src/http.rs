@@ -73,7 +73,10 @@ impl Http {
             request = request.header("Authorization", format!("Bearer {token}"));
         }
         let (content_type, text) = match body {
-            Body::None => (None, None),
+            Body::None if matches!(method, "GET" | "HEAD" | "DELETE") => (None, None),
+            // A POST or PUT says it's empty, rather than sending an empty chunked body,
+            // which some servers refuse or leave unread.
+            Body::None => (None, Some(String::new())),
             Body::Json(value) => (Some("application/json"), Some(value.to_string())),
             Body::Form(fields) => (
                 Some("application/x-www-form-urlencoded"),

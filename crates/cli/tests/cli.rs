@@ -343,7 +343,15 @@ fn a_script_can_ask_whether_anything_is_firing() {
     assert_eq!(elsewhere.status.code(), Some(0), "{}", stderr(&elsewhere));
 
     let acknowledged = maxnines(folder.path(), &with_key(&server.url), &["ack", "41"]);
-    assert_eq!(stdout(&acknowledged), "alert/41 acknowledged");
+    assert_eq!(
+        stdout(&acknowledged),
+        "alert/41 acknowledged",
+        "{}",
+        stderr(&acknowledged)
+    );
+    let posted = &server.requests_to("/api/v1/alerts/41/acknowledge")[0];
+    assert_eq!(posted.method, "POST");
+    assert_eq!(posted.body, "");
 
     // Something that's ended is still found by describe, as text or as JSON.
     let ended = maxnines(
