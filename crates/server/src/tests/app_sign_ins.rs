@@ -712,3 +712,24 @@ async fn only_your_own_apps_can_be_revoked_and_old_ones_are_cleared_away() {
     assert!(database.get_app_sign_in(theirs.id).await.unwrap().is_none());
     assert_eq!(database.list_app_sign_ins(None).await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn me_says_who_a_request_acts_as_and_through_what() {
+    let server = start().await;
+    let (status, me) = call_json(&server, &server.api_key, "GET", "/api/v1/me").await;
+    assert_eq!(status, 200, "{me}");
+    assert_eq!(me["email"], "test@example.com");
+    assert_eq!(me["role"], "admin");
+    assert_eq!(me["via"]["kind"], "api_key");
+    assert_eq!(me["via"]["name"], "tests");
+
+    let back = approve(&mut Browser::default(), &server, "viewer", "allow").await;
+    let (_, tokens) = swap_code(&server, &query_value(&back, "code").unwrap(), VERIFIER).await;
+    let access = tokens["access_token"].as_str().unwrap();
+    let (status, me) = call_json(&server, access, "GET", "/api/v1/me").await;
+    assert_eq!(status, 200, "{me}");
+    assert_eq!(me["role"], "viewer");
+    assert_eq!(me["via"]["kind"], "app");
+    assert_eq!(me["via"]["name"], "MaxNines command line on laptop");
+    assert_eq!(me["via"]["id"], tokens["sign_in_id"]);
+}

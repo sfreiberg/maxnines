@@ -4,6 +4,30 @@ Everyone who can sign in to the web pages. Nobody can sign up, so people are onl
 added here, on the Settings page, or with `maxnines-server users`. Passwords can't
 be read or set through the API: someone new gets a link to set their own.
 
+## Who am I
+
+`GET /api/v1/me`
+
+Who the request acts as, with the role it has now, and what it came with: an API key
+(`api_key`) or an app [signed in through the browser](api-app-sign-ins.md) (`app`).
+Anyone can ask about themselves.
+
+```sh
+curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/me"
+```
+
+```json
+{
+  "id": 1,
+  "email": "you@example.com",
+  "name": "You",
+  "role": "responder",
+  "via": { "kind": "app", "id": 4, "name": "MaxNines command line on sam-laptop" }
+}
+```
+
+`role` is the lower of the person's role and the key's or app's.
+
 ## List users
 
 `GET /api/v1/users`

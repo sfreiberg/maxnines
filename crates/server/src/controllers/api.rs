@@ -190,6 +190,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/api-keys", get(list_api_keys).post(create_api_key))
         .route("/audit-log", get(audit_log))
         .route("/api-keys/{id}", delete(revoke_api_key))
+        .route("/me", get(me))
         .route("/app-sign-ins", get(list_app_sign_ins))
         .route("/app-sign-ins/{id}", delete(revoke_app_sign_in))
         .route("/hosts/filter-options", get(filter_options))
@@ -497,6 +498,29 @@ async fn revoke_api_key(State(state): State<AppState>, UrlPath(id): UrlPath<i64>
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),
     }
+}
+
+/// Who a request acts as, with the role it has now, and what it came with: an API key
+/// or a signed-in app.
+async fn me() -> Response {
+    let Some(user) = super::signed_in_user() else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let via = crate::audit::current().via.map(|via| {
+        json!({
+            "kind": via.kind(),
+            "id": via.id().and_then(|id| id.parse::<i64>().ok()),
+            "name": via.name(),
+        })
+    });
+    Json(json!({
+        "id": user.id,
+        "email": user.email,
+        "name": user.name,
+        "role": user.role,
+        "via": via,
+    }))
+    .into_response()
 }
 
 async fn list_app_sign_ins(State(state): State<AppState>) -> Response {
