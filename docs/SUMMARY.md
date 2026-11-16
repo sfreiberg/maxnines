@@ -20,6 +20,7 @@
 - [Hosts without an agent](agentless-hosts.md)
 - [Map](map.md)
 - [Installing as an app](app.md)
+- [Command line](cli.md)
 - [API](api.md)
   - [Hosts](api-hosts.md)
   - [Metrics pages](api-metrics-pages.md)
