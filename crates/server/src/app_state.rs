@@ -78,6 +78,8 @@ pub struct AppState {
     /// Whether everyone has to set up two-factor before using the pages. Kept
     /// here so each request doesn't ask the database.
     pub require_two_factor: Arc<std::sync::atomic::AtomicBool>,
+    /// Apps approved in the browser, waiting to collect their tokens.
+    pub pending_sign_ins: Arc<crate::app_sign_ins::PendingSignIns>,
 }
 
 impl FromRef<AppState> for CsrfConfig {

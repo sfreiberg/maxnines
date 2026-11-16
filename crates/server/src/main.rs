@@ -3,6 +3,7 @@ mod agent_versions;
 mod alert_charts;
 mod alert_evaluator;
 mod alerting;
+mod app_sign_ins;
 mod app_state;
 mod audit;
 mod calculations;
@@ -300,6 +301,7 @@ async fn serve(path: &Path) -> Result<()> {
         web_url: web_url(config.audience()).unwrap_or_default().into(),
         sign_ins: Arc::default(),
         require_two_factor: Arc::new(require_two_factor.into()),
+        pending_sign_ins: Arc::default(),
     };
 
     let listener = TcpListener::bind(config.listen)

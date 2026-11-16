@@ -190,6 +190,8 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/api-keys", get(list_api_keys).post(create_api_key))
         .route("/audit-log", get(audit_log))
         .route("/api-keys/{id}", delete(revoke_api_key))
+        .route("/app-sign-ins", get(list_app_sign_ins))
+        .route("/app-sign-ins/{id}", delete(revoke_app_sign_in))
         .route("/hosts/filter-options", get(filter_options))
         .route("/hosts/{id}/approve", post(approve))
         .route("/hosts/{id}/revoke", post(revoke))
@@ -222,7 +224,8 @@ fn failed(status: StatusCode, error: &str) -> Response {
     (status, Json(json!({ "error": error }))).into_response()
 }
 
-/// Who a request acts as, and the key it came with, if it carries a working API key.
+/// Who a request acts as, and how, if it carries a working API key or a signed-in
+/// app's access token.
 pub async fn key_holder(
     state: &AppState,
     headers: &HeaderMap,
@@ -234,6 +237,16 @@ pub async fn key_holder(
     let Some(key) = presented else {
         return Ok(None);
     };
+    if key.starts_with(crate::app_sign_ins::ACCESS_PREFIX) {
+        let accepted = state.database.accept_app_token(key, now_ms()).await?;
+        return Ok(accepted.map(|(sign_in, owner)| {
+            let via = Via::App {
+                id: sign_in.id,
+                name: sign_in.title(),
+            };
+            (owner, via)
+        }));
+    }
     let accepted = state.database.accept_api_key(key, now_ms()).await?;
     Ok(accepted.map(|(key, owner)| {
         let via = Via::ApiKey {
@@ -480,6 +493,21 @@ async fn create_api_key(State(state): State<AppState>, Json(input): Json<NewApiK
 
 async fn revoke_api_key(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
     match super::api_keys::revoke_if_allowed(&state, id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn list_app_sign_ins(State(state): State<AppState>) -> Response {
+    match super::app_sign_ins::visible_sign_ins(&state).await {
+        Ok(sign_ins) => Json(sign_ins).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn revoke_app_sign_in(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match super::app_sign_ins::revoke_if_allowed(&state, id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),

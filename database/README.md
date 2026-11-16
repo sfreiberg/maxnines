@@ -49,6 +49,7 @@ erDiagram
     dashboards ||--o{ dashboard_variables : "offers"
     users ||--o{ user_sessions : "signed in as"
     users ||--o{ api_keys : "owns"
+    users ||--o{ app_sign_ins : "signed in"
     users ||--o{ recovery_codes : "can recover with"
     users ||--o{ sign_in_challenges : "is asked"
 
@@ -295,6 +296,22 @@ erDiagram
         int last_used_ms
         int revoked_ms
     }
+    app_sign_ins {
+        int id PK
+        int user_id FK
+        string client_id
+        string device
+        string role
+        string access_hash UK
+        int access_expires_ms
+        string refresh_hash UK
+        string previous_refresh_hash
+        int rotated_ms
+        int refresh_expires_ms
+        int created_ms
+        int last_used_ms
+        int revoked_ms
+    }
     recovery_codes {
         int id PK
         int user_id FK
@@ -407,6 +424,7 @@ erDiagram
 | `location_rules` | Where hosts are on the map |
 | `remote_checks` | Checks the server runs itself, each about a host without an agent or the server, with a name no other check about that host has. Deleting a host deletes its checks first |
 | `users`, `user_sessions`, `api_keys`, `recovery_codes`, `sign_in_challenges` | People, how they sign in, and their keys |
+| `app_sign_ins` | Apps people signed in through the browser, such as the command line, with hashes of the tokens each holds. A refresh token that's been swapped is kept a moment, so using it again can be told apart from a lost answer |
 | `audit_log` | Who changed what |
 | `server_settings`, `server_secrets` | Settings for the whole server, and secrets it generates |
 

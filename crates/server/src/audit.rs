@@ -75,6 +75,8 @@ impl Actor {
 pub enum Via {
     /// One of their API keys, which acts as them.
     ApiKey { id: i64, name: String },
+    /// An app they signed in through the browser, such as the command line.
+    App { id: i64, name: String },
     /// An alert's buttons in Slack, matched to them by email address.
     Slack,
 }
@@ -83,20 +85,21 @@ impl Via {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::ApiKey { .. } => "api_key",
+            Self::App { .. } => "app",
             Self::Slack => "slack",
         }
     }
 
     pub fn id(&self) -> Option<String> {
         match self {
-            Self::ApiKey { id, .. } => Some(id.to_string()),
+            Self::ApiKey { id, .. } | Self::App { id, .. } => Some(id.to_string()),
             Self::Slack => None,
         }
     }
 
     pub fn name(&self) -> String {
         match self {
-            Self::ApiKey { name, .. } => name.clone(),
+            Self::ApiKey { name, .. } | Self::App { name, .. } => name.clone(),
             Self::Slack => "Slack".to_string(),
         }
     }
@@ -212,6 +215,8 @@ impl Action {
 pub enum Kind {
     User,
     ApiKey,
+    /// An app signed in through the browser, such as the command line.
+    AppSignIn,
     Host,
     ConfigRule,
     AlertRule,
@@ -231,9 +236,10 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::User,
         Self::ApiKey,
+        Self::AppSignIn,
         Self::Host,
         Self::ConfigRule,
         Self::AlertRule,
@@ -253,6 +259,7 @@ impl Kind {
         match self {
             Self::User => "user",
             Self::ApiKey => "api_key",
+            Self::AppSignIn => "app_sign_in",
             Self::Host => "host",
             Self::ConfigRule => "config_rule",
             Self::AlertRule => "alert_rule",
@@ -273,6 +280,7 @@ impl Kind {
         match self {
             Self::User => "User",
             Self::ApiKey => "API key",
+            Self::AppSignIn => "Signed-in app",
             Self::Host => "Host",
             Self::ConfigRule => "Config rule",
             Self::AlertRule => "Alert rule",

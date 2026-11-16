@@ -555,6 +555,8 @@ impl Database {
             )
             .await?;
         }
+        // So do the apps they signed in.
+        super::app_sign_ins::delete_for_user(&transaction, id, &row.email).await?;
         user::Entity::delete_by_id(id)
             .exec(&transaction)
             .await

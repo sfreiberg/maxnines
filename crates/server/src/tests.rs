@@ -2,6 +2,7 @@
 
 mod agentless;
 mod alerting;
+mod app_sign_ins;
 mod audit;
 mod dashboards;
 mod docs;
@@ -199,6 +200,7 @@ async fn start_with_heartbeat(
         web_url: "http://site.test".into(),
         sign_ins: Arc::default(),
         require_two_factor: Arc::default(),
+        pending_sign_ins: Arc::default(),
     };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

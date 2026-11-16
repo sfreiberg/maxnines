@@ -40,6 +40,7 @@
   - [Calculations](api-calculations.md)
   - [Dashboards](api-dashboards.md)
   - [API keys](api-keys.md)
+  - [Signing in apps](api-app-sign-ins.md)
   - [Users](api-users.md)
   - [Audit log](api-audit-log.md)
 - [Load testing](load-testing.md)

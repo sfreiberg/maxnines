@@ -1,0 +1,24 @@
+{% extends "layouts/application.html" %}
+{% block title %}Sign in {{ app }} · MaxNines{% endblock title %}
+{% block main_class %} class="narrow"{% endblock main_class %}
+{% block content %}
+<h1>Sign in {{ app }}?</h1>
+<p class="subtitle">{% if device %}{{ app }} on <strong>{{ device }}</strong>{% else %}{{ app }}{% endif %} wants to act as you, {{ email }}. It sees what you see, can do what the role below allows, and its changes are recorded as yours. It stays signed in for up to 90 days after it was last used, until you revoke it under Settings, then Signed-in apps.</p>
+{% if user_code %}<p class="hint">Check that the device shows <code>{{ user_code }}</code> before you allow it.</p>{% endif %}
+
+<form method="post" action="{{ action }}" class="stacked">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  {% for field in hidden %}<input type="hidden" name="{{ field.name }}" value="{{ field.value }}">
+  {% endfor %}
+  <label>What it can do
+    <select name="chosen_role">
+      {% for role in roles %}<option value="{{ role.value }}"{% if role.value == chosen_role %} selected{% endif %}>{{ role.label }}: {{ role.adds }}</option>{% endfor %}
+    </select>
+    <small>Choose the lowest that does what you need. It never does more than your own role allows.</small>
+  </label>
+  <div class="actions">
+    <button type="submit" name="decision" value="allow">Allow</button>
+    <button type="submit" name="decision" value="deny" class="secondary">Deny</button>
+  </div>
+</form>
+{% endblock content %}

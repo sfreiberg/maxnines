@@ -67,6 +67,19 @@ rules and channels, which the [audit log](audit-log.md) records and which can be
 back. A leaked Admin key can add a user, make them an admin and delete hosts with their
 history, handing over the whole server.
 
+### Signed-in apps
+
+The command line and the desktop apps sign in through the browser rather than with a
+key. The app opens a MaxNines page, or shows a code to type at `/device` on any
+device, and you choose **Allow** and the most it may do: your role, or lower. Two-factor
+applies as it does to the pages, because it's the pages you approve it on.
+
+An app stays signed in for 90 days after it was last used. Each one is listed under
+**Settings > Signed-in apps**, where you can revoke it, as on a lost laptop. Admins see
+and revoke everyone's. Like a key, an app never does more than you can now, and stops
+working while you're disabled. See [Signing in apps](api-app-sign-ins.md) for how apps
+do it.
+
 ## Two-factor sign-in
 
 Anyone can add a second step to signing in: a six-digit code from an authenticator

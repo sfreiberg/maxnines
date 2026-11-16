@@ -76,9 +76,19 @@ const ADMIN_ONLY: [&str; 4] = [
 ];
 
 /// Paths open to everyone signed in, by how they start. Each acts only on what's
-/// the person's own: their profile, their session, and their API keys, where the
-/// handlers check whose a key is.
-const OWN: [&str; 4] = ["/profile", "/logout", "/settings/api-keys", "/api-keys"];
+/// the person's own: their profile, their session, their API keys and signed-in
+/// apps, where the handlers check whose each is, and approving an app to act as them,
+/// which can't do more than they can.
+const OWN: [&str; 8] = [
+    "/profile",
+    "/logout",
+    "/settings/api-keys",
+    "/api-keys",
+    "/settings/apps",
+    "/app-sign-ins",
+    "/oauth/authorize",
+    "/device",
+];
 
 /// Dealing with alerts as they happen: acknowledging them and silencing them.
 const RESPONDING: [&str; 18] = [
@@ -254,6 +264,11 @@ mod tests {
             (Method::POST, "/settings/api-keys"),
             (Method::POST, "/settings/api-keys/{id}/revoke"),
             (Method::DELETE, "/api-keys/{id}"),
+            (Method::POST, "/settings/apps/{id}/revoke"),
+            (Method::DELETE, "/app-sign-ins/{id}"),
+            (Method::POST, "/oauth/authorize"),
+            (Method::POST, "/device"),
+            (Method::POST, "/device/decide"),
         ] {
             assert_eq!(required(&method, route), Role::Viewer, "{method} {route}");
         }

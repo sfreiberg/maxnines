@@ -17,6 +17,7 @@ impl MigratorTrait for Migrator {
             Box::new(CheckSignIn),
             Box::new(DomainExpiry),
             Box::new(CheckStats),
+            Box::new(AppSignIns),
         ]
     }
 }
@@ -1931,6 +1932,95 @@ impl MigrationTrait for CheckStats {
                 .await?;
         }
         Ok(())
+    }
+}
+
+struct AppSignIns;
+
+impl MigrationName for AppSignIns {
+    fn name(&self) -> &str {
+        "m20261116_000008_app_sign_ins"
+    }
+}
+
+#[derive(Iden)]
+enum AppSignInsTable {
+    #[iden = "app_sign_ins"]
+    Table,
+    Id,
+    UserId,
+    ClientId,
+    Device,
+    Role,
+    AccessHash,
+    AccessExpiresMs,
+    RefreshHash,
+    PreviousRefreshHash,
+    RotatedMs,
+    RefreshExpiresMs,
+    CreatedMs,
+    LastUsedMs,
+    RevokedMs,
+}
+
+/// Apps signed in through the browser, such as the command line: who they act as,
+/// with what role, and the hashes of the tokens they hold.
+#[async_trait::async_trait]
+impl MigrationTrait for AppSignIns {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        use AppSignInsTable as T;
+        let hash = |column: T| ColumnDef::new(column).string_len(64).not_null().to_owned();
+        manager
+            .create_table(
+                Table::create()
+                    .table(T::Table)
+                    .col(id(T::Id))
+                    .col(ColumnDef::new(T::UserId).big_integer().not_null())
+                    .col(ColumnDef::new(T::ClientId).string_len(64).not_null())
+                    .col(ColumnDef::new(T::Device).string_len(100).not_null())
+                    .col(ColumnDef::new(T::Role).string_len(16).not_null())
+                    .col(hash(T::AccessHash).unique_key().to_owned())
+                    .col(ColumnDef::new(T::AccessExpiresMs).big_integer().not_null())
+                    .col(hash(T::RefreshHash).unique_key().to_owned())
+                    .col(ColumnDef::new(T::PreviousRefreshHash).string_len(64))
+                    .col(ColumnDef::new(T::RotatedMs).big_integer())
+                    .col(ColumnDef::new(T::RefreshExpiresMs).big_integer().not_null())
+                    .col(ColumnDef::new(T::CreatedMs).big_integer().not_null())
+                    .col(ColumnDef::new(T::LastUsedMs).big_integer())
+                    .col(ColumnDef::new(T::RevokedMs).big_integer())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_app_sign_ins_user_id")
+                            .from(T::Table, T::UserId)
+                            .to(Users::Table, Users::Id),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        for (name, column) in [
+            ("idx_app_sign_ins_user_id", T::UserId),
+            (
+                "idx_app_sign_ins_previous_refresh_hash",
+                T::PreviousRefreshHash,
+            ),
+        ] {
+            manager
+                .create_index(
+                    Index::create()
+                        .name(name)
+                        .table(T::Table)
+                        .col(column)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(AppSignInsTable::Table).to_owned())
+            .await
     }
 }
 

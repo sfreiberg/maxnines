@@ -1,0 +1,32 @@
+use sea_orm::entity::prelude::*;
+
+#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+#[sea_orm(table_name = "app_sign_ins")]
+pub struct Model {
+    #[sea_orm(primary_key)]
+    pub id: i64,
+    /// Who it acts as.
+    pub user_id: i64,
+    /// Which app, such as `maxnines-cli`.
+    pub client_id: String,
+    /// What the app calls the computer it's on.
+    pub device: String,
+    /// The most it may do: `viewer`, `responder`, `editor` or `admin`.
+    pub role: String,
+    /// Only hashes are kept, so reading the database doesn't sign anything in.
+    pub access_hash: String,
+    pub access_expires_ms: i64,
+    pub refresh_hash: String,
+    /// The refresh token this one replaced, which still works for a moment.
+    pub previous_refresh_hash: Option<String>,
+    pub rotated_ms: Option<i64>,
+    pub refresh_expires_ms: i64,
+    pub created_ms: i64,
+    pub last_used_ms: Option<i64>,
+    pub revoked_ms: Option<i64>,
+}
+
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {}
+
+impl ActiveModelBehavior for ActiveModel {}

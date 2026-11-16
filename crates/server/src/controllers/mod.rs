@@ -12,6 +12,7 @@ mod alerts;
 mod annotations;
 pub mod api;
 mod api_keys;
+mod app_sign_ins;
 mod assets;
 mod audit_log;
 mod condition_form;
@@ -108,13 +109,18 @@ async fn run_as(
     };
     let needed = roles::required(request.method(), route);
     let yours = user.role;
+    let holder = if matches!(via, Some(Via::App { .. })) {
+        "app"
+    } else {
+        "key"
+    };
     let answer = async {
         if yours >= needed {
             return next.run(request).await;
         }
         if is_api {
             let error = format!(
-                "This needs the {} role, and this key acts as {} {}",
+                "This needs the {} role, and this {holder} acts as {} {}",
                 needed.as_str(),
                 article(yours),
                 yours.as_str()
@@ -197,6 +203,7 @@ pub fn app(state: AppState) -> Router {
         .merge(dashboards::routes())
         .merge(docs::routes())
         .merge(api_keys::routes())
+        .merge(app_sign_ins::routes())
         .merge(audit_log::routes())
         .merge(users::routes())
         .merge(hosts::routes())
@@ -225,6 +232,7 @@ pub fn app(state: AppState) -> Router {
         // Open to all, so a form being filled in isn't lost to a login that ran out.
         .merge(update_notice::routes())
         .merge(health::routes())
+        .merge(app_sign_ins::app_routes())
         .nest(api::BASE_PATH, api::routes(state.clone()))
         .layer(middleware::from_fn_with_state(state.clone(), note_source))
         .layer(middleware::from_fn(security_headers))
@@ -247,10 +255,10 @@ async fn not_found(state: axum::extract::State<AppState>, token: CsrfToken) -> R
 async fn security_headers(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    headers.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(CONTENT_SECURITY_POLICY),
-    );
+    // A page that sends a form further, like an app's approval, sets its own.
+    headers
+        .entry(header::CONTENT_SECURITY_POLICY)
+        .or_insert(HeaderValue::from_static(CONTENT_SECURITY_POLICY));
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     // Setup links are secrets, and a referrer would hand them to anything linked to.
     headers.insert(

@@ -28,7 +28,8 @@ export HOST_ID=$(curl -s -H "Authorization: Bearer $MAXNINES_API_KEY" \
 API key. Each key belongs to a user and acts as them: what it does is recorded in the
 [audit log](audit-log.md) as that person, via the key, and it stops working while
 they're disabled. Give each tool its own key. Without a valid key, the answer is
-`401`.
+`401`. Apps that a person uses, such as the command line, instead
+[sign in through the browser](api-app-sign-ins.md) and send an access token the same way.
 
 **Roles.** A key has a [role](users.md#roles), its owner's or lower, and can do
 what that role can: reading needs a viewer, acknowledging and silencing a responder,
@@ -101,5 +102,6 @@ Each part has a page of its own:
 | [Calculations](api-calculations.md) | One number from many hosts, as dashboards and alert rules use |
 | [Dashboards](api-dashboards.md) | Dashboards, their widgets and variables |
 | [API keys](api-keys.md) | Listing, adding and revoking keys |
+| [Signing in apps](api-app-sign-ins.md) | How apps sign in through the browser, and revoking them |
 | [Users](api-users.md) | People, their roles, and two-factor sign-in |
 | [Audit log](api-audit-log.md) | Who changed what, and sign-ins |

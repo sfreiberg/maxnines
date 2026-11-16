@@ -10,6 +10,8 @@ mod alert_rule_action;
 mod alert_rule_channel;
 mod alerting;
 mod api_key;
+mod app_sign_in;
+mod app_sign_ins;
 mod audit;
 mod audit_entry;
 mod config_rule;
@@ -65,6 +67,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
+pub use self::app_sign_ins::{AppSignIn, AppTokens, Refreshed};
 use self::audit::record_change;
 pub use self::events::NewEvent;
 pub use self::stats::DatabaseStats;
