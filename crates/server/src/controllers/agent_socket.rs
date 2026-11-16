@@ -58,7 +58,7 @@ pub async fn upgrade(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Response {
-    let source = super::request_source(peer, &headers, &state.trusted_proxies);
+    let source = super::request_source(&state, peer, &headers);
     socket
         .read_buffer_size(SOCKET_BUFFER_SIZE)
         .write_buffer_size(SOCKET_BUFFER_SIZE)

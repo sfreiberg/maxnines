@@ -15,9 +15,10 @@ pub struct Config {
     pub listen: SocketAddr,
     /// The address agents connect to. Defaults to this server's own address.
     pub public_url: Option<String>,
-    /// Proxies whose `X-Forwarded-For` header can be believed.
+    /// Proxies whose `X-Forwarded-For` header can be believed. Loopback when it isn't
+    /// set; an empty list trusts none.
     #[serde(default)]
-    pub trusted_proxies: Vec<String>,
+    pub trusted_proxies: Option<Vec<String>>,
     /// How often to ping each agent.
     #[serde(default = "default_heartbeat_interval_secs")]
     pub heartbeat_interval_secs: u64,
@@ -332,11 +333,12 @@ impl Config {
         Ok(config)
     }
 
-    pub fn trusted_networks(&self) -> Result<Vec<IpNet>> {
+    /// The proxies the config trusts, if it says.
+    pub fn trusted_networks(&self) -> Result<Option<Vec<IpNet>>> {
         self.trusted_proxies
-            .iter()
-            .map(|text| parse_network(text))
-            .collect()
+            .as_ref()
+            .map(|all| all.iter().map(|text| parse_network(text)).collect())
+            .transpose()
     }
 
     pub fn audience(&self) -> String {
@@ -694,7 +696,7 @@ mod tests {
         let config = parse(&text).unwrap();
         assert_eq!(config.listen.to_string(), "0.0.0.0:8000");
         assert_eq!(config.audience(), "wss://m.example.com/ws");
-        assert_eq!(config.trusted_networks().unwrap().len(), 2);
+        assert_eq!(config.trusted_networks().unwrap().unwrap().len(), 2);
         assert_eq!(config.heartbeat_interval_secs, 2);
         assert_eq!(config.heartbeat_timeout_secs, 6);
     }

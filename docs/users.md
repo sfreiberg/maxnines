@@ -76,10 +76,9 @@ when it signed in, when it was last used, and when it runs out. **End** signs a 
 out at once, and **Revoke** stops an app or a key. Everyone sees and ends their own
 under **Where you're signed in** on their profile.
 
-The address is where each was last used from. Behind a reverse proxy, list the proxy's
-address under `trusted_proxies` in the server's config, or every address shown is the
-proxy's. The server only believes `X-Forwarded-For` from a proxy listed there, as
-anyone could send it otherwise.
+The address is where each was last used from. Behind a proxy that isn't trusted yet,
+it's the address the proxy gave, marked unconfirmed, with the proxy's own beside it.
+See [Proxies](proxies.md).
 
 ### Signed-in apps
 

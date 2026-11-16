@@ -27,6 +27,7 @@ pub mod map;
 mod metrics;
 mod notification_channels;
 mod overview;
+mod proxies;
 mod remote_checks;
 mod rules;
 mod server;
@@ -51,7 +52,6 @@ use axum::routing::get;
 use axum::{Form, Router};
 use axum_csrf::CsrfToken;
 use chrono_tz::Tz;
-use ipnet::IpNet;
 use serde_json::json;
 use tera::Context;
 use tower_http::compression::CompressionLayer;
@@ -146,6 +146,12 @@ async fn run_as(
             Err(_) => StatusCode::FORBIDDEN.into_response(),
         }
     };
+    // A signed-in request through a proxy that isn't trusted yet is one to tell
+    // admins about.
+    if let (Some(peer), Some(forwarded_for)) = (audit::source(), audit::forwarded_for()) {
+        let now = crate::metrics::now_ms();
+        state.proxies.note(peer, forwarded_for, &user.email, now);
+    }
     let signed_in = SIGNED_IN.scope(Arc::new(user), answer);
     audit::acting_as(actor, via, signed_in).await
 }
@@ -178,26 +184,25 @@ fn local_date(ms: i64) -> String {
 
 /// Where a request came from: the address connecting, or for a trusted proxy, the
 /// one it says it's passing on.
-fn request_source(peer: SocketAddr, headers: &HeaderMap, trusted: &[IpNet]) -> IpAddr {
-    let forwarded: Vec<&str> = headers
-        .get_all("x-forwarded-for")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .collect();
-    agent_socket::client_ip(peer.ip(), &forwarded.join(","), trusted)
+fn request_source(state: &AppState, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
+    state.proxies.source(peer.ip(), headers)
 }
 
 /// Notes where each request came from, for the audit log, with nobody acting until
 /// a sign in check says who it is.
 async fn note_source(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    let source = request
+    let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(peer)| request_source(*peer, request.headers(), &state.trusted_proxies));
+        .map(|ConnectInfo(peer)| *peer);
+    let source = peer.map(|peer| request_source(&state, peer, request.headers()));
+    let forwarded_for =
+        peer.and_then(|peer| state.proxies.forwarded_for(peer.ip(), request.headers()));
     let acting = Acting {
         actor: Actor::Nobody,
         via: None,
         source,
+        forwarded_for,
     };
     audit::acting(acting, next.run(request)).await
 }
@@ -216,6 +221,7 @@ pub fn app(state: AppState) -> Router {
         .merge(audit_log::routes())
         .merge(users::routes())
         .merge(sign_ins::routes())
+        .merge(proxies::routes())
         .merge(hosts::routes())
         .merge(alerts::routes())
         .merge(actions::routes())
@@ -348,6 +354,9 @@ impl<'a> Page<'a> {
         context.insert("can_respond", &(role >= Some(Role::Responder)));
         context.insert("can_edit", &(role >= Some(Role::Editor)));
         context.insert("is_admin", &(role >= Some(Role::Admin)));
+        if role >= Some(Role::Admin) {
+            context.insert("proxy_notice", &proxies::notice(state));
+        }
         let theme = user.as_deref().map_or(DEFAULT_THEME, |user| &user.theme);
         context.insert("theme", theme);
         context.insert("time_zone", viewer_zone().name());

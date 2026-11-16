@@ -51,6 +51,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/sign-ins
     "role": "admin",
     "name": "Chrome on macOS",
     "address": "192.168.0.20",
+    "forwarded_for": null,
     "signed_in_ms": 1793940265767,
     "last_used_ms": 1793940285797,
     "expires_ms": 1796532265767,
@@ -64,7 +65,8 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/sign-ins
 | `kind` | `browser`, `app` or `api_key` |
 | `role` | What it can do now: the person's role, or the app's or key's if that's lower |
 | `name` | The browser, the app and its device, or the key's name |
-| `address` | Where it was last used from. Behind a proxy, the address the proxy passed on if it's one of `trusted_proxies` in the server's config, and otherwise the proxy's own |
+| `address` | Where it was last used from. Behind a proxy, the address the proxy passed on once the proxy is [trusted](proxies.md), and otherwise the proxy's own |
+| `forwarded_for` | The address a proxy that isn't trusted said it was passing on, so unconfirmed. `null` otherwise |
 | `expires_ms` | When it stops working unless it's used. `null` for a key that never expires |
 | `current` | Whether it's the browser asking |
 

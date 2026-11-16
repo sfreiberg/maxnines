@@ -16,15 +16,15 @@ rights, which depends on how you run the server.
 ## No TLS
 
 Leave the `tls` block out. Behind a proxy that handles HTTPS, set `public_url` to the
-address agents use, and list the proxy so client addresses are read correctly.
-Sign-in attempts are limited per client address, so without `trusted_proxies` every
-browser behind the proxy shares one allowance:
+address agents use:
 
 ```hcl
-listen          = "127.0.0.1:9000"
-public_url      = "wss://maxnines.example.com/ws"
-trusted_proxies = ["127.0.0.1"]
+listen     = "127.0.0.1:9000"
+public_url = "wss://maxnines.example.com/ws"
 ```
+
+A proxy on the same machine is trusted to pass on each person's address. For one
+anywhere else, see [Proxies](proxies.md).
 
 ## Your own certificate
 

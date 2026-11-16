@@ -286,6 +286,7 @@ erDiagram
         int last_used_ms
         string last_address
         string user_agent
+        string last_forwarded_for
     }
     api_keys {
         int id PK
@@ -298,6 +299,7 @@ erDiagram
         int expires_ms
         int last_used_ms
         string last_address
+        string last_forwarded_for
         int revoked_ms
     }
     app_sign_ins {
@@ -315,6 +317,7 @@ erDiagram
         int created_ms
         int last_used_ms
         string last_address
+        string last_forwarded_for
         int revoked_ms
     }
     recovery_codes {
@@ -394,11 +397,18 @@ erDiagram
         string via_id
         string via_name
         string source
+        string forwarded_for
         string action
         string subject_kind "what was changed"
         string subject_id
         string subject_name
         text changes "before and after"
+    }
+    proxies {
+        int id PK
+        string address UK "an address, a range or a provider"
+        bool trusted
+        int created_ms
     }
     server_settings {
         string name PK
@@ -432,6 +442,7 @@ erDiagram
 | `app_sign_ins` | Apps people signed in through the browser, such as the command line, with hashes of the tokens each holds. A refresh token that's been swapped is kept a moment, so using it again can be told apart from a lost answer |
 | `audit_log` | Who changed what |
 | `server_settings`, `server_secrets` | Settings for the whole server, and secrets it generates |
+| `proxies` | What admins decided about proxies in front of the server: trusted, or not a proxy. Where a proxy that isn't trusted said a request came from is kept beside the address that connected, as `forwarded_for`, in the audit log and on sessions, keys and app sign-ins |
 
 sea-orm adds `seaql_migrations`, which records the migrations that have run.
 

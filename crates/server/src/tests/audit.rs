@@ -148,7 +148,13 @@ async fn a_change_on_the_pages_records_who_made_it() {
 }
 
 /// Calls the API from behind a proxy that says the request came from `client`.
-async fn api_from(server: &TestServer, client: &str, method: &str, path: &str, body: &str) -> u16 {
+pub(super) async fn api_from(
+    server: &TestServer,
+    client: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> u16 {
     let mut stream = TcpStream::connect(server.address).await.unwrap();
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {}\r\n\
@@ -206,8 +212,19 @@ async fn an_api_change_records_the_key_and_the_values_before_and_after() {
 }
 
 #[tokio::test]
-async fn a_forwarded_address_from_anyone_else_is_ignored() {
+async fn a_proxy_on_this_machine_is_trusted_unless_the_config_says() {
     let server = start().await;
+    let before = mark(&server).await;
+    let path = "/api/v1/dashboards";
+    api_from(&server, "203.0.113.9", "POST", path, r#"{"name": "Ops"}"#).await;
+    let entries = since(&server, before).await;
+    assert_eq!(entries[0].source.as_deref(), Some("203.0.113.9"));
+    assert_eq!(entries[0].forwarded_for, None);
+}
+
+#[tokio::test]
+async fn a_forwarded_address_from_anyone_else_is_kept_but_not_believed() {
+    let server = start_with("trusted_proxies = []").await;
     let before = mark(&server).await;
 
     api_from(
@@ -221,6 +238,7 @@ async fn a_forwarded_address_from_anyone_else_is_ignored() {
 
     let entries = since(&server, before).await;
     assert_eq!(entries[0].source.as_deref(), Some("127.0.0.1"));
+    assert_eq!(entries[0].forwarded_for.as_deref(), Some("203.0.113.9"));
 }
 
 fn channel(kind: ChannelKind, target: &str, credential: Option<&str>) -> ChannelInput {
@@ -341,6 +359,7 @@ async fn changes_with_nobody_acting_are_maxnines_own() {
         .await
         .unwrap();
     let command_line = Acting {
+        forwarded_for: None,
         actor: Actor::CommandLine {
             account: Some("sam".into()),
         },

@@ -35,6 +35,8 @@ pub struct AppSignIn {
     pub last_used_ms: Option<i64>,
     /// The address it was last used from.
     pub last_address: Option<String>,
+    /// What an untrusted proxy there said it was passing on, so unconfirmed.
+    pub last_forwarded_for: Option<String>,
     /// When it stops working unless it's used before then.
     pub expires_ms: i64,
     pub revoked_ms: Option<i64>,
@@ -55,6 +57,7 @@ impl AppSignIn {
             created_ms: row.created_ms,
             last_used_ms: row.last_used_ms,
             last_address: row.last_address,
+            last_forwarded_for: row.last_forwarded_for,
             expires_ms: row.refresh_expires_ms,
             revoked_ms: row.revoked_ms,
         }
@@ -171,6 +174,9 @@ impl Database {
             created_ms: Set(now_ms),
             last_used_ms: Set(Some(now_ms)),
             last_address: Set(crate::audit::source().map(|address| address.to_string())),
+            last_forwarded_for: Set(
+                crate::audit::forwarded_for().map(|address| address.to_string())
+            ),
             ..Default::default()
         }
         .insert(&transaction)
@@ -212,11 +218,15 @@ impl Database {
         };
         let role = Role::parse(&row.role).unwrap_or(Role::Viewer);
         owner.role = owner.role.min(role);
-        let noted = super::noted_use(row.last_used_ms, row.last_address.as_deref(), now_ms);
-        let row = if let Some((used, address)) = noted {
+        let last = super::UsedFrom {
+            address: row.last_address.clone(),
+            forwarded_for: row.last_forwarded_for.clone(),
+        };
+        let row = if let Some((used, from)) = super::noted_use(row.last_used_ms, &last, now_ms) {
             let mut row: app_sign_in::ActiveModel = row.into();
             row.last_used_ms = Set(Some(used));
-            row.last_address = Set(address);
+            row.last_address = Set(from.address);
+            row.last_forwarded_for = Set(from.forwarded_for);
             row.update(&self.connection)
                 .await
                 .context("noting an app's use")?

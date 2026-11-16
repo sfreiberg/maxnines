@@ -34,6 +34,8 @@ mod metrics_page;
 mod metrics_pages;
 mod notification;
 mod notification_channel;
+mod proxies;
+mod proxy;
 mod recovery_code;
 mod remote_check;
 mod remote_checks;
@@ -484,18 +486,37 @@ const API_KEY_HINT_LEN: usize = 12;
 /// every request.
 const USE_ACCURACY_MS: i64 = 60_000;
 
+/// Where a session, key or app was last used from: the address that connected, and
+/// what an untrusted proxy there said it was passing on.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct UsedFrom {
+    address: Option<String>,
+    forwarded_for: Option<String>,
+}
+
+impl UsedFrom {
+    /// Where the current request came from.
+    fn now() -> Self {
+        Self {
+            address: crate::audit::source().map(|address| address.to_string()),
+            forwarded_for: crate::audit::forwarded_for().map(|address| address.to_string()),
+        }
+    }
+}
+
 /// What to note about a session, key or app being used now, if anything: when, and
-/// the address the request came from. Nothing while it was noted under a minute ago
-/// from the same address.
-fn noted_use(
-    last_used_ms: Option<i64>,
-    last_address: Option<&str>,
-    now_ms: i64,
-) -> Option<(i64, Option<String>)> {
-    let address = crate::audit::source().map(|address| address.to_string());
+/// where from. Nothing while it was noted under a minute ago from the same place, or
+/// for a use with no request behind it.
+fn noted_use(last_used_ms: Option<i64>, last: &UsedFrom, now_ms: i64) -> Option<(i64, UsedFrom)> {
+    let now = UsedFrom::now();
     let stale = last_used_ms.is_none_or(|used| now_ms - used >= USE_ACCURACY_MS);
-    let moved = address.is_some() && address.as_deref() != last_address;
-    (stale || moved).then_some((now_ms, address.or_else(|| last_address.map(str::to_string))))
+    let moved = now.address.is_some() && now != *last;
+    let from = if now.address.is_some() {
+        now
+    } else {
+        last.clone()
+    };
+    (stale || moved).then_some((now_ms, from))
 }
 
 /// A key for the API, without the key itself, which only exists when it's created.
@@ -516,6 +537,8 @@ pub struct ApiKey {
     pub last_used_ms: Option<i64>,
     /// The address it was last used from.
     pub last_address: Option<String>,
+    /// What an untrusted proxy there said it was passing on, so unconfirmed.
+    pub last_forwarded_for: Option<String>,
     pub revoked_ms: Option<i64>,
 }
 
@@ -538,6 +561,7 @@ impl ApiKey {
             expires_ms: row.expires_ms,
             last_used_ms: row.last_used_ms,
             last_address: row.last_address,
+            last_forwarded_for: row.last_forwarded_for,
             revoked_ms: row.revoked_ms,
         }
     }
@@ -710,11 +734,15 @@ impl Database {
         // The key acts as its owner, with whichever of their roles is less.
         let key_role = Role::parse(&row.role).unwrap_or(Role::Viewer);
         owner.role = owner.role.min(key_role);
-        let noted = noted_use(row.last_used_ms, row.last_address.as_deref(), now_ms);
-        let row = if let Some((used, address)) = noted {
+        let last = UsedFrom {
+            address: row.last_address.clone(),
+            forwarded_for: row.last_forwarded_for.clone(),
+        };
+        let row = if let Some((used, from)) = noted_use(row.last_used_ms, &last, now_ms) {
             let mut row: api_key::ActiveModel = row.into();
             row.last_used_ms = Set(Some(used));
-            row.last_address = Set(address);
+            row.last_address = Set(from.address);
+            row.last_forwarded_for = Set(from.forwarded_for);
             row.update(&self.connection)
                 .await
                 .context("noting an API key's use")?

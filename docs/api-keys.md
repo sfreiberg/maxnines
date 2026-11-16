@@ -30,13 +30,14 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/api-keys
     "expires_ms": 1793943865767,
     "last_used_ms": 1793940285797,
     "last_address": "192.168.0.20",
+    "last_forwarded_for": null,
     "revoked_ms": null
   }
 ]
 ```
 
 `last_used_ms` is accurate to about a minute. `last_address` is where it was last used
-from.
+from, and `last_forwarded_for` what a proxy that isn't trusted said, unconfirmed.
 
 ## Add an API key
 
@@ -68,6 +69,7 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "expires_ms": 1793943886623,
   "last_used_ms": null,
   "last_address": null,
+  "last_forwarded_for": null,
   "revoked_ms": null
 }
 ```

@@ -33,6 +33,7 @@ mod notifier;
 mod passwords;
 mod places;
 mod presence;
+mod proxies;
 mod registration;
 mod remote_checks;
 mod roles;
@@ -272,6 +273,8 @@ async fn serve(path: &Path) -> Result<()> {
     let (writer, writer_thread) = store::spawn_writer(store, status.writes.clone());
 
     let require_two_factor = database.two_factor_required().await?;
+    let proxies = proxies::Proxies::new(config.trusted_networks()?);
+    proxies.set_decisions(&database.list_proxies().await?);
     let state = AppState {
         presence: Arc::new(Presence::default()),
         registry: Arc::new(Registry::new(
@@ -295,7 +298,7 @@ async fn serve(path: &Path) -> Result<()> {
             clock_every: clock::ASK_EVERY,
         },
         audience: config.audience().into(),
-        trusted_proxies: config.trusted_networks()?.into(),
+        proxies: Arc::new(proxies),
         views: Arc::new(Views::load()?),
         csrf,
         web_url: web_url(config.audience()).unwrap_or_default().into(),

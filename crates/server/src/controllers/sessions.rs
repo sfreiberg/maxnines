@@ -269,7 +269,7 @@ async fn check_code(
         Err(error) => return server_error(&error),
     };
     // Guesses at a code are limited as guesses at a password are.
-    let source = request_source(peer, &headers, &state.trusted_proxies);
+    let source = request_source(&state, peer, &headers);
     if !state.sign_ins.allow(source, &user.email) {
         warn!(%source, "too many sign in attempts");
         let problem = (
@@ -352,7 +352,7 @@ async fn sign_in(
     let password = form.fields.get("password").cloned().unwrap_or_default();
     let next = safe_next(form.fields.get("next").map(String::as_str)).to_string();
 
-    let source = request_source(peer, &headers, &state.trusted_proxies);
+    let source = request_source(&state, peer, &headers);
     if !state.sign_ins.allow(source, &email.to_lowercase()) {
         warn!(%source, "too many sign in attempts");
         let problem = (

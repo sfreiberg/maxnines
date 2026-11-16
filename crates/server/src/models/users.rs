@@ -32,6 +32,8 @@ pub struct BrowserSession {
     pub expires_ms: i64,
     pub last_used_ms: Option<i64>,
     pub last_address: Option<String>,
+    /// What an untrusted proxy there said it was passing on, so unconfirmed.
+    pub last_forwarded_for: Option<String>,
     /// What the browser said it was when it signed in.
     pub user_agent: Option<String>,
 }
@@ -45,6 +47,7 @@ impl From<user_session::Model> for BrowserSession {
             expires_ms: row.expires_ms,
             last_used_ms: row.last_used_ms,
             last_address: row.last_address,
+            last_forwarded_for: row.last_forwarded_for,
             user_agent: row.user_agent,
         }
     }
@@ -632,6 +635,9 @@ impl Database {
             expires_ms: Set(now_ms + SESSION_LIFETIME_MS),
             last_used_ms: Set(Some(now_ms)),
             last_address: Set(crate::audit::source().map(|address| address.to_string())),
+            last_forwarded_for: Set(
+                crate::audit::forwarded_for().map(|address| address.to_string())
+            ),
             user_agent: Set(
                 user_agent.map(|agent| agent.chars().take(MAX_USER_AGENT_CHARS).collect())
             ),
@@ -679,14 +685,15 @@ impl Database {
             return Ok(None);
         };
         let id = session.id;
-        if let Some((used, address)) = super::noted_use(
-            session.last_used_ms,
-            session.last_address.as_deref(),
-            now_ms,
-        ) {
+        let last = super::UsedFrom {
+            address: session.last_address.clone(),
+            forwarded_for: session.last_forwarded_for.clone(),
+        };
+        if let Some((used, from)) = super::noted_use(session.last_used_ms, &last, now_ms) {
             let mut session: user_session::ActiveModel = session.into();
             session.last_used_ms = Set(Some(used));
-            session.last_address = Set(address);
+            session.last_address = Set(from.address);
+            session.last_forwarded_for = Set(from.forwarded_for);
             session
                 .update(&self.connection)
                 .await

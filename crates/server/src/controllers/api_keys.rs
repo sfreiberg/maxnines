@@ -256,6 +256,7 @@ mod tests {
             expires_ms,
             last_used_ms: None,
             last_address: None,
+            last_forwarded_for: None,
             revoked_ms,
         }
     }

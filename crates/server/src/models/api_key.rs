@@ -20,6 +20,8 @@ pub struct Model {
     pub last_used_ms: Option<i64>,
     /// The address it was last used from.
     pub last_address: Option<String>,
+    /// The address an untrusted proxy said it was passing on, so unconfirmed.
+    pub last_forwarded_for: Option<String>,
     pub revoked_ms: Option<i64>,
 }
 

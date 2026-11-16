@@ -105,3 +105,4 @@ Each part has a page of its own:
 | [Signing in apps](api-app-sign-ins.md) | How apps sign in through the browser, and revoking them |
 | [Users](api-users.md) | People, their roles, and two-factor sign-in |
 | [Audit log](api-audit-log.md) | Who changed what, and sign-ins |
+| [Proxies](api-proxies.md) | Proxies in front of the server, and deciding whether to trust them |

@@ -43,6 +43,7 @@ where
         .into_iter()
         .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()));
     let acting = Acting {
+        forwarded_for: None,
         actor: Actor::CommandLine { account },
         via: None,
         source: None,

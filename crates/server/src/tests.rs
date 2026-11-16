@@ -7,6 +7,7 @@ mod audit;
 mod dashboards;
 mod docs;
 mod events;
+mod proxies;
 mod roles;
 mod sign_ins;
 mod two_factor;
@@ -203,6 +204,8 @@ async fn start_with_heartbeat(
         .unwrap();
     let status = Arc::new(ServerStatus::new(None).unwrap());
     let (writer, _thread) = spawn_writer(store, status.writes.clone());
+    let proxies = crate::proxies::Proxies::new(config.trusted_networks().unwrap());
+    proxies.set_decisions(&database.list_proxies().await.unwrap());
     let state = AppState {
         presence: Arc::new(Presence::refilling_slowly()),
         registry: Arc::new(Registry::new(
@@ -222,7 +225,7 @@ async fn start_with_heartbeat(
         status,
         heartbeat,
         audience: AUDIENCE.into(),
-        trusted_proxies: config.trusted_networks().unwrap().into(),
+        proxies: Arc::new(proxies),
         views: Arc::new(Views::load().unwrap()),
         csrf: CsrfConfig::default(),
         web_url: "http://site.test".into(),

@@ -192,6 +192,11 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/api-keys/{id}", delete(revoke_api_key))
         .route("/me", get(me))
         .route("/sign-ins", get(list_sign_ins))
+        .route(
+            "/proxies",
+            get(super::proxies::api_list).post(super::proxies::api_decide),
+        )
+        .route("/proxies/{id}", delete(super::proxies::api_delete))
         .route("/sign-ins/{kind}/{id}", delete(end_sign_in))
         .route("/app-sign-ins", get(list_app_sign_ins))
         .route("/app-sign-ins/{id}", delete(revoke_app_sign_in))

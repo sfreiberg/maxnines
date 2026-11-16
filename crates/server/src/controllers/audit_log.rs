@@ -32,6 +32,8 @@ struct Row {
     /// Like "via API key Deploy job".
     via: Option<String>,
     source: Option<String>,
+    /// What an untrusted proxy at `source` said, so unconfirmed.
+    forwarded_for: Option<String>,
     action: String,
     kind: String,
     subject: String,
@@ -81,6 +83,7 @@ fn row(entry: &Entry) -> Row {
         actor: entry.actor_label(),
         via: entry.via_label(),
         source: entry.source.clone(),
+        forwarded_for: entry.forwarded_for.clone(),
         action: entry.action_label(),
         kind: entry.kind_label(),
         subject: entry.subject.name.clone(),

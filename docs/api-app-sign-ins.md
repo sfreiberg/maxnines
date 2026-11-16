@@ -177,6 +177,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/app-sign
     "created_ms": 1793940265767,
     "last_used_ms": 1793940285797,
     "last_address": "192.168.0.20",
+    "last_forwarded_for": null,
     "expires_ms": 1801716285797,
     "revoked_ms": null
   }

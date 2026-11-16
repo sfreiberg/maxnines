@@ -4,7 +4,6 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use axum::extract::FromRef;
 use axum_csrf::CsrfConfig;
-use ipnet::IpNet;
 use tokio::sync::{mpsc, watch};
 
 use crate::actions::Actions;
@@ -69,7 +68,8 @@ pub struct AppState {
     pub heartbeat: Heartbeat,
     /// The URL agents must have signed.
     pub audience: Arc<str>,
-    pub trusted_proxies: Arc<[IpNet]>,
+    /// Proxies in front of the server, trusted and not.
+    pub proxies: Arc<crate::proxies::Proxies>,
     pub views: Arc<Views>,
     pub csrf: CsrfConfig,
     /// Where people reach the site, for links they're given.

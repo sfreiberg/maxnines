@@ -19,6 +19,7 @@ impl MigratorTrait for Migrator {
             Box::new(CheckStats),
             Box::new(AppSignIns),
             Box::new(SignInDetails),
+            Box::new(Proxies),
         ]
     }
 }
@@ -1553,12 +1554,14 @@ enum UserSessions {
     LastUsedMs,
     LastAddress,
     UserAgent,
+    LastForwardedFor,
 }
 
 #[derive(Iden)]
 enum ApiKeys {
     Table,
     LastAddress,
+    LastForwardedFor,
     Id,
     UserId,
     Name,
@@ -1812,6 +1815,7 @@ enum AuditLog {
     ViaId,
     ViaName,
     Source,
+    ForwardedFor,
     Action,
     SubjectKind,
     SubjectId,
@@ -1940,6 +1944,106 @@ impl MigrationTrait for CheckStats {
     }
 }
 
+struct Proxies;
+
+impl MigrationName for Proxies {
+    fn name(&self) -> &str {
+        "m20261116_000010_proxies"
+    }
+}
+
+#[derive(Iden)]
+enum ProxiesTable {
+    #[iden = "proxies"]
+    Table,
+    Id,
+    Address,
+    Trusted,
+    CreatedMs,
+}
+
+/// What admins decided about proxies in front of the server, and the address an
+/// untrusted proxy said it was passing on, kept beside the one that connected.
+#[async_trait::async_trait]
+impl MigrationTrait for Proxies {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        use ProxiesTable as T;
+        manager
+            .create_table(
+                Table::create()
+                    .table(T::Table)
+                    .col(id(T::Id))
+                    .col(
+                        ColumnDef::new(T::Address)
+                            .string_len(64)
+                            .not_null()
+                            .unique_key(),
+                    )
+                    .col(ColumnDef::new(T::Trusted).boolean().not_null())
+                    .col(ColumnDef::new(T::CreatedMs).big_integer().not_null())
+                    .to_owned(),
+            )
+            .await?;
+        // One column to a statement, as SQLite adds no more than that at once.
+        for (table, column) in [
+            (
+                UserSessions::Table.into_iden(),
+                UserSessions::LastForwardedFor.into_iden(),
+            ),
+            (
+                ApiKeys::Table.into_iden(),
+                ApiKeys::LastForwardedFor.into_iden(),
+            ),
+            (
+                AppSignInsTable::Table.into_iden(),
+                AppSignInsTable::LastForwardedFor.into_iden(),
+            ),
+            (
+                AuditLog::Table.into_iden(),
+                AuditLog::ForwardedFor.into_iden(),
+            ),
+        ] {
+            let column = ColumnDef::new(column).string_len(64).to_owned();
+            manager
+                .alter_table(Table::alter().table(table).add_column(column).to_owned())
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for (table, column) in [
+            (
+                AuditLog::Table.into_iden(),
+                AuditLog::ForwardedFor.into_iden(),
+            ),
+            (
+                AppSignInsTable::Table.into_iden(),
+                AppSignInsTable::LastForwardedFor.into_iden(),
+            ),
+            (
+                ApiKeys::Table.into_iden(),
+                ApiKeys::LastForwardedFor.into_iden(),
+            ),
+            (
+                UserSessions::Table.into_iden(),
+                UserSessions::LastForwardedFor.into_iden(),
+            ),
+        ] {
+            manager
+                .alter_table(Table::alter().table(table).drop_column(column).to_owned())
+                .await?;
+        }
+        manager
+            .drop_table(Table::drop().table(ProxiesTable::Table).to_owned())
+            .await
+    }
+}
+
 struct SignInDetails;
 
 impl MigrationName for SignInDetails {
@@ -2048,6 +2152,7 @@ enum AppSignInsTable {
     LastUsedMs,
     RevokedMs,
     LastAddress,
+    LastForwardedFor,
 }
 
 /// Apps signed in through the browser, such as the command line: who they act as,

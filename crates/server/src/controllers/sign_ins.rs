@@ -83,6 +83,8 @@ pub struct SignIn {
     /// Where it was last used from. Behind a proxy, it's the address the proxy passed
     /// on, if the proxy is one the server trusts.
     pub address: Option<String>,
+    /// What an untrusted proxy at `address` said it was passing on, so unconfirmed.
+    pub forwarded_for: Option<String>,
     pub signed_in_ms: i64,
     pub last_used_ms: Option<i64>,
     /// When it stops working unless it's used, or for a key that never expires, nothing.
@@ -123,6 +125,7 @@ pub async fn sign_ins(state: &AppState, user_id: Option<i64>, now: i64) -> Resul
             role: person.role,
             name: browser_name(session.user_agent.as_deref()),
             address: session.last_address,
+            forwarded_for: session.last_forwarded_for,
             signed_in_ms: session.created_ms,
             last_used_ms: session.last_used_ms,
             expires_ms: Some(session.expires_ms),
@@ -141,6 +144,7 @@ pub async fn sign_ins(state: &AppState, user_id: Option<i64>, now: i64) -> Resul
             role: app.role.min(person.role),
             name: app.title(),
             address: app.last_address,
+            forwarded_for: app.last_forwarded_for,
             signed_in_ms: app.created_ms,
             last_used_ms: app.last_used_ms,
             expires_ms: Some(app.expires_ms),
@@ -165,6 +169,7 @@ pub async fn sign_ins(state: &AppState, user_id: Option<i64>, now: i64) -> Resul
             role: key.role.min(person.role),
             name: key.name,
             address: key.last_address,
+            forwarded_for: key.last_forwarded_for,
             signed_in_ms: key.created_ms,
             last_used_ms: key.last_used_ms,
             expires_ms: key.expires_ms,
@@ -254,6 +259,7 @@ pub struct Row {
     role: &'static str,
     name: String,
     address: String,
+    forwarded_for: Option<String>,
     since: String,
     since_at: String,
     last_used: Option<String>,
@@ -275,6 +281,7 @@ pub fn rows(sign_ins: Vec<SignIn>, now: i64) -> Vec<Row> {
             id: sign_in.id,
             role: sign_in.role.label(),
             address: sign_in.address.unwrap_or_else(|| "–".to_string()),
+            forwarded_for: sign_in.forwarded_for,
             since: local_date(sign_in.signed_in_ms),
             since_at: local_time(sign_in.signed_in_ms),
             last_used: sign_in.last_used_ms.and_then(ago),

@@ -111,6 +111,9 @@ pub struct Acting {
     pub actor: Actor,
     pub via: Option<Via>,
     pub source: Option<IpAddr>,
+    /// The address an untrusted proxy at `source` said it was passing on, so
+    /// unconfirmed.
+    pub forwarded_for: Option<IpAddr>,
 }
 
 tokio::task_local! {
@@ -125,8 +128,18 @@ pub async fn acting<F: Future>(acting: Acting, work: F) -> F::Output {
 /// Runs `work` as `actor`, acting `via` something if they are, keeping the address
 /// the request came from.
 pub async fn acting_as<F: Future>(actor: Actor, via: Option<Via>, work: F) -> F::Output {
-    let source = source();
-    acting(Acting { actor, via, source }, work).await
+    let Acting {
+        source,
+        forwarded_for,
+        ..
+    } = current();
+    let acting_now = Acting {
+        actor,
+        via,
+        source,
+        forwarded_for,
+    };
+    acting(acting_now, work).await
 }
 
 /// Who is acting now. A task spawned from a request doesn't carry this, so a change
@@ -136,12 +149,18 @@ pub fn current() -> Acting {
         actor: Actor::MaxNines,
         via: None,
         source: None,
+        forwarded_for: None,
     })
 }
 
 /// The address the current request came from, if there is one.
 pub fn source() -> Option<IpAddr> {
     current().source
+}
+
+/// The address an untrusted proxy said the current request came from, if it did.
+pub fn forwarded_for() -> Option<IpAddr> {
+    current().forwarded_for
 }
 
 /// What was done.
@@ -233,10 +252,12 @@ pub enum Kind {
     Annotation,
     /// A setting for the whole server.
     Setting,
+    /// An address or range decided to be a proxy in front of the server, or not one.
+    Proxy,
 }
 
 impl Kind {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::User,
         Self::ApiKey,
         Self::AppSignIn,
@@ -253,6 +274,7 @@ impl Kind {
         Self::Dashboard,
         Self::Annotation,
         Self::Setting,
+        Self::Proxy,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -273,6 +295,7 @@ impl Kind {
             Self::Dashboard => "dashboard",
             Self::Annotation => "annotation",
             Self::Setting => "setting",
+            Self::Proxy => "proxy",
         }
     }
 
@@ -294,6 +317,7 @@ impl Kind {
             Self::Dashboard => "Dashboard",
             Self::Annotation => "Annotation",
             Self::Setting => "Setting",
+            Self::Proxy => "Proxy",
         }
     }
 
@@ -536,6 +560,9 @@ pub struct Entry {
     pub via: Option<EntryVia>,
     /// The address the request came from.
     pub source: Option<String>,
+    /// The address an untrusted proxy at `source` said it was passing on, so
+    /// unconfirmed.
+    pub forwarded_for: Option<String>,
     pub action: String,
     pub subject: EntrySubject,
     pub changes: Vec<Change>,
@@ -688,6 +715,7 @@ mod tests {
     async fn changes_are_maxnines_own_unless_someone_is_acting() {
         assert_eq!(current().actor, Actor::MaxNines);
         let someone = Acting {
+            forwarded_for: None,
             actor: Actor::CommandLine { account: None },
             via: None,
             source: Some([10, 0, 0, 1].into()),

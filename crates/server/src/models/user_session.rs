@@ -16,6 +16,8 @@ pub struct Model {
     pub last_address: Option<String>,
     /// What the browser said it was when it signed in.
     pub user_agent: Option<String>,
+    /// The address an untrusted proxy said it was passing on, so unconfirmed.
+    pub last_forwarded_for: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -36,6 +36,7 @@ pub(super) async fn record<C: ConnectionTrait>(connection: &C, record: Record) -
             .as_ref()
             .map(|via| clip(&via.name(), MAX_NAME_CHARS))),
         source: Set(acting.source.map(|ip| ip.to_string())),
+        forwarded_for: Set(acting.forwarded_for.map(|ip| ip.to_string())),
         action: Set(record.action.as_str().to_string()),
         subject_kind: Set(record.subject.kind.as_str().to_string()),
         subject_id: Set(record.subject.id.map(|id| clip(&id, MAX_ID_CHARS))),
@@ -83,6 +84,7 @@ fn to_entry(row: audit_entry::Model) -> Entry {
             name: row.via_name.unwrap_or_default(),
         }),
         source: row.source,
+        forwarded_for: row.forwarded_for,
         action: row.action,
         subject: EntrySubject {
             kind: row.subject_kind,

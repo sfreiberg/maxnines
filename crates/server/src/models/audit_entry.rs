@@ -13,6 +13,8 @@ pub struct Model {
     pub via_id: Option<String>,
     pub via_name: Option<String>,
     pub source: Option<String>,
+    /// The address an untrusted proxy said it was passing on, so unconfirmed.
+    pub forwarded_for: Option<String>,
     pub action: String,
     pub subject_kind: String,
     pub subject_id: Option<String>,

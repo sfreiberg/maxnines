@@ -27,6 +27,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
     "actor": { "kind": "person", "id": "1", "name": "sam@example.com" },
     "via": { "kind": "api_key", "id": "3", "name": "Deploy job" },
     "source": "192.168.0.20",
+    "forwarded_for": null,
     "action": "changed",
     "subject": { "kind": "alert_rule", "id": "3", "name": "Disk filling up" },
     "changes": [
@@ -40,6 +41,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
     "actor": { "kind": "person", "id": "1", "name": "sam@example.com" },
     "via": null,
     "source": "192.168.0.20",
+    "forwarded_for": null,
     "action": "signed_in",
     "subject": { "kind": "user", "id": "1", "name": "sam@example.com" },
     "changes": []
@@ -65,11 +67,12 @@ email address.
 which is someone running an action on a host. `subject.kind` is
 `user`, `api_key`, `host`, `config_rule`, `alert_rule`, `notification_channel`,
 `alert`, `silence`, `maintenance_window`, `remote_check`, `metrics_page`, `location_rule`,
-`dashboard`, `annotation` or `setting`. Names are as they were at the time.
+`dashboard`, `annotation`, `setting` or `proxy`. Names are as they were at the time.
 
 `source` is the address the request came from, which is empty for changes that
 didn't come from a request. Behind a proxy, it's the address the proxy passed on, if
-the proxy is in `trusted_proxies`.
+the proxy is trusted. A proxy that isn't trusted is `source` itself, and the address it
+said it was passing on is in `forwarded_for`, unconfirmed. See [Proxies](proxies.md).
 
 In `changes`, a field that had no value leaves out `before`, and one that has none
 now leaves out `after`. Nested fields are named with dots, like `settings.disk.interval`.

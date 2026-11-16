@@ -7,6 +7,7 @@
 - [Running an agent](agents.md)
 - [Windows services](windows-services.md)
 - [HTTPS](https.md)
+- [Proxies](proxies.md)
 - [Databases](databases.md)
 - [Alerts](alerts.md)
 - [Notification channels](notifications.md)
@@ -44,4 +45,5 @@
   - [Signing in apps](api-app-sign-ins.md)
   - [Users](api-users.md)
   - [Audit log](api-audit-log.md)
+  - [Proxies](api-proxies.md)
 - [Load testing](load-testing.md)

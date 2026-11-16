@@ -38,9 +38,9 @@ Each entry says who acted:
 - someone not signed in, for a failed sign in
 
 It also keeps the address each request came from. Behind a reverse proxy, that's
-the address the proxy passes on, but only if the proxy is listed in
-`trusted_proxies`, as anyone could otherwise claim any address. See
-[HTTPS](https.md).
+the address the proxy passes on, but only once the proxy is trusted, as anyone could
+otherwise claim any address. Until then, an entry shows the address the proxy gave
+as unconfirmed, beside the proxy's own. See [Proxies](proxies.md).
 
 ## Secrets
 
