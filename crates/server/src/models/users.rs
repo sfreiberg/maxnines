@@ -56,6 +56,11 @@ impl From<user_session::Model> for BrowserSession {
 /// The most of what a browser says it is that's kept.
 const MAX_USER_AGENT_CHARS: usize = 255;
 
+/// What a browser said it was, cut to what's kept.
+fn trimmed_user_agent(agent: &str) -> String {
+    agent.chars().take(MAX_USER_AGENT_CHARS).collect()
+}
+
 pub const SESSION_LIFETIME_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const SETUP_LINK_LIFETIME_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const MAX_EMAIL_LEN: usize = 254;
@@ -638,9 +643,7 @@ impl Database {
             last_forwarded_for: Set(
                 crate::audit::forwarded_for().map(|address| address.to_string())
             ),
-            user_agent: Set(
-                user_agent.map(|agent| agent.chars().take(MAX_USER_AGENT_CHARS).collect())
-            ),
+            user_agent: Set(user_agent.map(trimmed_user_agent)),
             ..Default::default()
         }
         .insert(&transaction)
@@ -661,12 +664,20 @@ impl Database {
 
     /// Who a session belongs to, if it's still good.
     pub async fn session_user(&self, token: &str, now_ms: i64) -> Result<Option<User>> {
-        Ok(self.session(token, now_ms).await?.map(|(user, _)| user))
+        Ok(self
+            .session(token, None, now_ms)
+            .await?
+            .map(|(user, _)| user))
     }
 
     /// Who a session belongs to and its ID, if it's still good, noting that it's been
-    /// used and from where.
-    pub async fn session(&self, token: &str, now_ms: i64) -> Result<Option<(User, i64)>> {
+    /// used, from where, and by what browser, as `user_agent` changes when it updates.
+    pub async fn session(
+        &self,
+        token: &str,
+        user_agent: Option<&str>,
+        now_ms: i64,
+    ) -> Result<Option<(User, i64)>> {
         let session = user_session::Entity::find()
             .filter(user_session::Column::TokenHash.eq(token_hash(token)))
             .filter(user_session::Column::ExpiresMs.gt(now_ms))
@@ -689,11 +700,20 @@ impl Database {
             address: session.last_address.clone(),
             forwarded_for: session.last_forwarded_for.clone(),
         };
-        if let Some((used, from)) = super::noted_use(session.last_used_ms, &last, now_ms) {
+        let new_agent = user_agent
+            .map(trimmed_user_agent)
+            .filter(|agent| session.user_agent.as_ref() != Some(agent));
+        let noted = super::noted_use(session.last_used_ms, &last, now_ms);
+        if noted.is_some() || new_agent.is_some() {
             let mut session: user_session::ActiveModel = session.into();
-            session.last_used_ms = Set(Some(used));
-            session.last_address = Set(from.address);
-            session.last_forwarded_for = Set(from.forwarded_for);
+            if let Some((used, from)) = noted {
+                session.last_used_ms = Set(Some(used));
+                session.last_address = Set(from.address);
+                session.last_forwarded_for = Set(from.forwarded_for);
+            }
+            if let Some(agent) = new_agent {
+                session.user_agent = Set(Some(agent));
+            }
             session
                 .update(&self.connection)
                 .await

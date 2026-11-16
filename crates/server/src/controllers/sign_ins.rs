@@ -78,8 +78,11 @@ pub struct SignIn {
     pub user: String,
     /// What it may do now: the person's role, or the app's or key's if that's lower.
     pub role: Role,
-    /// The browser, such as "Chrome on macOS", the app and its device, or the key's name.
+    /// The browser, such as "Chrome 131 on macOS", the app and its device, or the key's
+    /// name.
     pub name: String,
+    /// What a browser last said it was, in full. Nothing for apps and keys.
+    pub user_agent: Option<String>,
     /// Where it was last used from. Behind a proxy, it's the address the proxy passed
     /// on, if the proxy is one the server trusts.
     pub address: Option<String>,
@@ -124,6 +127,7 @@ pub async fn sign_ins(state: &AppState, user_id: Option<i64>, now: i64) -> Resul
             user: person.email.clone(),
             role: person.role,
             name: browser_name(session.user_agent.as_deref()),
+            user_agent: session.user_agent,
             address: session.last_address,
             forwarded_for: session.last_forwarded_for,
             signed_in_ms: session.created_ms,
@@ -143,6 +147,7 @@ pub async fn sign_ins(state: &AppState, user_id: Option<i64>, now: i64) -> Resul
             user: person.email.clone(),
             role: app.role.min(person.role),
             name: app.title(),
+            user_agent: None,
             address: app.last_address,
             forwarded_for: app.last_forwarded_for,
             signed_in_ms: app.created_ms,
@@ -168,6 +173,7 @@ pub async fn sign_ins(state: &AppState, user_id: Option<i64>, now: i64) -> Resul
             user: person.email.clone(),
             role: key.role.min(person.role),
             name: key.name,
+            user_agent: None,
             address: key.last_address,
             forwarded_for: key.last_forwarded_for,
             signed_in_ms: key.created_ms,
@@ -206,23 +212,32 @@ pub async fn end_if_allowed(state: &AppState, kind: Kind, id: i64) -> Result<boo
     }
 }
 
-/// What a browser said it was, in a few words, such as "Chrome on macOS".
+/// What a browser said it was, in a few words, such as "Chrome 131 on macOS".
+/// Browsers no longer say which version of the system they run on, so neither does
+/// this.
 pub fn browser_name(user_agent: Option<&str>) -> String {
     let Some(agent) = user_agent.filter(|agent| !agent.is_empty()) else {
         return "A browser".to_string();
     };
-    let browser = if agent.contains("Edg/") {
-        "Edge"
-    } else if agent.contains("OPR/") {
-        "Opera"
-    } else if agent.contains("Firefox/") || agent.contains("FxiOS/") {
-        "Firefox"
-    } else if agent.contains("Chrome/") || agent.contains("CriOS/") {
-        "Chrome"
-    } else if agent.contains("Safari/") {
-        "Safari"
-    } else {
-        "A browser"
+    // Each browser, the marks that give it away, and how many parts of its version
+    // to show. Chrome's later parts are always zero now; Safari's say something.
+    let browsers: [(&str, &[&str], usize); 6] = [
+        ("Edge", &["Edg/", "EdgiOS/", "EdgA/"], 1),
+        ("Opera", &["OPR/"], 1),
+        ("Firefox", &["Firefox/", "FxiOS/"], 1),
+        ("Samsung Internet", &["SamsungBrowser/"], 1),
+        ("Chrome", &["Chrome/", "CriOS/"], 1),
+        ("Safari", &["Version/"], 2),
+    ];
+    let found = browsers.iter().find_map(|(name, marks, parts)| {
+        let mark = marks.iter().find(|mark| agent.contains(**mark))?;
+        Some((*name, version_after(agent, mark, *parts)))
+    });
+    let browser = match found {
+        Some((name, Some(version))) => format!("{name} {version}"),
+        Some((name, None)) => name.to_string(),
+        None if agent.contains("Safari/") => "Safari".to_string(),
+        None => "A browser".to_string(),
     };
     let system = if agent.contains("iPhone") {
         Some("iPhone")
@@ -245,8 +260,26 @@ pub fn browser_name(user_agent: Option<&str>) -> String {
     };
     match system {
         Some(system) => format!("{browser} on {system}"),
-        None => browser.to_string(),
+        None => browser,
     }
+}
+
+/// The version that follows `mark`, cut to its first `parts` parts, with a trailing
+/// ".0" dropped: "Chrome/131.0.0.0" gives "131", "Version/18.1" gives "18.1".
+fn version_after(agent: &str, mark: &str, parts: usize) -> Option<String> {
+    let rest = &agent[agent.find(mark)? + mark.len()..];
+    let full: &str = rest
+        .split(|c: char| !c.is_ascii_digit() && c != '.')
+        .next()?;
+    let mut kept: Vec<&str> = full
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .take(parts)
+        .collect();
+    while kept.len() > 1 && kept.last() == Some(&"0") {
+        kept.pop();
+    }
+    (!kept.is_empty()).then(|| kept.join("."))
 }
 
 /// A sign-in as a table shows it.
@@ -258,6 +291,7 @@ pub struct Row {
     user: String,
     role: &'static str,
     name: String,
+    user_agent: Option<String>,
     address: String,
     forwarded_for: Option<String>,
     since: String,
@@ -292,6 +326,7 @@ pub fn rows(sign_ins: Vec<SignIn>, now: i64) -> Vec<Row> {
             current: sign_in.current,
             user: sign_in.user,
             name: sign_in.name,
+            user_agent: sign_in.user_agent,
         })
         .collect()
 }
@@ -339,23 +374,35 @@ mod tests {
         let names = [
             (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                "Chrome on macOS",
+                "Chrome 131 on macOS",
             ),
             (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
-                "Edge on Windows",
+                "Edge 131 on Windows",
             ),
             (
                 "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0",
-                "Firefox on Linux",
+                "Firefox 133 on Linux",
             ),
             (
                 "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1",
-                "Safari on iPhone",
+                "Safari 18.1 on iPhone",
             ),
             (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
-                "Safari on macOS",
+                "Safari 18.1 on macOS",
+            ),
+            (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/131.0.6778.73 Mobile/15E148 Safari/604.1",
+                "Chrome 131 on iPhone",
+            ),
+            (
+                "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/27.0 Chrome/125.0.0.0 Mobile Safari/537.36",
+                "Samsung Internet 27 on Android",
+            ),
+            (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+                "Safari 26 on macOS",
             ),
             ("curl/8.7.1", "A browser"),
         ];

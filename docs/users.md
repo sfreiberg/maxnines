@@ -72,7 +72,10 @@ history, handing over the whole server.
 **Settings > Users > Sign-ins** shows admins everywhere people are signed in now: each
 browser, each app signed in through the browser, and each API key used in the last 30
 days. For each there's the person, what it can do now, where it was last used from,
-when it signed in, when it was last used, and when it runs out. **End** signs a browser
+when it signed in, when it was last used, and when it runs out. A browser is named by
+its version and system, such as Chrome 131 on macOS, and **What it says it is** shows
+everything it said about itself, which changes as it updates. Browsers no longer say
+which version of the system they run on. **End** signs a browser
 out at once, and **Revoke** stops an app or a key. Everyone sees and ends their own
 under **Where you're signed in** on their profile.
 

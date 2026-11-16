@@ -57,7 +57,10 @@ async fn session_user(
     headers: &HeaderMap,
 ) -> anyhow::Result<Option<(User, i64)>> {
     match session_token(headers) {
-        Some(token) => state.database.session(token, now_ms()).await,
+        Some(token) => {
+            let agent = user_agent(headers);
+            state.database.session(token, agent, now_ms()).await
+        }
         None => Ok(None),
     }
 }

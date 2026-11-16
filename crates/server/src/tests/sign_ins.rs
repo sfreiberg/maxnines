@@ -88,11 +88,44 @@ async fn a_browser_is_named_and_noted_where_it_was_last_used() {
         .unwrap();
     let (_, listed) = call_json(&server, &server.api_key, "GET", "/api/v1/sign-ins").await;
     let all = listed.as_array().unwrap();
-    assert!(
-        all.iter()
-            .any(|row| row["kind"] == "browser" && row["name"] == "Chrome on macOS"),
-        "{listed}"
-    );
+    let row = all
+        .iter()
+        .find(|row| row["kind"] == "browser" && row["name"] == "Chrome 131 on macOS")
+        .unwrap_or_else(|| panic!("{listed}"));
+    assert_eq!(row["user_agent"], CHROME_ON_MAC);
+}
+
+#[tokio::test]
+async fn a_browser_that_updates_is_named_by_its_new_version() {
+    let server = start().await;
+    let database = &server.state.database;
+    let owner = database.list_users().await.unwrap()[0].id;
+    let token = database
+        .start_session(owner, now_ms(), Some(CHROME_ON_MAC))
+        .await
+        .unwrap();
+    let updated = CHROME_ON_MAC.replace("Chrome/131", "Chrome/132");
+    // Straight after signing in, so only the new version makes it worth saving.
+    database
+        .session(&token, Some(&updated), now_ms())
+        .await
+        .unwrap()
+        .unwrap();
+    let (_, listed) = call_json(&server, &server.api_key, "GET", "/api/v1/sign-ins").await;
+    // The test server's own browser said nothing about itself.
+    let row = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["kind"] == "browser" && !row["user_agent"].is_null())
+        .unwrap_or_else(|| panic!("{listed}"));
+    assert_eq!(row["name"], "Chrome 132 on macOS", "{listed}");
+    assert_eq!(row["user_agent"], updated.as_str());
+    let page = Browser::default()
+        .get(&server, "/settings/users/sign-ins")
+        .await;
+    assert!(page.body.contains("What it says it is"), "{}", page.body);
+    assert!(page.body.contains("Chrome/132.0.0.0"), "{}", page.body);
 }
 
 #[tokio::test]
@@ -199,7 +232,7 @@ async fn session_id(browser: &Browser, server: &TestServer) -> i64 {
     let found = server
         .state
         .database
-        .session(token, now_ms())
+        .session(token, None, now_ms())
         .await
         .unwrap();
     found.unwrap().1
