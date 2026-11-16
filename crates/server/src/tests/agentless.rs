@@ -713,10 +713,24 @@ async fn two_hosts_can_each_have_a_check_of_the_same_name() {
     let why = refused["error"].as_str().unwrap();
     assert!(why.contains("already exists for this host"), "{why}");
 
+    // Before running, the API says there's no result yet.
+    let (_, checks) = api(&server, "GET", "/api/v1/remote-checks", &Value::Null).await;
+    for check in checks.as_array().unwrap() {
+        assert!(check["latest"].is_null(), "{check}");
+    }
+
     // Each has its own result, and its own row on its host's page.
     let mut scheduler = check_scheduler(&server);
     assert_eq!(run_due(&mut scheduler, now_ms()).await, 3);
     assert_eq!(server.state.check_results.all().len(), 3);
+    let (_, checks) = api(&server, "GET", "/api/v1/remote-checks", &Value::Null).await;
+    for check in checks.as_array().unwrap() {
+        assert_eq!(check["latest"]["up"], true, "{check}");
+        assert!(check["latest"]["ran_ms"].as_i64().unwrap() > 0, "{check}");
+        let one = format!("/api/v1/remote-checks/{}", check["id"]);
+        let (_, alone) = api(&server, "GET", &one, &Value::Null).await;
+        assert_eq!(alone["latest"], check["latest"]);
+    }
     let mut browser = Browser::default();
     for host in [&orders, &billing] {
         let page = browser.get(&server, &format!("/hosts/{host}")).await;

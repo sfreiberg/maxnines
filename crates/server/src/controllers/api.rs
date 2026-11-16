@@ -37,7 +37,7 @@ use crate::models::{
 use crate::notifier::{self, Notice};
 use crate::presence::{HostPresence, Reach};
 use crate::registration::{HostRecord, HostState};
-use crate::remote_checks::{RemoteCheck, RemoteCheckInput, SignInWith};
+use crate::remote_checks::{LatestResults, RemoteCheck, RemoteCheckInput, SignInWith};
 use crate::roles::Role;
 use crate::rule_engine::{self, ResolvedConfig};
 use crate::silences::{ActiveSilences, Cover, SilenceInput};
@@ -1776,13 +1776,33 @@ struct RemoteCheckView {
     has_private_key: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     private_key_env: Option<String>,
+    /// How it last went, or nothing if it hasn't run since the server started.
+    latest: Option<LatestCheck>,
+}
+
+/// A check's last run, as the Checks page shows it.
+#[derive(Debug, Serialize)]
+struct LatestCheck {
+    up: bool,
+    ran_ms: i64,
+    /// Why it was down.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 impl RemoteCheckView {
-    fn new(check: RemoteCheck) -> Self {
+    fn new(check: RemoteCheck, results: &LatestResults) -> Self {
+        let latest = results
+            .latest(check.id)
+            .map(|(result, ran_ms)| LatestCheck {
+                up: result["up"] == 1,
+                ran_ms,
+                error: result["error"].as_str().map(String::from),
+            });
         let input = check.input;
         let sign_in = input.sign_in;
         Self {
+            latest,
             id: check.id,
             host_id: input.host_id,
             check: input.check,
@@ -1813,8 +1833,10 @@ struct RemoteCheckRequest {
 async fn list_remote_checks(State(state): State<AppState>) -> Response {
     match state.database.list_remote_checks().await {
         Ok(checks) => {
-            let views: Vec<RemoteCheckView> =
-                checks.into_iter().map(RemoteCheckView::new).collect();
+            let views: Vec<RemoteCheckView> = checks
+                .into_iter()
+                .map(|check| RemoteCheckView::new(check, &state.check_results))
+                .collect();
             Json(views).into_response()
         }
         Err(error) => server_error(&error),
@@ -1823,7 +1845,7 @@ async fn list_remote_checks(State(state): State<AppState>) -> Response {
 
 async fn show_remote_check(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
     match state.database.get_remote_check(id).await {
-        Ok(Some(check)) => Json(RemoteCheckView::new(check)).into_response(),
+        Ok(Some(check)) => Json(RemoteCheckView::new(check, &state.check_results)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),
     }

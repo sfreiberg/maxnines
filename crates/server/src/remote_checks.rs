@@ -336,6 +336,17 @@ impl LatestResults {
         ran_ms.retain(|id, _| ids.contains(id));
     }
 
+    /// A check's last result and when it ran, if it has since the server started.
+    pub fn latest(&self, id: i64) -> Option<(Value, i64)> {
+        let result = self
+            .results
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&id)
+            .cloned()?;
+        Some((result, self.ran_ms(id)?))
+    }
+
     pub fn all(&self) -> BTreeMap<i64, Value> {
         self.results
             .lock()

@@ -24,6 +24,10 @@ What comes back has `sign_in`, `username`, `password_env` and `private_key_env`,
 gives none of a password, its variable, a key or its variable keeps the one saved,
 as long as `sign_in` says, or the fields given show, that it still signs in that way.
 
+It also has `latest`, how the check last went: `up`, `ran_ms`, when it ran, and
+`error`, why it was down. It's `null` until the check has run since the server
+started, and a paused check keeps the result from before it was paused.
+
 | `check` field | For | Description |
 | --- | --- | --- |
 | `name` | All | Required. What it's called on charts and in alerts. Two checks about the same host can't have the same one |
@@ -85,7 +89,12 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "host_id": "server",
   "check": { "name": "Home page", "kind": "http", "target": "https://example.com" },
   "interval_secs": 60,
-  "enabled": true
+  "enabled": true,
+  "read_stats": false,
+  "sign_in": "none",
+  "has_password": false,
+  "has_private_key": false,
+  "latest": { "up": false, "ran_ms": 1793940279545, "error": "connection refused" }
 }
 ```
 
