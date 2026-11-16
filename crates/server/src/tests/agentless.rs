@@ -761,13 +761,15 @@ async fn a_check_has_a_page_of_its_own_with_only_its_charts() {
     assert_eq!(run_due(&mut scheduler, now_ms()).await, 2);
     let mut browser = Browser::default();
 
-    // Its results are charted on its own page once they're saved.
+    // Its results are charted on its own page once they're saved: whether it
+    // passed, and its response time, which can be saved a little after. "Total"
+    // is only in the response time chart's key.
     let path = format!("/checks/{}", ids[0]);
     let deadline = Instant::now() + Duration::from_secs(5);
     let page = loop {
         let page = browser.get(&server, &path).await;
         assert_eq!(page.status, 200, "{}", page.body);
-        if !page.body.contains("No data in this range") {
+        if !page.body.contains("No data in this range") && page.body.contains("Total") {
             break page;
         }
         assert!(
