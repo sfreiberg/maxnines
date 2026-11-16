@@ -880,8 +880,13 @@ mod tests {
 
     #[tokio::test]
     async fn something_else_isnt_taken_for_mongodb() {
+        // Like a real SSH server, it stays connected, reading what it's sent. One
+        // that closed at once would be reset on Windows, as what the driver sent
+        // was never read, and the driver would only see the connection go.
         let address = serve(|mut socket| async move {
             let _ = socket.write_all(b"SSH-2.0-OpenSSH_9.9\r\n").await;
+            let mut sent = Vec::new();
+            let _ = socket.read_to_end(&mut sent).await;
         })
         .await;
         let mut check = check(CheckKind::Mongodb, address);
