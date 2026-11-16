@@ -427,23 +427,26 @@ fn covers(
     }
 }
 
+/// One thing by name, as the API gives it. An alert or silence that's ended isn't in
+/// what's happening now, so it's looked for among those that have ended too.
+pub fn find_one(api: &Api, kind: Kind, name: &str) -> Result<Value> {
+    match fetch(api, kind, &[name.to_string()], &Options::default()) {
+        Ok(mut items) => Ok(items.remove(0)),
+        Err(_) if matches!(kind, Kind::Alerts | Kind::Silences) => {
+            let ended = Options {
+                ended: true,
+                ..Options::default()
+            };
+            Ok(fetch(api, kind, &[name.to_string()], &ended)?.remove(0))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Everything about one thing, with what's related, for people to read.
 pub fn describe(api: &Api, kind: Kind, name: &str) -> Result<String> {
     if kind != Kind::Hosts {
-        let found = fetch(api, kind, &[name.to_string()], &Options::default());
-        let item = match found {
-            Ok(mut items) => items.remove(0),
-            // An alert or silence that's ended isn't in what's happening now.
-            Err(_) if matches!(kind, Kind::Alerts | Kind::Silences) => {
-                let ended = Options {
-                    ended: true,
-                    ..Options::default()
-                };
-                fetch(api, kind, &[name.to_string()], &ended)?.remove(0)
-            }
-            Err(error) => return Err(error),
-        };
-        return Ok(output::pairs(&output::fields(&item)));
+        return Ok(output::pairs(&output::fields(&find_one(api, kind, name)?)));
     }
     let all = hosts(api, None)?;
     let host = find_host(&all, name)?;

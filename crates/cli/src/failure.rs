@@ -10,7 +10,7 @@ pub struct Failure {
 }
 
 impl Failure {
-    /// `--exit-code` found something.
+    /// `--exit-code` found something. Nothing else exits with 1, so a script can trust it.
     pub const FOUND: u8 = 1;
     /// The command itself was wrong.
     pub const USAGE: u8 = 2;
@@ -22,6 +22,8 @@ impl Failure {
     pub const REFUSED: u8 = 5;
     /// The server couldn't be reached, or waiting ran out.
     pub const UNREACHABLE: u8 = 6;
+    /// Anything else, such as the server failing or a config file that can't be read.
+    pub const OTHER: u8 = 7;
 
     pub fn new(code: u8, message: impl Into<String>) -> Self {
         Self {
@@ -59,10 +61,10 @@ impl fmt::Display for Failure {
 
 impl std::error::Error for Failure {}
 
-/// The exit code for an error: its own, or 1 for anything else.
+/// The exit code for an error: its own, or [`Failure::OTHER`] for anything else.
 pub fn exit_code(error: &anyhow::Error) -> u8 {
     error
         .chain()
         .find_map(|cause| cause.downcast_ref::<Failure>())
-        .map_or(1, |failure| failure.code)
+        .map_or(Failure::OTHER, |failure| failure.code)
 }

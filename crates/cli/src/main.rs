@@ -357,6 +357,10 @@ fn login(folder: &Path, args: LoginArgs) -> Result<u8> {
     let mut config = Config::load(folder)?;
     let (name, address) = match args.target.as_slice() {
         [name, address] => (Some(name.clone()), address.clone()),
+        // A context's name signs in to it again, as the messages about signing in say.
+        [name] if !name.contains("://") && config.contexts.contains_key(name) => {
+            (Some(name.clone()), config.contexts[name].server.clone())
+        }
         [address] => (None, address.clone()),
         [] => {
             let (name, context) = config.pick(None)?;
@@ -394,7 +398,11 @@ fn login(folder: &Path, args: LoginArgs) -> Result<u8> {
         user: issued.user.clone(),
         role: issued.role.clone(),
     };
-    tokens::system(folder).save(&name, &held)?;
+    {
+        // Others may be refreshing other contexts' tokens in the same store.
+        let _lock = tokens::lock(folder)?;
+        tokens::system(folder).save(&name, &held)?;
+    }
     config.contexts.insert(
         name.clone(),
         Context {
@@ -415,6 +423,9 @@ fn logout(folder: &Path, name: Option<&str>) -> Result<u8> {
     let config = Config::load(folder)?;
     let (name, context) = config.pick(name)?;
     let store = tokens::system(folder);
+    // Held throughout, so a refresh can't swap the token between reading it and
+    // revoking it, as the server only revokes the newest.
+    let lock = tokens::lock(folder)?;
     let Some(held) = store.load(&name)? else {
         println!("Not signed in to {name}.");
         return Ok(0);
@@ -422,6 +433,7 @@ fn logout(folder: &Path, name: Option<&str>) -> Result<u8> {
     let server = Server::parse(&context.server)?;
     let revoked = signin::revoke(&http::Http::new(), &server, &held.refresh_token);
     store.forget(&name)?;
+    drop(lock);
     match revoked {
         Ok(()) => println!("Signed out of {name}."),
         Err(failure) => {
@@ -543,8 +555,7 @@ fn act(api: &Api, command: Command, format: Format) -> Result<u8> {
         }
         Command::Describe { kind, name } => {
             if format == Format::Json {
-                let items = kinds::fetch(api, kind, &[name], &Options::default())?;
-                println!("{}", output::json(&items[0]));
+                println!("{}", output::json(&kinds::find_one(api, kind, &name)?));
             } else {
                 println!("{}", kinds::describe(api, kind, &name)?);
             }

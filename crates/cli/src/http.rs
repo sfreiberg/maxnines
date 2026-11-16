@@ -46,9 +46,14 @@ pub struct Http {
 
 impl Http {
     pub fn new() -> Self {
+        Self::with_timeout(Duration::from_secs(30))
+    }
+
+    /// One that waits `timeout` at most for each answer.
+    pub fn with_timeout(timeout: Duration) -> Self {
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(30)))
+            .timeout_global(Some(timeout))
             .user_agent(format!("maxnines/{}", env!("CARGO_PKG_VERSION")))
             .build();
         Self {

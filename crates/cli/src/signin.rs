@@ -25,11 +25,23 @@ const BROWSER_WAIT: Duration = Duration::from_secs(5 * 60);
 /// How long to wait before each new try when a refresh fails for any reason but being
 /// signed out. They all fall within the minute the server still takes a refresh token
 /// it has just replaced, so an answer lost on the way is asked for again in time.
+///
+/// Each try waits [`REFRESH_TIMEOUT`] at most, and a try only starts while
+/// [`RETRY_WINDOW`] since the first allows, so the last one still reaches the server
+/// inside its minute, however slow the earlier ones were.
 pub const REFRESH_RETRIES: [Duration; 3] = [
     Duration::from_secs(2),
     Duration::from_secs(5),
     Duration::from_secs(15),
 ];
+
+/// How long one refresh waits for its answer.
+pub const REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long after the first try a refresh may start another. The server takes a
+/// refresh token it has just replaced for a minute from when it replaced it, which is
+/// no earlier than the first try, so this leaves room for a slow network.
+pub const RETRY_WINDOW: Duration = Duration::from_secs(45);
 
 /// What signing in or refreshing gives.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -149,23 +161,34 @@ pub fn with_browser(
     open(&authorize_url(server, &redirect_uri, &pkce, device, role));
     listener.set_nonblocking(true)?;
     let deadline = Instant::now() + BROWSER_WAIT;
+    // Each connection is read on its own, so one a browser opens and never uses
+    // holds nothing up; requests come back here to be answered one at a time.
+    let (arrived, requests) = std::sync::mpsc::channel::<(TcpStream, String)>();
     loop {
-        let mut stream = match listener.accept() {
-            Ok((stream, _)) => stream,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let arrived = arrived.clone();
+                std::thread::spawn(move || {
+                    if let Some(target) = read_target(&mut stream) {
+                        let _ = arrived.send((stream, target));
+                    }
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error.into()),
+        }
+        let (mut stream, target) = match requests.try_recv() {
+            Ok(request) => request,
+            Err(_) => {
                 if Instant::now() >= deadline {
                     return Err(Failure::unreachable(
                         "Nobody allowed it in the browser within 5 minutes. Try again",
                     )
                     .into());
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(50));
                 continue;
             }
-            Err(error) => return Err(error.into()),
-        };
-        let Some(target) = read_target(&mut stream) else {
-            continue;
         };
         match callback(&target, &pkce.state) {
             Callback::NotOurs => {
@@ -231,8 +254,9 @@ fn redeem(
 
 fn issued(answer: &Answer, refused: &str) -> Result<Issued, Failure> {
     if answer.is_success() {
-        return serde_json::from_str(&answer.text)
-            .map_err(|_| Failure::new(1, "That didn't answer like a MaxNines server"));
+        return serde_json::from_str(&answer.text).map_err(|_| {
+            Failure::new(Failure::OTHER, "That didn't answer like a MaxNines server")
+        });
     }
     if answer.status >= 500 {
         return Err(Failure::new(
@@ -327,7 +351,7 @@ pub fn with_device(
         return Err(issued(&answer, "The server wouldn't start signing in").unwrap_err());
     }
     let start: DeviceStart = serde_json::from_str(&answer.text)
-        .map_err(|_| Failure::new(1, "That didn't answer like a MaxNines server"))?;
+        .map_err(|_| Failure::new(Failure::OTHER, "That didn't answer like a MaxNines server"))?;
     show(&start);
     let mut interval = start.interval.max(1);
     loop {
@@ -387,6 +411,7 @@ pub fn refresh(
         ("client_id", CLIENT_ID),
         ("refresh_token", refresh_token),
     ];
+    let started = Instant::now();
     let mut retries = retries.iter();
     loop {
         let answer = http.send(
@@ -406,14 +431,14 @@ pub fn refresh(
                 return Err(issued(&answer, "The server wouldn't refresh the sign in").unwrap_err());
             }
             Ok(answer) => Failure::new(
-                1,
+                Failure::OTHER,
                 format!("The server answered with status {}", answer.status),
             ),
             Err(failure) => failure,
         };
         match retries.next() {
-            Some(delay) => wait(*delay),
-            None => return Err(failed),
+            Some(delay) if started.elapsed() + *delay < RETRY_WINDOW => wait(*delay),
+            _ => return Err(failed),
         }
     }
 }
@@ -631,6 +656,25 @@ mod tests {
         let page = shown.lock().unwrap().clone();
         assert!(!page.contains("Signed in to MaxNines"), "{page}");
         assert!(page.contains("That code is &lt;old&gt;"), "{page}");
+    }
+
+    #[test]
+    fn a_refresh_is_tried_again_only_while_the_server_would_still_take_it() {
+        let (server, forms) = token_server(500, "");
+        let waits = std::cell::RefCell::new(Vec::new());
+        let wait = |delay: Duration| waits.borrow_mut().push(delay);
+        let quick = [Duration::ZERO; 3];
+        let failed = refresh(&Http::new(), &server, "mxr_1", &quick, &wait).unwrap_err();
+        assert_eq!(failed.code, Failure::OTHER);
+        assert_eq!(forms.try_iter().count(), 4);
+        assert_eq!(waits.borrow().len(), 3);
+
+        // A wait that would start the next try past the window isn't waited.
+        waits.borrow_mut().clear();
+        let late = [RETRY_WINDOW];
+        refresh(&Http::new(), &server, "mxr_1", &late, &wait).unwrap_err();
+        assert_eq!(forms.try_iter().count(), 1);
+        assert!(waits.borrow().is_empty());
     }
 
     #[test]

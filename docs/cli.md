@@ -19,6 +19,7 @@ pages, two-factor included, and stays signed in for 90 days after it was last us
 ```sh
 maxnines login https://monitor.example.com              # saved as "monitor"
 maxnines login lan http://192.168.0.155:9000            # saved as "lan"
+maxnines login lan                                      # sign in to it again
 maxnines login prod https://monitor.example.com --role viewer
 maxnines login prod https://monitor.example.com --device   # over SSH: a code to type elsewhere
 maxnines whoami
@@ -147,12 +148,13 @@ It never prompts, so it's safe without a terminal.
 | Exit code | Means |
 | --- | --- |
 | 0 | Done |
-| 1 | `--exit-code` found something, or something else went wrong |
+| 1 | `--exit-code` found something, and nothing else |
 | 2 | The command was wrong |
 | 3 | Not found, or a name matched more than one |
 | 4 | Not signed in, the key isn't accepted, or the role doesn't allow it |
 | 5 | The server refused it, and says why |
 | 6 | Couldn't reach the server, or nobody allowed the sign-in in time |
+| 7 | Anything else, such as the server failing |
 
 Shell completions:
 

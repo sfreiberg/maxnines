@@ -107,7 +107,10 @@ impl Api {
             400 | 409 | 422 => Failure::refused(
                 said.unwrap_or_else(|| format!("The server refused it (status {})", answer.status)),
             ),
-            status => Failure::new(1, format!("The server answered with status {status}")),
+            status => Failure::new(
+                Failure::OTHER,
+                format!("The server answered with status {status}"),
+            ),
         };
         Err(failure.into())
     }
@@ -141,8 +144,9 @@ impl Api {
                 }
                 let latest = store.load(context)?.unwrap_or(held);
                 let wait = |delay: Duration| std::thread::sleep(delay);
+                let quick = Http::with_timeout(signin::REFRESH_TIMEOUT);
                 match signin::refresh(
-                    &self.http,
+                    &quick,
                     &self.server,
                     &latest.refresh_token,
                     &REFRESH_RETRIES,

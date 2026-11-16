@@ -160,6 +160,11 @@ fn monitoring() -> FakeServer {
         }
         ("GET", target) if target.starts_with("/api/v1/hosts") => (200, hosts_json().to_string()),
         ("GET", "/api/v1/alerts") => (200, alerts_json().to_string()),
+        ("GET", "/api/v1/alert-rules") => (200, "[]".to_string()),
+        ("GET", "/api/v1/silences") => (
+            200,
+            json!({"active": [], "ended": [{"id": 9, "rule_id": null, "filter": "hostname=db*", "series": "", "all_alerts": false, "reason": "Done", "created_by": "you@example.com", "starts_ms": 1, "ends_ms": 2}]}).to_string(),
+        ),
         ("POST", "/api/v1/silences") => (201, json!({"id": 57}).to_string()),
         ("POST", "/api/v1/alerts/41/acknowledge") => (204, String::new()),
         ("GET", "/api/v1/me") => (200, json!({"email": "you@example.com", "role": "responder", "via": {"kind": "api_key", "id": 3, "name": "ci"}}).to_string()),
@@ -230,6 +235,7 @@ fn each_kind_of_failure_has_its_own_exit_code() {
 
     let refusing = FakeServer::start(|seen| match seen.target.as_str() {
         "/api/v1/hosts" => (401, String::new()),
+        "/api/v1/alerts" => (500, String::new()),
         "/api/v1/alerts/1/acknowledge" => (
             403,
             json!({"error": "This needs the responder role"}).to_string(),
@@ -252,6 +258,14 @@ fn each_kind_of_failure_has_its_own_exit_code() {
     );
     assert_eq!(refused.status.code(), Some(5));
     assert!(stderr(&refused).contains("A silence needs a reason"));
+
+    // The server failing is its own code, so it's never taken for --exit-code finding something.
+    let broken = maxnines(
+        folder.path(),
+        &with_key(&refusing.url),
+        &["get", "alerts", "--exit-code"],
+    );
+    assert_eq!(broken.status.code(), Some(7), "{}", stderr(&broken));
 
     // Nothing listens on port 0, so this fails at once everywhere.
     let gone = maxnines(
@@ -330,6 +344,16 @@ fn a_script_can_ask_whether_anything_is_firing() {
 
     let acknowledged = maxnines(folder.path(), &with_key(&server.url), &["ack", "41"]);
     assert_eq!(stdout(&acknowledged), "alert/41 acknowledged");
+
+    // Something that's ended is still found by describe, as text or as JSON.
+    let ended = maxnines(
+        folder.path(),
+        &with_key(&server.url),
+        &["describe", "silence", "9", "-o", "json"],
+    );
+    assert!(ended.status.success(), "{}", stderr(&ended));
+    let described: Value = serde_json::from_str(&stdout(&ended)).unwrap();
+    assert_eq!(described["reason"], "Done");
 
     let me = maxnines(folder.path(), &with_key(&server.url), &["whoami"]);
     assert_eq!(
@@ -453,4 +477,14 @@ fn signing_in_with_a_code_keeps_the_tokens_refreshes_them_and_signs_out() {
     );
     let after = maxnines(folder.path(), &[], &["get", "hosts"]);
     assert_eq!(after.status.code(), Some(4));
+    assert!(
+        stderr(&after).contains("run maxnines login lan"),
+        "{}",
+        stderr(&after)
+    );
+
+    // Which works: a context's name signs in to it again.
+    let again = maxnines(folder.path(), &[], &["login", "lan", "--device"]);
+    assert!(again.status.success(), "{}", stderr(&again));
+    assert_eq!(server.requests_to("/oauth/device").len(), 2);
 }
