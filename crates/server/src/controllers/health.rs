@@ -16,7 +16,7 @@ use crate::app_state::AppState;
 use crate::metrics::now_ms;
 
 /// A database slower than this isn't working, whatever the reason.
-const CHECK_LIMIT: Duration = Duration::from_secs(2);
+pub const CHECK_LIMIT: Duration = Duration::from_secs(2);
 
 /// Alert rules are checked every 15 seconds, so this means they've stopped.
 const ALERTS_STALE_MS: i64 = 60_000;
@@ -64,8 +64,9 @@ fn alerts_running(state: &AppState) -> bool {
 }
 
 async fn show(State(state): State<AppState>) -> Response {
-    let database = timeout(CHECK_LIMIT, state.database.is_reachable());
-    let metrics = timeout(CHECK_LIMIT, state.metrics.series_count());
+    let limit = state.health_limit;
+    let database = timeout(limit, state.database.is_reachable());
+    let metrics = timeout(limit, state.metrics.series_count());
     let (database, metrics) = tokio::join!(database, metrics);
 
     let checks = Checks {

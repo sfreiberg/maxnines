@@ -80,6 +80,8 @@ pub struct AppState {
     pub require_two_factor: Arc<std::sync::atomic::AtomicBool>,
     /// Apps approved in the browser, waiting to collect their tokens.
     pub pending_sign_ins: Arc<crate::app_sign_ins::PendingSignIns>,
+    /// How long the health check waits on each database before calling it failing.
+    pub health_limit: std::time::Duration,
 }
 
 impl FromRef<AppState> for CsrfConfig {

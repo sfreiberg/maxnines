@@ -96,6 +96,11 @@ const TEST_HEARTBEAT: Heartbeat = Heartbeat {
     clock_every: Duration::from_secs(3600),
 };
 
+/// How long the health check waits on a database in tests. A busy host running every
+/// test at once can stall a thread for seconds, which a real server's limit would
+/// call a failing database.
+const TEST_HEALTH_LIMIT: Duration = Duration::from_secs(30);
+
 /// For the tests about clocks, which wait to be asked.
 async fn start_asking_the_time() -> TestServer {
     let saved = Saved::default();
@@ -105,7 +110,7 @@ async fn start_asking_the_time() -> TestServer {
         clock_every: Duration::from_millis(50),
         ..TEST_HEARTBEAT
     };
-    start_with_heartbeat("", store, reader, saved, None, heartbeat).await
+    start_with_heartbeat("", store, reader, saved, None, heartbeat, TEST_HEALTH_LIMIT).await
 }
 
 /// For the tests about giving up on a quiet client, which wait for it to happen.
@@ -117,7 +122,16 @@ async fn start_quick_to_drop() -> TestServer {
         timeout: Duration::from_secs(1),
         ..TEST_HEARTBEAT
     };
-    start_with_heartbeat("", store, reader, saved, None, heartbeat).await
+    start_with_heartbeat("", store, reader, saved, None, heartbeat, TEST_HEALTH_LIMIT).await
+}
+
+/// For the tests about a stalled database, which wait for the health check to give up.
+async fn start_quick_to_call_it_failing() -> TestServer {
+    let saved = Saved::default();
+    let store = Box::new(MemoryStore(saved.clone()));
+    let reader = store.reader().unwrap();
+    let limit = Duration::from_secs(1);
+    start_with_heartbeat("", store, reader, saved, None, TEST_HEARTBEAT, limit).await
 }
 
 /// Starts with a real metrics database, for tests of what's stored.
@@ -138,7 +152,16 @@ async fn start_on(
     saved: Saved,
     folder: Option<tempfile::TempDir>,
 ) -> TestServer {
-    start_with_heartbeat(config, store, reader, saved, folder, TEST_HEARTBEAT).await
+    start_with_heartbeat(
+        config,
+        store,
+        reader,
+        saved,
+        folder,
+        TEST_HEARTBEAT,
+        TEST_HEALTH_LIMIT,
+    )
+    .await
 }
 
 async fn start_with_heartbeat(
@@ -148,6 +171,7 @@ async fn start_with_heartbeat(
     saved: Saved,
     folder: Option<tempfile::TempDir>,
     heartbeat: Heartbeat,
+    health_limit: Duration,
 ) -> TestServer {
     let text = format!("{config}\nmetrics \"duckdb\" {{\n  path = \"x\"\n}}\n");
     let config = Config::parse(&text).unwrap();
@@ -201,6 +225,7 @@ async fn start_with_heartbeat(
         sign_ins: Arc::default(),
         require_two_factor: Arc::default(),
         pending_sign_ins: Arc::default(),
+        health_limit,
     };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -882,7 +907,7 @@ mod health {
 
     #[tokio::test]
     async fn a_stalled_database_counts_as_failing_rather_than_hanging() {
-        let server = start().await;
+        let server = start_quick_to_call_it_failing().await;
         let _stalled = server.state.database.stall_for_test().await;
 
         let (status, body) = health(&server).await;

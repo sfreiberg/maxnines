@@ -19,7 +19,7 @@ mod condition_form;
 mod dashboards;
 mod docs;
 mod fleet;
-mod health;
+pub mod health;
 pub mod host_list;
 mod hosts;
 mod maintenance_windows;

@@ -302,6 +302,7 @@ async fn serve(path: &Path) -> Result<()> {
         sign_ins: Arc::default(),
         require_two_factor: Arc::new(require_two_factor.into()),
         pending_sign_ins: Arc::default(),
+        health_limit: controllers::health::CHECK_LIMIT,
     };
 
     let listener = TcpListener::bind(config.listen)
