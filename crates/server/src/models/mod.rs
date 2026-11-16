@@ -484,6 +484,20 @@ const API_KEY_HINT_LEN: usize = 12;
 /// every request.
 const USE_ACCURACY_MS: i64 = 60_000;
 
+/// What to note about a session, key or app being used now, if anything: when, and
+/// the address the request came from. Nothing while it was noted under a minute ago
+/// from the same address.
+fn noted_use(
+    last_used_ms: Option<i64>,
+    last_address: Option<&str>,
+    now_ms: i64,
+) -> Option<(i64, Option<String>)> {
+    let address = crate::audit::source().map(|address| address.to_string());
+    let stale = last_used_ms.is_none_or(|used| now_ms - used >= USE_ACCURACY_MS);
+    let moved = address.is_some() && address.as_deref() != last_address;
+    (stale || moved).then_some((now_ms, address.or_else(|| last_address.map(str::to_string))))
+}
+
 /// A key for the API, without the key itself, which only exists when it's created.
 /// It acts as the person who owns it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -500,6 +514,8 @@ pub struct ApiKey {
     /// Empty means it never expires.
     pub expires_ms: Option<i64>,
     pub last_used_ms: Option<i64>,
+    /// The address it was last used from.
+    pub last_address: Option<String>,
     pub revoked_ms: Option<i64>,
 }
 
@@ -521,6 +537,7 @@ impl ApiKey {
             created_ms: row.created_ms,
             expires_ms: row.expires_ms,
             last_used_ms: row.last_used_ms,
+            last_address: row.last_address,
             revoked_ms: row.revoked_ms,
         }
     }
@@ -693,12 +710,11 @@ impl Database {
         // The key acts as its owner, with whichever of their roles is less.
         let key_role = Role::parse(&row.role).unwrap_or(Role::Viewer);
         owner.role = owner.role.min(key_role);
-        let stale = row
-            .last_used_ms
-            .is_none_or(|used| now_ms - used >= USE_ACCURACY_MS);
-        let row = if stale {
+        let noted = noted_use(row.last_used_ms, row.last_address.as_deref(), now_ms);
+        let row = if let Some((used, address)) = noted {
             let mut row: api_key::ActiveModel = row.into();
-            row.last_used_ms = Set(Some(now_ms));
+            row.last_used_ms = Set(Some(used));
+            row.last_address = Set(address);
             row.update(&self.connection)
                 .await
                 .context("noting an API key's use")?

@@ -10,6 +10,12 @@ pub struct Model {
     pub token_hash: String,
     pub created_ms: i64,
     pub expires_ms: i64,
+    /// When it was last used, to about a minute.
+    pub last_used_ms: Option<i64>,
+    /// The address it was last used from.
+    pub last_address: Option<String>,
+    /// What the browser said it was when it signed in.
+    pub user_agent: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

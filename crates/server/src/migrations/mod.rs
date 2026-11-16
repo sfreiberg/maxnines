@@ -18,6 +18,7 @@ impl MigratorTrait for Migrator {
             Box::new(DomainExpiry),
             Box::new(CheckStats),
             Box::new(AppSignIns),
+            Box::new(SignInDetails),
         ]
     }
 }
@@ -1549,11 +1550,15 @@ enum UserSessions {
     TokenHash,
     CreatedMs,
     ExpiresMs,
+    LastUsedMs,
+    LastAddress,
+    UserAgent,
 }
 
 #[derive(Iden)]
 enum ApiKeys {
     Table,
+    LastAddress,
     Id,
     UserId,
     Name,
@@ -1935,6 +1940,87 @@ impl MigrationTrait for CheckStats {
     }
 }
 
+struct SignInDetails;
+
+impl MigrationName for SignInDetails {
+    fn name(&self) -> &str {
+        "m20261116_000009_sign_in_details"
+    }
+}
+
+/// Where each browser session, signed-in app and API key was last used from, and for
+/// a browser session which browser it is and when it was last used, so admins can see
+/// who's signed in and from where.
+#[async_trait::async_trait]
+impl MigrationTrait for SignInDetails {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    // One column to a statement, as SQLite adds no more than that at once.
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let address = |column: DynIden| ColumnDef::new(column).string_len(64).to_owned();
+        for (table, column) in [
+            (
+                UserSessions::Table.into_iden(),
+                ColumnDef::new(UserSessions::LastUsedMs)
+                    .big_integer()
+                    .to_owned(),
+            ),
+            (
+                UserSessions::Table.into_iden(),
+                address(UserSessions::LastAddress.into_iden()),
+            ),
+            (
+                UserSessions::Table.into_iden(),
+                ColumnDef::new(UserSessions::UserAgent)
+                    .string_len(255)
+                    .to_owned(),
+            ),
+            (
+                AppSignInsTable::Table.into_iden(),
+                address(AppSignInsTable::LastAddress.into_iden()),
+            ),
+            (
+                ApiKeys::Table.into_iden(),
+                address(ApiKeys::LastAddress.into_iden()),
+            ),
+        ] {
+            manager
+                .alter_table(Table::alter().table(table).add_column(column).to_owned())
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for (table, column) in [
+            (ApiKeys::Table.into_iden(), ApiKeys::LastAddress.into_iden()),
+            (
+                AppSignInsTable::Table.into_iden(),
+                AppSignInsTable::LastAddress.into_iden(),
+            ),
+            (
+                UserSessions::Table.into_iden(),
+                UserSessions::UserAgent.into_iden(),
+            ),
+            (
+                UserSessions::Table.into_iden(),
+                UserSessions::LastAddress.into_iden(),
+            ),
+            (
+                UserSessions::Table.into_iden(),
+                UserSessions::LastUsedMs.into_iden(),
+            ),
+        ] {
+            manager
+                .alter_table(Table::alter().table(table).drop_column(column).to_owned())
+                .await?;
+        }
+        Ok(())
+    }
+}
+
 struct AppSignIns;
 
 impl MigrationName for AppSignIns {
@@ -1961,6 +2047,7 @@ enum AppSignInsTable {
     CreatedMs,
     LastUsedMs,
     RevokedMs,
+    LastAddress,
 }
 
 /// Apps signed in through the browser, such as the command line: who they act as,

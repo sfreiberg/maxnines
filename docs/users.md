@@ -67,6 +67,20 @@ rules and channels, which the [audit log](audit-log.md) records and which can be
 back. A leaked Admin key can add a user, make them an admin and delete hosts with their
 history, handing over the whole server.
 
+### Who's signed in
+
+**Settings > Users > Sign-ins** shows admins everywhere people are signed in now: each
+browser, each app signed in through the browser, and each API key used in the last 30
+days. For each there's the person, what it can do now, where it was last used from,
+when it signed in, when it was last used, and when it runs out. **End** signs a browser
+out at once, and **Revoke** stops an app or a key. Everyone sees and ends their own
+under **Where you're signed in** on their profile.
+
+The address is where each was last used from. Behind a reverse proxy, list the proxy's
+address under `trusted_proxies` in the server's config, or every address shown is the
+proxy's. The server only believes `X-Forwarded-For` from a proxy listed there, as
+anyone could send it otherwise.
+
 ### Signed-in apps
 
 The command line and the desktop apps sign in through the browser rather than with a

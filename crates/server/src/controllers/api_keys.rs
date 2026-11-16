@@ -255,6 +255,7 @@ mod tests {
             created_ms: 0,
             expires_ms,
             last_used_ms: None,
+            last_address: None,
             revoked_ms,
         }
     }

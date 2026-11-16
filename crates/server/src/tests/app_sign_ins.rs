@@ -11,7 +11,7 @@ const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 /// Where the app listens for the answer.
 const BACK: &str = "http://127.0.0.1:5555/callback";
-const PASSWORD: &str = "a long enough password";
+pub(super) const PASSWORD: &str = "a long enough password";
 
 fn authorize_path(back: &str, role: &str) -> String {
     format!(
@@ -88,7 +88,12 @@ async fn refresh(server: &TestServer, refresh_token: &str) -> (u16, Value) {
 }
 
 /// Calls the API with a token, giving back the status and any JSON.
-async fn call_json(server: &TestServer, token: &str, method: &str, path: &str) -> (u16, Value) {
+pub(super) async fn call_json(
+    server: &TestServer,
+    token: &str,
+    method: &str,
+    path: &str,
+) -> (u16, Value) {
     let mut stream = TcpStream::connect(server.address).await.unwrap();
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\
@@ -108,7 +113,7 @@ async fn call(server: &TestServer, token: &str, method: &str, path: &str) -> u16
 }
 
 /// Someone with this role, and a browser signed in as them.
-async fn person(server: &TestServer, email: &str, role: Role) -> (i64, Browser) {
+pub(super) async fn person(server: &TestServer, email: &str, role: Role) -> (i64, Browser) {
     let database = &server.state.database;
     let (user, link) = database
         .create_user(email, "Someone", role, now_ms())

@@ -32,6 +32,7 @@ mod rules;
 mod server;
 mod sessions;
 mod settings;
+mod sign_ins;
 mod silences;
 mod update_notice;
 mod users;
@@ -214,6 +215,7 @@ pub fn app(state: AppState) -> Router {
         .merge(app_sign_ins::routes())
         .merge(audit_log::routes())
         .merge(users::routes())
+        .merge(sign_ins::routes())
         .merge(hosts::routes())
         .merge(alerts::routes())
         .merge(actions::routes())

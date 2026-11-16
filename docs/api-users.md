@@ -28,6 +28,61 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/me"
 
 `role` is the lower of the person's role and the key's or app's.
 
+## List sign-ins
+
+`GET /api/v1/sign-ins`
+
+Everywhere people are signed in now: browsers, apps
+[signed in through the browser](api-app-sign-ins.md), and API keys used in the last 30
+days. Admins see everyone's, and everyone else only their own, most recently used
+first.
+
+```sh
+curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/sign-ins"
+```
+
+```json
+[
+  {
+    "kind": "browser",
+    "id": 12,
+    "user_id": 1,
+    "user": "you@example.com",
+    "role": "admin",
+    "name": "Chrome on macOS",
+    "address": "192.168.0.20",
+    "signed_in_ms": 1793940265767,
+    "last_used_ms": 1793940285797,
+    "expires_ms": 1796532265767,
+    "current": false
+  }
+]
+```
+
+| Field | Meaning |
+| --- | --- |
+| `kind` | `browser`, `app` or `api_key` |
+| `role` | What it can do now: the person's role, or the app's or key's if that's lower |
+| `name` | The browser, the app and its device, or the key's name |
+| `address` | Where it was last used from. Behind a proxy, the address the proxy passed on if it's one of `trusted_proxies` in the server's config, and otherwise the proxy's own |
+| `expires_ms` | When it stops working unless it's used. `null` for a key that never expires |
+| `current` | Whether it's the browser asking |
+
+`last_used_ms` is accurate to about a minute, or to the moment the address changed.
+
+## End a sign-in
+
+`DELETE /api/v1/sign-ins/{kind}/{id}`
+
+Signs a browser out, or revokes an app or an API key, at once. Admins can end anyone's,
+and everyone else their own. Returns `204`, or `404` for one that isn't there or isn't
+yours to end.
+
+```sh
+curl -X DELETE -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  "$MAXNINES_URL/api/v1/sign-ins/browser/12"
+```
+
 ## List users
 
 `GET /api/v1/users`

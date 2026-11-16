@@ -93,6 +93,16 @@
 </section>
 
 <section class="card">
+  <h2>Where you're signed in</h2>
+  <p class="hint">Your browsers, apps such as the command line, and API keys used in the last 30 days, with where each was last used from. End any you don't recognise, or that's on a device you've lost.</p>
+  {% if sign_ins %}
+  {% set show_person = false %}{% set back = "/profile" %}{% include "settings/_sign_ins_table.html" %}
+  {% else %}
+  <p class="empty">Nowhere else.</p>
+  {% endif %}
+</section>
+
+<section class="card">
   <h2>Password</h2>
   <form method="post" action="/profile/password" class="stacked">
     <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">

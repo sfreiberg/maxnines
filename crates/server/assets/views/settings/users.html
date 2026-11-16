@@ -6,6 +6,7 @@
   <h1>Users</h1>
   <p class="subtitle">Everyone who can sign in. There's no way to sign up, so people are only ever added here. Each person's role says what they may do.</p>
 </div>
+{% set users_tab = "people" %}{% include "settings/_users_tabs.html" %}
 
 {% if new_link %}
 <section class="card">

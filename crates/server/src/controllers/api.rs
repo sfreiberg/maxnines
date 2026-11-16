@@ -191,6 +191,8 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/audit-log", get(audit_log))
         .route("/api-keys/{id}", delete(revoke_api_key))
         .route("/me", get(me))
+        .route("/sign-ins", get(list_sign_ins))
+        .route("/sign-ins/{kind}/{id}", delete(end_sign_in))
         .route("/app-sign-ins", get(list_app_sign_ins))
         .route("/app-sign-ins/{id}", delete(revoke_app_sign_in))
         .route("/hosts/filter-options", get(filter_options))
@@ -494,6 +496,33 @@ async fn create_api_key(State(state): State<AppState>, Json(input): Json<NewApiK
 
 async fn revoke_api_key(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
     match super::api_keys::revoke_if_allowed(&state, id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn list_sign_ins(State(state): State<AppState>) -> Response {
+    let Some(whose) = super::sign_ins::whose() else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    match super::sign_ins::sign_ins(&state, whose, now_ms()).await {
+        Ok(sign_ins) => Json(sign_ins).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn end_sign_in(
+    State(state): State<AppState>,
+    UrlPath((kind, id)): UrlPath<(String, i64)>,
+) -> Response {
+    let Some(kind) = super::sign_ins::Kind::parse(&kind) else {
+        return failed(
+            StatusCode::NOT_FOUND,
+            "That's not a kind of sign-in: use browser, app or api_key",
+        );
+    };
+    match super::sign_ins::end_if_allowed(&state, kind, id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),

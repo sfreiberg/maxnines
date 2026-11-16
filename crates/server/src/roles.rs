@@ -81,13 +81,14 @@ const ADMIN_ONLY: [&str; 4] = [
 /// the person's own: their profile, their session, their API keys and signed-in
 /// apps, where the handlers check whose each is, and approving an app to act as them,
 /// which can't do more than they can.
-const OWN: [&str; 8] = [
+const OWN: [&str; 9] = [
     "/profile",
     "/logout",
     "/settings/api-keys",
     "/api-keys",
     "/settings/apps",
     "/app-sign-ins",
+    "/sign-ins",
     "/oauth/authorize",
     "/device",
 ];
@@ -320,6 +321,8 @@ mod tests {
             (Method::DELETE, "/api-keys/{id}"),
             (Method::POST, "/settings/apps/{id}/revoke"),
             (Method::DELETE, "/app-sign-ins/{id}"),
+            (Method::DELETE, "/sign-ins/{kind}/{id}"),
+            (Method::POST, "/profile/sign-ins/{kind}/{id}/end"),
             (Method::POST, "/oauth/authorize"),
             (Method::POST, "/device"),
             (Method::POST, "/device/decide"),

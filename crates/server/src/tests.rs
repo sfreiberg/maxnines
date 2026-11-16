@@ -8,6 +8,7 @@ mod dashboards;
 mod docs;
 mod events;
 mod roles;
+mod sign_ins;
 mod two_factor;
 mod users;
 
@@ -192,7 +193,10 @@ async fn start_with_heartbeat(
         .await
         .unwrap()
         .unwrap();
-    let session = database.start_session(user.id, now_ms()).await.unwrap();
+    let session = database
+        .start_session(user.id, now_ms(), None)
+        .await
+        .unwrap();
     let (_, api_key) = database
         .create_api_key("tests", user.id, crate::roles::Role::Admin, None, now_ms())
         .await

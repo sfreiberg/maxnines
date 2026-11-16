@@ -23,6 +23,8 @@ pub struct Model {
     pub refresh_expires_ms: i64,
     pub created_ms: i64,
     pub last_used_ms: Option<i64>,
+    /// The address it was last used from.
+    pub last_address: Option<String>,
     pub revoked_ms: Option<i64>,
 }
 

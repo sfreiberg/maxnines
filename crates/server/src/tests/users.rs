@@ -331,7 +331,7 @@ async fn a_session_runs_out() {
     let id = person(&server, "a@example.com").await;
     let database = &server.state.database;
     let long_ago = now_ms() - crate::models::SESSION_LIFETIME_MS - 1000;
-    let token = database.start_session(id, long_ago).await.unwrap();
+    let token = database.start_session(id, long_ago, None).await.unwrap();
 
     assert!(
         database
@@ -351,7 +351,10 @@ async fn sessions_and_links_are_only_stored_as_hashes() {
         .await
         .unwrap()
         .unwrap();
-    let session = database.start_session(user.id, now_ms()).await.unwrap();
+    let session = database
+        .start_session(user.id, now_ms(), None)
+        .await
+        .unwrap();
 
     let saved = database.saved_secrets().await.join("\n");
     assert!(!saved.is_empty());
@@ -525,7 +528,7 @@ async fn a_sign_in_finishing_just_as_someone_is_disabled_does_not_count() {
     let database = &server.state.database;
     database.disable_user(id, now_ms()).await.unwrap();
 
-    let token = database.start_session(id, now_ms()).await.unwrap();
+    let token = database.start_session(id, now_ms(), None).await.unwrap();
 
     let user = database.session_user(&token, now_ms()).await.unwrap();
     assert_eq!(user, None);

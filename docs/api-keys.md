@@ -29,12 +29,14 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/api-keys
     "created_ms": 1793940265767,
     "expires_ms": 1793943865767,
     "last_used_ms": 1793940285797,
+    "last_address": "192.168.0.20",
     "revoked_ms": null
   }
 ]
 ```
 
-`last_used_ms` is accurate to about a minute.
+`last_used_ms` is accurate to about a minute. `last_address` is where it was last used
+from.
 
 ## Add an API key
 
@@ -65,6 +67,7 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "created_ms": 1793940286623,
   "expires_ms": 1793943886623,
   "last_used_ms": null,
+  "last_address": null,
   "revoked_ms": null
 }
 ```

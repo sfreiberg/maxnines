@@ -1,0 +1,16 @@
+{% extends "layouts/application.html" %}
+{% block title %}Sign-ins · MaxNines{% endblock title %}
+{% block content %}
+<p class="breadcrumb"><a href="/settings">Settings</a></p>
+<div>
+  <h1>Users</h1>
+  <p class="subtitle">Everyone signed in now: in a browser, in an app such as the command line, or with an API key used in the last 30 days. The role is what each can do now, which for an app or a key may be less than the person's own. The address is where each was last used from. Ending one signs it out at once.</p>
+</div>
+{% set users_tab = "sign_ins" %}{% include "settings/_users_tabs.html" %}
+
+{% if sign_ins %}
+{% set show_person = true %}{% set back = "/settings/users/sign-ins" %}{% include "settings/_sign_ins_table.html" %}
+{% else %}
+<p class="empty">Nobody's signed in.</p>
+{% endif %}
+{% endblock content %}

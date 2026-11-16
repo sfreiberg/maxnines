@@ -330,7 +330,13 @@ async fn profile_page(
             chosen: *value == user.theme,
         })
         .collect();
+    let now = crate::metrics::now_ms();
+    let sign_ins = match super::sign_ins::sign_ins(state, Some(user.id), now).await {
+        Ok(found) => super::sign_ins::rows(found, now),
+        Err(error) => return server_error(&error),
+    };
     let page = Page::new(state, token, "profile/show.html")
+        .with("sign_ins", &sign_ins)
         .with("person", &user)
         .with("themes", &themes)
         .with("zones", &zone_names())

@@ -52,11 +52,25 @@ fn cookie_named<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         .find_map(|cookie| cookie.trim().strip_prefix(name)?.strip_prefix('='))
 }
 
-async fn session_user(state: &AppState, headers: &HeaderMap) -> anyhow::Result<Option<User>> {
+async fn session_user(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> anyhow::Result<Option<(User, i64)>> {
     match session_token(headers) {
-        Some(token) => state.database.session_user(token, now_ms()).await,
+        Some(token) => state.database.session(token, now_ms()).await,
         None => Ok(None),
     }
+}
+
+tokio::task_local! {
+    /// The browser session this request came with, if it came with one.
+    static THIS_SESSION: i64;
+}
+
+/// The browser session this request came with, so a list of sign-ins can say which
+/// is this one.
+pub fn this_session() -> Option<i64> {
+    THIS_SESSION.try_with(|id| *id).ok()
 }
 
 /// Lets through someone signed in, or a script with an API key, and sends anyone
@@ -67,7 +81,7 @@ pub async fn require_login(
     next: Next,
 ) -> Response {
     match session_user(&state, request.headers()).await {
-        Ok(Some(user)) => {
+        Ok(Some((user, session))) => {
             // When everyone has to use two-factor, someone without it can only
             // reach their profile, to set it up, and sign out.
             let path = request.uri().path();
@@ -76,7 +90,9 @@ pub async fn require_login(
             if required && !user.two_factor && !allowed {
                 return redirect(&request, PROFILE_PAGE);
             }
-            run_as(&state, user, None, request, next).await
+            THIS_SESSION
+                .scope(session, run_as(&state, user, None, request, next))
+                .await
         }
         Ok(None) => match api::key_holder(&state, request.headers()).await {
             Ok(Some((owner, via))) => run_as(&state, owner, Some(via), request, next).await,
@@ -132,9 +148,25 @@ fn session_cookie(state: &AppState, value: String, lifetime_ms: i64) -> Option<H
     HeaderValue::from_str(&cookie.to_string()).ok()
 }
 
+/// What a browser says it is, for the list of where someone's signed in.
+fn user_agent(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+}
+
 /// Signs someone in on this browser and sends them on.
-async fn signed_in_response(state: &AppState, user_id: i64, next: &str) -> Response {
-    let token = match state.database.start_session(user_id, now_ms()).await {
+async fn signed_in_response(
+    state: &AppState,
+    user_id: i64,
+    next: &str,
+    user_agent: Option<&str>,
+) -> Response {
+    let token = match state
+        .database
+        .start_session(user_id, now_ms(), user_agent)
+        .await
+    {
         Ok(token) => token,
         Err(error) => return server_error(&error),
     };
@@ -157,9 +189,14 @@ fn challenge_cookie(state: &AppState, value: String, lifetime_ms: i64) -> Option
 
 /// What follows a right password, or a password set from a link: signed in, or for
 /// someone with two-factor on, asked for a code first.
-async fn after_password(state: &AppState, user: &User, next: &str) -> Response {
+async fn after_password(
+    state: &AppState,
+    user: &User,
+    next: &str,
+    user_agent: Option<&str>,
+) -> Response {
     if !user.two_factor {
-        return signed_in_response(state, user.id, next).await;
+        return signed_in_response(state, user.id, next, user_agent).await;
     }
     let token = match state
         .database
@@ -262,7 +299,7 @@ async fn check_code(
     if let Err(error) = state.database.end_sign_in_challenge(challenge).await {
         return server_error(&error);
     }
-    let mut response = signed_in_response(&state, user.id, &next).await;
+    let mut response = signed_in_response(&state, user.id, &next, user_agent(&headers)).await;
     if let Some(cookie) = challenge_cookie(&state, String::new(), 0) {
         response.headers_mut().append(header::SET_COOKIE, cookie);
     }
@@ -335,7 +372,7 @@ async fn sign_in(
         Err(error) => return server_error(&error),
     };
     if matches && let Some(user) = &user {
-        return after_password(&state, user, &next).await;
+        return after_password(&state, user, &next, user_agent(&headers)).await;
     }
     if let Err(error) = state
         .database
@@ -406,6 +443,7 @@ async fn setup_page(
 async fn setup(
     State(state): State<AppState>,
     Path(link): Path<String>,
+    headers: HeaderMap,
     form: CsrfForm,
 ) -> Response {
     let user = match state.database.setup_link_user(&link, now_ms()).await {
@@ -433,7 +471,7 @@ async fn setup(
         .use_setup_link(user.id, &link, &hash, now_ms())
         .await;
     match saved {
-        Ok(true) => after_password(&state, &user, SIGNED_IN_HOME).await,
+        Ok(true) => after_password(&state, &user, SIGNED_IN_HOME, user_agent(&headers)).await,
         Ok(false) => setup_form(&state, &form.token, &link, None, None),
         Err(error) => server_error(&error),
     }

@@ -23,6 +23,36 @@ use crate::audit::{Action, Actor, Kind, Record, Snapshot, Subject};
 use crate::roles::Role;
 use crate::times::{DEFAULT_TIME_ZONE, zone_named};
 
+/// A browser someone's signed in on, as the list of sign-ins shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserSession {
+    pub id: i64,
+    pub user_id: i64,
+    pub created_ms: i64,
+    pub expires_ms: i64,
+    pub last_used_ms: Option<i64>,
+    pub last_address: Option<String>,
+    /// What the browser said it was when it signed in.
+    pub user_agent: Option<String>,
+}
+
+impl From<user_session::Model> for BrowserSession {
+    fn from(row: user_session::Model) -> Self {
+        Self {
+            id: row.id,
+            user_id: row.user_id,
+            created_ms: row.created_ms,
+            expires_ms: row.expires_ms,
+            last_used_ms: row.last_used_ms,
+            last_address: row.last_address,
+            user_agent: row.user_agent,
+        }
+    }
+}
+
+/// The most of what a browser says it is that's kept.
+const MAX_USER_AGENT_CHARS: usize = 255;
+
 pub const SESSION_LIFETIME_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const SETUP_LINK_LIFETIME_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const MAX_EMAIL_LEN: usize = 254;
@@ -578,8 +608,13 @@ impl Database {
     }
 
     /// Signs someone in, and gives back the only copy of the session's token. Every
-    /// way of signing in ends here.
-    pub async fn start_session(&self, user_id: i64, now_ms: i64) -> Result<String> {
+    /// way of signing in ends here. `user_agent` is what the browser said it was.
+    pub async fn start_session(
+        &self,
+        user_id: i64,
+        now_ms: i64,
+        user_agent: Option<&str>,
+    ) -> Result<String> {
         user_session::Entity::delete_many()
             .filter(user_session::Column::ExpiresMs.lte(now_ms))
             .exec(&self.connection)
@@ -595,6 +630,11 @@ impl Database {
             token_hash: Set(token_hash(&token)),
             created_ms: Set(now_ms),
             expires_ms: Set(now_ms + SESSION_LIFETIME_MS),
+            last_used_ms: Set(Some(now_ms)),
+            last_address: Set(crate::audit::source().map(|address| address.to_string())),
+            user_agent: Set(
+                user_agent.map(|agent| agent.chars().take(MAX_USER_AGENT_CHARS).collect())
+            ),
             ..Default::default()
         }
         .insert(&transaction)
@@ -615,6 +655,12 @@ impl Database {
 
     /// Who a session belongs to, if it's still good.
     pub async fn session_user(&self, token: &str, now_ms: i64) -> Result<Option<User>> {
+        Ok(self.session(token, now_ms).await?.map(|(user, _)| user))
+    }
+
+    /// Who a session belongs to and its ID, if it's still good, noting that it's been
+    /// used and from where.
+    pub async fn session(&self, token: &str, now_ms: i64) -> Result<Option<(User, i64)>> {
         let session = user_session::Entity::find()
             .filter(user_session::Column::TokenHash.eq(token_hash(token)))
             .filter(user_session::Column::ExpiresMs.gt(now_ms))
@@ -629,7 +675,24 @@ impl Database {
             .one(&self.connection)
             .await
             .context("loading a session's user")?;
-        Ok(row.map(Into::into))
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let id = session.id;
+        if let Some((used, address)) = super::noted_use(
+            session.last_used_ms,
+            session.last_address.as_deref(),
+            now_ms,
+        ) {
+            let mut session: user_session::ActiveModel = session.into();
+            session.last_used_ms = Set(Some(used));
+            session.last_address = Set(address);
+            session
+                .update(&self.connection)
+                .await
+                .context("noting a session's use")?;
+        }
+        Ok(Some((row.into(), id)))
     }
 
     /// Every secret saved for users and sessions, for checking what's kept.
@@ -670,6 +733,49 @@ impl Database {
             record(&transaction, entry).await?;
         }
         transaction.commit().await.context("ending a session")
+    }
+
+    /// Browser sessions that haven't run out, newest first: everyone's, or only
+    /// `user_id`'s.
+    pub async fn list_sessions(
+        &self,
+        user_id: Option<i64>,
+        now_ms: i64,
+    ) -> Result<Vec<BrowserSession>> {
+        let mut query = user_session::Entity::find()
+            .filter(user_session::Column::ExpiresMs.gt(now_ms))
+            .order_by_desc(user_session::Column::Id);
+        if let Some(user_id) = user_id {
+            query = query.filter(user_session::Column::UserId.eq(user_id));
+        }
+        let rows = query
+            .all(&self.connection)
+            .await
+            .context("loading sessions")?;
+        Ok(rows.into_iter().map(BrowserSession::from).collect())
+    }
+
+    /// Ends a browser session, recorded as signed out by whoever's acting. Gives back
+    /// whose it was, or nothing if there's no such session.
+    pub async fn end_session_by_id(&self, id: i64) -> Result<Option<i64>> {
+        let transaction = self.connection.begin().await.context("starting a save")?;
+        let Some(session) = user_session::Entity::find_by_id(id)
+            .one(&transaction)
+            .await
+            .context("loading a session")?
+        else {
+            return Ok(None);
+        };
+        user_session::Entity::delete_by_id(id)
+            .exec(&transaction)
+            .await
+            .context("ending a session")?;
+        if let Some(row) = load(&transaction, session.user_id).await? {
+            let subject = Subject::new(Kind::User, row.id, row.email.clone());
+            record(&transaction, Record::new(Action::SignedOut, subject)).await?;
+        }
+        transaction.commit().await.context("ending a session")?;
+        Ok(Some(session.user_id))
     }
 
     /// Notes that someone failed to sign in as `email`, which may be nobody's.

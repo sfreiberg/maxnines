@@ -10,7 +10,7 @@ use serde_json::json;
 
 use super::audit::record_change;
 use super::users::enabled_user;
-use super::{Database, USE_ACCURACY_MS, User, app_sign_in, owner_emails, user};
+use super::{Database, User, app_sign_in, owner_emails, user};
 use crate::app_sign_ins::{
     ACCESS_LIFETIME_MS, ACCESS_PREFIX, REFRESH_GRACE_MS, REFRESH_LIFETIME_MS, REFRESH_PREFIX,
     client, new_secret, secret_hash,
@@ -33,6 +33,8 @@ pub struct AppSignIn {
     pub role: Role,
     pub created_ms: i64,
     pub last_used_ms: Option<i64>,
+    /// The address it was last used from.
+    pub last_address: Option<String>,
     /// When it stops working unless it's used before then.
     pub expires_ms: i64,
     pub revoked_ms: Option<i64>,
@@ -52,6 +54,7 @@ impl AppSignIn {
             device: row.device,
             created_ms: row.created_ms,
             last_used_ms: row.last_used_ms,
+            last_address: row.last_address,
             expires_ms: row.refresh_expires_ms,
             revoked_ms: row.revoked_ms,
         }
@@ -167,6 +170,7 @@ impl Database {
             refresh_expires_ms: Set(now_ms + REFRESH_LIFETIME_MS),
             created_ms: Set(now_ms),
             last_used_ms: Set(Some(now_ms)),
+            last_address: Set(crate::audit::source().map(|address| address.to_string())),
             ..Default::default()
         }
         .insert(&transaction)
@@ -208,12 +212,11 @@ impl Database {
         };
         let role = Role::parse(&row.role).unwrap_or(Role::Viewer);
         owner.role = owner.role.min(role);
-        let stale = row
-            .last_used_ms
-            .is_none_or(|used| now_ms - used >= USE_ACCURACY_MS);
-        let row = if stale {
+        let noted = super::noted_use(row.last_used_ms, row.last_address.as_deref(), now_ms);
+        let row = if let Some((used, address)) = noted {
             let mut row: app_sign_in::ActiveModel = row.into();
-            row.last_used_ms = Set(Some(now_ms));
+            row.last_used_ms = Set(Some(used));
+            row.last_address = Set(address);
             row.update(&self.connection)
                 .await
                 .context("noting an app's use")?

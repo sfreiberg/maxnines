@@ -18,6 +18,8 @@ pub struct Model {
     /// Empty means it never expires.
     pub expires_ms: Option<i64>,
     pub last_used_ms: Option<i64>,
+    /// The address it was last used from.
+    pub last_address: Option<String>,
     pub revoked_ms: Option<i64>,
 }
 

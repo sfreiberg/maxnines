@@ -283,6 +283,9 @@ erDiagram
         string token_hash UK
         int created_ms
         int expires_ms
+        int last_used_ms
+        string last_address
+        string user_agent
     }
     api_keys {
         int id PK
@@ -294,6 +297,7 @@ erDiagram
         int created_ms
         int expires_ms
         int last_used_ms
+        string last_address
         int revoked_ms
     }
     app_sign_ins {
@@ -310,6 +314,7 @@ erDiagram
         int refresh_expires_ms
         int created_ms
         int last_used_ms
+        string last_address
         int revoked_ms
     }
     recovery_codes {
@@ -423,7 +428,7 @@ erDiagram
 | `dashboards`, `dashboard_widgets`, `dashboard_variables` | Dashboards and what's on them |
 | `location_rules` | Where hosts are on the map |
 | `remote_checks` | Checks the server runs itself, each about a host without an agent or the server, with a name no other check about that host has. Deleting a host deletes its checks first |
-| `users`, `user_sessions`, `api_keys`, `recovery_codes`, `sign_in_challenges` | People, how they sign in, and their keys |
+| `users`, `user_sessions`, `api_keys`, `recovery_codes`, `sign_in_challenges` | People, how they sign in, and their keys. Each browser session, key and app sign-in keeps where it was last used from, for the list of who's signed in |
 | `app_sign_ins` | Apps people signed in through the browser, such as the command line, with hashes of the tokens each holds. A refresh token that's been swapped is kept a moment, so using it again can be told apart from a lost answer |
 | `audit_log` | Who changed what |
 | `server_settings`, `server_secrets` | Settings for the whole server, and secrets it generates |
