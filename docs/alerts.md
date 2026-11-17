@@ -86,7 +86,9 @@ then on of every change until it resolves:
 
 A resolved notification says where things stand as the problem cleared rather than
 repeating what was wrong, like `CPU usage on web-1 is now 42%, no longer above 90%`,
-`Disk usage (/) on web-1 is now 83.7% and steady` or `web-1 is back online`. Email,
+`Disk usage (/) on web-1 is now 83.7% and steady`,
+`Disk usage (/) on web-1 is now 84% and rising by 0.6% an hour, so it reaches 100% in about 27 hours, no longer within 1 day`
+or `web-1 is back online`. Email,
 Telegram and Teams add what it said when it fired. In Slack, the message the alert
 fired with is marked resolved and keeps its words, and the reply in its thread says
 where things stand now.

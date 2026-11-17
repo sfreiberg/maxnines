@@ -684,6 +684,11 @@ impl AlertRuleInput {
                 format_value(metric.unit, level),
                 format_eta(eta)
             ));
+            // It cleared because that is further off than the rule looks, which
+            // the rounded time alone doesn't say.
+            if let Some(ahead) = self.forecast_levels().iter().map(|(_, secs)| *secs).max() {
+                summary.push_str(&format!(", no longer within {}", format_duration(ahead)));
+            }
         }
         Ok(summary)
     }
@@ -1099,6 +1104,8 @@ mod tests {
             kind: RuleKind::Forecast,
             metric: Some("disk.usage".to_string()),
             threshold: Some(100.0),
+            forecast_secs: Some(4 * 3600),
+            warning_forecast_secs: Some(86_400),
             ..metric_rule()
         };
         let metric = crate::metrics::find("disk.usage").unwrap();
@@ -1117,7 +1124,12 @@ mod tests {
         );
         assert_eq!(
             said(0.1, Some(164 * 3600)),
-            "Disk usage (/) on web-1 is now 83.6% and rising by 0.1% an hour, so it reaches 100% in about 7 days"
+            "Disk usage (/) on web-1 is now 83.6% and rising by 0.1% an hour, so it reaches 100% in about 7 days, no longer within 1 day"
+        );
+        // Rounded, the time can look like it's still inside the day the rule watches.
+        assert_eq!(
+            said(0.6, Some(24 * 3600 + 600)),
+            "Disk usage (/) on web-1 is now 83.6% and rising by 0.6% an hour, so it reaches 100% in about 24 hours, no longer within 1 day"
         );
     }
 

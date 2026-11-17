@@ -8233,7 +8233,7 @@ async fn the_built_in_forecast_warns_a_day_ahead_and_goes_critical_four_hours_ah
     assert_eq!(
         resolved[0].resolved_summary.as_deref(),
         Some(
-            "Disk usage (/) on web-1 is now 93% and rising by 0.2% an hour, so it reaches 100% in about 35 hours"
+            "Disk usage (/) on web-1 is now 93% and rising by 0.2% an hour, so it reaches 100% in about 35 hours, no longer within 1 day"
         )
     );
 }
