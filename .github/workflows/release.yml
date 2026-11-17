@@ -70,7 +70,16 @@ jobs:
     name: Server for Linux ${{ matrix.arch }}
     needs: check
     runs-on: ${{ matrix.runner }}
-    container: rockylinux:9
+    container:
+      image: rockylinux:9
+      # The rockylinux:9 image published on 2026-11-13 no longer sets PATH.
+      # Commands still run on Docker's default PATH until a step adds to
+      # GITHUB_PATH (the Rust setup adds Cargo's bin folder); the runner then
+      # builds PATH from the added folders plus the image's own, which is now
+      # empty, and every later step fails with "bash: executable file not found".
+      # Setting PATH here, as the older image did, keeps the default folders in.
+      env:
+        PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     strategy:
       matrix:
         include:
