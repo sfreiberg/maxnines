@@ -117,7 +117,7 @@ impl Notice {
             Event::Escalated => format!("Now critical: {}", alert.summary),
             Event::Eased => format!("Down to a warning: {}", alert.summary),
             Event::Reminder => format!("Still firing: {}", alert.summary),
-            Event::Resolved => format!("Resolved: {}", alert.summary),
+            Event::Resolved => format!("Resolved: {}", said_as(&alert, event)),
             _ => alert.summary.clone(),
         };
         Self {
@@ -144,9 +144,17 @@ impl Notice {
     /// What it's about, in a sentence: what's wrong, or how an action went.
     pub(crate) fn summary(&self) -> &str {
         match (&self.action, &self.alert) {
-            (None, Some(alert)) => &alert.summary,
+            (None, Some(alert)) => said_as(alert, self.event),
             _ => &self.text,
         }
+    }
+
+    /// What it said when it fired, for a resolved notification that leads with
+    /// where things stand now instead. Nothing for any other.
+    pub(crate) fn fired_summary(&self) -> Option<&str> {
+        let alert = self.alert.as_ref()?;
+        (self.event == Event::Resolved && alert.resolved_summary.is_some())
+            .then_some(alert.summary.as_str())
     }
 
     /// What the action printed, up to `max` characters, ending at the end of a
@@ -200,7 +208,7 @@ impl Notice {
         let summary = self
             .alert
             .as_ref()
-            .map_or(self.text.as_str(), |a| &a.summary);
+            .map_or(self.text.as_str(), |a| said_as(a, self.event));
         format!("The last hour: {summary}")
     }
 
@@ -241,6 +249,15 @@ pub(crate) enum Tone {
     Warning,
     Clear,
     Neutral,
+}
+
+/// What an alert says in a notification about `event`: where things stand now once
+/// the problem's cleared, and otherwise what's wrong.
+fn said_as(alert: &Alert, event: Event) -> &str {
+    match (event, &alert.resolved_summary) {
+        (Event::Resolved, Some(now)) => now,
+        _ => &alert.summary,
+    }
 }
 
 pub fn format_ms(ms: i64) -> String {
@@ -349,11 +366,13 @@ pub async fn send(
     guarded(kind.name(), DELIVERY_LIMIT, sending).await
 }
 
-/// Whether a notification goes with a chart: an alert starting or getting worse,
-/// on a channel that shows pictures.
+/// Whether a notification goes with a chart: an alert starting, getting worse or
+/// ending, on a channel that shows pictures.
 fn shows_chart(delivery: &Delivery) -> bool {
-    matches!(delivery.event, Event::Firing | Event::Escalated)
-        && channels::of(delivery.channel.channel.kind).shows_charts()
+    matches!(
+        delivery.event,
+        Event::Firing | Event::Escalated | Event::Resolved
+    ) && channels::of(delivery.channel.channel.kind).shows_charts()
 }
 
 /// Runs a send with a time limit, turning a panic into an ordinary failure.

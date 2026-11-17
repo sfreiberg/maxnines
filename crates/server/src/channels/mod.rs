@@ -251,6 +251,7 @@ pub(crate) mod testing {
             started_ms: 1_000,
             resolved_ms: None,
             resolve_reason: None,
+            resolved_summary: None,
             acknowledged_by: None,
             acknowledged_ms: None,
         }

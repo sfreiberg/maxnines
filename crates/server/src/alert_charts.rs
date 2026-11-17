@@ -256,22 +256,32 @@ fn svg(
         );
     }
 
-    // When the alert started, if it was within the hour.
-    if alert.started_ms >= range.from_ms {
-        let x = metric_charts::x_of(alert.started_ms, range, frame);
+    // When the alert started and ended, if within the hour, each label on its own
+    // row so the two never cover each other.
+    let moments = [
+        (Some(alert.started_ms), "Started", colour("muted"), 6.0),
+        (alert.resolved_ms, "Resolved", colour("good"), 18.0),
+    ];
+    for (time, label, paint, above) in moments {
+        let Some(time) = time.filter(|time| (range.from_ms..=range.to_ms).contains(time)) else {
+            continue;
+        };
+        let x = metric_charts::x_of(time, range, frame);
         let _ = write!(
             svg,
-            r#"<line x1="{x}" x2="{x}" y1="{}" y2="{}" stroke="{}" stroke-width="1" stroke-dasharray="2 3"/>"#,
-            chart.top,
-            chart.bottom,
-            colour("muted")
+            r#"<line x1="{x}" x2="{x}" y1="{}" y2="{}" stroke="{paint}" stroke-width="1" stroke-dasharray="2 3"/>"#,
+            chart.top, chart.bottom,
         );
+        // Beside the line, on whichever side has room for it.
+        let (label_x, anchor) = if x + 4.0 + label_width(label) <= chart.right {
+            (x + 4.0, "start")
+        } else {
+            (x - 4.0, "end")
+        };
         let _ = write!(
             svg,
-            r#"<text x="{}" y="{}" font-size="10" fill="{}">Started</text>"#,
-            x + 4.0,
-            chart.bottom - 6.0,
-            colour("muted")
+            r#"<text x="{label_x}" y="{}" font-size="10" text-anchor="{anchor}" fill="{paint}">{label}</text>"#,
+            chart.bottom - above,
         );
     }
 
@@ -331,6 +341,12 @@ fn svg(
     svg
 }
 
+/// About how wide a label is in the 10px font, wide enough never to run off the
+/// edge.
+fn label_width(label: &str) -> f64 {
+    label.chars().count() as f64 * 6.5
+}
+
 fn png(svg: &str) -> Result<Vec<u8>> {
     let options = usvg::Options {
         fontdb: FONTS.clone(),
@@ -373,6 +389,7 @@ mod tests {
             started_ms: 1_700_000_000_000 - 600_000,
             resolved_ms: None,
             resolve_reason: None,
+            resolved_summary: None,
             acknowledged_by: None,
             acknowledged_ms: None,
         }
@@ -435,6 +452,7 @@ mod tests {
             "muted",
             "warn",
             "bad",
+            "good",
             "series-1",
             "border-strong",
         ] {
@@ -458,6 +476,29 @@ mod tests {
         assert!(svg.contains(">90% critical</text>"));
         assert!(svg.contains("<polyline"));
         assert!(!svg.contains("web-<1>"));
+        assert!(svg.contains(r#"text-anchor="start" fill="#), "{svg}");
+        assert!(!svg.contains(">Resolved</text>"), "{svg}");
+    }
+
+    #[test]
+    fn a_resolved_chart_marks_both_ends_inside_the_frame() {
+        let metric = metrics::find("disk.usage").unwrap();
+        let (range, result) = hour();
+        // Started a moment ago and ended now, both at the right edge.
+        let alert = Alert {
+            started_ms: range.to_ms - 1000,
+            resolved_ms: Some(range.to_ms),
+            ..alert()
+        };
+        let svg = svg(&alert, &rule(), metric, metric.unit, &result, range);
+
+        let started = svg.find(">Started</text>").expect("started");
+        let resolved = svg.find(">Resolved</text>").expect("resolved");
+        for end in [started, resolved] {
+            let tag = &svg[svg[..end].rfind("<text").unwrap()..end];
+            assert!(tag.contains(r#"text-anchor="end""#), "{tag}");
+        }
+        assert!(svg.contains(&format!(r#"fill="{}">Resolved"#, colour("good"))));
     }
 
     #[test]

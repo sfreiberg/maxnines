@@ -84,6 +84,13 @@ then on of every change until it resolves:
   critical. An alert that's critical from the start isn't sent.
 - **Both**, the default: everything.
 
+A resolved notification says where things stand as the problem cleared rather than
+repeating what was wrong, like `CPU usage on web-1 is now 42%, no longer above 90%`,
+`Disk usage (/) on web-1 is now 83.7% and steady` or `web-1 is back online`. Email,
+Telegram and Teams add what it said when it fired. In Slack, the message the alert
+fired with is marked resolved and keeps its words, and the reply in its thread says
+where things stand now.
+
 ## Actions
 
 A metric or forecast rule can run actions on the alert's host, and what they print is

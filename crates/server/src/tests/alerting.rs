@@ -272,7 +272,8 @@ async fn a_metric_alert_fires_once_and_resolves_when_it_clears() {
         "one alert, however long it lasts"
     );
 
-    // It resolves with the first reading that's clear, without waiting.
+    // It resolves with the first reading that's clear, without waiting, saying
+    // what the reading is now.
     test.cpu(4 * MINUTE_MS, 10.0).await;
     assert!(test.open().await.is_empty());
     let resolved = test.resolved().await;
@@ -280,6 +281,10 @@ async fn a_metric_alert_fires_once_and_resolves_when_it_clears() {
     assert_eq!(
         resolved[0].resolve_reason.as_deref(),
         Some("The problem cleared")
+    );
+    assert_eq!(
+        resolved[0].resolved_summary.as_deref(),
+        Some("CPU usage on web-1 is now 10%, no longer above 90%")
     );
     assert_eq!(resolved[0].resolved_ms, Some(test.now + 4 * MINUTE_MS));
 
@@ -1288,7 +1293,12 @@ async fn an_agent_coming_back_resolves_at_once() {
 
     test.evaluator.evaluate(back).await.unwrap();
     assert!(test.open().await.is_empty());
-    assert_eq!(test.resolved().await.len(), 1);
+    let resolved = test.resolved().await;
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(
+        resolved[0].resolved_summary.as_deref(),
+        Some("web-1 is back online")
+    );
 }
 
 #[tokio::test]
@@ -1930,11 +1940,19 @@ async fn a_webhook_hears_about_an_alert_starting_and_ending_once_each() {
     assert_eq!(received[0]["text"], "CPU usage on web-1 is 95%, above 90%");
     assert_eq!(
         received[1]["text"],
-        "Resolved: CPU usage on web-1 is 95%, above 90%"
+        "Resolved: CPU usage on web-1 is now 10%, no longer above 90%"
     );
     assert_eq!(
         received[1]["alert"]["resolve_reason"],
         "The problem cleared"
+    );
+    assert_eq!(
+        received[1]["alert"]["resolved_summary"],
+        "CPU usage on web-1 is now 10%, no longer above 90%"
+    );
+    assert_eq!(
+        received[1]["alert"]["summary"],
+        "CPU usage on web-1 is 95%, above 90%"
     );
     assert_ne!(received[0]["id"], received[1]["id"]);
 }
@@ -3315,7 +3333,10 @@ async fn resolving_updates_the_slack_message_and_replies_in_its_thread() {
     assert_eq!(update["attachments"][0]["color"], "#0b6b4b");
     let reply = &calls[2].2;
     assert_eq!(reply["thread_ts"], "1700000000.000100");
-    assert_eq!(reply["text"], "The problem cleared");
+    assert_eq!(
+        reply["text"],
+        "CPU usage on web-1 is now 10%, no longer above 90%"
+    );
 }
 
 #[tokio::test]
@@ -3702,11 +3723,11 @@ async fn resolving_an_alert_twice_only_tells_people_once() {
     let alert = test.open().await[0].id;
     let later = test.now + MINUTE_MS;
     test.database()
-        .resolve_alert(alert, later, "first")
+        .resolve_alert(alert, later, "first", None)
         .await
         .unwrap();
     test.database()
-        .resolve_alert(alert, later + 1, "second")
+        .resolve_alert(alert, later + 1, "second", None)
         .await
         .unwrap();
     notifier.deliver_due(later + 2).await.unwrap();
@@ -4755,7 +4776,12 @@ async fn the_alerts_page_shows_what_is_firing_and_what_ended() {
     test.cpu(MINUTE_MS, 10.0).await;
     let page = browser.get(&test.server, "/alerts").await;
     assert!(page.body.contains("No alerts are open."));
-    assert!(page.body.contains("The problem cleared"), "{}", page.body);
+    assert!(
+        page.body
+            .contains("CPU usage on web-1 is now 10%, no longer above 90%"),
+        "{}",
+        page.body
+    );
 }
 
 #[tokio::test]
@@ -5706,7 +5732,7 @@ mod silences {
         let open = test.open().await;
         let resolved = test
             .database()
-            .resolve_alert(open[0].id, test.now + 2000, "Fixed");
+            .resolve_alert(open[0].id, test.now + 2000, "Fixed", None);
         resolved.await.unwrap();
 
         assert_eq!(deliver(&test, &notifier, &hook, 3000).await, 0);
@@ -5726,7 +5752,7 @@ mod silences {
         let open = test.open().await;
         let resolved = test
             .database()
-            .resolve_alert(open[0].id, test.now + 500, "Fixed");
+            .resolve_alert(open[0].id, test.now + 500, "Fixed", None);
         resolved.await.unwrap();
 
         assert_eq!(deliver(&test, &notifier, &hook, 1000).await, 0);
@@ -5748,7 +5774,7 @@ mod silences {
         let open = test.open().await;
         let resolved = test
             .database()
-            .resolve_alert(open[0].id, test.now + 3000, "Fixed");
+            .resolve_alert(open[0].id, test.now + 3000, "Fixed", None);
         resolved.await.unwrap();
 
         assert_eq!(deliver(&test, &notifier, &hook, 4000).await, 2);
@@ -6482,7 +6508,7 @@ mod reminders {
         firing(&mut test, &hook, ChannelKind::Webhook, "").await;
         let id = test.open().await[0].id;
         test.database()
-            .resolve_alert(id, test.now, "Fixed")
+            .resolve_alert(id, test.now, "Fixed", None)
             .await
             .unwrap();
 
@@ -6552,7 +6578,7 @@ mod reminders {
 
         let id = test.open().await[0].id;
         test.database()
-            .resolve_alert(id, test.now + HOUR_MS, "Fixed")
+            .resolve_alert(id, test.now + HOUR_MS, "Fixed", None)
             .await
             .unwrap();
         at(&test, &notifier, 2 * HOUR_MS).await;
@@ -7545,7 +7571,7 @@ mod charts {
     }
 
     #[tokio::test]
-    async fn discord_gets_the_chart_attached_when_an_alert_starts_but_not_ends() {
+    async fn discord_gets_the_chart_attached_when_an_alert_starts_and_ends() {
         let server = start_with_metrics().await;
         let (host, _client) = report_samples(&server, "/data").await;
         let capture = Capture::default();
@@ -7578,12 +7604,18 @@ mod charts {
         server
             .state
             .database
-            .resolve_alert(alert.id, now_ms(), "The problem cleared")
+            .resolve_alert(alert.id, now_ms(), "The problem cleared", None)
             .await
             .unwrap();
         notifier.deliver_due(now_ms()).await.unwrap();
         let posts = capture.posts();
-        assert_eq!(posts[1].0, "application/json");
+        let (kind, body) = &posts[1];
+        assert!(kind.starts_with("multipart/form-data"), "{kind}");
+        assert!(
+            body.contains("**RESOLVED** Disk usage (/data) on web-1"),
+            "{body}"
+        );
+        assert!(body.contains(r#"name="files[0]"; filename="chart.png""#));
     }
 
     #[tokio::test]
@@ -7688,7 +7720,7 @@ mod charts {
     }
 
     #[tokio::test]
-    async fn slack_shows_the_chart_and_keeps_it_when_the_alert_resolves() {
+    async fn slack_shows_the_chart_and_swaps_it_for_one_to_the_end_when_the_alert_resolves() {
         let server = start_with_metrics().await;
         let (host, _client) = report_samples(&server, "/data").await;
         let slack = FakeSlack::default();
@@ -7730,17 +7762,24 @@ mod charts {
         server
             .state
             .database
-            .resolve_alert(alert.id, now_ms(), "The problem cleared")
+            .resolve_alert(alert.id, now_ms(), "The problem cleared", None)
             .await
             .unwrap();
         notifier.deliver_due(now_ms()).await.unwrap();
+        let methods: Vec<String> = slack.calls().into_iter().map(|call| call.0).collect();
+        assert_eq!(
+            methods[4..],
+            ["upload_url", "upload", "complete", "update", "post"]
+        );
         let calls = slack.calls();
-        let (method, _, update) = &calls[4];
-        assert_eq!(method, "update");
+        let (_, _, update) = &calls[7];
         assert_eq!(
             update["attachments"][0]["blocks"][1]["slack_file"]["id"],
             "F123"
         );
+        // The reply in the thread says where things stand now.
+        let reply = &calls[8].2;
+        assert!(reply["thread_ts"].is_string(), "{reply}");
     }
 
     #[tokio::test]
@@ -8174,6 +8213,23 @@ async fn the_built_in_forecast_warns_a_day_ahead_and_goes_critical_four_hours_ah
     assert_eq!(
         resolved[0].resolve_reason.as_deref(),
         Some("The problem cleared")
+    );
+    assert_eq!(
+        resolved[0].resolved_summary.as_deref(),
+        Some("Disk usage (/) on web-1 is now 92% and steady")
+    );
+
+    // Filling slowly is no alert, but the end says when it would be full.
+    let open = forecast_at(&mut test, 100, 93.0, 1.0).await;
+    assert!(open.is_empty(), "{open:?}");
+    assert!(forecast_at(&mut test, 130, 93.0, 1.0).await.len() == 1);
+    assert!(forecast_at(&mut test, 135, 93.0, 0.2).await.is_empty());
+    let resolved = test.resolved().await;
+    assert_eq!(
+        resolved[0].resolved_summary.as_deref(),
+        Some(
+            "Disk usage (/) on web-1 is now 93% and rising by 0.2% an hour, so it reaches 100% in about 35 hours"
+        )
     );
 }
 

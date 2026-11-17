@@ -106,6 +106,7 @@ fn example_alert() -> Alert {
         started_ms: chrono::Utc::now().timestamp_millis(),
         resolved_ms: None,
         resolve_reason: None,
+        resolved_summary: None,
         acknowledged_by: None,
         acknowledged_ms: None,
     }

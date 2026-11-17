@@ -86,7 +86,7 @@ fn text(notice: &Notice, web_url: Option<&str>) -> String {
     let mut lines = vec![format!(
         "<b>{}</b> {}",
         notice.label(),
-        escape(clip_utf16(&alert.summary, MAX_SUMMARY))
+        escape(clip_utf16(notice.summary(), MAX_SUMMARY))
     )];
     let place = if alert.host_id == FLEET_HOST_ID {
         format!("Hosts: {}", clip(&alert.hostname))
@@ -102,7 +102,9 @@ fn text(notice: &Notice, web_url: Option<&str>) -> String {
         clip(&alert.rule_name),
         format_ms(alert.started_ms)
     ));
-    if let (Event::Resolved, Some(reason)) = (notice.event, &alert.resolve_reason) {
+    if let Some(fired) = notice.fired_summary() {
+        lines.push(format!("When it fired: {}", clip(fired)));
+    } else if let (Event::Resolved, Some(reason)) = (notice.event, &alert.resolve_reason) {
         lines.push(format!("Reason: {}", clip(reason)));
     }
     if let Some(url) = web_url {
@@ -353,6 +355,7 @@ mod tests {
         let alert = Alert {
             resolved_ms: Some(61_000),
             resolve_reason: Some("The problem cleared".to_string()),
+            resolved_summary: None,
             ..alert()
         };
         let text = text(&notice(Event::Resolved, alert), None);

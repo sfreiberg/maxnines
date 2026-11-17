@@ -131,6 +131,7 @@ erDiagram
         int started_ms
         int resolved_ms "empty while open"
         text resolve_reason
+        text resolved_summary
         string acknowledged_by
         int acknowledged_ms
     }

@@ -56,7 +56,9 @@ fn body(notice: &Notice, web_url: Option<&str>) -> Value {
             },
             json!({ "title": "Started", "value": format_ms(alert.started_ms) }),
         ];
-        if let (Event::Resolved, Some(reason)) = (notice.event, &alert.resolve_reason) {
+        if let Some(fired) = notice.fired_summary() {
+            facts.push(json!({ "title": "When it fired", "value": unlinked(fired) }));
+        } else if let (Event::Resolved, Some(reason)) = (notice.event, &alert.resolve_reason) {
             facts.push(json!({ "title": "Reason", "value": unlinked(reason) }));
         }
         body.push(json!({ "type": "FactSet", "facts": facts }));

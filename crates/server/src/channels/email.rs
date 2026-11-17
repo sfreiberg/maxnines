@@ -154,7 +154,9 @@ fn details(notice: &Notice) -> String {
     if let Some(resolved) = alert.resolved_ms {
         lines.push(format!("Resolved: {}", format_ms(resolved)));
     }
-    if let Some(reason) = &alert.resolve_reason {
+    if let Some(fired) = notice.fired_summary() {
+        lines.push(format!("When it fired: {fired}"));
+    } else if let Some(reason) = &alert.resolve_reason {
         lines.push(format!("Reason: {reason}"));
     }
     lines.push(String::new());
@@ -383,10 +385,34 @@ mod tests {
     }
 
     #[test]
+    fn a_resolved_email_leads_with_where_things_stand_now() {
+        let alert = Alert {
+            resolved_ms: Some(61_000),
+            resolve_reason: Some("The problem cleared".to_string()),
+            resolved_summary: Some(
+                "CPU usage on web-1 is now 12%, no longer above 90%".to_string(),
+            ),
+            ..alert()
+        };
+        let notice = notice(Event::Resolved, alert);
+        assert_eq!(
+            subject(&notice),
+            "[MaxNines RESOLVED] CPU usage on web-1 is now 12%, no longer above 90%"
+        );
+        let body = text(&notice);
+        assert!(
+            body.contains("When it fired: CPU usage on web-1 is 97%, above 90%"),
+            "{body}"
+        );
+        assert!(!body.contains("Reason:"), "{body}");
+    }
+
+    #[test]
     fn a_resolved_email_says_when_and_why() {
         let alert = Alert {
             resolved_ms: Some(61_000),
             resolve_reason: Some("The problem cleared".to_string()),
+            resolved_summary: None,
             ..alert()
         };
         let body = text(&notice(Event::Resolved, alert));

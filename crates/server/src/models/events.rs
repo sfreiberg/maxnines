@@ -251,7 +251,10 @@ impl Database {
                     time_ms: resolved,
                     kind: EventKind::Resolved,
                     title,
-                    detail: row.resolve_reason.clone(),
+                    detail: row
+                        .resolved_summary
+                        .clone()
+                        .or_else(|| row.resolve_reason.clone()),
                     created_by: None,
                     id: None,
                 });

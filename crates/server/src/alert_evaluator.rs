@@ -502,13 +502,13 @@ impl Evaluator {
         }
 
         for alert in orphans {
-            self.close(&alert, now_ms, RULE_GONE_REASON).await?;
+            self.close(&alert, now_ms, RULE_GONE_REASON, None).await?;
         }
         for (key, alert) in &open {
             if !checked.contains(key)
                 && let Some(reason) = snapshot.reason_to_close(alert)
             {
-                self.close(alert, now_ms, reason).await?;
+                self.close(alert, now_ms, reason, None).await?;
             }
         }
 
@@ -562,7 +562,10 @@ impl Evaluator {
         let change = tracker.observe(&levels, snapshot.now_ms, hold_ms, current);
 
         let hostname = clean(&host.hostname);
-        let summary = rule.rule.offline_summary(&hostname);
+        let summary = match change {
+            Some(Change::Resolve) => crate::alerting::AlertRuleInput::online_summary(&hostname),
+            _ => rule.rule.offline_summary(&hostname),
+        };
         self.apply(change, rule, &hostname, key, None, summary, snapshot, open)
             .await
     }
@@ -652,8 +655,11 @@ impl Evaluator {
             let levels = crossed(&thresholds, comparison, *value);
             let change = tracker.observe(&levels, snapshot.now_ms, hold_ms(rule), current);
 
-            let summary = match change.as_ref().and_then(Change::severity) {
-                Some(severity) => rule
+            let summary = match change {
+                Some(Change::Resolve) => rule
+                    .rule
+                    .calculation_cleared_summary(&question, line, *value)?,
+                Some(Change::Fire(severity) | Change::Become(severity)) => rule
                     .rule
                     .calculation_summary(&question, line, *value, severity)?,
                 None => String::new(),
@@ -681,8 +687,8 @@ impl Evaluator {
                 .collect();
             for key in gone {
                 if let Some(alert) = open.remove(&key) {
-                    self.close(&alert, snapshot.now_ms, "This line is no longer reported")
-                        .await?;
+                    let reason = "This line is no longer reported";
+                    self.close(&alert, snapshot.now_ms, reason, None).await?;
                 }
             }
         }
@@ -738,10 +744,11 @@ impl Evaluator {
 
             let hostname = clean(&host.hostname);
             // Said in the collector's own words where it has them, such as a
-            // service that's failed, both as the alert starts and while it lasts.
+            // service that's failed, as the alert starts, while it lasts, and as
+            // it clears.
             let breached = levels.iter().any(|(_, breached)| *breached);
-            let says = change.as_ref().and_then(Change::severity).is_some()
-                || (change.is_none() && current.is_some() && breached);
+            let resolving = matches!(change, Some(Change::Resolve));
+            let says = change.is_some() || (current.is_some() && breached);
             let state = match described.filter(|_| says) {
                 Some(described) => {
                     if output.is_none() {
@@ -764,6 +771,11 @@ impl Evaluator {
                 None => None,
             };
             let summary = match (change.as_ref().and_then(Change::severity), state) {
+                (None, Some(state)) if resolving => state,
+                (None, None) if resolving => {
+                    rule.rule
+                        .metric_cleared_summary(metric, &hostname, &series, reading.value)?
+                }
                 (Some(_), Some(state)) => state,
                 (Some(severity), None) => {
                     rule.rule
@@ -848,6 +860,16 @@ impl Evaluator {
 
             let hostname = clean(&host.hostname);
             let summary = match (change.as_ref().and_then(Change::severity), eta) {
+                _ if matches!(change, Some(Change::Resolve)) => {
+                    rule.rule.forecast_cleared_summary(
+                        metric,
+                        &hostname,
+                        &series,
+                        trend.value,
+                        trend.slope_per_ms,
+                        eta,
+                    )?
+                }
                 (Some(_), Some(eta)) => rule.rule.forecast_summary(
                     metric,
                     &hostname,
@@ -889,7 +911,8 @@ impl Evaluator {
             None => Ok(()),
             Some(Change::Resolve) => {
                 if let Some(alert) = open.remove(&key) {
-                    self.close(&alert, snapshot.now_ms, "The problem cleared")
+                    let now = Some(summary.as_str()).filter(|summary| !summary.is_empty());
+                    self.close(&alert, snapshot.now_ms, "The problem cleared", now)
                         .await?;
                 }
                 Ok(())
@@ -968,9 +991,17 @@ impl Evaluator {
         })
     }
 
-    async fn close(&self, alert: &Alert, now_ms: i64, reason: &str) -> Result<()> {
+    /// Ends an alert for `reason`, saying where things stand now if the problem
+    /// cleared.
+    async fn close(
+        &self,
+        alert: &Alert,
+        now_ms: i64,
+        reason: &str,
+        summary: Option<&str>,
+    ) -> Result<()> {
         self.database
-            .resolve_alert(alert.id, now_ms, reason)
+            .resolve_alert(alert.id, now_ms, reason, summary)
             .await?;
         info!(
             rule = alert.rule_name,

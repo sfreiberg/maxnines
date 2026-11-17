@@ -2069,7 +2069,7 @@ mod tests {
             .unwrap();
 
         database
-            .resolve_alert(alert, started_ms + 10, "The problem cleared")
+            .resolve_alert(alert, started_ms + 10, "The problem cleared", None)
             .await
             .unwrap();
         let due = database.due_deliveries(started_ms + 10, 500).await.unwrap();

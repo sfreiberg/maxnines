@@ -310,7 +310,7 @@ async fn alerts_and_updates_are_on_the_timeline_too() {
     server
         .state
         .database
-        .resolve_alert(alert, started + 30_000, "cleared")
+        .resolve_alert(alert, started + 30_000, "cleared", None)
         .await
         .unwrap();
 

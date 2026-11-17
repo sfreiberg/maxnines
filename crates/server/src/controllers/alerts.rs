@@ -79,7 +79,7 @@ impl From<Alert> for AlertRow {
             severity: alert.severity.as_str(),
             started: local_time(alert.started_ms),
             resolved: alert.resolved_ms.map(local_time),
-            reason: alert.resolve_reason,
+            reason: alert.resolved_summary.or(alert.resolve_reason),
             short_id: if alert.host_id == FLEET_HOST_ID || alert.host_id == LOCAL_HOST_ID {
                 String::new()
             } else {

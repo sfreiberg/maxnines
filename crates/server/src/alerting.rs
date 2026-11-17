@@ -597,6 +597,96 @@ impl AlertRuleInput {
             secs => format!("{hostname} has been offline for {}", format_duration(secs)),
         }
     }
+
+    /// What an offline alert says as it clears.
+    pub fn online_summary(hostname: &str) -> String {
+        format!("{hostname} is back online")
+    }
+
+    /// What a metric alert says as it clears: the reading now, beside the mildest
+    /// level it had crossed.
+    pub fn metric_cleared_summary(
+        &self,
+        metric: &Metric,
+        hostname: &str,
+        series: &str,
+        value: f64,
+    ) -> Result<String> {
+        let comparison = self.comparison.context("no comparison")?;
+        let (_, threshold) = *self.levels().first().context("no threshold")?;
+        let name = match metric.source {
+            Source::Fields([_]) => metric.title.to_string(),
+            _ => format!("{} ({series})", metric.title),
+        };
+        Ok(format!(
+            "{name} on {hostname} is now {}, no longer {} {}",
+            format_value(metric.unit, value),
+            comparison.as_str(),
+            format_value(metric.unit, threshold)
+        ))
+    }
+
+    /// What a calculation alert says as it clears, for `line`.
+    pub fn calculation_cleared_summary(
+        &self,
+        question: &Question,
+        line: &str,
+        value: f64,
+    ) -> Result<String> {
+        let comparison = self.comparison.context("no comparison")?;
+        let (_, threshold) = *self.levels().first().context("no threshold")?;
+        let unit = question.unit();
+        Ok(format!(
+            "{} of {}{} is now {}, no longer {} {}",
+            question.calculation.label(),
+            question.metric.title,
+            match question.grouping {
+                Grouping::Nothing => String::new(),
+                _ => format!(" for {line}"),
+            },
+            format_value(unit, value),
+            comparison.as_str(),
+            format_value(unit, threshold)
+        ))
+    }
+
+    /// What a forecast alert says as it clears: the reading now and which way it's
+    /// going, with when it would reach the level if it still would, just not soon.
+    pub fn forecast_cleared_summary(
+        &self,
+        metric: &Metric,
+        hostname: &str,
+        series: &str,
+        value: f64,
+        slope_per_ms: f64,
+        eta_secs: Option<u64>,
+    ) -> Result<String> {
+        let level = self.threshold.context("no level")?;
+        let name = match metric.source {
+            Source::Fields([_]) => metric.title.to_string(),
+            _ => format!("{} ({series})", metric.title),
+        };
+        let now = format_value(metric.unit, value);
+        let per_hour = format_value(metric.unit, (slope_per_ms * 3_600_000.0).abs());
+        if per_hour == format_value(metric.unit, 0.0) {
+            return Ok(format!("{name} on {hostname} is now {now} and steady"));
+        }
+        let direction = if slope_per_ms > 0.0 {
+            "rising"
+        } else {
+            "falling"
+        };
+        let mut summary =
+            format!("{name} on {hostname} is now {now} and {direction} by {per_hour} an hour");
+        if let Some(eta) = eta_secs.filter(|eta| *eta > 0) {
+            summary.push_str(&format!(
+                ", so it reaches {} in about {}",
+                format_value(metric.unit, level),
+                format_eta(eta)
+            ));
+        }
+        Ok(summary)
+    }
 }
 
 /// Which way a forecast watches a metric go, in words.
@@ -899,6 +989,9 @@ pub struct Alert {
     pub started_ms: i64,
     pub resolved_ms: Option<i64>,
     pub resolve_reason: Option<String>,
+    /// Where things stood as the problem cleared, such as the reading then. Nothing
+    /// for an alert closed for another reason, such as its rule being deleted.
+    pub resolved_summary: Option<String>,
     /// Who said they're dealing with it.
     pub acknowledged_by: Option<String>,
     pub acknowledged_ms: Option<i64>,
@@ -999,6 +1092,34 @@ pub struct DeliveryProblem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_forecast_that_clears_says_which_way_it_is_going() {
+        let rule = AlertRuleInput {
+            kind: RuleKind::Forecast,
+            metric: Some("disk.usage".to_string()),
+            threshold: Some(100.0),
+            ..metric_rule()
+        };
+        let metric = crate::metrics::find("disk.usage").unwrap();
+        let said = |slope_per_hour: f64, eta| {
+            let slope = slope_per_hour / 3_600_000.0;
+            rule.forecast_cleared_summary(metric, "web-1", "/", 83.6, slope, eta)
+                .unwrap()
+        };
+        assert_eq!(
+            said(0.0, None),
+            "Disk usage (/) on web-1 is now 83.6% and steady"
+        );
+        assert_eq!(
+            said(-0.5, None),
+            "Disk usage (/) on web-1 is now 83.6% and falling by 0.5% an hour"
+        );
+        assert_eq!(
+            said(0.1, Some(164 * 3600)),
+            "Disk usage (/) on web-1 is now 83.6% and rising by 0.1% an hour, so it reaches 100% in about 7 days"
+        );
+    }
 
     fn metric_rule() -> AlertRuleInput {
         AlertRuleInput {

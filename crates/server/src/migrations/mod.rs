@@ -20,6 +20,7 @@ impl MigratorTrait for Migrator {
             Box::new(AppSignIns),
             Box::new(SignInDetails),
             Box::new(Proxies),
+            Box::new(ResolvedSummaries),
         ]
     }
 }
@@ -1662,6 +1663,7 @@ enum Alerts {
     StartedMs,
     ResolvedMs,
     ResolveReason,
+    ResolvedSummary,
     AcknowledgedBy,
     AcknowledgedMs,
 }
@@ -1941,6 +1943,46 @@ impl MigrationTrait for CheckStats {
                 .await?;
         }
         Ok(())
+    }
+}
+
+struct ResolvedSummaries;
+
+impl MigrationName for ResolvedSummaries {
+    fn name(&self) -> &str {
+        "m20261117_000011_resolved_summaries"
+    }
+}
+
+/// Where things stood as an alert's problem cleared, such as the reading then, so
+/// its resolved notifications say what it is now rather than what it was.
+#[async_trait::async_trait]
+impl MigrationTrait for ResolvedSummaries {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let column = ColumnDef::new(Alerts::ResolvedSummary).text().to_owned();
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alerts::Table)
+                    .add_column(column)
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alerts::Table)
+                    .drop_column(Alerts::ResolvedSummary)
+                    .to_owned(),
+            )
+            .await
     }
 }
 

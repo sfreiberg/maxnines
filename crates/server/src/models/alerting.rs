@@ -228,6 +228,7 @@ fn to_alert(row: alert::Model) -> Result<Alert> {
         started_ms: row.started_ms,
         resolved_ms: row.resolved_ms,
         resolve_reason: row.resolve_reason,
+        resolved_summary: row.resolved_summary,
         acknowledged_by: row.acknowledged_by,
         acknowledged_ms: row.acknowledged_ms,
     })
@@ -510,7 +511,7 @@ impl Database {
             .await
             .context("loading alerts")?;
         for alert in open {
-            resolve_in(&transaction, alert.id, now_ms, RULE_GONE_REASON).await?;
+            resolve_in(&transaction, alert.id, now_ms, RULE_GONE_REASON, None).await?;
         }
         if before.is_none() {
             return Ok(false);
@@ -765,10 +766,12 @@ async fn resolve_in<C: ConnectionTrait>(
     id: i64,
     now_ms: i64,
     reason: &str,
+    summary: Option<&str>,
 ) -> Result<()> {
     let result = alert::Entity::update_many()
         .col_expr(alert::Column::ResolvedMs, Expr::value(now_ms))
         .col_expr(alert::Column::ResolveReason, Expr::value(reason))
+        .col_expr(alert::Column::ResolvedSummary, Expr::value(summary))
         .filter(alert::Column::Id.eq(id))
         .filter(alert::Column::ResolvedMs.is_null())
         .exec(connection)
@@ -847,6 +850,7 @@ impl Database {
             started_ms: Set(new.started_ms),
             resolved_ms: Set(None),
             resolve_reason: Set(None),
+            resolved_summary: Set(None),
             acknowledged_by: Set(None),
             acknowledged_ms: Set(None),
             ..Default::default()
@@ -1020,9 +1024,16 @@ impl Database {
 
     /// Ends an alert and tells whoever was told it started, even if the rule
     /// has since changed or gone. Anyone a silence kept it from never hears of it.
-    pub async fn resolve_alert(&self, id: i64, now_ms: i64, reason: &str) -> Result<()> {
+    /// `summary` says where things stand now, when the problem cleared.
+    pub async fn resolve_alert(
+        &self,
+        id: i64,
+        now_ms: i64,
+        reason: &str,
+        summary: Option<&str>,
+    ) -> Result<()> {
         let transaction = self.connection.begin().await.context("resolving alert")?;
-        resolve_in(&transaction, id, now_ms, reason).await?;
+        resolve_in(&transaction, id, now_ms, reason, summary).await?;
         transaction.commit().await.context("resolving alert")?;
         Ok(())
     }

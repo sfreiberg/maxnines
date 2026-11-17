@@ -2,11 +2,14 @@
 
 ## Charts
 
-When an alert starts, or a warning becomes critical, Discord, Telegram, Slack, email and
-Resend get a chart with it: the last hour of what the alert watches, on that host or for that
-calculation, with the rule's thresholds and the moment the alert started. Times on it are
-in UTC, like the rest of the message. Other notifications, and other channels, are text
-only. An alert about a host going offline has nothing to chart.
+When an alert starts, a warning becomes critical, or an alert resolves, Discord,
+Telegram, Slack, email and Resend get a chart with it: the last hour of what the alert
+watches, on that host or for that calculation, with the rule's thresholds and the
+moments the alert started and resolved. Times on it are in UTC, like the rest of the
+message. Other notifications, and other channels, are text only. An alert about a host
+going offline has nothing to chart.
+
+In Slack, a resolved alert's chart replaces the one in the message it fired with.
 
 The chart is drawn inside the server, so nothing else needs to be installed. If one
 can't be drawn or sent, the notification goes without it, and the server's log says why.
@@ -113,7 +116,7 @@ What a template can use:
 | Name | What it is |
 | --- | --- |
 | `event` | `firing`, `escalated`, `eased`, `reminder`, `resolved`, `action` or `test` |
-| `text` | The notification in one line, like `Resolved: CPU usage on web-1 is 97%, above 90%` |
+| `text` | The notification in one line, like `Resolved: CPU usage on web-1 is now 42%, no longer above 90%` |
 | `id` | The same for every attempt at one notification, so a receiver can spot a repeat |
 | `link` | The alerts page, when the server knows the address people reach it at |
 | `alert.id`, `alert.rule_id`, `alert.rule_name` | The alert, and the rule that started it |
@@ -122,7 +125,8 @@ What a template can use:
 | `alert.series` | The disk, container or other series it's about, if any |
 | `alert.value`, `alert.summary` | The reading that started it, and what's wrong in words |
 | `alert.started`, `alert.resolved` | Times like `2026-11-10T14:03:00Z`, with `alert.started_ms` and `alert.resolved_ms` in milliseconds |
-| `alert.resolve_reason` | Why it resolved, when it wasn't the reading recovering |
+| `alert.resolve_reason` | Why it resolved, such as `The problem cleared` or the rule being deleted |
+| `alert.resolved_summary` | Where things stood as the problem cleared, like `CPU usage on web-1 is now 42%, no longer above 90%`. Empty when it resolved for another reason |
 | `alert.acknowledged_by`, `alert.acknowledged` | Who acknowledged it, if anyone, and `alert.acknowledged_ms` |
 | `action.name`, `action.outcome` | For the event `action`: which of the alert's [actions](#what-actions-print) ran, and `succeeded`, `failed`, `timed_out`, `not_defined` or `refused`. `action` is missing for other events, so test for it with `{% if action %}` |
 | `action.output`, `action.truncated` | What it printed, up to 64 KiB, and whether that was cut |

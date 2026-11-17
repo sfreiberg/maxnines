@@ -116,6 +116,8 @@ fn text(notice: &Notice, web_url: Option<&str>) -> String {
     let Some(alert) = &notice.alert else {
         return escape(&notice.text);
     };
+    // A resolved alert updates the message it fired with, which keeps saying what
+    // was wrong, while the reply in its thread says where things stand now.
     let mut lines = vec![format!("*{}* {}", notice.label(), escape(&alert.summary))];
     let mut details = vec![
         format!("Rule: {}", escape(&alert.rule_name)),
@@ -443,19 +445,31 @@ where
         .is_some()
         .then(SlackControls::default);
 
-    if let Some((message_channel, ts, chart)) = reply_to
+    if let Some((message_channel, ts, mut chart)) = reply_to
         .filter(|_| notice.event == Event::Resolved)
         .and_then(message_id)
     {
+        // The chart now runs to the recovery. The one it fired with stays if a new
+        // one can't be sent.
+        if let Some(png) = notice.chart.as_deref() {
+            match upload(&session, png, &notice.chart_description()).await {
+                Ok(file) => chart = Some(file),
+                Err(error) => warn!(
+                    error = format!("{error:#}"),
+                    "couldn't send a chart to Slack"
+                ),
+            }
+        }
         let content = content(notice, web_url, controls.as_ref(), chart.as_ref());
         let update =
             SlackApiChatUpdateRequest::new(message_channel.clone(), content.clone(), ts.clone());
         match session.chat_update(&update).await {
             Ok(_) => {
-                let reason = notice
-                    .alert
-                    .as_ref()
-                    .and_then(|a| a.resolve_reason.as_deref());
+                let reason = notice.alert.as_ref().and_then(|a| {
+                    a.resolved_summary
+                        .as_deref()
+                        .or(a.resolve_reason.as_deref())
+                });
                 let reply =
                     SlackMessageContent::new().with_text(escape(reason.unwrap_or("Resolved")));
                 let request = post_request(message_channel, reply).with_thread_ts(ts);

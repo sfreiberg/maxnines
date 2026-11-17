@@ -26,6 +26,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/alerts"
       "started_ms": 1793940279545,
       "resolved_ms": null,
       "resolve_reason": null,
+      "resolved_summary": null,
       "acknowledged_by": null,
       "acknowledged_ms": null,
       "silence_id": null,
@@ -38,6 +39,9 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/alerts"
 
 `silence_id` is the ID of the silence keeping an open alert's notifications back, and
 `maintenance_window_id` is the ID of the [window](api-maintenance-windows.md) doing so.
+`resolved_summary` says where things stood as a resolved alert's problem cleared, like
+`CPU usage on web-1 is now 42%, no longer above 90%`, and is `null` for one that resolved
+for another reason, given in `resolve_reason`.
 
 ## List delivery problems
 
