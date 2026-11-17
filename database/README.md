@@ -224,6 +224,9 @@ erDiagram
         int priority
         text condition_expr "CEL, over facts"
         boolean enabled
+        string operating_systems "comma separated, or null for all"
+        string built_in "key of a rule that ships with the server"
+        bigint built_in_changed_ms "when an upgrade last changed it"
     }
     config_rule_settings {
         int id PK
@@ -428,7 +431,7 @@ erDiagram
 | `host_facts` | What each host's agent reports about it, kept as history: a fact changing closes one row and starts another |
 | `host_config_status` | The config each host's agent last applied, and why if it refused one |
 | `host_boots` | When each host last started, to notice restarts |
-| `config_rules`, `config_rule_settings` | What agents monitor, chosen by facts |
+| `config_rules`, `config_rule_settings` | What agents monitor, chosen by operating system and facts. The server writes its built-in rules, marked by `built_in`, each time it starts |
 | `alert_rules`, `alert_rule_channels` | What raises an alert, and who hears of it. A deleted rule is kept, marked by `deleted_ms`, so its alerts still name it |
 | `alerts` | Every alert, open or resolved, with the hostname it had at the time |
 | `alert_rule_actions` | The actions each rule runs on an alert's host, and when in the alert's life |

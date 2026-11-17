@@ -6,6 +6,7 @@ mod alerting;
 mod app_sign_ins;
 mod app_state;
 mod audit;
+mod built_in_rules;
 mod calculations;
 mod channels;
 mod check_history;
@@ -262,6 +263,14 @@ async fn serve(path: &Path) -> Result<()> {
     let rules = Rules::compile(&config.registration)?;
 
     let database = Database::connect(&config.database.resolve_url()?).await?;
+    // The config rules that come with this version, which an upgrade may change.
+    let changed = database
+        .sync_built_in_rules(&built_in_rules::all(), metrics::now_ms())
+        .await
+        .context("updating the built-in config rules")?;
+    if !changed.is_empty() {
+        info!(rules = changed.join(", "), "built-in config rules updated");
+    }
     let secure_site = config.audience().starts_with("wss://");
     let csrf = csrf::config(&database, secure_site).await?;
     let hosts = database.load_hosts().await.context("loading hosts")?;

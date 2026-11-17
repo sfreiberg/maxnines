@@ -6,12 +6,15 @@
 <h1>{% if id %}Edit rule{% else %}Add rule{% endif %}</h1>
 
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
+{% if rule.built_in %}<p class="notice">This rule comes with MaxNines and is updated when the server is upgraded{% if rule.built_in_changed %}, most recently on {{ rule.built_in_changed }}{% endif %}. It can be turned off. To change what it sets, {% if can_edit %}<a href="/rules/new?from={{ id }}">add a rule of your own after it</a>{% else %}add a rule of your own after it{% endif %}.</p>{% endif %}
 
 <form method="post" action="{% if id %}/rules/{{ id }}{% else %}/rules{% endif %}" class="stacked">
   <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
   {# Pressing Enter uses the first button in a form, so it has to be Save. #}
   {% if can_edit %}<button type="submit" class="default-submit" tabindex="-1" aria-hidden="true">Save rule</button>{% endif %}
 
+  {# A built-in rule can only be turned on or off, so the rest is shown but locked. #}
+  <fieldset class="bare"{% if rule.built_in %} disabled{% endif %}>
   <label>Name
     <input type="text" name="name" value="{{ rule.name }}" required maxlength="255">
   </label>
@@ -23,13 +26,21 @@
 
   <fieldset>
     <legend>Applies to</legend>
+    <div class="field-row">
+      {% for system in rule.operating_systems %}
+      <label class="checkbox"><input type="checkbox" name="os_{{ system.key }}"{% if system.checked %} checked{% endif %}> {{ system.label }}</label>
+      {% endfor %}
+    </div>
+    <small class="hint">Leave every operating system unticked for all of them. Any conditions below have to match as well.</small>
     {% include "rules/_applies_to.html" %}
+  </fieldset>
   </fieldset>
 
   <label class="checkbox">
     <input type="checkbox" name="enabled"{% if rule.enabled %} checked{% endif %}> Enabled
   </label>
 
+  <fieldset class="bare"{% if rule.built_in %} disabled{% endif %}>
   <fieldset>
     <legend>Sampling</legend>
     <p class="hint">Anything left empty is decided by other rules.</p>
@@ -148,11 +159,12 @@
     </label>
 
   </fieldset>
+  </fieldset>
 
   <div class="actions">
     {% if can_edit %}<button type="submit">Save rule</button>{% else %}<span class="note">Your role lets you look at this, but not change it.</span>{% endif %}
     {# The fragment brings the results into view, since the page reloads at the top. #}
-    {% if can_edit %}<button type="submit" name="form_action" value="preview" class="secondary" formaction="{% if id %}/rules/{{ id }}{% else %}/rules{% endif %}#preview" formnovalidate>Preview</button>{% endif %}
+    {% if can_edit and not rule.built_in %}<button type="submit" name="form_action" value="preview" class="secondary" formaction="{% if id %}/rules/{{ id }}{% else %}/rules{% endif %}#preview" formnovalidate>Preview</button>{% endif %}
     <a class="button secondary" href="/rules">Cancel</a>
   </div>
 </form>
@@ -200,7 +212,7 @@
 </section>
 {% endif %}
 
-{% if id and can_edit %}
+{% if id and can_edit and not rule.built_in %}
 <form method="post" action="/rules/{{ id }}/delete" class="delete-form">
   <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
   <button type="submit" class="danger">Delete</button>

@@ -14,6 +14,7 @@ mod app_sign_in;
 mod app_sign_ins;
 mod audit;
 mod audit_entry;
+mod built_in_rules;
 mod config_rule;
 mod config_rule_setting;
 mod dashboard;
@@ -71,6 +72,7 @@ use tokio::sync::Mutex;
 
 pub use self::app_sign_ins::{AppSignIn, AppTokens, Refreshed};
 use self::audit::record_change;
+pub use self::built_in_rules::same_rule;
 pub use self::events::NewEvent;
 pub use self::stats::DatabaseStats;
 pub use self::two_factor::CHALLENGE_LIFETIME_MS;
@@ -102,6 +104,13 @@ pub struct FactVersion {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigRule {
     pub id: i64,
+    /// Which built-in rule it is, for one that ships with the server, which only
+    /// an upgrade changes, though it can be turned off.
+    #[serde(default)]
+    pub built_in: Option<String>,
+    /// When an upgrade last changed a built-in rule.
+    #[serde(skip)]
+    pub built_in_changed_ms: Option<i64>,
     #[serde(flatten)]
     pub rule: RuleInput,
 }
@@ -114,6 +123,9 @@ pub struct RuleInput {
     pub priority: i32,
     /// A CEL expression. An empty condition matches every agent.
     pub condition: Option<String>,
+    /// The operating systems it's for, by `os.family`, or none for all of them.
+    #[serde(default)]
+    pub operating_systems: Vec<String>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     pub settings: Value,
@@ -798,12 +810,35 @@ impl Database {
             .await
             .context("loading rule settings")?;
 
-        rows.into_iter()
+        let mut rules = rows
+            .into_iter()
             .map(|row| {
                 let mine = settings.iter().filter(|setting| setting.rule_id == row.id);
                 to_rule(row.clone(), mine)
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        // Built-in rules apply before people's own of the same priority, so theirs win.
+        rules.sort_by_key(|rule| (rule.rule.priority, rule.built_in.is_none(), rule.id));
+        Ok(rules)
+    }
+
+    /// Turns a rule on or off, and nothing else, which is all a built-in rule allows.
+    /// Returns false if there's no such rule.
+    pub async fn set_rule_enabled(&self, id: i64, enabled: bool) -> Result<bool> {
+        let transaction = self.connection.begin().await.context("saving rule")?;
+        let before = load_rule(&transaction, id).await?;
+        let Some(before) = before else {
+            return Ok(false);
+        };
+        config_rule::Entity::update_many()
+            .col_expr(config_rule::Column::Enabled, Expr::value(enabled))
+            .filter(config_rule::Column::Id.eq(id))
+            .exec(&transaction)
+            .await
+            .context("saving rule")?;
+        record_rule(&transaction, id, Some(&before)).await?;
+        transaction.commit().await.context("saving rule")?;
+        Ok(true)
     }
 
     pub async fn get_rule(&self, id: i64) -> Result<Option<ConfigRule>> {
@@ -817,6 +852,7 @@ impl Database {
             priority: Set(input.priority),
             condition_expr: Set(input.condition.clone()),
             enabled: Set(input.enabled),
+            operating_systems: Set(systems_text(&input.operating_systems)),
             ..Default::default()
         }
         .insert(&transaction)
@@ -846,6 +882,7 @@ impl Database {
         row.priority = Set(input.priority);
         row.condition_expr = Set(input.condition.clone());
         row.enabled = Set(input.enabled);
+        row.operating_systems = Set(systems_text(&input.operating_systems));
         row.update(&transaction).await.context("saving rule")?;
 
         config_rule_setting::Entity::delete_many()
@@ -997,14 +1034,29 @@ fn to_rule<'a>(
 
     Ok(ConfigRule {
         id: row.id,
+        built_in: row.built_in,
+        built_in_changed_ms: row.built_in_changed_ms,
         rule: RuleInput {
             name: row.name,
             priority: row.priority,
             condition: row.condition_expr,
+            operating_systems: row
+                .operating_systems
+                .as_deref()
+                .unwrap_or_default()
+                .split(',')
+                .filter(|system| !system.is_empty())
+                .map(String::from)
+                .collect(),
             enabled: row.enabled,
             settings: unflatten(&flat),
         },
     })
+}
+
+/// Operating systems as they're stored: comma separated, or nothing for all of them.
+fn systems_text(systems: &[String]) -> Option<String> {
+    (!systems.is_empty()).then(|| systems.join(","))
 }
 
 /// A list's own name for an item of it. Items inside lists of maps can't be reached
@@ -1676,6 +1728,7 @@ mod tests {
             name: name.to_string(),
             priority,
             condition: Some("facts.os.family == \"linux\"".to_string()),
+            operating_systems: Vec::new(),
             enabled: true,
             settings: json!({
                 "interval_secs": 10,

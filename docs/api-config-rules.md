@@ -8,8 +8,15 @@ lowest priority first, so higher priorities win.
 | `name` | Required |
 | `priority` | Required. Higher priorities apply later |
 | `condition` | A [CEL](https://cel.dev) expression over `facts`. Empty matches every host |
+| `operating_systems` | The systems it's for, from `freebsd`, `linux`, `macos` and `windows`, which `facts.os.family` has to be one of as well as the condition matching. Empty or left out for every system |
 | `enabled` | Defaults to `true` |
 | `settings` | Required. What to apply, as below |
+| `built_in` | Given back, never set: which built-in rule it is, such as `macos`, or `null` for one of your own |
+
+Built-in rules come with MaxNines, and upgrades change them. See
+[Built-in rules](agents.md#built-in-rules). Only `enabled` can change on one, so an update
+has to give everything else as it is, and one can't be deleted. Either gives `422`.
+Rules of the same priority apply built-in rules first.
 
 | Setting | Description |
 | --- | --- |
@@ -51,9 +58,11 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/rules/1"
 ```json
 {
   "id": 1,
+  "built_in": "default",
   "name": "Default",
   "priority": 0,
   "condition": null,
+  "operating_systems": [],
   "enabled": true,
   "settings": {
     "interval_secs": 15,
@@ -108,7 +117,7 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
   -d '{
     "name": "Slower on Linux",
     "priority": 10,
-    "condition": "facts.os.family == \"linux\"",
+    "operating_systems": ["linux"],
     "settings": {"interval_secs": 60}
   }' \
   "$MAXNINES_URL/api/v1/rules"
@@ -130,7 +139,7 @@ curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \
   -d '{
     "name": "Slower on Linux",
     "priority": 10,
-    "condition": "facts.os.family == \"linux\"",
+    "operating_systems": ["linux"],
     "settings": {"interval_secs": 30}
   }' \
   "$MAXNINES_URL/api/v1/rules/2"

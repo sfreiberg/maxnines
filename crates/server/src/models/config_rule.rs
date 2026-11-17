@@ -9,6 +9,12 @@ pub struct Model {
     pub priority: i32,
     pub condition_expr: Option<String>,
     pub enabled: bool,
+    /// The systems it's for, comma separated, or nothing for all of them.
+    pub operating_systems: Option<String>,
+    /// Which built-in rule it is, for one that ships with the server.
+    pub built_in: Option<String>,
+    /// When an upgrade last changed a built-in rule.
+    pub built_in_changed_ms: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

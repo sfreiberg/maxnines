@@ -17,6 +17,15 @@ use crate::models::{ConfigRule, RuleInput};
 /// What the database column holds.
 const MAX_NAME_LEN: usize = 255;
 
+/// The operating systems a rule can be limited to, by the `os.family` agents report,
+/// with their names for people.
+pub const OPERATING_SYSTEMS: [(&str, &str); 4] = [
+    ("freebsd", "FreeBSD"),
+    ("linux", "Linux"),
+    ("macos", "macOS"),
+    ("windows", "Windows"),
+];
+
 /// An agent's config, and how it came to be.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ResolvedConfig {
@@ -36,6 +45,17 @@ pub fn check_rule(rule: &RuleInput) -> Result<()> {
 
     if let Some(condition) = &rule.condition {
         Program::compile(condition).map_err(|error| anyhow!("invalid condition: {error}"))?;
+    }
+    for (index, system) in rule.operating_systems.iter().enumerate() {
+        ensure!(
+            OPERATING_SYSTEMS.iter().any(|(known, _)| known == system),
+            "unknown operating system {system:?}: use {}",
+            OPERATING_SYSTEMS.map(|(known, _)| known).join(", ")
+        );
+        ensure!(
+            !rule.operating_systems[..index].contains(system),
+            "{system:?} is listed twice"
+        );
     }
 
     ensure!(rule.settings.is_object(), "settings must be a map");
@@ -94,6 +114,13 @@ pub fn resolve(rules: &[ConfigRule], facts: &Value, host_id: &str) -> Result<Res
 pub fn matches(rule: &RuleInput, facts: &Value, host_id: &str) -> bool {
     if !rule.enabled {
         return false;
+    }
+    if !rule.operating_systems.is_empty() {
+        let family = facts["os"]["family"].as_str();
+        let listed = |family: &str| rule.operating_systems.iter().any(|system| system == family);
+        if !family.is_some_and(listed) {
+            return false;
+        }
     }
     let Some(condition) = &rule.condition else {
         return true;
@@ -162,10 +189,13 @@ mod tests {
     fn rule(name: &str, condition: Option<&str>, settings: Value) -> ConfigRule {
         ConfigRule {
             id: 1,
+            built_in: None,
+            built_in_changed_ms: None,
             rule: RuleInput {
                 name: name.to_string(),
                 priority: 0,
                 condition: condition.map(String::from),
+                operating_systems: Vec::new(),
                 enabled: true,
                 settings,
             },

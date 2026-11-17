@@ -64,6 +64,31 @@ reached, and sent when it's back.
   host, and `./maxnines-agent identity show` prints its ID once it's been started.
   Use `-c` to point any of them at a config file somewhere else.
 
+## Config rules
+
+What each agent monitors comes from config rules, under **Settings > Config rules**.
+Every rule that matches a host applies, lowest priority first, so a higher priority
+wins. A rule can be limited to some operating systems, by ticking them under
+**Applies to**, and to hosts whose facts match conditions.
+
+### Built-in rules
+
+Some rules come with MaxNines, and are marked **Comes with MaxNines**:
+
+| Rule | Applies to | Sets |
+|---|---|---|
+| **Default** | Every host | A sample every 15 seconds, facts every hour, and the host, CPU, memory, disk, network and system collectors |
+| **macOS** | Macs | The [GPU](#gpus) collector |
+
+An upgrade can change them, add more or remove one, and the audit log and the Config
+rules page say when it did. They can be turned off, which lasts through upgrades, but
+not changed or deleted. To change what one sets, open it and follow the link to add a
+rule of your own after it: that rule applies to the same hosts, one priority higher,
+and holds only your changes, so upgrades never touch them.
+
+If an upgrade brings a built-in rule with the same name as one of yours, yours is
+kept as it is and renamed, such as `Default (yours)`.
+
 ## CPU
 
 Besides the host's total, an agent reports each core's usage, so one core stuck at
@@ -132,9 +157,7 @@ Mac's memory, so that's the share it's using; a separate graphics card reports i
 own. Each GPU is named by its model, such as `Apple M4 Pro`. It needs no extra
 rights. Other systems don't report GPUs yet.
 
-It's off unless a config rule turns it on, under **Collectors**. A rule for Macs alone
-keeps other hosts from noting that they can't run it, with the condition
-`facts.os.family == "macos"`.
+The built-in **macOS** [config rule](#built-in-rules) turns it on for every Mac.
 
 ## Watching services and processes
 

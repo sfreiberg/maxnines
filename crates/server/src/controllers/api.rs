@@ -1038,6 +1038,26 @@ async fn update_rule(
     UrlPath(id): UrlPath<i64>,
     Json(input): Json<RuleInput>,
 ) -> Response {
+    // A rule that comes with MaxNines can only be turned on or off.
+    match state.database.get_rule(id).await {
+        Ok(Some(saved)) if saved.built_in.is_some() => {
+            if !crate::models::same_rule(&saved.rule, &input) {
+                return refused_built_in(
+                    "this rule comes with MaxNines, so only `enabled` can change. Add a rule of your own after it to change what it sets",
+                );
+            }
+            return match state.database.set_rule_enabled(id, input.enabled).await {
+                Ok(true) => {
+                    state.config_changed();
+                    StatusCode::NO_CONTENT.into_response()
+                }
+                Ok(false) => StatusCode::NOT_FOUND.into_response(),
+                Err(error) => server_error(&error),
+            };
+        }
+        Ok(_) => {}
+        Err(error) => return server_error(&error),
+    }
     if let Some(response) = refuse_rule(&state, &input, Some(id)).await {
         return response;
     }
@@ -1052,6 +1072,15 @@ async fn update_rule(
 }
 
 async fn delete_rule(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.get_rule(id).await {
+        Ok(Some(saved)) if saved.built_in.is_some() => {
+            return refused_built_in(
+                "this rule comes with MaxNines, so it can't be deleted, but it can be turned off",
+            );
+        }
+        Ok(_) => {}
+        Err(error) => return server_error(&error),
+    }
     match state.database.delete_rule(id).await {
         Ok(true) => {
             state.config_changed();
@@ -2074,6 +2103,14 @@ async fn delete_channel(State(state): State<AppState>, UrlPath(id): UrlPath<i64>
 }
 
 /// Explains what's wrong with a rule, if anything.
+fn refused_built_in(why: &str) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({ "error": why })),
+    )
+        .into_response()
+}
+
 async fn refuse_rule(state: &AppState, input: &RuleInput, id: Option<i64>) -> Option<Response> {
     let problem = match rule_engine::check_rule(input) {
         Err(error) => format!("{error:#}"),

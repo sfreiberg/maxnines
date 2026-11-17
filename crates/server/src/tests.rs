@@ -4,6 +4,7 @@ mod agentless;
 mod alerting;
 mod app_sign_ins;
 mod audit;
+mod built_in_rules;
 mod dashboards;
 mod docs;
 mod events;
@@ -179,8 +180,16 @@ async fn start_with_heartbeat(
     let config = Config::parse(&text).unwrap();
 
     let database = Database::for_test().await;
-    // Tests start with no alert rules, so each says what it relies on. The built-in
-    // rule has tests of its own.
+    // Tests start with the Default config rule alone, and no alert rules, so each
+    // says what it relies on. The other built-in rules have tests of their own.
+    let default_rule: Vec<_> = crate::built_in_rules::all()
+        .into_iter()
+        .filter(|built_in| built_in.key == "default")
+        .collect();
+    database
+        .sync_built_in_rules(&default_rule, now_ms())
+        .await
+        .unwrap();
     for rule in database.list_alert_rules().await.unwrap() {
         database.delete_alert_rule(rule.id, now_ms()).await.unwrap();
     }
@@ -1361,6 +1370,7 @@ impl TestServer {
             name: name.to_string(),
             priority,
             condition: Some(condition.to_string()),
+            operating_systems: Vec::new(),
             enabled: true,
             settings,
         };
@@ -2934,7 +2944,9 @@ async fn a_preview_of_a_broken_rule_explains_what_is_wrong() {
 #[tokio::test]
 async fn the_preview_button_brings_the_results_into_view() {
     let server = start().await;
-    let id = server.state.database.list_rules().await.unwrap()[0].id;
+    // A built-in rule can't be changed, so it has nothing to preview.
+    server.create_rule("web", 100, "true", json!({})).await;
+    let id = server.state.database.list_rules().await.unwrap()[1].id;
 
     let mut browser = Browser::default();
     for (form, action) in [

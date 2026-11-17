@@ -21,6 +21,7 @@ impl MigratorTrait for Migrator {
             Box::new(SignInDetails),
             Box::new(Proxies),
             Box::new(ResolvedSummaries),
+            Box::new(BuiltInConfigRules),
         ]
     }
 }
@@ -1512,6 +1513,9 @@ enum ConfigRules {
     Priority,
     ConditionExpr,
     Enabled,
+    OperatingSystems,
+    BuiltIn,
+    BuiltInChangedMs,
 }
 
 #[derive(Iden)]
@@ -1937,6 +1941,68 @@ impl MigrationTrait for CheckStats {
                 .alter_table(
                     Table::alter()
                         .table(RemoteChecks::Table)
+                        .drop_column(column)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+struct BuiltInConfigRules;
+
+impl MigrationName for BuiltInConfigRules {
+    fn name(&self) -> &str {
+        "m20261117_000012_built_in_config_rules"
+    }
+}
+
+/// Which operating systems a config rule is for, and which rules ship with the
+/// server: those name the built-in rule they are and when an upgrade last changed
+/// them. The server marks its own rules when it starts, so nothing is marked here.
+#[async_trait::async_trait]
+impl MigrationTrait for BuiltInConfigRules {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // One column to a statement, as SQLite adds no more than that at once.
+        for column in [
+            ColumnDef::new(ConfigRules::OperatingSystems)
+                .string_len(64)
+                .to_owned(),
+            ColumnDef::new(ConfigRules::BuiltIn)
+                .string_len(32)
+                .to_owned(),
+            ColumnDef::new(ConfigRules::BuiltInChangedMs)
+                .big_integer()
+                .to_owned(),
+        ] {
+            let mut column = column;
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(ConfigRules::Table)
+                        .add_column(&mut column)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for column in [
+            ConfigRules::BuiltInChangedMs,
+            ConfigRules::BuiltIn,
+            ConfigRules::OperatingSystems,
+        ] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(ConfigRules::Table)
                         .drop_column(column)
                         .to_owned(),
                 )

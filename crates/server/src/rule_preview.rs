@@ -84,6 +84,7 @@ pub fn preview(
 
 /// The rules as they'd be after saving, in the order the database would give.
 fn with_rule(rules: &[ConfigRule], id: Option<i64>, rule: &RuleInput) -> Vec<ConfigRule> {
+    let replaced = id.and_then(|id| rules.iter().find(|saved| saved.id == id));
     let mut proposed: Vec<ConfigRule> = rules
         .iter()
         .filter(|saved| Some(saved.id) != id)
@@ -91,9 +92,11 @@ fn with_rule(rules: &[ConfigRule], id: Option<i64>, rule: &RuleInput) -> Vec<Con
         .collect();
     proposed.push(ConfigRule {
         id: id.unwrap_or(NEW_RULE_ID),
+        built_in: replaced.and_then(|saved| saved.built_in.clone()),
+        built_in_changed_ms: None,
         rule: rule.clone(),
     });
-    proposed.sort_by_key(|saved| (saved.rule.priority, saved.id));
+    proposed.sort_by_key(|saved| (saved.rule.priority, saved.built_in.is_none(), saved.id));
     proposed
 }
 
@@ -341,6 +344,8 @@ mod tests {
     ) -> ConfigRule {
         ConfigRule {
             id,
+            built_in: None,
+            built_in_changed_ms: None,
             rule: input(name, priority, condition, settings),
         }
     }
@@ -350,6 +355,7 @@ mod tests {
             name: name.to_string(),
             priority,
             condition: condition.map(String::from),
+            operating_systems: Vec::new(),
             enabled: true,
             settings,
         }

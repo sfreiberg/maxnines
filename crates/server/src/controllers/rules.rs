@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context as _, Result, bail};
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -10,17 +10,17 @@ use axum_csrf::CsrfToken;
 use maxnines_protocol::{
     COLLECTORS, Check, CheckKind, DATABASE_EXTRAS, DatabaseChoice, LocalCheck, default_status_page,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use super::condition_form::{ConditionForm, operators};
-use super::{CsrfForm, Page, server_error};
+use super::{CsrfForm, Page, local_date, server_error};
 use crate::app_state::AppState;
 use crate::condition_builder::Builder;
 use crate::facts::unflatten;
-use crate::models::RuleInput;
+use crate::models::{ConfigRule, RuleInput};
 use crate::registration::HostState;
-use crate::rule_engine;
+use crate::rule_engine::{self, OPERATING_SYSTEMS};
 use crate::rule_preview::Preview;
 
 pub fn routes() -> Router<AppState> {
@@ -59,6 +59,44 @@ struct RuleForm {
     local_checks: String,
     databases: String,
     collectors: Vec<CollectorChoice>,
+    operating_systems: Vec<SystemChoice>,
+    /// Whether it comes with MaxNines, so only turning it on or off is allowed.
+    built_in: bool,
+    /// When an upgrade last changed it, for a built-in rule.
+    built_in_changed: Option<String>,
+}
+
+/// Whether a rule is for one operating system.
+#[derive(Serialize)]
+struct SystemChoice {
+    key: &'static str,
+    label: &'static str,
+    checked: bool,
+}
+
+fn systems(checked: impl Fn(&str) -> bool) -> Vec<SystemChoice> {
+    OPERATING_SYSTEMS
+        .iter()
+        .map(|(key, label)| SystemChoice {
+            key,
+            label,
+            checked: checked(key),
+        })
+        .collect()
+}
+
+/// Operating systems in words, such as "Linux and Windows".
+fn systems_label(keys: &[String]) -> Option<String> {
+    let labels: Vec<&str> = OPERATING_SYSTEMS
+        .iter()
+        .filter(|(key, _)| keys.iter().any(|wanted| wanted == key))
+        .map(|(_, label)| *label)
+        .collect();
+    match labels.as_slice() {
+        [] => None,
+        [one] => Some((*one).to_string()),
+        [rest @ .., last] => Some(format!("{} and {last}", rest.join(", "))),
+    }
 }
 
 /// A collector's setting. `inherit` leaves it to other rules.
@@ -75,6 +113,7 @@ impl RuleForm {
             enabled: true,
             applies_to: ConditionForm::blank(),
             collectors: choices(|_| "inherit".to_string()),
+            operating_systems: systems(|_| false),
             ..Self::default()
         }
     }
@@ -125,6 +164,32 @@ impl RuleForm {
                 .to_string()
             }),
             applies_to: ConditionForm::from_condition(rule.condition.as_deref()),
+            operating_systems: systems(|key| rule.operating_systems.iter().any(|os| os == key)),
+            built_in: false,
+            built_in_changed: None,
+        }
+    }
+
+    /// A saved rule, saying whether it's built in.
+    fn from_saved(saved: &ConfigRule) -> Self {
+        Self {
+            built_in: saved.built_in.is_some(),
+            built_in_changed: saved.built_in_changed_ms.map(local_date),
+            ..Self::from_rule(&saved.rule)
+        }
+    }
+
+    /// A new rule that applies just after `saved`, to the same hosts, to change
+    /// what it sets.
+    fn after(saved: &ConfigRule) -> Self {
+        Self {
+            name: format!("{} changes", saved.rule.name),
+            priority: (saved.rule.priority + 1).to_string(),
+            applies_to: ConditionForm::from_condition(saved.rule.condition.as_deref()),
+            operating_systems: systems(|key| {
+                saved.rule.operating_systems.iter().any(|os| os == key)
+            }),
+            ..Self::blank()
         }
     }
 
@@ -154,6 +219,9 @@ impl RuleForm {
             local_checks: text("local_checks"),
             databases: text("databases"),
             collectors: choices(|name| text(&format!("collector_{name}"))),
+            operating_systems: systems(|key| fields.contains_key(&format!("os_{key}"))),
+            built_in: false,
+            built_in_changed: None,
         }
     }
 
@@ -244,6 +312,12 @@ impl RuleForm {
                 .parse()
                 .context("priority must be a whole number")?,
             condition: self.applies_to.expression(known)?,
+            operating_systems: self
+                .operating_systems
+                .iter()
+                .filter(|system| system.checked)
+                .map(|system| system.key.to_string())
+                .collect(),
             enabled: self.enabled,
             settings: Value::Object(settings),
         })
@@ -492,6 +566,10 @@ struct RuleRow {
     summary: String,
     /// How many approved agents it applies to.
     hosts: usize,
+    /// The operating systems it's limited to, in words.
+    systems: Option<String>,
+    built_in: bool,
+    built_in_changed: Option<String>,
 }
 
 /// Describes what a rule sets in a few words.
@@ -559,6 +637,9 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
                 .filter(|(id, facts)| rule_engine::matches(&rule.rule, facts, id))
                 .count(),
             summary: summarize(&rule.rule.settings),
+            systems: systems_label(&rule.rule.operating_systems),
+            built_in: rule.built_in.is_some(),
+            built_in_changed: rule.built_in_changed_ms.map(local_date),
             description: rule
                 .rule
                 .condition
@@ -683,21 +764,32 @@ async fn preview(state: &AppState, form: &RuleForm, id: Option<i64>) -> Result<P
     state.preview_rule(id, input).await
 }
 
-async fn new(State(state): State<AppState>, token: CsrfToken) -> Response {
-    form_page(&state, &token, None, &RuleForm::blank(), None).await
+#[derive(Deserialize)]
+struct NewParams {
+    /// A rule the new one is to change, which it applies just after.
+    from: Option<i64>,
+}
+
+async fn new(
+    State(state): State<AppState>,
+    Query(params): Query<NewParams>,
+    token: CsrfToken,
+) -> Response {
+    let form = match params.from {
+        None => RuleForm::blank(),
+        Some(id) => match state.database.get_rule(id).await {
+            Ok(Some(saved)) => RuleForm::after(&saved),
+            Ok(None) => RuleForm::blank(),
+            Err(error) => return server_error(&error),
+        },
+    };
+    form_page(&state, &token, None, &form, None).await
 }
 
 async fn edit(State(state): State<AppState>, Path(id): Path<i64>, token: CsrfToken) -> Response {
     match state.database.get_rule(id).await {
         Ok(Some(rule)) => {
-            form_page(
-                &state,
-                &token,
-                Some(id),
-                &RuleForm::from_rule(&rule.rule),
-                None,
-            )
-            .await
+            form_page(&state, &token, Some(id), &RuleForm::from_saved(&rule), None).await
         }
         Ok(None) => not_found(&state, &token),
         Err(error) => server_error(&error),
@@ -748,6 +840,22 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
 }
 
 async fn update(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfForm) -> Response {
+    // A built-in rule's form only sends whether it's on, the rest being locked.
+    match state.database.get_rule(id).await {
+        Ok(Some(saved)) if saved.built_in.is_some() => {
+            let enabled = form.fields.contains_key("enabled");
+            return match state.database.set_rule_enabled(id, enabled).await {
+                Ok(true) => {
+                    state.config_changed();
+                    (form.token, Redirect::to("/rules")).into_response()
+                }
+                Ok(false) => not_found(&state, &form.token),
+                Err(error) => server_error(&error),
+            };
+        }
+        Ok(_) => {}
+        Err(error) => return server_error(&error),
+    }
     let mut fields = RuleForm::from_fields(&form.fields);
     if let Some(response) = without_saving(&state, Some(id), &mut fields, &form).await {
         return response;
@@ -772,6 +880,15 @@ async fn update(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfFo
 }
 
 async fn delete(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfForm) -> Response {
+    match state.database.get_rule(id).await {
+        Ok(Some(saved)) if saved.built_in.is_some() => {
+            let why = "A rule that comes with MaxNines can't be deleted, but it can be turned off.";
+            let fields = RuleForm::from_saved(&saved);
+            return form_page(&state, &form.token, Some(id), &fields, Some(why)).await;
+        }
+        Ok(_) => {}
+        Err(error) => return server_error(&error),
+    }
     match state.database.delete_rule(id).await {
         Ok(true) => {
             state.config_changed();
@@ -792,6 +909,7 @@ mod tests {
             name: "web".to_string(),
             priority: 100,
             condition: Some("true".to_string()),
+            operating_systems: Vec::new(),
             enabled: false,
             settings,
         }
