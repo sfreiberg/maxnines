@@ -2,7 +2,7 @@
 
 use std::error::Error;
 
-use vergen_gitcl::{Build, Emitter, Gitcl};
+use vergen_gitcl::{Build, Emitter, Gitcl, Rustc};
 
 fn main() -> Result<(), Box<dyn Error>> {
     // Everything that ends up in the binary, or the build time would go stale.
@@ -15,6 +15,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .default_on_error()
         .add_instructions(&Build::builder().build_timestamp(true).build())?
         .add_instructions(&Gitcl::builder().sha(true).dirty(true).build())?
+        .add_instructions(&Rustc::builder().semver(true).build())?
         .emit()?;
     Ok(())
 }

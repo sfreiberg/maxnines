@@ -594,6 +594,10 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         )
         .with("newest_agent_version", NEWEST_AGENT_VERSION)
         .with("agent_commit", &text_fact(&flat, "agent.commit"))
+        .with(
+            "agent_rust_version",
+            &text_fact(&flat, "agent.rust_version"),
+        )
         .with("facts", &facts)
         .with("config", &config)
         .with("version", &desired.version)

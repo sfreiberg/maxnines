@@ -7269,6 +7269,7 @@ mod server_page {
             "cpu",
             "Hosts",
             "Alert rules last ran",
+            &maxnines_protocol::build_info!().rust_version,
         ] {
             assert!(page.body.contains(text), "{text}: {}", page.body);
         }
@@ -7349,6 +7350,10 @@ mod server_page {
         let (status, stats) = api(&server, "GET", "/api/v1/server", &Value::Null).await;
         assert_eq!(status, 200);
         assert_eq!(stats["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            stats["rust_version"],
+            maxnines_protocol::build_info!().rust_version.as_str()
+        );
         assert_eq!(
             stats["database"]["engine"],
             crate::tests::main_database_engine()

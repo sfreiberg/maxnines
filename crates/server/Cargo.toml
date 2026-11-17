@@ -80,7 +80,7 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 tempfile = "3"
 
 [build-dependencies]
-vergen-gitcl = { version = "10", features = ["build"] }
+vergen-gitcl = { version = "10", features = ["build", "rustc"] }
 
 [features]
 # Runs the metrics store tests against a ClickHouse server as well.

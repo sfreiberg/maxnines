@@ -144,6 +144,7 @@ struct ServerPage {
     version: String,
     commit: String,
     built_at: String,
+    rust_version: String,
     started: String,
     uptime: String,
     os: Option<String>,
@@ -262,6 +263,7 @@ fn server_page(stats: ServerStats, now_ms: i64) -> ServerPage {
         version: stats.version,
         commit: stats.commit,
         built_at: stats.built_at,
+        rust_version: stats.rust_version,
         os: stats.os,
     }
 }

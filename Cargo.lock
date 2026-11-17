@@ -8030,6 +8030,7 @@ checksum = "d7081a999aada4e01c8ee04d32254e021e317dd051a250169305fbf2acf21824"
 dependencies = [
  "anyhow",
  "bon",
+ "rustc_version",
  "rustversion",
  "time",
  "vergen-lib",

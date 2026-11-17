@@ -19,6 +19,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/server"
   "version": "0.1.0",
   "commit": "770de39",
   "built_at": "2026-11-06T04:42:04.427542000Z",
+  "rust_version": "1.100.0",
   "started_ms": 1793940264095,
   "uptime_secs": 22,
   "os": "Ubuntu 24.04",

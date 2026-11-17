@@ -54,7 +54,7 @@ tempfile = "3"
 tokio = { version = "1.54.1", features = ["test-util"] }
 
 [build-dependencies]
-vergen-gitcl = { version = "10", features = ["build"] }
+vergen-gitcl = { version = "10", features = ["build", "rustc"] }
 
 # Linux packages, made by cargo-deb and cargo-generate-rpm from a binary that's
 # already built. The release workflow builds it with --target, which both tools

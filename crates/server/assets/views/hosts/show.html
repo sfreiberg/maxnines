@@ -170,7 +170,7 @@
       {% if own_memory %}<dt>Agent memory</dt><dd>{{ own_memory }}</dd>{% endif %}
       {% if host.state == "approved" %}<dt>Location</dt><dd>{% if location %}<a href="/map/rules/{{ location.rule_id }}/edit">{{ location.name }}</a>{% if location.place and location.place != location.name %}, {{ location.place }}{% endif %}{% if not location.just_this_one %} · <a href="/map/rules/new?host={{ host.id }}">Place it by itself</a>{% endif %}{% else %}Not on the map · <a href="/map/rules/new?host={{ host.id }}">Place it</a>{% endif %}</dd>{% endif %}
       {% if source %}<dt>Connected from</dt><dd><code>{{ source }}</code></dd>{% endif %}
-      {% if host.version %}<dt>Agent version</dt><dd>{{ host.version }}{% if agent_commit %}, commit <code>{{ agent_commit }}</code>{% endif %}{% if host.version_state == "outdated" %}. The newest is {{ newest_agent_version }}.{% elif host.version_state == "newer_than_server" %}, newer than the server. Upgrade the server first.{% endif %}</dd>{% endif %}
+      {% if host.version %}<dt>Agent version</dt><dd>{{ host.version }}{% if agent_commit %}, commit <code>{{ agent_commit }}</code>{% endif %}{% if agent_rust_version %}, built with Rust {{ agent_rust_version }}{% endif %}{% if host.version_state == "outdated" %}. The newest is {{ newest_agent_version }}.{% elif host.version_state == "newer_than_server" %}, newer than the server. Upgrade the server first.{% endif %}</dd>{% endif %}
       <dt>Host ID</dt><dd><code>{{ host.id }}</code></dd>
     </dl>
   </section>

@@ -197,6 +197,7 @@ fn gather_named(
             "version": build.version,
             "commit": build.commit,
             "built_at": build.built_at,
+            "rust_version": build.rust_version,
             "collectors": collector::supported(),
             // Only the names, for the server to choose from. What they run or
             // reach, and how they sign in, stays on this host.
@@ -368,6 +369,12 @@ mod tests {
         assert!(
             built_at.starts_with("20") && built_at.ends_with('Z'),
             "{built_at}"
+        );
+        // Whichever compiler built these tests, as a plain version like 1.100.0.
+        let rust = agent["rust_version"].as_str().unwrap();
+        assert!(
+            rust.starts_with("1.") && rust.split('.').count() >= 3,
+            "{rust}"
         );
     }
 

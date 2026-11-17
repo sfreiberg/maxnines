@@ -116,11 +116,19 @@ pub struct BuildInfo {
     pub commit: String,
     /// When it was compiled, in UTC.
     pub built_at: String,
+    /// The Rust compiler it was built with, such as `1.100.0`.
+    pub rust_version: String,
 }
 
 impl BuildInfo {
     /// Takes the values `build.rs` records. Use [`build_info`] to get them.
-    pub fn new(version: &str, commit: &str, dirty: &str, built_at: &str) -> Self {
+    pub fn new(
+        version: &str,
+        commit: &str,
+        dirty: &str,
+        built_at: &str,
+        rust_version: &str,
+    ) -> Self {
         let known = |value: &str| match value {
             NO_BUILD_VALUE => "unknown".to_string(),
             value => value.to_string(),
@@ -130,6 +138,7 @@ impl BuildInfo {
             version: version.to_string(),
             commit: format!("{}{suffix}", known(commit)),
             built_at: known(built_at),
+            rust_version: known(rust_version),
         }
     }
 
@@ -138,8 +147,8 @@ impl BuildInfo {
     pub fn describe(&self, program: &str) -> String {
         let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
         format!(
-            "{program} {}\ncommit:   {}\nbuilt:    {}\nplatform: {platform}",
-            self.version, self.commit, self.built_at
+            "{program} {}\ncommit:   {}\nbuilt:    {}\nrust:     {}\nplatform: {platform}",
+            self.version, self.commit, self.built_at, self.rust_version
         )
     }
 }
@@ -154,6 +163,7 @@ macro_rules! build_info {
             env!("VERGEN_GIT_SHA"),
             env!("VERGEN_GIT_DIRTY"),
             env!("VERGEN_BUILD_TIMESTAMP"),
+            env!("VERGEN_RUSTC_SEMVER"),
         )
     };
 }
@@ -1527,7 +1537,13 @@ mod tests {
 
     #[test]
     fn a_build_describes_itself_for_the_version_command() {
-        let build = BuildInfo::new("1.2.3", "abc123", "false", "2026-11-04T10:00:00Z");
+        let build = BuildInfo::new(
+            "1.2.3",
+            "abc123",
+            "false",
+            "2026-11-04T10:00:00Z",
+            "1.100.0",
+        );
 
         let text = build.describe("maxnines-agent");
 
@@ -1535,33 +1551,40 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "maxnines-agent 1.2.3\ncommit:   abc123\nbuilt:    2026-11-04T10:00:00Z\nplatform: {platform}"
+                "maxnines-agent 1.2.3\ncommit:   abc123\nbuilt:    2026-11-04T10:00:00Z\nrust:     1.100.0\nplatform: {platform}"
             )
         );
     }
 
     #[test]
     fn a_build_with_uncommitted_changes_says_so() {
-        let build = BuildInfo::new("1.2.3", "abc123", "true", "2026-11-04");
+        let build = BuildInfo::new("1.2.3", "abc123", "true", "2026-11-04", "1.100.0");
 
         assert_eq!(build.commit, "abc123-dirty");
     }
 
     #[test]
     fn a_clean_build_is_just_its_commit() {
-        let build = BuildInfo::new("1.2.3", "abc123", "false", "2026-11-04");
+        let build = BuildInfo::new("1.2.3", "abc123", "false", "2026-11-04", "1.100.0");
 
         assert_eq!(build.commit, "abc123");
     }
 
     #[test]
     fn a_build_without_git_history_is_unknown_and_not_a_placeholder() {
-        let build = BuildInfo::new("1.2.3", NO_BUILD_VALUE, NO_BUILD_VALUE, "2026-11-04");
+        let build = BuildInfo::new(
+            "1.2.3",
+            NO_BUILD_VALUE,
+            NO_BUILD_VALUE,
+            "2026-11-04",
+            NO_BUILD_VALUE,
+        );
 
         assert_eq!(build.commit, "unknown");
         assert_eq!(build.built_at, "2026-11-04");
+        assert_eq!(build.rust_version, "unknown");
         assert_eq!(
-            BuildInfo::new("1.2.3", "abc", "false", NO_BUILD_VALUE).built_at,
+            BuildInfo::new("1.2.3", "abc", "false", NO_BUILD_VALUE, "1.100.0").built_at,
             "unknown"
         );
     }
