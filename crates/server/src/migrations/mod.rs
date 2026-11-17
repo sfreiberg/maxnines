@@ -2,27 +2,13 @@
 //! draws. A change to a table is a new migration after this one, with the README
 //! changed to match.
 
-use sea_orm::{DbBackend, Statement};
 use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
 
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![
-            Box::new(CreateTables),
-            Box::new(PageTokens),
-            Box::new(CheckNamesPerHost),
-            Box::new(SilenceSeries),
-            Box::new(CheckSignIn),
-            Box::new(DomainExpiry),
-            Box::new(CheckStats),
-            Box::new(AppSignIns),
-            Box::new(SignInDetails),
-            Box::new(Proxies),
-            Box::new(ResolvedSummaries),
-            Box::new(BuiltInConfigRules),
-        ]
+        vec![Box::new(CreateTables)]
     }
 }
 
@@ -40,7 +26,7 @@ struct CreateTables;
 
 impl MigrationName for CreateTables {
     fn name(&self) -> &str {
-        "m20261114_000001_create_tables"
+        "m20261117_000001_create_tables"
     }
 }
 
@@ -207,6 +193,8 @@ impl MigrationTrait for CreateTables {
                     .col(ColumnDef::new(MetricsPages::Username).string_len(255))
                     .col(ColumnDef::new(MetricsPages::Password).text())
                     .col(ColumnDef::new(MetricsPages::PasswordEnv).string_len(255))
+                    .col(ColumnDef::new(MetricsPages::Token).text())
+                    .col(ColumnDef::new(MetricsPages::TokenEnv).string_len(255))
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_metrics_pages_host_id")
@@ -239,6 +227,9 @@ impl MigrationTrait for CreateTables {
                     .col(ColumnDef::new(ConfigRules::Priority).integer().not_null())
                     .col(ColumnDef::new(ConfigRules::ConditionExpr).text())
                     .col(ColumnDef::new(ConfigRules::Enabled).boolean().not_null())
+                    .col(ColumnDef::new(ConfigRules::OperatingSystems).string_len(64))
+                    .col(ColumnDef::new(ConfigRules::BuiltIn).string_len(32))
+                    .col(ColumnDef::new(ConfigRules::BuiltInChangedMs).big_integer())
                     .to_owned(),
             )
             .await?;
@@ -365,6 +356,10 @@ impl MigrationTrait for CreateTables {
                             .big_integer()
                             .not_null(),
                     )
+                    .col(ColumnDef::new(UserSessions::LastUsedMs).big_integer())
+                    .col(ColumnDef::new(UserSessions::LastAddress).string_len(64))
+                    .col(ColumnDef::new(UserSessions::LastForwardedFor).string_len(64))
+                    .col(ColumnDef::new(UserSessions::UserAgent).string_len(255))
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_user_sessions_user_id")
@@ -408,6 +403,8 @@ impl MigrationTrait for CreateTables {
                     .col(ColumnDef::new(ApiKeys::ExpiresMs).big_integer())
                     .col(ColumnDef::new(ApiKeys::LastUsedMs).big_integer())
                     .col(ColumnDef::new(ApiKeys::RevokedMs).big_integer())
+                    .col(ColumnDef::new(ApiKeys::LastAddress).string_len(64))
+                    .col(ColumnDef::new(ApiKeys::LastForwardedFor).string_len(64))
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_api_keys_user_id")
@@ -417,6 +414,56 @@ impl MigrationTrait for CreateTables {
                     .to_owned(),
             )
             .await?;
+        {
+            use AppSignIns as T;
+            let hash = |column: T| ColumnDef::new(column).string_len(64).not_null().to_owned();
+            manager
+                .create_table(
+                    Table::create()
+                        .table(T::Table)
+                        .col(id(T::Id))
+                        .col(ColumnDef::new(T::UserId).big_integer().not_null())
+                        .col(ColumnDef::new(T::ClientId).string_len(64).not_null())
+                        .col(ColumnDef::new(T::Device).string_len(100).not_null())
+                        .col(ColumnDef::new(T::Role).string_len(16).not_null())
+                        .col(hash(T::AccessHash).unique_key().to_owned())
+                        .col(ColumnDef::new(T::AccessExpiresMs).big_integer().not_null())
+                        .col(hash(T::RefreshHash).unique_key().to_owned())
+                        .col(ColumnDef::new(T::PreviousRefreshHash).string_len(64))
+                        .col(ColumnDef::new(T::RotatedMs).big_integer())
+                        .col(ColumnDef::new(T::RefreshExpiresMs).big_integer().not_null())
+                        .col(ColumnDef::new(T::CreatedMs).big_integer().not_null())
+                        .col(ColumnDef::new(T::LastUsedMs).big_integer())
+                        .col(ColumnDef::new(T::RevokedMs).big_integer())
+                        .col(ColumnDef::new(T::LastAddress).string_len(64))
+                        .col(ColumnDef::new(T::LastForwardedFor).string_len(64))
+                        .foreign_key(
+                            ForeignKey::create()
+                                .name("fk_app_sign_ins_user_id")
+                                .from(T::Table, T::UserId)
+                                .to(Users::Table, Users::Id),
+                        )
+                        .to_owned(),
+                )
+                .await?;
+            for (name, column) in [
+                ("idx_app_sign_ins_user_id", T::UserId),
+                (
+                    "idx_app_sign_ins_previous_refresh_hash",
+                    T::PreviousRefreshHash,
+                ),
+            ] {
+                manager
+                    .create_index(
+                        Index::create()
+                            .name(name)
+                            .table(T::Table)
+                            .col(column)
+                            .to_owned(),
+                    )
+                    .await?;
+            }
+        }
         manager
             .create_table(
                 Table::create()
@@ -607,6 +654,7 @@ impl MigrationTrait for CreateTables {
                     .col(ColumnDef::new(Alerts::StartedMs).big_integer().not_null())
                     .col(ColumnDef::new(Alerts::ResolvedMs).big_integer())
                     .col(ColumnDef::new(Alerts::ResolveReason).text())
+                    .col(ColumnDef::new(Alerts::ResolvedSummary).text())
                     .col(ColumnDef::new(Alerts::AcknowledgedBy).string_len(255))
                     .col(ColumnDef::new(Alerts::AcknowledgedMs).big_integer())
                     .foreign_key(
@@ -734,6 +782,12 @@ impl MigrationTrait for CreateTables {
                     )
                     .col(ColumnDef::new(Silences::StartsMs).big_integer().not_null())
                     .col(ColumnDef::new(Silences::EndsMs).big_integer().not_null())
+                    .col(
+                        ColumnDef::new(Silences::Series)
+                            .string_len(255)
+                            .not_null()
+                            .default(""),
+                    )
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_silences_rule_id")
@@ -930,13 +984,72 @@ impl MigrationTrait for CreateTables {
                     .to_owned(),
             )
             .await?;
-        manager.create_table(remote_checks_table(true)).await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(RemoteChecks::Table)
+                    .col(id(RemoteChecks::Id))
+                    .col(ColumnDef::new(RemoteChecks::Name).string_len(64).not_null())
+                    .col(ColumnDef::new(RemoteChecks::Kind).string_len(16).not_null())
+                    .col(
+                        ColumnDef::new(RemoteChecks::Target)
+                            .string_len(255)
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(RemoteChecks::TimeoutSecs).big_integer())
+                    .col(ColumnDef::new(RemoteChecks::Method).string_len(16))
+                    .col(ColumnDef::new(RemoteChecks::Body).text())
+                    .col(ColumnDef::new(RemoteChecks::Regex).text())
+                    .col(ColumnDef::new(RemoteChecks::Insecure).boolean())
+                    .col(ColumnDef::new(RemoteChecks::Server).string_len(255))
+                    .col(ColumnDef::new(RemoteChecks::Record).string_len(16))
+                    .col(ColumnDef::new(RemoteChecks::Count).integer())
+                    .col(
+                        ColumnDef::new(RemoteChecks::IntervalSecs)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(RemoteChecks::Enabled).boolean().not_null())
+                    .col(
+                        ColumnDef::new(RemoteChecks::HostId)
+                            .string_len(32)
+                            .not_null()
+                            .default("server"),
+                    )
+                    .col(ColumnDef::new(RemoteChecks::Database).string_len(63))
+                    .col(ColumnDef::new(RemoteChecks::Tls).boolean())
+                    .col(ColumnDef::new(RemoteChecks::HostKey).string_len(100))
+                    .col(ColumnDef::new(RemoteChecks::Username).string_len(255))
+                    .col(ColumnDef::new(RemoteChecks::Password).text())
+                    .col(ColumnDef::new(RemoteChecks::PasswordEnv).string_len(255))
+                    .col(ColumnDef::new(RemoteChecks::PrivateKey).text())
+                    .col(ColumnDef::new(RemoteChecks::PrivateKeyEnv).string_len(255))
+                    .col(ColumnDef::new(RemoteChecks::DomainExpiry).boolean())
+                    .col(
+                        ColumnDef::new(RemoteChecks::ReadStats)
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .col(ColumnDef::new(RemoteChecks::Extras).string_len(255))
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_remote_checks_host_id")
+                            .from(RemoteChecks::Table, RemoteChecks::HostId)
+                            .to(Hosts::Table, Hosts::Id),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        // A check's name only has to differ from the others about the same host.
         manager
             .create_index(
                 Index::create()
-                    .name("idx_remote_checks_host")
+                    .name("idx_remote_checks_host_name")
                     .table(RemoteChecks::Table)
                     .col(RemoteChecks::HostId)
+                    .col(RemoteChecks::Name)
+                    .unique()
                     .to_owned(),
             )
             .await?;
@@ -1147,6 +1260,7 @@ impl MigrationTrait for CreateTables {
                     .col(ColumnDef::new(AuditLog::ViaId).string_len(64))
                     .col(ColumnDef::new(AuditLog::ViaName).string_len(255))
                     .col(ColumnDef::new(AuditLog::Source).string_len(45))
+                    .col(ColumnDef::new(AuditLog::ForwardedFor).string_len(64))
                     .col(ColumnDef::new(AuditLog::Action).string_len(32).not_null())
                     .col(
                         ColumnDef::new(AuditLog::SubjectKind)
@@ -1195,12 +1309,29 @@ impl MigrationTrait for CreateTables {
                     .to_owned(),
             )
             .await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(Proxies::Table)
+                    .col(id(Proxies::Id))
+                    .col(
+                        ColumnDef::new(Proxies::Address)
+                            .string_len(64)
+                            .not_null()
+                            .unique_key(),
+                    )
+                    .col(ColumnDef::new(Proxies::Trusted).boolean().not_null())
+                    .col(ColumnDef::new(Proxies::CreatedMs).big_integer().not_null())
+                    .to_owned(),
+            )
+            .await?;
 
         add_built_ins(manager).await
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         for table in [
+            "proxies",
             "server_secrets",
             "server_settings",
             "audit_log",
@@ -1221,6 +1352,7 @@ impl MigrationTrait for CreateTables {
             "notification_channels",
             "sign_in_challenges",
             "recovery_codes",
+            "app_sign_ins",
             "api_keys",
             "user_sessions",
             "users",
@@ -1843,407 +1975,8 @@ enum ServerSecrets {
     Value,
 }
 
-struct PageTokens;
-
-impl MigrationName for PageTokens {
-    fn name(&self) -> &str {
-        "m20261115_000002_page_tokens"
-    }
-}
-
-/// A metrics page can be signed in to with a token instead of a username and
-/// password, typed in or from the server's environment as a password is.
-#[async_trait::async_trait]
-impl MigrationTrait for PageTokens {
-    fn use_transaction(&self) -> Option<bool> {
-        Some(true)
-    }
-
-    // One column to a statement, as SQLite adds no more than that at once.
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        for column in [
-            ColumnDef::new(MetricsPages::Token).text().to_owned(),
-            ColumnDef::new(MetricsPages::TokenEnv)
-                .string_len(255)
-                .to_owned(),
-        ] {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(MetricsPages::Table)
-                        .add_column(column)
-                        .to_owned(),
-                )
-                .await?;
-        }
-        Ok(())
-    }
-
-    /// Pages signed in to with a token go back to not being signed in to.
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        for column in [MetricsPages::TokenEnv, MetricsPages::Token] {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(MetricsPages::Table)
-                        .drop_column(column)
-                        .to_owned(),
-                )
-                .await?;
-        }
-        Ok(())
-    }
-}
-
-struct CheckStats;
-
-impl MigrationName for CheckStats {
-    fn name(&self) -> &str {
-        "m20261115_000007_check_stats"
-    }
-}
-
-/// A database check can also read the database's health and replication, with
-/// any extras it's asked for, such as sizes.
-#[async_trait::async_trait]
-impl MigrationTrait for CheckStats {
-    fn use_transaction(&self) -> Option<bool> {
-        Some(true)
-    }
-
-    // One column to a statement, as SQLite adds no more than that at once.
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        for column in [
-            ColumnDef::new(RemoteChecks::ReadStats)
-                .boolean()
-                .not_null()
-                .default(false)
-                .to_owned(),
-            ColumnDef::new(RemoteChecks::Extras)
-                .string_len(255)
-                .to_owned(),
-        ] {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(RemoteChecks::Table)
-                        .add_column(column)
-                        .to_owned(),
-                )
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        for column in [RemoteChecks::Extras, RemoteChecks::ReadStats] {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(RemoteChecks::Table)
-                        .drop_column(column)
-                        .to_owned(),
-                )
-                .await?;
-        }
-        Ok(())
-    }
-}
-
-struct BuiltInConfigRules;
-
-impl MigrationName for BuiltInConfigRules {
-    fn name(&self) -> &str {
-        "m20261117_000012_built_in_config_rules"
-    }
-}
-
-/// Which operating systems a config rule is for, and which rules ship with the
-/// server: those name the built-in rule they are and when an upgrade last changed
-/// them. The server marks its own rules when it starts, so nothing is marked here.
-#[async_trait::async_trait]
-impl MigrationTrait for BuiltInConfigRules {
-    fn use_transaction(&self) -> Option<bool> {
-        Some(true)
-    }
-
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        // One column to a statement, as SQLite adds no more than that at once.
-        for column in [
-            ColumnDef::new(ConfigRules::OperatingSystems)
-                .string_len(64)
-                .to_owned(),
-            ColumnDef::new(ConfigRules::BuiltIn)
-                .string_len(32)
-                .to_owned(),
-            ColumnDef::new(ConfigRules::BuiltInChangedMs)
-                .big_integer()
-                .to_owned(),
-        ] {
-            let mut column = column;
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(ConfigRules::Table)
-                        .add_column(&mut column)
-                        .to_owned(),
-                )
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        for column in [
-            ConfigRules::BuiltInChangedMs,
-            ConfigRules::BuiltIn,
-            ConfigRules::OperatingSystems,
-        ] {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(ConfigRules::Table)
-                        .drop_column(column)
-                        .to_owned(),
-                )
-                .await?;
-        }
-        Ok(())
-    }
-}
-
-struct ResolvedSummaries;
-
-impl MigrationName for ResolvedSummaries {
-    fn name(&self) -> &str {
-        "m20261117_000011_resolved_summaries"
-    }
-}
-
-/// Where things stood as an alert's problem cleared, such as the reading then, so
-/// its resolved notifications say what it is now rather than what it was.
-#[async_trait::async_trait]
-impl MigrationTrait for ResolvedSummaries {
-    fn use_transaction(&self) -> Option<bool> {
-        Some(true)
-    }
-
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let column = ColumnDef::new(Alerts::ResolvedSummary).text().to_owned();
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(Alerts::Table)
-                    .add_column(column)
-                    .to_owned(),
-            )
-            .await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(Alerts::Table)
-                    .drop_column(Alerts::ResolvedSummary)
-                    .to_owned(),
-            )
-            .await
-    }
-}
-
-struct Proxies;
-
-impl MigrationName for Proxies {
-    fn name(&self) -> &str {
-        "m20261116_000010_proxies"
-    }
-}
-
 #[derive(Iden)]
-enum ProxiesTable {
-    #[iden = "proxies"]
-    Table,
-    Id,
-    Address,
-    Trusted,
-    CreatedMs,
-}
-
-/// What admins decided about proxies in front of the server, and the address an
-/// untrusted proxy said it was passing on, kept beside the one that connected.
-#[async_trait::async_trait]
-impl MigrationTrait for Proxies {
-    fn use_transaction(&self) -> Option<bool> {
-        Some(true)
-    }
-
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        use ProxiesTable as T;
-        manager
-            .create_table(
-                Table::create()
-                    .table(T::Table)
-                    .col(id(T::Id))
-                    .col(
-                        ColumnDef::new(T::Address)
-                            .string_len(64)
-                            .not_null()
-                            .unique_key(),
-                    )
-                    .col(ColumnDef::new(T::Trusted).boolean().not_null())
-                    .col(ColumnDef::new(T::CreatedMs).big_integer().not_null())
-                    .to_owned(),
-            )
-            .await?;
-        // One column to a statement, as SQLite adds no more than that at once.
-        for (table, column) in [
-            (
-                UserSessions::Table.into_iden(),
-                UserSessions::LastForwardedFor.into_iden(),
-            ),
-            (
-                ApiKeys::Table.into_iden(),
-                ApiKeys::LastForwardedFor.into_iden(),
-            ),
-            (
-                AppSignInsTable::Table.into_iden(),
-                AppSignInsTable::LastForwardedFor.into_iden(),
-            ),
-            (
-                AuditLog::Table.into_iden(),
-                AuditLog::ForwardedFor.into_iden(),
-            ),
-        ] {
-            let column = ColumnDef::new(column).string_len(64).to_owned();
-            manager
-                .alter_table(Table::alter().table(table).add_column(column).to_owned())
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        for (table, column) in [
-            (
-                AuditLog::Table.into_iden(),
-                AuditLog::ForwardedFor.into_iden(),
-            ),
-            (
-                AppSignInsTable::Table.into_iden(),
-                AppSignInsTable::LastForwardedFor.into_iden(),
-            ),
-            (
-                ApiKeys::Table.into_iden(),
-                ApiKeys::LastForwardedFor.into_iden(),
-            ),
-            (
-                UserSessions::Table.into_iden(),
-                UserSessions::LastForwardedFor.into_iden(),
-            ),
-        ] {
-            manager
-                .alter_table(Table::alter().table(table).drop_column(column).to_owned())
-                .await?;
-        }
-        manager
-            .drop_table(Table::drop().table(ProxiesTable::Table).to_owned())
-            .await
-    }
-}
-
-struct SignInDetails;
-
-impl MigrationName for SignInDetails {
-    fn name(&self) -> &str {
-        "m20261116_000009_sign_in_details"
-    }
-}
-
-/// Where each browser session, signed-in app and API key was last used from, and for
-/// a browser session which browser it is and when it was last used, so admins can see
-/// who's signed in and from where.
-#[async_trait::async_trait]
-impl MigrationTrait for SignInDetails {
-    fn use_transaction(&self) -> Option<bool> {
-        Some(true)
-    }
-
-    // One column to a statement, as SQLite adds no more than that at once.
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let address = |column: DynIden| ColumnDef::new(column).string_len(64).to_owned();
-        for (table, column) in [
-            (
-                UserSessions::Table.into_iden(),
-                ColumnDef::new(UserSessions::LastUsedMs)
-                    .big_integer()
-                    .to_owned(),
-            ),
-            (
-                UserSessions::Table.into_iden(),
-                address(UserSessions::LastAddress.into_iden()),
-            ),
-            (
-                UserSessions::Table.into_iden(),
-                ColumnDef::new(UserSessions::UserAgent)
-                    .string_len(255)
-                    .to_owned(),
-            ),
-            (
-                AppSignInsTable::Table.into_iden(),
-                address(AppSignInsTable::LastAddress.into_iden()),
-            ),
-            (
-                ApiKeys::Table.into_iden(),
-                address(ApiKeys::LastAddress.into_iden()),
-            ),
-        ] {
-            manager
-                .alter_table(Table::alter().table(table).add_column(column).to_owned())
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        for (table, column) in [
-            (ApiKeys::Table.into_iden(), ApiKeys::LastAddress.into_iden()),
-            (
-                AppSignInsTable::Table.into_iden(),
-                AppSignInsTable::LastAddress.into_iden(),
-            ),
-            (
-                UserSessions::Table.into_iden(),
-                UserSessions::UserAgent.into_iden(),
-            ),
-            (
-                UserSessions::Table.into_iden(),
-                UserSessions::LastAddress.into_iden(),
-            ),
-            (
-                UserSessions::Table.into_iden(),
-                UserSessions::LastUsedMs.into_iden(),
-            ),
-        ] {
-            manager
-                .alter_table(Table::alter().table(table).drop_column(column).to_owned())
-                .await?;
-        }
-        Ok(())
-    }
-}
-
-struct AppSignIns;
-
-impl MigrationName for AppSignIns {
-    fn name(&self) -> &str {
-        "m20261116_000008_app_sign_ins"
-    }
-}
-
-#[derive(Iden)]
-enum AppSignInsTable {
-    #[iden = "app_sign_ins"]
+enum AppSignIns {
     Table,
     Id,
     UserId,
@@ -2263,450 +1996,13 @@ enum AppSignInsTable {
     LastForwardedFor,
 }
 
-/// Apps signed in through the browser, such as the command line: who they act as,
-/// with what role, and the hashes of the tokens they hold.
-#[async_trait::async_trait]
-impl MigrationTrait for AppSignIns {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        use AppSignInsTable as T;
-        let hash = |column: T| ColumnDef::new(column).string_len(64).not_null().to_owned();
-        manager
-            .create_table(
-                Table::create()
-                    .table(T::Table)
-                    .col(id(T::Id))
-                    .col(ColumnDef::new(T::UserId).big_integer().not_null())
-                    .col(ColumnDef::new(T::ClientId).string_len(64).not_null())
-                    .col(ColumnDef::new(T::Device).string_len(100).not_null())
-                    .col(ColumnDef::new(T::Role).string_len(16).not_null())
-                    .col(hash(T::AccessHash).unique_key().to_owned())
-                    .col(ColumnDef::new(T::AccessExpiresMs).big_integer().not_null())
-                    .col(hash(T::RefreshHash).unique_key().to_owned())
-                    .col(ColumnDef::new(T::PreviousRefreshHash).string_len(64))
-                    .col(ColumnDef::new(T::RotatedMs).big_integer())
-                    .col(ColumnDef::new(T::RefreshExpiresMs).big_integer().not_null())
-                    .col(ColumnDef::new(T::CreatedMs).big_integer().not_null())
-                    .col(ColumnDef::new(T::LastUsedMs).big_integer())
-                    .col(ColumnDef::new(T::RevokedMs).big_integer())
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_app_sign_ins_user_id")
-                            .from(T::Table, T::UserId)
-                            .to(Users::Table, Users::Id),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-        for (name, column) in [
-            ("idx_app_sign_ins_user_id", T::UserId),
-            (
-                "idx_app_sign_ins_previous_refresh_hash",
-                T::PreviousRefreshHash,
-            ),
-        ] {
-            manager
-                .create_index(
-                    Index::create()
-                        .name(name)
-                        .table(T::Table)
-                        .col(column)
-                        .to_owned(),
-                )
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .drop_table(Table::drop().table(AppSignInsTable::Table).to_owned())
-            .await
-    }
-}
-
-struct DomainExpiry;
-
-impl MigrationName for DomainExpiry {
-    fn name(&self) -> &str {
-        "m20261115_000006_domain_expiry"
-    }
-}
-
-/// A website check can be told not to look up when its domain expires, which it
-/// does unless told.
-#[async_trait::async_trait]
-impl MigrationTrait for DomainExpiry {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(RemoteChecks::Table)
-                    .add_column(ColumnDef::new(RemoteChecks::DomainExpiry).boolean())
-                    .to_owned(),
-            )
-            .await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(RemoteChecks::Table)
-                    .drop_column(RemoteChecks::DomainExpiry)
-                    .to_owned(),
-            )
-            .await
-    }
-}
-
-struct CheckSignIn;
-
-impl MigrationName for CheckSignIn {
-    fn name(&self) -> &str {
-        "m20261115_000005_check_sign_in"
-    }
-}
-
-/// Checks of databases, Redis and SSH servers: what they connect to, and how they
-/// sign in. A password or key is typed in or named as one of the server's
-/// environment variables.
-#[async_trait::async_trait]
-impl MigrationTrait for CheckSignIn {
-    fn use_transaction(&self) -> Option<bool> {
-        Some(true)
-    }
-
-    // One column to a statement, as SQLite adds no more than that at once.
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        for column in [
-            ColumnDef::new(RemoteChecks::Database)
-                .string_len(63)
-                .to_owned(),
-            ColumnDef::new(RemoteChecks::Tls).boolean().to_owned(),
-            ColumnDef::new(RemoteChecks::HostKey)
-                .string_len(100)
-                .to_owned(),
-            ColumnDef::new(RemoteChecks::Username)
-                .string_len(255)
-                .to_owned(),
-            ColumnDef::new(RemoteChecks::Password).text().to_owned(),
-            ColumnDef::new(RemoteChecks::PasswordEnv)
-                .string_len(255)
-                .to_owned(),
-            ColumnDef::new(RemoteChecks::PrivateKey).text().to_owned(),
-            ColumnDef::new(RemoteChecks::PrivateKeyEnv)
-                .string_len(255)
-                .to_owned(),
-        ] {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(RemoteChecks::Table)
-                        .add_column(column)
-                        .to_owned(),
-                )
-                .await?;
-        }
-        Ok(())
-    }
-
-    /// Checks of the kinds that came with it go too, as nothing before it knows them.
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let new_kinds = Query::delete()
-            .from_table(RemoteChecks::Table)
-            .and_where(Expr::col(RemoteChecks::Kind).is_in(["postgres", "mysql", "redis", "ssh"]))
-            .to_owned();
-        manager.exec_stmt(new_kinds).await?;
-        for column in [
-            RemoteChecks::PrivateKeyEnv,
-            RemoteChecks::PrivateKey,
-            RemoteChecks::PasswordEnv,
-            RemoteChecks::Password,
-            RemoteChecks::Username,
-            RemoteChecks::HostKey,
-            RemoteChecks::Tls,
-            RemoteChecks::Database,
-        ] {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(RemoteChecks::Table)
-                        .drop_column(column)
-                        .to_owned(),
-                )
-                .await?;
-        }
-        Ok(())
-    }
-}
-
-struct SilenceSeries;
-
-impl MigrationName for SilenceSeries {
-    fn name(&self) -> &str {
-        "m20261115_000004_silence_series"
-    }
-}
-
-/// A silence can be for one series alone, such as one check of a host that has
-/// several, where it used to be for everything a rule watched on its hosts.
-#[async_trait::async_trait]
-impl MigrationTrait for SilenceSeries {
-    fn use_transaction(&self) -> Option<bool> {
-        Some(true)
-    }
-
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(Silences::Table)
-                    .add_column(
-                        ColumnDef::new(Silences::Series)
-                            .string_len(255)
-                            .not_null()
-                            .default(""),
-                    )
-                    .to_owned(),
-            )
-            .await
-    }
-
-    /// Ones for a single series go, as they'd come to cover every series.
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let narrow = Query::delete()
-            .from_table(Silences::Table)
-            .and_where(Expr::col(Silences::Series).ne(""))
-            .to_owned();
-        manager.exec_stmt(narrow).await?;
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(Silences::Table)
-                    .drop_column(Silences::Series)
-                    .to_owned(),
-            )
-            .await
-    }
-}
-
-struct CheckNamesPerHost;
-
-impl MigrationName for CheckNamesPerHost {
-    fn name(&self) -> &str {
-        "m20261115_000003_check_names_per_host"
-    }
-}
-
-/// A check's name only has to differ from the others about the same host, so two
-/// hosts can each have one called the same. SQLite can only drop a column's
-/// unique constraint by making the table again, which has to be done with foreign
-/// keys switched off, and SQLite only allows that outside a transaction. Its pool
-/// has a single connection, so the switch holds for every step.
-#[async_trait::async_trait]
-impl MigrationTrait for CheckNamesPerHost {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let backend = manager.get_database_backend();
-        if backend == sea_orm::DatabaseBackend::Sqlite {
-            let tables = [(
-                "remote_checks",
-                remote_checks_table(false),
-                REMOTE_CHECK_COLUMNS,
-            )];
-            remake_on_sqlite(manager, &tables).await?;
-            // The index on the host alone went with the old table, and this one
-            // does its job.
-            return manager.create_index(check_names_index()).await;
-        }
-        let unique = if backend == sea_orm::DatabaseBackend::MySql {
-            "ALTER TABLE remote_checks DROP INDEX name"
-        } else {
-            "ALTER TABLE remote_checks DROP CONSTRAINT remote_checks_name_key"
-        };
-        manager.get_connection().execute_unprepared(unique).await?;
-        // Made first, as MySQL wants an index for the foreign key throughout.
-        manager.create_index(check_names_index()).await?;
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_remote_checks_host")
-                    .table(RemoteChecks::Table)
-                    .to_owned(),
-            )
-            .await
-    }
-
-    /// Of checks that share a name, only the first is kept.
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let connection = manager.get_connection();
-        connection
-            .execute_unprepared(
-                "DELETE FROM remote_checks WHERE id NOT IN \
-                 (SELECT id FROM (SELECT MIN(id) AS id FROM remote_checks GROUP BY name) firsts)",
-            )
-            .await?;
-        let host_index = Index::create()
-            .name("idx_remote_checks_host")
-            .table(RemoteChecks::Table)
-            .col(RemoteChecks::HostId)
-            .to_owned();
-        let backend = manager.get_database_backend();
-        if backend == sea_orm::DatabaseBackend::Sqlite {
-            let tables = [(
-                "remote_checks",
-                remote_checks_table(true),
-                REMOTE_CHECK_COLUMNS,
-            )];
-            remake_on_sqlite(manager, &tables).await?;
-            return manager.create_index(host_index).await;
-        }
-        manager.create_index(host_index).await?;
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_remote_checks_host_name")
-                    .table(RemoteChecks::Table)
-                    .to_owned(),
-            )
-            .await?;
-        let unique = if backend == sea_orm::DatabaseBackend::MySql {
-            "ALTER TABLE remote_checks ADD UNIQUE INDEX name (name)"
-        } else {
-            "ALTER TABLE remote_checks ADD CONSTRAINT remote_checks_name_key UNIQUE (name)"
-        };
-        connection.execute_unprepared(unique).await?;
-        Ok(())
-    }
-}
-
-/// Every column of `remote_checks`, to copy from one making of it to the next.
-const REMOTE_CHECK_COLUMNS: &str = "id, name, kind, target, timeout_secs, method, body, \
-     regex, insecure, server, record, count, interval_secs, enabled, host_id";
-
-fn check_names_index() -> IndexCreateStatement {
-    Index::create()
-        .name("idx_remote_checks_host_name")
-        .table(RemoteChecks::Table)
-        .col(RemoteChecks::HostId)
-        .col(RemoteChecks::Name)
-        .unique()
-        .to_owned()
-}
-
-/// `remote_checks`, with names that no two checks share, as they were at first, or
-/// that only the checks about one host don't, which an index sees to.
-fn remote_checks_table(unique_names: bool) -> TableCreateStatement {
-    let mut name = ColumnDef::new(RemoteChecks::Name);
-    name.string_len(64).not_null();
-    if unique_names {
-        name.unique_key();
-    }
-    Table::create()
-        .table(RemoteChecks::Table)
-        .col(id(RemoteChecks::Id))
-        .col(name)
-        .col(ColumnDef::new(RemoteChecks::Kind).string_len(16).not_null())
-        .col(
-            ColumnDef::new(RemoteChecks::Target)
-                .string_len(255)
-                .not_null(),
-        )
-        .col(ColumnDef::new(RemoteChecks::TimeoutSecs).big_integer())
-        .col(ColumnDef::new(RemoteChecks::Method).string_len(16))
-        .col(ColumnDef::new(RemoteChecks::Body).text())
-        .col(ColumnDef::new(RemoteChecks::Regex).text())
-        .col(ColumnDef::new(RemoteChecks::Insecure).boolean())
-        .col(ColumnDef::new(RemoteChecks::Server).string_len(255))
-        .col(ColumnDef::new(RemoteChecks::Record).string_len(16))
-        .col(ColumnDef::new(RemoteChecks::Count).integer())
-        .col(
-            ColumnDef::new(RemoteChecks::IntervalSecs)
-                .big_integer()
-                .not_null(),
-        )
-        .col(ColumnDef::new(RemoteChecks::Enabled).boolean().not_null())
-        .col(
-            ColumnDef::new(RemoteChecks::HostId)
-                .string_len(32)
-                .not_null()
-                .default("server"),
-        )
-        .foreign_key(
-            ForeignKey::create()
-                .name("fk_remote_checks_host_id")
-                .from(RemoteChecks::Table, RemoteChecks::HostId)
-                .to(Hosts::Table, Hosts::Id),
-        )
-        .to_owned()
-}
-
-/// Makes each table again as given on SQLite, keeping its rows and the next ID it
-/// would give, with foreign keys off so tables pointing at it are left alone, then
-/// checks nothing points anywhere it shouldn't before keeping the result. This is
-/// the order SQLite's own documentation gives for changes ALTER TABLE can't make.
-async fn remake_on_sqlite(
-    manager: &SchemaManager<'_>,
-    tables: &[(&str, TableCreateStatement, &str)],
-) -> Result<(), DbErr> {
-    let connection = manager.get_connection();
-    connection
-        .execute_unprepared("PRAGMA foreign_keys = OFF")
-        .await?;
-    let remade = async {
-        connection.execute_unprepared("BEGIN").await?;
-        for (table, create, columns) in tables {
-            let made = format!("{table}_remade");
-            let mut create = create.clone();
-            create.table(Alias::new(&made));
-            manager.create_table(create).await?;
-            connection
-                .execute_unprepared(&format!(
-                    "INSERT INTO {made} ({columns}) SELECT {columns} FROM {table}"
-                ))
-                .await?;
-            let next = format!("SELECT seq FROM sqlite_sequence WHERE name = '{table}'");
-            let seq: Option<i64> = connection
-                .query_one_raw(Statement::from_string(DbBackend::Sqlite, next))
-                .await?
-                .map(|row| row.try_get_by_index(0))
-                .transpose()?;
-            connection
-                .execute_unprepared(&format!("DROP TABLE {table}"))
-                .await?;
-            connection
-                .execute_unprepared(&format!("ALTER TABLE {made} RENAME TO {table}"))
-                .await?;
-            if let Some(seq) = seq {
-                connection
-                    .execute_unprepared(&format!(
-                        "UPDATE sqlite_sequence SET seq = max(seq, {seq}) WHERE name = '{table}'"
-                    ))
-                    .await?;
-            }
-        }
-        let broken = connection
-            .query_all_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "PRAGMA foreign_key_check",
-            ))
-            .await?;
-        if !broken.is_empty() {
-            return Err(DbErr::Migration(format!(
-                "{} rows would point at nothing",
-                broken.len()
-            )));
-        }
-        connection.execute_unprepared("COMMIT").await?;
-        Ok(())
-    }
-    .await;
-    if remade.is_err() {
-        connection.execute_unprepared("ROLLBACK").await.ok();
-    }
-    connection
-        .execute_unprepared("PRAGMA foreign_keys = ON")
-        .await?;
-    remade
+#[derive(Iden)]
+enum Proxies {
+    Table,
+    Id,
+    Address,
+    Trusted,
+    CreatedMs,
 }
 
 #[derive(DeriveIden)]
@@ -2855,45 +2151,10 @@ mod tests {
             .unwrap();
         let about = "SELECT host_id FROM remote_checks WHERE name = 'Site'";
         assert_eq!(texts(&connection, about).await, ["server"]);
-    }
 
-    #[tokio::test]
-    async fn checks_keep_their_rows_when_names_become_a_hosts_own() {
-        let connection = fresh().await;
-        Migrator::up(&connection, Some(2)).await.unwrap();
-        let add = |name: &str, host: &str| {
-            let sql = format!(
-                "INSERT INTO remote_checks (name, kind, target, interval_secs, enabled, host_id)
-                 VALUES ('{name}', 'ping', 'example.com', 60, TRUE, '{host}')"
-            );
-            let connection = &connection;
-            async move { connection.execute_unprepared(&sql).await }
-        };
-        connection
-            .execute_unprepared(
-                "INSERT INTO hosts (id, hostname, public_key, state, first_seen_ms, kind)
-                 VALUES ('abc', 'db', '', 'approved', 1, 'agentless');
-                 INSERT INTO remote_checks (id, name, kind, target, interval_secs, enabled)
-                 VALUES (4, 'Site', 'http', 'https://example.com', 60, TRUE)",
-            )
-            .await
-            .unwrap();
-        assert!(add("Site", "abc").await.is_err(), "unique at first");
-
-        Migrator::up(&connection, None).await.unwrap();
-
+        // A name only has to differ from the other checks about the same host.
         add("Site", "abc").await.unwrap();
         assert!(add("Site", "abc").await.is_err(), "one to a host");
         assert!(add("Site", "server").await.is_err());
-        assert!(add("Other", "nobody").await.is_err(), "still about a host");
-        let rows = "SELECT CAST(id AS TEXT) || ' ' || host_id FROM remote_checks ORDER BY id";
-        assert_eq!(texts(&connection, rows).await, ["4 server", "5 abc"]);
-
-        // Going back past it, to the two before it, the first of each name is kept.
-        let after_it = Migrator::migrations().len() as u32 - 2;
-        Migrator::down(&connection, Some(after_it)).await.unwrap();
-        assert_eq!(texts(&connection, rows).await, ["4 server"]);
-        assert!(add("Site", "abc").await.is_err(), "unique again");
-        add("Database", "abc").await.unwrap();
     }
 }
