@@ -78,6 +78,192 @@ warning and critical levels after the value are left out, as an alert rule sets 
 own. A value of `U`, meaning it couldn't be measured, is skipped, and so is anything
 that isn't a number. Up to 32 values are kept from each run.
 
+## Writing your own
+
+A check command can be any program, in any language, that:
+
+- prints one line saying how things are, with any
+  [performance data](#performance-data) after a `|`
+- exits with 0 for OK, 1 for a warning, 2 for critical or 3 for unknown
+
+The agent runs it as its own user, gives it no input, and reads up to 8 KiB of what it
+prints. Anything it prints to standard error is ignored. It has to finish within its
+`timeout_secs`, 30 seconds unless the definition says otherwise.
+
+Some things to keep in mind:
+
+- When it can't tell how things are, such as a directory it can't read, it should say
+  why and exit with 3, rather than report OK.
+- The first line is shown in MaxNines, so it shouldn't contain a password or anything
+  else secret.
+- It can decide what's a warning and what's critical itself, as the examples below do,
+  or always exit with 0 and only report values, leaving the limits to an alert rule on
+  **Check command values**. Limits in an alert rule can be changed in MaxNines without
+  touching the host.
+
+### Examples
+
+Each of these counts the files in a directory, warning at 10 and critical at 50:
+
+```text
+FILES WARNING - 12 files in /srv/queue | files=12
+```
+
+They report `files` as a value, which MaxNines names after the check command, such as
+`queue files` for one defined as `queue`.
+
+**Bash**, or any other shell, saved as `check_files` and made executable with
+`chmod +x check_files`:
+
+```sh
+#!/bin/sh
+# Counts the files in a directory: a warning at 10, critical at 50.
+dir="$1"
+if [ ! -d "$dir" ]; then
+  echo "FILES UNKNOWN - $dir isn't a directory"
+  exit 3
+fi
+count=$(find "$dir" -maxdepth 1 -type f | wc -l | tr -d ' ')
+if [ "$count" -ge 50 ]; then
+  status=CRITICAL code=2
+elif [ "$count" -ge 10 ]; then
+  status=WARNING code=1
+else
+  status=OK code=0
+fi
+echo "FILES $status - $count files in $dir | files=$count"
+exit $code
+```
+
+**Python**, saved as `check_files` and made executable with `chmod +x check_files`:
+
+```python
+#!/usr/bin/env python3
+"""Counts the files in a directory: a warning at 10, critical at 50."""
+import os
+import sys
+
+directory = sys.argv[1] if len(sys.argv) > 1 else ""
+try:
+    count = sum(1 for entry in os.scandir(directory) if entry.is_file())
+except OSError as error:
+    print(f"FILES UNKNOWN - can't read {directory}: {error.strerror}")
+    sys.exit(3)
+
+if count >= 50:
+    status, code = "CRITICAL", 2
+elif count >= 10:
+    status, code = "WARNING", 1
+else:
+    status, code = "OK", 0
+print(f"FILES {status} - {count} files in {directory} | files={count}")
+sys.exit(code)
+```
+
+**Go**, built with `go build -o check_files` in a directory with this as `main.go`,
+after `go mod init check_files`:
+
+```go
+// Counts the files in a directory: a warning at 10, critical at 50.
+package main
+
+import (
+	"fmt"
+	"os"
+)
+
+func main() {
+	dir := ""
+	if len(os.Args) > 1 {
+		dir = os.Args[1]
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		fmt.Printf("FILES UNKNOWN - %v\n", err)
+		os.Exit(3)
+	}
+	count := 0
+	for _, entry := range entries {
+		if entry.Type().IsRegular() {
+			count++
+		}
+	}
+
+	status, code := "OK", 0
+	if count >= 50 {
+		status, code = "CRITICAL", 2
+	} else if count >= 10 {
+		status, code = "WARNING", 1
+	}
+	fmt.Printf("FILES %s - %d files in %s | files=%d\n", status, count, dir, count)
+	os.Exit(code)
+}
+```
+
+**Rust**, built with `rustc -O main.rs -o check_files`, or as `src/main.rs` in a Cargo
+project:
+
+```rust
+// Counts the files in a directory: a warning at 10, critical at 50.
+use std::{env, fs, process};
+
+fn main() {
+    let dir = env::args().nth(1).unwrap_or_default();
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            println!("FILES UNKNOWN - can't read {dir}: {error}");
+            process::exit(3);
+        }
+    };
+    let count = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .count();
+
+    let (status, code) = if count >= 50 {
+        ("CRITICAL", 2)
+    } else if count >= 10 {
+        ("WARNING", 1)
+    } else {
+        ("OK", 0)
+    };
+    println!("FILES {status} - {count} files in {dir} | files={count}");
+    process::exit(code);
+}
+```
+
+### Running one
+
+Copy it to the host, then define it in `agent.hcl` as above:
+
+```hcl
+check_command "queue" {
+  command = ["/usr/local/bin/check_files", "/srv/queue"]
+}
+```
+
+A script runs through its `#!` line, so it needs one, and needs to be executable. On
+Windows, which doesn't read `#!` lines, name the interpreter first, by its full path
+on that host:
+
+```hcl
+check_command "queue" {
+  command = ["C:\\Program Files\\Python313\\python.exe", "C:\\checks\\check_files.py", "D:\\queue"]
+}
+```
+
+Go and Rust build to a single program with nothing else to install. Build it for the
+host's system, such as with `GOOS=linux GOARCH=amd64 go build` or
+`cargo build --release --target x86_64-unknown-linux-musl`.
+
+Before relying on one, run it as the agent's user and check what it prints and its
+exit code:
+
+```sh
+./check_files /srv/queue; echo "exit $?"
+```
+
 ## Alerting
 
 To be told when a plugin says something is wrong, add an alert rule on **Check command
