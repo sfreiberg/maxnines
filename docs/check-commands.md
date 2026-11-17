@@ -92,8 +92,8 @@ prints. Anything it prints to standard error is ignored. It has to finish within
 
 Some things to keep in mind:
 
-- When it can't tell how things are, such as a directory it can't read, it should say
-  why and exit with 3, rather than report OK.
+- When it can't tell how things are, such as a file it can't read, it should say why
+  and exit with 3, rather than report OK.
 - The first line is shown in MaxNines, so it shouldn't contain a password or anything
   else secret.
 - It can decide what's a warning and what's critical itself, as the examples below do,
@@ -103,132 +103,134 @@ Some things to keep in mind:
 
 ### Examples
 
-Each of these counts the files in a directory, warning at 10 and critical at 50:
+Each of these checks a made-up greenhouse, whose sensor writes the temperature to a
+file in whole degrees. It warns above 30 and is critical above 35:
 
 ```text
-FILES WARNING - 12 files in /srv/queue | files=12
+GREENHOUSE WARNING - 31 degrees | temperature=31
 ```
 
-They report `files` as a value, which MaxNines names after the check command, such as
-`queue files` for one defined as `queue`.
+They report `temperature` as a value, which MaxNines names after the check command,
+such as `greenhouse temperature` for one defined as `greenhouse`. A missing file, or
+one without a number in it, is unknown.
 
-**Bash**, or any other shell, saved as `check_files` and made executable with
-`chmod +x check_files`:
+**Bash**, or any other shell, saved as `check_greenhouse` and made executable with
+`chmod +x check_greenhouse`:
 
 ```sh
 #!/bin/sh
-# Counts the files in a directory: a warning at 10, critical at 50.
-dir="$1"
-if [ ! -d "$dir" ]; then
-  echo "FILES UNKNOWN - $dir isn't a directory"
-  exit 3
-fi
-count=$(find "$dir" -maxdepth 1 -type f | wc -l | tr -d ' ')
-if [ "$count" -ge 50 ]; then
+# Reads the greenhouse temperature a sensor writes to a file, in whole degrees:
+# a warning above 30, critical above 35.
+file="${1:-/var/lib/greenhouse/temperature}"
+temperature=$(cat "$file" 2>/dev/null | tr -d ' \n')
+case "$temperature" in
+  '' | *[!0-9]*)
+    echo "GREENHOUSE UNKNOWN - no temperature in $file"
+    exit 3
+    ;;
+esac
+if [ "$temperature" -gt 35 ]; then
   status=CRITICAL code=2
-elif [ "$count" -ge 10 ]; then
+elif [ "$temperature" -gt 30 ]; then
   status=WARNING code=1
 else
   status=OK code=0
 fi
-echo "FILES $status - $count files in $dir | files=$count"
+echo "GREENHOUSE $status - $temperature degrees | temperature=$temperature"
 exit $code
 ```
 
-**Python**, saved as `check_files` and made executable with `chmod +x check_files`:
+**Python**, saved as `check_greenhouse` and made executable with
+`chmod +x check_greenhouse`:
 
 ```python
 #!/usr/bin/env python3
-"""Counts the files in a directory: a warning at 10, critical at 50."""
-import os
+"""Reads the greenhouse temperature a sensor writes to a file, in whole degrees:
+a warning above 30, critical above 35."""
 import sys
 
-directory = sys.argv[1] if len(sys.argv) > 1 else ""
+path = sys.argv[1] if len(sys.argv) > 1 else "/var/lib/greenhouse/temperature"
 try:
-    count = sum(1 for entry in os.scandir(directory) if entry.is_file())
-except OSError as error:
-    print(f"FILES UNKNOWN - can't read {directory}: {error.strerror}")
+    with open(path) as file:
+        temperature = int(file.read().strip())
+except (OSError, ValueError):
+    print(f"GREENHOUSE UNKNOWN - no temperature in {path}")
     sys.exit(3)
 
-if count >= 50:
+if temperature > 35:
     status, code = "CRITICAL", 2
-elif count >= 10:
+elif temperature > 30:
     status, code = "WARNING", 1
 else:
     status, code = "OK", 0
-print(f"FILES {status} - {count} files in {directory} | files={count}")
+print(f"GREENHOUSE {status} - {temperature} degrees | temperature={temperature}")
 sys.exit(code)
 ```
 
-**Go**, built with `go build -o check_files` in a directory with this as `main.go`,
-after `go mod init check_files`:
+**Go**, built with `go build -o check_greenhouse` in a directory with this as
+`main.go`, after `go mod init check_greenhouse`:
 
 ```go
-// Counts the files in a directory: a warning at 10, critical at 50.
+// Reads the greenhouse temperature a sensor writes to a file, in whole degrees:
+// a warning above 30, critical above 35.
 package main
 
 import (
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 )
 
 func main() {
-	dir := ""
+	path := "/var/lib/greenhouse/temperature"
 	if len(os.Args) > 1 {
-		dir = os.Args[1]
+		path = os.Args[1]
 	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		fmt.Printf("FILES UNKNOWN - %v\n", err)
+	text, err := os.ReadFile(path)
+	temperature, parseErr := strconv.Atoi(strings.TrimSpace(string(text)))
+	if err != nil || parseErr != nil {
+		fmt.Printf("GREENHOUSE UNKNOWN - no temperature in %s\n", path)
 		os.Exit(3)
-	}
-	count := 0
-	for _, entry := range entries {
-		if entry.Type().IsRegular() {
-			count++
-		}
 	}
 
 	status, code := "OK", 0
-	if count >= 50 {
+	if temperature > 35 {
 		status, code = "CRITICAL", 2
-	} else if count >= 10 {
+	} else if temperature > 30 {
 		status, code = "WARNING", 1
 	}
-	fmt.Printf("FILES %s - %d files in %s | files=%d\n", status, count, dir, count)
+	fmt.Printf("GREENHOUSE %s - %d degrees | temperature=%d\n", status, temperature, temperature)
 	os.Exit(code)
 }
 ```
 
-**Rust**, built with `rustc -O main.rs -o check_files`, or as `src/main.rs` in a Cargo
-project:
+**Rust**, built with `rustc -O main.rs -o check_greenhouse`, or as `src/main.rs` in a
+Cargo project:
 
 ```rust
-// Counts the files in a directory: a warning at 10, critical at 50.
+// Reads the greenhouse temperature a sensor writes to a file, in whole degrees:
+// a warning above 30, critical above 35.
 use std::{env, fs, process};
 
 fn main() {
-    let dir = env::args().nth(1).unwrap_or_default();
-    let entries = match fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(error) => {
-            println!("FILES UNKNOWN - can't read {dir}: {error}");
-            process::exit(3);
-        }
+    let path = env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/var/lib/greenhouse/temperature".to_string());
+    let read = fs::read_to_string(&path).ok();
+    let Some(temperature) = read.and_then(|text| text.trim().parse::<i64>().ok()) else {
+        println!("GREENHOUSE UNKNOWN - no temperature in {path}");
+        process::exit(3);
     };
-    let count = entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-        .count();
 
-    let (status, code) = if count >= 50 {
+    let (status, code) = if temperature > 35 {
         ("CRITICAL", 2)
-    } else if count >= 10 {
+    } else if temperature > 30 {
         ("WARNING", 1)
     } else {
         ("OK", 0)
     };
-    println!("FILES {status} - {count} files in {dir} | files={count}");
+    println!("GREENHOUSE {status} - {temperature} degrees | temperature={temperature}");
     process::exit(code);
 }
 ```
@@ -238,8 +240,8 @@ fn main() {
 Copy it to the host, then define it in `agent.hcl` as above:
 
 ```hcl
-check_command "queue" {
-  command = ["/usr/local/bin/check_files", "/srv/queue"]
+check_command "greenhouse" {
+  command = ["/usr/local/bin/check_greenhouse", "/var/lib/greenhouse/temperature"]
 }
 ```
 
@@ -248,8 +250,8 @@ Windows, which doesn't read `#!` lines, name the interpreter first, by its full 
 on that host:
 
 ```hcl
-check_command "queue" {
-  command = ["C:\\Program Files\\Python313\\python.exe", "C:\\checks\\check_files.py", "D:\\queue"]
+check_command "greenhouse" {
+  command = ["C:\\Program Files\\Python313\\python.exe", "C:\\checks\\check_greenhouse.py", "C:\\greenhouse\\temperature.txt"]
 }
 ```
 
@@ -261,7 +263,7 @@ Before relying on one, run it as the agent's user and check what it prints and i
 exit code:
 
 ```sh
-./check_files /srv/queue; echo "exit $?"
+./check_greenhouse; echo "exit $?"
 ```
 
 ## Alerting
