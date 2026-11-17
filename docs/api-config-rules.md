@@ -28,7 +28,7 @@ lowest priority first, so higher priorities win.
 | `local_checks` | `checks` | Checks the agent's own config defines, which sign in, as `{"name": "bastion", "interval_secs": 300, "timeout_secs": 5}` with the times optional. The agent lists the ones it has in its `agent.checks` fact. See [signing in on an agent](checks.md#on-an-agent) |
 | `urls` | `apache`, `nginx`, `php_fpm`, `openmetrics` | The status pages to read. Leave it out for the usual page on the host itself. For `openmetrics` they're the [metrics pages](openmetrics.md) to read, which have no usual address |
 
-The collectors are `apache`, `checks`, `containers`, `counters`, `cpu`, `custom`, `databases`, `disk`, `files`, `host`,
+The collectors are `apache`, `checks`, `containers`, `counters`, `cpu`, `custom`, `databases`, `disk`, `files`, `gpu`, `host`,
 `memory`, `network`, `nginx`, `openmetrics`, `php_fpm`, `processes`, `sensors`, `services`,
 `system` and `top_processes`.
 

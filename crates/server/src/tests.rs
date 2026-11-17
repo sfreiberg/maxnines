@@ -1551,7 +1551,7 @@ async fn invalid_rules_are_refused_with_a_reason() {
             "at least 1",
         ),
         (
-            r#"{"name":"a","priority":1,"condition":null,"settings":{"collectors":{"gpu":{}}}}"#,
+            r#"{"name":"a","priority":1,"condition":null,"settings":{"collectors":{"nope":{}}}}"#,
             "unknown collector",
         ),
         (

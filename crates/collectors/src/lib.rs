@@ -4,6 +4,8 @@ pub mod counters;
 pub mod disk_activity;
 pub mod failed_services;
 mod file_systems;
+#[cfg(target_os = "macos")]
+pub mod gpu;
 pub mod host;
 pub mod interface_drops;
 pub mod system;

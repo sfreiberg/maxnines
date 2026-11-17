@@ -18,7 +18,7 @@ use serde_json::Value;
 
 /// Every collector the project knows about. An agent reports the ones it can
 /// run in its facts, because older agents may not have them all.
-pub const COLLECTORS: [&str; 21] = [
+pub const COLLECTORS: [&str; 22] = [
     "apache",
     "checks",
     "commands",
@@ -29,6 +29,7 @@ pub const COLLECTORS: [&str; 21] = [
     "databases",
     "disk",
     "files",
+    "gpu",
     "host",
     "memory",
     "network",
@@ -1489,7 +1490,7 @@ mod tests {
 
         let mut bad = config();
         let cpu = bad.collectors["cpu"].clone();
-        bad.collectors.insert("gpu".to_string(), cpu);
+        bad.collectors.insert("nope".to_string(), cpu);
         assert!(bad.validate().is_err());
 
         assert!(config().validate().is_ok());

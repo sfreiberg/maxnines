@@ -124,6 +124,18 @@ It's off unless a config rule turns it on, under **Collectors**, as it says what
 running on a host. The `processes` collector, by contrast, only answers about the
 names it's given.
 
+## GPUs
+
+On a Mac, the `gpu` collector reports how busy each GPU is, as **GPU usage**, and how
+much memory it's using, as **GPU memory used**. On Apple silicon the GPU shares the
+Mac's memory, so that's the share it's using; a separate graphics card reports its
+own. Each GPU is named by its model, such as `Apple M4 Pro`. It needs no extra
+rights. Other systems don't report GPUs yet.
+
+It's off unless a config rule turns it on, under **Collectors**. A rule for Macs alone
+keeps other hosts from noting that they can't run it, with the condition
+`facts.os.family == "macos"`.
+
 ## Watching services and processes
 
 A config rule can name services and processes to watch, under **Collectors**, one to

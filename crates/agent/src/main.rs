@@ -526,7 +526,7 @@ mod tests {
     async fn a_bad_config_is_refused() {
         for config in [
             json!({ "interval_secs": 0 }),
-            json!({ "collectors": { "gpu": {} } }),
+            json!({ "collectors": { "nope": {} } }),
         ] {
             assert!(Monitoring::start(&update("v1", config), Local::none()).is_err());
         }

@@ -528,6 +528,29 @@ pub const METRICS: &[Metric] = &[
         source: Source::Fields(&[("Difference", Reading::Field("$.difference_secs"))]),
         chart: ShowChart::WithData,
     },
+    // Only macOS reports these so far.
+    Metric {
+        name: "gpu.usage",
+        title: "GPU usage",
+        unit: Unit::Percent,
+        collector: "gpu",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.usage_percent"),
+        },
+        chart: ShowChart::WithData,
+    },
+    Metric {
+        name: "gpu.memory",
+        title: "GPU memory used",
+        unit: Unit::Bytes,
+        collector: "gpu",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.memory_used_bytes"),
+        },
+        chart: ShowChart::WithData,
+    },
     Metric {
         name: "sensor.temperature",
         title: "Temperature",

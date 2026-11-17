@@ -217,7 +217,7 @@ mod platform {
 }
 
 #[cfg(target_os = "macos")]
-mod platform {
+pub(crate) mod platform {
     use std::collections::HashMap;
     use std::ffi::CString;
 
@@ -237,7 +237,7 @@ mod platform {
     const MAX_DEPTH: usize = 32;
 
     /// A name as IOKit takes one: a fixed array, ending with a zero.
-    fn io_name(name: &std::ffi::CStr) -> [std::ffi::c_char; 128] {
+    pub(crate) fn io_name(name: &std::ffi::CStr) -> [std::ffi::c_char; 128] {
         let mut array = [0; 128];
         for (place, byte) in array.iter_mut().zip(name.to_bytes().iter().take(127)) {
             *place = *byte as std::ffi::c_char;

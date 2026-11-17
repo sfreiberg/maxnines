@@ -31,6 +31,8 @@ use crate::system_collector::SystemCollector;
 const LINUX_ONLY: [&str; 1] = ["containers"];
 /// Performance counters are part of Windows.
 const WINDOWS_ONLY: [&str; 1] = ["counters"];
+/// Only macOS says how busy its GPUs are so far.
+const MACOS_ONLY: [&str; 1] = ["gpu"];
 
 /// What this agent can run, reported to the server as a fact.
 pub fn supported() -> Vec<&'static str> {
@@ -38,6 +40,7 @@ pub fn supported() -> Vec<&'static str> {
         .into_iter()
         .filter(|name| cfg!(target_os = "linux") || !LINUX_ONLY.contains(name))
         .filter(|name| cfg!(windows) || !WINDOWS_ONLY.contains(name))
+        .filter(|name| cfg!(target_os = "macos") || !MACOS_ONLY.contains(name))
         .collect()
 }
 
@@ -108,6 +111,8 @@ fn build(
             config.names.clone().unwrap_or_default(),
         )),
         "sensors" => Box::new(SensorCollector::new()?),
+        #[cfg(target_os = "macos")]
+        "gpu" => Box::new(maxnines_collectors::gpu::GpuCollector),
         "system" => Box::new(SystemCollector::new(interval)),
         "checks" => {
             let checks = config.checks.clone().unwrap_or_default();
@@ -615,6 +620,6 @@ mod tests {
 
     #[test]
     fn an_unknown_collector_is_an_error() {
-        assert!(build_all(&config(json!({ "gpu": {} })), Local::none()).is_err());
+        assert!(build_all(&config(json!({ "nope": {} })), Local::none()).is_err());
     }
 }
