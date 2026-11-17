@@ -7575,6 +7575,138 @@ mod charts {
         assert!(charts.draw(&offline, now).await.unwrap().is_none());
     }
 
+    /// A sample with two disks, so a chart can be seen to keep to one of them.
+    fn two_disks(time_ms: u64) -> AgentMessage {
+        let mut message = full_sample(time_ms, "/data");
+        if let AgentMessage::Sample(sample) = &mut message {
+            sample.metrics.insert(
+                "disk".to_string(),
+                json!([
+                    { "mount_point": "/data", "total_bytes": 100, "used_bytes": 95 },
+                    { "mount_point": "/boot", "total_bytes": 100, "used_bytes": 10 },
+                ]),
+            );
+        }
+        message
+    }
+
+    #[tokio::test]
+    async fn an_alert_has_a_page_charting_just_its_own_series() {
+        let server = start_with_metrics().await;
+        let (host, _client) = report(&server, two_disks).await;
+        let alert = disk_alert(&server, &host, "/data", &[]).await;
+
+        let list = Browser::default().get(&server, "/alerts").await;
+        let button = format!(r#"href="/alerts/{}">Chart</a>"#, alert.id);
+        assert!(list.body.contains(&button), "{}", list.body);
+
+        let path = format!("/alerts/{}", alert.id);
+        let page = Browser::default().get(&server, &path).await;
+        assert_eq!(page.status, 200, "{}", page.body);
+        assert!(
+            page.body.contains("<h2>Disk usage (/data)</h2>"),
+            "{}",
+            page.body
+        );
+        assert!(page.body.contains(">80% warning</text>"), "{}", page.body);
+        assert!(page.body.contains(">90% critical</text>"));
+        assert!(page.body.contains("event-line k-alert"));
+        assert!(!page.body.contains("event-line k-resolved"));
+        assert!(page.body.contains(">95%</td>"), "{}", page.body);
+        assert!(!page.body.contains("boot"), "{}", page.body);
+        // Started just now, so the shortest range shows it.
+        assert!(
+            page.body
+                .contains(r#"class="selected" aria-current="true">1 hour"#)
+        );
+        assert!(page.body.contains("series=%2Fdata"), "{}", page.body);
+
+        server
+            .state
+            .database
+            .resolve_alert(alert.id, now_ms(), "The problem cleared", None)
+            .await
+            .unwrap();
+        let page = Browser::default().get(&server, &path).await;
+        assert!(page.body.contains("event-line k-resolved"), "{}", page.body);
+        assert!(
+            page.body
+                .contains(r#"<span class="badge good">Resolved</span>"#)
+        );
+
+        let missing = Browser::default().get(&server, "/alerts/999999").await;
+        assert_eq!(missing.status, 404);
+    }
+
+    #[tokio::test]
+    async fn an_offline_alert_has_no_chart() {
+        let server = start_with_metrics().await;
+        let (host, _client) = report_samples(&server, "/data").await;
+        let database = &server.state.database;
+        let rule_id = database.create_alert_rule(&offline_rule()).await.unwrap();
+        let new = NewAlert {
+            rule_id,
+            rule_name: "Gone".to_string(),
+            severity: Severity::Critical,
+            host_id: host.id(),
+            hostname: "web-1".to_string(),
+            series: String::new(),
+            value: None,
+            summary: "web-1 is offline".to_string(),
+            started_ms: now_ms() - 30_000,
+        };
+        let id = database.fire_alert(&new, &[]).await.unwrap();
+
+        let list = Browser::default().get(&server, "/alerts").await;
+        assert!(list.body.contains("web-1 is offline"), "{}", list.body);
+        assert!(!list.body.contains(">Chart</a>"), "{}", list.body);
+        let page = Browser::default()
+            .get(&server, &format!("/alerts/{id}"))
+            .await;
+        assert_eq!(page.status, 200, "{}", page.body);
+        assert!(
+            page.body.contains("no chart for this alert"),
+            "{}",
+            page.body
+        );
+        let path = format!("/api/v1/alerts/{id}/series");
+        assert_eq!(api(&server, "GET", &path, &Value::Null).await.0, 404);
+    }
+
+    #[tokio::test]
+    async fn the_api_gives_an_alerts_own_series_with_its_thresholds() {
+        let server = start_with_metrics().await;
+        let (host, _client) = report(&server, two_disks).await;
+        let alert = disk_alert(&server, &host, "/data", &[]).await;
+
+        let path = format!("/api/v1/alerts/{}/series", alert.id);
+        let (status, body) = api(&server, "GET", &path, &Value::Null).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["alert_id"], alert.id);
+        assert_eq!(body["metric"], "disk.usage");
+        assert_eq!(body["unit"], "percent");
+        assert_eq!(
+            body["thresholds"],
+            json!([
+                { "severity": "warning", "value": 80.0 },
+                { "severity": "critical", "value": 90.0 },
+            ])
+        );
+        let series = body["series"].as_array().unwrap();
+        assert_eq!(series.len(), 1, "{body}");
+        assert_eq!(series[0]["name"], "/data");
+        // At least an hour, reaching back past the start.
+        let (from, to) = (
+            body["from_ms"].as_i64().unwrap(),
+            body["to_ms"].as_i64().unwrap(),
+        );
+        assert!(to - from >= 3_600_000);
+        assert!(from < alert.started_ms);
+
+        let missing = "/api/v1/alerts/999999/series";
+        assert_eq!(api(&server, "GET", missing, &Value::Null).await.0, 404);
+    }
+
     #[tokio::test]
     async fn discord_gets_the_chart_attached_when_an_alert_starts_and_ends() {
         let server = start_with_metrics().await;

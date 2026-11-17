@@ -171,6 +171,15 @@ A maintenance window is a silence that comes round on a schedule, like Sundays f
 for two hours. Add one under **Alerts > Silences**, with a time zone so it keeps its place
 in the day when the clocks change.
 
+## An alert's chart
+
+Press **Chart** on an open alert to see just what it's about: its own series, such as
+the one disk that's filling, with the rule's thresholds across it and lines where the
+alert started and, once it has, resolved. The chart reaches back past the start to
+show what led up to it, and the ranges above it look further. A forecast's chart has
+its level, such as 100%, across it instead. Offline alerts have no chart, as they
+don't watch a metric.
+
 ## Reminders and acknowledging
 
 Set **Remind every** on an alert rule to hear again while it's still firing, at most

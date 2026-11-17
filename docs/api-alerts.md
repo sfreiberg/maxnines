@@ -70,6 +70,50 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 ]
 ```
 
+## Get an alert's series
+
+`GET /api/v1/alerts/{id}/series`
+
+What an alert watches over a period of time, as its chart on the Alerts page shows it:
+only the alert's own series, with the rule's `thresholds`. Points are as for
+[a host's metric](api-hosts.md#get-a-hosts-metric), and for a calculation rule they're
+the calculation's answer. Returns `404` if there's no such alert, or nothing to chart:
+an offline alert, or one whose rule has been deleted.
+
+| Parameter | Description |
+| --- | --- |
+| `from_ms` | The start. Defaults to a quarter as long again before the alert started as since, and at least an hour before `to_ms` |
+| `to_ms` | The end. Defaults to now |
+
+```sh
+curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  "$MAXNINES_URL/api/v1/alerts/7/series"
+```
+
+```json
+{
+  "alert_id": 7,
+  "metric": "disk.usage",
+  "unit": "percent",
+  "thresholds": [
+    { "severity": "warning", "value": 80.0 },
+    { "severity": "critical", "value": 90.0 }
+  ],
+  "from_ms": 1793936685969,
+  "to_ms": 1793940285969,
+  "step_ms": 15000,
+  "series": [
+    {
+      "name": "/",
+      "points": [
+        { "time_ms": 1793940270000, "avg": 83.9, "min": 83.9, "max": 83.9 }
+      ]
+    }
+  ],
+  "hidden": 0
+}
+```
+
 ## Acknowledge an alert
 
 `POST /api/v1/alerts/{id}/acknowledge`

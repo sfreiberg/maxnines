@@ -77,72 +77,94 @@ impl ChartSources {
     /// The alert's picture as a PNG, or nothing for an alert that has no metric to
     /// show, such as an agent going offline, or whose rule is gone.
     pub async fn draw(&self, alert: &Alert, now_ms: i64) -> Result<Option<Vec<u8>>> {
-        let Some(rule_id) = alert.rule_id else {
-            return Ok(None);
-        };
-        let Some(rule) = self.database.get_alert_rule(rule_id).await? else {
-            return Ok(None);
-        };
         let Some(range) = TimeRange::new(now_ms - HOUR_MS, now_ms) else {
             return Ok(None);
         };
-        let rule = &rule.rule;
-        let Some((metric, unit, mut result)) = self.read(alert, rule, range).await? else {
+        let sources = Sources {
+            database: &self.database,
+            registry: &self.registry,
+            metrics: &self.metrics,
+        };
+        let Some(watched) = watched(&sources, alert, range).await? else {
             return Ok(None);
         };
-        result
-            .series
-            .retain(|series| alert.series.is_empty() || clean(&series.name) == alert.series);
-        if result.series.is_empty() {
+        if watched.result.series.is_empty() {
             return Ok(None);
         }
 
-        let svg = svg(alert, rule, metric, unit, &result, range);
+        let svg = svg(alert, &watched, range);
         let png = tokio::task::spawn_blocking(move || png(&svg))
             .await
             .context("drawing a chart")??;
         Ok(Some(png))
     }
+}
 
-    async fn read(
-        &self,
-        alert: &Alert,
-        rule: &AlertRuleInput,
-        range: TimeRange,
-    ) -> Result<Option<(&'static Metric, Unit, SeriesResult)>> {
-        match rule.kind {
-            RuleKind::Offline => Ok(None),
-            RuleKind::Metric | RuleKind::Forecast => {
-                let Some(metric) = rule.metric() else {
-                    return Ok(None);
-                };
-                let result = self
-                    .metrics
-                    .series(&alert.host_id, metric, range, MAX_SERIES)
-                    .await?;
-                Ok(Some((metric, metric.unit, result)))
-            }
-            RuleKind::Calculation => {
-                let Ok(question) = rule.question() else {
-                    return Ok(None);
-                };
-                let sources = Sources {
-                    database: &self.database,
-                    registry: &self.registry,
-                    metrics: &self.metrics,
-                };
-                let mut result =
-                    calculations::answer(&sources, &question, range, MAX_SERIES).await?;
-                // One line for everything is named after the metric in the alert.
-                if question.grouping == Grouping::Nothing {
-                    for series in &mut result.series {
-                        series.name = alert.series.clone();
-                    }
-                }
-                Ok(Some((question.metric, question.unit(), result)))
-            }
+/// What an alert is about over a time: the rule it fired by, the metric that rule
+/// watches, and the readings of just the alert's series.
+pub struct Watched {
+    pub rule: AlertRuleInput,
+    pub metric: &'static Metric,
+    pub unit: Unit,
+    pub result: SeriesResult,
+}
+
+/// Enough to hold every series a host has of one metric, so the alert's own is
+/// never one of those a chart leaves out.
+const EVERY_SERIES: usize = 10_000;
+
+/// What `alert` watched over `range`, or nothing for an alert with no metric to
+/// show, such as an agent going offline, or whose rule is gone. Its readings can be
+/// empty when nothing was recorded in the range.
+pub async fn watched(
+    sources: &Sources<'_>,
+    alert: &Alert,
+    range: TimeRange,
+) -> Result<Option<Watched>> {
+    let Some(rule_id) = alert.rule_id else {
+        return Ok(None);
+    };
+    let Some(rule) = sources.database.get_alert_rule(rule_id).await? else {
+        return Ok(None);
+    };
+    let rule = rule.rule;
+    let (metric, unit, mut result) = match rule.kind {
+        RuleKind::Offline => return Ok(None),
+        RuleKind::Metric | RuleKind::Forecast => {
+            let Some(metric) = rule.metric() else {
+                return Ok(None);
+            };
+            let result = sources
+                .metrics
+                .series(&alert.host_id, metric, range, EVERY_SERIES)
+                .await?;
+            (metric, metric.unit, result)
         }
-    }
+        RuleKind::Calculation => {
+            let Ok(question) = rule.question() else {
+                return Ok(None);
+            };
+            let mut result = calculations::answer(sources, &question, range, EVERY_SERIES).await?;
+            // One line for everything is named after the metric in the alert.
+            if question.grouping == Grouping::Nothing {
+                for series in &mut result.series {
+                    series.name = alert.series.clone();
+                }
+            }
+            (question.metric, question.unit(), result)
+        }
+    };
+    result
+        .series
+        .retain(|series| alert.series.is_empty() || clean(&series.name) == alert.series);
+    result.series.truncate(MAX_SERIES);
+    result.hidden = 0;
+    Ok(Some(Watched {
+        rule,
+        metric,
+        unit,
+        result,
+    }))
 }
 
 /// Escapes text for SVG.
@@ -178,14 +200,14 @@ fn severity_colour(severity: Severity) -> &'static str {
     }
 }
 
-fn svg(
-    alert: &Alert,
-    rule: &AlertRuleInput,
-    metric: &Metric,
-    unit: Unit,
-    result: &SeriesResult,
-    range: TimeRange,
-) -> String {
+fn svg(alert: &Alert, watched: &Watched, range: TimeRange) -> String {
+    let Watched {
+        rule,
+        metric,
+        unit,
+        result,
+    } = watched;
+    let (metric, unit) = (*metric, *unit);
     let frame = Frame {
         width: WIDTH - 2.0 * PADDING,
         height: HEIGHT - HEADER - PADDING,
@@ -442,6 +464,17 @@ mod tests {
         (range, result)
     }
 
+    /// Disk usage, watched by the test rule.
+    fn disk(result: SeriesResult) -> Watched {
+        let metric = metrics::find("disk.usage").unwrap();
+        Watched {
+            rule: rule(),
+            metric,
+            unit: metric.unit,
+            result,
+        }
+    }
+
     #[test]
     fn the_colours_come_from_the_carbon_theme() {
         let css = include_str!("../assets/static/css/themes.css");
@@ -466,9 +499,8 @@ mod tests {
 
     #[test]
     fn a_chart_shows_both_thresholds_and_escapes_what_agents_chose() {
-        let metric = metrics::find("disk.usage").unwrap();
         let (range, result) = hour();
-        let svg = svg(&alert(), &rule(), metric, metric.unit, &result, range);
+        let svg = svg(&alert(), &disk(result), range);
 
         assert!(svg.contains("Disk usage (/) on web-&lt;1&gt;"), "{svg}");
         assert!(svg.contains("Disk &amp; more"));
@@ -482,7 +514,6 @@ mod tests {
 
     #[test]
     fn a_resolved_chart_marks_both_ends_inside_the_frame() {
-        let metric = metrics::find("disk.usage").unwrap();
         let (range, result) = hour();
         // Started a moment ago and ended now, both at the right edge.
         let alert = Alert {
@@ -490,7 +521,7 @@ mod tests {
             resolved_ms: Some(range.to_ms),
             ..alert()
         };
-        let svg = svg(&alert, &rule(), metric, metric.unit, &result, range);
+        let svg = svg(&alert, &disk(result), range);
 
         let started = svg.find(">Started</text>").expect("started");
         let resolved = svg.find(">Resolved</text>").expect("resolved");
@@ -503,9 +534,8 @@ mod tests {
 
     #[test]
     fn a_chart_becomes_a_png_twice_its_size() {
-        let metric = metrics::find("disk.usage").unwrap();
         let (range, result) = hour();
-        let png = png(&svg(&alert(), &rule(), metric, metric.unit, &result, range)).unwrap();
+        let png = png(&svg(&alert(), &disk(result), range)).unwrap();
 
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
         let width = u32::from_be_bytes(png[16..20].try_into().unwrap());

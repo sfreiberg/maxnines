@@ -18,6 +18,7 @@ use super::fleet::Health;
 use super::host_list::HostSearch;
 use super::hosts::suggestions;
 use super::users::{refusal, setup_url};
+use crate::alert_charts;
 use crate::alerting::{Alert, AlertRuleInput, ChannelInput, ChannelKind};
 use crate::app_state::{AppState, EventRefusal, HostDeletion};
 use crate::audit::Via;
@@ -127,6 +128,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/alerts/delivery-problems", get(list_delivery_problems))
         .route("/alerts/{id}/acknowledge", post(acknowledge_alert))
         .route("/alerts/{id}/actions", get(alert_actions))
+        .route("/alerts/{id}/series", get(alert_series))
         .route("/hosts/{id}/actions", get(host_actions).post(run_action))
         .route("/action-runs/{id}", get(show_action_run))
         .route("/alerts/{id}/unacknowledge", post(unacknowledge_alert))
@@ -1612,6 +1614,74 @@ async fn alert_actions(State(state): State<AppState>, UrlPath(id): UrlPath<i64>)
     }
     match state.database.action_runs_for_alert(id).await {
         Ok(runs) => Json(runs).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// What an alert watches over a time, as its page charts it: just its own series,
+/// with the rule's thresholds. Without a range it reaches back past the start.
+#[derive(Debug, Serialize)]
+struct AlertSeriesView {
+    alert_id: i64,
+    metric: &'static str,
+    unit: Unit,
+    thresholds: Vec<ThresholdView>,
+    from_ms: i64,
+    to_ms: i64,
+    step_ms: i64,
+    #[serde(flatten)]
+    result: SeriesResult,
+}
+
+#[derive(Debug, Serialize)]
+struct ThresholdView {
+    severity: &'static str,
+    value: f64,
+}
+
+async fn alert_series(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<i64>,
+    Query(params): Query<MetricParams>,
+) -> Response {
+    let alert = match state.database.get_alert(id).await {
+        Ok(Some(alert)) => alert,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return server_error(&error),
+    };
+    let to_ms = params.to_ms.unwrap_or_else(now_ms);
+    let from_ms = params.from_ms.unwrap_or_else(|| {
+        let lead = to_ms.saturating_sub(alert.started_ms) / 4;
+        alert
+            .started_ms
+            .saturating_sub(lead)
+            .min(to_ms.saturating_sub(DEFAULT_RANGE_MS))
+    });
+    let Some(range) = TimeRange::new(from_ms, to_ms) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    match alert_charts::watched(&state.sources(), &alert, range).await {
+        Ok(Some(watched)) => Json(AlertSeriesView {
+            alert_id: alert.id,
+            metric: watched.metric.name,
+            unit: watched.unit,
+            thresholds: watched
+                .rule
+                .levels()
+                .into_iter()
+                .map(|(severity, value)| ThresholdView {
+                    severity: severity.as_str(),
+                    value,
+                })
+                .collect(),
+            from_ms,
+            to_ms,
+            step_ms: range.step_ms,
+            result: watched.result,
+        })
+        .into_response(),
+        // An offline alert, or one whose rule is gone, has nothing to chart.
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),
     }
 }

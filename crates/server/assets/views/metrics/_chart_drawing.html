@@ -7,6 +7,10 @@
       <text class="tick" x="{{ tick.position }}" y="{{ chart.bottom + 18 }}" text-anchor="middle">{{ tick.label }}</text>
       {% endfor %}
       {% for marker in chart.markers %}<line class="event-line k-{{ marker.kind }}" x1="{{ marker.x }}" x2="{{ marker.x }}" y1="{{ chart.top }}" y2="{{ chart.bottom }}"/>{% endfor %}
+      {% for threshold in chart.thresholds %}
+      <line class="threshold t-{{ threshold.kind }}" x1="{{ chart.left }}" x2="{{ chart.right }}" y1="{{ threshold.y }}" y2="{{ threshold.y }}"/>
+      <text class="threshold-label t-{{ threshold.kind }}" x="{{ chart.right }}" y="{{ threshold.y - 4 }}" text-anchor="end">{{ threshold.label }}</text>
+      {% endfor %}
       {% for line in chart.lines %}
       {% for band in line.bands %}<polygon class="band s{{ line.slot }}" points="{{ band }}"/>{% endfor %}
       {% for whisker in line.whiskers %}<line class="whisker s{{ line.slot }}" x1="{{ whisker.x }}" x2="{{ whisker.x }}" y1="{{ whisker.top }}" y2="{{ whisker.bottom }}"/>{% endfor %}

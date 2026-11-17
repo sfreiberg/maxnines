@@ -379,6 +379,11 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .chart .event-line.k-restart { stroke: var(--warn); } .chart .event-dot.k-restart { fill: var(--warn); }
 .chart .event-line.k-alert { stroke: var(--bad); } .chart .event-dot.k-alert { fill: var(--bad); }
 .chart .event-line.k-resolved { stroke: var(--good); } .chart .event-dot.k-resolved { fill: var(--good); }
+/* An alert rule's levels, dashed across the chart with the value at the right. */
+.chart .threshold { stroke-width: 1.5; stroke-dasharray: 6 4; }
+.chart .threshold.t-warning { stroke: var(--warn); } .chart .threshold-label.t-warning { fill: var(--warn); }
+.chart .threshold.t-critical { stroke: var(--bad); } .chart .threshold-label.t-critical { fill: var(--bad); }
+.chart .threshold.t-level { stroke: var(--muted); } .chart .threshold-label.t-level { fill: var(--muted); }
 .chart .event-tip { visibility: hidden; pointer-events: none; }
 .chart .event:hover .event-tip { visibility: visible; }
 .chart .hit { fill: transparent; }

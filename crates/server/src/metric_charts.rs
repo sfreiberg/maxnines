@@ -202,6 +202,17 @@ pub struct Chart {
     pub summary: Vec<Summary>,
     /// What happened to the host while the chart covers.
     pub markers: Vec<Marker>,
+    /// Levels across the chart, such as an alert rule's thresholds.
+    pub thresholds: Vec<Threshold>,
+}
+
+/// A level drawn across a chart, labelled with its value and what it stands for.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Threshold {
+    pub y: f64,
+    /// A word for its look, like `warning` or `critical`.
+    pub kind: &'static str,
+    pub label: String,
 }
 
 /// A chart with its times in `zone`.
@@ -256,6 +267,34 @@ pub fn build_marked(
         chart: chart_on(axis, metric, unit, title, frame, result, range, zone),
         marks,
     }
+}
+
+/// A chart with levels drawn across it, each a kind such as `warning` and its value,
+/// and a scale that reaches every one of them.
+#[allow(clippy::too_many_arguments)]
+pub fn build_with_thresholds(
+    metric: &Metric,
+    unit: Unit,
+    title: &str,
+    frame: Frame,
+    result: &SeriesResult,
+    range: TimeRange,
+    zone: Tz,
+    levels: &[(&'static str, f64)],
+) -> Chart {
+    let values: Vec<f64> = levels.iter().map(|(_, value)| *value).collect();
+    let Marked { mut chart, marks } =
+        build_marked(metric, unit, title, frame, result, range, zone, &values);
+    chart.thresholds = levels
+        .iter()
+        .zip(marks)
+        .map(|((kind, value), y)| Threshold {
+            y,
+            kind,
+            label: format!("{} {kind}", format_value(unit, *value)),
+        })
+        .collect();
+    chart
 }
 
 /// How far across a chart a moment is.
@@ -316,6 +355,7 @@ fn chart_on(
             .map(|(series, slot)| summary(unit, series, *slot))
             .collect(),
         markers: Vec::new(),
+        thresholds: Vec::new(),
     }
 }
 

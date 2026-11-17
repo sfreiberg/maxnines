@@ -297,6 +297,17 @@ pub(super) fn selected_range(params: &RangeParams) -> (&'static str, &'static st
         .unwrap_or(RANGES[0])
 }
 
+/// The shortest range that reaches back to `since_ms` with a quarter as long again
+/// before it, to show what led up to it, or the longest when none does.
+pub(super) fn range_reaching(since_ms: i64, now_ms: i64) -> &'static str {
+    let wanted = now_ms.saturating_sub(since_ms).saturating_mul(5) / 4;
+    RANGES
+        .into_iter()
+        .find(|(_, _, length_ms)| *length_ms >= wanted)
+        .unwrap_or(RANGES[RANGES.len() - 1])
+        .0
+}
+
 pub(super) fn time_range(length_ms: i64) -> Option<TimeRange> {
     let now = now_ms();
     TimeRange::new(now - length_ms, now)
@@ -541,6 +552,18 @@ mod tests {
     #[test]
     fn an_offered_range_is_used() {
         assert_eq!(selected_range(&params(Some("7d"))).0, "7d");
+    }
+
+    #[test]
+    fn the_range_reaching_a_moment_leaves_room_before_it() {
+        let now = 100 * 24 * HOUR_MS;
+        assert_eq!(range_reaching(now - 10 * 60_000, now), "1h");
+        assert_eq!(range_reaching(now - 50 * 60_000, now), "6h");
+        assert_eq!(range_reaching(now - 4 * HOUR_MS, now), "6h");
+        assert_eq!(range_reaching(now - 18 * HOUR_MS, now), "24h");
+        assert_eq!(range_reaching(now - 20 * HOUR_MS, now), "7d");
+        assert_eq!(range_reaching(now - 3 * 24 * HOUR_MS, now), "7d");
+        assert_eq!(range_reaching(now - 90 * 24 * HOUR_MS, now), "30d");
     }
 
     #[test]
