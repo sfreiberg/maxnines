@@ -32,7 +32,7 @@ function Msiexec([string] $name, [string[]] $arguments) {
     $process = Start-Process msiexec.exe -Wait -PassThru `
         -ArgumentList ($arguments + @('/qn', '/l*v', "`"$log`""))
     if ($process.ExitCode -ne 0) {
-        Get-Content $log -Tail 100
+        Get-Content $log -Tail 100 | Out-Host
         throw "msiexec $name exited with $($process.ExitCode)"
     }
     $log

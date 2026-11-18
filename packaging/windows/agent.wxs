@@ -17,7 +17,8 @@
   packages do.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
-     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <Package Name="MaxNines Agent"
            Manufacturer="MaxNines"
            Version="$(var.Version)"
@@ -74,11 +75,11 @@
           <ServiceConfig PreShutdownDelay="60000"
                          FailureActionsWhen="failedToStopOrReturnedError"
                          OnInstall="yes" OnReinstall="yes" />
-          <ServiceConfigFailureActions ResetPeriod="86400" OnInstall="yes" OnReinstall="yes">
-            <Failure Action="restartService" Delay="30000" />
-            <Failure Action="restartService" Delay="30000" />
-            <Failure Action="restartService" Delay="30000" />
-          </ServiceConfigFailureActions>
+          <!-- Windows Installer's own way of setting these is refused access,
+               so WiX's sets them. -->
+          <util:ServiceConfig FirstFailureActionType="restart" SecondFailureActionType="restart"
+                              ThirdFailureActionType="restart" RestartServiceDelayInSeconds="30"
+                              ResetPeriodInDays="1" />
         </ServiceInstall>
         <ServiceControl Name="MaxNinesAgent" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
       </Component>

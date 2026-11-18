@@ -23,6 +23,7 @@
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util"
      xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall">
   <Package Name="MaxNines Server"
            Manufacturer="MaxNines"
@@ -96,11 +97,11 @@
           <ServiceConfig PreShutdownDelay="60000"
                          FailureActionsWhen="failedToStopOrReturnedError"
                          OnInstall="yes" OnReinstall="yes" />
-          <ServiceConfigFailureActions ResetPeriod="86400" OnInstall="yes" OnReinstall="yes">
-            <Failure Action="restartService" Delay="30000" />
-            <Failure Action="restartService" Delay="30000" />
-            <Failure Action="restartService" Delay="30000" />
-          </ServiceConfigFailureActions>
+          <!-- Windows Installer's own way of setting these is refused access,
+               so WiX's sets them. -->
+          <util:ServiceConfig FirstFailureActionType="restart" SecondFailureActionType="restart"
+                              ThirdFailureActionType="restart" RestartServiceDelayInSeconds="30"
+                              ResetPeriodInDays="1" />
         </ServiceInstall>
         <ServiceControl Name="MaxNinesServer" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
         <!-- For the program rather than a port, so changing the port in Modify
@@ -151,7 +152,6 @@
     </InstallExecuteSequence>
 
     <!-- The finish page opens the link, in the installing person's browser. -->
-    <Property Id="WixShellExecTarget" Value="[SETUP_LINK_FILE]" />
     <CustomAction Id="OpenSetupLink" DllEntry="WixShellExec" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
                   Impersonate="yes" Return="ignore" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
@@ -175,7 +175,9 @@
       <DialogRef Id="MaintenanceTypeDlg" />
       <DialogRef Id="VerifyReadyDlg" />
 
-      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="OpenSetupLink" Order="1"
+      <Publish Dialog="ExitDialog" Control="Finish" Property="WixShellExecTarget" Value="[SETUP_LINK_FILE]" Order="1"
+               Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" />
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="OpenSetupLink" Order="2"
                Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" />
       <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999" />
 
