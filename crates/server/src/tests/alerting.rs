@@ -771,8 +771,23 @@ async fn an_agent_going_offline_alerts_after_the_wait() {
     test.evaluator.evaluate(gone + 60_000).await.unwrap();
     let open = test.open().await;
     assert_eq!(open.len(), 1);
-    assert_eq!(open[0].summary, "web-1 has been offline for 1 minute");
+    assert_eq!(open[0].summary, "web-1 is offline");
     assert_eq!(open[0].series, "");
+
+    // The pages say since when, in the viewer's time zone, which is UTC here.
+    let since = format!(
+        "since {}",
+        crate::times::format_time(gone as u64, chrono_tz::Tz::UTC)
+    );
+    for path in ["/".to_string(), format!("/hosts/{}", test.id())] {
+        let page = Browser::default().get(&test.server, &path).await;
+        assert!(
+            page.body.contains("web-1 is offline"),
+            "{path}: {}",
+            page.body
+        );
+        assert!(page.body.contains(&since), "{path}: {}", page.body);
+    }
 }
 
 /// The rules every server starts with, as the migrations add them.
@@ -936,7 +951,7 @@ async fn the_built_in_rule_tells_every_channel_once_an_agent_is_gone_a_minute() 
     test.evaluator.evaluate(gone + 60_000).await.unwrap();
     let open = test.open().await;
     assert_eq!(open.len(), 1);
-    assert_eq!(open[0].summary, "web-1 has been offline for 1 minute");
+    assert_eq!(open[0].summary, "web-1 is offline");
     let deliveries = test.database().due_deliveries(i64::MAX, 10).await.unwrap();
     let told: Vec<i64> = deliveries
         .iter()

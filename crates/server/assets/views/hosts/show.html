@@ -49,7 +49,7 @@
   {% for alert in alerts %}
   <div class="problem">
     {% if alert.severity == "critical" %}<span class="badge bad">Critical</span>{% else %}<span class="badge warn">Warning</span>{% endif %}
-    <span class="text">{{ alert.summary }}</span>
+    <span class="text">{{ alert.summary }} <span class="since">since {{ alert.since }}</span></span>
     <a class="button secondary" href="/alerts">View</a>
   </div>
   {% endfor %}

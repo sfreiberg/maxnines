@@ -125,6 +125,7 @@ main > .breadcrumb { margin-bottom: -12px; }
 .problem { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 8px 0; border-bottom: 1px solid var(--border); }
 .problem:last-child { border-bottom: 0; }
 .problem .text { flex: 1 1 320px; min-width: 0; overflow-wrap: anywhere; }
+.problem .since { color: var(--muted); font-size: 13px; white-space: nowrap; }
 .problem .button, .problem button { min-height: 36px; padding: 0 14px; font-size: 14px; }
 .problem .host-button { gap: 8px; }
 .problem-host { flex: 0 0 auto; min-width: 9rem; color: var(--text); font-weight: 600; text-decoration: none; }

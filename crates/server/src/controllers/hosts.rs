@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use super::fleet::{Health, OsFamily};
 use super::host_list::{HostSearch, address, page_number, paginate};
-use super::{CsrfForm, Page, recorded_by, server_error, viewer_zone};
+use super::{CsrfForm, Page, local_time, recorded_by, server_error, viewer_zone};
 use crate::agent_versions::{self, NEWEST_AGENT_VERSION, VersionState};
 use crate::alerting::Alert;
 use crate::app_state::{AppState, HostDeletion};
@@ -491,7 +491,18 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         Ok(open) => open,
         Err(error) => return server_error(&error),
     };
-    let alerts: Vec<&Alert> = open.iter().filter(|a| a.host_id == id).collect();
+    let rules = match state.database.list_alert_rules().await {
+        Ok(rules) => rules,
+        Err(error) => return server_error(&error),
+    };
+    let here: Vec<&Alert> = open.iter().filter(|alert| alert.host_id == id).collect();
+    let alerts: Vec<OpenAlert> = here
+        .iter()
+        .map(|&alert| OpenAlert {
+            since: local_time(alert.began_ms(&rules)),
+            alert,
+        })
+        .collect();
 
     let current = match state.database.current_facts(&id).await {
         Ok(current) => current,
@@ -561,7 +572,7 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         Ok(checks) => checks,
         Err(error) => return server_error(&error),
     };
-    let health = Health::of(state.presence.reach(&host), &alerts);
+    let health = Health::of(state.presence.reach(&host), &here);
     let mut row = row(&state, host.clone(), Some(&flat), health);
     row.config = Some(config_state(
         Some(desired.version.as_str()),
@@ -813,6 +824,15 @@ async fn delete(State(state): State<AppState>, Path(id): Path<String>, form: Csr
         }
         Err(error) => server_error(&error),
     }
+}
+
+/// An open alert on the host's page, with when its problem began.
+#[derive(Serialize)]
+struct OpenAlert<'a> {
+    #[serde(flatten)]
+    alert: &'a Alert,
+    /// Where the viewer is.
+    since: String,
 }
 
 #[cfg(test)]

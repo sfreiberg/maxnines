@@ -10,7 +10,7 @@ use serde::Serialize;
 use super::fleet::OsFamily;
 use super::metrics::{CheckRow, check_row};
 use super::server::count;
-use super::{Page, fleet, server_error};
+use super::{Page, fleet, local_time, server_error};
 use crate::alerting::Severity;
 use crate::app_state::AppState;
 use crate::registration::{HostState, short_id};
@@ -29,6 +29,8 @@ pub fn routes() -> Router<AppState> {
 struct Problem {
     critical: bool,
     summary: String,
+    /// When the problem began, where the viewer is.
+    since: String,
     host_id: String,
     hostname: String,
     /// Empty for the fleet and the server, which are one of a kind.
@@ -47,10 +49,11 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
     let data = async {
         let hosts = fleet::rows(&state).await?;
         let alerts = state.database.open_alerts().await?;
+        let rules = state.database.list_alert_rules().await?;
         let checks = state.database.list_remote_checks().await?;
-        anyhow::Ok((hosts, alerts, checks))
+        anyhow::Ok((hosts, alerts, rules, checks))
     };
-    let (mut hosts, alerts, checks) = match data.await {
+    let (mut hosts, alerts, rules, checks) = match data.await {
         Ok(data) => data,
         Err(error) => return server_error(&error),
     };
@@ -75,6 +78,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
             } else {
                 short_id(&alert.host_id).to_string()
             },
+            since: local_time(alert.began_ms(&rules)),
             summary: alert.summary,
             host_id: alert.host_id,
             hostname: alert.hostname,

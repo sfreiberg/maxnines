@@ -455,7 +455,7 @@ async fn a_host_that_stops_answering_is_offline_and_one_with_nothing_to_read_is_
     assert_eq!(open.len(), 1, "{open:?}");
     assert_eq!(open[0].host_id, reading);
     assert_ne!(open[0].host_id, idle);
-    assert_eq!(open[0].summary, "orders-db has been offline for 1 minute");
+    assert_eq!(open[0].summary, "orders-db is offline");
 
     // Nor is it listed or counted as offline, as it couldn't be online.
     let (_, host) = api(

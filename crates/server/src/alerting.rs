@@ -590,12 +590,11 @@ impl AlertRuleInput {
         ))
     }
 
-    /// What an offline alert says when it fires.
-    pub fn offline_summary(&self, hostname: &str) -> String {
-        match self.for_secs {
-            0 => format!("{hostname} is offline"),
-            secs => format!("{hostname} has been offline for {}", format_duration(secs)),
-        }
+    /// What an offline alert says when it fires. It's kept as long as the alert
+    /// is open, so it says nothing about how long, which pages show from when the
+    /// problem began.
+    pub fn offline_summary(hostname: &str) -> String {
+        format!("{hostname} is offline")
     }
 
     /// What an offline alert says as it clears.
@@ -1000,6 +999,20 @@ pub struct Alert {
     /// Who said they're dealing with it.
     pub acknowledged_by: Option<String>,
     pub acknowledged_ms: Option<i64>,
+}
+
+impl Alert {
+    /// When the problem began: an alert starts once its problem has lasted the
+    /// rule's hold, so that long before, such as when a host went offline. One
+    /// whose rule is gone starts when it does.
+    pub fn began_ms(&self, rules: &[AlertRule]) -> i64 {
+        let hold_secs = rules
+            .iter()
+            .find(|rule| Some(rule.id) == self.rule_id)
+            .map_or(0, |rule| rule.rule.for_secs);
+        let hold_ms = i64::try_from(hold_secs).map_or(i64::MAX, |secs| secs.saturating_mul(1000));
+        self.started_ms.saturating_sub(hold_ms)
+    }
 }
 
 /// What's needed to start an alert.
@@ -1495,16 +1508,36 @@ mod tests {
     }
 
     #[test]
-    fn offline_summaries_say_how_long() {
-        assert_eq!(
-            offline_rule().offline_summary("web-1"),
-            "web-1 has been offline for 1 minute"
-        );
-        let rule = AlertRuleInput {
-            for_secs: 0,
-            ..offline_rule()
+    fn a_problem_began_its_rules_hold_before_the_alert() {
+        let rule = AlertRule {
+            id: 7,
+            rule: offline_rule(),
         };
-        assert_eq!(rule.offline_summary("web-1"), "web-1 is offline");
+        let alert = Alert {
+            id: 1,
+            rule_id: Some(7),
+            rule_name: "Host offline".to_string(),
+            severity: Severity::Critical,
+            host_id: "a".to_string(),
+            hostname: "web-1".to_string(),
+            series: String::new(),
+            value: None,
+            summary: AlertRuleInput::offline_summary("web-1"),
+            started_ms: 1_000_000,
+            resolved_ms: None,
+            resolve_reason: None,
+            resolved_summary: None,
+            acknowledged_by: None,
+            acknowledged_ms: None,
+        };
+        assert_eq!(alert.began_ms(&[rule]), 940_000);
+        // A rule that's gone takes its hold with it.
+        assert_eq!(alert.began_ms(&[]), 1_000_000);
+    }
+
+    #[test]
+    fn an_offline_summary_says_nothing_that_goes_stale() {
+        assert_eq!(AlertRuleInput::offline_summary("web-1"), "web-1 is offline");
     }
 
     #[test]

@@ -40,7 +40,7 @@
   <div class="problem">
     {% if problem.critical %}<span class="badge bad">Critical</span>{% else %}<span class="badge warn">Warning</span>{% endif %}
     {% if problem.host_id != "fleet" %}{% set os_family = problem.os_family %}<a class="host-name problem-host" href="/hosts/{{ problem.host_id }}/metrics"{% if problem.short_id %} title="Host {{ problem.short_id }}"{% endif %}>{% include "hosts/_os_icon.html" %}{{ problem.hostname }}</a>{% else %}<span class="problem-host">{{ problem.hostname }}</span>{% endif %}
-    <span class="text">{{ problem.summary }}</span>
+    <span class="text">{{ problem.summary }} <span class="since">since {{ problem.since }}</span></span>
     <a class="button secondary" href="/alerts">View</a>
   </div>
   {% endfor %}

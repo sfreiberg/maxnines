@@ -564,7 +564,7 @@ impl Evaluator {
         let hostname = clean(&host.hostname);
         let summary = match change {
             Some(Change::Resolve) => crate::alerting::AlertRuleInput::online_summary(&hostname),
-            _ => rule.rule.offline_summary(&hostname),
+            _ => crate::alerting::AlertRuleInput::offline_summary(&hostname),
         };
         self.apply(change, rule, &hostname, key, None, summary, snapshot, open)
             .await
