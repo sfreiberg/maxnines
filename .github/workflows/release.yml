@@ -224,9 +224,10 @@ jobs:
           echo "$USERPROFILE\.dotnet\tools" >> "$GITHUB_PATH"
           dotnet tool install --global wix --version 7.0.1
           export PATH="$USERPROFILE/.dotnet/tools:$PATH"
+          # Before anything else, as every command refuses to run until then.
+          wix eula accept wix7
           wix extension add -g WixToolset.UI.wixext/7.0.1
           wix extension add -g WixToolset.Util.wixext/7.0.1
-          wix eula accept wix7
       # An MSI version is three numbers, so a pre-release's number goes in a
       # fourth, which Windows shows but doesn't compare.
       - name: Build the agent's installer
