@@ -155,6 +155,12 @@ impl Database {
     /// Connects and brings the schema up to date. Errors don't mention the URL,
     /// because it can hold a password.
     pub async fn connect(url: &str) -> Result<Self> {
+        Self::connect_waiting(url, CONNECT_TIMEOUT).await
+    }
+
+    /// As [`connect`](Self::connect), waiting up to `limit` for a connection, to
+    /// make one and each time one's needed.
+    async fn connect_waiting(url: &str, limit: Duration) -> Result<Self> {
         create_sqlite_folder(url)?;
 
         // SQLite allows one writer, and each connection to an in-memory
@@ -163,8 +169,8 @@ impl Database {
         let mut options = ConnectOptions::new(url);
         options
             .max_connections(if is_sqlite { 1 } else { MAX_CONNECTIONS })
-            .connect_timeout(CONNECT_TIMEOUT)
-            .acquire_timeout(CONNECT_TIMEOUT)
+            .connect_timeout(limit)
+            .acquire_timeout(limit)
             .sqlx_logging(false);
         // The default journal waits on the disk several times for every write, which
         // a fleet reporting at once can't get through on a slow disk. In this mode a
@@ -1196,12 +1202,18 @@ async fn fresh_test_database(server: &str) -> String {
 impl Database {
     /// An empty database of its own. SQLite in memory, unless `MAXNINES_TEST_DATABASE_URL`
     /// names a Postgres or MySQL server to run the tests against instead.
+    ///
+    /// It waits far longer for a connection than a server does, as a CI machine
+    /// running every test at once can stall for seconds, which isn't the database
+    /// being down.
     pub async fn for_test() -> Self {
         let url = match std::env::var("MAXNINES_TEST_DATABASE_URL") {
             Ok(server) => fresh_test_database(&server).await,
             Err(_) => "sqlite::memory:".to_string(),
         };
-        Self::connect(&url).await.unwrap()
+        Self::connect_waiting(&url, Duration::from_secs(60))
+            .await
+            .unwrap()
     }
 
     /// Takes every connection, so that queries wait until it's dropped, as they do on a
