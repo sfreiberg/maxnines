@@ -4,11 +4,14 @@
 #
 #   packaging/windows/test-agent-install.ps1 -Msi maxnines-agent.msi -Upgrade newer.msi
 #
+# On Arm, -X64OnArm names an x64 installer, which should refuse to install.
+#
 # The server it points at isn't there, which the agent copes with by retrying.
 param(
     [Parameter(Mandatory)] [string] $Msi,
     # The same agent with a higher version.
-    [Parameter(Mandatory)] [string] $Upgrade
+    [Parameter(Mandatory)] [string] $Upgrade,
+    [string] $X64OnArm
 )
 $ErrorActionPreference = 'Stop'
 # msiexec can't open a package from a relative path.
@@ -51,6 +54,17 @@ function Check-Running([string] $when) {
 function Url-In-Config {
     (Get-Content $config -Raw) -match 'url = "([^"]*)"' | Out-Null
     $Matches[1]
+}
+
+# On Arm, the x64 installer refuses, naming the one to use, before installing
+# anything. Given a server, so that's the only reason it has.
+if ($X64OnArm) {
+    $log = Join-Path $logs 'agent-x64-on-arm.log'
+    $refused = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+        '/i', "`"$((Resolve-Path $X64OnArm).Path)`"", 'SERVER_URL=http://127.0.0.1:9', '/qn', '/l*v', "`"$log`"")
+    Check ($refused.ExitCode -eq 1603) 'the x64 installer refuses on Arm'
+    Check ((Get-Content $log -Raw) -match 'aarch64 in its name') 'it says which installer to use'
+    Check ($null -eq (Get-Service MaxNinesAgent -ErrorAction SilentlyContinue)) 'it installs nothing'
 }
 
 # Install, as a silent install with the questions given as properties.

@@ -42,6 +42,15 @@
 
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/sfreiberg/maxnines" />
 
+    <!-- Windows on Arm runs x64 programs by translating them, which works but
+         costs memory and time. One already installed can still be changed or
+         removed, or replaced by installing the Arm64 one over it. -->
+    <?if $(sys.BUILDARCH) = x64 ?>
+    <util:QueryNativeMachine />
+    <Launch Condition="Installed OR WIX_NATIVE_MACHINE &lt;&gt; 43620"
+            Message="This installer is for x64 processors, and this computer has an Arm processor. Use the MaxNines Server installer with aarch64 in its name instead." />
+    <?endif?>
+
     <!-- Remembered for Modify by the server whenever it starts, from its config,
          under the same names. One given on the command line wins. -->
     <?foreach SETTING in SERVER_ADDRESS;PORT;HTTPS;ACME_EMAIL;CERTIFICATE_FILE;KEY_FILE ?>

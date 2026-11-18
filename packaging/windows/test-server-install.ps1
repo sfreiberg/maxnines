@@ -4,10 +4,13 @@
 # and an uninstall.
 #
 #   packaging/windows/test-server-install.ps1 -Msi maxnines-server.msi -Upgrade newer.msi
+#
+# On Arm, -X64OnArm names an x64 installer, which should refuse to install.
 param(
     [Parameter(Mandatory)] [string] $Msi,
     # The same server with a higher version.
-    [Parameter(Mandatory)] [string] $Upgrade
+    [Parameter(Mandatory)] [string] $Upgrade,
+    [string] $X64OnArm
 )
 $ErrorActionPreference = 'Stop'
 # msiexec can't open a package from a relative path.
@@ -70,6 +73,17 @@ function Setting([string] $name) {
 
 function Users {
     @(& "$program\maxnines-server.exe" --config $config users list | Where-Object { $_ })
+}
+
+# On Arm, the x64 installer refuses, naming the one to use, before installing
+# anything.
+if ($X64OnArm) {
+    $log = Join-Path $logs 'server-x64-on-arm.log'
+    $refused = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+        '/i', "`"$((Resolve-Path $X64OnArm).Path)`"", '/qn', '/l*v', "`"$log`"")
+    Check ($refused.ExitCode -eq 1603) 'the x64 installer refuses on Arm'
+    Check ((Get-Content $log -Raw) -match 'aarch64 in its name') 'it says which installer to use'
+    Check ($null -eq (Get-Service MaxNinesServer -ErrorAction SilentlyContinue)) 'it installs nothing'
 }
 
 # Install, as a silent install with the questions given as properties, and the

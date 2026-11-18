@@ -238,10 +238,10 @@ jobs:
             *) msi_version=$base ;;
           esac
           IFS=. read -r major minor patch _ <<< "$base"
-          mkdir -p msi/upgrade dist
+          mkdir -p msi/upgrade msi/x64 dist
           for program in agent server; do
             build() {
-              wix build -arch "${{ matrix.wix_arch }}" \
+              wix build -arch "${3:-${{ matrix.wix_arch }}}" \
                 -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext -ext WixToolset.Firewall.wixext \
                 -d Version="$1" -d Program="$TARGET_DIR/$TARGET/release/maxnines-$program.exe" -d License=LICENSE \
                 -o "$2" "packaging/windows/$program.wxs"
@@ -249,20 +249,46 @@ jobs:
             build "$msi_version" "msi/maxnines-$program-$VERSION-$TARGET.msi"
             # The same program as a later version, to test upgrading.
             build "$major.$minor.$((patch + 1))" "msi/upgrade/maxnines-$program.msi"
+            # An x64 installer, to test that it refuses on Arm. What's in it
+            # doesn't matter, as it stops before installing anything.
+            if [ "${{ matrix.wix_arch }}" = arm64 ]; then
+              build "$msi_version" "msi/x64/maxnines-$program.msi" x64
+            fi
             cp "msi/maxnines-$program-$VERSION-$TARGET.msi" dist/
           done
       - name: Test the agent's installer
         shell: pwsh
         run: |
+          $x64 = if (Test-Path msi/x64/maxnines-agent.msi) { @{ X64OnArm = 'msi/x64/maxnines-agent.msi' } } else { @{} }
           packaging/windows/test-agent-install.ps1 `
             -Msi "msi/maxnines-agent-$env:VERSION-$env:TARGET.msi" `
-            -Upgrade msi/upgrade/maxnines-agent.msi
+            -Upgrade msi/upgrade/maxnines-agent.msi @x64
       - name: Test the server's installer
         shell: pwsh
         run: |
+          $x64 = if (Test-Path msi/x64/maxnines-server.msi) { @{ X64OnArm = 'msi/x64/maxnines-server.msi' } } else { @{} }
           packaging/windows/test-server-install.ps1 `
             -Msi "msi/maxnines-server-$env:VERSION-$env:TARGET.msi" `
-            -Upgrade msi/upgrade/maxnines-server.msi
+            -Upgrade msi/upgrade/maxnines-server.msi @x64
+      # Windows on Arm runs x64 programs by translating them, and tells them the
+      # processor is an x64 one. An x64 agent installed there before its installer
+      # refused still has to report the real processor.
+      - name: Check an emulated agent reports the real processor
+        if: matrix.arch == 'aarch64'
+        shell: pwsh
+        run: |
+          rustup target add x86_64-pc-windows-msvc
+          cargo build --locked -p maxnines-agent --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $config = Join-Path $env:RUNNER_TEMP 'facts.hcl'
+          Set-Content $config "server {`n  url = `"ws://127.0.0.1:9/ws`"`n}`n"
+          $facts = & "$env:TARGET_DIR/x86_64-pc-windows-msvc/debug/maxnines-agent.exe" -c $config facts | ConvertFrom-Json
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $processor = (Get-ItemProperty 'HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0').ProcessorNameString.Trim()
+          Write-Host "host.arch = $($facts.host.arch), cpu.model = $($facts.cpu.model), the processor is $processor"
+          if ($facts.host.arch -ne 'arm64' -or $facts.cpu.model -ne $processor) {
+            throw 'the emulated agent reported the x64 processor it was shown'
+          }
       - name: Keep the installer's logs
         if: failure()
         uses: actions/upload-artifact@v4

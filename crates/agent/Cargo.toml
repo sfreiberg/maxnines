@@ -46,6 +46,9 @@ bollard = { version = "0.21", default-features = false, features = ["pipe"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
+# The processor as Windows records it, which an x64 agent emulated on Arm can't
+# ask the processor for.
+windows-registry = "0.6"
 # For the agent's own memory, counted as Task Manager counts it.
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 

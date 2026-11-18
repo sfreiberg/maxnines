@@ -155,6 +155,7 @@ fn gather_named(
         let name = name.to_string_lossy().into_owned();
         (name, data.mac_address(), data.ip_networks())
     });
+    let (arch, model) = processor(&system);
     let mut networking = network_facts(interfaces);
     if let (Some(networking), Some(names)) = (
         networking.as_object_mut(),
@@ -173,10 +174,10 @@ fn gather_named(
         },
         "host": {
             "name": hostname.map(short_name),
-            "arch": System::cpu_arch(),
+            "arch": arch,
         },
         "cpu": {
-            "model": system.cpus().first().map(|cpu| cpu.brand().trim().to_string()),
+            "model": model,
             "physical_cores": System::physical_core_count().ok(),
             "logical_cores": system.cpus().len(),
         },
@@ -217,6 +218,46 @@ fn gather_named(
     }))
 }
 
+/// The processor's architecture and name.
+#[cfg(not(windows))]
+fn processor(system: &System) -> (Option<String>, Option<String>) {
+    let model = system
+        .cpus()
+        .first()
+        .map(|cpu| cpu.brand().trim().to_string());
+    (Some(System::cpu_arch()), model)
+}
+
+/// The processor's architecture and name, as Windows records them. Windows on Arm
+/// runs the x64 agent by translating it, and tells it the processor is the x64 one
+/// it pretends to be, so asking the processor would describe that instead.
+#[cfg(windows)]
+fn processor(_system: &System) -> (Option<String>, Option<String>) {
+    use windows_registry::LOCAL_MACHINE;
+
+    let arch = LOCAL_MACHINE
+        .open(r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment")
+        .and_then(|key| key.get_string("PROCESSOR_ARCHITECTURE"))
+        .ok()
+        .map(|name| arch_name(&name));
+    let model = LOCAL_MACHINE
+        .open(r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
+        .and_then(|key| key.get_string("ProcessorNameString"))
+        .ok()
+        .map(|name| name.trim().to_string());
+    (arch, model)
+}
+
+/// Windows' name for an architecture as the other systems' agents name it.
+#[cfg(any(windows, test))]
+fn arch_name(windows: &str) -> String {
+    match windows {
+        "AMD64" => "x86_64".to_string(),
+        "ARM64" => "arm64".to_string(),
+        other => other.to_lowercase(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +268,7 @@ mod tests {
 
         assert_eq!(facts["os"]["family"], std::env::consts::OS);
         assert!(facts["host"]["arch"].is_string());
+        assert!(facts["cpu"]["model"].is_string());
         assert!(facts["cpu"]["logical_cores"].as_u64().unwrap() > 0);
         assert!(facts["memory"]["total_bytes"].as_u64().unwrap() > 0);
         assert!(facts["networking"]["addresses"].is_array());
@@ -400,6 +442,13 @@ mod tests {
             gather_named(custom, none, &actions, true, Some("web-1"), canonical).unwrap()
         };
         assert_eq!(named(&custom, &none), named(&custom, &none));
+    }
+
+    #[test]
+    fn windows_architectures_are_named_as_elsewhere() {
+        assert_eq!(arch_name("AMD64"), "x86_64");
+        assert_eq!(arch_name("ARM64"), "arm64");
+        assert_eq!(arch_name("x86"), "x86");
     }
 
     #[test]
