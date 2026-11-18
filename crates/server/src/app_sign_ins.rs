@@ -1,4 +1,4 @@
-//! Signing in apps, such as the command line and the menu bar app, through the
+//! Signing in apps, such as the command line and MaxNines Desktop, through the
 //! browser rather than with a pasted API key. It's OAuth 2.0 for native apps: the
 //! authorization code flow with PKCE and a loopback redirect (RFC 8252 and 7636), and
 //! the device flow for machines with no browser (RFC 8628).
@@ -61,11 +61,11 @@ pub const CLIENTS: [AppClient; 3] = [
     },
     AppClient {
         id: "maxnines-menubar",
-        name: "MaxNines menu bar app",
+        name: "MaxNines Desktop for Mac",
     },
     AppClient {
         id: "maxnines-tray",
-        name: "MaxNines for Windows",
+        name: "MaxNines Desktop for Windows",
     },
 ];
 

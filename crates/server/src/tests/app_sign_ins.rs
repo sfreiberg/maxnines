@@ -472,7 +472,7 @@ async fn signed_in_apps_are_listed_and_revoked() {
 
     let (status, listed) = call_json(&server, &server.api_key, "GET", "/api/v1/app-sign-ins").await;
     assert_eq!(status, 200);
-    assert_eq!(listed[0]["app"], "MaxNines for Windows");
+    assert_eq!(listed[0]["app"], "MaxNines Desktop for Windows");
     assert_eq!(listed[0]["device"], "office PC");
     assert!(listed[0].get("access_hash").is_none());
 
