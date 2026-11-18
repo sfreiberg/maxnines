@@ -3952,6 +3952,7 @@ dependencies = [
  "vergen-gitcl",
  "webpki-roots 0.26.11",
  "windows-service",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

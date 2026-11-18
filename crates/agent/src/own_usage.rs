@@ -63,9 +63,50 @@ fn own_memory() -> Option<u64> {
     proportional_bytes(&std::fs::read_to_string("/proc/self/smaps_rollup").ok()?)
 }
 
-/// Windows and FreeBSD have nothing as cheap to ask, so they report the resident
-/// size.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// The agent's private working set, which is what Task Manager shows: the pages it
+/// has in memory that no other process can use. Windows lists the pages with whether
+/// each can be shared, and the count of the others is it. The resident size, which
+/// counts the system's libraries too, comes out around three times larger.
+#[cfg(windows)]
+fn own_memory() -> Option<u64> {
+    use windows_sys::Win32::Foundation::{ERROR_BAD_LENGTH, GetLastError};
+    use windows_sys::Win32::System::ProcessStatus::QueryWorkingSet;
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    /// The bit of a page's entry that says it can be shared.
+    const SHAREABLE: usize = 1 << 8;
+
+    // The number of pages, then an entry for each. Asking with no room for entries
+    // gives the number, and the list is made with room to spare, as making it can add
+    // pages of its own.
+    let mut list: Vec<usize> = vec![0];
+    for _ in 0..3 {
+        let bytes = u32::try_from(std::mem::size_of_val(list.as_slice())).ok()?;
+        // SAFETY: the list is as long as it's said to be, and is laid out as Windows
+        // expects, a count and then entries, each the size of a pointer.
+        if unsafe { QueryWorkingSet(GetCurrentProcess(), list.as_mut_ptr().cast(), bytes) } != 0 {
+            let pages = list.get(1..=list[0])?;
+            let private = pages.iter().filter(|&page| page & SHAREABLE == 0).count();
+            // SAFETY: it fills in the whole struct and can't fail.
+            let page_size = unsafe {
+                let mut system = std::mem::zeroed::<SYSTEM_INFO>();
+                GetSystemInfo(&mut system);
+                system.dwPageSize
+            };
+            return Some(private as u64 * u64::from(page_size));
+        }
+        // SAFETY: always safe, and nothing has run since the call that failed.
+        if unsafe { GetLastError() } != ERROR_BAD_LENGTH {
+            return None;
+        }
+        list = vec![0; 1 + list[0] + list[0] / 8];
+    }
+    None
+}
+
+/// FreeBSD has nothing as cheap to ask, so it reports the resident size.
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn own_memory() -> Option<u64> {
     None
 }
@@ -123,7 +164,7 @@ mod tests {
         assert!(uptime < 3600, "{output}");
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     #[test]
     fn memory_leaves_out_what_is_shared_with_other_processes() {
         let mut system = System::new().unwrap();
@@ -140,7 +181,7 @@ mod tests {
 
         assert!(own > 0);
         // macOS also charges for memory it has compressed, which isn't resident.
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", windows)) {
             assert!(
                 own <= resident,
                 "{own} is more than the {resident} resident"

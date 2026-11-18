@@ -331,10 +331,12 @@ charges to the agent alone:
 - **macOS:** its physical footprint, the figure Activity Monitor shows.
 - **Linux:** its proportional share, where a page shared with other programs counts
   as the agent's part of it.
-- **Windows and FreeBSD:** its resident size, which also counts shared pages in full.
+- **Windows:** its private working set, the figure Task Manager shows.
+- **FreeBSD:** its resident size, which also counts shared pages in full.
 
-`ps` and `top` show the resident size everywhere, which on macOS is around three
-times the footprint, as it takes in the system libraries every program shares.
+`ps` and `top` show the resident size everywhere, as does the "Working set (memory)"
+column you can add to Task Manager's Details tab. It's around three times larger, as it takes in the system
+libraries every program shares.
 
 ## Actions
 
