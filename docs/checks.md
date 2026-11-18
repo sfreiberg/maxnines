@@ -26,6 +26,15 @@ are defined in the agent's own config, as [below](#on-an-agent).
 Agents older than this version don't know the database, Redis, SSH and mail checks. Upgrade
 them before giving those kinds to them in a config rule.
 
+## Ping
+
+A ping check sends its pings itself and reports a host as up only if the host itself
+replied, not when a router answers that it can't be reached. It needs no special
+rights on Windows or macOS. Linux allows it when `net.ipv4.ping_group_range` includes
+the account, which current Ubuntu, Debian and Fedora do for everyone. Where the
+system doesn't allow it, as on FreeBSD, the check runs the system's own `ping`
+instead.
+
 ## Domain expiry
 
 A website check also finds out when the site's domain registration runs out, from the

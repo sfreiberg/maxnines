@@ -8,6 +8,7 @@
 pub mod databases;
 mod mail;
 pub mod openmetrics;
+mod ping;
 mod rdap;
 mod sign_in;
 
@@ -15,6 +16,7 @@ pub use sign_in::Credentials;
 
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
+#[cfg(unix)]
 use std::process::Stdio;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -46,6 +48,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UdpSocket, lookup_host};
+#[cfg(unix)]
 use tokio::process::Command;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
@@ -797,17 +800,14 @@ fn now_nanos() -> u128 {
         .map_or(0, |time| time.as_nanos())
 }
 
-/// Sending ICMP directly needs special rights, so this uses the system's own
-/// `ping`, which every platform ships with those rights. Their options differ:
-/// macOS and FreeBSD take a deadline for the whole run, Linux takes a per-reply
-/// wait and a separate deadline, and Windows only takes a per-reply wait, so the
-/// limit is shared out between the replies there.
+/// Where the system won't let this account send pings itself, its own `ping`
+/// does, which has the rights. Their options differ: macOS and FreeBSD take a
+/// deadline for the whole run, and Linux a per-reply wait and a separate deadline.
+#[cfg(unix)]
 fn ping_arguments(os: &str, host: &str, count: u32, limit: Duration) -> Vec<String> {
-    let per_reply_ms = (limit.as_millis() / u128::from(count.max(1))).to_string();
     let count = count.to_string();
     let seconds = limit.as_secs().to_string();
     let options: Vec<&str> = match os {
-        "windows" => vec!["-n", &count, "-w", &per_reply_ms],
         "linux" => vec!["-c", &count, "-W", &seconds, "-w", &seconds],
         _ => vec!["-c", &count, "-t", &seconds],
     };
@@ -819,6 +819,7 @@ fn ping_arguments(os: &str, host: &str, count: u32, limit: Duration) -> Vec<Stri
 }
 
 /// Reads the summary Unix pings end with.
+#[cfg(unix)]
 fn read_ping_summary(output: &str, findings: &mut Findings) {
     for line in output.lines() {
         if let Some(before) = line
@@ -848,52 +849,33 @@ fn read_ping_summary(output: &str, findings: &mut Findings) {
     }
 }
 
-/// Reads the summary Windows' ping ends with. Its words change with the system's
-/// language, but its shape doesn't:
-///
-/// ```text
-///     Packets: Sent = 2, Received = 2, Lost = 0 (0% loss),
-///     Minimum = 0ms, Maximum = 1ms, Average = 0ms
-/// ```
-///
-/// So the loss is the percentage in brackets, as in `(perte 0%)` in French, and the
-/// times are the three ` = Nms` values, smallest first, then largest, then average.
-/// Replies are written `time=1ms`, without the spaces.
-fn read_windows_ping_summary(output: &str, findings: &mut Findings) {
-    for line in output.lines() {
-        let bracketed = line
-            .split_once('(')
-            .and_then(|(_, rest)| rest.split_once(')'))
-            .map(|(inside, _)| inside);
-        if let Some((before, _)) = bracketed.and_then(|inside| inside.split_once('%')) {
-            let start = before
-                .rfind(|c: char| !c.is_ascii_digit() && c != '.')
-                .map_or(0, |at| at + 1);
-            if let Ok(loss) = before[start..].parse() {
-                findings.packet_loss_percent = Some(loss);
-            }
-        }
-
-        let times: Vec<f64> = line
-            .split(" = ")
-            .skip(1)
-            .filter_map(|value| {
-                let digits = value.find(|c: char| !c.is_ascii_digit())?;
-                value[digits..]
-                    .starts_with("ms")
-                    .then(|| value[..digits].parse().ok())
-                    .flatten()
-            })
-            .collect();
-        if let [min, max, _] = times[..] {
-            findings.rtt_min_ms = Some(min);
-            findings.rtt_max_ms = Some(max);
-        }
-    }
-}
-
 async fn check_ping(check: &Check, findings: &mut Findings) -> Result<()> {
     let count = check.count.unwrap_or(1);
+    let host = check.target.trim_start_matches('[').trim_end_matches(']');
+    let target = tokio::net::lookup_host((host, 0))
+        .await
+        .ok()
+        .and_then(|mut found| found.next())
+        .ok_or_else(|| anyhow!("couldn't find {host}"))?;
+    let replies = match ping::ping(target, count, limit(check)).await? {
+        ping::Pinged::Replies(replies) => replies,
+        #[cfg(unix)]
+        ping::Pinged::NotAllowed => return system_ping(check, count, findings).await,
+        #[cfg(not(unix))]
+        ping::Pinged::NotAllowed => bail!("this system doesn't allow pinging"),
+    };
+    findings.packet_loss_percent = Some(replies.loss_percent());
+    if let Some((min, max, stddev)) = replies.times_ms() {
+        findings.rtt_min_ms = Some(min);
+        findings.rtt_max_ms = Some(max);
+        findings.rtt_stddev_ms = Some(stddev);
+    }
+    ensure!(replies.received() > 0, "no reply");
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn system_ping(check: &Check, count: u32, findings: &mut Findings) -> Result<()> {
     let arguments = ping_arguments(std::env::consts::OS, &check.target, count, limit(check));
     let output = Command::new("ping")
         .args(arguments)
@@ -902,12 +884,7 @@ async fn check_ping(check: &Check, findings: &mut Findings) -> Result<()> {
         .output()
         .await
         .map_err(|_| anyhow!("couldn't run ping"))?;
-    let summary = String::from_utf8_lossy(&output.stdout);
-    if cfg!(windows) {
-        read_windows_ping_summary(&summary, findings);
-    } else {
-        read_ping_summary(&summary, findings);
-    }
+    read_ping_summary(&String::from_utf8_lossy(&output.stdout), findings);
     ensure!(output.status.success(), "no reply");
     Ok(())
 }
@@ -1501,6 +1478,7 @@ mod tests {
         assert!(dns_answers(&bytes, 2).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn ping_options_suit_each_system() {
         let limit = Duration::from_secs(10);
@@ -1516,13 +1494,9 @@ mod tests {
             ping_arguments("freebsd", "a", 1, limit),
             ["-c", "1", "-t", "10", "a"]
         );
-        assert_eq!(
-            ping_arguments("windows", "a", 5, limit),
-            ["-n", "5", "-w", "2000", "a"],
-            "Windows only waits per reply, so the limit is shared out"
-        );
     }
 
+    #[cfg(unix)]
     #[test]
     fn ping_summaries_are_read_on_each_system() {
         let linux = "5 packets transmitted, 4 received, 20% packet loss, time 4005ms\n\
@@ -1542,44 +1516,7 @@ mod tests {
         assert_eq!(findings.rtt_min_ms, Some(0.1));
     }
 
-    #[test]
-    fn windows_ping_summaries_are_read_in_any_language() {
-        let english = "Pinging 10.0.0.1 with 32 bytes of data:\r\n\
-                       Reply from 10.0.0.1: bytes=32 time=3ms TTL=64\r\n\
-                       Request timed out.\r\n\
-                       \r\n\
-                       Ping statistics for 10.0.0.1:\r\n\
-                       \x20   Packets: Sent = 2, Received = 1, Lost = 1 (50% loss),\r\n\
-                       Approximate round trip times in milli-seconds:\r\n\
-                       \x20   Minimum = 3ms, Maximum = 12ms, Average = 7ms\r\n";
-        let german = "    Pakete: Gesendet = 4, Empfangen = 4, Verloren = 0\r\n\
-                      \x20   (0% Verlust),\r\n\
-                      \x20   Minimum = 1ms, Maximum = 2ms, Mittelwert = 1ms\r\n";
-        let french = "    Paquets : envoyés = 4, reçus = 3, perdus = 1 (perte 25%),\r\n\
-                      \x20   Minimum = 0ms, Maximum = 5ms, Moyenne = 2ms\r\n";
-        for (output, loss, min, max) in [
-            (english, 50.0, 3.0, 12.0),
-            (german, 0.0, 1.0, 2.0),
-            (french, 25.0, 0.0, 5.0),
-        ] {
-            let mut findings = Findings::default();
-            read_windows_ping_summary(output, &mut findings);
-            assert_eq!(findings.packet_loss_percent, Some(loss), "{output}");
-            assert_eq!(findings.rtt_min_ms, Some(min), "{output}");
-            assert_eq!(findings.rtt_max_ms, Some(max), "{output}");
-            assert_eq!(findings.rtt_stddev_ms, None);
-        }
-
-        // Nothing came back, so there are no times to report.
-        let mut findings = Findings::default();
-        read_windows_ping_summary(
-            "    Packets: Sent = 1, Received = 0, Lost = 1 (100% loss),\r\n",
-            &mut findings,
-        );
-        assert_eq!(findings.packet_loss_percent, Some(100.0));
-        assert_eq!(findings.rtt_min_ms, None);
-    }
-
+    #[cfg(unix)]
     #[test]
     fn an_unreadable_ping_summary_is_left_out() {
         let mut findings = Findings::default();
