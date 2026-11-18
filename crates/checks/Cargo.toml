@@ -41,13 +41,7 @@ mongodb = { version = "3.10.1", default-features = false, features = ["compat-3-
 async-imap = { version = "0.12.0", default-features = false, features = ["runtime-tokio"] }
 lettre = { version = "0.11.23", default-features = false, features = ["tokio1", "smtp-transport", "tokio1-rustls", "ring", "webpki-roots"] }
 
-# Pinging without running the system's ping: ICMP datagram sockets, which
-# ordinary users may open where the system allows, and Windows' own ICMP
-# functions, which any account may use.
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-socket2 = "0.6"
-
+# Pinging with Windows' own ICMP functions, which any account may use.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_IO"] }
 

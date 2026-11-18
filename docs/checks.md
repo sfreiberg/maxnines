@@ -28,12 +28,10 @@ them before giving those kinds to them in a config rule.
 
 ## Ping
 
-A ping check sends its pings itself and reports a host as up only if the host itself
-replied, not when a router answers that it can't be reached. It needs no special
-rights on Windows or macOS. Linux allows it when `net.ipv4.ping_group_range` includes
-the account, which current Ubuntu, Debian and Fedora do for everyone. Where the
-system doesn't allow it, as on FreeBSD, the check runs the system's own `ping`
-instead.
+A ping check reports a host as up only if the host itself replied, not when a
+router answers that it can't be reached. On Windows MaxNines sends the pings itself.
+On Linux, macOS and FreeBSD it runs the system's own `ping`, which every account can
+use there, and pings the name's IPv4 address if it has one.
 
 ## Domain expiry
 

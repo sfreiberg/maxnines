@@ -8,6 +8,7 @@
 pub mod databases;
 mod mail;
 pub mod openmetrics;
+#[cfg(windows)]
 mod ping;
 mod rdap;
 mod sign_in;
@@ -800,22 +801,32 @@ fn now_nanos() -> u128 {
         .map_or(0, |time| time.as_nanos())
 }
 
-/// Where the system won't let this account send pings itself, its own `ping`
-/// does, which has the rights. Their options differ: macOS and FreeBSD take a
-/// deadline for the whole run, and Linux a per-reply wait and a separate deadline.
+/// Linux, macOS and FreeBSD only let programs with the rights send pings, which
+/// their own `ping` has. It's given an address rather than the name, IPv4 first,
+/// as macOS's only does IPv4 and IPv6 is `ping6` there and on FreeBSD. Their
+/// options differ: macOS and FreeBSD take a deadline for the whole run, and Linux
+/// a per-reply wait and a separate deadline. `ping6` takes no deadline, so the
+/// check's own limit stops it.
 #[cfg(unix)]
-fn ping_arguments(os: &str, host: &str, count: u32, limit: Duration) -> Vec<String> {
+fn ping_command(
+    os: &str,
+    address: IpAddr,
+    count: u32,
+    limit: Duration,
+) -> (&'static str, Vec<String>) {
     let count = count.to_string();
-    let seconds = limit.as_secs().to_string();
-    let options: Vec<&str> = match os {
-        "linux" => vec!["-c", &count, "-W", &seconds, "-w", &seconds],
-        _ => vec!["-c", &count, "-t", &seconds],
+    let seconds = limit.as_secs().max(1).to_string();
+    let (program, options): (&str, Vec<&str>) = match (os, address) {
+        ("linux", _) => ("ping", vec!["-c", &count, "-W", &seconds, "-w", &seconds]),
+        (_, IpAddr::V4(_)) => ("ping", vec!["-c", &count, "-t", &seconds]),
+        (_, IpAddr::V6(_)) => ("ping6", vec!["-c", &count]),
     };
-    options
+    let arguments = options
         .into_iter()
         .map(String::from)
-        .chain([host.to_string()])
-        .collect()
+        .chain([address.to_string()])
+        .collect();
+    (program, arguments)
 }
 
 /// Reads the summary Unix pings end with.
@@ -849,22 +860,19 @@ fn read_ping_summary(output: &str, findings: &mut Findings) {
     }
 }
 
-async fn check_ping(check: &Check, findings: &mut Findings) -> Result<()> {
-    // The check as a whole stops at its limit, so pinging stops a little before,
-    // to report what came back rather than running out of time.
+/// The check as a whole stops at its limit, so pinging stops a little before, to
+/// report what came back rather than running out of time.
+fn ping_deadline(check: &Check) -> tokio::time::Instant {
     let limit = limit(check);
-    let deadline =
-        tokio::time::Instant::now() + limit - (limit / 10).min(Duration::from_millis(500));
-    let count = check.count.unwrap_or(1);
+    tokio::time::Instant::now() + limit - (limit / 10).min(Duration::from_millis(500))
+}
+
+#[cfg(windows)]
+async fn check_ping(check: &Check, findings: &mut Findings) -> Result<()> {
+    let deadline = ping_deadline(check);
     let host = check.target.trim_start_matches('[').trim_end_matches(']');
     let addresses = resolve(host, 0, findings).await?;
-    let replies = match ping::ping(&addresses, count, deadline).await? {
-        ping::Pinged::Replies(replies) => replies,
-        #[cfg(unix)]
-        ping::Pinged::NotAllowed => return system_ping(check, count, deadline, findings).await,
-        #[cfg(not(unix))]
-        ping::Pinged::NotAllowed => bail!("this system doesn't allow pinging"),
-    };
+    let replies = ping::ping(&addresses, check.count.unwrap_or(1), deadline).await?;
     findings.packet_loss_percent = Some(replies.loss_percent());
     if let Some((min, max, stddev)) = replies.times_ms() {
         findings.rtt_min_ms = Some(min);
@@ -875,25 +883,32 @@ async fn check_ping(check: &Check, findings: &mut Findings) -> Result<()> {
     Ok(())
 }
 
-/// The system's own `ping`, given what's left of the time, in whole seconds as
-/// it takes them.
 #[cfg(unix)]
-async fn system_ping(
-    check: &Check,
-    count: u32,
-    deadline: tokio::time::Instant,
-    findings: &mut Findings,
-) -> Result<()> {
+async fn check_ping(check: &Check, findings: &mut Findings) -> Result<()> {
+    let deadline = ping_deadline(check);
+    let host = check.target.trim_start_matches('[').trim_end_matches(']');
+    let addresses = resolve(host, 0, findings).await?;
+    let address = addresses
+        .iter()
+        .find(|address| address.is_ipv4())
+        .unwrap_or(&addresses[0])
+        .ip();
     let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-    let left = Duration::from_secs(left.as_secs().max(1));
-    let arguments = ping_arguments(std::env::consts::OS, &check.target, count, left);
-    let output = Command::new("ping")
+    let (program, arguments) = ping_command(
+        std::env::consts::OS,
+        address,
+        check.count.unwrap_or(1),
+        left,
+    );
+    let output = Command::new(program)
         .args(arguments)
+        // Newer Linux pings print in the system's language otherwise.
+        .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .kill_on_drop(true)
         .output()
         .await
-        .map_err(|_| anyhow!("couldn't run ping"))?;
+        .map_err(|_| anyhow!("couldn't run {program}"))?;
     read_ping_summary(&String::from_utf8_lossy(&output.stdout), findings);
     ensure!(output.status.success(), "no reply");
     Ok(())
@@ -1490,19 +1505,52 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn ping_options_suit_each_system() {
+    fn ping_commands_suit_each_system() {
         let limit = Duration::from_secs(10);
+        let v4: IpAddr = "10.0.0.1".parse().unwrap();
+        let v6: IpAddr = "::1".parse().unwrap();
         assert_eq!(
-            ping_arguments("linux", "a", 5, limit),
-            ["-c", "5", "-W", "10", "-w", "10", "a"]
+            ping_command("linux", v4, 5, limit),
+            (
+                "ping",
+                vec!["-c", "5", "-W", "10", "-w", "10", "10.0.0.1"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            )
         );
         assert_eq!(
-            ping_arguments("macos", "a", 5, limit),
-            ["-c", "5", "-t", "10", "a"]
+            ping_command("linux", v6, 1, limit)
+                .1
+                .last()
+                .map(String::as_str),
+            Some("::1"),
+            "Linux's ping does IPv6 itself"
         );
         assert_eq!(
-            ping_arguments("freebsd", "a", 1, limit),
-            ["-c", "1", "-t", "10", "a"]
+            ping_command("macos", v4, 5, limit),
+            (
+                "ping",
+                vec!["-c", "5", "-t", "10", "10.0.0.1"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            )
+        );
+        assert_eq!(
+            ping_command("freebsd", v6, 1, limit),
+            (
+                "ping6",
+                vec!["-c", "1", "::1"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            )
+        );
+        assert_eq!(
+            ping_command("macos", v4, 1, Duration::from_millis(300)).1[3],
+            "1",
+            "never less than a second"
         );
     }
 

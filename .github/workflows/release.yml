@@ -303,7 +303,7 @@ jobs:
             # root and for reading who holds sockets run here, and then the real thing: started as root, it becomes
             # maxnines, and its helper reads what only root can.
             cargo test --locked -p maxnines-agent --target "$TARGET" -- privileges connections
-            # FreeBSD has no ICMP datagram sockets, so ping checks fall back to its ping.
+            # Ping checks run FreeBSD's own ping, so they're tried here for real.
             cargo test --locked -p maxnines-checks --target "$TARGET" -- ping
             pw useradd maxnines -d /nonexistent -s /usr/sbin/nologin
             cat >/tmp/agent.hcl <<'CONFIG'
