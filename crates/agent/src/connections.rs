@@ -584,8 +584,11 @@ CONNECTIONS  ADDRESS   NAME
         };
         assert!(mine.iter().filter(to_itself).count() >= 2, "{mine:?}");
 
-        let text = report().unwrap();
+        // Only this process's sockets: the report lists just the processes holding
+        // the most, and on a busy host that may not include this one.
+        let text = describe(&mine, &super::holders().unwrap(), sees_everything());
         assert!(text.contains(&format!("{me}  ")), "{text}");
         assert!(text.contains("127.0.0.1"), "{text}");
+        report().unwrap();
     }
 }
