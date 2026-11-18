@@ -50,9 +50,9 @@
     <?endforeach?>
 
     <!-- Defaults for a first install. The address uses the port, so it comes after. -->
-    <SetProperty Id="PORT" Value="9000" After="AppSearch" Sequence="first" Condition="NOT PORT" />
-    <SetProperty Id="HTTPS" Value="none" After="AppSearch" Sequence="first" Condition="NOT HTTPS" />
-    <SetProperty Id="SERVER_ADDRESS" Value="http://[ComputerName]:[PORT]" Before="LaunchConditions"
+    <SetProperty Id="PORT" Action="Default_PORT" Value="9000" After="AppSearch" Sequence="first" Condition="NOT PORT" />
+    <SetProperty Id="HTTPS" Action="Default_HTTPS" Value="none" After="AppSearch" Sequence="first" Condition="NOT HTTPS" />
+    <SetProperty Id="SERVER_ADDRESS" Action="Default_SERVER_ADDRESS" Value="http://[ComputerName]:[PORT]" Before="LaunchConditions"
                  Sequence="first" Condition="NOT SERVER_ADDRESS" />
 
     <!-- The first administrator, on a first install only. -->
@@ -78,7 +78,8 @@
     <Feature Id="Server" Title="MaxNines Server">
       <Component Directory="INSTALLFOLDER">
         <File Id="ServerExe" Source="$(var.Program)" Name="maxnines-server.exe" KeyPath="yes" />
-        <!-- Its recovery settings match the server's own service install command. -->
+        <!-- Windows restarts it 30 seconds after a failure, stopping with an error
+             included, and gives it a minute to save everything at shutdown. -->
         <ServiceInstall Name="MaxNinesServer"
                         DisplayName="MaxNines Server"
                         Description="Receives and stores metrics from MaxNines agents."
