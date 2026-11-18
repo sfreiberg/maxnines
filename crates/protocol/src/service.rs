@@ -240,18 +240,62 @@ pub fn uninstall(service: &Service) -> Result<()> {
     if installed.query_status()?.current_state == ServiceState::Running {
         installed.stop()?;
     }
-    let deadline = Instant::now() + TIME_TO_STOP;
-    while installed.query_status()?.current_state != ServiceState::Stopped {
-        if Instant::now() > deadline {
-            println!("{} is taking a while to stop.", service.name);
-            break;
-        }
-        thread::sleep(Duration::from_millis(250));
+    if !stopped_in_time(&installed)? {
+        println!("{} is taking a while to stop.", service.name);
     }
 
     installed.delete()?;
     println!("Removed {}.", service.name);
     Ok(())
+}
+
+/// Restarts the service so it reads a changed config, if it's installed and
+/// running. A stopped service reads the config when it next starts.
+pub fn restart_if_running(service: &Service) -> Result<()> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .context(NEEDS_ADMIN)?;
+    let installed = match manager.open_service(
+        OsStr::new(service.name),
+        ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::START,
+    ) {
+        Ok(installed) => installed,
+        Err(windows_service::Error::Winapi(error))
+            if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST) =>
+        {
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("finding the {} service", service.name));
+        }
+    };
+    if installed.query_status()?.current_state != ServiceState::Running {
+        return Ok(());
+    }
+
+    installed.stop()?;
+    anyhow::ensure!(
+        stopped_in_time(&installed)?,
+        "{} didn't stop to restart, so it still has the old config",
+        service.name
+    );
+    installed
+        .start::<&OsStr>(&[])
+        .with_context(|| format!("starting {} again", service.name))?;
+    println!("Restarted {}.", service.name);
+    Ok(())
+}
+
+const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+
+fn stopped_in_time(installed: &windows_service::service::Service) -> Result<bool> {
+    let deadline = Instant::now() + TIME_TO_STOP;
+    while installed.query_status()?.current_state != ServiceState::Stopped {
+        if Instant::now() > deadline {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    Ok(true)
 }
 
 #[cfg(test)]

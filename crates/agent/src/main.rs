@@ -5,6 +5,8 @@ mod checks;
 mod collector;
 mod commands;
 mod config;
+#[cfg(any(windows, test))]
+mod configure;
 #[cfg(any(
     target_os = "linux",
     target_os = "macos",
@@ -98,6 +100,19 @@ enum Command {
     #[cfg(windows)]
     #[command(subcommand)]
     Service(ServiceCommand),
+    /// Set the server to report to, creating the config file if there isn't one,
+    /// and restart the service if it's running
+    #[cfg(windows)]
+    Configure {
+        /// The server's address as opened in a browser, such as
+        /// https://monitor.example.com, or its public_url
+        #[arg(long)]
+        server_url: String,
+        /// Enrollment token, for servers with automatic approval rules. Leave it
+        /// out to keep the one there is
+        #[arg(long)]
+        token: Option<String>,
+    },
 }
 
 #[derive(Debug, PartialEq, Subcommand)]
@@ -174,6 +189,12 @@ fn main() -> Result<()> {
         Command::Service(ServiceCommand::Uninstall) => service::uninstall(&SERVICE),
         #[cfg(windows)]
         Command::Service(ServiceCommand::Run) => service::run(&SERVICE, &cli.config, run),
+        #[cfg(windows)]
+        Command::Configure { server_url, token } => {
+            let url = configure::write(&cli.config, &server_url, token.as_deref())?;
+            configure::remember_for_installer(&url)?;
+            service::restart_if_running(&SERVICE)
+        }
         Command::Version => {
             let build = maxnines_protocol::build_info!();
             println!("{}", build.describe(env!("CARGO_PKG_NAME")));
@@ -471,6 +492,22 @@ mod tests {
         let cli = parse(r"--config C:\agent.hcl service run").unwrap();
         assert_eq!(cli.command, Some(Command::Service(ServiceCommand::Run)));
         assert_eq!(cli.config, PathBuf::from(r"C:\agent.hcl"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parses_what_the_installer_configures_with() {
+        let cli = parse(
+            r"--config C:\agent.hcl configure --server-url https://m.example.com --token abc",
+        )
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::Configure {
+                server_url: "https://m.example.com".to_string(),
+                token: Some("abc".to_string()),
+            })
+        );
     }
 
     #[test]

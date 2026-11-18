@@ -54,10 +54,52 @@ docker exec maxnines maxnines-server --config /etc/maxnines/server.hcl \
   users create you@example.com "Your Name"
 ```
 
+## The agent on Windows
+
+The agent has an installer for x64 and Arm, `maxnines-agent-<version>-x86_64-pc-windows-msvc.msi`
+or `maxnines-agent-<version>-aarch64-pc-windows-msvc.msi`. It asks for:
+
+- **The server's address,** as you open it in a browser, such as
+  `https://monitor.example.com`. The agent connects to `/ws` there. If the server's
+  `public_url` is somewhere else, such as behind a proxy, give that instead, starting
+  with `wss://`.
+- **An enrollment token,** only if the server's registration rules approve agents
+  with one. Leave it empty to approve the host on the Hosts page instead.
+
+It then installs the agent as the **MaxNines Agent** service, which starts with
+Windows, and starts it. The agent's program goes in `C:\Program Files\MaxNines\Agent`,
+which is added to the `PATH`. Its config, token, key, logs and unsent samples go in
+`C:\ProgramData\MaxNines\Agent`, which only Windows and administrators can open.
+
+To change the server later, open **Settings > Apps > Installed apps**, choose
+**MaxNines Agent** and then **Modify**. It asks again, keeps the token if you
+leave it empty, and restarts the service. Anything you've added to `agent.hcl` by
+hand is kept. From a command prompt opened as administrator, this does the same:
+
+```powershell
+maxnines-agent --config C:\ProgramData\MaxNines\Agent\agent.hcl configure --server-url https://monitor.example.com
+```
+
+To install it on many computers at once, such as with Intune, Group Policy or
+Configuration Manager, give the answers as properties and install it silently:
+
+```powershell
+msiexec /i maxnines-agent-<version>-x86_64-pc-windows-msvc.msi SERVER_URL=https://monitor.example.com ENROLLMENT_TOKEN=<token> /qn
+```
+
+The token is saved for the agent but never written to the installer's log.
+Upgrading is the same without the properties, and keeps the server and token.
+Uninstalling removes the program and the service but keeps
+`C:\ProgramData\MaxNines\Agent`, so reinstalling brings back the same host rather
+than a new one to approve.
+
+The installer isn't signed yet, so Windows may warn that it's from an unknown
+publisher. Choose **More info** and then **Run anyway**.
+
 ## Other systems
 
-The macOS, Windows and FreeBSD downloads are archives holding the program, an example
-config and a README. Unpack one and see [running an agent](agents.md) or
+The macOS, FreeBSD and Windows server downloads are archives holding the program, an
+example config and a README. Unpack one and see [running an agent](agents.md) or
 [Windows services](windows-services.md). The macOS programs aren't signed by Apple
 yet, so clear the flag that stops them opening first:
 

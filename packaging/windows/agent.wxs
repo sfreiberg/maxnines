@@ -1,0 +1,200 @@
+<!--
+  The agent's Windows installer, built by the release workflow with WiX:
+
+    wix build -arch x64 -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext
+      -d Version=0.1.0 -d Program=path\to\maxnines-agent.exe -d License=LICENSE
+      -o maxnines-agent.msi packaging\windows\agent.wxs
+
+  It asks for the server and an optional enrollment token, which can also be
+  given for a silent install:
+
+    msiexec /i maxnines-agent.msi SERVER_URL=https://monitor.example.com ENROLLMENT_TOKEN=... /qn
+
+  The agent writes its own config, with its configure command, so only the
+  values asked for change and anything added by hand is kept. Modify, in
+  Settings > Apps, asks again and restarts the service. Uninstalling leaves the
+  config and the agent's key in C:\ProgramData\MaxNines\Agent, as the Linux
+  packages do.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="MaxNines Agent"
+           Manufacturer="MaxNines"
+           Version="$(var.Version)"
+           UpgradeCode="31D9856D-4813-43DC-97E3-F0BC07CD243C">
+
+    <!-- A pre-release's suffix can't go in an MSI version, so two of them can
+         have the same one, and the later one still has to upgrade. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/sfreiberg/maxnines" />
+
+    <!-- The server, remembered for Modify and upgrades by the configure command.
+         One given on the command line wins over the remembered one. -->
+    <Property Id="SERVER_URL" Secure="yes">
+      <RegistrySearch Id="RememberedServerUrl" Root="HKLM" Key="SOFTWARE\MaxNines\Agent"
+                      Name="ServerUrl" Type="raw" Bitness="always64" />
+    </Property>
+    <SetProperty Id="CMDLINE_SERVER_URL" Value="[SERVER_URL]" Before="AppSearch" Sequence="first" />
+    <SetProperty Id="SERVER_URL" Value="[CMDLINE_SERVER_URL]" After="AppSearch" Sequence="first"
+                 Condition="CMDLINE_SERVER_URL" />
+
+    <!-- Never remembered or logged. Blank keeps the token the agent has. -->
+    <Property Id="ENROLLMENT_TOKEN" Secure="yes" Hidden="yes" />
+
+    <Launch Condition="SERVER_URL OR UILevel = 5 OR Installed OR WIX_UPGRADE_DETECTED"
+            Message="Set SERVER_URL to the server's address, such as: msiexec /i maxnines-agent.msi SERVER_URL=https://monitor.example.com /qn" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="ProgramFolder" Name="MaxNines">
+        <Directory Id="INSTALLFOLDER" Name="Agent" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DataParent" Name="MaxNines">
+        <Directory Id="AgentData" Name="Agent" />
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Agent" Title="MaxNines Agent">
+      <Component Directory="INSTALLFOLDER">
+        <File Id="AgentExe" Source="$(var.Program)" Name="maxnines-agent.exe" KeyPath="yes" />
+        <!-- Its recovery settings match the agent's own service install command. -->
+        <ServiceInstall Name="MaxNinesAgent"
+                        DisplayName="MaxNines Agent"
+                        Description="Reports system metrics to a MaxNines server."
+                        Type="ownProcess"
+                        Start="auto"
+                        ErrorControl="normal"
+                        Arguments="--config &quot;[AgentData]agent.hcl&quot; service run"
+                        Vital="yes">
+          <ServiceConfig PreShutdownDelay="60000"
+                         FailureActionsWhen="failedToStopOrReturnedError"
+                         OnInstall="yes" OnReinstall="yes" />
+          <ServiceConfigFailureActions ResetPeriod="86400" OnInstall="yes" OnReinstall="yes">
+            <Failure Action="restartService" Delay="30000" />
+            <Failure Action="restartService" Delay="30000" />
+            <Failure Action="restartService" Delay="30000" />
+          </ServiceConfigFailureActions>
+        </ServiceInstall>
+        <ServiceControl Name="MaxNinesAgent" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+      </Component>
+
+      <Component Directory="INSTALLFOLDER">
+        <File Source="$(var.License)" Name="LICENSE.txt" KeyPath="yes" />
+      </Component>
+
+      <!-- So maxnines-agent works in any command prompt. -->
+      <Component Id="PathEntry" Directory="INSTALLFOLDER" Guid="D745E0DA-E4DB-402D-A646-EDA4F56489EC">
+        <RegistryValue Root="HKLM" Key="SOFTWARE\MaxNines\Agent" Name="InstallFolder"
+                       Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+        <RemoveRegistryKey Root="HKLM" Key="SOFTWARE\MaxNines\Agent" Action="removeOnUninstall" />
+        <Environment Id="Path" Name="PATH" Value="[INSTALLFOLDER]" Part="last" Action="set"
+                     System="yes" Permanent="no" />
+      </Component>
+
+      <!-- Holds the config, the token and the agent's key, so only Windows and
+           administrators can get in. -->
+      <Component Id="DataFolder" Directory="AgentData" Guid="EF5F4850-127D-4621-874A-7DC898F6DB7A">
+        <CreateFolder>
+          <PermissionEx Sddl="D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />
+        </CreateFolder>
+      </Component>
+    </Feature>
+
+    <!-- Writes the config once the program is there, before the service starts.
+         The command line holds the token, so it's kept out of the log. -->
+    <SetProperty Id="ConfigureAgent"
+                 Value="&quot;[#AgentExe]&quot; --config &quot;[AgentData]agent.hcl&quot; configure --server-url &quot;[SERVER_URL]&quot; --token &quot;[ENROLLMENT_TOKEN]&quot;"
+                 Before="ConfigureAgent" Sequence="execute"
+                 Condition="NOT REMOVE~=&quot;ALL&quot; AND SERVER_URL" />
+    <CustomAction Id="ConfigureAgent" DllEntry="WixQuietExec" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  Execute="deferred" Impersonate="no" Return="check" HideTarget="yes" />
+    <InstallExecuteSequence>
+      <Custom Action="ConfigureAgent" Before="StartServices"
+              Condition="NOT REMOVE~=&quot;ALL&quot; AND SERVER_URL" />
+    </InstallExecuteSequence>
+
+    <UI Id="AgentUI">
+      <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="Tahoma" Size="12" />
+      <TextStyle Id="WixUI_Font_Title" FaceName="Tahoma" Size="9" Bold="yes" />
+      <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="PrepareDlg" />
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="ResumeDlg" />
+      <DialogRef Id="UserExit" />
+      <DialogRef Id="WelcomeDlg" />
+      <DialogRef Id="MaintenanceWelcomeDlg" />
+      <DialogRef Id="MaintenanceTypeDlg" />
+      <DialogRef Id="VerifyReadyDlg" />
+
+      <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999" />
+
+      <!-- Installing: Welcome, Server, Ready. -->
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="ServerDlg" Condition="NOT Installed" />
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Condition="Installed AND PATCH" />
+
+      <Publish Dialog="ServerDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Condition="NOT Installed" />
+      <Publish Dialog="ServerDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" Condition="Installed" />
+      <Publish Dialog="ServerDlg" Control="Next" Event="SpawnDialog" Value="ServerUrlDlg" Order="1"
+               Condition="NOT (SERVER_URL ~&lt;&lt; &quot;https://&quot; OR SERVER_URL ~&lt;&lt; &quot;http://&quot; OR SERVER_URL ~&lt;&lt; &quot;wss://&quot; OR SERVER_URL ~&lt;&lt; &quot;ws://&quot;)" />
+      <Publish Dialog="ServerDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="2"
+               Condition="SERVER_URL ~&lt;&lt; &quot;https://&quot; OR SERVER_URL ~&lt;&lt; &quot;http://&quot; OR SERVER_URL ~&lt;&lt; &quot;wss://&quot; OR SERVER_URL ~&lt;&lt; &quot;ws://&quot;" />
+
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="ServerDlg" Order="1"
+               Condition="NOT Installed OR WixUI_InstallMode = &quot;Change&quot;" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" Order="2"
+               Condition="Installed AND NOT PATCH AND WixUI_InstallMode &lt;&gt; &quot;Change&quot;" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="3"
+               Condition="Installed AND PATCH" />
+
+      <!-- Settings > Apps: Modify asks for the server again. -->
+      <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="ChangeButton" Event="NewDialog" Value="ServerDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RepairButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="Back" Event="NewDialog" Value="MaintenanceWelcomeDlg" />
+
+      <Dialog Id="ServerDlg" Width="370" Height="270" Title="[ProductName] Setup">
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="WixUI_Bmp_Banner" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="200" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="{\WixUI_Font_Title}Server" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="280" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="Where this computer reports to." />
+
+        <Control Id="UrlLabel" Type="Text" X="20" Y="60" Width="330" Height="20"
+                 Text="&amp;Server address, as you open it in a browser, such as https://monitor.example.com:" />
+        <Control Id="Url" Type="Edit" X="20" Y="82" Width="330" Height="18" Property="SERVER_URL" Text="{1024}" />
+
+        <Control Id="TokenLabel" Type="Text" X="20" Y="115" Width="330" Height="40"
+                 Text="&amp;Enrollment token, if the server approves agents with one. Leave it empty to approve this computer on the server instead, or to keep the token it already has." />
+        <Control Id="Token" Type="Edit" X="20" Y="157" Width="330" Height="18" Property="ENROLLMENT_TOKEN" Password="yes" Text="{1024}" />
+
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)" />
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)" />
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+      </Dialog>
+
+      <Dialog Id="ServerUrlDlg" Width="260" Height="85" Title="[ProductName] Setup" NoMinimize="yes">
+        <Control Id="Text" Type="Text" X="15" Y="15" Width="230" Height="30"
+                 Text="Enter the server's address, starting with https:// or http://." />
+        <Control Id="OK" Type="PushButton" X="102" Y="57" Width="56" Height="17" Default="yes" Cancel="yes" Text="!(loc.WixUIOK)">
+          <Publish Event="EndDialog" Value="Return" />
+        </Control>
+      </Dialog>
+    </UI>
+    <UIRef Id="WixUI_Common" />
+  </Package>
+</Wix>

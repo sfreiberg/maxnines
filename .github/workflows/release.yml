@@ -183,10 +183,11 @@ jobs:
     strategy:
       matrix:
         include:
-          - { arch: x86_64, runner: windows-2025 }
-          - { arch: aarch64, runner: windows-11-arm }
+          - { arch: x86_64, wix_arch: x64, runner: windows-2025 }
+          - { arch: aarch64, wix_arch: arm64, runner: windows-11-arm }
     env:
       TARGET: ${{ matrix.arch }}-pc-windows-msvc
+      VERSION: ${{ needs.check.outputs.version }}
     defaults:
       run:
         shell: bash
@@ -212,10 +213,53 @@ jobs:
           packaging/check-windows-dlls.sh \
             "$TARGET_DIR/$TARGET/release/maxnines-agent.exe" \
             "$TARGET_DIR/$TARGET/release/maxnines-server.exe"
-      - run: |
-          for program in maxnines-agent maxnines-server; do
-            packaging/archive.sh "$program" "${{ needs.check.outputs.version }}" "$TARGET" dist
-          done
+      - run: packaging/archive.sh maxnines-server "$VERSION" "$TARGET" dist
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      # WiX asks anyone earning US$10,000 a year or more from it to pay its Open
+      # Source Maintenance Fee, and won't build until its terms are accepted.
+      - name: Install WiX
+        run: |
+          echo "$USERPROFILE\.dotnet\tools" >> "$GITHUB_PATH"
+          dotnet tool install --global wix --version 7.0.1
+          export PATH="$USERPROFILE/.dotnet/tools:$PATH"
+          wix extension add -g WixToolset.UI.wixext/7.0.1
+          wix extension add -g WixToolset.Util.wixext/7.0.1
+          wix eula accept wix7
+      # An MSI version is three numbers, so a pre-release's number goes in a
+      # fourth, which Windows shows but doesn't compare.
+      - name: Build the agent's installer
+        run: |
+          base=${VERSION%%-*}
+          case $VERSION in
+            *-*) number=$(echo "${VERSION#*-}" | tr -cd 0-9); msi_version=$base.${number:-0} ;;
+            *) msi_version=$base ;;
+          esac
+          build() {
+            wix build -arch "${{ matrix.wix_arch }}" \
+              -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext \
+              -d Version="$1" -d Program="$TARGET_DIR/$TARGET/release/maxnines-agent.exe" -d License=LICENSE \
+              -o "$2" packaging/windows/agent.wxs
+          }
+          mkdir -p msi/upgrade
+          build "$msi_version" "msi/maxnines-agent-$VERSION-$TARGET.msi"
+          # The same agent as a later version, to test upgrading.
+          IFS=. read -r major minor patch _ <<< "$base"
+          build "$major.$minor.$((patch + 1))" msi/upgrade/maxnines-agent.msi
+          cp "msi/maxnines-agent-$VERSION-$TARGET.msi" dist/
+      - name: Test the agent's installer
+        shell: pwsh
+        run: |
+          packaging/windows/test-install.ps1 `
+            -Msi "msi/maxnines-agent-$env:VERSION-$env:TARGET.msi" `
+            -Upgrade msi/upgrade/maxnines-agent.msi
+      - name: Keep the installer's logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}-msi-logs
+          path: ${{ runner.temp }}/msi-logs
       - uses: actions/upload-artifact@v4
         with:
           name: windows-${{ matrix.arch }}

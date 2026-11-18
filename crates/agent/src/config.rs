@@ -139,7 +139,7 @@ impl Config {
         Self::parse(&text).with_context(|| format!("invalid config file {}", path.display()))
     }
 
-    fn parse(text: &str) -> Result<Self> {
+    pub(crate) fn parse(text: &str) -> Result<Self> {
         let body: Body = hcl::eval::from_str(text, &config_context())?;
         let (body, facts) = take_facts(body)?;
         let mut config: Config = hcl::from_body(body)?;

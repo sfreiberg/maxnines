@@ -1,7 +1,7 @@
 # Running an agent
 
 Without a package, an agent is one file you copy to a host and start yourself. On
-Windows, [run it as a service](windows-services.md) instead. Download it
+Windows, use [the installer](installing.md#the-agent-on-windows) instead. Download it
 from a [release](https://github.com/sfreiberg/maxnines/releases), or build it with
 `cargo build --release -p maxnines-agent`.
 
