@@ -1,6 +1,6 @@
 # Signing in apps
 
-The command line and MaxNines Desktop, for Mac and Windows, sign in through the
+The command line and MaxNines Desktop, for Mac, Windows and Linux, sign in through the
 browser instead of asking for an API key. The person approves the app on a MaxNines
 page, signed in however they sign in to the pages, and the app gets tokens that act as
 them with at most the role they chose. Scripts and CI jobs, with nobody to approve
@@ -37,6 +37,7 @@ Only these apps can sign in, as `client_id`:
 | `maxnines-cli` | The command line |
 | `maxnines-menubar` | MaxNines Desktop for Mac, a menu bar app |
 | `maxnines-tray` | MaxNines Desktop for Windows, a notification area app |
+| `maxnines-desktop-linux` | MaxNines Desktop for Linux, a tray app |
 
 ## Sign in through the browser
 

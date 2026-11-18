@@ -54,7 +54,7 @@ pub struct AppClient {
     pub name: &'static str,
 }
 
-pub const CLIENTS: [AppClient; 3] = [
+pub const CLIENTS: [AppClient; 4] = [
     AppClient {
         id: "maxnines-cli",
         name: "MaxNines command line",
@@ -66,6 +66,10 @@ pub const CLIENTS: [AppClient; 3] = [
     AppClient {
         id: "maxnines-tray",
         name: "MaxNines Desktop for Windows",
+    },
+    AppClient {
+        id: "maxnines-desktop-linux",
+        name: "MaxNines Desktop for Linux",
     },
 ];
 
@@ -445,6 +449,18 @@ mod tests {
             device: "laptop".to_string(),
             role: Role::Viewer,
         }
+    }
+
+    #[test]
+    fn each_desktop_app_signs_in_under_its_own_name() {
+        let named = |id| client(id).map(|client| client.name);
+        assert_eq!(named("maxnines-menubar"), Some("MaxNines Desktop for Mac"));
+        assert_eq!(named("maxnines-tray"), Some("MaxNines Desktop for Windows"));
+        assert_eq!(
+            named("maxnines-desktop-linux"),
+            Some("MaxNines Desktop for Linux")
+        );
+        assert_eq!(named("maxnines-desktop"), None);
     }
 
     #[test]
