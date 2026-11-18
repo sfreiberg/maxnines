@@ -85,7 +85,7 @@ Check ((Setting 'listen') -eq '0.0.0.0:9123') 'the config listens on the port'
 Check ((Setting 'public_url') -eq 'ws://localhost:9123/ws') 'the config has the address, as an agent address'
 Check ((Setting 'path') -eq (Join-Path $data 'metrics.duckdb')) 'the metrics are kept with the config'
 
-$users = Users
+$users = @(Users)
 Check ($users.Count -eq 1 -and $users[0] -match 'admin@example.com') "the first administrator is added (found: $users)"
 $url = (Get-Content $link | Where-Object { $_ -like 'URL=*' }) -replace '^URL=', ''
 Check ($url -like 'http://localhost:9123/setup/*') "the link to set a password is saved for the finish page (found: $url)"
