@@ -7,9 +7,11 @@
 //! falls back to the system's `ping`, which has the rights.
 
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use tokio::time::{Instant, sleep_until};
 
 /// What came back from the echo requests sent.
 #[derive(Debug, Default, PartialEq)]
@@ -55,56 +57,70 @@ pub(crate) enum Pinged {
     NotAllowed,
 }
 
-/// Sends `count` echo requests, a second apart as `ping` does, waiting for each
-/// reply for an equal share of `limit`.
-pub(crate) async fn ping(target: SocketAddr, count: u32, limit: Duration) -> Result<Pinged> {
-    tokio::task::spawn_blocking(move || ping_blocking(target, count.max(1), limit))
-        .await
-        .context("pinging")?
+/// Pings the first of `addresses` there's a way to, IPv4 first as `ping` does on
+/// most systems: `count` echo requests, a second apart, each waiting for its reply
+/// for an equal share of the time left before `deadline`. Anything that goes wrong
+/// once it's started is a lost ping, not a failure, as is a router saying the
+/// target can't be reached.
+pub(crate) async fn ping(
+    addresses: &[SocketAddr],
+    count: u32,
+    deadline: Instant,
+) -> Result<Pinged> {
+    let mut problem = None;
+    for &address in &in_order(addresses) {
+        match system::Pinger::open(address) {
+            Ok(pinger) => return Ok(Pinged::Replies(echoes(pinger, count, deadline).await)),
+            Err(error) if system::not_allowed(&error) => return Ok(Pinged::NotAllowed),
+            // Such as no route to this address, when another may have one.
+            Err(error) => problem = Some(error),
+        }
+    }
+    match problem {
+        Some(error) => Err(error).context("couldn't ping it"),
+        None => bail!("the name wasn't found"),
+    }
 }
 
-fn ping_blocking(target: SocketAddr, count: u32, limit: Duration) -> Result<Pinged> {
-    let pinger = match system::Pinger::open(target) {
-        Ok(pinger) => pinger,
-        Err(error) if system::not_allowed(&error) => return Ok(Pinged::NotAllowed),
-        Err(error) => return Err(error).context("couldn't open a socket to ping with"),
-    };
-    // The check as a whole stops at `limit`, so this finishes a little before,
-    // to report what came back rather than running out of time.
-    let budget = limit - (limit / 10).min(Duration::from_millis(500));
-    let deadline = Instant::now() + budget;
-    let wait = budget / count;
+/// IPv4 addresses before IPv6, each kept in the order the system gave them.
+fn in_order(addresses: &[SocketAddr]) -> Vec<SocketAddr> {
+    let mut ordered = addresses.to_vec();
+    ordered.sort_by_key(SocketAddr::is_ipv6);
+    ordered
+}
+
+async fn echoes(pinger: system::Pinger, count: u32, deadline: Instant) -> Replies {
+    let count = count.max(1);
+    let wait = deadline.saturating_duration_since(Instant::now()) / count;
     let token = token();
     let mut replies = Replies::default();
-
     for sequence in 0..count {
         let started = Instant::now();
-        let left = deadline.saturating_duration_since(started);
-        if left.is_zero() {
+        if started >= deadline {
             break;
         }
         replies.sent += 1;
         // The sequence number only tells requests apart, so it wraps.
-        if let Some(took) = pinger.echo(sequence as u16, &token, wait.min(left))? {
+        let left = deadline - started;
+        if let Some(took) = pinger.echo(sequence as u16, &token, wait.min(left)).await {
             replies.times.push(took);
         }
         if sequence + 1 < count {
             let next = (started + Duration::from_secs(1).min(wait)).min(deadline);
-            std::thread::sleep(next.saturating_duration_since(Instant::now()));
+            sleep_until(next).await;
         }
     }
-    Ok(Pinged::Replies(replies))
+    replies
 }
 
-/// Sent in every request and expected back, so replies to someone else's ping
-/// aren't counted.
+/// Sent in every request and expected back, so replies to another check's pings,
+/// or another program's, aren't counted. Unique within this process, and the
+/// process ID sets it apart from others.
 fn token() -> [u8; 8] {
-    let nanos = crate::now_nanos() ^ u128::from(std::process::id()) << 64;
-    let bytes = nanos.to_be_bytes();
+    static NEXT: AtomicU32 = AtomicU32::new(0);
     let mut token = [0; 8];
-    for (index, byte) in bytes.iter().enumerate() {
-        token[index % 8] ^= byte;
-    }
+    token[..4].copy_from_slice(&std::process::id().to_be_bytes());
+    token[4..].copy_from_slice(&NEXT.fetch_add(1, Ordering::Relaxed).to_be_bytes());
     token
 }
 
@@ -160,10 +176,12 @@ fn is_reply(packet: &[u8], v6: bool, sequence: u16, token: &[u8; 8]) -> bool {
 #[cfg(unix)]
 mod system {
     use std::io::{self, ErrorKind};
-    use std::net::{SocketAddr, UdpSocket};
-    use std::time::{Duration, Instant};
+    use std::net::SocketAddr;
+    use std::time::Duration;
 
     use socket2::{Domain, Protocol, Socket, Type};
+    use tokio::net::UdpSocket;
+    use tokio::time::{Instant, sleep, timeout_at};
 
     pub struct Pinger {
         /// Sending and receiving only, which works the same for ICMP.
@@ -183,60 +201,41 @@ mod system {
             let socket = Socket::new(Domain::for_address(target), Type::DGRAM, Some(protocol))?;
             // So only replies from the target arrive.
             socket.connect(&target.into())?;
+            socket.set_nonblocking(true)?;
             Ok(Self {
-                socket: socket.into(),
+                socket: UdpSocket::from_std(socket.into())?,
                 v6,
                 identifier: std::process::id() as u16,
             })
         }
 
         /// How long the reply took, or nothing if none came in time.
-        pub fn echo(
+        pub async fn echo(
             &self,
             sequence: u16,
             token: &[u8; 8],
             wait: Duration,
-        ) -> io::Result<Option<Duration>> {
+        ) -> Option<Duration> {
             let request = super::request(self.v6, self.identifier, sequence, token);
             let started = Instant::now();
-            match self.socket.send(&request) {
-                Ok(_) => {}
-                Err(error) if unreachable(&error) => return Ok(None),
-                Err(error) => return Err(error),
-            }
+            self.socket.send(&request).await.ok()?;
             let mut buffer = [0; 1500];
             loop {
-                let left = (started + wait).saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    return Ok(None);
-                }
-                self.socket.set_read_timeout(Some(left))?;
-                match self.socket.recv(&mut buffer) {
-                    Ok(size) if super::is_reply(&buffer[..size], self.v6, sequence, token) => {
-                        return Ok(Some(started.elapsed()));
+                match timeout_at(started + wait, self.socket.recv(&mut buffer)).await {
+                    Err(_) => return None,
+                    Ok(Ok(size)) if super::is_reply(&buffer[..size], self.v6, sequence, token) => {
+                        return Some(started.elapsed());
                     }
                     // Someone else's reply, or an older one of ours.
-                    Ok(_) => {}
-                    Err(error)
-                        if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
-                    {
-                        return Ok(None);
-                    }
-                    // A router said the target can't be reached, which isn't a reply.
-                    Err(error) if unreachable(&error) => return Ok(None),
-                    Err(error) => return Err(error),
+                    Ok(Ok(_)) => {}
+                    // The system passing on an ICMP error, such as a router saying
+                    // the target can't be reached. It doesn't say which request it
+                    // was for, so this one keeps waiting for its own reply. The
+                    // pause is in case the error doesn't clear.
+                    Ok(Err(_)) => sleep(Duration::from_millis(10)).await,
                 }
             }
         }
-    }
-
-    fn unreachable(error: &io::Error) -> bool {
-        matches!(
-            error.kind(),
-            ErrorKind::HostUnreachable
-                | ErrorKind::NetworkUnreachable
-                | ErrorKind::ConnectionRefused
-        )
     }
 
     /// The system refused this account an ICMP socket, rather than failing.
@@ -254,29 +253,40 @@ mod system {
     use std::io;
     use std::net::SocketAddr;
     use std::ptr::{null, null_mut};
-    use std::time::{Duration, Instant};
+    use std::sync::Arc;
+    use std::time::Duration;
 
+    use tokio::time::Instant;
     use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        ICMP_ECHO_REPLY, ICMPV6_ECHO_REPLY_LH, IP_STATUS_BASE, IP_SUCCESS, Icmp6CreateFile,
-        Icmp6SendEcho2, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho, MAX_IP_STATUS,
+        ICMP_ECHO_REPLY, ICMPV6_ECHO_REPLY_LH, IP_SUCCESS, Icmp6CreateFile, Icmp6SendEcho2,
+        IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho,
     };
     use windows_sys::Win32::Networking::WinSock::{AF_INET6, SOCKADDR_IN6};
 
     /// Room for the reply and what's echoed back, aligned as the reply needs.
     const REPLY_WORDS: usize = 64;
 
-    pub struct Pinger {
-        handle: HANDLE,
-        target: SocketAddr,
+    /// Closed once nothing is using it, which may be a wait still going after
+    /// the check that started it was given up on.
+    struct Handle(HANDLE);
+
+    // SAFETY: an ICMP handle can be used from any thread.
+    unsafe impl Send for Handle {}
+    // SAFETY: Windows lets several threads send through one handle at once.
+    unsafe impl Sync for Handle {}
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            // SAFETY: it came from IcmpCreateFile or Icmp6CreateFile, and nothing
+            // can use it after this.
+            unsafe { IcmpCloseHandle(self.0) };
+        }
     }
 
-    impl Drop for Pinger {
-        fn drop(&mut self) {
-            // SAFETY: the handle came from IcmpCreateFile or Icmp6CreateFile and
-            // isn't used after this.
-            unsafe { IcmpCloseHandle(self.handle) };
-        }
+    pub struct Pinger {
+        handle: Arc<Handle>,
+        target: SocketAddr,
     }
 
     impl Pinger {
@@ -292,84 +302,89 @@ mod system {
             if handle == INVALID_HANDLE_VALUE {
                 return Err(io::Error::last_os_error());
             }
-            Ok(Self { handle, target })
+            Ok(Self {
+                handle: Arc::new(Handle(handle)),
+                target,
+            })
         }
 
-        /// How long the reply took, or nothing if none came in time or a router
-        /// said the target can't be reached.
-        pub fn echo(
+        /// How long the reply took, or nothing if none came in time, a router
+        /// said the target can't be reached, or Windows couldn't send it. Windows
+        /// only waits by blocking, so each wait has a thread of its own.
+        pub async fn echo(
             &self,
             _sequence: u16,
             token: &[u8; 8],
             wait: Duration,
-        ) -> io::Result<Option<Duration>> {
-            let mut reply = [0u64; REPLY_WORDS];
-            let reply_size = std::mem::size_of_val(&reply) as u32;
-            let timeout_ms = u32::try_from(wait.as_millis()).unwrap_or(u32::MAX).max(1);
+        ) -> Option<Duration> {
+            let handle = Arc::clone(&self.handle);
+            let target = self.target;
+            let token = *token;
             let started = Instant::now();
-            // SAFETY: the request and reply buffers outlive the calls, the sizes
-            // given are theirs, and the reply is only read where Windows said it
-            // wrote one, at the start of the buffer, which is aligned for it.
-            let status = unsafe {
-                match self.target {
-                    SocketAddr::V4(target) => {
-                        let replies = IcmpSendEcho(
-                            self.handle,
-                            u32::from_ne_bytes(target.ip().octets()),
-                            token.as_ptr().cast(),
-                            token.len() as u16,
-                            null(),
-                            reply.as_mut_ptr().cast(),
-                            reply_size,
-                            timeout_ms,
-                        );
-                        if replies == 0 {
-                            return lost_or_error();
-                        }
-                        (*reply.as_ptr().cast::<ICMP_ECHO_REPLY>()).Status
-                    }
-                    SocketAddr::V6(target) => {
-                        let mut source: SOCKADDR_IN6 = std::mem::zeroed();
-                        source.sin6_family = AF_INET6;
-                        let mut destination: SOCKADDR_IN6 = std::mem::zeroed();
-                        destination.sin6_family = AF_INET6;
-                        destination.sin6_addr.u.Byte = target.ip().octets();
-                        destination.Anonymous.sin6_scope_id = target.scope_id();
-                        let replies = Icmp6SendEcho2(
-                            self.handle,
-                            null_mut(),
-                            None,
-                            null(),
-                            &source,
-                            &destination,
-                            token.as_ptr().cast(),
-                            token.len() as u16,
-                            null(),
-                            reply.as_mut_ptr().cast(),
-                            reply_size,
-                            timeout_ms,
-                        );
-                        if replies == 0 {
-                            return lost_or_error();
-                        }
-                        (*reply.as_ptr().cast::<ICMPV6_ECHO_REPLY_LH>()).Status
-                    }
-                }
-            };
-            // Anything but success, such as a router saying the target is
-            // unreachable, isn't a reply from it.
-            Ok((status == IP_SUCCESS).then(|| started.elapsed()))
+            let replied = tokio::task::spawn_blocking(move || send(&handle, target, &token, wait))
+                .await
+                .unwrap_or(false);
+            replied.then(|| started.elapsed())
         }
     }
 
-    /// No reply: running out of time or the network saying no is a lost ping,
-    /// and anything else is something wrong with asking.
-    fn lost_or_error() -> io::Result<Option<Duration>> {
-        let error = io::Error::last_os_error();
-        match error.raw_os_error().map(|code| code as u32) {
-            Some(code) if (IP_STATUS_BASE..=MAX_IP_STATUS).contains(&code) => Ok(None),
-            _ => Err(error),
-        }
+    /// Whether the target itself replied.
+    fn send(handle: &Handle, target: SocketAddr, token: &[u8; 8], wait: Duration) -> bool {
+        let mut reply = [0u64; REPLY_WORDS];
+        let reply_size = std::mem::size_of_val(&reply) as u32;
+        let timeout_ms = u32::try_from(wait.as_millis()).unwrap_or(u32::MAX).max(1);
+        // SAFETY: the request and reply buffers outlive the calls, the sizes given
+        // are theirs, and the reply is only read where Windows said it wrote one,
+        // at the start of the buffer, which is aligned for it.
+        let status = unsafe {
+            match target {
+                SocketAddr::V4(target) => {
+                    let replies = IcmpSendEcho(
+                        handle.0,
+                        u32::from_ne_bytes(target.ip().octets()),
+                        token.as_ptr().cast(),
+                        token.len() as u16,
+                        null(),
+                        reply.as_mut_ptr().cast(),
+                        reply_size,
+                        timeout_ms,
+                    );
+                    if replies == 0 {
+                        return false;
+                    }
+                    (*reply.as_ptr().cast::<ICMP_ECHO_REPLY>()).Status
+                }
+                SocketAddr::V6(target) => {
+                    let mut source: SOCKADDR_IN6 = std::mem::zeroed();
+                    source.sin6_family = AF_INET6;
+                    let mut destination: SOCKADDR_IN6 = std::mem::zeroed();
+                    destination.sin6_family = AF_INET6;
+                    destination.sin6_addr.u.Byte = target.ip().octets();
+                    destination.Anonymous.sin6_scope_id = target.scope_id();
+                    let replies = Icmp6SendEcho2(
+                        handle.0,
+                        null_mut(),
+                        None,
+                        null(),
+                        &source,
+                        &destination,
+                        token.as_ptr().cast(),
+                        token.len() as u16,
+                        null(),
+                        reply.as_mut_ptr().cast(),
+                        reply_size,
+                        timeout_ms,
+                    );
+                    if replies == 0 {
+                        return false;
+                    }
+                    (*reply.as_ptr().cast::<ICMPV6_ECHO_REPLY_LH>()).Status
+                }
+            }
+        };
+        // Anything but success, such as a router saying the target can't be
+        // reached, isn't a reply from it.
+        status == IP_SUCCESS
     }
 
     /// Windows lets any account ping.
@@ -446,18 +461,18 @@ mod tests {
         assert_eq!(nothing.times_ms(), None);
     }
 
-    fn ping_now(target: &str, count: u32, limit: Duration) -> Pinged {
+    fn ping_now(addresses: &[&str], count: u32, limit: Duration) -> Result<Pinged> {
+        let addresses: Vec<SocketAddr> = addresses.iter().map(|a| a.parse().unwrap()).collect();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
-            .block_on(ping(target.parse().unwrap(), count, limit))
-            .unwrap()
+            .block_on(async { ping(&addresses, count, Instant::now() + limit).await })
     }
 
     #[test]
     fn this_host_answers() {
-        match ping_now("127.0.0.1:0", 2, Duration::from_secs(5)) {
+        match ping_now(&["127.0.0.1:0"], 2, Duration::from_secs(5)).unwrap() {
             Pinged::Replies(replies) => {
                 assert_eq!((replies.sent, replies.received()), (2, 2));
             }
@@ -472,8 +487,28 @@ mod tests {
 
     #[test]
     fn nothing_answers_for_an_address_kept_for_documentation() {
-        if let Pinged::Replies(replies) = ping_now("192.0.2.1:0", 1, Duration::from_secs(1)) {
+        // Without a route there, it can't be pinged at all, which is fine too.
+        if let Ok(Pinged::Replies(replies)) = ping_now(&["192.0.2.1:0"], 1, Duration::from_secs(1))
+        {
             assert_eq!((replies.sent, replies.received()), (1, 0));
         }
+    }
+
+    #[test]
+    fn ipv4_comes_first() {
+        let addresses: Vec<SocketAddr> = ["[::1]:0", "10.0.0.1:0", "[::2]:0", "10.0.0.2:0"]
+            .iter()
+            .map(|a| a.parse().unwrap())
+            .collect();
+        let ordered: Vec<String> = in_order(&addresses)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(ordered, ["10.0.0.1:0", "10.0.0.2:0", "[::1]:0", "[::2]:0"]);
+    }
+
+    #[test]
+    fn every_ping_has_its_own_token() {
+        assert_ne!(token(), token());
     }
 }

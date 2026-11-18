@@ -850,17 +850,18 @@ fn read_ping_summary(output: &str, findings: &mut Findings) {
 }
 
 async fn check_ping(check: &Check, findings: &mut Findings) -> Result<()> {
+    // The check as a whole stops at its limit, so pinging stops a little before,
+    // to report what came back rather than running out of time.
+    let limit = limit(check);
+    let deadline =
+        tokio::time::Instant::now() + limit - (limit / 10).min(Duration::from_millis(500));
     let count = check.count.unwrap_or(1);
     let host = check.target.trim_start_matches('[').trim_end_matches(']');
-    let target = tokio::net::lookup_host((host, 0))
-        .await
-        .ok()
-        .and_then(|mut found| found.next())
-        .ok_or_else(|| anyhow!("couldn't find {host}"))?;
-    let replies = match ping::ping(target, count, limit(check)).await? {
+    let addresses = resolve(host, 0, findings).await?;
+    let replies = match ping::ping(&addresses, count, deadline).await? {
         ping::Pinged::Replies(replies) => replies,
         #[cfg(unix)]
-        ping::Pinged::NotAllowed => return system_ping(check, count, findings).await,
+        ping::Pinged::NotAllowed => return system_ping(check, count, deadline, findings).await,
         #[cfg(not(unix))]
         ping::Pinged::NotAllowed => bail!("this system doesn't allow pinging"),
     };
@@ -874,9 +875,18 @@ async fn check_ping(check: &Check, findings: &mut Findings) -> Result<()> {
     Ok(())
 }
 
+/// The system's own `ping`, given what's left of the time, in whole seconds as
+/// it takes them.
 #[cfg(unix)]
-async fn system_ping(check: &Check, count: u32, findings: &mut Findings) -> Result<()> {
-    let arguments = ping_arguments(std::env::consts::OS, &check.target, count, limit(check));
+async fn system_ping(
+    check: &Check,
+    count: u32,
+    deadline: tokio::time::Instant,
+    findings: &mut Findings,
+) -> Result<()> {
+    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let left = Duration::from_secs(left.as_secs().max(1));
+    let arguments = ping_arguments(std::env::consts::OS, &check.target, count, left);
     let output = Command::new("ping")
         .args(arguments)
         .stdin(Stdio::null())
@@ -1537,5 +1547,6 @@ mod tests {
         assert_eq!(output["up"], 1, "{output}");
         assert_eq!(output["packet_loss_percent"], 0.0);
         assert!(output["rtt_max_ms"].is_f64(), "{output}");
+        assert!(output["dns_ms"].is_f64(), "{output}");
     }
 }
