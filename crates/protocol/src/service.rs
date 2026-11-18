@@ -12,9 +12,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use clap::Subcommand;
 use windows_service::service::{
-    ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept,
-    ServiceErrorControl, ServiceExitCode, ServiceFailureActions, ServiceFailureResetPeriod,
-    ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState,
+    ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{
     self, ServiceControlHandlerResult, ServiceStatusHandle,
@@ -28,22 +27,15 @@ use crate::{logging, stopping};
 /// also applies while the host shuts down.
 const TIME_TO_STOP: Duration = Duration::from_secs(60);
 
-/// Long enough that a config mistake doesn't fill the log, and a server that's starting
-/// late doesn't use up the attempts.
-const RESTART_AFTER: Duration = Duration::from_secs(30);
-
 const FAILED: u32 = 1;
 
 const NEEDS_ADMIN: &str = "reaching the Windows service manager, which needs an administrator";
 
+/// The installers register the service, with Windows starting it as
+/// `service run`.
 #[derive(Debug, PartialEq, Subcommand)]
 pub enum ServiceCommand {
-    /// Install the Windows service, which starts with the host
-    Install,
-    /// Stop and remove the Windows service, leaving the config and data in place
-    Uninstall,
     /// What Windows starts, which can't be run by hand
-    #[command(hide = true)]
     Run,
 }
 
@@ -174,81 +166,6 @@ fn service_status(
     }
 }
 
-/// Registers this program to start with the host, restarting if it fails.
-pub fn install(service: &Service, config: &Path) -> Result<()> {
-    let config = std::path::absolute(config).context("finding the config file")?;
-    let manager =
-        ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)
-            .context(NEEDS_ADMIN)?;
-    let installed = manager
-        .create_service(
-            &ServiceInfo {
-                name: service.name.into(),
-                display_name: service.display_name.into(),
-                service_type: ServiceType::OWN_PROCESS,
-                start_type: ServiceStartType::AutoStart,
-                error_control: ServiceErrorControl::Normal,
-                executable_path: std::env::current_exe().context("finding this program")?,
-                launch_arguments: launch_arguments(&config),
-                dependencies: vec![],
-                account_name: None,
-                account_password: None,
-            },
-            ServiceAccess::CHANGE_CONFIG | ServiceAccess::START,
-        )
-        .with_context(|| format!("creating the {} service", service.name))?;
-
-    installed.set_description(service.description)?;
-    installed.set_preshutdown_timeout(TIME_TO_STOP)?;
-    installed.update_failure_actions(ServiceFailureActions {
-        reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(24 * 60 * 60)),
-        reboot_msg: None,
-        command: None,
-        actions: Some(vec![ServiceAction {
-            action_type: ServiceActionType::Restart,
-            delay: RESTART_AFTER,
-        }]),
-    })?;
-    // Otherwise only a crash counts as failing, and not stopping with an error.
-    installed.set_failure_actions_on_non_crash_failures(true)?;
-
-    println!("Installed {}. Start it with:", service.name);
-    println!("  Start-Service {}", service.name);
-    Ok(())
-}
-
-fn launch_arguments(config: &Path) -> Vec<OsString> {
-    vec![
-        "--config".into(),
-        config.into(),
-        "service".into(),
-        "run".into(),
-    ]
-}
-
-/// Windows only removes a service once it's stopped, so this stops it first.
-pub fn uninstall(service: &Service) -> Result<()> {
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-        .context(NEEDS_ADMIN)?;
-    let installed = manager
-        .open_service(
-            OsStr::new(service.name),
-            ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
-        )
-        .with_context(|| format!("finding the {} service", service.name))?;
-
-    if installed.query_status()?.current_state == ServiceState::Running {
-        installed.stop()?;
-    }
-    if !stopped_in_time(&installed)? {
-        println!("{} is taking a while to stop.", service.name);
-    }
-
-    installed.delete()?;
-    println!("Removed {}.", service.name);
-    Ok(())
-}
-
 /// Restarts the service so it reads a changed config, if it's installed and
 /// running. A stopped service reads the config when it next starts.
 pub fn restart_if_running(service: &Service) -> Result<()> {
@@ -301,16 +218,6 @@ fn stopped_in_time(installed: &windows_service::service::Service) -> Result<bool
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn windows_starts_it_with_the_config_it_was_installed_with() {
-        let arguments = launch_arguments(Path::new(r"C:\Program Data\agent.hcl"));
-
-        assert_eq!(
-            arguments,
-            ["--config", r"C:\Program Data\agent.hcl", "service", "run"]
-        );
-    }
 
     #[test]
     fn only_a_pending_stop_counts_as_making_progress() {

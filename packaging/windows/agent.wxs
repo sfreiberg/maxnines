@@ -61,7 +61,8 @@
     <Feature Id="Agent" Title="MaxNines Agent">
       <Component Directory="INSTALLFOLDER">
         <File Id="AgentExe" Source="$(var.Program)" Name="maxnines-agent.exe" KeyPath="yes" />
-        <!-- Its recovery settings match the agent's own service install command. -->
+        <!-- Windows restarts it 30 seconds after a failure, stopping with an error
+             included, and gives it a minute to save everything at shutdown. -->
         <ServiceInstall Name="MaxNinesAgent"
                         DisplayName="MaxNines Agent"
                         Description="Reports system metrics to a MaxNines server."

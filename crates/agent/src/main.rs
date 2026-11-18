@@ -96,9 +96,9 @@ enum Command {
     },
     /// Print this agent's version, and exactly which build it is
     Version,
-    /// Run the agent as a Windows service
+    /// What Windows starts the agent's service with
     #[cfg(windows)]
-    #[command(subcommand)]
+    #[command(subcommand, hide = true)]
     Service(ServiceCommand),
     /// Set the server to report to, creating the config file if there isn't one,
     /// and restart the service if it's running
@@ -180,13 +180,6 @@ fn main() -> Result<()> {
             logging::to_stderr();
             run(cli.config)
         }
-        #[cfg(windows)]
-        Command::Service(ServiceCommand::Install) => {
-            Config::load(&cli.config)?;
-            service::install(&SERVICE, &cli.config)
-        }
-        #[cfg(windows)]
-        Command::Service(ServiceCommand::Uninstall) => service::uninstall(&SERVICE),
         #[cfg(windows)]
         Command::Service(ServiceCommand::Run) => service::run(&SERVICE, &cli.config, |path| {
             remember_for_installer(&path);

@@ -116,9 +116,9 @@ enum Command {
     Users(UsersCommand),
     /// Print this server's version, and exactly which build it is
     Version,
-    /// Run the server as a Windows service
+    /// What Windows starts the server's service with
     #[cfg(windows)]
-    #[command(subcommand)]
+    #[command(subcommand, hide = true)]
     Service(ServiceCommand),
     /// Set the address, port and HTTPS, creating the config file if there isn't
     /// one, add the first administrator, and restart the service if it's running
@@ -288,13 +288,6 @@ fn main() -> Result<()> {
             logging::to_stderr();
             serve(&cli.config)
         }
-        #[cfg(windows)]
-        Command::Service(ServiceCommand::Install) => {
-            Config::load(&cli.config)?;
-            service::install(&SERVICE, &cli.config)
-        }
-        #[cfg(windows)]
-        Command::Service(ServiceCommand::Uninstall) => service::uninstall(&SERVICE),
         #[cfg(windows)]
         Command::Service(ServiceCommand::Run) => service::run(&SERVICE, &cli.config, |path| {
             let saved = Config::load(&path).and_then(|config| remember_for_installer(&config));

@@ -5,7 +5,6 @@
 - [Users](users.md)
 - [Audit log](audit-log.md)
 - [Running an agent](agents.md)
-- [Windows services](windows-services.md)
 - [HTTPS](https.md)
 - [Proxies](proxies.md)
 - [Databases](databases.md)
