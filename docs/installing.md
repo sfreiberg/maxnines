@@ -65,8 +65,11 @@ administrators can open. Logs are in a `logs` folder there, a file for each day,
 kept for 14 days.
 
 To change what the installer asked later, open **Settings > Apps > Installed apps**,
-choose the program and then **Modify**. It asks again, showing what the config says
-now, and restarts the service. Anything you've added to the config by hand is kept.
+choose the program and then **Modify**. It asks again and restarts the service. A
+setting you leave as it was keeps what the config has, so changes you've made to the
+config by hand stay unless you change the same setting in Modify. The server's
+installer shows your answers from last time, which may not show a change made by hand
+since; the agent's shows what its config says now.
 After editing the config by hand, restart the service, such as with
 `Restart-Service MaxNinesServer`.
 
@@ -98,8 +101,10 @@ msiexec /i maxnines-server-<version>-x86_64-pc-windows-msvc.msi SERVER_ADDRESS=h
 ```
 
 The server runs as its own account, `NT SERVICE\MaxNinesServer`, which Windows makes
-for the service and which can open little but its data folder. The installer lets it
-read the certificate and key you give it, wherever they are. If you point
+for the service and which can open little but its data folder. It can read
+`server.hcl` but not change it, so that a server someone has taken over can't choose
+what the installer does next. The installer lets it read the certificate and key you
+give it, wherever they are. If you point
 `server.hcl` at other files by hand, such as a `password_file` or a registration
 rule's `token_file`, put them in `C:\ProgramData\MaxNines\Server` or let the
 account read them:

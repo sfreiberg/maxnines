@@ -73,10 +73,6 @@ governor = "0.10.4"
 cookie = "0.18"
 totp-rs = { version = "6.0.0", features = ["qr", "gen_secret", "otpauth"] }
 
-# Lets the Windows service's own account read the certificate it's given.
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem"] }
-
 [dev-dependencies]
 rcgen = "0.14"
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }

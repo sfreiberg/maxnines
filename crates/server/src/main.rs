@@ -165,24 +165,44 @@ fn configure_for_installer(path: &Path, arguments: ConfigureArgs) -> Result<()> 
     use maxnines_protocol::config_file;
 
     let given = |value: Option<String>| value.filter(|value| !value.trim().is_empty());
-    let settings = configure::Settings {
-        address: arguments.address,
-        port: arguments.port,
-        https: Some(arguments.https),
-        acme_email: given(arguments.acme_email),
-        certificate_file: given(arguments.certificate_file).map(PathBuf::from),
-        key_file: given(arguments.key_file).map(PathBuf::from),
-    };
-    let config = configure::write(path, &settings)?;
-    // The service runs as its own account, which can't otherwise read files
-    // only administrators can.
-    for file in [&settings.certificate_file, &settings.key_file]
-        .into_iter()
-        .flatten()
-    {
-        configure::let_service_read(file)
-            .with_context(|| format!("letting the service read {}", file.display()))?;
+    let installer = vec![
+        ("SERVER_ADDRESS", arguments.address.clone()),
+        ("PORT", arguments.port.to_string()),
+        ("HTTPS", arguments.https.as_str().to_string()),
+        (
+            "ACME_EMAIL",
+            arguments.acme_email.clone().unwrap_or_default(),
+        ),
+        (
+            "CERTIFICATE_FILE",
+            arguments.certificate_file.clone().unwrap_or_default(),
+        ),
+        ("KEY_FILE", arguments.key_file.clone().unwrap_or_default()),
+    ];
+    let remembered =
+        config_file::remembered_for_installer("Server", &configure::INSTALLER_SETTINGS);
+    let current = Config::load(path)
+        .map(|config| configure::installer_settings(&config))
+        .unwrap_or_default();
+    let settings = configure::Settings::from_installer(&configure::keep_hand_edits(
+        &installer,
+        &remembered,
+        &current,
+    ))?;
+
+    // The service runs as its own account, which can't otherwise read files only
+    // administrators can. Before the config names them, so a failure leaves the
+    // old config as it was.
+    if settings.https == Some(configure::Https::Files) {
+        for file in [&settings.certificate_file, &settings.key_file]
+            .into_iter()
+            .flatten()
+        {
+            configure::let_service_read(file)
+                .with_context(|| format!("letting the service read {}", file.display()))?;
+        }
     }
+    let config = configure::write(path, &settings)?;
     remember_for_installer(&config)?;
 
     if let Some(email) = given(arguments.admin_email) {
@@ -206,8 +226,9 @@ fn configure_for_installer(path: &Path, arguments: ConfigureArgs) -> Result<()> 
     service::restart_if_running(&SERVICE)
 }
 
-/// Saves the settings for the installer to show in Modify, from the config, so
-/// they stay right after the file's edited by hand.
+/// Saves the settings for the installer to show in Modify. Only this, run by the
+/// installer as Windows itself, saves them: the service can't, so a server that's
+/// been taken over can't choose what the installer does next.
 #[cfg(windows)]
 fn remember_for_installer(config: &Config) -> Result<()> {
     let settings = configure::installer_settings(config);
@@ -298,16 +319,9 @@ fn main() -> Result<()> {
             serve(&cli.config)
         }
         #[cfg(windows)]
-        Command::Service(ServiceCommand::Run) => service::run(&SERVICE, &cli.config, |path| {
-            let saved = Config::load(&path).and_then(|config| remember_for_installer(&config));
-            if let Err(error) = saved {
-                tracing::warn!(
-                    error = format!("{error:#}"),
-                    "couldn't save the settings for the installer"
-                );
-            }
-            serve(&path)
-        }),
+        Command::Service(ServiceCommand::Run) => {
+            service::run(&SERVICE, &cli.config, |path| serve(&path))
+        }
         #[cfg(windows)]
         Command::Configure(arguments) => configure_for_installer(&cli.config, arguments),
         Command::Version => {

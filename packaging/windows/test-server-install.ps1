@@ -99,9 +99,21 @@ Check ($remembered.SERVER_ADDRESS -eq 'http://localhost:9123' -and $remembered.P
 $acl = Get-Acl $data
 $who = $acl.Access | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique
 Check $acl.AreAccessRulesProtected 'the data folder does not inherit permissions'
-Check ((Compare-Object $who @('BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM', 'NT SERVICE\MaxNinesServer')) -eq $null) "only Windows, administrators and the server can open the data folder (found: $($who -join ', '))"
+Check ((Compare-Object $who @('BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM', 'NT SERVICE\MaxNinesServer', 'OWNER RIGHTS')) -eq $null) "only Windows, administrators and the server can open the data folder (found: $($who -join ', '))"
+$rights = [Security.AccessControl.FileSystemRights]
 $own = $acl.Access | Where-Object { $_.IdentityReference.Value -eq 'NT SERVICE\MaxNinesServer' }
-Check (-not ($own.FileSystemRights -band [Security.AccessControl.FileSystemRights]::ChangePermissions)) 'the server cannot change who can open its data folder'
+Check (-not ($own | Where-Object { $_.FileSystemRights -band $rights::ChangePermissions })) 'the server cannot change who can open its data folder'
+$itself = $own | Where-Object { -not ($_.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) }
+Check (-not ($itself.FileSystemRights -band $rights::Delete)) 'the server cannot delete or rename its data folder'
+$owners = $acl.Access | Where-Object { $_.IdentityReference.Value -eq 'OWNER RIGHTS' }
+Check (-not ($owners.FileSystemRights -band $rights::ChangePermissions)) 'the server cannot change who can open the files it makes'
+
+# The config, and the settings saved for Modify, are out of the server's reach.
+$configAcl = Get-Acl $config
+$serverOnConfig = $configAcl.Access | Where-Object { $_.IdentityReference.Value -eq 'NT SERVICE\MaxNinesServer' }
+Check ($configAcl.AreAccessRulesProtected -and $serverOnConfig -and -not ($serverOnConfig | Where-Object { $_.FileSystemRights -band ($rights::Write -bor $rights::Delete -bor $rights::ChangePermissions) })) 'the server can only read its config'
+$keyAcl = Get-Acl 'HKLM:\SOFTWARE\MaxNines\Server'
+Check (-not ($keyAcl.Access | Where-Object { $_.IdentityReference.Value -eq 'NT SERVICE\MaxNinesServer' })) 'the server cannot change the settings saved for Modify'
 
 $rule = Get-NetFirewallRule -DisplayName 'MaxNines Server' -ErrorAction SilentlyContinue
 Check ($null -ne $rule -and $rule.Direction -eq 'Inbound' -and $rule.Action -eq 'Allow') 'Windows Firewall lets the server through'
@@ -123,12 +135,15 @@ Check ((Setting 'public_url') -eq 'ws://localhost:9124/ws') 'Modify changes the 
 Check ((Get-Content $config -Raw) -match 'rule "office"') 'Modify keeps what was added by hand'
 Check ((Users).Count -eq 1) 'Modify adds nobody'
 
-# The port changed by hand, which the server remembers when it restarts.
+# The port changed by hand, then Modify given the answers it would show, as
+# they were: the change by hand stays.
 (Get-Content $config -Raw).Replace('0.0.0.0:9124', '0.0.0.0:9125').Replace('localhost:9124', 'localhost:9125') |
     Set-Content $config -NoNewline
 Restart-Service MaxNinesServer
 Check-Answering 9125 'after a change by hand'
-Check ((Get-ItemProperty 'HKLM:\SOFTWARE\MaxNines\Server').PORT -eq '9125') 'a port set by hand is remembered for Modify'
+Msiexec 'modify-unchanged' @('/i', "`"$Msi`"", 'SERVER_ADDRESS=http://localhost:9124', 'PORT=9124') | Out-Null
+Check-Answering 9125 'after Modify with the answers left as they were'
+Check ((Get-ItemProperty 'HKLM:\SOFTWARE\MaxNines\Server').PORT -eq '9125') 'Modify remembers the change by hand'
 
 # HTTPS from a certificate in a folder only administrators can open, which
 # the server's own account can't read until the installer lets it.
@@ -165,5 +180,7 @@ Check (Test-Path $config) 'uninstalling keeps the config'
 Check (Test-Path (Join-Path $data 'maxnines.sqlite')) 'uninstalling keeps the databases'
 $path = [Environment]::GetEnvironmentVariable('Path', 'Machine')
 Check (-not ($path.Split(';') -contains $program)) 'uninstalling takes the program off the PATH'
+
+Remove-Item $certs -Recurse -Force
 
 Write-Host 'The installer works.'

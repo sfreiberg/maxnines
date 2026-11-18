@@ -145,10 +145,24 @@ pub fn locate(config: &Path) -> Result<(PathBuf, PathBuf)> {
 /// Writes beside the file and then swaps it in, so a failure halfway leaves the
 /// old one whole.
 pub fn replace(path: &Path, text: &str) -> Result<()> {
+    replace_prepared(path, text, |_| Ok(()))
+}
+
+/// As [`replace`], doing `prepare` to the new file before it's swapped in, such
+/// as setting who can open it, so it's never there without that done.
+pub fn replace_prepared(
+    path: &Path,
+    text: &str,
+    prepare: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".new");
     let temporary = PathBuf::from(temporary);
     std::fs::write(&temporary, text).with_context(|| format!("writing {}", temporary.display()))?;
+    if let Err(error) = prepare(&temporary) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
     std::fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))
 }
 
@@ -211,6 +225,23 @@ pub fn remember_for_installer(program: &str, values: &[(&str, &str)]) -> Result<
         }
     }
     Ok(())
+}
+
+/// What [`remember_for_installer`] saved last, for these names. One never saved,
+/// or saved empty, isn't there.
+#[cfg(windows)]
+pub fn remembered_for_installer(
+    program: &str,
+    names: &[&str],
+) -> std::collections::BTreeMap<String, String> {
+    let Ok(key) = windows_registry::LOCAL_MACHINE.open(format!(r"SOFTWARE\MaxNines\{program}"))
+    else {
+        return Default::default();
+    };
+    names
+        .iter()
+        .filter_map(|name| Some((name.to_string(), key.get_string(name).ok()?)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -310,6 +341,26 @@ mod tests {
             body.to_string(),
             "# Mine\nlisten = \"0.0.0.0:443\" # here\npublic_url = \"wss://m.example.com/ws\"\n\ntls {\n  key_file = \"key.pem\"\n}\n"
         );
+    }
+
+    #[test]
+    fn a_failed_preparation_leaves_the_old_file() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("x.hcl");
+        replace(&path, "one").unwrap();
+
+        assert!(replace_prepared(&path, "two", |_| anyhow::bail!("no")).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one");
+        assert!(!folder.path().join("x.hcl.new").exists());
+
+        let mut prepared = None;
+        replace_prepared(&path, "three", |new| {
+            prepared = Some(std::fs::read_to_string(new)?);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(prepared.as_deref(), Some("three"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "three");
     }
 
     #[test]

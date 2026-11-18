@@ -3,6 +3,7 @@
 //! sets change: comments, registration rules and anything else in the file are
 //! kept as they were.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
@@ -154,6 +155,9 @@ pub fn write(config: &Path, settings: &Settings) -> Result<Config> {
     let (path, folder) = config_file::locate(config)?;
     let existing = config_file::read(&path)?;
     let text = edit(existing.as_deref(), &folder, settings)?;
+    #[cfg(windows)]
+    config_file::replace_prepared(&path, &text, protect_config)?;
+    #[cfg(not(windows))]
     config_file::replace(&path, &text)?;
     println!("Saved the settings in {}.", path.display());
     Config::parse(&text)
@@ -197,90 +201,107 @@ pub fn installer_settings(config: &Config) -> Vec<(&'static str, String)> {
 /// certificate and key, wherever they are. The rest of who can read it stays.
 #[cfg(windows)]
 pub fn let_service_read(path: &Path) -> Result<()> {
-    use std::ffi::{OsStr, c_void};
-    use std::os::windows::ffi::OsStrExt;
-    use std::ptr::null_mut;
+    icacls(path, &["/grant", &format!("*{SERVICE_ACCOUNT_SID}:(R)")])
+}
 
-    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
-        NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW,
-        TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
-    };
-    use windows_sys::Win32::Security::{
-        ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE, PSECURITY_DESCRIPTOR, PSID,
-    };
-    use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
+/// Only Windows and administrators can change the config, and the service can
+/// only read it, so a server that's been taken over can't choose what the
+/// installer, which runs as Windows itself, does next.
+#[cfg(windows)]
+fn protect_config(path: &Path) -> Result<()> {
+    icacls(
+        path,
+        &[
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-5-18:(F)",
+            "*S-1-5-32-544:(F)",
+            &format!("*{SERVICE_ACCOUNT_SID}:(R)"),
+        ],
+    )
+}
 
-    /// Memory Windows handed over, given back when done with.
-    struct Local(*mut c_void);
-    impl Drop for Local {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                // SAFETY: Windows allocated it for this, and nothing uses it after.
-                unsafe { LocalFree(self.0) };
+/// Windows' own icacls, which sets who can open a file. Only whether it worked
+/// is read from it, as what it prints is in the system's language.
+#[cfg(windows)]
+fn icacls(path: &Path, arguments: &[&str]) -> Result<()> {
+    let windows = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    let icacls = Path::new(&windows).join("System32").join("icacls.exe");
+    let output = std::process::Command::new(&icacls)
+        .arg(path)
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .with_context(|| format!("running {}", icacls.display()))?;
+    ensure!(
+        output.status.success(),
+        "icacls couldn't change {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stdout).trim()
+    );
+    Ok(())
+}
+
+/// The installer's settings, in its names for them, as [`installer_settings`]
+/// gives them.
+pub const INSTALLER_SETTINGS: [&str; 6] = [
+    "SERVER_ADDRESS",
+    "PORT",
+    "HTTPS",
+    "ACME_EMAIL",
+    "CERTIFICATE_FILE",
+    "KEY_FILE",
+];
+
+/// What to set, from what the installer was given. Modify shows what it was
+/// given last time, which may since have been changed in the config by hand, so
+/// a setting given as it was then keeps what the config says now.
+pub fn keep_hand_edits(
+    given: &[(&'static str, String)],
+    remembered: &BTreeMap<String, String>,
+    current: &[(&'static str, String)],
+) -> Vec<(&'static str, String)> {
+    given
+        .iter()
+        .map(|(name, value)| {
+            let unchanged = remembered.get(*name).map_or("", String::as_str) == value.trim();
+            let now = current.iter().find(|(other, _)| other == name);
+            match now {
+                Some((_, now)) if unchanged => (*name, now.clone()),
+                _ => (*name, value.trim().to_string()),
             }
-        }
-    }
-    let succeeded = |code: u32| {
-        anyhow::ensure!(
-            code == ERROR_SUCCESS,
-            std::io::Error::from_raw_os_error(code as i32)
-        );
-        Ok(())
-    };
-    let wide = |text: &OsStr| -> Vec<u16> { text.encode_wide().chain(Some(0)).collect() };
-    let name = wide(path.as_os_str());
-    let sid_text = wide(OsStr::new(SERVICE_ACCOUNT_SID));
+        })
+        .collect()
+}
 
-    // SAFETY: every string passed ends in a 0, every pointer Windows fills in is
-    // freed by a guard once nothing uses it, and the old list is only read.
-    unsafe {
-        let mut sid: PSID = null_mut();
-        anyhow::ensure!(
-            ConvertStringSidToSidW(sid_text.as_ptr(), &mut sid) != 0,
-            std::io::Error::last_os_error()
-        );
-        let _sid = Local(sid);
-
-        let mut old: *mut ACL = null_mut();
-        let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
-        succeeded(GetNamedSecurityInfoW(
-            name.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            null_mut(),
-            null_mut(),
-            &mut old,
-            null_mut(),
-            &mut descriptor,
-        ))?;
-        let _descriptor = Local(descriptor);
-
-        let reading = EXPLICIT_ACCESS_W {
-            grfAccessPermissions: FILE_GENERIC_READ,
-            grfAccessMode: GRANT_ACCESS,
-            grfInheritance: NO_INHERITANCE,
-            Trustee: TRUSTEE_W {
-                pMultipleTrustee: null_mut(),
-                MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
-                TrusteeForm: TRUSTEE_IS_SID,
-                TrusteeType: TRUSTEE_IS_UNKNOWN,
-                ptstrName: sid.cast(),
-            },
+impl Settings {
+    /// From the installer's settings, with an empty one left out.
+    pub fn from_installer(values: &[(&'static str, String)]) -> Result<Self> {
+        let get = |name: &str| {
+            values
+                .iter()
+                .find(|(other, _)| *other == name)
+                .map(|(_, value)| value.as_str())
+                .filter(|value| !value.is_empty())
         };
-        let mut new: *mut ACL = null_mut();
-        succeeded(SetEntriesInAclW(1, &reading, old, &mut new))?;
-        let _new = Local(new.cast());
-        succeeded(SetNamedSecurityInfoW(
-            name.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            null_mut(),
-            null_mut(),
-            new,
-            null_mut(),
-        ))
+        let port = get("PORT").context("the port is missing")?;
+        let https = get("HTTPS").unwrap_or("none");
+        Ok(Self {
+            address: get("SERVER_ADDRESS")
+                .context("the address is missing")?
+                .to_string(),
+            port: port
+                .parse()
+                .map_err(|_| anyhow::anyhow!("{port:?} isn't a port"))?,
+            https: Some(
+                <Https as clap::ValueEnum>::from_str(https, true).map_err(|_| {
+                    anyhow::anyhow!("HTTPS is none, automatic or files, not {https:?}")
+                })?,
+            ),
+            acme_email: get("ACME_EMAIL").map(String::from),
+            certificate_file: get("CERTIFICATE_FILE").map(PathBuf::from),
+            key_file: get("KEY_FILE").map(PathBuf::from),
+        })
     }
 }
 
@@ -477,9 +498,81 @@ registration {
             .collect();
         assert_eq!(SERVICE_ACCOUNT_SID, format!("S-1-5-80-{}", parts.join("-")));
 
+        // The installer has it once, and gives it its data folder and registry key.
         let installer = include_str!("../../../packaging/windows/server.wxs");
         assert!(installer.contains(r#"Account="NT SERVICE\MaxNinesServer""#));
-        assert!(installer.matches(SERVICE_ACCOUNT_SID).count() >= 2);
+        assert!(installer.contains(&format!(
+            r#"<?define ServiceSid = "{SERVICE_ACCOUNT_SID}" ?>"#
+        )));
+        assert_eq!(installer.matches(SERVICE_ACCOUNT_SID).count(), 1);
+        // The folder itself, which it can't delete or rename, then what's inside.
+        assert!(installer.contains("(A;;0x1201bf;;;$(var.ServiceSid))"));
+        assert!(installer.contains("(A;OICIIO;0x1301bf;;;$(var.ServiceSid))"));
+    }
+
+    #[test]
+    fn a_setting_given_as_it_was_keeps_a_change_made_by_hand() {
+        let given = vec![
+            ("SERVER_ADDRESS", "http://m:9000".to_string()),
+            ("PORT", "9000".to_string()),
+            ("HTTPS", "none".to_string()),
+            ("ACME_EMAIL", String::new()),
+        ];
+        let remembered = BTreeMap::from([
+            ("SERVER_ADDRESS".to_string(), "http://old:9000".to_string()),
+            ("PORT".to_string(), "9000".to_string()),
+            ("HTTPS".to_string(), "none".to_string()),
+        ]);
+        // By hand: the port, and an email that was never set.
+        let current = vec![
+            ("SERVER_ADDRESS", "http://old:9000".to_string()),
+            ("PORT", "9001".to_string()),
+            ("HTTPS", "none".to_string()),
+            ("ACME_EMAIL", "hand@example.com".to_string()),
+        ];
+
+        let merged = keep_hand_edits(&given, &remembered, &current);
+        assert_eq!(
+            merged,
+            [
+                ("SERVER_ADDRESS", "http://m:9000".to_string()),
+                ("PORT", "9001".to_string()),
+                ("HTTPS", "none".to_string()),
+                ("ACME_EMAIL", "hand@example.com".to_string()),
+            ]
+        );
+
+        // A first install has nothing remembered or in the config yet.
+        assert_eq!(keep_hand_edits(&given, &BTreeMap::new(), &[]), given);
+    }
+
+    #[test]
+    fn the_installer_settings_read_back() {
+        let values = vec![
+            ("SERVER_ADDRESS", "https://m.example.com".to_string()),
+            ("PORT", "443".to_string()),
+            ("HTTPS", "files".to_string()),
+            ("ACME_EMAIL", String::new()),
+            ("CERTIFICATE_FILE", "/c.crt".to_string()),
+            ("KEY_FILE", "/c.key".to_string()),
+        ];
+        let settings = Settings::from_installer(&values).unwrap();
+        assert_eq!(settings.port, 443);
+        assert_eq!(settings.https, Some(Https::Files));
+        assert_eq!(settings.acme_email, None);
+        assert_eq!(settings.key_file.as_deref(), Some(Path::new("/c.key")));
+
+        let mut bad = values.clone();
+        bad[1].1 = "http".to_string();
+        assert!(Settings::from_installer(&bad).is_err());
+
+        // What it remembers is what it reads back.
+        let config = Config::parse(&edit(None, Path::new("/data"), &settings).unwrap()).unwrap();
+        let names: Vec<&str> = installer_settings(&config)
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(names, INSTALLER_SETTINGS);
     }
 
     #[test]

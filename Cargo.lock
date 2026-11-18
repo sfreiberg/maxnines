@@ -4130,7 +4130,6 @@ dependencies = [
  "ureq",
  "vergen-gitcl",
  "wildmatch",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
