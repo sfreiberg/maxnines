@@ -192,7 +192,10 @@ fn main() -> Result<()> {
         #[cfg(windows)]
         Command::Configure { server_url, token } => {
             let url = configure::write(&cli.config, &server_url, token.as_deref())?;
-            configure::remember_for_installer(&url)?;
+            maxnines_protocol::config_file::remember_for_installer(
+                "Agent",
+                &[("ServerUrl", &url)],
+            )?;
             service::restart_if_running(&SERVICE)
         }
         Command::Version => {

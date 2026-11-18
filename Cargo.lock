@@ -3951,7 +3951,6 @@ dependencies = [
  "tracing",
  "vergen-gitcl",
  "webpki-roots 0.26.11",
- "windows-registry",
  "windows-service",
 ]
 
@@ -4063,6 +4062,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "windows-registry",
  "windows-service",
 ]
 

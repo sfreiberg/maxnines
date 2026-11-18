@@ -20,6 +20,8 @@ tracing-subscriber.workspace = true
 [target.'cfg(windows)'.dependencies]
 clap.workspace = true
 windows-service = "0.8"
+# Saves settings where the installers find them for Modify.
+windows-registry = "0.6"
 
 [dev-dependencies]
 tempfile = "3"
