@@ -142,8 +142,14 @@ pub fn edit(existing: Option<&str>, folder: &Path, settings: &Settings) -> Resul
     Ok(text)
 }
 
-/// Writes the config, returning it as the server will read it.
-pub fn write(config: &Path, settings: &Settings) -> Result<Config> {
+/// Writes the config, returning it as the server will read it. `prepare` is done
+/// to the new file before it takes the old one's place, such as setting who can
+/// open it.
+pub fn write(
+    config: &Path,
+    settings: &Settings,
+    prepare: impl FnOnce(&Path) -> Result<()>,
+) -> Result<Config> {
     if settings.https == Some(Https::Files) {
         for file in [&settings.certificate_file, &settings.key_file]
             .into_iter()
@@ -155,10 +161,7 @@ pub fn write(config: &Path, settings: &Settings) -> Result<Config> {
     let (path, folder) = config_file::locate(config)?;
     let existing = config_file::read(&path)?;
     let text = edit(existing.as_deref(), &folder, settings)?;
-    #[cfg(windows)]
-    config_file::replace_prepared(&path, &text, protect_config)?;
-    #[cfg(not(windows))]
-    config_file::replace(&path, &text)?;
+    config_file::replace_prepared(&path, &text, prepare)?;
     println!("Saved the settings in {}.", path.display());
     Config::parse(&text)
 }
@@ -208,7 +211,7 @@ pub fn let_service_read(path: &Path) -> Result<()> {
 /// only read it, so a server that's been taken over can't choose what the
 /// installer, which runs as Windows itself, does next.
 #[cfg(windows)]
-fn protect_config(path: &Path) -> Result<()> {
+pub fn protect_config(path: &Path) -> Result<()> {
     icacls(
         path,
         &[
@@ -235,8 +238,9 @@ fn icacls(path: &Path, arguments: &[&str]) -> Result<()> {
         .with_context(|| format!("running {}", icacls.display()))?;
     ensure!(
         output.status.success(),
-        "icacls couldn't change {}: {}",
+        "icacls couldn't change {}: {} {}",
         path.display(),
+        String::from_utf8_lossy(&output.stderr).trim(),
         String::from_utf8_lossy(&output.stdout).trim()
     );
     Ok(())
@@ -445,12 +449,13 @@ registration {
         files.certificate_file = Some(folder.path().join("missing.crt"));
         files.key_file = Some(folder.path().join("missing.key"));
 
-        assert!(write(&config, &files).is_err());
+        assert!(write(&config, &files, |_| Ok(())).is_err());
         assert!(!config.exists());
 
         write(
             &config,
             &settings("http://m.example.com:9000", 9000, Https::None),
+            |_| Ok(()),
         )
         .unwrap();
         assert!(Config::load(&config).is_ok());

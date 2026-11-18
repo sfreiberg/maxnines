@@ -202,7 +202,7 @@ fn configure_for_installer(path: &Path, arguments: ConfigureArgs) -> Result<()> 
                 .with_context(|| format!("letting the service read {}", file.display()))?;
         }
     }
-    let config = configure::write(path, &settings)?;
+    let config = configure::write(path, &settings, configure::protect_config)?;
     remember_for_installer(&config)?;
 
     if let Some(email) = given(arguments.admin_email) {
