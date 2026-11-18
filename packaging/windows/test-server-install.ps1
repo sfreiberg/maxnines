@@ -124,7 +124,9 @@ Check ($failure -match 'RESTART -- Delay = 30000') "Windows restarts it 30 secon
 $path = [Environment]::GetEnvironmentVariable('Path', 'Machine')
 Check ($path.Split(';') -contains $program) 'the program is on the PATH'
 
-# Something added by hand has to survive the installer.
+# Something added by hand has to survive the installer: a registration rule,
+# with the token file it names, as the server won't start without it.
+Set-Content (Join-Path $data 'office.token') 'office-enrollment-token'
 Add-Content $config "`nregistration {`n  rule `"office`" {`n    action       = `"approve`"`n    source_cidrs = [`"10.0.0.0/8`"]`n    token_file   = `"office.token`"`n  }`n}"
 
 # Modify, as Settings > Apps does without the dialogs: a new port and address.
