@@ -4,7 +4,8 @@
 //! and Linux and macOS let ordinary users send them through ICMP datagram
 //! sockets, where the system allows it. Where it doesn't, as on FreeBSD or a
 //! Linux with `net.ipv4.ping_group_range` closed, this says so and the caller
-//! falls back to the system's `ping`, which has the rights.
+//! falls back to the system's `ping`, which has the rights. The release
+//! workflow runs the ping tests on FreeBSD to keep that working.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -238,12 +239,19 @@ mod system {
         }
     }
 
-    /// The system refused this account an ICMP socket, rather than failing.
+    /// The system refused this account an ICMP socket, rather than failing:
+    /// Linux with `net.ipv4.ping_group_range` closed says permission denied, and
+    /// FreeBSD, which has no ICMP datagram sockets, says the type is wrong.
     pub fn not_allowed(error: &io::Error) -> bool {
         error.kind() == ErrorKind::PermissionDenied
             || matches!(
                 error.raw_os_error(),
-                Some(libc::EPROTONOSUPPORT | libc::EAFNOSUPPORT | libc::ESOCKTNOSUPPORT)
+                Some(
+                    libc::EPROTOTYPE
+                        | libc::EPROTONOSUPPORT
+                        | libc::EAFNOSUPPORT
+                        | libc::ESOCKTNOSUPPORT
+                )
             )
     }
 }
