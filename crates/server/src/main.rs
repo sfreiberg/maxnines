@@ -155,9 +155,11 @@ struct ConfigureArgs {
     #[arg(long)]
     admin_name: Option<String>,
     /// Save the administrator's link for setting a password here, as a shortcut,
-    /// instead of printing it. Empty says how to get the link instead
+    /// instead of printing it. Empty says how to get the link instead. Text
+    /// rather than a path, as a path can't be empty, and the installer passes an
+    /// empty one when there's nowhere to put it
     #[arg(long)]
-    setup_link_file: Option<PathBuf>,
+    setup_link_file: Option<String>,
 }
 
 #[cfg(windows)]
@@ -214,10 +216,12 @@ fn configure_for_installer(path: &Path, arguments: ConfigureArgs) -> Result<()> 
                     None => println!("Open this to set a password: {link}"),
                     // A silent install has nowhere to show it, and its log isn't
                     // the place for it.
-                    Some(file) if file.as_os_str().is_empty() => println!(
+                    Some("") => println!(
                         "Get the link to set a password with: maxnines-server users setup-link {id}"
                     ),
-                    Some(file) => config_file::replace(file, &configure::shortcut(&link))?,
+                    Some(file) => {
+                        config_file::replace(Path::new(file), &configure::shortcut(&link))?;
+                    }
                 }
             }
             None => println!("Someone's already been added, so {email} wasn't."),

@@ -2682,6 +2682,43 @@ fn parse(text: &str) -> Result<Cli, clap::Error> {
     Cli::try_parse_from(std::iter::once("maxnines-server").chain(text.split_whitespace()))
 }
 
+/// Exactly what the Windows installer passes on a silent install or Modify,
+/// where most settings and the place for the setup link are empty.
+#[cfg(windows)]
+#[test]
+fn takes_the_empty_settings_the_installer_passes() {
+    let arguments = [
+        "maxnines-server",
+        "--config",
+        r"C:\ProgramData\MaxNines\Server\server.hcl",
+        "configure",
+        "--address",
+        "http://localhost:9124",
+        "--port",
+        "9124",
+        "--https",
+        "none",
+        "--acme-email",
+        "",
+        "--certificate-file",
+        "",
+        "--key-file",
+        "",
+        "--admin-email",
+        "",
+        "--admin-name",
+        "",
+        "--setup-link-file",
+        "",
+    ];
+    let cli = Cli::try_parse_from(arguments).unwrap();
+    let Some(Command::Configure(configure)) = cli.command else {
+        panic!("not configure");
+    };
+    assert_eq!(configure.setup_link_file.as_deref(), Some(""));
+    assert_eq!(configure.port, 9124);
+}
+
 #[test]
 fn the_cli_definition_is_valid() {
     use clap::CommandFactory;
