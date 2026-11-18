@@ -1,10 +1,10 @@
 # Windows services
 
 The agent and the server can both run as Windows services, which start with
-Windows and restart after a failure. The agent's [installer](installing.md#the-agent-on-windows)
-sets all this up, so this page is for the server, and for an agent you'd rather set up
-by hand. Everything below is for the agent, and works the same for the server with
-`maxnines-server.exe`, `server.hcl` and `MaxNinesServer`.
+Windows and restart after a failure. Their [installers](installing.md#windows) set
+all this up, so this page is only for setting one up by hand. Everything below is
+for the agent, and works the same for the server with `maxnines-server.exe`,
+`server.hcl` and `MaxNinesServer`.
 
 Put the program somewhere permanent, because the service runs it from where it was when
 you installed it. Put `agent.hcl` in a folder of its own, then let only Windows and

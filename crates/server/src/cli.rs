@@ -326,9 +326,29 @@ pub fn print_users(config: &Config) -> Result<()> {
 
 /// Prints the link, the only time it can be seen.
 fn print_link(config: &Config, token: &str) {
-    let site = web_url(config.audience()).unwrap_or_default();
-    println!("{site}/setup/{token}");
+    println!("{}", setup_link(config, token));
     eprintln!("Open this to set a password. It works once and lasts 7 days.");
+}
+
+fn setup_link(config: &Config, token: &str) -> String {
+    let site = web_url(config.audience()).unwrap_or_default();
+    format!("{site}/setup/{token}")
+}
+
+/// Adds the first administrator for the Windows installer, unless there's
+/// already someone, and gives the link for them to set a password.
+#[cfg(windows)]
+pub fn first_admin(config: &Config, email: &str, name: &str) -> Result<Option<(i64, String)>> {
+    let (email, name) = check_new_user(email, name)?;
+    let created = with_database(config, |database| async move {
+        if !database.list_users().await?.is_empty() {
+            return Ok(None);
+        }
+        database
+            .create_user(&email, &name, Role::Admin, now_ms())
+            .await
+    })?;
+    Ok(created.map(|(user, token)| (user.id, setup_link(config, &token))))
 }
 
 pub fn create_user(config: &Config, email: &str, name: &str, role: Role) -> Result<()> {

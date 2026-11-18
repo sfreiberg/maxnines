@@ -14,6 +14,8 @@ mod cli;
 mod clock;
 mod condition_builder;
 mod config;
+#[cfg(any(windows, test))]
+mod configure;
 mod controllers;
 mod csrf;
 mod dashboard_variables;
@@ -118,6 +120,93 @@ enum Command {
     #[cfg(windows)]
     #[command(subcommand)]
     Service(ServiceCommand),
+    /// Set the address, port and HTTPS, creating the config file if there isn't
+    /// one, add the first administrator, and restart the service if it's running
+    #[cfg(windows)]
+    Configure(ConfigureArgs),
+}
+
+/// What the Windows installer asks. It passes an empty value for anything not
+/// given, which counts as leaving it out.
+#[cfg(windows)]
+#[derive(Debug, PartialEq, clap::Args)]
+struct ConfigureArgs {
+    /// The address people open in a browser and agents connect to, such as
+    /// https://monitor.example.com
+    #[arg(long)]
+    address: String,
+    /// The port to listen on
+    #[arg(long)]
+    port: u16,
+    #[arg(long, value_enum, default_value = "none")]
+    https: configure::Https,
+    /// Who Let's Encrypt can contact about the certificate
+    #[arg(long)]
+    acme_email: Option<String>,
+    /// The certificate in PEM format, for --https files
+    #[arg(long)]
+    certificate_file: Option<String>,
+    /// Its private key in PEM format, for --https files
+    #[arg(long)]
+    key_file: Option<String>,
+    /// Add this administrator, if nobody's been added yet
+    #[arg(long)]
+    admin_email: Option<String>,
+    #[arg(long)]
+    admin_name: Option<String>,
+    /// Save the administrator's link for setting a password here, as a shortcut,
+    /// instead of printing it. Empty says how to get the link instead
+    #[arg(long)]
+    setup_link_file: Option<PathBuf>,
+}
+
+#[cfg(windows)]
+fn configure_for_installer(path: &Path, arguments: ConfigureArgs) -> Result<()> {
+    use maxnines_protocol::config_file;
+
+    let given = |value: Option<String>| value.filter(|value| !value.trim().is_empty());
+    let settings = configure::Settings {
+        address: arguments.address,
+        port: arguments.port,
+        https: Some(arguments.https),
+        acme_email: given(arguments.acme_email),
+        certificate_file: given(arguments.certificate_file).map(PathBuf::from),
+        key_file: given(arguments.key_file).map(PathBuf::from),
+    };
+    let config = configure::write(path, &settings)?;
+    remember_for_installer(&config)?;
+
+    if let Some(email) = given(arguments.admin_email) {
+        let name = arguments.admin_name.unwrap_or_default();
+        match cli::first_admin(&config, &email, &name)? {
+            Some((id, link)) => {
+                println!("Added {email} as an administrator.");
+                match arguments.setup_link_file.as_deref() {
+                    None => println!("Open this to set a password: {link}"),
+                    // A silent install has nowhere to show it, and its log isn't
+                    // the place for it.
+                    Some(file) if file.as_os_str().is_empty() => println!(
+                        "Get the link to set a password with: maxnines-server users setup-link {id}"
+                    ),
+                    Some(file) => config_file::replace(file, &configure::shortcut(&link))?,
+                }
+            }
+            None => println!("Someone's already been added, so {email} wasn't."),
+        }
+    }
+    service::restart_if_running(&SERVICE)
+}
+
+/// Saves the settings for the installer to show in Modify, from the config, so
+/// they stay right after the file's edited by hand.
+#[cfg(windows)]
+fn remember_for_installer(config: &Config) -> Result<()> {
+    let settings = configure::installer_settings(config);
+    let settings: Vec<(&str, &str)> = settings
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect();
+    maxnines_protocol::config_file::remember_for_installer("Server", &settings)
 }
 
 #[derive(Debug, PartialEq, Subcommand)]
@@ -207,9 +296,18 @@ fn main() -> Result<()> {
         #[cfg(windows)]
         Command::Service(ServiceCommand::Uninstall) => service::uninstall(&SERVICE),
         #[cfg(windows)]
-        Command::Service(ServiceCommand::Run) => {
-            service::run(&SERVICE, &cli.config, |path| serve(&path))
-        }
+        Command::Service(ServiceCommand::Run) => service::run(&SERVICE, &cli.config, |path| {
+            let saved = Config::load(&path).and_then(|config| remember_for_installer(&config));
+            if let Err(error) = saved {
+                tracing::warn!(
+                    error = format!("{error:#}"),
+                    "couldn't save the settings for the installer"
+                );
+            }
+            serve(&path)
+        }),
+        #[cfg(windows)]
+        Command::Configure(arguments) => configure_for_installer(&cli.config, arguments),
         Command::Version => {
             let build = maxnines_protocol::build_info!();
             println!("{}", build.describe(env!("CARGO_PKG_NAME")));

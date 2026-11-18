@@ -54,31 +54,68 @@ docker exec maxnines maxnines-server --config /etc/maxnines/server.hcl \
   users create you@example.com "Your Name"
 ```
 
-## The agent on Windows
+## Windows
 
-The agent has an installer for x64 and Arm, `maxnines-agent-<version>-x86_64-pc-windows-msvc.msi`
-or `maxnines-agent-<version>-aarch64-pc-windows-msvc.msi`. It asks for:
+The server and the agent each have an installer for x64 and Arm, such as
+`maxnines-server-<version>-x86_64-pc-windows-msvc.msi` or
+`maxnines-agent-<version>-aarch64-pc-windows-msvc.msi`. Each installs a service that
+starts with Windows, puts its program in `C:\Program Files\MaxNines` on the `PATH`,
+and keeps its config and data in `C:\ProgramData\MaxNines`, which only Windows and
+administrators can open. Logs are in a `logs` folder there, a file for each day,
+kept for 14 days.
 
-- **The server's address,** as you open it in a browser, such as
-  `https://monitor.example.com`. The agent connects to `/ws` there. If the server's
-  `public_url` is somewhere else, such as behind a proxy, give that instead, starting
-  with `wss://`.
-- **An enrollment token,** only if the server's registration rules approve agents
-  with one. Leave it empty to approve the host on the Hosts page instead.
+To change what the installer asked later, open **Settings > Apps > Installed apps**,
+choose the program and then **Modify**. It asks again, showing what the config says
+now, and restarts the service. Anything you've added to the config by hand is kept.
+After editing the config by hand, restart the service, such as with
+`Restart-Service MaxNinesServer`.
 
-It then installs the agent as the **MaxNines Agent** service, which starts with
-Windows, and starts it. The agent's program goes in `C:\Program Files\MaxNines\Agent`,
-which is added to the `PATH`. Its config, token, key, logs and unsent samples go in
-`C:\ProgramData\MaxNines\Agent`, which only Windows and administrators can open.
+Upgrading keeps the config. Uninstalling removes the program and the service but keeps
+`C:\ProgramData\MaxNines`, so reinstalling the server brings back everything, and
+reinstalling an agent brings back the same host rather than a new one to approve.
 
-To change the server later, open **Settings > Apps > Installed apps**, choose
-**MaxNines Agent** and then **Modify**. It asks again, keeps the token if you
-leave it empty, and restarts the service. Anything you've added to `agent.hcl` by
-hand is kept. From a command prompt opened as administrator, this does the same:
+The installers aren't signed yet, so Windows may warn that they're from an unknown
+publisher. Choose **More info** and then **Run anyway**.
+
+### The server
+
+The server's installer asks for:
+
+- **The address** people will open in a browser and agents will connect to, such as
+  `https://monitor.example.com`. It starts as this computer's name on port 9000.
+  Behind a proxy, give the proxy's address.
+- **The port** to listen on, which Windows Firewall lets through.
+- **[HTTPS](https.md):** none, an automatic certificate from Let's Encrypt, or your own
+  certificate from files. Either kind needs an address starting with `https://`.
+- **The first administrator,** as nobody can sign up. When the installer finishes, it
+  opens the page for them to set a password.
+
+To install it without the questions, give the answers as properties. Everything but
+the administrator has a default:
 
 ```powershell
-maxnines-agent --config C:\ProgramData\MaxNines\Agent\agent.hcl configure --server-url https://monitor.example.com
+msiexec /i maxnines-server-<version>-x86_64-pc-windows-msvc.msi SERVER_ADDRESS=https://monitor.example.com PORT=443 HTTPS=automatic ACME_EMAIL=you@example.com ADMIN_EMAIL=you@example.com ADMIN_NAME="Your Name" /qn
 ```
+
+`HTTPS` is `none`, `automatic` or `files`, with `CERTIFICATE_FILE` and `KEY_FILE`. A
+silent install doesn't keep the link for setting a password, so get it from a command
+prompt opened as administrator:
+
+```powershell
+maxnines-server --config C:\ProgramData\MaxNines\Server\server.hcl users list
+maxnines-server --config C:\ProgramData\MaxNines\Server\server.hcl users setup-link <id>
+```
+
+### The agent
+
+The agent's installer asks for:
+
+- **The server's address,** as you open it in a browser. The agent connects to `/ws`
+  there. If the server's `public_url` is somewhere else, give that instead, starting
+  with `wss://`.
+- **An enrollment token,** only if the server's registration rules approve agents
+  with one. Leave it empty to approve the host on the Hosts page instead. Modify keeps
+  the token if you leave it empty.
 
 To install it on many computers at once, such as with Intune, Group Policy or
 Configuration Manager, give the answers as properties and install it silently:
@@ -88,19 +125,12 @@ msiexec /i maxnines-agent-<version>-x86_64-pc-windows-msvc.msi SERVER_URL=https:
 ```
 
 The token is saved for the agent but never written to the installer's log.
-Upgrading is the same without the properties, and keeps the server and token.
-Uninstalling removes the program and the service but keeps
-`C:\ProgramData\MaxNines\Agent`, so reinstalling brings back the same host rather
-than a new one to approve.
-
-The installer isn't signed yet, so Windows may warn that it's from an unknown
-publisher. Choose **More info** and then **Run anyway**.
 
 ## Other systems
 
-The macOS, FreeBSD and Windows server downloads are archives holding the program, an
-example config and a README. Unpack one and see [running an agent](agents.md) or
-[Windows services](windows-services.md). The macOS programs aren't signed by Apple
+The macOS and FreeBSD downloads are archives holding the program, an example config
+and a README. Unpack one and see [running an agent](agents.md). The macOS programs
+aren't signed by Apple
 yet, so clear the flag that stops them opening first:
 
 ```sh

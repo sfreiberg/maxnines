@@ -1,0 +1,146 @@
+# Installs the server's MSI on a Windows machine, as an administrator, and checks
+# what it did: the service, the config it wrote, the first administrator and
+# their link, the firewall and who can read the data. Then Modify, an upgrade
+# and an uninstall.
+#
+#   packaging/windows/test-server-install.ps1 -Msi maxnines-server.msi -Upgrade newer.msi
+param(
+    [Parameter(Mandatory)] [string] $Msi,
+    # The same server with a higher version.
+    [Parameter(Mandatory)] [string] $Upgrade
+)
+$ErrorActionPreference = 'Stop'
+# msiexec can't open a package from a relative path.
+$Msi = (Resolve-Path $Msi).Path
+$Upgrade = (Resolve-Path $Upgrade).Path
+
+$data = 'C:\ProgramData\MaxNines\Server'
+$config = Join-Path $data 'server.hcl'
+$program = 'C:\Program Files\MaxNines\Server\'
+$temp = $env:RUNNER_TEMP ?? [IO.Path]::GetTempPath()
+$logs = Join-Path $temp 'msi-logs'
+$link = Join-Path $temp 'MaxNines setup.url'
+New-Item -ItemType Directory -Force $logs | Out-Null
+
+function Check([bool] $ok, [string] $what) {
+    if (-not $ok) { throw "Failed: $what" }
+    Write-Host "ok: $what"
+}
+
+function Msiexec([string] $name, [string[]] $arguments) {
+    $log = Join-Path $logs "server-$name.log"
+    $process = Start-Process msiexec.exe -Wait -PassThru `
+        -ArgumentList ($arguments + @('/qn', '/l*v', "`"$log`""))
+    if ($process.ExitCode -ne 0) {
+        Get-Content $log -Tail 100
+        throw "msiexec $name exited with $($process.ExitCode)"
+    }
+    $log
+}
+
+function Service-Pid {
+    (Get-CimInstance Win32_Service -Filter "Name='MaxNinesServer'").ProcessId
+}
+
+# The sign-in page, once the server has started, which can take a while the
+# first time as it sets up its databases.
+function Check-Answering([int] $port, [string] $when) {
+    $answered = $false
+    for ($i = 0; $i -lt 90 -and -not $answered; $i++) {
+        try {
+            $response = Invoke-WebRequest "http://localhost:$port/login" -UseBasicParsing -TimeoutSec 5
+            $answered = $response.StatusCode -eq 200
+        } catch {
+            Start-Sleep -Seconds 1
+        }
+    }
+    if (-not $answered) {
+        Get-ChildItem (Join-Path $data 'logs') -File -ErrorAction SilentlyContinue |
+            ForEach-Object { Get-Content $_.FullName -Tail 40 }
+    }
+    Check $answered "the server answers on port $port $when"
+    Check ((Get-Service MaxNinesServer).Status -eq 'Running') "the service is running $when"
+}
+
+function Setting([string] $name) {
+    (Get-Content $config -Raw) -match "(?m)^\s*$name\s*=\s*`"([^`"]*)`"" | Out-Null
+    $Matches[1]
+}
+
+function Users {
+    @(& "$program\maxnines-server.exe" --config $config users list | Where-Object { $_ })
+}
+
+# Install, as a silent install with the questions given as properties, and the
+# link put where the finish page would open it.
+$log = Msiexec 'install' @('/i', "`"$Msi`"", 'SERVER_ADDRESS=http://localhost:9123', 'PORT=9123',
+    'ADMIN_EMAIL=admin@example.com', 'ADMIN_NAME="First Admin"', "SETUP_LINK_FILE=`"$link`"")
+
+Check-Answering 9123 'after installing'
+Check ((Get-Service MaxNinesServer).StartType -eq 'Automatic') 'the service starts with Windows'
+Check ((Setting 'listen') -eq '0.0.0.0:9123') 'the config listens on the port'
+Check ((Setting 'public_url') -eq 'ws://localhost:9123/ws') 'the config has the address, as an agent address'
+Check ((Setting 'path') -eq (Join-Path $data 'metrics.duckdb')) 'the metrics are kept with the config'
+
+$users = Users
+Check ($users.Count -eq 1 -and $users[0] -match 'admin@example.com') "the first administrator is added (found: $users)"
+$url = (Get-Content $link | Where-Object { $_ -like 'URL=*' }) -replace '^URL=', ''
+Check ($url -like 'http://localhost:9123/setup/*') "the link to set a password is saved for the finish page (found: $url)"
+$token = $url.Split('/')[-1]
+Check (-not (Select-String -Path $log -SimpleMatch $token -Quiet)) 'the link is not in the log'
+$page = Invoke-WebRequest $url -UseBasicParsing
+Check ($page.StatusCode -eq 200 -and $page.Content -match 'password') 'the link opens the page for setting a password'
+
+$remembered = Get-ItemProperty 'HKLM:\SOFTWARE\MaxNines\Server'
+Check ($remembered.SERVER_ADDRESS -eq 'http://localhost:9123' -and $remembered.PORT -eq '9123' -and $remembered.HTTPS -eq 'none') 'the settings are remembered for Modify'
+
+$acl = Get-Acl $data
+$who = $acl.Access | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique
+Check $acl.AreAccessRulesProtected 'the data folder does not inherit permissions'
+Check ((Compare-Object $who @('BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM')) -eq $null) "only Windows and administrators can open the data folder (found: $($who -join ', '))"
+
+$rule = Get-NetFirewallRule -DisplayName 'MaxNines Server' -ErrorAction SilentlyContinue
+Check ($null -ne $rule -and $rule.Direction -eq 'Inbound' -and $rule.Action -eq 'Allow') 'Windows Firewall lets the server through'
+
+$failure = sc.exe qfailure MaxNinesServer | Out-String
+Check ($failure -match 'RESTART -- Delay = 30000') "Windows restarts it 30 seconds after a failure:`n$failure"
+$path = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+Check ($path.Split(';') -contains $program) 'the program is on the PATH'
+
+# Something added by hand has to survive the installer.
+Add-Content $config "`nregistration {`n  rule `"office`" {`n    action       = `"approve`"`n    source_cidrs = [`"10.0.0.0/8`"]`n    token_file   = `"office.token`"`n  }`n}"
+
+# Modify, as Settings > Apps does without the dialogs: a new port and address.
+$before = Service-Pid
+Msiexec 'modify' @('/i', "`"$Msi`"", 'SERVER_ADDRESS=http://localhost:9124', 'PORT=9124') | Out-Null
+Check-Answering 9124 'after Modify'
+Check ((Service-Pid) -ne $before) 'Modify restarts the service'
+Check ((Setting 'public_url') -eq 'ws://localhost:9124/ws') 'Modify changes the address'
+Check ((Get-Content $config -Raw) -match 'rule "office"') 'Modify keeps what was added by hand'
+Check ((Users).Count -eq 1) 'Modify adds nobody'
+
+# The port changed by hand, which the server remembers when it restarts.
+(Get-Content $config -Raw).Replace('0.0.0.0:9124', '0.0.0.0:9125').Replace('localhost:9124', 'localhost:9125') |
+    Set-Content $config -NoNewline
+Restart-Service MaxNinesServer
+Check-Answering 9125 'after a change by hand'
+Check ((Get-ItemProperty 'HKLM:\SOFTWARE\MaxNines\Server').PORT -eq '9125') 'a port set by hand is remembered for Modify'
+
+# An upgrade, without saying anything again.
+Msiexec 'upgrade' @('/i', "`"$Upgrade`"") | Out-Null
+Check-Answering 9125 'after upgrading'
+Check ((Get-Content $config -Raw) -match 'rule "office"') 'upgrading keeps what was added by hand'
+Check ((Users).Count -eq 1) 'upgrading keeps the users'
+$products = Get-CimInstance Win32_Product -Filter "Name='MaxNines Server'"
+Check (@($products).Count -eq 1) 'upgrading replaces the old version'
+
+# Uninstall.
+Msiexec 'uninstall' @('/x', "`"$Upgrade`"") | Out-Null
+Check ($null -eq (Get-Service MaxNinesServer -ErrorAction SilentlyContinue)) 'uninstalling removes the service'
+Check ($null -eq (Get-NetFirewallRule -DisplayName 'MaxNines Server' -ErrorAction SilentlyContinue)) 'uninstalling removes the firewall rule'
+Check (Test-Path $config) 'uninstalling keeps the config'
+Check (Test-Path (Join-Path $data 'maxnines.sqlite')) 'uninstalling keeps the databases'
+$path = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+Check (-not ($path.Split(';') -contains $program)) 'uninstalling takes the program off the PATH'
+
+Write-Host 'The installer works.'
