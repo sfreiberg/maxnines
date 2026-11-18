@@ -2,7 +2,7 @@
 # what it did: the service, the config it wrote, who can read it, and that the
 # token stays out of the log. Then Modify, an upgrade and an uninstall.
 #
-#   packaging/windows/test-install.ps1 -Msi maxnines-agent.msi -Upgrade newer.msi
+#   packaging/windows/test-agent-install.ps1 -Msi maxnines-agent.msi -Upgrade newer.msi
 #
 # The server it points at isn't there, which the agent copes with by retrying.
 param(
@@ -11,6 +11,9 @@ param(
     [Parameter(Mandatory)] [string] $Upgrade
 )
 $ErrorActionPreference = 'Stop'
+# msiexec can't open a package from a relative path.
+$Msi = (Resolve-Path $Msi).Path
+$Upgrade = (Resolve-Path $Upgrade).Path
 
 $data = 'C:\ProgramData\MaxNines\Agent'
 $config = Join-Path $data 'agent.hcl'
@@ -60,7 +63,7 @@ Check ($service.StartType -eq 'Automatic') 'the service starts with Windows'
 Check ((Url-In-Config) -eq 'ws://127.0.0.1:9/ws') 'the config has the server, as an agent address'
 Check ((Get-Content (Join-Path $data 'enrollment.token') -Raw) -eq $token) 'the token is saved'
 Check (-not (Select-String -Path $log -SimpleMatch $token -Quiet)) 'the token is not in the log'
-Check ((Get-ItemProperty 'HKLM:\SOFTWARE\MaxNines\Agent').ServerUrl -eq 'ws://127.0.0.1:9/ws') 'the server is remembered for Modify'
+Check ((Get-ItemProperty 'HKLM:\SOFTWARE\MaxNines\Agent').SERVER_URL -eq 'http://127.0.0.1:9') 'the server is remembered for Modify, as it was typed'
 
 $acl = Get-Acl $data
 $who = $acl.Access | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique
@@ -99,10 +102,17 @@ Check ((Get-Content $config -Raw) -match 'added = "by hand"') 'Modify keeps what
 Check ((Get-Content (Join-Path $data 'enrollment.token') -Raw) -eq $token) 'Modify without a token keeps the one there is'
 Check ((Service-Pid) -ne $before) 'Modify restarts the service'
 
+# The server changed by hand, which the agent remembers when it restarts.
+(Get-Content $config -Raw).Replace('wss://example.invalid/ws', 'wss://by-hand.invalid/ws') |
+    Set-Content $config -NoNewline
+Restart-Service MaxNinesAgent
+Start-Sleep -Seconds 5
+Check ((Get-ItemProperty 'HKLM:\SOFTWARE\MaxNines\Agent').SERVER_URL -eq 'https://by-hand.invalid') 'a server set by hand is remembered for Modify'
+
 # An upgrade, without saying the server again.
 Msiexec 'upgrade' @('/i', "`"$Upgrade`"") | Out-Null
 Check-Running 'after upgrading'
-Check ((Url-In-Config) -eq 'wss://example.invalid/ws') 'upgrading keeps the server'
+Check ((Url-In-Config) -eq 'wss://by-hand.invalid/ws') 'upgrading keeps the server set by hand'
 Check ((Get-Content $config -Raw) -match 'added = "by hand"') 'upgrading keeps what was added by hand'
 $products = Get-CimInstance Win32_Product -Filter "Name='MaxNines Agent'"
 Check (@($products).Count -eq 1) 'upgrading replaces the old version'

@@ -31,11 +31,11 @@
 
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/sfreiberg/maxnines" />
 
-    <!-- The server, remembered for Modify and upgrades by the configure command.
-         One given on the command line wins over the remembered one. -->
+    <!-- The server, which the agent remembers for Modify whenever it starts, from
+         its config. One given on the command line wins over the remembered one. -->
     <Property Id="SERVER_URL" Secure="yes">
       <RegistrySearch Id="RememberedServerUrl" Root="HKLM" Key="SOFTWARE\MaxNines\Agent"
-                      Name="ServerUrl" Type="raw" Bitness="always64" />
+                      Name="SERVER_URL" Type="raw" Bitness="always64" />
     </Property>
     <SetProperty Id="CMDLINE_SERVER_URL" Value="[SERVER_URL]" Before="AppSearch" Sequence="first" />
     <SetProperty Id="SERVER_URL" Value="[CMDLINE_SERVER_URL]" After="AppSearch" Sequence="first"
@@ -105,16 +105,17 @@
     </Feature>
 
     <!-- Writes the config once the program is there, before the service starts.
-         The command line holds the token, so it's kept out of the log. -->
+         The command line holds the token, so it's kept out of the log. Upgrades
+         and repairs leave the config alone unless given something to change. -->
     <SetProperty Id="ConfigureAgent"
                  Value="&quot;[#AgentExe]&quot; --config &quot;[AgentData]agent.hcl&quot; configure --server-url &quot;[SERVER_URL]&quot; --token &quot;[ENROLLMENT_TOKEN]&quot;"
                  Before="ConfigureAgent" Sequence="execute"
-                 Condition="NOT REMOVE~=&quot;ALL&quot; AND SERVER_URL" />
+                 Condition="NOT REMOVE~=&quot;ALL&quot; AND NOT REINSTALL AND SERVER_URL AND (NOT WIX_UPGRADE_DETECTED OR CMDLINE_SERVER_URL OR ENROLLMENT_TOKEN)" />
     <CustomAction Id="ConfigureAgent" DllEntry="WixQuietExec" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
                   Execute="deferred" Impersonate="no" Return="check" HideTarget="yes" />
     <InstallExecuteSequence>
       <Custom Action="ConfigureAgent" Before="StartServices"
-              Condition="NOT REMOVE~=&quot;ALL&quot; AND SERVER_URL" />
+              Condition="NOT REMOVE~=&quot;ALL&quot; AND NOT REINSTALL AND SERVER_URL AND (NOT WIX_UPGRADE_DETECTED OR CMDLINE_SERVER_URL OR ENROLLMENT_TOKEN)" />
     </InstallExecuteSequence>
 
     <UI Id="AgentUI">

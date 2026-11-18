@@ -102,6 +102,26 @@ impl Address {
     }
 }
 
+/// An agent address as people would open the server in a browser, for the
+/// installer to show: `/ws` dropped and the scheme swapped. One that doesn't end
+/// in `/ws` is kept as it is, which the installer also accepts.
+pub fn browser_address(agent_url: &str) -> String {
+    let swapped = agent_url
+        .strip_prefix("wss://")
+        .map(|rest| ("https://", rest))
+        .or_else(|| {
+            agent_url
+                .strip_prefix("ws://")
+                .map(|rest| ("http://", rest))
+        });
+    match swapped {
+        Some((scheme, rest)) if rest.ends_with("/ws") => {
+            format!("{scheme}{}", &rest[..rest.len() - 3])
+        }
+        _ => agent_url.to_string(),
+    }
+}
+
 /// Reads a config file, if there is one yet.
 pub fn read(path: &Path) -> Result<Option<String>> {
     match std::fs::read_to_string(path) {
@@ -245,6 +265,18 @@ mod tests {
         assert_eq!((address.host(), address.port()), ("MAXNINES", 9000));
         let address = Address::parse("ws://[::1]/ws").unwrap();
         assert_eq!((address.host(), address.port()), ("::1", 80));
+    }
+
+    #[test]
+    fn the_installer_shows_what_was_typed() {
+        for address in [
+            "https://monitor.example.com",
+            "http://MAXNINES:9000",
+            "https://example.com/maxnines",
+            "ws://10.0.0.5:9000/agents",
+        ] {
+            assert_eq!(browser_address(&agent_url(address)), address);
+        }
     }
 
     #[test]

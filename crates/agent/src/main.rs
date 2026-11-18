@@ -188,14 +188,14 @@ fn main() -> Result<()> {
         #[cfg(windows)]
         Command::Service(ServiceCommand::Uninstall) => service::uninstall(&SERVICE),
         #[cfg(windows)]
-        Command::Service(ServiceCommand::Run) => service::run(&SERVICE, &cli.config, run),
+        Command::Service(ServiceCommand::Run) => service::run(&SERVICE, &cli.config, |path| {
+            remember_for_installer(&path);
+            run(path)
+        }),
         #[cfg(windows)]
         Command::Configure { server_url, token } => {
-            let url = configure::write(&cli.config, &server_url, token.as_deref())?;
-            maxnines_protocol::config_file::remember_for_installer(
-                "Agent",
-                &[("ServerUrl", &url)],
-            )?;
+            configure::write(&cli.config, &server_url, token.as_deref())?;
+            remember_for_installer(&cli.config);
             service::restart_if_running(&SERVICE)
         }
         Command::Version => {
@@ -233,6 +233,24 @@ fn main() -> Result<()> {
             print_identity(&identity);
             Ok(())
         }
+    }
+}
+
+/// Saves the server for the installer to show in Modify, from the config, so it
+/// stays right after the file's edited by hand.
+#[cfg(windows)]
+fn remember_for_installer(path: &Path) {
+    use maxnines_protocol::config_file;
+
+    let saved = Config::load(path).and_then(|config| {
+        let address = config_file::browser_address(&config.server.url);
+        config_file::remember_for_installer("Agent", &[("SERVER_URL", &address)])
+    });
+    if let Err(error) = saved {
+        warn!(
+            error = format!("{error:#}"),
+            "couldn't save the settings for the installer"
+        );
     }
 }
 
