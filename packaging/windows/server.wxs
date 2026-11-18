@@ -78,7 +78,11 @@
     <Feature Id="Server" Title="MaxNines Server">
       <Component Directory="INSTALLFOLDER">
         <File Id="ServerExe" Source="$(var.Program)" Name="maxnines-server.exe" KeyPath="yes" />
-        <!-- Windows restarts it 30 seconds after a failure, stopping with an error
+        <!-- It runs as its own account, which Windows makes for the service and
+             which can do almost nothing but what it's given here: its data folder
+             and its registry key. Its ID, S-1-5-80-4185855007-1177842744-2721872280-2574161336-224657692, comes from
+             the service's name, which is how it's given them before it exists.
+             Windows restarts it 30 seconds after a failure, stopping with an error
              included, and gives it a minute to save everything at shutdown. -->
         <ServiceInstall Name="MaxNinesServer"
                         DisplayName="MaxNines Server"
@@ -87,6 +91,7 @@
                         Start="auto"
                         ErrorControl="normal"
                         Arguments="--config &quot;[ServerData]server.hcl&quot; service run"
+                        Account="NT SERVICE\MaxNinesServer"
                         Vital="yes">
           <ServiceConfig PreShutdownDelay="60000"
                          FailureActionsWhen="failedToStopOrReturnedError"
@@ -109,20 +114,25 @@
         <File Source="$(var.License)" Name="LICENSE.txt" KeyPath="yes" />
       </Component>
 
-      <!-- So maxnines-server works in any command prompt, for adding users. -->
+      <!-- So maxnines-server works in any command prompt, for adding users. The
+           key is where the server saves its settings for Modify, which the
+           installer reads as whoever runs it. -->
       <Component Id="PathEntry" Directory="INSTALLFOLDER" Guid="9256D95A-943D-41DB-BF06-10FBD33861BE">
-        <RegistryValue Root="HKLM" Key="SOFTWARE\MaxNines\Server" Name="InstallFolder"
-                       Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+        <RegistryKey Root="HKLM" Key="SOFTWARE\MaxNines\Server">
+          <RegistryValue Name="InstallFolder" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+          <PermissionEx Sddl="D:PAI(A;CI;KA;;;SY)(A;CI;KA;;;BA)(A;CI;KR;;;BU)(A;CI;0x2001f;;;S-1-5-80-4185855007-1177842744-2721872280-2574161336-224657692)" />
+        </RegistryKey>
         <RemoveRegistryKey Root="HKLM" Key="SOFTWARE\MaxNines\Server" Action="removeOnUninstall" />
         <Environment Id="Path" Name="PATH" Value="[INSTALLFOLDER]" Part="last" Action="set"
                      System="yes" Permanent="no" />
       </Component>
 
-      <!-- Holds the config and the databases, so only Windows and administrators
-           can get in. -->
+      <!-- Holds the config and the databases, so only Windows, administrators and
+           the server can get in. The server can change what's inside but not who
+           can. -->
       <Component Id="DataFolder" Directory="ServerData" Guid="8036C532-D4FB-4D3B-8EE1-47CDE2132BB8">
         <CreateFolder>
-          <PermissionEx Sddl="D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />
+          <PermissionEx Sddl="D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;S-1-5-80-4185855007-1177842744-2721872280-2574161336-224657692)" />
         </CreateFolder>
       </Component>
     </Feature>

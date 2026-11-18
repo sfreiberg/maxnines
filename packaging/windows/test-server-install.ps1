@@ -44,11 +44,11 @@ function Service-Pid {
 
 # The sign-in page, once the server has started, which can take a while the
 # first time as it sets up its databases.
-function Check-Answering([int] $port, [string] $when) {
+function Check-Answering([int] $port, [string] $when, [string] $scheme = 'http') {
     $answered = $false
     for ($i = 0; $i -lt 90 -and -not $answered; $i++) {
         try {
-            $response = Invoke-WebRequest "http://localhost:$port/login" -UseBasicParsing -TimeoutSec 5
+            $response = Invoke-WebRequest "${scheme}://localhost:$port/login" -UseBasicParsing -TimeoutSec 5 -SkipCertificateCheck
             $answered = $response.StatusCode -eq 200
         } catch {
             Start-Sleep -Seconds 1
@@ -58,7 +58,7 @@ function Check-Answering([int] $port, [string] $when) {
         Get-ChildItem (Join-Path $data 'logs') -File -ErrorAction SilentlyContinue |
             ForEach-Object { Get-Content $_.FullName -Tail 40 }
     }
-    Check $answered "the server answers on port $port $when"
+    Check $answered "the server answers $scheme on port $port $when"
     Check ((Get-Service MaxNinesServer).Status -eq 'Running') "the service is running $when"
 }
 
@@ -78,6 +78,8 @@ $log = Msiexec 'install' @('/i', "`"$Msi`"", 'SERVER_ADDRESS=http://localhost:91
 
 Check-Answering 9123 'after installing'
 Check ((Get-Service MaxNinesServer).StartType -eq 'Automatic') 'the service starts with Windows'
+$account = (Get-CimInstance Win32_Service -Filter "Name='MaxNinesServer'").StartName
+Check ($account -eq 'NT SERVICE\MaxNinesServer') "the service runs as its own account (found: $account)"
 Check ((Setting 'listen') -eq '0.0.0.0:9123') 'the config listens on the port'
 Check ((Setting 'public_url') -eq 'ws://localhost:9123/ws') 'the config has the address, as an agent address'
 Check ((Setting 'path') -eq (Join-Path $data 'metrics.duckdb')) 'the metrics are kept with the config'
@@ -97,7 +99,9 @@ Check ($remembered.SERVER_ADDRESS -eq 'http://localhost:9123' -and $remembered.P
 $acl = Get-Acl $data
 $who = $acl.Access | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique
 Check $acl.AreAccessRulesProtected 'the data folder does not inherit permissions'
-Check ((Compare-Object $who @('BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM')) -eq $null) "only Windows and administrators can open the data folder (found: $($who -join ', '))"
+Check ((Compare-Object $who @('BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM', 'NT SERVICE\MaxNinesServer')) -eq $null) "only Windows, administrators and the server can open the data folder (found: $($who -join ', '))"
+$own = $acl.Access | Where-Object { $_.IdentityReference.Value -eq 'NT SERVICE\MaxNinesServer' }
+Check (-not ($own.FileSystemRights -band [Security.AccessControl.FileSystemRights]::ChangePermissions)) 'the server cannot change who can open its data folder'
 
 $rule = Get-NetFirewallRule -DisplayName 'MaxNines Server' -ErrorAction SilentlyContinue
 Check ($null -ne $rule -and $rule.Direction -eq 'Inbound' -and $rule.Action -eq 'Allow') 'Windows Firewall lets the server through'
@@ -126,9 +130,28 @@ Restart-Service MaxNinesServer
 Check-Answering 9125 'after a change by hand'
 Check ((Get-ItemProperty 'HKLM:\SOFTWARE\MaxNines\Server').PORT -eq '9125') 'a port set by hand is remembered for Modify'
 
+# HTTPS from a certificate in a folder only administrators can open, which
+# the server's own account can't read until the installer lets it.
+$certs = 'C:\maxnines-test-certs'
+New-Item -ItemType Directory -Force $certs | Out-Null
+icacls $certs /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+$rsa = [Security.Cryptography.RSA]::Create(2048)
+$request = [Security.Cryptography.X509Certificates.CertificateRequest]::new('CN=localhost', $rsa,
+    [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)
+$names = [Security.Cryptography.X509Certificates.SubjectAlternativeNameBuilder]::new()
+$names.AddDnsName('localhost')
+$request.CertificateExtensions.Add($names.Build())
+$certificate = $request.CreateSelfSigned([DateTimeOffset]::Now.AddDays(-1), [DateTimeOffset]::Now.AddDays(30))
+Set-Content (Join-Path $certs 'server.crt') $certificate.ExportCertificatePem()
+Set-Content (Join-Path $certs 'server.key') $rsa.ExportPkcs8PrivateKeyPem()
+Msiexec 'https' @('/i', "`"$Msi`"", 'SERVER_ADDRESS=https://localhost:9126', 'PORT=9126', 'HTTPS=files',
+    "CERTIFICATE_FILE=$certs\server.crt", "KEY_FILE=$certs\server.key") | Out-Null
+Check-Answering 9126 'with a certificate only administrators could read' 'https'
+Check ((Get-ItemProperty 'HKLM:\SOFTWARE\MaxNines\Server').HTTPS -eq 'files') 'HTTPS from files is remembered for Modify'
+
 # An upgrade, without saying anything again.
 Msiexec 'upgrade' @('/i', "`"$Upgrade`"") | Out-Null
-Check-Answering 9125 'after upgrading'
+Check-Answering 9126 'after upgrading' 'https'
 Check ((Get-Content $config -Raw) -match 'rule "office"') 'upgrading keeps what was added by hand'
 Check ((Users).Count -eq 1) 'upgrading keeps the users'
 $products = Get-CimInstance Win32_Product -Filter "Name='MaxNines Server'"

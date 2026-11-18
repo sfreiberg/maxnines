@@ -97,6 +97,20 @@ the administrator has a default:
 msiexec /i maxnines-server-<version>-x86_64-pc-windows-msvc.msi SERVER_ADDRESS=https://monitor.example.com PORT=443 HTTPS=automatic ACME_EMAIL=you@example.com ADMIN_EMAIL=you@example.com ADMIN_NAME="Your Name" /qn
 ```
 
+The server runs as its own account, `NT SERVICE\MaxNinesServer`, which Windows makes
+for the service and which can open little but its data folder. The installer lets it
+read the certificate and key you give it, wherever they are. If you point
+`server.hcl` at other files by hand, such as a `password_file` or a registration
+rule's `token_file`, put them in `C:\ProgramData\MaxNines\Server` or let the
+account read them:
+
+```powershell
+icacls C:\path\to\file /grant "NT SERVICE\MaxNinesServer:R"
+```
+
+The same goes for a renewed certificate: copying it over the old file keeps the
+permission, but deleting the old one first loses it.
+
 `HTTPS` is `none`, `automatic` or `files`, with `CERTIFICATE_FILE` and `KEY_FILE`. A
 silent install doesn't keep the link for setting a password, so get it from a command
 prompt opened as administrator:

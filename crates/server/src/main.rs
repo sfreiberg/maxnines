@@ -174,6 +174,15 @@ fn configure_for_installer(path: &Path, arguments: ConfigureArgs) -> Result<()> 
         key_file: given(arguments.key_file).map(PathBuf::from),
     };
     let config = configure::write(path, &settings)?;
+    // The service runs as its own account, which can't otherwise read files
+    // only administrators can.
+    for file in [&settings.certificate_file, &settings.key_file]
+        .into_iter()
+        .flatten()
+    {
+        configure::let_service_read(file)
+            .with_context(|| format!("letting the service read {}", file.display()))?;
+    }
     remember_for_installer(&config)?;
 
     if let Some(email) = given(arguments.admin_email) {

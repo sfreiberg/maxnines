@@ -13,6 +13,12 @@ use maxnines_protocol::config_file::{self, Address, block, path_text, set};
 
 use crate::config::Config;
 
+/// The account the Windows service runs as, `NT SERVICE\MaxNinesServer`, which
+/// Windows makes from the service's name. The installer gives it the data folder
+/// and its registry key, before the service exists.
+pub const SERVICE_ACCOUNT_SID: &str =
+    "S-1-5-80-4185855007-1177842744-2721872280-2574161336-224657692";
+
 /// The config written when there isn't one yet.
 const TEMPLATE: &str = include_str!("../../../packaging/windows/server.hcl");
 
@@ -185,6 +191,97 @@ pub fn installer_settings(config: &Config) -> Vec<(&'static str, String)> {
         ),
         ("KEY_FILE", text(tls.and_then(|tls| tls.key_file.as_ref()))),
     ]
+}
+
+/// Lets the service's account read a file the installer was given, such as the
+/// certificate and key, wherever they are. The rest of who can read it stays.
+#[cfg(windows)]
+pub fn let_service_read(path: &Path) -> Result<()> {
+    use std::ffi::{OsStr, c_void};
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::null_mut;
+
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
+        NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW,
+        TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE, PSECURITY_DESCRIPTOR, PSID,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
+
+    /// Memory Windows handed over, given back when done with.
+    struct Local(*mut c_void);
+    impl Drop for Local {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: Windows allocated it for this, and nothing uses it after.
+                unsafe { LocalFree(self.0) };
+            }
+        }
+    }
+    let succeeded = |code: u32| {
+        anyhow::ensure!(
+            code == ERROR_SUCCESS,
+            std::io::Error::from_raw_os_error(code as i32)
+        );
+        Ok(())
+    };
+    let wide = |text: &OsStr| -> Vec<u16> { text.encode_wide().chain(Some(0)).collect() };
+    let name = wide(path.as_os_str());
+    let sid_text = wide(OsStr::new(SERVICE_ACCOUNT_SID));
+
+    // SAFETY: every string passed ends in a 0, every pointer Windows fills in is
+    // freed by a guard once nothing uses it, and the old list is only read.
+    unsafe {
+        let mut sid: PSID = null_mut();
+        anyhow::ensure!(
+            ConvertStringSidToSidW(sid_text.as_ptr(), &mut sid) != 0,
+            std::io::Error::last_os_error()
+        );
+        let _sid = Local(sid);
+
+        let mut old: *mut ACL = null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+        succeeded(GetNamedSecurityInfoW(
+            name.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut old,
+            null_mut(),
+            &mut descriptor,
+        ))?;
+        let _descriptor = Local(descriptor);
+
+        let reading = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: FILE_GENERIC_READ,
+            grfAccessMode: GRANT_ACCESS,
+            grfInheritance: NO_INHERITANCE,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: null_mut(),
+                MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_UNKNOWN,
+                ptstrName: sid.cast(),
+            },
+        };
+        let mut new: *mut ACL = null_mut();
+        succeeded(SetEntriesInAclW(1, &reading, old, &mut new))?;
+        let _new = Local(new.cast());
+        succeeded(SetNamedSecurityInfoW(
+            name.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            new,
+            null_mut(),
+        ))
+    }
 }
 
 /// A shortcut that opens `url`, which Windows opens in the browser.
@@ -364,6 +461,25 @@ registration {
         assert_eq!(shown[0].1, "https://m.example.com:8443");
         assert_eq!(shown[2].1, "files");
         assert_eq!(shown[4].1, "/certs/m.crt");
+    }
+
+    #[test]
+    fn the_service_account_is_the_one_windows_makes_for_the_service() {
+        let name: Vec<u8> = "MAXNINESSERVER"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let hash = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &name);
+        let parts: Vec<String> = hash
+            .as_ref()
+            .chunks(4)
+            .map(|four| u32::from_le_bytes(four.try_into().unwrap()).to_string())
+            .collect();
+        assert_eq!(SERVICE_ACCOUNT_SID, format!("S-1-5-80-{}", parts.join("-")));
+
+        let installer = include_str!("../../../packaging/windows/server.wxs");
+        assert!(installer.contains(r#"Account="NT SERVICE\MaxNinesServer""#));
+        assert!(installer.matches(SERVICE_ACCOUNT_SID).count() >= 2);
     }
 
     #[test]
