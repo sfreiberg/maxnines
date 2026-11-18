@@ -28,7 +28,7 @@ use crate::presence::Reach;
 use crate::registration::{HostRecord, HostState, short_id};
 use crate::rule_engine;
 use crate::silences::{ActiveSilences, Cover, Silence, SilenceInput};
-use crate::times::format_time;
+use crate::times::{format_time, lasting};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -496,10 +496,12 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         Err(error) => return server_error(&error),
     };
     let here: Vec<&Alert> = open.iter().filter(|alert| alert.host_id == id).collect();
+    let now = now_ms();
     let alerts: Vec<OpenAlert> = here
         .iter()
         .map(|&alert| OpenAlert {
-            since: local_time(alert.began_ms(&rules)),
+            lasted: lasting(u64::try_from(now - alert.began_ms(&rules)).unwrap_or(0)),
+            began: local_time(alert.began_ms(&rules)),
             alert,
         })
         .collect();
@@ -826,13 +828,14 @@ async fn delete(State(state): State<AppState>, Path(id): Path<String>, form: Csr
     }
 }
 
-/// An open alert on the host's page, with when its problem began.
+/// An open alert on the host's page, with how long its problem has lasted.
 #[derive(Serialize)]
 struct OpenAlert<'a> {
     #[serde(flatten)]
     alert: &'a Alert,
-    /// Where the viewer is.
-    since: String,
+    lasted: String,
+    /// When it began, where the viewer is.
+    began: String,
 }
 
 #[cfg(test)]

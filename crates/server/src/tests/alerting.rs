@@ -774,9 +774,10 @@ async fn an_agent_going_offline_alerts_after_the_wait() {
     assert_eq!(open[0].summary, "web-1 is offline");
     assert_eq!(open[0].series, "");
 
-    // The pages say since when, in the viewer's time zone, which is UTC here.
+    // The pages say how long, and since when in the viewer's time zone, which is
+    // UTC here. The clock hasn't moved on as far as the test pretends.
     let since = format!(
-        "since {}",
+        "title=\"Since {}\">for less than a minute<",
         crate::times::format_time(gone as u64, chrono_tz::Tz::UTC)
     );
     for path in ["/".to_string(), format!("/hosts/{}", test.id())] {

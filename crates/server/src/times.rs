@@ -33,6 +33,28 @@ pub fn format_date(ms: u64, zone: Tz) -> String {
     }
 }
 
+/// How long something has lasted, in its two largest units, such as "1 day and 13
+/// hours", which says enough at a glance without counting seconds.
+pub fn lasting(ms: u64) -> String {
+    let plural = |count: u64, unit: &str| match count {
+        1 => format!("1 {unit}"),
+        _ => format!("{count} {unit}s"),
+    };
+    let minutes = ms / 60_000;
+    let (days, hours, minutes) = (minutes / 1440, minutes / 60 % 24, minutes % 60);
+    let (larger, smaller) = match (days, hours) {
+        (0, 0) if minutes == 0 => return "less than a minute".to_string(),
+        (0, 0) => return plural(minutes, "minute"),
+        (0, _) => (plural(hours, "hour"), plural(minutes, "minute")),
+        _ => (plural(days, "day"), plural(hours, "hour")),
+    };
+    if smaller.starts_with("0 ") {
+        larger
+    } else {
+        format!("{larger} and {smaller}")
+    }
+}
+
 /// In the largest unit that makes sense, as "3 minutes ago" reads better than a
 /// timestamp when you're only asking how recent something is.
 pub fn ago(ms: u64, now_ms: u64) -> String {
@@ -90,6 +112,22 @@ mod tests {
         assert_eq!(format_date(NOV_14_2023, Tz::UTC), "2023-11-14");
         // Already the next day there.
         assert_eq!(format_date(NOV_14_2023, Tz::Asia__Kolkata), "2023-11-15");
+    }
+
+    #[test]
+    fn how_long_is_said_in_two_units_at_most() {
+        const MINUTE: u64 = 60_000;
+        assert_eq!(lasting(59_999), "less than a minute");
+        assert_eq!(lasting(MINUTE), "1 minute");
+        assert_eq!(lasting(59 * MINUTE + 59_999), "59 minutes");
+        assert_eq!(lasting(60 * MINUTE), "1 hour");
+        assert_eq!(lasting(125 * MINUTE), "2 hours and 5 minutes");
+        assert_eq!(lasting(1440 * MINUTE), "1 day");
+        assert_eq!(
+            lasting((1440 + 13 * 60 + 59) * MINUTE),
+            "1 day and 13 hours"
+        );
+        assert_eq!(lasting(3 * 1440 * MINUTE + MINUTE), "3 days");
     }
 
     #[test]
