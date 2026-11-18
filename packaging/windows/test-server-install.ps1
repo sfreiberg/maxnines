@@ -62,9 +62,10 @@ function Check-Answering([int] $port, [string] $when, [string] $scheme = 'http')
     Check ((Get-Service MaxNinesServer).Status -eq 'Running') "the service is running $when"
 }
 
+# A setting's value as text, with HCL's doubled backslashes undone.
 function Setting([string] $name) {
     (Get-Content $config -Raw) -match "(?m)^\s*$name\s*=\s*`"([^`"]*)`"" | Out-Null
-    $Matches[1]
+    $Matches[1].Replace('\\', '\')
 }
 
 function Users {
