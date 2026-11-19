@@ -3927,7 +3927,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "maxnines-agent"
-version = "0.1.0-alpha.7"
+version = "0.1.0-alpha.8"
 dependencies = [
  "anyhow",
  "bollard",
@@ -3961,7 +3961,7 @@ dependencies = [
 
 [[package]]
 name = "maxnines-checks"
-version = "0.1.0-alpha.7"
+version = "0.1.0-alpha.8"
 dependencies = [
  "anyhow",
  "async-imap",
@@ -3995,7 +3995,7 @@ dependencies = [
 
 [[package]]
 name = "maxnines-cli"
-version = "0.1.0-alpha.7"
+version = "0.1.0-alpha.8"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4017,7 +4017,7 @@ dependencies = [
 
 [[package]]
 name = "maxnines-collectors"
-version = "0.1.0-alpha.7"
+version = "0.1.0-alpha.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4035,7 +4035,7 @@ dependencies = [
 
 [[package]]
 name = "maxnines-loadtest"
-version = "0.1.0-alpha.7"
+version = "0.1.0-alpha.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4057,7 +4057,7 @@ dependencies = [
 
 [[package]]
 name = "maxnines-protocol"
-version = "0.1.0-alpha.7"
+version = "0.1.0-alpha.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4079,7 +4079,7 @@ dependencies = [
 
 [[package]]
 name = "maxnines-server"
-version = "0.1.0-alpha.7"
+version = "0.1.0-alpha.8"
 dependencies = [
  "anyhow",
  "argon2",
