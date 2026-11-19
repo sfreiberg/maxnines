@@ -3633,6 +3633,7 @@ async fn a_channel_that_is_down_does_not_hold_up_the_others() {
         value: Some(99.0),
         summary: format!("{series} on web-1 is 99% full"),
         started_ms: test.now,
+        breached_ms: test.now,
     };
     for n in 0..600 {
         test.database()
@@ -4829,6 +4830,7 @@ async fn names_from_agents_are_escaped_on_the_alerts_page() {
                 value: None,
                 summary: format!("{hostname} is offline"),
                 started_ms: 1000,
+                breached_ms: 1000,
             },
             &[],
         )
@@ -6113,6 +6115,7 @@ mod silences {
             value: Some(0.0),
             summary: "Service nginx.service is failed".to_string(),
             started_ms: now_ms() - 30_000,
+            breached_ms: now_ms() - 30_000,
         };
         database.fire_alert(&new, &[]).await.unwrap();
 
@@ -6735,6 +6738,7 @@ mod pages {
             value: None,
             summary: summary.to_string(),
             started_ms: 1000,
+            breached_ms: 1000,
         }
     }
 
@@ -7513,6 +7517,7 @@ mod charts {
             value: Some(95.0),
             summary: format!("Disk usage ({series}) on web-1 is 95%, above 90%"),
             started_ms: now_ms() - 30_000,
+            breached_ms: now_ms() - 30_000,
         };
         let id = database.fire_alert(&new, channels).await.unwrap();
         database.get_alert(id).await.unwrap().unwrap()
@@ -7670,6 +7675,7 @@ mod charts {
             value: None,
             summary: "web-1 is offline".to_string(),
             started_ms: now_ms() - 30_000,
+            breached_ms: now_ms() - 30_000,
         };
         let id = database.fire_alert(&new, &[]).await.unwrap();
 

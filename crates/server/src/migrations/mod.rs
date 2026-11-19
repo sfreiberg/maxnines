@@ -8,7 +8,62 @@ pub struct Migrator;
 
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(CreateTables)]
+        vec![Box::new(CreateTables), Box::new(AddAlertsBreachedMs)]
+    }
+}
+
+/// When the problem behind an alert began, which is earlier than the alert started
+/// by however long its rule waits before firing. Alerts from before this have it
+/// worked out from their rule's wait as it is now, or the start, if their rule's gone.
+struct AddAlertsBreachedMs;
+
+impl MigrationName for AddAlertsBreachedMs {
+    fn name(&self) -> &str {
+        "m20261119_000001_add_alerts_breached_ms"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for AddAlertsBreachedMs {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // Every database can only add a column that can't be empty with a default
+        // for the rows already there, which are filled in properly next.
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alerts::Table)
+                    .add_column(
+                        ColumnDef::new(Alerts::BreachedMs)
+                            .big_integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "UPDATE alerts SET breached_ms = started_ms - 1000 * COALESCE(
+                    (SELECT for_secs FROM alert_rules WHERE alert_rules.id = alerts.rule_id), 0)",
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alerts::Table)
+                    .drop_column(Alerts::BreachedMs)
+                    .to_owned(),
+            )
+            .await
     }
 }
 
@@ -1797,6 +1852,7 @@ enum Alerts {
     Value,
     Summary,
     StartedMs,
+    BreachedMs,
     ResolvedMs,
     ResolveReason,
     ResolvedSummary,
@@ -2100,6 +2156,39 @@ mod tests {
         let names = texts(&connection, settings).await;
         assert_eq!(names.len(), DEFAULT_SETTINGS.len());
         assert_eq!(names[0], "interval_secs");
+    }
+
+    #[tokio::test]
+    async fn alerts_from_before_learn_when_their_problem_began() {
+        let connection = fresh().await;
+        Migrator::up(&connection, Some(1)).await.unwrap();
+        // Host offline waits a minute before firing; the other rule has gone.
+        let sql = "INSERT INTO alerts (rule_id, rule_name, severity, host_id, hostname,
+                       series, summary, started_ms)
+                   SELECT r.id, r.name, 'critical', h.id, h.hostname, '', 'x', 600000
+                   FROM alert_rules r, hosts h
+                   WHERE r.name = 'Host offline' AND h.hostname = 'Fleet'
+                   UNION ALL
+                   SELECT NULL, 'Gone', 'warning', h.id, h.hostname, '', 'y', 700000
+                   FROM hosts h WHERE h.hostname = 'Fleet'";
+        connection.execute_unprepared(sql).await.unwrap();
+        let wait = texts(
+            &connection,
+            "SELECT CAST(for_secs AS TEXT) FROM alert_rules WHERE name = 'Host offline'",
+        )
+        .await;
+        let wait_ms: i64 = wait[0].parse::<i64>().unwrap() * 1000;
+
+        Migrator::up(&connection, None).await.unwrap();
+        let began = texts(
+            &connection,
+            "SELECT CAST(breached_ms AS TEXT) FROM alerts ORDER BY id",
+        )
+        .await;
+        assert_eq!(
+            began,
+            [(600_000 - wait_ms).to_string(), "700000".to_string()]
+        );
     }
 
     #[tokio::test]

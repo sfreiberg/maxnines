@@ -990,7 +990,11 @@ pub struct Alert {
     /// The reading that started the alert.
     pub value: Option<f64>,
     pub summary: String,
+    /// When the alert fired.
     pub started_ms: i64,
+    /// When the problem began, such as when a host went offline: earlier than the
+    /// alert started by however long its rule waited before firing.
+    pub breached_ms: i64,
     pub resolved_ms: Option<i64>,
     pub resolve_reason: Option<String>,
     /// Where things stood as the problem cleared, such as the reading then. Nothing
@@ -999,20 +1003,6 @@ pub struct Alert {
     /// Who said they're dealing with it.
     pub acknowledged_by: Option<String>,
     pub acknowledged_ms: Option<i64>,
-}
-
-impl Alert {
-    /// When the problem began: an alert starts once its problem has lasted the
-    /// rule's hold, so that long before, such as when a host went offline. One
-    /// whose rule is gone starts when it does.
-    pub fn began_ms(&self, rules: &[AlertRule]) -> i64 {
-        let hold_secs = rules
-            .iter()
-            .find(|rule| Some(rule.id) == self.rule_id)
-            .map_or(0, |rule| rule.rule.for_secs);
-        let hold_ms = i64::try_from(hold_secs).map_or(i64::MAX, |secs| secs.saturating_mul(1000));
-        self.started_ms.saturating_sub(hold_ms)
-    }
 }
 
 /// What's needed to start an alert.
@@ -1027,6 +1017,8 @@ pub struct NewAlert {
     pub value: Option<f64>,
     pub summary: String,
     pub started_ms: i64,
+    /// When the problem began, which the rule waited on before firing.
+    pub breached_ms: i64,
 }
 
 /// An open alert becoming a warning or critical, with what it says then.
@@ -1505,34 +1497,6 @@ mod tests {
             .unwrap(),
             "Disk usage (/data) on web-1 is 91%, above 90%"
         );
-    }
-
-    #[test]
-    fn a_problem_began_its_rules_hold_before_the_alert() {
-        let rule = AlertRule {
-            id: 7,
-            rule: offline_rule(),
-        };
-        let alert = Alert {
-            id: 1,
-            rule_id: Some(7),
-            rule_name: "Host offline".to_string(),
-            severity: Severity::Critical,
-            host_id: "a".to_string(),
-            hostname: "web-1".to_string(),
-            series: String::new(),
-            value: None,
-            summary: AlertRuleInput::offline_summary("web-1"),
-            started_ms: 1_000_000,
-            resolved_ms: None,
-            resolve_reason: None,
-            resolved_summary: None,
-            acknowledged_by: None,
-            acknowledged_ms: None,
-        };
-        assert_eq!(alert.began_ms(&[rule]), 940_000);
-        // A rule that's gone takes its hold with it.
-        assert_eq!(alert.began_ms(&[]), 1_000_000);
     }
 
     #[test]

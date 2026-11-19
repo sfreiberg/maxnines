@@ -14,6 +14,7 @@ pub struct Model {
     pub value: Option<f64>,
     pub summary: String,
     pub started_ms: i64,
+    pub breached_ms: i64,
     pub resolved_ms: Option<i64>,
     pub resolve_reason: Option<String>,
     pub resolved_summary: Option<String>,

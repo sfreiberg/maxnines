@@ -52,11 +52,10 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
     let data = async {
         let hosts = fleet::rows(&state).await?;
         let alerts = state.database.open_alerts().await?;
-        let rules = state.database.list_alert_rules().await?;
         let checks = state.database.list_remote_checks().await?;
-        anyhow::Ok((hosts, alerts, rules, checks))
+        anyhow::Ok((hosts, alerts, checks))
     };
-    let (mut hosts, alerts, rules, checks) = match data.await {
+    let (mut hosts, alerts, checks) = match data.await {
         Ok(data) => data,
         Err(error) => return server_error(&error),
     };
@@ -82,8 +81,8 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
             } else {
                 short_id(&alert.host_id).to_string()
             },
-            lasted: lasting(u64::try_from(now - alert.began_ms(&rules)).unwrap_or(0)),
-            began: local_time(alert.began_ms(&rules)),
+            lasted: lasting(u64::try_from(now - alert.breached_ms).unwrap_or(0)),
+            began: local_time(alert.breached_ms),
             summary: alert.summary,
             host_id: alert.host_id,
             hostname: alert.hostname,

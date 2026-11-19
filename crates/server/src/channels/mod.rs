@@ -249,6 +249,7 @@ pub(crate) mod testing {
             value: Some(97.0),
             summary: "CPU usage on web-1 is 97%, above 90%".to_string(),
             started_ms: 1_000,
+            breached_ms: 1_000,
             resolved_ms: None,
             resolve_reason: None,
             resolved_summary: None,

@@ -24,6 +24,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/alerts"
       "value": 97.2,
       "summary": "High CPU on web-1",
       "started_ms": 1793940279545,
+      "breached_ms": 1793939979545,
       "resolved_ms": null,
       "resolve_reason": null,
       "resolved_summary": null,
@@ -36,6 +37,11 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/alerts"
   "resolved": []
 }
 ```
+
+`started_ms` is when the alert fired, and `breached_ms` when its problem began, such
+as when a host went offline. An alert fires once its rule's condition has held for the
+rule's `for_secs`, so `breached_ms` is that much earlier, or more, as checks run on a
+schedule. It's when the page says the problem has lasted since.
 
 `silence_id` is the ID of the silence keeping an open alert's notifications back, and
 `maintenance_window_id` is the ID of the [window](api-maintenance-windows.md) doing so.

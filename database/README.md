@@ -128,7 +128,8 @@ erDiagram
         string series
         double value
         text summary
-        int started_ms
+        int started_ms "when it fired"
+        int breached_ms "when the problem began"
         int resolved_ms "empty while open"
         text resolve_reason
         text resolved_summary

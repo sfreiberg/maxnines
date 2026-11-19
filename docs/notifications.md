@@ -125,6 +125,7 @@ What a template can use:
 | `alert.series` | The disk, container or other series it's about, if any |
 | `alert.value`, `alert.summary` | The reading that started it, and what's wrong in words |
 | `alert.started`, `alert.resolved` | Times like `2026-11-10T14:03:00Z`, with `alert.started_ms` and `alert.resolved_ms` in milliseconds |
+| `alert.breached` | When the problem began, which is before it started by the rule's wait, with `alert.breached_ms` |
 | `alert.resolve_reason` | Why it resolved, such as `The problem cleared` or the rule being deleted |
 | `alert.resolved_summary` | Where things stood as the problem cleared, like `CPU usage on web-1 is now 42%, no longer above 90%`. Empty when it resolved for another reason |
 | `alert.acknowledged_by`, `alert.acknowledged` | Who acknowledged it, if anyone, and `alert.acknowledged_ms` |

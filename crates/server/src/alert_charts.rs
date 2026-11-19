@@ -409,6 +409,7 @@ mod tests {
             value: Some(85.0),
             summary: String::new(),
             started_ms: 1_700_000_000_000 - 600_000,
+            breached_ms: 1_700_000_000_000 - 600_000,
             resolved_ms: None,
             resolve_reason: None,
             resolved_summary: None,

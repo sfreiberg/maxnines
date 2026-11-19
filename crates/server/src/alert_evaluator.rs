@@ -132,6 +132,15 @@ struct Tracker {
 }
 
 impl Tracker {
+    /// When the problem began: the earliest any of its levels was crossed, and has
+    /// been since.
+    fn breached_ms(&self) -> Option<i64> {
+        self.holds
+            .iter()
+            .filter_map(|hold| hold.breached_since)
+            .min()
+    }
+
     /// The hold for a rule with one level, which an offline rule sets for itself.
     fn only_hold(&mut self) -> &mut Hold {
         self.holds.resize_with(1, Hold::default);
@@ -946,6 +955,13 @@ impl Evaluator {
                 Ok(())
             }
             Some(Change::Fire(severity)) => {
+                // A level only counts once it's held, so a problem has always begun
+                // by the time its alert fires.
+                let breached_ms = self
+                    .trackers
+                    .get(&key)
+                    .and_then(Tracker::breached_ms)
+                    .unwrap_or(snapshot.now_ms);
                 let new = NewAlert {
                     rule_id: rule.id,
                     rule_name: rule.rule.name.clone(),
@@ -956,6 +972,7 @@ impl Evaluator {
                     value,
                     summary,
                     started_ms: snapshot.now_ms,
+                    breached_ms,
                 };
                 let channels = self.channels_for(rule).await?;
                 let id = self.database.fire_alert(&new, &channels).await?;
@@ -1076,6 +1093,27 @@ mod tests {
     const FIRING: Option<Severity> = Some(C);
 
     /// A rule with one level.
+    #[test]
+    fn a_problem_breached_when_its_first_level_was_crossed() {
+        let mut tracker = Tracker::default();
+        let levels = |warning, critical| [(W, warning), (C, critical)];
+        assert_eq!(
+            tracker.observe(&levels(true, false), 1_000, 60_000, None),
+            None
+        );
+        assert_eq!(tracker.breached_ms(), Some(1_000));
+        // Worse later, it still breached when it first went wrong.
+        tracker.observe(&levels(true, true), 30_000, 60_000, None);
+        assert_eq!(
+            tracker.observe(&levels(true, true), 61_000, 60_000, None),
+            Some(Change::Fire(W))
+        );
+        assert_eq!(tracker.breached_ms(), Some(1_000));
+        // Once it's fine, there's nothing breached.
+        tracker.observe(&levels(false, false), 70_000, 60_000, Some(W));
+        assert_eq!(tracker.breached_ms(), None);
+    }
+
     fn one(breached: bool) -> [(Severity, bool); 1] {
         [(C, breached)]
     }

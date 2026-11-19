@@ -305,6 +305,7 @@ async fn alerts_and_updates_are_on_the_timeline_too() {
         value: Some(85.0),
         summary: "Disk usage of / is 85%".into(),
         started_ms: started,
+        breached_ms: started,
     };
     let alert = server.state.database.fire_alert(&new, &[]).await.unwrap();
     server

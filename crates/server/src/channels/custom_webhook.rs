@@ -104,6 +104,7 @@ fn example_alert() -> Alert {
         value: None,
         summary: Notice::test().text,
         started_ms: chrono::Utc::now().timestamp_millis(),
+        breached_ms: chrono::Utc::now().timestamp_millis(),
         resolved_ms: None,
         resolve_reason: None,
         resolved_summary: None,
@@ -143,6 +144,7 @@ fn context(notice: &Notice, web_url: Option<&str>) -> Result<Context> {
         _ => Map::new(),
     };
     fields.insert("started".into(), crate::audit::time(alert.started_ms));
+    fields.insert("breached".into(), crate::audit::time(alert.breached_ms));
     fields.insert(
         "resolved".into(),
         alert.resolved_ms.map_or(Value::Null, crate::audit::time),
@@ -504,12 +506,15 @@ mod tests {
     #[test]
     fn times_are_given_as_text_too() {
         let body = render(
-            &request("text/plain", "{{ alert.started }} {{ alert.started_ms }}"),
+            &request(
+                "text/plain",
+                "{{ alert.started }} {{ alert.started_ms }} {{ alert.breached }}",
+            ),
             &notice(Event::Firing, alert()),
             None,
         )
         .unwrap();
-        assert_eq!(body, "1970-01-01T00:00:01Z 1000");
+        assert_eq!(body, "1970-01-01T00:00:01Z 1000 1970-01-01T00:00:01Z");
     }
 
     #[test]

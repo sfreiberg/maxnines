@@ -491,17 +491,13 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         Ok(open) => open,
         Err(error) => return server_error(&error),
     };
-    let rules = match state.database.list_alert_rules().await {
-        Ok(rules) => rules,
-        Err(error) => return server_error(&error),
-    };
     let here: Vec<&Alert> = open.iter().filter(|alert| alert.host_id == id).collect();
     let now = now_ms();
     let alerts: Vec<OpenAlert> = here
         .iter()
         .map(|&alert| OpenAlert {
-            lasted: lasting(u64::try_from(now - alert.began_ms(&rules)).unwrap_or(0)),
-            began: local_time(alert.began_ms(&rules)),
+            lasted: lasting(u64::try_from(now - alert.breached_ms).unwrap_or(0)),
+            began: local_time(alert.breached_ms),
             alert,
         })
         .collect();

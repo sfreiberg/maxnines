@@ -2107,6 +2107,7 @@ mod tests {
             value: Some(91.5),
             summary: "x".repeat(5000),
             started_ms,
+            breached_ms: started_ms,
         };
         let alert = database.fire_alert(&new, &[channel]).await.unwrap();
         let open = database.open_alerts().await.unwrap();
