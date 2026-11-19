@@ -75,10 +75,10 @@ use self::audit::record_change;
 pub use self::built_in_rules::same_rule;
 pub use self::events::NewEvent;
 pub use self::stats::DatabaseStats;
-pub use self::two_factor::CHALLENGE_LIFETIME_MS;
+pub use self::two_factor::CHALLENGE_LIFETIME;
 pub use self::users::{
-    DEFAULT_THEME, SESSION_LIFETIME_MS, THEMES, User, UserChange, check_new_password,
-    check_new_user, is_theme,
+    DEFAULT_THEME, SESSION_LIFETIME, THEMES, User, UserChange, check_new_password, check_new_user,
+    is_theme,
 };
 use crate::audit::{Kind, Snapshot};
 use crate::facts::{FlatFacts, decode, encode, flatten, unflatten};
@@ -86,7 +86,7 @@ use crate::host_filter;
 use crate::migrations::Migrator;
 use crate::registration::{HostKind, HostRecord, HostState};
 use crate::roles::Role;
-use crate::times::{self, Timestamp};
+use crate::times::Timestamp;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Registry calls run one at a time, so a small pool is plenty.
@@ -312,10 +312,9 @@ impl Database {
         &self,
         host_id: &str,
         facts: &FlatFacts,
-        now_ms: u64,
+        now: Timestamp,
     ) -> Result<bool> {
         let _only_writer = self.facts_lock.lock().await;
-        let now = times::from_ms(i64::try_from(now_ms).unwrap_or(i64::MAX));
         let transaction = self.connection.begin().await.context("saving facts")?;
 
         let current = host_fact::Entity::find()
@@ -504,7 +503,7 @@ const MAX_API_KEY_NAME_LEN: usize = 100;
 const API_KEY_HINT_LEN: usize = 12;
 /// How current "last used" stays, so using a key or a signed-in app doesn't write on
 /// every request.
-const USE_ACCURACY_MS: i64 = 60_000;
+const USE_ACCURACY: chrono::TimeDelta = chrono::TimeDelta::minutes(1);
 
 /// Where a session, key or app was last used from: the address that connected, and
 /// what an untrusted proxy there said it was passing on.
@@ -530,17 +529,17 @@ impl UsedFrom {
 fn noted_use(
     last_used_at: Option<Timestamp>,
     last: &UsedFrom,
-    now_ms: i64,
+    now: Timestamp,
 ) -> Option<(Timestamp, UsedFrom)> {
-    let now = UsedFrom::now();
-    let stale = last_used_at.is_none_or(|used| now_ms - used.timestamp_millis() >= USE_ACCURACY_MS);
-    let moved = now.address.is_some() && now != *last;
-    let from = if now.address.is_some() {
-        now
+    let here = UsedFrom::now();
+    let stale = last_used_at.is_none_or(|used| now - used >= USE_ACCURACY);
+    let moved = here.address.is_some() && here != *last;
+    let from = if here.address.is_some() {
+        here
     } else {
         last.clone()
     };
-    (stale || moved).then_some((times::from_ms(now_ms), from))
+    (stale || moved).then_some((now, from))
 }
 
 /// A key for the API, without the key itself, which only exists when it's created.
@@ -567,9 +566,8 @@ pub struct ApiKey {
 }
 
 impl ApiKey {
-    pub fn has_expired(&self, now_ms: i64) -> bool {
-        self.expires_at
-            .is_some_and(|expires| now_ms >= expires.timestamp_millis())
+    pub fn has_expired(&self, now: Timestamp) -> bool {
+        self.expires_at.is_some_and(|expires| now >= expires)
     }
 }
 
@@ -603,12 +601,11 @@ pub fn check_api_key_name(name: &str) -> Result<()> {
 
 /// When a key lasting this long from now runs out. Every database keeps times up to
 /// the end of the year 9999, so one that would last longer than that is refused.
-pub fn expiry_after(secs: u64, now_ms: i64) -> Result<Timestamp> {
-    anyhow::ensure!(secs > 0, "A key has to last longer than that.");
-    i64::try_from(secs)
+pub fn expiry_after(lasting: Duration, now: Timestamp) -> Result<Timestamp> {
+    anyhow::ensure!(!lasting.is_zero(), "A key has to last longer than that.");
+    chrono::TimeDelta::from_std(lasting)
         .ok()
-        .and_then(chrono::TimeDelta::try_seconds)
-        .and_then(|lasting| times::from_ms(now_ms).checked_add_signed(lasting))
+        .and_then(|lasting| now.checked_add_signed(lasting))
         .filter(|expires| chrono::Datelike::year(expires) <= 9999)
         .context("That's too long for a key to last. Leave it out for a key that never expires.")
 }
@@ -653,7 +650,7 @@ impl Database {
         user_id: i64,
         role: Role,
         expires_at: Option<Timestamp>,
-        now_ms: i64,
+        now: Timestamp,
     ) -> Result<(ApiKey, String)> {
         let key = format!("mxn_{}", new_nonce()?);
         let transaction = self.connection.begin().await.context("saving an API key")?;
@@ -671,7 +668,7 @@ impl Database {
             role: Set(role.as_str().to_string()),
             hint: Set(key[..API_KEY_HINT_LEN].to_string()),
             token_hash: Set(api_key_hash(&key)),
-            created_at: Set(times::from_ms(now_ms)),
+            created_at: Set(now),
             expires_at: Set(expires_at),
             ..Default::default()
         }
@@ -702,7 +699,7 @@ impl Database {
     }
 
     /// Stops a key working. Returns false if there's no such key.
-    pub async fn revoke_api_key(&self, id: i64, now_ms: i64) -> Result<bool> {
+    pub async fn revoke_api_key(&self, id: i64, now: Timestamp) -> Result<bool> {
         let Some(row) = api_key::Entity::find_by_id(id)
             .one(&self.connection)
             .await
@@ -722,7 +719,7 @@ impl Database {
                 .unwrap_or_default();
             let before = api_key_snapshot(&row, &owner);
             let mut row: api_key::ActiveModel = row.into();
-            row.revoked_at = Set(Some(times::from_ms(now_ms)));
+            row.revoked_at = Set(Some(now));
             let row = row
                 .update(&transaction)
                 .await
@@ -744,17 +741,18 @@ impl Database {
 
     /// The key and who it acts as, if it still works, noting that it's been used. A
     /// key stops working while its owner is disabled.
-    pub async fn accept_api_key(&self, key: &str, now_ms: i64) -> Result<Option<(ApiKey, User)>> {
+    pub async fn accept_api_key(
+        &self,
+        key: &str,
+        now: Timestamp,
+    ) -> Result<Option<(ApiKey, User)>> {
         let row = api_key::Entity::find()
             .filter(api_key::Column::TokenHash.eq(api_key_hash(key)))
             .filter(api_key::Column::RevokedAt.is_null())
             .one(&self.connection)
             .await
             .context("checking an API key")?;
-        let Some(row) = row.filter(|row| {
-            row.expires_at
-                .is_none_or(|expires| now_ms < expires.timestamp_millis())
-        }) else {
+        let Some(row) = row.filter(|row| row.expires_at.is_none_or(|expires| now < expires)) else {
             return Ok(None);
         };
         let Some(mut owner) = users::enabled_user(&self.connection, row.user_id).await? else {
@@ -767,7 +765,7 @@ impl Database {
             address: row.last_address.clone(),
             forwarded_for: row.last_forwarded_for.clone(),
         };
-        let row = if let Some((used, from)) = noted_use(row.last_used_at, &last, now_ms) {
+        let row = if let Some((used, from)) = noted_use(row.last_used_at, &last, now) {
             let mut row: api_key::ActiveModel = row.into();
             row.last_used_at = Set(Some(used));
             row.last_address = Set(from.address);
@@ -1282,8 +1280,15 @@ impl Database {
 mod tests {
     use serde_json::json;
 
+    use chrono::TimeDelta;
+
     use super::*;
     use crate::facts::flatten;
+
+    /// `ms` milliseconds after 1970, as the tests count.
+    fn at(ms: i64) -> Timestamp {
+        crate::times::from_ms(ms)
+    }
 
     fn record(id: &str) -> HostRecord {
         HostRecord {
@@ -1316,7 +1321,12 @@ mod tests {
             return user.id;
         }
         let made = database
-            .create_user("owner@example.com", "Owner", crate::roles::Role::Admin, 0)
+            .create_user(
+                "owner@example.com",
+                "Owner",
+                crate::roles::Role::Admin,
+                at(0),
+            )
             .await;
         made.unwrap().unwrap().0.id
     }
@@ -1326,21 +1336,42 @@ mod tests {
         let database = Database::for_test().await;
         let id = owner(&database).await;
         database
-            .create_user("other@example.com", "Other", crate::roles::Role::Admin, 0)
+            .create_user(
+                "other@example.com",
+                "Other",
+                crate::roles::Role::Admin,
+                at(0),
+            )
             .await
             .unwrap();
         let (key, secret) = database
-            .create_api_key("ci", id, crate::roles::Role::Admin, None, 0)
+            .create_api_key("ci", id, crate::roles::Role::Admin, None, at(0))
             .await
             .unwrap();
         assert_eq!(key.owner, "owner@example.com");
 
-        let (_, acts_as) = database.accept_api_key(&secret, 1).await.unwrap().unwrap();
+        let (_, acts_as) = database
+            .accept_api_key(&secret, at(1))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(acts_as.id, id);
-        database.disable_user(id, 2).await.unwrap();
-        assert!(database.accept_api_key(&secret, 3).await.unwrap().is_none());
+        database.disable_user(id, at(2)).await.unwrap();
+        assert!(
+            database
+                .accept_api_key(&secret, at(3))
+                .await
+                .unwrap()
+                .is_none()
+        );
         database.enable_user(id).await.unwrap();
-        assert!(database.accept_api_key(&secret, 4).await.unwrap().is_some());
+        assert!(
+            database
+                .accept_api_key(&secret, at(4))
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -1348,19 +1379,30 @@ mod tests {
         let database = Database::for_test().await;
         let id = owner(&database).await;
         database
-            .create_user("other@example.com", "Other", crate::roles::Role::Admin, 0)
+            .create_user(
+                "other@example.com",
+                "Other",
+                crate::roles::Role::Admin,
+                at(0),
+            )
             .await
             .unwrap();
         let (_, secret) = database
-            .create_api_key("ci", id, crate::roles::Role::Admin, None, 0)
+            .create_api_key("ci", id, crate::roles::Role::Admin, None, at(0))
             .await
             .unwrap();
 
-        database.disable_user(id, 1).await.unwrap();
+        database.disable_user(id, at(1)).await.unwrap();
         database.delete_user(id).await.unwrap();
 
         assert!(database.list_api_keys().await.unwrap().is_empty());
-        assert!(database.accept_api_key(&secret, 2).await.unwrap().is_none());
+        assert!(
+            database
+                .accept_api_key(&secret, at(2))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1368,20 +1410,25 @@ mod tests {
         let database = Database::for_test().await;
         let id = owner(&database).await;
         database
-            .create_user("other@example.com", "Other", crate::roles::Role::Admin, 0)
+            .create_user(
+                "other@example.com",
+                "Other",
+                crate::roles::Role::Admin,
+                at(0),
+            )
             .await
             .unwrap();
-        database.disable_user(id, 1).await.unwrap();
+        database.disable_user(id, at(1)).await.unwrap();
 
         assert!(
             database
-                .create_api_key("ci", id, crate::roles::Role::Admin, None, 2)
+                .create_api_key("ci", id, crate::roles::Role::Admin, None, at(2))
                 .await
                 .is_err()
         );
         assert!(
             database
-                .create_api_key("ci", id + 100, crate::roles::Role::Admin, None, 2)
+                .create_api_key("ci", id + 100, crate::roles::Role::Admin, None, at(2))
                 .await
                 .is_err()
         );
@@ -1396,22 +1443,22 @@ mod tests {
                 owner(&database).await,
                 crate::roles::Role::Admin,
                 None,
-                1000,
+                at(1000),
             )
             .await
             .unwrap();
 
         assert!(
             database
-                .accept_api_key(&secret, 2000)
+                .accept_api_key(&secret, at(2000))
                 .await
                 .unwrap()
                 .is_some()
         );
-        assert!(database.revoke_api_key(key.id, 3000).await.unwrap());
+        assert!(database.revoke_api_key(key.id, at(3000)).await.unwrap());
         assert!(
             database
-                .accept_api_key(&secret, 4000)
+                .accept_api_key(&secret, at(4000))
                 .await
                 .unwrap()
                 .is_none()
@@ -1427,19 +1474,25 @@ mod tests {
                 owner(&database).await,
                 crate::roles::Role::Admin,
                 None,
-                1000,
+                at(1000),
             )
             .await
             .unwrap();
 
         assert!(
             database
-                .accept_api_key("mxn_guess", 2000)
+                .accept_api_key("mxn_guess", at(2000))
                 .await
                 .unwrap()
                 .is_none()
         );
-        assert!(database.accept_api_key("", 2000).await.unwrap().is_none());
+        assert!(
+            database
+                .accept_api_key("", at(2000))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1451,7 +1504,7 @@ mod tests {
                 owner(&database).await,
                 crate::roles::Role::Admin,
                 None,
-                1000,
+                at(1000),
             )
             .await
             .unwrap();
@@ -1476,7 +1529,7 @@ mod tests {
                 owner(&database).await,
                 crate::roles::Role::Admin,
                 None,
-                1,
+                at(1),
             )
             .await
             .unwrap();
@@ -1486,7 +1539,7 @@ mod tests {
                 owner(&database).await,
                 crate::roles::Role::Admin,
                 None,
-                1,
+                at(1),
             )
             .await
             .unwrap();
@@ -1502,20 +1555,20 @@ mod tests {
                 owner(&database).await,
                 crate::roles::Role::Admin,
                 None,
-                0,
+                at(0),
             )
             .await
             .unwrap();
         let used = async || database.list_api_keys().await.unwrap()[0].last_used_at;
         assert_eq!(used().await, None);
 
-        database.accept_api_key(&secret, 100_000).await.unwrap();
+        database.accept_api_key(&secret, at(100_000)).await.unwrap();
         assert_eq!(used().await, Some(crate::times::from_ms(100_000)));
 
-        database.accept_api_key(&secret, 100_500).await.unwrap();
+        database.accept_api_key(&secret, at(100_500)).await.unwrap();
         assert_eq!(used().await, Some(crate::times::from_ms(100_000)));
 
-        database.accept_api_key(&secret, 170_000).await.unwrap();
+        database.accept_api_key(&secret, at(170_000)).await.unwrap();
         assert_eq!(used().await, Some(crate::times::from_ms(170_000)));
     }
 
@@ -1528,17 +1581,17 @@ mod tests {
                 owner(&database).await,
                 crate::roles::Role::Admin,
                 None,
-                0,
+                at(0),
             )
             .await
             .unwrap();
 
-        database.revoke_api_key(key.id, 100).await.unwrap();
-        database.revoke_api_key(key.id, 200).await.unwrap();
+        database.revoke_api_key(key.id, at(100)).await.unwrap();
+        database.revoke_api_key(key.id, at(200)).await.unwrap();
 
         let keys = database.list_api_keys().await.unwrap();
         assert_eq!(keys[0].revoked_at, Some(crate::times::from_ms(100)));
-        assert!(!database.revoke_api_key(999, 300).await.unwrap());
+        assert!(!database.revoke_api_key(999, at(300)).await.unwrap());
     }
 
     #[tokio::test]
@@ -1550,34 +1603,34 @@ mod tests {
                 owner(&database).await,
                 crate::roles::Role::Admin,
                 Some(crate::times::from_ms(5000)),
-                1000,
+                at(1000),
             )
             .await
             .unwrap();
 
         assert!(
             database
-                .accept_api_key(&secret, 4999)
+                .accept_api_key(&secret, at(4999))
                 .await
                 .unwrap()
                 .is_some()
         );
         assert!(
             database
-                .accept_api_key(&secret, 5000)
+                .accept_api_key(&secret, at(5000))
                 .await
                 .unwrap()
                 .is_none()
         );
         assert!(
             database
-                .accept_api_key(&secret, 9000)
+                .accept_api_key(&secret, at(9000))
                 .await
                 .unwrap()
                 .is_none()
         );
-        assert!(!key.has_expired(4999));
-        assert!(key.has_expired(5000));
+        assert!(!key.has_expired(at(4999)));
+        assert!(key.has_expired(at(5000)));
     }
 
     #[tokio::test]
@@ -1589,7 +1642,7 @@ mod tests {
                 owner(&database).await,
                 crate::roles::Role::Admin,
                 None,
-                0,
+                at(0),
             )
             .await
             .unwrap();
@@ -1598,24 +1651,22 @@ mod tests {
         let much_later = 4_102_444_800_000;
         assert!(
             database
-                .accept_api_key(&secret, much_later)
+                .accept_api_key(&secret, at(much_later))
                 .await
                 .unwrap()
                 .is_some()
         );
-        assert!(!key.has_expired(i64::MAX));
+        assert!(!key.has_expired(Timestamp::MAX_UTC));
     }
 
     #[test]
     fn expiry_is_counted_from_now() {
-        assert_eq!(
-            expiry_after(60, 1000).unwrap(),
-            crate::times::from_ms(61_000)
-        );
-        assert!(expiry_after(0, 1000).is_err());
-        assert!(expiry_after(u64::MAX, 1000).is_err());
+        let seconds = Duration::from_secs;
+        assert_eq!(expiry_after(seconds(60), at(1000)).unwrap(), at(61_000));
+        assert!(expiry_after(Duration::ZERO, at(1000)).is_err());
+        assert!(expiry_after(Duration::MAX, at(1000)).is_err());
         // Ten thousand years is more than any database keeps.
-        assert!(expiry_after(10_000 * 366 * 86_400, 1000).is_err());
+        assert!(expiry_after(seconds(10_000 * 366 * 86_400), at(1000)).is_err());
     }
 
     #[test]
@@ -1779,8 +1830,14 @@ mod tests {
             "custom": { "tags": ["a", "b"], "rack": 12, "disks": [{ "mount": "/" }] },
         }))
         .unwrap();
-        database.record_facts("host-1", &facts, 1).await.unwrap();
-        database.record_facts("host-2", &facts, 1).await.unwrap();
+        database
+            .record_facts("host-1", &facts, at(1))
+            .await
+            .unwrap();
+        database
+            .record_facts("host-2", &facts, at(1))
+            .await
+            .unwrap();
 
         let known = database.known_facts().await.unwrap();
 
@@ -1890,8 +1947,8 @@ mod tests {
             ("custom.enabled", json!(true)),
             ("custom.note", json!("сервер-🚀")),
         ]);
-        assert!(database.record_facts(host, &first, 100).await.unwrap());
-        assert!(!database.record_facts(host, &first, 200).await.unwrap());
+        assert!(database.record_facts(host, &first, at(100)).await.unwrap());
+        assert!(!database.record_facts(host, &first, at(200)).await.unwrap());
 
         let facts = database.current_facts(host).await.unwrap();
         assert_eq!(facts.len(), 5);
@@ -1911,7 +1968,7 @@ mod tests {
             ("custom.enabled", json!(true)),
             ("custom.role", json!("web")),
         ]);
-        assert!(database.record_facts(host, &second, 300).await.unwrap());
+        assert!(database.record_facts(host, &second, at(300)).await.unwrap());
 
         let history = database.facts_history(host).await.unwrap();
         assert_eq!(history.len(), 7);
@@ -1929,14 +1986,19 @@ mod tests {
 
         // Going back to earlier values is a change too: os.version and
         // custom.note return, so two more rows.
-        assert!(database.record_facts(host, &first, 400).await.unwrap());
+        assert!(database.record_facts(host, &first, at(400)).await.unwrap());
         assert_eq!(database.facts_history(host).await.unwrap().len(), 9);
 
         // A value keeps its type: 1 and "1" are different facts.
         let number = flat(&[("custom.level", json!(1))]);
         let text = flat(&[("custom.level", json!("1"))]);
-        assert!(database.record_facts(other, &number, 500).await.unwrap());
-        assert!(database.record_facts(other, &text, 600).await.unwrap());
+        assert!(
+            database
+                .record_facts(other, &number, at(500))
+                .await
+                .unwrap()
+        );
+        assert!(database.record_facts(other, &text, at(600)).await.unwrap());
         let levels = database.current_facts(other).await.unwrap();
 
         // Each agent's current values, and none of the ones they replaced.
@@ -1961,12 +2023,17 @@ mod tests {
         let tags = |value: Value| flatten(&json!({ "custom": { "tags": value } })).unwrap();
 
         let list = tags(json!(["web", "prod"]));
-        assert!(database.record_facts(other, &list, 700).await.unwrap());
-        assert!(!database.record_facts(other, &list, 750).await.unwrap());
+        assert!(database.record_facts(other, &list, at(700)).await.unwrap());
+        assert!(!database.record_facts(other, &list, at(750)).await.unwrap());
 
         let longer = tags(json!(["web", "prod", "eu"]));
         let before = database.facts_history(other).await.unwrap().len();
-        assert!(database.record_facts(other, &longer, 800).await.unwrap());
+        assert!(
+            database
+                .record_facts(other, &longer, at(800))
+                .await
+                .unwrap()
+        );
         let after = database.facts_history(other).await.unwrap().len();
         assert_eq!(after, before + 1);
 
@@ -1982,7 +2049,12 @@ mod tests {
 
         // Removing the first item shifts the rest and drops the last name.
         let shifted = tags(json!(["prod", "eu"]));
-        assert!(database.record_facts(other, &shifted, 900).await.unwrap());
+        assert!(
+            database
+                .record_facts(other, &shifted, at(900))
+                .await
+                .unwrap()
+        );
         let current = database.current_facts(other).await.unwrap();
         assert_eq!(
             names(&current),
@@ -1994,7 +2066,12 @@ mod tests {
 
         // A single value is a different name from a one-item list.
         let single = tags(json!("prod"));
-        assert!(database.record_facts(other, &single, 1000).await.unwrap());
+        assert!(
+            database
+                .record_facts(other, &single, at(1000))
+                .await
+                .unwrap()
+        );
         let current = database.current_facts(other).await.unwrap();
         assert_eq!(
             names(&current),
@@ -2026,9 +2103,9 @@ mod tests {
         let hosts = database.load_hosts().await.unwrap();
         assert!(hosts.iter().any(|host| host.id == LOCAL_HOST_ID));
 
-        let name = format!("site {}", crate::metrics::now_ms());
+        let name = format!("site {}", crate::times::now().timestamp_millis());
         let mut check = Check::new(&name, CheckKind::Http, "https://example.com/");
-        check.timeout_secs = Some(5);
+        check.timeout = Some(std::time::Duration::from_secs(5));
         check.method = Some("POST".to_string());
         check.body = Some("é".repeat(100));
         check.regex = Some("Welcome".to_string());
@@ -2036,7 +2113,7 @@ mod tests {
         let mut input = RemoteCheckInput {
             host_id: crate::remote_checks::LOCAL_HOST_ID.to_string(),
             check,
-            interval_secs: 60,
+            interval: std::time::Duration::from_secs(60),
             enabled: true,
             read_stats: false,
             extras: Vec::new(),
@@ -2047,12 +2124,12 @@ mod tests {
         let saved = database.get_remote_check(id).await.unwrap().unwrap();
         assert_eq!(saved.input, input);
 
-        input.interval_secs = 120;
+        input.interval = std::time::Duration::from_secs(120);
         input.check.count = None;
         assert!(database.update_remote_check(id, &input).await.unwrap());
         let list = database.list_remote_checks().await.unwrap();
         let saved = list.iter().find(|check| check.id == id).unwrap();
-        assert_eq!(saved.input.interval_secs, 120);
+        assert_eq!(saved.input.interval, std::time::Duration::from_secs(120));
 
         assert!(database.delete_remote_check(id).await.unwrap());
         assert!(database.get_remote_check(id).await.unwrap().is_none());
@@ -2065,7 +2142,7 @@ mod tests {
             Severity,
         };
 
-        let suffix = crate::metrics::now_ms();
+        let suffix = crate::times::now().timestamp_millis();
         let channel = database
             .create_channel(&ChannelInput {
                 name: format!("Ops {suffix}"),
@@ -2087,7 +2164,7 @@ mod tests {
             comparison: Some(Comparison::Above),
             threshold: Some(90.5),
             warning_threshold: None,
-            for_secs: 120,
+            hold: TimeDelta::seconds(120),
             severity: Severity::Critical,
             condition: Some("true".to_string()),
             enabled: true,
@@ -2096,10 +2173,10 @@ mod tests {
             calculation: None,
             group_by: None,
             filter: None,
-            window_secs: None,
-            remind_every_secs: None,
-            forecast_secs: None,
-            warning_forecast_secs: None,
+            window: None,
+            remind_every: None,
+            forecast: None,
+            warning_forecast: None,
             actions: Vec::new(),
         };
         let rule = database.create_alert_rule(&input).await.unwrap();
@@ -2115,7 +2192,7 @@ mod tests {
             input
         );
 
-        let started_at = suffix;
+        let started_at = at(suffix);
         let new = NewAlert {
             rule_id: rule,
             rule_name: input.name.clone(),
@@ -2125,8 +2202,8 @@ mod tests {
             series: "é".repeat(255),
             value: Some(91.5),
             summary: "x".repeat(5000),
-            started_at: crate::times::from_ms(started_at),
-            breached_at: crate::times::from_ms(started_at),
+            started_at,
+            breached_at: started_at,
         };
         let alert = database.fire_alert(&new, &[channel]).await.unwrap();
         let open = database.open_alerts().await.unwrap();
@@ -2142,22 +2219,35 @@ mod tests {
                 firing.id,
                 1,
                 "the webhook returned status 500",
-                Some(crate::times::from_ms(started_at + 5)),
+                Some(started_at + TimeDelta::milliseconds(5)),
             )
             .await
             .unwrap();
         let problems = database.delivery_problems(10).await.unwrap();
         assert_eq!(problems[0].error, "the webhook returned status 500");
         database
-            .delivery_sent(firing.id, 2, started_at + 5, Some("C123:1.2"))
+            .delivery_sent(
+                firing.id,
+                2,
+                started_at + TimeDelta::milliseconds(5),
+                Some("C123:1.2"),
+            )
             .await
             .unwrap();
 
         database
-            .resolve_alert(alert, started_at + 10, "The problem cleared", None)
+            .resolve_alert(
+                alert,
+                started_at + TimeDelta::milliseconds(10),
+                "The problem cleared",
+                None,
+            )
             .await
             .unwrap();
-        let due = database.due_deliveries(started_at + 10, 500).await.unwrap();
+        let due = database
+            .due_deliveries(started_at + TimeDelta::milliseconds(10), 500)
+            .await
+            .unwrap();
         let resolved = due.iter().find(|d| d.alert.id == alert).unwrap();
         assert_eq!(resolved.event, Event::Resolved);
         assert_eq!(resolved.reply_to.as_deref(), Some("C123:1.2"));
@@ -2170,7 +2260,7 @@ mod tests {
         // deleted channel goes.
         assert!(
             database
-                .delete_alert_rule(rule, started_at + 20)
+                .delete_alert_rule(rule, started_at + TimeDelta::milliseconds(20))
                 .await
                 .unwrap()
         );
@@ -2179,11 +2269,14 @@ mod tests {
         assert_eq!(ended.rule_id, Some(rule));
         assert!(
             database
-                .delete_channel(channel, started_at + 5)
+                .delete_channel(channel, started_at + TimeDelta::milliseconds(5))
                 .await
                 .unwrap()
         );
-        let due = database.due_deliveries(started_at + 10, 500).await.unwrap();
+        let due = database
+            .due_deliveries(started_at + TimeDelta::milliseconds(10), 500)
+            .await
+            .unwrap();
         assert!(!due.iter().any(|d| d.alert.id == alert));
     }
 
@@ -2191,7 +2284,7 @@ mod tests {
     async fn facts_need_a_registered_agent() {
         let database = Database::for_test().await;
         let result = database
-            .record_facts("nobody", &flat(&[("a", json!(1))]), 1)
+            .record_facts("nobody", &flat(&[("a", json!(1))]), at(1))
             .await;
         assert!(result.is_err());
     }
@@ -2203,7 +2296,10 @@ mod tests {
         let database = Database::for_test().await;
         database.save_host(&record("host-1")).await.unwrap();
         let before = flat(&[("os.version", json!("24.04"))]);
-        database.record_facts("host-1", &before, 100).await.unwrap();
+        database
+            .record_facts("host-1", &before, at(100))
+            .await
+            .unwrap();
 
         // The old value is closed first, then adding the new one fails.
         let trigger = match database.connection.get_database_backend() {
@@ -2229,7 +2325,12 @@ mod tests {
             .unwrap();
 
         let after = flat(&[("os.version", json!("24.10"))]);
-        assert!(database.record_facts("host-1", &after, 200).await.is_err());
+        assert!(
+            database
+                .record_facts("host-1", &after, at(200))
+                .await
+                .is_err()
+        );
 
         let facts = database.current_facts("host-1").await.unwrap();
         assert_eq!(facts.len(), 1);
@@ -2245,7 +2346,10 @@ mod tests {
             let database = database.clone();
             tokio::spawn(async move {
                 let facts = flat(&[("os.version", json!(n))]);
-                database.record_facts("host-1", &facts, n).await.unwrap();
+                database
+                    .record_facts("host-1", &facts, at(n))
+                    .await
+                    .unwrap();
             })
         });
         for report in reports.collect::<Vec<_>>() {

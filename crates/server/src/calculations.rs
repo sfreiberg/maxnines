@@ -4,6 +4,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{Result, bail};
+use chrono::TimeDelta;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -17,7 +18,7 @@ use crate::registration::{HostRecord, HostState, Registry, short_id};
 const NO_VALUE: &str = "(none)";
 /// The shortest moment hosts are combined over. Agents report at their own times,
 /// so a shorter one would only hold some of them, and a sum or count would jump around.
-pub const SMALLEST_STEP_MS: i64 = 60_000;
+pub const SMALLEST_STEP: TimeDelta = TimeDelta::minutes(1);
 const FACT_PREFIX: &str = "fact:";
 const MAX_FACT_NAME_LEN: usize = 200;
 const MAX_FILTER_LEN: usize = 500;
@@ -295,7 +296,7 @@ mod tests {
         values
             .iter()
             .map(|value| Point {
-                time_ms: 0,
+                time: chrono::DateTime::UNIX_EPOCH,
                 avg: *value,
                 min: *value,
                 max: *value,

@@ -26,7 +26,7 @@ use crate::rule_preview::{self, Preview, PreviewHost};
 use crate::server_stats::ServerStatus;
 use crate::silences::{self, SilenceInput};
 use crate::store::{self, WriterCommand};
-use crate::times::{self, Timestamp};
+use crate::times::Timestamp;
 use crate::views::Views;
 
 /// What came of deleting an agent.
@@ -104,20 +104,20 @@ impl AppState {
         &self,
         mut input: EventInput,
         by: &str,
-        now_ms: i64,
+        now: Timestamp,
     ) -> Result<i64, EventRefusal> {
         input.tidy();
-        let kind = input.check(now_ms).map_err(EventRefusal::Invalid)?;
+        let kind = input.check(now).map_err(EventRefusal::Invalid)?;
         let filter = input.filter.clone().unwrap_or_default();
         let new = NewEvent {
             kind,
-            occurred_at: input.occurred_at.unwrap_or(times::from_ms(now_ms)),
+            occurred_at: input.occurred_at.unwrap_or(now),
             title: &input.title,
             detail: input.detail.as_deref(),
             filter: &filter,
         };
         self.database
-            .record_event(&new, by, now_ms)
+            .record_event(&new, by, now)
             .await
             .map_err(EventRefusal::Failed)
     }

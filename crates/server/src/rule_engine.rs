@@ -184,6 +184,8 @@ fn remove_unsupported(config: &mut AgentConfig, facts: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn rule(name: &str, condition: Option<&str>, settings: Value) -> ConfigRule {
@@ -230,7 +232,7 @@ mod tests {
     fn a_rule_with_no_condition_applies_to_everyone() {
         let resolved = resolve_for(&[base()], &json!({}));
 
-        assert_eq!(resolved.config.interval_secs, 15);
+        assert_eq!(resolved.config.interval, Duration::from_secs(15));
         assert_eq!(resolved.matched_rules, ["Default"]);
     }
 
@@ -247,7 +249,7 @@ mod tests {
 
         let resolved = resolve_for(&rules, &linux());
 
-        assert_eq!(resolved.config.interval_secs, 5);
+        assert_eq!(resolved.config.interval, Duration::from_secs(5));
         assert_eq!(resolved.config.collectors.len(), 2);
         assert_eq!(resolved.matched_rules, ["Default", "linux"]);
     }
@@ -265,7 +267,7 @@ mod tests {
 
         let resolved = resolve_for(&rules, &linux());
 
-        assert_eq!(resolved.config.interval_secs, 15);
+        assert_eq!(resolved.config.interval, Duration::from_secs(15));
         assert_eq!(resolved.matched_rules, ["Default"]);
     }
 
@@ -284,8 +286,8 @@ mod tests {
                 rule("r", Some(condition), json!({ "interval_secs": 5 })),
             ];
             assert_eq!(
-                resolve_for(&rules, &linux()).config.interval_secs,
-                5,
+                resolve_for(&rules, &linux()).config.interval,
+                Duration::from_secs(5),
                 "{condition}"
             );
         }
@@ -302,7 +304,10 @@ mod tests {
             ),
         ];
 
-        assert_eq!(resolve_for(&rules, &linux()).config.interval_secs, 15);
+        assert_eq!(
+            resolve_for(&rules, &linux()).config.interval,
+            Duration::from_secs(15)
+        );
     }
 
     #[test]
@@ -311,7 +316,10 @@ mod tests {
             base(),
             rule("r", Some("1 + 1"), json!({ "interval_secs": 5 })),
         ];
-        assert_eq!(resolve_for(&rules, &linux()).config.interval_secs, 15);
+        assert_eq!(
+            resolve_for(&rules, &linux()).config.interval,
+            Duration::from_secs(15)
+        );
     }
 
     #[test]
@@ -320,8 +328,8 @@ mod tests {
         off.rule.enabled = false;
 
         assert_eq!(
-            resolve_for(&[base(), off], &linux()).config.interval_secs,
-            15
+            resolve_for(&[base(), off], &linux()).config.interval,
+            Duration::from_secs(15)
         );
     }
 
@@ -394,7 +402,7 @@ mod tests {
     fn no_rules_at_all_still_gives_a_usable_config() {
         let resolved = resolve_for(&[], &linux());
 
-        assert_eq!(resolved.config.interval_secs, 15);
+        assert_eq!(resolved.config.interval, Duration::from_secs(15));
         assert!(resolved.config.collectors.is_empty());
     }
 

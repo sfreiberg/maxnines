@@ -17,23 +17,25 @@ use std::sync::Mutex;
 use anyhow::{Result, bail, ensure};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use chrono::TimeDelta;
 use ring::digest::{SHA256, digest};
 use ring::rand::{SecureRandom, SystemRandom};
 
 use crate::roles::Role;
+use crate::times::Timestamp;
 
 /// How long an access token works.
-pub const ACCESS_LIFETIME_MS: i64 = 60 * 60 * 1000;
+pub const ACCESS_LIFETIME: TimeDelta = TimeDelta::hours(1);
 /// How long a refresh token works. Each use gives a new one that lasts this long again.
-pub const REFRESH_LIFETIME_MS: i64 = 90 * 24 * 60 * 60 * 1000;
+pub const REFRESH_LIFETIME: TimeDelta = TimeDelta::days(90);
 /// How long a refresh token that's just been swapped still works, in case the answer
 /// with its replacement was lost on the way. After that, using it again means it was
 /// copied, and the sign in is revoked.
-pub const REFRESH_GRACE_MS: i64 = 60 * 1000;
+pub const REFRESH_GRACE: TimeDelta = TimeDelta::minutes(1);
 /// How long an approval has to be collected.
-pub const PENDING_LIFETIME_MS: i64 = 10 * 60 * 1000;
+pub const PENDING_LIFETIME: TimeDelta = TimeDelta::minutes(10);
 /// How often a device may ask whether it's been approved.
-pub const DEVICE_INTERVAL_SECS: i64 = 5;
+pub const DEVICE_INTERVAL: TimeDelta = TimeDelta::seconds(5);
 /// The most devices that can be waiting at once. Anyone can start one, so this keeps
 /// someone who starts thousands from using up the server's memory.
 pub const MAX_WAITING_DEVICES: usize = 1000;
@@ -240,7 +242,7 @@ struct Code {
     approval: Approval,
     redirect_uri: String,
     challenge: String,
-    expires_ms: i64,
+    expires_at: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,10 +259,11 @@ struct DeviceRequest {
     device: String,
     /// The role the app asked for, which the person can lower.
     role: Option<Role>,
-    expires_ms: i64,
+    expires_at: Timestamp,
     /// When it may next ask without being told to slow down.
-    next_poll_ms: i64,
-    interval_secs: i64,
+    next_poll_at: Timestamp,
+    /// How long it has to wait between asks.
+    interval: TimeDelta,
     state: DeviceState,
 }
 
@@ -311,11 +314,11 @@ impl PendingSignIns {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn forget_expired(waiting: &mut Waiting, now_ms: i64) {
-        waiting.codes.retain(|_, code| code.expires_ms > now_ms);
+    fn forget_expired(waiting: &mut Waiting, now: Timestamp) {
+        waiting.codes.retain(|_, code| code.expires_at > now);
         waiting
             .devices
-            .retain(|_, request| request.expires_ms > now_ms);
+            .retain(|_, request| request.expires_at > now);
     }
 
     /// Keeps an approval for the app to swap for tokens, giving back the code it's sent.
@@ -324,18 +327,18 @@ impl PendingSignIns {
         approval: Approval,
         redirect_uri: &str,
         challenge: &str,
-        now_ms: i64,
+        now: Timestamp,
     ) -> Result<String> {
         let code = new_secret(CODE_PREFIX)?;
         let mut waiting = self.lock();
-        Self::forget_expired(&mut waiting, now_ms);
+        Self::forget_expired(&mut waiting, now);
         waiting.codes.insert(
             secret_hash(&code),
             Code {
                 approval,
                 redirect_uri: redirect_uri.to_string(),
                 challenge: challenge.to_string(),
-                expires_ms: now_ms + PENDING_LIFETIME_MS,
+                expires_at: now + PENDING_LIFETIME,
             },
         );
         Ok(code)
@@ -349,10 +352,10 @@ impl PendingSignIns {
         client_id: &str,
         redirect_uri: &str,
         verifier: &str,
-        now_ms: i64,
+        now: Timestamp,
     ) -> Option<Approval> {
         let mut waiting = self.lock();
-        Self::forget_expired(&mut waiting, now_ms);
+        Self::forget_expired(&mut waiting, now);
         let found = waiting.codes.remove(&secret_hash(code))?;
         let proven = found.approval.client.id == client_id
             && found.redirect_uri == redirect_uri
@@ -366,11 +369,11 @@ impl PendingSignIns {
         client: AppClient,
         device: &str,
         role: Option<Role>,
-        now_ms: i64,
+        now: Timestamp,
     ) -> Result<Option<DeviceStart>> {
         let device_code = new_secret(DEVICE_CODE_PREFIX)?;
         let mut waiting = self.lock();
-        Self::forget_expired(&mut waiting, now_ms);
+        Self::forget_expired(&mut waiting, now);
         if waiting.devices.len() >= MAX_WAITING_DEVICES {
             return Ok(None);
         }
@@ -392,9 +395,9 @@ impl PendingSignIns {
                 client,
                 device: device.to_string(),
                 role,
-                expires_ms: now_ms + PENDING_LIFETIME_MS,
-                next_poll_ms: now_ms,
-                interval_secs: DEVICE_INTERVAL_SECS,
+                expires_at: now + PENDING_LIFETIME,
+                next_poll_at: now,
+                interval: DEVICE_INTERVAL,
                 state: DeviceState::Waiting,
             },
         );
@@ -405,10 +408,10 @@ impl PendingSignIns {
     }
 
     /// The device waiting under the code someone typed, if any still is.
-    pub fn device_asking(&self, user_code: &str, now_ms: i64) -> Option<DeviceAsk> {
+    pub fn device_asking(&self, user_code: &str, now: Timestamp) -> Option<DeviceAsk> {
         let user_code = normalise_user_code(user_code);
         let mut waiting = self.lock();
-        Self::forget_expired(&mut waiting, now_ms);
+        Self::forget_expired(&mut waiting, now);
         waiting
             .devices
             .values()
@@ -427,11 +430,11 @@ impl PendingSignIns {
         &self,
         user_code: &str,
         approver: Option<(i64, Role)>,
-        now_ms: i64,
+        now: Timestamp,
     ) -> bool {
         let user_code = normalise_user_code(user_code);
         let mut waiting = self.lock();
-        Self::forget_expired(&mut waiting, now_ms);
+        Self::forget_expired(&mut waiting, now);
         let request = waiting.devices.values_mut().find(|request| {
             request.user_code == user_code && request.state == DeviceState::Waiting
         });
@@ -451,25 +454,25 @@ impl PendingSignIns {
     }
 
     /// What a device hears when it asks. An answer is given once.
-    pub fn poll_device(&self, device_code: &str, client_id: &str, now_ms: i64) -> DevicePoll {
+    pub fn poll_device(&self, device_code: &str, client_id: &str, now: Timestamp) -> DevicePoll {
         let hash = secret_hash(device_code);
         let mut waiting = self.lock();
         let Some(request) = waiting.devices.get_mut(&hash) else {
             return DevicePoll::Expired;
         };
-        if request.client.id != client_id || request.expires_ms <= now_ms {
+        if request.client.id != client_id || request.expires_at <= now {
             waiting.devices.remove(&hash);
             return DevicePoll::Expired;
         }
         match request.state.clone() {
-            DeviceState::Waiting if now_ms < request.next_poll_ms => {
+            DeviceState::Waiting if now < request.next_poll_at => {
                 // Asking too often: wait longer between asks from now on.
-                request.interval_secs += DEVICE_INTERVAL_SECS;
-                request.next_poll_ms = now_ms + request.interval_secs * 1000;
+                request.interval += DEVICE_INTERVAL;
+                request.next_poll_at = now + request.interval;
                 DevicePoll::SlowDown
             }
             DeviceState::Waiting => {
-                request.next_poll_ms = now_ms + request.interval_secs * 1000;
+                request.next_poll_at = now + request.interval;
                 DevicePoll::Pending
             }
             DeviceState::Denied => {
@@ -487,6 +490,12 @@ impl PendingSignIns {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::times::from_ms;
+
+    /// `ms` milliseconds into the tests' made-up time.
+    fn at(ms: i64) -> Timestamp {
+        from_ms(1_795_000_000_000 + ms)
+    }
 
     const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
     /// RFC 7636's own example.
@@ -584,38 +593,44 @@ mod tests {
         let pending = PendingSignIns::default();
         let redirect = "http://127.0.0.1:5000/";
         let code = pending
-            .approve_code(approval(), redirect, CHALLENGE, 0)
+            .approve_code(approval(), redirect, CHALLENGE, at(0))
             .unwrap();
         // The wrong proof spends it anyway, so it can't be guessed at.
         assert!(
             pending
-                .take_code(&code, "maxnines-cli", redirect, "x".repeat(43).as_str(), 1)
+                .take_code(
+                    &code,
+                    "maxnines-cli",
+                    redirect,
+                    "x".repeat(43).as_str(),
+                    at(1)
+                )
                 .is_none()
         );
         assert!(
             pending
-                .take_code(&code, "maxnines-cli", redirect, VERIFIER, 1)
+                .take_code(&code, "maxnines-cli", redirect, VERIFIER, at(1))
                 .is_none()
         );
 
         let code = pending
-            .approve_code(approval(), redirect, CHALLENGE, 0)
+            .approve_code(approval(), redirect, CHALLENGE, at(0))
             .unwrap();
         assert!(
             pending
-                .take_code(&code, "maxnines-desktop-windows", redirect, VERIFIER, 1)
+                .take_code(&code, "maxnines-desktop-windows", redirect, VERIFIER, at(1))
                 .is_none()
         );
         let code = pending
-            .approve_code(approval(), redirect, CHALLENGE, 0)
+            .approve_code(approval(), redirect, CHALLENGE, at(0))
             .unwrap();
         assert_eq!(
-            pending.take_code(&code, "maxnines-cli", redirect, VERIFIER, 1),
+            pending.take_code(&code, "maxnines-cli", redirect, VERIFIER, at(1)),
             Some(approval())
         );
 
         let code = pending
-            .approve_code(approval(), redirect, CHALLENGE, 0)
+            .approve_code(approval(), redirect, CHALLENGE, at(0))
             .unwrap();
         assert!(
             pending
@@ -624,7 +639,7 @@ mod tests {
                     "maxnines-cli",
                     redirect,
                     VERIFIER,
-                    PENDING_LIFETIME_MS
+                    at(0) + PENDING_LIFETIME
                 )
                 .is_none()
         );
@@ -638,7 +653,7 @@ mod tests {
                 known_client("maxnines-cli").unwrap(),
                 "build box",
                 Some(Role::Responder),
-                0,
+                at(0),
             )
             .unwrap()
             .unwrap();
@@ -646,31 +661,32 @@ mod tests {
         assert_eq!(start.user_code.len(), 9);
 
         assert_eq!(
-            pending.poll_device(code, "maxnines-cli", 0),
+            pending.poll_device(code, "maxnines-cli", at(0)),
             DevicePoll::Pending
         );
         assert_eq!(
-            pending.poll_device(code, "maxnines-cli", 1000),
+            pending.poll_device(code, "maxnines-cli", at(1000)),
             DevicePoll::SlowDown
         );
         assert_eq!(
-            pending.poll_device(code, "maxnines-cli", 20_000),
+            pending.poll_device(code, "maxnines-cli", at(20_000)),
             DevicePoll::Pending
         );
 
         let typed = start.user_code.to_lowercase().replace('-', " ");
-        let asking = pending.device_asking(&typed, 20_000).unwrap();
+        let asking = pending.device_asking(&typed, at(20_000)).unwrap();
         assert_eq!(asking.device, "build box");
         assert_eq!(asking.role, Some(Role::Responder));
-        assert!(pending.decide_device(&typed, Some((1, Role::Viewer)), 20_000));
-        assert!(!pending.decide_device(&typed, Some((1, Role::Viewer)), 20_000));
+        assert!(pending.decide_device(&typed, Some((1, Role::Viewer)), at(20_000)));
+        assert!(!pending.decide_device(&typed, Some((1, Role::Viewer)), at(20_000)));
 
-        let DevicePoll::Allowed(allowed) = pending.poll_device(code, "maxnines-cli", 60_000) else {
+        let DevicePoll::Allowed(allowed) = pending.poll_device(code, "maxnines-cli", at(60_000))
+        else {
             panic!("not allowed");
         };
         assert_eq!(allowed.device, "build box");
         assert_eq!(
-            pending.poll_device(code, "maxnines-cli", 60_000),
+            pending.poll_device(code, "maxnines-cli", at(60_000)),
             DevicePoll::Expired
         );
     }
@@ -681,14 +697,14 @@ mod tests {
         for _ in 0..MAX_WAITING_DEVICES {
             assert!(
                 pending
-                    .start_device(known_client("maxnines-cli").unwrap(), "", None, 0)
+                    .start_device(known_client("maxnines-cli").unwrap(), "", None, at(0))
                     .unwrap()
                     .is_some()
             );
         }
         assert!(
             pending
-                .start_device(known_client("maxnines-cli").unwrap(), "", None, 0)
+                .start_device(known_client("maxnines-cli").unwrap(), "", None, at(0))
                 .unwrap()
                 .is_none()
         );
@@ -697,7 +713,7 @@ mod tests {
             known_client("maxnines-cli").unwrap(),
             "",
             None,
-            PENDING_LIFETIME_MS,
+            at(0) + PENDING_LIFETIME,
         );
         assert!(later.unwrap().is_some());
     }
@@ -706,30 +722,40 @@ mod tests {
     fn a_device_turned_down_or_left_too_long_hears_so() {
         let pending = PendingSignIns::default();
         let start = pending
-            .start_device(known_client("maxnines-desktop-mac").unwrap(), "", None, 0)
+            .start_device(
+                known_client("maxnines-desktop-mac").unwrap(),
+                "",
+                None,
+                at(0),
+            )
             .unwrap()
             .unwrap();
-        assert!(pending.decide_device(&start.user_code, None, 1));
+        assert!(pending.decide_device(&start.user_code, None, at(1)));
         assert_eq!(
-            pending.poll_device(&start.device_code, "maxnines-desktop-mac", 2),
+            pending.poll_device(&start.device_code, "maxnines-desktop-mac", at(2)),
             DevicePoll::Denied
         );
 
         let start = pending
-            .start_device(known_client("maxnines-desktop-mac").unwrap(), "", None, 0)
+            .start_device(
+                known_client("maxnines-desktop-mac").unwrap(),
+                "",
+                None,
+                at(0),
+            )
             .unwrap()
             .unwrap();
         assert_eq!(
             pending.poll_device(
                 &start.device_code,
                 "maxnines-desktop-mac",
-                PENDING_LIFETIME_MS
+                at(0) + PENDING_LIFETIME
             ),
             DevicePoll::Expired
         );
         assert!(
             pending
-                .device_asking(&start.user_code, PENDING_LIFETIME_MS)
+                .device_asking(&start.user_code, at(0) + PENDING_LIFETIME)
                 .is_none()
         );
     }

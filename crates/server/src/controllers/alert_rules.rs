@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use axum::Router;
@@ -7,21 +8,20 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
+use chrono::TimeDelta;
 use serde::Serialize;
 
-use maxnines_protocol::actions::DEFAULT_ACTION_TIMEOUT_SECS;
+use maxnines_protocol::actions::DEFAULT_ACTION_TIMEOUT;
 
 use super::condition_form::{ConditionForm, operators};
 use super::{CsrfForm, Page, server_error};
 use crate::actions::{RuleAction, RunOn};
-use crate::alerting::{
-    AlertRuleInput, Comparison, DEFAULT_FORECAST_WINDOW_SECS, RuleKind, Severity,
-};
+use crate::alerting::{AlertRuleInput, Comparison, DEFAULT_FORECAST_WINDOW, RuleKind, Severity};
 use crate::app_state::AppState;
 use crate::calculations::Calculation;
 use crate::condition_builder::Builder;
 use crate::dashboards::grouping_fields;
-use crate::metrics::{METRICS, Unit, now_ms};
+use crate::metrics::{METRICS, Unit};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -78,7 +78,7 @@ fn parse_actions(text: &str) -> Result<Vec<RuleAction>> {
             let mut wanted = RuleAction {
                 action,
                 run_on: RunOn::First,
-                timeout_secs: None,
+                timeout: None,
             };
             for option in words {
                 match option.split_once('=') {
@@ -91,7 +91,7 @@ fn parse_actions(text: &str) -> Result<Vec<RuleAction>> {
                         let secs = secs.parse().with_context(|| {
                             format!("timeout= has to be a number of seconds, in {line:?}")
                         })?;
-                        wanted.timeout_secs = Some(secs);
+                        wanted.timeout = Some(Duration::from_secs(secs));
                     }
                     _ => anyhow::bail!("{option:?} isn't an option, in {line:?}"),
                 }
@@ -109,8 +109,8 @@ fn action_lines(actions: &[RuleAction]) -> String {
             if wanted.run_on != RunOn::First {
                 line.push_str(&format!(" on={}", wanted.run_on.as_str()));
             }
-            if wanted.timeout() != DEFAULT_ACTION_TIMEOUT_SECS {
-                line.push_str(&format!(" timeout={}", wanted.timeout()));
+            if wanted.timeout() != DEFAULT_ACTION_TIMEOUT {
+                line.push_str(&format!(" timeout={}", wanted.timeout().as_secs()));
             }
             line
         })
@@ -142,7 +142,7 @@ impl AlertRuleForm {
             level: String::new(),
             warning_within_hours: "24".to_string(),
             critical_within_hours: "4".to_string(),
-            forecast_window_hours: hours(DEFAULT_FORECAST_WINDOW_SECS),
+            forecast_window_hours: hours(DEFAULT_FORECAST_WINDOW),
             actions: String::new(),
             applies_to: ConditionForm::blank(),
         }
@@ -156,7 +156,7 @@ impl AlertRuleForm {
             rule.forecast_levels()
                 .into_iter()
                 .find(|(severity, _)| *severity == wanted)
-                .map(|(_, secs)| hours(secs))
+                .map(|(_, ahead)| hours(ahead))
                 .unwrap_or_default()
         };
         let threshold = |wanted: Severity| {
@@ -201,12 +201,13 @@ impl AlertRuleForm {
             window_secs: if forecast {
                 blank.window_secs
             } else {
-                rule.window().to_string()
+                rule.window().num_seconds().to_string()
             },
             // Shown in minutes, with a fraction when the API set something finer.
             remind_every_minutes: rule
-                .remind_every_secs
-                .map(|secs| {
+                .remind_every
+                .map(|every| {
+                    let secs = every.num_seconds();
                     if secs % 60 == 0 {
                         (secs / 60).to_string()
                     } else {
@@ -223,7 +224,7 @@ impl AlertRuleForm {
                 .map_or(blank.comparison, |c| c.as_str().to_string()),
             warning_threshold: threshold(Severity::Warning),
             critical_threshold: threshold(Severity::Critical),
-            for_secs: rule.for_secs.to_string(),
+            for_secs: rule.hold.num_seconds().to_string(),
             severity: rule.severity.as_str().to_string(),
             enabled: rule.enabled,
             channels: rule.channels.iter().copied().collect(),
@@ -268,12 +269,9 @@ impl AlertRuleForm {
 
     fn to_rule(&self, known: &BTreeMap<String, String>) -> Result<AlertRuleInput> {
         let kind = RuleKind::parse(&self.kind)?;
-        let for_secs: u64 = self
-            .for_secs
-            .trim()
-            .parse()
+        let hold = whole_seconds(&self.for_secs)
             .context("the duration must be a whole number of seconds")?;
-        let remind_every_secs = match self.remind_every_minutes.as_str() {
+        let remind_every = match self.remind_every_minutes.as_str() {
             "" => None,
             text => {
                 let minutes: f64 = text
@@ -281,7 +279,7 @@ impl AlertRuleForm {
                     .ok()
                     .filter(|minutes: &f64| minutes.is_finite() && *minutes >= 0.0)
                     .context("reminders must be a number of minutes")?;
-                Some((minutes * 60.0).round() as u64)
+                Some(rounded_seconds(minutes * 60.0).context("reminders are too far apart")?)
             }
         };
 
@@ -302,8 +300,8 @@ impl AlertRuleForm {
                 )
             }
         };
-        let mut forecast_secs = None;
-        let mut warning_forecast_secs = None;
+        let mut forecast = None;
+        let mut warning_forecast = None;
         let (threshold, warning_threshold, severity) = match kind {
             RuleKind::Offline => (None, None, Severity::parse(&self.severity)?),
             RuleKind::Forecast => {
@@ -311,19 +309,19 @@ impl AlertRuleForm {
                     "" => bail!("a forecast needs a level to watch for"),
                     text => text.parse().context("the level must be a number")?,
                 };
-                let warning = seconds(&self.warning_within_hours, "warning")?;
-                let severity = match seconds(&self.critical_within_hours, "critical")? {
+                let warning = hours_typed(&self.warning_within_hours, "warning")?;
+                let severity = match hours_typed(&self.critical_within_hours, "critical")? {
                     None => {
-                        forecast_secs = warning;
+                        forecast = warning;
                         Severity::Warning
                     }
                     Some(critical) => {
-                        forecast_secs = Some(critical);
-                        warning_forecast_secs = warning;
+                        forecast = Some(critical);
+                        warning_forecast = warning;
                         Severity::Critical
                     }
                 };
-                if forecast_secs.is_none() {
+                if forecast.is_none() {
                     bail!(
                         "a forecast needs how many hours ahead to warn, or to be critical, or both"
                     );
@@ -347,13 +345,13 @@ impl AlertRuleForm {
         } else {
             self.group_by.clone()
         };
-        let window_secs = match kind {
-            RuleKind::Calculation => {
-                let secs = self.window_secs.trim().parse();
-                Some(secs.context("how far back has to be a whole number of seconds")?)
-            }
+        let window = match kind {
+            RuleKind::Calculation => Some(
+                whole_seconds(&self.window_secs)
+                    .context("how far back has to be a whole number of seconds")?,
+            ),
             RuleKind::Forecast => Some(
-                seconds(&self.forecast_window_hours, "looking back")?
+                hours_typed(&self.forecast_window_hours, "looking back")?
                     .context("a forecast needs how many hours back to judge by")?,
             ),
             _ => None,
@@ -370,8 +368,8 @@ impl AlertRuleForm {
                 .flatten(),
             group_by: only_for_calculations(group_by),
             filter: only_for_calculations(self.filter.clone()).filter(|text| !text.is_empty()),
-            window_secs,
-            remind_every_secs,
+            window,
+            remind_every,
             name: self.name.trim().to_string(),
             kind,
             metric,
@@ -379,30 +377,45 @@ impl AlertRuleForm {
             comparison,
             threshold,
             warning_threshold,
-            for_secs,
+            hold,
             severity,
             condition,
             enabled: self.enabled,
             channels: self.channels.iter().copied().collect(),
             all_channels: self.all_channels,
-            forecast_secs,
-            warning_forecast_secs,
+            forecast,
+            warning_forecast,
             actions: parse_actions(&self.actions)?,
         })
     }
 }
 
-/// Seconds as hours for the form, with a fraction only when needed.
-fn hours(secs: u64) -> String {
-    if secs.is_multiple_of(3600) {
+/// A length of time as hours for the form, with a fraction only when needed.
+fn hours(length: TimeDelta) -> String {
+    let secs = length.num_seconds();
+    if secs % 3600 == 0 {
         (secs / 3600).to_string()
     } else {
         (secs as f64 / 3600.0).to_string()
     }
 }
 
-/// Hours typed into the form as seconds, which may be left empty.
-fn seconds(text: &str, which: &str) -> Result<Option<u64>> {
+/// Whole seconds typed into the form.
+fn whole_seconds(text: &str) -> Option<TimeDelta> {
+    let secs: u64 = text.trim().parse().ok()?;
+    TimeDelta::try_seconds(i64::try_from(secs).ok()?)
+}
+
+/// A number of seconds worked out from what was typed, to the nearest second, as rules
+/// keep them.
+fn rounded_seconds(secs: f64) -> Option<TimeDelta> {
+    let secs = secs.round();
+    // Far beyond anything a rule allows, and still a length chrono can hold.
+    (secs < 1e15).then(|| TimeDelta::seconds(secs as i64))
+}
+
+/// Hours typed into the form, which may be left empty.
+fn hours_typed(text: &str, which: &str) -> Result<Option<TimeDelta>> {
     match text.trim() {
         "" => Ok(None),
         text => {
@@ -411,7 +424,9 @@ fn seconds(text: &str, which: &str) -> Result<Option<u64>> {
                 .ok()
                 .filter(|hours: &f64| hours.is_finite() && *hours > 0.0)
                 .with_context(|| format!("the {which} time must be a number of hours"))?;
-            Ok(Some((hours * 3600.0).round() as u64))
+            rounded_seconds(hours * 3600.0)
+                .map(Some)
+                .with_context(|| format!("the {which} time is too long"))
         }
     }
 }
@@ -692,7 +707,11 @@ async fn update(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfFo
 }
 
 async fn delete(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfForm) -> Response {
-    match state.database.delete_alert_rule(id, now_ms()).await {
+    match state
+        .database
+        .delete_alert_rule(id, crate::times::now())
+        .await
+    {
         Ok(true) => (form.token, Redirect::to("/alerts/rules")).into_response(),
         Ok(false) => not_found(&state, &form.token),
         Err(error) => server_error(&error),
@@ -712,7 +731,7 @@ mod tests {
             comparison: Some(Comparison::Below),
             threshold: Some(12.5),
             warning_threshold: None,
-            for_secs: 60,
+            hold: TimeDelta::seconds(60),
             severity: Severity::Critical,
             condition: Some("true".to_string()),
             enabled: false,
@@ -721,10 +740,10 @@ mod tests {
             calculation: None,
             group_by: None,
             filter: None,
-            window_secs: None,
-            remind_every_secs: None,
-            forecast_secs: None,
-            warning_forecast_secs: None,
+            window: None,
+            remind_every: None,
+            forecast: None,
+            warning_forecast: None,
             actions: Vec::new(),
         }
     }

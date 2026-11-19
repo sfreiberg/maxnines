@@ -6,6 +6,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
+use chrono::TimeDelta;
 use serde::Serialize;
 
 use super::{CsrfForm, Page, server_error};
@@ -52,7 +53,7 @@ impl WindowForm {
     fn from_window(window: MaintenanceWindowInput) -> Self {
         Self {
             rule_id: window.rule_id.map(|id| id.to_string()).unwrap_or_default(),
-            duration_minutes: (window.duration_secs / 60).to_string(),
+            duration_minutes: window.duration.num_minutes().to_string(),
             name: window.name,
             filter: window.filter,
             all_alerts: window.all_alerts,
@@ -85,7 +86,7 @@ impl WindowForm {
             "" => None,
             text => Some(text.parse().map_err(|_| "Choose a rule.".to_string())?),
         };
-        let duration_minutes: u32 = self
+        let duration_minutes: i64 = self
             .duration_minutes
             .trim()
             .parse()
@@ -97,7 +98,8 @@ impl WindowForm {
             all_alerts: self.all_alerts,
             days: self.days.clone(),
             start_time: self.start_time.clone(),
-            duration_secs: duration_minutes.saturating_mul(60),
+            duration: TimeDelta::try_minutes(duration_minutes)
+                .ok_or_else(|| "A maintenance window can last up to 7 days.".to_string())?,
             time_zone: self.time_zone.clone(),
         })
     }

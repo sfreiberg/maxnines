@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use super::sessions::this_session;
 use super::{CsrfForm, Page, local_date, local_time, server_error, signed_in_user};
 use crate::app_state::AppState;
-use crate::metrics::now_ms;
 use crate::models::User;
 use crate::roles::Role;
 use crate::times::{self, Timestamp};
@@ -25,7 +24,7 @@ pub const SIGN_INS_PAGE: &str = "/settings/users/sign-ins";
 const PROFILE_PAGE: &str = "/profile";
 
 /// An API key used within this long counts as signed in.
-const KEY_IN_USE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+const KEY_IN_USE: chrono::TimeDelta = chrono::TimeDelta::days(30);
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -106,7 +105,11 @@ pub fn whose() -> Option<Option<i64>> {
 
 /// Every way people are signed in now, most recently used first: everyone's, or only
 /// `user_id`'s. Disabled people are left out, as none of theirs works.
-pub async fn sign_ins(state: &AppState, user_id: Option<i64>, now: i64) -> Result<Vec<SignIn>> {
+pub async fn sign_ins(
+    state: &AppState,
+    user_id: Option<i64>,
+    now: Timestamp,
+) -> Result<Vec<SignIn>> {
     let people: BTreeMap<i64, User> = state
         .database
         .list_users()
@@ -160,9 +163,7 @@ pub async fn sign_ins(state: &AppState, user_id: Option<i64>, now: i64) -> Resul
     for key in state.database.list_api_keys().await? {
         let in_use = key.revoked_at.is_none()
             && !key.has_expired(now)
-            && key
-                .last_used_at
-                .is_some_and(|used| now - used.timestamp_millis() < KEY_IN_USE_MS)
+            && key.last_used_at.is_some_and(|used| now - used < KEY_IN_USE)
             && user_id.is_none_or(|user_id| key.user_id == user_id);
         let Some(person) = people.get(&key.user_id).filter(|_| in_use) else {
             continue;
@@ -199,7 +200,7 @@ pub async fn end_if_allowed(state: &AppState, kind: Kind, id: i64) -> Result<boo
         Kind::Browser => {
             let theirs = state
                 .database
-                .list_sessions(whose, now_ms())
+                .list_sessions(whose, crate::times::now())
                 .await?
                 .iter()
                 .any(|session| session.id == id);
@@ -303,8 +304,7 @@ pub struct Row {
     current: bool,
 }
 
-pub fn rows(sign_ins: Vec<SignIn>, now_ms: i64) -> Vec<Row> {
-    let now = times::from_ms(now_ms);
+pub fn rows(sign_ins: Vec<SignIn>, now: Timestamp) -> Vec<Row> {
     sign_ins
         .into_iter()
         .map(|sign_in| Row {
@@ -330,7 +330,7 @@ pub fn rows(sign_ins: Vec<SignIn>, now_ms: i64) -> Vec<Row> {
 }
 
 async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
-    let now = now_ms();
+    let now = crate::times::now();
     match sign_ins(&state, None, now).await {
         Ok(found) => Page::new(&state, &token, "settings/sign_ins.html")
             .with("sign_ins", &rows(found, now))

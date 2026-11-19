@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Result, ensure};
+use chrono::TimeDelta;
 use maxnines_checks::Login;
 use maxnines_checks::openmetrics::{Page, Totals};
 use maxnines_protocol::{Sample, check_metrics_pages, metrics_page_name};
@@ -21,17 +22,17 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, warn};
 
-use crate::metrics::now_ms;
 use crate::models::Database;
 use crate::presence::{Presence, Reached};
 use crate::registration::{HostKind, HostState, Registry};
 use crate::store::{NewSample, WriterCommand};
+use crate::times::{self, Timestamp};
 
 /// How often to look for pages that are due.
 const TICK: Duration = Duration::from_secs(5);
 
-pub const MIN_INTERVAL_SECS: u64 = 10;
-pub const MAX_INTERVAL_SECS: u64 = 86_400;
+pub const MIN_INTERVAL: Duration = Duration::from_secs(10);
+pub const MAX_INTERVAL: Duration = Duration::from_secs(86_400);
 
 /// How many pages are read at once. Anything over this waits its turn.
 const MAX_RUNNING: usize = 32;
@@ -67,7 +68,8 @@ pub struct MetricsPageInput {
     #[serde(default)]
     pub names: Vec<String>,
     /// How often it's read.
-    pub interval_secs: u64,
+    #[serde(rename = "interval_secs", with = "maxnines_protocol::time::seconds")]
+    pub interval: Duration,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     /// For a page that asks who's reading, with one of the two below.
@@ -115,7 +117,7 @@ impl fmt::Debug for MetricsPageInput {
         f.debug_struct("MetricsPageInput")
             .field("url", &self.url)
             .field("names", &self.names)
-            .field("interval_secs", &self.interval_secs)
+            .field("interval", &self.interval)
             .field("enabled", &self.enabled)
             .field("username", &self.username)
             .field("password_env", &self.password_env)
@@ -212,8 +214,10 @@ fn check_secret(what: &str, typed: Option<&String>, variable: Option<&String>) -
 pub fn check_input(input: &MetricsPageInput) -> Result<()> {
     check_metrics_pages(std::slice::from_ref(&input.url), &input.names)?;
     ensure!(
-        (MIN_INTERVAL_SECS..=MAX_INTERVAL_SECS).contains(&input.interval_secs),
-        "the interval has to be from {MIN_INTERVAL_SECS} to {MAX_INTERVAL_SECS} seconds"
+        (MIN_INTERVAL..=MAX_INTERVAL).contains(&input.interval),
+        "the interval has to be from {} to {} seconds",
+        MIN_INTERVAL.as_secs(),
+        MAX_INTERVAL.as_secs()
     );
 
     let (password, password_env) = (input.password.as_ref(), input.password_env.as_ref());
@@ -351,7 +355,7 @@ pub struct Scheduler {
     slots: Arc<Semaphore>,
     reads: Arc<PageReads>,
     /// When each page is next due, by ID.
-    next_run: HashMap<i64, i64>,
+    next_run: HashMap<i64, Timestamp>,
 }
 
 impl Scheduler {
@@ -380,7 +384,7 @@ impl Scheduler {
             timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
                 timer.tick().await;
-                if let Err(error) = self.start_due(now_ms()).await {
+                if let Err(error) = self.start_due(times::now()).await {
                     error!(error = format!("{error:#}"), "reading metrics pages failed");
                 }
             }
@@ -389,7 +393,7 @@ impl Scheduler {
 
     /// Starts reading everything that's due, without waiting for any of it, and
     /// returns what it started so that tests can wait for them.
-    pub async fn start_due(&mut self, now_ms: i64) -> Result<Vec<JoinHandle<()>>> {
+    pub async fn start_due(&mut self, now: Timestamp) -> Result<Vec<JoinHandle<()>>> {
         let hostnames: BTreeMap<String, String> = self
             .registry
             .list()
@@ -415,12 +419,12 @@ impl Scheduler {
 
         let mut started = Vec::new();
         for page in pages {
-            let due = *self.next_run.get(&page.id).unwrap_or(&now_ms);
-            if due > now_ms {
+            let due = *self.next_run.get(&page.id).unwrap_or(&now);
+            if due > now {
                 continue;
             }
-            let interval_ms = i64::try_from(page.input.interval_secs)?.saturating_mul(1000);
-            self.next_run.insert(page.id, now_ms + interval_ms);
+            let interval = TimeDelta::from_std(page.input.interval)?;
+            self.next_run.insert(page.id, now + interval);
             let hostname = hostnames[&page.host_id].clone();
             started.push(self.start(page, hostname));
         }
@@ -461,7 +465,7 @@ async fn save(
     rows: Vec<Value>,
 ) {
     let sample = Sample {
-        timestamp_ms: now_ms() as u64,
+        time: times::now(),
         metrics: BTreeMap::from([("openmetrics".to_string(), Value::Array(rows))]),
     };
     let command = WriterCommand::Save(NewSample {
@@ -482,7 +486,7 @@ mod tests {
         MetricsPageInput {
             url: "http://db.example.com:9187/metrics".to_string(),
             names: vec!["pg_*".to_string()],
-            interval_secs: 60,
+            interval: Duration::from_secs(60),
             enabled: true,
             username: None,
             password: None,
@@ -524,12 +528,13 @@ mod tests {
             };
             assert!(check_input(&bad).is_err(), "{url} {names}");
         }
-        for interval_secs in [MIN_INTERVAL_SECS - 1, MAX_INTERVAL_SECS + 1] {
+        let second = Duration::from_secs(1);
+        for interval in [MIN_INTERVAL - second, MAX_INTERVAL + second] {
             let bad = MetricsPageInput {
-                interval_secs,
+                interval,
                 ..input()
             };
-            assert!(check_input(&bad).is_err(), "{interval_secs}");
+            assert!(check_input(&bad).is_err(), "{interval:?}");
         }
     }
 

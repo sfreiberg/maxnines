@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+use chrono::TimeDelta;
 use futures_util::FutureExt;
 use maxnines_protocol::actions::ActionOutcome;
 use serde::Serialize;
@@ -21,10 +22,9 @@ use crate::actions::ActionRun;
 use crate::alert_charts::ChartSources;
 use crate::alerting::{Alert, Channel, Delivery, Event, Severity};
 use crate::channels::{self, pagerduty, resend, telegram};
-use crate::metrics::now_ms;
 use crate::models::Database;
 use crate::silences::ActiveSilences;
-use crate::times::{Timestamp, from_ms};
+use crate::times::Timestamp;
 
 /// How often the queue is checked.
 const INTERVAL: Duration = Duration::from_secs(5);
@@ -35,18 +35,18 @@ const BATCH_SIZE: usize = 16;
 /// How long one delivery can take, however many requests it makes.
 const DELIVERY_LIMIT: Duration = Duration::from_secs(60);
 
-const FIRST_RETRY_MS: i64 = 30_000;
-const LONGEST_RETRY_MS: i64 = 30 * 60_000;
+const FIRST_RETRY: TimeDelta = TimeDelta::seconds(30);
+const LONGEST_RETRY: TimeDelta = TimeDelta::minutes(30);
 
 /// After this, a notification is too old to be useful and shows as failed.
-const GIVE_UP_AFTER_MS: i64 = 24 * 3_600_000;
+const GIVE_UP_AFTER: TimeDelta = TimeDelta::hours(24);
 
 /// Doubles each time, up to a limit.
-fn retry_delay_ms(attempts: i32) -> i64 {
+fn retry_delay(attempts: i32) -> TimeDelta {
     let doublings = u32::try_from(attempts.saturating_sub(1))
         .unwrap_or(0)
         .min(16);
-    (FIRST_RETRY_MS << doublings).min(LONGEST_RETRY_MS)
+    (FIRST_RETRY * 2_i32.pow(doublings)).min(LONGEST_RETRY)
 }
 
 /// What a notification says, in the form every channel starts from.
@@ -192,7 +192,7 @@ impl Notice {
             "error": run.error,
             "output": run.output,
             "truncated": run.truncated,
-            "duration_ms": run.duration_ms,
+            "duration_ms": run.duration.map(|duration| duration.as_millis()),
         })
     }
 
@@ -412,12 +412,12 @@ impl Notifier {
 
     /// The chart for a delivery, if it gets one. Drawing one is never a reason not
     /// to send the notification.
-    async fn chart_for(&self, delivery: &Delivery, now_ms: i64) -> Option<Arc<Vec<u8>>> {
+    async fn chart_for(&self, delivery: &Delivery, now: Timestamp) -> Option<Arc<Vec<u8>>> {
         let charts = self.charts.as_ref()?;
         if !shows_chart(delivery) {
             return None;
         }
-        match charts.draw(&delivery.alert, now_ms).await {
+        match charts.draw(&delivery.alert, now).await {
             Ok(chart) => chart.map(Arc::new),
             Err(error) => {
                 warn!(
@@ -439,7 +439,8 @@ impl Notifier {
             loop {
                 timer.tick().await;
                 let notifier = self.clone();
-                let pass = tokio::spawn(async move { notifier.deliver_due(now_ms()).await });
+                let pass =
+                    tokio::spawn(async move { notifier.deliver_due(crate::times::now()).await });
                 match pass.await {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
@@ -457,7 +458,7 @@ impl Notifier {
     /// Lets go of what no silence covers any more. Something held for an alert
     /// that has since ended is dropped instead: the alert ended in the moment
     /// between the queue being read and the hold, and nobody needs to hear of it.
-    async fn release_held(&self, silences: &ActiveSilences, now_ms: i64) -> Result<()> {
+    async fn release_held(&self, silences: &ActiveSilences, now: Timestamp) -> Result<()> {
         let mut ids = Vec::new();
         for (alert, held) in self.database.held_deliveries().await? {
             if alert.resolved_at.is_some() {
@@ -467,7 +468,7 @@ impl Notifier {
             }
         }
         if !ids.is_empty() {
-            self.database.release_deliveries(&ids, now_ms).await?;
+            self.database.release_deliveries(&ids, now).await?;
         }
         Ok(())
     }
@@ -480,25 +481,25 @@ impl Notifier {
             || silences.covering(alert).is_some()
     }
 
-    async fn queue_reminders(&self, silences: &ActiveSilences, now_ms: i64) -> Result<()> {
-        let alerts: Vec<(i64, i64)> = self
+    async fn queue_reminders(&self, silences: &ActiveSilences, now: Timestamp) -> Result<()> {
+        let alerts: Vec<(i64, TimeDelta)> = self
             .database
             .alerts_to_remind()
             .await?
             .into_iter()
             .filter(|(alert, _)| silences.covering(alert).is_none())
-            .map(|(alert, every_secs)| (alert.id, every_secs))
+            .map(|(alert, every)| (alert.id, every))
             .collect();
-        self.database.queue_reminders(&alerts, now_ms).await
+        self.database.queue_reminders(&alerts, now).await
     }
 
     /// Sends what's due, and saves how each one went. Someone who was told an alert
     /// started always hears that it ended, or an on-call incident would stay open.
-    pub async fn deliver_due(&self, now_ms: i64) -> Result<()> {
-        let silences = ActiveSilences::load(&self.database, now_ms).await?;
-        self.release_held(&silences, now_ms).await?;
-        self.queue_reminders(&silences, now_ms).await?;
-        let due = self.database.due_deliveries(now_ms, BATCH_SIZE).await?;
+    pub async fn deliver_due(&self, now: Timestamp) -> Result<()> {
+        let silences = ActiveSilences::load(&self.database, now).await?;
+        self.release_held(&silences, now).await?;
+        self.queue_reminders(&silences, now).await?;
+        let due = self.database.due_deliveries(now, BATCH_SIZE).await?;
 
         let mut sends = JoinSet::new();
         // Each chart is drawn once a pass, however many channels it goes to.
@@ -522,7 +523,7 @@ impl Notifier {
                 match charts.get(&key) {
                     Some(drawn) => drawn.clone(),
                     None => {
-                        let drawn = self.chart_for(&delivery, now_ms).await;
+                        let drawn = self.chart_for(&delivery, now).await;
                         charts.insert(key, drawn.clone());
                         drawn
                     }
@@ -544,7 +545,7 @@ impl Notifier {
 
         while let Some(finished) = sends.join_next().await {
             match finished {
-                Ok((delivery, result)) => self.record(&delivery, result, now_ms).await?,
+                Ok((delivery, result)) => self.record(&delivery, result, now).await?,
                 // The rest of the batch still gets recorded.
                 Err(error) => error!(%error, "a delivery stopped unexpectedly"),
             }
@@ -556,7 +557,7 @@ impl Notifier {
         &self,
         delivery: &Delivery,
         result: Result<Option<String>>,
-        now_ms: i64,
+        now: Timestamp,
     ) -> Result<()> {
         let attempts = delivery.attempts.saturating_add(1);
         let channel = &delivery.channel.channel.name;
@@ -568,13 +569,13 @@ impl Notifier {
                     "notification sent"
                 );
                 self.database
-                    .delivery_sent(delivery.id, attempts, now_ms, external_id.as_deref())
+                    .delivery_sent(delivery.id, attempts, now, external_id.as_deref())
                     .await
             }
             Err(error) => {
                 let message = format!("{error:#}");
-                let next = (now_ms - delivery.created_at.timestamp_millis() < GIVE_UP_AFTER_MS)
-                    .then(|| from_ms(now_ms + retry_delay_ms(attempts)));
+                let next = (now - delivery.created_at < GIVE_UP_AFTER)
+                    .then(|| now + retry_delay(attempts));
                 warn!(
                     channel,
                     attempts,
@@ -618,12 +619,12 @@ mod tests {
 
     #[test]
     fn retries_slow_down_up_to_a_limit() {
-        assert_eq!(retry_delay_ms(1), 30_000);
-        assert_eq!(retry_delay_ms(2), 60_000);
-        assert_eq!(retry_delay_ms(3), 120_000);
-        assert_eq!(retry_delay_ms(7), LONGEST_RETRY_MS);
-        assert_eq!(retry_delay_ms(i32::MAX), LONGEST_RETRY_MS);
-        assert_eq!(retry_delay_ms(0), 30_000);
+        assert_eq!(retry_delay(1), TimeDelta::seconds(30));
+        assert_eq!(retry_delay(2), TimeDelta::minutes(1));
+        assert_eq!(retry_delay(3), TimeDelta::minutes(2));
+        assert_eq!(retry_delay(7), LONGEST_RETRY);
+        assert_eq!(retry_delay(i32::MAX), LONGEST_RETRY);
+        assert_eq!(retry_delay(0), TimeDelta::seconds(30));
     }
 
     #[test]

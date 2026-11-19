@@ -2,13 +2,13 @@ use std::collections::{BTreeMap, HashSet};
 use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
 use serde::Serialize;
 use tokio::sync::Notify;
 
 use crate::registration::{HostRecord, HostState};
+use crate::times::Timestamp;
 
 /// How often one agent may connect. A real agent reconnects a few times after a
 /// network blip; two hosts sharing a key knock each other off far faster.
@@ -38,10 +38,10 @@ pub enum Reach {
 pub struct HostPresence {
     pub online: bool,
     /// When `online` last changed.
-    pub since_ms: u64,
+    pub since: Timestamp,
     /// When the server last heard anything from this host, if it ever has. One
     /// with no agent has been heard from once something of it answers.
-    pub last_seen_ms: Option<u64>,
+    pub last_seen_at: Option<Timestamp>,
     /// Where the latest connection came from, as seen by the server.
     pub source: IpAddr,
 }
@@ -120,13 +120,13 @@ impl State {
         let online = reached.values().any(|answered| *answered);
         self.next_connection += 1;
         let connection = self.next_connection;
-        let now = now_ms();
+        let now = crate::times::now();
         let entry = self.hosts.entry(id.to_string()).or_insert(Entry {
             presence: HostPresence {
                 // The opposite, so that the first answer counts as a change.
                 online: !online,
-                since_ms: now,
-                last_seen_ms: None,
+                since: now,
+                last_seen_at: None,
                 // It has no connection, so there's nowhere it connected from.
                 source: IpAddr::from([0, 0, 0, 0]),
             },
@@ -134,12 +134,12 @@ impl State {
             replaced: Arc::new(Notify::new()),
         });
         if online {
-            entry.presence.last_seen_ms = Some(now);
+            entry.presence.last_seen_at = Some(now);
         }
         let changed = entry.presence.online != online;
         if changed {
             entry.presence.online = online;
-            entry.presence.since_ms = now;
+            entry.presence.since = now;
         }
         changed && online
     }
@@ -158,13 +158,13 @@ impl Presence {
         let mut state = self.state.lock().unwrap();
         state.next_connection += 1;
         let connection = state.next_connection;
-        let now = now_ms();
+        let now = crate::times::now();
 
         let entry = state.hosts.entry(id.to_string()).or_insert(Entry {
             presence: HostPresence {
                 online: false,
-                since_ms: now,
-                last_seen_ms: Some(now),
+                since: now,
+                last_seen_at: Some(now),
                 source,
             },
             connection,
@@ -179,11 +179,11 @@ impl Presence {
         let replaced = Arc::new(Notify::new());
         entry.replaced = replaced.clone();
         entry.connection = connection;
-        entry.presence.last_seen_ms = Some(now);
+        entry.presence.last_seen_at = Some(now);
         entry.presence.source = source;
         if !already_online {
             entry.presence.online = true;
-            entry.presence.since_ms = now;
+            entry.presence.since = now;
             self.came_online.notify_one();
         }
 
@@ -256,7 +256,7 @@ impl Presence {
 
     pub fn seen(&self, id: &str) {
         if let Some(entry) = self.state.lock().unwrap().hosts.get_mut(id) {
-            entry.presence.last_seen_ms = Some(now_ms());
+            entry.presence.last_seen_at = Some(crate::times::now());
         }
     }
 
@@ -266,7 +266,7 @@ impl Presence {
             && entry.connection == connection
         {
             entry.presence.online = false;
-            entry.presence.since_ms = now_ms();
+            entry.presence.since = crate::times::now();
         }
     }
 
@@ -293,13 +293,6 @@ impl Presence {
     }
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
@@ -317,11 +310,11 @@ mod tests {
         presence.reached("db", Reached::Page(1), true);
         let first = presence.get("db").unwrap();
         assert!(first.online);
-        assert!(first.last_seen_ms.is_some());
+        assert!(first.last_seen_at.is_some());
 
         // Answering again changes nothing about when it came online.
         presence.reached("db", Reached::Page(1), true);
-        assert_eq!(presence.get("db").unwrap().since_ms, first.since_ms);
+        assert_eq!(presence.get("db").unwrap().since, first.since);
 
         // A check that fails doesn't take it offline while its page answers.
         presence.reached("db", Reached::Check(1), false);
@@ -336,7 +329,7 @@ mod tests {
         let never = presence.get("cache").unwrap();
         assert!(!never.online);
         // Nothing of it has been heard from yet.
-        assert_eq!(never.last_seen_ms, None);
+        assert_eq!(never.last_seen_at, None);
     }
 
     #[test]

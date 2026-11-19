@@ -10,6 +10,7 @@ use super::audit::record_change;
 use super::{Database, proxy};
 use crate::audit::{Kind, Snapshot};
 use crate::proxies::Decision;
+use crate::times::Timestamp;
 
 impl From<proxy::Model> for Decision {
     fn from(row: proxy::Model) -> Self {
@@ -46,7 +47,7 @@ impl Database {
         &self,
         address: &str,
         trusted: bool,
-        now_ms: i64,
+        now: Timestamp,
     ) -> Result<Decision> {
         let transaction = self.connection.begin().await.context("starting a save")?;
         let existing = proxy::Entity::find()
@@ -80,7 +81,7 @@ impl Database {
                 let row = proxy::ActiveModel {
                     address: Set(address.to_string()),
                     trusted: Set(trusted),
-                    created_at: Set(crate::times::from_ms(now_ms)),
+                    created_at: Set(now),
                     ..Default::default()
                 }
                 .insert(&transaction)

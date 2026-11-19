@@ -2,6 +2,7 @@
 //! pages the server reads for it.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use axum::extract::{Path, State};
@@ -102,7 +103,7 @@ impl PageForm {
         Self {
             url: input.url.clone(),
             names: input.names.join("\n"),
-            interval_secs: input.interval_secs.to_string(),
+            interval_secs: input.interval.as_secs().to_string(),
             enabled: input.enabled,
             sign_in: input.sign_in().as_str().to_string(),
             username: input.username.clone().unwrap_or_default(),
@@ -143,15 +144,16 @@ impl PageForm {
             _ => SignIn::None,
         };
         let (with_password, with_token) = (sign_in == SignIn::Password, sign_in == SignIn::Token);
-        let interval_secs = self
+        let interval = self
             .interval_secs
             .trim()
             .parse()
+            .map(Duration::from_secs)
             .context("the interval has to be a number of seconds")?;
         let input = MetricsPageInput {
             url: self.url.trim().to_string(),
             names: self.names.lines().filter_map(filled).collect(),
-            interval_secs,
+            interval,
             enabled: self.enabled,
             username: filled(&self.username).filter(|_| with_password),
             // A password is whatever was typed, spaces and all.
@@ -358,7 +360,7 @@ pub async fn page_rows(state: &AppState, host_id: &str) -> Result<Vec<PageRow>> 
                     .and_then(|result| result["dropped"].as_u64())
                     .unwrap_or_default(),
                 url: page.input.url,
-                interval_secs: page.input.interval_secs,
+                interval_secs: page.input.interval.as_secs(),
                 enabled: page.input.enabled,
                 username: page.input.username,
                 password_env: page.input.password_env,
@@ -402,7 +404,7 @@ pub async fn check_rows(state: &AppState, host_id: &str) -> Result<Vec<CheckRow>
                     .map(String::from),
                 name: input.check.name,
                 target: input.check.target,
-                interval_secs: input.interval_secs,
+                interval_secs: input.interval.as_secs(),
                 enabled: input.enabled,
             }
         })
@@ -417,7 +419,7 @@ mod tests {
         MetricsPageInput {
             url: "https://db.example.com:9187/metrics".to_string(),
             names: vec!["pg_*".to_string(), "process_cpu_seconds_total".to_string()],
-            interval_secs: 120,
+            interval: Duration::from_secs(120),
             enabled: false,
             username: Some("metrics".to_string()),
             password: None,

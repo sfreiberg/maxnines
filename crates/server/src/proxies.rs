@@ -19,7 +19,7 @@ use serde::Serialize;
 
 use crate::config::parse_network;
 use crate::controllers::agent_socket::client_ip;
-use crate::times::{Timestamp, from_ms};
+use crate::times::Timestamp;
 
 /// The most proxies waiting for a decision that are kept, so a busy network can't
 /// grow the list for ever.
@@ -300,7 +300,7 @@ impl Proxies {
 
     /// Notes a signed-in request by `person` that came from `peer`, which said it was
     /// passing on `forwarded_for`, unless that's been decided either way.
-    pub fn note(&self, peer: IpAddr, forwarded_for: IpAddr, person: &str, now_ms: i64) {
+    pub fn note(&self, peer: IpAddr, forwarded_for: IpAddr, person: &str, now: Timestamp) {
         let decided = self
             .decided
             .read()
@@ -327,8 +327,8 @@ impl Proxies {
         let entry = seen.entry(peer).or_insert_with(|| Seen {
             address: peer,
             forwarded_for,
-            first_seen_at: from_ms(now_ms),
-            last_seen_at: from_ms(now_ms),
+            first_seen_at: now,
+            last_seen_at: now,
             requests: 0,
             people: BTreeSet::new(),
             kind: kind_of(&peer),
@@ -336,7 +336,7 @@ impl Proxies {
             suggested: suggested_range(&peer),
         });
         entry.forwarded_for = forwarded_for;
-        entry.last_seen_at = from_ms(now_ms);
+        entry.last_seen_at = now;
         entry.requests += 1;
         if entry.people.len() < MAX_PEOPLE {
             entry.people.insert(person.to_string());
@@ -534,9 +534,24 @@ mod tests {
     #[test]
     fn proxies_are_noted_until_decided() {
         let proxies = Proxies::new(None);
-        proxies.note(ip("10.0.0.5"), ip("203.0.113.7"), "a@example.com", 1);
-        proxies.note(ip("10.0.0.5"), ip("203.0.113.8"), "b@example.com", 2);
-        proxies.note(ip("127.0.0.1"), ip("203.0.113.7"), "a@example.com", 3);
+        proxies.note(
+            ip("10.0.0.5"),
+            ip("203.0.113.7"),
+            "a@example.com",
+            crate::times::from_ms(1),
+        );
+        proxies.note(
+            ip("10.0.0.5"),
+            ip("203.0.113.8"),
+            "b@example.com",
+            crate::times::from_ms(2),
+        );
+        proxies.note(
+            ip("127.0.0.1"),
+            ip("203.0.113.7"),
+            "a@example.com",
+            crate::times::from_ms(3),
+        );
         let undecided = proxies.undecided();
         assert_eq!(undecided.len(), 1);
         assert_eq!(undecided[0].requests, 2);
@@ -553,9 +568,19 @@ mod tests {
                 .any(|network| network.contains(&ip("10.0.9.9")))
         );
         // Not a proxy: no more notices, and still not believed.
-        proxies.note(ip("192.168.0.9"), ip("203.0.113.7"), "a@example.com", 4);
+        proxies.note(
+            ip("192.168.0.9"),
+            ip("203.0.113.7"),
+            "a@example.com",
+            crate::times::from_ms(4),
+        );
         proxies.set_decisions(&[decision(2, "192.168.0.9", false)]);
-        proxies.note(ip("192.168.0.9"), ip("203.0.113.7"), "a@example.com", 5);
+        proxies.note(
+            ip("192.168.0.9"),
+            ip("203.0.113.7"),
+            "a@example.com",
+            crate::times::from_ms(5),
+        );
         assert!(proxies.undecided().is_empty());
         assert!(
             !proxies
@@ -570,7 +595,12 @@ mod tests {
         let proxies = Proxies::new(None);
         for n in 0..30u8 {
             let peer = IpAddr::from([10, 0, 0, n]);
-            proxies.note(peer, ip("203.0.113.7"), "a@example.com", i64::from(n));
+            proxies.note(
+                peer,
+                ip("203.0.113.7"),
+                "a@example.com",
+                crate::times::from_ms(i64::from(n)),
+            );
         }
         let undecided = proxies.undecided();
         assert_eq!(undecided.len(), MAX_SEEN);

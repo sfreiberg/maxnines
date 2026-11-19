@@ -6,6 +6,7 @@
 //! sign-on, only has to find the user and call it.
 
 use anyhow::{Context, Result, ensure};
+use chrono::TimeDelta;
 use chrono_tz::Tz;
 use lettre::Address;
 use maxnines_protocol::auth::new_nonce;
@@ -21,7 +22,7 @@ use super::audit::{record, record_change};
 use super::{Database, api_key, api_key_snapshot, user, user_session};
 use crate::audit::{Action, Actor, Kind, Record, Snapshot, Subject};
 use crate::roles::Role;
-use crate::times::{DEFAULT_TIME_ZONE, Timestamp, from_ms, zone_named};
+use crate::times::{DEFAULT_TIME_ZONE, Timestamp, zone_named};
 
 /// A browser someone's signed in on, as the list of sign-ins shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,8 +62,8 @@ fn trimmed_user_agent(agent: &str) -> String {
     agent.chars().take(MAX_USER_AGENT_CHARS).collect()
 }
 
-pub const SESSION_LIFETIME_MS: i64 = 30 * 24 * 60 * 60 * 1000;
-const SETUP_LINK_LIFETIME_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+pub const SESSION_LIFETIME: TimeDelta = TimeDelta::days(30);
+const SETUP_LINK_LIFETIME: TimeDelta = TimeDelta::days(7);
 const MAX_EMAIL_LEN: usize = 254;
 const MAX_NAME_LEN: usize = 100;
 const MIN_PASSWORD_CHARS: usize = 12;
@@ -282,7 +283,7 @@ impl Database {
         email: &str,
         name: &str,
         role: Role,
-        now_ms: i64,
+        now: Timestamp,
     ) -> Result<Option<(User, String)>> {
         let taken = user::Entity::find()
             .filter(user::Column::Email.eq(email))
@@ -301,8 +302,8 @@ impl Database {
             theme: Set(DEFAULT_THEME.to_string()),
             time_zone: Set(DEFAULT_TIME_ZONE.name().to_string()),
             setup_token_hash: Set(Some(token_hash(&token))),
-            setup_expires_at: Set(Some(from_ms(now_ms + SETUP_LINK_LIFETIME_MS))),
-            created_at: Set(from_ms(now_ms)),
+            setup_expires_at: Set(Some(now + SETUP_LINK_LIFETIME)),
+            created_at: Set(now),
             ..Default::default()
         }
         .insert(&transaction)
@@ -323,7 +324,7 @@ impl Database {
 
     /// Replaces a user's setup link with a new one, which is how a forgotten password
     /// is reset. Their current password works until the link is used.
-    pub async fn new_setup_link(&self, id: i64, now_ms: i64) -> Result<Option<String>> {
+    pub async fn new_setup_link(&self, id: i64, now: Timestamp) -> Result<Option<String>> {
         let Some(row) = user::Entity::find_by_id(id)
             .one(&self.connection)
             .await
@@ -336,7 +337,7 @@ impl Database {
         let transaction = self.connection.begin().await.context("starting a save")?;
         let mut row: user::ActiveModel = row.into();
         row.setup_token_hash = Set(Some(token_hash(&token)));
-        row.setup_expires_at = Set(Some(from_ms(now_ms + SETUP_LINK_LIFETIME_MS)));
+        row.setup_expires_at = Set(Some(now + SETUP_LINK_LIFETIME));
         row.update(&transaction)
             .await
             .context("saving a setup link")?;
@@ -346,10 +347,10 @@ impl Database {
     }
 
     /// Who a setup link is for, if it still works.
-    pub async fn setup_link_user(&self, token: &str, now_ms: i64) -> Result<Option<User>> {
+    pub async fn setup_link_user(&self, token: &str, now: Timestamp) -> Result<Option<User>> {
         let row = user::Entity::find()
             .filter(user::Column::SetupTokenHash.eq(token_hash(token)))
-            .filter(user::Column::SetupExpiresAt.gt(from_ms(now_ms)))
+            .filter(user::Column::SetupExpiresAt.gt(now))
             .filter(user::Column::DisabledAt.is_null())
             .one(&self.connection)
             .await
@@ -364,7 +365,7 @@ impl Database {
         user_id: i64,
         token: &str,
         password_hash: &str,
-        now_ms: i64,
+        now: Timestamp,
     ) -> Result<bool> {
         let transaction = self.connection.begin().await.context("starting a save")?;
         let before = load(&transaction, user_id).await?;
@@ -381,7 +382,7 @@ impl Database {
             )
             .filter(user::Column::Id.eq(user_id))
             .filter(user::Column::SetupTokenHash.eq(token_hash(token)))
-            .filter(user::Column::SetupExpiresAt.gt(from_ms(now_ms)))
+            .filter(user::Column::SetupExpiresAt.gt(now))
             .filter(user::Column::DisabledAt.is_null())
             .exec(&transaction)
             .await
@@ -516,7 +517,7 @@ impl Database {
     }
 
     /// Stops someone signing in, and signs them out.
-    pub async fn disable_user(&self, id: i64, now_ms: i64) -> Result<UserChange> {
+    pub async fn disable_user(&self, id: i64, now: Timestamp) -> Result<UserChange> {
         let Some(row) = user::Entity::find_by_id(id)
             .one(&self.connection)
             .await
@@ -533,7 +534,7 @@ impl Database {
         let transaction = self.connection.begin().await.context("starting a save")?;
         let before = row.clone();
         let mut row: user::ActiveModel = row.into();
-        row.disabled_at = Set(Some(from_ms(now_ms)));
+        row.disabled_at = Set(Some(now));
         row.update(&transaction).await.context("disabling a user")?;
         record_user(&transaction, id, Some(&before), None).await?;
         user_session::Entity::delete_many()
@@ -623,11 +624,11 @@ impl Database {
     pub async fn start_session(
         &self,
         user_id: i64,
-        now_ms: i64,
+        now: Timestamp,
         user_agent: Option<&str>,
     ) -> Result<String> {
         user_session::Entity::delete_many()
-            .filter(user_session::Column::ExpiresAt.lte(from_ms(now_ms)))
+            .filter(user_session::Column::ExpiresAt.lte(now))
             .exec(&self.connection)
             .await
             .context("clearing old sessions")?;
@@ -639,9 +640,9 @@ impl Database {
         user_session::ActiveModel {
             user_id: Set(user_id),
             token_hash: Set(token_hash(&token)),
-            created_at: Set(from_ms(now_ms)),
-            expires_at: Set(from_ms(now_ms + SESSION_LIFETIME_MS)),
-            last_used_at: Set(Some(from_ms(now_ms))),
+            created_at: Set(now),
+            expires_at: Set(now + SESSION_LIFETIME),
+            last_used_at: Set(Some(now)),
             last_address: Set(crate::audit::source().map(|address| address.to_string())),
             last_forwarded_for: Set(
                 crate::audit::forwarded_for().map(|address| address.to_string())
@@ -653,7 +654,7 @@ impl Database {
         .await
         .context("saving a session")?;
         user::Entity::update_many()
-            .col_expr(user::Column::LastSignInAt, Expr::value(from_ms(now_ms)))
+            .col_expr(user::Column::LastSignInAt, Expr::value(now))
             .filter(user::Column::Id.eq(user_id))
             .exec(&transaction)
             .await
@@ -666,11 +667,8 @@ impl Database {
     }
 
     /// Who a session belongs to, if it's still good.
-    pub async fn session_user(&self, token: &str, now_ms: i64) -> Result<Option<User>> {
-        Ok(self
-            .session(token, None, now_ms)
-            .await?
-            .map(|(user, _)| user))
+    pub async fn session_user(&self, token: &str, now: Timestamp) -> Result<Option<User>> {
+        Ok(self.session(token, None, now).await?.map(|(user, _)| user))
     }
 
     /// Who a session belongs to and its ID, if it's still good, noting that it's been
@@ -679,11 +677,11 @@ impl Database {
         &self,
         token: &str,
         user_agent: Option<&str>,
-        now_ms: i64,
+        now: Timestamp,
     ) -> Result<Option<(User, i64)>> {
         let session = user_session::Entity::find()
             .filter(user_session::Column::TokenHash.eq(token_hash(token)))
-            .filter(user_session::Column::ExpiresAt.gt(from_ms(now_ms)))
+            .filter(user_session::Column::ExpiresAt.gt(now))
             .one(&self.connection)
             .await
             .context("checking a session")?;
@@ -706,7 +704,7 @@ impl Database {
         let new_agent = user_agent
             .map(trimmed_user_agent)
             .filter(|agent| session.user_agent.as_ref() != Some(agent));
-        let noted = super::noted_use(session.last_used_at, &last, now_ms);
+        let noted = super::noted_use(session.last_used_at, &last, now);
         if noted.is_some() || new_agent.is_some() {
             let mut session: user_session::ActiveModel = session.into();
             if let Some((used, from)) = noted {
@@ -770,10 +768,10 @@ impl Database {
     pub async fn list_sessions(
         &self,
         user_id: Option<i64>,
-        now_ms: i64,
+        now: Timestamp,
     ) -> Result<Vec<BrowserSession>> {
         let mut query = user_session::Entity::find()
-            .filter(user_session::Column::ExpiresAt.gt(from_ms(now_ms)))
+            .filter(user_session::Column::ExpiresAt.gt(now))
             .order_by_desc(user_session::Column::Id);
         if let Some(user_id) = user_id {
             query = query.filter(user_session::Column::UserId.eq(user_id));

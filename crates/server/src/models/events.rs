@@ -18,7 +18,7 @@ use super::{Database, alert, event, host_boot, host_fact, to_fact_version};
 use crate::audit::{self, Kind, Snapshot};
 use crate::events::{Event, EventKind, SERVER, TimelineEvent, UPDATE_FACTS};
 use crate::host_filter;
-use crate::times::{self, Timestamp};
+use crate::times::Timestamp;
 
 /// The most of a host's events a timeline holds, newest first.
 pub const MAX_TIMELINE: u64 = 500;
@@ -72,7 +72,7 @@ async fn insert_event<C: ConnectionTrait>(
     connection: &C,
     new: &NewEvent<'_>,
     by: &str,
-    now_ms: i64,
+    now: Timestamp,
 ) -> Result<event::Model> {
     let row = event::ActiveModel {
         occurred_at: Set(new.occurred_at),
@@ -81,7 +81,7 @@ async fn insert_event<C: ConnectionTrait>(
         detail: Set(new.detail.map(str::to_string)),
         filter: Set(new.filter.to_string()),
         created_by: Set(by.to_string()),
-        created_at: Set(times::from_ms(now_ms)),
+        created_at: Set(now),
         ..Default::default()
     };
     row.insert(connection).await.context("saving event")
@@ -89,9 +89,9 @@ async fn insert_event<C: ConnectionTrait>(
 
 impl Database {
     /// Saves an annotation, with the change in the audit log.
-    pub async fn record_event(&self, new: &NewEvent<'_>, by: &str, now_ms: i64) -> Result<i64> {
+    pub async fn record_event(&self, new: &NewEvent<'_>, by: &str, now: Timestamp) -> Result<i64> {
         let transaction = self.connection.begin().await.context("saving event")?;
-        let row = insert_event(&transaction, new, by, now_ms).await?;
+        let row = insert_event(&transaction, new, by, now).await?;
         let after = snapshot(&row);
         record_change(
             &transaction,
@@ -112,20 +112,20 @@ impl Database {
         &self,
         kind: EventKind,
         host_id: &str,
-        time_ms: i64,
+        occurred_at: Timestamp,
         title: &str,
         detail: Option<&str>,
-        now_ms: i64,
+        now: Timestamp,
     ) -> Result<()> {
         let filter = host_filter::only(host_id);
         let new = NewEvent {
             kind,
-            occurred_at: times::from_ms(time_ms),
+            occurred_at,
             title,
             detail,
             filter: &filter,
         };
-        insert_event(&self.connection, &new, SERVER, now_ms).await?;
+        insert_event(&self.connection, &new, SERVER, now).await?;
         Ok(())
     }
 
@@ -300,21 +300,21 @@ impl Database {
     }
 
     /// When a host last started, as far as the server knows.
-    pub async fn boot_time(&self, host_id: &str) -> Result<Option<i64>> {
+    pub async fn boot_time(&self, host_id: &str) -> Result<Option<Timestamp>> {
         let row = host_boot::Entity::find_by_id(host_id)
             .one(&self.connection)
             .await
             .context("loading a boot time")?;
-        Ok(row.map(|row| row.booted_at.timestamp_millis()))
+        Ok(row.map(|row| row.booted_at))
     }
 
     /// Notes when a host started, and marks a restart if it had started before.
     pub async fn save_boot_time(
         &self,
         host_id: &str,
-        boot_ms: i64,
+        booted_at: Timestamp,
         restarted: bool,
-        now_ms: i64,
+        now: Timestamp,
     ) -> Result<()> {
         let transaction = self
             .connection
@@ -323,7 +323,7 @@ impl Database {
             .context("saving a boot time")?;
         let row = host_boot::ActiveModel {
             host_id: Set(host_id.to_string()),
-            booted_at: Set(times::from_ms(boot_ms)),
+            booted_at: Set(booted_at),
         };
         host_boot::Entity::insert(row)
             .on_conflict(
@@ -338,12 +338,12 @@ impl Database {
             let filter = host_filter::only(host_id);
             let new = NewEvent {
                 kind: EventKind::Restart,
-                occurred_at: times::from_ms(boot_ms),
+                occurred_at: booted_at,
                 title: "Host started",
                 detail: None,
                 filter: &filter,
             };
-            insert_event(&transaction, &new, SERVER, now_ms).await?;
+            insert_event(&transaction, &new, SERVER, now).await?;
         }
         transaction.commit().await.context("saving a boot time")?;
         Ok(())

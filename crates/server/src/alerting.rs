@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use cel::Program;
+use chrono::TimeDelta;
 use serde::{Deserialize, Serialize};
 use wildmatch::WildMatch;
 
@@ -24,19 +25,21 @@ const MAX_NAME_LEN: usize = 255;
 const MAX_TARGET_LEN: usize = 2048;
 
 /// A rule can't wait longer than this before firing.
-const MAX_FOR_SECS: u64 = 7 * 86_400;
+const MAX_HOLD: TimeDelta = TimeDelta::days(7);
 
 /// A calculation needs a finished minute to look at.
-const MIN_WINDOW_SECS: u64 = 60;
-const MAX_WINDOW_SECS: u64 = 86_400;
-const DEFAULT_WINDOW_SECS: u64 = 300;
+const MIN_WINDOW: TimeDelta = TimeDelta::minutes(1);
+const MAX_WINDOW: TimeDelta = TimeDelta::days(1);
+const DEFAULT_WINDOW: TimeDelta = TimeDelta::minutes(5);
 
 /// How far back a forecast looks by default, and at least. Less than an hour is
 /// mostly noise, and more than a day is a lot to read every few minutes.
-pub const DEFAULT_FORECAST_WINDOW_SECS: u64 = 6 * 3600;
-const MIN_FORECAST_WINDOW_SECS: u64 = 3600;
-/// How far ahead a forecast can look. A line through a day says little about a month.
-const MAX_FORECAST_SECS: u64 = 30 * 86_400;
+pub const DEFAULT_FORECAST_WINDOW: TimeDelta = TimeDelta::hours(6);
+const MIN_FORECAST_WINDOW: TimeDelta = TimeDelta::hours(1);
+/// How far ahead a forecast can look, from a minute to 30 days. A line through a day
+/// says little about a month.
+const MIN_FORECAST: TimeDelta = TimeDelta::minutes(1);
+const MAX_FORECAST: TimeDelta = TimeDelta::days(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -158,7 +161,8 @@ pub struct AlertRuleInput {
     pub warning_threshold: Option<f64>,
     /// How long the problem has to last before the alert fires. It resolves as
     /// soon as the problem is gone.
-    pub for_secs: u64,
+    #[serde(rename = "for_secs", with = "crate::times::whole_seconds")]
+    pub hold: TimeDelta,
     pub severity: Severity,
     /// A CEL expression over facts. An empty condition matches every agent.
     #[serde(default)]
@@ -181,20 +185,36 @@ pub struct AlertRuleInput {
     #[serde(default)]
     pub filter: Option<String>,
     /// How far back a calculation rule looks, so one busy moment isn't a problem.
-    #[serde(default)]
-    pub window_secs: Option<u64>,
+    #[serde(
+        default,
+        rename = "window_secs",
+        with = "crate::times::optional_whole_seconds"
+    )]
+    pub window: Option<TimeDelta>,
     /// How often to say an alert is still firing, until someone acknowledges it. Never,
     /// if empty. On-call services are left out, as repeating is their job.
-    #[serde(default)]
-    pub remind_every_secs: Option<u64>,
+    #[serde(
+        default,
+        rename = "remind_every_secs",
+        with = "crate::times::optional_whole_seconds"
+    )]
+    pub remind_every: Option<TimeDelta>,
     /// For a forecast, how soon the metric has to be on course to reach `threshold`
     /// for the rule's severity.
-    #[serde(default)]
-    pub forecast_secs: Option<u64>,
+    #[serde(
+        default,
+        rename = "forecast_secs",
+        with = "crate::times::optional_whole_seconds"
+    )]
+    pub forecast: Option<TimeDelta>,
     /// For a critical forecast, a longer time ahead that's a warning first. One alert
     /// covers both, as with thresholds.
-    #[serde(default)]
-    pub warning_forecast_secs: Option<u64>,
+    #[serde(
+        default,
+        rename = "warning_forecast_secs",
+        with = "crate::times::optional_whole_seconds"
+    )]
+    pub warning_forecast: Option<TimeDelta>,
     /// What to run on an alert's host, and when. Only for metric and forecast
     /// rules, whose alerts are about one host.
     #[serde(default)]
@@ -208,19 +228,18 @@ fn default_enabled() -> bool {
 /// Checks a rule before it's saved. Whether its channels exist is up to the
 /// caller, which can see them.
 /// Any more often and people stop reading them.
-const MIN_REMINDER_SECS: u64 = 300;
+const MIN_REMINDER: TimeDelta = TimeDelta::minutes(5);
 
 pub fn check_rule(rule: &AlertRuleInput) -> Result<()> {
     ensure!(!rule.name.trim().is_empty(), "a rule needs a name");
     ensure!(rule.name.len() <= MAX_NAME_LEN, "the rule name is too long");
     ensure!(
-        rule.for_secs <= MAX_FOR_SECS,
+        rule.hold <= MAX_HOLD,
         "the duration can't be longer than 7 days"
     );
     check_rule_actions(rule)?;
     ensure!(
-        rule.remind_every_secs
-            .is_none_or(|secs| secs >= MIN_REMINDER_SECS),
+        rule.remind_every.is_none_or(|every| every >= MIN_REMINDER),
         "reminders can't be more often than every 5 minutes"
     );
     ensure!(
@@ -249,7 +268,7 @@ pub fn check_rule(rule: &AlertRuleInput) -> Result<()> {
             let threshold = rule.threshold.context("a rule needs a threshold")?;
             ensure!(threshold.is_finite(), "the threshold must be a number");
             ensure!(
-                (MIN_WINDOW_SECS..=MAX_WINDOW_SECS).contains(&rule.window()),
+                (MIN_WINDOW..=MAX_WINDOW).contains(&rule.window()),
                 "the window has to be between a minute and a day"
             );
             ensure!(
@@ -270,7 +289,7 @@ pub fn check_rule(rule: &AlertRuleInput) -> Result<()> {
     }
     if rule.kind != RuleKind::Forecast {
         ensure!(
-            rule.forecast_secs.is_none() && rule.warning_forecast_secs.is_none(),
+            rule.forecast.is_none() && rule.warning_forecast.is_none(),
             "only a forecast looks ahead"
         );
     }
@@ -304,7 +323,7 @@ pub fn check_rule(rule: &AlertRuleInput) -> Result<()> {
             "only a calculation rule takes a calculation, grouping or filter"
         );
         ensure!(
-            rule.window_secs.is_none() || rule.kind == RuleKind::Forecast,
+            rule.window.is_none() || rule.kind == RuleKind::Forecast,
             "only a calculation or forecast looks back over a window"
         );
     }
@@ -327,18 +346,15 @@ fn check_forecast(rule: &AlertRuleInput) -> Result<()> {
         ensure!(series.len() <= MAX_NAME_LEN, "the series name is too long");
     }
     let soon = rule
-        .forecast_secs
+        .forecast
         .context("a forecast needs how far ahead to look")?;
-    for secs in [Some(soon), rule.warning_forecast_secs]
-        .into_iter()
-        .flatten()
-    {
+    for ahead in [Some(soon), rule.warning_forecast].into_iter().flatten() {
         ensure!(
-            (60..=MAX_FORECAST_SECS).contains(&secs),
+            (MIN_FORECAST..=MAX_FORECAST).contains(&ahead),
             "a forecast can look between a minute and 30 days ahead"
         );
     }
-    if let Some(warning) = rule.warning_forecast_secs {
+    if let Some(warning) = rule.warning_forecast {
         ensure!(
             rule.severity == Severity::Critical,
             "a warning goes with a critical forecast"
@@ -349,7 +365,7 @@ fn check_forecast(rule: &AlertRuleInput) -> Result<()> {
         );
     }
     ensure!(
-        (MIN_FORECAST_WINDOW_SECS..=MAX_WINDOW_SECS).contains(&rule.window()),
+        (MIN_FORECAST_WINDOW..=MAX_WINDOW).contains(&rule.window()),
         "a forecast has to look back between an hour and a day"
     );
     Ok(())
@@ -404,21 +420,21 @@ impl AlertRuleInput {
         }
     }
 
-    pub fn window(&self) -> u64 {
-        self.window_secs.unwrap_or(match self.kind {
-            RuleKind::Forecast => DEFAULT_FORECAST_WINDOW_SECS,
-            _ => DEFAULT_WINDOW_SECS,
+    pub fn window(&self) -> TimeDelta {
+        self.window.unwrap_or(match self.kind {
+            RuleKind::Forecast => DEFAULT_FORECAST_WINDOW,
+            _ => DEFAULT_WINDOW,
         })
     }
 
     /// For a forecast, how far ahead each severity looks, mildest first.
-    pub fn forecast_levels(&self) -> Vec<(Severity, u64)> {
-        let Some(soon) = self.forecast_secs else {
+    pub fn forecast_levels(&self) -> Vec<(Severity, TimeDelta)> {
+        let Some(soon) = self.forecast else {
             return Vec::new();
         };
         let warning = self
-            .warning_forecast_secs
-            .map(|secs| (Severity::Warning, secs));
+            .warning_forecast
+            .map(|ahead| (Severity::Warning, ahead));
         warning.into_iter().chain([(self.severity, soon)]).collect()
     }
 
@@ -434,9 +450,9 @@ impl AlertRuleInput {
 
     /// What the rule watches, in a few words.
     pub fn describe(&self) -> String {
-        let wait = |text: String| match self.for_secs {
-            0 => text,
-            secs => format!("{text} for {}", format_duration(secs)),
+        let wait = |text: String| match self.hold {
+            hold if hold.is_zero() => text,
+            hold => format!("{text} for {}", format_duration(hold)),
         };
         let (Some(metric), Some(comparison), Some(level)) =
             (self.metric(), self.comparison, self.threshold)
@@ -451,9 +467,9 @@ impl AlertRuleInput {
             let ahead = self
                 .forecast_levels()
                 .iter()
-                .map(|(severity, secs)| {
-                    let within = format_duration(*secs);
-                    if self.warning_forecast_secs.is_some() {
+                .map(|(severity, ahead)| {
+                    let within = format_duration(*ahead);
+                    if self.warning_forecast.is_some() {
                         format!("{within} ({})", severity.as_str())
                     } else {
                         within
@@ -512,8 +528,8 @@ impl AlertRuleInput {
             comparison.as_str(),
             format_value(metric.unit, threshold)
         );
-        if self.for_secs > 0 {
-            summary.push_str(&format!(" for {}", format_duration(self.for_secs)));
+        if self.hold > TimeDelta::zero() {
+            summary.push_str(&format!(" for {}", format_duration(self.hold)));
         }
         Ok(summary)
     }
@@ -548,22 +564,22 @@ impl AlertRuleInput {
             comparison.as_str(),
             format_value(unit, threshold)
         );
-        if self.for_secs > 0 {
-            summary.push_str(&format!(" for {}", format_duration(self.for_secs)));
+        if self.hold > TimeDelta::zero() {
+            summary.push_str(&format!(" for {}", format_duration(self.hold)));
         }
         Ok(summary)
     }
 
     /// What a forecast alert says when it fires, or reaches `severity`, for a value
-    /// changing `slope_per_ms` and reaching the level in `eta_secs`.
+    /// changing `slope_per_sec` each second and reaching the level in `eta`.
     pub fn forecast_summary(
         &self,
         metric: &Metric,
         hostname: &str,
         series: &str,
         value: f64,
-        slope_per_ms: f64,
-        eta_secs: u64,
+        slope_per_sec: f64,
+        eta: TimeDelta,
     ) -> Result<String> {
         let comparison = self.comparison.context("no comparison")?;
         let level = self.threshold.context("no level")?;
@@ -573,21 +589,21 @@ impl AlertRuleInput {
         };
         let now = format_value(metric.unit, value);
         let goal = format_value(metric.unit, level);
-        if eta_secs == 0 {
+        if eta <= TimeDelta::zero() {
             return Ok(format!(
                 "{name} on {hostname} is {now}, already {} {goal}",
                 comparison.as_str()
             ));
         }
-        let per_hour = format_value(metric.unit, (slope_per_ms * 3_600_000.0).abs());
-        let direction = if slope_per_ms > 0.0 {
+        let per_hour = format_value(metric.unit, (slope_per_sec * 3600.0).abs());
+        let direction = if slope_per_sec > 0.0 {
             "rising"
         } else {
             "falling"
         };
         Ok(format!(
             "{name} on {hostname} is {now} and {direction} by {per_hour} an hour, so it reaches {goal} in about {}",
-            format_eta(eta_secs)
+            format_eta(eta)
         ))
     }
 
@@ -658,8 +674,8 @@ impl AlertRuleInput {
         hostname: &str,
         series: &str,
         value: f64,
-        slope_per_ms: f64,
-        eta_secs: Option<u64>,
+        slope_per_sec: f64,
+        eta: Option<TimeDelta>,
     ) -> Result<String> {
         let level = self.threshold.context("no level")?;
         let name = match metric.source {
@@ -667,18 +683,18 @@ impl AlertRuleInput {
             _ => format!("{} ({series})", metric.title),
         };
         let now = format_value(metric.unit, value);
-        let per_hour = format_value(metric.unit, (slope_per_ms * 3_600_000.0).abs());
+        let per_hour = format_value(metric.unit, (slope_per_sec * 3600.0).abs());
         if per_hour == format_value(metric.unit, 0.0) {
             return Ok(format!("{name} on {hostname} is now {now} and steady"));
         }
-        let direction = if slope_per_ms > 0.0 {
+        let direction = if slope_per_sec > 0.0 {
             "rising"
         } else {
             "falling"
         };
         let mut summary =
             format!("{name} on {hostname} is now {now} and {direction} by {per_hour} an hour");
-        if let Some(eta) = eta_secs.filter(|eta| *eta > 0) {
+        if let Some(eta) = eta.filter(|eta| *eta > TimeDelta::zero()) {
             summary.push_str(&format!(
                 ", so it reaches {} in about {}",
                 format_value(metric.unit, level),
@@ -686,7 +702,7 @@ impl AlertRuleInput {
             ));
             // It cleared because that is further off than the rule looks, which
             // the rounded time alone doesn't say.
-            if let Some(ahead) = self.forecast_levels().iter().map(|(_, secs)| *secs).max() {
+            if let Some(ahead) = self.forecast_levels().iter().map(|(_, ahead)| *ahead).max() {
                 summary.push_str(&format!(", no longer within {}", format_duration(ahead)));
             }
         }
@@ -704,12 +720,13 @@ fn heading(comparison: Comparison) -> &'static str {
 
 /// How long until something happens, roughly, as nobody can say to the minute
 /// when a line through the past will be right.
-pub fn format_eta(secs: u64) -> String {
-    let plural = |count: u64, unit: &str| match count {
+pub fn format_eta(eta: TimeDelta) -> String {
+    let plural = |count: i64, unit: &str| match count {
         1 => format!("1 {unit}"),
         _ => format!("{count} {unit}s"),
     };
-    let rounded = |unit: u64| (secs + unit / 2) / unit;
+    let secs = eta.num_seconds().max(0);
+    let rounded = |unit: i64| (secs + unit / 2) / unit;
     match secs {
         _ if rounded(60) < 60 => plural(rounded(60).max(1), "minute"),
         _ if rounded(3600) < 48 => plural(rounded(3600), "hour"),
@@ -727,12 +744,13 @@ pub fn clean(text: &str) -> String {
         .collect()
 }
 
-pub fn format_duration(secs: u64) -> String {
-    let plural = |count: u64, unit: &str| match count {
+/// A length of time in the largest unit it's a whole number of, such as "5 minutes".
+pub fn format_duration(length: TimeDelta) -> String {
+    let plural = |count: i64, unit: &str| match count {
         1 => format!("1 {unit}"),
         _ => format!("{count} {unit}s"),
     };
-    match secs {
+    match length.num_seconds() {
         secs if secs % 86_400 == 0 && secs > 0 => plural(secs / 86_400, "day"),
         secs if secs % 3600 == 0 && secs > 0 => plural(secs / 3600, "hour"),
         secs if secs % 60 == 0 && secs > 0 => plural(secs / 60, "minute"),
@@ -1029,7 +1047,7 @@ pub struct SeverityChange {
     pub severity: Severity,
     pub value: Option<f64>,
     pub summary: String,
-    pub now_ms: i64,
+    pub changed_at: Timestamp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -1110,13 +1128,14 @@ mod tests {
             kind: RuleKind::Forecast,
             metric: Some("disk.usage".to_string()),
             threshold: Some(100.0),
-            forecast_secs: Some(4 * 3600),
-            warning_forecast_secs: Some(86_400),
+            forecast: Some(TimeDelta::seconds(4 * 3600)),
+            warning_forecast: Some(TimeDelta::seconds(86_400)),
             ..metric_rule()
         };
         let metric = crate::metrics::find("disk.usage").unwrap();
-        let said = |slope_per_hour: f64, eta| {
-            let slope = slope_per_hour / 3_600_000.0;
+        let said = |slope_per_hour: f64, eta: Option<i64>| {
+            let slope = slope_per_hour / 3600.0;
+            let eta = eta.map(TimeDelta::seconds);
             rule.forecast_cleared_summary(metric, "web-1", "/", 83.6, slope, eta)
                 .unwrap()
         };
@@ -1148,7 +1167,7 @@ mod tests {
             comparison: Some(Comparison::Above),
             threshold: Some(90.0),
             warning_threshold: None,
-            for_secs: 300,
+            hold: TimeDelta::seconds(300),
             severity: Severity::Critical,
             condition: None,
             enabled: true,
@@ -1157,10 +1176,10 @@ mod tests {
             calculation: None,
             group_by: None,
             filter: None,
-            window_secs: None,
-            remind_every_secs: None,
-            forecast_secs: None,
-            warning_forecast_secs: None,
+            window: None,
+            remind_every: None,
+            forecast: None,
+            warning_forecast: None,
             actions: Vec::new(),
         }
     }
@@ -1171,7 +1190,7 @@ mod tests {
             metric: None,
             comparison: None,
             threshold: None,
-            for_secs: 60,
+            hold: TimeDelta::seconds(60),
             ..metric_rule()
         }
     }
@@ -1262,7 +1281,7 @@ mod tests {
             ),
             (
                 AlertRuleInput {
-                    remind_every_secs: Some(MIN_REMINDER_SECS - 1),
+                    remind_every: Some(MIN_REMINDER - TimeDelta::seconds(1)),
                     ..metric_rule()
                 },
                 "every 5 minutes",
@@ -1304,7 +1323,7 @@ mod tests {
             ),
             (
                 AlertRuleInput {
-                    for_secs: MAX_FOR_SECS + 1,
+                    hold: MAX_HOLD + TimeDelta::seconds(1),
                     ..metric_rule()
                 },
                 "7 days",
@@ -1366,7 +1385,7 @@ mod tests {
         let rule = AlertRuleInput {
             metric: Some("disk.usage".to_string()),
             series: Some("/".to_string()),
-            for_secs: 0,
+            hold: TimeDelta::seconds(0),
             ..metric_rule()
         };
         assert_eq!(rule.describe(), "Disk usage (/) above 90%");
@@ -1484,7 +1503,7 @@ mod tests {
 
         let disk = AlertRuleInput {
             metric: Some("disk.usage".to_string()),
-            for_secs: 0,
+            hold: TimeDelta::seconds(0),
             ..metric_rule()
         };
         assert_eq!(
@@ -1523,7 +1542,7 @@ mod tests {
             (7200, "2 hours"),
             (86_400, "1 day"),
         ] {
-            assert_eq!(format_duration(secs), text);
+            assert_eq!(format_duration(TimeDelta::seconds(secs)), text);
         }
     }
 
@@ -1798,7 +1817,7 @@ mod tests {
             (10 * 86_400, "10 days"),
         ];
         for (secs, words) in cases {
-            assert_eq!(format_eta(secs), words, "{secs}");
+            assert_eq!(format_eta(TimeDelta::seconds(secs)), words, "{secs}");
         }
     }
 
@@ -1812,7 +1831,7 @@ mod tests {
             comparison: Some(Comparison::Above),
             threshold: Some(100.0),
             warning_threshold: None,
-            for_secs: 0,
+            hold: TimeDelta::seconds(0),
             severity: Severity::Critical,
             condition: None,
             enabled: true,
@@ -1821,20 +1840,23 @@ mod tests {
             calculation: None,
             group_by: None,
             filter: None,
-            window_secs: None,
-            remind_every_secs: None,
-            forecast_secs: Some(4 * 3600),
-            warning_forecast_secs: Some(24 * 3600),
+            window: None,
+            remind_every: None,
+            forecast: Some(TimeDelta::seconds(4 * 3600)),
+            warning_forecast: Some(TimeDelta::seconds(24 * 3600)),
         }
     }
 
     #[test]
     fn forecasts_are_checked_like_any_rule() {
         assert!(check_rule(&forecast()).is_ok());
-        assert_eq!(forecast().window(), DEFAULT_FORECAST_WINDOW_SECS);
+        assert_eq!(forecast().window(), DEFAULT_FORECAST_WINDOW);
         assert_eq!(
             forecast().forecast_levels(),
-            [(Severity::Warning, 86_400), (Severity::Critical, 14_400)]
+            [
+                (Severity::Warning, TimeDelta::days(1)),
+                (Severity::Critical, TimeDelta::hours(4))
+            ]
         );
         let refused = |rule: AlertRuleInput, words: &str| {
             let error = check_rule(&rule).unwrap_err().to_string();
@@ -1842,7 +1864,7 @@ mod tests {
         };
         refused(
             AlertRuleInput {
-                forecast_secs: None,
+                forecast: None,
                 ..forecast()
             },
             "how far ahead",
@@ -1870,21 +1892,21 @@ mod tests {
         );
         refused(
             AlertRuleInput {
-                warning_forecast_secs: Some(3600),
+                warning_forecast: Some(TimeDelta::seconds(3600)),
                 ..forecast()
             },
             "further ahead",
         );
         refused(
             AlertRuleInput {
-                forecast_secs: Some(31 * 86_400),
+                forecast: Some(TimeDelta::seconds(31 * 86_400)),
                 ..forecast()
             },
             "30 days",
         );
         refused(
             AlertRuleInput {
-                window_secs: Some(600),
+                window: Some(TimeDelta::seconds(600)),
                 ..forecast()
             },
             "an hour and a day",
@@ -1912,10 +1934,10 @@ mod tests {
         );
         let metric = AlertRuleInput {
             kind: RuleKind::Metric,
-            forecast_secs: None,
-            warning_forecast_secs: None,
+            forecast: None,
+            warning_forecast: None,
             actions: Vec::new(),
-            window_secs: Some(3600),
+            window: Some(TimeDelta::seconds(3600)),
             ..forecast()
         };
         refused(metric, "only a calculation or forecast");

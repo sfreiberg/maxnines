@@ -1,8 +1,10 @@
 //! Dashboards, and asking about many hosts at once.
 
+use chrono::DurationRound;
+
 use super::*;
 
-const MINUTE_MS: i64 = 60_000;
+const MINUTE: TimeDelta = TimeDelta::minutes(1);
 
 /// Calls the API with the admin token, giving back the status and any JSON.
 async fn api(server: &TestServer, method: &str, path: &str, body: &Value) -> (u16, Value) {
@@ -15,9 +17,9 @@ async fn api(server: &TestServer, method: &str, path: &str, body: &Value) -> (u1
 /// When every host's reading was taken: the middle of a minute that's over, as the
 /// one still filling up isn't counted. It's the same for every host, as one taking
 /// its own time could land in the next minute and be counted apart.
-static READING_TIME: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
-    let minute = MINUTE_MS as u64;
-    (now_ms() as u64 / minute - 2) * minute + minute / 2
+static READING_TIME: std::sync::LazyLock<Timestamp> = std::sync::LazyLock::new(|| {
+    let this_minute = crate::times::now().duration_trunc(MINUTE).unwrap();
+    this_minute - MINUTE * 2 + MINUTE / 2
 });
 
 /// An approved host reporting a CPU reading, with these facts.
@@ -26,7 +28,7 @@ async fn host(server: &TestServer, hostname: &str, usage: f64, facts: Value) -> 
     let mut client = server.connect_approved(&host, hostname).await;
     send(&mut client, &AgentMessage::Facts { facts }).await;
     let sample = AgentMessage::Sample(Sample {
-        timestamp_ms: *READING_TIME,
+        time: *READING_TIME,
         metrics: BTreeMap::from([("cpu".to_string(), json!({ "usage_percent": usage }))]),
     });
     send(&mut client, &sample).await;
@@ -892,7 +894,10 @@ mod variables {
         assert_eq!(api(&server, "DELETE", &path, &Value::Null).await.0, 204);
 
         let database = &server.state.database;
-        let id = database.create_dashboard("Again", now_ms()).await.unwrap();
+        let id = database
+            .create_dashboard("Again", crate::times::now())
+            .await
+            .unwrap();
         let fresh = database.get_dashboard(id).await.unwrap().unwrap();
         assert!(fresh.variables.is_empty());
     }
@@ -926,7 +931,7 @@ mod calculation_alerts {
             comparison: Some(comparison),
             threshold: Some(threshold),
             warning_threshold: None,
-            for_secs: 0,
+            hold: TimeDelta::zero(),
             severity: Severity::Warning,
             condition: None,
             enabled: true,
@@ -935,15 +940,15 @@ mod calculation_alerts {
             calculation: Some(calculation),
             group_by: None,
             filter: None,
-            window_secs: Some(300),
-            remind_every_secs: None,
-            forecast_secs: None,
-            warning_forecast_secs: None,
+            window: Some(TimeDelta::minutes(5)),
+            remind_every: None,
+            forecast: None,
+            warning_forecast: None,
             actions: Vec::new(),
         }
     }
 
-    fn evaluator(server: &TestServer, started_ms: i64) -> Evaluator {
+    fn evaluator(server: &TestServer, started_at: Timestamp) -> Evaluator {
         let state = &server.state;
         Evaluator::new(
             state.database.clone(),
@@ -952,13 +957,13 @@ mod calculation_alerts {
             state.metrics.clone(),
             state.status.clone(),
             state.actions.clone(),
-            started_ms,
+            started_at,
         )
     }
 
     /// Well after the start, so the wait for agents to come back is over.
-    fn past_grace() -> i64 {
-        now_ms() - 600_000
+    fn past_grace() -> Timestamp {
+        crate::times::now() - TimeDelta::minutes(10)
     }
 
     async fn open_alerts(server: &TestServer) -> Vec<crate::alerting::Alert> {
@@ -975,7 +980,7 @@ mod calculation_alerts {
         database.create_alert_rule(&firing).await.unwrap();
 
         evaluator(&server, past_grace())
-            .evaluate(now_ms())
+            .evaluate(crate::times::now())
             .await
             .unwrap();
 
@@ -1025,7 +1030,7 @@ mod calculation_alerts {
             .unwrap();
 
         evaluator(&server, past_grace())
-            .evaluate(now_ms())
+            .evaluate(crate::times::now())
             .await
             .unwrap();
 
@@ -1047,7 +1052,7 @@ mod calculation_alerts {
             .unwrap();
 
         evaluator(&server, past_grace())
-            .evaluate(now_ms())
+            .evaluate(crate::times::now())
             .await
             .unwrap();
 
@@ -1071,7 +1076,7 @@ mod calculation_alerts {
             .unwrap();
 
         evaluator(&server, past_grace())
-            .evaluate(now_ms())
+            .evaluate(crate::times::now())
             .await
             .unwrap();
 
@@ -1095,7 +1100,7 @@ mod calculation_alerts {
             .unwrap();
 
         evaluator(&server, past_grace())
-            .evaluate(now_ms())
+            .evaluate(crate::times::now())
             .await
             .unwrap();
 
@@ -1115,8 +1120,8 @@ mod calculation_alerts {
             .await
             .unwrap();
 
-        evaluator(&server, now_ms())
-            .evaluate(now_ms())
+        evaluator(&server, crate::times::now())
+            .evaluate(crate::times::now())
             .await
             .unwrap();
 
@@ -1134,13 +1139,16 @@ mod calculation_alerts {
             .await
             .unwrap();
         let mut evaluator = evaluator(&server, past_grace());
-        evaluator.evaluate(now_ms()).await.unwrap();
+        evaluator.evaluate(crate::times::now()).await.unwrap();
         assert_eq!(open_alerts(&server).await.len(), 1);
 
         // Raising the threshold has the same effect as the number coming down.
         let raised = rule(Calculation::Avg, Comparison::Above, 90.0);
         database.update_alert_rule(id, &raised).await.unwrap();
-        evaluator.evaluate(now_ms() + MINUTE_MS).await.unwrap();
+        evaluator
+            .evaluate(crate::times::now() + MINUTE)
+            .await
+            .unwrap();
 
         assert!(open_alerts(&server).await.is_empty());
     }
@@ -1161,7 +1169,7 @@ mod calculation_alerts {
             .unwrap();
 
         evaluator(&server, past_grace())
-            .evaluate(now_ms())
+            .evaluate(crate::times::now())
             .await
             .unwrap();
 
@@ -1265,8 +1273,8 @@ impl MetricsReader for FailingReader {
 
     fn last_samples(
         &self,
-        _since_ms: i64,
-        _until_ms: i64,
+        _since: Timestamp,
+        _until: Timestamp,
     ) -> anyhow::Result<Vec<crate::metrics::LastSample>> {
         Ok(Vec::new())
     }
@@ -1275,8 +1283,8 @@ impl MetricsReader for FailingReader {
         &self,
         _host_id: &str,
         _collector: &str,
-        _since_ms: i64,
-        _until_ms: i64,
+        _since: Timestamp,
+        _until: Timestamp,
     ) -> anyhow::Result<Option<Value>> {
         Ok(None)
     }
@@ -1284,8 +1292,8 @@ impl MetricsReader for FailingReader {
     fn newest(
         &self,
         _metric: &crate::metrics::Metric,
-        _since_ms: i64,
-        _until_ms: i64,
+        _since: Timestamp,
+        _until: Timestamp,
     ) -> anyhow::Result<Vec<crate::metrics::NewestReading>> {
         Ok(Vec::new())
     }
@@ -1293,13 +1301,13 @@ impl MetricsReader for FailingReader {
     fn trends(
         &self,
         _metric: &crate::metrics::Metric,
-        _since_ms: i64,
-        _until_ms: i64,
+        _since: Timestamp,
+        _until: Timestamp,
     ) -> anyhow::Result<Vec<crate::metrics::Trend>> {
         Ok(Vec::new())
     }
 
-    fn stats(&self, _hour_ago_ms: i64) -> anyhow::Result<crate::store::StoreStats> {
+    fn stats(&self, _hour_ago: Timestamp) -> anyhow::Result<crate::store::StoreStats> {
         Ok(Default::default())
     }
 

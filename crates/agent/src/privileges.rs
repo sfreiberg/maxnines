@@ -16,6 +16,7 @@
 //! An agent that isn't started as root runs as it always has, with no helper.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -31,7 +32,8 @@ struct Request {
     id: u64,
     name: String,
     variables: BTreeMap<String, String>,
-    timeout_secs: u64,
+    #[serde(rename = "timeout_secs", with = "maxnines_protocol::time::seconds")]
+    timeout: Duration,
 }
 
 /// How the action a request asked for went.
@@ -52,6 +54,7 @@ pub use other::helper;
 #[cfg(not(unix))]
 mod other {
     use std::collections::BTreeMap;
+    use std::time::Duration;
 
     use super::Ended;
 
@@ -62,7 +65,7 @@ mod other {
             &self,
             _name: &str,
             _variables: &BTreeMap<String, String>,
-            _timeout_secs: u64,
+            _timeout: Duration,
         ) -> Option<Ended> {
             None
         }
@@ -87,7 +90,7 @@ mod unix {
     use std::time::Duration;
 
     use anyhow::{Context, Result, bail, ensure};
-    use maxnines_protocol::actions::{ActionOutcome, MAX_ACTION_TIMEOUT_SECS};
+    use maxnines_protocol::actions::{ActionOutcome, MAX_ACTION_TIMEOUT};
     use nix::sys::signal::{Signal, kill};
     use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
     use nix::unistd::{ForkResult, Gid, Pid, Uid, User, chown, fork, geteuid, setgid, setuid};
@@ -163,7 +166,7 @@ mod unix {
             &self,
             name: &str,
             variables: &BTreeMap<String, String>,
-            timeout_secs: u64,
+            limit: Duration,
         ) -> Option<Ended> {
             let mut open = self.open.lock().await;
             let made = self
@@ -183,7 +186,7 @@ mod unix {
                 id: self.asked.fetch_add(1, Ordering::Relaxed) + 1,
                 name: name.to_string(),
                 variables: variables.clone(),
-                timeout_secs,
+                timeout: limit,
             };
             // A question the helper only half took would break every one after
             // it, so not taking one in good time is the end of asking.
@@ -191,7 +194,7 @@ mod unix {
                 Ok(sent) => sent,
                 Err(_) => Err(anyhow::anyhow!("it stopped reading")),
             };
-            let limit = Duration::from_secs(timeout_secs.min(MAX_ACTION_TIMEOUT_SECS));
+            let limit = limit.min(MAX_ACTION_TIMEOUT);
             let answer = match sent {
                 Ok(()) => timeout(limit + ANSWER_GRACE, lines.answer_to(request.id)).await,
                 Err(error) => Ok(Err(error)),
@@ -586,7 +589,7 @@ mod unix {
             let answer = match serde_json::from_str::<Request>(&line) {
                 Ok(request) => {
                     let ended = executor
-                        .run_privileged(&request.name, &request.variables, request.timeout_secs)
+                        .run_privileged(&request.name, &request.variables, request.timeout)
                         .await;
                     info!(
                         action = request.name,
@@ -645,19 +648,35 @@ mod unix {
             let helper = helper_with(Actions::from([("plain".to_string(), plain)]), None);
             let none = BTreeMap::new();
 
-            let plain = helper.ask("plain", &none, 5).await.unwrap();
+            let plain = helper
+                .ask("plain", &none, Duration::from_secs(5))
+                .await
+                .unwrap();
             assert_eq!(plain.outcome, ActionOutcome::Refused);
             assert_eq!(plain.output, "");
             // So is a built-in that sees everything as anyone.
-            let top = helper.ask("top_cpu", &none, 5).await.unwrap();
+            let top = helper
+                .ask("top_cpu", &none, Duration::from_secs(5))
+                .await
+                .unwrap();
             assert_eq!(top.outcome, ActionOutcome::Refused);
-            let unknown = helper.ask("reboot", &none, 5).await.unwrap();
+            let unknown = helper
+                .ask("reboot", &none, Duration::from_secs(5))
+                .await
+                .unwrap();
             assert_eq!(unknown.outcome, ActionOutcome::NotDefined);
 
             // What it does run is checked as ever.
-            let missing = helper.ask("disk_space", &none, 5).await.unwrap();
+            let missing = helper
+                .ask("disk_space", &none, Duration::from_secs(5))
+                .await
+                .unwrap();
             assert_eq!(missing.outcome, ActionOutcome::Refused);
-            let too_long = helper.ask("disk_io", &none, MAX_ACTION_TIMEOUT_SECS + 1);
+            let too_long = helper.ask(
+                "disk_io",
+                &none,
+                MAX_ACTION_TIMEOUT + Duration::from_secs(1),
+            );
             assert_eq!(too_long.await.unwrap().outcome, ActionOutcome::Refused);
         }
 
@@ -668,7 +687,10 @@ mod unix {
             let folder = tempfile::tempdir().unwrap();
             std::fs::write(folder.path().join("file"), vec![1u8; 8192]).unwrap();
             let given = BTreeMap::from([("disk".to_string(), folder.path().display().to_string())]);
-            let ran = helper.ask("disk_space", &given, 30).await.unwrap();
+            let ran = helper
+                .ask("disk_space", &given, Duration::from_secs(30))
+                .await
+                .unwrap();
             assert_eq!(ran.outcome, ActionOutcome::Succeeded, "{ran:?}");
             assert!(ran.output.contains("found"), "{ran:?}");
             assert!(kept.path().join("disk_space.json").exists());
@@ -695,9 +717,15 @@ mod unix {
             drop(helpers);
             let helper = Helper::new(agents);
             let none = BTreeMap::new();
-            assert_eq!(helper.ask("disk_io", &none, 5).await, None);
+            assert_eq!(
+                helper.ask("disk_io", &none, Duration::from_secs(5)).await,
+                None
+            );
             assert!(helper.gone.load(Ordering::Relaxed));
-            assert_eq!(helper.ask("disk_io", &none, 5).await, None);
+            assert_eq!(
+                helper.ask("disk_io", &none, Duration::from_secs(5)).await,
+                None
+            );
         }
 
         #[tokio::test]

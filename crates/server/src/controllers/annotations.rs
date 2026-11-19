@@ -17,7 +17,6 @@ use crate::app_state::{AppState, EventRefusal};
 use crate::events::EventInput;
 use crate::host_filter;
 use crate::maintenance::moment;
-use crate::metrics::now_ms;
 use crate::times::{self, Timestamp};
 
 /// How far back the list goes.
@@ -126,7 +125,7 @@ fn when(text: &str) -> Result<Option<Timestamp>, String> {
     let local = NaiveDateTime::parse_from_str(text, FORM_TIME)
         .map_err(|_| "Give the time as a date and time, or leave it empty for now.".to_string())?;
     moment(viewer_zone(), local.date(), local.time())
-        .map(|time| Some(times::from_ms(time)))
+        .map(Some)
         .ok_or_else(|| "That time doesn't exist in your time zone.".to_string())
 }
 
@@ -150,7 +149,10 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
         occurred_at,
         filter: Some(filled.filter.clone()),
     };
-    match state.record_event(input, &recorded_by(), now_ms()).await {
+    match state
+        .record_event(input, &recorded_by(), crate::times::now())
+        .await
+    {
         Ok(_) => (form.token, Redirect::to("/metrics/annotations")).into_response(),
         Err(EventRefusal::Invalid(message)) => {
             page(&state, &form.token, &filled, Some(&message)).await
@@ -196,7 +198,10 @@ async fn create_for_host(
         occurred_at: None,
         filter: Some(host_filter::only(&host.id)),
     };
-    match state.record_event(input, &recorded_by(), now_ms()).await {
+    match state
+        .record_event(input, &recorded_by(), crate::times::now())
+        .await
+    {
         Ok(_) => {
             let target = back_to(&host.id, &form, None);
             (form.token, Redirect::to(&target)).into_response()

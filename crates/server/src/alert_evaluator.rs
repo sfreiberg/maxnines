@@ -11,6 +11,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use chrono::TimeDelta;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -22,17 +23,17 @@ use crate::alerting::{
     Alert, AlertRule, NewAlert, RULE_GONE_REASON, RuleKind, Severity, SeverityChange, clean,
 };
 use crate::calculations::{
-    self, Calculation, Grouping, Question, SMALLEST_STEP_MS, Sources, over_window,
+    self, Calculation, Grouping, Question, SMALLEST_STEP, Sources, over_window,
 };
 use crate::facts::unflatten;
-use crate::metrics::{self, Metrics, NewestReading, TimeRange, Trend, now_ms};
+use crate::metrics::{self, Metrics, NewestReading, TimeRange, Trend};
 use crate::models::Database;
 use crate::presence::Presence;
 use crate::registration::{HostRecord, HostState, Registry};
 use crate::remote_checks::{FLEET_HOST_ID, FLEET_HOSTNAME};
 use crate::rule_engine;
 use crate::server_stats::ServerStatus;
-use crate::times::from_ms;
+use crate::times::{self, Timestamp};
 
 /// How often rules are checked. Matches the default sample interval.
 const INTERVAL: Duration = Duration::from_secs(15);
@@ -43,7 +44,7 @@ const RECONNECT_SETTLE: Duration = Duration::from_secs(1);
 
 /// Nobody is connected just after a start, and agents take a moment to come
 /// back. Without this, every restart would look like the whole fleet going down.
-const STARTUP_GRACE_MS: i64 = 120_000;
+const STARTUP_GRACE: TimeDelta = TimeDelta::minutes(2);
 
 /// An agent can report as many disks or interfaces as it likes, and each series
 /// can be its own alert. No real host needs more than this.
@@ -54,21 +55,21 @@ const MAX_CALCULATION_LINES: usize = 500;
 
 /// How often forecasts read their metrics again. Reading hours of every disk is
 /// work, and a line through hours barely moves in a few minutes.
-const FORECAST_EVERY_MS: i64 = 5 * 60_000;
+const FORECAST_EVERY: TimeDelta = TimeDelta::minutes(5);
 /// A line through fewer readings than this, or through less than half of how far
 /// back the rule looks, isn't trusted to say anything.
 const MIN_FORECAST_SAMPLES: u64 = 10;
 /// A series not heard from for this long has no forecast, as with any missing
 /// reading, which says nothing about whether anything is wrong.
-const FORECAST_FRESH_MS: i64 = 10 * 60_000;
+const FORECAST_FRESH: TimeDelta = TimeDelta::minutes(10);
 
 /// What a forecast reads: a metric over how far back it looks.
-type TrendKey = (&'static str, u64);
+type TrendKey = (&'static str, TimeDelta);
 
 /// Trends by agent, and when they were read.
 #[derive(Clone)]
 struct Trends {
-    read_ms: i64,
+    read_at: Timestamp,
     by_host: Arc<BTreeMap<String, Vec<Trend>>>,
 }
 
@@ -100,13 +101,13 @@ enum Change {
 /// How long one level of a problem has lasted.
 #[derive(Debug, Default)]
 struct Hold {
-    breached_since: Option<i64>,
+    breached_since: Option<Timestamp>,
 }
 
 impl Hold {
-    fn observe(&mut self, breached: bool, now_ms: i64) {
+    fn observe(&mut self, breached: bool, now: Timestamp) {
         if breached {
-            self.breached_since.get_or_insert(now_ms);
+            self.breached_since.get_or_insert(now);
         } else {
             self.breached_since = None;
         }
@@ -116,9 +117,8 @@ impl Hold {
         self.breached_since.is_some()
     }
 
-    fn breached_for(&self, now_ms: i64, hold_ms: i64) -> bool {
-        self.breached_since
-            .is_some_and(|since| now_ms - since >= hold_ms)
+    fn breached_for(&self, now: Timestamp, hold: TimeDelta) -> bool {
+        self.breached_since.is_some_and(|since| now - since >= hold)
     }
 }
 
@@ -129,13 +129,13 @@ struct Tracker {
     holds: Vec<Hold>,
     /// Each sample is only counted once, as checks run more often than some
     /// agents report.
-    last_sample_ms: Option<i64>,
+    last_sample: Option<Timestamp>,
 }
 
 impl Tracker {
     /// When the problem began: the earliest any of its levels was crossed, and has
     /// been since.
-    fn breached_ms(&self) -> Option<i64> {
+    fn breached_since(&self) -> Option<Timestamp> {
         self.holds
             .iter()
             .filter_map(|hold| hold.breached_since)
@@ -149,7 +149,7 @@ impl Tracker {
     }
 
     /// Takes whether each of a rule's levels is crossed now, mildest first, and
-    /// what the alert is at, if it's open. A level has to last `hold_ms` to count,
+    /// what the alert is at, if it's open. A level has to last `hold` to count,
     /// so a passing moment doesn't alert, and stops counting the moment it's gone:
     /// a recovery is said at once, and something going back and forth is seen
     /// doing it, not hidden behind a wait. The alert is at the worst level that
@@ -157,13 +157,13 @@ impl Tracker {
     fn observe(
         &mut self,
         levels: &[(Severity, bool)],
-        now_ms: i64,
-        hold_ms: i64,
+        now: Timestamp,
+        hold: TimeDelta,
         open: Option<Severity>,
     ) -> Option<Change> {
         self.holds.resize_with(levels.len(), Hold::default);
-        for (hold, (_, breached)) in self.holds.iter_mut().zip(levels) {
-            hold.observe(*breached, now_ms);
+        for (level, (_, breached)) in self.holds.iter_mut().zip(levels) {
+            level.observe(*breached, now);
         }
         let worst = |counts: &dyn Fn(&Hold) -> bool| {
             levels
@@ -173,7 +173,7 @@ impl Tracker {
                 .find(|(_, hold)| counts(hold))
                 .map(|((severity, _), _)| *severity)
         };
-        let lasted = worst(&|hold| hold.breached_for(now_ms, hold_ms));
+        let lasted = worst(&|level| level.breached_for(now, hold));
 
         let Some(current) = open else {
             return lasted.map(Change::Fire);
@@ -200,7 +200,7 @@ impl Tracker {
 
 /// Everything one pass looks at, loaded once.
 struct Snapshot {
-    now_ms: i64,
+    now: Timestamp,
     in_grace: bool,
     rules: BTreeMap<i64, AlertRule>,
     hosts: BTreeMap<String, HostRecord>,
@@ -285,7 +285,7 @@ pub struct Evaluator {
     status: Arc<ServerStatus>,
     /// Runs what a rule asks for on an alert's host.
     actions: Arc<Actions>,
-    started_ms: i64,
+    started_at: Timestamp,
     trackers: HashMap<Key, Tracker>,
     /// Kept between passes, as forecasts read less often than rules are checked.
     trends: HashMap<TrendKey, Trends>,
@@ -299,7 +299,7 @@ impl Evaluator {
         metrics: Metrics,
         status: Arc<ServerStatus>,
         actions: Arc<Actions>,
-        started_ms: i64,
+        started_at: Timestamp,
     ) -> Self {
         Self {
             database,
@@ -308,7 +308,7 @@ impl Evaluator {
             metrics,
             status,
             actions,
-            started_ms,
+            started_at,
             trackers: HashMap::new(),
             trends: HashMap::new(),
         }
@@ -334,7 +334,9 @@ impl Evaluator {
                 }
                 let evaluator = evaluator.clone();
                 let pass =
-                    tokio::spawn(async move { evaluator.lock().await.evaluate(now_ms()).await });
+                    tokio::spawn(
+                        async move { evaluator.lock().await.evaluate(times::now()).await },
+                    );
                 match pass.await {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
@@ -346,7 +348,7 @@ impl Evaluator {
         })
     }
 
-    async fn snapshot(&mut self, now_ms: i64) -> Result<Snapshot> {
+    async fn snapshot(&mut self, now: Timestamp) -> Result<Snapshot> {
         let rules: BTreeMap<i64, AlertRule> = self
             .database
             .list_alert_rules()
@@ -384,7 +386,7 @@ impl Evaluator {
         let mut readings = BTreeMap::new();
         for name in wanted {
             let metric = metrics::find(name).context("unknown metric")?;
-            match self.metrics.newest(metric, now_ms).await {
+            match self.metrics.newest(metric, now).await {
                 Ok(rows) => {
                     let mut by_host: BTreeMap<String, Vec<NewestReading>> = BTreeMap::new();
                     for row in rows {
@@ -408,12 +410,12 @@ impl Evaluator {
             .collect();
         self.trends.retain(|key, _| forecasts.contains(key));
         for key in forecasts {
-            self.read_trends(key, now_ms).await?;
+            self.read_trends(key, now).await?;
         }
 
         Ok(Snapshot {
-            now_ms,
-            in_grace: now_ms - self.started_ms < STARTUP_GRACE_MS,
+            now,
+            in_grace: now - self.started_at < STARTUP_GRACE,
             rules,
             hosts,
             facts,
@@ -424,29 +426,23 @@ impl Evaluator {
 
     /// Reads which way a metric has been heading, if it's been long enough since
     /// the last time. If it can't be read, the forecast is missing until it can be.
-    async fn read_trends(&mut self, key: TrendKey, now_ms: i64) -> Result<()> {
-        let fresh = self
-            .trends
-            .get(&key)
-            .is_some_and(|trends| (0..FORECAST_EVERY_MS).contains(&(now_ms - trends.read_ms)));
+    async fn read_trends(&mut self, key: TrendKey, now: Timestamp) -> Result<()> {
+        let fresh = self.trends.get(&key).is_some_and(|trends| {
+            (TimeDelta::zero()..FORECAST_EVERY).contains(&(now - trends.read_at))
+        });
         if fresh {
             return Ok(());
         }
-        let (name, window_secs) = key;
+        let (name, window) = key;
         let metric = metrics::find(name).context("unknown metric")?;
-        let window_ms = i64::try_from(window_secs).unwrap_or(i64::MAX / 1000) * 1000;
-        match self
-            .metrics
-            .trends(metric, now_ms - window_ms, now_ms)
-            .await
-        {
+        match self.metrics.trends(metric, now - window, now).await {
             Ok(rows) => {
                 let mut by_host: BTreeMap<String, Vec<Trend>> = BTreeMap::new();
                 for row in rows {
                     by_host.entry(row.host_id.clone()).or_default().push(row);
                 }
                 let trends = Trends {
-                    read_ms: now_ms,
+                    read_at: now,
                     by_host: Arc::new(by_host),
                 };
                 self.trends.insert(key, trends);
@@ -465,8 +461,8 @@ impl Evaluator {
 
     /// Checks every rule once. Stopping partway is safe, as anything not done
     /// this time still needs doing next time.
-    pub async fn evaluate(&mut self, now_ms: i64) -> Result<()> {
-        let snapshot = self.snapshot(now_ms).await?;
+    pub async fn evaluate(&mut self, now: Timestamp) -> Result<()> {
+        let snapshot = self.snapshot(now).await?;
         let open_alerts = self.database.open_alerts().await?;
         let mut open: HashMap<Key, Alert> = HashMap::new();
         let mut orphans = Vec::new();
@@ -512,23 +508,21 @@ impl Evaluator {
         }
 
         for alert in orphans {
-            self.close(&alert, now_ms, RULE_GONE_REASON, None).await?;
+            self.close(&alert, now, RULE_GONE_REASON, None).await?;
         }
         for (key, alert) in &open {
             if !checked.contains(key)
                 && let Some(reason) = snapshot.reason_to_close(alert)
             {
-                self.close(alert, now_ms, reason, None).await?;
+                self.close(alert, now, reason, None).await?;
             }
         }
 
-        self.actions.give_up_on_unanswered(now_ms).await?;
+        self.actions.give_up_on_unanswered(now).await?;
         self.trackers.retain(|key, _| checked.contains(key));
         let firing = self.database.open_alerts().await?.len();
         self.status.firing.store(firing, Ordering::Relaxed);
-        self.status
-            .last_alert_pass_ms
-            .store(now_ms, Ordering::Relaxed);
+        self.status.alert_pass_finished(now);
         Ok(())
     }
 
@@ -556,7 +550,7 @@ impl Evaluator {
             return Ok(());
         }
         let online = presence.is_some_and(|p| p.online);
-        let since = presence.map_or(self.started_ms, |p| p.since_ms as i64);
+        let since = presence.map_or(self.started_at, |p| p.since);
         // Just after a start, an agent that isn't back yet may only be slow to
         // reconnect, so it's left as it was. One that is back is certainly online.
         if snapshot.in_grace && !online {
@@ -566,10 +560,9 @@ impl Evaluator {
         let tracker = self.trackers.entry(key.clone()).or_default();
         let hold = tracker.only_hold();
         hold.breached_since = (!online).then_some(since);
-        let hold_ms = hold_ms(rule);
         let levels = [(rule.rule.severity, !online)];
         let current = open.get(&key).map(|alert| alert.severity);
-        let change = tracker.observe(&levels, snapshot.now_ms, hold_ms, current);
+        let change = tracker.observe(&levels, snapshot.now, rule.rule.hold, current);
 
         let hostname = clean(&host.hostname);
         let summary = match change {
@@ -586,10 +579,9 @@ impl Evaluator {
         &self,
         rule: &AlertRule,
         question: &Question,
-        now_ms: i64,
+        now: Timestamp,
     ) -> Option<Vec<(String, f64)>> {
-        let window_ms = i64::try_from(rule.rule.window()).unwrap_or(i64::MAX / 1000) * 1000;
-        let range = TimeRange::new(now_ms - window_ms - SMALLEST_STEP_MS, now_ms)?;
+        let range = TimeRange::ending(now, rule.rule.window() + SMALLEST_STEP)?;
         let sources = Sources {
             database: &self.database,
             registry: &self.registry,
@@ -644,10 +636,7 @@ impl Evaluator {
                 return Ok(());
             }
         };
-        let Some(lines) = self
-            .calculated_lines(rule, &question, snapshot.now_ms)
-            .await
-        else {
+        let Some(lines) = self.calculated_lines(rule, &question, snapshot.now).await else {
             return Ok(());
         };
 
@@ -663,7 +652,7 @@ impl Evaluator {
             let tracker = self.trackers.entry(key.clone()).or_default();
             let current = open.get(&key).map(|alert| alert.severity);
             let levels = crossed(&thresholds, comparison, *value);
-            let change = tracker.observe(&levels, snapshot.now_ms, hold_ms(rule), current);
+            let change = tracker.observe(&levels, snapshot.now, rule.rule.hold, current);
 
             let summary = match change {
                 Some(Change::Resolve) => rule
@@ -698,7 +687,7 @@ impl Evaluator {
             for key in gone {
                 if let Some(alert) = open.remove(&key) {
                     let reason = "This line is no longer reported";
-                    self.close(&alert, snapshot.now_ms, reason, None).await?;
+                    self.close(&alert, snapshot.now, reason, None).await?;
                 }
             }
         }
@@ -744,13 +733,13 @@ impl Evaluator {
             checked.insert(key.clone());
 
             let tracker = self.trackers.entry(key.clone()).or_default();
-            if tracker.last_sample_ms == Some(reading.time_ms) {
+            if tracker.last_sample == Some(reading.time) {
                 continue;
             }
             let current = open.get(&key).map(|alert| alert.severity);
             let levels = crossed(&thresholds, comparison, reading.value);
-            let change = tracker.observe(&levels, snapshot.now_ms, hold_ms(rule), current);
-            tracker.last_sample_ms = Some(reading.time_ms);
+            let change = tracker.observe(&levels, snapshot.now, rule.rule.hold, current);
+            tracker.last_sample = Some(reading.time);
 
             let hostname = clean(&host.hostname);
             // Said in the collector's own words where it has them, such as a
@@ -764,7 +753,7 @@ impl Evaluator {
                     if output.is_none() {
                         let latest =
                             self.metrics
-                                .latest_output(&host.id, metric.collector, snapshot.now_ms);
+                                .latest_output(&host.id, metric.collector, snapshot.now);
                         output = Some(latest.await.ok().flatten().unwrap_or(Value::Null));
                     }
                     let state =
@@ -836,7 +825,7 @@ impl Evaluator {
         let Some(host_trends) = trends.by_host.get(&host.id) else {
             return Ok(());
         };
-        let window_ms = i64::try_from(rule.rule.window()).unwrap_or(i64::MAX / 1000) * 1000;
+        let window = rule.rule.window();
         let watched = host_trends
             .iter()
             .map(|trend| (clean(&trend.series), trend))
@@ -851,22 +840,22 @@ impl Evaluator {
             };
             checked.insert(key.clone());
             let trusted = trend.samples >= MIN_FORECAST_SAMPLES
-                && trends.read_ms - trend.first_ms >= window_ms / 2
-                && trends.read_ms - trend.time_ms <= FORECAST_FRESH_MS;
+                && trends.read_at - trend.first_time >= window / 2
+                && trends.read_at - trend.time <= FORECAST_FRESH;
             let tracker = self.trackers.entry(key.clone()).or_default();
-            if !trusted || tracker.last_sample_ms == Some(trend.time_ms) {
+            if !trusted || tracker.last_sample == Some(trend.time) {
                 continue;
             }
-            let eta = eta_secs(trend, level, comparison, snapshot.now_ms);
+            let eta = eta(trend, level, comparison, snapshot.now);
             let levels: Vec<(Severity, bool)> = rule
                 .rule
                 .forecast_levels()
                 .into_iter()
-                .map(|(severity, secs)| (severity, eta.is_some_and(|eta| eta <= secs)))
+                .map(|(severity, soon)| (severity, eta.is_some_and(|eta| eta <= soon)))
                 .collect();
             let current = open.get(&key).map(|alert| alert.severity);
-            let change = tracker.observe(&levels, snapshot.now_ms, hold_ms(rule), current);
-            tracker.last_sample_ms = Some(trend.time_ms);
+            let change = tracker.observe(&levels, snapshot.now, rule.rule.hold, current);
+            tracker.last_sample = Some(trend.time);
 
             let hostname = clean(&host.hostname);
             let summary = match (change.as_ref().and_then(Change::severity), eta) {
@@ -876,7 +865,7 @@ impl Evaluator {
                         &hostname,
                         &series,
                         trend.value,
-                        trend.slope_per_ms,
+                        trend.slope_per_sec,
                         eta,
                     )?
                 }
@@ -885,7 +874,7 @@ impl Evaluator {
                     &hostname,
                     &series,
                     trend.value,
-                    trend.slope_per_ms,
+                    trend.slope_per_sec,
                     eta,
                 )?,
                 _ => String::new(),
@@ -922,7 +911,7 @@ impl Evaluator {
             Some(Change::Resolve) => {
                 if let Some(alert) = open.remove(&key) {
                     let now = Some(summary.as_str()).filter(|summary| !summary.is_empty());
-                    self.close(&alert, snapshot.now_ms, "The problem cleared", now)
+                    self.close(&alert, snapshot.now, "The problem cleared", now)
                         .await?;
                 }
                 Ok(())
@@ -936,7 +925,7 @@ impl Evaluator {
                     severity,
                     value,
                     summary,
-                    now_ms: snapshot.now_ms,
+                    changed_at: snapshot.now,
                 };
                 let channels = self.channels_for(rule).await?;
                 if self.database.change_severity(&change, &channels).await? {
@@ -951,18 +940,18 @@ impl Evaluator {
                         value: value.or(alert.value),
                         ..alert.clone()
                     };
-                    self.run_actions(rule, &alert, false, snapshot.now_ms).await;
+                    self.run_actions(rule, &alert, false, snapshot.now).await;
                 }
                 Ok(())
             }
             Some(Change::Fire(severity)) => {
                 // A level only counts once it's held, so a problem has always begun
                 // by the time its alert fires.
-                let breached_ms = self
+                let breached_at = self
                     .trackers
                     .get(&key)
-                    .and_then(Tracker::breached_ms)
-                    .unwrap_or(snapshot.now_ms);
+                    .and_then(Tracker::breached_since)
+                    .unwrap_or(snapshot.now);
                 let new = NewAlert {
                     rule_id: rule.id,
                     rule_name: rule.rule.name.clone(),
@@ -972,14 +961,14 @@ impl Evaluator {
                     series: key.series,
                     value,
                     summary,
-                    started_at: from_ms(snapshot.now_ms),
-                    breached_at: from_ms(breached_ms),
+                    started_at: snapshot.now,
+                    breached_at,
                 };
                 let channels = self.channels_for(rule).await?;
                 let id = self.database.fire_alert(&new, &channels).await?;
                 info!(rule = rule.rule.name, hostname, "alert fired");
                 if let Some(alert) = self.database.get_alert(id).await? {
-                    self.run_actions(rule, &alert, true, snapshot.now_ms).await;
+                    self.run_actions(rule, &alert, true, snapshot.now).await;
                 }
                 Ok(())
             }
@@ -988,8 +977,8 @@ impl Evaluator {
 
     /// Asks the alert's host for whatever the rule runs at this point. A failure
     /// here is logged and left, as the alert itself has already been saved.
-    async fn run_actions(&self, rule: &AlertRule, alert: &Alert, started: bool, now_ms: i64) {
-        let asked = self.actions.run_for_alert(rule, alert, started, now_ms);
+    async fn run_actions(&self, rule: &AlertRule, alert: &Alert, started: bool, now: Timestamp) {
+        let asked = self.actions.run_for_alert(rule, alert, started, now);
         if let Err(error) = asked.await {
             error!(
                 rule = rule.rule.name,
@@ -1014,12 +1003,12 @@ impl Evaluator {
     async fn close(
         &self,
         alert: &Alert,
-        now_ms: i64,
+        now: Timestamp,
         reason: &str,
         summary: Option<&str>,
     ) -> Result<()> {
         self.database
-            .resolve_alert(alert.id, now_ms, reason, summary)
+            .resolve_alert(alert.id, now, reason, summary)
             .await?;
         info!(
             rule = alert.rule_name,
@@ -1053,41 +1042,49 @@ fn crossed(
         .collect()
 }
 
-/// How long from `now_ms` until a series reaches `level`, carrying on the way it
-/// has been going. Nothing if it's heading the other way or not moving, and none
-/// if it's already there.
-fn eta_secs(
+/// How long from `now` until a series reaches `level`, carrying on the way it has
+/// been going, to the second. Nothing if it's heading the other way or not moving,
+/// and none if it's already there.
+fn eta(
     trend: &Trend,
     level: f64,
     comparison: crate::alerting::Comparison,
-    now_ms: i64,
-) -> Option<u64> {
+    now: Timestamp,
+) -> Option<TimeDelta> {
     if comparison.is_breached(trend.value, level) || trend.value == level {
-        return Some(0);
+        return Some(TimeDelta::zero());
     }
     let towards = match comparison {
-        crate::alerting::Comparison::Above => trend.slope_per_ms,
-        crate::alerting::Comparison::Below => -trend.slope_per_ms,
+        crate::alerting::Comparison::Above => trend.slope_per_sec,
+        crate::alerting::Comparison::Below => -trend.slope_per_sec,
     };
     if towards.is_nan() || towards <= 0.0 {
         return None;
     }
-    let from_newest_ms = (level - trend.value).abs() / towards;
-    let from_now_ms = from_newest_ms - (now_ms - trend.time_ms) as f64;
-    if !from_now_ms.is_finite() {
+    let from_newest = (level - trend.value).abs() / towards;
+    let since_newest = (now - trend.time).num_milliseconds() as f64 / 1000.0;
+    let from_now = (from_newest - since_newest).max(0.0).ceil();
+    // Something so slow it would take longer than a moment can be away is of no
+    // interest, and neither is anything that isn't a number.
+    if !from_now.is_finite() || from_now >= TimeDelta::MAX.num_seconds() as f64 {
         return None;
     }
-    // Saturates for something so slow it's of no interest.
-    Some((from_now_ms.max(0.0) / 1000.0).ceil() as u64)
-}
-
-fn hold_ms(rule: &AlertRule) -> i64 {
-    i64::try_from(rule.rule.for_secs).unwrap_or(i64::MAX / 1000) * 1000
+    Some(TimeDelta::seconds(from_now as i64))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::times::from_ms;
+
+    /// The moment `seconds` into the tests' time.
+    fn at(seconds: i64) -> Timestamp {
+        from_ms(1_795_000_000_000 + seconds * 1000)
+    }
+
+    fn secs(seconds: i64) -> TimeDelta {
+        TimeDelta::seconds(seconds)
+    }
 
     const W: Severity = Severity::Warning;
     const C: Severity = Severity::Critical;
@@ -1099,20 +1096,20 @@ mod tests {
         let mut tracker = Tracker::default();
         let levels = |warning, critical| [(W, warning), (C, critical)];
         assert_eq!(
-            tracker.observe(&levels(true, false), 1_000, 60_000, None),
+            tracker.observe(&levels(true, false), at(1), secs(60), None),
             None
         );
-        assert_eq!(tracker.breached_ms(), Some(1_000));
+        assert_eq!(tracker.breached_since(), Some(at(1)));
         // Worse later, it still breached when it first went wrong.
-        tracker.observe(&levels(true, true), 30_000, 60_000, None);
+        tracker.observe(&levels(true, true), at(30), secs(60), None);
         assert_eq!(
-            tracker.observe(&levels(true, true), 61_000, 60_000, None),
+            tracker.observe(&levels(true, true), at(61), secs(60), None),
             Some(Change::Fire(W))
         );
-        assert_eq!(tracker.breached_ms(), Some(1_000));
+        assert_eq!(tracker.breached_since(), Some(at(1)));
         // Once it's fine, there's nothing breached.
-        tracker.observe(&levels(false, false), 70_000, 60_000, Some(W));
-        assert_eq!(tracker.breached_ms(), None);
+        tracker.observe(&levels(false, false), at(70), secs(60), Some(W));
+        assert_eq!(tracker.breached_since(), None);
     }
 
     fn one(breached: bool) -> [(Severity, bool); 1] {
@@ -1127,10 +1124,10 @@ mod tests {
     #[test]
     fn a_problem_has_to_last_before_it_fires() {
         let mut tracker = Tracker::default();
-        assert_eq!(tracker.observe(&one(true), 0, 60, None), None);
-        assert_eq!(tracker.observe(&one(true), 59, 60, None), None);
+        assert_eq!(tracker.observe(&one(true), at(0), secs(60), None), None);
+        assert_eq!(tracker.observe(&one(true), at(59), secs(60), None), None);
         assert_eq!(
-            tracker.observe(&one(true), 60, 60, None),
+            tracker.observe(&one(true), at(60), secs(60), None),
             Some(Change::Fire(C))
         );
     }
@@ -1138,12 +1135,12 @@ mod tests {
     #[test]
     fn a_problem_that_goes_away_starts_the_wait_again() {
         let mut tracker = Tracker::default();
-        tracker.observe(&one(true), 0, 60, None);
-        assert_eq!(tracker.observe(&one(false), 30, 60, None), None);
-        assert_eq!(tracker.observe(&one(true), 40, 60, None), None);
-        assert_eq!(tracker.observe(&one(true), 99, 60, None), None);
+        tracker.observe(&one(true), at(0), secs(60), None);
+        assert_eq!(tracker.observe(&one(false), at(30), secs(60), None), None);
+        assert_eq!(tracker.observe(&one(true), at(40), secs(60), None), None);
+        assert_eq!(tracker.observe(&one(true), at(99), secs(60), None), None);
         assert_eq!(
-            tracker.observe(&one(true), 100, 60, None),
+            tracker.observe(&one(true), at(100), secs(60), None),
             Some(Change::Fire(C))
         );
     }
@@ -1152,7 +1149,7 @@ mod tests {
     fn with_no_wait_a_problem_fires_at_once() {
         let mut tracker = Tracker::default();
         assert_eq!(
-            tracker.observe(&one(true), 0, 0, None),
+            tracker.observe(&one(true), at(0), secs(0), None),
             Some(Change::Fire(C))
         );
     }
@@ -1160,16 +1157,16 @@ mod tests {
     #[test]
     fn an_alert_already_firing_does_not_fire_again() {
         let mut tracker = Tracker::default();
-        assert_eq!(tracker.observe(&one(true), 0, 0, FIRING), None);
-        assert_eq!(tracker.observe(&one(true), 100, 0, FIRING), None);
+        assert_eq!(tracker.observe(&one(true), at(0), secs(0), FIRING), None);
+        assert_eq!(tracker.observe(&one(true), at(100), secs(0), FIRING), None);
     }
 
     #[test]
     fn a_problem_that_is_gone_resolves_at_once() {
         let mut tracker = Tracker::default();
-        assert_eq!(tracker.observe(&one(true), 0, 60, FIRING), None);
+        assert_eq!(tracker.observe(&one(true), at(0), secs(60), FIRING), None);
         assert_eq!(
-            tracker.observe(&one(false), 1, 60, FIRING),
+            tracker.observe(&one(false), at(1), secs(60), FIRING),
             Some(Change::Resolve)
         );
     }
@@ -1177,56 +1174,59 @@ mod tests {
     #[test]
     fn a_problem_that_comes_and_goes_is_said_each_time_it_lasts() {
         let mut tracker = Tracker::default();
-        tracker.observe(&one(true), 0, 60, None);
+        tracker.observe(&one(true), at(0), secs(60), None);
         assert_eq!(
-            tracker.observe(&one(true), 60, 60, None),
+            tracker.observe(&one(true), at(60), secs(60), None),
             Some(Change::Fire(C))
         );
         assert_eq!(
-            tracker.observe(&one(false), 70, 60, FIRING),
+            tracker.observe(&one(false), at(70), secs(60), FIRING),
             Some(Change::Resolve)
         );
         // Back again, it has to last all over again.
-        assert_eq!(tracker.observe(&one(true), 80, 60, None), None);
-        assert_eq!(tracker.observe(&one(true), 139, 60, None), None);
+        assert_eq!(tracker.observe(&one(true), at(80), secs(60), None), None);
+        assert_eq!(tracker.observe(&one(true), at(139), secs(60), None), None);
         assert_eq!(
-            tracker.observe(&one(true), 140, 60, None),
+            tracker.observe(&one(true), at(140), secs(60), None),
             Some(Change::Fire(C))
         );
         // One that never lasts never alerts.
         let mut tracker = Tracker::default();
         for now in (0..600).step_by(20) {
-            assert_eq!(tracker.observe(&one(now % 40 == 0), now, 60, None), None);
+            assert_eq!(
+                tracker.observe(&one(now % 40 == 0), at(now), secs(60), None),
+                None
+            );
         }
     }
 
     #[test]
     fn nothing_resolves_when_nothing_is_firing() {
         let mut tracker = Tracker::default();
-        assert_eq!(tracker.observe(&one(false), 0, 0, None), None);
-        assert_eq!(tracker.observe(&one(false), 100, 0, None), None);
+        assert_eq!(tracker.observe(&one(false), at(0), secs(0), None), None);
+        assert_eq!(tracker.observe(&one(false), at(100), secs(0), None), None);
     }
 
     #[test]
     fn the_worst_level_that_has_lasted_fires() {
         let mut tracker = Tracker::default();
-        assert_eq!(tracker.observe(&two(2), 0, 60, None), None);
+        assert_eq!(tracker.observe(&two(2), at(0), secs(60), None), None);
         assert_eq!(
-            tracker.observe(&two(2), 60, 60, None),
+            tracker.observe(&two(2), at(60), secs(60), None),
             Some(Change::Fire(C))
         );
 
         let mut tracker = Tracker::default();
-        tracker.observe(&two(1), 0, 60, None);
-        assert_eq!(tracker.observe(&two(2), 30, 60, None), None);
+        tracker.observe(&two(1), at(0), secs(60), None);
+        assert_eq!(tracker.observe(&two(2), at(30), secs(60), None), None);
         // The warning has lasted, but the critical level hasn't yet.
         assert_eq!(
-            tracker.observe(&two(2), 60, 60, None),
+            tracker.observe(&two(2), at(60), secs(60), None),
             Some(Change::Fire(W))
         );
-        assert_eq!(tracker.observe(&two(2), 89, 60, Some(W)), None);
+        assert_eq!(tracker.observe(&two(2), at(89), secs(60), Some(W)), None);
         assert_eq!(
-            tracker.observe(&two(2), 90, 60, Some(W)),
+            tracker.observe(&two(2), at(90), secs(60), Some(W)),
             Some(Change::Become(C))
         );
     }
@@ -1234,16 +1234,16 @@ mod tests {
     #[test]
     fn a_critical_alert_eases_as_soon_as_the_critical_level_is_gone() {
         let mut tracker = Tracker::default();
-        tracker.observe(&two(2), 0, 60, FIRING);
+        tracker.observe(&two(2), at(0), secs(60), FIRING);
         assert_eq!(
-            tracker.observe(&two(1), 10, 60, FIRING),
+            tracker.observe(&two(1), at(10), secs(60), FIRING),
             Some(Change::Become(W))
         );
-        assert_eq!(tracker.observe(&two(1), 200, 60, Some(W)), None);
+        assert_eq!(tracker.observe(&two(1), at(200), secs(60), Some(W)), None);
         // Critical again has to last before it counts again.
-        assert_eq!(tracker.observe(&two(2), 210, 60, Some(W)), None);
+        assert_eq!(tracker.observe(&two(2), at(210), secs(60), Some(W)), None);
         assert_eq!(
-            tracker.observe(&two(2), 270, 60, Some(W)),
+            tracker.observe(&two(2), at(270), secs(60), Some(W)),
             Some(Change::Become(C))
         );
     }
@@ -1251,10 +1251,10 @@ mod tests {
     #[test]
     fn an_alert_resolves_as_soon_as_the_mildest_level_is_gone() {
         let mut tracker = Tracker::default();
-        tracker.observe(&two(2), 0, 60, FIRING);
+        tracker.observe(&two(2), at(0), secs(60), FIRING);
         // Straight from critical, without easing first.
         assert_eq!(
-            tracker.observe(&two(0), 10, 60, FIRING),
+            tracker.observe(&two(0), at(10), secs(60), FIRING),
             Some(Change::Resolve)
         );
     }
@@ -1263,49 +1263,43 @@ mod tests {
     fn a_warning_does_not_ease_or_resolve_while_it_lasts() {
         let mut tracker = Tracker::default();
         for now in [0, 100, 1000] {
-            assert_eq!(tracker.observe(&two(1), now, 60, Some(W)), None);
+            assert_eq!(tracker.observe(&two(1), at(now), secs(60), Some(W)), None);
         }
     }
 
-    fn trend(value: f64, per_hour: f64, time_ms: i64) -> Trend {
+    fn trend(value: f64, per_hour: f64) -> Trend {
         Trend {
             host_id: "a".to_string(),
             series: "/".to_string(),
-            time_ms,
+            time: at(0),
             value,
-            first_ms: 0,
+            first_time: at(-3600),
             samples: 100,
-            slope_per_ms: per_hour / 3_600_000.0,
+            slope_per_sec: per_hour / 3600.0,
         }
     }
 
     #[test]
     fn eta_carries_the_line_on_from_the_newest_reading() {
         use crate::alerting::Comparison::{Above, Below};
-        let hour = 3_600_000;
-        assert_eq!(
-            eta_secs(&trend(90.0, 2.0, 0), 100.0, Above, 0),
-            Some(5 * 3600)
-        );
+        let hours = |count| Some(TimeDelta::hours(count));
+        assert_eq!(eta(&trend(90.0, 2.0), 100.0, Above, at(0)), hours(5));
         // An hour after the reading, an hour of it has gone.
+        assert_eq!(eta(&trend(90.0, 2.0), 100.0, Above, at(3600)), hours(4));
+        assert_eq!(eta(&trend(90.0, 2.0), 100.0, Above, at(9 * 3600)), hours(0));
+        assert_eq!(eta(&trend(90.0, 0.0), 100.0, Above, at(0)), None);
+        assert_eq!(eta(&trend(90.0, -2.0), 100.0, Above, at(0)), None);
         assert_eq!(
-            eta_secs(&trend(90.0, 2.0, 0), 100.0, Above, hour),
-            Some(4 * 3600)
+            eta(&trend(100.0, -2.0), 100.0, Above, at(0)),
+            Some(TimeDelta::zero())
         );
+        assert_eq!(eta(&trend(20.0, -5.0), 10.0, Below, at(0)), hours(2));
+        assert_eq!(eta(&trend(20.0, 5.0), 10.0, Below, at(0)), None);
         assert_eq!(
-            eta_secs(&trend(90.0, 2.0, 0), 100.0, Above, 9 * hour),
-            Some(0)
+            eta(&trend(5.0, 5.0), 10.0, Below, at(0)),
+            Some(TimeDelta::zero())
         );
-        assert_eq!(eta_secs(&trend(90.0, 0.0, 0), 100.0, Above, 0), None);
-        assert_eq!(eta_secs(&trend(90.0, -2.0, 0), 100.0, Above, 0), None);
-        assert_eq!(eta_secs(&trend(100.0, -2.0, 0), 100.0, Above, 0), Some(0));
-        assert_eq!(
-            eta_secs(&trend(20.0, -5.0, 0), 10.0, Below, 0),
-            Some(2 * 3600)
-        );
-        assert_eq!(eta_secs(&trend(20.0, 5.0, 0), 10.0, Below, 0), None);
-        assert_eq!(eta_secs(&trend(5.0, 5.0, 0), 10.0, Below, 0), Some(0));
-        assert_eq!(eta_secs(&trend(90.0, f64::NAN, 0), 100.0, Above, 0), None);
-        assert_eq!(eta_secs(&trend(0.0, 1e-300, 0), 100.0, Above, 0), None);
+        assert_eq!(eta(&trend(90.0, f64::NAN), 100.0, Above, at(0)), None);
+        assert_eq!(eta(&trend(0.0, 1e-300), 100.0, Above, at(0)), None);
     }
 }

@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Result, bail, ensure};
+use chrono::TimeDelta;
 use maxnines_checks::Credentials;
 use maxnines_checks::databases::{self as stats, Reader, Settle, by_kind, is_database};
 use maxnines_protocol::{Check, CheckKind, DATABASE_EXTRAS, Sample};
@@ -19,11 +20,11 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, warn};
 
-use crate::metrics::now_ms;
 use crate::models::Database;
 use crate::presence::{Presence, Reached};
 use crate::registration::{HostState, Registry};
 use crate::store::{NewSample, WriterCommand};
+use crate::times::{self, Timestamp};
 
 /// The built-in agent's ID. See the migration that creates it.
 pub const LOCAL_HOST_ID: &str = "server";
@@ -36,8 +37,8 @@ pub const FLEET_HOSTNAME: &str = "Fleet";
 /// How often to look for checks that are due.
 const TICK: Duration = Duration::from_secs(5);
 
-const MIN_INTERVAL_SECS: u64 = 10;
-const MAX_INTERVAL_SECS: u64 = 86_400;
+const MIN_INTERVAL: Duration = Duration::from_secs(10);
+const MAX_INTERVAL: Duration = Duration::from_secs(86_400);
 
 /// How many checks run at once. Anything over this waits its turn.
 const MAX_RUNNING: usize = 32;
@@ -57,7 +58,8 @@ pub struct RemoteCheckInput {
     pub host_id: String,
     pub check: Check,
     /// How often it runs.
-    pub interval_secs: u64,
+    #[serde(rename = "interval_secs", with = "maxnines_protocol::time::seconds")]
+    pub interval: Duration,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     /// For a database: also read its health and replication, as an agent reads
@@ -275,12 +277,14 @@ pub fn check_input(input: &RemoteCheckInput) -> Result<()> {
     input.check.validate()?;
     input.sign_in.validate(input.check.kind)?;
     ensure!(
-        input.check.interval_secs.is_none(),
+        input.check.interval.is_none(),
         "a remote check's interval goes beside the check, as interval_secs"
     );
     ensure!(
-        (MIN_INTERVAL_SECS..=MAX_INTERVAL_SECS).contains(&input.interval_secs),
-        "the interval has to be from {MIN_INTERVAL_SECS} to {MAX_INTERVAL_SECS} seconds"
+        (MIN_INTERVAL..=MAX_INTERVAL).contains(&input.interval),
+        "the interval has to be from {} to {} seconds",
+        MIN_INTERVAL.as_secs(),
+        MAX_INTERVAL.as_secs()
     );
     ensure!(
         !input.read_stats || is_database(input.check.kind),
@@ -311,40 +315,40 @@ pub fn check_input(input: &RemoteCheckInput) -> Result<()> {
 pub struct LatestResults {
     results: Mutex<BTreeMap<i64, Value>>,
     /// When each last ran.
-    ran_ms: Mutex<BTreeMap<i64, i64>>,
+    ran_at: Mutex<BTreeMap<i64, Timestamp>>,
 }
 
 impl LatestResults {
     fn set(&self, id: i64, result: Value) {
         let mut results = self.results.lock().unwrap_or_else(PoisonError::into_inner);
         results.insert(id, result);
-        let mut ran_ms = self.ran_ms.lock().unwrap_or_else(PoisonError::into_inner);
-        ran_ms.insert(id, now_ms());
+        let mut ran_at = self.ran_at.lock().unwrap_or_else(PoisonError::into_inner);
+        ran_at.insert(id, times::now());
     }
 
     /// When a check last ran, if it has since the server started.
-    pub fn ran_ms(&self, id: i64) -> Option<i64> {
-        let ran_ms = self.ran_ms.lock().unwrap_or_else(PoisonError::into_inner);
-        ran_ms.get(&id).copied()
+    pub fn ran_at(&self, id: i64) -> Option<Timestamp> {
+        let ran_at = self.ran_at.lock().unwrap_or_else(PoisonError::into_inner);
+        ran_at.get(&id).copied()
     }
 
     /// Forgets checks that no longer exist.
     fn keep_only(&self, ids: &BTreeSet<i64>) {
         let mut results = self.results.lock().unwrap_or_else(PoisonError::into_inner);
         results.retain(|id, _| ids.contains(id));
-        let mut ran_ms = self.ran_ms.lock().unwrap_or_else(PoisonError::into_inner);
-        ran_ms.retain(|id, _| ids.contains(id));
+        let mut ran_at = self.ran_at.lock().unwrap_or_else(PoisonError::into_inner);
+        ran_at.retain(|id, _| ids.contains(id));
     }
 
     /// A check's last result and when it ran, if it has since the server started.
-    pub fn latest(&self, id: i64) -> Option<(Value, i64)> {
+    pub fn latest(&self, id: i64) -> Option<(Value, Timestamp)> {
         let result = self
             .results
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&id)
             .cloned()?;
-        Some((result, self.ran_ms(id)?))
+        Some((result, self.ran_at(id)?))
     }
 
     pub fn all(&self) -> BTreeMap<i64, Value> {
@@ -372,7 +376,7 @@ pub struct Scheduler {
     results: Arc<LatestResults>,
     slots: Arc<Semaphore>,
     /// When each check is next due, by ID.
-    next_run: HashMap<i64, i64>,
+    next_run: HashMap<i64, Timestamp>,
     /// For each check that reads a database's stats, by ID.
     readers: HashMap<i64, StatsReader>,
 }
@@ -404,7 +408,7 @@ impl Scheduler {
             timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
                 timer.tick().await;
-                if let Err(error) = self.start_due(now_ms()).await {
+                if let Err(error) = self.start_due(times::now()).await {
                     error!(error = format!("{error:#}"), "starting checks failed");
                 }
             }
@@ -414,7 +418,7 @@ impl Scheduler {
     /// Starts everything that's due, without waiting for any of it, and returns
     /// what it started so that tests can wait for them. A check that panics only
     /// loses its own run.
-    pub async fn start_due(&mut self, now_ms: i64) -> Result<Vec<JoinHandle<()>>> {
+    pub async fn start_due(&mut self, now: Timestamp) -> Result<Vec<JoinHandle<()>>> {
         let checks = self.database.list_remote_checks().await?;
         let ids: BTreeSet<i64> = checks.iter().map(|check| check.id).collect();
         self.results.keep_only(&ids);
@@ -438,8 +442,8 @@ impl Scheduler {
 
         let mut started = Vec::new();
         for check in checks {
-            let due = *self.next_run.get(&check.id).unwrap_or(&now_ms);
-            if !check.input.enabled || due > now_ms {
+            let due = *self.next_run.get(&check.id).unwrap_or(&now);
+            if !check.input.enabled || due > now {
                 continue;
             }
             let hostname = match agentless.get(&check.input.host_id) {
@@ -448,8 +452,8 @@ impl Scheduler {
                 // Its host isn't one the server runs checks for any more.
                 None => continue,
             };
-            let interval_ms = i64::try_from(check.input.interval_secs)?.saturating_mul(1000);
-            self.next_run.insert(check.id, now_ms + interval_ms);
+            let interval = TimeDelta::from_std(check.input.interval)?;
+            self.next_run.insert(check.id, now + interval);
             started.push(self.start(check, hostname));
         }
         Ok(started)
@@ -556,7 +560,7 @@ async fn save(
     output: Value,
 ) {
     let sample = Sample {
-        timestamp_ms: now_ms() as u64,
+        time: times::now(),
         metrics: BTreeMap::from([(collector.to_string(), output)]),
     };
     let command = WriterCommand::Save(NewSample {
@@ -575,11 +579,11 @@ mod tests {
 
     use super::*;
 
-    fn input(interval_secs: u64) -> RemoteCheckInput {
+    fn input(interval: Duration) -> RemoteCheckInput {
         RemoteCheckInput {
             host_id: crate::remote_checks::LOCAL_HOST_ID.to_string(),
             check: Check::new("a", CheckKind::Tcp, "example.com:80"),
-            interval_secs,
+            interval,
             enabled: true,
             read_stats: false,
             extras: Vec::new(),
@@ -589,20 +593,21 @@ mod tests {
 
     #[test]
     fn intervals_are_limited() {
-        check_input(&input(60)).unwrap();
-        check_input(&input(MIN_INTERVAL_SECS)).unwrap();
-        assert!(check_input(&input(MIN_INTERVAL_SECS - 1)).is_err());
-        assert!(check_input(&input(MAX_INTERVAL_SECS + 1)).is_err());
+        let second = Duration::from_secs(1);
+        check_input(&input(second * 60)).unwrap();
+        check_input(&input(MIN_INTERVAL)).unwrap();
+        assert!(check_input(&input(MIN_INTERVAL - second)).is_err());
+        assert!(check_input(&input(MAX_INTERVAL + second)).is_err());
 
         // Only one place says how often it runs.
-        let mut inside = input(60);
-        inside.check.interval_secs = Some(300);
+        let mut inside = input(second * 60);
+        inside.check.interval = Some(second * 300);
         assert!(check_input(&inside).is_err());
     }
 
     #[test]
     fn the_check_itself_is_validated() {
-        let mut bad = input(60);
+        let mut bad = input(Duration::from_secs(60));
         bad.check.target = "no port".to_string();
         assert!(check_input(&bad).is_err());
     }

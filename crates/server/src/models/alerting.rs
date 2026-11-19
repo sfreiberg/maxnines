@@ -1,8 +1,10 @@
 //! Alert rules, notification channels, alerts and the notification queue.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use chrono::TimeDelta;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
@@ -26,7 +28,7 @@ use crate::alerting::{
 use crate::audit::{Action, Kind, Record, Snapshot, Subject};
 use crate::calculations::Calculation;
 use crate::channels;
-use crate::times::{self, Timestamp};
+use crate::times::Timestamp;
 
 const PENDING: &str = "pending";
 const SENT: &str = "sent";
@@ -53,7 +55,7 @@ fn to_alert_rule(
                 .transpose()?,
             threshold: row.threshold,
             warning_threshold: row.warning_threshold,
-            for_secs: u64::try_from(row.for_secs).context("invalid duration")?,
+            hold: whole_seconds(row.for_secs).context("invalid duration")?,
             severity: Severity::parse(&row.severity)?,
             condition: row.condition_expr,
             enabled: row.enabled,
@@ -62,29 +64,38 @@ fn to_alert_rule(
             calculation: row.calculation.as_deref().and_then(Calculation::parse),
             group_by: row.group_by,
             filter: row.filter,
-            window_secs: row
+            window: row
                 .window_secs
-                .map(u64::try_from)
+                .map(whole_seconds)
                 .transpose()
                 .context("invalid window")?,
-            remind_every_secs: row
+            remind_every: row
                 .remind_every_secs
-                .map(u64::try_from)
+                .map(whole_seconds)
                 .transpose()
                 .context("invalid reminder")?,
-            forecast_secs: row
+            forecast: row
                 .forecast_secs
-                .map(u64::try_from)
+                .map(whole_seconds)
                 .transpose()
                 .context("invalid forecast")?,
-            warning_forecast_secs: row
+            warning_forecast: row
                 .warning_forecast_secs
-                .map(u64::try_from)
+                .map(whole_seconds)
                 .transpose()
                 .context("invalid forecast")?,
             actions,
         },
     })
+}
+
+/// A length the database keeps in whole seconds, as rules are written. One that's
+/// negative was never saved by the server.
+fn whole_seconds(seconds: i64) -> Result<TimeDelta> {
+    (seconds >= 0)
+        .then(|| TimeDelta::try_seconds(seconds))
+        .flatten()
+        .context("not a length of time")
 }
 
 fn alert_rule_row(input: &AlertRuleInput) -> Result<alert_rule::ActiveModel> {
@@ -96,34 +107,18 @@ fn alert_rule_row(input: &AlertRuleInput) -> Result<alert_rule::ActiveModel> {
         comparison: Set(input.comparison.map(|c| c.as_str().to_string())),
         threshold: Set(input.threshold),
         warning_threshold: Set(input.warning_threshold),
-        for_secs: Set(i64::try_from(input.for_secs).context("invalid duration")?),
+        for_secs: Set(input.hold.num_seconds()),
         severity: Set(input.severity.as_str().to_string()),
         condition_expr: Set(input.condition.clone()),
         enabled: Set(input.enabled),
         calculation: Set(input.calculation.map(|c| c.as_str().to_string())),
         group_by: Set(input.group_by.clone()),
         filter: Set(input.filter.clone()),
-        window_secs: Set(input
-            .window_secs
-            .map(i64::try_from)
-            .transpose()
-            .context("invalid window")?),
-        remind_every_secs: Set(input
-            .remind_every_secs
-            .map(i64::try_from)
-            .transpose()
-            .context("invalid reminder")?),
+        window_secs: Set(input.window.map(|window| window.num_seconds())),
+        remind_every_secs: Set(input.remind_every.map(|every| every.num_seconds())),
         all_channels: Set(input.all_channels),
-        forecast_secs: Set(input
-            .forecast_secs
-            .map(i64::try_from)
-            .transpose()
-            .context("invalid forecast")?),
-        warning_forecast_secs: Set(input
-            .warning_forecast_secs
-            .map(i64::try_from)
-            .transpose()
-            .context("invalid forecast")?),
+        forecast_secs: Set(input.forecast.map(|ahead| ahead.num_seconds())),
+        warning_forecast_secs: Set(input.warning_forecast.map(|ahead| ahead.num_seconds())),
         ..Default::default()
     })
 }
@@ -249,7 +244,7 @@ fn action_rows(
                 rule_id: Set(rule_id),
                 action: Set(wanted.action.clone()),
                 run_on: Set(wanted.run_on.as_str().to_string()),
-                timeout_secs: Set(i64::try_from(wanted.timeout())?),
+                timeout_secs: Set(i64::try_from(wanted.timeout().as_secs())?),
                 position: Set(i32::try_from(position)?),
                 ..Default::default()
             })
@@ -260,7 +255,7 @@ fn action_rows(
 fn to_rule_action(row: alert_rule_action::Model) -> Result<RuleAction> {
     Ok(RuleAction {
         run_on: RunOn::parse(&row.run_on).context("invalid moment for an action")?,
-        timeout_secs: Some(u64::try_from(row.timeout_secs)?),
+        timeout: Some(Duration::from_secs(u64::try_from(row.timeout_secs)?)),
         action: row.action,
     })
 }
@@ -297,16 +292,21 @@ fn links(rule_id: i64, channels: &[i64]) -> Vec<alert_rule_channel::ActiveModel>
         .collect()
 }
 
-fn queued(alert_id: i64, channel_id: i64, event: Event, now_ms: i64) -> notification::ActiveModel {
+fn queued(
+    alert_id: i64,
+    channel_id: i64,
+    event: Event,
+    now: Timestamp,
+) -> notification::ActiveModel {
     notification::ActiveModel {
         alert_id: Set(alert_id),
         channel_id: Set(channel_id),
         event: Set(event.as_str().to_string()),
         state: Set(PENDING.to_string()),
         attempts: Set(0),
-        next_attempt_at: Set(times::from_ms(now_ms)),
+        next_attempt_at: Set(now),
         last_error: Set(None),
-        created_at: Set(times::from_ms(now_ms)),
+        created_at: Set(now),
         sent_at: Set(None),
         external_id: Set(None),
         action_run_id: Set(None),
@@ -322,7 +322,7 @@ fn queued(alert_id: i64, channel_id: i64, event: Event, now_ms: i64) -> notifica
 pub(super) async fn queue_action_output<C: ConnectionTrait>(
     connection: &C,
     run_id: i64,
-    now_ms: i64,
+    now: Timestamp,
 ) -> Result<()> {
     let run = action_run::Entity::find_by_id(run_id)
         .one(connection)
@@ -357,7 +357,7 @@ pub(super) async fn queue_action_output<C: ConnectionTrait>(
         })
         .map(|channel| notification::ActiveModel {
             action_run_id: Set(Some(run_id)),
-            ..queued(alert_id, channel.id, Event::Action, now_ms)
+            ..queued(alert_id, channel.id, Event::Action, now)
         })
         .collect();
     if !rows.is_empty() {
@@ -496,7 +496,7 @@ impl Database {
     /// maintenance windows go, so an alert they were holding back has to end in the
     /// same step, or its notifications would go out in the moments before the
     /// evaluator noticed. Returns false if there's no such rule.
-    pub async fn delete_alert_rule(&self, id: i64, now_ms: i64) -> Result<bool> {
+    pub async fn delete_alert_rule(&self, id: i64, now: Timestamp) -> Result<bool> {
         let transaction = self
             .connection
             .begin()
@@ -513,14 +513,14 @@ impl Database {
             .await
             .context("loading alerts")?;
         for alert in open {
-            resolve_in(&transaction, alert.id, now_ms, RULE_GONE_REASON, None).await?;
+            resolve_in(&transaction, alert.id, now, RULE_GONE_REASON, None).await?;
         }
         if before.is_none() {
             return Ok(false);
         }
         silence::Entity::delete_many()
             .filter(silence::Column::RuleId.eq(id))
-            .filter(silence::Column::EndsAt.gt(times::from_ms(now_ms)))
+            .filter(silence::Column::EndsAt.gt(now))
             .exec(&transaction)
             .await
             .context("deleting the rule's silences")?;
@@ -530,10 +530,7 @@ impl Database {
             .await
             .context("deleting the rule's maintenance windows")?;
         alert_rule::Entity::update_many()
-            .col_expr(
-                alert_rule::Column::DeletedAt,
-                Expr::value(times::from_ms(now_ms)),
-            )
+            .col_expr(alert_rule::Column::DeletedAt, Expr::value(now))
             .filter(alert_rule::Column::Id.eq(id))
             .exec(&transaction)
             .await
@@ -600,7 +597,7 @@ impl Database {
     /// The channel is kept, marked deleted, so what was sent through it still says
     /// where it went. Anything still waiting to go goes, and rules stop naming it.
     /// Returns false if there's no such channel.
-    pub async fn delete_channel(&self, id: i64, now_ms: i64) -> Result<bool> {
+    pub async fn delete_channel(&self, id: i64, now: Timestamp) -> Result<bool> {
         let transaction = self.connection.begin().await.context("deleting channel")?;
         let Some(before) = load_channel(&transaction, id).await? else {
             return Ok(false);
@@ -617,10 +614,7 @@ impl Database {
             .await
             .context("deleting the channel from rules")?;
         notification_channel::Entity::update_many()
-            .col_expr(
-                notification_channel::Column::DeletedAt,
-                Expr::value(times::from_ms(now_ms)),
-            )
+            .col_expr(notification_channel::Column::DeletedAt, Expr::value(now))
             .filter(notification_channel::Column::Id.eq(id))
             .exec(&transaction)
             .await
@@ -772,15 +766,12 @@ fn alert_subject(row: &alert::Model) -> Subject {
 async fn resolve_in<C: ConnectionTrait>(
     connection: &C,
     id: i64,
-    now_ms: i64,
+    now: Timestamp,
     reason: &str,
     summary: Option<&str>,
 ) -> Result<()> {
     let result = alert::Entity::update_many()
-        .col_expr(
-            alert::Column::ResolvedAt,
-            Expr::value(times::from_ms(now_ms)),
-        )
+        .col_expr(alert::Column::ResolvedAt, Expr::value(now))
         .col_expr(alert::Column::ResolveReason, Expr::value(reason))
         .col_expr(alert::Column::ResolvedSummary, Expr::value(summary))
         .filter(alert::Column::Id.eq(id))
@@ -809,7 +800,7 @@ async fn resolve_in<C: ConnectionTrait>(
         .context("loading notifications")?;
     let rows: Vec<_> = told
         .into_iter()
-        .map(|row| queued(id, row.channel_id, Event::Resolved, now_ms))
+        .map(|row| queued(id, row.channel_id, Event::Resolved, now))
         .collect();
     if !rows.is_empty() {
         notification::Entity::insert_many(rows)
@@ -878,14 +869,7 @@ impl Database {
 
         let rows: Vec<_> = hearing
             .into_iter()
-            .map(|channel| {
-                queued(
-                    id,
-                    channel,
-                    Event::Firing,
-                    new.started_at.timestamp_millis(),
-                )
-            })
+            .map(|channel| queued(id, channel, Event::Firing, new.started_at))
             .collect();
         if !rows.is_empty() {
             notification::Entity::insert_many(rows)
@@ -956,7 +940,7 @@ impl Database {
         let mut rows: Vec<_> = firing
             .iter()
             .filter(|row| row.state == SENT)
-            .map(|row| queued(change.alert_id, row.channel_id, event, change.now_ms))
+            .map(|row| queued(change.alert_id, row.channel_id, event, change.changed_at))
             .collect();
         let heard: BTreeSet<i64> = firing.iter().map(|row| row.channel_id).collect();
         // Channels that take this severity and not the one before hear of the
@@ -969,7 +953,7 @@ impl Database {
                         && !takes(**channel, before)
                         && !heard.contains(channel)
                 })
-                .map(|channel| queued(change.alert_id, *channel, Event::Firing, change.now_ms)),
+                .map(|channel| queued(change.alert_id, *channel, Event::Firing, change.changed_at)),
         );
         // What hasn't been sent yet to channels that don't take this severity
         // would now tell them of an alert they don't want.
@@ -1050,12 +1034,12 @@ impl Database {
     pub async fn resolve_alert(
         &self,
         id: i64,
-        now_ms: i64,
+        now: Timestamp,
         reason: &str,
         summary: Option<&str>,
     ) -> Result<()> {
         let transaction = self.connection.begin().await.context("resolving alert")?;
-        resolve_in(&transaction, id, now_ms, reason, summary).await?;
+        resolve_in(&transaction, id, now, reason, summary).await?;
         transaction.commit().await.context("resolving alert")?;
         Ok(())
     }
@@ -1063,7 +1047,7 @@ impl Database {
     /// What can be sent now. Each channel hears about an alert in order: a
     /// resolved notification waits while its firing one is being retried, or a
     /// receiver would see the alert start after it ended, and never close it.
-    pub async fn due_deliveries(&self, now_ms: i64, limit: usize) -> Result<Vec<Delivery>> {
+    pub async fn due_deliveries(&self, now: Timestamp, limit: usize) -> Result<Vec<Delivery>> {
         // Both conditions are in the query, so rows waiting to be retried cost
         // nothing: a channel that's down can't hold up the others.
         let earlier = Alias::new("earlier");
@@ -1086,7 +1070,7 @@ impl Database {
             .to_owned();
         let due = notification::Entity::find()
             .filter(notification::Column::State.eq(PENDING))
-            .filter(notification::Column::NextAttemptAt.lte(times::from_ms(now_ms)))
+            .filter(notification::Column::NextAttemptAt.lte(now))
             .filter(Expr::not_exists(waiting_behind_another))
             .order_by_asc(notification::Column::Id)
             .limit(limit as u64)
@@ -1179,7 +1163,7 @@ impl Database {
         row.map(to_alert).transpose()
     }
 
-    pub async fn acknowledge_alert(&self, id: i64, by: &str, now_ms: i64) -> Result<bool> {
+    pub async fn acknowledge_alert(&self, id: i64, by: &str, now: Timestamp) -> Result<bool> {
         let transaction = self.connection.begin().await.context("saving alert")?;
         let firing = alert::Entity::find_by_id(id)
             .filter(alert::Column::ResolvedAt.is_null())
@@ -1191,10 +1175,7 @@ impl Database {
         };
         let updated = alert::Entity::update_many()
             .col_expr(alert::Column::AcknowledgedBy, Expr::value(by))
-            .col_expr(
-                alert::Column::AcknowledgedAt,
-                Expr::value(times::from_ms(now_ms)),
-            )
+            .col_expr(alert::Column::AcknowledgedAt, Expr::value(now))
             .filter(alert::Column::Id.eq(id))
             .filter(alert::Column::AcknowledgedAt.is_null())
             .exec(&transaction)
@@ -1238,15 +1219,15 @@ impl Database {
     }
 
     /// Alerts that nobody has acknowledged, on rules that send reminders, with how often.
-    pub async fn alerts_to_remind(&self) -> Result<Vec<(Alert, i64)>> {
-        let rules: BTreeMap<i64, i64> = alert_rule::Entity::find()
+    pub async fn alerts_to_remind(&self) -> Result<Vec<(Alert, TimeDelta)>> {
+        let rules: BTreeMap<i64, TimeDelta> = alert_rule::Entity::find()
             .filter(alert_rule::Column::RemindEverySecs.is_not_null())
             .filter(alert_rule::Column::DeletedAt.is_null())
             .all(&self.connection)
             .await
             .context("loading alert rules")?
             .into_iter()
-            .filter_map(|row| Some((row.id, row.remind_every_secs?)))
+            .filter_map(|row| Some((row.id, whole_seconds(row.remind_every_secs?).ok()?)))
             .collect();
         if rules.is_empty() {
             return Ok(Vec::new());
@@ -1266,9 +1247,9 @@ impl Database {
     }
 
     /// Queues a reminder for each channel that was told an alert started and hasn't heard
-    /// about it for as long as the alert's rule says. Each alert comes with that time, in
-    /// seconds. On-call services are left out.
-    pub async fn queue_reminders(&self, alerts: &[(i64, i64)], now_ms: i64) -> Result<()> {
+    /// about it for as long as the alert's rule says. Each alert comes with that time.
+    /// On-call services are left out.
+    pub async fn queue_reminders(&self, alerts: &[(i64, TimeDelta)], now: Timestamp) -> Result<()> {
         if alerts.is_empty() {
             return Ok(());
         }
@@ -1278,14 +1259,14 @@ impl Database {
             .await
             .context("loading notifications")?;
 
-        let mut last_told: BTreeMap<(i64, i64), i64> = BTreeMap::new();
+        let mut last_told: BTreeMap<(i64, i64), Timestamp> = BTreeMap::new();
         let mut waiting = BTreeSet::new();
         for row in rows {
             let key = (row.alert_id, row.channel_id);
             match row.sent_at {
                 Some(sent) => {
-                    let last = last_told.entry(key).or_default();
-                    *last = std::cmp::max(sent.timestamp_millis(), *last);
+                    let last = last_told.entry(key).or_insert(sent);
+                    *last = std::cmp::max(sent, *last);
                 }
                 None if row.state != FAILED => {
                     waiting.insert(key);
@@ -1294,10 +1275,7 @@ impl Database {
             }
         }
 
-        let every_ms: BTreeMap<i64, i64> = alerts
-            .iter()
-            .map(|(id, secs)| (*id, secs.saturating_mul(1000)))
-            .collect();
+        let every: BTreeMap<i64, TimeDelta> = alerts.iter().copied().collect();
         let on_call: BTreeSet<i64> = self
             .list_channels()
             .await?
@@ -1309,11 +1287,9 @@ impl Database {
             .into_iter()
             .filter(|(key, _)| !waiting.contains(key) && !on_call.contains(&key.1))
             .filter(|((alert, _), told)| {
-                every_ms
-                    .get(alert)
-                    .is_some_and(|every| now_ms - told >= *every)
+                every.get(alert).is_some_and(|every| now - *told >= *every)
             })
-            .map(|((alert, channel), _)| queued(alert, channel, Event::Reminder, now_ms))
+            .map(|((alert, channel), _)| queued(alert, channel, Event::Reminder, now))
             .collect();
         if !rows.is_empty() {
             notification::Entity::insert_many(rows)
@@ -1421,8 +1397,7 @@ impl Database {
 
     /// Lets held notifications go. The day they get to arrive starts now, however long
     /// they waited.
-    pub async fn release_deliveries(&self, ids: &[i64], now_ms: i64) -> Result<()> {
-        let now = times::from_ms(now_ms);
+    pub async fn release_deliveries(&self, ids: &[i64], now: Timestamp) -> Result<()> {
         notification::Entity::update_many()
             .col_expr(notification::Column::State, Expr::value(PENDING))
             .col_expr(notification::Column::NextAttemptAt, Expr::value(now))
@@ -1439,16 +1414,13 @@ impl Database {
         &self,
         id: i64,
         attempts: i32,
-        now_ms: i64,
+        now: Timestamp,
         external_id: Option<&str>,
     ) -> Result<()> {
         notification::Entity::update_many()
             .col_expr(notification::Column::State, Expr::value(SENT))
             .col_expr(notification::Column::Attempts, Expr::value(attempts))
-            .col_expr(
-                notification::Column::SentAt,
-                Expr::value(times::from_ms(now_ms)),
-            )
+            .col_expr(notification::Column::SentAt, Expr::value(now))
             .col_expr(
                 notification::Column::ExternalId,
                 Expr::value(external_id.map(String::from)),

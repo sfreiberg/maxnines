@@ -11,6 +11,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, TimeDelta, Utc};
+use clickhouse::serde::chrono::datetime64::millis;
 use clickhouse::{Client, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,19 +21,20 @@ use tracing::warn;
 
 use super::flatten::{DataType, ENTRY_LABEL, Reported, flatten};
 use super::rollups::{
-    EXPIRE_EVERY_MS, FIVE_MINUTES_MS, HOUR_MS, RATE_LEAD_MS, Retention, Tier,
-    full_resolution_cutoff, hour_of, hours_to_redo, is_due, metric_names, tier_for,
+    EXPIRE_EVERY, FIVE_MINUTES, HOUR, RATE_LEAD, Retention, Tier, full_resolution_cutoff,
+    hours_to_redo, is_due, kept_since, metric_names, tier_for,
 };
 use super::shared::{
     MAX_NAME_BYTES, MAX_SERIES_PER_HOST, StoredSeries, labels_key, rebuilt_output, shortened,
     top_of,
 };
-use super::{CollectorStats, LATEST_SAMPLE_MS, MetricsReader, NewSample, Store, StoreStats};
-use crate::calculations::{Calculation, CalculationQuery, SMALLEST_STEP_MS, numbered};
+use super::{CollectorStats, MetricsReader, NewSample, Store, StoreStats, can_store};
+use crate::calculations::{Calculation, CalculationQuery, SMALLEST_STEP, numbered};
 use crate::metrics::{
     LastSample, METRICS, Metric, NewestReading, Point, Reading, Series, SeriesQuery, SeriesResult,
-    Source, Trend, now_ms,
+    Source, Trend,
 };
+use crate::times::{self, Timestamp, hour_of};
 
 /// Anything beyond this is skipped, as in the other stores.
 const LARGEST_VALUE: &str = "1e300";
@@ -42,13 +45,14 @@ const BATCH_EVERY: Duration = Duration::from_secs(1);
 const MAX_QUERY_BYTES: &str = "67108864";
 
 /// Tables are made here, as ClickHouse has no transactions to make them all at once,
-/// so each statement can safely run again. Months keep partitions to a number that
+/// so each statement can safely run again, and so can a migration stopped partway. Months keep partitions to a number that
 /// can't grow out of hand, whatever times agents send. The hour in the sort order lets
 /// a query for what's recent skip everything older.
-const MIGRATIONS: &[(&str, &[&str])] = &[(
-    "0001_create_tables",
-    &[
-        "CREATE TABLE IF NOT EXISTS samples (
+const MIGRATIONS: &[(&str, &[&str])] = &[
+    (
+        "0001_create_tables",
+        &[
+            "CREATE TABLE IF NOT EXISTS samples (
              metric  String,
              host_id String,
              labels  Map(String, String),
@@ -59,8 +63,8 @@ const MIGRATIONS: &[(&str, &[&str])] = &[(
          ENGINE = ReplacingMergeTree
          PARTITION BY toStartOfMonth(time)
          ORDER BY (metric, toStartOfHour(time), host_id, labels, time)",
-        // Text, only when it changes. Nothing means it stopped being reported.
-        "CREATE TABLE IF NOT EXISTS texts (
+            // Text, only when it changes. Nothing means it stopped being reported.
+            "CREATE TABLE IF NOT EXISTS texts (
              metric  String,
              host_id String,
              labels  Map(String, String),
@@ -70,27 +74,27 @@ const MIGRATIONS: &[(&str, &[&str])] = &[(
          ENGINE = ReplacingMergeTree
          PARTITION BY toStartOfMonth(time)
          ORDER BY (host_id, metric, labels, time)",
-        // What exists, to limit what a host can create without reading the samples.
-        "CREATE TABLE IF NOT EXISTS series (
+            // What exists, to limit what a host can create without reading the samples.
+            "CREATE TABLE IF NOT EXISTS series (
              host_id String,
              metric  String,
              labels  Map(String, String)
          )
          ENGINE = ReplacingMergeTree
          ORDER BY (host_id, metric, labels)",
-        // When each host reported, so asking who's current doesn't read the samples.
-        "CREATE TABLE IF NOT EXISTS reports (
+            // When each host reported, so asking who's current doesn't read the samples.
+            "CREATE TABLE IF NOT EXISTS reports (
              time    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
              host_id String
          )
          ENGINE = ReplacingMergeTree
          PARTITION BY toStartOfMonth(time)
          ORDER BY (time, host_id)",
-        // What each chart in the catalog showed, 5 minutes and an hour at a time, as the
-        // lowest, highest and total value and how many there were. A span rolled up
-        // again is written again with a higher version, which replaces the old rows
-        // when ClickHouse merges them, and reads say FINAL until then.
-        "CREATE TABLE IF NOT EXISTS rollups_five_minute (
+            // What each chart in the catalog showed, 5 minutes and an hour at a time, as the
+            // lowest, highest and total value and how many there were. A span rolled up
+            // again is written again with a higher version, which replaces the old rows
+            // when ClickHouse merges them, and reads say FINAL until then.
+            "CREATE TABLE IF NOT EXISTS rollups_five_minute (
              metric  LowCardinality(String),
              host_id String,
              series  String,
@@ -104,7 +108,7 @@ const MIGRATIONS: &[(&str, &[&str])] = &[(
          ENGINE = ReplacingMergeTree(version)
          PARTITION BY toStartOfMonth(time)
          ORDER BY (metric, host_id, series, time)",
-        "CREATE TABLE IF NOT EXISTS rollups_hour (
+            "CREATE TABLE IF NOT EXISTS rollups_hour (
              metric  LowCardinality(String),
              host_id String,
              series  String,
@@ -118,20 +122,74 @@ const MIGRATIONS: &[(&str, &[&str])] = &[(
          ENGINE = ReplacingMergeTree(version)
          PARTITION BY toStartOfYear(time)
          ORDER BY (metric, host_id, series, time)",
-        // How far each metric is rolled up: every hour before this, in milliseconds.
-        "CREATE TABLE IF NOT EXISTS rollup_progress (
+            // How far each metric is rolled up: every hour before this, in milliseconds.
+            "CREATE TABLE IF NOT EXISTS rollup_progress (
              metric        String,
              done_until_ms Int64,
              version       UInt64
          )
          ENGINE = ReplacingMergeTree(version)
          ORDER BY metric",
-        // Hours that got samples after they were rolled up, to roll up again.
-        "CREATE TABLE IF NOT EXISTS rollup_redo (hour_ms Int64)
+            // Hours that got samples after they were rolled up, to roll up again.
+            "CREATE TABLE IF NOT EXISTS rollup_redo (hour_ms Int64)
          ENGINE = ReplacingMergeTree
          ORDER BY hour_ms",
-    ],
-)];
+        ],
+    ),
+    // How far each metric is rolled up, and the hours to roll up again, become times like
+    // everything else here. A column in the sort order can't change its type, so the
+    // tables are made again: copied first, then replaced from the copies, then the copies
+    // go, each a migration of its own, so a migration run again always has what it reads.
+    // A row copied twice is the same row, which the engine keeps once.
+    (
+        "0002_copy_rollup_progress_as_times",
+        &[
+            "CREATE TABLE IF NOT EXISTS rollup_progress_copy (
+             metric     String,
+             done_until DateTime64(3, 'UTC'),
+             version    UInt64
+         )
+         ENGINE = ReplacingMergeTree(version)
+         ORDER BY metric",
+            "CREATE TABLE IF NOT EXISTS rollup_redo_copy (hour DateTime64(3, 'UTC'))
+         ENGINE = ReplacingMergeTree
+         ORDER BY hour",
+            "INSERT INTO rollup_progress_copy
+         SELECT metric, fromUnixTimestamp64Milli(done_until_ms, 'UTC'), version
+         FROM rollup_progress",
+            "INSERT INTO rollup_redo_copy
+         SELECT fromUnixTimestamp64Milli(hour_ms, 'UTC') FROM rollup_redo",
+        ],
+    ),
+    (
+        "0003_rollup_progress_as_times",
+        &[
+            "DROP TABLE IF EXISTS rollup_progress SYNC",
+            "DROP TABLE IF EXISTS rollup_redo SYNC",
+            // How far each metric is rolled up: every hour before this.
+            "CREATE TABLE IF NOT EXISTS rollup_progress (
+             metric     String,
+             done_until DateTime64(3, 'UTC'),
+             version    UInt64
+         )
+         ENGINE = ReplacingMergeTree(version)
+         ORDER BY metric",
+            // Hours that got samples after they were rolled up, to roll up again.
+            "CREATE TABLE IF NOT EXISTS rollup_redo (hour DateTime64(3, 'UTC'))
+         ENGINE = ReplacingMergeTree
+         ORDER BY hour",
+            "INSERT INTO rollup_progress SELECT * FROM rollup_progress_copy FINAL",
+            "INSERT INTO rollup_redo SELECT * FROM rollup_redo_copy FINAL",
+        ],
+    ),
+    (
+        "0004_drop_rollup_progress_copies",
+        &[
+            "DROP TABLE IF EXISTS rollup_progress_copy SYNC",
+            "DROP TABLE IF EXISTS rollup_redo_copy SYNC",
+        ],
+    ),
+];
 
 /// One runtime for every store, as the client is async and stores aren't. It's never
 /// shut down, because that isn't allowed from the async code a store can be dropped in.
@@ -164,7 +222,8 @@ struct SampleRow {
     metric: String,
     host_id: String,
     labels: Labels,
-    time: i64,
+    #[serde(with = "millis")]
+    time: Timestamp,
     value: f64,
     kind: &'static str,
 }
@@ -174,7 +233,8 @@ struct TextRow {
     metric: String,
     host_id: String,
     labels: Labels,
-    time: i64,
+    #[serde(with = "millis")]
+    time: Timestamp,
     value: Option<String>,
 }
 
@@ -187,7 +247,8 @@ struct SeriesRow {
 
 #[derive(Row, Serialize)]
 struct ReportRow {
-    time: i64,
+    #[serde(with = "millis")]
+    time: Timestamp,
     host_id: String,
 }
 
@@ -308,10 +369,8 @@ impl Memory {
     }
 
     fn add_sample(&mut self, new: &NewSample, rows: &mut Rows) -> Result<()> {
-        let time = i64::try_from(new.sample.timestamp_ms)
-            .ok()
-            .filter(|_| new.sample.timestamp_ms <= LATEST_SAMPLE_MS)
-            .context("timestamp out of range")?;
+        let time = new.sample.time;
+        anyhow::ensure!(can_store(time), "a sample's time is out of range");
         let host = new.host_id.as_str();
         rows.reports.push(ReportRow {
             time,
@@ -549,11 +608,11 @@ pub struct ClickHouseStore {
     memory: Memory,
     retention: Retention,
     /// How far each metric is rolled up, as kept in `rollup_progress`.
-    progress: HashMap<String, i64>,
+    progress: HashMap<String, Timestamp>,
     /// Hours to roll up again, as kept in `rollup_redo`.
-    redo: BTreeSet<i64>,
+    redo: BTreeSet<Timestamp>,
     /// When to next look for old data to delete.
-    next_expiry_ms: i64,
+    next_expiry: Timestamp,
     /// The last version rollups were written with, as each has to be higher.
     version: u64,
 }
@@ -561,19 +620,34 @@ pub struct ClickHouseStore {
 #[derive(Row, Deserialize)]
 struct ProgressRow {
     metric: String,
-    done_until_ms: i64,
+    #[serde(with = "millis")]
+    done_until: Timestamp,
 }
 
 #[derive(Row, Serialize, Deserialize)]
 struct RedoRow {
-    hour_ms: i64,
+    #[serde(with = "millis")]
+    hour: Timestamp,
 }
 
 #[derive(Row, Serialize)]
 struct NewProgress {
     metric: String,
-    done_until_ms: i64,
+    #[serde(with = "millis")]
+    done_until: Timestamp,
     version: u64,
+}
+
+#[derive(Row, Deserialize)]
+struct DoneRow {
+    #[serde(with = "millis")]
+    done_until: Timestamp,
+}
+
+#[derive(Row, Deserialize)]
+struct FirstRow {
+    #[serde(with = "millis::option")]
+    first: Option<Timestamp>,
 }
 
 impl ClickHouseStore {
@@ -607,11 +681,11 @@ impl ClickHouseStore {
                     migrate(&client, MIGRATIONS).await?;
                     let memory = load_memory(&client).await?;
                     let progress: Vec<ProgressRow> = client
-                        .query("SELECT metric, done_until_ms FROM rollup_progress FINAL")
+                        .query("SELECT metric, done_until FROM rollup_progress FINAL")
                         .fetch_all()
                         .await?;
                     let redo: Vec<RedoRow> = client
-                        .query("SELECT hour_ms FROM rollup_redo FINAL")
+                        .query("SELECT hour FROM rollup_redo FINAL")
                         .fetch_all()
                         .await?;
                     anyhow::Ok(Self {
@@ -620,10 +694,10 @@ impl ClickHouseStore {
                         retention,
                         progress: progress
                             .into_iter()
-                            .map(|row| (row.metric, row.done_until_ms))
+                            .map(|row| (row.metric, row.done_until))
                             .collect(),
-                        redo: redo.into_iter().map(|row| row.hour_ms).collect(),
-                        next_expiry_ms: 0,
+                        redo: redo.into_iter().map(|row| row.hour).collect(),
+                        next_expiry: DateTime::<Utc>::MIN_UTC,
                         version: 0,
                     })
                 })
@@ -680,30 +754,29 @@ impl ClickHouseStore {
 }
 
 impl ClickHouseStore {
-    /// Higher than any before, so a rollup written again replaces the old one.
+    /// Higher than any before, so a rollup written again replaces the old one. Counting
+    /// on from the clock keeps it higher than any from before a restart.
     fn next_version(&mut self) -> u64 {
-        self.version = self
-            .version
-            .saturating_add(1)
-            .max(u64::try_from(now_ms()).unwrap_or(0));
+        let from_the_clock = u64::try_from(times::now().timestamp_millis()).unwrap_or(0);
+        self.version = self.version.saturating_add(1).max(from_the_clock);
         self.version
     }
 
     /// Hours these rows land in that are already rolled up, and not yet waiting to be
     /// rolled up again.
-    fn late_hours(&self, rows: &Rows) -> BTreeSet<i64> {
+    fn late_hours(&self, rows: &Rows) -> BTreeSet<Timestamp> {
         let Some(rolled_up_until) = self.progress.values().max().copied() else {
             return BTreeSet::new();
         };
         let times = rows.samples.iter().map(|row| row.time);
-        let full_since = now_ms() - self.retention.full_ms;
+        let full_since = kept_since(times::now(), self.retention.full);
         let mut hours = hours_to_redo(times, rolled_up_until, full_since);
         hours.retain(|hour| !self.redo.contains(hour));
         hours
     }
 
     /// Every catalog metric is rolled up this far, or `None` if one hasn't started.
-    fn rolled_up_until(&self) -> Option<i64> {
+    fn rolled_up_until(&self) -> Option<Timestamp> {
         metric_names()
             .map(|name| self.progress.get(name).copied())
             .min()
@@ -712,25 +785,25 @@ impl ClickHouseStore {
 
     /// Rolls up one hour of a metric: each 5 minutes from the samples, and then the hour
     /// from those.
-    async fn roll_up_hour(&self, metric: &Metric, hour: i64, version: u64) -> Result<()> {
-        let end = hour + HOUR_MS;
+    async fn roll_up_hour(&self, metric: &Metric, hour: Timestamp, version: u64) -> Result<()> {
+        let end = hour + HOUR;
         let lead = if is_rate(metric.source) {
-            RATE_LEAD_MS
+            RATE_LEAD
         } else {
-            0
+            TimeDelta::zero()
         };
         let name = quoted(metric.name);
         let sql = format!(
             "INSERT INTO rollups_five_minute
                  (metric, host_id, series, time, low, high, summed, samples, version)
-             SELECT {name}, host_id, series,
-                    fromUnixTimestamp64Milli(
-                        toInt64(intDiv(t, {FIVE_MINUTES_MS}) * {FIVE_MINUTES_MS}), 'UTC'
-                    ) AS span,
+             SELECT {name}, host_id, series, {span} AS span,
                     min(v), max(v), sum(v), count(), {version}
              FROM ({values})
-             WHERE t >= {hour} AND t < {end}
+             WHERE t >= {from} AND t < {to}
              GROUP BY host_id, series, span",
+            span = bucket_of("t", FIVE_MINUTES),
+            from = moment(hour),
+            to = moment(end),
             values = computed(metric, &time_between(hour - lead, end, "<")),
         );
         self.client
@@ -741,12 +814,13 @@ impl ClickHouseStore {
         let sql = format!(
             "INSERT INTO rollups_hour
                  (metric, host_id, series, time, low, high, summed, samples, version)
-             SELECT metric, host_id, series, fromUnixTimestamp64Milli(toInt64({hour}), 'UTC'),
+             SELECT metric, host_id, series, {start},
                     min(low), max(high), sum(summed), sum(samples), {version}
              FROM rollups_five_minute FINAL
              WHERE metric = {name} AND {}
              GROUP BY metric, host_id, series",
             time_between(hour, end, "<"),
+            start = moment(hour),
         );
         self.client
             .query_raw(&sql)
@@ -758,23 +832,20 @@ impl ClickHouseStore {
     /// Rolls up the next finished hour for every metric that's reached it. Hours
     /// without a single sample are skipped over, so a gap costs nothing. Without
     /// transactions, a rollup that stops partway is simply done again.
-    fn roll_up_next(&mut self, now_ms: i64) -> Result<bool> {
-        let start = metric_names()
-            .map(|name| self.progress.get(name).copied().unwrap_or(i64::MIN))
-            .min()
-            .unwrap_or(i64::MIN);
+    fn roll_up_next(&mut self, now: Timestamp) -> Result<bool> {
+        // From 1970 while any metric hasn't started.
+        let start = self.rolled_up_until().unwrap_or(DateTime::UNIX_EPOCH);
         let sql = format!(
-            "SELECT toUnixTimestamp64Milli(minOrNull(time))
-             FROM samples WHERE time >= fromUnixTimestamp64Milli(toInt64({}), 'UTC')",
-            start.max(0)
+            "SELECT minOrNull(time) AS first FROM samples WHERE time >= {}",
+            moment(start)
         );
-        let first: Option<i64> = wait(self.client.query_raw(&sql).fetch_one())
+        let first: FirstRow = wait(self.client.query_raw(&sql).fetch_one())
             .context("finding the first sample to roll up")?;
-        let Some(first) = first else {
+        let Some(first) = first.first else {
             return Ok(false);
         };
         let hour = start.max(hour_of(first));
-        if !is_due(hour, now_ms) {
+        if !is_due(hour, now) {
             return Ok(false);
         }
         let due: Vec<&'static Metric> = METRICS
@@ -790,7 +861,7 @@ impl ClickHouseStore {
             .iter()
             .map(|metric| NewProgress {
                 metric: metric.name.to_string(),
-                done_until_ms: hour + HOUR_MS,
+                done_until: hour + HOUR,
                 version,
             })
             .collect();
@@ -801,8 +872,7 @@ impl ClickHouseStore {
             self.insert("rollup_progress", &progress).await
         })?;
         for metric in due {
-            self.progress
-                .insert(metric.name.to_string(), hour + HOUR_MS);
+            self.progress.insert(metric.name.to_string(), hour + HOUR);
         }
         Ok(true)
     }
@@ -826,8 +896,10 @@ impl ClickHouseStore {
                 self.roll_up_hour(metric, hour, version).await?;
             }
             self.client
-                .query("DELETE FROM rollup_redo WHERE hour_ms = ?")
-                .bind(hour)
+                .query_raw(&format!(
+                    "DELETE FROM rollup_redo WHERE hour = {}",
+                    moment(hour)
+                ))
                 .execute()
                 .await
                 .context("noting an hour was rolled up again")
@@ -839,20 +911,21 @@ impl ClickHouseStore {
     /// Deletes what's older than it's kept for, once an hour. Samples go only once
     /// they're rolled up, and text only once something newer replaced it, as text is
     /// only saved when it changes.
-    fn expire(&mut self, now_ms: i64) -> Result<bool> {
-        if now_ms < self.next_expiry_ms {
+    fn expire(&mut self, now: Timestamp) -> Result<bool> {
+        if now < self.next_expiry {
             return Ok(false);
         }
         let cutoff = full_resolution_cutoff(
-            now_ms,
+            now,
             &self.retention,
             self.rolled_up_until(),
             self.redo.first().copied(),
         );
         let mut statements = Vec::new();
-        // Nothing is from before 1970, and a time much further back can't be compared.
-        if let Some(cutoff) = cutoff.filter(|cutoff| *cutoff > 0) {
-            let before = format!("time < fromUnixTimestamp64Milli(toInt64({cutoff}), 'UTC')");
+        // Nothing is from before 1970, and ClickHouse can't write a time much before it.
+        let after_1970 = |cutoff: &Timestamp| *cutoff > DateTime::UNIX_EPOCH;
+        if let Some(cutoff) = cutoff.filter(after_1970) {
+            let before = format!("time < {}", moment(cutoff));
             statements.push(format!("DELETE FROM samples WHERE {before}"));
             statements.push(format!("DELETE FROM reports WHERE {before}"));
             statements.push(format!(
@@ -864,15 +937,15 @@ impl ClickHouseStore {
             ));
         }
         let kept = [
-            ("rollups_five_minute", Some(self.retention.five_minute_ms)),
-            ("rollups_hour", self.retention.hour_ms),
+            ("rollups_five_minute", Some(self.retention.five_minute)),
+            ("rollups_hour", self.retention.hour),
         ];
-        for (table, kept_ms) in kept {
-            let cutoff = kept_ms.map(|kept_ms| now_ms.saturating_sub(kept_ms));
-            if let Some(cutoff) = cutoff.filter(|cutoff| *cutoff > 0) {
+        for (table, kept) in kept {
+            let cutoff = kept.and_then(|kept| kept_since(now, kept));
+            if let Some(cutoff) = cutoff.filter(after_1970) {
                 statements.push(format!(
-                    "DELETE FROM {table}
-                     WHERE time < fromUnixTimestamp64Milli(toInt64({cutoff}), 'UTC')"
+                    "DELETE FROM {table} WHERE time < {}",
+                    moment(cutoff)
                 ));
             }
         }
@@ -886,7 +959,7 @@ impl ClickHouseStore {
             }
             anyhow::Ok(())
         })?;
-        self.next_expiry_ms = now_ms + EXPIRE_EVERY_MS;
+        self.next_expiry = now + EXPIRE_EVERY;
         Ok(false)
     }
 }
@@ -909,7 +982,7 @@ impl Store for ClickHouseStore {
         // is only rolled up again with nothing new.
         let late = self.late_hours(&rows);
         if !late.is_empty() {
-            let redo: Vec<RedoRow> = late.iter().map(|hour| RedoRow { hour_ms: *hour }).collect();
+            let redo: Vec<RedoRow> = late.iter().map(|hour| RedoRow { hour: *hour }).collect();
             if let Err(error) = wait(self.insert("rollup_redo", &redo)) {
                 self.memory.take_back(rows.undo);
                 return Err(error);
@@ -933,8 +1006,8 @@ impl Store for ClickHouseStore {
 
     /// Hours to roll up again come first, as charts are wrong until they are, then new
     /// hours, then deleting.
-    fn tidy(&mut self, now_ms: i64) -> Result<bool> {
-        Ok(self.redo_next()? || self.roll_up_next(now_ms)? || self.expire(now_ms)?)
+    fn tidy(&mut self, now: Timestamp) -> Result<bool> {
+        Ok(self.redo_next()? || self.roll_up_next(now)? || self.expire(now)?)
     }
 
     fn delete_host(&mut self, host_id: &str) -> Result<()> {
@@ -975,14 +1048,15 @@ impl Naming<'_> {
     }
 }
 
-/// One reading of a metric as rows of `agent`, `t`, `series` and `v`. `scope` narrows
+/// One reading of a metric as rows of `agent`, `t`, `series` and `v`, with `t` the time
+/// it was taken. `scope` narrows
 /// down the rows, and is always worked out here.
 fn reading_values(metric: &Metric, reading: Reading, naming: &Naming<'_>, scope: &str) -> String {
     let series = naming.expression();
     let filter = naming.filter();
     match reading {
         Reading::Field(path) | Reading::Rate(path) => format!(
-            "SELECT host_id, toUnixTimestamp64Milli(time) AS t, {series} AS series, value AS v
+            "SELECT host_id, time AS t, {series} AS series, value AS v
              FROM samples WHERE metric = {name} {filter} AND {scope}",
             name = quoted(&stored_name(metric, path)),
         ),
@@ -990,7 +1064,7 @@ fn reading_values(metric: &Metric, reading: Reading, naming: &Naming<'_>, scope:
             let part = quoted(&stored_name(metric, part));
             let whole = quoted(&stored_name(metric, whole));
             format!(
-                "SELECT host_id, toUnixTimestamp64Milli(time) AS t, {series} AS series,
+                "SELECT host_id, time AS t, {series} AS series,
                         avgIf(value, metric = {part}) / nullIf(avgIf(value, metric = {whole}), 0) * 100 AS v
                  FROM samples WHERE metric IN ({part}, {whole}) {filter} AND {scope}
                  GROUP BY host_id, t, series
@@ -1029,15 +1103,16 @@ fn is_rate(source: Source) -> bool {
     }
 }
 
-/// Readings as values, with counts turned into rates. Each value covers the time since
-/// the sample before it, so the first has nothing to compare with and is dropped.
+/// Readings as values, with counts turned into rates, each a second. Each value covers
+/// the time since the sample before it, so the first has nothing to compare with and is
+/// dropped.
 fn computed(metric: &Metric, scope: &str) -> String {
     let readings = readings(metric, scope);
     let value = if is_rate(metric.source) {
-        "v * 1000.0 / nullIf(t - lagInFrame(toNullable(t)) OVER (
+        "v * 1000.0 / nullIf(dateDiff('millisecond', lagInFrame(toNullable(t)) OVER (
              PARTITION BY host_id, series ORDER BY t
              ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
-         ), 0)"
+         ), t), 0)"
     } else {
         "v"
     };
@@ -1048,17 +1123,34 @@ fn computed(metric: &Metric, scope: &str) -> String {
     )
 }
 
-fn time_between(from_ms: i64, to_ms: i64, upper: &str) -> String {
+/// A moment written into SQL as one of ClickHouse's own, to the millisecond as they're
+/// all kept.
+fn moment(time: Timestamp) -> String {
     format!(
-        "time >= fromUnixTimestamp64Milli(toInt64({from_ms}), 'UTC')
-         AND time {upper} fromUnixTimestamp64Milli(toInt64({to_ms}), 'UTC')"
+        "toDateTime64('{}', 3, 'UTC')",
+        time.format("%Y-%m-%d %H:%M:%S%.3f")
     )
+}
+
+/// A length of time written into SQL, in milliseconds, as the times it's added to are.
+fn interval(length: TimeDelta) -> String {
+    format!("toIntervalMillisecond({})", length.num_milliseconds())
+}
+
+/// The start of the span of `step` that `time` falls in, counted from 1970.
+fn bucket_of(time: &str, step: TimeDelta) -> String {
+    format!("toStartOfInterval({time}, {})", interval(step))
+}
+
+fn time_between(from: Timestamp, to: Timestamp, upper: &str) -> String {
+    format!("time >= {} AND time {upper} {}", moment(from), moment(to))
 }
 
 #[derive(Row, Deserialize)]
 struct PointRow {
     series: String,
-    bucket: i64,
+    #[serde(with = "millis")]
+    bucket: Timestamp,
     avg: f64,
     min: f64,
     max: f64,
@@ -1068,7 +1160,8 @@ struct PointRow {
 #[derive(Row, Deserialize)]
 struct LineRow {
     line: String,
-    bucket: i64,
+    #[serde(with = "millis")]
+    bucket: Timestamp,
     value: f64,
     total: u64,
 }
@@ -1076,14 +1169,16 @@ struct LineRow {
 #[derive(Row, Deserialize)]
 struct LastRow {
     host_id: String,
-    time_ms: i64,
+    #[serde(with = "millis")]
+    newest: Timestamp,
 }
 
 #[derive(Row, Deserialize)]
 struct NewestRow {
     host_id: String,
     series: String,
-    time_ms: i64,
+    #[serde(with = "millis")]
+    time: Timestamp,
     value: f64,
 }
 
@@ -1091,9 +1186,11 @@ struct NewestRow {
 struct TrendRow {
     host_id: String,
     series: String,
-    time_ms: i64,
+    #[serde(with = "millis")]
+    time: Timestamp,
     value: f64,
-    first_ms: i64,
+    #[serde(with = "millis")]
+    first_time: Timestamp,
     samples: u64,
     slope: f64,
 }
@@ -1123,8 +1220,10 @@ struct KnownSeries {
 struct CollectorRow {
     name: String,
     rows: u64,
-    oldest_ms: i64,
-    newest_ms: i64,
+    #[serde(with = "millis")]
+    oldest: Timestamp,
+    #[serde(with = "millis")]
+    newest: Timestamp,
 }
 
 #[derive(Row, Deserialize)]
@@ -1140,14 +1239,14 @@ struct ClickHouseReader {
 
 impl ClickHouseReader {
     /// How far a metric is rolled up, if it's started.
-    fn rolled_up_until(&self, metric: &Metric) -> Result<Option<i64>> {
-        let found: Vec<i64> = wait(
+    fn rolled_up_until(&self, metric: &Metric) -> Result<Option<Timestamp>> {
+        let found: Vec<DoneRow> = wait(
             self.client
-                .query("SELECT done_until_ms FROM rollup_progress FINAL WHERE metric = ?")
+                .query("SELECT done_until FROM rollup_progress FINAL WHERE metric = ?")
                 .bind(metric.name)
                 .fetch_all(),
         )?;
-        Ok(found.first().copied())
+        Ok(found.first().map(|row| row.done_until))
     }
 }
 
@@ -1158,34 +1257,31 @@ impl ClickHouseReader {
 fn cells(
     metric: &Metric,
     hosts: &str,
-    (from_ms, to_ms): (i64, i64),
+    (from, to): (Timestamp, Timestamp),
     tier: Tier,
-    done: Option<i64>,
+    done: Option<Timestamp>,
 ) -> String {
     let rolled = tier.table().zip(done);
-    let samples_from = rolled.map_or(from_ms, |(_, done)| from_ms.max(done));
+    let samples_from = rolled.map_or(from, |(_, done)| from.max(done));
     let lead = if is_rate(metric.source) {
-        RATE_LEAD_MS
+        RATE_LEAD
     } else {
-        0
+        TimeDelta::zero()
     };
-    let scope = format!(
-        "{hosts} AND {}",
-        time_between(samples_from - lead, to_ms, "<")
-    );
+    let scope = format!("{hosts} AND {}", time_between(samples_from - lead, to, "<"));
     let mut cells = format!(
         "SELECT host_id, t, series, v AS low, v AS high, v AS summed, toUInt64(1) AS samples
          FROM ({values}) WHERE t >= {samples_from}",
         values = computed(metric, &scope),
+        samples_from = moment(samples_from),
     );
     if let Some((table, done)) = rolled {
         cells.push_str(&format!(
             " UNION ALL
-             SELECT host_id, toInt64(toUnixTimestamp64Milli(time)) AS t, series, low, high,
-                    summed, samples
+             SELECT host_id, time AS t, series, low, high, summed, samples
              FROM {table} FINAL
              WHERE metric = {name} AND {hosts} AND {}",
-            time_between(from_ms, to_ms.min(done), "<"),
+            time_between(from, to.min(done), "<"),
             name = quoted(metric.name),
         ));
     }
@@ -1195,7 +1291,7 @@ fn cells(
 impl MetricsReader for ClickHouseReader {
     fn series(&self, query: &SeriesQuery) -> Result<SeriesResult> {
         let range = query.range;
-        let tier = tier_for(range.step_ms, range.from_ms, now_ms(), &self.retention);
+        let tier = tier_for(range.step, range.from, times::now(), &self.retention);
         let done = self.rolled_up_until(query.metric)?;
         let host = format!("host_id = {}", quoted(query.host_id));
         // One that stayed at zero is still shown, after the busier ones, as a
@@ -1212,7 +1308,7 @@ impl MetricsReader for ClickHouseReader {
                                 sum(sum_v) OVER (PARTITION BY series)
                                     / sum(rows_v) OVER (PARTITION BY series) AS overall
                          FROM (
-                             SELECT series, toInt64(intDiv(t, {step}) * {step}) AS bucket,
+                             SELECT series, {bucket} AS bucket,
                                     sum(summed) / sum(samples) AS mean_v,
                                     min(low) AS low_v, max(high) AS high_v,
                                     sum(summed) AS sum_v, sum(samples) AS rows_v
@@ -1224,14 +1320,8 @@ impl MetricsReader for ClickHouseReader {
              )
              WHERE position <= {max_series}
              ORDER BY series, bucket",
-            cells = cells(
-                query.metric,
-                &host,
-                (range.from_ms, range.to_ms),
-                tier,
-                done
-            ),
-            step = range.step_ms,
+            cells = cells(query.metric, &host, (range.from, range.to), tier, done),
+            bucket = bucket_of("t", range.step),
             max_series = query.max_series,
         );
         let rows: Vec<PointRow> = wait(self.client.query_raw(&sql).fetch_all())?;
@@ -1241,7 +1331,7 @@ impl MetricsReader for ClickHouseReader {
         for row in rows {
             total = row.total as usize;
             let point = Point {
-                time_ms: row.bucket,
+                time: row.bucket,
                 avg: row.avg,
                 min: row.min,
                 max: row.max,
@@ -1258,18 +1348,17 @@ impl MetricsReader for ClickHouseReader {
         Ok(result)
     }
 
-    fn last_samples(&self, since_ms: i64, until_ms: i64) -> Result<Vec<LastSample>> {
+    fn last_samples(&self, since: Timestamp, until: Timestamp) -> Result<Vec<LastSample>> {
         let sql = format!(
-            "SELECT host_id, toInt64(toUnixTimestamp64Milli(max(time))) AS time_ms
-             FROM reports WHERE {} GROUP BY host_id",
-            time_between(since_ms, until_ms, "<=")
+            "SELECT host_id, max(time) AS newest FROM reports WHERE {} GROUP BY host_id",
+            time_between(since, until, "<=")
         );
         let rows: Vec<LastRow> = wait(self.client.query_raw(&sql).fetch_all())?;
         Ok(rows
             .into_iter()
             .map(|row| LastSample {
                 host_id: row.host_id,
-                time_ms: row.time_ms,
+                time: row.newest,
             })
             .collect())
     }
@@ -1278,8 +1367,8 @@ impl MetricsReader for ClickHouseReader {
         &self,
         host_id: &str,
         collector: &str,
-        since_ms: i64,
-        until_ms: i64,
+        since: Timestamp,
+        until: Timestamp,
     ) -> Result<Option<Value>> {
         let host = quoted(host_id);
         let prefix = quoted(&format!("{collector}."));
@@ -1301,7 +1390,7 @@ impl MetricsReader for ClickHouseReader {
 
         let scope = format!(
             "metric IN ({metrics}) AND host_id = {host} AND {}",
-            time_between(since_ms, until_ms, "<=")
+            time_between(since, until, "<=")
         );
         let sql = format!(
             "SELECT metric, labels, value, kind FROM samples WHERE {scope}
@@ -1315,8 +1404,9 @@ impl MetricsReader for ClickHouseReader {
         let sql = format!(
             "SELECT metric, labels, argMax(tuple(value), time).1 AS value FROM texts
              WHERE host_id = {host} AND startsWith(metric, {prefix})
-               AND time <= fromUnixTimestamp64Milli(toInt64({until_ms}), 'UTC')
-             GROUP BY metric, labels"
+               AND time <= {until}
+             GROUP BY metric, labels",
+            until = moment(until),
         );
         let current: Vec<LatestText> = wait(self.client.query_raw(&sql).fetch_all())?;
 
@@ -1360,10 +1450,15 @@ impl MetricsReader for ClickHouseReader {
         Ok(rebuilt_output(&series, &numbers, &texts))
     }
 
-    fn newest(&self, metric: &Metric, since_ms: i64, until_ms: i64) -> Result<Vec<NewestReading>> {
-        let scope = time_between(since_ms, until_ms, "<=");
+    fn newest(
+        &self,
+        metric: &Metric,
+        since: Timestamp,
+        until: Timestamp,
+    ) -> Result<Vec<NewestReading>> {
+        let scope = time_between(since, until, "<=");
         let sql = format!(
-            "SELECT host_id, series, toInt64(max(t)) AS time_ms, argMax(v, t) AS value
+            "SELECT host_id, series, max(t) AS time, argMax(v, t) AS value
              FROM ({values})
              GROUP BY host_id, series
              ORDER BY host_id, series",
@@ -1375,24 +1470,25 @@ impl MetricsReader for ClickHouseReader {
             .map(|row| NewestReading {
                 host_id: row.host_id,
                 series: row.series,
-                time_ms: row.time_ms,
+                time: row.time,
                 value: row.value,
             })
             .collect())
     }
 
-    /// Times are counted from the start, as milliseconds since 1970 are big enough
-    /// to cost the fit its precision.
-    fn trends(&self, metric: &Metric, since_ms: i64, until_ms: i64) -> Result<Vec<Trend>> {
-        let scope = time_between(since_ms, until_ms, "<=");
+    /// The slope is a change each second. Times are counted in seconds from the start,
+    /// as seconds since 1970 are big enough to cost the fit its precision.
+    fn trends(&self, metric: &Metric, since: Timestamp, until: Timestamp) -> Result<Vec<Trend>> {
+        let scope = time_between(since, until, "<=");
         let sql = format!(
-            "SELECT host_id, series, toInt64(max(t)) AS time_ms, argMax(v, t) AS value,
-                    toInt64(min(t)) AS first_ms, count() AS samples,
-                    tupleElement(simpleLinearRegression(toFloat64(t - {since_ms}), v), 1) AS slope
+            "SELECT host_id, series, max(t) AS time, argMax(v, t) AS value,
+                    min(t) AS first_time, count() AS samples,
+                    tupleElement(simpleLinearRegression(toFloat64(t - {since}), v), 1) AS slope
              FROM ({values})
              GROUP BY host_id, series
-             HAVING time_ms > first_ms
+             HAVING time > first_time
              ORDER BY host_id, series",
+            since = moment(since),
             values = computed(metric, &scope),
         );
         let rows: Vec<TrendRow> = wait(self.client.query_raw(&sql).fetch_all())?;
@@ -1402,11 +1498,11 @@ impl MetricsReader for ClickHouseReader {
             .map(|row| Trend {
                 host_id: row.host_id,
                 series: row.series,
-                time_ms: row.time_ms,
+                time: row.time,
                 value: row.value,
-                first_ms: row.first_ms,
+                first_time: row.first_time,
                 samples: row.samples,
-                slope_per_ms: row.slope,
+                slope_per_sec: row.slope,
             })
             .collect())
     }
@@ -1424,8 +1520,8 @@ impl MetricsReader for ClickHouseReader {
         let hosts = hosts.join(", ");
 
         let range = query.range;
-        let step = range.step_ms.max(SMALLEST_STEP_MS);
-        let tier = tier_for(step, range.from_ms, now_ms(), &self.retention);
+        let step = range.step.max(SMALLEST_STEP);
+        let tier = tier_for(step, range.from, times::now(), &self.retention);
         let done = self.rolled_up_until(query.metric)?;
         // The list of hosts is by far the longest part of the query, so it's only
         // written once, and the list of groups only if there's more than one.
@@ -1458,7 +1554,7 @@ impl MetricsReader for ClickHouseReader {
         // Ranked in one pass, as ClickHouse would work a `WITH` out again for each use.
         let sql = format!(
             "WITH [{hosts}] AS chosen{places}
-             SELECT line, toInt64(bucket) AS bucket, toFloat64(combined) AS value,
+             SELECT line, bucket, toFloat64(combined) AS value,
                     toUInt64(lines) AS total
              FROM (
                  SELECT *, max(position) OVER () AS lines FROM (
@@ -1468,13 +1564,13 @@ impl MetricsReader for ClickHouseReader {
                          FROM (
                              SELECT line, bucket, {combined} AS combined FROM (
                                  SELECT {line} AS line, host_id, series,
-                                        intDiv(t, {step}) * {step} AS bucket,
+                                        {bucket} AS bucket,
                                         sum(summed) / sum(samples) AS v
                                  FROM ({cells})
                                  WHERE 1 {only_main_line}
                                  GROUP BY line, host_id, series, bucket
                              )
-                             WHERE bucket + {step} <= {to_ms}
+                             WHERE bucket + {step} <= {to}
                              GROUP BY line, bucket
                          )
                      )
@@ -1485,11 +1581,13 @@ impl MetricsReader for ClickHouseReader {
             cells = cells(
                 query.metric,
                 "has(chosen, host_id)",
-                (range.from_ms, range.to_ms),
+                (range.from, range.to),
                 tier,
                 done
             ),
-            to_ms = range.to_ms,
+            bucket = bucket_of("t", step),
+            step = interval(step),
+            to = moment(range.to),
             max_lines = query.max_lines,
         );
         let rows: Vec<LineRow> = wait(
@@ -1508,7 +1606,7 @@ impl MetricsReader for ClickHouseReader {
         for row in rows {
             total = row.total as usize;
             let point = Point {
-                time_ms: row.bucket,
+                time: row.bucket,
                 avg: row.value,
                 min: row.value,
                 max: row.value,
@@ -1538,7 +1636,7 @@ impl MetricsReader for ClickHouseReader {
     /// Sizes come from ClickHouse's own records of its files, which cost nothing to read.
     /// Rows by collector only cover the last hour, as a count of everything would read
     /// every metric on every look at the Server page.
-    fn stats(&self, hour_ago_ms: i64) -> Result<StoreStats> {
+    fn stats(&self, hour_ago: Timestamp) -> Result<StoreStats> {
         let size: SizeRow = wait(
             self.client
                 .query(
@@ -1558,11 +1656,10 @@ impl MetricsReader for ClickHouseReader {
         )?;
         let sql = format!(
             "SELECT splitByChar('.', metric)[1] AS name, count() AS rows,
-                    toInt64(toUnixTimestamp64Milli(min(time))) AS oldest_ms,
-                    toInt64(toUnixTimestamp64Milli(max(time))) AS newest_ms
-             FROM samples
-             WHERE time >= fromUnixTimestamp64Milli(toInt64({hour_ago_ms}), 'UTC')
-             GROUP BY name ORDER BY name"
+                    min(time) AS oldest, max(time) AS newest
+             FROM samples WHERE time >= {hour_ago}
+             GROUP BY name ORDER BY name",
+            hour_ago = moment(hour_ago),
         );
         let collectors: Vec<CollectorRow> = wait(self.client.query_raw(&sql).fetch_all())?;
         let collectors = collectors
@@ -1573,8 +1670,8 @@ impl MetricsReader for ClickHouseReader {
                     // Counting all time per collector would scan the whole table.
                     rows: None,
                     rows_last_hour: i64::try_from(row.rows).unwrap_or(i64::MAX),
-                    oldest_ms: row.oldest_ms,
-                    newest_ms: row.newest_ms,
+                    oldest_sample_at: row.oldest,
+                    newest_sample_at: row.newest,
                 }
             })
             .collect();
@@ -1628,10 +1725,8 @@ mod tests {
     /// started in it too, or a later run could find an old run's rows.
     fn new_database() -> String {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        static RUN: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
-            let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
-            since.map_or(0, |since| since.as_secs())
-        });
+        static RUN: std::sync::LazyLock<i64> =
+            std::sync::LazyLock::new(|| crate::times::now().timestamp());
         let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         format!("test_{}_{}_{next}", *RUN, std::process::id())
     }
@@ -1722,7 +1817,7 @@ mod tests {
 
         store.client = good.clone().with_url("http://127.0.0.1:1");
         let sample = Sample {
-            timestamp_ms: 2000,
+            time: at(2000),
             metrics: BTreeMap::from([
                 ("checks".to_string(), working.clone()),
                 ("cpu".to_string(), json!({ "usage_percent": 1.0 })),
@@ -1742,7 +1837,7 @@ mod tests {
         );
         let reader = store.reader().unwrap();
         let output = reader
-            .latest_output("a", "checks", 0, 5000)
+            .latest_output("a", "checks", at(0), at(5000))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -1755,11 +1850,17 @@ mod tests {
     #[test]
     fn a_time_too_far_away_for_clickhouse_is_refused() {
         let mut store = in_memory();
-        let sample = Sample {
-            timestamp_ms: u64::MAX,
-            metrics: BTreeMap::new(),
-        };
-        assert!(write_one(&mut store, "a", "host", &sample).is_err());
+        let after_the_last = crate::store::latest_sample() + chrono::TimeDelta::milliseconds(1);
+        for time in [after_the_last, DateTime::<Utc>::MAX_UTC] {
+            let sample = Sample {
+                time,
+                metrics: BTreeMap::new(),
+            };
+            assert!(
+                write_one(&mut store, "a", "host", &sample).is_err(),
+                "{time}"
+            );
+        }
     }
 
     #[test]
@@ -1791,7 +1892,7 @@ mod tests {
 
         let reader = store.reader().unwrap();
         let output = reader
-            .latest_output("a", "checks", 0, 5000)
+            .latest_output("a", "checks", at(0), at(5000))
             .unwrap()
             .unwrap();
 
@@ -1830,12 +1931,73 @@ mod tests {
         write_metric(&mut store, "a", 5000, "cpu", cpu());
         write_metric(&mut store, "a", 9000, "cpu", cpu());
 
-        let stats = store.reader().unwrap().stats(4000).unwrap();
+        let stats = store.reader().unwrap().stats(at(4000)).unwrap();
 
         assert_eq!(stats.engine, "ClickHouse");
         assert_eq!(stats.total_rows, Some(3));
         assert_eq!(stats.collectors[0].name, "cpu");
         assert_eq!(stats.collectors[0].rows_last_hour, 2);
+        assert_eq!(stats.collectors[0].oldest_sample_at, at(5000));
+        assert_eq!(stats.collectors[0].newest_sample_at, at(9000));
+    }
+
+    fn run(client: &Client, statements: &[&str]) {
+        for statement in statements {
+            wait(client.query_raw(statement).execute()).unwrap();
+        }
+    }
+
+    /// A database made before rollups kept their times as times, when they were
+    /// milliseconds since 1970, keeps the same moments once it's migrated, even if
+    /// copying them was stopped partway and done again.
+    #[test]
+    fn rollup_progress_in_milliseconds_becomes_times() {
+        let database = new_database();
+        let client = Client::default().with_url(url());
+        run(&client, &[&format!("CREATE DATABASE `{database}`")]);
+        let client = client.with_database(&database);
+        wait(migrate(&client, &MIGRATIONS[..1])).unwrap();
+        run(
+            &client,
+            &[
+                "INSERT INTO rollup_progress VALUES
+                     ('cpu.usage', 1795053600000, 1), ('disk.usage', 1795050000000, 1)",
+                "INSERT INTO rollup_redo VALUES (1795046400000), (1795042800000)",
+            ],
+        );
+        // As if the first copy had stopped partway, so it all runs again.
+        wait(migrate(&client, &MIGRATIONS[..2])).unwrap();
+        run(&client, MIGRATIONS[1].1);
+
+        let store = opened(&database);
+
+        let moment = |text| crate::times::parse_moment(text).unwrap();
+        assert_eq!(
+            store.progress,
+            HashMap::from([
+                ("cpu.usage".to_string(), moment("2026-11-19T02:00:00Z")),
+                ("disk.usage".to_string(), moment("2026-11-19T01:00:00Z")),
+            ])
+        );
+        assert_eq!(
+            store.redo,
+            BTreeSet::from([
+                moment("2026-11-19T00:00:00Z"),
+                moment("2026-11-18T23:00:00Z")
+            ])
+        );
+        let copies = "SELECT count() FROM system.tables
+                      WHERE database = currentDatabase() AND name LIKE '%copy'";
+        assert_eq!(count(&store, copies), 0);
+        let reader = ClickHouseReader {
+            client: store.client.clone(),
+            retention: store.retention,
+        };
+        let cpu = find("cpu.usage").unwrap();
+        assert_eq!(
+            reader.rolled_up_until(cpu).unwrap(),
+            Some(moment("2026-11-19T02:00:00Z"))
+        );
     }
 
     #[test]

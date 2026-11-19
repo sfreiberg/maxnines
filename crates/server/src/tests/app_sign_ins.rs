@@ -1,8 +1,10 @@
 //! Signing in apps through the browser: approving one, the tokens it's given, and
 //! how they're refreshed, limited and revoked.
 
+use chrono::TimeDelta;
+
 use super::*;
-use crate::app_sign_ins::{ACCESS_LIFETIME_MS, REFRESH_GRACE_MS, REFRESH_LIFETIME_MS};
+use crate::app_sign_ins::{ACCESS_LIFETIME, REFRESH_GRACE, REFRESH_LIFETIME};
 use crate::models::Refreshed;
 use crate::roles::Role;
 
@@ -116,7 +118,7 @@ async fn call(server: &TestServer, token: &str, method: &str, path: &str) -> u16
 pub(super) async fn person(server: &TestServer, email: &str, role: Role) -> (i64, Browser) {
     let database = &server.state.database;
     let (user, link) = database
-        .create_user(email, "Someone", role, now_ms())
+        .create_user(email, "Someone", role, crate::times::now())
         .await
         .unwrap()
         .unwrap();
@@ -125,7 +127,7 @@ pub(super) async fn person(server: &TestServer, email: &str, role: Role) -> (i64
         .unwrap();
     assert!(
         database
-            .use_setup_link(user.id, &link, &hash, now_ms())
+            .use_setup_link(user.id, &link, &hash, crate::times::now())
             .await
             .unwrap()
     );
@@ -167,10 +169,10 @@ async fn an_app_signs_in_through_the_browser_and_uses_its_token() {
     let (status, tokens) = swap_code(&server, &code, VERIFIER).await;
     assert_eq!(status, 200, "{tokens}");
     assert_eq!(tokens["token_type"], "Bearer");
-    assert_eq!(tokens["expires_in"], ACCESS_LIFETIME_MS / 1000);
+    assert_eq!(tokens["expires_in"], ACCESS_LIFETIME.num_seconds());
     assert_eq!(
         tokens["refresh_token_expires_in"],
-        REFRESH_LIFETIME_MS / 1000
+        REFRESH_LIFETIME.num_seconds()
     );
     assert_eq!(tokens["role"], "viewer");
     let access = tokens["access_token"].as_str().unwrap();
@@ -457,7 +459,7 @@ async fn refreshing_swaps_both_tokens_and_a_copied_one_revokes_the_sign_in() {
 
     // Long after it was swapped, the old one being used again means it was copied.
     let database = &server.state.database;
-    let later = now_ms() + REFRESH_GRACE_MS + 1;
+    let later = crate::times::now() + REFRESH_GRACE + TimeDelta::milliseconds(1);
     let reused = database
         .refresh_app_sign_in(old_refresh, "maxnines-cli", later)
         .await
@@ -489,25 +491,25 @@ async fn tokens_expire_and_stop_with_their_owner() {
     let server = start().await;
     let database = &server.state.database;
     let (id, _) = person(&server, "someone@example.com", Role::Responder).await;
-    let now = now_ms();
+    let now = crate::times::now();
     let (_, tokens) = database
         .create_app_sign_in(id, "maxnines-desktop-mac", "Mac", Role::Responder, now)
         .await
         .unwrap();
 
-    let accepted = |at: i64| database.accept_app_token(&tokens.access_token, at);
+    let accepted = |at: Timestamp| database.accept_app_token(&tokens.access_token, at);
     assert!(
-        accepted(now + ACCESS_LIFETIME_MS - 1)
+        accepted(now + ACCESS_LIFETIME - TimeDelta::milliseconds(1))
             .await
             .unwrap()
             .is_some()
     );
-    assert!(accepted(now + ACCESS_LIFETIME_MS).await.unwrap().is_none());
+    assert!(accepted(now + ACCESS_LIFETIME).await.unwrap().is_none());
     let late = database
         .refresh_app_sign_in(
             &tokens.refresh_token,
             "maxnines-desktop-mac",
-            now + REFRESH_LIFETIME_MS,
+            now + REFRESH_LIFETIME,
         )
         .await
         .unwrap();
@@ -542,7 +544,7 @@ async fn signed_in_apps_are_listed_and_revoked() {
     let server = start().await;
     let database = &server.state.database;
     let owner = database.list_users().await.unwrap()[0].id;
-    let now = now_ms();
+    let now = crate::times::now();
     let (first, first_tokens) = database
         .create_app_sign_in(owner, "maxnines-cli", "laptop", Role::Viewer, now)
         .await
@@ -676,12 +678,12 @@ async fn using_a_swapped_token_again_never_stretches_its_minute() {
     let server = start().await;
     let database = &server.state.database;
     let owner = database.list_users().await.unwrap()[0].id;
-    let now = now_ms();
+    let now = crate::times::now();
     let (_, first) = database
         .create_app_sign_in(owner, "maxnines-cli", "", Role::Viewer, now)
         .await
         .unwrap();
-    let refresh = |token: String, at: i64| async move {
+    let refresh = |token: String, at: Timestamp| async move {
         database
             .refresh_app_sign_in(&token, "maxnines-cli", at)
             .await
@@ -691,14 +693,14 @@ async fn using_a_swapped_token_again_never_stretches_its_minute() {
         panic!("not refreshed");
     };
     // Its answer was lost, so it's used again inside the minute: that works.
-    let half = now + REFRESH_GRACE_MS / 2;
+    let half = now + REFRESH_GRACE / 2;
     assert!(matches!(
         refresh(first.refresh_token.clone(), half).await,
         Refreshed::Issued(..)
     ));
     // But the minute still counts from the first swap, so a copy can't be kept alive
     // by using it again and again.
-    let after = now + REFRESH_GRACE_MS + 1;
+    let after = now + REFRESH_GRACE + TimeDelta::milliseconds(1);
     assert_eq!(
         refresh(first.refresh_token.clone(), after).await,
         Refreshed::Reused
@@ -714,7 +716,7 @@ async fn two_refreshes_at_once_both_get_tokens_and_the_newest_works() {
     let server = start().await;
     let database = &server.state.database;
     let owner = database.list_users().await.unwrap()[0].id;
-    let now = now_ms();
+    let now = crate::times::now();
     let (_, first) = database
         .create_app_sign_in(owner, "maxnines-cli", "", Role::Viewer, now)
         .await
@@ -747,7 +749,7 @@ async fn someone_who_cant_sign_in_any_more_gets_a_final_no() {
     server
         .state
         .database
-        .disable_user(id, now_ms())
+        .disable_user(id, crate::times::now())
         .await
         .unwrap();
     let (status, refused) =
@@ -765,7 +767,7 @@ async fn only_your_own_apps_can_be_revoked_and_old_ones_are_cleared_away() {
     let server = start().await;
     let database = &server.state.database;
     let admin = database.list_users().await.unwrap()[0].id;
-    let now = now_ms();
+    let now = crate::times::now();
     let (theirs, _) = database
         .create_app_sign_in(admin, "maxnines-cli", "admin's laptop", Role::Viewer, now)
         .await
@@ -791,7 +793,7 @@ async fn only_your_own_apps_can_be_revoked_and_old_ones_are_cleared_away() {
 
     // Revoked long ago, it goes the next time an app signs in.
     database.revoke_app_sign_in(theirs.id, now).await.unwrap();
-    let much_later = now + 91 * 24 * 60 * 60 * 1000;
+    let much_later = now + TimeDelta::days(91);
     database
         .create_app_sign_in(
             admin,

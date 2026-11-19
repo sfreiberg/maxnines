@@ -5,9 +5,10 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use maxnines_protocol::auth::Identity;
 use maxnines_protocol::{AgentMessage, Backoff, RegistrationStatus, Sample, ServerMessage};
@@ -72,13 +73,6 @@ enum End {
     Outage,
     Churn,
     Failed(String),
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 fn chance(percent: f64) -> bool {
@@ -149,14 +143,14 @@ pub async fn register(
 /// A sample that's yet to reach the server.
 #[derive(Clone, Copy)]
 struct Waiting {
-    taken_at: u64,
+    taken_at: DateTime<Utc>,
     /// Going again because the connection ended before it was confirmed, so it's
     /// already been counted.
     resend: bool,
 }
 
 impl Waiting {
-    fn new(taken_at: u64) -> Self {
+    fn new(taken_at: DateTime<Utc>) -> Self {
         Self {
             taken_at,
             resend: false,
@@ -175,9 +169,9 @@ pub struct SimulatedAgent {
     saved: VecDeque<Waiting>,
     next_saved: Instant,
     /// When samples the server hasn't confirmed yet were taken.
-    unconfirmed: Vec<u64>,
+    unconfirmed: Vec<DateTime<Utc>>,
     /// The saved one on its way, as they go one at a time.
-    saved_unconfirmed: Option<u64>,
+    saved_unconfirmed: Option<DateTime<Utc>>,
     next_churn: Option<Instant>,
     build: u64,
 }
@@ -188,8 +182,7 @@ impl SimulatedAgent {
         let mut ticker = interval_at(first, plan.interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let shape: Shape = plan.shape;
-        let interval_ms = plan.interval.as_millis() as u64;
-        let started = now_ms();
+        let started = maxnines_protocol::time::now();
         Self {
             index,
             identity,
@@ -197,9 +190,9 @@ impl SimulatedAgent {
             readings: Readings::new(shape, chance(plan.hot_percent)),
             ticker,
             last_sample: Instant::now(),
-            saved: (0..plan.backlog as u64)
+            saved: (1..=plan.backlog)
                 .rev()
-                .map(|age| Waiting::new(started.saturating_sub((age + 1) * interval_ms)))
+                .map(|age| Waiting::new(started - plan.interval.mul_f64(age as f64)))
                 .collect(),
             next_saved: Instant::now(),
             unconfirmed: Vec::new(),
@@ -209,14 +202,11 @@ impl SimulatedAgent {
         }
     }
 
-    fn sample_text(&mut self, timestamp_ms: u64) -> Result<String> {
-        let elapsed = self.last_sample.elapsed().as_secs();
+    fn sample_text(&mut self, time: DateTime<Utc>) -> Result<String> {
+        let elapsed = self.last_sample.elapsed();
         self.last_sample = Instant::now();
         let metrics = self.readings.metrics(elapsed);
-        let sample = AgentMessage::Sample(Sample {
-            timestamp_ms,
-            metrics,
-        });
+        let sample = AgentMessage::Sample(Sample { time, metrics });
         Ok(serde_json::to_string(&sample)?)
     }
 
@@ -266,7 +256,7 @@ impl SimulatedAgent {
                     return Ok(End::Churn);
                 }
                 _ = self.ticker.tick() => {
-                    let taken_at = now_ms();
+                    let taken_at = maxnines_protocol::time::now();
                     let text = self.sample_text(taken_at)?;
                     counters.bytes.fetch_add(text.len() as u64, Relaxed);
                     self.unconfirmed.push(taken_at);
@@ -292,12 +282,12 @@ impl SimulatedAgent {
                 }
                 message = socket.next() => match message {
                     Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
-                        Ok(ServerMessage::Ack { timestamp_ms }) => {
-                            if self.saved_unconfirmed == Some(timestamp_ms) {
+                        Ok(ServerMessage::Ack { time }) => {
+                            if self.saved_unconfirmed == Some(time) {
                                 self.saved_unconfirmed = None;
                                 self.next_saved = Instant::now() + plan.backlog_gap;
                             } else {
-                                self.unconfirmed.retain(|time| *time != timestamp_ms);
+                                self.unconfirmed.retain(|taken_at| *taken_at != time);
                             }
                         }
                         Ok(ServerMessage::Config { version, .. }) => {
@@ -394,7 +384,7 @@ impl SimulatedAgent {
             loop {
                 tokio::select! {
                     () = sleep_until(retry) => break,
-                    _ = self.ticker.tick() => self.saved.push_back(Waiting::new(now_ms())),
+                    _ = self.ticker.tick() => self.saved.push_back(Waiting::new(maxnines_protocol::time::now())),
                     _ = stop.changed() => return,
                 }
             }
@@ -452,10 +442,10 @@ mod tests {
 
         let agent = SimulatedAgent::new(0, identity, "h".to_string(), &plan);
 
-        let saved: Vec<u64> = agent.saved.iter().map(|sample| sample.taken_at).collect();
+        let saved: Vec<DateTime<Utc>> = agent.saved.iter().map(|sample| sample.taken_at).collect();
         assert_eq!(saved.len(), 3);
-        assert_eq!(saved[1] - saved[0], 15_000);
-        assert!(saved[2] < now_ms());
+        assert_eq!(saved[1] - saved[0], chrono::TimeDelta::seconds(15));
+        assert!(saved[2] < maxnines_protocol::time::now());
     }
 
     #[test]

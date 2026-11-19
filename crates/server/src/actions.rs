@@ -7,21 +7,24 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Result, ensure};
+use chrono::TimeDelta;
 use maxnines_protocol::ServerMessage;
 use maxnines_protocol::actions::{
-    ActionOutcome, ActionResult, DEFAULT_ACTION_TIMEOUT_SECS, MAX_ACTION_TIMEOUT_SECS,
-    check_variable, is_action_name,
+    ActionOutcome, ActionResult, DEFAULT_ACTION_TIMEOUT, MAX_ACTION_TIMEOUT, check_variable,
+    is_action_name,
 };
-use serde::{Deserialize, Serialize};
+use maxnines_protocol::time::{optional_seconds, seconds};
+use serde::{Deserialize, Serialize, Serializer};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::alerting::{Alert, AlertRule, AlertRuleInput, RuleKind, Severity};
 use crate::metrics::{Metric, Source};
 use crate::models::Database;
-use crate::times::{Timestamp, from_ms};
+use crate::times::Timestamp;
 
 /// How many actions one rule can run.
 pub const MAX_RULE_ACTIONS: usize = 8;
@@ -31,7 +34,7 @@ const REQUEST_QUEUE_SIZE: usize = 16;
 
 /// How long past its time limit an action's answer is waited for, which covers
 /// waiting its turn on the agent and the trip back.
-const ANSWER_GRACE_MS: i64 = 60_000;
+const ANSWER_GRACE: TimeDelta = TimeDelta::minutes(1);
 
 /// Who asked for a run that a person started.
 pub const RUN_BY_HAND: &str = "manual";
@@ -86,22 +89,41 @@ pub struct RuleAction {
     #[serde(default = "first")]
     pub run_on: RunOn,
     /// How long it gets. 30 seconds if left out.
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
+    #[serde(
+        default,
+        rename = "timeout_secs",
+        with = "optional_seconds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub timeout: Option<Duration>,
 }
 
 impl RuleAction {
-    pub fn timeout(&self) -> u64 {
-        self.timeout_secs.unwrap_or(DEFAULT_ACTION_TIMEOUT_SECS)
+    pub fn timeout(&self) -> Duration {
+        self.timeout.unwrap_or(DEFAULT_ACTION_TIMEOUT)
     }
 }
 
-pub fn check_timeout(secs: u64) -> Result<()> {
+pub fn check_timeout(timeout: Duration) -> Result<()> {
     ensure!(
-        (1..=MAX_ACTION_TIMEOUT_SECS).contains(&secs),
-        "an action's time limit has to be from 1 to {MAX_ACTION_TIMEOUT_SECS} seconds"
+        (Duration::from_secs(1)..=MAX_ACTION_TIMEOUT).contains(&timeout),
+        "an action's time limit has to be from 1 to {} seconds",
+        MAX_ACTION_TIMEOUT.as_secs()
     );
     Ok(())
+}
+
+/// For serde, how long a run took, in milliseconds, as the API gives it.
+fn optional_milliseconds<S: Serializer>(
+    length: &Option<Duration>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match length {
+        Some(length) => {
+            serializer.serialize_some(&u64::try_from(length.as_millis()).unwrap_or(u64::MAX))
+        }
+        None => serializer.serialize_none(),
+    }
 }
 
 /// Checks a rule's actions by themselves. Whether any host has them, and whether
@@ -231,14 +253,17 @@ pub struct ActionRun {
     /// Who asked, for one a person started.
     pub requested_by: Option<String>,
     pub requested_at: Timestamp,
-    pub timeout_secs: u64,
+    #[serde(rename = "timeout_secs", serialize_with = "seconds::serialize")]
+    pub timeout: Duration,
     /// Empty until the agent answers or is given up on.
     pub outcome: Option<ActionOutcome>,
     pub exit_code: Option<i32>,
     pub error: Option<String>,
     pub output: String,
     pub truncated: bool,
-    pub duration_ms: Option<u64>,
+    /// How long it took, as the agent timed it.
+    #[serde(rename = "duration_ms", serialize_with = "optional_milliseconds")]
+    pub duration: Option<Duration>,
     pub finished_at: Option<Timestamp>,
 }
 
@@ -252,7 +277,7 @@ pub struct NewRun {
     pub variables: BTreeMap<String, String>,
     pub requested_by: Option<String>,
     pub requested_at: Timestamp,
-    pub timeout_secs: u64,
+    pub timeout: Duration,
 }
 
 /// How a run ended.
@@ -263,7 +288,7 @@ pub struct Finished {
     pub error: Option<String>,
     pub output: String,
     pub truncated: bool,
-    pub duration_ms: Option<u64>,
+    pub duration: Option<Duration>,
 }
 
 impl Finished {
@@ -275,7 +300,7 @@ impl Finished {
             error: Some(error.into()),
             output: String::new(),
             truncated: false,
-            duration_ms: None,
+            duration: None,
         }
     }
 }
@@ -349,9 +374,8 @@ impl Actions {
             Some(needed) => self.ask(id, &new, needed),
         };
         if let Some(finished) = refusal {
-            let now_ms = new.requested_at.timestamp_millis();
             self.database
-                .finish_action_run(id, &new.host_id, &finished, now_ms)
+                .finish_action_run(id, &new.host_id, &finished, new.requested_at)
                 .await?;
         } else {
             info!(
@@ -378,7 +402,7 @@ impl Actions {
             id: id.to_string(),
             action: new.action.clone(),
             variables: new.variables.clone(),
-            timeout_secs: new.timeout_secs,
+            timeout: new.timeout,
         };
         let Ok(text) = serde_json::to_string(&message) else {
             return refused("the request couldn't be written".to_string());
@@ -395,7 +419,12 @@ impl Actions {
 
     /// Records an agent's answer. One for a run that isn't waiting, or isn't that
     /// host's, is ignored, so an agent can only answer for itself.
-    pub async fn finished(&self, host_id: &str, result: ActionResult, now_ms: i64) -> Result<()> {
+    pub async fn finished(
+        &self,
+        host_id: &str,
+        result: ActionResult,
+        now: Timestamp,
+    ) -> Result<()> {
         let Ok(id) = result.id.parse::<i64>() else {
             warn!(host_id, "ignoring an action result with an invalid ID");
             return Ok(());
@@ -406,11 +435,11 @@ impl Actions {
             error: result.error,
             output: result.output,
             truncated: result.truncated,
-            duration_ms: Some(result.duration_ms),
+            duration: Some(result.duration),
         };
         let recorded = self
             .database
-            .finish_action_run(id, host_id, &finished, now_ms)
+            .finish_action_run(id, host_id, &finished, now)
             .await?;
         if !recorded {
             warn!(
@@ -422,18 +451,18 @@ impl Actions {
     }
 
     /// Finishes runs whose agents never answered, so nothing waits for ever.
-    pub async fn give_up_on_unanswered(&self, now_ms: i64) -> Result<()> {
+    pub async fn give_up_on_unanswered(&self, now: Timestamp) -> Result<()> {
         for run in self.database.unanswered_action_runs().await? {
-            let limit_ms = i64::try_from(run.timeout_secs)
-                .unwrap_or(i64::MAX / 1000)
-                .saturating_mul(1000);
-            if now_ms - run.requested_at.timestamp_millis() < limit_ms + ANSWER_GRACE_MS {
+            let waited_for = TimeDelta::from_std(run.timeout)
+                .ok()
+                .and_then(|timeout| timeout.checked_add(&ANSWER_GRACE));
+            if waited_for.is_none_or(|waited_for| now - run.requested_at < waited_for) {
                 continue;
             }
             let finished =
                 Finished::without_running(ActionOutcome::Failed, "the agent never answered");
             self.database
-                .finish_action_run(run.id, &run.host_id, &finished, now_ms)
+                .finish_action_run(run.id, &run.host_id, &finished, now)
                 .await?;
         }
         Ok(())
@@ -446,7 +475,7 @@ impl Actions {
         rule: &AlertRule,
         alert: &Alert,
         started: bool,
-        now_ms: i64,
+        now: Timestamp,
     ) -> Result<()> {
         for wanted in &rule.rule.actions {
             if !wanted.run_on.is_due(started, alert.severity) {
@@ -467,8 +496,8 @@ impl Actions {
                 run_on: run_on.to_string(),
                 variables: alert_variables(&rule.rule, alert),
                 requested_by: None,
-                requested_at: from_ms(now_ms),
-                timeout_secs: wanted.timeout(),
+                requested_at: now,
+                timeout: wanted.timeout(),
             };
             self.run(new).await?;
         }

@@ -5,7 +5,6 @@ use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::PoisonError;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use ipnet::IpNet;
@@ -228,7 +227,7 @@ impl Rules {
 pub struct Registry {
     hosts: Mutex<BTreeMap<String, HostRecord>>,
     /// When each waiting agent last tried to connect. In memory, as it asks again.
-    asked_ms: std::sync::Mutex<BTreeMap<String, u64>>,
+    asked: std::sync::Mutex<BTreeMap<String, Timestamp>>,
     rules: Rules,
     max_pending: usize,
     database: Database,
@@ -245,7 +244,7 @@ impl Registry {
     ) -> Self {
         Self {
             hosts: Mutex::new(hosts.into_iter().map(|a| (a.id.clone(), a)).collect()),
-            asked_ms: std::sync::Mutex::default(),
+            asked: std::sync::Mutex::default(),
             rules,
             max_pending,
             database,
@@ -347,15 +346,15 @@ impl Registry {
     }
 
     fn note_asked(&self, id: &str) {
-        self.asked_ms
+        self.asked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(id.to_string(), now_ms());
+            .insert(id.to_string(), times::now());
     }
 
     /// When a waiting agent last tried to connect, if it has since the server started.
-    pub fn last_asked_ms(&self, id: &str) -> Option<u64> {
-        self.asked_ms
+    pub fn last_asked_at(&self, id: &str) -> Option<Timestamp> {
+        self.asked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(id)
@@ -387,7 +386,7 @@ impl Registry {
         host.decided_at = Some(times::now());
         self.save(&mut hosts, host.clone()).await?;
         drop(hosts);
-        self.asked_ms
+        self.asked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(id);
@@ -441,7 +440,7 @@ impl Registry {
     /// Takes a deleted agent off the list. If it connects again, it's new.
     pub async fn forget(&self, id: &str) {
         self.hosts.lock().await.remove(id);
-        self.asked_ms
+        self.asked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(id);
@@ -479,13 +478,6 @@ impl Registry {
         hosts.insert(host.id.clone(), host);
         Ok(())
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 #[cfg(test)]

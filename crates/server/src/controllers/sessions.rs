@@ -11,6 +11,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
+use chrono::TimeDelta;
 use cookie::time::Duration;
 use cookie::{Cookie, SameSite};
 use serde::Deserialize;
@@ -18,8 +19,7 @@ use tracing::warn;
 
 use super::{CsrfForm, Page, api, request_source, run_as, server_error};
 use crate::app_state::AppState;
-use crate::metrics::now_ms;
-use crate::models::{CHALLENGE_LIFETIME_MS, SESSION_LIFETIME_MS, User, check_new_password};
+use crate::models::{CHALLENGE_LIFETIME, SESSION_LIFETIME, User, check_new_password};
 use crate::passwords::{hash_password, password_matches};
 
 const SESSION_COOKIE: &str = "maxnines_session";
@@ -59,7 +59,10 @@ async fn session_user(
     match session_token(headers) {
         Some(token) => {
             let agent = user_agent(headers);
-            state.database.session(token, agent, now_ms()).await
+            state
+                .database
+                .session(token, agent, crate::times::now())
+                .await
         }
         None => Ok(None),
     }
@@ -141,13 +144,13 @@ fn safe_next(next: Option<&str>) -> &str {
     .unwrap_or(SIGNED_IN_HOME)
 }
 
-fn session_cookie(state: &AppState, value: String, lifetime_ms: i64) -> Option<HeaderValue> {
+fn session_cookie(state: &AppState, value: String, lifetime: TimeDelta) -> Option<HeaderValue> {
     let cookie = Cookie::build((SESSION_COOKIE, value))
         .path("/")
         .http_only(true)
         .same_site(SameSite::Lax)
         .secure(state.audience.starts_with("wss://"))
-        .max_age(Duration::milliseconds(lifetime_ms));
+        .max_age(Duration::seconds(lifetime.num_seconds()));
     HeaderValue::from_str(&cookie.to_string()).ok()
 }
 
@@ -167,26 +170,26 @@ async fn signed_in_response(
 ) -> Response {
     let token = match state
         .database
-        .start_session(user_id, now_ms(), user_agent)
+        .start_session(user_id, crate::times::now(), user_agent)
         .await
     {
         Ok(token) => token,
         Err(error) => return server_error(&error),
     };
     let mut response = Redirect::to(next).into_response();
-    if let Some(cookie) = session_cookie(state, token, SESSION_LIFETIME_MS) {
+    if let Some(cookie) = session_cookie(state, token, SESSION_LIFETIME) {
         response.headers_mut().append(header::SET_COOKIE, cookie);
     }
     response
 }
 
-fn challenge_cookie(state: &AppState, value: String, lifetime_ms: i64) -> Option<HeaderValue> {
+fn challenge_cookie(state: &AppState, value: String, lifetime: TimeDelta) -> Option<HeaderValue> {
     let cookie = Cookie::build((CHALLENGE_COOKIE, value))
         .path("/login")
         .http_only(true)
         .same_site(SameSite::Strict)
         .secure(state.audience.starts_with("wss://"))
-        .max_age(Duration::milliseconds(lifetime_ms));
+        .max_age(Duration::seconds(lifetime.num_seconds()));
     HeaderValue::from_str(&cookie.to_string()).ok()
 }
 
@@ -203,7 +206,7 @@ async fn after_password(
     }
     let token = match state
         .database
-        .start_sign_in_challenge(user.id, now_ms())
+        .start_sign_in_challenge(user.id, crate::times::now())
         .await
     {
         Ok(token) => token,
@@ -211,7 +214,7 @@ async fn after_password(
     };
     let query = serde_urlencoded::to_string([("next", next)]).unwrap_or_default();
     let mut response = Redirect::to(&format!("{CODE_PAGE}?{query}")).into_response();
-    if let Some(cookie) = challenge_cookie(state, token, CHALLENGE_LIFETIME_MS) {
+    if let Some(cookie) = challenge_cookie(state, token, CHALLENGE_LIFETIME) {
         response.headers_mut().append(header::SET_COOKIE, cookie);
     }
     response
@@ -227,7 +230,7 @@ async fn challenged<'a>(
     };
     let user = state
         .database
-        .sign_in_challenge_user(token, now_ms())
+        .sign_in_challenge_user(token, crate::times::now())
         .await?;
     Ok(user.map(|user| (user, token)))
 }
@@ -284,7 +287,7 @@ async fn check_code(
     let code = form.fields.get("code").map_or("", String::as_str);
     let accepted = state
         .database
-        .accept_two_factor_code(user.id, code, now_ms());
+        .accept_two_factor_code(user.id, code, crate::times::now());
     match accepted.await {
         Ok(true) => {}
         Ok(false) => {
@@ -303,7 +306,7 @@ async fn check_code(
         return server_error(&error);
     }
     let mut response = signed_in_response(&state, user.id, &next, user_agent(&headers)).await;
-    if let Some(cookie) = challenge_cookie(&state, String::new(), 0) {
+    if let Some(cookie) = challenge_cookie(&state, String::new(), TimeDelta::zero()) {
         response.headers_mut().append(header::SET_COOKIE, cookie);
     }
     response
@@ -399,7 +402,7 @@ async fn sign_out(State(state): State<AppState>, headers: HeaderMap, _form: Csrf
         return server_error(&error);
     }
     let mut response = Redirect::to("/login").into_response();
-    if let Some(cookie) = session_cookie(&state, String::new(), 0) {
+    if let Some(cookie) = session_cookie(&state, String::new(), TimeDelta::zero()) {
         response.headers_mut().append(header::SET_COOKIE, cookie);
     }
     response
@@ -437,7 +440,11 @@ async fn setup_page(
     Path(link): Path<String>,
     token: CsrfToken,
 ) -> Response {
-    match state.database.setup_link_user(&link, now_ms()).await {
+    match state
+        .database
+        .setup_link_user(&link, crate::times::now())
+        .await
+    {
         Ok(user) => setup_form(&state, &token, &link, user.as_ref(), None),
         Err(error) => server_error(&error),
     }
@@ -449,7 +456,11 @@ async fn setup(
     headers: HeaderMap,
     form: CsrfForm,
 ) -> Response {
-    let user = match state.database.setup_link_user(&link, now_ms()).await {
+    let user = match state
+        .database
+        .setup_link_user(&link, crate::times::now())
+        .await
+    {
         Ok(Some(user)) => user,
         Ok(None) => return setup_form(&state, &form.token, &link, None, None),
         Err(error) => return server_error(&error),
@@ -471,7 +482,7 @@ async fn setup(
     };
     let saved = state
         .database
-        .use_setup_link(user.id, &link, &hash, now_ms())
+        .use_setup_link(user.id, &link, &hash, crate::times::now())
         .await;
     match saved {
         Ok(true) => after_password(&state, &user, SIGNED_IN_HOME, user_agent(&headers)).await,

@@ -7,6 +7,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use axum_csrf::CsrfToken;
+use chrono::TimeDelta;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -22,13 +23,12 @@ use crate::host_filter::{self, MAX_SUGGESTIONS, PartialValue, Suggestion, sugges
 use crate::locations::Locator;
 use crate::metric_charts::format_value;
 use crate::metrics::Unit;
-use crate::metrics::now_ms;
 use crate::models::ConfigStatus;
 use crate::presence::Reach;
 use crate::registration::{HostRecord, HostState, short_id};
 use crate::rule_engine;
 use crate::silences::{ActiveSilences, Cover, Silence, SilenceInput};
-use crate::times::{format_moment, from_ms, lasting};
+use crate::times::{self, format_moment, lasting};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -155,11 +155,17 @@ fn readable(name: &str, value: &Value) -> Option<String> {
     Some(format_value(Unit::Bytes, bytes))
 }
 
-pub fn format_uptime(secs: u64) -> String {
-    let part = |count: u64, unit: &str| match count {
+/// How long a collector says something has been running, as its `uptime_secs`.
+fn uptime_of(output: &Value) -> Option<TimeDelta> {
+    TimeDelta::try_seconds(output["uptime_secs"].as_i64()?)
+}
+
+pub fn format_uptime(uptime: TimeDelta) -> String {
+    let part = |count: i64, unit: &str| match count {
         1 => format!("1 {unit}"),
         _ => format!("{count} {unit}s"),
     };
+    let secs = uptime.num_seconds().max(0);
     let (days, hours, minutes) = (secs / 86_400, secs % 86_400 / 3600, secs % 3600 / 60);
     if days > 0 {
         format!("{}, {}", part(days, "day"), part(hours, "hour"))
@@ -182,8 +188,8 @@ fn row(state: &AppState, host: HostRecord, facts: Option<&FlatFacts>, health: He
         os: facts.and_then(os_of),
         os_family: facts.and_then(OsFamily::of),
         seen: presence
-            .and_then(|p| p.last_seen_ms)
-            .map(|seen_ms| crate::times::ago(from_ms(seen_ms as i64), crate::times::now())),
+            .and_then(|p| p.last_seen_at)
+            .map(|seen| times::ago(seen, times::now())),
         config: None,
         state: host.state.as_str(),
         agentless: host.is_agentless(),
@@ -293,9 +299,9 @@ async fn index(
         }
         if host.state == HostState::Pending {
             // Waiting agents never get as far as presence, so the registry remembers.
-            let asked = state.registry.last_asked_ms(&host.id);
+            let asked = state.registry.last_asked_at(&host.id);
             waiting.push(WaitingHost {
-                seen: asked.map(|ms| crate::times::ago(from_ms(ms as i64), crate::times::now())),
+                seen: asked.map(|asked| times::ago(asked, times::now())),
                 id: host.id,
                 hostname: host.hostname,
             });
@@ -496,9 +502,7 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
     let alerts: Vec<OpenAlert> = here
         .iter()
         .map(|&alert| OpenAlert {
-            lasted: lasting(
-                u64::try_from((now - alert.breached_at).num_milliseconds()).unwrap_or(0),
-            ),
+            lasted: lasting(now - alert.breached_at),
             began: local_time(alert.breached_at),
             alert,
         })
@@ -524,16 +528,16 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
     let flat: FlatFacts = current.into_iter().map(|f| (f.name, f.value)).collect();
     let mut facts = Vec::new();
     fact_rows("", &unflatten(&flat), &mut facts);
-    let own = match state.metrics.latest_output(&id, "agent", now_ms()).await {
+    let own = match state.metrics.latest_output(&id, "agent", now).await {
         Ok(output) => output,
         Err(error) => return server_error(&error),
     };
     let own_memory = own
         .as_ref()
         .and_then(|agent| agent["memory_bytes"].as_f64());
-    let own_uptime = own.as_ref().and_then(|agent| agent["uptime_secs"].as_u64());
-    let uptime = match state.metrics.latest_output(&id, "host", now_ms()).await {
-        Ok(output) => output.and_then(|output| output["uptime_secs"].as_u64()),
+    let own_uptime = own.as_ref().and_then(uptime_of);
+    let uptime = match state.metrics.latest_output(&id, "host", now).await {
+        Ok(output) => output.as_ref().and_then(uptime_of),
         Err(error) => return server_error(&error),
     };
     let locator = match Locator::load(&state.database).await {
@@ -619,17 +623,17 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         .render()
 }
 
-/// How long maintenance can be started for from a host's page, in seconds, with
-/// what the page calls each. Anything else goes through Silences.
-const MAINTENANCE_CHOICES: [(u64, &str); 6] = [
-    (1800, "30 minutes"),
-    (3600, "1 hour"),
-    (2 * 3600, "2 hours"),
-    (4 * 3600, "4 hours"),
-    (8 * 3600, "8 hours"),
-    (86_400, "1 day"),
+/// How long maintenance can be started for from a host's page, with what the page
+/// calls each. Anything else goes through Silences.
+const MAINTENANCE_CHOICES: [(TimeDelta, &str); 6] = [
+    (TimeDelta::minutes(30), "30 minutes"),
+    (TimeDelta::hours(1), "1 hour"),
+    (TimeDelta::hours(2), "2 hours"),
+    (TimeDelta::hours(4), "4 hours"),
+    (TimeDelta::hours(8), "8 hours"),
+    (TimeDelta::days(1), "1 day"),
 ];
-const DEFAULT_MAINTENANCE_SECS: u64 = 3600;
+const DEFAULT_MAINTENANCE: TimeDelta = TimeDelta::hours(1);
 
 /// What's holding back notifications about a host, or about one check, for its
 /// page.
@@ -644,9 +648,10 @@ pub(super) struct Maintenance {
     window: bool,
 }
 
+/// One of [`MAINTENANCE_CHOICES`], for a form, which sends how long in seconds.
 #[derive(Serialize)]
 pub(super) struct MaintenanceChoice {
-    secs: u64,
+    secs: i64,
     label: &'static str,
     chosen: bool,
 }
@@ -655,26 +660,30 @@ pub(super) struct MaintenanceChoice {
 pub(super) fn maintenance_choices() -> Vec<MaintenanceChoice> {
     MAINTENANCE_CHOICES
         .iter()
-        .map(|(secs, label)| MaintenanceChoice {
-            secs: *secs,
+        .map(|(length, label)| MaintenanceChoice {
+            secs: length.num_seconds(),
             label,
-            chosen: *secs == DEFAULT_MAINTENANCE_SECS,
+            chosen: *length == DEFAULT_MAINTENANCE,
         })
         .collect()
 }
 
 /// How long a page's form asked for, if it's one of the choices.
-pub(super) fn maintenance_secs(form: &CsrfForm) -> Option<u64> {
+pub(super) fn maintenance_length(form: &CsrfForm) -> Option<TimeDelta> {
     form.fields
         .get("duration_secs")
-        .and_then(|secs| secs.parse().ok())
-        .filter(|secs| MAINTENANCE_CHOICES.iter().any(|(choice, _)| choice == secs))
+        .and_then(|secs| TimeDelta::try_seconds(secs.parse().ok()?))
+        .filter(|length| {
+            MAINTENANCE_CHOICES
+                .iter()
+                .any(|(choice, _)| choice == length)
+        })
 }
 
 /// What's keeping all of this host's alerts quiet, if anything is. A silence
 /// for some rules only doesn't count, as the host isn't quiet.
 async fn maintenance_of(state: &AppState, host: &HostRecord) -> Result<Option<Maintenance>> {
-    let now = now_ms();
+    let now = times::now();
     let active = ActiveSilences::load(&state.database, now).await?;
     let cover = active.covering_host(&host.id, &host.hostname);
     let own = host_filter::only(&host.id);
@@ -694,7 +703,7 @@ pub(super) async fn described(
     let Some(cover) = cover else {
         return Ok(None);
     };
-    let now = now_ms();
+    let now = times::now();
     let until = super::local_time(cover.ends_at());
     Ok(match cover {
         Cover::Silence { id, .. } => {
@@ -741,7 +750,7 @@ async fn start_maintenance(
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some(duration_secs) = maintenance_secs(&form) else {
+    let Some(duration) = maintenance_length(&form) else {
         return (StatusCode::BAD_REQUEST, "Choose how long from the list.").into_response();
     };
     let reason = form.fields.get("reason").map(|reason| reason.trim());
@@ -755,13 +764,17 @@ async fn start_maintenance(
         series: String::new(),
         all_alerts: false,
         reason,
-        duration_secs,
+        duration,
     };
     if let Err(error) = state.check_silence(&input).await {
         return (StatusCode::UNPROCESSABLE_ENTITY, format!("{error:#}")).into_response();
     }
     let by = recorded_by();
-    match state.database.create_silence(&input, &by, now_ms()).await {
+    match state
+        .database
+        .create_silence(&input, &by, times::now())
+        .await
+    {
         Ok(_) => (form.token, Redirect::to(&format!("/hosts/{id}"))).into_response(),
         Err(error) => server_error(&error),
     }
@@ -774,7 +787,7 @@ async fn end_maintenance(
     Path(id): Path<String>,
     form: CsrfForm,
 ) -> Response {
-    let now = now_ms();
+    let now = times::now();
     let silences = match state.database.active_silences(now).await {
         Ok(silences) => silences,
         Err(error) => return server_error(&error),
@@ -871,10 +884,13 @@ mod tests {
 
     #[test]
     fn uptime_reads_naturally() {
-        assert_eq!(format_uptime(30), "0 minutes");
-        assert_eq!(format_uptime(60), "1 minute");
-        assert_eq!(format_uptime(3660), "1 hour, 1 minute");
-        assert_eq!(format_uptime(4_603_242), "53 days, 6 hours");
+        assert_eq!(format_uptime(TimeDelta::seconds(30)), "0 minutes");
+        assert_eq!(format_uptime(TimeDelta::seconds(60)), "1 minute");
+        assert_eq!(format_uptime(TimeDelta::seconds(3660)), "1 hour, 1 minute");
+        assert_eq!(
+            format_uptime(TimeDelta::seconds(4_603_242)),
+            "53 days, 6 hours"
+        );
     }
 
     #[test]

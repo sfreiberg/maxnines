@@ -24,8 +24,8 @@ use tokio::time::timeout;
 use crate::background::{Background, probe_all};
 use crate::collector::Collector;
 
-const DEFAULT_TIMEOUT_SECS: u64 = 10;
-const MAX_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_DEFINITIONS: usize = 64;
 
 /// A number is short, so anything past this is a command doing something else.
@@ -50,12 +50,17 @@ const MAX_VALUES: usize = 32;
 pub struct CustomMetric {
     /// The program, then its arguments.
     pub command: Vec<String>,
-    pub timeout_secs: Option<u64>,
+    #[serde(
+        rename = "timeout_secs",
+        default,
+        with = "maxnines_protocol::time::optional_seconds"
+    )]
+    pub timeout: Option<Duration>,
 }
 
 impl CustomMetric {
     fn limit(&self) -> Duration {
-        Duration::from_secs(self.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS))
+        self.timeout.unwrap_or(DEFAULT_TIMEOUT)
     }
 }
 
@@ -81,9 +86,10 @@ pub fn check_definitions(definitions: &Definitions) -> Result<()> {
         );
         ensure!(
             metric
-                .timeout_secs
-                .is_none_or(|secs| (1..=MAX_TIMEOUT_SECS).contains(&secs)),
-            "custom metric {name:?} needs a timeout_secs from 1 to {MAX_TIMEOUT_SECS}"
+                .timeout
+                .is_none_or(|timeout| (Duration::from_secs(1)..=MAX_TIMEOUT).contains(&timeout)),
+            "custom metric {name:?} needs a timeout_secs from 1 to {}",
+            MAX_TIMEOUT.as_secs()
         );
     }
     Ok(())
@@ -273,7 +279,7 @@ mod tests {
     fn metric(command: &[&str]) -> CustomMetric {
         CustomMetric {
             command: command.iter().map(ToString::to_string).collect(),
-            timeout_secs: None,
+            timeout: None,
         }
     }
 
@@ -385,7 +391,7 @@ mod tests {
     #[test]
     fn sensible_definitions_are_accepted() {
         let mut slow = metric(&["/bin/true"]);
-        slow.timeout_secs = Some(MAX_TIMEOUT_SECS);
+        slow.timeout = Some(MAX_TIMEOUT);
         check_definitions(&definitions(&[("queue.depth-1_a", slow)])).unwrap();
     }
 
@@ -393,14 +399,14 @@ mod tests {
     fn bad_definitions_are_refused() {
         let good = metric(&["/bin/true"]);
         let timed = |secs| CustomMetric {
-            timeout_secs: Some(secs),
+            timeout: Some(Duration::from_secs(secs)),
             ..good.clone()
         };
         for (name, bad) in [
             ("no command", metric(&[])),
             ("empty program", metric(&[""])),
             ("no time", timed(0)),
-            ("too long", timed(MAX_TIMEOUT_SECS + 1)),
+            ("too long", timed(MAX_TIMEOUT.as_secs() + 1)),
         ] {
             let name = name.replace(' ', "_");
             let refused = check_definitions(&definitions(&[(&name, bad)]));

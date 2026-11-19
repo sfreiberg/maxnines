@@ -14,6 +14,7 @@ use super::{
 use crate::audit::{Actor, Kind, Record};
 use crate::built_in_rules::BuiltInRule;
 use crate::facts::{flatten, unflatten};
+use crate::times::Timestamp;
 
 /// Whether two rules set the same things for the same hosts. Whether they're turned
 /// on is left out, as that's for people to decide, even for a built-in rule.
@@ -51,7 +52,7 @@ impl Database {
     pub async fn sync_built_in_rules(
         &self,
         shipped: &[BuiltInRule],
-        now_ms: i64,
+        now: Timestamp,
     ) -> Result<Vec<String>> {
         let transaction = self
             .connection
@@ -80,7 +81,7 @@ impl Database {
                 active.priority = Set(built_in.rule.priority);
                 active.condition_expr = Set(built_in.rule.condition.clone());
                 active.operating_systems = Set(systems_text(&built_in.rule.operating_systems));
-                active.built_in_changed_at = Set(Some(crate::times::from_ms(now_ms)));
+                active.built_in_changed_at = Set(Some(now));
                 active
                     .update(&transaction)
                     .await
@@ -136,7 +137,7 @@ impl Database {
                 enabled: Set(built_in.rule.enabled),
                 operating_systems: Set(systems_text(&built_in.rule.operating_systems)),
                 built_in: Set(Some(built_in.key.to_string())),
-                built_in_changed_at: Set(Some(crate::times::from_ms(now_ms))),
+                built_in_changed_at: Set(Some(now)),
                 ..Default::default()
             }
             .insert(&transaction)

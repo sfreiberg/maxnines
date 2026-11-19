@@ -142,16 +142,18 @@ fn describe_changes(before: &ResolvedConfig, after: &ResolvedConfig) -> Vec<Stri
     let (old, new) = (&before.config, &after.config);
     let mut changes = Vec::new();
 
-    if old.interval_secs != new.interval_secs {
+    if old.interval != new.interval {
         changes.push(format!(
             "Sample interval: {}s → {}s",
-            old.interval_secs, new.interval_secs
+            old.interval.as_secs(),
+            new.interval.as_secs()
         ));
     }
-    if old.facts_interval_secs != new.facts_interval_secs {
+    if old.facts_interval != new.facts_interval {
         changes.push(format!(
             "Fact report interval: {}s → {}s",
-            old.facts_interval_secs, new.facts_interval_secs
+            old.facts_interval.as_secs(),
+            new.facts_interval.as_secs()
         ));
     }
 
@@ -681,7 +683,10 @@ mod tests {
         let resolved = rule_engine::resolve(&proposed, &web.facts, &web.id).unwrap();
 
         assert_eq!(resolved.matched_rules, ["Default", "r", "pinned"]);
-        assert_eq!(resolved.config.interval_secs, 5);
-        assert_eq!(resolved.config.facts_interval_secs, 60);
+        assert_eq!(resolved.config.interval, std::time::Duration::from_secs(5));
+        assert_eq!(
+            resolved.config.facts_interval,
+            std::time::Duration::from_secs(60)
+        );
     }
 }

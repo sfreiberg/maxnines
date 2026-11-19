@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use axum::Router;
@@ -7,12 +8,14 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
+use chrono::TimeDelta;
 use maxnines_checks::databases::is_database;
 use maxnines_protocol::{Check, CheckKind, DATABASE_EXTRAS};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::host_list::address;
-use super::hosts::{described, maintenance_choices, maintenance_secs};
+use super::hosts::{described, maintenance_choices, maintenance_length};
 use super::metrics::{
     CheckRow, RangeParams, check_row, one_series, range_links, selected_range, time_range,
 };
@@ -28,7 +31,7 @@ use crate::remote_checks::{
     LOCAL_HOST_ID, LOCAL_HOSTNAME, RemoteCheck, RemoteCheckInput, SignIn, SignInWith,
 };
 use crate::silences::{ActiveSilences, SilenceInput};
-use crate::times::from_ms;
+use crate::times::{self, Timestamp};
 
 const KINDS: [CheckKind; 14] = [
     CheckKind::Http,
@@ -134,10 +137,10 @@ impl CheckForm {
             name: check.name.clone(),
             kind: check.kind.as_str().to_string(),
             target: check.target.clone(),
-            interval_secs: input.interval_secs.to_string(),
+            interval_secs: input.interval.as_secs().to_string(),
             timeout_secs: check
-                .timeout_secs
-                .map(|t| t.to_string())
+                .timeout
+                .map(|timeout| timeout.as_secs().to_string())
                 .unwrap_or_default(),
             method: text(&check.method),
             body: text(&check.body),
@@ -210,7 +213,7 @@ impl CheckForm {
             bail!("choose a kind of check");
         };
         let mut check = Check::new(self.name.trim(), kind, self.target.trim());
-        check.timeout_secs = number(&self.timeout_secs, "the timeout")?;
+        check.timeout = number(&self.timeout_secs, "the timeout")?.map(Duration::from_secs);
         check.method = optional(&self.method);
         check.body = optional(&self.body);
         check.regex = optional(&self.regex);
@@ -223,8 +226,9 @@ impl CheckForm {
         check.host_key = optional(&self.host_key);
         // Only a website check has a domain to look up, and on is how it starts.
         check.domain_expiry = (kind == CheckKind::Http && !self.domain_expiry).then_some(false);
-        let interval_secs =
-            number(&self.interval_secs, "the interval")?.context("a check needs an interval")?;
+        let interval = number(&self.interval_secs, "the interval")?
+            .map(Duration::from_secs)
+            .context("a check needs an interval")?;
         let with = match self.sign_in.as_str() {
             "password" if kind.signs_in() => SignInWith::Password,
             "key" if kind == CheckKind::Ssh => SignInWith::Key,
@@ -253,7 +257,7 @@ impl CheckForm {
         let input = RemoteCheckInput {
             host_id: self.host_id.clone(),
             check,
-            interval_secs,
+            interval,
             enabled: self.enabled,
             read_stats,
             extras: if read_stats {
@@ -275,6 +279,7 @@ struct ListRow {
     name: String,
     kind: &'static str,
     target: String,
+    /// How often it runs, in seconds, for the page to say.
     interval_secs: u64,
     enabled: bool,
     latest: Option<CheckRow>,
@@ -326,7 +331,7 @@ async fn index(
                 latest: latest.get(&check.id).and_then(check_row),
                 name: input.check.name,
                 target: input.check.target,
-                interval_secs: input.interval_secs,
+                interval_secs: input.interval.as_secs(),
                 enabled: input.enabled,
             }
         })
@@ -561,7 +566,7 @@ async fn charts(
 
 /// How many bars the last day is cut into on a check's page.
 const BARS: usize = 48;
-const DAY_MS: i64 = 86_400_000;
+const DAY: TimeDelta = TimeDelta::days(1);
 
 /// One of the figures across the top of a check's page.
 #[derive(Serialize)]
@@ -596,19 +601,19 @@ struct WatchingRule {
 fn uptime(
     label: &'static str,
     points: &[metrics::Point],
-    step_ms: i64,
-    ran_for_ms: Option<i64>,
+    step: TimeDelta,
+    ran_for: Option<TimeDelta>,
 ) -> Uptime {
-    let found = check_history::availability(points, step_ms, ran_for_ms);
+    let found = check_history::availability(points, step, ran_for);
     let note = match found.failures {
         0 => "never failed".to_string(),
         1 => format!(
             "failed once, for about {}",
-            check_history::span_text(found.down_ms)
+            check_history::span_text(found.down)
         ),
-        times => format!(
-            "failed {times} times, for about {}",
-            check_history::span_text(found.down_ms)
+        failures => format!(
+            "failed {failures} times, for about {}",
+            check_history::span_text(found.down)
         ),
     };
     let tone = match found.percent {
@@ -634,9 +639,9 @@ async fn passing(
     state: &AppState,
     host_id: &str,
     name: &str,
-    length_ms: i64,
+    length: TimeDelta,
 ) -> Result<(Vec<metrics::Point>, TimeRange)> {
-    let range = time_range(length_ms).context("no such time range")?;
+    let range = time_range(length).context("no such time range")?;
     let up = metrics::find("check.up").context("the metrics checks report are missing")?;
     let mut found = one_series(state, host_id, up, name, range).await?;
     let points = found
@@ -648,12 +653,21 @@ async fn passing(
 }
 
 /// "26 s ago", finer than elsewhere, as a check runs every few seconds.
-fn ran_text(ran_ms: i64, now_ms: i64) -> String {
-    let secs = (now_ms - ran_ms).max(0) / 1000;
+fn ran_text(ran_at: Timestamp, now: Timestamp) -> String {
+    let secs = (now - ran_at).num_seconds().max(0);
     if secs < 60 {
         format!("{secs} s ago")
     } else {
-        crate::times::ago(from_ms(ran_ms), from_ms(now_ms))
+        times::ago(ran_at, now)
+    }
+}
+
+/// The day a check said something runs out, such as its certificate.
+fn until_text(result: &Value, field: &str) -> String {
+    let until = result[field].as_str().and_then(times::parse_moment);
+    match until {
+        Some(until) => format!("left, until {}", super::local_date(until)),
+        None => "left".to_string(),
     }
 }
 
@@ -685,10 +699,10 @@ async fn page(
     let id = check.id;
     let input = check.input;
     let name = &input.check.name;
-    let (selected, _, length_ms) = selected_range(params);
-    let range = time_range(length_ms).context("no such time range")?;
+    let (selected, _, length) = selected_range(params);
+    let range = time_range(length).context("no such time range")?;
     let charts = charts(state, &input.host_id, name, range, selected).await?;
-    let now = metrics::now_ms();
+    let now = times::now();
 
     let hosts = host_choices(state).await;
     let host = hosts
@@ -703,25 +717,25 @@ async fn page(
     });
 
     // How it's been: the last day in bars, then longer stretches in figures.
-    let (day, day_range) = passing(state, &input.host_id, name, DAY_MS).await?;
-    let (week, week_range) = passing(state, &input.host_id, name, 7 * DAY_MS).await?;
-    let (month, month_range) = passing(state, &input.host_id, name, 30 * DAY_MS).await?;
-    let bars = check_history::slots(&day, day_range.from_ms, day_range.to_ms, BARS);
+    let (day, day_range) = passing(state, &input.host_id, name, DAY).await?;
+    let (week, week_range) = passing(state, &input.host_id, name, DAY * 7).await?;
+    let (month, month_range) = passing(state, &input.host_id, name, DAY * 30).await?;
+    let bars = check_history::slots(&day, day_range.from, day_range.to, BARS);
     // The last day is kept finest. Where it starts after the day does, the check
     // is newer than that, and the time its points cover is how long it's run,
     // which the longer ranges' coarser points can't tell.
     let newer = day
         .first()
-        .is_some_and(|first| first.time_ms > day_range.from_ms + day_range.step_ms);
-    let ran_for = newer.then(|| day.len() as i64 * day_range.step_ms);
+        .is_some_and(|first| first.time > day_range.from + day_range.step);
+    let ran_for = newer.then(|| day_range.step * i32::try_from(day.len()).unwrap_or(i32::MAX));
     let uptimes = [
-        uptime("Last 24 hours", &day, day_range.step_ms, ran_for),
-        uptime("Last 7 days", &week, week_range.step_ms, ran_for),
-        uptime("Last 30 days", &month, month_range.step_ms, ran_for),
+        uptime("Last 24 hours", &day, day_range.step, ran_for),
+        uptime("Last 7 days", &week, week_range.step, ran_for),
+        uptime("Last 30 days", &month, month_range.step, ran_for),
     ];
 
     let mut tiles = Vec::new();
-    let streak = check_history::streak(&month, month_range.step_ms);
+    let streak = check_history::streak(&month, month_range.step);
     let status = match (&latest, input.enabled) {
         (_, false) => Tile {
             label: "Status",
@@ -740,7 +754,7 @@ async fn page(
             let note = streak
                 .filter(|streak| streak.passing == row.up)
                 .map(|streak| {
-                    let span = check_history::span_text(now - streak.since_ms);
+                    let span = check_history::span_text(now - streak.since);
                     let more = if streak.or_longer { " or more" } else { "" };
                     format!("for {span}{more}")
                 })
@@ -758,9 +772,9 @@ async fn page(
         label: "Last run",
         value: state
             .check_results
-            .ran_ms(id)
+            .ran_at(id)
             .map_or("Not yet".to_string(), |ran| ran_text(ran, now)),
-        note: format!("every {} s, from the server", input.interval_secs),
+        note: format!("every {} s, from the server", input.interval.as_secs()),
         tone: "",
     });
     if let Some((row, result)) = &latest {
@@ -784,11 +798,10 @@ async fn page(
             });
         }
         if let Some(days) = result["cert_days_left"].as_i64() {
-            let until = now + days * DAY_MS;
             tiles.push(Tile {
                 label: "Certificate",
                 value: format!("{days} day{}", if days == 1 { "" } else { "s" }),
-                note: format!("left, until about {}", super::local_date(from_ms(until))),
+                note: until_text(result, "cert_valid_until"),
                 tone: if days < 14 { "bad" } else { "" },
             });
         }
@@ -804,11 +817,10 @@ async fn page(
             None => "without signing in".to_string(),
         };
         if let Some(days) = result["domain_days_left"].as_i64() {
-            let until = now + days * DAY_MS;
             tiles.push(Tile {
                 label: "Domain",
                 value: format!("{days} day{}", if days == 1 { "" } else { "s" }),
-                note: format!("left, until about {}", super::local_date(from_ms(until))),
+                note: until_text(result, "domain_expires_at"),
                 tone: if days < 30 { "bad" } else { "" },
             });
         }
@@ -976,7 +988,7 @@ async fn start_maintenance(
         Ok(None) => return not_found(&state, &form.token),
         Err(error) => return server_error(&error),
     };
-    let Some(duration_secs) = maintenance_secs(&form) else {
+    let Some(duration) = maintenance_length(&form) else {
         return (StatusCode::BAD_REQUEST, "Choose how long from the list.").into_response();
     };
     let name = check.input.check.name;
@@ -990,14 +1002,14 @@ async fn start_maintenance(
         series: name,
         all_alerts: false,
         reason,
-        duration_secs,
+        duration,
     };
     if let Err(error) = state.check_silence(&input).await {
         return (StatusCode::UNPROCESSABLE_ENTITY, format!("{error:#}")).into_response();
     }
     match state
         .database
-        .create_silence(&input, &recorded_by(), metrics::now_ms())
+        .create_silence(&input, &recorded_by(), times::now())
         .await
     {
         Ok(_) => (form.token, Redirect::to(&format!("/checks/{id}"))).into_response(),
@@ -1017,7 +1029,7 @@ async fn end_maintenance(
         Ok(None) => return not_found(&state, &form.token),
         Err(error) => return server_error(&error),
     };
-    let now = metrics::now_ms();
+    let now = times::now();
     let silences = match state.database.active_silences(now).await {
         Ok(silences) => silences,
         Err(error) => return server_error(&error),
@@ -1109,7 +1121,7 @@ mod tests {
 
     fn input() -> RemoteCheckInput {
         let mut check = Check::new("site", CheckKind::Http, "https://example.com/");
-        check.timeout_secs = Some(5);
+        check.timeout = Some(Duration::from_secs(5));
         check.method = Some("POST".to_string());
         check.body = Some("hello".to_string());
         check.regex = Some("Welcome back".to_string());
@@ -1117,7 +1129,7 @@ mod tests {
         RemoteCheckInput {
             host_id: "5f0c1d6f2a8e4b7790d3c1a2b4e6f809".to_string(),
             check,
-            interval_secs: 120,
+            interval: Duration::from_secs(120),
             enabled: false,
             read_stats: false,
             extras: Vec::new(),
@@ -1139,7 +1151,7 @@ mod tests {
         let original = RemoteCheckInput {
             host_id: crate::remote_checks::LOCAL_HOST_ID.to_string(),
             check: dns,
-            interval_secs: 60,
+            interval: Duration::from_secs(60),
             enabled: true,
             read_stats: false,
             extras: Vec::new(),
@@ -1176,7 +1188,7 @@ mod tests {
         let (input, _) = form.to_input().unwrap();
         assert_eq!(input.check.method, None);
         assert_eq!(input.check.insecure, None);
-        assert_eq!(input.check.timeout_secs, None);
+        assert_eq!(input.check.timeout, None);
         input.check.validate().unwrap();
     }
 

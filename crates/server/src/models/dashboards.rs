@@ -12,6 +12,7 @@ use super::{Database, dashboard, dashboard_variable, dashboard_widget};
 use crate::audit::{Kind, Snapshot};
 use crate::dashboard_variables::{Variable, VariableKind};
 use crate::dashboards::{Dashboard, DashboardSummary, Placed, Placement, Widget, WidgetInput};
+use crate::times::Timestamp;
 
 /// A row is only ever written from a checked variable, so an unknown kind is a
 /// database someone changed by hand, and it's read as a fact rather than lost.
@@ -158,10 +159,10 @@ impl Database {
         load(&self.connection, id).await
     }
 
-    pub async fn create_dashboard(&self, name: &str, now_ms: i64) -> Result<i64> {
+    pub async fn create_dashboard(&self, name: &str, now: Timestamp) -> Result<i64> {
         let row = dashboard::ActiveModel {
             name: Set(name.to_string()),
-            created_at: Set(crate::times::from_ms(now_ms)),
+            created_at: Set(now),
             ..Default::default()
         };
         let transaction = self.connection.begin().await.context("saving dashboard")?;

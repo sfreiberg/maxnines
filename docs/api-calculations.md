@@ -16,7 +16,7 @@ things, like memory and swap, uses the first unless `group_by` is `series`.
 | `calculation` | `avg`, `sum`, `min`, `max` or `count`, which is how many series are reporting. Defaults to `avg`. |
 | `group_by` | What gets a line of its own: `nothing`, `host`, `series` or `fact:<name>`. Defaults to `nothing`. |
 | `filter` | Which hosts, in the same form as the Hosts list, such as `os=linux hostname=web*`. Defaults to all of them. |
-| `from_ms`, `to_ms` | The time range. Defaults to the last hour. |
+| `from`, `to` | The time range, such as `2026-11-06T03:00:00Z`. Defaults to the last hour. |
 
 The result has the same shape as a host's metric. The highest 100 lines are kept, and
 `hidden` says how many more there were. A question that makes no sense gets a `422`.

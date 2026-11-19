@@ -3,7 +3,9 @@
 //! would make the database look smaller than it'll be.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use maxnines_protocol::COLLECTORS;
 use rand::random_range;
 use serde_json::{Map, Value, json};
@@ -26,7 +28,8 @@ pub struct Readings {
     network_bytes: Vec<(u64, u64)>,
     used_memory_percent: f64,
     used_disk_percent: f64,
-    uptime_secs: u64,
+    uptime: Duration,
+    booted_at: DateTime<Utc>,
 }
 
 fn percent_near(value: f64, spread: f64) -> f64 {
@@ -35,6 +38,7 @@ fn percent_near(value: f64, spread: f64) -> f64 {
 
 impl Readings {
     pub fn new(shape: Shape, hot: bool) -> Self {
+        let uptime = Duration::from_secs(random_range(3_600..10_000_000));
         Self {
             shape,
             hot,
@@ -42,12 +46,13 @@ impl Readings {
             network_bytes: vec![(0, 0); shape.interfaces],
             used_memory_percent: random_range(20.0..80.0),
             used_disk_percent: random_range(20.0..80.0),
-            uptime_secs: random_range(3_600..10_000_000),
+            uptime,
+            booted_at: maxnines_protocol::time::now() - uptime,
         }
     }
 
-    pub fn metrics(&mut self, elapsed_secs: u64) -> BTreeMap<String, Value> {
-        self.uptime_secs += elapsed_secs;
+    pub fn metrics(&mut self, elapsed: Duration) -> BTreeMap<String, Value> {
+        self.uptime += elapsed;
         BTreeMap::from([
             ("cpu".to_string(), self.cpu()),
             ("memory".to_string(), self.memory()),
@@ -161,7 +166,7 @@ impl Readings {
     }
 
     fn host_output(&self) -> Value {
-        json!({ "uptime_secs": self.uptime_secs, "boot_time_secs": 1_700_000_000 })
+        json!({ "uptime_secs": self.uptime.as_secs(), "booted_at": self.booted_at })
     }
 }
 
@@ -193,6 +198,7 @@ pub fn facts(index: usize, hostname: &str, build: u64) -> Value {
 mod tests {
     use super::*;
 
+    const INTERVAL: Duration = Duration::from_secs(15);
     const SHAPE: Shape = Shape {
         cores: 4,
         disks: 2,
@@ -201,7 +207,7 @@ mod tests {
 
     #[test]
     fn samples_have_what_was_asked_for() {
-        let metrics = Readings::new(SHAPE, false).metrics(15);
+        let metrics = Readings::new(SHAPE, false).metrics(INTERVAL);
 
         assert_eq!(
             metrics["cpu"]["per_core_percent"].as_array().unwrap().len(),
@@ -215,7 +221,7 @@ mod tests {
 
     #[test]
     fn only_collectors_the_server_knows_are_reported() {
-        let metrics = Readings::new(SHAPE, false).metrics(15);
+        let metrics = Readings::new(SHAPE, false).metrics(INTERVAL);
         for name in metrics.keys() {
             assert!(COLLECTORS.contains(&name.as_str()), "{name}");
         }
@@ -226,7 +232,7 @@ mod tests {
         let mut readings = Readings::new(SHAPE, false);
         let mut previous = 0;
         for _ in 0..20 {
-            let metrics = readings.metrics(15);
+            let metrics = readings.metrics(INTERVAL);
             let total = metrics["network"]["eth0"]["total_received_bytes"]
                 .as_u64()
                 .unwrap();
@@ -238,15 +244,18 @@ mod tests {
     #[test]
     fn values_change_between_samples() {
         let mut readings = Readings::new(SHAPE, false);
-        assert_ne!(readings.metrics(15)["cpu"], readings.metrics(15)["cpu"]);
+        assert_ne!(
+            readings.metrics(INTERVAL)["cpu"],
+            readings.metrics(INTERVAL)["cpu"]
+        );
     }
 
     #[test]
     fn hot_agents_report_high_cpu() {
-        let metrics = Readings::new(SHAPE, true).metrics(15);
+        let metrics = Readings::new(SHAPE, true).metrics(INTERVAL);
         assert_eq!(metrics["cpu"]["usage_percent"], 99.0);
         for _ in 0..50 {
-            let usage = Readings::new(SHAPE, false).metrics(15)["cpu"]["usage_percent"]
+            let usage = Readings::new(SHAPE, false).metrics(INTERVAL)["cpu"]["usage_percent"]
                 .as_f64()
                 .unwrap();
             assert!(usage < 90.0);
@@ -256,7 +265,7 @@ mod tests {
     #[test]
     fn percentages_stay_in_range() {
         for _ in 0..100 {
-            let metrics = Readings::new(SHAPE, true).metrics(15);
+            let metrics = Readings::new(SHAPE, true).metrics(INTERVAL);
             for core in metrics["cpu"]["per_core_percent"].as_array().unwrap() {
                 assert!((0.0..=100.0).contains(&core.as_f64().unwrap()));
             }

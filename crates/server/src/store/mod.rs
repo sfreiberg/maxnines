@@ -17,6 +17,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use chrono::{DateTime, NaiveDate, Utc};
 use maxnines_protocol::Sample;
 use serde::Serialize;
 use serde_json::Value;
@@ -26,8 +27,9 @@ use tracing::{error, warn};
 
 use crate::calculations::CalculationQuery;
 use crate::config::{MetricsConfig, RetentionConfig};
-use crate::metrics::{LastSample, Metric, NewestReading, SeriesQuery, SeriesResult, Trend, now_ms};
+use crate::metrics::{LastSample, Metric, NewestReading, SeriesQuery, SeriesResult, Trend};
 use crate::remote_checks::LOCAL_HOST_ID;
+use crate::times::{self, Timestamp};
 use rollups::Retention;
 
 /// Samples waiting to be written. When this fills up, connections stop reading
@@ -39,9 +41,22 @@ const TIDY_CHECK_EVERY: Duration = Duration::from_secs(60);
 /// The pause between pieces of upkeep, so samples don't queue up behind it.
 const TIDY_PAUSE: Duration = Duration::from_millis(250);
 
-/// The end of what every store can hold, a little before the year 2300. Agents can
-/// send any time at all, so anything later is turned away before it gets this far.
-pub const LATEST_SAMPLE_MS: u64 = 10_413_791_999_000;
+/// The end of what every store can hold, the last moment of 2299, as ClickHouse's
+/// times end there.
+pub fn latest_sample() -> Timestamp {
+    NaiveDate::from_ymd_opt(2299, 12, 31)
+        .and_then(|day| day.and_hms_milli_opt(23, 59, 59, 999))
+        .map_or(DateTime::<Utc>::MAX_UTC, |moment| moment.and_utc())
+}
+
+/// Whether every store can keep a sample taken at `time`: from 1970 to the end of
+/// [`latest_sample`], to the millisecond. Agents can send any time at all, so their
+/// samples are checked as they arrive, and a store refuses anything else outright, as
+/// a finer time would be kept as one that was never sent.
+pub fn can_store(time: Timestamp) -> bool {
+    (DateTime::UNIX_EPOCH..=latest_sample()).contains(&time)
+        && time.timestamp_subsec_nanos().is_multiple_of(1_000_000)
+}
 
 /// How often to try a batch the store couldn't take, and how many times. That's about
 /// two minutes, which is plenty for a database to restart. Agents keep what isn't
@@ -79,7 +94,7 @@ pub trait Store: Send {
 
     /// Does a piece of whatever upkeep the store needs, on the writer's thread between
     /// writes. Returns whether there's more to do.
-    fn tidy(&mut self, _now_ms: i64) -> Result<bool> {
+    fn tidy(&mut self, _now: Timestamp) -> Result<bool> {
         Ok(false)
     }
 
@@ -98,7 +113,7 @@ pub trait MetricsReader: Send + Sync {
     fn series(&self, query: &SeriesQuery) -> Result<SeriesResult>;
 
     /// When each agent last sent anything, between two times.
-    fn last_samples(&self, since_ms: i64, until_ms: i64) -> Result<Vec<LastSample>>;
+    fn last_samples(&self, since: Timestamp, until: Timestamp) -> Result<Vec<LastSample>>;
 
     /// What one of an agent's collectors last sent between two times, including
     /// text like an error. It's an object, or a list for what repeats. Nothing is
@@ -107,22 +122,27 @@ pub trait MetricsReader: Send + Sync {
         &self,
         host_id: &str,
         collector: &str,
-        since_ms: i64,
-        until_ms: i64,
+        since: Timestamp,
+        until: Timestamp,
     ) -> Result<Option<Value>>;
 
     /// The newest value of each series of a metric, across every agent, between
     /// two times. Values that aren't usable numbers are skipped.
-    fn newest(&self, metric: &Metric, since_ms: i64, until_ms: i64) -> Result<Vec<NewestReading>>;
+    fn newest(
+        &self,
+        metric: &Metric,
+        since: Timestamp,
+        until: Timestamp,
+    ) -> Result<Vec<NewestReading>>;
 
     /// Which way each series of a metric has been heading between two times,
     /// across every agent, from a straight line fitted to its readings. A series
     /// needs two readings at different times to have one.
-    fn trends(&self, metric: &Metric, since_ms: i64, until_ms: i64) -> Result<Vec<Trend>>;
+    fn trends(&self, metric: &Metric, since: Timestamp, until: Timestamp) -> Result<Vec<Trend>>;
 
-    /// How the database itself is doing. `hour_ago_ms` is the start of the last
-    /// hour, for how much is arriving now.
-    fn stats(&self, hour_ago_ms: i64) -> Result<StoreStats>;
+    /// How the database itself is doing. `hour_ago` is the start of the last hour, for
+    /// how much is arriving now.
+    fn stats(&self, hour_ago: Timestamp) -> Result<StoreStats>;
 
     /// How many separate series have been stored, which is what storage grows with.
     fn series_count(&self) -> Result<u64>;
@@ -153,8 +173,8 @@ pub struct CollectorStats {
     /// last hour, so it leaves this out.
     pub rows: Option<i64>,
     pub rows_last_hour: i64,
-    pub oldest_ms: i64,
-    pub newest_ms: i64,
+    pub oldest_sample_at: Timestamp,
+    pub newest_sample_at: Timestamp,
 }
 
 /// How many samples have been through the writer since the server started.
@@ -164,8 +184,9 @@ pub struct WriteCounts {
     pub failed: AtomicU64,
     /// How many readings those samples held.
     pub values: AtomicU64,
-    /// The longest write since this was last reset, as a sign of a struggling disk.
-    pub slowest_write_ms: AtomicU64,
+    /// The longest write since this was last reset, as a sign of a struggling disk, in
+    /// microseconds, as a length of time can't be kept where threads share it.
+    pub slowest_write_micros: AtomicU64,
 }
 
 pub fn open(config: &MetricsConfig, retention: RetentionConfig) -> Result<Box<dyn Store>> {
@@ -198,10 +219,11 @@ pub struct NewSample {
 pub enum WriterCommand {
     /// Something the server recorded itself.
     Save(NewSample),
-    /// A sample from an agent, which keeps it until told on `acks` that it's stored.
+    /// A sample from an agent, which keeps it until told on `acks` that it's stored,
+    /// by the time it was taken.
     SaveAndAck {
         sample: NewSample,
-        acks: mpsc::Sender<u64>,
+        acks: mpsc::Sender<Timestamp>,
     },
     /// Deletes everything an agent sent, after anything queued before this is saved.
     /// `done` hears whether that worked.
@@ -236,31 +258,31 @@ pub async fn delete_host(writer: &mpsc::Sender<WriterCommand>, host_id: &str) ->
 /// those shouldn't be stored twice. This catches them straight away. A server restart
 /// forgets these, so the store also drops repeats when it tidies.
 #[derive(Default)]
-struct RecentSamples(HashMap<String, VecDeque<u64>>);
+struct RecentSamples(HashMap<String, VecDeque<Timestamp>>);
 
 impl RecentSamples {
     /// Notes a sample, and returns whether it's already been seen.
-    fn seen(&mut self, host_id: &str, timestamp_ms: u64) -> bool {
+    fn seen(&mut self, host_id: &str, time: Timestamp) -> bool {
         if !self.0.contains_key(host_id) {
             self.0.insert(host_id.to_string(), VecDeque::new());
         }
         let Some(recent) = self.0.get_mut(host_id) else {
             return false;
         };
-        if recent.contains(&timestamp_ms) {
+        if recent.contains(&time) {
             return true;
         }
         if recent.len() == RECENT_SAMPLES_PER_HOST {
             recent.pop_front();
         }
-        recent.push_back(timestamp_ms);
+        recent.push_back(time);
         false
     }
 
     /// For a sample that couldn't be stored, which needs to be let in next time.
-    fn forget(&mut self, host_id: &str, timestamp_ms: u64) {
+    fn forget(&mut self, host_id: &str, time: Timestamp) {
         if let Some(recent) = self.0.get_mut(host_id) {
-            recent.retain(|time| *time != timestamp_ms);
+            recent.retain(|seen| *seen != time);
         }
     }
 
@@ -303,8 +325,8 @@ fn run_writer(
         let mut samples = Vec::with_capacity(queued.len());
         // Every acknowledgement each sample owes: a sample sent twice in one batch is
         // stored once, and both copies hear about it only if the batch is saved.
-        let mut acks: Vec<Vec<mpsc::Sender<u64>>> = Vec::with_capacity(queued.len());
-        let mut in_batch: HashMap<(String, u64), usize> = HashMap::new();
+        let mut acks: Vec<Vec<mpsc::Sender<Timestamp>>> = Vec::with_capacity(queued.len());
+        let mut in_batch: HashMap<(String, Timestamp), usize> = HashMap::new();
         // Repeats of samples stored by an earlier batch, which can be answered now.
         let mut answered = Vec::new();
         let mut deletion = None;
@@ -321,7 +343,7 @@ fn run_writer(
                     acks.push(Vec::new());
                 }
                 WriterCommand::SaveAndAck { sample, acks: ack } => {
-                    let time = sample.sample.timestamp_ms;
+                    let time = sample.sample.time;
                     let key = (sample.host_id.clone(), time);
                     if let Some(&index) = in_batch.get(&key) {
                         acks[index].push(ack);
@@ -344,7 +366,7 @@ fn run_writer(
         if !samples.is_empty() {
             let saved = save(store.as_mut(), &samples, counts);
             for (new, acks) in samples.iter().zip(acks) {
-                let time = new.sample.timestamp_ms;
+                let time = new.sample.time;
                 if saved {
                     answered.extend(acks.into_iter().map(|ack| (ack, time)));
                 } else if !acks.is_empty() {
@@ -417,7 +439,7 @@ fn delete_from(store: &mut dyn Store, host_id: &str) -> Result<(), String> {
 
 /// Upkeep failing leaves everything readable, so it's only worth saying so.
 fn tidy(store: &mut dyn Store) -> bool {
-    match catch_unwind(AssertUnwindSafe(|| store.tidy(now_ms()))) {
+    match catch_unwind(AssertUnwindSafe(|| store.tidy(times::now()))) {
         Ok(Ok(more)) => more,
         Ok(Err(error)) => {
             error!(error = format!("{error:#}"), "tidying the store failed");
@@ -448,9 +470,10 @@ fn write_batch(
             counts
                 .values
                 .fetch_add(values.map(count_values).sum(), Ordering::Relaxed);
+            let took = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
             counts
-                .slowest_write_ms
-                .fetch_max(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                .slowest_write_micros
+                .fetch_max(took, Ordering::Relaxed);
             Ok(())
         }
         Ok(Err(error)) => Err(format!("{error:#}")),
@@ -509,8 +532,8 @@ pub mod testing {
     /// to the writer thread.
     #[derive(Clone, Default)]
     pub struct Saved {
-        /// (agent ID, host, timestamp)
-        pub samples: Arc<Mutex<Vec<(String, String, u64)>>>,
+        /// (agent ID, host, when it was taken)
+        pub samples: Arc<Mutex<Vec<(String, String, Timestamp)>>>,
         /// How many samples each successful write held.
         pub writes: Arc<Mutex<Vec<usize>>>,
         pub closed: Arc<Mutex<bool>>,
@@ -528,7 +551,7 @@ pub mod testing {
             Ok(SeriesResult::default())
         }
 
-        fn last_samples(&self, _since_ms: i64, _until_ms: i64) -> Result<Vec<LastSample>> {
+        fn last_samples(&self, _since: Timestamp, _until: Timestamp) -> Result<Vec<LastSample>> {
             Ok(Vec::new())
         }
 
@@ -536,8 +559,8 @@ pub mod testing {
             &self,
             _host_id: &str,
             _collector: &str,
-            _since_ms: i64,
-            _until_ms: i64,
+            _since: Timestamp,
+            _until: Timestamp,
         ) -> Result<Option<Value>> {
             Ok(None)
         }
@@ -545,17 +568,22 @@ pub mod testing {
         fn newest(
             &self,
             _metric: &Metric,
-            _since_ms: i64,
-            _until_ms: i64,
+            _since: Timestamp,
+            _until: Timestamp,
         ) -> Result<Vec<NewestReading>> {
             Ok(Vec::new())
         }
 
-        fn trends(&self, _metric: &Metric, _since_ms: i64, _until_ms: i64) -> Result<Vec<Trend>> {
+        fn trends(
+            &self,
+            _metric: &Metric,
+            _since: Timestamp,
+            _until: Timestamp,
+        ) -> Result<Vec<Trend>> {
             Ok(Vec::new())
         }
 
-        fn stats(&self, _hour_ago_ms: i64) -> Result<StoreStats> {
+        fn stats(&self, _hour_ago: Timestamp) -> Result<StoreStats> {
             Ok(StoreStats::default())
         }
 
@@ -584,17 +612,11 @@ pub mod testing {
                 }
             }
             self.0.writes.lock().unwrap().push(samples.len());
-            self.0
-                .samples
-                .lock()
-                .unwrap()
-                .extend(samples.iter().map(|new| {
-                    (
-                        new.host_id.clone(),
-                        new.hostname.clone(),
-                        new.sample.timestamp_ms,
-                    )
-                }));
+            self.0.samples.lock().unwrap().extend(
+                samples
+                    .iter()
+                    .map(|new| (new.host_id.clone(), new.hostname.clone(), new.sample.time)),
+            );
             Ok(())
         }
 
@@ -626,14 +648,28 @@ mod tests {
 
     use super::testing::{MemoryStore, Saved};
     use super::*;
+    use crate::times::from_ms;
 
-    fn from_host(hostname: &str, timestamp_ms: u64, acks: &mpsc::Sender<u64>) -> WriterCommand {
+    /// The `n`th sample's time, as the tests count them.
+    fn at(n: i64) -> Timestamp {
+        from_ms(1_795_000_000_000 + n * 1000)
+    }
+
+    /// Which samples these are, as the tests count them.
+    fn numbered(times: &[Timestamp]) -> Vec<i64> {
+        times
+            .iter()
+            .map(|time| (*time - at(0)).num_seconds())
+            .collect()
+    }
+
+    fn from_host(hostname: &str, n: i64, acks: &mpsc::Sender<Timestamp>) -> WriterCommand {
         WriterCommand::SaveAndAck {
             sample: NewSample {
                 host_id: "host-1".to_string(),
                 hostname: hostname.to_string(),
                 sample: Sample {
-                    timestamp_ms,
+                    time: at(n),
                     metrics: BTreeMap::new(),
                 },
             },
@@ -641,10 +677,11 @@ mod tests {
         }
     }
 
-    /// Runs commands through a writer, and returns what it stored and acknowledged.
+    /// Runs commands through a writer, and returns which samples it stored and
+    /// acknowledged.
     fn run(
-        commands: impl FnOnce(&mpsc::Sender<u64>) -> Vec<WriterCommand>,
-    ) -> (Vec<u64>, Vec<u64>) {
+        commands: impl FnOnce(&mpsc::Sender<Timestamp>) -> Vec<WriterCommand>,
+    ) -> (Vec<i64>, Vec<i64>) {
         let saved = Saved::default();
         let store = Box::new(MemoryStore(saved.clone()));
         let (writer, thread) = spawn_writer(store, Arc::default());
@@ -661,7 +698,8 @@ mod tests {
             times.push(time);
         }
         let stored = saved.samples.lock().unwrap();
-        (stored.iter().map(|sample| sample.2).collect(), times)
+        let stored: Vec<Timestamp> = stored.iter().map(|sample| sample.2).collect();
+        (numbered(&stored), numbered(&times))
     }
 
     #[test]
@@ -687,9 +725,9 @@ mod tests {
         let (acks, mut acked) = mpsc::channel(16);
 
         writer.blocking_send(from_host("web", 1, &acks)).unwrap();
-        assert_eq!(acked.blocking_recv(), Some(1));
+        assert_eq!(acked.blocking_recv(), Some(at(1)));
         writer.blocking_send(from_host("web", 1, &acks)).unwrap();
-        assert_eq!(acked.blocking_recv(), Some(1));
+        assert_eq!(acked.blocking_recv(), Some(at(1)));
 
         writer.blocking_send(WriterCommand::Stop).unwrap();
         thread.join().unwrap();
@@ -736,7 +774,7 @@ mod tests {
         writer.blocking_send(from_host("fail", 1, &acks)).unwrap();
         wait_for_failures(&counts, 1);
         writer.blocking_send(from_host("web", 1, &acks)).unwrap();
-        assert_eq!(acked.blocking_recv(), Some(1));
+        assert_eq!(acked.blocking_recv(), Some(at(1)));
 
         writer.blocking_send(WriterCommand::Stop).unwrap();
         thread.join().unwrap();
@@ -784,13 +822,13 @@ mod tests {
         }
     }
 
-    fn batch(size: u64) -> Vec<NewSample> {
+    fn batch(size: i64) -> Vec<NewSample> {
         (0..size)
-            .map(|time| NewSample {
+            .map(|n| NewSample {
                 host_id: "host-1".to_string(),
                 hostname: "web".to_string(),
                 sample: Sample {
-                    timestamp_ms: time,
+                    time: at(n),
                     metrics: BTreeMap::new(),
                 },
             })
@@ -894,7 +932,7 @@ mod tests {
         // The first goes at once, as nothing came before it.
         writer.blocking_send(save("web", 0)).unwrap();
         wait_for_written(&writes, 1);
-        for time in 1..=WRITE_QUEUE_SIZE as u64 {
+        for time in 1..=WRITE_QUEUE_SIZE as i64 {
             writer.blocking_send(save("web", time)).unwrap();
         }
         wait_for_written(&writes, 1 + WRITE_QUEUE_SIZE);
@@ -943,21 +981,21 @@ mod tests {
     #[test]
     fn only_the_latest_samples_are_remembered() {
         let mut recent = RecentSamples::default();
-        for time in 0..RECENT_SAMPLES_PER_HOST as u64 + 1 {
-            assert!(!recent.seen("a", time));
+        for n in 0..RECENT_SAMPLES_PER_HOST as i64 + 1 {
+            assert!(!recent.seen("a", at(n)));
         }
 
-        assert!(recent.seen("a", 1));
-        assert!(!recent.seen("a", 0), "pushed out by newer samples");
-        assert!(!recent.seen("b", 1), "each host has its own");
+        assert!(recent.seen("a", at(1)));
+        assert!(!recent.seen("a", at(0)), "pushed out by newer samples");
+        assert!(!recent.seen("b", at(1)), "each host has its own");
     }
 
-    fn save(hostname: &str, timestamp_ms: u64) -> WriterCommand {
+    fn save(hostname: &str, n: i64) -> WriterCommand {
         WriterCommand::Save(NewSample {
             host_id: "host-1".to_string(),
             hostname: hostname.to_string(),
             sample: Sample {
-                timestamp_ms,
+                time: at(n),
                 metrics: BTreeMap::new(),
             },
         })
@@ -975,8 +1013,9 @@ mod tests {
         (saved, counts)
     }
 
-    fn timestamps(saved: &Saved) -> Vec<u64> {
-        saved.samples.lock().unwrap().iter().map(|s| s.2).collect()
+    fn timestamps(saved: &Saved) -> Vec<i64> {
+        let stored: Vec<Timestamp> = saved.samples.lock().unwrap().iter().map(|s| s.2).collect();
+        numbered(&stored)
     }
 
     fn delete(host_id: &str) -> (WriterCommand, oneshot::Receiver<Result<(), String>>) {

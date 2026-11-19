@@ -21,9 +21,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::process::Stdio;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use chrono::{DateTime, TimeDelta, Utc};
 use flate2::read::GzDecoder;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RecordType};
@@ -35,7 +36,7 @@ use hyper::header::{
 };
 use hyper::{Method, Request, Response, Uri};
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use maxnines_protocol::{Check, CheckKind};
+use maxnines_protocol::{Check, CheckKind, DEFAULT_CHECK_TIMEOUT};
 use regex_lite::Regex;
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -56,10 +57,6 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use x509_parser::parse_x509_certificate;
 
-/// How long a check gets unless it says otherwise. A slower answer counts as down.
-const DEFAULT_TIMEOUT: Duration =
-    Duration::from_secs(maxnines_protocol::DEFAULT_CHECK_TIMEOUT_SECS);
-
 /// A name can have several addresses, and one that's gone shouldn't use up the
 /// whole time limit before the others are tried.
 const CONNECT_ATTEMPT: Duration = Duration::from_secs(5);
@@ -70,18 +67,14 @@ const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// What's put in the logs of sites being checked.
 const AGENT_NAME: &str = concat!("MaxNines-Agent/", env!("CARGO_PKG_VERSION"));
 
-const SECS_PER_DAY: i64 = 86_400;
-
 const DNS_PORT: u16 = 53;
 
 /// The largest answer a plain UDP lookup returns.
 const DNS_BUFFER_BYTES: usize = 4096;
 
-/// How long a check gets.
+/// How long a check gets. A slower answer counts as down.
 pub fn limit(check: &Check) -> Duration {
-    check
-        .timeout_secs
-        .map_or(DEFAULT_TIMEOUT, Duration::from_secs)
+    check.timeout.unwrap_or(DEFAULT_CHECK_TIMEOUT)
 }
 
 fn timed_out() -> anyhow::Error {
@@ -106,8 +99,8 @@ struct Findings {
     tls_version: Option<String>,
     cert_valid: Option<bool>,
     hostname_valid: Option<bool>,
-    cert_not_before: Option<i64>,
-    cert_not_after: Option<i64>,
+    cert_valid_from: Option<DateTime<Utc>>,
+    cert_valid_until: Option<DateTime<Utc>>,
     cert_days_left: Option<i64>,
     records: Option<usize>,
     /// postgres: whether it offers TLS, asked without signing in.
@@ -124,7 +117,7 @@ struct Findings {
     password_sign_in: Option<u8>,
     /// http: when the site's domain registration runs out, and how many days
     /// that leaves, or why that couldn't be found out.
-    domain_expires: Option<i64>,
+    domain_expires_at: Option<DateTime<Utc>>,
     domain_days_left: Option<i64>,
     domain_error: Option<String>,
     packet_loss_percent: Option<f64>,
@@ -223,8 +216,8 @@ async fn domain_expiry(check: &Check, findings: &mut Findings) {
         .unwrap_or_else(|_| Err("the registry didn't answer in time".to_string()));
     match answer {
         Ok(Some(expires)) => {
-            findings.domain_expires = Some(expires);
-            findings.domain_days_left = Some(days_left(expires, now_secs()));
+            findings.domain_expires_at = Some(expires);
+            findings.domain_days_left = Some(days_left(expires, maxnines_protocol::time::now()));
         }
         Ok(None) => {}
         Err(why) => findings.domain_error = Some(why),
@@ -409,28 +402,35 @@ fn describe_certificate_problem(error: &TlsError) -> &'static str {
 
 /// Reads the dates across the whole chain, as any certificate in it expiring
 /// breaks the site. So the start is the latest and the end is the earliest.
-fn read_dates(chain: &[CertificateDer<'_>], now_secs: i64, findings: &mut Findings) {
+fn read_dates(chain: &[CertificateDer<'_>], now: DateTime<Utc>, findings: &mut Findings) {
     for certificate in chain {
-        if let Ok((_, parsed)) = parse_x509_certificate(certificate) {
-            let (start, end) = (
-                parsed.validity().not_before.timestamp(),
-                parsed.validity().not_after.timestamp(),
-            );
-            findings.cert_not_before = findings.cert_not_before.max(Some(start));
-            findings.cert_not_after = Some(findings.cert_not_after.map_or(end, |e| e.min(end)));
-        }
+        let Ok((_, parsed)) = parse_x509_certificate(certificate) else {
+            continue;
+        };
+        let validity = parsed.validity();
+        let (Some(start), Some(end)) = (
+            DateTime::from_timestamp(validity.not_before.timestamp(), 0),
+            DateTime::from_timestamp(validity.not_after.timestamp(), 0),
+        ) else {
+            continue;
+        };
+        findings.cert_valid_from = findings.cert_valid_from.max(Some(start));
+        findings.cert_valid_until = Some(findings.cert_valid_until.map_or(end, |e| e.min(end)));
     }
-    findings.cert_days_left = findings.cert_not_after.map(|end| days_left(end, now_secs));
+    findings.cert_days_left = findings.cert_valid_until.map(|end| days_left(end, now));
 }
 
-fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |time| time.as_secs() as i64)
-}
-
-fn days_left(expires_secs: i64, now_secs: i64) -> i64 {
-    (expires_secs - now_secs).div_euclid(SECS_PER_DAY)
+/// Whole days until `expires`, rounded down, so it's -1 as soon as it's passed.
+fn days_left(expires: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
+    let left = expires - now;
+    let days = left.num_days();
+    // Counting whole days rounds towards zero, which would leave a moment past the
+    // end with 0 days left rather than -1.
+    if left < TimeDelta::days(days) {
+        days - 1
+    } else {
+        days
+    }
 }
 
 fn tls_config(verifier: Arc<RecordingVerifier>) -> Result<ClientConfig> {
@@ -487,7 +487,7 @@ async fn secure(
     let (_, connection) = stream.get_ref();
     findings.tls_version = version_name(connection.protocol_version());
     let chain = connection.peer_certificates().unwrap_or_default();
-    read_dates(chain, now_secs(), findings);
+    read_dates(chain, maxnines_protocol::time::now(), findings);
     findings.hostname_valid = chain.first().and_then(|certificate| {
         let parsed = ParsedCertificate::try_from(certificate).ok()?;
         Some(rustls::client::verify_server_name(&parsed, &name).is_ok())
@@ -780,7 +780,7 @@ async fn query_server(check: &Check, server: &str, findings: &mut Findings) -> R
         .map_err(|_| anyhow!("couldn't connect"))?;
 
     // Not for secrecy: this only has to tell one answer from another.
-    let id = (now_nanos() & 0xffff) as u16;
+    let id = (Utc::now().timestamp_subsec_nanos() & 0xffff) as u16;
     let started = Instant::now();
     socket
         .send(&dns_query(check, id)?)
@@ -793,12 +793,6 @@ async fn query_server(check: &Check, server: &str, findings: &mut Findings) -> R
         .map_err(|_| anyhow!("couldn't connect"))?;
     findings.dns_ms = Some(elapsed_ms(started));
     dns_answers(&buffer[..size], id)
-}
-
-fn now_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |time| time.as_nanos())
 }
 
 /// Linux, macOS and FreeBSD only let programs with the rights send pings, which
@@ -1235,7 +1229,7 @@ mod tests {
         let address = listener.local_addr().unwrap().to_string();
         let started = Instant::now();
         let output = run(&Check {
-            timeout_secs: Some(2),
+            timeout: Some(Duration::from_secs(2)),
             ..http_check(&address)
         });
 
@@ -1414,20 +1408,29 @@ mod tests {
             [issuer.clone(), leaf.clone()],
         ] {
             let mut findings = Findings::default();
-            read_dates(&chain, 0, &mut findings);
-            let start = rcgen::date_time_ymd(2024, 1, 1).unix_timestamp();
-            let end = rcgen::date_time_ymd(2030, 1, 1).unix_timestamp();
-            assert_eq!(findings.cert_not_before, Some(start));
-            assert_eq!(findings.cert_not_after, Some(end));
-            assert_eq!(findings.cert_days_left, Some(days_left(end, 0)));
+            let now = DateTime::UNIX_EPOCH;
+            read_dates(&chain, now, &mut findings);
+            let at = |year| {
+                DateTime::from_timestamp(rcgen::date_time_ymd(year, 1, 1).unix_timestamp(), 0)
+            };
+            assert_eq!(findings.cert_valid_from, at(2024));
+            assert_eq!(findings.cert_valid_until, at(2030));
+            assert_eq!(
+                findings.cert_days_left,
+                Some(days_left(at(2030).unwrap(), now))
+            );
         }
     }
 
     #[test]
     fn days_left_rounds_down_and_goes_negative_once_expired() {
-        assert_eq!(days_left(10 * SECS_PER_DAY, 0), 10);
-        assert_eq!(days_left(10 * SECS_PER_DAY - 1, 0), 9);
-        assert_eq!(days_left(0, 1), -1);
+        let now = DateTime::UNIX_EPOCH;
+        let day = TimeDelta::days(1);
+        assert_eq!(days_left(now + day * 10, now), 10);
+        assert_eq!(days_left(now + day * 10 - TimeDelta::seconds(1), now), 9);
+        assert_eq!(days_left(now - TimeDelta::seconds(1), now), -1);
+        assert_eq!(days_left(now - day, now), -1);
+        assert_eq!(days_left(now - day - TimeDelta::seconds(1), now), -2);
     }
 
     #[test]

@@ -460,9 +460,9 @@ each host, for each thing it describes, is a series. New numbers land in
 `samples_recent` and move to `samples` once their hour is over, sorted so a
 query only reads what it needs. Rollups keep the lowest, highest, total and count
 of each chart's line, 5 minutes and an hour at a time, so long ranges are quick
-and spikes survive. A host is numbered here to keep series small. The lines are
-references the server keeps: there are no foreign keys, as DuckDB checks them
-slowly.
+and spikes survive. A host is numbered here to keep series small. Every moment is a
+`TIMESTAMP` in UTC, to the millisecond. The lines are references the server keeps:
+there are no foreign keys, as DuckDB checks them slowly.
 
 ```mermaid
 erDiagram
@@ -537,10 +537,10 @@ erDiagram
     }
     rollup_progress {
         string metric
-        bigint done_until_ms
+        timestamp done_until "every hour before this is rolled up"
     }
     rollup_redo {
-        bigint hour_ms
+        timestamp hour "its start"
     }
 ```
 
@@ -552,7 +552,7 @@ The view `all_samples` is `samples` and `samples_recent` together, and
 ClickHouse keeps the same things without numbering them: each row names its
 metric, host ID and labels in full, which it compresses well. Tables are sorted so
 a query reads only what it asks for, and `ReplacingMergeTree` drops repeated rows
-as it merges them.
+as it merges them. Every moment is a `DateTime64(3, 'UTC')`.
 
 ```mermaid
 erDiagram
@@ -604,11 +604,11 @@ erDiagram
     }
     rollup_progress {
         string metric
-        int done_until_ms
+        datetime done_until "every hour before this is rolled up"
         int version
     }
     rollup_redo {
-        int hour_ms
+        datetime hour "its start"
     }
 ```
 

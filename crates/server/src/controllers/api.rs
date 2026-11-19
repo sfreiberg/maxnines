@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
+use std::time::Duration;
 
 use axum::extract::{Path as UrlPath, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -10,6 +11,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use chrono::TimeDelta;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::error;
@@ -29,7 +31,7 @@ use crate::events::EventInput;
 use crate::facts::unflatten;
 use crate::locations::{LocationRuleInput, check_rule};
 use crate::maintenance::MaintenanceWindowInput;
-use crate::metrics::{self, METRICS, Metric, SeriesResult, TimeRange, Unit, now_ms};
+use crate::metrics::{self, METRICS, Metric, SeriesResult, TimeRange, Unit};
 use crate::metrics_pages::{MetricsPage, MetricsPageInput, SignIn};
 use crate::models::User;
 use crate::models::{
@@ -42,7 +44,7 @@ use crate::remote_checks::{LatestResults, RemoteCheck, RemoteCheckInput, SignInW
 use crate::roles::Role;
 use crate::rule_engine::{self, ResolvedConfig};
 use crate::silences::{ActiveSilences, Cover, SilenceInput};
-use crate::times::{self, Timestamp, millis, zone_named};
+use crate::times::{self, Timestamp, zone_named};
 
 /// An agent as admins see it.
 #[derive(Debug, Serialize, Deserialize)]
@@ -54,10 +56,9 @@ pub struct HostView {
     pub last_seen_at: Option<Timestamp>,
 }
 
-/// When the server last heard from a host, which presence keeps in milliseconds.
+/// When the server last heard from a host.
 fn last_seen_at(presence: Option<HostPresence>) -> Option<Timestamp> {
-    let ms = presence?.last_seen_ms?;
-    Some(times::from_ms(i64::try_from(ms).ok()?))
+    presence?.last_seen_at
 }
 
 /// Facts come in two kinds. `trusted` is what the server knows for itself, and
@@ -254,7 +255,7 @@ pub async fn key_holder(
         return Ok(None);
     };
     if key.starts_with(crate::app_sign_ins::ACCESS_PREFIX) {
-        let accepted = state.database.accept_app_token(key, now_ms()).await?;
+        let accepted = state.database.accept_app_token(key, times::now()).await?;
         return Ok(accepted.map(|(sign_in, owner)| {
             let via = Via::App {
                 id: sign_in.id,
@@ -263,7 +264,7 @@ pub async fn key_holder(
             (owner, via)
         }));
     }
-    let accepted = state.database.accept_api_key(key, now_ms()).await?;
+    let accepted = state.database.accept_api_key(key, times::now()).await?;
     Ok(accepted.map(|(key, owner)| {
         let via = Via::ApiKey {
             id: key.id,
@@ -317,7 +318,7 @@ async fn create_user(State(state): State<AppState>, Json(input): Json<NewUser>) 
     let role = input.role.unwrap_or(Role::Viewer);
     match state
         .database
-        .create_user(&email, &name, role, now_ms())
+        .create_user(&email, &name, role, times::now())
         .await
     {
         Ok(Some((user, link))) => {
@@ -400,7 +401,7 @@ fn after_user_change(change: anyhow::Result<UserChange>) -> Response {
 }
 
 async fn disable_user(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
-    after_user_change(state.database.disable_user(id, now_ms()).await)
+    after_user_change(state.database.disable_user(id, times::now()).await)
 }
 
 async fn enable_user(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
@@ -446,7 +447,7 @@ async fn require_two_factor(
 
 /// Replaces a user's setup link, which is also how a forgotten password is reset.
 async fn new_setup_link(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
-    match state.database.new_setup_link(id, now_ms()).await {
+    match state.database.new_setup_link(id, times::now()).await {
         Ok(Some(link)) => Json(json!({ "setup_url": setup_url(&state, &link) })).into_response(),
         Ok(None) => no_such_user(),
         Err(error) => server_error(&error),
@@ -476,8 +477,9 @@ async fn create_api_key(State(state): State<AppState>, Json(input): Json<NewApiK
     if let Err(error) = check_api_key_name(name) {
         return refused(&error);
     }
-    let now = now_ms();
-    let expires_at = match input.expires_in_secs.map(|secs| expiry_after(secs, now)) {
+    let now = times::now();
+    let lasting = input.expires_in_secs.map(Duration::from_secs);
+    let expires_at = match lasting.map(|lasting| expiry_after(lasting, now)) {
         Some(Ok(expires)) => Some(expires),
         Some(Err(error)) => return refused(&error),
         None => None,
@@ -519,7 +521,7 @@ async fn list_sign_ins(State(state): State<AppState>) -> Response {
     let Some(whose) = super::sign_ins::whose() else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    match super::sign_ins::sign_ins(&state, whose, now_ms()).await {
+    match super::sign_ins::sign_ins(&state, whose, times::now()).await {
         Ok(sign_ins) => Json(sign_ins).into_response(),
         Err(error) => server_error(&error),
     }
@@ -756,7 +758,7 @@ impl MetricsPageView {
             token_env: page.input.token_env,
             url: page.input.url,
             names: page.input.names,
-            interval_secs: page.input.interval_secs,
+            interval_secs: page.input.interval.as_secs(),
             enabled: page.input.enabled,
             username: page.input.username,
             password_env: page.input.password_env,
@@ -923,7 +925,7 @@ async fn agent_config(State(state): State<AppState>, UrlPath(id): UrlPath<String
 }
 
 /// How much a query covers unless it says otherwise.
-const DEFAULT_RANGE_MS: i64 = 3_600_000;
+const DEFAULT_RANGE: TimeDelta = TimeDelta::hours(1);
 
 /// Enough for any real host, while an agent inventing names can't make a
 /// response huge.
@@ -934,27 +936,68 @@ async fn metric_catalog() -> Json<&'static [Metric]> {
 }
 
 async fn current_metrics(State(state): State<AppState>) -> Response {
-    match state.metrics.current(now_ms()).await {
+    match state.metrics.current(times::now()).await {
         Ok(current) => Json(current).into_response(),
         Err(error) => server_error(&error),
     }
 }
 
-#[derive(Debug, Deserialize)]
+/// The span of time a request for readings asks for, in ISO 8601. Either end can
+/// be left out: `to` is now, and `from` is `default` before `to`.
+#[derive(Debug, Default, Deserialize)]
 struct MetricParams {
-    from_ms: Option<i64>,
-    to_ms: Option<i64>,
+    #[serde(
+        default,
+        deserialize_with = "crate::times::optional_moment::deserialize"
+    )]
+    from: Option<Timestamp>,
+    #[serde(
+        default,
+        deserialize_with = "crate::times::optional_moment::deserialize"
+    )]
+    to: Option<Timestamp>,
+}
+
+impl MetricParams {
+    /// The range asked for, or nothing for one that's backwards, empty or too long.
+    fn range(&self, default: impl FnOnce(Timestamp) -> Option<Timestamp>) -> Option<TimeRange> {
+        let to = self.to.unwrap_or_else(times::now);
+        let from = match self.from {
+            Some(from) => from,
+            None => default(to)?,
+        };
+        TimeRange::new(from, to)
+    }
+
+    /// The last [`DEFAULT_RANGE`] up to `to`, unless it says.
+    fn usual_range(&self) -> Option<TimeRange> {
+        self.range(|to| to.checked_sub_signed(DEFAULT_RANGE))
+    }
 }
 
 #[derive(Debug, Serialize)]
 struct MetricView {
     metric: &'static str,
     unit: Unit,
-    from_ms: i64,
-    to_ms: i64,
-    step_ms: i64,
+    from: Timestamp,
+    to: Timestamp,
+    /// How long each point covers, from its time.
+    step_secs: i64,
     #[serde(flatten)]
     result: SeriesResult,
+}
+
+impl MetricView {
+    fn new(metric: &'static str, unit: Unit, range: TimeRange, result: SeriesResult) -> Self {
+        Self {
+            metric,
+            unit,
+            from: range.from,
+            to: range.to,
+            step_secs: range.step.num_seconds(),
+            result,
+        }
+    }
 }
 
 async fn host_metric(
@@ -966,11 +1009,7 @@ async fn host_metric(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let to_ms = params.to_ms.unwrap_or_else(now_ms);
-    let from_ms = params
-        .from_ms
-        .unwrap_or_else(|| to_ms.saturating_sub(DEFAULT_RANGE_MS));
-    let Some(range) = TimeRange::new(from_ms, to_ms) else {
+    let Some(range) = params.usual_range() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
 
@@ -979,15 +1018,9 @@ async fn host_metric(
         .series(&host.id, metric, range, MAX_SERIES)
         .await
     {
-        Ok(result) => Json(MetricView {
-            metric: metric.name,
-            unit: metric.unit,
-            from_ms,
-            to_ms,
-            step_ms: range.step_ms,
-            result,
-        })
-        .into_response(),
+        Ok(result) => {
+            Json(MetricView::new(metric.name, metric.unit, range, result)).into_response()
+        }
         Err(error) => server_error(&error),
     }
 }
@@ -1133,7 +1166,7 @@ impl OpenAlert {
 
 async fn list_alerts(State(state): State<AppState>) -> Response {
     let alerts = async {
-        let silences = ActiveSilences::load(&state.database, now_ms()).await?;
+        let silences = ActiveSilences::load(&state.database, times::now()).await?;
         let open: Vec<OpenAlert> = state
             .database
             .open_alerts()
@@ -1174,7 +1207,7 @@ async fn list_delivery_problems(State(state): State<AppState>) -> Response {
 async fn acknowledge_alert(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
     match state
         .database
-        .acknowledge_alert(id, &super::recorded_by(), now_ms())
+        .acknowledge_alert(id, &super::recorded_by(), times::now())
         .await
     {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
@@ -1195,7 +1228,7 @@ async fn unacknowledge_alert(State(state): State<AppState>, UrlPath(id): UrlPath
 const ENDED_SILENCES: u64 = 200;
 
 async fn list_silences(State(state): State<AppState>) -> Response {
-    let now = now_ms();
+    let now = times::now();
     let silences = async {
         let active = state.database.active_silences(now).await?;
         let ended = state.database.ended_silences(now, ENDED_SILENCES).await?;
@@ -1224,7 +1257,7 @@ async fn create_silence(
     }
     match state
         .database
-        .create_silence(&input, &super::recorded_by(), now_ms())
+        .create_silence(&input, &super::recorded_by(), times::now())
         .await
     {
         Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
@@ -1233,7 +1266,7 @@ async fn create_silence(
 }
 
 async fn end_silence(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
-    match state.database.end_silence(id, now_ms()).await {
+    match state.database.end_silence(id, times::now()).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),
@@ -1249,8 +1282,16 @@ struct QueryParams {
     group_by: String,
     #[serde(default)]
     filter: String,
-    from_ms: Option<i64>,
-    to_ms: Option<i64>,
+    #[serde(
+        default,
+        deserialize_with = "crate::times::optional_moment::deserialize"
+    )]
+    from: Option<Timestamp>,
+    #[serde(
+        default,
+        deserialize_with = "crate::times::optional_moment::deserialize"
+    )]
+    to: Option<Timestamp>,
 }
 
 fn default_calculation() -> String {
@@ -1268,24 +1309,19 @@ async fn query(State(state): State<AppState>, Query(params): Query<QueryParams>)
         Ok(question) => question,
         Err(error) => return refused(&anyhow::anyhow!(error)),
     };
-    let to_ms = params.to_ms.unwrap_or_else(now_ms);
-    let from_ms = params
-        .from_ms
-        .unwrap_or_else(|| to_ms.saturating_sub(DEFAULT_RANGE_MS));
-    let Some(range) = TimeRange::new(from_ms, to_ms) else {
+    let span = MetricParams {
+        from: params.from,
+        to: params.to,
+    };
+    let Some(range) = span.usual_range() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
 
     match calculations::answer(&state.sources(), &question, range, MAX_SERIES).await {
-        Ok(result) => Json(MetricView {
-            metric: question.metric.name,
-            unit: question.unit(),
-            from_ms,
-            to_ms,
-            step_ms: range.step_ms,
-            result,
-        })
-        .into_response(),
+        Ok(result) => {
+            let view = MetricView::new(question.metric.name, question.unit(), range, result);
+            Json(view).into_response()
+        }
         Err(error) => server_error(&error),
     }
 }
@@ -1318,7 +1354,7 @@ async fn create_dashboard(
         Ok(name) => name,
         Err(error) => return refused(&anyhow::anyhow!(error)),
     };
-    match state.database.create_dashboard(&name, now_ms()).await {
+    match state.database.create_dashboard(&name, times::now()).await {
         Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
         Err(error) => server_error(&error),
     }
@@ -1492,14 +1528,16 @@ async fn widget_data(
     let Some(widget) = dashboard.widgets.iter().find(|w| w.id == widget_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let number = |name: &str| params.get(name).map(|text| text.parse::<i64>());
-    let (to_ms, from_ms) = match (number("to_ms").transpose(), number("from_ms").transpose()) {
-        (Ok(to_ms), Ok(from_ms)) => (to_ms, from_ms),
-        _ => return StatusCode::BAD_REQUEST.into_response(),
+    // Read by hand, as the rest of the parameters are the variables' picks.
+    let moment = |name: &str| params.get(name).map(|text| times::parse_moment(text));
+    let span = match (moment("from"), moment("to")) {
+        (Some(None), _) | (_, Some(None)) => return StatusCode::BAD_REQUEST.into_response(),
+        (from, to) => MetricParams {
+            from: from.flatten(),
+            to: to.flatten(),
+        },
     };
-    let to_ms = to_ms.unwrap_or_else(now_ms);
-    let from_ms = from_ms.unwrap_or_else(|| to_ms.saturating_sub(DEFAULT_RANGE_MS));
-    let Some(range) = TimeRange::new(from_ms, to_ms) else {
+    let Some(range) = span.usual_range() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let picks = match Picks::from_params(&state.sources(), &dashboard.variables, &params).await {
@@ -1519,14 +1557,7 @@ async fn widget_data(
             title: input.title(&question, &picks),
             kind: input.kind.clone(),
             filter: question.filter.clone(),
-            view: MetricView {
-                metric: question.metric.name,
-                unit: question.unit(),
-                from_ms,
-                to_ms,
-                step_ms: range.step_ms,
-                result,
-            },
+            view: MetricView::new(question.metric.name, question.unit(), range, result),
         })
         .into_response(),
         Err(error) => server_error(&error),
@@ -1534,7 +1565,9 @@ async fn widget_data(
 }
 
 /// How long a list of events covers unless asked.
-const DEFAULT_EVENTS_MS: i64 = 7 * 24 * 3_600_000;
+const DEFAULT_EVENTS: TimeDelta = TimeDelta::days(7);
+/// How long a host's timeline covers unless asked.
+const DEFAULT_TIMELINE: TimeDelta = TimeDelta::days(1);
 /// The most events a list returns.
 const MAX_EVENTS: u64 = 1000;
 
@@ -1555,15 +1588,15 @@ struct EventParams {
 }
 
 impl EventParams {
-    fn span(&self, default_ms: i64) -> (Timestamp, Timestamp) {
+    fn span(&self, usual: TimeDelta) -> (Timestamp, Timestamp) {
         let to = self.to.unwrap_or_else(times::now);
-        let from = self.from.unwrap_or_else(|| to - millis(default_ms));
+        let from = self.from.unwrap_or_else(|| to - usual);
         (from, to)
     }
 }
 
 async fn list_events(State(state): State<AppState>, Query(params): Query<EventParams>) -> Response {
-    let (from, to) = params.span(DEFAULT_EVENTS_MS);
+    let (from, to) = params.span(DEFAULT_EVENTS);
     let limit = params.limit.unwrap_or(200).min(MAX_EVENTS);
     match state.database.list_events(from, to, limit).await {
         Ok(events) => Json(events).into_response(),
@@ -1573,7 +1606,7 @@ async fn list_events(State(state): State<AppState>, Query(params): Query<EventPa
 
 async fn create_event(State(state): State<AppState>, Json(input): Json<EventInput>) -> Response {
     let by = super::recorded_by();
-    match state.record_event(input, &by, now_ms()).await {
+    match state.record_event(input, &by, times::now()).await {
         Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
         Err(EventRefusal::Invalid(message)) => {
             let body = Json(json!({ "error": message }));
@@ -1608,7 +1641,7 @@ async fn host_events(
     if state.registry.get(&id).await.is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let (from, to) = params.span(24 * 3_600_000);
+    let (from, to) = params.span(DEFAULT_TIMELINE);
     match state.timeline(&id, from, to).await {
         Ok(events) => Json(events).into_response(),
         Err(error) => server_error(&error),
@@ -1638,9 +1671,10 @@ struct AlertSeriesView {
     metric: &'static str,
     unit: Unit,
     thresholds: Vec<ThresholdView>,
-    from_ms: i64,
-    to_ms: i64,
-    step_ms: i64,
+    from: Timestamp,
+    to: Timestamp,
+    /// How long each point covers, from its time.
+    step_secs: i64,
     #[serde(flatten)]
     result: SeriesResult,
 }
@@ -1661,15 +1695,15 @@ async fn alert_series(
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return server_error(&error),
     };
-    let to_ms = params.to_ms.unwrap_or_else(now_ms);
-    let started_ms = alert.started_at.timestamp_millis();
-    let from_ms = params.from_ms.unwrap_or_else(|| {
-        let lead = to_ms.saturating_sub(started_ms) / 4;
-        started_ms
-            .saturating_sub(lead)
-            .min(to_ms.saturating_sub(DEFAULT_RANGE_MS))
+    // A quarter as long again before it started, to show what led up to it, and
+    // never less than the usual range.
+    let started = alert.started_at;
+    let range = params.range(|to| {
+        let lead = (to - started) / 4;
+        let usual = to.checked_sub_signed(DEFAULT_RANGE)?;
+        Some(started.checked_sub_signed(lead)?.min(usual))
     });
-    let Some(range) = TimeRange::new(from_ms, to_ms) else {
+    let Some(range) = range else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     match alert_charts::watched(&state.sources(), &alert, range).await {
@@ -1686,9 +1720,9 @@ async fn alert_series(
                     value,
                 })
                 .collect(),
-            from_ms,
-            to_ms,
-            step_ms: range.step_ms,
+            from: range.from,
+            to: range.to,
+            step_secs: range.step.num_seconds(),
             result: watched.result,
         })
         .into_response(),
@@ -1728,8 +1762,12 @@ struct RunActionInput {
     action: String,
     #[serde(default)]
     variables: BTreeMap<String, String>,
-    #[serde(default)]
-    timeout_secs: Option<u64>,
+    #[serde(
+        default,
+        rename = "timeout_secs",
+        with = "maxnines_protocol::time::optional_seconds"
+    )]
+    timeout: Option<Duration>,
 }
 
 /// Asks a host to run an action now. The answer is the run as it stands, which is
@@ -1742,10 +1780,10 @@ async fn run_action(
     if state.registry.get(&id).await.is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let timeout_secs = input
-        .timeout_secs
-        .unwrap_or(maxnines_protocol::actions::DEFAULT_ACTION_TIMEOUT_SECS);
-    if let Err(error) = crate::actions::check_timeout(timeout_secs) {
+    let timeout = input
+        .timeout
+        .unwrap_or(maxnines_protocol::actions::DEFAULT_ACTION_TIMEOUT);
+    if let Err(error) = crate::actions::check_timeout(timeout) {
         return refused(&error);
     }
     let new = crate::actions::NewRun {
@@ -1756,7 +1794,7 @@ async fn run_action(
         variables: input.variables,
         requested_by: Some(super::recorded_by()),
         requested_at: times::now(),
-        timeout_secs,
+        timeout,
     };
     let run = async {
         let id = state.actions.run(new).await?;
@@ -1945,7 +1983,7 @@ async fn update_alert_rule(
 }
 
 async fn delete_alert_rule(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
-    match state.database.delete_alert_rule(id, now_ms()).await {
+    match state.database.delete_alert_rule(id, times::now()).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),
@@ -1991,9 +2029,9 @@ impl RemoteCheckView {
     fn new(check: RemoteCheck, results: &LatestResults) -> Self {
         let latest = results
             .latest(check.id)
-            .map(|(result, ran_ms)| LatestCheck {
+            .map(|(result, ran_at)| LatestCheck {
                 up: result["up"] == 1,
-                ran_at: times::from_ms(ran_ms),
+                ran_at,
                 error: result["error"].as_str().map(String::from),
             });
         let input = check.input;
@@ -2003,7 +2041,7 @@ impl RemoteCheckView {
             id: check.id,
             host_id: input.host_id,
             check: input.check,
-            interval_secs: input.interval_secs,
+            interval_secs: input.interval.as_secs(),
             enabled: input.enabled,
             read_stats: input.read_stats,
             extras: input.extras,
@@ -2177,7 +2215,7 @@ async fn update_channel(
 }
 
 async fn delete_channel(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
-    match state.database.delete_channel(id, now_ms()).await {
+    match state.database.delete_channel(id, times::now()).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),

@@ -3,26 +3,27 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, Result};
-use duckdb::types::{TimeUnit, ToSqlOutput, ValueRef};
+use chrono::{DateTime, TimeDelta, Utc};
+use duckdb::types::{TimeUnit, ToSqlOutput, Value as SqlValue, ValueRef};
 use duckdb::{Config, Connection, Transaction, appender_params_from_iter, params};
-use maxnines_protocol::Sample;
 use serde_json::Value;
 use tracing::warn;
 
 use super::flatten::{DataType, ENTRY_LABEL, Reported, flatten};
 use super::rollups::{
-    EXPIRE_EVERY_MS, FIVE_MINUTES_MS, HOUR_MS, RATE_LEAD_MS, Retention, Tier,
-    full_resolution_cutoff, hour_of, hours_to_redo, is_due, metric_names, tier_for,
+    EXPIRE_EVERY, FIVE_MINUTES, HOUR, RATE_LEAD, Retention, Tier, full_resolution_cutoff,
+    hours_to_redo, is_due, kept_since, metric_names, tier_for,
 };
 use super::shared::{
     MAX_NAME_BYTES, MAX_SERIES_PER_HOST, labels_key, rebuilt_output, shortened, top_of,
 };
-use super::{CollectorStats, MetricsReader, NewSample, Store, StoreStats};
-use crate::calculations::{Calculation, CalculationQuery, SMALLEST_STEP_MS, numbered};
+use super::{CollectorStats, MetricsReader, NewSample, Store, StoreStats, can_store};
+use crate::calculations::{Calculation, CalculationQuery, SMALLEST_STEP, numbered};
 use crate::metrics::{
     LastSample, METRICS, Metric, NewestReading, Point, Reading, Series, SeriesQuery, SeriesResult,
-    Source, Trend, now_ms,
+    Source, Trend,
 };
+use crate::times::{self, Timestamp, hour_of};
 
 /// A schema change. SeaORM doesn't support DuckDB, so this mirrors how its
 /// migrations work: each one runs once, in order, and is recorded.
@@ -33,10 +34,16 @@ struct Migration {
 
 /// Every schema change, in order. Applied ones are recorded in the database, so
 /// never edit one that has shipped: add a new one instead.
-const MIGRATIONS: &[Migration] = &[Migration {
-    name: "0001_create_tables",
-    sql: include_str!("migrations/0001_create_tables.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        name: "0001_create_tables",
+        sql: include_str!("migrations/0001_create_tables.sql"),
+    },
+    Migration {
+        name: "0002_rollup_times",
+        sql: include_str!("migrations/0002_rollup_times.sql"),
+    },
+];
 
 /// Only the bookkeeping table is created outside a migration, because it is
 /// what records them.
@@ -161,8 +168,8 @@ struct Rows {
     hosts: Vec<(i32, String)>,
     series: Vec<(i64, i32, i32)>,
     labels: Vec<(i64, String, String)>,
-    numbers: Vec<(i64, i32, i64, f64)>,
-    texts: Vec<(i64, i64, Option<String>)>,
+    numbers: Vec<(Timestamp, i32, i64, f64)>,
+    texts: Vec<(Timestamp, i64, Option<String>)>,
 }
 
 impl Names {
@@ -243,7 +250,8 @@ impl Names {
     }
 
     fn add_sample(&mut self, new: &NewSample, rows: &mut Rows) -> Result<()> {
-        let time = microseconds(&new.sample)?;
+        let time = new.sample.time;
+        anyhow::ensure!(can_store(time), "a sample's time is out of range");
         let host = self.host(&new.host_id, rows);
         for (name, output) in &new.sample.metrics {
             if name.len() > MAX_NAME_BYTES {
@@ -302,8 +310,36 @@ impl Names {
     }
 }
 
-fn timestamp(microseconds: i64) -> ToSqlOutput<'static> {
-    ToSqlOutput::Borrowed(ValueRef::Timestamp(TimeUnit::Microsecond, microseconds))
+/// A moment as a TIMESTAMP, which counts microseconds. The duckdb crate binds chrono's
+/// times as text, which DuckDB would parse again for every row.
+fn timestamp(time: Timestamp) -> ToSqlOutput<'static> {
+    ToSqlOutput::Owned(SqlValue::Timestamp(
+        TimeUnit::Microsecond,
+        time.timestamp_micros(),
+    ))
+}
+
+/// A moment written into SQL, for one that comes from the store itself rather than a
+/// request.
+fn timestamp_literal(time: Timestamp) -> String {
+    format!("TIMESTAMP '{}'", time.format("%Y-%m-%d %H:%M:%S%.6f"))
+}
+
+/// A length of time written into SQL, in microseconds, which every length of time this
+/// store uses is a whole number of. Days or months would make DuckDB bucket by the
+/// calendar.
+fn interval_literal(length: TimeDelta) -> String {
+    let micros = length.num_microseconds().unwrap_or(i64::MAX);
+    format!("INTERVAL '{micros} microseconds'")
+}
+
+/// Buckets of a length, counted from 1970 as the other store's are, rather than from
+/// DuckDB's default of 2000.
+fn bucket_of(time: &str, step: TimeDelta) -> String {
+    format!(
+        "time_bucket({}, {time}, TIMESTAMP '1970-01-01')",
+        interval_literal(step)
+    )
 }
 
 /// Each appender is flushed by hand, because dropping one hides any failure.
@@ -388,11 +424,11 @@ pub struct DuckDbStore {
     names: Option<Names>,
     retention: Retention,
     /// How far each metric is rolled up, as kept in `rollup_progress`.
-    progress: HashMap<String, i64>,
+    progress: HashMap<String, Timestamp>,
     /// Hours to roll up again, as kept in `rollup_redo`.
-    redo: BTreeSet<i64>,
+    redo: BTreeSet<Timestamp>,
     /// When to next look for old data to delete.
-    next_expiry_ms: i64,
+    next_expiry: Timestamp,
 }
 
 impl DuckDbStore {
@@ -412,12 +448,11 @@ impl DuckDbStore {
     fn with_connection(mut connection: Connection, retention: Retention) -> Result<Self> {
         migrate(&mut connection, MIGRATIONS)?;
         let names = Names::load(&connection).context("loading metric names")?;
-        let mut statement =
-            connection.prepare("SELECT metric, done_until_ms FROM rollup_progress")?;
+        let mut statement = connection.prepare("SELECT metric, done_until FROM rollup_progress")?;
         let progress = statement
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<duckdb::Result<_>>()?;
-        let mut statement = connection.prepare("SELECT hour_ms FROM rollup_redo")?;
+        let mut statement = connection.prepare("SELECT hour FROM rollup_redo")?;
         let redo = statement
             .query_map([], |row| row.get(0))?
             .collect::<duckdb::Result<_>>()?;
@@ -428,7 +463,7 @@ impl DuckDbStore {
             retention,
             progress,
             redo,
-            next_expiry_ms: 0,
+            next_expiry: DateTime::<Utc>::MIN_UTC,
         })
     }
 
@@ -436,13 +471,12 @@ impl DuckDbStore {
     /// nothing can be lost or seen twice. A piece at a time, so that writes aren't kept
     /// waiting and a bigger fleet doesn't need more memory. Series are moved in order,
     /// so each one's rows stay together however many pieces its metric takes.
-    fn tidy_up_to(&mut self, now_ms: i64, max_rows: i64) -> Result<bool> {
-        let hour_start = now_ms / HOUR_MS * HOUR_MS;
+    fn tidy_up_to(&mut self, now: Timestamp, max_rows: i64) -> Result<bool> {
         let found = self.connection.query_row(
-            "SELECT metric_id, epoch_ms(date_trunc('hour', time)) FROM samples_recent
-             WHERE time < epoch_ms($1::BIGINT) LIMIT 1",
-            params![hour_start],
-            |row| Ok((row.get::<_, i32>(0)?, row.get::<_, i64>(1)?)),
+            "SELECT metric_id, date_trunc('hour', time) FROM samples_recent
+             WHERE time < $1::TIMESTAMP LIMIT 1",
+            [timestamp(hour_of(now))],
+            |row| Ok((row.get::<_, i32>(0)?, row.get::<_, Timestamp>(1)?)),
         );
         let (metric, hour) = match found {
             Ok(found) => found,
@@ -451,29 +485,29 @@ impl DuckDbStore {
         };
 
         let chosen = "WHERE metric_id = $1
-                        AND time >= epoch_ms($2::BIGINT) AND time < epoch_ms($3::BIGINT)";
+                        AND time >= $2::TIMESTAMP AND time < $3::TIMESTAMP";
         let (rows, first, last): (i64, i64, i64) = self.connection.query_row(
             &format!(
                 "SELECT count(*), min(series_id), max(series_id) FROM samples_recent {chosen}"
             ),
-            params![metric, hour, hour + HOUR_MS],
+            params![metric, timestamp(hour), timestamp(hour + HOUR)],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         let pieces = (rows + max_rows - 1) / max_rows;
         let up_to = first + (last - first) / pieces.max(1);
 
         let piece = format!("{chosen} AND series_id <= $4");
-        let values = params![metric, hour, hour + HOUR_MS, up_to];
+        let values = params![metric, timestamp(hour), timestamp(hour + HOUR), up_to];
         // A series can only have one value at a moment, so anything more is a sample
         // sent twice, which the writer can't catch after a restart. That covers rows
         // that arrived late for an hour already sorted too.
         let already_sorted = format!(
             "SELECT series_id, time FROM samples
              WHERE metric_id = {metric}
-               AND time >= epoch_ms({hour}::BIGINT)
-               AND time < epoch_ms({next_hour}::BIGINT)
+               AND time >= {hour} AND time < {next_hour}
                AND series_id BETWEEN {first} AND {up_to}",
-            next_hour = hour + HOUR_MS,
+            hour = timestamp_literal(hour),
+            next_hour = timestamp_literal(hour + HOUR),
         );
         let transaction = self.connection.transaction()?;
         transaction.execute(
@@ -538,7 +572,7 @@ impl DuckDbStore {
         let transaction = self.connection.transaction()?;
         write_rows(&transaction, &rows)?;
         for hour in &late {
-            transaction.execute("INSERT INTO rollup_redo VALUES (?)", params![hour])?;
+            transaction.execute("INSERT INTO rollup_redo VALUES (?)", [timestamp(*hour)])?;
         }
         transaction.commit()?;
         self.redo.extend(late);
@@ -547,19 +581,19 @@ impl DuckDbStore {
 
     /// Hours these rows land in that are already rolled up, and not yet waiting to be
     /// rolled up again.
-    fn late_hours(&self, rows: &Rows) -> BTreeSet<i64> {
+    fn late_hours(&self, rows: &Rows) -> BTreeSet<Timestamp> {
         let Some(rolled_up_until) = self.progress.values().max().copied() else {
             return BTreeSet::new();
         };
-        let times = rows.numbers.iter().map(|(time, ..)| time.div_euclid(1000));
-        let full_since = now_ms() - self.retention.full_ms;
+        let times = rows.numbers.iter().map(|(time, ..)| *time);
+        let full_since = kept_since(times::now(), self.retention.full);
         let mut hours = hours_to_redo(times, rolled_up_until, full_since);
         hours.retain(|hour| !self.redo.contains(hour));
         hours
     }
 
     /// Every catalog metric is rolled up this far, or `None` if one hasn't started.
-    fn rolled_up_until(&self) -> Option<i64> {
+    fn rolled_up_until(&self) -> Option<Timestamp> {
         metric_names()
             .map(|name| self.progress.get(name).copied())
             .min()
@@ -569,16 +603,14 @@ impl DuckDbStore {
     /// Rolls up the next finished hour for every metric that's reached it, in one
     /// transaction with their progress. Hours without a single sample are skipped
     /// over, so a gap costs nothing.
-    fn roll_up_next(&mut self, now_ms: i64) -> Result<bool> {
-        let start = metric_names()
-            .map(|name| self.progress.get(name).copied().unwrap_or(i64::MIN))
-            .min()
-            .unwrap_or(i64::MIN);
-        let first: Option<i64> = self
+    fn roll_up_next(&mut self, now: Timestamp) -> Result<bool> {
+        // From 1970 while any metric hasn't started.
+        let start = self.rolled_up_until().unwrap_or(DateTime::UNIX_EPOCH);
+        let first: Option<Timestamp> = self
             .connection
             .query_row(
-                "SELECT epoch_ms(min(time)) FROM all_samples WHERE time >= epoch_ms($1::BIGINT)",
-                params![start.max(0)],
+                "SELECT min(time) FROM all_samples WHERE time >= $1::TIMESTAMP",
+                [timestamp(start)],
                 |row| row.get(0),
             )
             .context("finding the first sample to roll up")?;
@@ -586,7 +618,7 @@ impl DuckDbStore {
             return Ok(false);
         };
         let hour = start.max(hour_of(first));
-        if !is_due(hour, now_ms) {
+        if !is_due(hour, now) {
             return Ok(false);
         }
         let due: Vec<&'static Metric> = METRICS
@@ -607,13 +639,12 @@ impl DuckDbStore {
             )?;
             transaction.execute(
                 "INSERT INTO rollup_progress VALUES (?, ?)",
-                params![metric.name, hour + HOUR_MS],
+                params![metric.name, timestamp(hour + HOUR)],
             )?;
         }
         transaction.commit()?;
         for metric in due {
-            self.progress
-                .insert(metric.name.to_string(), hour + HOUR_MS);
+            self.progress.insert(metric.name.to_string(), hour + HOUR);
         }
         Ok(true)
     }
@@ -633,16 +664,16 @@ impl DuckDbStore {
                 for table in ["rollups_five_minute", "rollups_hour"] {
                     transaction.execute(
                         &format!(
-                            "DELETE FROM {table} WHERE metric = ?
-                             AND time >= epoch_ms($2::BIGINT) AND time < epoch_ms($3::BIGINT)"
+                            "DELETE FROM {table} WHERE metric = $1
+                             AND time >= $2::TIMESTAMP AND time < $3::TIMESTAMP"
                         ),
-                        params![metric.name, hour, hour + HOUR_MS],
+                        params![metric.name, timestamp(hour), timestamp(hour + HOUR)],
                     )?;
                 }
                 roll_up_hour(&transaction, metric, hour)?;
             }
         }
-        transaction.execute("DELETE FROM rollup_redo WHERE hour_ms = ?", params![hour])?;
+        transaction.execute("DELETE FROM rollup_redo WHERE hour = ?", [timestamp(hour)])?;
         transaction.commit()?;
         self.redo.remove(&hour);
         Ok(true)
@@ -651,46 +682,47 @@ impl DuckDbStore {
     /// Deletes what's older than it's kept for, once an hour. Samples go only once
     /// they're rolled up, and text only once something newer replaced it, as text is
     /// only saved when it changes.
-    fn expire(&mut self, now_ms: i64) -> Result<bool> {
-        if now_ms < self.next_expiry_ms {
+    fn expire(&mut self, now: Timestamp) -> Result<bool> {
+        if now < self.next_expiry {
             return Ok(false);
         }
         let cutoff = full_resolution_cutoff(
-            now_ms,
+            now,
             &self.retention,
             self.rolled_up_until(),
             self.redo.first().copied(),
         );
         let transaction = self.connection.transaction()?;
-        // Nothing is from before 1970, and a time much further back can't be compared.
-        if let Some(cutoff) = cutoff.filter(|cutoff| *cutoff > 0) {
+        // Nothing is from before 1970, so there's nothing to delete before then.
+        let after_1970 = |cutoff: &Timestamp| *cutoff > DateTime::UNIX_EPOCH;
+        if let Some(cutoff) = cutoff.filter(after_1970) {
             for table in ["samples", "samples_recent"] {
                 transaction.execute(
-                    &format!("DELETE FROM {table} WHERE time < epoch_ms($1::BIGINT)"),
-                    params![cutoff],
+                    &format!("DELETE FROM {table} WHERE time < $1::TIMESTAMP"),
+                    [timestamp(cutoff)],
                 )?;
             }
             transaction.execute(
-                "DELETE FROM texts WHERE time < epoch_ms($1::BIGINT)
+                "DELETE FROM texts WHERE time < $1::TIMESTAMP
                  AND (series_id, time) NOT IN (SELECT series_id, max(time) FROM texts GROUP BY series_id)",
-                params![cutoff],
+                [timestamp(cutoff)],
             )?;
         }
         let kept = [
-            ("rollups_five_minute", Some(self.retention.five_minute_ms)),
-            ("rollups_hour", self.retention.hour_ms),
+            ("rollups_five_minute", Some(self.retention.five_minute)),
+            ("rollups_hour", self.retention.hour),
         ];
-        for (table, kept_ms) in kept {
-            let cutoff = kept_ms.map(|kept_ms| now_ms.saturating_sub(kept_ms));
-            if let Some(cutoff) = cutoff.filter(|cutoff| *cutoff > 0) {
+        for (table, kept) in kept {
+            let cutoff = kept.and_then(|kept| kept_since(now, kept));
+            if let Some(cutoff) = cutoff.filter(after_1970) {
                 transaction.execute(
-                    &format!("DELETE FROM {table} WHERE time < epoch_ms($1::BIGINT)"),
-                    params![cutoff],
+                    &format!("DELETE FROM {table} WHERE time < $1::TIMESTAMP"),
+                    [timestamp(cutoff)],
                 )?;
             }
         }
         transaction.commit()?;
-        self.next_expiry_ms = now_ms + EXPIRE_EVERY_MS;
+        self.next_expiry = now + EXPIRE_EVERY;
         Ok(false)
     }
 }
@@ -745,11 +777,11 @@ impl Store for DuckDbStore {
 
     /// Sorting comes first, as it keeps up with what's arriving. Then hours to roll up
     /// again, as charts are wrong until they are, then new hours, then deleting.
-    fn tidy(&mut self, now_ms: i64) -> Result<bool> {
-        Ok(self.tidy_up_to(now_ms, MAX_TIDY_ROWS)?
+    fn tidy(&mut self, now: Timestamp) -> Result<bool> {
+        Ok(self.tidy_up_to(now, MAX_TIDY_ROWS)?
             || self.redo_next()?
-            || self.roll_up_next(now_ms)?
-            || self.expire(now_ms)?)
+            || self.roll_up_next(now)?
+            || self.expire(now)?)
     }
 
     fn delete_host(&mut self, host_id: &str) -> Result<()> {
@@ -769,14 +801,6 @@ impl Store for DuckDbStore {
             .execute_batch("FORCE CHECKPOINT")
             .context("saving recent writes")
     }
-}
-
-/// Agents send this, so it can be anything.
-fn microseconds(sample: &Sample) -> Result<i64> {
-    i64::try_from(sample.timestamp_ms)
-        .ok()
-        .and_then(|milliseconds| milliseconds.checked_mul(1000))
-        .context("timestamp out of range")
 }
 
 /// Reads on connections of its own, so a slow query doesn't hold up writes and
@@ -828,7 +852,7 @@ enum Naming<'a> {
     Label(&'a str),
 }
 
-/// One stored metric as rows of `host_id`, `t`, `series` and `v`. Metric and host
+/// One stored metric as rows of `host_id`, `time`, `series` and `v`. Metric and host
 /// numbers and the names here come from the catalog, never from a request or an agent.
 fn stored_values(
     connection: &Connection,
@@ -840,7 +864,7 @@ fn stored_values(
     let Some(id) = metric_id(connection, metric.collector, path)? else {
         // Nothing has reported it yet. This still takes the query's parameters.
         return Ok(format!(
-            "SELECT NULL::VARCHAR AS host_id, 0::BIGINT AS t,
+            "SELECT NULL::VARCHAR AS host_id, NULL::TIMESTAMP AS time,
                     NULL::VARCHAR AS series, NULL::DOUBLE AS v
              FROM all_samples s WHERE false AND {}",
             scope.time
@@ -857,7 +881,7 @@ fn stored_values(
         .host
         .map_or_else(String::new, |host| format!("AND se.host_number = {host}"));
     Ok(format!(
-        "SELECT h.host_id, epoch_ms(s.time) AS t, {name} AS series, s.value AS v
+        "SELECT h.host_id, s.time, {name} AS series, s.value AS v
          FROM all_samples s
          JOIN series se ON se.id = s.series_id
          JOIN hosts h ON h.number = se.host_number
@@ -879,15 +903,15 @@ fn reading_values(
             stored_values(connection, metric, path, naming, scope)
         }
         Reading::Percent { part, whole } => Ok(format!(
-            "SELECT p.host_id, p.t, p.series, p.v / NULLIF(w.v, 0) * 100 AS v
-             FROM ({}) p JOIN ({}) w USING (host_id, t, series)",
+            "SELECT p.host_id, p.time, p.series, p.v / NULLIF(w.v, 0) * 100 AS v
+             FROM ({}) p JOIN ({}) w USING (host_id, time, series)",
             stored_values(connection, metric, part, naming, scope)?,
             stored_values(connection, metric, whole, naming, scope)?,
         )),
     }
 }
 
-/// One row per value, as `host_id`, `t`, `series` and `v`.
+/// One row per value, as `host_id`, `time`, `series` and `v`.
 fn readings(connection: &Connection, metric: &Metric, scope: &Scope) -> Result<String> {
     match metric.source {
         Source::Fields(fields) => {
@@ -925,16 +949,18 @@ fn is_rate(source: Source) -> bool {
 }
 
 /// Each reading of a metric as a `computed` table of agent, time, series and value,
-/// with counts made rates. A rate needs the sample before it, so the first is `NULL`.
+/// with counts made rates, each a second. A rate needs the sample before it, so the
+/// first is `NULL`.
 fn computed_with(connection: &Connection, metric: &Metric, scope: &Scope) -> Result<String> {
     let values = if is_rate(metric.source) {
-        "SELECT host_id, t, series,
-                v * 1000.0 / NULLIF(
-                    t - lag(t) OVER (PARTITION BY host_id, series ORDER BY t), 0
+        "SELECT host_id, time, series,
+                v / NULLIF(
+                    epoch(time - lag(time) OVER (PARTITION BY host_id, series ORDER BY time)),
+                    0
                 ) AS v
          FROM readings"
     } else {
-        "SELECT host_id, t, series, v FROM readings"
+        "SELECT host_id, time, series, v FROM readings"
     };
     Ok(format!(
         "WITH readings AS ({readings}),
@@ -947,15 +973,15 @@ fn computed_with(connection: &Connection, metric: &Metric, scope: &Scope) -> Res
 fn computed_sql(connection: &Connection, metric: &Metric) -> Result<String> {
     let scope = Scope {
         host: None,
-        time: "s.time >= epoch_ms($1::BIGINT) AND s.time <= epoch_ms($2::BIGINT)".to_string(),
+        time: "s.time >= $1::TIMESTAMP AND s.time <= $2::TIMESTAMP".to_string(),
     };
     computed_with(connection, metric, &scope)
 }
 
 /// How far a metric is rolled up, if it's started.
-fn rolled_up_until(connection: &Connection, metric: &Metric) -> Result<Option<i64>> {
+fn rolled_up_until(connection: &Connection, metric: &Metric) -> Result<Option<Timestamp>> {
     let found = connection.query_row(
-        "SELECT done_until_ms FROM rollup_progress WHERE metric = ?",
+        "SELECT done_until FROM rollup_progress WHERE metric = ?",
         params![metric.name],
         |row| row.get(0),
     );
@@ -966,7 +992,7 @@ fn rolled_up_until(connection: &Connection, metric: &Metric) -> Result<Option<i6
     }
 }
 
-/// Parameters: from and to. Rows of `host_id`, `t`, `series`, `low`, `high`, `summed`
+/// Parameters: from and to. Rows of `host_id`, `time`, `series`, `low`, `high`, `summed`
 /// and `samples`: rolled up for what is, at `tier`, and each sample after that, as a
 /// row of its own. Rates read a little before the start, as each needs the sample
 /// before it.
@@ -975,28 +1001,29 @@ fn cells_sql(
     metric: &Metric,
     host: Option<i32>,
     tier: Tier,
-    done: Option<i64>,
+    done: Option<Timestamp>,
 ) -> Result<String> {
     let rolled = tier.table().zip(done);
     let samples_from = match rolled {
-        Some((_, done)) => format!("greatest($1::BIGINT, {done})"),
-        None => "$1::BIGINT".to_string(),
+        Some((_, done)) => format!("greatest($1::TIMESTAMP, {})", timestamp_literal(done)),
+        None => "$1::TIMESTAMP".to_string(),
     };
     let lead = if is_rate(metric.source) {
-        RATE_LEAD_MS
+        RATE_LEAD
     } else {
-        0
+        TimeDelta::zero()
     };
     let scope = Scope {
         host,
         time: format!(
-            "s.time >= epoch_ms({samples_from} - {lead}) AND s.time < epoch_ms($2::BIGINT)"
+            "s.time >= {samples_from} - {lead} AND s.time < $2::TIMESTAMP",
+            lead = interval_literal(lead)
         ),
     };
     let mut cells = format!(
-        "SELECT host_id, t, series, v AS low, v AS high, v AS summed, 1::BIGINT AS samples
+        "SELECT host_id, time, series, v AS low, v AS high, v AS summed, 1::BIGINT AS samples
          FROM ({computed} SELECT * FROM computed)
-         WHERE t >= {samples_from} AND series IS NOT NULL AND abs(v) <= {LARGEST_VALUE}",
+         WHERE time >= {samples_from} AND series IS NOT NULL AND abs(v) <= {LARGEST_VALUE}",
         computed = computed_with(connection, metric, &scope)?,
     );
     if let Some((table, done)) = rolled {
@@ -1004,25 +1031,26 @@ fn cells_sql(
         // The name comes from the catalog, never from a request.
         cells.push_str(&format!(
             " UNION ALL
-             SELECT h.host_id, epoch_ms(r.time) AS t, r.series, r.low, r.high, r.summed,
-                    r.samples
+             SELECT h.host_id, r.time, r.series, r.low, r.high, r.summed, r.samples
              FROM {table} r JOIN hosts h ON h.number = r.host_number
              WHERE r.metric = '{name}' {host}
-               AND r.time >= epoch_ms($1::BIGINT)
-               AND r.time < epoch_ms(least($2::BIGINT, {done}))",
+               AND r.time >= $1::TIMESTAMP
+               AND r.time < least($2::TIMESTAMP, {done})",
             name = metric.name,
+            done = timestamp_literal(done),
         ));
     }
     Ok(cells)
 }
 
-/// Parameters: from, to, step, and how many series to keep.
+/// Parameters: from, to, and how many series to keep.
 fn series_sql(
     connection: &Connection,
     metric: &Metric,
     host: i32,
+    step: TimeDelta,
     tier: Tier,
-    done: Option<i64>,
+    done: Option<Timestamp>,
 ) -> Result<String> {
     // One that stayed at zero is still shown, after the busier ones, as a chart
     // without it looks like it isn't being read.
@@ -1035,25 +1063,27 @@ fn series_sql(
                     count(*) OVER () AS total
              FROM cells GROUP BY series
          )
-         SELECT series, t // $3::BIGINT * $3::BIGINT AS bucket,
+         SELECT series, {bucket} AS bucket,
                 sum(summed) / sum(samples), min(low), max(high), total
          FROM cells JOIN ranked USING (series)
-         WHERE position <= $4::BIGINT
+         WHERE position <= $3::BIGINT
          GROUP BY series, bucket, total
          ORDER BY series, bucket",
+        bucket = bucket_of("time", step),
         cells = cells_sql(connection, metric, Some(host), tier, done)?,
     ))
 }
 
-/// Parameters: from, to, step, and how many lines to keep. A moment still filling up
+/// Parameters: from, to, and how many lines to keep. A moment still filling up
 /// is left out, as it would look like hosts disappearing. `members` is pairs of an
 /// agent's number and the number of its group, so nothing here comes from a request.
 fn calculation_sql(
     connection: &Connection,
     query: &CalculationQuery,
     members: &[(i32, usize)],
+    step: TimeDelta,
     tier: Tier,
-    done: Option<i64>,
+    done: Option<Timestamp>,
 ) -> Result<String> {
     let members: Vec<String> = members
         .iter()
@@ -1084,7 +1114,7 @@ fn calculation_sql(
          cells AS ({cells}),
          per_series AS (
              SELECT m.grp, u.host_id, u.series,
-                    u.t // $3::BIGINT * $3::BIGINT AS bucket,
+                    {bucket} AS bucket,
                     sum(u.summed) / sum(u.samples) AS v
              FROM cells u
              JOIN hosts h ON h.host_id = u.host_id
@@ -1095,7 +1125,7 @@ fn calculation_sql(
          combined AS (
              SELECT {line} AS line, bucket, {combined} AS v
              FROM per_series
-             WHERE bucket + $3::BIGINT <= $2::BIGINT
+             WHERE bucket + {step} <= $2::TIMESTAMP
              GROUP BY line, bucket
          ),
          ranked AS (
@@ -1106,8 +1136,10 @@ fn calculation_sql(
          )
          SELECT line, bucket, v, total
          FROM combined JOIN ranked USING (line)
-         WHERE position <= $4::BIGINT
+         WHERE position <= $3::BIGINT
          ORDER BY line, bucket",
+        bucket = bucket_of("u.time", step),
+        step = interval_literal(step),
         members = members.join(", "),
         cells = cells_sql(connection, query.metric, None, tier, done)?,
     ))
@@ -1115,18 +1147,19 @@ fn calculation_sql(
 
 /// Rolls up one hour of a metric: each 5 minutes from the samples, and then the hour
 /// from those. Reads from a little before the hour, for the first rate's sample before.
-fn roll_up_hour(connection: &Connection, metric: &Metric, hour: i64) -> Result<()> {
-    let end = hour + HOUR_MS;
+fn roll_up_hour(connection: &Connection, metric: &Metric, hour: Timestamp) -> Result<()> {
+    let end = hour + HOUR;
     let lead = if is_rate(metric.source) {
-        RATE_LEAD_MS
+        RATE_LEAD
     } else {
-        0
+        TimeDelta::zero()
     };
     let scope = Scope {
         host: None,
         time: format!(
-            "s.time >= epoch_ms({}::BIGINT) AND s.time < epoch_ms({end}::BIGINT)",
-            hour - lead
+            "s.time >= {} AND s.time < {}",
+            timestamp_literal(hour - lead),
+            timestamp_literal(end)
         ),
     };
     // The name comes from the catalog, never from a request.
@@ -1134,18 +1167,20 @@ fn roll_up_hour(connection: &Connection, metric: &Metric, hour: i64) -> Result<(
         .execute(
             &format!(
                 "INSERT INTO rollups_five_minute
-             SELECT '{name}', h.number, c.series, epoch_ms(c.bucket)::TIMESTAMP,
+             SELECT '{name}', h.number, c.series, c.bucket,
                     min(c.v), max(c.v), sum(c.v), count(*)
              FROM (
                  {computed}
-                 SELECT host_id, series, v,
-                        t // {FIVE_MINUTES_MS} * {FIVE_MINUTES_MS} AS bucket
+                 SELECT host_id, series, v, {bucket} AS bucket
                  FROM computed
                  WHERE series IS NOT NULL AND abs(v) <= {LARGEST_VALUE}
-                   AND t >= {hour} AND t < {end}
+                   AND time >= {hour} AND time < {end}
              ) c JOIN hosts h ON h.host_id = c.host_id
              GROUP BY h.number, c.series, c.bucket",
                 name = metric.name,
+                bucket = bucket_of("time", FIVE_MINUTES),
+                hour = timestamp_literal(hour),
+                end = timestamp_literal(end),
                 computed = computed_with(connection, metric, &scope)?,
             ),
             [],
@@ -1154,12 +1189,12 @@ fn roll_up_hour(connection: &Connection, metric: &Metric, hour: i64) -> Result<(
     connection
         .execute(
             "INSERT INTO rollups_hour
-         SELECT metric, host_number, series, epoch_ms($2::BIGINT)::TIMESTAMP,
+         SELECT metric, host_number, series, $2::TIMESTAMP,
                 min(low), max(high), sum(summed), sum(samples)::BIGINT
          FROM rollups_five_minute
-         WHERE metric = $1 AND time >= epoch_ms($2::BIGINT) AND time < epoch_ms($3::BIGINT)
+         WHERE metric = $1 AND time >= $2::TIMESTAMP AND time < $3::TIMESTAMP
          GROUP BY metric, host_number, series",
-            params![metric.name, hour, end],
+            params![metric.name, timestamp(hour), timestamp(end)],
         )
         .with_context(|| format!("rolling up the hour of {}", metric.name))?;
     Ok(())
@@ -1168,7 +1203,7 @@ fn roll_up_hour(connection: &Connection, metric: &Metric, hour: i64) -> Result<(
 fn newest_sql(connection: &Connection, metric: &Metric) -> Result<String> {
     Ok(format!(
         "{computed}
-         SELECT host_id, series, max(t), arg_max(v, t)
+         SELECT host_id, series, max(time), arg_max(v, time)
          FROM computed
          WHERE series IS NOT NULL AND abs(v) <= {LARGEST_VALUE}
          GROUP BY host_id, series
@@ -1178,17 +1213,17 @@ fn newest_sql(connection: &Connection, metric: &Metric) -> Result<String> {
 }
 
 /// Each series' newest value and the slope of the line that fits it best, by least
-/// squares. Times are counted from the start, as milliseconds since 1970 are big
-/// enough to cost the fit its precision.
+/// squares, as a change each second. Times are counted in seconds from the start, as
+/// seconds since 1970 are big enough to cost the fit its precision.
 fn trends_sql(connection: &Connection, metric: &Metric) -> Result<String> {
     Ok(format!(
         "{computed}
-         SELECT host_id, series, max(t), arg_max(v, t), min(t), count(*),
-                regr_slope(v, (t - $1::BIGINT)::DOUBLE)
+         SELECT host_id, series, max(time), arg_max(v, time), min(time), count(*),
+                regr_slope(v, epoch(time - $1::TIMESTAMP))
          FROM computed
          WHERE series IS NOT NULL AND abs(v) <= {LARGEST_VALUE}
          GROUP BY host_id, series
-         HAVING max(t) > min(t)
+         HAVING max(time) > min(time)
          ORDER BY host_id, series",
         computed = computed_sql(connection, metric)?,
     ))
@@ -1215,20 +1250,19 @@ impl MetricsReader for DuckDbReader {
             return Ok(SeriesResult::default());
         };
         let range = query.range;
-        let tier = tier_for(range.step_ms, range.from_ms, now_ms(), &self.retention);
+        let tier = tier_for(range.step, range.from, times::now(), &self.retention);
         let done = rolled_up_until(&connection, query.metric)?;
-        let mut statement =
-            connection.prepare(&series_sql(&connection, query.metric, host, tier, done)?)?;
+        let sql = series_sql(&connection, query.metric, host, range.step, tier, done)?;
+        let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map(
             params![
-                range.from_ms,
-                range.to_ms,
-                range.step_ms,
+                timestamp(range.from),
+                timestamp(range.to),
                 i64::try_from(query.max_series)?,
             ],
             |row| {
                 let point = Point {
-                    time_ms: row.get(1)?,
+                    time: row.get(1)?,
                     avg: row.get(2)?,
                     min: row.get(3)?,
                     max: row.get(4)?,
@@ -1254,21 +1288,21 @@ impl MetricsReader for DuckDbReader {
         Ok(result)
     }
 
-    fn last_samples(&self, since_ms: i64, until_ms: i64) -> Result<Vec<LastSample>> {
+    fn last_samples(&self, since: Timestamp, until: Timestamp) -> Result<Vec<LastSample>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT h.host_id, epoch_ms(newest.time)
+            "SELECT h.host_id, newest.time
              FROM (
                  SELECT se.host_number, max(s.time) AS time
                  FROM all_samples s JOIN series se ON se.id = s.series_id
-                 WHERE s.time >= epoch_ms($1::BIGINT) AND s.time <= epoch_ms($2::BIGINT)
+                 WHERE s.time >= $1::TIMESTAMP AND s.time <= $2::TIMESTAMP
                  GROUP BY se.host_number
              ) newest JOIN hosts h ON h.number = newest.host_number",
         )?;
-        let rows = statement.query_map(params![since_ms, until_ms], |row| {
+        let rows = statement.query_map([timestamp(since), timestamp(until)], |row| {
             Ok(LastSample {
                 host_id: row.get(0)?,
-                time_ms: row.get(1)?,
+                time: row.get(1)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -1278,8 +1312,8 @@ impl MetricsReader for DuckDbReader {
         &self,
         host_id: &str,
         collector: &str,
-        since_ms: i64,
-        until_ms: i64,
+        since: Timestamp,
+        until: Timestamp,
     ) -> Result<Option<Value>> {
         let connection = self.connection()?;
         let Some(host) = host_number(&connection, host_id)? else {
@@ -1322,22 +1356,22 @@ impl MetricsReader for DuckDbReader {
             "WITH chosen AS (
                  SELECT time, series_id, value FROM all_samples
                  WHERE series_id IN ({ids})
-                   AND time >= epoch_ms($1::BIGINT) AND time <= epoch_ms($2::BIGINT)
+                   AND time >= $1::TIMESTAMP AND time <= $2::TIMESTAMP
              )
              SELECT series_id, value FROM chosen
              WHERE time = (SELECT max(time) FROM chosen)"
         ))?;
-        let rows = statement.query_map(params![since_ms, until_ms], |row| {
+        let rows = statement.query_map([timestamp(since), timestamp(until)], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
         })?;
         let numbers: HashMap<i64, f64> = rows.collect::<Result<_, _>>()?;
 
         let mut statement = connection.prepare(&format!(
             "SELECT series_id, arg_max_null(value, time) FROM texts
-             WHERE series_id IN ({ids}) AND time <= epoch_ms($1::BIGINT)
+             WHERE series_id IN ({ids}) AND time <= $1::TIMESTAMP
              GROUP BY series_id"
         ))?;
-        let rows = statement.query_map(params![until_ms], |row| {
+        let rows = statement.query_map([timestamp(until)], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
         })?;
         let mut texts = HashMap::new();
@@ -1353,33 +1387,38 @@ impl MetricsReader for DuckDbReader {
         Ok(rebuilt_output(&series, &numbers, &texts))
     }
 
-    fn newest(&self, metric: &Metric, since_ms: i64, until_ms: i64) -> Result<Vec<NewestReading>> {
+    fn newest(
+        &self,
+        metric: &Metric,
+        since: Timestamp,
+        until: Timestamp,
+    ) -> Result<Vec<NewestReading>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(&newest_sql(&connection, metric)?)?;
-        let rows = statement.query_map(params![since_ms, until_ms], |row| {
+        let rows = statement.query_map([timestamp(since), timestamp(until)], |row| {
             Ok(NewestReading {
                 host_id: row.get(0)?,
                 series: row.get(1)?,
-                time_ms: row.get(2)?,
+                time: row.get(2)?,
                 value: row.get(3)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    fn trends(&self, metric: &Metric, since_ms: i64, until_ms: i64) -> Result<Vec<Trend>> {
+    fn trends(&self, metric: &Metric, since: Timestamp, until: Timestamp) -> Result<Vec<Trend>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(&trends_sql(&connection, metric)?)?;
-        let rows = statement.query_map(params![since_ms, until_ms], |row| {
+        let rows = statement.query_map([timestamp(since), timestamp(until)], |row| {
             Ok((
                 Trend {
                     host_id: row.get(0)?,
                     series: row.get(1)?,
-                    time_ms: row.get(2)?,
+                    time: row.get(2)?,
                     value: row.get(3)?,
-                    first_ms: row.get(4)?,
+                    first_time: row.get(4)?,
                     samples: row.get(5)?,
-                    slope_per_ms: 0.0,
+                    slope_per_sec: 0.0,
                 },
                 row.get::<_, Option<f64>>(6)?,
             ))
@@ -1389,7 +1428,7 @@ impl MetricsReader for DuckDbReader {
             let (trend, slope) = row?;
             if let Some(slope) = slope.filter(|slope| slope.is_finite()) {
                 trends.push(Trend {
-                    slope_per_ms: slope,
+                    slope_per_sec: slope,
                     ..trend
                 });
             }
@@ -1416,19 +1455,23 @@ impl MetricsReader for DuckDbReader {
         }
 
         let range = query.range;
-        let step = range.step_ms.max(SMALLEST_STEP_MS);
-        let tier = tier_for(step, range.from_ms, now_ms(), &self.retention);
+        let step = range.step.max(SMALLEST_STEP);
+        let tier = tier_for(step, range.from, times::now(), &self.retention);
         let done = rolled_up_until(&connection, query.metric)?;
-        let mut statement =
-            connection.prepare(&calculation_sql(&connection, query, &members, tier, done)?)?;
+        let sql = calculation_sql(&connection, query, &members, step, tier, done)?;
+        let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map(
-            params![range.from_ms, range.to_ms, step, query.max_lines as i64],
+            params![
+                timestamp(range.from),
+                timestamp(range.to),
+                query.max_lines as i64
+            ],
             |row| {
                 let line: String = row.get(0)?;
-                let time_ms: i64 = row.get(1)?;
+                let time: Timestamp = row.get(1)?;
                 let value: f64 = row.get(2)?;
                 let total: i64 = row.get(3)?;
-                Ok((line, time_ms, value, total))
+                Ok((line, time, value, total))
             },
         )?;
 
@@ -1439,10 +1482,10 @@ impl MetricsReader for DuckDbReader {
         let mut result = SeriesResult::default();
         let mut shown_of_total = 0;
         for row in rows {
-            let (line, time_ms, value, total) = row?;
+            let (line, time, value, total) = row?;
             shown_of_total = total;
             let point = Point {
-                time_ms,
+                time,
                 avg: value,
                 min: value,
                 max: value,
@@ -1469,7 +1512,7 @@ impl MetricsReader for DuckDbReader {
         Ok(count.try_into()?)
     }
 
-    fn stats(&self, hour_ago_ms: i64) -> Result<StoreStats> {
+    fn stats(&self, hour_ago: Timestamp) -> Result<StoreStats> {
         let connection = self.connection()?;
         let (size, write_ahead_log, memory_used, memory_limit) = connection.query_row(
             "SELECT database_size, wal_size, memory_usage, memory_limit
@@ -1479,11 +1522,10 @@ impl MetricsReader for DuckDbReader {
         )?;
 
         let mut statement = connection.prepare(
-            "SELECT c.name, sum(total)::BIGINT, sum(recent)::BIGINT,
-                    epoch_ms(min(oldest)), epoch_ms(max(newest))
+            "SELECT c.name, sum(total)::BIGINT, sum(recent)::BIGINT, min(oldest), max(newest)
              FROM (
                  SELECT metric_id, count(*) AS total,
-                        count(*) FILTER (WHERE time >= epoch_ms($1::BIGINT)) AS recent,
+                        count(*) FILTER (WHERE time >= $1::TIMESTAMP) AS recent,
                         min(time) AS oldest, max(time) AS newest
                  FROM all_samples GROUP BY metric_id
              ) counted
@@ -1491,13 +1533,13 @@ impl MetricsReader for DuckDbReader {
              JOIN collectors c ON c.id = m.collector_id
              GROUP BY c.name ORDER BY c.name",
         )?;
-        let rows = statement.query_map(params![hour_ago_ms], |row| {
+        let rows = statement.query_map([timestamp(hour_ago)], |row| {
             Ok(CollectorStats {
                 name: row.get(0)?,
                 rows: Some(row.get(1)?),
                 rows_last_hour: row.get(2)?,
-                oldest_ms: row.get(3)?,
-                newest_ms: row.get(4)?,
+                oldest_sample_at: row.get(3)?,
+                newest_sample_at: row.get(4)?,
             })
         })?;
 
@@ -1517,6 +1559,7 @@ impl MetricsReader for DuckDbReader {
 mod tests {
     use std::collections::BTreeMap;
 
+    use maxnines_protocol::Sample;
     use serde_json::{Value, json};
 
     use super::super::shared::MAX_TEXT_BYTES;
@@ -1526,11 +1569,14 @@ mod tests {
 
     type TestStore = DuckDbStore;
 
+    /// How the tests count, in milliseconds from 1970, as the contract tests do.
+    const HOUR_MS: i64 = 3_600_000;
+
     include!("contract_tests.rs");
 
     fn sample() -> Sample {
         Sample {
-            timestamp_ms: 1_700_000_000_123,
+            time: at(1_700_000_000_123),
             metrics: BTreeMap::from([
                 ("cpu".to_string(), json!({ "usage_percent": 12.5 })),
                 ("disk".to_string(), json!([{ "mount_point": "/" }])),
@@ -1548,7 +1594,7 @@ mod tests {
         let disks = json!([{ "mount_point": "/", "used_bytes": 1 }]);
         write_metric(&mut store, "a", 2000, "disk", disks);
 
-        let stats = store.reader().unwrap().stats(4000).unwrap();
+        let stats = store.reader().unwrap().stats(at(4000)).unwrap();
 
         assert_eq!(stats.engine, "DuckDB");
         assert!(!stats.memory_limit.is_empty());
@@ -1559,15 +1605,15 @@ mod tests {
                     name: "cpu".to_string(),
                     rows: Some(3),
                     rows_last_hour: 2,
-                    oldest_ms: 1000,
-                    newest_ms: 9000,
+                    oldest_sample_at: at(1000),
+                    newest_sample_at: at(9000),
                 },
                 CollectorStats {
                     name: "disk".to_string(),
                     rows: Some(1),
                     rows_last_hour: 0,
-                    oldest_ms: 2000,
-                    newest_ms: 2000,
+                    oldest_sample_at: at(2000),
+                    newest_sample_at: at(2000),
                 },
             ]
         );
@@ -1610,6 +1656,60 @@ mod tests {
         .unwrap()
     }
 
+    /// A database made before rollups kept their times as times, when they were
+    /// milliseconds since 1970, keeps the same moments once it's migrated.
+    #[test]
+    fn rollup_progress_in_milliseconds_becomes_times() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection, &MIGRATIONS[..1]).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO rollup_progress VALUES
+                     ('cpu.usage', 1795053600000), ('disk.usage', 1795050000000);
+                 INSERT INTO rollup_redo VALUES (1795046400000), (1795042800000);",
+            )
+            .unwrap();
+
+        let store = DuckDbStore::with_connection(connection, Retention::default()).unwrap();
+
+        let moment = |text| crate::times::parse_moment(text).unwrap();
+        assert_eq!(
+            store.progress,
+            HashMap::from([
+                ("cpu.usage".to_string(), moment("2026-11-19T02:00:00Z")),
+                ("disk.usage".to_string(), moment("2026-11-19T01:00:00Z")),
+            ])
+        );
+        assert_eq!(
+            store.redo,
+            BTreeSet::from([
+                moment("2026-11-19T00:00:00Z"),
+                moment("2026-11-18T23:00:00Z")
+            ])
+        );
+        let columns: Vec<(String, String)> = store
+            .connection
+            .prepare(
+                "SELECT column_name, data_type FROM information_schema.columns
+                 WHERE table_name IN ('rollup_progress', 'rollup_redo')
+                 ORDER BY table_name, ordinal_position",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let named = |name: &str, kind: &str| (name.to_string(), kind.to_string());
+        assert_eq!(
+            columns,
+            [
+                named("metric", "VARCHAR"),
+                named("done_until", "TIMESTAMP"),
+                named("hour", "TIMESTAMP"),
+            ]
+        );
+    }
+
     #[test]
     fn names_chosen_by_agents_are_kept_exactly() {
         let mut store = in_memory();
@@ -1647,7 +1747,7 @@ mod tests {
                 .unwrap();
         write_one(&mut store, "a", "h", &sample()).unwrap();
         let newcomer = Sample {
-            timestamp_ms: 1_700_000_001_000,
+            time: at(1_700_000_001_000),
             metrics: BTreeMap::from([("memory".to_string(), json!({ "used_percent": 40.0 }))]),
         };
 
@@ -1663,7 +1763,7 @@ mod tests {
 
         let reader = store.reader().unwrap();
         let latest = reader
-            .latest_output("a", "memory", 0, 2_000_000_000_000)
+            .latest_output("a", "memory", at(0), at(2_000_000_000_000))
             .unwrap();
         let latest = latest.expect("the sample should be readable");
         assert_eq!(latest["used_percent"].as_f64(), Some(40.0));
@@ -1681,7 +1781,13 @@ mod tests {
         store.close().unwrap();
 
         assert!(!path.with_extension("duckdb.wal").exists());
-        assert_eq!(reader.last_samples(0, 2_000_000_000_000).unwrap().len(), 1);
+        assert_eq!(
+            reader
+                .last_samples(at(0), at(2_000_000_000_000))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     /// How many numbers are saved, sorted or not.
@@ -1706,11 +1812,11 @@ mod tests {
             let checks = json!([{ "name": "site", "kind": "http", "up": 0, "error": "no" }]);
             write_metric(&mut store, host, 1000, "checks", checks);
         }
-        tidy_all(&mut store, 2 * HOUR_MS);
+        tidy_all(&mut store, at(2 * HOUR_MS));
         write_metric(
             &mut store,
             "gone",
-            HOUR_MS as u64 + 1,
+            HOUR_MS + 1,
             "cpu",
             json!({ "usage_percent": 1 }),
         );
@@ -1762,7 +1868,7 @@ mod tests {
         );
         assert_eq!(stored_rows(&store), 4);
 
-        while store.tidy(HOUR_MS * 2).unwrap() {}
+        while store.tidy(at(HOUR_MS * 2)).unwrap() {}
 
         assert_eq!(
             stored_rows(&store),
@@ -1781,7 +1887,7 @@ mod tests {
             "cpu",
             json!({ "usage_percent": 5.0 }),
         );
-        while store.tidy(HOUR_MS * 2).unwrap() {}
+        while store.tidy(at(HOUR_MS * 2)).unwrap() {}
 
         write_metric(
             &mut store,
@@ -1797,7 +1903,7 @@ mod tests {
             "cpu",
             json!({ "usage_percent": 7.0 }),
         );
-        while store.tidy(HOUR_MS * 2).unwrap() {}
+        while store.tidy(at(HOUR_MS * 2)).unwrap() {}
 
         assert_eq!(
             stored_rows(&store),
@@ -2072,8 +2178,8 @@ mod tests {
             .unwrap()
     }
 
-    fn tidy_all(store: &mut DuckDbStore, now_ms: i64) {
-        while store.tidy(now_ms).unwrap() {}
+    fn tidy_all(store: &mut DuckDbStore, now: Timestamp) {
+        while store.tidy(now).unwrap() {}
     }
 
     #[test]
@@ -2085,14 +2191,14 @@ mod tests {
             write_metric(
                 &mut store,
                 "a",
-                u64::from(minute) * 60_000,
+                i64::from(minute) * 60_000,
                 "cpu",
                 usage.clone(),
             );
             write_metric(
                 &mut store,
                 "b",
-                u64::from(minute) * 60_000,
+                i64::from(minute) * 60_000,
                 "memory",
                 memory,
             );
@@ -2100,7 +2206,7 @@ mod tests {
         let before = query(&store, "a", "cpu.usage", 8);
         let total = row_count(&store);
 
-        tidy_all(&mut store, 150 * 60_000);
+        tidy_all(&mut store, at(150 * 60_000));
 
         assert_eq!(row_count(&store), total);
         // Two metrics of memory and one of cpu, for the two finished hours.
@@ -2120,7 +2226,7 @@ mod tests {
         let before = query(&store, "c", "cpu.usage", 8);
 
         let mut moves = 0;
-        while store.tidy_up_to(2 * HOUR_MS, 30).unwrap() {
+        while store.tidy_up_to(at(2 * HOUR_MS), 30).unwrap() {
             moves += 1;
         }
 
@@ -2145,7 +2251,7 @@ mod tests {
         write_metric(&mut store, "a", 3_700_000, "cpu", cpu.clone());
         write_metric(&mut store, "a", 99_000_000, "cpu", cpu);
 
-        assert!(!store.tidy(3_800_000).unwrap());
+        assert!(!store.tidy(at(3_800_000)).unwrap());
 
         assert_eq!(sorted_count(&store), 0);
         assert_eq!(row_count(&store), 2);
@@ -2156,11 +2262,11 @@ mod tests {
         let mut store = in_memory();
         let cpu = json!({ "usage_percent": 1.0 });
         write_metric(&mut store, "a", 1000, "cpu", cpu.clone());
-        tidy_all(&mut store, 2 * HOUR_MS);
+        tidy_all(&mut store, at(2 * HOUR_MS));
         // An agent coming back with samples it kept while it was offline.
         write_metric(&mut store, "a", 2000, "cpu", cpu);
 
-        tidy_all(&mut store, 2 * HOUR_MS);
+        tidy_all(&mut store, at(2 * HOUR_MS));
 
         assert_eq!(sorted_count(&store), 2);
         assert_eq!(row_count(&store), 2);
@@ -2182,7 +2288,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(store.tidy(2 * HOUR_MS).is_err());
+        assert!(store.tidy(at(2 * HOUR_MS)).is_err());
 
         assert_eq!(row_count(&store), 1);
     }
@@ -2211,22 +2317,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_out_of_range_timestamps() {
+    fn rejects_times_no_store_can_keep() {
         let mut store = in_memory();
-        let mut bad = sample();
-        bad.timestamp_ms = u64::MAX;
-
-        assert!(write_one(&mut store, "host-1", "web-1", &bad).is_err());
-        assert_eq!(row_count(&store), 0);
-    }
-
-    #[test]
-    fn rejects_timestamps_too_large_to_store() {
-        let mut store = in_memory();
-        let mut bad = sample();
-        bad.timestamp_ms = i64::MAX as u64;
-
-        assert!(write_one(&mut store, "host-1", "web-1", &bad).is_err());
+        let millisecond = TimeDelta::milliseconds(1);
+        let after_the_last = crate::store::latest_sample() + millisecond;
+        let before_1970 = DateTime::UNIX_EPOCH - millisecond;
+        let finer = sample().time + TimeDelta::microseconds(1);
+        for time in [after_the_last, before_1970, finer, DateTime::<Utc>::MAX_UTC] {
+            let bad = Sample { time, ..sample() };
+            assert!(
+                write_one(&mut store, "host-1", "web-1", &bad).is_err(),
+                "{time}"
+            );
+        }
         assert_eq!(row_count(&store), 0);
     }
 
@@ -2234,7 +2337,7 @@ mod tests {
     fn writes_several_samples_at_once() {
         let mut store = in_memory();
         let mut second = sample();
-        second.timestamp_ms += 1000;
+        second.time += TimeDelta::seconds(1);
 
         store
             .write(&[
@@ -2268,7 +2371,7 @@ mod tests {
     fn a_bad_sample_stores_none_of_its_batch() {
         let mut store = in_memory();
         let mut bad = sample();
-        bad.timestamp_ms = u64::MAX;
+        bad.time = DateTime::<Utc>::MAX_UTC;
 
         let result = store.write(&[
             new_sample("host-1", "web-1", &sample()),
@@ -2329,7 +2432,7 @@ mod tests {
             ),
             (
                 "host".to_string(),
-                json!({ "uptime_secs": 90, "boot_time_secs": 10 }),
+                json!({ "uptime_secs": 90, "booted_at": "2026-11-19T01:57:17.828Z" }),
             ),
             (
                 "system".to_string(),
@@ -2391,8 +2494,8 @@ mod tests {
                     "connect_ms": 2.0, "tls_ms": 3.0, "first_byte_ms": 4.0, "download_ms": 2.5,
                     "status": 200, "protocol": "HTTP/2", "content_length": 512,
                     "compressed": true, "regex_matched": true, "tls_version": "TLS 1.3",
-                    "cert_valid": true, "hostname_valid": true, "cert_not_before": 100,
-                    "cert_not_after": 900, "cert_days_left": 30, "records": 2,
+                    "cert_valid": true, "hostname_valid": true, "cert_valid_from": "2026-01-01T00:00:00Z",
+                    "cert_valid_until": "2027-01-01T00:00:00Z", "cert_days_left": 30, "records": 2,
                     "packet_loss_percent": 0.0, "rtt_min_ms": 1.0, "rtt_max_ms": 2.0,
                     "rtt_stddev_ms": 0.5,
                 }]),
@@ -2404,7 +2507,7 @@ mod tests {
     fn every_collector_can_be_read_back() {
         let mut store = in_memory();
         let sample = Sample {
-            timestamp_ms: 1000,
+            time: at(1000),
             metrics: every_collector(),
         };
 
@@ -2417,7 +2520,10 @@ mod tests {
             .count();
         assert!(readable > 25, "{readable}");
         let output = latest_output(&store, "a", "host").unwrap();
-        assert_eq!(output, json!({ "uptime_secs": 90, "boot_time_secs": 10 }));
+        assert_eq!(
+            output,
+            json!({ "uptime_secs": 90, "booted_at": "2026-11-19T01:57:17.828Z" })
+        );
     }
 
     #[test]

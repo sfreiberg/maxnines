@@ -13,6 +13,7 @@ use std::net::IpAddr;
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, NaiveDateTime, Utc};
 use serde_json::Value;
 
 use crate::fetch_page;
@@ -32,7 +33,7 @@ type Servers = Vec<(Vec<String>, String)>;
 
 /// What's known of a domain: when its registration ends, nothing to look up,
 /// such as an address or a name with no registry, or why it couldn't be found.
-type Answer = Result<Option<i64>, String>;
+type Answer = Result<Option<DateTime<Utc>>, String>;
 
 #[derive(Default)]
 struct Cache {
@@ -50,7 +51,7 @@ fn cache() -> std::sync::MutexGuard<'static, Cache> {
         .unwrap_or_else(PoisonError::into_inner)
 }
 
-/// When `host`'s domain registration ends, in seconds since 1970.
+/// When `host`'s domain registration ends.
 pub(crate) async fn expiry(host: &str) -> Answer {
     expiry_from(BOOTSTRAP, host).await
 }
@@ -142,37 +143,25 @@ async fn servers(list_url: &str) -> Result<Servers, String> {
     Ok(services)
 }
 
-/// The record's expiration event, as seconds since 1970.
-fn expiration(record: &Value) -> Option<i64> {
+/// The record's expiration event.
+fn expiration(record: &Value) -> Option<DateTime<Utc>> {
     record["events"]
         .as_array()?
         .iter()
         .find(|event| event["eventAction"] == "expiration")
-        .and_then(|event| timestamp(event["eventDate"].as_str()?))
+        .and_then(|event| moment(event["eventDate"].as_str()?))
 }
 
-/// An RFC 3339 time, such as `2027-08-13T04:00:00Z`, to the second. An offset
-/// other than UTC is rare enough here to be left out, as a day either way doesn't
-/// change how many days are left by more than one.
-fn timestamp(text: &str) -> Option<i64> {
-    let number = |range: std::ops::Range<usize>| text.get(range)?.parse::<i64>().ok();
-    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
-    let (hour, minute, second) = (
-        number(11..13).unwrap_or(0),
-        number(14..16).unwrap_or(0),
-        number(17..19).unwrap_or(0),
-    );
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    // Days since 1970 from a civil date, after Howard Hinnant's algorithm.
-    let shifted = if month <= 2 { year - 1 } else { year };
-    let era = shifted.div_euclid(400);
-    let of_era = shifted - era * 400;
-    let of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
-    let of_era_days = of_era * 365 + of_era / 4 - of_era / 100 + of_year;
-    let days = era * 146_097 + of_era_days - 719_468;
-    Some(days * 86_400 + hour * 3600 + minute * 60 + second)
+/// An RFC 3339 time, such as `2027-08-13T04:00:00Z`, as RDAP's dates are. A
+/// registry that leaves the offset out is taken to mean UTC, as a day either way
+/// doesn't change how many days are left by more than one.
+fn moment(text: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(text)
+        .map(|time| time.to_utc())
+        .or_else(|_| {
+            NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f").map(|time| time.and_utc())
+        })
+        .ok()
 }
 
 #[cfg(test)]
@@ -186,15 +175,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn times_are_read_to_the_second() {
-        assert_eq!(timestamp("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(timestamp("2027-08-13T04:00:00Z"), Some(1_818_129_600));
+    fn times_are_read_with_or_without_an_offset() {
+        let at = |seconds| DateTime::from_timestamp(seconds, 0);
+        assert_eq!(moment("1970-01-01T00:00:00Z"), at(0));
+        assert_eq!(moment("2027-08-13T04:00:00Z"), at(1_818_129_600));
+        assert_eq!(moment("2027-08-13T04:00:00"), at(1_818_129_600));
         assert_eq!(
-            timestamp("2024-02-29T12:30:15.123+00:00"),
-            Some(1_709_209_815)
+            moment("2024-02-29T12:30:15.123+00:00"),
+            DateTime::from_timestamp_millis(1_709_209_815_123)
         );
-        assert_eq!(timestamp("2027-13-01T00:00:00Z"), None);
-        assert_eq!(timestamp("soon"), None);
+        assert_eq!(moment("2027-08-13T06:00:00+02:00"), at(1_818_129_600));
+        assert_eq!(moment("2027-13-01T00:00:00Z"), None);
+        assert_eq!(moment("soon"), None);
     }
 
     /// A list naming one registry, and that registry, which knows only
@@ -245,7 +237,7 @@ mod tests {
     #[tokio::test]
     async fn a_sites_domain_is_found_by_asking_up_from_its_host() {
         let (list, asked) = registry();
-        let expected = Ok(Some(1_818_129_600));
+        let expected = Ok(DateTime::from_timestamp(1_818_129_600, 0));
         assert_eq!(expiry_from(&list, "www.shop.example.test").await, expected);
         // The list, then shop.example.test's two misses on the way up, then the hit.
         assert_eq!(asked.load(Ordering::Relaxed), 4);

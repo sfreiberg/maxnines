@@ -17,7 +17,6 @@ use crate::audit::{self, Acting, Actor};
 use crate::config::Config;
 use crate::controllers::api::{BASE_PATH, HostView};
 use crate::fact_history::describe_history;
-use crate::metrics::now_ms;
 use crate::models::{
     Database, FactVersion, UserChange, check_api_key_name, check_new_user, expiry_after,
 };
@@ -230,7 +229,7 @@ pub fn print_api_keys(config: &Config) -> Result<()> {
         return Ok(());
     }
 
-    let now = now_ms();
+    let now = crate::times::now();
     println!(
         "{:<6} {:<16} {:<8} {:<20} {:<30} {:<9} NAME",
         "ID", "KEY", "STATE", "EXPIRES", "OWNER", "ROLE"
@@ -268,10 +267,8 @@ pub fn create_api_key(
 ) -> Result<()> {
     let name = name.trim();
     check_api_key_name(name)?;
-    let now = now_ms();
-    let expires_at = expires_in
-        .map(|time| expiry_after(time.as_secs(), now))
-        .transpose()?;
+    let now = crate::times::now();
+    let expires_at = expires_in.map(|time| expiry_after(time, now)).transpose()?;
     let (_, key) = with_database(config, |database| async move {
         let owner = database
             .active_user_by_email(owner)
@@ -290,7 +287,7 @@ pub fn create_api_key(
 
 pub fn revoke_api_key(config: &Config, id: i64) -> Result<()> {
     let revoked = with_database(config, |database| async move {
-        database.revoke_api_key(id, now_ms()).await
+        database.revoke_api_key(id, crate::times::now()).await
     })?;
     if !revoked {
         bail!("no API key with that ID");
@@ -344,7 +341,7 @@ pub fn first_admin(config: &Config, email: &str, name: &str) -> Result<Option<(i
             return Ok(None);
         }
         database
-            .create_user(&email, &name, Role::Admin, now_ms())
+            .create_user(&email, &name, Role::Admin, crate::times::now())
             .await
     })?;
     Ok(created.map(|(user, token)| (user.id, setup_link(config, &token))))
@@ -353,7 +350,9 @@ pub fn first_admin(config: &Config, email: &str, name: &str) -> Result<Option<(i
 pub fn create_user(config: &Config, email: &str, name: &str, role: Role) -> Result<()> {
     let (email, name) = check_new_user(email, name)?;
     let created = with_database(config, |database| async move {
-        database.create_user(&email, &name, role, now_ms()).await
+        database
+            .create_user(&email, &name, role, crate::times::now())
+            .await
     })?;
     let Some((_, token)) = created else {
         bail!("there's already a user with that address");
@@ -364,7 +363,7 @@ pub fn create_user(config: &Config, email: &str, name: &str, role: Role) -> Resu
 
 pub fn print_setup_link(config: &Config, id: i64) -> Result<()> {
     let token = with_database(config, |database| async move {
-        database.new_setup_link(id, now_ms()).await
+        database.new_setup_link(id, crate::times::now()).await
     })?;
     let Some(token) = token else {
         bail!("no user with that ID");
@@ -408,7 +407,7 @@ pub fn set_role(config: &Config, id: i64, role: Role) -> Result<()> {
 pub fn change_user(config: &Config, id: i64, action: &str) -> Result<()> {
     let change = with_database(config, |database| async move {
         match action {
-            "disable" => database.disable_user(id, now_ms()).await,
+            "disable" => database.disable_user(id, crate::times::now()).await,
             _ => database.enable_user(id).await,
         }
     })?;

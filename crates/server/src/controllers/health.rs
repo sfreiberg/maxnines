@@ -1,7 +1,6 @@
 //! For load balancers and uptime monitors, which have no login. It says whether each
 //! part is working and nothing else, so it gives nothing away to a stranger.
 
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use axum::extract::State;
@@ -9,17 +8,17 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use chrono::TimeDelta;
 use serde::Serialize;
 use tokio::time::timeout;
 
 use crate::app_state::AppState;
-use crate::metrics::now_ms;
 
 /// A database slower than this isn't working, whatever the reason.
 pub const CHECK_LIMIT: Duration = Duration::from_secs(2);
 
 /// Alert rules are checked every 15 seconds, so this means they've stopped.
-const ALERTS_STALE_MS: i64 = 60_000;
+const ALERTS_STALE: TimeDelta = TimeDelta::minutes(1);
 
 pub fn routes() -> Router<AppState> {
     Router::new().route("/health", get(show))
@@ -59,8 +58,8 @@ struct Health {
 /// Whether rules have run lately. Nothing has to have run just after a start.
 fn alerts_running(state: &AppState) -> bool {
     let status = &state.status;
-    let last_pass = status.last_alert_pass_ms.load(Ordering::Relaxed);
-    now_ms() - last_pass.max(status.started_at.timestamp_millis()) < ALERTS_STALE_MS
+    let last_pass = status.last_alert_pass().unwrap_or(status.started_at);
+    crate::times::now() - last_pass.max(status.started_at) < ALERTS_STALE
 }
 
 async fn show(State(state): State<AppState>) -> Response {

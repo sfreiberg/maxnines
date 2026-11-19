@@ -1512,6 +1512,7 @@ dependencies = [
  "bnum",
  "bstr",
  "bytes",
+ "chrono",
  "cityhash-rs",
  "clickhouse-macros",
  "clickhouse-types",
@@ -2237,6 +2238,7 @@ checksum = "1a46cc5f64f534993bae616668a94b1b8e58295c2bd39f85afef7c44297817da"
 dependencies = [
  "arrow 58.4.1",
  "cast",
+ "chrono",
  "comfy-table",
  "fallible-iterator 0.3.0",
  "fallible-streaming-iterator",
@@ -3929,6 +3931,7 @@ version = "0.1.0-alpha.7"
 dependencies = [
  "anyhow",
  "bollard",
+ "chrono",
  "clap",
  "dns-lookup",
  "futures-util",
@@ -3963,6 +3966,7 @@ dependencies = [
  "anyhow",
  "async-imap",
  "base64 0.22.1",
+ "chrono",
  "flate2",
  "hickory-proto",
  "http-body-util",
@@ -4016,6 +4020,7 @@ name = "maxnines-collectors"
 version = "0.1.0-alpha.7"
 dependencies = [
  "anyhow",
+ "chrono",
  "libc",
  "objc2-core-foundation",
  "objc2-io-kit",
@@ -4033,6 +4038,7 @@ name = "maxnines-loadtest"
 version = "0.1.0-alpha.7"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "futures-util",
  "hex",
@@ -4054,6 +4060,7 @@ name = "maxnines-protocol"
 version = "0.1.0-alpha.7"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "hcl-rs",
  "hex",

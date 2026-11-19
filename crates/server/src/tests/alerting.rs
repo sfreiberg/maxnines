@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use axum::Router;
 use axum::http::StatusCode;
 use axum::routing::{any, post};
+use chrono::TimeDelta;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use super::*;
@@ -19,12 +20,12 @@ use crate::channels::slack::{ACKNOWLEDGE_ACTION, SILENCE_HOUR_ACTION};
 use crate::metrics::{Metric, NewestReading};
 use crate::notifier::{Notice, Notifier, Senders};
 use crate::slack_actions::SlackActions;
-use crate::times::{from_ms, millis};
+use crate::times::Timestamp;
 use hyper_util::client::legacy::connect::HttpConnector;
 use slack_morphism::SlackClient;
 use slack_morphism::prelude::{SlackClientHyperConnector, SlackInteractionBlockActionsEvent};
 
-const MINUTE_MS: i64 = 60_000;
+const MINUTE: TimeDelta = TimeDelta::minutes(1);
 
 /// What the metrics store will say next.
 #[derive(Clone, Default)]
@@ -61,8 +62,8 @@ impl MetricsReader for Script {
 
     fn last_samples(
         &self,
-        _since_ms: i64,
-        _until_ms: i64,
+        _since: Timestamp,
+        _until: Timestamp,
     ) -> anyhow::Result<Vec<crate::metrics::LastSample>> {
         Ok(Vec::new())
     }
@@ -71,8 +72,8 @@ impl MetricsReader for Script {
         &self,
         _host_id: &str,
         collector: &str,
-        _since_ms: i64,
-        _until_ms: i64,
+        _since: Timestamp,
+        _until: Timestamp,
     ) -> anyhow::Result<Option<serde_json::Value>> {
         Ok(self.outputs.lock().unwrap().get(collector).cloned())
     }
@@ -80,8 +81,8 @@ impl MetricsReader for Script {
     fn newest(
         &self,
         _metric: &Metric,
-        _since_ms: i64,
-        _until_ms: i64,
+        _since: Timestamp,
+        _until: Timestamp,
     ) -> anyhow::Result<Vec<NewestReading>> {
         if *self.broken.lock().unwrap() {
             anyhow::bail!("deliberate test failure");
@@ -92,8 +93,8 @@ impl MetricsReader for Script {
     fn trends(
         &self,
         _metric: &crate::metrics::Metric,
-        _since_ms: i64,
-        _until_ms: i64,
+        _since: Timestamp,
+        _until: Timestamp,
     ) -> anyhow::Result<Vec<crate::metrics::Trend>> {
         if *self.broken.lock().unwrap() {
             anyhow::bail!("deliberate test failure");
@@ -101,7 +102,7 @@ impl MetricsReader for Script {
         Ok(self.trends.lock().unwrap().clone())
     }
 
-    fn stats(&self, _hour_ago_ms: i64) -> anyhow::Result<crate::store::StoreStats> {
+    fn stats(&self, _hour_ago: Timestamp) -> anyhow::Result<crate::store::StoreStats> {
         Ok(Default::default())
     }
 
@@ -125,7 +126,7 @@ struct Harness {
     host: Identity,
     client: Option<Client>,
     /// A time to count from. Later than any presence change in the test.
-    now: i64,
+    now: Timestamp,
 }
 
 impl Harness {
@@ -137,8 +138,8 @@ impl Harness {
 
         let host = identity();
         let client = server.connect_approved(&host, "web-1").await;
-        let now = now_ms() + MINUTE_MS;
-        let evaluator = evaluator(&server, now - 60 * MINUTE_MS);
+        let now = crate::times::now() + MINUTE;
+        let evaluator = evaluator(&server, now - MINUTE * 60);
         Self {
             server,
             script,
@@ -157,24 +158,24 @@ impl Harness {
         self.host.id()
     }
 
-    fn reading(&self, series: &str, time_ms: i64, value: f64) -> NewestReading {
+    fn reading(&self, series: &str, time: Timestamp, value: f64) -> NewestReading {
         NewestReading {
             host_id: self.id(),
             series: series.to_string(),
-            time_ms,
+            time,
             value,
         }
     }
 
-    /// Checks rules at `offset_ms` with a new CPU reading.
-    async fn cpu(&mut self, offset_ms: i64, value: f64) {
-        let time = self.now + offset_ms;
+    /// Checks rules `offset` after [`Self::now`] with a new CPU reading.
+    async fn cpu(&mut self, offset: TimeDelta, value: f64) {
+        let time = self.now + offset;
         self.script.set(vec![self.reading("CPU", time, value)]);
-        self.evaluate(offset_ms).await;
+        self.evaluate(offset).await;
     }
 
-    async fn evaluate(&mut self, offset_ms: i64) {
-        self.evaluator.evaluate(self.now + offset_ms).await.unwrap();
+    async fn evaluate(&mut self, offset: TimeDelta) {
+        self.evaluator.evaluate(self.now + offset).await.unwrap();
     }
 
     async fn open(&self) -> Vec<crate::alerting::Alert> {
@@ -191,7 +192,7 @@ impl Harness {
     }
 }
 
-fn evaluator(server: &TestServer, started_ms: i64) -> Evaluator {
+fn evaluator(server: &TestServer, started: Timestamp) -> Evaluator {
     Evaluator::new(
         server.state.database.clone(),
         server.state.registry.clone(),
@@ -199,7 +200,7 @@ fn evaluator(server: &TestServer, started_ms: i64) -> Evaluator {
         server.state.metrics.clone(),
         server.state.status.clone(),
         server.state.actions.clone(),
-        started_ms,
+        started,
     )
 }
 
@@ -212,7 +213,7 @@ pub(super) fn cpu_rule() -> AlertRuleInput {
         comparison: Some(Comparison::Above),
         threshold: Some(90.0),
         warning_threshold: None,
-        for_secs: 120,
+        hold: TimeDelta::seconds(120),
         severity: Severity::Critical,
         condition: None,
         enabled: true,
@@ -221,10 +222,10 @@ pub(super) fn cpu_rule() -> AlertRuleInput {
         calculation: None,
         group_by: None,
         filter: None,
-        window_secs: None,
-        remind_every_secs: None,
-        forecast_secs: None,
-        warning_forecast_secs: None,
+        window: None,
+        remind_every: None,
+        forecast: None,
+        warning_forecast: None,
         actions: Vec::new(),
     }
 }
@@ -236,7 +237,7 @@ fn offline_rule() -> AlertRuleInput {
         metric: None,
         comparison: None,
         threshold: None,
-        for_secs: 60,
+        hold: TimeDelta::seconds(60),
         ..cpu_rule()
     }
 }
@@ -251,11 +252,11 @@ async fn a_metric_alert_fires_once_and_resolves_when_it_clears() {
         .await
         .unwrap();
 
-    test.cpu(0, 95.0).await;
-    test.cpu(MINUTE_MS, 95.0).await;
+    test.cpu(TimeDelta::zero(), 95.0).await;
+    test.cpu(MINUTE, 95.0).await;
     assert!(test.open().await.is_empty(), "it hasn't lasted long enough");
 
-    test.cpu(2 * MINUTE_MS, 96.5).await;
+    test.cpu(MINUTE * 2, 96.5).await;
     let open = test.open().await;
     assert_eq!(open.len(), 1);
     assert_eq!(open[0].value, Some(96.5));
@@ -266,7 +267,7 @@ async fn a_metric_alert_fires_once_and_resolves_when_it_clears() {
         "CPU usage on web-1 is 96.5%, above 90% for 2 minutes"
     );
 
-    test.cpu(3 * MINUTE_MS, 97.0).await;
+    test.cpu(MINUTE * 3, 97.0).await;
     assert_eq!(
         test.open().await.len(),
         1,
@@ -275,7 +276,7 @@ async fn a_metric_alert_fires_once_and_resolves_when_it_clears() {
 
     // It resolves with the first reading that's clear, without waiting, saying
     // what the reading is now.
-    test.cpu(4 * MINUTE_MS, 10.0).await;
+    test.cpu(MINUTE * 4, 10.0).await;
     assert!(test.open().await.is_empty());
     let resolved = test.resolved().await;
     assert_eq!(resolved.len(), 1);
@@ -287,15 +288,12 @@ async fn a_metric_alert_fires_once_and_resolves_when_it_clears() {
         resolved[0].resolved_summary.as_deref(),
         Some("CPU usage on web-1 is now 10%, no longer above 90%")
     );
-    assert_eq!(
-        resolved[0].resolved_at,
-        Some(from_ms(test.now + 4 * MINUTE_MS))
-    );
+    assert_eq!(resolved[0].resolved_at, Some(test.now + MINUTE * 4));
 
     // Back over, it has to last all over again, and then it's a new alert.
-    test.cpu(5 * MINUTE_MS, 95.0).await;
+    test.cpu(MINUTE * 5, 95.0).await;
     assert!(test.open().await.is_empty());
-    test.cpu(7 * MINUTE_MS, 95.0).await;
+    test.cpu(MINUTE * 7, 95.0).await;
     assert_eq!(test.open().await.len(), 1);
     assert_eq!(test.resolved().await.len(), 1);
 }
@@ -308,10 +306,10 @@ async fn a_short_spike_does_not_alert() {
         .await
         .unwrap();
 
-    test.cpu(0, 95.0).await;
-    test.cpu(MINUTE_MS, 10.0).await;
-    test.cpu(2 * MINUTE_MS, 95.0).await;
-    test.cpu(3 * MINUTE_MS, 95.0).await;
+    test.cpu(TimeDelta::zero(), 95.0).await;
+    test.cpu(MINUTE, 10.0).await;
+    test.cpu(MINUTE * 2, 95.0).await;
+    test.cpu(MINUTE * 3, 95.0).await;
     assert!(test.open().await.is_empty());
 }
 
@@ -323,12 +321,12 @@ async fn the_same_sample_is_not_counted_twice() {
         .await
         .unwrap();
 
-    test.cpu(0, 95.0).await;
+    test.cpu(TimeDelta::zero(), 95.0).await;
     // Time passes, but the agent hasn't reported anything new.
-    test.evaluate(5 * MINUTE_MS).await;
+    test.evaluate(MINUTE * 5).await;
     assert!(test.open().await.is_empty());
 
-    test.cpu(6 * MINUTE_MS, 95.0).await;
+    test.cpu(MINUTE * 6, 95.0).await;
     assert_eq!(test.open().await.len(), 1);
 }
 
@@ -338,14 +336,14 @@ async fn below_rules_fire_on_low_readings() {
     let rule = AlertRuleInput {
         comparison: Some(Comparison::Below),
         threshold: Some(5.0),
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
 
-    test.cpu(0, 6.0).await;
+    test.cpu(TimeDelta::zero(), 6.0).await;
     assert!(test.open().await.is_empty());
-    test.cpu(MINUTE_MS, 4.0).await;
+    test.cpu(MINUTE, 4.0).await;
     assert_eq!(test.open().await.len(), 1);
 }
 
@@ -354,7 +352,7 @@ async fn each_series_alerts_separately() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
         metric: Some("disk.usage".to_string()),
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
@@ -365,7 +363,7 @@ async fn each_series_alerts_separately() {
         test.reading("/tmp", test.now, 5.0),
     ];
     test.script.set(readings);
-    test.evaluate(0).await;
+    test.evaluate(TimeDelta::zero()).await;
 
     let mut series: Vec<String> = test.open().await.into_iter().map(|a| a.series).collect();
     series.sort();
@@ -378,7 +376,7 @@ async fn a_rule_can_be_limited_to_some_series() {
     let rule = AlertRuleInput {
         metric: Some("disk.usage".to_string()),
         series: Some("/data*".to_string()),
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
@@ -388,7 +386,7 @@ async fn a_rule_can_be_limited_to_some_series() {
         test.reading("/data/logs", test.now, 96.0),
     ];
     test.script.set(readings);
-    test.evaluate(0).await;
+    test.evaluate(TimeDelta::zero()).await;
 
     let open = test.open().await;
     assert_eq!(open.len(), 1);
@@ -401,7 +399,7 @@ async fn a_condition_limits_which_agents_a_rule_watches() {
     let other = identity();
     let _client = test.server.connect_approved(&other, "db-1").await;
     let facts = |role: &str| FlatFacts::from([("custom.role".to_string(), json!(role))]);
-    let now = now_ms() as u64;
+    let now = crate::times::now();
     test.database()
         .record_facts(&test.id(), &facts("web"), now)
         .await
@@ -413,7 +411,7 @@ async fn a_condition_limits_which_agents_a_rule_watches() {
 
     let rule = AlertRuleInput {
         condition: Some(r#"facts.custom.role == "db""#.to_string()),
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
@@ -424,7 +422,7 @@ async fn a_condition_limits_which_agents_a_rule_watches() {
         ..test.reading("CPU", test.now, 95.0)
     });
     test.script.set(readings);
-    test.evaluate(0).await;
+    test.evaluate(TimeDelta::zero()).await;
 
     let open = test.open().await;
     assert_eq!(open.len(), 1);
@@ -435,11 +433,11 @@ async fn a_condition_limits_which_agents_a_rule_watches() {
 async fn a_disabled_rule_watches_nothing_and_closes_its_alerts() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
     let id = test.database().create_alert_rule(&rule).await.unwrap();
-    test.cpu(0, 95.0).await;
+    test.cpu(TimeDelta::zero(), 95.0).await;
     assert_eq!(test.open().await.len(), 1);
 
     let disabled = AlertRuleInput {
@@ -450,7 +448,7 @@ async fn a_disabled_rule_watches_nothing_and_closes_its_alerts() {
         .update_alert_rule(id, &disabled)
         .await
         .unwrap();
-    test.cpu(MINUTE_MS, 96.0).await;
+    test.cpu(MINUTE, 96.0).await;
 
     assert!(test.open().await.is_empty());
     assert_eq!(
@@ -466,23 +464,22 @@ async fn deleting_a_rule_closes_its_alerts_and_keeps_the_history_pointing_at_it(
 
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
     let id = test.database().create_alert_rule(&rule).await.unwrap();
-    test.cpu(0, 95.0).await;
+    test.cpu(TimeDelta::zero(), 95.0).await;
     let silence = SilenceInput {
         rule_id: Some(id),
         filter: String::new(),
         all_alerts: false,
         series: String::new(),
         reason: "Upgrading".to_string(),
-        duration_secs: 3600,
+        duration: TimeDelta::seconds(3600),
     };
     let database = test.database();
-    let hour_ms = 3_600_000;
     database
-        .create_silence(&silence, "sam", test.now - 2 * hour_ms)
+        .create_silence(&silence, "sam", test.now - HOUR * 2)
         .await
         .unwrap();
     database
@@ -496,13 +493,13 @@ async fn deleting_a_rule_closes_its_alerts_and_keeps_the_history_pointing_at_it(
         all_alerts: false,
         days: vec!["sun".to_string()],
         start_time: "02:00".to_string(),
-        duration_secs: 3600,
+        duration: TimeDelta::seconds(3600),
         time_zone: "UTC".to_string(),
     };
     database.create_maintenance_window(&window).await.unwrap();
 
     assert!(database.delete_alert_rule(id, test.now).await.unwrap());
-    test.evaluate(MINUTE_MS).await;
+    test.evaluate(MINUTE).await;
 
     assert!(test.open().await.is_empty());
     let resolved = test.resolved().await;
@@ -545,11 +542,11 @@ async fn deleting_a_rule_closes_its_alerts_and_keeps_the_history_pointing_at_it(
 async fn a_rule_that_stops_matching_closes_its_alerts() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
     let id = test.database().create_alert_rule(&rule).await.unwrap();
-    test.cpu(0, 95.0).await;
+    test.cpu(TimeDelta::zero(), 95.0).await;
 
     let narrowed = AlertRuleInput {
         condition: Some("false".to_string()),
@@ -559,7 +556,7 @@ async fn a_rule_that_stops_matching_closes_its_alerts() {
         .update_alert_rule(id, &narrowed)
         .await
         .unwrap();
-    test.cpu(MINUTE_MS, 96.0).await;
+    test.cpu(MINUTE, 96.0).await;
 
     assert_eq!(
         test.resolved().await[0].resolve_reason.as_deref(),
@@ -571,11 +568,11 @@ async fn a_rule_that_stops_matching_closes_its_alerts() {
 async fn revoking_an_agent_closes_its_alerts() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
-    test.cpu(0, 95.0).await;
+    test.cpu(TimeDelta::zero(), 95.0).await;
 
     let id = test.id();
     test.server
@@ -584,7 +581,7 @@ async fn revoking_an_agent_closes_its_alerts() {
         .decide(&id, HostState::Revoked)
         .await
         .unwrap();
-    test.cpu(MINUTE_MS, 96.0).await;
+    test.cpu(MINUTE, 96.0).await;
 
     assert_eq!(
         test.resolved().await[0].resolve_reason.as_deref(),
@@ -596,14 +593,14 @@ async fn revoking_an_agent_closes_its_alerts() {
 async fn missing_data_does_not_close_an_alert() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
-    test.cpu(0, 95.0).await;
+    test.cpu(TimeDelta::zero(), 95.0).await;
 
     test.script.set(Vec::new());
-    test.evaluate(10 * MINUTE_MS).await;
+    test.evaluate(MINUTE * 10).await;
     assert_eq!(test.open().await.len(), 1);
 }
 
@@ -611,18 +608,18 @@ async fn missing_data_does_not_close_an_alert() {
 async fn a_failed_metrics_read_changes_nothing() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
-    test.cpu(0, 95.0).await;
+    test.cpu(TimeDelta::zero(), 95.0).await;
 
     test.script.set_broken(true);
-    test.evaluate(MINUTE_MS).await;
+    test.evaluate(MINUTE).await;
     assert_eq!(test.open().await.len(), 1);
 
     test.script.set_broken(false);
-    test.cpu(2 * MINUTE_MS, 10.0).await;
+    test.cpu(MINUTE * 2, 10.0).await;
     assert!(test.open().await.is_empty());
 }
 
@@ -631,7 +628,7 @@ async fn a_series_that_disappears_closes_its_alert() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
         metric: Some("disk.usage".to_string()),
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
@@ -641,14 +638,14 @@ async fn a_series_that_disappears_closes_its_alert() {
         test.reading("/", test.now, 5.0),
     ];
     test.script.set(readings);
-    test.evaluate(0).await;
+    test.evaluate(TimeDelta::zero()).await;
     assert_eq!(test.open().await.len(), 1);
 
     // The agent is still reporting, so the disk really has gone.
-    let time = test.now + MINUTE_MS;
+    let time = test.now + MINUTE;
     let readings = vec![test.reading("/", time, 5.0)];
     test.script.set(readings);
-    test.evaluate(MINUTE_MS).await;
+    test.evaluate(MINUTE).await;
 
     assert!(test.open().await.is_empty());
     assert_eq!(
@@ -664,13 +661,13 @@ async fn a_series_the_rule_stops_watching_closes_with_that_reason() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
         metric: Some("disk.usage".to_string()),
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
     let id = test.database().create_alert_rule(&rule).await.unwrap();
     test.script
         .set(vec![test.reading("/mnt/usb", test.now, 95.0)]);
-    test.evaluate(0).await;
+    test.evaluate(TimeDelta::zero()).await;
     assert_eq!(test.open().await.len(), 1);
 
     let narrowed = AlertRuleInput {
@@ -681,9 +678,9 @@ async fn a_series_the_rule_stops_watching_closes_with_that_reason() {
         .update_alert_rule(id, &narrowed)
         .await
         .unwrap();
-    let time = test.now + MINUTE_MS;
+    let time = test.now + MINUTE;
     test.script.set(vec![test.reading("/mnt/usb", time, 95.0)]);
-    test.evaluate(MINUTE_MS).await;
+    test.evaluate(MINUTE).await;
 
     assert!(test.open().await.is_empty());
     assert_eq!(
@@ -696,18 +693,18 @@ async fn a_series_the_rule_stops_watching_closes_with_that_reason() {
 async fn a_restart_does_not_repeat_an_open_alert() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
-    test.cpu(0, 95.0).await;
+    test.cpu(TimeDelta::zero(), 95.0).await;
 
     test.evaluator = evaluator(&test.server, test.now);
-    test.cpu(MINUTE_MS, 95.0).await;
+    test.cpu(MINUTE, 95.0).await;
     assert_eq!(test.open().await.len(), 1);
     assert!(test.resolved().await.is_empty());
 
-    test.cpu(2 * MINUTE_MS, 10.0).await;
+    test.cpu(MINUTE * 2, 10.0).await;
     assert!(test.open().await.is_empty());
 }
 
@@ -716,7 +713,7 @@ async fn names_agents_choose_are_cleaned_before_they_are_kept() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
         metric: Some("disk.usage".to_string()),
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
@@ -724,10 +721,10 @@ async fn names_agents_choose_are_cleaned_before_they_are_kept() {
     let long = format!("/evil\r\nBcc: x@example.com\0{}", "x".repeat(400));
     let readings = vec![test.reading(&long, test.now, 95.0)];
     test.script.set(readings);
-    test.evaluate(0).await;
-    let readings = vec![test.reading(&long, test.now + 1, 95.0)];
+    test.evaluate(TimeDelta::zero()).await;
+    let readings = vec![test.reading(&long, test.now + TimeDelta::milliseconds(1), 95.0)];
     test.script.set(readings);
-    test.evaluate(1).await;
+    test.evaluate(TimeDelta::milliseconds(1)).await;
 
     let open = test.open().await;
     assert_eq!(open.len(), 1, "the cleaned name still matches itself");
@@ -741,7 +738,7 @@ async fn an_agent_cannot_flood_alerts_by_inventing_series() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
         metric: Some("disk.usage".to_string()),
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
@@ -750,7 +747,7 @@ async fn an_agent_cannot_flood_alerts_by_inventing_series() {
         .map(|index| test.reading(&format!("/m{index:03}"), test.now, 95.0))
         .collect();
     test.script.set(readings);
-    test.evaluate(0).await;
+    test.evaluate(TimeDelta::zero()).await;
 
     assert_eq!(test.open().await.len(), 64);
 }
@@ -763,16 +760,22 @@ async fn an_agent_going_offline_alerts_after_the_wait() {
         .await
         .unwrap();
 
-    test.evaluate(0).await;
+    test.evaluate(TimeDelta::zero()).await;
     assert!(test.open().await.is_empty(), "it's online");
 
     test.go_offline().await;
-    let gone = test.server.state.presence.get(&test.id()).unwrap().since_ms as i64;
+    let gone = test.server.state.presence.get(&test.id()).unwrap().since;
 
-    test.evaluator.evaluate(gone + 59_000).await.unwrap();
+    test.evaluator
+        .evaluate(gone + TimeDelta::seconds(59))
+        .await
+        .unwrap();
     assert!(test.open().await.is_empty());
 
-    test.evaluator.evaluate(gone + 60_000).await.unwrap();
+    test.evaluator
+        .evaluate(gone + TimeDelta::minutes(1))
+        .await
+        .unwrap();
     let open = test.open().await;
     assert_eq!(open.len(), 1);
     assert_eq!(open[0].summary, "web-1 is offline");
@@ -782,7 +785,7 @@ async fn an_agent_going_offline_alerts_after_the_wait() {
     // UTC here. The clock hasn't moved on as far as the test pretends.
     let since = format!(
         "title=\"Since {}\">for less than a minute<",
-        crate::times::format_time(gone as u64, chrono_tz::Tz::UTC)
+        crate::times::format_moment(gone, chrono_tz::Tz::UTC)
     );
     for path in ["/".to_string(), format!("/hosts/{}", test.id())] {
         let page = Browser::default().get(&test.server, &path).await;
@@ -843,7 +846,7 @@ async fn every_server_starts_with_a_rule_for_failing_containers() {
     assert_eq!(rule.name, "Container down");
     assert_eq!(rule.comparison, Some(Comparison::Below));
     assert_eq!(rule.levels(), [(Severity::Critical, 1.0)]);
-    assert_eq!(rule.for_secs, 60);
+    assert_eq!(rule.hold, TimeDelta::seconds(60));
     assert!(rule.all_channels);
     check_rule(rule).unwrap();
 }
@@ -856,7 +859,10 @@ async fn a_stopped_service_alerts_in_its_service_managers_words() {
         .into_iter()
         .find(|rule| rule.metric.as_deref() == Some("service.running"))
         .unwrap();
-    assert_eq!((rule.name.as_str(), rule.for_secs), ("Service stopped", 60));
+    assert_eq!(
+        (rule.name.as_str(), rule.hold),
+        ("Service stopped", TimeDelta::seconds(60))
+    );
     test.database().create_alert_rule(&rule).await.unwrap();
     let channel = webhook_channel("http://127.0.0.1:9/hook");
     test.database().create_channel(&channel).await.unwrap();
@@ -867,8 +873,8 @@ async fn a_stopped_service_alerts_in_its_service_managers_words() {
             { "name": "sshd.service", "running": 1, "state": "active" },
         ])
     };
-    let report = async |test: &mut Harness, minute: i64, state: &str| {
-        let offset = minute * MINUTE_MS;
+    let report = async |test: &mut Harness, minute: i32, state: &str| {
+        let offset = MINUTE * minute;
         let readings = vec![
             test.reading("nginx.service", test.now + offset, 0.0),
             test.reading("sshd.service", test.now + offset, 1.0),
@@ -916,7 +922,7 @@ async fn a_failing_container_alerts_after_a_minute() {
     test.database().create_alert_rule(&rule).await.unwrap();
 
     for minute in [0, 5] {
-        let offset = minute * MINUTE_MS;
+        let offset = MINUTE * minute;
         let readings = vec![
             test.reading("web", test.now + offset, 0.0),
             test.reading("db", test.now + offset, 1.0),
@@ -937,7 +943,7 @@ async fn every_server_starts_with_a_rule_for_agents_going_offline() {
 
     assert_eq!(rule.name, "Host offline");
     assert_eq!(rule.kind, RuleKind::Offline);
-    assert_eq!(rule.for_secs, 60);
+    assert_eq!(rule.hold, TimeDelta::seconds(60));
     assert_eq!(rule.severity, Severity::Critical);
     assert!(rule.enabled);
     assert!(rule.all_channels);
@@ -957,11 +963,17 @@ async fn the_built_in_rule_tells_every_channel_once_an_agent_is_gone_a_minute() 
     let channel = test.database().create_channel(&channel).await.unwrap();
 
     test.go_offline().await;
-    let gone = test.server.state.presence.get(&test.id()).unwrap().since_ms as i64;
-    test.evaluator.evaluate(gone + 59_000).await.unwrap();
+    let gone = test.server.state.presence.get(&test.id()).unwrap().since;
+    test.evaluator
+        .evaluate(gone + TimeDelta::seconds(59))
+        .await
+        .unwrap();
     assert!(test.open().await.is_empty());
 
-    test.evaluator.evaluate(gone + 60_000).await.unwrap();
+    test.evaluator
+        .evaluate(gone + TimeDelta::minutes(1))
+        .await
+        .unwrap();
     let open = test.open().await;
     assert_eq!(open.len(), 1);
     assert_eq!(open[0].summary, "web-1 is offline");
@@ -995,7 +1007,7 @@ async fn every_server_starts_with_a_warning_at_80_percent_full_and_critical_at_9
     );
     assert_eq!(rule.comparison, Some(Comparison::Above));
     assert_eq!(rule.series, None);
-    assert_eq!(rule.for_secs, 300);
+    assert_eq!(rule.hold, TimeDelta::seconds(300));
     assert!(rule.enabled);
     assert!(rule.all_channels);
     check_rule(rule).unwrap();
@@ -1016,7 +1028,7 @@ async fn every_server_starts_with_a_rule_for_inodes_running_out() {
     );
     assert_eq!(rule.comparison, Some(Comparison::Above));
     assert_eq!(rule.series, None);
-    assert_eq!(rule.for_secs, 300);
+    assert_eq!(rule.hold, TimeDelta::seconds(300));
     assert!(rule.enabled);
     assert!(rule.all_channels);
     check_rule(rule).unwrap();
@@ -1039,8 +1051,8 @@ async fn deliver_all(test: &Harness) -> Vec<Event> {
 }
 
 /// Checks rules after a reading of `/` at `minute`, and gives what's open.
-async fn disk_at(test: &mut Harness, minute: i64, percent: f64) -> Vec<crate::alerting::Alert> {
-    let offset = minute * MINUTE_MS;
+async fn disk_at(test: &mut Harness, minute: i32, percent: f64) -> Vec<crate::alerting::Alert> {
+    let offset = MINUTE * minute;
     let reading = test.reading("/", test.now + offset, percent);
     test.script.set(vec![reading]);
     test.evaluate(offset).await;
@@ -1101,7 +1113,7 @@ async fn a_channel_not_told_yet_hears_of_the_alert_as_it_is_when_it_does() {
         metric: Some("disk.usage".to_string()),
         threshold: Some(90.0),
         warning_threshold: Some(80.0),
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         all_channels: true,
         ..cpu_rule()
     };
@@ -1201,7 +1213,7 @@ async fn a_warnings_only_channel_follows_a_warning_that_goes_critical_but_not_on
         metric: Some("disk.usage".to_string()),
         threshold: Some(90.0),
         warning_threshold: Some(80.0),
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         all_channels: true,
         ..cpu_rule()
     };
@@ -1232,7 +1244,7 @@ async fn a_pager_is_not_sent_an_alert_that_eased_before_it_went() {
         metric: Some("disk.usage".to_string()),
         threshold: Some(90.0),
         warning_threshold: Some(80.0),
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         all_channels: true,
         ..cpu_rule()
     };
@@ -1256,14 +1268,14 @@ async fn a_critical_alert_reaches_a_critical_only_channel_straight_away() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
         all_channels: true,
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
     let pager = pager("http://127.0.0.1:9/pager");
     let pager = test.database().create_channel(&pager).await.unwrap();
 
-    test.cpu(0, 99.0).await;
+    test.cpu(TimeDelta::zero(), 99.0).await;
     assert_eq!(deliver_by_channel(&test).await, [(pager, Event::Firing)]);
 }
 
@@ -1271,14 +1283,14 @@ async fn a_critical_alert_reaches_a_critical_only_channel_straight_away() {
 async fn alerts_lead_with_the_host_and_keep_its_id_for_hovering() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
     let client = test.client.as_mut().unwrap();
     send(client, &facts("24.04")).await;
     test.server.wait_for_facts(&test.id(), 2).await;
-    test.cpu(0, 95.0).await;
+    test.cpu(TimeDelta::zero(), 95.0).await;
     let short = crate::registration::short_id(&test.id()).to_string();
 
     let mut browser = Browser::default();
@@ -1325,15 +1337,18 @@ async fn an_agent_coming_back_resolves_at_once() {
         .await
         .unwrap();
     test.go_offline().await;
-    let gone = test.server.state.presence.get(&test.id()).unwrap().since_ms as i64;
-    test.evaluator.evaluate(gone + 60_000).await.unwrap();
+    let gone = test.server.state.presence.get(&test.id()).unwrap().since;
+    test.evaluator
+        .evaluate(gone + TimeDelta::minutes(1))
+        .await
+        .unwrap();
     assert_eq!(test.open().await.len(), 1);
 
     let mut client = test.server.connect().await;
     let status = handshake(&mut client, &test.host, "web-1", None).await;
     assert_eq!(status, RegistrationStatus::Approved);
     test.server.wait_for_online(&test.id(), true).await;
-    let back = test.server.state.presence.get(&test.id()).unwrap().since_ms as i64;
+    let back = test.server.state.presence.get(&test.id()).unwrap().since;
 
     test.evaluator.evaluate(back).await.unwrap();
     assert!(test.open().await.is_empty());
@@ -1353,24 +1368,29 @@ async fn an_agent_coming_back_just_after_a_restart_resolves_at_once() {
         .await
         .unwrap();
     test.go_offline().await;
-    let gone = test.server.state.presence.get(&test.id()).unwrap().since_ms as i64;
-    test.evaluator.evaluate(gone + 60_000).await.unwrap();
+    let gone = test.server.state.presence.get(&test.id()).unwrap().since;
+    test.evaluator
+        .evaluate(gone + TimeDelta::minutes(1))
+        .await
+        .unwrap();
     assert_eq!(test.open().await.len(), 1);
 
     let mut client = test.server.connect().await;
     handshake(&mut client, &test.host, "web-1", None).await;
     test.server.wait_for_online(&test.id(), true).await;
-    let back = test.server.state.presence.get(&test.id()).unwrap().since_ms as i64;
+    let back = test.server.state.presence.get(&test.id()).unwrap().since;
 
     // Still within the grace period after the restart.
     let mut restarted = evaluator(&test.server, back);
-    restarted.evaluate(back + 1000).await.unwrap();
+    restarted
+        .evaluate(back + TimeDelta::seconds(1))
+        .await
+        .unwrap();
     assert!(test.open().await.is_empty());
 }
 
 #[tokio::test]
 async fn the_running_evaluator_resolves_a_reconnected_agent_within_moments() {
-    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
     let mut test = Harness::start().await;
@@ -1379,16 +1399,19 @@ async fn the_running_evaluator_resolves_a_reconnected_agent_within_moments() {
         .await
         .unwrap();
     test.go_offline().await;
-    let gone = test.server.state.presence.get(&test.id()).unwrap().since_ms as i64;
-    test.evaluator.evaluate(gone + 60_000).await.unwrap();
+    let gone = test.server.state.presence.get(&test.id()).unwrap().since;
+    test.evaluator
+        .evaluate(gone + TimeDelta::minutes(1))
+        .await
+        .unwrap();
     assert_eq!(test.open().await.len(), 1);
 
     // Its first pass runs at once. After that only the agent coming back can make
     // it check again before the next pass, 15 seconds later.
     let status = test.server.state.status.clone();
-    let before = status.last_alert_pass_ms.load(Ordering::Relaxed);
-    let running = evaluator(&test.server, gone - 10 * MINUTE_MS).spawn();
-    while status.last_alert_pass_ms.load(Ordering::Relaxed) == before {
+    let before = status.last_alert_pass();
+    let running = evaluator(&test.server, gone - MINUTE * 10).spawn();
+    while status.last_alert_pass() == before {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(test.open().await.len(), 1);
@@ -1423,9 +1446,12 @@ async fn a_restart_does_not_look_like_the_fleet_going_down() {
     server.connect_approved(&host, "web-1").await;
     server.wait_for_online(&host.id(), false).await;
 
-    let started = now_ms() + MINUTE_MS;
+    let started = crate::times::now() + MINUTE;
     let mut restarted = evaluator(&server, started);
-    restarted.evaluate(started + 119_000).await.unwrap();
+    restarted
+        .evaluate(started + TimeDelta::seconds(119))
+        .await
+        .unwrap();
     assert!(
         server
             .state
@@ -1437,7 +1463,10 @@ async fn a_restart_does_not_look_like_the_fleet_going_down() {
     );
 
     // The grace period is over, and it really is gone.
-    restarted.evaluate(started + 120_000).await.unwrap();
+    restarted
+        .evaluate(started + TimeDelta::minutes(2))
+        .await
+        .unwrap();
     assert_eq!(server.state.database.open_alerts().await.unwrap().len(), 1);
 }
 
@@ -1449,12 +1478,18 @@ async fn an_open_offline_alert_survives_the_grace_period_after_a_restart() {
         .await
         .unwrap();
     test.go_offline().await;
-    let gone = test.server.state.presence.get(&test.id()).unwrap().since_ms as i64;
-    test.evaluator.evaluate(gone + 60_000).await.unwrap();
+    let gone = test.server.state.presence.get(&test.id()).unwrap().since;
+    test.evaluator
+        .evaluate(gone + TimeDelta::minutes(1))
+        .await
+        .unwrap();
 
-    let restart = gone + 120_000;
+    let restart = gone + TimeDelta::minutes(2);
     let mut restarted = evaluator(&test.server, restart);
-    restarted.evaluate(restart + 1000).await.unwrap();
+    restarted
+        .evaluate(restart + TimeDelta::seconds(1))
+        .await
+        .unwrap();
 
     assert_eq!(test.open().await.len(), 1);
     assert!(test.resolved().await.is_empty());
@@ -1481,7 +1516,7 @@ async fn an_agent_never_seen_since_a_restart_counts_as_offline() {
         .await
         .unwrap();
 
-    let started = now_ms();
+    let started = crate::times::now();
     let mut restarted = Evaluator::new(
         state.database.clone(),
         state.registry.clone(),
@@ -1491,7 +1526,10 @@ async fn an_agent_never_seen_since_a_restart_counts_as_offline() {
         state.actions.clone(),
         started,
     );
-    restarted.evaluate(started + 120_000).await.unwrap();
+    restarted
+        .evaluate(started + TimeDelta::minutes(2))
+        .await
+        .unwrap();
 
     let open = state.database.open_alerts().await.unwrap();
     assert_eq!(open.len(), 1);
@@ -1509,7 +1547,7 @@ async fn a_stopped_process_alerts_from_what_an_agent_really_sends() {
         series: Some("nginx".to_string()),
         comparison: Some(Comparison::Below),
         threshold: Some(1.0),
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
     server
@@ -1519,9 +1557,9 @@ async fn a_stopped_process_alerts_from_what_an_agent_really_sends() {
         .await
         .unwrap();
 
-    let sample = |timestamp_ms: i64, count: u64| {
+    let sample = |time: Timestamp, count: u64| {
         AgentMessage::Sample(Sample {
-            timestamp_ms: timestamp_ms as u64,
+            time,
             metrics: BTreeMap::from([(
                 "processes".to_string(),
                 json!([
@@ -1531,16 +1569,16 @@ async fn a_stopped_process_alerts_from_what_an_agent_really_sends() {
             )]),
         })
     };
-    let wait_for = |count: f64, after: i64| {
+    let wait_for = |count: f64, after: Timestamp| {
         let metrics = server.state.metrics.clone();
         async move {
             let metric = crate::metrics::find("process.count").unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
             while Instant::now() < deadline {
-                let rows = metrics.newest(metric, now_ms()).await.unwrap();
+                let rows = metrics.newest(metric, crate::times::now()).await.unwrap();
                 if rows
                     .iter()
-                    .any(|r| r.series == "nginx" && r.value == count && r.time_ms >= after)
+                    .any(|r| r.series == "nginx" && r.value == count && r.time >= after)
                 {
                     return;
                 }
@@ -1550,11 +1588,11 @@ async fn a_stopped_process_alerts_from_what_an_agent_really_sends() {
         }
     };
 
-    let mut evaluator = evaluator(&server, now_ms() - 60 * MINUTE_MS);
-    let first = now_ms() - 2000;
+    let mut evaluator = evaluator(&server, crate::times::now() - MINUTE * 60);
+    let first = crate::times::now() - TimeDelta::seconds(2);
     send(&mut client, &sample(first, 2)).await;
     wait_for(2.0, first).await;
-    evaluator.evaluate(now_ms()).await.unwrap();
+    evaluator.evaluate(crate::times::now()).await.unwrap();
     assert!(
         server
             .state
@@ -1565,10 +1603,10 @@ async fn a_stopped_process_alerts_from_what_an_agent_really_sends() {
             .is_empty()
     );
 
-    let second = now_ms() - 1000;
+    let second = crate::times::now() - TimeDelta::seconds(1);
     send(&mut client, &sample(second, 0)).await;
     wait_for(0.0, second).await;
-    evaluator.evaluate(now_ms()).await.unwrap();
+    evaluator.evaluate(crate::times::now()).await.unwrap();
 
     let open = server.state.database.open_alerts().await.unwrap();
     assert_eq!(open.len(), 1, "only the rule's own process");
@@ -1585,9 +1623,9 @@ async fn process_charts_only_appear_for_agents_that_report_processes() {
 
     let watching = identity();
     let mut client = server.connect_approved(&watching, "web-2").await;
-    let time = now_ms() - 1000;
+    let time = crate::times::now() - TimeDelta::seconds(1);
     let sample = AgentMessage::Sample(Sample {
-        timestamp_ms: time as u64,
+        time,
         metrics: BTreeMap::from([(
             "processes".to_string(),
             json!([{ "name": "nginx", "count": 2, "cpu_percent": 1.0, "memory_percent": 1.0 }]),
@@ -1600,7 +1638,7 @@ async fn process_charts_only_appear_for_agents_that_report_processes() {
     while server
         .state
         .metrics
-        .newest(metric, now_ms())
+        .newest(metric, crate::times::now())
         .await
         .unwrap()
         .is_empty()
@@ -1629,9 +1667,9 @@ async fn a_metric_for_alerts_only_gets_no_chart_but_can_still_be_read() {
     let server = start_with_metrics().await;
     let host = identity();
     let mut client = server.connect_approved(&host, "web-1").await;
-    let time = now_ms() - 1000;
+    let time = crate::times::now() - TimeDelta::seconds(1);
     let sample = AgentMessage::Sample(Sample {
-        timestamp_ms: time as u64,
+        time,
         metrics: BTreeMap::from([(
             "network".to_string(),
             json!({ "en0": { "received_bytes": 0, "transmitted_bytes": 0, "link_up": 1 } }),
@@ -1644,7 +1682,7 @@ async fn a_metric_for_alerts_only_gets_no_chart_but_can_still_be_read() {
     while server
         .state
         .metrics
-        .newest(metric, now_ms())
+        .newest(metric, crate::times::now())
         .await
         .unwrap()
         .is_empty()
@@ -1664,9 +1702,9 @@ async fn an_hosts_page_shows_how_its_checks_last_went() {
     let server = start_with_metrics().await;
     let host = identity();
     let mut client = server.connect_approved(&host, "web-1").await;
-    let time = now_ms() - 1000;
+    let time = crate::times::now() - TimeDelta::seconds(1);
     let sample = AgentMessage::Sample(Sample {
-        timestamp_ms: time as u64,
+        time,
         metrics: BTreeMap::from([(
             "checks".to_string(),
             json!([
@@ -1691,7 +1729,7 @@ async fn an_hosts_page_shows_how_its_checks_last_went() {
     while server
         .state
         .metrics
-        .newest(metric, now_ms())
+        .newest(metric, crate::times::now())
         .await
         .unwrap()
         .is_empty()
@@ -1718,7 +1756,7 @@ async fn an_hosts_page_shows_its_custom_metrics_without_trusting_them() {
     let host = identity();
     let mut client = server.connect_approved(&host, "web-1").await;
     let sample = AgentMessage::Sample(Sample {
-        timestamp_ms: (now_ms() - 1000) as u64,
+        time: (crate::times::now() - TimeDelta::seconds(1)),
         metrics: BTreeMap::from([(
             "custom".to_string(),
             json!([
@@ -1738,7 +1776,7 @@ async fn an_hosts_page_shows_its_custom_metrics_without_trusting_them() {
     while server
         .state
         .metrics
-        .newest(metric, now_ms())
+        .newest(metric, crate::times::now())
         .await
         .unwrap()
         .is_empty()
@@ -1765,7 +1803,7 @@ async fn a_windows_hosts_page_shows_its_performance_counters() {
     let host = identity();
     let mut client = server.connect_approved(&host, "win-1").await;
     let sample = AgentMessage::Sample(Sample {
-        timestamp_ms: (now_ms() - 1000) as u64,
+        time: (crate::times::now() - TimeDelta::seconds(1)),
         metrics: BTreeMap::from([(
             "counters".to_string(),
             json!([
@@ -1781,7 +1819,12 @@ async fn a_windows_hosts_page_shows_its_performance_counters() {
     let metric = crate::metrics::find("counter.value").unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     let newest = loop {
-        let newest = server.state.metrics.newest(metric, now_ms()).await.unwrap();
+        let newest = server
+            .state
+            .metrics
+            .newest(metric, crate::times::now())
+            .await
+            .unwrap();
         if !newest.is_empty() {
             break newest;
         }
@@ -1929,8 +1972,8 @@ impl Hook {
 }
 
 /// A time long enough from now that every notification queued is due by then.
-fn everything_due() -> i64 {
-    now_ms() + 365 * 24 * 3_600_000
+fn everything_due() -> Timestamp {
+    crate::times::now() + TimeDelta::days(365)
 }
 
 fn webhook_channel(url: &str) -> ChannelInput {
@@ -1954,17 +1997,17 @@ async fn firing_with_channel(test: &mut Harness, url: &str) -> Notifier {
         .await
         .unwrap();
     let rule = AlertRuleInput {
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         channels: vec![channel],
         ..cpu_rule()
     };
     database.create_alert_rule(&rule).await.unwrap();
-    test.cpu(0, 95.0).await;
+    test.cpu(TimeDelta::zero(), 95.0).await;
     Notifier::new(database, Senders::default())
 }
 
-async fn due(test: &Harness, at_ms: i64) -> Vec<Delivery> {
-    test.database().due_deliveries(at_ms, 16).await.unwrap()
+async fn due(test: &Harness, at: Timestamp) -> Vec<Delivery> {
+    test.database().due_deliveries(at, 16).await.unwrap()
 }
 
 #[tokio::test]
@@ -1975,11 +2018,14 @@ async fn a_webhook_hears_about_an_alert_starting_and_ending_once_each() {
     let notifier = firing_with_channel(&mut test, &url).await;
 
     notifier.deliver_due(test.now).await.unwrap();
-    notifier.deliver_due(test.now + 1).await.unwrap();
+    notifier
+        .deliver_due(test.now + TimeDelta::milliseconds(1))
+        .await
+        .unwrap();
     assert_eq!(hook.events(), ["firing"]);
 
-    test.cpu(MINUTE_MS, 10.0).await;
-    notifier.deliver_due(test.now + MINUTE_MS).await.unwrap();
+    test.cpu(MINUTE, 10.0).await;
+    notifier.deliver_due(test.now + MINUTE).await.unwrap();
     assert_eq!(hook.events(), ["firing", "resolved"]);
 
     let received = hook.received.lock().unwrap();
@@ -2023,12 +2069,12 @@ async fn a_discord_channel_gets_discords_message_format() {
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         channels: vec![channel],
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
-    test.cpu(0, 95.0).await;
+    test.cpu(TimeDelta::zero(), 95.0).await;
 
     Notifier::new(test.database().clone(), Senders::default())
         .deliver_due(test.now)
@@ -2091,12 +2137,12 @@ async fn a_teams_channel_gets_an_adaptive_card() {
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         channels: vec![channel],
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
-    test.cpu(0, 95.0).await;
+    test.cpu(TimeDelta::zero(), 95.0).await;
 
     Notifier::new(test.database().clone(), Senders::default())
         .deliver_due(test.now)
@@ -2351,12 +2397,12 @@ async fn firing_on(
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         channels: vec![channel],
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
-    test.cpu(0, 95.0).await;
+    test.cpu(TimeDelta::zero(), 95.0).await;
     Notifier::new(test.database().clone(), senders)
 }
 
@@ -2375,8 +2421,8 @@ async fn an_alert_opens_and_closes_in_alertops() {
     let notifier = firing_on(&mut test, ChannelKind::AlertOps, &url, with_web_url()).await;
 
     notifier.deliver_due(test.now).await.unwrap();
-    test.cpu(MINUTE_MS, 10.0).await;
-    notifier.deliver_due(test.now + MINUTE_MS).await.unwrap();
+    test.cpu(MINUTE, 10.0).await;
+    notifier.deliver_due(test.now + MINUTE).await.unwrap();
 
     let events = alertops.events();
     assert_eq!(events.len(), 2, "{events:?}");
@@ -2398,8 +2444,8 @@ async fn an_alert_opens_and_closes_in_signl4() {
     let notifier = firing_on(&mut test, ChannelKind::Signl4, &url, with_web_url()).await;
 
     notifier.deliver_due(test.now).await.unwrap();
-    test.cpu(MINUTE_MS, 10.0).await;
-    notifier.deliver_due(test.now + MINUTE_MS).await.unwrap();
+    test.cpu(MINUTE, 10.0).await;
+    notifier.deliver_due(test.now + MINUTE).await.unwrap();
 
     let events = signl4.events();
     assert_eq!(events.len(), 2, "{events:?}");
@@ -2571,8 +2617,8 @@ async fn resolving_closes_the_same_pagerduty_incident() {
     let notifier = firing_on_pagerduty(&mut test, &pagerduty).await;
     notifier.deliver_due(test.now).await.unwrap();
 
-    test.cpu(MINUTE_MS, 10.0).await;
-    notifier.deliver_due(test.now + MINUTE_MS).await.unwrap();
+    test.cpu(MINUTE, 10.0).await;
+    notifier.deliver_due(test.now + MINUTE).await.unwrap();
 
     let events = pagerduty.events();
     assert_eq!(events.len(), 2, "{events:?}");
@@ -2592,7 +2638,10 @@ async fn pagerduty_being_busy_is_tried_again_with_the_same_incident() {
     let problems = test.database().delivery_problems(10).await.unwrap();
     assert_eq!(problems[0].error, "PagerDuty returned status 429");
 
-    notifier.deliver_due(test.now + 60_000).await.unwrap();
+    notifier
+        .deliver_due(test.now + TimeDelta::minutes(1))
+        .await
+        .unwrap();
 
     let events = pagerduty.events();
     assert_eq!(events.len(), 2);
@@ -2751,12 +2800,12 @@ async fn firing_on_telegram(test: &mut Harness, telegram: &FakeTelegram) -> Noti
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         channels: vec![channel],
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
-    test.cpu(0, 95.0).await;
+    test.cpu(TimeDelta::zero(), 95.0).await;
     Notifier::new(
         test.database().clone(),
         Senders {
@@ -2773,8 +2822,8 @@ async fn an_alert_posts_to_telegram_and_resolving_replies_to_it() {
     let telegram = FakeTelegram::default();
     let notifier = firing_on_telegram(&mut test, &telegram).await;
     notifier.deliver_due(test.now).await.unwrap();
-    test.cpu(MINUTE_MS, 10.0).await;
-    notifier.deliver_due(test.now + MINUTE_MS).await.unwrap();
+    test.cpu(MINUTE, 10.0).await;
+    notifier.deliver_due(test.now + MINUTE).await.unwrap();
 
     let calls = telegram.calls();
     assert_eq!(calls.len(), 2, "{calls:?}");
@@ -2832,7 +2881,10 @@ async fn a_telegram_error_is_retried_and_never_shows_the_token() {
     assert!(page.body.contains("find that chat"), "{}", page.body);
     assert!(!page.body.contains("AAHdqTcv"), "{}", page.body);
 
-    notifier.deliver_due(test.now + 30_000).await.unwrap();
+    notifier
+        .deliver_due(test.now + TimeDelta::seconds(30))
+        .await
+        .unwrap();
     assert_eq!(telegram.calls().len(), 2);
     assert!(
         test.database()
@@ -2952,12 +3004,12 @@ async fn firing_on_slack_app(
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         channels: vec![channel],
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
-    test.cpu(0, 95.0).await;
+    test.cpu(TimeDelta::zero(), 95.0).await;
     Notifier::new(
         test.database().clone(),
         Senders {
@@ -3040,8 +3092,8 @@ async fn slack_alerts_get_buttons_when_the_server_listens_to_the_app() {
     assert_eq!(first["value"], alert_id);
     assert_eq!(first["style"], "primary");
 
-    test.cpu(MINUTE_MS, 10.0).await;
-    notifier.deliver_due(test.now + MINUTE_MS).await.unwrap();
+    test.cpu(MINUTE, 10.0).await;
+    notifier.deliver_due(test.now + MINUTE).await.unwrap();
     let update = &slack.calls()[1].2;
     assert!(buttons(update).is_empty(), "{update}");
 }
@@ -3077,7 +3129,11 @@ async fn silencing_from_slack_covers_just_that_alert_for_an_hour() {
     press(&slack, &actions, SILENCE_HOUR_ACTION, alert_id).await;
     press(&slack, &actions, SILENCE_HOUR_ACTION, alert_id).await;
 
-    let silences = test.database().active_silences(now_ms()).await.unwrap();
+    let silences = test
+        .database()
+        .active_silences(crate::times::now())
+        .await
+        .unwrap();
     assert_eq!(silences.len(), 1, "{silences:?}");
     let silence = &silences[0];
     assert_eq!(silence.rule_id, test.open().await[0].rule_id);
@@ -3088,7 +3144,7 @@ async fn silencing_from_slack_covers_just_that_alert_for_an_hour() {
     );
     assert_eq!(silence.created_by, SLACK_MEMBER);
     assert_eq!(silence.reason, "Silenced from Slack");
-    assert_eq!(silence.ends_at - silence.starts_at, millis(3_600_000));
+    assert_eq!(silence.ends_at - silence.starts_at, TimeDelta::hours(1));
 
     let answer = slack.answer();
     assert!(
@@ -3125,7 +3181,7 @@ async fn a_viewer_cannot_act_from_slack() {
     let (actions, alert_id) = slack_buttons(&mut test, &slack).await;
     let viewer = crate::roles::Role::Viewer;
     test.database()
-        .create_user("viewer@example.com", "Viewer", viewer, 0)
+        .create_user("viewer@example.com", "Viewer", viewer, test.now)
         .await
         .unwrap();
     *slack.user.lock().unwrap() =
@@ -3191,7 +3247,7 @@ async fn a_disabled_account_stops_working_at_once() {
         .unwrap()
         .unwrap();
     test.database()
-        .disable_user(user.id, now_ms())
+        .disable_user(user.id, crate::times::now())
         .await
         .unwrap();
     press(&slack, &actions, ACKNOWLEDGE_ACTION, alert_id).await;
@@ -3205,7 +3261,7 @@ async fn a_button_on_a_resolved_alert_shows_that_it_resolved() {
     let mut test = Harness::start().await;
     let slack = FakeSlack::default();
     let (actions, alert_id) = slack_buttons(&mut test, &slack).await;
-    test.cpu(MINUTE_MS, 10.0).await;
+    test.cpu(MINUTE, 10.0).await;
 
     press(&slack, &actions, SILENCE_HOUR_ACTION, alert_id).await;
 
@@ -3217,7 +3273,7 @@ async fn a_button_on_a_resolved_alert_shows_that_it_resolved() {
     assert!(text.starts_with("*RESOLVED*"), "{text}");
     assert!(
         test.database()
-            .active_silences(now_ms())
+            .active_silences(crate::times::now())
             .await
             .unwrap()
             .is_empty()
@@ -3371,8 +3427,8 @@ async fn resolving_updates_the_slack_message_and_replies_in_its_thread() {
     let notifier = firing_on_slack(&mut test, &slack).await;
     notifier.deliver_due(test.now).await.unwrap();
 
-    test.cpu(MINUTE_MS, 10.0).await;
-    notifier.deliver_due(test.now + MINUTE_MS).await.unwrap();
+    test.cpu(MINUTE, 10.0).await;
+    notifier.deliver_due(test.now + MINUTE).await.unwrap();
 
     assert_eq!(slack.methods(), ["post", "update", "post"]);
     let calls = slack.calls();
@@ -3395,9 +3451,9 @@ async fn a_deleted_slack_message_gets_a_new_one_when_resolving() {
     let notifier = firing_on_slack(&mut test, &slack).await;
     notifier.deliver_due(test.now).await.unwrap();
 
-    test.cpu(MINUTE_MS, 10.0).await;
+    test.cpu(MINUTE, 10.0).await;
     slack.errors.lock().unwrap().push("message_not_found");
-    notifier.deliver_due(test.now + MINUTE_MS).await.unwrap();
+    notifier.deliver_due(test.now + MINUTE).await.unwrap();
 
     assert_eq!(slack.methods(), ["post", "update", "post"]);
     let calls = slack.calls();
@@ -3428,7 +3484,10 @@ async fn a_slack_error_is_retried_and_says_what_slack_said() {
     );
     assert_eq!(problems[0].state, "pending");
 
-    notifier.deliver_due(test.now + 30_000).await.unwrap();
+    notifier
+        .deliver_due(test.now + TimeDelta::seconds(30))
+        .await
+        .unwrap();
     assert_eq!(slack.methods(), ["post", "post"]);
     assert!(
         test.database()
@@ -3559,13 +3618,13 @@ async fn a_plain_webhook_into_slack_gets_a_warning() {
 async fn an_alert_with_no_channels_sends_nothing() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
-    test.cpu(0, 95.0).await;
-    test.cpu(MINUTE_MS, 10.0).await;
-    assert!(due(&test, test.now + 2 * MINUTE_MS).await.is_empty());
+    test.cpu(TimeDelta::zero(), 95.0).await;
+    test.cpu(MINUTE, 10.0).await;
+    assert!(due(&test, test.now + MINUTE * 2).await.is_empty());
 }
 
 #[tokio::test]
@@ -3587,8 +3646,16 @@ async fn a_failed_delivery_is_retried_later_and_shown_until_it_works() {
     assert_eq!(problems[0].state, "pending");
     assert_eq!(problems[0].attempts, 1);
 
-    assert!(due(&test, test.now + 29_999).await.is_empty(), "too soon");
-    notifier.deliver_due(test.now + 30_000).await.unwrap();
+    assert!(
+        due(&test, test.now + TimeDelta::milliseconds(29_999))
+            .await
+            .is_empty(),
+        "too soon"
+    );
+    notifier
+        .deliver_due(test.now + TimeDelta::seconds(30))
+        .await
+        .unwrap();
     assert_eq!(hook.events().len(), 2);
     assert!(
         test.database()
@@ -3597,7 +3664,7 @@ async fn a_failed_delivery_is_retried_later_and_shown_until_it_works() {
             .unwrap()
             .is_empty()
     );
-    assert!(due(&test, test.now + 10 * MINUTE_MS).await.is_empty());
+    assert!(due(&test, test.now + MINUTE * 10).await.is_empty());
 }
 
 #[tokio::test]
@@ -3612,13 +3679,22 @@ async fn a_resolved_notice_waits_for_its_firing_notice() {
     let notifier = firing_with_channel(&mut test, &url).await;
 
     notifier.deliver_due(test.now).await.unwrap();
-    test.cpu(1000, 10.0).await;
+    test.cpu(TimeDelta::seconds(1), 10.0).await;
 
-    notifier.deliver_due(test.now + 2000).await.unwrap();
+    notifier
+        .deliver_due(test.now + TimeDelta::seconds(2))
+        .await
+        .unwrap();
     assert_eq!(hook.events(), ["firing"], "only the failed attempt so far");
 
-    notifier.deliver_due(test.now + 31_000).await.unwrap();
-    notifier.deliver_due(test.now + 31_001).await.unwrap();
+    notifier
+        .deliver_due(test.now + TimeDelta::seconds(31))
+        .await
+        .unwrap();
+    notifier
+        .deliver_due(test.now + TimeDelta::milliseconds(31_001))
+        .await
+        .unwrap();
     assert_eq!(hook.events(), ["firing", "firing", "resolved"]);
 }
 
@@ -3665,8 +3741,8 @@ async fn a_channel_that_is_down_does_not_hold_up_the_others() {
         series: series.to_string(),
         value: Some(99.0),
         summary: format!("{series} on web-1 is 99% full"),
-        started_at: crate::times::from_ms(test.now),
-        breached_at: crate::times::from_ms(test.now),
+        started_at: test.now,
+        breached_at: test.now,
     };
     for n in 0..600 {
         test.database()
@@ -3683,7 +3759,10 @@ async fn a_channel_that_is_down_does_not_hold_up_the_others() {
     // Each pass takes a batch. The dead channel's rows fail at once and wait to be
     // retried, so the healthy channel's turn comes within a few dozen passes.
     for pass in 0..60 {
-        notifier.deliver_due(test.now + pass).await.unwrap();
+        notifier
+            .deliver_due(test.now + TimeDelta::milliseconds(pass))
+            .await
+            .unwrap();
         if !hook.events().is_empty() {
             break;
         }
@@ -3710,25 +3789,29 @@ async fn a_delivery_is_given_up_on_after_a_day_and_says_so() {
     let notifier = firing_with_channel(&mut test, &url).await;
 
     notifier.deliver_due(test.now).await.unwrap();
-    let day = 24 * 60 * MINUTE_MS;
+    let day = TimeDelta::days(1);
     notifier.deliver_due(test.now + day).await.unwrap();
 
     let problems = test.database().delivery_problems(10).await.unwrap();
     assert_eq!(problems[0].state, "failed");
-    assert!(due(&test, test.now + 2 * day).await.is_empty());
+    assert!(due(&test, test.now + day * 2).await.is_empty());
 
     let page = Browser::default().get(&test.server, "/alerts").await;
     assert!(page.body.contains(">Failed</span>"), "{}", page.body);
     assert!(page.body.contains("the webhook returned status 502"));
 
     // The channel never heard the alert start, so it doesn't hear it end.
-    test.cpu(2 * day, 10.0).await;
+    test.cpu(day * 2, 10.0).await;
     notifier
-        .deliver_due(test.now + 2 * day + 1000)
+        .deliver_due(test.now + day * 2 + TimeDelta::seconds(1))
         .await
         .unwrap();
     assert_eq!(hook.events(), ["firing", "firing"]);
-    assert!(due(&test, test.now + 2 * day + 2000).await.is_empty());
+    assert!(
+        due(&test, test.now + day * 2 + TimeDelta::seconds(2))
+            .await
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -3756,8 +3839,8 @@ async fn resolved_notices_go_to_whoever_heard_it_fired_even_if_the_rule_is_gone(
         .delete_alert_rule(rule, test.now)
         .await
         .unwrap();
-    test.evaluate(MINUTE_MS).await;
-    notifier.deliver_due(test.now + MINUTE_MS).await.unwrap();
+    test.evaluate(MINUTE).await;
+    notifier.deliver_due(test.now + MINUTE).await.unwrap();
 
     assert_eq!(hook.events(), ["firing", "resolved"]);
 }
@@ -3771,17 +3854,23 @@ async fn resolving_an_alert_twice_only_tells_people_once() {
     notifier.deliver_due(test.now).await.unwrap();
 
     let alert = test.open().await[0].id;
-    let later = test.now + MINUTE_MS;
+    let later = test.now + MINUTE;
     test.database()
         .resolve_alert(alert, later, "first", None)
         .await
         .unwrap();
     test.database()
-        .resolve_alert(alert, later + 1, "second", None)
+        .resolve_alert(alert, later + TimeDelta::milliseconds(1), "second", None)
         .await
         .unwrap();
-    notifier.deliver_due(later + 2).await.unwrap();
-    notifier.deliver_due(later + 3).await.unwrap();
+    notifier
+        .deliver_due(later + TimeDelta::milliseconds(2))
+        .await
+        .unwrap();
+    notifier
+        .deliver_due(later + TimeDelta::milliseconds(3))
+        .await
+        .unwrap();
 
     assert_eq!(hook.events(), ["firing", "resolved"]);
     assert_eq!(
@@ -3962,12 +4051,12 @@ async fn email_channels_send_a_message_to_every_address() {
         .await
         .unwrap();
     let rule = AlertRuleInput {
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         channels: vec![channel],
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
-    test.cpu(0, 95.0).await;
+    test.cpu(TimeDelta::zero(), 95.0).await;
 
     let notifier = Notifier::new(test.database().clone(), Senders::default());
     notifier.deliver_due(test.now).await.unwrap();
@@ -3981,7 +4070,7 @@ async fn email_channels_send_a_message_to_every_address() {
         "{heard}"
     );
     assert!(heard.contains("Rule: High CPU"), "{heard}");
-    assert!(due(&test, test.now + 10 * MINUTE_MS).await.is_empty());
+    assert!(due(&test, test.now + MINUTE * 10).await.is_empty());
 }
 
 #[tokio::test]
@@ -3994,12 +4083,12 @@ async fn an_email_channel_from_before_mail_servers_were_per_channel_says_what_it
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         channels: vec![channel],
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
-    test.cpu(0, 95.0).await;
+    test.cpu(TimeDelta::zero(), 95.0).await;
 
     Notifier::new(test.database().clone(), Senders::default())
         .deliver_due(test.now)
@@ -4118,12 +4207,12 @@ async fn resend_firing(test: &mut Harness) {
         .await
         .unwrap();
     let rule = AlertRuleInput {
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         channels: vec![channel],
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
-    test.cpu(0, 95.0).await;
+    test.cpu(TimeDelta::zero(), 95.0).await;
 }
 
 #[tokio::test]
@@ -4155,7 +4244,7 @@ async fn resend_channels_send_through_the_api_with_the_key() {
         heard.contains("[MaxNines CRITICAL] CPU usage on web-1 is 95%"),
         "{heard}"
     );
-    assert!(due(&test, test.now + 10 * MINUTE_MS).await.is_empty());
+    assert!(due(&test, test.now + MINUTE * 10).await.is_empty());
 }
 
 #[tokio::test]
@@ -4808,7 +4897,7 @@ async fn the_test_button_says_how_it_went() {
 async fn the_alerts_page_shows_what_is_firing_and_what_ended() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
@@ -4817,13 +4906,13 @@ async fn the_alerts_page_shows_what_is_firing_and_what_ended() {
     let page = browser.get(&test.server, "/alerts").await;
     assert!(page.body.contains("No alerts are open."), "{}", page.body);
 
-    test.cpu(0, 95.0).await;
+    test.cpu(TimeDelta::zero(), 95.0).await;
     let page = browser.get(&test.server, "/alerts").await;
     assert!(!page.body.contains("No alerts are open."));
     assert!(page.body.contains("CPU usage on web-1 is 95%, above 90%"));
     assert!(page.body.contains("Critical"));
 
-    test.cpu(MINUTE_MS, 10.0).await;
+    test.cpu(MINUTE, 10.0).await;
     let page = browser.get(&test.server, "/alerts").await;
     assert!(page.body.contains("No alerts are open."));
     assert!(
@@ -4844,7 +4933,7 @@ async fn names_from_agents_are_escaped_on_the_alerts_page() {
         .state
         .database
         .create_alert_rule(&AlertRuleInput {
-            for_secs: 0,
+            hold: TimeDelta::seconds(0),
             ..offline_rule()
         })
         .await
@@ -4919,12 +5008,12 @@ async fn deleting_an_agent_takes_everything_about_it_once_it_is_revoked() {
     let channel = webhook_channel("http://127.0.0.1:9/hook");
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         channels: vec![channel],
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
-    test.cpu(0, 95.0).await;
+    test.cpu(TimeDelta::zero(), 95.0).await;
     assert_eq!(test.open().await.len(), 1);
     let database = test.database().clone();
     let deliveries = || async { database.due_deliveries(everything_due(), 10).await.unwrap() };
@@ -5161,18 +5250,18 @@ async fn the_api_takes_a_webhook_url_but_never_gives_it_back() {
 async fn the_api_lists_open_and_resolved_alerts() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
-    test.cpu(0, 95.0).await;
+    test.cpu(TimeDelta::zero(), 95.0).await;
 
     let (status, alerts) = api(&test.server, "GET", "/api/v1/alerts", &Value::Null).await;
     assert_eq!(status, 200);
     assert_eq!(alerts["open"][0]["rule_name"], "High CPU");
     assert_eq!(alerts["resolved"].as_array().unwrap().len(), 0);
 
-    test.cpu(MINUTE_MS, 10.0).await;
+    test.cpu(MINUTE, 10.0).await;
     let (_, alerts) = api(&test.server, "GET", "/api/v1/alerts", &Value::Null).await;
     assert_eq!(alerts["open"].as_array().unwrap().len(), 0);
     assert_eq!(
@@ -5202,7 +5291,10 @@ async fn the_api_lists_notifications_that_have_not_arrived() {
     assert_eq!(problems[0]["attempts"], 1);
     assert_eq!(problems[0]["error"], "the webhook returned status 500");
 
-    notifier.deliver_due(test.now + 30_000).await.unwrap();
+    notifier
+        .deliver_due(test.now + TimeDelta::seconds(30))
+        .await
+        .unwrap();
     let (_, problems) = api(&test.server, "GET", path, &Value::Null).await;
     assert_eq!(problems, json!([]), "sent, so no longer a problem");
 }
@@ -5247,7 +5339,7 @@ mod remote {
         RemoteCheckInput {
             host_id: crate::remote_checks::LOCAL_HOST_ID.to_string(),
             check: Check::new(name, CheckKind::Tcp, target),
-            interval_secs: 60,
+            interval: Duration::from_secs(60),
             enabled: true,
             read_stats: false,
             extras: Vec::new(),
@@ -5255,7 +5347,7 @@ mod remote {
         }
     }
 
-    async fn run_due(scheduler: &mut Scheduler, now: i64) -> usize {
+    async fn run_due(scheduler: &mut Scheduler, now: Timestamp) -> usize {
         let started = scheduler.start_due(now).await.unwrap();
         let count = started.len();
         for task in started {
@@ -5279,10 +5371,16 @@ mod remote {
         let id = created.unwrap();
         let mut scheduler = scheduler(&server);
 
-        let now = now_ms();
+        let now = crate::times::now();
         assert_eq!(run_due(&mut scheduler, now).await, 1);
-        assert_eq!(run_due(&mut scheduler, now + 59_000).await, 0);
-        assert_eq!(run_due(&mut scheduler, now + 60_000).await, 1);
+        assert_eq!(
+            run_due(&mut scheduler, now + TimeDelta::seconds(59)).await,
+            0
+        );
+        assert_eq!(
+            run_due(&mut scheduler, now + TimeDelta::minutes(1)).await,
+            1
+        );
         assert_eq!(server.state.check_results.all()[&id]["up"], 1);
     }
 
@@ -5303,7 +5401,10 @@ mod remote {
             .await
             .unwrap();
 
-        assert_eq!(run_due(&mut scheduler(&server), now_ms()).await, 0);
+        assert_eq!(
+            run_due(&mut scheduler(&server), crate::times::now()).await,
+            0
+        );
     }
 
     #[tokio::test]
@@ -5318,10 +5419,10 @@ mod remote {
             .await
             .unwrap();
         let mut scheduler = scheduler(&server);
-        run_due(&mut scheduler, now_ms()).await;
+        run_due(&mut scheduler, crate::times::now()).await;
 
         server.state.database.delete_remote_check(id).await.unwrap();
-        run_due(&mut scheduler, now_ms()).await;
+        run_due(&mut scheduler, crate::times::now()).await;
         assert!(server.state.check_results.all().is_empty());
     }
 
@@ -5341,7 +5442,7 @@ mod remote {
             metric: Some("check.up".to_string()),
             comparison: Some(Comparison::Below),
             threshold: Some(1.0),
-            for_secs: 0,
+            hold: TimeDelta::seconds(0),
             ..cpu_rule()
         };
         server
@@ -5351,14 +5452,14 @@ mod remote {
             .await
             .unwrap();
 
-        run_due(&mut scheduler(&server), now_ms()).await;
+        run_due(&mut scheduler(&server), crate::times::now()).await;
 
         let metric = crate::metrics::find("check.up").unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while server
             .state
             .metrics
-            .newest(metric, now_ms())
+            .newest(metric, crate::times::now())
             .await
             .unwrap()
             .is_empty()
@@ -5367,8 +5468,8 @@ mod remote {
             sleep(Duration::from_millis(10)).await;
         }
 
-        let mut evaluator = evaluator(&server, now_ms() - 60 * MINUTE_MS);
-        evaluator.evaluate(now_ms()).await.unwrap();
+        let mut evaluator = evaluator(&server, crate::times::now() - MINUTE * 60);
+        evaluator.evaluate(crate::times::now()).await.unwrap();
         let open = server.state.database.open_alerts().await.unwrap();
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].host_id, LOCAL_HOST_ID);
@@ -5388,8 +5489,8 @@ mod remote {
             .await
             .unwrap();
 
-        let mut evaluator = evaluator(&server, now_ms() - 60 * MINUTE_MS);
-        evaluator.evaluate(now_ms()).await.unwrap();
+        let mut evaluator = evaluator(&server, crate::times::now() - MINUTE * 60);
+        evaluator.evaluate(crate::times::now()).await.unwrap();
         assert!(
             server
                 .state
@@ -5450,7 +5551,7 @@ mod remote {
         assert_eq!(page.status, 303, "{}", page.body);
         let saved = server.state.database.list_remote_checks().await.unwrap();
         assert_eq!(saved[0].input.check.regex.as_deref(), Some("Welcome back"));
-        assert_eq!(saved[0].input.interval_secs, 120);
+        assert_eq!(saved[0].input.interval, Duration::from_secs(120));
         let id = saved[0].id;
 
         let page = browser.get(&server, "/checks").await;
@@ -5472,7 +5573,7 @@ mod remote {
             .await;
         assert_eq!(page.status, 303, "{}", page.body);
         let saved = server.state.database.get_remote_check(id).await.unwrap();
-        assert_eq!(saved.unwrap().input.interval_secs, 300);
+        assert_eq!(saved.unwrap().input.interval, Duration::from_secs(300));
 
         let delete = format!("/checks/{id}/delete");
         let page = browser.submit(&server, &edit, &delete, &[]).await;
@@ -5558,7 +5659,7 @@ mod remote {
         let input = tcp_input("<b>db</b>", &target);
         let created = server.state.database.create_remote_check(&input).await;
         let id = created.unwrap();
-        run_due(&mut scheduler(&server), now_ms()).await;
+        run_due(&mut scheduler(&server), crate::times::now()).await;
 
         let mut browser = Browser::default();
         let own = format!("/checks/{id}");
@@ -5638,8 +5739,7 @@ mod silences {
     use super::*;
     use crate::silences::SilenceInput;
 
-    const HOUR_SECS: u64 = 3600;
-    const HOUR_MS: i64 = 3_600_000;
+    const HOUR: TimeDelta = TimeDelta::hours(1);
 
     fn silence(filter: &str) -> SilenceInput {
         SilenceInput {
@@ -5648,18 +5748,18 @@ mod silences {
             all_alerts: filter.is_empty(),
             series: String::new(),
             reason: "Upgrading".to_string(),
-            duration_secs: HOUR_SECS,
+            duration: HOUR,
         }
     }
 
-    /// Delivers notifications at `offset_ms`, and says how many have arrived in all.
+    /// Delivers notifications at `offset`, and says how many have arrived in all.
     async fn deliver(
         test: &Harness,
         notifier: &Notifier,
         hook: &FakeOnCall,
-        offset_ms: i64,
+        offset: TimeDelta,
     ) -> usize {
-        notifier.deliver_due(test.now + offset_ms).await.unwrap();
+        notifier.deliver_due(test.now + offset).await.unwrap();
         hook.events().len()
     }
 
@@ -5678,7 +5778,10 @@ mod silences {
         let hook = FakeOnCall::default();
         let notifier = on_a_webhook(&mut test, &hook).await;
 
-        assert_eq!(deliver(&test, &notifier, &hook, 1000).await, 0);
+        assert_eq!(
+            deliver(&test, &notifier, &hook, TimeDelta::seconds(1)).await,
+            0
+        );
         assert_eq!(test.open().await.len(), 1);
     }
 
@@ -5699,14 +5802,20 @@ mod silences {
             .create_silence(&silence, "sam", test.now)
             .await
             .unwrap();
-        assert_eq!(deliver(&test, &notifier, &hook, 1000).await, 0);
+        assert_eq!(
+            deliver(&test, &notifier, &hook, TimeDelta::seconds(1)).await,
+            0
+        );
 
         test.database()
-            .delete_alert_rule(rule, test.now + 2000)
+            .delete_alert_rule(rule, test.now + TimeDelta::seconds(2))
             .await
             .unwrap();
 
-        assert_eq!(deliver(&test, &notifier, &hook, 3000).await, 0);
+        assert_eq!(
+            deliver(&test, &notifier, &hook, TimeDelta::seconds(3)).await,
+            0
+        );
         assert!(test.open().await.is_empty());
         assert_eq!(
             test.resolved().await[0].resolve_reason.as_deref(),
@@ -5725,15 +5834,15 @@ mod silences {
         let due = test.database().due_deliveries(test.now, 16).await.unwrap();
         assert_eq!(due.len(), 1);
 
-        test.cpu(MINUTE_MS, 10.0).await;
+        test.cpu(MINUTE, 10.0).await;
         test.database().hold_delivery(&due[0]).await.unwrap();
 
         assert!(test.database().held_deliveries().await.unwrap().is_empty());
-        assert_eq!(deliver(&test, &notifier, &hook, MINUTE_MS + 1000).await, 0);
         assert_eq!(
-            deliver(&test, &notifier, &hook, HOUR_MS + MINUTE_MS).await,
+            deliver(&test, &notifier, &hook, MINUTE + TimeDelta::seconds(1)).await,
             0
         );
+        assert_eq!(deliver(&test, &notifier, &hook, HOUR + MINUTE).await, 0);
     }
 
     #[tokio::test]
@@ -5745,10 +5854,19 @@ mod silences {
             .unwrap();
         let hook = FakeOnCall::default();
         let notifier = on_a_webhook(&mut test, &hook).await;
-        assert_eq!(deliver(&test, &notifier, &hook, 1000).await, 0);
+        assert_eq!(
+            deliver(&test, &notifier, &hook, TimeDelta::seconds(1)).await,
+            0
+        );
 
-        assert_eq!(deliver(&test, &notifier, &hook, HOUR_MS + 1000).await, 1);
-        assert_eq!(deliver(&test, &notifier, &hook, HOUR_MS + 2000).await, 1);
+        assert_eq!(
+            deliver(&test, &notifier, &hook, HOUR + TimeDelta::seconds(1)).await,
+            1
+        );
+        assert_eq!(
+            deliver(&test, &notifier, &hook, HOUR + TimeDelta::seconds(2)).await,
+            1
+        );
     }
 
     #[tokio::test]
@@ -5761,12 +5879,21 @@ mod silences {
             .unwrap();
         let hook = FakeOnCall::default();
         let notifier = on_a_webhook(&mut test, &hook).await;
-        assert_eq!(deliver(&test, &notifier, &hook, 1000).await, 0);
+        assert_eq!(
+            deliver(&test, &notifier, &hook, TimeDelta::seconds(1)).await,
+            0
+        );
 
-        let ended = test.database().end_silence(id, test.now + 2000).await;
+        let ended = test
+            .database()
+            .end_silence(id, test.now + TimeDelta::seconds(2))
+            .await;
         assert!(ended.unwrap());
 
-        assert_eq!(deliver(&test, &notifier, &hook, 3000).await, 1);
+        assert_eq!(
+            deliver(&test, &notifier, &hook, TimeDelta::seconds(3)).await,
+            1
+        );
     }
 
     #[tokio::test]
@@ -5778,16 +5905,28 @@ mod silences {
             .unwrap();
         let hook = FakeOnCall::default();
         let notifier = on_a_webhook(&mut test, &hook).await;
-        assert_eq!(deliver(&test, &notifier, &hook, 1000).await, 0);
+        assert_eq!(
+            deliver(&test, &notifier, &hook, TimeDelta::seconds(1)).await,
+            0
+        );
 
         let open = test.open().await;
-        let resolved = test
-            .database()
-            .resolve_alert(open[0].id, test.now + 2000, "Fixed", None);
+        let resolved = test.database().resolve_alert(
+            open[0].id,
+            test.now + TimeDelta::seconds(2),
+            "Fixed",
+            None,
+        );
         resolved.await.unwrap();
 
-        assert_eq!(deliver(&test, &notifier, &hook, 3000).await, 0);
-        assert_eq!(deliver(&test, &notifier, &hook, HOUR_MS + 1000).await, 0);
+        assert_eq!(
+            deliver(&test, &notifier, &hook, TimeDelta::seconds(3)).await,
+            0
+        );
+        assert_eq!(
+            deliver(&test, &notifier, &hook, HOUR + TimeDelta::seconds(1)).await,
+            0
+        );
     }
 
     #[tokio::test]
@@ -5801,14 +5940,26 @@ mod silences {
         let notifier = on_a_webhook(&mut test, &hook).await;
 
         let open = test.open().await;
-        let resolved = test
-            .database()
-            .resolve_alert(open[0].id, test.now + 500, "Fixed", None);
+        let resolved = test.database().resolve_alert(
+            open[0].id,
+            test.now + TimeDelta::milliseconds(500),
+            "Fixed",
+            None,
+        );
         resolved.await.unwrap();
 
-        assert_eq!(deliver(&test, &notifier, &hook, 1000).await, 0);
-        assert_eq!(deliver(&test, &notifier, &hook, 2000).await, 0);
-        assert_eq!(deliver(&test, &notifier, &hook, HOUR_MS + 1000).await, 0);
+        assert_eq!(
+            deliver(&test, &notifier, &hook, TimeDelta::seconds(1)).await,
+            0
+        );
+        assert_eq!(
+            deliver(&test, &notifier, &hook, TimeDelta::seconds(2)).await,
+            0
+        );
+        assert_eq!(
+            deliver(&test, &notifier, &hook, HOUR + TimeDelta::seconds(1)).await,
+            0
+        );
     }
 
     #[tokio::test]
@@ -5816,19 +5967,28 @@ mod silences {
         let mut test = Harness::start().await;
         let hook = FakeOnCall::default();
         let notifier = on_a_webhook(&mut test, &hook).await;
-        assert_eq!(deliver(&test, &notifier, &hook, 1000).await, 1);
+        assert_eq!(
+            deliver(&test, &notifier, &hook, TimeDelta::seconds(1)).await,
+            1
+        );
 
         test.database()
-            .create_silence(&silence(""), "sam", test.now + 2000)
+            .create_silence(&silence(""), "sam", test.now + TimeDelta::seconds(2))
             .await
             .unwrap();
         let open = test.open().await;
-        let resolved = test
-            .database()
-            .resolve_alert(open[0].id, test.now + 3000, "Fixed", None);
+        let resolved = test.database().resolve_alert(
+            open[0].id,
+            test.now + TimeDelta::seconds(3),
+            "Fixed",
+            None,
+        );
         resolved.await.unwrap();
 
-        assert_eq!(deliver(&test, &notifier, &hook, 4000).await, 2);
+        assert_eq!(
+            deliver(&test, &notifier, &hook, TimeDelta::seconds(4)).await,
+            2
+        );
     }
 
     #[tokio::test]
@@ -5841,7 +6001,10 @@ mod silences {
         let hook = FakeOnCall::default();
         let notifier = on_a_webhook(&mut test, &hook).await;
 
-        assert_eq!(deliver(&test, &notifier, &hook, 1000).await, 1);
+        assert_eq!(
+            deliver(&test, &notifier, &hook, TimeDelta::seconds(1)).await,
+            1
+        );
     }
 
     #[tokio::test]
@@ -5849,7 +6012,7 @@ mod silences {
         let mut test = Harness::start().await;
         let facts = BTreeMap::from([("os.family".to_string(), json!("linux"))]);
         test.database()
-            .record_facts(&test.id(), &facts, test.now as u64)
+            .record_facts(&test.id(), &facts, test.now)
             .await
             .unwrap();
         test.database()
@@ -5859,7 +6022,10 @@ mod silences {
         let hook = FakeOnCall::default();
         let notifier = on_a_webhook(&mut test, &hook).await;
 
-        assert_eq!(deliver(&test, &notifier, &hook, 1000).await, 0);
+        assert_eq!(
+            deliver(&test, &notifier, &hook, TimeDelta::seconds(1)).await,
+            0
+        );
     }
 
     #[tokio::test]
@@ -5881,7 +6047,10 @@ mod silences {
         let hook = FakeOnCall::default();
         let notifier = on_a_webhook(&mut test, &hook).await;
 
-        assert_eq!(deliver(&test, &notifier, &hook, 1000).await, 1);
+        assert_eq!(
+            deliver(&test, &notifier, &hook, TimeDelta::seconds(1)).await,
+            1
+        );
     }
 
     #[tokio::test]
@@ -5923,7 +6092,7 @@ mod silences {
         );
 
         test.database()
-            .create_silence(&silence(""), "sam", now_ms())
+            .create_silence(&silence(""), "sam", crate::times::now())
             .await
             .unwrap();
         let page = Browser::default().get(&test.server, "/alerts").await;
@@ -5963,7 +6132,11 @@ mod silences {
             .await;
         assert_eq!(page.status, 303, "{}", page.body);
 
-        let silences = test.database().active_silences(now_ms()).await.unwrap();
+        let silences = test
+            .database()
+            .active_silences(crate::times::now())
+            .await
+            .unwrap();
         assert_eq!(silences.len(), 1);
         assert_eq!(silences[0].rule_id, Some(rule));
         assert!(!silences[0].created_by.is_empty());
@@ -5998,7 +6171,7 @@ mod silences {
         let test = Harness::start().await;
         let id = test
             .database()
-            .create_silence(&silence(""), "sam", now_ms())
+            .create_silence(&silence(""), "sam", crate::times::now())
             .await;
         let id = id.unwrap();
         let mut browser = Browser::default();
@@ -6009,7 +6182,11 @@ mod silences {
             .await;
 
         assert_eq!(page.status, 303, "{}", page.body);
-        let active = test.database().active_silences(now_ms() + 1).await.unwrap();
+        let active = test
+            .database()
+            .active_silences(crate::times::now() + TimeDelta::milliseconds(1))
+            .await
+            .unwrap();
         assert!(active.is_empty());
     }
 
@@ -6069,7 +6246,7 @@ mod silences {
         assert!(error.contains("Choose what the silence covers"), "{error}");
         assert!(
             test.database()
-                .active_silences(now_ms())
+                .active_silences(crate::times::now())
                 .await
                 .unwrap()
                 .is_empty()
@@ -6117,7 +6294,7 @@ mod silences {
         assert!(page.body.contains("choose every alert"), "{}", page.body);
         assert!(
             test.database()
-                .active_silences(now_ms())
+                .active_silences(crate::times::now())
                 .await
                 .unwrap()
                 .is_empty()
@@ -6128,7 +6305,11 @@ mod silences {
             .submit(&test.server, form, "/alerts/silences", &fields)
             .await;
         assert_eq!(page.status, 303, "{}", page.body);
-        let silences = test.database().active_silences(now_ms()).await.unwrap();
+        let silences = test
+            .database()
+            .active_silences(crate::times::now())
+            .await
+            .unwrap();
         assert_eq!(silences.len(), 1);
         assert!(silences[0].all_alerts);
     }
@@ -6147,8 +6328,8 @@ mod silences {
             series: "nginx.service".to_string(),
             value: Some(0.0),
             summary: "Service nginx.service is failed".to_string(),
-            started_at: crate::times::from_ms(now_ms() - 30_000),
-            breached_at: crate::times::from_ms(now_ms() - 30_000),
+            started_at: crate::times::now() - TimeDelta::seconds(30),
+            breached_at: crate::times::now() - TimeDelta::seconds(30),
         };
         database.fire_alert(&new, &[]).await.unwrap();
 
@@ -6169,7 +6350,7 @@ mod silences {
         on_a_webhook(&mut test, &hook).await;
         let id = test
             .database()
-            .create_silence(&silence(""), "sam", now_ms())
+            .create_silence(&silence(""), "sam", crate::times::now())
             .await;
         let id = id.unwrap();
 
@@ -6196,7 +6377,7 @@ mod maintenance_windows {
                 .map(String::from)
                 .to_vec(),
             start_time: "00:00".to_string(),
-            duration_secs: 24 * 60 * 60,
+            duration: TimeDelta::seconds(24 * 60 * 60),
             time_zone: "UTC".to_string(),
         }
     }
@@ -6218,8 +6399,14 @@ mod maintenance_windows {
             .delete_maintenance_window(window)
             .await
             .unwrap();
-        notifier.deliver_due(test.now + 1000).await.unwrap();
-        notifier.deliver_due(test.now + 2000).await.unwrap();
+        notifier
+            .deliver_due(test.now + TimeDelta::seconds(1))
+            .await
+            .unwrap();
+        notifier
+            .deliver_due(test.now + TimeDelta::seconds(2))
+            .await
+            .unwrap();
         assert_eq!(hook.events().len(), 1);
     }
 
@@ -6423,7 +6610,7 @@ mod reminders {
     use super::*;
     use crate::silences::SilenceInput;
 
-    const HOUR_MS: i64 = 3_600_000;
+    const HOUR: TimeDelta = TimeDelta::hours(1);
 
     /// A firing alert that's been delivered to a channel, on a rule with hourly reminders.
     async fn firing(
@@ -6450,13 +6637,13 @@ mod reminders {
         };
         let channel = test.database().create_channel(&channel).await.unwrap();
         let rule = AlertRuleInput {
-            for_secs: 0,
+            hold: TimeDelta::seconds(0),
             channels: vec![channel],
-            remind_every_secs: Some(3600),
+            remind_every: Some(TimeDelta::seconds(3600)),
             ..cpu_rule()
         };
         test.database().create_alert_rule(&rule).await.unwrap();
-        test.cpu(0, 95.0).await;
+        test.cpu(TimeDelta::zero(), 95.0).await;
         let senders = Senders {
             pagerduty_url: Some(url),
             ..Senders::default()
@@ -6466,8 +6653,8 @@ mod reminders {
         notifier
     }
 
-    async fn at(test: &Harness, notifier: &Notifier, offset_ms: i64) {
-        notifier.deliver_due(test.now + offset_ms).await.unwrap();
+    async fn at(test: &Harness, notifier: &Notifier, offset: TimeDelta) {
+        notifier.deliver_due(test.now + offset).await.unwrap();
     }
 
     #[tokio::test]
@@ -6477,10 +6664,10 @@ mod reminders {
         let notifier = firing(&mut test, &hook, ChannelKind::Webhook, "").await;
         assert_eq!(hook.events().len(), 1);
 
-        at(&test, &notifier, HOUR_MS - 1000).await;
+        at(&test, &notifier, HOUR - TimeDelta::seconds(1)).await;
         assert_eq!(hook.events().len(), 1, "it's too soon");
 
-        at(&test, &notifier, HOUR_MS).await;
+        at(&test, &notifier, HOUR).await;
         let events = hook.events();
         assert_eq!(events.len(), 2);
         assert_eq!(events[1]["event"], "reminder");
@@ -6491,10 +6678,10 @@ mod reminders {
                 .starts_with("Still firing: ")
         );
 
-        at(&test, &notifier, HOUR_MS + 1000).await;
+        at(&test, &notifier, HOUR + TimeDelta::seconds(1)).await;
         assert_eq!(hook.events().len(), 2, "the wait starts again");
 
-        at(&test, &notifier, 2 * HOUR_MS).await;
+        at(&test, &notifier, HOUR * 2).await;
         assert_eq!(hook.events().len(), 3);
     }
 
@@ -6506,7 +6693,7 @@ mod reminders {
         let notifier = firing_on(&mut test, ChannelKind::Webhook, &url, Senders::default()).await;
         notifier.deliver_due(test.now).await.unwrap();
 
-        at(&test, &notifier, 100 * HOUR_MS).await;
+        at(&test, &notifier, HOUR * 100).await;
 
         assert_eq!(hook.events().len(), 1);
     }
@@ -6524,11 +6711,11 @@ mod reminders {
                 .await
                 .unwrap()
         );
-        at(&test, &notifier, 2 * HOUR_MS).await;
+        at(&test, &notifier, HOUR * 2).await;
         assert_eq!(hook.events().len(), 1);
 
         assert!(test.database().unacknowledge_alert(id).await.unwrap());
-        at(&test, &notifier, 3 * HOUR_MS).await;
+        at(&test, &notifier, HOUR * 3).await;
         assert_eq!(hook.events().len(), 2);
     }
 
@@ -6550,7 +6737,7 @@ mod reminders {
 
         let open = test.open().await;
         assert_eq!(open[0].acknowledged_by.as_deref(), Some("sam"));
-        assert_eq!(open[0].acknowledged_at, Some(from_ms(test.now)));
+        assert_eq!(open[0].acknowledged_at, Some(test.now));
     }
 
     #[tokio::test]
@@ -6581,7 +6768,7 @@ mod reminders {
         let notifier = firing(&mut test, &hook, ChannelKind::PagerDuty, PAGERDUTY_KEY).await;
         assert_eq!(hook.events().len(), 1);
 
-        at(&test, &notifier, 5 * HOUR_MS).await;
+        at(&test, &notifier, HOUR * 5).await;
 
         assert_eq!(hook.events().len(), 1);
     }
@@ -6597,17 +6784,17 @@ mod reminders {
             all_alerts: true,
             series: String::new(),
             reason: "Upgrading".to_string(),
-            duration_secs: 3 * 3600,
+            duration: TimeDelta::seconds(3 * 3600),
         };
         test.database()
             .create_silence(&input, "sam", test.now)
             .await
             .unwrap();
 
-        at(&test, &notifier, 2 * HOUR_MS).await;
+        at(&test, &notifier, HOUR * 2).await;
         assert_eq!(hook.events().len(), 1);
 
-        at(&test, &notifier, 3 * HOUR_MS).await;
+        at(&test, &notifier, HOUR * 3).await;
         assert_eq!(
             hook.events().len(),
             2,
@@ -6621,7 +6808,7 @@ mod reminders {
         let hook = FakeOnCall::default();
         let notifier = firing(&mut test, &hook, ChannelKind::Webhook, "").await;
         hook.statuses.lock().unwrap().push(500);
-        at(&test, &notifier, HOUR_MS).await;
+        at(&test, &notifier, HOUR).await;
         assert_eq!(
             hook.events().len(),
             2,
@@ -6630,11 +6817,11 @@ mod reminders {
 
         let id = test.open().await[0].id;
         test.database()
-            .resolve_alert(id, test.now + HOUR_MS, "Fixed", None)
+            .resolve_alert(id, test.now + HOUR, "Fixed", None)
             .await
             .unwrap();
-        at(&test, &notifier, 2 * HOUR_MS).await;
-        at(&test, &notifier, 2 * HOUR_MS + 1000).await;
+        at(&test, &notifier, HOUR * 2).await;
+        at(&test, &notifier, HOUR * 2 + TimeDelta::seconds(1)).await;
 
         let events = hook.events();
         assert_eq!(events.len(), 3, "{events:?}");
@@ -6722,7 +6909,7 @@ mod reminders {
         assert_eq!(page.status, 303, "{}", page.body);
 
         let rules = test.database().list_alert_rules().await.unwrap();
-        assert_eq!(rules[0].rule.remind_every_secs, Some(1800));
+        assert_eq!(rules[0].rule.remind_every, Some(TimeDelta::minutes(30)));
         let edit = format!("/alerts/rules/{}/edit", rules[0].id);
         let page = browser.get(&test.server, &edit).await;
         assert!(
@@ -6828,7 +7015,7 @@ mod pages {
         let input = crate::remote_checks::RemoteCheckInput {
             host_id: crate::remote_checks::LOCAL_HOST_ID.to_string(),
             check: maxnines_protocol::Check::new("site", maxnines_protocol::CheckKind::Tcp, "a:1"),
-            interval_secs: 60,
+            interval: Duration::from_secs(60),
             enabled: true,
             read_stats: false,
             extras: Vec::new(),
@@ -6865,11 +7052,11 @@ mod pages {
     async fn the_navigation_marks_the_current_section_and_counts_what_is_firing() {
         let mut test = Harness::start().await;
         let rule = AlertRuleInput {
-            for_secs: 0,
+            hold: TimeDelta::seconds(0),
             ..cpu_rule()
         };
         test.database().create_alert_rule(&rule).await.unwrap();
-        test.cpu(0, 95.0).await;
+        test.cpu(TimeDelta::zero(), 95.0).await;
         let mut browser = Browser::default();
 
         for (path, link) in [
@@ -6971,7 +7158,7 @@ mod pages {
         let host = identity();
         let mut client = server.connect_approved(&host, "web-1").await;
         let sample = AgentMessage::Sample(Sample {
-            timestamp_ms: now_ms() as u64 - 1000,
+            time: crate::times::now() - TimeDelta::seconds(1),
             metrics: BTreeMap::from([
                 (
                     "host".to_string(),
@@ -6992,7 +7179,7 @@ mod pages {
         server
             .state
             .database
-            .record_facts(&host.id(), &facts, now_ms() as u64)
+            .record_facts(&host.id(), &facts, crate::times::now())
             .await
             .unwrap();
         let rule = server
@@ -7009,7 +7196,7 @@ mod pages {
         while server
             .state
             .metrics
-            .newest(metric, now_ms())
+            .newest(metric, crate::times::now())
             .await
             .unwrap()
             .is_empty()
@@ -7044,7 +7231,7 @@ mod pages {
             metric: Some("host.uptime".to_string()),
             comparison: Some(Comparison::Below),
             threshold: Some(600.0),
-            for_secs: 0,
+            hold: TimeDelta::seconds(0),
             ..cpu_rule()
         };
         server
@@ -7054,7 +7241,7 @@ mod pages {
             .await
             .unwrap();
         let sample = AgentMessage::Sample(Sample {
-            timestamp_ms: now_ms() as u64 - 1000,
+            time: crate::times::now() - TimeDelta::seconds(1),
             metrics: BTreeMap::from([("host".to_string(), json!({ "uptime_secs": 90 }))]),
         });
         send(&mut client, &sample).await;
@@ -7064,7 +7251,7 @@ mod pages {
         while server
             .state
             .metrics
-            .newest(metric, now_ms())
+            .newest(metric, crate::times::now())
             .await
             .unwrap()
             .is_empty()
@@ -7072,8 +7259,8 @@ mod pages {
             assert!(Instant::now() < deadline, "the sample never arrived");
             sleep(Duration::from_millis(10)).await;
         }
-        evaluator(&server, now_ms() - 60 * MINUTE_MS)
-            .evaluate(now_ms())
+        evaluator(&server, crate::times::now() - MINUTE * 60)
+            .evaluate(crate::times::now())
             .await
             .unwrap();
 
@@ -7091,7 +7278,7 @@ mod pages {
             metric: Some("agent.uptime".to_string()),
             comparison: Some(Comparison::Below),
             threshold: Some(600.0),
-            for_secs: 0,
+            hold: TimeDelta::seconds(0),
             ..cpu_rule()
         };
         server
@@ -7101,7 +7288,7 @@ mod pages {
             .await
             .unwrap();
         let sample = AgentMessage::Sample(Sample {
-            timestamp_ms: now_ms() as u64 - 1000,
+            time: crate::times::now() - TimeDelta::seconds(1),
             metrics: BTreeMap::from([("agent".to_string(), json!({ "uptime_secs": 90 }))]),
         });
         send(&mut client, &sample).await;
@@ -7111,7 +7298,7 @@ mod pages {
         while server
             .state
             .metrics
-            .newest(metric, now_ms())
+            .newest(metric, crate::times::now())
             .await
             .unwrap()
             .is_empty()
@@ -7119,8 +7306,8 @@ mod pages {
             assert!(Instant::now() < deadline, "the sample never arrived");
             sleep(Duration::from_millis(10)).await;
         }
-        evaluator(&server, now_ms() - 60 * MINUTE_MS)
-            .evaluate(now_ms())
+        evaluator(&server, crate::times::now() - MINUTE * 60)
+            .evaluate(crate::times::now())
             .await
             .unwrap();
 
@@ -7148,7 +7335,7 @@ mod pages {
         let input = |name: &str, enabled| crate::remote_checks::RemoteCheckInput {
             host_id: crate::remote_checks::LOCAL_HOST_ID.to_string(),
             check: maxnines_protocol::Check::new(name, maxnines_protocol::CheckKind::Tcp, "a:1"),
-            interval_secs: 60,
+            interval: Duration::from_secs(60),
             enabled,
             read_stats: false,
             extras: Vec::new(),
@@ -7193,7 +7380,7 @@ mod pages {
         server
             .state
             .database
-            .record_facts(&host.id(), &facts, now_ms() as u64)
+            .record_facts(&host.id(), &facts, crate::times::now())
             .await
             .unwrap();
         let mut browser = Browser::default();
@@ -7255,7 +7442,11 @@ mod server_page {
         assert!(page.body.contains(r#"href="/server""#));
 
         let metric = crate::metrics::find("server.hosts").unwrap();
-        let range = TimeRange::new(now_ms() - 60_000, now_ms() + 60_000).unwrap();
+        let range = TimeRange::new(
+            crate::times::now() - TimeDelta::minutes(1),
+            crate::times::now() + TimeDelta::minutes(1),
+        )
+        .unwrap();
         let hosts = server
             .state
             .metrics
@@ -7304,8 +7495,8 @@ mod server_page {
     async fn the_server_page_reports_on_everything() {
         let server = start_with_metrics().await;
         let (_host, _client) = report_samples(&server, "/").await;
-        evaluator(&server, now_ms())
-            .evaluate(now_ms())
+        evaluator(&server, crate::times::now())
+            .evaluate(crate::times::now())
             .await
             .unwrap();
 
@@ -7361,7 +7552,7 @@ mod server_page {
     #[tokio::test]
     async fn the_page_warns_when_alert_rules_have_stopped_running() {
         let server = start().await;
-        let late = now_ms() - 10 * MINUTE_MS;
+        let late = crate::times::now() - MINUTE * 10;
         evaluator(&server, late).evaluate(late).await.unwrap();
 
         let page = Browser::default().get(&server, "/server").await;
@@ -7426,7 +7617,7 @@ mod server_page {
         // A rate needs something to have arrived between two records.
         let writes = server.state.status.writes.clone();
         let before = writes.written.load(std::sync::atomic::Ordering::Relaxed);
-        let text = serde_json::to_string(&full_sample(now_ms() as u64, "/")).unwrap();
+        let text = serde_json::to_string(&full_sample(crate::times::now(), "/")).unwrap();
         sender.send(Message::text(text)).await.unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while writes.written.load(std::sync::atomic::Ordering::Relaxed) == before {
@@ -7437,7 +7628,11 @@ mod server_page {
         record_once(&server.state, &mut recorded).await;
 
         let metric = crate::metrics::find("server.metrics").unwrap();
-        let range = TimeRange::new(now_ms() - 60_000, now_ms() + 60_000).unwrap();
+        let range = TimeRange::new(
+            crate::times::now() - TimeDelta::minutes(1),
+            crate::times::now() + TimeDelta::minutes(1),
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let page = loop {
             let found = server.state.metrics.series("server", metric, range, 8);
@@ -7473,7 +7668,11 @@ mod server_page {
         record_once(&server.state, &mut recorded).await;
 
         let metric = crate::metrics::find("memory.usage").unwrap();
-        let range = TimeRange::new(now_ms() - 60_000, now_ms() + 60_000).unwrap();
+        let range = TimeRange::new(
+            crate::times::now() - TimeDelta::minutes(1),
+            crate::times::now() + TimeDelta::minutes(1),
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let found = server.state.metrics.series("server", metric, range, 8);
@@ -7535,7 +7734,7 @@ mod charts {
             metric: Some("disk.usage".to_string()),
             threshold: Some(90.0),
             warning_threshold: Some(80.0),
-            for_secs: 0,
+            hold: TimeDelta::seconds(0),
             channels: channels.to_vec(),
             ..cpu_rule()
         };
@@ -7549,8 +7748,8 @@ mod charts {
             series: series.to_string(),
             value: Some(95.0),
             summary: format!("Disk usage ({series}) on web-1 is 95%, above 90%"),
-            started_at: crate::times::from_ms(now_ms() - 30_000),
-            breached_at: crate::times::from_ms(now_ms() - 30_000),
+            started_at: crate::times::now() - TimeDelta::seconds(30),
+            breached_at: crate::times::now() - TimeDelta::seconds(30),
         };
         let id = database.fire_alert(&new, channels).await.unwrap();
         database.get_alert(id).await.unwrap().unwrap()
@@ -7606,7 +7805,7 @@ mod charts {
         let server = start_with_metrics().await;
         let (host, _client) = report_samples(&server, "/data").await;
         let charts = sources(&server);
-        let now = now_ms();
+        let now = crate::times::now();
 
         let alert = disk_alert(&server, &host, "/data", &[]).await;
         let png = charts.draw(&alert, now).await.unwrap().unwrap();
@@ -7630,8 +7829,8 @@ mod charts {
     }
 
     /// A sample with two disks, so a chart can be seen to keep to one of them.
-    fn two_disks(time_ms: u64) -> AgentMessage {
-        let mut message = full_sample(time_ms, "/data");
+    fn two_disks(time: Timestamp) -> AgentMessage {
+        let mut message = full_sample(time, "/data");
         if let AgentMessage::Sample(sample) = &mut message {
             sample.metrics.insert(
                 "disk".to_string(),
@@ -7678,7 +7877,7 @@ mod charts {
         server
             .state
             .database
-            .resolve_alert(alert.id, now_ms(), "The problem cleared", None)
+            .resolve_alert(alert.id, crate::times::now(), "The problem cleared", None)
             .await
             .unwrap();
         let page = Browser::default().get(&server, &path).await;
@@ -7707,8 +7906,8 @@ mod charts {
             series: String::new(),
             value: None,
             summary: "web-1 is offline".to_string(),
-            started_at: crate::times::from_ms(now_ms() - 30_000),
-            breached_at: crate::times::from_ms(now_ms() - 30_000),
+            started_at: crate::times::now() - TimeDelta::seconds(30),
+            breached_at: crate::times::now() - TimeDelta::seconds(30),
         };
         let id = database.fire_alert(&new, &[]).await.unwrap();
 
@@ -7751,12 +7950,10 @@ mod charts {
         assert_eq!(series.len(), 1, "{body}");
         assert_eq!(series[0]["name"], "/data");
         // At least an hour, reaching back past the start.
-        let (from, to) = (
-            body["from_ms"].as_i64().unwrap(),
-            body["to_ms"].as_i64().unwrap(),
-        );
-        assert!(to - from >= 3_600_000);
-        assert!(from < alert.started_at.timestamp_millis());
+        let moment = |name: &str| crate::times::parse_moment(body[name].as_str().unwrap());
+        let (from, to) = (moment("from").unwrap(), moment("to").unwrap());
+        assert!(to - from >= TimeDelta::hours(1));
+        assert!(from < alert.started_at);
 
         let missing = "/api/v1/alerts/999999/series";
         assert_eq!(api(&server, "GET", missing, &Value::Null).await.0, 404);
@@ -7783,7 +7980,7 @@ mod charts {
         let notifier = Notifier::new(server.state.database.clone(), Senders::default())
             .with_charts(sources(&server));
 
-        notifier.deliver_due(now_ms()).await.unwrap();
+        notifier.deliver_due(crate::times::now()).await.unwrap();
         let posts = capture.posts();
         assert_eq!(posts.len(), 1);
         let (kind, body) = &posts[0];
@@ -7796,10 +7993,10 @@ mod charts {
         server
             .state
             .database
-            .resolve_alert(alert.id, now_ms(), "The problem cleared", None)
+            .resolve_alert(alert.id, crate::times::now(), "The problem cleared", None)
             .await
             .unwrap();
-        notifier.deliver_due(now_ms()).await.unwrap();
+        notifier.deliver_due(crate::times::now()).await.unwrap();
         let posts = capture.posts();
         let (kind, body) = &posts[1];
         assert!(kind.starts_with("multipart/form-data"), "{kind}");
@@ -7839,7 +8036,7 @@ mod charts {
         };
         Notifier::new(server.state.database.clone(), senders)
             .with_charts(sources(&server))
-            .deliver_due(now_ms())
+            .deliver_due(crate::times::now())
             .await
             .unwrap();
 
@@ -7943,7 +8140,7 @@ mod charts {
         )
         .with_charts(sources(&server));
 
-        notifier.deliver_due(now_ms()).await.unwrap();
+        notifier.deliver_due(crate::times::now()).await.unwrap();
         let methods: Vec<String> = slack.calls().into_iter().map(|call| call.0).collect();
         assert_eq!(methods, ["upload_url", "upload", "complete", "post"]);
         let calls = slack.calls();
@@ -7954,10 +8151,10 @@ mod charts {
         server
             .state
             .database
-            .resolve_alert(alert.id, now_ms(), "The problem cleared", None)
+            .resolve_alert(alert.id, crate::times::now(), "The problem cleared", None)
             .await
             .unwrap();
-        notifier.deliver_due(now_ms()).await.unwrap();
+        notifier.deliver_due(crate::times::now()).await.unwrap();
         let methods: Vec<String> = slack.calls().into_iter().map(|call| call.0).collect();
         assert_eq!(
             methods[4..],
@@ -8006,7 +8203,7 @@ mod charts {
             },
         )
         .with_charts(sources(&server))
-        .deliver_due(now_ms())
+        .deliver_due(crate::times::now())
         .await
         .unwrap();
 
@@ -8153,16 +8350,16 @@ async fn a_custom_webhook_made_on_the_form_sends_the_request_it_describes() {
     );
 
     let rule = AlertRuleInput {
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         channels: vec![channel.id],
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap();
-    test.cpu(0, 95.0).await;
+    test.cpu(TimeDelta::zero(), 95.0).await;
     let notifier = Notifier::new(test.database().clone(), Senders::default());
     notifier.deliver_due(test.now).await.unwrap();
-    test.cpu(MINUTE_MS, 10.0).await;
-    notifier.deliver_due(test.now + MINUTE_MS).await.unwrap();
+    test.cpu(MINUTE, 10.0).await;
+    notifier.deliver_due(test.now + MINUTE).await.unwrap();
 
     let received = receiver.received();
     assert_eq!(received.len(), 2);
@@ -8329,24 +8526,24 @@ async fn a_custom_webhook_whose_template_does_not_work_is_not_saved() {
     );
 }
 
-const HOUR_MS: i64 = 3_600_000;
+const HOUR: TimeDelta = TimeDelta::hours(1);
 const DISK_FORECAST: &str = "Disk will be full soon";
 
 /// The root disk at `percent`, changing `per_hour`, with six hours of readings.
 fn disk_trend(
     test: &Harness,
-    offset_ms: i64,
+    offset: TimeDelta,
     percent: f64,
     per_hour: f64,
 ) -> crate::metrics::Trend {
     crate::metrics::Trend {
         host_id: test.id(),
         series: "/".to_string(),
-        time_ms: test.now + offset_ms,
+        time: test.now + offset,
         value: percent,
-        first_ms: test.now + offset_ms - 6 * HOUR_MS,
+        first_time: test.now + offset - HOUR * 6,
         samples: 360,
-        slope_per_ms: per_hour / HOUR_MS as f64,
+        slope_per_sec: per_hour / 3600.0,
     }
 }
 
@@ -8354,11 +8551,11 @@ fn disk_trend(
 /// forecast alerts open then.
 async fn forecast_at(
     test: &mut Harness,
-    minute: i64,
+    minute: i32,
     percent: f64,
     per_hour: f64,
 ) -> Vec<crate::alerting::Alert> {
-    let offset = minute * MINUTE_MS;
+    let offset = MINUTE * minute;
     *test.script.trends.lock().unwrap() = vec![disk_trend(test, offset, percent, per_hour)];
     test.evaluate(offset).await;
     test.open().await
@@ -8435,10 +8632,10 @@ async fn quick_forecast(test: &Harness) -> i64 {
         comparison: Some(Comparison::Above),
         threshold: Some(100.0),
         warning_threshold: None,
-        for_secs: 0,
+        hold: TimeDelta::seconds(0),
         severity: Severity::Critical,
-        window_secs: Some(6 * 3600),
-        forecast_secs: Some(4 * 3600),
+        window: Some(TimeDelta::seconds(6 * 3600)),
+        forecast: Some(TimeDelta::seconds(4 * 3600)),
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap()
@@ -8448,23 +8645,23 @@ async fn quick_forecast(test: &Harness) -> i64 {
 async fn a_forecast_needs_enough_recent_readings_to_trust() {
     let mut test = Harness::start().await;
     quick_forecast(&test).await;
-    let filling = |test: &Harness, minute: i64| disk_trend(test, minute * MINUTE_MS, 95.0, 5.0);
+    let filling = |test: &Harness, minute: i32| disk_trend(test, MINUTE * minute, 95.0, 5.0);
 
     let few = crate::metrics::Trend {
         samples: 9,
         ..filling(&test, 0)
     };
     let short = crate::metrics::Trend {
-        first_ms: test.now + 5 * MINUTE_MS - 2 * HOUR_MS,
+        first_time: test.now + MINUTE * 5 - HOUR * 2,
         ..filling(&test, 5)
     };
     let stale = crate::metrics::Trend {
-        time_ms: test.now - 11 * MINUTE_MS + 10 * MINUTE_MS,
+        time: test.now - MINUTE * 11 + MINUTE * 10,
         ..filling(&test, 10)
     };
     for (minute, trend) in [(0, few), (5, short), (10, stale)] {
         *test.script.trends.lock().unwrap() = vec![trend];
-        test.evaluate(minute * MINUTE_MS).await;
+        test.evaluate(MINUTE * minute).await;
         assert!(test.open().await.is_empty(), "minute {minute}");
     }
 
@@ -8520,9 +8717,9 @@ async fn a_forecast_rule_can_be_made_on_the_form_and_through_the_api() {
     assert_eq!(rule.rule.kind, RuleKind::Forecast);
     assert_eq!(rule.rule.threshold, Some(95.0));
     assert_eq!(rule.rule.severity, Severity::Critical);
-    assert_eq!(rule.rule.forecast_secs, Some(9000));
-    assert_eq!(rule.rule.warning_forecast_secs, Some(48 * 3600));
-    assert_eq!(rule.rule.window_secs, Some(12 * 3600));
+    assert_eq!(rule.rule.forecast, Some(TimeDelta::seconds(9000)));
+    assert_eq!(rule.rule.warning_forecast, Some(TimeDelta::hours(48)));
+    assert_eq!(rule.rule.window, Some(TimeDelta::hours(12)));
     assert_eq!(rule.rule.series.as_deref(), Some("/var*"));
 
     let page = browser
@@ -8588,7 +8785,7 @@ fn alert_about(host_id: &str, rule_id: i64) -> crate::alerting::Alert {
 }
 
 async fn held(server: &TestServer, alert: &crate::alerting::Alert) -> bool {
-    let active = crate::silences::ActiveSilences::load(&server.state.database, now_ms())
+    let active = crate::silences::ActiveSilences::load(&server.state.database, crate::times::now())
         .await
         .unwrap();
     active.covering(alert).is_some()
@@ -8626,7 +8823,7 @@ async fn a_host_can_be_quieted_from_its_page_and_brought_back() {
     let silences = server
         .state
         .database
-        .active_silences(now_ms())
+        .active_silences(crate::times::now())
         .await
         .unwrap();
     let [silence] = &silences[..] else {
@@ -8635,7 +8832,7 @@ async fn a_host_can_be_quieted_from_its_page_and_brought_back() {
     assert_eq!(silence.rule_id, None);
     assert_eq!(silence.filter, crate::host_filter::only(&id));
     assert_eq!(silence.reason, "Maintenance on web-1");
-    assert_eq!(silence.ends_at - silence.starts_at, millis(2 * 3600 * 1000));
+    assert_eq!(silence.ends_at - silence.starts_at, TimeDelta::hours(2));
     assert!(held(&server, &alert_about(&id, 1)).await);
     assert!(!held(&server, &alert_about(&other.id(), 1)).await);
 
@@ -8667,7 +8864,7 @@ async fn a_host_can_be_quieted_from_its_page_and_brought_back() {
         server
             .state
             .database
-            .active_silences(now_ms())
+            .active_silences(crate::times::now())
             .await
             .unwrap()
             .is_empty()
@@ -8689,12 +8886,12 @@ async fn a_host_page_names_a_wider_silence_but_leaves_ending_it_to_its_page() {
         all_alerts: true,
         series: String::new(),
         reason: "Moving data centres".to_string(),
-        duration_secs: 3600,
+        duration: TimeDelta::seconds(3600),
     };
     server
         .state
         .database
-        .create_silence(&everything, "ops@example.com", now_ms())
+        .create_silence(&everything, "ops@example.com", crate::times::now())
         .await
         .unwrap();
     // One rule alone doesn't make the host quiet, so it isn't mentioned.
@@ -8710,12 +8907,12 @@ async fn a_host_page_names_a_wider_silence_but_leaves_ending_it_to_its_page() {
         all_alerts: false,
         series: String::new(),
         reason: "Noisy CPU rule".to_string(),
-        duration_secs: 7200,
+        duration: TimeDelta::seconds(7200),
     };
     server
         .state
         .database
-        .create_silence(&one_rule, "ops@example.com", now_ms())
+        .create_silence(&one_rule, "ops@example.com", crate::times::now())
         .await
         .unwrap();
 
@@ -8746,7 +8943,7 @@ async fn a_host_page_names_a_wider_silence_but_leaves_ending_it_to_its_page() {
         server
             .state
             .database
-            .active_silences(now_ms())
+            .active_silences(crate::times::now())
             .await
             .unwrap()
             .len(),
@@ -8788,7 +8985,7 @@ mod actions {
         RuleAction {
             action: action.to_string(),
             run_on,
-            timeout_secs: None,
+            timeout: None,
         }
     }
 
@@ -8827,10 +9024,10 @@ mod actions {
                         id,
                         action,
                         variables,
-                        timeout_secs,
+                        timeout,
                     } = read_server_message(client).await
                     {
-                        return (id, action, variables, timeout_secs);
+                        return (id, action, variables, timeout.as_secs());
                     }
                 }
             };
@@ -8847,7 +9044,7 @@ mod actions {
                 error: None,
                 output: output.to_string(),
                 truncated: false,
-                duration_ms: 1200,
+                duration: Duration::from_millis(1200),
             };
             let client = self.client.as_mut().unwrap();
             send(client, &AgentMessage::ActionResult(result)).await;
@@ -8867,8 +9064,8 @@ mod actions {
         }
 
         async fn fire(&mut self) -> i64 {
-            self.cpu(0, 95.0).await;
-            self.cpu(2 * MINUTE_MS, 96.0).await;
+            self.cpu(TimeDelta::zero(), 95.0).await;
+            self.cpu(MINUTE * 2, 96.0).await;
             let open = self.open().await;
             assert_eq!(open.len(), 1);
             open[0].id
@@ -8892,23 +9089,14 @@ mod actions {
         let alert = test.fire().await;
         let (id, ..) = test.next_request().await;
         // Nothing is said about it until it's known how it went.
-        notifier
-            .deliver_due(test.now + 3 * MINUTE_MS)
-            .await
-            .unwrap();
-        notifier
-            .deliver_due(test.now + 3 * MINUTE_MS)
-            .await
-            .unwrap();
+        notifier.deliver_due(test.now + MINUTE * 3).await.unwrap();
+        notifier.deliver_due(test.now + MINUTE * 3).await.unwrap();
         assert_eq!(hook.events(), ["firing"]);
 
         let printed = "PID  NAME\n  7  init\n";
         test.answer(&id, ActionOutcome::Succeeded, printed).await;
         test.finished(id.parse().unwrap()).await;
-        notifier
-            .deliver_due(test.now + 3 * MINUTE_MS)
-            .await
-            .unwrap();
+        notifier.deliver_due(test.now + MINUTE * 3).await.unwrap();
         assert_eq!(hook.events(), ["firing", "action"]);
         {
             let received = hook.received.lock().unwrap();
@@ -8928,17 +9116,14 @@ mod actions {
             run_on: RUN_BY_HAND.to_string(),
             variables: BTreeMap::new(),
             requested_by: Some("you@example.com".to_string()),
-            requested_at: crate::times::from_ms(test.now),
-            timeout_secs: 30,
+            requested_at: test.now,
+            timeout: Duration::from_secs(30),
         };
         test.server.state.actions.run(by_hand).await.unwrap();
         let (id, ..) = test.next_request().await;
         test.answer(&id, ActionOutcome::Succeeded, "more").await;
         test.finished(id.parse().unwrap()).await;
-        notifier
-            .deliver_due(test.now + 4 * MINUTE_MS)
-            .await
-            .unwrap();
+        notifier.deliver_due(test.now + MINUTE * 4).await.unwrap();
         assert_eq!(hook.events(), ["firing", "action"]);
     }
 
@@ -8973,17 +9158,11 @@ mod actions {
         let alert = test.fire().await;
         let (first, ..) = test.next_request().await;
         let (second, ..) = test.next_request().await;
-        notifier
-            .deliver_due(test.now + 3 * MINUTE_MS)
-            .await
-            .unwrap();
+        notifier.deliver_due(test.now + MINUTE * 3).await.unwrap();
         test.answer(&first, ActionOutcome::Succeeded, "PID  NAME\n  7  init\n")
             .await;
         test.finished(first.parse().unwrap()).await;
-        notifier
-            .deliver_due(test.now + 3 * MINUTE_MS)
-            .await
-            .unwrap();
+        notifier.deliver_due(test.now + MINUTE * 3).await.unwrap();
 
         assert_eq!(slack.methods(), ["post", "post"]);
         let reply = slack.calls()[1].2.clone();
@@ -9002,10 +9181,7 @@ mod actions {
         test.answer(&second, ActionOutcome::Failed, "").await;
         test.finished(second.parse().unwrap()).await;
         slack.errors.lock().unwrap().push("thread_not_found");
-        notifier
-            .deliver_due(test.now + 3 * MINUTE_MS)
-            .await
-            .unwrap();
+        notifier.deliver_due(test.now + MINUTE * 3).await.unwrap();
         assert_eq!(slack.methods(), ["post", "post", "post", "post"]);
         let alone = slack.calls()[3].2.clone();
         assert_eq!(alone["channel"], "#alerts");
@@ -9084,10 +9260,10 @@ mod actions {
         assert_eq!(run.run_on, "first");
         assert_eq!(run.outcome, Some(ActionOutcome::Succeeded));
         assert_eq!(run.output, printed);
-        assert_eq!(run.duration_ms, Some(1200));
+        assert_eq!(run.duration, Some(Duration::from_millis(1200)));
 
         // Checking again doesn't run it again.
-        test.cpu(3 * MINUTE_MS, 97.0).await;
+        test.cpu(MINUTE * 3, 97.0).await;
         let runs = test.database().action_runs_for_alert(alert).await.unwrap();
         assert_eq!(runs.len(), 1);
 
@@ -9127,10 +9303,10 @@ mod actions {
 
         let first = test.reading("/var", test.now, 95.0);
         test.script.set(vec![first]);
-        test.evaluate(0).await;
-        let second = test.reading("/var", test.now + 2 * MINUTE_MS, 96.0);
+        test.evaluate(TimeDelta::zero()).await;
+        let second = test.reading("/var", test.now + MINUTE * 2, 96.0);
         test.script.set(vec![second]);
-        test.evaluate(2 * MINUTE_MS).await;
+        test.evaluate(MINUTE * 2).await;
         assert_eq!(test.open().await.len(), 1);
 
         let (_, action, variables, _) = test.next_request().await;
@@ -9155,15 +9331,15 @@ mod actions {
         };
         test.database().create_alert_rule(&rule).await.unwrap();
 
-        test.cpu(0, 85.0).await;
-        test.cpu(2 * MINUTE_MS, 85.0).await;
+        test.cpu(TimeDelta::zero(), 85.0).await;
+        test.cpu(MINUTE * 2, 85.0).await;
         let alert = test.open().await[0].id;
         assert_eq!(test.next_request().await.1, "top_cpu");
         let runs = test.database().action_runs_for_alert(alert).await.unwrap();
         assert_eq!(runs.len(), 1);
 
-        test.cpu(3 * MINUTE_MS, 95.0).await;
-        test.cpu(5 * MINUTE_MS, 95.0).await;
+        test.cpu(MINUTE * 3, 95.0).await;
+        test.cpu(MINUTE * 5, 95.0).await;
         assert_eq!(test.open().await[0].severity, Severity::Critical);
         assert_eq!(test.next_request().await.1, "restart_nginx");
         let runs = test.database().action_runs_for_alert(alert).await.unwrap();
@@ -9188,8 +9364,8 @@ mod actions {
                 .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
                 .collect(),
             requested_by: Some("you@example.com".to_string()),
-            requested_at: crate::times::from_ms(now),
-            timeout_secs: 30,
+            requested_at: now,
+            timeout: Duration::from_secs(30),
         };
         let actions = test.server.state.actions.clone();
         let database = test.database().clone();
@@ -9244,7 +9420,7 @@ mod actions {
             error: None,
             output: "forged".to_string(),
             truncated: false,
-            duration_ms: 1,
+            duration: Duration::from_millis(1),
         };
         send(&mut intruder, &AgentMessage::ActionResult(forged)).await;
         // Its facts are handled after the answer, so the answer has been by then.
@@ -9297,16 +9473,22 @@ mod actions {
         let (id, ..) = test.next_request().await;
         let id: i64 = id.parse().unwrap();
 
-        let asked = test.now + 2 * MINUTE_MS;
+        let asked = test.now + MINUTE * 2;
         let actions = test.server.state.actions.clone();
-        actions.give_up_on_unanswered(asked + 80_000).await.unwrap();
+        actions
+            .give_up_on_unanswered(asked + TimeDelta::seconds(80))
+            .await
+            .unwrap();
         let run = test.database().get_action_run(id).await.unwrap().unwrap();
         assert_eq!(
             run.outcome, None,
             "30 seconds and a minute's grace aren't up"
         );
 
-        actions.give_up_on_unanswered(asked + 91_000).await.unwrap();
+        actions
+            .give_up_on_unanswered(asked + TimeDelta::seconds(91))
+            .await
+            .unwrap();
         let run = test.database().get_action_run(id).await.unwrap().unwrap();
         assert_eq!(run.outcome, Some(ActionOutcome::Failed));
         assert_eq!(run.error.as_deref(), Some("the agent never answered"));
@@ -9386,11 +9568,11 @@ mod actions {
             rule.rule.actions,
             [
                 RuleAction {
-                    timeout_secs: Some(30),
+                    timeout: Some(Duration::from_secs(30)),
                     ..run("top_cpu", RunOn::First)
                 },
                 RuleAction {
-                    timeout_secs: Some(120),
+                    timeout: Some(Duration::from_secs(120)),
                     ..run("restart_nginx", RunOn::Critical)
                 },
             ]

@@ -5,9 +5,11 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use axum::http::{HeaderName, HeaderValue};
+use chrono::{DateTime, TimeDelta};
 use maxnines_protocol::actions::ActionOutcome;
 use serde_json::{Map, Value, json};
 use tera::{Context, Kwargs, State, Tera};
@@ -123,15 +125,15 @@ fn example_run() -> ActionRun {
         run_on: "first".to_string(),
         variables: BTreeMap::new(),
         requested_by: None,
-        requested_at: crate::times::from_ms(0),
-        timeout_secs: 30,
+        requested_at: DateTime::UNIX_EPOCH,
+        timeout: Duration::from_secs(30),
         outcome: Some(ActionOutcome::Succeeded),
         exit_code: Some(0),
         error: None,
         output: "PID  NAME\n  1  init\n".to_string(),
         truncated: false,
-        duration_ms: Some(1000),
-        finished_at: Some(crate::times::from_ms(1000)),
+        duration: Some(Duration::from_secs(1)),
+        finished_at: Some(DateTime::UNIX_EPOCH + TimeDelta::seconds(1)),
     }
 }
 

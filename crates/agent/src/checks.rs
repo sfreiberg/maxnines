@@ -91,8 +91,8 @@ impl CheckDefinition {
         check.tls = self.tls;
         check.insecure = self.insecure;
         check.host_key = self.host_key.clone();
-        check.timeout_secs = timing.timeout_secs;
-        check.interval_secs = timing.interval_secs;
+        check.timeout = timing.timeout;
+        check.interval = timing.interval;
         Ok(check)
     }
 
@@ -190,9 +190,9 @@ impl Ready {
         }
     }
 
-    fn interval_secs(&self) -> Option<u64> {
+    fn interval(&self) -> Option<Duration> {
         match self {
-            Self::Run(check, _) => check.interval_secs,
+            Self::Run(check, _) => check.interval,
             Self::Broken { .. } => None,
         }
     }
@@ -220,13 +220,11 @@ struct Scheduled {
 
 /// A check runs with every sample unless it asks for longer, rounded up to whole
 /// samples. It never runs more often than samples are sent.
-fn rounds(interval_secs: Option<u64>, interval: Duration) -> u64 {
-    let Some(seconds) = interval_secs else {
+fn rounds(wanted: Option<Duration>, interval: Duration) -> u64 {
+    let Some(wanted) = wanted else {
         return 1;
     };
-    let interval_ms = interval.as_millis().max(1);
-    let wanted_ms = u128::from(seconds) * 1000;
-    u64::try_from(wanted_ms.div_ceil(interval_ms))
+    u64::try_from(wanted.as_nanos().div_ceil(interval.as_nanos().max(1)))
         .unwrap_or(u64::MAX)
         .max(1)
 }
@@ -256,7 +254,7 @@ impl CheckCollector {
         let scheduled: Vec<Scheduled> = ready
             .into_iter()
             .map(|item| {
-                let every = rounds(item.interval_secs(), interval);
+                let every = rounds(item.interval(), interval);
                 let offset = (rand::random::<f64>() * every as f64) as u64;
                 Scheduled {
                     check: Arc::new(item),
@@ -345,11 +343,11 @@ mod tests {
     fn a_check_runs_every_so_many_samples() {
         let interval = Duration::from_secs(15);
         assert_eq!(rounds(None, interval), 1);
-        assert_eq!(rounds(Some(1), interval), 1);
-        assert_eq!(rounds(Some(15), interval), 1);
-        assert_eq!(rounds(Some(60), interval), 4);
-        assert_eq!(rounds(Some(61), interval), 5);
-        assert_eq!(rounds(Some(86_400), interval), 5760);
+        assert_eq!(rounds(Some(Duration::from_secs(1)), interval), 1);
+        assert_eq!(rounds(Some(Duration::from_secs(15)), interval), 1);
+        assert_eq!(rounds(Some(Duration::from_secs(60)), interval), 4);
+        assert_eq!(rounds(Some(Duration::from_secs(61)), interval), 5);
+        assert_eq!(rounds(Some(Duration::from_secs(86_400)), interval), 5760);
     }
 
     /// The names of the checks in one sample.
@@ -369,7 +367,7 @@ mod tests {
         let fast = Check::new("fast", CheckKind::Tcp, &target);
         // 50 rounds of 20ms each, so it runs once in the second it covers.
         let slow = Check {
-            interval_secs: Some(1),
+            interval: Some(Duration::from_secs(1)),
             ..Check::new("slow", CheckKind::Tcp, &target)
         };
         let mut collector = CheckCollector::new(
@@ -412,7 +410,7 @@ mod tests {
         let checks = vec![
             Check::new("fast", CheckKind::Tcp, &fast_target),
             Check {
-                interval_secs: Some(1),
+                interval: Some(Duration::from_secs(1)),
                 ..Check::new("slow", CheckKind::Tcp, &slow_target)
             },
         ];
@@ -551,7 +549,7 @@ mod tests {
         )]);
         let local = [
             LocalCheck {
-                timeout_secs: Some(1),
+                timeout: Some(Duration::from_secs(1)),
                 ..LocalCheck::new("cache")
             },
             LocalCheck::new("nowhere"),

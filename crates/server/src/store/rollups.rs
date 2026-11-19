@@ -9,28 +9,29 @@
 
 use std::collections::BTreeSet;
 
+use chrono::TimeDelta;
+
 use crate::config::RetentionConfig;
 use crate::metrics::METRICS;
+use crate::times::{Timestamp, hour_of};
 
-pub const MINUTE_MS: i64 = 60_000;
 /// The finer of the two rollups. A chart has at most 240 points, so this is as fine
 /// as one of 20 hours or more can show, and a year of it takes a fifth of the space of
 /// minutes.
-pub const FIVE_MINUTES_MS: i64 = 5 * MINUTE_MS;
-pub const HOUR_MS: i64 = 3_600_000;
-const DAY_MS: i64 = 86_400_000;
+pub const FIVE_MINUTES: TimeDelta = TimeDelta::minutes(5);
+pub const HOUR: TimeDelta = TimeDelta::hours(1);
 
 /// How long after an hour ends before it's rolled up, so samples a few minutes late,
 /// such as from agents reconnecting after a restart, are in it. Anything later has its
 /// hour rolled up again.
-pub const SETTLE_MS: i64 = 5 * MINUTE_MS;
+pub const SETTLE: TimeDelta = TimeDelta::minutes(5);
 
 /// How far before a span the samples are read when working out rates, as each rate
 /// needs the sample before it. Agents report every 15 seconds unless told otherwise.
-pub const RATE_LEAD_MS: i64 = 10 * MINUTE_MS;
+pub const RATE_LEAD: TimeDelta = TimeDelta::minutes(10);
 
 /// How often old data is looked for to delete.
-pub const EXPIRE_EVERY_MS: i64 = HOUR_MS;
+pub const EXPIRE_EVERY: TimeDelta = HOUR;
 
 /// The resolutions a metric is kept at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,21 +52,21 @@ impl Tier {
     }
 }
 
-/// How long each resolution is kept, in milliseconds. Hours can be kept for good.
+/// How long each resolution is kept. Hours can be kept for good.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Retention {
-    pub full_ms: i64,
-    pub five_minute_ms: i64,
-    pub hour_ms: Option<i64>,
+    pub full: TimeDelta,
+    pub five_minute: TimeDelta,
+    pub hour: Option<TimeDelta>,
 }
 
 impl From<RetentionConfig> for Retention {
     fn from(config: RetentionConfig) -> Self {
-        let days = |days: u32| i64::from(days) * DAY_MS;
+        let days = |days: u32| TimeDelta::days(i64::from(days));
         Self {
-            full_ms: days(config.full_resolution_days),
-            five_minute_ms: days(config.five_minute_days),
-            hour_ms: config.hour_days.map(days),
+            full: days(config.full_resolution_days),
+            five_minute: days(config.five_minute_days),
+            hour: config.hour_days.map(days),
         }
     }
 }
@@ -74,9 +75,9 @@ impl Retention {
     /// For tests, whose samples can be from any time at all.
     #[cfg(test)]
     pub const KEEP_EVERYTHING: Self = Self {
-        full_ms: i64::MAX / 4,
-        five_minute_ms: i64::MAX / 4,
-        hour_ms: None,
+        full: TimeDelta::MAX,
+        five_minute: TimeDelta::MAX,
+        hour: None,
     };
 }
 
@@ -86,48 +87,53 @@ impl Default for Retention {
     }
 }
 
+/// The moment `kept` before `now`, before which something kept that long goes. Nothing
+/// does if that's further back than a moment can be.
+pub fn kept_since(now: Timestamp, kept: TimeDelta) -> Option<Timestamp> {
+    now.checked_sub_signed(kept)
+}
+
 /// Which resolution a chart reads. The coarsest that fits evenly into its step is just
 /// as exact and much quicker, and a range reaching back past what's kept at a finer
 /// resolution reads a coarser one. Whatever isn't rolled up yet comes from the samples.
-pub fn tier_for(step_ms: i64, from_ms: i64, now_ms: i64, retention: &Retention) -> Tier {
-    let mut tier = if step_ms % HOUR_MS == 0 {
+pub fn tier_for(step: TimeDelta, from: Timestamp, now: Timestamp, retention: &Retention) -> Tier {
+    let fits = |span: TimeDelta| step.num_milliseconds() % span.num_milliseconds() == 0;
+    let mut tier = if fits(HOUR) {
         Tier::Hour
-    } else if step_ms % FIVE_MINUTES_MS == 0 {
+    } else if fits(FIVE_MINUTES) {
         Tier::FiveMinutes
     } else {
         Tier::Full
     };
-    if tier == Tier::Full && from_ms < now_ms.saturating_sub(retention.full_ms) {
+    let older_than = |kept| kept_since(now, kept).is_some_and(|since| from < since);
+    if tier == Tier::Full && older_than(retention.full) {
         tier = Tier::FiveMinutes;
     }
-    if tier == Tier::FiveMinutes && from_ms < now_ms.saturating_sub(retention.five_minute_ms) {
+    if tier == Tier::FiveMinutes && older_than(retention.five_minute) {
         tier = Tier::Hour;
     }
     tier
 }
 
-pub fn hour_of(time_ms: i64) -> i64 {
-    time_ms.div_euclid(HOUR_MS) * HOUR_MS
-}
-
 /// Whether an hour is over and settled, and so ready to roll up.
-pub fn is_due(hour_ms: i64, now_ms: i64) -> bool {
-    hour_ms.saturating_add(HOUR_MS + SETTLE_MS) <= now_ms
+pub fn is_due(hour: Timestamp, now: Timestamp) -> bool {
+    hour + HOUR + SETTLE <= now
 }
 
 /// The hours that samples at these times change, of those already rolled up and still
 /// kept at full resolution. A rate's first sample in an hour reaches back to the one
 /// before, so a sample also changes the hour after its own.
 pub fn hours_to_redo(
-    times_ms: impl IntoIterator<Item = i64>,
-    rolled_up_until: i64,
-    full_since: i64,
-) -> BTreeSet<i64> {
+    times: impl IntoIterator<Item = Timestamp>,
+    rolled_up_until: Timestamp,
+    full_since: Option<Timestamp>,
+) -> BTreeSet<Timestamp> {
     let mut hours = BTreeSet::new();
-    for time in times_ms {
+    for time in times {
         let hour = hour_of(time);
-        for hour in [hour, hour + HOUR_MS] {
-            if hour < rolled_up_until && hour >= hour_of(full_since) {
+        for hour in [hour, hour + HOUR] {
+            let still_full = full_since.is_none_or(|since| hour >= hour_of(since));
+            if hour < rolled_up_until && still_full {
                 hours.insert(hour);
             }
         }
@@ -139,13 +145,12 @@ pub fn hours_to_redo(
 /// and every metric has rolled them up, with none waiting to be rolled up again. So a
 /// rollup that falls behind keeps the samples instead of losing them.
 pub fn full_resolution_cutoff(
-    now_ms: i64,
+    now: Timestamp,
     retention: &Retention,
-    rolled_up_until: Option<i64>,
-    first_redo: Option<i64>,
-) -> Option<i64> {
-    let rolled_up_until = rolled_up_until?;
-    let cutoff = [now_ms - retention.full_ms, rolled_up_until]
+    rolled_up_until: Option<Timestamp>,
+    first_redo: Option<Timestamp>,
+) -> Option<Timestamp> {
+    let cutoff = [kept_since(now, retention.full)?, rolled_up_until?]
         .into_iter()
         .chain(first_redo)
         .min()?;
@@ -160,102 +165,124 @@ pub fn metric_names() -> impl Iterator<Item = &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::times::from_ms;
 
-    const NOW: i64 = 1_000 * DAY_MS;
+    const DAY: TimeDelta = TimeDelta::days(1);
+
+    fn now() -> Timestamp {
+        from_ms(1_000 * DAY.num_milliseconds())
+    }
+
+    /// The start of the `n`th hour after 1970.
+    fn hour(n: i32) -> Timestamp {
+        from_ms(0) + HOUR * n
+    }
 
     fn retention() -> Retention {
         Retention {
-            full_ms: 30 * DAY_MS,
-            five_minute_ms: 365 * DAY_MS,
-            hour_ms: None,
+            full: DAY * 30,
+            five_minute: DAY * 365,
+            hour: None,
         }
     }
 
     #[test]
     fn a_chart_reads_the_coarsest_resolution_that_fits_its_step() {
-        let recent = NOW - HOUR_MS;
-        assert_eq!(tier_for(15_000, recent, NOW, &retention()), Tier::Full);
-        assert_eq!(tier_for(30_000, recent, NOW, &retention()), Tier::Full);
-        assert_eq!(tier_for(120_000, recent, NOW, &retention()), Tier::Full);
-        assert_eq!(
-            tier_for(300_000, recent, NOW, &retention()),
-            Tier::FiveMinutes
-        );
-        assert_eq!(
-            tier_for(900_000, recent, NOW, &retention()),
-            Tier::FiveMinutes
-        );
-        assert_eq!(tier_for(3 * HOUR_MS, recent, NOW, &retention()), Tier::Hour);
+        let recent = now() - HOUR;
+        let tier = |step| tier_for(step, recent, now(), &retention());
+        assert_eq!(tier(TimeDelta::seconds(15)), Tier::Full);
+        assert_eq!(tier(TimeDelta::seconds(30)), Tier::Full);
+        assert_eq!(tier(TimeDelta::minutes(2)), Tier::Full);
+        assert_eq!(tier(TimeDelta::minutes(5)), Tier::FiveMinutes);
+        assert_eq!(tier(TimeDelta::minutes(15)), Tier::FiveMinutes);
+        assert_eq!(tier(HOUR * 3), Tier::Hour);
     }
 
     #[test]
     fn a_range_older_than_a_resolution_is_kept_reads_a_coarser_one() {
-        let two_months_ago = NOW - 60 * DAY_MS;
+        let two_months_ago = now() - DAY * 60;
         assert_eq!(
-            tier_for(15_000, two_months_ago, NOW, &retention()),
+            tier_for(TimeDelta::seconds(15), two_months_ago, now(), &retention()),
             Tier::FiveMinutes
         );
-        let two_years_ago = NOW - 730 * DAY_MS;
+        let two_years_ago = now() - DAY * 730;
         assert_eq!(
-            tier_for(15_000, two_years_ago, NOW, &retention()),
+            tier_for(TimeDelta::seconds(15), two_years_ago, now(), &retention()),
             Tier::Hour
         );
         assert_eq!(
-            tier_for(120_000, two_years_ago, NOW, &retention()),
+            tier_for(TimeDelta::minutes(2), two_years_ago, now(), &retention()),
             Tier::Hour
+        );
+        // Kept for good, however far back.
+        assert_eq!(
+            tier_for(
+                TimeDelta::seconds(15),
+                two_years_ago,
+                now(),
+                &Retention::KEEP_EVERYTHING
+            ),
+            Tier::Full
         );
     }
 
     #[test]
     fn an_hour_is_rolled_up_once_it_has_settled() {
-        let hour = 10 * HOUR_MS;
-        assert!(!is_due(hour, hour + HOUR_MS));
-        assert!(!is_due(hour, hour + HOUR_MS + SETTLE_MS - 1));
-        assert!(is_due(hour, hour + HOUR_MS + SETTLE_MS));
+        let hour = hour(10);
+        let millisecond = TimeDelta::milliseconds(1);
+        assert!(!is_due(hour, hour + HOUR));
+        assert!(!is_due(hour, hour + HOUR + SETTLE - millisecond));
+        assert!(is_due(hour, hour + HOUR + SETTLE));
     }
 
     #[test]
     fn a_late_sample_redoes_its_hour_and_the_next() {
-        let hours = hours_to_redo([5 * HOUR_MS + 10], 20 * HOUR_MS, 0);
-        assert_eq!(
-            hours.into_iter().collect::<Vec<_>>(),
-            [5 * HOUR_MS, 6 * HOUR_MS]
-        );
+        let late = hour(5) + TimeDelta::milliseconds(10);
+        let hours = hours_to_redo([late], hour(20), Some(hour(0)));
+        assert_eq!(hours.into_iter().collect::<Vec<_>>(), [hour(5), hour(6)]);
     }
 
     #[test]
     fn only_rolled_up_hours_still_at_full_resolution_are_redone() {
         // Not rolled up yet, so it'll be included when it is.
-        assert!(hours_to_redo([30 * HOUR_MS], 20 * HOUR_MS, 0).is_empty());
+        assert!(hours_to_redo([hour(30)], hour(20), Some(hour(0))).is_empty());
         // Its samples are already going, so rolling it up again would lose the rest.
-        assert!(hours_to_redo([5 * HOUR_MS], 20 * HOUR_MS, 10 * HOUR_MS).is_empty());
+        assert!(hours_to_redo([hour(5)], hour(20), Some(hour(10))).is_empty());
         // The hour after the last one rolled up isn't rolled up either.
-        let hours = hours_to_redo([19 * HOUR_MS + 5], 20 * HOUR_MS, 0);
-        assert_eq!(hours.into_iter().collect::<Vec<_>>(), [19 * HOUR_MS]);
+        let late = hour(19) + TimeDelta::milliseconds(5);
+        let hours = hours_to_redo([late], hour(20), Some(hour(0)));
+        assert_eq!(hours.into_iter().collect::<Vec<_>>(), [hour(19)]);
     }
 
     #[test]
     fn samples_go_only_once_rolled_up_and_older_than_they_are_kept() {
         let retention = retention();
-        let old = NOW - retention.full_ms;
+        let now = now();
+        let old = now - retention.full;
         assert_eq!(
-            full_resolution_cutoff(NOW, &retention, Some(NOW), None),
+            full_resolution_cutoff(now, &retention, Some(now), None),
             Some(hour_of(old))
         );
         // Behind on rolling up: what's not rolled up stays.
-        let behind = old - 50 * HOUR_MS;
+        let behind = old - HOUR * 50;
         assert_eq!(
-            full_resolution_cutoff(NOW, &retention, Some(behind), None),
+            full_resolution_cutoff(now, &retention, Some(behind), None),
             Some(behind)
         );
         // An hour waiting to be redone keeps its samples.
-        let redo = old - 3 * HOUR_MS;
+        let redo = old - HOUR * 3;
         assert_eq!(
-            full_resolution_cutoff(NOW, &retention, Some(NOW), Some(redo)),
+            full_resolution_cutoff(now, &retention, Some(now), Some(redo)),
             Some(redo)
         );
         // Nothing rolled up yet: nothing goes.
-        assert_eq!(full_resolution_cutoff(NOW, &retention, None, None), None);
+        assert_eq!(full_resolution_cutoff(now, &retention, None, None), None);
+        // Kept for good: nothing goes either.
+        let everything = Retention::KEEP_EVERYTHING;
+        assert_eq!(
+            full_resolution_cutoff(now, &everything, Some(now), None),
+            None
+        );
     }
 
     #[test]
@@ -265,8 +292,8 @@ mod tests {
             five_minute_days: 3,
             hour_days: Some(4),
         });
-        assert_eq!(retention.full_ms, 2 * DAY_MS);
-        assert_eq!(retention.five_minute_ms, 3 * DAY_MS);
-        assert_eq!(retention.hour_ms, Some(4 * DAY_MS));
+        assert_eq!(retention.full, DAY * 2);
+        assert_eq!(retention.five_minute, DAY * 3);
+        assert_eq!(retention.hour, Some(DAY * 4));
     }
 }

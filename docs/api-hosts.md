@@ -222,7 +222,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 `GET /api/v1/hosts/{id}/metrics/{metric}`
 
 One metric from the [catalog](api-metrics.md#list-metrics) over a period of time. The server
-chooses `step_ms` to suit the period. Each point covers one step: `avg` is the average
+chooses `step_secs` to suit the period. Each point covers one step from its `time`: `avg` is the average
 of what was reported in it, and `min` and `max` the lowest and highest, so a short spike
 shows in `max` however long the step. Long periods are read from what's
 [kept](databases.md#how-long-metrics-are-kept) 5 minutes or an hour at a time. A metric can
@@ -230,8 +230,11 @@ have several series, such as one for each disk, and `hidden` says how many were 
 
 | Parameter | Description |
 | --- | --- |
-| `from_ms` | The start. Defaults to an hour before `to_ms` |
-| `to_ms` | The end. Defaults to now |
+| `from` | The start, such as `2026-11-06T03:00:00Z`. Defaults to an hour before `to` |
+| `to` | The end. Defaults to now |
+
+A period has to start after it ends, start no earlier than 1970, end before 2300 and
+last no more than 366 days, or it's refused with `400`.
 
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
@@ -242,14 +245,14 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 {
   "metric": "cpu.usage",
   "unit": "percent",
-  "from_ms": 1793936685969,
-  "to_ms": 1793940285969,
-  "step_ms": 15000,
+  "from": "2026-11-06T03:44:45.969Z",
+  "to": "2026-11-06T04:44:45.969Z",
+  "step_secs": 15,
   "series": [
     {
       "name": "CPU",
       "points": [
-        { "occurred_at": "2026-11-06T04:44:30Z", "avg": 19.4, "min": 19.4, "max": 19.4 }
+        { "time": "2026-11-06T04:44:30Z", "avg": 19.4, "min": 19.4, "max": 19.4 }
       ]
     }
   ],

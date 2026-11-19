@@ -12,7 +12,7 @@ use super::audit::record_change;
 use super::{Database, silence};
 use crate::audit::{self, Kind, Snapshot};
 use crate::silences::{Silence, SilenceInput};
-use crate::times::from_ms;
+use crate::times::Timestamp;
 
 fn to_silence(row: silence::Model) -> Silence {
     Silence {
@@ -55,10 +55,10 @@ async fn load<C: ConnectionTrait>(connection: &C, id: i64) -> Result<Option<sile
 
 impl Database {
     /// The one that lasts longest comes first.
-    pub async fn active_silences(&self, now_ms: i64) -> Result<Vec<Silence>> {
+    pub async fn active_silences(&self, now: Timestamp) -> Result<Vec<Silence>> {
         let rows = silence::Entity::find()
-            .filter(silence::Column::StartsAt.lte(from_ms(now_ms)))
-            .filter(silence::Column::EndsAt.gt(from_ms(now_ms)))
+            .filter(silence::Column::StartsAt.lte(now))
+            .filter(silence::Column::EndsAt.gt(now))
             .order_by_desc(silence::Column::EndsAt)
             .order_by_desc(silence::Column::Id)
             .all(&self.connection)
@@ -68,9 +68,9 @@ impl Database {
     }
 
     /// The ones that ended most recently.
-    pub async fn ended_silences(&self, now_ms: i64, limit: u64) -> Result<Vec<Silence>> {
+    pub async fn ended_silences(&self, now: Timestamp, limit: u64) -> Result<Vec<Silence>> {
         let rows = silence::Entity::find()
-            .filter(silence::Column::EndsAt.lte(from_ms(now_ms)))
+            .filter(silence::Column::EndsAt.lte(now))
             .order_by_desc(silence::Column::EndsAt)
             .order_by_desc(silence::Column::Id)
             .limit(limit)
@@ -89,18 +89,22 @@ impl Database {
     }
 
     /// Starts now, and `by` says who asked for it.
-    pub async fn create_silence(&self, input: &SilenceInput, by: &str, now_ms: i64) -> Result<i64> {
-        let lasts_ms = i64::try_from(input.duration_secs)
-            .context("invalid duration")?
-            .saturating_mul(1000);
+    pub async fn create_silence(
+        &self,
+        input: &SilenceInput,
+        by: &str,
+        now: Timestamp,
+    ) -> Result<i64> {
         let row = silence::ActiveModel {
             rule_id: Set(input.rule_id),
             filter: Set(input.filter.trim().to_string()),
             series: Set(input.series.trim().to_string()),
             reason: Set(input.reason.trim().to_string()),
             created_by: Set(by.to_string()),
-            starts_at: Set(from_ms(now_ms)),
-            ends_at: Set(from_ms(now_ms.saturating_add(lasts_ms))),
+            starts_at: Set(now),
+            ends_at: Set(now
+                .checked_add_signed(input.duration)
+                .context("invalid duration")?),
             ..Default::default()
         };
         let transaction = self.connection.begin().await.context("saving silence")?;
@@ -120,13 +124,13 @@ impl Database {
     }
 
     /// Returns false if there's no such silence running.
-    pub async fn end_silence(&self, id: i64, now_ms: i64) -> Result<bool> {
+    pub async fn end_silence(&self, id: i64, now: Timestamp) -> Result<bool> {
         let transaction = self.connection.begin().await.context("ending silence")?;
         let before = load(&transaction, id).await?;
         let result = silence::Entity::update_many()
-            .col_expr(silence::Column::EndsAt, Expr::value(from_ms(now_ms)))
+            .col_expr(silence::Column::EndsAt, Expr::value(now))
             .filter(silence::Column::Id.eq(id))
-            .filter(silence::Column::EndsAt.gt(from_ms(now_ms)))
+            .filter(silence::Column::EndsAt.gt(now))
             .exec(&transaction)
             .await
             .context("ending silence")?;

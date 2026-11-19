@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use axum::Router;
@@ -382,8 +383,8 @@ fn set_option(check: &mut Check, option: &str, line: &str) -> Result<()> {
             .with_context(|| format!("{name} has to be a number, in {line:?}"))
     };
     match name {
-        "timeout" => check.timeout_secs = Some(number()?),
-        "interval" => check.interval_secs = Some(number()?),
+        "timeout" => check.timeout = Some(Duration::from_secs(number()?)),
+        "interval" => check.interval = Some(Duration::from_secs(number()?)),
         "count" => check.count = Some(u32::try_from(number()?)?),
         "method" => check.method = Some(value.to_string()),
         "body" => check.body = Some(value.to_string()),
@@ -424,10 +425,13 @@ fn check_line(check: &Check) -> String {
         quote(&check.target),
     ];
     let options = [
-        ("timeout", check.timeout_secs.map(|value| value.to_string())),
+        (
+            "timeout",
+            check.timeout.map(|value| value.as_secs().to_string()),
+        ),
         (
             "interval",
-            check.interval_secs.map(|value| value.to_string()),
+            check.interval.map(|value| value.as_secs().to_string()),
         ),
         ("method", check.method.clone()),
         ("body", check.body.clone()),
@@ -461,15 +465,15 @@ fn parse_local_checks(text: &str) -> Result<Vec<LocalCheck>> {
             let mut check = LocalCheck::new(name);
             for option in options {
                 let (key, value) = option.split_once('=').unwrap_or((option, ""));
-                let seconds = || -> Result<Option<u64>> {
+                let seconds = || -> Result<Option<Duration>> {
                     let seconds = value.parse().with_context(|| {
                         format!("{key} should be a whole number of seconds, in {line:?}")
                     })?;
-                    Ok(Some(seconds))
+                    Ok(Some(Duration::from_secs(seconds)))
                 };
                 match key {
-                    "timeout" => check.timeout_secs = seconds()?,
-                    "interval" => check.interval_secs = seconds()?,
+                    "timeout" => check.timeout = seconds()?,
+                    "interval" => check.interval = seconds()?,
                     other => bail!(
                         "{other:?} isn't an option here, where only timeout and interval \
                          are, in {line:?}"
@@ -518,11 +522,11 @@ fn local_check_lines(value: &Value) -> String {
         .iter()
         .map(|check| {
             let mut words = vec![quote(&check.name)];
-            if let Some(seconds) = check.timeout_secs {
-                words.push(format!("timeout={seconds}"));
+            if let Some(timeout) = check.timeout {
+                words.push(format!("timeout={}", timeout.as_secs()));
             }
-            if let Some(seconds) = check.interval_secs {
-                words.push(format!("interval={seconds}"));
+            if let Some(interval) = check.interval {
+                words.push(format!("interval={}", interval.as_secs()));
             }
             words.join(" ")
         })
@@ -930,8 +934,8 @@ mod tests {
             parse_local_checks("bastion\n\n \"mail box\" interval=300 timeout=5 ").unwrap();
         assert_eq!(checks[0], LocalCheck::new("bastion"));
         assert_eq!(checks[1].name, "mail box");
-        assert_eq!(checks[1].interval_secs, Some(300));
-        assert_eq!(checks[1].timeout_secs, Some(5));
+        assert_eq!(checks[1].interval, Some(Duration::from_secs(300)));
+        assert_eq!(checks[1].timeout, Some(Duration::from_secs(5)));
         let lines = local_check_lines(&json!(checks));
         assert_eq!(lines, "bastion\n\"mail box\" timeout=5 interval=300");
         assert_eq!(parse_local_checks(&lines).unwrap(), checks);
@@ -953,8 +957,8 @@ mod tests {
     fn check_options_can_follow_the_target() {
         let line = r#"http site https://example.com/ timeout=5 interval=300 regex="Welcome \"back\"" insecure"#;
         let checks = parse_checks(line).unwrap();
-        assert_eq!(checks[0].timeout_secs, Some(5));
-        assert_eq!(checks[0].interval_secs, Some(300));
+        assert_eq!(checks[0].timeout, Some(Duration::from_secs(5)));
+        assert_eq!(checks[0].interval, Some(Duration::from_secs(300)));
         assert_eq!(checks[0].regex.as_deref(), Some(r#"Welcome "back""#));
         assert_eq!(checks[0].insecure, Some(true));
     }

@@ -10,7 +10,7 @@ const EMAIL: &str = "a@example.com";
 async fn person(server: &TestServer, email: &str) -> i64 {
     let database = &server.state.database;
     let (user, link) = database
-        .create_user(email, "Someone", Role::Admin, now_ms())
+        .create_user(email, "Someone", Role::Admin, crate::times::now())
         .await
         .unwrap()
         .unwrap();
@@ -19,7 +19,7 @@ async fn person(server: &TestServer, email: &str) -> i64 {
         .unwrap();
     assert!(
         database
-            .use_setup_link(user.id, &link, &hash, now_ms())
+            .use_setup_link(user.id, &link, &hash, crate::times::now())
             .await
             .unwrap()
     );
@@ -27,7 +27,7 @@ async fn person(server: &TestServer, email: &str) -> i64 {
 }
 
 fn secs() -> u64 {
-    u64::try_from(now_ms() / 1000).unwrap()
+    u64::try_from(crate::times::now().timestamp()).unwrap()
 }
 
 /// Turns two-factor on for someone, and gives their secret and recovery codes.
@@ -36,7 +36,9 @@ async fn with_two_factor(server: &TestServer, id: i64, email: &str) -> (String, 
     let secret = database.start_two_factor(id).await.unwrap().unwrap();
     // A step back, so the code for now is still unused when signing in.
     let code = code_at(&secret, email, secs() - 30);
-    let codes = database.confirm_two_factor(id, &code, now_ms()).await;
+    let codes = database
+        .confirm_two_factor(id, &code, crate::times::now())
+        .await;
     (secret, codes.unwrap().unwrap())
 }
 
@@ -94,13 +96,13 @@ async fn a_code_only_works_once() {
 
     assert!(
         database
-            .accept_two_factor_code(id, &code, now_ms())
+            .accept_two_factor_code(id, &code, crate::times::now())
             .await
             .unwrap()
     );
     assert!(
         !database
-            .accept_two_factor_code(id, &code, now_ms())
+            .accept_two_factor_code(id, &code, crate::times::now())
             .await
             .unwrap()
     );
@@ -108,7 +110,7 @@ async fn a_code_only_works_once() {
     let older = code_at(&secret, EMAIL, secs() - 30);
     assert!(
         !database
-            .accept_two_factor_code(id, &older, now_ms())
+            .accept_two_factor_code(id, &older, crate::times::now())
             .await
             .unwrap()
     );

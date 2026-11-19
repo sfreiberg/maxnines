@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context, Result};
+use chrono::TimeDelta;
 use chrono_tz::Tz;
 use resvg::{tiny_skia, usvg};
 
@@ -20,9 +21,10 @@ use crate::metric_charts::{self, Frame, MAX_SERIES, Marked};
 use crate::metrics::{Metric, Metrics, SeriesResult, Source, TimeRange, Unit};
 use crate::models::Database;
 use crate::registration::Registry;
+use crate::times::Timestamp;
 
 /// How far back the picture goes.
-const HOUR_MS: i64 = 3_600_000;
+const LOOKS_BACK: TimeDelta = TimeDelta::hours(1);
 
 /// The picture's size before it's doubled for sharp screens.
 const WIDTH: f64 = 720.0;
@@ -76,8 +78,8 @@ pub struct ChartSources {
 impl ChartSources {
     /// The alert's picture as a PNG, or nothing for an alert that has no metric to
     /// show, such as an agent going offline, or whose rule is gone.
-    pub async fn draw(&self, alert: &Alert, now_ms: i64) -> Result<Option<Vec<u8>>> {
-        let Some(range) = TimeRange::new(now_ms - HOUR_MS, now_ms) else {
+    pub async fn draw(&self, alert: &Alert, now: Timestamp) -> Result<Option<Vec<u8>>> {
+        let Some(range) = TimeRange::ending(now, LOOKS_BACK) else {
             return Ok(None);
         };
         let sources = Sources {
@@ -285,10 +287,7 @@ fn svg(alert: &Alert, watched: &Watched, range: TimeRange) -> String {
         (alert.resolved_at, "Resolved", colour("good"), 18.0),
     ];
     for (time, label, paint, above) in moments {
-        let Some(time) = time
-            .map(|time| time.timestamp_millis())
-            .filter(|time| (range.from_ms..=range.to_ms).contains(time))
-        else {
+        let Some(time) = time.filter(|time| (range.from..=range.to).contains(time)) else {
             continue;
         };
         let x = metric_charts::x_of(time, range, frame);
@@ -430,7 +429,7 @@ mod tests {
             comparison: Some(Comparison::Above),
             threshold: Some(90.0),
             warning_threshold: Some(80.0),
-            for_secs: 300,
+            hold: TimeDelta::minutes(5),
             severity: Severity::Critical,
             condition: None,
             enabled: true,
@@ -439,20 +438,20 @@ mod tests {
             calculation: None,
             group_by: None,
             filter: None,
-            window_secs: None,
-            remind_every_secs: None,
-            forecast_secs: None,
-            warning_forecast_secs: None,
+            window: None,
+            remind_every: None,
+            forecast: None,
+            warning_forecast: None,
             actions: Vec::new(),
         }
     }
 
     fn hour() -> (TimeRange, SeriesResult) {
-        let now = 1_700_000_000_000;
-        let range = TimeRange::new(now - HOUR_MS, now).unwrap();
+        let now = crate::times::from_ms(1_700_000_000_000);
+        let range = TimeRange::ending(now, LOOKS_BACK).unwrap();
         let points = (0..60)
             .map(|minute| Point {
-                time_ms: now - HOUR_MS + minute * 60_000,
+                time: range.from + TimeDelta::minutes(minute),
                 avg: 70.0 + minute as f64 / 3.0,
                 min: 70.0,
                 max: 90.0,
@@ -521,8 +520,8 @@ mod tests {
         let (range, result) = hour();
         // Started a moment ago and ended now, both at the right edge.
         let alert = Alert {
-            started_at: crate::times::from_ms(range.to_ms - 1000),
-            resolved_at: Some(crate::times::from_ms(range.to_ms)),
+            started_at: range.to - TimeDelta::seconds(1),
+            resolved_at: Some(range.to),
             ..alert()
         };
         let svg = svg(&alert, &disk(result), range);

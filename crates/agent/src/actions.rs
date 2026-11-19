@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, ensure};
 use maxnines_protocol::actions::{
-    ActionOutcome, ActionResult, MAX_ACTION_OUTPUT_BYTES, MAX_ACTION_TIMEOUT_SECS, check_variable,
+    ActionOutcome, ActionResult, MAX_ACTION_OUTPUT_BYTES, MAX_ACTION_TIMEOUT, check_variable,
     fill_variables, is_action_name, variables_used,
 };
 use serde::{Deserialize, Serialize};
@@ -155,7 +155,7 @@ impl Executor {
         &self,
         name: &str,
         variables: &BTreeMap<String, String>,
-        timeout_secs: u64,
+        timeout: Duration,
     ) -> Result<Found, Ended> {
         let built_in = builtin_actions::find(name).filter(|_| self.built_ins);
         let found = match (self.actions.get(name), built_in) {
@@ -169,9 +169,11 @@ impl Executor {
             }
         };
         let found = found.map_err(|error| Ended::refused(error.to_string()))?;
-        if !(1..=MAX_ACTION_TIMEOUT_SECS).contains(&timeout_secs) {
-            let error =
-                format!("the time limit has to be from 1 to {MAX_ACTION_TIMEOUT_SECS} seconds");
+        if !(Duration::from_secs(1)..=MAX_ACTION_TIMEOUT).contains(&timeout) {
+            let error = format!(
+                "the time limit has to be from 1 to {} seconds",
+                MAX_ACTION_TIMEOUT.as_secs()
+            );
             return Err(Ended::refused(error));
         }
         Ok(found)
@@ -184,20 +186,19 @@ impl Executor {
         found: Found,
         name: &str,
         variables: &BTreeMap<String, String>,
-        timeout_secs: u64,
+        timeout: Duration,
     ) -> Ended {
-        let limit = Duration::from_secs(timeout_secs);
         match found {
-            Found::Command(command) => run_command(&command, limit).await,
+            Found::Command(command) => run_command(&command, timeout).await,
             Found::BuiltIn(built_in) => {
                 if built_in.privileged
                     && let Some(helper) = privileges::helper()
-                    && let Some(ended) = helper.ask(name, variables, timeout_secs).await
+                    && let Some(ended) = helper.ask(name, variables, timeout).await
                 {
                     return ended;
                 }
                 // Without the helper it still runs, and says what it couldn't see.
-                run_built_in(built_in, variables, limit, self.state_dir.clone()).await
+                run_built_in(built_in, variables, timeout, self.state_dir.clone()).await
             }
         }
     }
@@ -210,16 +211,15 @@ impl Executor {
         &self,
         name: &str,
         variables: &BTreeMap<String, String>,
-        timeout_secs: u64,
+        timeout: Duration,
     ) -> Ended {
-        let found = match self.find(name, variables, timeout_secs) {
+        let found = match self.find(name, variables, timeout) {
             Ok(found) => found,
             Err(ended) => return ended,
         };
-        let limit = Duration::from_secs(timeout_secs);
         match found {
             Found::BuiltIn(built_in) if built_in.privileged => {
-                run_built_in(built_in, variables, limit, self.state_dir.clone()).await
+                run_built_in(built_in, variables, timeout, self.state_dir.clone()).await
             }
             Found::BuiltIn(_) | Found::Command(_) => Ended::refused("it's the agent's to run"),
         }
@@ -249,10 +249,10 @@ impl Runner {
         id: String,
         name: &str,
         variables: &BTreeMap<String, String>,
-        timeout_secs: u64,
+        timeout: Duration,
     ) -> ActionResult {
         let started = Instant::now();
-        let ended = self.take_turn(name, variables, timeout_secs).await;
+        let ended = self.take_turn(name, variables, timeout).await;
         info!(
             action = name,
             outcome = ended.outcome.as_str(),
@@ -265,7 +265,7 @@ impl Runner {
             error: ended.error,
             output: ended.output,
             truncated: ended.truncated,
-            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            duration: started.elapsed(),
         }
     }
 
@@ -273,10 +273,10 @@ impl Runner {
         &self,
         name: &str,
         variables: &BTreeMap<String, String>,
-        timeout_secs: u64,
+        timeout: Duration,
     ) -> Ended {
         // Checked before waiting, so a request that can't run doesn't take a place.
-        let found = match self.executor.find(name, variables, timeout_secs) {
+        let found = match self.executor.find(name, variables, timeout) {
             Ok(found) => found,
             Err(ended) => return ended,
         };
@@ -290,9 +290,7 @@ impl Runner {
             return Ended::refused("the agent is stopping");
         };
         let executor = &self.executor;
-        executor
-            .run_here(found, name, variables, timeout_secs)
-            .await
+        executor.run_here(found, name, variables, timeout).await
     }
 }
 
@@ -544,7 +542,9 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_action_is_not_run() {
         let runner = runner(Actions::new(), true);
-        let result = runner.run("1".into(), "nope", &variables(&[]), 5).await;
+        let result = runner
+            .run("1".into(), "nope", &variables(&[]), Duration::from_secs(5))
+            .await;
         assert_eq!(result.id, "1");
         assert_eq!(result.outcome, ActionOutcome::NotDefined);
         assert_eq!(result.output, "");
@@ -554,7 +554,9 @@ mod tests {
     async fn a_built_in_action_runs_without_being_defined() {
         let runner = runner(Actions::new(), true);
         let none = variables(&[]);
-        let result = runner.run("1".into(), "top_memory", &none, 30).await;
+        let result = runner
+            .run("1".into(), "top_memory", &none, Duration::from_secs(30))
+            .await;
         assert_eq!(result.outcome, ActionOutcome::Succeeded, "{result:?}");
         assert!(result.output.contains("processes running"), "{result:?}");
     }
@@ -563,12 +565,16 @@ mod tests {
     async fn a_built_in_action_is_refused_without_what_it_needs() {
         let runner = runner(Actions::new(), true);
         let none = variables(&[]);
-        let result = runner.run("1".into(), "disk_space", &none, 30).await;
+        let result = runner
+            .run("1".into(), "disk_space", &none, Duration::from_secs(30))
+            .await;
         assert_eq!(result.outcome, ActionOutcome::Refused, "{result:?}");
         assert!(result.error.unwrap().contains("{disk}"));
 
         let nowhere = variables(&[("disk", "/nonexistent/maxnines-test")]);
-        let result = runner.run("2".into(), "disk_space", &nowhere, 30).await;
+        let result = runner
+            .run("2".into(), "disk_space", &nowhere, Duration::from_secs(30))
+            .await;
         assert_eq!(result.outcome, ActionOutcome::Failed, "{result:?}");
     }
 
@@ -576,7 +582,9 @@ mod tests {
     async fn built_in_actions_can_be_turned_off() {
         let runner = runner(Actions::new(), false);
         let none = variables(&[]);
-        let result = runner.run("1".into(), "top_cpu", &none, 30).await;
+        let result = runner
+            .run("1".into(), "top_cpu", &none, Duration::from_secs(30))
+            .await;
         assert_eq!(result.outcome, ActionOutcome::NotDefined);
     }
 
@@ -585,8 +593,11 @@ mod tests {
         use super::*;
 
         async fn run(command: &[&str], given: &[(&str, &str)], secs: u64) -> ActionResult {
+            let timeout = Duration::from_secs(secs);
             let runner = runner(actions(&[("a", command)]), true);
-            runner.run("7".into(), "a", &variables(given), secs).await
+            runner
+                .run("7".into(), "a", &variables(given), timeout)
+                .await
         }
 
         #[tokio::test]
@@ -636,7 +647,7 @@ mod tests {
             }
             let result = run(&command, &[("disk", "/")], 0).await;
             assert_eq!(result.outcome, ActionOutcome::Refused);
-            let result = run(&command, &[("disk", "/")], MAX_ACTION_TIMEOUT_SECS + 1).await;
+            let result = run(&command, &[("disk", "/")], MAX_ACTION_TIMEOUT.as_secs() + 1).await;
             assert_eq!(result.outcome, ActionOutcome::Refused);
         }
 
@@ -675,7 +686,8 @@ mod tests {
             let runner = runner(actions(&[("a", &command)]), true);
 
             let none = variables(&[]);
-            let runs = (0..4).map(|i| runner.run(i.to_string(), "a", &none, 10));
+            let runs =
+                (0..4).map(|i| runner.run(i.to_string(), "a", &none, Duration::from_secs(10)));
             for result in futures_util::future::join_all(runs).await {
                 assert_eq!(result.outcome, ActionOutcome::Succeeded, "{result:?}");
             }
@@ -685,7 +697,8 @@ mod tests {
         async fn a_long_queue_of_actions_is_refused() {
             let runner = runner(actions(&[("a", &["/bin/sleep", "0.1"])]), true);
             let none = variables(&[]);
-            let runs = (0..MAX_WAITING + 5).map(|i| runner.run(i.to_string(), "a", &none, 10));
+            let runs = (0..MAX_WAITING + 5)
+                .map(|i| runner.run(i.to_string(), "a", &none, Duration::from_secs(10)));
             let results = futures_util::future::join_all(runs).await;
             let refused = results
                 .iter()

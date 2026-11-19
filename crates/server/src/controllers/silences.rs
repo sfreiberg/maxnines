@@ -4,13 +4,14 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
+use chrono::TimeDelta;
 use serde::{Deserialize, Serialize};
 
 use super::{CsrfForm, Page, local_time, recorded_by, server_error};
 use crate::app_state::AppState;
 use crate::maintenance::MaintenanceWindow;
-use crate::metrics::now_ms;
 use crate::silences::{Silence, SilenceInput};
+use crate::times::Timestamp;
 
 /// How many ended silences the page shows.
 const HISTORY: u64 = 20;
@@ -87,7 +88,7 @@ struct WindowRow {
 async fn window_rows(
     state: &AppState,
     windows: Vec<MaintenanceWindow>,
-    now: i64,
+    now: Timestamp,
 ) -> anyhow::Result<Vec<WindowRow>> {
     let names = state.database.alert_rule_names().await?;
     let rule_name = |id: i64| names.get(&id).cloned().unwrap_or_default();
@@ -112,7 +113,7 @@ async fn window_rows(
 }
 
 async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
-    let now = now_ms();
+    let now = crate::times::now();
     let lists = async {
         let active = state.database.active_silences(now).await?;
         let ended = state.database.ended_silences(now, HISTORY).await?;
@@ -215,17 +216,19 @@ fn input_from(silence: &SilenceForm) -> Result<SilenceInput, String> {
         "" => None,
         text => Some(text.parse().map_err(|_| "Choose a rule.".to_string())?),
     };
-    let duration_secs = silence
+    let duration = silence
         .duration_secs
         .parse()
-        .map_err(|_| "Choose how long it lasts.".to_string())?;
+        .ok()
+        .and_then(TimeDelta::try_seconds)
+        .ok_or_else(|| "Choose how long it lasts.".to_string())?;
     Ok(SilenceInput {
         rule_id,
         filter: silence.filter.clone(),
         series: silence.series.clone(),
         all_alerts: silence.all_alerts,
         reason: silence.reason.clone(),
-        duration_secs,
+        duration,
     })
 }
 
@@ -250,14 +253,18 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
     }
 
     let by = recorded_by();
-    match state.database.create_silence(&input, &by, now_ms()).await {
+    match state
+        .database
+        .create_silence(&input, &by, crate::times::now())
+        .await
+    {
         Ok(_) => (form.token, Redirect::to("/alerts/silences")).into_response(),
         Err(error) => server_error(&error),
     }
 }
 
 async fn end(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfForm) -> Response {
-    match state.database.end_silence(id, now_ms()).await {
+    match state.database.end_silence(id, crate::times::now()).await {
         Ok(true) => (form.token, Redirect::to("/alerts/silences")).into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),

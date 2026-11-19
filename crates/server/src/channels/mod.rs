@@ -281,13 +281,13 @@ pub(crate) mod testing {
             variables: BTreeMap::from([("disk".to_string(), "/var".to_string())]),
             requested_by: None,
             requested_at: crate::times::from_ms(2_000),
-            timeout_secs: 30,
+            timeout: std::time::Duration::from_secs(30),
             outcome: Some(ActionOutcome::Succeeded),
             exit_code: None,
             error: None,
             output: output.to_string(),
             truncated: false,
-            duration_ms: Some(1_500),
+            duration: Some(std::time::Duration::from_millis(1_500)),
             finished_at: Some(crate::times::from_ms(3_500)),
         };
         Notice {

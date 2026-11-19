@@ -13,11 +13,13 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use chrono::TimeDelta;
 use maxnines_protocol::Sample;
 use serde_json::json;
 use tokio::time::Instant;
 
 use crate::store::NewSample;
+use crate::times::Timestamp;
 
 /// How often each connected agent is asked. Clocks drift slowly.
 pub const ASK_EVERY: Duration = Duration::from_secs(60);
@@ -31,24 +33,26 @@ pub struct Asked {
     /// Sent back with the answer, so an answer to an older question, or one
     /// nobody asked, matches nothing.
     pub nonce: String,
+    /// When it was sent, by a clock that only goes forward, for timing the answer.
     sent: Instant,
     /// What the server's clock said when it was sent.
-    sent_ms: i64,
+    sent_at: Timestamp,
 }
 
 impl Asked {
-    pub fn new(nonce: String, now_ms: i64) -> Self {
+    pub fn new(nonce: String, now: Timestamp) -> Self {
         Self {
             nonce,
             sent: Instant::now(),
-            sent_ms: now_ms,
+            sent_at: now,
         }
     }
 
-    /// What an answer saying `host_ms` means, if it's the answer to this.
-    pub fn answered(&self, nonce: &str, host_ms: u64) -> Option<Reading> {
+    /// What an answer saying the host's clock read `host_time` means, if it's the
+    /// answer to this.
+    pub fn answered(&self, nonce: &str, host_time: Timestamp) -> Option<Reading> {
         (nonce == self.nonce)
-            .then(|| reading(self.sent_ms, self.sent.elapsed(), host_ms))
+            .then(|| reading(self.sent_at, self.sent.elapsed(), host_time))
             .flatten()
     }
 }
@@ -56,24 +60,21 @@ impl Asked {
 /// How a host's clock compares with the server's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reading {
-    /// How far ahead of the server's the host's clock is, in milliseconds. Behind
-    /// is negative.
-    pub offset_ms: i64,
-    pub round_trip_ms: u64,
+    /// How far ahead of the server's the host's clock is. Behind is negative.
+    pub offset: TimeDelta,
+    pub round_trip: Duration,
 }
 
 /// Compares what the host said with the middle of the round trip, or nothing if
 /// that took too long to say where in it the host's clock was read.
-fn reading(sent_ms: i64, round_trip: Duration, host_ms: u64) -> Option<Reading> {
+fn reading(sent_at: Timestamp, round_trip: Duration, host_time: Timestamp) -> Option<Reading> {
     if round_trip > MAX_ROUND_TRIP {
         return None;
     }
-    let round_trip_ms = round_trip.as_millis() as u64;
-    let middle_ms = sent_ms.saturating_add((round_trip_ms / 2) as i64);
-    let host_ms = i64::try_from(host_ms).unwrap_or(i64::MAX);
+    let middle = sent_at + TimeDelta::from_std(round_trip / 2).ok()?;
     Some(Reading {
-        offset_ms: host_ms.saturating_sub(middle_ms),
-        round_trip_ms,
+        offset: host_time - middle,
+        round_trip,
     })
 }
 
@@ -81,16 +82,17 @@ impl Reading {
     /// As a sample from the host, dated by the server. Only how far apart the
     /// clocks are is kept, not which is ahead: either way the host's is wrong,
     /// and one number is one thing to alert on.
-    pub fn sample(self, host_id: &str, hostname: &str, now_ms: i64) -> NewSample {
+    pub fn sample(self, host_id: &str, hostname: &str, now: Timestamp) -> NewSample {
+        let apart = self.offset.abs();
         let clock = json!({
-            "difference_secs": self.offset_ms.unsigned_abs() as f64 / 1000.0,
-            "round_trip_ms": self.round_trip_ms,
+            "difference_secs": apart.num_milliseconds() as f64 / 1000.0,
+            "round_trip_ms": u64::try_from(self.round_trip.as_millis()).unwrap_or(u64::MAX),
         });
         NewSample {
             host_id: host_id.to_string(),
             hostname: hostname.to_string(),
             sample: Sample {
-                timestamp_ms: u64::try_from(now_ms).unwrap_or(0),
+                time: now,
                 metrics: BTreeMap::from([("clock".to_string(), clock)]),
             },
         }
@@ -100,63 +102,71 @@ impl Reading {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::times::from_ms;
 
-    const NOON_MS: i64 = 1_800_000_000_000;
+    fn noon() -> Timestamp {
+        from_ms(1_800_000_000_000)
+    }
+
+    fn ms(milliseconds: i64) -> TimeDelta {
+        TimeDelta::milliseconds(milliseconds)
+    }
 
     #[test]
     fn a_clock_is_compared_with_the_middle_of_the_round_trip() {
         // Asked at noon and answered 40 ms later, so it was read about 20 ms in.
         let took = Duration::from_millis(40);
-        let right = reading(NOON_MS, took, NOON_MS as u64 + 20).unwrap();
-        assert_eq!((right.offset_ms, right.round_trip_ms), (0, 40));
+        let right = reading(noon(), took, noon() + ms(20)).unwrap();
+        assert_eq!((right.offset, right.round_trip), (ms(0), took));
 
-        let ahead = reading(NOON_MS, took, NOON_MS as u64 + 7020).unwrap();
-        assert_eq!(ahead.offset_ms, 7000);
-        let behind = reading(NOON_MS, took, NOON_MS as u64 - 2980).unwrap();
-        assert_eq!(behind.offset_ms, -3000);
+        let ahead = reading(noon(), took, noon() + ms(7020)).unwrap();
+        assert_eq!(ahead.offset, ms(7000));
+        let behind = reading(noon(), took, noon() - ms(2980)).unwrap();
+        assert_eq!(behind.offset, ms(-3000));
     }
 
     #[test]
     fn an_answer_that_took_too_long_is_not_used() {
-        assert!(reading(NOON_MS, MAX_ROUND_TRIP, NOON_MS as u64).is_some());
+        assert!(reading(noon(), MAX_ROUND_TRIP, noon()).is_some());
         let late = MAX_ROUND_TRIP + Duration::from_millis(1);
-        assert_eq!(reading(NOON_MS, late, NOON_MS as u64), None);
+        assert_eq!(reading(noon(), late, noon()), None);
     }
 
     #[test]
     fn a_time_that_cannot_be_true_does_not_overflow() {
-        let reading = reading(NOON_MS, Duration::ZERO, u64::MAX).unwrap();
-        assert!(reading.offset_ms > 0);
+        let reading = reading(noon(), Duration::ZERO, Timestamp::MAX_UTC).unwrap();
+        assert!(reading.offset > TimeDelta::zero());
     }
 
     #[tokio::test]
     async fn only_the_answer_to_the_question_asked_counts() {
-        let asked = Asked::new("this one".to_string(), NOON_MS);
-        assert_eq!(asked.answered("another", NOON_MS as u64), None);
-        assert!(asked.answered("this one", NOON_MS as u64).is_some());
+        let asked = Asked::new("this one".to_string(), noon());
+        assert_eq!(asked.answered("another", noon()), None);
+        assert!(asked.answered("this one", noon()).is_some());
     }
 
     #[test]
     fn a_reading_is_saved_as_how_far_apart_and_dated_by_the_server() {
+        let round_trip = Duration::from_millis(12);
         let ahead = Reading {
-            offset_ms: 7500,
-            round_trip_ms: 12,
+            offset: ms(7500),
+            round_trip,
         };
-        let saved = ahead.sample("abc", "web-1", NOON_MS);
+        let saved = ahead.sample("abc", "web-1", noon());
         assert_eq!(
             (saved.host_id.as_str(), saved.hostname.as_str()),
             ("abc", "web-1")
         );
-        assert_eq!(saved.sample.timestamp_ms, NOON_MS as u64);
+        assert_eq!(saved.sample.time, noon());
         let clock = &saved.sample.metrics["clock"];
         assert_eq!(clock["difference_secs"], 7.5);
         assert_eq!(clock["round_trip_ms"], 12);
 
         let behind = Reading {
-            offset_ms: -250,
-            round_trip_ms: 12,
+            offset: ms(-250),
+            round_trip,
         };
-        let clock = &behind.sample("abc", "web-1", NOON_MS).sample.metrics["clock"];
+        let clock = &behind.sample("abc", "web-1", noon()).sample.metrics["clock"];
         assert_eq!(clock["difference_secs"], 0.25);
     }
 }

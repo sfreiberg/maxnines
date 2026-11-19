@@ -16,14 +16,14 @@ use serde_json::{Value, json};
 use super::users::role_choices;
 use super::{CsrfForm, Page, local_date, local_time, server_error, signed_in_user};
 use crate::app_sign_ins::{
-    ACCESS_LIFETIME_MS, AppClient, Approval, DEVICE_INTERVAL_SECS, DevicePoll, PENDING_LIFETIME_MS,
-    REFRESH_LIFETIME_MS, check_challenge, check_device, check_redirect, client, known_client,
+    ACCESS_LIFETIME, AppClient, Approval, DEVICE_INTERVAL, DevicePoll, PENDING_LIFETIME,
+    REFRESH_LIFETIME, check_challenge, check_device, check_redirect, client, known_client,
 };
 use crate::app_state::AppState;
 use crate::audit::{self, Actor};
-use crate::metrics::now_ms;
 use crate::models::{AppSignIn, AppTokens, Refreshed};
 use crate::roles::Role;
+use crate::times::Timestamp;
 
 const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
@@ -269,7 +269,7 @@ async fn authorize(State(state): State<AppState>, form: CsrfForm) -> Response {
         approval,
         &asked.redirect_uri,
         &asked.challenge,
-        now_ms(),
+        crate::times::now(),
     ) {
         Ok(code) => back_to(
             &asked.redirect_uri,
@@ -308,7 +308,10 @@ fn device_approval(
     typed: &str,
     error: Option<&str>,
 ) -> Response {
-    let Some(asking) = state.pending_sign_ins.device_asking(typed, now_ms()) else {
+    let Some(asking) = state
+        .pending_sign_ins
+        .device_asking(typed, crate::times::now())
+    else {
         return Page::new(state, token, "app_sign_ins/device.html")
             .with("code", typed)
             .with(
@@ -338,7 +341,10 @@ fn device_approval(
 
 async fn device_decide(State(state): State<AppState>, form: CsrfForm) -> Response {
     let user_code = field(&form.fields, "user_code");
-    let Some(asking) = state.pending_sign_ins.device_asking(user_code, now_ms()) else {
+    let Some(asking) = state
+        .pending_sign_ins
+        .device_asking(user_code, crate::times::now())
+    else {
         return device_approval(&state, &form.token, user_code, None);
     };
     let approver = if field(&form.fields, "decision") == "allow" {
@@ -353,7 +359,7 @@ async fn device_decide(State(state): State<AppState>, form: CsrfForm) -> Respons
     let approved = approver.is_some();
     if !state
         .pending_sign_ins
-        .decide_device(user_code, approver, now_ms())
+        .decide_device(user_code, approver, crate::times::now())
     {
         return device_approval(&state, &form.token, user_code, None);
     }
@@ -385,9 +391,9 @@ fn issued(sign_in: &AppSignIn, tokens: &AppTokens) -> Response {
     let body = Json(json!({
         "access_token": tokens.access_token,
         "token_type": "Bearer",
-        "expires_in": ACCESS_LIFETIME_MS / 1000,
+        "expires_in": ACCESS_LIFETIME.num_seconds(),
         "refresh_token": tokens.refresh_token,
-        "refresh_token_expires_in": REFRESH_LIFETIME_MS / 1000,
+        "refresh_token_expires_in": REFRESH_LIFETIME.num_seconds(),
         "role": sign_in.role,
         "user": sign_in.owner,
         "sign_in_id": sign_in.id,
@@ -422,7 +428,7 @@ async fn sign_in_approved(state: &AppState, approval: Approval) -> Response {
             &approval.client.id,
             &approval.device,
             approval.role.min(user.role),
-            now_ms(),
+            crate::times::now(),
         ),
     )
     .await;
@@ -448,7 +454,7 @@ async fn token(State(state): State<AppState>, Form(fields): Form<Fields>) -> Res
                 client_id,
                 field(&fields, "redirect_uri"),
                 field(&fields, "code_verifier"),
-                now_ms(),
+                crate::times::now(),
             );
             match approval {
                 Some(approval) => sign_in_approved(&state, approval).await,
@@ -463,7 +469,7 @@ async fn token(State(state): State<AppState>, Form(fields): Form<Fields>) -> Res
             let poll = state.pending_sign_ins.poll_device(
                 field(&fields, "device_code"),
                 client_id,
-                now_ms(),
+                crate::times::now(),
             );
             let waiting = |error: &str, description: &str| {
                 oauth_error(StatusCode::BAD_REQUEST, error, description)
@@ -483,7 +489,7 @@ async fn token(State(state): State<AppState>, Form(fields): Form<Fields>) -> Res
                 state.database.refresh_app_sign_in(
                     field(&fields, "refresh_token"),
                     client_id,
-                    now_ms(),
+                    crate::times::now(),
                 ),
             )
             .await;
@@ -526,28 +532,29 @@ async fn start_device(State(state): State<AppState>, Form(fields): Form<Fields>)
             "The device name or role isn't one that works",
         );
     };
-    let started = match state
-        .pending_sign_ins
-        .start_device(client, &device, role, now_ms())
-    {
-        Ok(Some(started)) => started,
-        Ok(None) => {
-            return oauth_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "temporarily_unavailable",
-                "Too many devices are waiting to be signed in. Try again in a few minutes",
-            );
-        }
-        Err(error) => return server_error(&error),
-    };
+    let started =
+        match state
+            .pending_sign_ins
+            .start_device(client, &device, role, crate::times::now())
+        {
+            Ok(Some(started)) => started,
+            Ok(None) => {
+                return oauth_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "temporarily_unavailable",
+                    "Too many devices are waiting to be signed in. Try again in a few minutes",
+                );
+            }
+            Err(error) => return server_error(&error),
+        };
     let page = format!("{}/device", state.web_url.trim_end_matches('/'));
     let body: Value = json!({
         "device_code": started.device_code,
         "user_code": started.user_code,
         "verification_uri": page,
         "verification_uri_complete": format!("{page}?code={}", started.user_code),
-        "expires_in": PENDING_LIFETIME_MS / 1000,
-        "interval": DEVICE_INTERVAL_SECS,
+        "expires_in": PENDING_LIFETIME.num_seconds(),
+        "interval": DEVICE_INTERVAL.num_seconds(),
     });
     no_store(Json(body).into_response())
 }
@@ -568,7 +575,7 @@ async fn revoke_token(State(state): State<AppState>, Form(fields): Form<Fields>)
         None,
         state
             .database
-            .revoke_app_token(field(&fields, "token"), client_id, now_ms()),
+            .revoke_app_token(field(&fields, "token"), client_id, crate::times::now()),
     )
     .await;
     match revoked {
@@ -600,7 +607,7 @@ pub async fn active_sign_ins(state: &AppState) -> anyhow::Result<u64> {
         Some(whose) => {
             state
                 .database
-                .count_active_app_sign_ins(whose, now_ms())
+                .count_active_app_sign_ins(whose, crate::times::now())
                 .await
         }
         None => Ok(0),
@@ -619,7 +626,10 @@ pub async fn revoke_if_allowed(state: &AppState, id: i64) -> anyhow::Result<bool
     if whose.is_some_and(|user_id| user_id != sign_in.user_id) {
         return Ok(false);
     }
-    state.database.revoke_app_sign_in(id, now_ms()).await
+    state
+        .database
+        .revoke_app_sign_in(id, crate::times::now())
+        .await
 }
 
 #[derive(Serialize)]
@@ -637,8 +647,8 @@ struct SignInRow {
     active: bool,
 }
 
-fn row(sign_in: AppSignIn, now_ms: i64) -> SignInRow {
-    let active = sign_in.is_active(now_ms);
+fn row(sign_in: AppSignIn, now: Timestamp) -> SignInRow {
+    let active = sign_in.is_active(now);
     let status = if sign_in.revoked_at.is_some() {
         "Revoked"
     } else if active {
@@ -646,7 +656,6 @@ fn row(sign_in: AppSignIn, now_ms: i64) -> SignInRow {
     } else {
         "Expired"
     };
-    let now = crate::times::from_ms(now_ms);
     SignInRow {
         id: sign_in.id,
         title: sign_in.title(),
@@ -669,7 +678,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
         Ok(sign_ins) => sign_ins,
         Err(error) => return server_error(&error),
     };
-    let now = now_ms();
+    let now = crate::times::now();
     let rows: Vec<SignInRow> = sign_ins
         .into_iter()
         .map(|sign_in| row(sign_in, now))

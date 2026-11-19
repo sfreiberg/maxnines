@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use futures_util::{FutureExt, Sink, SinkExt, StreamExt};
@@ -31,8 +31,7 @@ use crate::facts::Allowed;
 use crate::spool::Spool;
 
 /// The server pings regularly, so this much silence means the connection died.
-const SERVER_SILENCE_LIMIT: Duration =
-    Duration::from_secs(maxnines_protocol::AGENT_SILENCE_LIMIT_SECS);
+const SERVER_SILENCE_LIMIT: Duration = maxnines_protocol::AGENT_SILENCE_LIMIT;
 /// How long connecting, and then the handshake, each get. A server, firewall or load
 /// balancer that accepts the connection and then says nothing would otherwise hold
 /// the agent offline for good.
@@ -295,10 +294,8 @@ where
 async fn receive(text: &str, connection: &Connection) -> Option<String> {
     match serde_json::from_str(text) {
         Ok(ServerMessage::AskTime { nonce }) => {
-            let time_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |since| since.as_millis() as u64);
-            return serde_json::to_string(&AgentMessage::Time { nonce, time_ms })
+            let answered_at = maxnines_protocol::time::now();
+            return serde_json::to_string(&AgentMessage::Time { nonce, answered_at })
                 .inspect_err(|error| error!(%error, "the time couldn't be sent"))
                 .ok();
         }
@@ -308,16 +305,16 @@ async fn receive(text: &str, connection: &Connection) -> Option<String> {
                 error!("config dropped, the agent has stopped");
             }
         }
-        Ok(ServerMessage::Ack { timestamp_ms }) => connection.spool.acked(timestamp_ms),
+        Ok(ServerMessage::Ack { time }) => connection.spool.acked(time),
         Ok(ServerMessage::RunAction {
             id,
             action,
             variables,
-            timeout_secs,
+            timeout,
         }) => {
             let (runner, outgoing) = (connection.runner.clone(), connection.outgoing.clone());
             tokio::spawn(async move {
-                let result = runner.run(id, &action, &variables, timeout_secs).await;
+                let result = runner.run(id, &action, &variables, timeout).await;
                 match serde_json::to_string(&AgentMessage::ActionResult(result)) {
                     // Waits its turn if the connection is down, and goes when it's back.
                     Ok(text) => {
@@ -439,9 +436,14 @@ mod tests {
         }
     }
 
+    /// When [`sample`] was taken.
+    fn taken_at() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp_millis(1_789_000_000_007).unwrap()
+    }
+
     fn sample() -> Sample {
         Sample {
-            timestamp_ms: 7,
+            time: taken_at(),
             metrics: BTreeMap::new(),
         }
     }
@@ -605,7 +607,7 @@ mod tests {
             id: "run-1".to_string(),
             action: "greet".to_string(),
             variables: BTreeMap::from([("hostname".to_string(), "web-1".to_string())]),
-            timeout_secs: 5,
+            timeout: Duration::from_secs(5),
         };
         send_to_agent(&mut socket, &ask).await;
 
@@ -618,26 +620,21 @@ mod tests {
     #[tokio::test]
     async fn says_what_its_clock_reads_as_soon_as_it_is_asked() {
         let (_link, mut socket) = connected().await;
-        let now_ms = || {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64
-        };
-        let before = now_ms();
+        let before = maxnines_protocol::time::now();
         let ask = ServerMessage::AskTime {
             nonce: "question-1".to_string(),
         };
         send_to_agent(&mut socket, &ask).await;
 
         // Facts arrive whenever they're due, so they're skipped over.
-        let (nonce, time_ms) = loop {
-            if let AgentMessage::Time { nonce, time_ms } = next_message(&mut socket).await {
-                break (nonce, time_ms);
+        let (nonce, answered_at) = loop {
+            if let AgentMessage::Time { nonce, answered_at } = next_message(&mut socket).await {
+                break (nonce, answered_at);
             }
         };
         assert_eq!(nonce, "question-1");
-        assert!((before..=now_ms()).contains(&time_ms), "{time_ms}");
+        let after = maxnines_protocol::time::now();
+        assert!((before..=after).contains(&answered_at), "{answered_at}");
     }
 
     #[tokio::test]
@@ -647,7 +644,7 @@ mod tests {
             id: "run-2".to_string(),
             action: "reboot".to_string(),
             variables: BTreeMap::new(),
-            timeout_secs: 5,
+            timeout: Duration::from_secs(5),
         };
         send_to_agent(&mut socket, &ask).await;
 
@@ -767,7 +764,8 @@ mod tests {
     async fn a_sample_that_fails_to_send_stays_queued() {
         let folder = tempfile::tempdir().unwrap();
         let spool = Spool::open(&folder.path().join("samples"));
-        spool.push(r#"{"timestamp_ms":1}"#.to_string());
+        let text = serde_json::to_string(&sample()).unwrap();
+        spool.push(text.clone());
         let broken = futures_util::sink::unfold((), |(), _: Message| async {
             Err::<(), &str>("connection lost")
         });
@@ -776,7 +774,7 @@ mod tests {
         assert!(send_next(&mut broken, &spool).await.is_err());
         spool.set_online(false);
 
-        assert_eq!(spool.next().unwrap(), r#"{"timestamp_ms":1}"#);
+        assert_eq!(spool.next().unwrap(), text);
     }
 
     /// Waits for a new connection from the agent, and gets past its first facts.
@@ -820,7 +818,7 @@ mod tests {
 
         link.send_sample(&sample()).unwrap();
         next_message(&mut socket).await;
-        let ack = ServerMessage::Ack { timestamp_ms: 7 };
+        let ack = ServerMessage::Ack { time: taken_at() };
         send_to_agent(&mut socket, &ack).await;
         until(|| link.spool.unconfirmed() == 0).await;
         drop(socket);

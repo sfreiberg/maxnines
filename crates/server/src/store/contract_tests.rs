@@ -1,6 +1,12 @@
 // What every metrics store has to do, the same way. Each store's tests include this,
 // with `TestStore` and `in_memory` of their own.
 
+/// The moment `ms` milliseconds after 1970. Most tests count from there in round
+/// numbers, which every store treats like any other time.
+fn at(ms: i64) -> Timestamp {
+    crate::times::from_ms(ms)
+}
+
 fn names(result: &SeriesResult) -> Vec<&str> {
     result.series.iter().map(|s| s.name.as_str()).collect()
 }
@@ -26,12 +32,12 @@ fn write_one(
 fn write_metric(
     store: &mut TestStore,
     host: &str,
-    time_ms: u64,
+    time_ms: i64,
     collector: &str,
     data: Value,
 ) {
     let sample = Sample {
-        timestamp_ms: time_ms,
+        time: at(time_ms),
         metrics: BTreeMap::from([(collector.to_string(), data)]),
     };
     write_one(store, host, "host", &sample).unwrap();
@@ -44,7 +50,7 @@ fn query(store: &TestStore, host_id: &str, metric: &str, max_series: usize) -> S
         .series(&SeriesQuery {
             host_id,
             metric: find(metric).unwrap(),
-            range: TimeRange::new(0, HOUR_MS).unwrap(),
+            range: TimeRange::new(at(0), at(HOUR_MS)).unwrap(),
             max_series,
         })
         .unwrap()
@@ -56,21 +62,21 @@ fn averages(series: &Series) -> Vec<f64> {
 
 fn latest_output(store: &TestStore, host: &str, collector: &str) -> Option<Value> {
     let reader = store.reader().unwrap();
-    reader.latest_output(host, collector, 0, 9000).unwrap()
+    reader.latest_output(host, collector, at(0), at(9000)).unwrap()
 }
 
 fn newest(store: &TestStore, metric: &str, since: i64, until: i64) -> Vec<NewestReading> {
     store
         .reader()
         .unwrap()
-        .newest(find(metric).unwrap(), since, until)
+        .newest(find(metric).unwrap(), at(since), at(until))
         .unwrap()
 }
 
 fn values(readings: &[NewestReading]) -> Vec<(&str, &str, i64, f64)> {
     readings
         .iter()
-        .map(|r| (r.host_id.as_str(), r.series.as_str(), r.time_ms, r.value))
+        .map(|r| (r.host_id.as_str(), r.series.as_str(), r.time.timestamp_millis(), r.value))
         .collect()
 }
 
@@ -83,7 +89,7 @@ fn calculate(
 ) -> SeriesResult {
     let query = CalculationQuery {
         metric: find(metric).unwrap(),
-        range: TimeRange::new(0, 3_600_000).unwrap(),
+        range: TimeRange::new(at(0), at(HOUR_MS)).unwrap(),
         calculation,
         members: members
             .iter()
@@ -137,13 +143,13 @@ fn values_in_a_bucket_are_summarized_together() {
         result.series[0].points,
         [
             Point {
-                time_ms: 0,
+                time: at(0),
                 avg: 20.0,
                 min: 10.0,
                 max: 30.0
             },
             Point {
-                time_ms: 15_000,
+                time: at(15_000),
                 avg: 50.0,
                 min: 50.0,
                 max: 50.0
@@ -431,7 +437,7 @@ fn a_query_only_sees_its_agent_and_its_time_range() {
     let cpu = || json!({ "usage_percent": 1.0 });
     write_metric(&mut store, "a", 1000, "cpu", cpu());
     write_metric(&mut store, "b", 1000, "cpu", cpu());
-    write_metric(&mut store, "a", HOUR_MS as u64, "cpu", cpu());
+    write_metric(&mut store, "a", HOUR_MS, "cpu", cpu());
 
     let result = query(&store, "a", "cpu.usage", 8);
 
@@ -466,7 +472,7 @@ fn last_samples_give_each_agents_newest_time_from_any_collector() {
     write_metric(&mut store, "a", 2000, "memory", json!({ "used_bytes": 1 }));
     write_metric(&mut store, "b", 1500, "cpu", cpu());
 
-    let mut last = store.reader().unwrap().last_samples(0, 5000).unwrap();
+    let mut last = store.reader().unwrap().last_samples(at(0), at(5000)).unwrap();
     last.sort_by_key(|sample| sample.host_id.clone());
 
     assert_eq!(
@@ -474,11 +480,11 @@ fn last_samples_give_each_agents_newest_time_from_any_collector() {
         [
             LastSample {
                 host_id: "a".to_string(),
-                time_ms: 2000
+                time: at(2000),
             },
             LastSample {
                 host_id: "b".to_string(),
-                time_ms: 1500
+                time: at(1500),
             },
         ]
     );
@@ -492,7 +498,7 @@ fn last_samples_ignore_what_is_outside_their_window() {
     write_metric(&mut store, "now", 5000, "cpu", cpu());
     write_metric(&mut store, "future", 9000, "cpu", cpu());
 
-    let last = store.reader().unwrap().last_samples(2000, 8000).unwrap();
+    let last = store.reader().unwrap().last_samples(at(2000), at(8000)).unwrap();
 
     assert_eq!(last.len(), 1);
     assert_eq!(last[0].host_id, "now");
@@ -562,7 +568,7 @@ fn reads_see_writes_and_work_while_writes_continue() {
 
     let reads = std::thread::spawn(move || {
         for _ in 0..200 {
-            reader.last_samples(0, HOUR_MS).unwrap();
+            reader.last_samples(at(0), at(HOUR_MS)).unwrap();
         }
         reader
     });
@@ -577,7 +583,7 @@ fn reads_see_writes_and_work_while_writes_continue() {
     }
     let reader = reads.join().unwrap();
 
-    assert_eq!(reader.last_samples(0, HOUR_MS).unwrap()[0].time_ms, 199);
+    assert_eq!(reader.last_samples(at(0), at(HOUR_MS)).unwrap()[0].time, at(199));
 }
 
 #[test]
@@ -1068,7 +1074,7 @@ fn a_moment_still_filling_up_is_left_out() {
 
     let query = CalculationQuery {
         metric: find("cpu.usage").unwrap(),
-        range: TimeRange::new(0, 90_000).unwrap(),
+        range: TimeRange::new(at(0), at(90_000)).unwrap(),
         calculation: Calculation::Sum,
         members: ["a", "b"]
             .iter()
@@ -1166,7 +1172,7 @@ fn series_are_counted_once_however_often_they_report() {
 
 #[test]
 fn stats_work_on_an_empty_database() {
-    let stats = in_memory().reader().unwrap().stats(0).unwrap();
+    let stats = in_memory().reader().unwrap().stats(at(0)).unwrap();
     assert!(stats.collectors.is_empty());
 }
 
@@ -1211,8 +1217,8 @@ fn deleting_an_agent_removes_everything_it_sent_and_nothing_else() {
         write_metric(&mut store, host, 2000, "checks", checks);
     }
     // Into the sorted table too, for a store that has one, as the hour is over.
-    while store.tidy(2 * HOUR_MS).unwrap() {}
-    write_metric(&mut store, "gone", HOUR_MS as u64 + 1000, "cpu", json!({ "usage_percent": 6.0 }));
+    while store.tidy(at(2 * HOUR_MS)).unwrap() {}
+    write_metric(&mut store, "gone", HOUR_MS + 1000, "cpu", json!({ "usage_percent": 6.0 }));
 
     store.delete_host("gone").unwrap();
 
@@ -1220,7 +1226,7 @@ fn deleting_an_agent_removes_everything_it_sent_and_nothing_else() {
     assert_eq!(latest_output(&store, "gone", "checks"), None);
     let reader = store.reader().unwrap();
     let hosts: Vec<String> = reader
-        .last_samples(0, 9000)
+        .last_samples(at(0), at(9000))
         .unwrap()
         .into_iter()
         .map(|last| last.host_id)
@@ -1254,7 +1260,7 @@ fn trends(store: &TestStore, metric: &str, since: i64, until: i64) -> Vec<Trend>
     store
         .reader()
         .unwrap()
-        .trends(find(metric).unwrap(), since, until)
+        .trends(find(metric).unwrap(), at(since), at(until))
         .unwrap()
 }
 
@@ -1268,7 +1274,7 @@ fn trends_fit_a_line_through_each_series() {
             { "mount_point": "/", "total_bytes": 100, "used_bytes": used },
             { "mount_point": "/data", "total_bytes": 100, "used_bytes": 50 },
         ]);
-        write_metric(&mut store, "a", minute * (i as u64 + 1), "disk", disks);
+        write_metric(&mut store, "a", minute * (i as i64 + 1), "disk", disks);
     }
     write_metric(
         &mut store,
@@ -1290,7 +1296,8 @@ fn trends_fit_a_line_through_each_series() {
         .iter()
         .map(|t| {
             let value = (t.value * 1e6).round() / 1e6;
-            (t.host_id.as_str(), t.series.as_str(), t.time_ms, value, t.first_ms, t.samples)
+            let (time, first) = (t.time.timestamp_millis(), t.first_time.timestamp_millis());
+            (t.host_id.as_str(), t.series.as_str(), time, value, first, t.samples)
         })
         .collect();
     assert_eq!(
@@ -1302,7 +1309,7 @@ fn trends_fit_a_line_through_each_series() {
         ]
     );
     // Least squares through 10, 12, 11, 13, 14 a minute apart is 0.9 a minute.
-    let per_minute = |trend: &Trend| trend.slope_per_ms * 60_000.0;
+    let per_minute = |trend: &Trend| trend.slope_per_sec * 60.0;
     assert!((per_minute(&found[0]) - 0.9).abs() < 1e-9, "{found:?}");
     assert!(per_minute(&found[1]).abs() < 1e-9, "{found:?}");
     assert!((per_minute(&found[2]) + 5.0).abs() < 1e-9, "{found:?}");
@@ -1322,28 +1329,31 @@ fn trends_need_two_readings_at_different_times_inside_the_window() {
     let found = trends(&store, "cpu.usage", 1500, HOUR_MS);
     assert_eq!(found.len(), 1);
     assert_eq!((found[0].host_id.as_str(), found[0].samples), ("b", 2));
-    assert!((found[0].slope_per_ms - 0.07).abs() < 1e-9, "{found:?}");
+    // 70 a second: from 20 to 90 in one.
+    assert!((found[0].slope_per_sec - 70.0).abs() < 1e-9, "{found:?}");
 }
 
 // ---- Rollups and how long things are kept
 
-const RECENT_DAY_MS: i64 = 86_400_000;
+const HOUR: TimeDelta = TimeDelta::hours(1);
+const MINUTE: TimeDelta = TimeDelta::minutes(1);
+const FIFTEEN_SECONDS: TimeDelta = TimeDelta::seconds(15);
 
 /// The start of an hour this many hours before the current one, so charts read it
 /// as they would any recent data.
-fn hours_ago(hours: i64) -> i64 {
-    crate::store::rollups::hour_of(crate::metrics::now_ms()) - hours * HOUR_MS
+fn hours_ago(hours: i32) -> Timestamp {
+    crate::times::hour_of(crate::times::now()) - HOUR * hours
 }
 
-fn settle(store: &mut TestStore, now_ms: i64) {
-    while store.tidy(now_ms).unwrap() {}
+fn settle(store: &mut TestStore, now: Timestamp) {
+    while store.tidy(now).unwrap() {}
 }
 
 fn retention(full_days: i64, five_minute_days: i64, hour_days: Option<i64>) -> Retention {
     Retention {
-        full_ms: full_days * RECENT_DAY_MS,
-        five_minute_ms: five_minute_days * RECENT_DAY_MS,
-        hour_ms: hour_days.map(|days| days * RECENT_DAY_MS),
+        full: TimeDelta::days(full_days),
+        five_minute: TimeDelta::days(five_minute_days),
+        hour: hour_days.map(TimeDelta::days),
     }
 }
 
@@ -1352,8 +1362,8 @@ fn chart_of(
     store: &TestStore,
     host_id: &str,
     metric: &str,
-    (from_ms, to_ms): (i64, i64),
-    step_ms: i64,
+    (from, to): (Timestamp, Timestamp),
+    step: TimeDelta,
 ) -> SeriesResult {
     store
         .reader()
@@ -1361,32 +1371,36 @@ fn chart_of(
         .series(&SeriesQuery {
             host_id,
             metric: find(metric).unwrap(),
-            range: TimeRange {
-                from_ms,
-                to_ms,
-                step_ms,
-            },
+            range: TimeRange { from, to, step },
             max_series: 8,
         })
         .unwrap()
+}
+
+fn write_at(store: &mut TestStore, host: &str, time: Timestamp, collector: &str, data: Value) {
+    let sample = Sample {
+        time,
+        metrics: BTreeMap::from([(collector.to_string(), data)]),
+    };
+    write_one(store, host, "host", &sample).unwrap();
 }
 
 /// CPU every 15 seconds for `minutes`, at `percent` except where `spikes` say.
 fn cpu_from(
     store: &mut TestStore,
     host: &str,
-    start_ms: i64,
-    minutes: i64,
+    start: Timestamp,
+    minutes: i32,
     percent: f64,
-    spikes: &[(i64, f64)],
+    spikes: &[(Timestamp, f64)],
 ) {
     for index in 0..minutes * 4 {
-        let time = start_ms + index * 15_000;
+        let time = start + FIFTEEN_SECONDS * index;
         let value = spikes
             .iter()
             .find(|(at, _)| *at == time)
             .map_or(percent, |(_, spike)| *spike);
-        write_metric(store, host, time as u64, "cpu", json!({ "usage_percent": value }));
+        write_at(store, host, time, "cpu", json!({ "usage_percent": value }));
     }
 }
 
@@ -1398,14 +1412,16 @@ fn high_avg_low(point: &Point) -> (f64, f64, f64) {
 fn a_spike_outlasts_its_samples_in_the_rollups() {
     let mut store = with_retention(retention(2, 4, None));
     let start = hours_ago(72);
-    let spike = start + 30 * 60_000;
+    let spike = start + MINUTE * 30;
     cpu_from(&mut store, "a", start, 120, 10.0, &[(spike, 100.0)]);
 
-    settle(&mut store, crate::metrics::now_ms());
+    settle(&mut store, crate::times::now());
 
     // The samples themselves are gone, as they're older than two days.
-    assert!(newest(&store, "cpu.usage", start, start + 2 * HOUR_MS).is_empty());
-    let hours = chart_of(&store, "a", "cpu.usage", (start, start + 2 * HOUR_MS), HOUR_MS);
+    let reader = store.reader().unwrap();
+    let cpu = find("cpu.usage").unwrap();
+    assert!(reader.newest(cpu, start, start + HOUR * 2).unwrap().is_empty());
+    let hours = chart_of(&store, "a", "cpu.usage", (start, start + HOUR * 2), HOUR);
     let points = &hours.series[0].points;
     assert_eq!(points.len(), 2);
     let (high, avg, low) = high_avg_low(&points[0]);
@@ -1414,11 +1430,11 @@ fn a_spike_outlasts_its_samples_in_the_rollups() {
     assert_eq!(high_avg_low(&points[1]), (10.0, 10.0, 10.0));
 
     // Every 5 minutes is still kept, so a close look finds when it happened.
-    let spans = chart_of(&store, "a", "cpu.usage", (start, start + HOUR_MS), 15_000);
+    let spans = chart_of(&store, "a", "cpu.usage", (start, start + HOUR), FIFTEEN_SECONDS);
     let points = &spans.series[0].points;
     assert_eq!(points.len(), 12);
     let peak = points.iter().find(|point| point.max == 100.0).unwrap();
-    assert_eq!(peak.time_ms, spike);
+    assert_eq!(peak.time, spike);
     assert_eq!(peak.avg, (19.0 * 10.0 + 100.0) / 20.0);
 }
 
@@ -1427,16 +1443,16 @@ fn a_burst_keeps_its_peak_rate_once_rolled_up() {
     let mut store = with_retention(retention(2, 4, None));
     let start = hours_ago(72);
     for index in 0..240 {
-        let time = start + index * 15_000;
+        let time = start + FIFTEEN_SECONDS * index;
         // 100 bytes a second, and ten seconds' worth at 10 kB a second once.
         let bytes = if index == 100 { 150_000 } else { 1_500 };
         let interfaces = json!({ "en0": { "received_bytes": bytes } });
-        write_metric(&mut store, "a", time as u64, "network", interfaces);
+        write_at(&mut store, "a", time, "network", interfaces);
     }
 
-    settle(&mut store, crate::metrics::now_ms());
+    settle(&mut store, crate::times::now());
 
-    let hours = chart_of(&store, "a", "network.received", (start, start + HOUR_MS), HOUR_MS);
+    let hours = chart_of(&store, "a", "network.received", (start, start + HOUR), HOUR);
     let (high, _, low) = high_avg_low(&hours.series[0].points[0]);
     assert_eq!((high, low), (10_000.0, 100.0));
 }
@@ -1446,13 +1462,13 @@ fn the_newest_hour_is_charted_before_it_is_rolled_up() {
     let mut store = with_retention(Retention::KEEP_EVERYTHING);
     let start = hours_ago(2);
     for (hour, percent) in [(0, 10.0), (1, 20.0), (2, 30.0)] {
-        cpu_from(&mut store, "a", start + hour * HOUR_MS, 10, percent, &[]);
+        cpu_from(&mut store, "a", start + HOUR * hour, 10, percent, &[]);
     }
 
     // The two finished hours are rolled up, and the current one can't be yet.
-    settle(&mut store, start + 2 * HOUR_MS + 30 * 60_000);
+    settle(&mut store, start + HOUR * 2 + MINUTE * 30);
 
-    let chart = chart_of(&store, "a", "cpu.usage", (start, start + 3 * HOUR_MS), HOUR_MS);
+    let chart = chart_of(&store, "a", "cpu.usage", (start, start + HOUR * 3), HOUR);
     assert_eq!(averages(&chart.series[0]), [10.0, 20.0, 30.0]);
 }
 
@@ -1461,15 +1477,16 @@ fn a_sample_that_arrives_late_is_rolled_up_too() {
     let mut store = with_retention(Retention::KEEP_EVERYTHING);
     let start = hours_ago(5);
     cpu_from(&mut store, "a", start, 60, 10.0, &[]);
-    settle(&mut store, crate::metrics::now_ms());
-    let range = (start, start + HOUR_MS);
-    assert_eq!(chart_of(&store, "a", "cpu.usage", range, HOUR_MS).series[0].points[0].max, 10.0);
+    settle(&mut store, crate::times::now());
+    let range = (start, start + HOUR);
+    assert_eq!(chart_of(&store, "a", "cpu.usage", range, HOUR).series[0].points[0].max, 10.0);
 
     // As from an agent that was cut off and sends what it kept once it's back.
-    write_metric(&mut store, "a", (start + 20 * 60_000 + 5_000) as u64, "cpu", json!({ "usage_percent": 90.0 }));
-    settle(&mut store, crate::metrics::now_ms());
+    let late = start + MINUTE * 20 + TimeDelta::seconds(5);
+    write_at(&mut store, "a", late, "cpu", json!({ "usage_percent": 90.0 }));
+    settle(&mut store, crate::times::now());
 
-    let point = chart_of(&store, "a", "cpu.usage", range, HOUR_MS).series[0].points[0];
+    let point = chart_of(&store, "a", "cpu.usage", range, HOUR).series[0].points[0];
     assert_eq!(point.max, 90.0);
     assert!((point.avg - (240.0 * 10.0 + 90.0) / 241.0).abs() < 1e-9, "{point:?}");
 }
@@ -1480,13 +1497,13 @@ fn deleting_an_agent_deletes_its_rollups() {
     let start = hours_ago(5);
     cpu_from(&mut store, "gone", start, 60, 10.0, &[]);
     cpu_from(&mut store, "kept", start, 60, 20.0, &[]);
-    settle(&mut store, crate::metrics::now_ms());
+    settle(&mut store, crate::times::now());
 
     store.delete_host("gone").unwrap();
 
-    let range = (start, start + HOUR_MS);
-    assert!(chart_of(&store, "gone", "cpu.usage", range, HOUR_MS).series.is_empty());
-    assert_eq!(averages(&chart_of(&store, "kept", "cpu.usage", range, HOUR_MS).series[0]), [20.0]);
+    let range = (start, start + HOUR);
+    assert!(chart_of(&store, "gone", "cpu.usage", range, HOUR).series.is_empty());
+    assert_eq!(averages(&chart_of(&store, "kept", "cpu.usage", range, HOUR).series[0]), [20.0]);
 }
 
 #[test]
@@ -1497,13 +1514,13 @@ fn rollups_go_once_they_are_older_than_they_are_kept() {
     cpu_from(&mut store, "a", five_days_ago, 60, 10.0, &[]);
     cpu_from(&mut store, "a", three_and_a_half_days_ago, 60, 20.0, &[]);
 
-    settle(&mut store, crate::metrics::now_ms());
+    settle(&mut store, crate::times::now());
 
-    let gone = (five_days_ago, five_days_ago + HOUR_MS);
-    assert!(chart_of(&store, "a", "cpu.usage", gone, HOUR_MS).series.is_empty());
+    let gone = (five_days_ago, five_days_ago + HOUR);
+    assert!(chart_of(&store, "a", "cpu.usage", gone, HOUR).series.is_empty());
     // Its 5 minute spans are past three days, but its hour is still kept.
-    let kept = (three_and_a_half_days_ago, three_and_a_half_days_ago + HOUR_MS);
-    let close_look = chart_of(&store, "a", "cpu.usage", kept, 15_000);
+    let kept = (three_and_a_half_days_ago, three_and_a_half_days_ago + HOUR);
+    let close_look = chart_of(&store, "a", "cpu.usage", kept, FIFTEEN_SECONDS);
     assert_eq!(averages(&close_look.series[0]), [20.0]);
 }
 
@@ -1513,14 +1530,14 @@ fn hosts_are_combined_from_their_rollups() {
     let start = hours_ago(5);
     cpu_from(&mut store, "a", start, 60, 10.0, &[]);
     cpu_from(&mut store, "b", start, 60, 30.0, &[]);
-    settle(&mut store, crate::metrics::now_ms());
+    settle(&mut store, crate::times::now());
 
     let query = CalculationQuery {
         metric: find("cpu.usage").unwrap(),
         range: TimeRange {
-            from_ms: start,
-            to_ms: start + 2 * HOUR_MS,
-            step_ms: HOUR_MS,
+            from: start,
+            to: start + HOUR * 2,
+            step: HOUR,
         },
         calculation: Calculation::Avg,
         members: ["a", "b"]

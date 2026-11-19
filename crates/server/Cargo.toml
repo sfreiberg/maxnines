@@ -12,11 +12,11 @@ async-trait = "0.1"
 anyhow.workspace = true
 clap.workspace = true
 axum = { version = "0.8.9", features = ["ws"] }
-chrono = { version = "0.4.45", default-features = false, features = ["std", "clock", "serde"] }
+chrono.workspace = true
 chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
 # Stay on DuckDB 1.5: 1.20000.x bundles a pre-release 2.0 with a development
 # storage format. Tilde because a minor bump changes the bundled DuckDB.
-duckdb = { version = "~1.10506.1", features = ["bundled", "json"] }
+duckdb = { version = "~1.10506.1", features = ["bundled", "chrono", "json"] }
 # Unpacks the built-in place list.
 flate2 = "1"
 # Windows paths without the \\?\ that canonicalize adds, which nothing else uses.
@@ -49,7 +49,7 @@ futures-util.workspace = true
 rustls-acme = { version = "0.15", default-features = false, features = ["axum", "ring", "tls12", "webpki-roots"] }
 tower-http = { version = "0.6", features = ["compression-gzip"] }
 tracing.workspace = true
-clickhouse = { version = "0.15", default-features = false, features = ["lz4", "rustls-tls-ring", "rustls-tls-webpki-roots"] }
+clickhouse = { version = "0.15", default-features = false, features = ["chrono", "lz4", "rustls-tls-ring", "rustls-tls-webpki-roots"] }
 ureq = { version = "3.5.1", default-features = false, features = ["rustls", "multipart"] }
 # Draws the charts sent with alerts. Fonts are built in, not read from the machine.
 resvg = { version = "0.47", default-features = false, features = ["text"] }

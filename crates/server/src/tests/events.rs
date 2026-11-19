@@ -1,8 +1,11 @@
 //! Events marked on hosts' charts: annotations people and scripts add, and what the
 //! server notices.
 
+use chrono::{DurationRound, TimeDelta};
+
 use super::*;
 use crate::alerting::{NewAlert, Severity};
+use crate::times::Timestamp;
 
 /// Calls the API with the admin token, giving back the status and any JSON.
 async fn api(server: &TestServer, method: &str, path: &str, body: &Value) -> (u16, Value) {
@@ -47,14 +50,20 @@ async fn wait_for_kind(server: &TestServer, host: &Identity, kind: &str) -> Vec<
     }
 }
 
-fn with_boot(boot_secs: i64) -> AgentMessage {
+fn with_boot(booted_at: Timestamp) -> AgentMessage {
     AgentMessage::Sample(Sample {
-        timestamp_ms: now_ms() as u64,
+        time: crate::times::now(),
         metrics: BTreeMap::from([(
             "host".to_string(),
-            json!({ "uptime_secs": 60, "boot_time_secs": boot_secs }),
+            json!({ "uptime_secs": 60, "booted_at": booted_at }),
         )]),
     })
+}
+
+/// When a host started, this long ago, to the second as systems say.
+fn booted(ago: TimeDelta) -> Timestamp {
+    let time = crate::times::now() - ago;
+    time.duration_trunc(TimeDelta::seconds(1)).unwrap()
 }
 
 #[tokio::test]
@@ -129,7 +138,7 @@ async fn an_annotation_of_the_servers_own_kind_or_with_a_broken_filter_is_refuse
 async fn an_event_can_be_dated_when_it_happened() {
     let server = start().await;
     let (web, _client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
-    let earlier = crate::times::from_ms(now_ms() - 2 * 3_600_000);
+    let earlier = crate::times::now() - TimeDelta::hours(2);
 
     let body =
         json!({ "title": "Deployed before lunch", "kind": "deploy", "occurred_at": earlier });
@@ -178,24 +187,21 @@ async fn deleting_an_event_takes_it_off_every_host_and_is_audited() {
 async fn a_restart_is_noticed_from_the_boot_time_and_a_backlog_is_not_one() {
     let server = start().await;
     let (host, mut client) = connect_host(&server, "web-1", json!({ "n": 1 })).await;
-    let first_boot = now_ms() / 1000 - 86_400;
+    let first_boot = booted(TimeDelta::days(1));
 
     // The first boot time the server hears of is no restart.
     send(&mut client, &with_boot(first_boot)).await;
     let deadline = Instant::now() + Duration::from_secs(10);
-    while server.state.database.boot_time(&host.id()).await.unwrap() != Some(first_boot * 1000) {
+    while server.state.database.boot_time(&host.id()).await.unwrap() != Some(first_boot) {
         assert!(Instant::now() < deadline, "the boot time wasn't saved");
         sleep(Duration::from_millis(20)).await;
     }
     assert!(timeline(&server, &host).await.is_empty());
 
-    let second_boot = now_ms() / 1000 - 120;
+    let second_boot = booted(TimeDelta::minutes(2));
     send(&mut client, &with_boot(second_boot)).await;
     let events = wait_for_kind(&server, &host, "restart").await;
-    assert_eq!(
-        events[0]["occurred_at"],
-        json!(crate::times::from_ms(second_boot * 1000))
-    );
+    assert_eq!(events[0]["occurred_at"], json!(second_boot));
     assert_eq!(events[0]["created_by"], Value::Null);
 
     // Samples kept from before the restart arrive after the live ones.
@@ -221,7 +227,7 @@ async fn a_restart_while_disconnected_is_noticed_on_reconnecting() {
     let server = start().await;
     let host = identity();
     let mut client = server.connect_approved(&host, "web-1").await;
-    let first_boot = now_ms() / 1000 - 86_400;
+    let first_boot = booted(TimeDelta::days(1));
     send(&mut client, &with_boot(first_boot)).await;
     let deadline = Instant::now() + Duration::from_secs(10);
     while server
@@ -240,7 +246,7 @@ async fn a_restart_while_disconnected_is_noticed_on_reconnecting() {
     let mut client = server.connect().await;
     let status = handshake(&mut client, &host, "web-1", None).await;
     assert_eq!(status, RegistrationStatus::Approved);
-    send(&mut client, &with_boot(now_ms() / 1000 - 30)).await;
+    send(&mut client, &with_boot(booted(TimeDelta::seconds(30)))).await;
 
     wait_for_kind(&server, &host, "restart").await;
 }
@@ -302,7 +308,7 @@ async fn alerts_and_updates_are_on_the_timeline_too() {
         .create_alert_rule(&super::alerting::cpu_rule())
         .await
         .unwrap();
-    let started = now_ms() - 60_000;
+    let started = crate::times::now() - TimeDelta::minutes(1);
     let new = NewAlert {
         rule_id: rule,
         rule_name: "Disk filling up".into(),
@@ -312,14 +318,14 @@ async fn alerts_and_updates_are_on_the_timeline_too() {
         series: "/".into(),
         value: Some(85.0),
         summary: "Disk usage of / is 85%".into(),
-        started_at: crate::times::from_ms(started),
-        breached_at: crate::times::from_ms(started),
+        started_at: started,
+        breached_at: started,
     };
     let alert = server.state.database.fire_alert(&new, &[]).await.unwrap();
     server
         .state
         .database
-        .resolve_alert(alert, started + 30_000, "cleared", None)
+        .resolve_alert(alert, started + TimeDelta::seconds(30), "cleared", None)
         .await
         .unwrap();
 

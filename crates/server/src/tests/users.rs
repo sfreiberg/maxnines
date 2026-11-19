@@ -9,7 +9,12 @@ const PASSWORD: &str = "a long enough password";
 async fn person(server: &TestServer, email: &str) -> i64 {
     let database = &server.state.database;
     let (user, link) = database
-        .create_user(email, "Someone", crate::roles::Role::Admin, now_ms())
+        .create_user(
+            email,
+            "Someone",
+            crate::roles::Role::Admin,
+            crate::times::now(),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -18,7 +23,7 @@ async fn person(server: &TestServer, email: &str) -> i64 {
         .unwrap();
     assert!(
         database
-            .use_setup_link(user.id, &link, &hash, now_ms())
+            .use_setup_link(user.id, &link, &hash, crate::times::now())
             .await
             .unwrap()
     );
@@ -270,7 +275,7 @@ async fn someone_who_never_set_a_password_cannot_sign_in() {
             "new@example.com",
             "New",
             crate::roles::Role::Admin,
-            now_ms(),
+            crate::times::now(),
         )
         .await
         .unwrap();
@@ -330,12 +335,13 @@ async fn a_session_runs_out() {
     let server = start().await;
     let id = person(&server, "a@example.com").await;
     let database = &server.state.database;
-    let long_ago = now_ms() - crate::models::SESSION_LIFETIME_MS - 1000;
+    let long_ago =
+        crate::times::now() - crate::models::SESSION_LIFETIME - chrono::TimeDelta::seconds(1);
     let token = database.start_session(id, long_ago, None).await.unwrap();
 
     assert!(
         database
-            .session_user(&token, now_ms())
+            .session_user(&token, crate::times::now())
             .await
             .unwrap()
             .is_none()
@@ -347,12 +353,17 @@ async fn sessions_and_links_are_only_stored_as_hashes() {
     let server = start().await;
     let database = &server.state.database;
     let (user, link) = database
-        .create_user("a@example.com", "A", crate::roles::Role::Admin, now_ms())
+        .create_user(
+            "a@example.com",
+            "A",
+            crate::roles::Role::Admin,
+            crate::times::now(),
+        )
         .await
         .unwrap()
         .unwrap();
     let session = database
-        .start_session(user.id, now_ms(), None)
+        .start_session(user.id, crate::times::now(), None)
         .await
         .unwrap();
 
@@ -425,7 +436,7 @@ async fn someone_new_sets_their_own_password_from_a_link() {
 async fn an_old_setup_link_stops_working() {
     let server = start().await;
     let database = &server.state.database;
-    let week_ago = now_ms() - 8 * 24 * 60 * 60 * 1000;
+    let week_ago = crate::times::now() - chrono::TimeDelta::days(8);
     let (_, link) = database
         .create_user("a@example.com", "A", crate::roles::Role::Admin, week_ago)
         .await
@@ -447,12 +458,12 @@ async fn a_new_link_replaces_the_old_one_and_resets_a_password() {
     let database = &server.state.database;
 
     let first = database
-        .new_setup_link(id, now_ms())
+        .new_setup_link(id, crate::times::now())
         .await
         .unwrap()
         .unwrap();
     let second = database
-        .new_setup_link(id, now_ms())
+        .new_setup_link(id, crate::times::now())
         .await
         .unwrap()
         .unwrap();
@@ -511,7 +522,11 @@ async fn disabling_someone_signs_them_out_at_once() {
     )
     .await;
     assert_eq!(page.status, 401);
-    let link = server.state.database.new_setup_link(id, now_ms()).await;
+    let link = server
+        .state
+        .database
+        .new_setup_link(id, crate::times::now())
+        .await;
     let page = Browser::anonymous()
         .get(&server, &format!("/setup/{}", link.unwrap().unwrap()))
         .await;
@@ -526,11 +541,20 @@ async fn a_sign_in_finishing_just_as_someone_is_disabled_does_not_count() {
     let server = start().await;
     let id = person(&server, "a@example.com").await;
     let database = &server.state.database;
-    database.disable_user(id, now_ms()).await.unwrap();
+    database
+        .disable_user(id, crate::times::now())
+        .await
+        .unwrap();
 
-    let token = database.start_session(id, now_ms(), None).await.unwrap();
+    let token = database
+        .start_session(id, crate::times::now(), None)
+        .await
+        .unwrap();
 
-    let user = database.session_user(&token, now_ms()).await.unwrap();
+    let user = database
+        .session_user(&token, crate::times::now())
+        .await
+        .unwrap();
     assert_eq!(user, None);
 }
 
@@ -550,9 +574,17 @@ async fn nobody_can_lock_everyone_out() {
     assert_eq!(api(&server, "POST", &path, &Value::Null).await.0, 409);
 
     let id = person(&server, "a@example.com").await;
-    let change = server.state.database.disable_user(id, now_ms()).await;
+    let change = server
+        .state
+        .database
+        .disable_user(id, crate::times::now())
+        .await;
     assert_eq!(change.unwrap(), UserChange::Done);
-    let change = server.state.database.disable_user(me, now_ms()).await;
+    let change = server
+        .state
+        .database
+        .disable_user(me, crate::times::now())
+        .await;
     assert_eq!(change.unwrap(), UserChange::LastAdmin);
 }
 
@@ -585,7 +617,7 @@ async fn deleting_someone_takes_two_steps() {
     server
         .state
         .database
-        .disable_user(id, now_ms())
+        .disable_user(id, crate::times::now())
         .await
         .unwrap();
     let page = Browser::default()
@@ -739,7 +771,12 @@ async fn names_are_only_ever_text() {
     server
         .state
         .database
-        .create_user("a@example.com", name, crate::roles::Role::Admin, now_ms())
+        .create_user(
+            "a@example.com",
+            name,
+            crate::roles::Role::Admin,
+            crate::times::now(),
+        )
         .await
         .unwrap();
 
@@ -775,7 +812,7 @@ async fn an_api_key_reads_pages_as_its_owner_but_cannot_submit_forms() {
             server.user_id().await,
             crate::roles::Role::Admin,
             None,
-            now_ms(),
+            crate::times::now(),
         )
         .await
         .unwrap();

@@ -57,7 +57,6 @@ mod tests;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -72,7 +71,7 @@ use maxnines_protocol::logging;
 #[cfg(windows)]
 use maxnines_protocol::service::{self, Service, ServiceCommand};
 use maxnines_protocol::stopping::StopSignal;
-use metrics::{Metrics, now_ms};
+use metrics::Metrics;
 use models::Database;
 use notifier::{Notifier, Senders, web_url};
 use presence::Presence;
@@ -383,7 +382,7 @@ async fn serve(path: &Path) -> Result<()> {
     let database = Database::connect(&config.database.resolve_url()?).await?;
     // The config rules that come with this version, which an upgrade may change.
     let changed = database
-        .sync_built_in_rules(&built_in_rules::all(), metrics::now_ms())
+        .sync_built_in_rules(&built_in_rules::all(), crate::times::now())
         .await
         .context("updating the built-in config rules")?;
     if !changed.is_empty() {
@@ -420,8 +419,8 @@ async fn serve(path: &Path) -> Result<()> {
         page_reads: Arc::default(),
         status,
         heartbeat: Heartbeat {
-            interval: Duration::from_secs(config.heartbeat_interval_secs),
-            timeout: Duration::from_secs(config.heartbeat_timeout_secs),
+            interval: config.heartbeat_interval,
+            timeout: config.heartbeat_timeout,
             clock_every: clock::ASK_EVERY,
         },
         audience: config.audience().into(),
@@ -452,7 +451,7 @@ async fn serve(path: &Path) -> Result<()> {
         state.metrics.clone(),
         state.status.clone(),
         state.actions.clone(),
-        now_ms(),
+        crate::times::now(),
     )
     .spawn();
     Notifier::new(state.database.clone(), state.senders.clone())

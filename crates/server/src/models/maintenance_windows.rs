@@ -1,6 +1,7 @@
 //! Maintenance windows, which keep notifications back on a schedule.
 
 use anyhow::{Context, Result};
+use chrono::TimeDelta;
 use sea_orm::{ConnectionTrait, EntityTrait, QueryOrder, Set, TransactionTrait};
 
 use super::audit::record_change;
@@ -18,7 +19,7 @@ fn to_window(row: maintenance_window::Model) -> MaintenanceWindow {
             filter: row.filter,
             days: row.days.split(',').map(String::from).collect(),
             start_time: row.start_time,
-            duration_secs: u32::try_from(row.duration_secs).unwrap_or_default(),
+            duration: TimeDelta::try_seconds(row.duration_secs).unwrap_or_default(),
             time_zone: row.time_zone,
         },
     }
@@ -31,7 +32,7 @@ fn window_row(input: &MaintenanceWindowInput) -> maintenance_window::ActiveModel
         filter: Set(input.filter.trim().to_string()),
         days: Set(input.days.join(",")),
         start_time: Set(input.start_time.clone()),
-        duration_secs: Set(i64::from(input.duration_secs)),
+        duration_secs: Set(input.duration.num_seconds()),
         time_zone: Set(input.time_zone.clone()),
         ..Default::default()
     }

@@ -8,6 +8,7 @@ description = "MaxNines monitoring agent"
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 futures-util.workspace = true
 hcl-rs.workspace = true

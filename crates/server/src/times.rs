@@ -11,21 +11,26 @@ pub type Timestamp = DateTime<Utc>;
 
 /// Now, to the millisecond, as everything kept is. Finer than that, SQLite, which keeps
 /// times as text, would write some with more digits than others, and they'd no longer
-/// sort or compare as text the way they do as times.
+/// sort or compare as text the way they do as times. This is the server's only clock:
+/// everything else is handed the time, so tests can choose it.
 pub fn now() -> Timestamp {
-    Utc::now()
-        .duration_trunc(TimeDelta::milliseconds(1))
-        .unwrap_or_else(|_| Utc::now())
+    maxnines_protocol::time::now()
 }
 
-/// The moment `ms` milliseconds after 1970, as agents and the metric stores count, or
-/// the nearest one there can be.
+/// The moment `ms` milliseconds after 1970, or the nearest one there can be. For
+/// tests, which count in round numbers.
+#[cfg(test)]
 pub fn from_ms(ms: i64) -> Timestamp {
     DateTime::from_timestamp_millis(ms).unwrap_or(if ms < 0 {
         DateTime::<Utc>::MIN_UTC
     } else {
         DateTime::<Utc>::MAX_UTC
     })
+}
+
+/// The start of the hour a moment is in.
+pub fn hour_of(time: Timestamp) -> Timestamp {
+    time.duration_trunc(TimeDelta::hours(1)).unwrap_or(time)
 }
 
 /// A moment written in ISO 8601, as the API takes them, such as
@@ -57,7 +62,51 @@ pub mod optional_moment {
     }
 }
 
-/// How long `ms` milliseconds is.
+/// For serde, a length of time in whole seconds, as rules and forms write them, such
+/// as `for_secs`. A negative number or one too big to be a length isn't one.
+pub mod whole_seconds {
+    use chrono::TimeDelta;
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(length: &TimeDelta, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_i64(length.num_seconds())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<TimeDelta, D::Error> {
+        let seconds = u64::deserialize(deserializer)?;
+        i64::try_from(seconds)
+            .ok()
+            .and_then(TimeDelta::try_seconds)
+            .ok_or_else(|| D::Error::custom(format!("{seconds} seconds is too long")))
+    }
+}
+
+/// For serde, a length of time in whole seconds that can be left out.
+pub mod optional_whole_seconds {
+    use chrono::TimeDelta;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        length: &Option<TimeDelta>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match length {
+            Some(length) => serializer.serialize_some(&length.num_seconds()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<TimeDelta>, D::Error> {
+        #[derive(Deserialize)]
+        struct Seconds(#[serde(with = "super::whole_seconds")] TimeDelta);
+        Ok(Option::<Seconds>::deserialize(deserializer)?.map(|Seconds(length)| length))
+    }
+}
+
+/// How long `ms` milliseconds is. For tests, which count in round numbers.
+#[cfg(test)]
 pub fn millis(ms: i64) -> TimeDelta {
     TimeDelta::milliseconds(ms)
 }
@@ -73,17 +122,6 @@ pub fn format_moment(time: Timestamp, zone: Tz) -> String {
 /// Where everyone starts, until they choose their own.
 pub const DEFAULT_TIME_ZONE: Tz = Tz::UTC;
 
-/// A time to the second, ending with the zone's abbreviation, such as `PST`.
-pub fn format_time(ms: u64, zone: Tz) -> String {
-    let time = i64::try_from(ms)
-        .ok()
-        .and_then(DateTime::from_timestamp_millis);
-    match time {
-        Some(time) => format_moment(time, zone),
-        None => format!("{ms} ms"),
-    }
-}
-
 /// Just the day, for where the time of day is more than anyone needs.
 pub fn format_date(time: Timestamp, zone: Tz) -> String {
     time.with_timezone(&zone).format("%Y-%m-%d").to_string()
@@ -91,12 +129,12 @@ pub fn format_date(time: Timestamp, zone: Tz) -> String {
 
 /// How long something has lasted, in its two largest units, such as "1 day and 13
 /// hours", which says enough at a glance without counting seconds.
-pub fn lasting(ms: u64) -> String {
-    let plural = |count: u64, unit: &str| match count {
+pub fn lasting(length: TimeDelta) -> String {
+    let plural = |count: i64, unit: &str| match count {
         1 => format!("1 {unit}"),
         _ => format!("{count} {unit}s"),
     };
-    let minutes = ms / 60_000;
+    let minutes = length.num_minutes().max(0);
     let (days, hours, minutes) = (minutes / 1440, minutes / 60 % 24, minutes % 60);
     let (larger, smaller) = match (days, hours) {
         (0, 0) if minutes == 0 => return "less than a minute".to_string(),
@@ -144,23 +182,35 @@ pub fn zone_names() -> Vec<&'static str> {
 mod tests {
     use super::*;
 
-    const NOV_14_2023: u64 = 1_700_000_000_000;
+    fn nov_14_2023() -> Timestamp {
+        from_ms(1_700_000_000_000)
+    }
 
     #[test]
     fn formats_times_in_utc() {
-        assert_eq!(format_time(NOV_14_2023, Tz::UTC), "2023-11-14 22:13:20 UTC");
+        assert_eq!(
+            format_moment(nov_14_2023(), Tz::UTC),
+            "2023-11-14 22:13:20 UTC"
+        );
     }
 
     #[test]
     fn formats_times_in_a_zone_with_its_abbreviation() {
         assert_eq!(
-            format_time(NOV_14_2023, Tz::America__Los_Angeles),
+            format_moment(nov_14_2023(), Tz::America__Los_Angeles),
             "2023-11-14 14:13:20 PST"
         );
         assert_eq!(
-            format_time(NOV_14_2023, Tz::Asia__Kolkata),
+            format_moment(nov_14_2023(), Tz::Asia__Kolkata),
             "2023-11-15 03:43:20 IST"
         );
+    }
+
+    #[test]
+    fn an_hour_starts_on_the_hour() {
+        let time = parse_moment("2026-11-19T01:57:17.828Z").unwrap();
+        assert_eq!(hour_of(time), parse_moment("2026-11-19T01:00:00Z").unwrap());
+        assert_eq!(hour_of(hour_of(time)), hour_of(time));
     }
 
     #[test]
@@ -186,7 +236,7 @@ mod tests {
 
     #[test]
     fn a_date_is_the_day_in_the_zone() {
-        let time = from_ms(NOV_14_2023 as i64);
+        let time = nov_14_2023();
         assert_eq!(format_date(time, Tz::UTC), "2023-11-14");
         // Already the next day there.
         assert_eq!(format_date(time, Tz::Asia__Kolkata), "2023-11-15");
@@ -194,18 +244,16 @@ mod tests {
 
     #[test]
     fn how_long_is_said_in_two_units_at_most() {
-        const MINUTE: u64 = 60_000;
-        assert_eq!(lasting(59_999), "less than a minute");
-        assert_eq!(lasting(MINUTE), "1 minute");
-        assert_eq!(lasting(59 * MINUTE + 59_999), "59 minutes");
-        assert_eq!(lasting(60 * MINUTE), "1 hour");
-        assert_eq!(lasting(125 * MINUTE), "2 hours and 5 minutes");
-        assert_eq!(lasting(1440 * MINUTE), "1 day");
-        assert_eq!(
-            lasting((1440 + 13 * 60 + 59) * MINUTE),
-            "1 day and 13 hours"
-        );
-        assert_eq!(lasting(3 * 1440 * MINUTE + MINUTE), "3 days");
+        let minutes = TimeDelta::minutes;
+        assert_eq!(lasting(millis(59_999)), "less than a minute");
+        assert_eq!(lasting(minutes(1)), "1 minute");
+        assert_eq!(lasting(minutes(59) + millis(59_999)), "59 minutes");
+        assert_eq!(lasting(minutes(60)), "1 hour");
+        assert_eq!(lasting(minutes(125)), "2 hours and 5 minutes");
+        assert_eq!(lasting(minutes(1440)), "1 day");
+        assert_eq!(lasting(minutes(1440 + 13 * 60 + 59)), "1 day and 13 hours");
+        assert_eq!(lasting(minutes(3 * 1440 + 1)), "3 days");
+        assert_eq!(lasting(-minutes(5)), "less than a minute");
     }
 
     #[test]

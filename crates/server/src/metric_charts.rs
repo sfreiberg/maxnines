@@ -4,13 +4,13 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, TimeZone};
+use chrono::{DurationRound, TimeDelta, TimeZone};
 use chrono_tz::Tz;
 use serde::Serialize;
 
 use crate::events::TimelineEvent;
 use crate::metrics::{Metric, Point, Series, SeriesResult, TimeRange, Unit};
-use crate::times::{format_moment, format_time};
+use crate::times::{Timestamp, format_moment};
 
 /// The chart palette has this many colors, and a chart shows no more series.
 pub const MAX_SERIES: usize = 8;
@@ -46,33 +46,32 @@ impl Frame {
     }
 }
 
-const MINUTE_MS: i64 = 60_000;
-const DAY_MS: i64 = 1440 * MINUTE_MS;
+const DAY: TimeDelta = TimeDelta::days(1);
 
 /// Spacing for time labels, of which a chart shows at most [`MAX_TIME_LABELS`].
-const TIME_LABEL_STEPS_MS: [i64; 13] = [
-    MINUTE_MS,
-    5 * MINUTE_MS,
-    15 * MINUTE_MS,
-    30 * MINUTE_MS,
-    60 * MINUTE_MS,
-    120 * MINUTE_MS,
-    360 * MINUTE_MS,
-    720 * MINUTE_MS,
-    DAY_MS,
-    2 * DAY_MS,
-    7 * DAY_MS,
-    14 * DAY_MS,
-    30 * DAY_MS,
+const TIME_LABEL_STEPS: [TimeDelta; 13] = [
+    TimeDelta::minutes(1),
+    TimeDelta::minutes(5),
+    TimeDelta::minutes(15),
+    TimeDelta::minutes(30),
+    TimeDelta::hours(1),
+    TimeDelta::hours(2),
+    TimeDelta::hours(6),
+    TimeDelta::hours(12),
+    DAY,
+    TimeDelta::days(2),
+    TimeDelta::days(7),
+    TimeDelta::days(14),
+    TimeDelta::days(30),
 ];
-const MAX_TIME_LABELS: i64 = 5;
+const MAX_TIME_LABELS: i32 = 5;
 
 /// Half the width of a time label, which must stay inside the chart.
 const TIME_LABEL_MARGIN: f64 = 18.0;
 
-/// Points further apart than this many steps have a gap between them, so no
+/// Points further apart than this many half steps have a gap between them, so no
 /// line is drawn across a time when nothing was reported.
-const GAP_STEPS: f64 = 2.5;
+const GAP_HALF_STEPS: i32 = 5;
 
 /// Keeps very large values from overflowing when the axis is worked out.
 const LARGEST_VALUE: f64 = 1e300;
@@ -136,7 +135,8 @@ pub struct Column {
     pub x: f64,
     pub hit_x: f64,
     pub hit_width: f64,
-    /// For finding the same moment on the page's other charts.
+    /// For finding the nearest moment on the page's other charts, which the page's
+    /// script does by subtracting, so it's a number: milliseconds since 1970.
     pub time_ms: i64,
     pub time: String,
     pub tooltip_x: f64,
@@ -197,7 +197,8 @@ pub struct Chart {
     pub lines: Vec<Line>,
     pub columns: Vec<Column>,
     /// How far from a moment this chart's data still counts as being at that moment.
-    /// Further than this is a gap in its lines, so it has nothing to show for it.
+    /// Further than this is a gap in its lines, so it has nothing to show for it. A
+    /// number, for the page's script, as [`Column::time_ms`] is.
     pub reach_ms: i64,
     pub summary: Vec<Summary>,
     /// What happened to the host while the chart covers.
@@ -298,8 +299,8 @@ pub fn build_with_thresholds(
 }
 
 /// How far across a chart a moment is.
-pub fn x_of(time_ms: i64, range: TimeRange, frame: Frame) -> f64 {
-    x_for(time_ms, range, frame)
+pub fn x_of(time: Timestamp, range: TimeRange, frame: Frame) -> f64 {
+    x_for(time, range, frame)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -345,9 +346,10 @@ fn chart_on(
         reach_ms: result
             .series
             .iter()
-            .map(|series| (gap_limit_ms(series, range) / 2.0) as i64)
+            .map(|series| gap_limit(series, range) / 2)
             .max()
-            .unwrap_or(0),
+            .unwrap_or_default()
+            .num_milliseconds(),
         summary: result
             .series
             .iter()
@@ -370,11 +372,9 @@ pub fn mark(chart: &mut Chart, events: &[TimelineEvent], range: TimeRange, zone:
     let room = ((widest - TOOLTIP_PADDING) / TOOLTIP_CHAR_WIDTH) as usize;
     chart.markers = events
         .iter()
-        .filter(|event| {
-            (range.from_ms..=range.to_ms).contains(&event.occurred_at.timestamp_millis())
-        })
+        .filter(|event| (range.from..=range.to).contains(&event.occurred_at))
         .map(|event| {
-            let x = x_for(event.occurred_at.timestamp_millis(), range, frame);
+            let x = x_for(event.occurred_at, range, frame);
             let kind_label = event.kind.label();
             let room = room.saturating_sub(kind_label.chars().count() + 1);
             let mut title: String = event.title.chars().take(room).collect();
@@ -406,8 +406,9 @@ pub fn mark(chart: &mut Chart, events: &[TimelineEvent], range: TimeRange, zone:
         .collect();
 }
 
-fn x_for(time_ms: i64, range: TimeRange, frame: Frame) -> f64 {
-    let share = (time_ms - range.from_ms) as f64 / (range.to_ms - range.from_ms) as f64;
+fn x_for(time: Timestamp, range: TimeRange, frame: Frame) -> f64 {
+    let milliseconds = |length: TimeDelta| length.num_milliseconds() as f64;
+    let share = milliseconds(time - range.from) / milliseconds(range.to - range.from);
     LEFT + share.clamp(0.0, 1.0) * (frame.right() - LEFT)
 }
 
@@ -497,29 +498,25 @@ fn nice_step(span: f64) -> f64 {
 /// UTC, and days start at its midnight. Rounding is done on the zone's wall clock,
 /// counted as if it were UTC, then each label goes back to the moment it names.
 fn time_ticks(range: TimeRange, frame: Frame, zone: Tz) -> Vec<Tick> {
-    let span = range.to_ms - range.from_ms;
-    let step = TIME_LABEL_STEPS_MS
+    let span = range.to - range.from;
+    let step = TIME_LABEL_STEPS
         .into_iter()
-        .find(|step| span / step <= MAX_TIME_LABELS)
+        .find(|step| span <= *step * MAX_TIME_LABELS)
         .unwrap_or(span / MAX_TIME_LABELS)
-        .max(1);
-    let format = if step < DAY_MS { "%H:%M" } else { "%b %-d" };
+        .max(TimeDelta::milliseconds(1));
+    let format = if step < DAY { "%H:%M" } else { "%b %-d" };
 
-    let Some(start) = DateTime::from_timestamp_millis(range.from_ms) else {
+    let wall_start = range.from.with_timezone(&zone).naive_local().and_utc();
+    let Ok(first) = wall_start.duration_trunc(step).map(|start| start + step) else {
         return Vec::new();
     };
-    let wall_start = start.with_timezone(&zone).naive_local().and_utc();
-    let first = (wall_start.timestamp_millis() / step + 1) * step;
     // One more than fits, as clocks going back can make room for it.
     (0..=MAX_TIME_LABELS + 1)
-        .map(|index| first + index * step)
-        .filter_map(|wall| {
-            let wall = DateTime::from_timestamp_millis(wall)?.naive_utc();
-            // Nothing, for a time skipped when the clocks go forward.
-            zone.from_local_datetime(&wall).earliest()
-        })
-        .map(|moment| (moment, moment.timestamp_millis()))
-        .take_while(|(_, time)| *time < range.to_ms)
+        .map(|index| (first + step * index).naive_utc())
+        // Nothing, for a time skipped when the clocks go forward.
+        .filter_map(|wall| zone.from_local_datetime(&wall).earliest())
+        .map(|moment| (moment, moment.to_utc()))
+        .take_while(|(_, time)| *time < range.to)
         .map(|(moment, time)| (moment, x_for(time, range, frame)))
         .filter(|(_, x)| *x - TIME_LABEL_MARGIN >= 0.0 && *x + TIME_LABEL_MARGIN <= frame.width)
         .map(|(moment, x)| Tick {
@@ -531,15 +528,15 @@ fn time_ticks(range: TimeRange, frame: Frame, zone: Tz) -> Vec<Tick> {
 
 /// Spacing is judged against the series itself as well as the step, because
 /// an agent sampling every minute leaves empty buckets on a short range.
-fn gap_limit_ms(series: &Series, range: TimeRange) -> f64 {
-    let mut spacing: Vec<i64> = series
+fn gap_limit(series: &Series, range: TimeRange) -> TimeDelta {
+    let mut spacing: Vec<TimeDelta> = series
         .points
         .windows(2)
-        .map(|pair| pair[1].time_ms - pair[0].time_ms)
+        .map(|pair| pair[1].time - pair[0].time)
         .collect();
     spacing.sort_unstable();
-    let typical = spacing.get(spacing.len() / 2).copied().unwrap_or(0);
-    GAP_STEPS * typical.max(range.step_ms) as f64
+    let typical = spacing.get(spacing.len() / 2).copied().unwrap_or_default();
+    typical.max(range.step) * GAP_HALF_STEPS / 2
 }
 
 /// Which colour each series gets. A metric with named fields gives each of its
@@ -575,19 +572,19 @@ fn colour_slots(metric: &Metric, series: &[Series]) -> Vec<usize> {
 }
 
 fn line(series: &Series, slot: usize, axis: &Axis, range: TimeRange) -> Line {
-    let limit = gap_limit_ms(series, range);
+    let limit = gap_limit(series, range);
 
     let mut runs: Vec<Vec<&Point>> = Vec::new();
     let mut previous = None;
     for point in &series.points {
         match (previous, runs.last_mut()) {
-            (Some(time), Some(run)) if (point.time_ms - time) as f64 <= limit => run.push(point),
+            (Some(time), Some(run)) if point.time - time <= limit => run.push(point),
             _ => runs.push(vec![point]),
         }
-        previous = Some(point.time_ms);
+        previous = Some(point.time);
     }
 
-    let x = |point: &Point| x_for(point.time_ms, range, axis.frame);
+    let x = |point: &Point| x_for(point.time, range, axis.frame);
     let joined = |points: &mut dyn Iterator<Item = (f64, f64)>| {
         points
             .map(|(x, y)| format!("{x:.1},{y:.1}"))
@@ -648,11 +645,11 @@ fn columns(
     zone: Tz,
 ) -> Vec<Column> {
     // Every moment any series has a value for, with a place for each series.
-    let mut moments: BTreeMap<i64, Vec<Option<f64>>> = BTreeMap::new();
+    let mut moments: BTreeMap<Timestamp, Vec<Option<f64>>> = BTreeMap::new();
     for (index, series) in series.iter().enumerate() {
         for point in &series.points {
             moments
-                .entry(point.time_ms)
+                .entry(point.time)
                 .or_insert_with(|| vec![None; slots.len()])[index] = Some(point.avg);
         }
     }
@@ -693,7 +690,7 @@ fn column(
     series: &[Series],
     slots: &[usize],
     axis: &Axis,
-    (time_ms, x): (i64, f64),
+    (time, x): (Timestamp, f64),
     values: &[Option<f64>],
     start: f64,
     end: f64,
@@ -734,8 +731,8 @@ fn column(
         x,
         hit_x: start,
         hit_width: end - start,
-        time_ms,
-        time: format_time(u64::try_from(time_ms).unwrap_or(0), zone),
+        time_ms: time.timestamp_millis(),
+        time: format_moment(time, zone),
         tooltip_x,
         tooltip_width,
         tooltip_height: (rows.len() + 1) as f64 * TOOLTIP_ROW_HEIGHT + 12.0,
@@ -861,15 +858,22 @@ mod tests {
     use crate::metrics::{Point, find};
     use chrono_tz::Tz;
 
+    use crate::times::from_ms;
+
     const HOUR_MS: i64 = 3_600_000;
 
+    /// A range of `ms` milliseconds from that many after 1970.
+    fn range_of(start_ms: i64, ms: i64) -> TimeRange {
+        TimeRange::new(from_ms(start_ms), from_ms(start_ms + ms)).unwrap()
+    }
+
     fn range() -> TimeRange {
-        TimeRange::new(0, HOUR_MS).unwrap()
+        range_of(0, HOUR_MS)
     }
 
     fn point(time_ms: i64, avg: f64) -> Point {
         Point {
-            time_ms,
+            time: from_ms(time_ms),
             avg,
             min: avg,
             max: avg,
@@ -1043,7 +1047,7 @@ mod tests {
     /// A moment that averages several samples, like a long range has.
     fn spread(time_ms: i64, min: f64, avg: f64, max: f64) -> Point {
         Point {
-            time_ms,
+            time: from_ms(time_ms),
             avg,
             min,
             max,
@@ -1090,7 +1094,7 @@ mod tests {
     fn events_are_marked_where_they_happened_and_only_in_range() {
         use crate::events::{EventKind, TimelineEvent};
         let event = |time_ms: i64, kind: EventKind| TimelineEvent {
-            occurred_at: crate::times::from_ms(time_ms),
+            occurred_at: from_ms(time_ms),
             kind,
             title: "Deployed".into(),
             detail: None,
@@ -1122,7 +1126,7 @@ mod tests {
     fn what_an_event_was_fits_on_the_chart_wherever_it_happened() {
         use crate::events::{EventKind, TimelineEvent};
         let event = |time_ms: i64, title: &str| TimelineEvent {
-            occurred_at: crate::times::from_ms(time_ms),
+            occurred_at: from_ms(time_ms),
             kind: EventKind::Restart,
             title: title.into(),
             detail: None,
@@ -1372,7 +1376,7 @@ mod tests {
     fn time_labels_suit_the_range() {
         let start = 1_700_000_000_000;
         let ticks = |hours: i64| {
-            let range = TimeRange::new(start, start + hours * HOUR_MS).unwrap();
+            let range = range_of(start, hours * HOUR_MS);
             time_ticks(range, Frame::STANDARD, Tz::UTC)
         };
 
@@ -1385,7 +1389,7 @@ mod tests {
     fn time_labels_fall_on_round_times_in_the_readers_zone() {
         let start = 1_700_000_000_000;
         let ticks = |hours: i64, zone: Tz| {
-            let range = TimeRange::new(start, start + hours * HOUR_MS).unwrap();
+            let range = range_of(start, hours * HOUR_MS);
             time_ticks(range, Frame::STANDARD, zone)
         };
 
@@ -1407,10 +1411,10 @@ mod tests {
         let week = ticks(24 * 7, Tz::Pacific__Auckland);
         assert_eq!(labels(&week).first(), Some(&"Nov 17"));
         let auckland_midnight = 1_700_132_400_000; // Nov 17 00:00 NZDT
-        let range = TimeRange::new(start, start + 24 * 7 * HOUR_MS).unwrap();
+        let range = range_of(start, 24 * 7 * HOUR_MS);
         assert_eq!(
             week[0].position,
-            x_for(auckland_midnight, range, Frame::STANDARD)
+            x_for(from_ms(auckland_midnight), range, Frame::STANDARD)
         );
     }
 
@@ -1418,7 +1422,7 @@ mod tests {
     fn time_labels_skip_the_hour_the_clocks_jump_over() {
         // Clocks in New York went from 02:00 to 03:00 on March 10, 2024 (07:00 UTC).
         let from = 1_710_050_400_000; // 01:00 EST
-        let range = TimeRange::new(from, from + 3 * HOUR_MS).unwrap();
+        let range = range_of(from, 3 * HOUR_MS);
 
         let ticks = time_ticks(range, Frame::STANDARD, Tz::America__New_York);
 
@@ -1450,7 +1454,7 @@ mod tests {
     fn time_labels_stay_in_order_and_inside_the_chart() {
         for hours in [1, 6, 24, 24 * 7, 24 * 30, 24 * 366] {
             let from = 1_700_000_123_456;
-            let range = TimeRange::new(from, from + hours * HOUR_MS).unwrap();
+            let range = range_of(from, hours * HOUR_MS);
 
             let ticks = time_ticks(range, Frame::STANDARD, Tz::UTC);
 

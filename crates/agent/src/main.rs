@@ -35,7 +35,7 @@ mod websocket;
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
@@ -90,9 +90,9 @@ enum Command {
         /// Values for its variables, like disk=/var
         #[arg(value_name = "NAME=VALUE", value_parser = parse_variable)]
         variables: Vec<(String, String)>,
-        /// How long it gets, in seconds
-        #[arg(long, default_value_t = maxnines_protocol::actions::DEFAULT_ACTION_TIMEOUT_SECS)]
-        timeout_secs: u64,
+        /// How long it gets, in seconds. Without it, as long as the server gives
+        #[arg(long = "timeout-secs", value_name = "SECONDS", value_parser = parse_seconds)]
+        timeout: Option<Duration>,
     },
     /// Print this agent's version, and exactly which build it is
     Version,
@@ -134,13 +134,19 @@ fn parse_variable(text: &str) -> Result<(String, String), String> {
     Ok((name.to_string(), value.to_string()))
 }
 
+fn parse_seconds(text: &str) -> Result<Duration, String> {
+    text.parse()
+        .map(Duration::from_secs)
+        .map_err(|_| "a time limit is a whole number of seconds, like 30".to_string())
+}
+
 /// Runs an action exactly as it would for the server, so it can be tried out on
 /// the host, as the user the agent runs as.
 fn try_action(
     config: &Config,
     name: &str,
     variables: Vec<(String, String)>,
-    secs: u64,
+    timeout: Duration,
 ) -> Result<()> {
     #[cfg(unix)]
     privileges::split(config)?;
@@ -153,13 +159,13 @@ fn try_action(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let result = runtime.block_on(runner.run("try".to_string(), name, &variables, secs));
+    let result = runtime.block_on(runner.run("try".to_string(), name, &variables, timeout));
 
     print!("{}", result.output);
     if result.truncated {
         eprintln!("(the rest was cut off)");
     }
-    let took = Duration::from_millis(result.duration_ms).as_secs_f64();
+    let took = result.duration.as_secs_f64();
     let outcome = result.outcome.as_str().replace('_', " ");
     match (result.error, result.exit_code) {
         (Some(error), _) => eprintln!("{outcome} after {took:.1}s: {error}"),
@@ -210,10 +216,11 @@ fn main() -> Result<()> {
         Command::Action {
             name,
             variables,
-            timeout_secs,
+            timeout,
         } => {
             let config = Config::load(&cli.config)?;
-            try_action(&config, &name, variables, timeout_secs)
+            let timeout = timeout.unwrap_or(maxnines_protocol::actions::DEFAULT_ACTION_TIMEOUT);
+            try_action(&config, &name, variables, timeout)
         }
         Command::Identity(command) => {
             let config = Config::load(&cli.config)?;
@@ -272,7 +279,7 @@ impl Monitoring {
             // CPU usage is measured between refreshes, so the first sample waits. The
             // random part is because a config can reach every agent at the same moment,
             // and they would then all collect together from then on.
-            let period = Duration::from_secs(update.config.interval_secs);
+            let period = update.config.interval;
             let first = Instant::now() + collector::WARMUP + jitter(period);
             let mut ticker = interval_at(first, period);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -310,7 +317,7 @@ async fn run_agent(path: PathBuf, config: Config) -> Result<()> {
         match Monitoring::start(&update, config.local()) {
             Ok(started) => {
                 info!(version = update.version, "using the saved config");
-                link.set_facts_interval(Duration::from_secs(update.config.facts_interval_secs));
+                link.set_facts_interval(update.config.facts_interval);
                 monitoring = Some(started);
             }
             Err(error) => warn!(error = format!("{error:#}"), "saved config is unusable"),
@@ -368,11 +375,11 @@ fn apply(
             info!(
                 version = update.version,
                 collectors = started.collectors.len(),
-                interval_secs = update.config.interval_secs,
+                interval_secs = update.config.interval.as_secs(),
                 "config applied"
             );
             *monitoring = Some(started);
-            link.set_facts_interval(Duration::from_secs(update.config.facts_interval_secs));
+            link.set_facts_interval(update.config.facts_interval);
             if let Err(error) = saved_config::save(saved_file, &update) {
                 warn!(error = format!("{error:#}"), "saving the config failed");
             }
@@ -403,13 +410,8 @@ fn collect(collectors: &mut [Box<dyn Collector>]) -> Sample {
         }
     }
 
-    let timestamp_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
     Sample {
-        timestamp_ms,
+        time: maxnines_protocol::time::now(),
         metrics,
     }
 }

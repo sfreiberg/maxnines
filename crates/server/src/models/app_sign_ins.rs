@@ -12,12 +12,12 @@ use super::audit::record_change;
 use super::users::enabled_user;
 use super::{Database, User, app_sign_in, owner_emails, user};
 use crate::app_sign_ins::{
-    ACCESS_LIFETIME_MS, ACCESS_PREFIX, REFRESH_GRACE_MS, REFRESH_LIFETIME_MS, REFRESH_PREFIX,
-    app_name, client, new_secret, secret_hash,
+    ACCESS_LIFETIME, ACCESS_PREFIX, REFRESH_GRACE, REFRESH_LIFETIME, REFRESH_PREFIX, app_name,
+    client, new_secret, secret_hash,
 };
 use crate::audit::{Kind, Snapshot};
 use crate::roles::Role;
-use crate::times::{self, Timestamp, millis};
+use crate::times::Timestamp;
 
 /// An app someone signed in, as the pages and the API show it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -63,8 +63,8 @@ impl AppSignIn {
         }
     }
 
-    pub fn is_active(&self, now_ms: i64) -> bool {
-        self.revoked_at.is_none() && now_ms < self.expires_at.timestamp_millis()
+    pub fn is_active(&self, now: Timestamp) -> bool {
+        self.revoked_at.is_none() && now < self.expires_at
     }
 
     /// What it's called where it's listed, and in the audit log.
@@ -113,7 +113,7 @@ fn snapshot(row: &app_sign_in::Model, owner: &str) -> Snapshot {
 
 /// How long one that's been revoked or has run out stays listed before it's deleted.
 /// The audit log keeps what happened to it.
-const KEPT_AFTER_ENDING_MS: i64 = 90 * 24 * 60 * 60 * 1000;
+const KEPT_AFTER_ENDING: chrono::TimeDelta = chrono::TimeDelta::days(90);
 
 /// The email address of the user with this ID, or nothing if they've gone.
 async fn owner_email<C: ConnectionTrait>(connection: &C, user_id: i64) -> Result<String> {
@@ -140,16 +140,15 @@ impl Database {
         client_id: &str,
         device: &str,
         role: Role,
-        now_ms: i64,
+        now: Timestamp,
     ) -> Result<(AppSignIn, AppTokens)> {
         ensure!(
             client(client_id).is_some(),
             "there's no app called {client_id}"
         );
         let tokens = new_tokens()?;
-        let now = times::from_ms(now_ms);
         // Ones that ended long ago go, so the list doesn't grow with every sign in.
-        let ended = now - millis(KEPT_AFTER_ENDING_MS);
+        let ended = now - KEPT_AFTER_ENDING;
         app_sign_in::Entity::delete_many()
             .filter(
                 sea_orm::Condition::any()
@@ -170,9 +169,9 @@ impl Database {
             device: Set(device.to_string()),
             role: Set(role.as_str().to_string()),
             access_hash: Set(secret_hash(&tokens.access_token)),
-            access_expires_at: Set(now + millis(ACCESS_LIFETIME_MS)),
+            access_expires_at: Set(now + ACCESS_LIFETIME),
             refresh_hash: Set(secret_hash(&tokens.refresh_token)),
-            refresh_expires_at: Set(now + millis(REFRESH_LIFETIME_MS)),
+            refresh_expires_at: Set(now + REFRESH_LIFETIME),
             created_at: Set(now),
             last_used_at: Set(Some(now)),
             last_address: Set(crate::audit::source().map(|address| address.to_string())),
@@ -204,7 +203,7 @@ impl Database {
     pub async fn accept_app_token(
         &self,
         access_token: &str,
-        now_ms: i64,
+        now: Timestamp,
     ) -> Result<Option<(AppSignIn, User)>> {
         let row = app_sign_in::Entity::find()
             .filter(app_sign_in::Column::AccessHash.eq(secret_hash(access_token)))
@@ -212,7 +211,7 @@ impl Database {
             .one(&self.connection)
             .await
             .context("checking an app's token")?;
-        let Some(row) = row.filter(|row| now_ms < row.access_expires_at.timestamp_millis()) else {
+        let Some(row) = row.filter(|row| now < row.access_expires_at) else {
             return Ok(None);
         };
         let Some(mut owner) = enabled_user(&self.connection, row.user_id).await? else {
@@ -224,7 +223,7 @@ impl Database {
             address: row.last_address.clone(),
             forwarded_for: row.last_forwarded_for.clone(),
         };
-        let row = if let Some((used, from)) = super::noted_use(row.last_used_at, &last, now_ms) {
+        let row = if let Some((used, from)) = super::noted_use(row.last_used_at, &last, now) {
             let mut row: app_sign_in::ActiveModel = row.into();
             row.last_used_at = Set(Some(used));
             row.last_address = Set(from.address);
@@ -245,12 +244,12 @@ impl Database {
         &self,
         refresh_token: &str,
         client_id: &str,
-        now_ms: i64,
+        now: Timestamp,
     ) -> Result<Refreshed> {
         // Another refresh may swap the same token at the same moment. Whichever comes
         // second finds it just swapped, and goes again as one inside the grace.
         for _ in 0..3 {
-            if let Some(refreshed) = self.try_refresh(refresh_token, client_id, now_ms).await? {
+            if let Some(refreshed) = self.try_refresh(refresh_token, client_id, now).await? {
                 return Ok(refreshed);
             }
         }
@@ -262,7 +261,7 @@ impl Database {
         &self,
         refresh_token: &str,
         client_id: &str,
-        now_ms: i64,
+        now: Timestamp,
     ) -> Result<Option<Refreshed>> {
         let hash = secret_hash(refresh_token);
         let transaction = self.connection.begin().await.context("refreshing an app")?;
@@ -284,10 +283,10 @@ impl Database {
                 };
                 let in_grace = row
                     .rotated_at
-                    .is_some_and(|rotated| now_ms - rotated.timestamp_millis() < REFRESH_GRACE_MS);
+                    .is_some_and(|rotated| now - rotated < REFRESH_GRACE);
                 if !in_grace {
                     if row.revoked_at.is_none() {
-                        revoke_row(&transaction, row, now_ms).await?;
+                        revoke_row(&transaction, row, now).await?;
                         transaction.commit().await.context("revoking an app")?;
                         return Ok(Some(Refreshed::Reused));
                     }
@@ -296,9 +295,8 @@ impl Database {
                 (row, true)
             }
         };
-        let usable = row.client_id == client_id
-            && row.revoked_at.is_none()
-            && now_ms < row.refresh_expires_at.timestamp_millis();
+        let usable =
+            row.client_id == client_id && row.revoked_at.is_none() && now < row.refresh_expires_at;
         if !usable {
             return Ok(Some(Refreshed::Refused));
         }
@@ -306,12 +304,11 @@ impl Database {
             return Ok(Some(Refreshed::Refused));
         };
         let tokens = new_tokens()?;
-        let now = times::from_ms(now_ms);
         let mut changes = app_sign_in::ActiveModel {
             access_hash: Set(secret_hash(&tokens.access_token)),
-            access_expires_at: Set(now + millis(ACCESS_LIFETIME_MS)),
+            access_expires_at: Set(now + ACCESS_LIFETIME),
             refresh_hash: Set(secret_hash(&tokens.refresh_token)),
-            refresh_expires_at: Set(now + millis(REFRESH_LIFETIME_MS)),
+            refresh_expires_at: Set(now + REFRESH_LIFETIME),
             last_used_at: Set(Some(now)),
             ..Default::default()
         };
@@ -383,11 +380,11 @@ impl Database {
     pub async fn count_active_app_sign_ins(
         &self,
         user_id: Option<i64>,
-        now_ms: i64,
+        now: Timestamp,
     ) -> Result<u64> {
         let mut query = app_sign_in::Entity::find()
             .filter(app_sign_in::Column::RevokedAt.is_null())
-            .filter(app_sign_in::Column::RefreshExpiresAt.gt(times::from_ms(now_ms)));
+            .filter(app_sign_in::Column::RefreshExpiresAt.gt(now));
         if let Some(user_id) = user_id {
             query = query.filter(app_sign_in::Column::UserId.eq(user_id));
         }
@@ -398,7 +395,7 @@ impl Database {
     }
 
     /// Signs an app out. Returns false if there's no such sign in.
-    pub async fn revoke_app_sign_in(&self, id: i64, now_ms: i64) -> Result<bool> {
+    pub async fn revoke_app_sign_in(&self, id: i64, now: Timestamp) -> Result<bool> {
         let transaction = self.connection.begin().await.context("revoking an app")?;
         let Some(row) = app_sign_in::Entity::find_by_id(id)
             .one(&transaction)
@@ -408,7 +405,7 @@ impl Database {
             return Ok(false);
         };
         if row.revoked_at.is_none() {
-            revoke_row(&transaction, row, now_ms).await?;
+            revoke_row(&transaction, row, now).await?;
             transaction.commit().await.context("revoking an app")?;
         }
         Ok(true)
@@ -416,7 +413,12 @@ impl Database {
 
     /// Signs out whichever app holds this token, access or refresh, as an app does when
     /// someone signs it out. A token that's nobody's is ignored.
-    pub async fn revoke_app_token(&self, token: &str, client_id: &str, now_ms: i64) -> Result<()> {
+    pub async fn revoke_app_token(
+        &self,
+        token: &str,
+        client_id: &str,
+        now: Timestamp,
+    ) -> Result<()> {
         let hash = secret_hash(token);
         let row = app_sign_in::Entity::find()
             .filter(
@@ -429,7 +431,7 @@ impl Database {
             .context("checking an app's token")?;
         match row {
             Some(row) if row.client_id == client_id => {
-                self.revoke_app_sign_in(row.id, now_ms).await.map(|_| ())
+                self.revoke_app_sign_in(row.id, now).await.map(|_| ())
             }
             _ => Ok(()),
         }
@@ -439,12 +441,12 @@ impl Database {
 async fn revoke_row<C: ConnectionTrait>(
     connection: &C,
     row: app_sign_in::Model,
-    now_ms: i64,
+    now: Timestamp,
 ) -> Result<()> {
     let owner = owner_email(connection, row.user_id).await?;
     let before = snapshot(&row, &owner);
     let mut active: app_sign_in::ActiveModel = row.into();
-    active.revoked_at = Set(Some(times::from_ms(now_ms)));
+    active.revoked_at = Set(Some(now));
     let row = active.update(connection).await.context("revoking an app")?;
     let after = snapshot(&row, &owner);
     record_change(

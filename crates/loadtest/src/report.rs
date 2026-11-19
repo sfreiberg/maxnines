@@ -1,5 +1,6 @@
 //! What a test found: the results, the verdict and the terminal summary.
 
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::monitor::Point;
@@ -153,7 +154,7 @@ pub struct Event {
 
 #[derive(Serialize)]
 pub struct Report {
-    pub started: String,
+    pub started_at: DateTime<Utc>,
     pub ran_for_secs: f64,
     pub stopped_early: bool,
     pub outcome: Outcome,

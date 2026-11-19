@@ -1,20 +1,22 @@
 //! The page for creating and revoking API keys.
 
+use std::time::Duration;
+
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
+use chrono::TimeDelta;
 use serde::Serialize;
 
 use super::users::role_choices;
 use super::{CsrfForm, Page, local_date, local_time, server_error, signed_in_user};
 use crate::app_state::AppState;
-use crate::metrics::now_ms;
 use crate::models::{ApiKey, check_api_key_name, expiry_after};
 use crate::roles::Role;
-use crate::times::{self, millis};
+use crate::times::{self, Timestamp};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -57,7 +59,7 @@ struct KeyRow {
 }
 
 /// How close to expiring a key is worth pointing out.
-const EXPIRES_SOON_MS: i64 = 7 * 86_400_000;
+const EXPIRES_SOON: TimeDelta = TimeDelta::days(7);
 
 #[derive(Serialize)]
 struct Lifetime {
@@ -87,15 +89,14 @@ fn chosen_lifetime(value: &str) -> Option<Option<u64>> {
         .then_some(Some(secs))
 }
 
-fn row(key: ApiKey, now_ms: i64) -> KeyRow {
+fn row(key: ApiKey, now: Timestamp) -> KeyRow {
     let status = if key.revoked_at.is_some() {
         "Revoked"
-    } else if key.has_expired(now_ms) {
+    } else if key.has_expired(now) {
         "Expired"
     } else {
         "Active"
     };
-    let now = times::from_ms(now_ms);
     let usable = status == "Active";
     let expiry = match key.expires_at {
         None => "Never expires".to_string(),
@@ -110,7 +111,7 @@ fn row(key: ApiKey, now_ms: i64) -> KeyRow {
         expires_soon: usable
             && key
                 .expires_at
-                .is_some_and(|expires| expires - now <= millis(EXPIRES_SOON_MS)),
+                .is_some_and(|expires| expires - now <= EXPIRES_SOON),
         last_used: key.last_used_at.map(|used| times::ago(used, now)),
         last_used_at: key.last_used_at.map(local_time),
         status,
@@ -142,7 +143,7 @@ pub async fn revoke_if_allowed(state: &AppState, id: i64) -> anyhow::Result<bool
     if !visible_keys(state).await?.iter().any(|key| key.id == id) {
         return Ok(false);
     }
-    state.database.revoke_api_key(id, now_ms()).await
+    state.database.revoke_api_key(id, crate::times::now()).await
 }
 
 /// `new_key` is only ever on the page right after creating it.
@@ -157,7 +158,7 @@ async fn page(
         Err(error) => return server_error(&error),
     };
     let yours = signed_in_user().map_or(Role::Viewer, |user| user.role);
-    let now = now_ms();
+    let now = crate::times::now();
     let rows: Vec<KeyRow> = keys.into_iter().map(|key| row(key, now)).collect();
     let page = Page::new(state, token, "settings/api_keys.html")
         .with("keys", &rows)
@@ -188,8 +189,11 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
         let error = "Choose how long the key should last.";
         return page(&state, &form.token, None, Some(error)).await;
     };
-    let now = now_ms();
-    let expires_at = match lifetime.map(|secs| expiry_after(secs, now)).transpose() {
+    let now = crate::times::now();
+    let expires_at = match lifetime
+        .map(|secs| expiry_after(Duration::from_secs(secs), now))
+        .transpose()
+    {
         Ok(expires) => expires,
         Err(error) => return server_error(&error),
     };
@@ -242,8 +246,8 @@ mod tests {
         assert_eq!(chosen_lifetime("soon"), None);
     }
 
-    /// A key, with when it expires and was revoked in milliseconds.
-    fn key(expires_ms: Option<i64>, revoked_ms: Option<i64>) -> ApiKey {
+    /// A key, with when it expires and was revoked.
+    fn key(expires_at: Option<Timestamp>, revoked_at: Option<Timestamp>) -> ApiKey {
         ApiKey {
             id: 1,
             name: "a".to_string(),
@@ -252,27 +256,31 @@ mod tests {
             role: Role::Admin,
             hint: "mxn_".to_string(),
             created_at: times::from_ms(0),
-            expires_at: expires_ms.map(times::from_ms),
+            expires_at,
             last_used_at: None,
             last_address: None,
             last_forwarded_for: None,
-            revoked_at: revoked_ms.map(times::from_ms),
+            revoked_at,
         }
     }
 
     #[test]
     fn keys_say_whether_they_still_work() {
-        assert_eq!(row(key(None, None), 100).status, "Active");
-        assert_eq!(row(key(Some(200), None), 100).status, "Active");
-        assert_eq!(row(key(Some(50), None), 100).status, "Expired");
-        assert_eq!(row(key(Some(50), Some(10)), 100).status, "Revoked");
-        assert!(!row(key(Some(50), None), 100).usable);
+        let at = times::from_ms;
+        assert_eq!(row(key(None, None), at(100)).status, "Active");
+        assert_eq!(row(key(Some(at(200)), None), at(100)).status, "Active");
+        assert_eq!(row(key(Some(at(50)), None), at(100)).status, "Expired");
+        assert_eq!(
+            row(key(Some(at(50)), Some(at(10))), at(100)).status,
+            "Revoked"
+        );
+        assert!(!row(key(Some(at(50)), None), at(100)).usable);
     }
 
     #[test]
     fn keys_say_when_they_expire_and_how_long_ago_they_were_used() {
-        const DAY_MS: i64 = 86_400_000;
-        let now = 400 * DAY_MS;
+        const DAY: TimeDelta = TimeDelta::days(1);
+        let now = times::from_ms(0) + DAY * 400;
 
         let forever = row(key(None, None), now);
         assert_eq!(forever.created, "1970-01-01");
@@ -282,18 +290,18 @@ mod tests {
         assert_eq!((forever.last_used, forever.last_used_at), (None, None));
 
         // A week or less to go is worth pointing out, while it still works.
-        let soon = row(key(Some(now + 7 * DAY_MS), None), now);
+        let soon = row(key(Some(now + DAY * 7), None), now);
         assert_eq!(soon.expiry, "Expires 1971-02-12");
         assert!(soon.expires_soon);
-        assert!(!row(key(Some(now + 8 * DAY_MS), None), now).expires_soon);
-        assert!(!row(key(Some(now + DAY_MS), Some(5)), now).expires_soon);
+        assert!(!row(key(Some(now + DAY * 8), None), now).expires_soon);
+        assert!(!row(key(Some(now + DAY), Some(times::from_ms(5))), now).expires_soon);
 
-        let expired = row(key(Some(now - DAY_MS), None), now);
+        let expired = row(key(Some(now - DAY), None), now);
         assert_eq!(expired.expiry, "Expired 1971-02-04");
         assert!(!expired.expires_soon);
 
         let mut used = key(None, None);
-        used.last_used_at = Some(times::from_ms(now - 5 * 60_000));
+        used.last_used_at = Some(now - TimeDelta::minutes(5));
         let used = row(used, now);
         assert_eq!(used.last_used.as_deref(), Some("5 minutes ago"));
         assert_eq!(

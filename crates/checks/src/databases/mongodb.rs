@@ -7,6 +7,7 @@
 //! where it isn't.
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, TimeDelta, Utc};
 use maxnines_protocol::Check;
 use mongodb::Client;
 use mongodb::bson::{Bson, Document, doc};
@@ -39,11 +40,17 @@ fn number(value: Option<&Bson>) -> Option<f64> {
     }
 }
 
-fn millis(value: Option<&Bson>) -> Option<i64> {
+fn moment(value: Option<&Bson>) -> Option<DateTime<Utc>> {
     match value? {
-        Bson::DateTime(time) => Some(time.timestamp_millis()),
+        Bson::DateTime(time) => DateTime::from_timestamp_millis(time.timestamp_millis()),
         _ => None,
     }
+}
+
+/// How far `later` is ahead of `earlier`, in seconds, as lag is reported. Behind
+/// counts as not lagging at all.
+fn seconds_ahead(later: DateTime<Utc>, earlier: DateTime<Utc>) -> f64 {
+    (later - earlier).max(TimeDelta::zero()).as_seconds_f64()
 }
 
 fn text(value: Option<&Bson>) -> Option<String> {
@@ -230,7 +237,7 @@ impl Mongodb {
         let primary = members
             .iter()
             .find(|member| number(member.get("state")) == Some(1.0));
-        let newest = |member: &Document| millis(member.get("optimeDate"));
+        let newest = |member: &Document| moment(member.get("optimeDate"));
         // With no primary, lag is against whichever member is furthest on.
         let leader = primary
             .and_then(|primary| newest(primary))
@@ -246,14 +253,11 @@ impl Mongodb {
         main.flag("has_primary", primary.is_some());
         main.maybe("term", number(status.get("term")));
         if let (Some(applied), Some(committed)) = (
-            millis(at(&status, &["optimes", "lastAppliedWallTime"])),
-            millis(at(&status, &["optimes", "lastCommittedWallTime"])),
+            moment(at(&status, &["optimes", "lastAppliedWallTime"])),
+            moment(at(&status, &["optimes", "lastCommittedWallTime"])),
         ) && primary.is_some_and(|primary| primary.get_bool("self").unwrap_or(false))
         {
-            main.set(
-                "majority_lag_secs",
-                (applied - committed).max(0) as f64 / 1000.0,
-            );
+            main.set("majority_lag_secs", seconds_ahead(applied, committed));
         }
 
         for member in &members {
@@ -264,7 +268,7 @@ impl Mongodb {
             // A member that's down reports a time from 1970, which isn't lag.
             let lag = match (leader, newest(member)) {
                 (Some(leader), Some(own)) if healthy && secondary => {
-                    Some((leader - own).max(0) as f64 / 1000.0)
+                    Some(seconds_ahead(leader, own))
                 }
                 _ => None,
             };
@@ -300,12 +304,13 @@ impl Mongodb {
                 return rows.missed("the oplog", mongodb_error(&error));
             }
         };
-        let seconds = |entry: Option<Document>| match entry?.get("ts")? {
-            Bson::Timestamp(stamp) => Some(f64::from(stamp.time)),
+        let written_at = |entry: Option<Document>| match entry?.get("ts")? {
+            Bson::Timestamp(stamp) => DateTime::from_timestamp(i64::from(stamp.time), 0),
             _ => None,
         };
-        if let (Some(first), Some(last)) = (seconds(first), seconds(last)) {
-            rows.main.set("oplog_window_secs", (last - first).max(0.0));
+        if let (Some(first), Some(last)) = (written_at(first), written_at(last)) {
+            rows.main
+                .set("oplog_window_secs", seconds_ahead(last, first));
         }
     }
 

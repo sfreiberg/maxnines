@@ -1,6 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use axum::body::Bytes;
@@ -21,12 +20,13 @@ use tracing::{info, warn};
 use crate::actions::Actions;
 use crate::app_state::AppState;
 use crate::clock::Asked;
-use crate::events::{BOOT_TIME_SLACK_MS, EventKind, restarted};
+use crate::events::{BOOT_TIME_SLACK, EventKind, restarted};
 use crate::facts::flatten;
 use crate::models::ConfigStatus;
 use crate::presence::Presence;
 use crate::registration::Admission;
-use crate::store::{LATEST_SAMPLE_MS, NewSample, WriterCommand};
+use crate::store::{NewSample, WriterCommand, can_store};
+use crate::times::{self, Timestamp};
 
 /// The longest hostname DNS allows, and what the database column holds.
 const MAX_HOST_LEN: usize = 255;
@@ -248,8 +248,8 @@ enum Job {
         version: String,
         error: Option<String>,
     },
-    /// When the host started, in milliseconds, as a sample said.
-    Boot(i64),
+    /// When the host started, as a sample said.
+    Boot(Timestamp),
 }
 
 /// Reads from the agent and pings it until the connection ends, returning why.
@@ -318,7 +318,7 @@ async fn serve(
                     continue;
                 };
                 // Timed from before it's sent, so a slow send counts against it.
-                let question = Asked::new(nonce.clone(), crate::metrics::now_ms());
+                let question = Asked::new(nonce.clone(), times::now());
                 if send(socket, &ServerMessage::AskTime { nonce }).await.is_err() {
                     return "send failed";
                 }
@@ -334,8 +334,8 @@ async fn serve(
                     return "send failed";
                 }
             }
-            Some(timestamp_ms) = acks.recv() => {
-                if send(socket, &ServerMessage::Ack { timestamp_ms }).await.is_err() {
+            Some(time) = acks.recv() => {
+                if send(socket, &ServerMessage::Ack { time }).await.is_err() {
                     return "send failed";
                 }
             }
@@ -410,11 +410,11 @@ async fn do_jobs(
                 Some(Job::ConfigResult { version, error }) => {
                     save_config_result(version, error, agent, state).await;
                 }
-                Some(Job::Boot(boot_ms)) => {
-                    save_boot(boot_ms, agent, state, &mut known_boot).await;
+                Some(Job::Boot(booted_at)) => {
+                    save_boot(booted_at, agent, state, &mut known_boot).await;
                 }
                 Some(Job::ActionResult(result)) => {
-                    let saved = state.actions.finished(&agent.id, result, crate::metrics::now_ms());
+                    let saved = state.actions.finished(&agent.id, result, times::now());
                     if let Err(error) = saved.await {
                         warn!(id = agent.id, error = format!("{error:#}"), "saving an action's result failed");
                     }
@@ -474,8 +474,8 @@ async fn send_config(
 /// What one connection keeps between messages.
 struct Connection<'a> {
     jobs: &'a mpsc::Sender<Job>,
-    acks: &'a mpsc::Sender<u64>,
-    last_boot: &'a mut Option<i64>,
+    acks: &'a mpsc::Sender<Timestamp>,
+    last_boot: &'a mut Option<Timestamp>,
     /// The question about its clock that the agent hasn't answered yet.
     asked: &'a mut Option<Asked>,
     /// Set when its answer took too long to use.
@@ -498,14 +498,14 @@ fn receive(
         time_came_late,
     } = connection;
     let job = match serde_json::from_str(text) {
-        Ok(AgentMessage::Time { nonce, time_ms }) => {
-            *time_came_late = !save_time(&nonce, time_ms, agent, state, asked);
+        Ok(AgentMessage::Time { nonce, answered_at }) => {
+            *time_came_late = !save_time(&nonce, answered_at, agent, state, asked);
             return None;
         }
-        Ok(AgentMessage::Sample(sample)) if sample.timestamp_ms > LATEST_SAMPLE_MS => {
+        Ok(AgentMessage::Sample(sample)) if !can_store(sample.time) => {
             // Answered, so the agent lets go of something that can never be stored.
             warn!(id = agent.id, "skipping a sample with an impossible time");
-            acks.try_send(sample.timestamp_ms).ok();
+            acks.try_send(sample.time).ok();
             return None;
         }
         Ok(AgentMessage::Sample(sample)) => {
@@ -562,7 +562,7 @@ fn receive(
 /// the right answer taking too long to use.
 fn save_time(
     nonce: &str,
-    time_ms: u64,
+    answered_at: Timestamp,
     agent: &Agent,
     state: &AppState,
     asked: &mut Option<Asked>,
@@ -570,10 +570,10 @@ fn save_time(
     let Some(question) = asked.take_if(|question| question.nonce == nonce) else {
         return true;
     };
-    let Some(reading) = question.answered(nonce, time_ms) else {
+    let Some(reading) = question.answered(nonce, answered_at) else {
         return false;
     };
-    let sample = reading.sample(&agent.id, &agent.hostname, crate::metrics::now_ms());
+    let sample = reading.sample(&agent.id, &agent.hostname, times::now());
     // The next one is a minute away, so one the writer has no room for is let go.
     if state.writer.try_send(WriterCommand::Save(sample)).is_err() {
         warn!(
@@ -591,20 +591,20 @@ fn note_boot(
     sample: &maxnines_protocol::Sample,
     agent: &Agent,
     jobs: &mpsc::Sender<Job>,
-    last_boot: &mut Option<i64>,
+    last_boot: &mut Option<Timestamp>,
 ) {
-    let Some(boot_ms) = sample
+    let Some(booted_at) = sample
         .metrics
         .get("host")
-        .and_then(|output| output.get("boot_time_secs"))
-        .and_then(Value::as_i64)
-        .and_then(|secs| secs.checked_mul(1000))
+        .and_then(|output| output.get("booted_at"))
+        .and_then(Value::as_str)
+        .and_then(times::parse_moment)
     else {
         return;
     };
-    let later = last_boot.is_none_or(|known| boot_ms > known + BOOT_TIME_SLACK_MS);
-    if later && jobs.try_send(Job::Boot(boot_ms)).is_ok() {
-        *last_boot = Some(boot_ms);
+    let later = last_boot.is_none_or(|known| booted_at > known + BOOT_TIME_SLACK);
+    if later && jobs.try_send(Job::Boot(booted_at)).is_ok() {
+        *last_boot = Some(booted_at);
     } else if later {
         warn!(
             id = agent.id,
@@ -615,7 +615,12 @@ fn note_boot(
 
 /// Notes when the host started, and marks a restart when it's later than the start
 /// the server last knew of. `known` is loaded the first time.
-async fn save_boot(boot_ms: i64, agent: &Agent, state: &AppState, known: &mut Option<Option<i64>>) {
+async fn save_boot(
+    booted_at: Timestamp,
+    agent: &Agent,
+    state: &AppState,
+    known: &mut Option<Option<Timestamp>>,
+) {
     let previous = match known {
         Some(previous) => *previous,
         None => match state.database.boot_time(&agent.id).await {
@@ -630,17 +635,18 @@ async fn save_boot(boot_ms: i64, agent: &Agent, state: &AppState, known: &mut Op
             }
         },
     };
-    let restarted = restarted(previous, boot_ms) && previous.is_some_and(|known| boot_ms > known);
+    let restarted =
+        restarted(previous, booted_at) && previous.is_some_and(|known| booted_at > known);
     if previous.is_some() && !restarted {
         *known = Some(previous);
         return;
     }
     match state
         .database
-        .save_boot_time(&agent.id, boot_ms, restarted, now_ms() as i64)
+        .save_boot_time(&agent.id, booted_at, restarted, times::now())
         .await
     {
-        Ok(()) => *known = Some(Some(boot_ms)),
+        Ok(()) => *known = Some(Some(booted_at)),
         Err(error) => warn!(
             id = agent.id,
             error = format!("{error:#}"),
@@ -692,12 +698,12 @@ async fn save_config_result(
         return;
     }
     if changed {
-        record_config_change(agent, state, status.reported_at.timestamp_millis()).await;
+        record_config_change(agent, state, status.reported_at).await;
     }
 }
 
 /// Marks a new config on the host's charts, saying which rules it came from.
-async fn record_config_change(agent: &Agent, state: &AppState, now_ms: i64) {
+async fn record_config_change(agent: &Agent, state: &AppState, now: Timestamp) {
     let rules = match state.config_for(&agent.id).await {
         Ok(resolved) => Some(format!(
             "From rules: {}.",
@@ -710,10 +716,10 @@ async fn record_config_change(agent: &Agent, state: &AppState, now_ms: i64) {
         .record_server_event(
             EventKind::Config,
             &agent.id,
-            now_ms,
+            now,
             "Config changed",
             rules.as_deref(),
-            now_ms,
+            now,
         )
         .await;
     if let Err(error) = saved {
@@ -723,13 +729,6 @@ async fn record_config_change(agent: &Agent, state: &AppState, now_ms: i64) {
             "recording a config change failed"
         );
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 /// Failing to save loses nothing, because the agent reports again later.
@@ -749,7 +748,7 @@ async fn save_facts(facts: Value, agent: &Agent, state: &AppState) -> bool {
 
     match state
         .database
-        .record_facts(&agent.id, &facts, now_ms())
+        .record_facts(&agent.id, &facts, times::now())
         .await
     {
         Ok(true) => {

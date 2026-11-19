@@ -3,6 +3,7 @@
 //! use it.
 
 use anyhow::{Context, Result};
+use chrono::TimeDelta;
 use maxnines_protocol::auth::new_nonce;
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
@@ -15,10 +16,11 @@ use super::audit::record_change;
 use super::users::{load, record_user, token_hash};
 use super::{Database, User, recovery_code, server_setting, sign_in_challenge, user};
 use crate::audit::{Kind, Snapshot};
+use crate::times::Timestamp;
 use crate::two_factor::{matching_step, new_recovery_codes, new_secret, normalise_recovery_code};
 
 /// How long someone has to type their code after their password.
-pub const CHALLENGE_LIFETIME_MS: i64 = 5 * 60 * 1000;
+pub const CHALLENGE_LIFETIME: TimeDelta = TimeDelta::minutes(5);
 const REQUIRE_TWO_FACTOR: &str = "require_two_factor";
 
 fn code_hash(code: &str) -> String {
@@ -64,8 +66,9 @@ pub(super) async fn forget<C: ConnectionTrait>(connection: &C, id: i64) -> Resul
     Ok(())
 }
 
-fn secs(now_ms: i64) -> u64 {
-    u64::try_from(now_ms / 1000).unwrap_or_default()
+/// Seconds since 1970, which is what codes are worked out from.
+fn secs(now: Timestamp) -> u64 {
+    u64::try_from(now.timestamp()).unwrap_or_default()
 }
 
 impl Database {
@@ -99,7 +102,7 @@ impl Database {
         &self,
         id: i64,
         code: &str,
-        now_ms: i64,
+        now: Timestamp,
     ) -> Result<Option<Vec<String>>> {
         let transaction = self.connection.begin().await.context("starting a save")?;
         let Some(before) = load(&transaction, id)
@@ -111,7 +114,7 @@ impl Database {
         let Some(secret) = &before.totp_secret else {
             return Ok(None);
         };
-        let Some(step) = matching_step(secret, &before.email, code, secs(now_ms))? else {
+        let Some(step) = matching_step(secret, &before.email, code, secs(now))? else {
             return Ok(None);
         };
         let mut row: user::ActiveModel = before.clone().into();
@@ -131,7 +134,12 @@ impl Database {
 
     /// Whether this is a code that signs them in: one from their app, for a step not
     /// used before, or a recovery code not used before. Either is used up by this.
-    pub async fn accept_two_factor_code(&self, id: i64, code: &str, now_ms: i64) -> Result<bool> {
+    pub async fn accept_two_factor_code(
+        &self,
+        id: i64,
+        code: &str,
+        now: Timestamp,
+    ) -> Result<bool> {
         let Some(row) = load(&self.connection, id)
             .await?
             .filter(|row| row.totp_enabled)
@@ -139,7 +147,7 @@ impl Database {
             return Ok(false);
         };
         let secret = row.totp_secret.as_deref().unwrap_or_default();
-        if let Some(step) = matching_step(secret, &row.email, code, secs(now_ms))? {
+        if let Some(step) = matching_step(secret, &row.email, code, secs(now))? {
             let step = i64::try_from(step).context("an impossible time")?;
             // One update, so the same code sent twice at once only works once.
             let unused = Condition::any()
@@ -155,10 +163,7 @@ impl Database {
             return Ok(updated.rows_affected == 1);
         }
         let used = recovery_code::Entity::update_many()
-            .col_expr(
-                recovery_code::Column::UsedAt,
-                Expr::value(crate::times::from_ms(now_ms)),
-            )
+            .col_expr(recovery_code::Column::UsedAt, Expr::value(now))
             .filter(recovery_code::Column::UserId.eq(id))
             .filter(recovery_code::Column::CodeHash.eq(code_hash(code)))
             .filter(recovery_code::Column::UsedAt.is_null())
@@ -220,9 +225,9 @@ impl Database {
 
     /// Remembers that someone gave the right password and still owes a code, and
     /// gives back the only copy of the token their browser keeps meanwhile.
-    pub async fn start_sign_in_challenge(&self, user_id: i64, now_ms: i64) -> Result<String> {
+    pub async fn start_sign_in_challenge(&self, user_id: i64, now: Timestamp) -> Result<String> {
         sign_in_challenge::Entity::delete_many()
-            .filter(sign_in_challenge::Column::ExpiresAt.lte(crate::times::from_ms(now_ms)))
+            .filter(sign_in_challenge::Column::ExpiresAt.lte(now))
             .exec(&self.connection)
             .await
             .context("clearing old sign in challenges")?;
@@ -230,7 +235,7 @@ impl Database {
         sign_in_challenge::ActiveModel {
             user_id: Set(user_id),
             token_hash: Set(token_hash(&token)),
-            expires_at: Set(crate::times::from_ms(now_ms + CHALLENGE_LIFETIME_MS)),
+            expires_at: Set(now + CHALLENGE_LIFETIME),
             ..Default::default()
         }
         .insert(&self.connection)
@@ -240,10 +245,14 @@ impl Database {
     }
 
     /// Who owes a code for this token, if it still stands.
-    pub async fn sign_in_challenge_user(&self, token: &str, now_ms: i64) -> Result<Option<User>> {
+    pub async fn sign_in_challenge_user(
+        &self,
+        token: &str,
+        now: Timestamp,
+    ) -> Result<Option<User>> {
         let challenge = sign_in_challenge::Entity::find()
             .filter(sign_in_challenge::Column::TokenHash.eq(token_hash(token)))
-            .filter(sign_in_challenge::Column::ExpiresAt.gt(crate::times::from_ms(now_ms)))
+            .filter(sign_in_challenge::Column::ExpiresAt.gt(now))
             .one(&self.connection)
             .await
             .context("checking a sign in challenge")?;

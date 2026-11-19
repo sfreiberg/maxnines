@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 
 use super::{CsrfForm, Page, local_time, server_error};
 use crate::app_state::AppState;
-use crate::metrics::now_ms;
 use crate::proxies::{AddressKind, Decision, PROVIDERS, Seen, check_address};
 
 pub const PROXIES_PAGE: &str = "/settings/proxies";
@@ -61,7 +60,7 @@ pub async fn decide_about(
     };
     let decision = state
         .database
-        .decide_proxy(&address, trusted, now_ms())
+        .decide_proxy(&address, trusted, crate::times::now())
         .await?;
     reload(state).await?;
     Ok(Ok(decision))

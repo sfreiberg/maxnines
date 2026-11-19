@@ -47,8 +47,8 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/server"
         "name": "cpu",
         "rows": 295967,
         "rows_last_hour": 295967,
-        "oldest_ms": 1793936249223,
-        "newest_ms": 1793937138143
+        "oldest_sample_at": "2026-11-06T03:37:29.223Z",
+        "newest_sample_at": "2026-11-06T03:52:18.143Z"
       }
     ]
   },

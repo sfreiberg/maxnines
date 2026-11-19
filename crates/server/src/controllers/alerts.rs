@@ -6,6 +6,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
+use chrono::TimeDelta;
 use serde::Serialize;
 
 use super::fleet::OsFamily;
@@ -18,7 +19,7 @@ use crate::alerting::{Alert, DeliveryProblem, RuleKind, Severity};
 use crate::app_state::AppState;
 use crate::events::{EventKind, TimelineEvent};
 use crate::metric_charts::{self, Frame};
-use crate::metrics::{Source, now_ms};
+use crate::metrics::Source;
 use crate::registration::short_id;
 use crate::remote_checks::{FLEET_HOST_ID, LOCAL_HOST_ID};
 use crate::silences::{self, ActiveSilences};
@@ -71,7 +72,7 @@ struct AlertRow {
 /// Where to start a silence for just this alert. Agents choose their own names, which
 /// is fine here because it only fills in a form for someone to read.
 fn silence_link(alert: &Alert) -> Option<String> {
-    let silence = silences::silence_for(alert, "", 0)?;
+    let silence = silences::silence_for(alert, "", TimeDelta::zero())?;
     let mut fields = Vec::new();
     if let Some(id) = silence.rule_id {
         fields.push(("rule_id", id.to_string()));
@@ -143,7 +144,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
         let open = state.database.open_alerts().await?;
         let resolved = state.database.resolved_alerts(HISTORY).await?;
         let problems = state.database.delivery_problems(PROBLEMS).await?;
-        let silences = ActiveSilences::load(&state.database, now_ms()).await?;
+        let silences = ActiveSilences::load(&state.database, crate::times::now()).await?;
         let charted: HashSet<i64> = state
             .database
             .list_alert_rules()
@@ -219,14 +220,14 @@ async fn show(
         Ok(None) => return not_found(&state, &token),
         Err(error) => return server_error(&error),
     };
-    let now = now_ms();
+    let now = crate::times::now();
     let asked = RangeParams {
         range: params
             .range
-            .or_else(|| Some(range_reaching(alert.started_at.timestamp_millis(), now).to_string())),
+            .or_else(|| Some(range_reaching(alert.started_at, now).to_string())),
     };
-    let (selected, _, length_ms) = selected_range(&asked);
-    let Some(range) = time_range(length_ms) else {
+    let (selected, _, length) = selected_range(&asked);
+    let Some(range) = time_range(length) else {
         return not_found(&state, &token);
     };
     let watched = match alert_charts::watched(&state.sources(), &alert, range).await {
@@ -321,7 +322,11 @@ async fn acknowledge(
     form: CsrfForm,
 ) -> Response {
     let by = recorded_by();
-    match state.database.acknowledge_alert(id, &by, now_ms()).await {
+    match state
+        .database
+        .acknowledge_alert(id, &by, crate::times::now())
+        .await
+    {
         Ok(true) => (form.token, Redirect::to("/alerts")).into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),

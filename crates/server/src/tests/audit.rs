@@ -25,7 +25,12 @@ async fn since(server: &TestServer, mark: i64) -> Vec<Entry> {
 async fn person(server: &TestServer, email: &str) -> i64 {
     let database = &server.state.database;
     let (user, link) = database
-        .create_user(email, "Someone", crate::roles::Role::Admin, now_ms())
+        .create_user(
+            email,
+            "Someone",
+            crate::roles::Role::Admin,
+            crate::times::now(),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -34,7 +39,7 @@ async fn person(server: &TestServer, email: &str) -> i64 {
         .unwrap();
     assert!(
         database
-            .use_setup_link(user.id, &link, &hash, now_ms())
+            .use_setup_link(user.id, &link, &hash, crate::times::now())
             .await
             .unwrap()
     );
@@ -336,7 +341,10 @@ async fn nothing_is_recorded_for_a_change_that_changes_nothing() {
 async fn a_deletion_keeps_what_was_deleted() {
     let server = start().await;
     let database = &server.state.database;
-    let id = database.create_dashboard("Ops", now_ms()).await.unwrap();
+    let id = database
+        .create_dashboard("Ops", crate::times::now())
+        .await
+        .unwrap();
     let before = mark(&server).await;
 
     database.delete_dashboard(id).await.unwrap();
@@ -355,7 +363,7 @@ async fn changes_with_nobody_acting_are_maxnines_own() {
     let before = mark(&server).await;
 
     database
-        .create_dashboard("By the server", now_ms())
+        .create_dashboard("By the server", crate::times::now())
         .await
         .unwrap();
     let command_line = Acting {
@@ -366,9 +374,12 @@ async fn changes_with_nobody_acting_are_maxnines_own() {
         via: None,
         source: None,
     };
-    audit::acting(command_line, database.create_dashboard("By hand", now_ms()))
-        .await
-        .unwrap();
+    audit::acting(
+        command_line,
+        database.create_dashboard("By hand", crate::times::now()),
+    )
+    .await
+    .unwrap();
 
     let entries = since(&server, before).await;
     assert_eq!(entries[0].actor.kind, "maxnines");
@@ -442,7 +453,10 @@ async fn the_log_reads_newest_first_a_page_at_a_time() {
     let server = start().await;
     let database = &server.state.database;
     for name in ["One", "Two", "Three"] {
-        database.create_dashboard(name, now_ms()).await.unwrap();
+        database
+            .create_dashboard(name, crate::times::now())
+            .await
+            .unwrap();
     }
 
     let first = database.audit_log(None, 2).await.unwrap();
@@ -459,7 +473,7 @@ async fn the_page_shows_entries_without_secrets() {
     let hook = channel(ChannelKind::Webhook, "https://hooks.test/page-secret", None);
     database.create_channel(&hook).await.unwrap();
     database
-        .create_dashboard("<b>Ops</b>", now_ms())
+        .create_dashboard("<b>Ops</b>", crate::times::now())
         .await
         .unwrap();
 

@@ -9,6 +9,7 @@
 //! those are left out there, as they are on FreeBSD altogether.
 
 use std::collections::HashMap;
+use std::time::Duration;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::Instant;
 
@@ -60,12 +61,14 @@ pub struct Totals {
     pub queued_ms: Option<f64>,
 }
 
-/// What changed between two totals, `elapsed_ms` apart. A total that went backwards,
+/// What changed between two totals, `elapsed` apart. A total that went backwards,
 /// as when a disk is replaced, gives nothing.
-pub fn activity(before: &Totals, after: &Totals, elapsed_ms: f64) -> Option<Activity> {
-    if elapsed_ms <= 0.0 || after.reads < before.reads || after.writes < before.writes {
+pub fn activity(before: &Totals, after: &Totals, elapsed: Duration) -> Option<Activity> {
+    if elapsed.is_zero() || after.reads < before.reads || after.writes < before.writes {
         return None;
     }
+    // The totals are in milliseconds, as the systems count them.
+    let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
     let reads = (after.reads - before.reads) as f64;
     let writes = (after.writes - before.writes) as f64;
     let per_op = |ms: f64, ops: f64| if ops > 0.0 { (ms / ops).max(0.0) } else { 0.0 };
@@ -145,11 +148,10 @@ impl DiskActivity {
         let totals = platform::totals(disks);
         let mut measured = HashMap::new();
         for (mount_point, after) in &totals {
-            if let Some((then, before)) = self.previous.get(mount_point) {
-                let elapsed = now.duration_since(*then).as_secs_f64() * 1000.0;
-                if let Some(activity) = activity(before, after, elapsed) {
-                    measured.insert(mount_point.clone(), activity);
-                }
+            if let Some((then, before)) = self.previous.get(mount_point)
+                && let Some(activity) = activity(before, after, now.duration_since(*then))
+            {
+                measured.insert(mount_point.clone(), activity);
             }
         }
         self.previous = totals
@@ -458,7 +460,7 @@ mod tests {
             queued_ms: Some(5000.0),
         };
 
-        let activity = activity(&before, &after, 1500.0).unwrap();
+        let activity = activity(&before, &after, Duration::from_millis(1500)).unwrap();
 
         assert_eq!(activity.read_ops_per_sec, 200.0);
         assert_eq!(activity.write_ops_per_sec, 0.0);
@@ -480,7 +482,9 @@ mod tests {
             ..Totals::default()
         };
         assert_eq!(
-            activity(&before, &after, 1000.0).unwrap().busy_percent,
+            activity(&before, &after, Duration::from_secs(1))
+                .unwrap()
+                .busy_percent,
             Some(100.0)
         );
     }
@@ -491,8 +495,11 @@ mod tests {
             reads: 10,
             ..Totals::default()
         };
-        assert_eq!(activity(&before, &Totals::default(), 1000.0), None);
-        assert_eq!(activity(&Totals::default(), &before, 0.0), None);
+        assert_eq!(
+            activity(&before, &Totals::default(), Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(activity(&Totals::default(), &before, Duration::ZERO), None);
     }
 
     #[test]

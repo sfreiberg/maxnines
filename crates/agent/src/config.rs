@@ -346,8 +346,8 @@ mod env_tests {
         assert_eq!(config.custom_metrics.len(), 2);
         let queue = &config.custom_metrics["queue"];
         assert_eq!(queue.command[2], "mail");
-        assert_eq!(queue.timeout_secs, Some(5));
-        assert_eq!(config.custom_metrics["disk.temp"].timeout_secs, None);
+        assert_eq!(queue.timeout, Some(std::time::Duration::from_secs(5)));
+        assert_eq!(config.custom_metrics["disk.temp"].timeout, None);
     }
 
     #[test]

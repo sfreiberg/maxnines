@@ -2,19 +2,22 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 
 /// The server's own figures at one moment.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Snapshot {
-    pub started_ms: i64,
+    /// When the server started, which tells a restart apart.
+    pub started_at: Option<DateTime<Utc>>,
     pub written: u64,
     pub failed: u64,
     pub queued: u64,
     pub queue_capacity: u64,
     pub firing: u64,
-    pub alert_pass_age_secs: Option<f64>,
+    /// How long since alerts were last checked.
+    pub alert_pass_age: Option<Duration>,
     pub memory_bytes: Option<u64>,
     pub cpu_cores: Option<f64>,
     pub metrics_bytes: Option<u64>,
@@ -38,22 +41,22 @@ pub fn parse_size(text: &str) -> Option<u64> {
 }
 
 impl Snapshot {
-    pub fn read(stats: &Value, now_ms: i64) -> Self {
+    pub fn read(stats: &Value, now: DateTime<Utc>) -> Self {
         let activity = &stats["activity"];
         let process = &stats["process"];
         let size = |name: &str| stats["metrics"][name].as_str().and_then(parse_size);
         let cores = process["cores"].as_f64();
+        let moment =
+            |value: &Value| -> Option<DateTime<Utc>> { serde_json::from_value(value.clone()).ok() };
         Self {
-            started_ms: stats["started_ms"].as_i64().unwrap_or_default(),
+            started_at: moment(&stats["started_at"]),
             written: activity["samples_written"].as_u64().unwrap_or_default(),
             failed: activity["samples_failed"].as_u64().unwrap_or_default(),
             queued: activity["samples_queued"].as_u64().unwrap_or_default(),
             queue_capacity: activity["queue_capacity"].as_u64().unwrap_or_default(),
             firing: activity["alerts_firing"].as_u64().unwrap_or_default(),
-            alert_pass_age_secs: activity["last_alert_pass_ms"]
-                .as_i64()
-                .filter(|time| *time > 0)
-                .map(|time| (now_ms - time).max(0) as f64 / 1000.0),
+            alert_pass_age: moment(&activity["last_alert_pass_at"])
+                .map(|time| (now - time).to_std().unwrap_or_default()),
             memory_bytes: process["memory_bytes"].as_u64(),
             cpu_cores: process["cpu_percent"]
                 .as_f64()
@@ -108,7 +111,7 @@ impl Timeline {
                 cpu_cores: snapshot.cpu_cores,
                 memory_mb: snapshot.memory_bytes.map(|bytes| bytes as f64 / 1e6),
                 metrics_mb: snapshot.metrics_bytes.map(|bytes| bytes as f64 / 1e6),
-                alert_pass_age_secs: snapshot.alert_pass_age_secs,
+                alert_pass_age_secs: snapshot.alert_pass_age.map(|age| age.as_secs_f64()),
             });
         }
         self.last_sent = sent;
@@ -130,7 +133,7 @@ impl Timeline {
     fn count(&mut self, snapshot: &Snapshot) -> u64 {
         let (new_written, new_failed) = match &self.last {
             // The server's counts start again when it does.
-            Some(last) if last.started_ms != snapshot.started_ms => {
+            Some(last) if last.started_at != snapshot.started_at => {
                 (snapshot.written, snapshot.failed)
             }
             Some(last) => (
@@ -153,14 +156,15 @@ mod tests {
 
     fn stats() -> Value {
         json!({
-            "started_ms": 1000,
+            "started_at": "2026-11-19T01:00:00.000Z",
             "process": { "memory_bytes": 2_000_000_000u64, "cpu_percent": 5.0, "cores": 12 },
             "disk": { "available_bytes": 500 },
             "metrics": { "size": "417.5 MiB", "write_ahead_log": "12.5 MiB" },
             "database": { "size_bytes": 28 },
             "activity": {
                 "samples_written": 10, "samples_failed": 1, "samples_queued": 2,
-                "queue_capacity": 1024, "alerts_firing": 3, "last_alert_pass_ms": 5000,
+                "queue_capacity": 1024, "alerts_firing": 3,
+                "last_alert_pass_at": "2026-11-19T01:00:05.000Z",
             },
         })
     }
@@ -177,27 +181,29 @@ mod tests {
 
     #[test]
     fn the_servers_figures_are_read() {
-        let snapshot = Snapshot::read(&stats(), 7000);
+        let now = "2026-11-19T01:00:07Z".parse().unwrap();
+        let snapshot = Snapshot::read(&stats(), now);
 
         assert_eq!(snapshot.written, 10);
         assert_eq!(snapshot.queue_capacity, 1024);
-        assert_eq!(snapshot.alert_pass_age_secs, Some(2.0));
+        assert_eq!(snapshot.alert_pass_age, Some(Duration::from_secs(2)));
         assert!((snapshot.cpu_cores.unwrap() - 0.6).abs() < 1e-9);
         assert_eq!(snapshot.metrics_bytes, Some(430 * 1024 * 1024));
     }
 
     #[test]
     fn missing_parts_stay_empty() {
-        let snapshot = Snapshot::read(&json!({ "activity": {} }), 0);
+        let snapshot = Snapshot::read(&json!({ "activity": {} }), DateTime::UNIX_EPOCH);
 
         assert_eq!(snapshot.memory_bytes, None);
         assert_eq!(snapshot.cpu_cores, None);
-        assert_eq!(snapshot.alert_pass_age_secs, None);
+        assert_eq!(snapshot.alert_pass_age, None);
     }
 
-    fn at(started_ms: i64, written: u64) -> Snapshot {
+    /// A reading from the server's `start`th run.
+    fn at(start: i64, written: u64) -> Snapshot {
         Snapshot {
-            started_ms,
+            started_at: DateTime::from_timestamp(start, 0),
             written,
             ..Snapshot::default()
         }

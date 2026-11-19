@@ -26,8 +26,8 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/metrics"
 
 `GET /api/v1/metrics/current`
 
-The latest headline numbers from every host, by host ID. Hosts with nothing in the
-last 5 minutes are left out.
+The latest headline numbers from every host, by host ID, with when each last sent a
+sample. Hosts with nothing in the last 5 minutes are left out.
 
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
@@ -37,7 +37,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 ```json
 {
   "22ad9264b6eb708ffdbedcd5cc073e5c": {
-    "time_ms": 1793940279545,
+    "last_sample_at": "2026-11-06T04:44:39.545Z",
     "cpu_percent": 19.4,
     "memory_percent": 75.6,
     "disk_percent": 84.5,

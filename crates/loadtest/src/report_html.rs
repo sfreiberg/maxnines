@@ -564,7 +564,9 @@ pub fn render(report: &Report) -> String {
 "#,
         agents = grouped(report.connections.wanted),
         length = clock(report.ran_for_secs),
-        started = escape(&report.started),
+        started = report
+            .started_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         class = class(report.outcome),
         icon = icon(report.outcome),
         label = report.outcome.label(),

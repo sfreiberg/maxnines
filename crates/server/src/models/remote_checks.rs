@@ -1,5 +1,7 @@
 //! Checks the server runs itself.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use maxnines_protocol::{Check, CheckKind};
 use sea_orm::{ConnectionTrait, EntityTrait, QueryOrder, Set, TransactionTrait};
@@ -12,7 +14,11 @@ use crate::remote_checks::{RemoteCheck, RemoteCheckInput, SignIn};
 fn to_remote_check(row: remote_check::Model) -> Result<RemoteCheck> {
     let kind = CheckKind::parse(&row.kind).context("unknown kind of check")?;
     let mut check = Check::new(&row.name, kind, &row.target);
-    check.timeout_secs = row.timeout_secs.map(u64::try_from).transpose()?;
+    check.timeout = row
+        .timeout_secs
+        .map(u64::try_from)
+        .transpose()?
+        .map(Duration::from_secs);
     check.method = row.method;
     check.body = row.body;
     check.regex = row.regex;
@@ -29,7 +35,7 @@ fn to_remote_check(row: remote_check::Model) -> Result<RemoteCheck> {
         input: RemoteCheckInput {
             host_id: row.host_id,
             check,
-            interval_secs: u64::try_from(row.interval_secs)?,
+            interval: Duration::from_secs(u64::try_from(row.interval_secs)?),
             enabled: row.enabled,
             read_stats: row.read_stats,
             extras: row
@@ -54,7 +60,10 @@ fn to_row(input: &RemoteCheckInput) -> Result<remote_check::ActiveModel> {
         name: Set(check.name.clone()),
         kind: Set(check.kind.as_str().to_string()),
         target: Set(check.target.clone()),
-        timeout_secs: Set(check.timeout_secs.map(i64::try_from).transpose()?),
+        timeout_secs: Set(check
+            .timeout
+            .map(|timeout| i64::try_from(timeout.as_secs()))
+            .transpose()?),
         method: Set(check.method.clone()),
         body: Set(check.body.clone()),
         regex: Set(check.regex.clone()),
@@ -62,7 +71,7 @@ fn to_row(input: &RemoteCheckInput) -> Result<remote_check::ActiveModel> {
         server: Set(check.server.clone()),
         record: Set(check.record.clone()),
         count: Set(check.count.map(i32::try_from).transpose()?),
-        interval_secs: Set(i64::try_from(input.interval_secs)?),
+        interval_secs: Set(i64::try_from(input.interval.as_secs())?),
         enabled: Set(input.enabled),
         database: Set(check.database.clone()),
         tls: Set(check.tls),

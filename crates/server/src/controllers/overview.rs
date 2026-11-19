@@ -13,7 +13,6 @@ use super::server::count;
 use super::{Page, fleet, local_time, server_error};
 use crate::alerting::Severity;
 use crate::app_state::AppState;
-use crate::metrics::now_ms;
 use crate::registration::{HostState, short_id};
 use crate::remote_checks::{FLEET_HOST_ID, LOCAL_HOST_ID};
 use crate::times::lasting;
@@ -70,7 +69,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
         Ok(facts) => facts,
         Err(error) => return server_error(&error),
     };
-    let now = now_ms();
+    let now = crate::times::now();
     let mut problems: Vec<Problem> = alerts
         .into_iter()
         .map(|alert| Problem {
@@ -81,7 +80,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
             } else {
                 short_id(&alert.host_id).to_string()
             },
-            lasted: lasting(u64::try_from(now - alert.breached_at.timestamp_millis()).unwrap_or(0)),
+            lasted: lasting(now - alert.breached_at),
             began: local_time(alert.breached_at),
             summary: alert.summary,
             host_id: alert.host_id,

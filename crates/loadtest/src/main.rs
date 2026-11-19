@@ -15,7 +15,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -49,13 +49,6 @@ const SECONDS_PER_DAY: f64 = 86_400.0;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }
 
 /// Each connection needs a file, and the usual limit on Linux is 1024.
@@ -185,7 +178,10 @@ fn watch_server(
     let mut own_cpu = OwnCpu::new();
     while !finished.load(Relaxed) {
         if let Ok(stats) = server.stats() {
-            measurements.record(Snapshot::read(&stats, now_ms()), &plan.counters);
+            measurements.record(
+                Snapshot::read(&stats, maxnines_protocol::time::now()),
+                &plan.counters,
+            );
         }
         if let Some(own_cpu) = &mut own_cpu {
             lock(&measurements.generator_cpu).push(own_cpu.percent());
@@ -339,7 +335,7 @@ async fn drain(server: &Server, measurements: &Measurements) {
         let Ok(Ok(stats)) = tokio::task::spawn_blocking(move || client.stats()).await else {
             continue;
         };
-        let snapshot = Snapshot::read(&stats, now_ms());
+        let snapshot = Snapshot::read(&stats, maxnines_protocol::time::now());
         let settled = snapshot.queued == 0 && last_written == Some(snapshot.written);
         last_written = Some(snapshot.written);
         lock(&measurements.timeline).settle(snapshot);
@@ -515,7 +511,10 @@ async fn run(options: Options) -> Result<Outcome> {
     let before = tokio::task::spawn_blocking(move || client.stats())
         .await
         .context("reaching the server")??;
-    measurements.record(Snapshot::read(&before, now_ms()), &plan.counters);
+    measurements.record(
+        Snapshot::read(&before, maxnines_protocol::time::now()),
+        &plan.counters,
+    );
 
     let (stop, stopped) = watch::channel(false);
     let (outage, outage_watch) = watch::channel(false);
@@ -690,10 +689,7 @@ async fn run(options: Options) -> Result<Outcome> {
     let checks = judge(&connections, &samples, &pages, &timeline.points, generator);
     let outcome = overall(&checks);
     let report = Report {
-        started: humantime::format_rfc3339_seconds(
-            SystemTime::now() - Duration::from_secs_f64(ran_for),
-        )
-        .to_string(),
+        started_at: maxnines_protocol::time::now() - Duration::from_secs_f64(ran_for),
         ran_for_secs: ran_for,
         stopped_early,
         outcome,

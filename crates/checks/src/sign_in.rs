@@ -890,7 +890,7 @@ mod tests {
         })
         .await;
         let mut check = check(CheckKind::Mongodb, address);
-        check.timeout_secs = Some(2);
+        check.timeout = Some(std::time::Duration::from_secs(2));
         let result = run(&check, Some(&login("monitor", "s3cret"))).await;
         assert_eq!(result["up"], 0, "{result}");
         assert!(result.get("signed_in").is_none(), "{result}");

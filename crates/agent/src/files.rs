@@ -6,9 +6,10 @@ use std::fs::{self, Metadata};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::Result;
+use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::{Value, json};
 
 use crate::background::{Background, Busy, probe_all};
@@ -42,7 +43,9 @@ async fn check_path(watched: Arc<WatchedPath>) -> Value {
     let (answer, inspected) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
         let _busy = busy;
-        answer.send(inspect(&path, SystemTime::now())).ok();
+        answer
+            .send(inspect(&path, maxnines_protocol::time::now()))
+            .ok();
     });
     inspected.await.unwrap_or_else(|_| timed_out(&watched))
 }
@@ -84,13 +87,10 @@ fn timed_out(watched: &WatchedPath) -> Value {
     json!({ "path": watched.path, "error": "timed out" })
 }
 
-fn age_secs(metadata: &Metadata, now: SystemTime) -> Option<f64> {
-    let modified = metadata.modified().ok()?;
+fn age_secs(metadata: &Metadata, now: DateTime<Utc>) -> Option<f64> {
+    let modified = DateTime::<Utc>::from(metadata.modified().ok()?);
     // A file dated in the future hasn't aged at all.
-    Some(
-        now.duration_since(modified)
-            .map_or(0.0, |age| age.as_secs_f64()),
-    )
+    Some((now - modified).max(TimeDelta::zero()).as_seconds_f64())
 }
 
 /// What's directly inside a folder, not counting sub-folders' contents.
@@ -108,7 +108,7 @@ fn folder_totals(path: &Path) -> Option<(u64, u64)> {
     Some((entries, size))
 }
 
-fn inspect(path: &String, now: SystemTime) -> Value {
+fn inspect(path: &String, now: DateTime<Utc>) -> Value {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -150,7 +150,7 @@ mod tests {
         let file = folder.path().join("backup.tar");
         fs::write(&file, "12345").unwrap();
 
-        let later = SystemTime::now() + Duration::from_secs(3600);
+        let later = maxnines_protocol::time::now() + TimeDelta::hours(1);
         let output = inspect(&path_of(&file), later);
 
         assert_eq!(output["exists"], 1);
@@ -163,7 +163,10 @@ mod tests {
     #[test]
     fn a_missing_path_is_a_clear_answer() {
         let folder = tempfile::tempdir().unwrap();
-        let output = inspect(&path_of(&folder.path().join("nope")), SystemTime::now());
+        let output = inspect(
+            &path_of(&folder.path().join("nope")),
+            maxnines_protocol::time::now(),
+        );
 
         assert_eq!(output["exists"], 0);
         assert!(output.get("error").is_none());
@@ -177,7 +180,7 @@ mod tests {
         fs::create_dir(folder.path().join("sub")).unwrap();
         fs::write(folder.path().join("sub/deep"), "ignored").unwrap();
 
-        let output = inspect(&path_of(folder.path()), SystemTime::now());
+        let output = inspect(&path_of(folder.path()), maxnines_protocol::time::now());
 
         assert_eq!(output["is_folder"], true);
         assert_eq!(output["entries"], 3);
@@ -190,7 +193,7 @@ mod tests {
         let file = folder.path().join("secret.txt");
         fs::write(&file, "the-password").unwrap();
 
-        let output = inspect(&path_of(&file), SystemTime::now());
+        let output = inspect(&path_of(&file), maxnines_protocol::time::now());
         assert!(!output.to_string().contains("the-password"));
     }
 
@@ -200,7 +203,7 @@ mod tests {
         let file = folder.path().join("x");
         fs::write(&file, "").unwrap();
 
-        let past = SystemTime::now() - Duration::from_secs(3600);
+        let past = maxnines_protocol::time::now() - TimeDelta::hours(1);
         assert_eq!(inspect(&path_of(&file), past)["age_secs"], 0.0);
     }
 
@@ -212,7 +215,10 @@ mod tests {
         let file = folder.path().join("file");
         fs::write(&file, "").unwrap();
 
-        let output = inspect(&path_of(&file.join("inside")), SystemTime::now());
+        let output = inspect(
+            &path_of(&file.join("inside")),
+            maxnines_protocol::time::now(),
+        );
         assert!(output.get("exists").is_none(), "{output}");
         assert_eq!(output["error"], "not allowed");
     }

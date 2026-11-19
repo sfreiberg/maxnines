@@ -10,7 +10,7 @@ const PASSWORD: &str = "a long enough password";
 async fn person(server: &TestServer, email: &str, role: Role) -> i64 {
     let database = &server.state.database;
     let (user, link) = database
-        .create_user(email, "Someone", role, now_ms())
+        .create_user(email, "Someone", role, crate::times::now())
         .await
         .unwrap()
         .unwrap();
@@ -19,7 +19,7 @@ async fn person(server: &TestServer, email: &str, role: Role) -> i64 {
         .unwrap();
     assert!(
         database
-            .use_setup_link(user.id, &link, &hash, now_ms())
+            .use_setup_link(user.id, &link, &hash, crate::times::now())
             .await
             .unwrap()
     );
@@ -43,7 +43,7 @@ async fn key_as(server: &TestServer, role: Role) -> (i64, String) {
     let id = person(server, &email, role).await;
     let database = &server.state.database;
     let (_, key) = database
-        .create_api_key("theirs", id, role, None, now_ms())
+        .create_api_key("theirs", id, role, None, crate::times::now())
         .await
         .unwrap();
     (id, key)
@@ -159,7 +159,7 @@ async fn a_responder_silences_but_does_not_change_rules() {
     let silences = server
         .state
         .database
-        .active_silences(now_ms())
+        .active_silences(crate::times::now())
         .await
         .unwrap();
     assert_eq!(silences.len(), 1, "{}", page.body);
@@ -279,11 +279,11 @@ async fn a_key_does_no_more_than_it_was_given_or_its_owner_can() {
     let database = &server.state.database;
     let owner = person(&server, "owner@example.com", Role::Editor).await;
     let (_, reader) = database
-        .create_api_key("reader", owner, Role::Viewer, None, now_ms())
+        .create_api_key("reader", owner, Role::Viewer, None, crate::times::now())
         .await
         .unwrap();
     let (_, full) = database
-        .create_api_key("full", owner, Role::Editor, None, now_ms())
+        .create_api_key("full", owner, Role::Editor, None, crate::times::now())
         .await
         .unwrap();
     let dashboard = r#"{"name":"x"}"#;
@@ -302,7 +302,8 @@ async fn a_key_does_no_more_than_it_was_given_or_its_owner_can() {
         201
     );
     // Nobody is given a key that does more than they can.
-    let admin_key = database.create_api_key("too much", owner, Role::Admin, None, now_ms());
+    let admin_key =
+        database.create_api_key("too much", owner, Role::Admin, None, crate::times::now());
     assert!(admin_key.await.is_err());
 
     // Their keys follow them down.
@@ -580,7 +581,7 @@ async fn only_a_responder_can_quiet_a_host() {
         server
             .state
             .database
-            .active_silences(now_ms())
+            .active_silences(crate::times::now())
             .await
             .unwrap()
             .is_empty()

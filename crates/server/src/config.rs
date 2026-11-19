@@ -1,10 +1,12 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail, ensure};
 use indexmap::IndexMap;
 use ipnet::IpNet;
-use maxnines_protocol::{AGENT_SILENCE_LIMIT_SECS, hcl_env::config_context};
+use maxnines_protocol::time::seconds;
+use maxnines_protocol::{AGENT_SILENCE_LIMIT, hcl_env::config_context};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -20,11 +22,19 @@ pub struct Config {
     #[serde(default)]
     pub trusted_proxies: Option<Vec<String>>,
     /// How often to ping each agent.
-    #[serde(default = "default_heartbeat_interval_secs")]
-    pub heartbeat_interval_secs: u64,
+    #[serde(
+        rename = "heartbeat_interval_secs",
+        deserialize_with = "seconds::deserialize",
+        default = "default_heartbeat_interval"
+    )]
+    pub heartbeat_interval: Duration,
     /// How long an agent can stay silent before it counts as offline.
-    #[serde(default = "default_heartbeat_timeout_secs")]
-    pub heartbeat_timeout_secs: u64,
+    #[serde(
+        rename = "heartbeat_timeout_secs",
+        deserialize_with = "seconds::deserialize",
+        default = "default_heartbeat_timeout"
+    )]
+    pub heartbeat_timeout: Duration,
     /// Where samples are saved.
     pub metrics: MetricsConfig,
     /// How long samples are kept, at full resolution and rolled up.
@@ -270,12 +280,12 @@ fn default_listen() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 9000))
 }
 
-fn default_heartbeat_interval_secs() -> u64 {
-    5
+fn default_heartbeat_interval() -> Duration {
+    Duration::from_secs(5)
 }
 
-fn default_heartbeat_timeout_secs() -> u64 {
-    15
+fn default_heartbeat_timeout() -> Duration {
+    Duration::from_secs(15)
 }
 
 fn default_duckdb_memory_limit() -> String {
@@ -303,20 +313,22 @@ impl Config {
     pub fn parse(text: &str) -> Result<Self> {
         let config: Config = hcl::eval::from_str(text, &config_context())?;
         ensure!(
-            config.heartbeat_interval_secs > 0,
+            !config.heartbeat_interval.is_zero(),
             "heartbeat_interval_secs must be at least 1"
         );
         ensure!(
-            config.heartbeat_timeout_secs > config.heartbeat_interval_secs,
+            config.heartbeat_timeout > config.heartbeat_interval,
             "heartbeat_timeout_secs must be longer than heartbeat_interval_secs"
         );
         // Agents reconnect after this long without a word, so one heartbeat
         // arriving late mustn't be enough to cause that.
-        let longest_interval = AGENT_SILENCE_LIMIT_SECS / 2;
+        let longest_interval = AGENT_SILENCE_LIMIT / 2;
         ensure!(
-            config.heartbeat_interval_secs <= longest_interval,
-            "heartbeat_interval_secs can be at most {longest_interval}, as agents give up \
-             after {AGENT_SILENCE_LIMIT_SECS} seconds without hearing from the server"
+            config.heartbeat_interval <= longest_interval,
+            "heartbeat_interval_secs can be at most {}, as agents give up after {} seconds \
+             without hearing from the server",
+            longest_interval.as_secs(),
+            AGENT_SILENCE_LIMIT.as_secs()
         );
         config.trusted_networks()?;
         config.retention.validate().context("retention block")?;
@@ -682,8 +694,8 @@ mod tests {
         let config = parse(STORAGE).unwrap();
         assert_eq!(config.listen.to_string(), "127.0.0.1:9000");
         assert_eq!(config.audience(), "ws://127.0.0.1:9000/ws");
-        assert_eq!(config.heartbeat_interval_secs, 5);
-        assert_eq!(config.heartbeat_timeout_secs, 15);
+        assert_eq!(config.heartbeat_interval, Duration::from_secs(5));
+        assert_eq!(config.heartbeat_timeout, Duration::from_secs(15));
     }
 
     #[test]
@@ -697,8 +709,8 @@ mod tests {
         assert_eq!(config.listen.to_string(), "0.0.0.0:8000");
         assert_eq!(config.audience(), "wss://m.example.com/ws");
         assert_eq!(config.trusted_networks().unwrap().unwrap().len(), 2);
-        assert_eq!(config.heartbeat_interval_secs, 2);
-        assert_eq!(config.heartbeat_timeout_secs, 6);
+        assert_eq!(config.heartbeat_interval, Duration::from_secs(2));
+        assert_eq!(config.heartbeat_timeout, Duration::from_secs(6));
     }
 
     #[test]

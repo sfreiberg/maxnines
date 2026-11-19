@@ -7,6 +7,7 @@
 //! values from the alert the action runs for, like which disk is filling up.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -32,9 +33,9 @@ pub const ACTION_VARIABLES: [&str; 12] = [
 ];
 
 /// How long an action gets when the server doesn't say.
-pub const DEFAULT_ACTION_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 /// Scanning a big disk takes minutes, but nothing should run for longer than this.
-pub const MAX_ACTION_TIMEOUT_SECS: u64 = 600;
+pub const MAX_ACTION_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// How much of an action's output is kept. The rest is dropped, and the result
 /// says so.
@@ -202,7 +203,9 @@ pub struct ActionResult {
     /// Whether it printed more than is kept.
     #[serde(default)]
     pub truncated: bool,
-    pub duration_ms: u64,
+    /// How long it took.
+    #[serde(rename = "duration_ms", with = "crate::time::milliseconds")]
+    pub duration: Duration,
 }
 
 #[cfg(test)]

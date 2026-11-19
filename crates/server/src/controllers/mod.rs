@@ -149,7 +149,7 @@ async fn run_as(
     // A signed-in request through a proxy that isn't trusted yet is one to tell
     // admins about.
     if let (Some(peer), Some(forwarded_for)) = (audit::source(), audit::forwarded_for()) {
-        let now = crate::metrics::now_ms();
+        let now = crate::times::now();
         state.proxies.note(peer, forwarded_for, &user.email, now);
     }
     let signed_in = SIGNED_IN.scope(Arc::new(user), answer);

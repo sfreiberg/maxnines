@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum_csrf::CsrfConfig;
+use chrono::TimeDelta;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use maxnines_protocol::auth::Identity;
@@ -39,13 +40,14 @@ use crate::config::Config;
 use crate::controllers::app;
 use crate::controllers::host_list::PAGE_SIZE;
 use crate::facts::FlatFacts;
-use crate::metrics::{Metrics, TimeRange, now_ms};
+use crate::metrics::{Metrics, TimeRange};
 use crate::models::{Database, FactVersion, RuleInput};
 use crate::presence::Presence;
 use crate::registration::{HostState, Registry, Rules};
 use crate::server_stats::ServerStatus;
 use crate::store::testing::{MemoryStore, Saved};
 use crate::store::{self, MetricsReader, Store, WRITE_QUEUE_SIZE, spawn_writer};
+use crate::times::Timestamp;
 use crate::views::Views;
 use crate::{Cli, Command, HostsCommand};
 
@@ -187,28 +189,37 @@ async fn start_with_heartbeat(
         .filter(|built_in| built_in.key == "default")
         .collect();
     database
-        .sync_built_in_rules(&default_rule, now_ms())
+        .sync_built_in_rules(&default_rule, crate::times::now())
         .await
         .unwrap();
     for rule in database.list_alert_rules().await.unwrap() {
-        database.delete_alert_rule(rule.id, now_ms()).await.unwrap();
+        database
+            .delete_alert_rule(rule.id, crate::times::now())
+            .await
+            .unwrap();
     }
     let (user, _) = database
         .create_user(
             "test@example.com",
             "Tester",
             crate::roles::Role::Admin,
-            now_ms(),
+            crate::times::now(),
         )
         .await
         .unwrap()
         .unwrap();
     let session = database
-        .start_session(user.id, now_ms(), None)
+        .start_session(user.id, crate::times::now(), None)
         .await
         .unwrap();
     let (_, api_key) = database
-        .create_api_key("tests", user.id, crate::roles::Role::Admin, None, now_ms())
+        .create_api_key(
+            "tests",
+            user.id,
+            crate::roles::Role::Admin,
+            None,
+            crate::times::now(),
+        )
         .await
         .unwrap();
     let status = Arc::new(ServerStatus::new(None).unwrap());
@@ -325,7 +336,7 @@ impl TestServer {
         panic!("{id} never reached online={online}");
     }
 
-    async fn wait_for_sample(&self) -> (String, String, u64) {
+    async fn wait_for_sample(&self) -> (String, String, Timestamp) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             if let Some(sample) = self.saved.samples.lock().unwrap().first() {
@@ -399,9 +410,15 @@ async fn handshake(
     read_status(client).await
 }
 
-fn sample(timestamp_ms: u64) -> AgentMessage {
+/// The moment `ms` milliseconds after 1970, for samples that only need a time of
+/// their own.
+fn at(ms: i64) -> Timestamp {
+    crate::times::from_ms(ms)
+}
+
+fn sample(time: Timestamp) -> AgentMessage {
     AgentMessage::Sample(Sample {
-        timestamp_ms,
+        time,
         metrics: BTreeMap::new(),
     })
 }
@@ -444,7 +461,9 @@ async fn a_pending_agent_can_not_send_samples() {
     handshake(&mut client, &host, "web-1", None).await;
 
     let _ = client
-        .send(Message::text(serde_json::to_string(&sample(1)).unwrap()))
+        .send(Message::text(
+            serde_json::to_string(&sample(at(1))).unwrap(),
+        ))
         .await;
     sleep(Duration::from_millis(100)).await;
 
@@ -457,11 +476,11 @@ async fn an_approved_agent_is_accepted_and_its_samples_are_attributed() {
     let host = identity();
     let mut client = server.connect_approved(&host, "web-1").await;
 
-    send(&mut client, &sample(42)).await;
+    send(&mut client, &sample(at(42))).await;
 
     assert_eq!(
         server.wait_for_sample().await,
-        (host.id(), "web-1".to_string(), 42)
+        (host.id(), "web-1".to_string(), at(42))
     );
 }
 
@@ -493,8 +512,8 @@ async fn approving_one_agent_does_not_disturb_another() {
 
     server.connect_approved(&identity(), "web-2").await;
 
-    send(&mut client, &sample(42)).await;
-    assert_eq!(server.wait_for_sample().await.2, 42);
+    send(&mut client, &sample(at(42))).await;
+    assert_eq!(server.wait_for_sample().await.2, at(42));
 }
 
 // ---- authentication
@@ -553,7 +572,7 @@ async fn a_sample_before_the_handshake_ends_the_connection() {
     let mut client = server.connect().await;
 
     read_nonce(&mut client).await;
-    send(&mut client, &sample(1)).await;
+    send(&mut client, &sample(at(1))).await;
 
     assert!(is_closed(&mut client).await);
     assert!(server.saved.samples.lock().unwrap().is_empty());
@@ -649,7 +668,7 @@ async fn facts_reported_too_often_are_dropped() {
     }
     // Messages are judged in the order they come, so once a sample after them is
     // confirmed, every one of the facts has been kept or dropped.
-    send(&mut client, &sample(1)).await;
+    send(&mut client, &sample(at(1))).await;
     let confirmed = async {
         while let Some(Ok(message)) = client.next().await {
             if let Message::Text(text) = message
@@ -791,12 +810,12 @@ async fn a_hosts_clock_is_asked_for_and_saved_under_the_servers_time() {
     let server = start_asking_the_time().await;
     let host = identity();
     let mut client = server.connect_approved(&host, "web-1").await;
-    let before = now_ms() as u64;
+    let before = crate::times::now();
 
-    let an_hour_ahead = now_ms() as u64 + 3_600_000;
+    let an_hour_ahead = crate::times::now() + TimeDelta::hours(1);
     let answer = |nonce: &str| AgentMessage::Time {
         nonce: nonce.to_string(),
-        time_ms: an_hour_ahead,
+        answered_at: an_hour_ahead,
     };
     // A busy host can be asked again before its answer arrives, and that answer
     // then counts for nothing, so each question is answered until one has counted.
@@ -814,12 +833,12 @@ async fn a_hosts_clock_is_asked_for_and_saved_under_the_servers_time() {
 
     let saved = server.saved.samples.lock().unwrap().clone();
     assert!(saved.len() <= questions.len(), "{saved:?}");
-    let (id, hostname, time_ms) = &saved[0];
+    let (id, hostname, time) = &saved[0];
     assert_eq!((id, hostname.as_str()), (&host.id(), "web-1"));
     // Dated by the server, not by the clock that's an hour out.
     assert!(
-        (before..an_hour_ahead - 60_000).contains(time_ms),
-        "{time_ms}"
+        (before..an_hour_ahead - TimeDelta::minutes(1)).contains(time),
+        "{time}"
     );
 }
 
@@ -854,8 +873,6 @@ async fn more_pings(pings: &AtomicU64) {
 }
 
 mod health {
-    use std::sync::atomic::Ordering;
-
     use super::*;
 
     async fn health(server: &TestServer) -> (u16, Value) {
@@ -935,15 +952,12 @@ mod health {
     #[tokio::test]
     async fn alert_rules_that_have_stopped_fail_the_check() {
         let server = start().await;
-        let long_ago = now_ms() - 120_000;
+        let long_ago = crate::times::now() - TimeDelta::minutes(2);
         let mut stale = ServerStatus::new(None).unwrap();
-        stale.started_at = crate::times::from_ms(long_ago);
+        stale.started_at = long_ago;
         let mut state = server.state.clone();
         state.status = Arc::new(stale);
-        state
-            .status
-            .last_alert_pass_ms
-            .store(long_ago, Ordering::Relaxed);
+        state.status.alert_pass_finished(long_ago);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -973,18 +987,19 @@ async fn a_sample_with_an_impossible_time_is_answered_but_never_stored() {
     let host = identity();
     let mut client = server.connect_approved(&host, "web-1").await;
 
-    send(&mut client, &sample(u64::MAX)).await;
+    let impossible = store::latest_sample() + TimeDelta::milliseconds(1);
+    send(&mut client, &sample(impossible)).await;
     loop {
-        if let ServerMessage::Ack { timestamp_ms } = read_server_message(&mut client).await {
-            assert_eq!(timestamp_ms, u64::MAX);
+        if let ServerMessage::Ack { time } = read_server_message(&mut client).await {
+            assert_eq!(time, impossible);
             break;
         }
     }
 
-    send(&mut client, &sample(5)).await;
+    send(&mut client, &sample(at(5))).await;
     assert_eq!(
         server.wait_for_sample().await.2,
-        5,
+        at(5),
         "and it blocked nothing"
     );
 }
@@ -1001,12 +1016,12 @@ async fn a_stalled_database_does_not_hold_up_samples_or_heartbeats() {
     let facts = AgentMessage::Facts {
         facts: json!({ "os": "linux" }),
     };
-    for message in [&facts, &sample(1)] {
+    for message in [&facts, &sample(at(1))] {
         let text = serde_json::to_string(message).unwrap();
         sender.send(Message::text(text)).await.unwrap();
     }
 
-    assert_eq!(server.wait_for_sample().await.2, 1);
+    assert_eq!(server.wait_for_sample().await.2, at(1));
     more_pings(&pings).await;
 
     drop(stalled);
@@ -1024,9 +1039,9 @@ async fn a_full_write_queue_stops_reading_but_not_the_heartbeat() {
     server.saved.paused.store(true, Ordering::Relaxed);
 
     // One lot being written, a full queue, and more waiting behind them.
-    let count = 2 * WRITE_QUEUE_SIZE as u64 + 100;
+    let count = 2 * WRITE_QUEUE_SIZE as i64 + 100;
     for time in 0..count {
-        let text = serde_json::to_string(&sample(time)).unwrap();
+        let text = serde_json::to_string(&sample(at(time))).unwrap();
         sender.send(Message::text(text)).await.unwrap();
     }
 
@@ -1037,7 +1052,7 @@ async fn a_full_write_queue_stops_reading_but_not_the_heartbeat() {
 
     server.saved.paused.store(false, Ordering::Relaxed);
     let deadline = Instant::now() + Duration::from_secs(30);
-    while (server.saved.samples.lock().unwrap().len() as u64) < count {
+    while (server.saved.samples.lock().unwrap().len() as i64) < count {
         assert!(Instant::now() < deadline, "samples went missing");
         sleep(Duration::from_millis(10)).await;
     }
@@ -1085,9 +1100,9 @@ async fn invalid_messages_do_not_end_the_connection() {
     let mut client = server.connect_approved(&identity(), "web-1").await;
 
     client.send(Message::text("not json")).await.unwrap();
-    send(&mut client, &sample(42)).await;
+    send(&mut client, &sample(at(42))).await;
 
-    assert_eq!(server.wait_for_sample().await.2, 42);
+    assert_eq!(server.wait_for_sample().await.2, at(42));
 }
 
 // ---- facts
@@ -1401,7 +1416,7 @@ async fn an_approved_agent_is_sent_the_default_config() {
     let (version, config) = TestServer::next_config(&mut client).await;
 
     assert_eq!(version, config.version().unwrap());
-    assert_eq!(config.interval_secs, 15);
+    assert_eq!(config.interval, Duration::from_secs(15));
     assert_eq!(config.collectors.len(), 6);
     assert!(config.collectors["system"].enabled);
 }
@@ -1417,7 +1432,7 @@ async fn a_rule_change_reaches_connected_agents() {
         .await;
 
     let (_, config) = TestServer::next_config(&mut client).await;
-    assert_eq!(config.interval_secs, 5);
+    assert_eq!(config.interval, Duration::from_secs(5));
 }
 
 #[tokio::test]
@@ -1434,12 +1449,12 @@ async fn an_agent_gets_a_new_config_when_its_facts_start_matching_a_rule() {
     let mut client = server.connect_approved(&identity(), "web-1").await;
 
     let (_, first) = TestServer::next_config(&mut client).await;
-    assert_eq!(first.interval_secs, 15);
+    assert_eq!(first.interval, Duration::from_secs(15));
 
     send(&mut client, &facts("24.04")).await;
 
     let (_, second) = TestServer::next_config(&mut client).await;
-    assert_eq!(second.interval_secs, 7);
+    assert_eq!(second.interval, Duration::from_secs(7));
 }
 
 #[tokio::test]
@@ -2064,7 +2079,7 @@ async fn a_rule_created_in_the_browser_is_stored_and_reaches_agents() {
     assert_eq!(rule.settings, json!({ "interval_secs": 30 }));
 
     let (_, config) = TestServer::next_config(&mut client).await;
-    assert_eq!(config.interval_secs, 30);
+    assert_eq!(config.interval, Duration::from_secs(30));
 
     let list = browser.get(&server, "/rules").await;
     assert!(list.body.contains("Web servers"));
@@ -2548,7 +2563,7 @@ async fn a_number_fact_is_compared_as_a_number() {
     assert_eq!(page.status, 303, "{}", page.body);
 
     let (_, config) = TestServer::next_config(&mut client).await;
-    assert_eq!(config.interval_secs, 3);
+    assert_eq!(config.interval, Duration::from_secs(3));
 }
 
 #[tokio::test]
@@ -2575,7 +2590,7 @@ async fn a_quote_in_a_value_stays_a_value_all_the_way_through() {
     let host = identity();
     let mut client = server.connect_approved(&host, "web-1").await;
     let (_, config) = TestServer::next_config(&mut client).await;
-    assert_eq!(config.interval_secs, 15);
+    assert_eq!(config.interval, Duration::from_secs(15));
 
     // Editing shows the same text, safely.
     let id = server.state.database.list_rules().await.unwrap()[1].id;
@@ -2870,7 +2885,7 @@ async fn a_preview_shows_the_effect_and_saves_nothing() {
         .await;
     assert_eq!(saved.status, 303, "{}", saved.body);
     let (_, config) = TestServer::next_config(&mut web_client).await;
-    assert_eq!(config.interval_secs, 30);
+    assert_eq!(config.interval, Duration::from_secs(30));
 }
 
 #[tokio::test]
@@ -3055,9 +3070,9 @@ async fn every_page_shows_which_build_of_the_server_is_running() {
 // ---- metrics
 
 /// What a real agent sends, for the keys the server reads.
-fn full_sample(timestamp_ms: u64, mount_point: &str) -> AgentMessage {
+fn full_sample(time: Timestamp, mount_point: &str) -> AgentMessage {
     AgentMessage::Sample(Sample {
-        timestamp_ms,
+        time,
         metrics: BTreeMap::from([
             (
                 "cpu".to_string(),
@@ -3088,8 +3103,8 @@ fn full_sample(timestamp_ms: u64, mount_point: &str) -> AgentMessage {
 }
 
 /// What a Windows agent sends: everything but a load average.
-fn windows_sample(timestamp_ms: u64, mount_point: &str) -> AgentMessage {
-    let mut message = full_sample(timestamp_ms, mount_point);
+fn windows_sample(time: Timestamp, mount_point: &str) -> AgentMessage {
+    let mut message = full_sample(time, mount_point);
     if let AgentMessage::Sample(sample) = &mut message {
         sample.metrics.get_mut("cpu").unwrap()["load_average"] = Value::Null;
     }
@@ -3098,26 +3113,30 @@ fn windows_sample(timestamp_ms: u64, mount_point: &str) -> AgentMessage {
 
 /// Connects an agent and waits until what it sent can be read back.
 async fn report_samples(server: &TestServer, mount_point: &str) -> (Identity, Client) {
-    report(server, |time_ms| full_sample(time_ms, mount_point)).await
+    report(server, |time| full_sample(time, mount_point)).await
 }
 
 /// Connects an agent, sends four samples made by `sample` and waits until they
 /// can be read back.
-async fn report(server: &TestServer, sample: impl Fn(u64) -> AgentMessage) -> (Identity, Client) {
+async fn report(
+    server: &TestServer,
+    sample: impl Fn(Timestamp) -> AgentMessage,
+) -> (Identity, Client) {
     let host = identity();
     let mut client = server.connect_approved(&host, "web-1").await;
 
-    let now = now_ms() as u64;
+    let now = crate::times::now();
     for seconds_ago in [60, 45, 30, 15] {
-        send(&mut client, &sample(now - seconds_ago * 1000)).await;
+        send(&mut client, &sample(now - TimeDelta::seconds(seconds_ago))).await;
     }
 
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        let current = server.state.metrics.current(now_ms()).await.unwrap();
+        let current = server.state.metrics.current(crate::times::now()).await;
         if current
+            .unwrap()
             .get(&host.id())
-            .is_some_and(|v| v.time_ms >= (now - 15_000) as i64)
+            .is_some_and(|v| v.last_sample_at >= now - TimeDelta::seconds(15))
         {
             return (host, client);
         }
@@ -3151,10 +3170,10 @@ async fn a_clock_reading_reaches_the_hosts_charts() {
     let _client = server.connect_approved(&host, "web-1").await;
     // Behind by as much reads the same as ahead.
     let reading = crate::clock::Reading {
-        offset_ms: -7500,
-        round_trip_ms: 12,
+        offset: TimeDelta::milliseconds(-7500),
+        round_trip: Duration::from_millis(12),
     };
-    let sample = reading.sample(&host.id(), "web-1", now_ms());
+    let sample = reading.sample(&host.id(), "web-1", crate::times::now());
     let saved = store::WriterCommand::Save(sample);
     server.state.writer.send(saved).await.unwrap();
 
@@ -3182,7 +3201,7 @@ async fn watched_services_are_listed_with_what_their_service_manager_says() {
         { "name": "ngnix.service", "running": 0, "state": "not found" },
     ]);
     let sample = Sample {
-        timestamp_ms: now_ms() as u64,
+        time: crate::times::now(),
         metrics: BTreeMap::from([("services".to_string(), services)]),
     };
     send(&mut client, &AgentMessage::Sample(sample)).await;
@@ -3258,7 +3277,7 @@ async fn samples_from_an_agent_reach_its_charts() {
 #[tokio::test]
 async fn a_host_without_a_load_average_gets_no_load_average_chart() {
     let server = start_with_metrics().await;
-    let (host, _client) = report(&server, |time_ms| windows_sample(time_ms, "C:\\")).await;
+    let (host, _client) = report(&server, |time| windows_sample(time, "C:\\")).await;
 
     let page = Browser::default()
         .get(&server, &format!("/hosts/{}/metrics", host.id()))
@@ -3456,8 +3475,9 @@ async fn a_form_still_works_after_the_page_has_updated_around_it() {
 
 /// How many samples of `metric` are stored in a range around now.
 async fn stored_points(server: &TestServer, host: &Identity) -> usize {
-    let now = now_ms();
-    let range = TimeRange::new(now - 3_600_000, now + 3_600_000).unwrap();
+    let now = crate::times::now();
+    let hour = TimeDelta::hours(1);
+    let range = TimeRange::new(now - hour, now + hour).unwrap();
     let metric = crate::metrics::find("cpu.usage").unwrap();
     let id = host.id();
     let result = server.state.metrics.series(&id, metric, range, 8);
@@ -3485,25 +3505,40 @@ async fn only_recent_samples_count_as_current() {
     // the checks below take. The server would drop a client that went quiet.
     let (mut sender, mut receiver) = client.split();
     tokio::spawn(async move { while receiver.next().await.is_some() {} });
-    let now = now_ms() as u64;
-    let mut report = async |time_ms| {
-        let text = serde_json::to_string(&full_sample(time_ms, "/")).unwrap();
+    let now = crate::times::now();
+    let mut report = async |time| {
+        let text = serde_json::to_string(&full_sample(time, "/")).unwrap();
         sender.send(Message::text(text)).await.unwrap();
     };
 
-    report(now - 600_000).await;
+    report(now - TimeDelta::minutes(10)).await;
     wait_for_points(&server, &host, 1).await;
-    let current = server.state.metrics.current(now_ms()).await.unwrap();
+    let current = server
+        .state
+        .metrics
+        .current(crate::times::now())
+        .await
+        .unwrap();
     assert!(!current.contains_key(&host.id()), "ten minutes old");
 
-    report(now + 1_800_000).await;
+    report(now + TimeDelta::minutes(30)).await;
     wait_for_points(&server, &host, 2).await;
-    let current = server.state.metrics.current(now_ms()).await.unwrap();
+    let current = server
+        .state
+        .metrics
+        .current(crate::times::now())
+        .await
+        .unwrap();
     assert!(!current.contains_key(&host.id()), "from the future");
 
-    report(now - 240_000).await;
+    report(now - TimeDelta::minutes(4)).await;
     wait_for_points(&server, &host, 3).await;
-    let current = server.state.metrics.current(now_ms()).await.unwrap();
+    let current = server
+        .state
+        .metrics
+        .current(crate::times::now())
+        .await
+        .unwrap();
     assert!(current.contains_key(&host.id()), "four minutes old");
 }
 
@@ -3735,7 +3770,7 @@ async fn the_metrics_api_returns_series_and_current_values() {
 
     assert_eq!(body["metric"], "cpu.usage");
     assert_eq!(body["unit"], "percent");
-    assert_eq!(body["step_ms"], 15_000);
+    assert_eq!(body["step_secs"], 15);
     assert_eq!(body["hidden"], 0);
     assert_eq!(body["series"][0]["name"], "CPU");
     let point = &body["series"][0]["points"][0];
@@ -3756,21 +3791,25 @@ async fn the_metrics_api_returns_series_and_current_values() {
 async fn the_metrics_api_can_be_given_a_time_range() {
     let server = start_with_metrics().await;
     let (host, _client) = report_samples(&server, "/").await;
-    let now = now_ms();
+    let now = crate::times::now();
     let base = format!("/api/v1/hosts/{}/metrics/cpu.usage", host.id());
+    let iso = |time: Timestamp| time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let hour = TimeDelta::hours(1);
 
-    let path = format!(
-        "{base}?from_ms={}&to_ms={}",
-        now - 7_200_000,
-        now - 3_600_000
-    );
+    let path = format!("{base}?from={}&to={}", iso(now - hour * 2), iso(now - hour));
     let body = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
     assert_eq!(body["series"], json!([]));
 
-    let path = format!("{base}?from_ms={}&to_ms={now}", now - 86_400_000);
+    let (from, to) = (now - TimeDelta::days(1), now);
+    let path = format!("{base}?from={}&to={}", iso(from), iso(to));
     let body = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
-    assert_eq!(body["step_ms"], 600_000);
+    assert_eq!(body["step_secs"], 600);
+    assert_eq!(body["from"], json!(from));
+    assert_eq!(body["to"], json!(to));
     assert_eq!(body["series"][0]["name"], "CPU");
+    // Every point says when it is, as every other time in the API does.
+    let first = body["series"][0]["points"][0]["time"].as_str().unwrap();
+    assert!(crate::times::parse_moment(first).is_some(), "{first}");
 }
 
 #[tokio::test]
@@ -3783,16 +3822,18 @@ async fn the_metrics_api_refuses_what_it_can_not_answer() {
 
     let metric = format!("/api/v1/hosts/{id}/metrics/cpu.usage");
     for query in [
-        "from_ms=5&to_ms=1",
-        "from_ms=-1&to_ms=5",
-        "to_ms=not-a-number",
+        "from=2026-11-19T02:00:00Z&to=2026-11-19T01:00:00Z",
+        "from=1969-12-31T23:00:00Z&to=1970-01-01T00:00:01Z",
+        "to=not-a-time",
+        "to=1795053437828",
+        "from=2025-01-01T00:00:00Z&to=2026-11-19T00:00:00Z",
     ] {
         let response = server
             .http("GET", &format!("{metric}?{query}"), token)
             .await;
         assert!(response.starts_with("HTTP/1.1 400"), "{query}: {response}");
     }
-    let far_future = format!("{metric}?to_ms={}", i64::MAX);
+    let far_future = format!("{metric}?to=9999-12-31T23:59:59Z");
     assert!(
         server
             .http("GET", &far_future, token)
@@ -3822,8 +3863,8 @@ impl MetricsReader for BrokenReader {
 
     fn last_samples(
         &self,
-        _since_ms: i64,
-        _until_ms: i64,
+        _since: Timestamp,
+        _until: Timestamp,
     ) -> anyhow::Result<Vec<crate::metrics::LastSample>> {
         anyhow::bail!("deliberate test failure with a secret in it");
     }
@@ -3832,8 +3873,8 @@ impl MetricsReader for BrokenReader {
         &self,
         _host_id: &str,
         _collector: &str,
-        _since_ms: i64,
-        _until_ms: i64,
+        _since: Timestamp,
+        _until: Timestamp,
     ) -> anyhow::Result<Option<Value>> {
         anyhow::bail!("deliberate test failure with a secret in it");
     }
@@ -3841,8 +3882,8 @@ impl MetricsReader for BrokenReader {
     fn newest(
         &self,
         _metric: &crate::metrics::Metric,
-        _since_ms: i64,
-        _until_ms: i64,
+        _since: Timestamp,
+        _until: Timestamp,
     ) -> anyhow::Result<Vec<crate::metrics::NewestReading>> {
         anyhow::bail!("deliberate test failure with a secret in it");
     }
@@ -3850,13 +3891,13 @@ impl MetricsReader for BrokenReader {
     fn trends(
         &self,
         _metric: &crate::metrics::Metric,
-        _since_ms: i64,
-        _until_ms: i64,
+        _since: Timestamp,
+        _until: Timestamp,
     ) -> anyhow::Result<Vec<crate::metrics::Trend>> {
         anyhow::bail!("deliberate test failure with a secret in it");
     }
 
-    fn stats(&self, _hour_ago_ms: i64) -> anyhow::Result<crate::store::StoreStats> {
+    fn stats(&self, _hour_ago: Timestamp) -> anyhow::Result<crate::store::StoreStats> {
         anyhow::bail!("deliberate test failure with a secret in it");
     }
 
@@ -3899,8 +3940,8 @@ async fn containers_become_charts_of_each_one() {
     let id = host.id();
 
     // As the agent sends them: a failing container has no figures to give.
-    let now = now_ms() as u64;
-    for (step, seconds_ago) in [45_u64, 30, 15].into_iter().enumerate() {
+    let now = crate::times::now();
+    for (step, seconds_ago) in [45, 30, 15].into_iter().enumerate() {
         let containers = json!([
             {
                 "name": "web", "image": "nginx", "state": "running", "health": "healthy",
@@ -3912,7 +3953,7 @@ async fn containers_become_charts_of_each_one() {
               "up": 0, "restarts": 4 },
         ]);
         let message = AgentMessage::Sample(Sample {
-            timestamp_ms: now - seconds_ago * 1000,
+            time: now - TimeDelta::seconds(seconds_ago),
             metrics: BTreeMap::from([("containers".to_string(), containers)]),
         });
         send(&mut client, &message).await;
@@ -3967,7 +4008,7 @@ async fn web_server_status_pages_become_charts() {
     let pool = "http://localhost/status-www";
 
     // As the agent sends them: totals as the change since the sample before.
-    let now = now_ms() as u64;
+    let now = crate::times::now();
     for seconds_ago in [45, 30, 15] {
         let metrics = BTreeMap::from([
             (
@@ -3986,7 +4027,7 @@ async fn web_server_status_pages_become_charts() {
             ),
         ]);
         let message = AgentMessage::Sample(Sample {
-            timestamp_ms: now - seconds_ago * 1000,
+            time: now - TimeDelta::seconds(seconds_ago),
             metrics,
         });
         send(&mut client, &message).await;
@@ -4053,7 +4094,7 @@ async fn check_commands_report_their_status_message_and_values() {
         { "name": "ntp", "status": 0, "ok": 1, "message": "NTP OK: offset 0.002s" },
     ]);
     let message = AgentMessage::Sample(Sample {
-        timestamp_ms: now_ms() as u64,
+        time: crate::times::now(),
         metrics: BTreeMap::from([("commands".to_string(), rows)]),
     });
     send(&mut client, &message).await;
@@ -4115,7 +4156,7 @@ async fn openmetrics_pages_become_values_and_rates() {
     let requests = r#"localhost:8080 http_requests_total{code="200"}"#;
 
     // As the agent sends them: counters as the change since the sample before.
-    let now = now_ms() as u64;
+    let now = crate::times::now();
     for seconds_ago in [45, 30, 15] {
         let rows = json!([
             { "name": "localhost:8080", "up": 1, "dropped": 4 },
@@ -4124,7 +4165,7 @@ async fn openmetrics_pages_become_values_and_rates() {
             { "name": "localhost:9187", "up": 0, "error": "timed out" },
         ]);
         let message = AgentMessage::Sample(Sample {
-            timestamp_ms: now - seconds_ago * 1000,
+            time: now - TimeDelta::seconds(seconds_ago),
             metrics: BTreeMap::from([("openmetrics".to_string(), rows)]),
         });
         send(&mut client, &message).await;
@@ -4743,9 +4784,9 @@ async fn a_key_can_be_short_lived() {
     .await;
 
     let expires = crate::times::parse_moment(created["expires_at"].as_str().unwrap()).unwrap();
-    let hour = 3_600_000;
+    let hour = chrono::TimeDelta::hours(1);
     assert!(
-        (expires.timestamp_millis() - now_ms() - hour).abs() < 5000,
+        (expires - crate::times::now() - hour).abs() < chrono::TimeDelta::seconds(5),
         "{created}"
     );
 
@@ -4763,8 +4804,8 @@ async fn a_key_that_has_run_out_is_refused() {
             "old",
             server.user_id().await,
             crate::roles::Role::Admin,
-            Some(crate::times::from_ms(now_ms() - 1000)),
-            now_ms() - 5000,
+            Some(crate::times::now() - chrono::TimeDelta::seconds(1)),
+            crate::times::now() - chrono::TimeDelta::seconds(5),
         )
         .await
         .unwrap();

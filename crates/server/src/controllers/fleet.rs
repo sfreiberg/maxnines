@@ -10,7 +10,7 @@ use crate::alerting::{Alert, Severity};
 use crate::app_state::AppState;
 use crate::facts::FlatFacts;
 use crate::metric_charts::format_value;
-use crate::metrics::{CurrentValues, Unit, now_ms};
+use crate::metrics::{CurrentValues, Unit};
 use crate::presence::Reach;
 use crate::registration::{HostRecord, HostState, short_id};
 
@@ -107,24 +107,27 @@ pub struct FleetRow {
 fn row(
     state: &AppState,
     host: HostRecord,
-    values: CurrentValues,
+    values: Option<CurrentValues>,
     facts: Option<&FlatFacts>,
     alerts: &[&Alert],
 ) -> FleetRow {
     let reach = state.presence.reach(&host);
+    let updated = values
+        .as_ref()
+        .map(|values| local_time(values.last_sample_at));
+    let values = values.as_ref();
+    let disk = values.and_then(|values| values.disk_percent);
     FleetRow {
         os_family: facts.and_then(OsFamily::of),
         online: reach == Reach::Online,
         not_read: reach == Reach::NotRead,
         health: Health::of(reach, alerts),
-        cpu: Meter::new(values.cpu_percent),
-        memory: Meter::new(values.memory_percent),
-        disk_is_full: values.disk_percent.is_some_and(|d| d >= FULL_DISK_PERCENT),
-        disk: Meter::new(values.disk_percent),
-        disk_mount_point: values.disk_mount_point,
-        updated: Some(values.time_ms)
-            .filter(|time| *time > 0)
-            .map(|time| local_time(crate::times::from_ms(time))),
+        cpu: Meter::new(values.and_then(|values| values.cpu_percent)),
+        memory: Meter::new(values.and_then(|values| values.memory_percent)),
+        disk_is_full: disk.is_some_and(|d| d >= FULL_DISK_PERCENT),
+        disk: Meter::new(disk),
+        disk_mount_point: values.and_then(|values| values.disk_mount_point.clone()),
+        updated,
         short_id: short_id(&host.id).to_string(),
         id: host.id,
         hostname: host.hostname,
@@ -133,7 +136,7 @@ fn row(
 
 /// Every approved agent, most in need of attention first.
 pub async fn rows(state: &AppState) -> Result<Vec<FleetRow>> {
-    let mut current = state.metrics.current(now_ms()).await?;
+    let mut current = state.metrics.current(crate::times::now()).await?;
     let open = state.database.open_alerts().await?;
     let mut alerts: BTreeMap<&str, Vec<&Alert>> = BTreeMap::new();
     for alert in &open {
@@ -153,7 +156,7 @@ pub async fn rows(state: &AppState) -> Result<Vec<FleetRow>> {
     let mut rows: Vec<FleetRow> = hosts
         .into_iter()
         .map(|host| {
-            let values = current.remove(&host.id).unwrap_or_default();
+            let values = current.remove(&host.id);
             let mine = alerts.get(host.id.as_str()).map_or(&[][..], Vec::as_slice);
             let known = facts.get(&host.id);
             row(state, host, values, known, mine)

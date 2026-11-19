@@ -8,11 +8,13 @@ pub mod logging;
 #[cfg(windows)]
 pub mod service;
 pub mod stopping;
+pub mod time;
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::{Result, ensure};
+use chrono::{DateTime, Utc};
 use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -58,13 +60,13 @@ const MAX_SETTING_LEN: usize = 255;
 const MAX_CHECKS: usize = 32;
 
 /// A check runs inside a sampling round, so it can't take forever.
-const MAX_CHECK_TIMEOUT_SECS: u64 = 60;
+const MAX_CHECK_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a check gets when it doesn't say.
-pub const DEFAULT_CHECK_TIMEOUT_SECS: u64 = 10;
+pub const DEFAULT_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long an agent waits to hear anything from the server before it reconnects.
 /// The server's heartbeat has to come well inside this.
-pub const AGENT_SILENCE_LIMIT_SECS: u64 = 30;
+pub const AGENT_SILENCE_LIMIT: Duration = Duration::from_secs(30);
 
 const MAX_PING_COUNT: u32 = 20;
 
@@ -178,12 +180,20 @@ macro_rules! build_info {
 /// rule is saved, which is where a typo can be put right.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentConfig {
-    /// Seconds between samples.
-    #[serde(default = "default_interval_secs")]
-    pub interval_secs: u64,
-    /// Seconds between fact reports, on top of one on every connection.
-    #[serde(default = "default_facts_interval_secs")]
-    pub facts_interval_secs: u64,
+    /// How long between samples.
+    #[serde(
+        rename = "interval_secs",
+        with = "time::seconds",
+        default = "default_interval"
+    )]
+    pub interval: Duration,
+    /// How long between fact reports, on top of one on every connection.
+    #[serde(
+        rename = "facts_interval_secs",
+        with = "time::seconds",
+        default = "default_facts_interval"
+    )]
+    pub facts_interval: Duration,
     #[serde(default)]
     pub collectors: BTreeMap<String, CollectorSettings>,
 }
@@ -234,20 +244,30 @@ pub struct CollectorSettings {
 #[serde(deny_unknown_fields)]
 pub struct LocalCheck {
     pub name: String,
-    /// How long it gets. Defaults to [`DEFAULT_CHECK_TIMEOUT_SECS`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_secs: Option<u64>,
+    /// How long it gets. Defaults to [`DEFAULT_CHECK_TIMEOUT`].
+    #[serde(
+        rename = "timeout_secs",
+        with = "time::optional_seconds",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub timeout: Option<Duration>,
     /// How often it runs, if less often than every sample.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub interval_secs: Option<u64>,
+    #[serde(
+        rename = "interval_secs",
+        with = "time::optional_seconds",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub interval: Option<Duration>,
 }
 
 impl LocalCheck {
     pub fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
-            timeout_secs: None,
-            interval_secs: None,
+            timeout: None,
+            interval: None,
         }
     }
 
@@ -258,16 +278,18 @@ impl LocalCheck {
             "{name:?} isn't a check's name, which is at most {MAX_CHECK_NAME_LEN} \
              characters with no line breaks"
         );
-        if let Some(seconds) = self.timeout_secs {
+        if let Some(timeout) = self.timeout {
             ensure!(
-                (1..=MAX_CHECK_TIMEOUT_SECS).contains(&seconds),
-                "check {name:?} needs a timeout from 1 to {MAX_CHECK_TIMEOUT_SECS} seconds"
+                (Duration::from_secs(1)..=MAX_CHECK_TIMEOUT).contains(&timeout),
+                "check {name:?} needs a timeout from 1 to {} seconds",
+                MAX_CHECK_TIMEOUT.as_secs()
             );
         }
-        if let Some(seconds) = self.interval_secs {
+        if let Some(interval) = self.interval {
             ensure!(
-                (1..=MAX_INTERVAL_SECS).contains(&seconds),
-                "check {name:?} needs an interval from 1 to {MAX_INTERVAL_SECS} seconds, a day"
+                (Duration::from_secs(1)..=MAX_INTERVAL).contains(&interval),
+                "check {name:?} needs an interval from 1 to {} seconds, a day",
+                MAX_INTERVAL.as_secs()
             );
         }
         Ok(())
@@ -400,13 +422,23 @@ pub struct Check {
     /// `host:port` for tcp and tls, a URL for http, and a host for dns and ping.
     pub target: String,
     /// How long it gets, up to a minute. A slower answer counts as down.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_secs: Option<u64>,
+    #[serde(
+        rename = "timeout_secs",
+        with = "time::optional_seconds",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub timeout: Option<Duration>,
     /// On an agent, how often it runs, up to a day. Without one it runs with every
     /// sample, and it can't run more often than that. The server's own checks have
     /// their interval beside the check instead.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub interval_secs: Option<u64>,
+    #[serde(
+        rename = "interval_secs",
+        with = "time::optional_seconds",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub interval: Option<Duration>,
     /// http: the method to use. Defaults to GET.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
@@ -568,8 +600,8 @@ impl Check {
             name: name.to_string(),
             kind,
             target: target.to_string(),
-            timeout_secs: None,
-            interval_secs: None,
+            timeout: None,
+            interval: None,
             method: None,
             body: None,
             regex: None,
@@ -705,16 +737,18 @@ impl Check {
         only_for(self.record.is_some(), "record", &[CheckKind::Dns])?;
         only_for(self.count.is_some(), "count", &[CheckKind::Ping])?;
 
-        if let Some(seconds) = self.timeout_secs {
+        if let Some(timeout) = self.timeout {
             ensure!(
-                (1..=MAX_CHECK_TIMEOUT_SECS).contains(&seconds),
-                "check {name:?} needs a timeout from 1 to {MAX_CHECK_TIMEOUT_SECS} seconds"
+                (Duration::from_secs(1)..=MAX_CHECK_TIMEOUT).contains(&timeout),
+                "check {name:?} needs a timeout from 1 to {} seconds",
+                MAX_CHECK_TIMEOUT.as_secs()
             );
         }
-        if let Some(seconds) = self.interval_secs {
+        if let Some(interval) = self.interval {
             ensure!(
-                (1..=MAX_INTERVAL_SECS).contains(&seconds),
-                "check {name:?} needs an interval from 1 to {MAX_INTERVAL_SECS} seconds, a day"
+                (Duration::from_secs(1)..=MAX_INTERVAL).contains(&interval),
+                "check {name:?} needs an interval from 1 to {} seconds, a day",
+                MAX_INTERVAL.as_secs()
             );
         }
         if let Some(method) = &self.method {
@@ -761,9 +795,9 @@ impl Check {
                 "check {name:?} needs a count from 1 to {MAX_PING_COUNT}"
             );
             // Every platform's ping sends one a second, whatever it's told.
-            let limit = self.timeout_secs.unwrap_or(DEFAULT_CHECK_TIMEOUT_SECS);
+            let limit = self.timeout.unwrap_or(DEFAULT_CHECK_TIMEOUT);
             ensure!(
-                u64::from(count) < limit,
+                Duration::from_secs(u64::from(count)) < limit,
                 "check {name:?} sends one ping a second, so a count of {count} needs \
                  timeout_secs above {count}"
             );
@@ -771,12 +805,12 @@ impl Check {
         Ok(())
     }
 }
-fn default_interval_secs() -> u64 {
-    15
+fn default_interval() -> Duration {
+    Duration::from_secs(15)
 }
 
-fn default_facts_interval_secs() -> u64 {
-    3600
+fn default_facts_interval() -> Duration {
+    Duration::from_secs(3600)
 }
 
 fn default_enabled() -> bool {
@@ -784,26 +818,32 @@ fn default_enabled() -> bool {
 }
 
 /// Longer than anyone wants between samples, and far below what a timer can hold.
-pub const MAX_INTERVAL_SECS: u64 = 86_400;
+pub const MAX_INTERVAL: Duration = Duration::from_secs(86_400);
 /// Facts rarely change, and the server drops reports that come faster than this.
-pub const MIN_FACTS_INTERVAL_SECS: u64 = 60;
+pub const MIN_FACTS_INTERVAL: Duration = Duration::from_secs(60);
 /// A week between fact reports, on top of one on every connection.
-pub const MAX_FACTS_INTERVAL_SECS: u64 = 7 * 86_400;
+pub const MAX_FACTS_INTERVAL: Duration = Duration::from_secs(7 * 86_400);
 
 impl AgentConfig {
     pub fn validate(&self) -> Result<()> {
-        ensure!(self.interval_secs > 0, "interval_secs must be at least 1");
         ensure!(
-            self.interval_secs <= MAX_INTERVAL_SECS,
-            "interval_secs can be at most {MAX_INTERVAL_SECS}, a day"
+            self.interval >= Duration::from_secs(1),
+            "interval_secs must be at least 1"
         );
         ensure!(
-            self.facts_interval_secs >= MIN_FACTS_INTERVAL_SECS,
-            "facts_interval_secs must be at least {MIN_FACTS_INTERVAL_SECS}"
+            self.interval <= MAX_INTERVAL,
+            "interval_secs can be at most {}, a day",
+            MAX_INTERVAL.as_secs()
         );
         ensure!(
-            self.facts_interval_secs <= MAX_FACTS_INTERVAL_SECS,
-            "facts_interval_secs can be at most {MAX_FACTS_INTERVAL_SECS}, a week"
+            self.facts_interval >= MIN_FACTS_INTERVAL,
+            "facts_interval_secs must be at least {}",
+            MIN_FACTS_INTERVAL.as_secs()
+        );
+        ensure!(
+            self.facts_interval <= MAX_FACTS_INTERVAL,
+            "facts_interval_secs can be at most {}, a week",
+            MAX_FACTS_INTERVAL.as_secs()
         );
         for (name, settings) in &self.collectors {
             ensure!(
@@ -964,7 +1004,8 @@ impl CollectorSettings {
 /// came from, because the server takes that from the authenticated connection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sample {
-    pub timestamp_ms: u64,
+    /// When it was taken, which also tells it apart from the agent's other samples.
+    pub time: DateTime<Utc>,
     /// Collector output, keyed by collector name.
     pub metrics: BTreeMap<String, Value>,
 }
@@ -1003,7 +1044,7 @@ pub enum AgentMessage {
     /// the moment it's asked and never kept to send later, as it's only true then.
     Time {
         nonce: String,
-        time_ms: u64,
+        answered_at: DateTime<Utc>,
     },
 }
 
@@ -1029,12 +1070,13 @@ pub enum ServerMessage {
         #[serde(default)]
         variables: BTreeMap<String, String>,
         /// How long it gets before it's stopped.
-        timeout_secs: u64,
+        #[serde(rename = "timeout_secs", with = "time::seconds")]
+        timeout: Duration,
     },
     /// The sample taken at this time is safely stored, so the agent can forget it.
     /// Until then it keeps the sample and sends it again if the connection ends, so
     /// the server ignores one it's already stored.
-    Ack { timestamp_ms: u64 },
+    Ack { time: DateTime<Utc> },
     /// Asks what the agent's clock says, to compare with the server's. The agent
     /// answers at once with an [`AgentMessage::Time`] carrying the same `nonce`,
     /// and the server times how long that took, which is how far out the
@@ -1098,20 +1140,23 @@ mod tests {
     #[test]
     fn intervals_have_limits() {
         let with = |interval: u64, facts: u64| AgentConfig {
-            interval_secs: interval,
-            facts_interval_secs: facts,
+            interval: Duration::from_secs(interval),
+            facts_interval: Duration::from_secs(facts),
             ..config()
         };
-        with(MAX_INTERVAL_SECS, MAX_FACTS_INTERVAL_SECS)
-            .validate()
-            .unwrap();
+        let (max, min_facts, max_facts) = (
+            MAX_INTERVAL.as_secs(),
+            MIN_FACTS_INTERVAL.as_secs(),
+            MAX_FACTS_INTERVAL.as_secs(),
+        );
+        with(max, max_facts).validate().unwrap();
         for bad in [
             with(0, 60),
-            with(MAX_INTERVAL_SECS + 1, 60),
+            with(max + 1, 60),
             with(u64::MAX, 60),
             with(60, 0),
-            with(60, MIN_FACTS_INTERVAL_SECS - 1),
-            with(60, MAX_FACTS_INTERVAL_SECS + 1),
+            with(60, min_facts - 1),
+            with(60, max_facts + 1),
             with(60, u64::MAX),
         ] {
             assert!(bad.validate().is_err(), "{bad:?}");
@@ -1136,7 +1181,7 @@ mod tests {
             },
         }))
         .unwrap();
-        assert_eq!(config.interval_secs, 30);
+        assert_eq!(config.interval, Duration::from_secs(30));
         assert_eq!(config.collectors.len(), 2);
         config.validate().unwrap();
     }
@@ -1474,7 +1519,7 @@ mod tests {
     fn a_config_fills_in_defaults() {
         let config = config();
 
-        assert_eq!(config.facts_interval_secs, 3600);
+        assert_eq!(config.facts_interval, Duration::from_secs(3600));
         assert!(config.collectors["cpu"].enabled);
         assert_eq!(config.collectors["cpu"].mount_points, None);
     }
@@ -1482,11 +1527,11 @@ mod tests {
     #[test]
     fn a_config_rejects_unusable_values() {
         let mut bad = config();
-        bad.interval_secs = 0;
+        bad.interval = Duration::ZERO;
         assert!(bad.validate().is_err());
 
         let mut bad = config();
-        bad.facts_interval_secs = 0;
+        bad.facts_interval = Duration::ZERO;
         assert!(bad.validate().is_err());
 
         let mut bad = config();
@@ -1500,7 +1545,7 @@ mod tests {
     #[test]
     fn the_version_changes_with_the_config() {
         let mut changed = config();
-        changed.interval_secs = 31;
+        changed.interval = Duration::from_secs(31);
 
         assert_eq!(config().version().unwrap(), config().version().unwrap());
         assert_ne!(config().version().unwrap(), changed.version().unwrap());
@@ -1516,7 +1561,7 @@ mod tests {
                 token: Some("secret".to_string()),
             },
             AgentMessage::Sample(Sample {
-                timestamp_ms: 1_789_000_000_000,
+                time: DateTime::from_timestamp_millis(1_789_000_000_123).unwrap(),
                 metrics: BTreeMap::from([("memory".to_string(), json!({ "total": 1 }))]),
             }),
             AgentMessage::Facts {
@@ -1525,6 +1570,10 @@ mod tests {
             AgentMessage::ConfigResult {
                 version: "abc".to_string(),
                 error: Some("nope".to_string()),
+            },
+            AgentMessage::Time {
+                nonce: "ab".to_string(),
+                answered_at: DateTime::from_timestamp_millis(1_789_000_000_000).unwrap(),
             },
         ];
 
@@ -1603,6 +1652,15 @@ mod tests {
             ServerMessage::Config {
                 version: "abc".to_string(),
                 config: config(),
+            },
+            ServerMessage::RunAction {
+                id: "1".to_string(),
+                action: "restart".to_string(),
+                variables: BTreeMap::new(),
+                timeout: Duration::from_secs(30),
+            },
+            ServerMessage::Ack {
+                time: DateTime::from_timestamp_millis(1_789_000_000_123).unwrap(),
             },
         ];
 

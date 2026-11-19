@@ -430,7 +430,7 @@ mod tests {
     #[tokio::test]
     async fn a_database_that_isnt_there_says_why() {
         let mut check = Check::new("orders", CheckKind::Postgres, "127.0.0.1:0");
-        check.timeout_secs = Some(2);
+        check.timeout = Some(Duration::from_secs(2));
         let database = Database {
             check,
             credentials: Credentials {

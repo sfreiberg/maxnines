@@ -4,6 +4,7 @@
 //! server records restarts and config changes itself, and alerts and updates come from
 //! what's already kept about them.
 
+use chrono::TimeDelta;
 use serde::{Deserialize, Serialize};
 
 use crate::host_filter::HostFilter;
@@ -12,11 +13,10 @@ use crate::times::Timestamp;
 pub const MAX_TITLE_LEN: usize = 200;
 pub const MAX_DETAIL_LEN: usize = 2000;
 pub const MAX_FILTER_LEN: usize = 500;
-const DAY_MS: i64 = 86_400_000;
 /// How long ago an event can be said to have happened, such as a deploy recorded late.
-const LONGEST_AGO_MS: i64 = 366 * DAY_MS;
+const LONGEST_AGO: TimeDelta = TimeDelta::days(366);
 /// A script's clock can be a little ahead of the server's.
-const FURTHEST_AHEAD_MS: i64 = 3_600_000;
+const FURTHEST_AHEAD: TimeDelta = TimeDelta::hours(1);
 /// Who the server's own events are by.
 pub const SERVER: &str = "server";
 
@@ -117,7 +117,7 @@ impl EventInput {
 
     /// Checks everything that doesn't need the database, and says what's wrong in a
     /// way that can be shown to whoever sent it.
-    pub fn check(&self, now_ms: i64) -> Result<EventKind, String> {
+    pub fn check(&self, now: Timestamp) -> Result<EventKind, String> {
         let kind = match self.kind.as_deref() {
             None | Some("") => EventKind::Note,
             Some(text) => EventKind::parse(text)
@@ -142,8 +142,7 @@ impl EventInput {
             ));
         }
         if let Some(time) = self.occurred_at
-            && !(now_ms - LONGEST_AGO_MS..=now_ms + FURTHEST_AHEAD_MS)
-                .contains(&time.timestamp_millis())
+            && !(now - LONGEST_AGO..=now + FURTHEST_AHEAD).contains(&time)
         {
             return Err("An event's time has to be within the last year.".into());
         }
@@ -192,18 +191,23 @@ pub const UPDATE_FACTS: [(&str, &str); 3] = [
 
 /// A host is only taken to have restarted when its boot time moves by more than
 /// this, as some systems work it out from the uptime and it wobbles.
-pub const BOOT_TIME_SLACK_MS: i64 = 60_000;
+pub const BOOT_TIME_SLACK: TimeDelta = TimeDelta::minutes(1);
 
 /// Whether a boot time reported now means the host restarted since `known`.
-pub fn restarted(known: Option<i64>, reported: i64) -> bool {
-    known.is_some_and(|known| (reported - known).abs() > BOOT_TIME_SLACK_MS)
+pub fn restarted(known: Option<Timestamp>, reported: Timestamp) -> bool {
+    known.is_some_and(|known| (reported - known).abs() > BOOT_TIME_SLACK)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::times::from_ms;
 
-    const NOW: i64 = 1_000 * DAY_MS;
+    const DAY: TimeDelta = TimeDelta::days(1);
+
+    fn now() -> Timestamp {
+        from_ms(1_000 * DAY.num_milliseconds())
+    }
 
     fn input(title: &str) -> EventInput {
         EventInput {
@@ -214,12 +218,12 @@ mod tests {
 
     #[test]
     fn an_event_is_a_note_unless_it_says_it_is_a_deploy() {
-        assert_eq!(input("x").check(NOW), Ok(EventKind::Note));
+        assert_eq!(input("x").check(now()), Ok(EventKind::Note));
         let deploy = EventInput {
             kind: Some("deploy".into()),
             ..input("x")
         };
-        assert_eq!(deploy.check(NOW), Ok(EventKind::Deploy));
+        assert_eq!(deploy.check(now()), Ok(EventKind::Deploy));
     }
 
     #[test]
@@ -231,7 +235,7 @@ mod tests {
                 kind: Some(kind.into()),
                 ..input("x")
             };
-            assert!(event.check(NOW).is_err(), "{kind}");
+            assert!(event.check(now()).is_err(), "{kind}");
         }
     }
 
@@ -239,21 +243,21 @@ mod tests {
     fn a_title_is_needed_and_limited() {
         let mut blank = input("   ");
         blank.tidy();
-        assert!(blank.check(NOW).is_err());
-        assert!(input(&"x".repeat(MAX_TITLE_LEN)).check(NOW).is_ok());
-        assert!(input(&"x".repeat(MAX_TITLE_LEN + 1)).check(NOW).is_err());
+        assert!(blank.check(now()).is_err());
+        assert!(input(&"x".repeat(MAX_TITLE_LEN)).check(now()).is_ok());
+        assert!(input(&"x".repeat(MAX_TITLE_LEN + 1)).check(now()).is_err());
     }
 
     #[test]
     fn an_event_can_be_recorded_late_but_not_far_off() {
-        let at = |time_ms| EventInput {
-            occurred_at: Some(crate::times::from_ms(time_ms)),
+        let at = |time| EventInput {
+            occurred_at: Some(time),
             ..input("x")
         };
-        assert!(at(NOW - 30 * DAY_MS).check(NOW).is_ok());
-        assert!(at(NOW + 60_000).check(NOW).is_ok());
-        assert!(at(NOW - 400 * DAY_MS).check(NOW).is_err());
-        assert!(at(NOW + DAY_MS).check(NOW).is_err());
+        assert!(at(now() - DAY * 30).check(now()).is_ok());
+        assert!(at(now() + TimeDelta::minutes(1)).check(now()).is_ok());
+        assert!(at(now() - DAY * 400).check(now()).is_err());
+        assert!(at(now() + DAY).check(now()).is_err());
     }
 
     #[test]
@@ -262,9 +266,9 @@ mod tests {
             filter: Some(filter.into()),
             ..input("x")
         };
-        assert!(filtered("role=web").check(NOW).is_ok());
-        assert!(filtered("").check(NOW).is_ok());
-        assert!(filtered("role=\"unclosed").check(NOW).is_err());
+        assert!(filtered("role=web").check(now()).is_ok());
+        assert!(filtered("").check(now()).is_ok());
+        assert!(filtered("role=\"unclosed").check(now()).is_err());
     }
 
     #[test]
@@ -280,8 +284,8 @@ mod tests {
 
     #[test]
     fn a_restart_moves_the_boot_time_by_more_than_a_wobble() {
-        assert!(!restarted(None, NOW));
-        assert!(!restarted(Some(NOW), NOW + 1_000));
-        assert!(restarted(Some(NOW), NOW + 3_600_000));
+        assert!(!restarted(None, now()));
+        assert!(!restarted(Some(now()), now() + TimeDelta::seconds(1)));
+        assert!(restarted(Some(now()), now() + TimeDelta::hours(1)));
     }
 }

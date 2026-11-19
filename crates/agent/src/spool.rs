@@ -20,6 +20,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use tokio::sync::Notify;
 use tokio::time::{Instant, sleep_until};
@@ -52,7 +53,7 @@ const LOCK_RETRY_EVERY: Duration = Duration::from_millis(10);
 /// A saved sample that's been sent, to remove it once the server confirms it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SavedPlace {
-    taken_at: u64,
+    taken_at: DateTime<Utc>,
     file: u64,
     end: u64,
 }
@@ -183,7 +184,7 @@ impl Spool {
     }
 
     /// The server has stored the sample taken at this time.
-    pub fn acked(&self, taken_at: u64) {
+    pub fn acked(&self, taken_at: DateTime<Utc>) {
         let mut state = self.state();
         let place = state.saved_unconfirmed.filter(|p| p.taken_at == taken_at);
         if let Some(place) = place {
@@ -556,7 +557,7 @@ fn saved_files(folder: &Path) -> Result<VecDeque<SavedFile>> {
     Ok(files.into())
 }
 
-fn whole_sample(line: Vec<u8>) -> Option<(String, u64)> {
+fn whole_sample(line: Vec<u8>) -> Option<(String, DateTime<Utc>)> {
     let text = String::from_utf8(line).ok()?;
     let taken_at = sample_time(&text)?;
     Some((text, taken_at))
@@ -564,14 +565,16 @@ fn whole_sample(line: Vec<u8>) -> Option<(String, u64)> {
 
 /// When a sample was taken, which is how the server says which one it means. Samples
 /// are kept as the text that's sent, so this is the one thing read back out of them.
-fn sample_time(text: &str) -> Option<u64> {
+/// One without a time, such as from a version of the agent that wrote it in another
+/// way, is skipped as damaged, as the server couldn't take it either.
+fn sample_time(text: &str) -> Option<DateTime<Utc>> {
     #[derive(Deserialize)]
     struct Taken {
-        timestamp_ms: u64,
+        time: DateTime<Utc>,
     }
     serde_json::from_str::<Taken>(text)
         .ok()
-        .map(|taken| taken.timestamp_ms)
+        .map(|taken| taken.time)
 }
 
 #[cfg(test)]
@@ -613,15 +616,22 @@ mod tests {
         )
     }
 
-    fn sample(time: u64) -> String {
-        format!(r#"{{"timestamp_ms":{time}}}"#)
+    /// The moment `number` milliseconds after 1970, which tells samples apart here.
+    fn at(number: u64) -> DateTime<Utc> {
+        DateTime::from_timestamp_millis(i64::try_from(number).unwrap()).unwrap()
     }
 
-    /// Takes the next sample and has the server confirm it.
+    /// Always written to the millisecond, so every sample here is the same size.
+    fn sample(number: u64) -> String {
+        let time = at(number).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        format!(r#"{{"time":"{time}"}}"#)
+    }
+
+    /// Takes the next sample and has the server confirm it, and says which it was.
     fn deliver(spool: &Spool) -> Option<u64> {
         let time = sample_time(&spool.next()?).unwrap();
         spool.acked(time);
-        Some(time)
+        u64::try_from(time.timestamp_millis()).ok()
     }
 
     /// The sample files in a folder, oldest first.
@@ -770,7 +780,7 @@ mod tests {
         spool.push(sample(1));
         spool.next();
 
-        spool.acked(1);
+        spool.acked(at(1));
 
         spool.set_online(false);
         assert!(spool.next().is_none());
@@ -787,7 +797,7 @@ mod tests {
             spool.next();
         }
 
-        spool.acked(2);
+        spool.acked(at(2));
         spool.set_online(false);
 
         assert_eq!(drain(&spool), ["1", "3"]);
@@ -801,7 +811,7 @@ mod tests {
         spool.push(sample(1));
         spool.next();
 
-        spool.acked(99);
+        spool.acked(at(99));
         spool.set_online(false);
 
         assert_eq!(drain(&spool), ["1"]);
@@ -830,7 +840,7 @@ mod tests {
         assert_eq!(spool.next(), Some(sample(1)));
         assert_eq!(spool.next(), None);
 
-        spool.acked(1);
+        spool.acked(at(1));
         assert_eq!(spool.next(), Some(sample(2)));
     }
 
@@ -844,7 +854,7 @@ mod tests {
         assert_eq!(spool.next(), Some(sample(1)));
         assert_eq!(spool.next(), Some(sample(1)));
 
-        spool.acked(1);
+        spool.acked(at(1));
         assert_eq!(spool.next(), None);
     }
 
@@ -896,7 +906,7 @@ mod tests {
     #[test]
     fn the_oldest_saved_samples_go_first_when_the_limit_is_reached() {
         let (_parent, path) = folder();
-        let spool = limited(&path, 60);
+        let spool = limited(&path, 80);
         for number in 0..10 {
             spool.push(sample(10_000_000 + number));
         }
@@ -907,12 +917,12 @@ mod tests {
     #[test]
     fn the_limit_counts_samples_saved_before_a_restart() {
         let (_parent, path) = folder();
-        let spool = limited(&path, 60);
+        let spool = limited(&path, 80);
         spool.push(sample(10000000));
         spool.push(sample(10000001));
         drop(spool);
 
-        let spool = limited(&path, 60);
+        let spool = limited(&path, 80);
         spool.push(sample(10000002));
 
         assert_eq!(drain(&spool), ["10000001", "10000002"]);
@@ -921,7 +931,7 @@ mod tests {
     #[test]
     fn sending_a_backlog_frees_its_space() {
         let (_parent, path) = folder();
-        let spool = limited(&path, 60);
+        let spool = limited(&path, 80);
         spool.push(sample(10000000));
         drain(&spool);
 
@@ -937,9 +947,7 @@ mod tests {
         let spool = limited(&path, 1_000_000);
         for time in 0..5 {
             let padding = "x".repeat(100_000);
-            spool.push(format!(
-                r#"{{"timestamp_ms":{time},"padding":"{padding}"}}"#
-            ));
+            spool.push(serde_json::json!({ "time": at(time), "padding": padding }).to_string());
         }
         assert!(files_in(&path).len() > 1);
 
@@ -1052,12 +1060,29 @@ mod tests {
         let spool = unpaced(&path);
         spool.push(sample(1));
         drop(spool);
+        let damage = b"{\"cut\n\0\0\0\n\xff\xfe\n";
         add_to_file(
             &files_in(&path)[0],
-            b"{\"cut\n\0\0\0\n\xff\xfe\n{\"timestamp_ms\":2}\n",
+            &[&damage[..], sample(2).as_bytes(), b"\n"].concat(),
         );
 
         assert_eq!(drain(&unpaced(&path)), ["1", "2"]);
+    }
+
+    /// An agent upgraded with a backlog saved by an older version, which said when a
+    /// sample was taken another way, sends what it can read and drops the rest.
+    #[test]
+    fn samples_without_a_time_are_skipped() {
+        let (_parent, path) = folder();
+        let spool = unpaced(&path);
+        spool.push(sample(1));
+        drop(spool);
+        let older = format!("{{\"timestamp_ms\":2}}\n{}\n", sample(3));
+        add_to_file(&files_in(&path)[0], older.as_bytes());
+
+        let spool = unpaced(&path);
+        assert_eq!(drain(&spool), ["1", "3"]);
+        assert!(files_in(&path).is_empty());
     }
 
     #[test]
@@ -1107,12 +1132,12 @@ mod tests {
     #[test]
     fn a_restart_keeps_the_order_across_files() {
         let (_parent, path) = folder();
-        let spool = limited(&path, 1000);
+        let spool = limited(&path, 2000);
         for number in 0..30 {
             spool.push(sample(1000 + number));
         }
         drop(spool);
-        let spool = limited(&path, 1000);
+        let spool = limited(&path, 2000);
         spool.push(sample(2000));
 
         let expected: Vec<String> = (1000..1030).chain([2000]).map(|n| n.to_string()).collect();

@@ -2,6 +2,7 @@
 //! and what each run printed, for a host or for an alert.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::{Path, State};
@@ -9,7 +10,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum_csrf::CsrfToken;
-use maxnines_protocol::actions::{ActionOutcome, DEFAULT_ACTION_TIMEOUT_SECS};
+use maxnines_protocol::actions::{ActionOutcome, DEFAULT_ACTION_TIMEOUT};
 use serde::Serialize;
 
 use super::{CsrfForm, Page, local_time, recorded_by, server_error};
@@ -68,8 +69,8 @@ pub(super) fn run_row(run: ActionRun) -> RunRow {
     if let Some(code) = run.exit_code.filter(|code| *code != 0) {
         detail.push(format!("exit status {code}"));
     }
-    if let Some(ms) = run.duration_ms {
-        detail.push(format!("took {:.1}s", ms as f64 / 1000.0));
+    if let Some(took) = run.duration {
+        detail.push(format!("took {:.1}s", took.as_secs_f64()));
     }
     let given: Vec<String> = run
         .variables
@@ -136,7 +137,7 @@ async fn host_page(state: &AppState, token: &CsrfToken, id: &str, error: Option<
         .with("online", &online)
         .with("available", &available)
         .with("runs", &runs)
-        .with("default_timeout", &DEFAULT_ACTION_TIMEOUT_SECS)
+        .with("default_timeout", &DEFAULT_ACTION_TIMEOUT.as_secs())
         .with("error", &error)
         .with_status(status)
         .render()
@@ -152,12 +153,12 @@ async fn run_now(
         return StatusCode::NOT_FOUND.into_response();
     }
     let action = form.fields.get("action").cloned().unwrap_or_default();
-    let timeout_secs = match form.fields.get("timeout_secs").map(|secs| secs.trim()) {
-        None | Some("") => Ok(DEFAULT_ACTION_TIMEOUT_SECS),
-        Some(secs) => secs.parse::<u64>().map_err(|_| ()),
+    let timeout = match form.fields.get("timeout_secs").map(|secs| secs.trim()) {
+        None | Some("") => Ok(DEFAULT_ACTION_TIMEOUT),
+        Some(secs) => secs.parse::<u64>().map(Duration::from_secs).map_err(|_| ()),
     };
-    let timeout_secs = match timeout_secs {
-        Ok(secs) if check_timeout(secs).is_ok() => secs,
+    let timeout = match timeout {
+        Ok(timeout) if check_timeout(timeout).is_ok() => timeout,
         _ => {
             let error = "The time limit has to be from 1 to 600 seconds.";
             return host_page(&state, &form.token, &id, Some(error)).await;
@@ -180,7 +181,7 @@ async fn run_now(
         variables,
         requested_by: Some(recorded_by()),
         requested_at: crate::times::now(),
-        timeout_secs,
+        timeout,
     };
     match state.actions.run(new).await {
         Ok(_) => (form.token, Redirect::to(&format!("/hosts/{id}/actions"))).into_response(),

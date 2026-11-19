@@ -84,7 +84,7 @@ impl Local<'static> {
 
 /// Builds everything a config turns on.
 pub fn build_all(config: &AgentConfig, local: Local<'_>) -> Result<Vec<Box<dyn Collector>>> {
-    let interval = Duration::from_secs(config.interval_secs);
+    let interval = config.interval;
     config
         .collectors
         .iter()

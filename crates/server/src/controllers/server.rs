@@ -5,6 +5,7 @@ use axum::extract::{Query, State};
 use axum::response::Response;
 use axum::routing::get;
 use axum_csrf::CsrfToken;
+use chrono::TimeDelta;
 use chrono_tz::Tz;
 use serde::Serialize;
 use tracing::warn;
@@ -14,14 +15,14 @@ use super::metrics::{RangeParams, charts_for, not_found, range_links, selected_r
 use super::{Page, local_time, viewer_zone};
 use crate::app_state::AppState;
 use crate::metric_charts::{Chart, format_value};
-use crate::metrics::{self, Metric, Unit, now_ms};
+use crate::metrics::{self, Metric, Unit};
 use crate::remote_checks::LOCAL_HOST_ID;
 use crate::server_stats::{self, ServerStats};
 use crate::store::StoreStats;
-use crate::times::from_ms;
+use crate::times::{self, Timestamp};
 
 /// Alert rules are checked every 15 seconds, so this means they've stopped.
-const ALERT_PASS_STALE_MS: i64 = 60_000;
+const ALERT_PASS_STALE: TimeDelta = TimeDelta::minutes(1);
 
 /// What the dashboard shows, in order. The first is what people come here to see.
 const SECTIONS: [(&str, &[&str]); 4] = [
@@ -179,7 +180,7 @@ struct ServerPage {
     alert_rules_stalled: bool,
 }
 
-fn server_page(stats: ServerStats, now_ms: i64) -> ServerPage {
+fn server_page(stats: ServerStats, now: Timestamp) -> ServerPage {
     let process = stats.process.as_ref();
     let database = stats.database.as_ref();
     let collectors = stats
@@ -201,7 +202,7 @@ fn server_page(stats: ServerStats, now_ms: i64) -> ServerPage {
 
     ServerPage {
         started: local_time(stats.started_at),
-        uptime: format_uptime(stats.uptime_secs),
+        uptime: format_uptime(TimeDelta::seconds(stats.uptime_secs as i64)),
         process_memory: process.map(|p| bytes(p.memory_bytes as f64)),
         process_cpu: process
             .and_then(|p| p.cpu_percent)
@@ -227,8 +228,8 @@ fn server_page(stats: ServerStats, now_ms: i64) -> ServerPage {
                     .rows
                     .map_or_else(|| "–".to_string(), |rows| count(rows.max(0) as u64)),
                 last_hour: count(collector.rows_last_hour.max(0) as u64),
-                oldest: local_time(from_ms(collector.oldest_ms)),
-                newest: local_time(from_ms(collector.newest_ms)),
+                oldest: local_time(collector.oldest_sample_at),
+                newest: local_time(collector.newest_sample_at),
             })
             .collect(),
         total_rows: count(total_rows.max(0) as u64),
@@ -259,8 +260,7 @@ fn server_page(stats: ServerStats, now_ms: i64) -> ServerPage {
         hosts_waiting: activity.hosts_waiting,
         alerts_open: activity.alerts_open,
         last_alert_pass: last_pass.map(local_time),
-        alert_rules_stalled: last_pass
-            .is_some_and(|pass| now_ms - pass.timestamp_millis() > ALERT_PASS_STALE_MS),
+        alert_rules_stalled: last_pass.is_some_and(|pass| now - pass > ALERT_PASS_STALE),
         metrics: stats.metrics,
         version: stats.version,
         commit: stats.commit,
@@ -275,8 +275,8 @@ async fn show(
     Query(params): Query<RangeParams>,
     token: CsrfToken,
 ) -> Response {
-    let (selected, _, length_ms) = selected_range(&params);
-    let Some(range) = time_range(length_ms) else {
+    let (selected, _, length) = selected_range(&params);
+    let Some(range) = time_range(length) else {
         return not_found(&state, &token);
     };
     let (stats, sections) = tokio::join!(
@@ -294,7 +294,7 @@ async fn show(
     });
 
     Page::new(&state, &token, "server/show.html")
-        .with("server", &server_page(stats, now_ms()))
+        .with("server", &server_page(stats, times::now()))
         .with("metrics_per_second", &latest(&sections, "server.metrics"))
         .with("samples_per_second", &latest(&sections, "server.samples"))
         .with("series", &latest(&sections, "server.series"))

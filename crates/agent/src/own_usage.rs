@@ -1,6 +1,5 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use anyhow::{Result, anyhow};
+use chrono::DateTime;
 use serde_json::{Value, json};
 use sysinfo::{CpuRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
@@ -133,9 +132,14 @@ impl Collector for OwnUsageCollector {
         // From when the process started rather than when this collector did, so a
         // restart shows however the agent was started. It's what shows an agent
         // that keeps crashing, which looks like no more than a reconnect otherwise.
-        let uptime_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |now| now.as_secs().saturating_sub(process.start_time()));
+        let started = i64::try_from(process.start_time())
+            .ok()
+            .and_then(|seconds| DateTime::from_timestamp(seconds, 0));
+        let uptime_secs = started.map_or(0, |started| {
+            (maxnines_protocol::time::now() - started)
+                .num_seconds()
+                .max(0)
+        });
         Ok(json!({
             "memory_bytes": own_memory().unwrap_or_else(|| process.memory()),
             // As a share of the whole host, as other CPU figures are.

@@ -6,38 +6,47 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, TimeDelta};
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::calculations::CalculationQuery;
-use crate::store::{MetricsReader, StoreStats};
+use crate::store::{MetricsReader, StoreStats, latest_sample};
+use crate::times::Timestamp;
 
 /// The most points a series is split into. Charts can't show more than this
 /// anyway, so asking for more only costs time.
-const MAX_POINTS: i64 = 240;
+const MAX_POINTS: i32 = 240;
 
-/// Bucket sizes in seconds. The smallest matches the default sample interval.
-const STEPS_SECS: [i64; 14] = [
-    15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400,
+/// Bucket sizes. The smallest matches the default sample interval.
+const STEPS: [TimeDelta; 14] = [
+    TimeDelta::seconds(15),
+    TimeDelta::seconds(30),
+    TimeDelta::minutes(1),
+    TimeDelta::minutes(2),
+    TimeDelta::minutes(5),
+    TimeDelta::minutes(10),
+    TimeDelta::minutes(15),
+    TimeDelta::minutes(30),
+    TimeDelta::hours(1),
+    TimeDelta::hours(2),
+    TimeDelta::hours(3),
+    TimeDelta::hours(6),
+    TimeDelta::hours(12),
+    TimeDelta::days(1),
 ];
 
-const DAY_MS: i64 = 86_400_000;
-
 /// The longest range one query can cover.
-const MAX_RANGE_MS: i64 = 366 * DAY_MS;
-
-/// The end of the year 9999, well inside what the database can store.
-const MAX_TIME_MS: i64 = 253_402_300_799_000;
+const MAX_RANGE: TimeDelta = TimeDelta::days(366);
 
 /// How old a sample can be and still count as an agent's current values.
-const CURRENT_WINDOW_MS: i64 = 5 * 60 * 1000;
+const CURRENT_WINDOW: TimeDelta = TimeDelta::minutes(5);
 
 /// An agent's clock can run a little fast, but a sample dated far in the future
 /// would otherwise stay "current" until that date.
-const CLOCK_SKEW_MS: i64 = 60 * 1000;
+const CLOCK_SKEW: TimeDelta = TimeDelta::minutes(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -4213,14 +4222,6 @@ pub const METRICS: &[Metric] = &[
     },
 ];
 
-pub fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
-        })
-}
-
 pub fn find(name: &str) -> Option<&'static Metric> {
     METRICS.iter().find(|metric| metric.name == name)
 }
@@ -4235,36 +4236,43 @@ impl Metric {
     }
 }
 
-/// A span of time, split into buckets of `step_ms`.
+/// A span of time, split into buckets of `step`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeRange {
-    pub from_ms: i64,
-    pub to_ms: i64,
-    pub step_ms: i64,
+    pub from: Timestamp,
+    pub to: Timestamp,
+    pub step: TimeDelta,
 }
 
 impl TimeRange {
-    /// Returns nothing for a range that's backwards, empty, or too long.
-    pub fn new(from_ms: i64, to_ms: i64) -> Option<Self> {
-        let valid = 0 <= from_ms
-            && from_ms < to_ms
-            && to_ms <= MAX_TIME_MS
-            && to_ms - from_ms <= MAX_RANGE_MS;
+    /// Returns nothing for a range that's backwards, empty, too long, or outside what
+    /// the stores can hold.
+    pub fn new(from: Timestamp, to: Timestamp) -> Option<Self> {
+        let valid = DateTime::UNIX_EPOCH <= from
+            && from < to
+            && to <= latest_sample()
+            && to - from <= MAX_RANGE;
         valid.then(|| Self {
-            from_ms,
-            to_ms,
-            step_ms: step_for(to_ms - from_ms),
+            from,
+            to,
+            step: step_for(to - from),
         })
+    }
+
+    /// The range of this length that ends now.
+    pub fn ending(now: Timestamp, length: TimeDelta) -> Option<Self> {
+        Self::new(now.checked_sub_signed(length)?, now)
     }
 }
 
-fn step_for(range_ms: i64) -> i64 {
-    let wanted = (range_ms + MAX_POINTS - 1) / MAX_POINTS;
-    STEPS_SECS
-        .iter()
-        .map(|secs| secs * 1000)
+/// The smallest step that splits `range` into no more than [`MAX_POINTS`], or whole
+/// days for ranges longer than the steps offered.
+fn step_for(range: TimeDelta) -> TimeDelta {
+    let wanted = range / MAX_POINTS;
+    STEPS
+        .into_iter()
         .find(|step| *step >= wanted)
-        .unwrap_or_else(|| (wanted + DAY_MS - 1) / DAY_MS * DAY_MS)
+        .unwrap_or_else(|| TimeDelta::days((wanted.num_seconds() + 86_399) / 86_400))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4276,10 +4284,10 @@ pub struct SeriesQuery<'a> {
     pub max_series: usize,
 }
 
-/// One bucket of a series.
+/// One bucket of a series, at the moment it starts.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Point {
-    pub time_ms: i64,
+    pub time: Timestamp,
     pub avg: f64,
     pub min: f64,
     pub max: f64,
@@ -4302,13 +4310,13 @@ pub struct SeriesResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LastSample {
     pub host_id: String,
-    pub time_ms: i64,
+    pub time: Timestamp,
 }
 
-/// An agent's headline numbers.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+/// An agent's headline numbers, from the sample it sent last.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CurrentValues {
-    pub time_ms: i64,
+    pub last_sample_at: Timestamp,
     pub cpu_percent: Option<f64>,
     pub memory_percent: Option<f64>,
     /// The fullest disk.
@@ -4316,12 +4324,24 @@ pub struct CurrentValues {
     pub disk_mount_point: Option<String>,
 }
 
+impl CurrentValues {
+    fn at(last_sample_at: Timestamp) -> Self {
+        Self {
+            last_sample_at,
+            cpu_percent: None,
+            memory_percent: None,
+            disk_percent: None,
+            disk_mount_point: None,
+        }
+    }
+}
+
 /// A series' newest value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewestReading {
     pub host_id: String,
     pub series: String,
-    pub time_ms: i64,
+    pub time: Timestamp,
     pub value: f64,
 }
 
@@ -4332,13 +4352,13 @@ pub struct Trend {
     pub host_id: String,
     pub series: String,
     /// The newest reading.
-    pub time_ms: i64,
+    pub time: Timestamp,
     pub value: f64,
     /// The oldest reading, so a line through a few minutes isn't trusted for days.
-    pub first_ms: i64,
+    pub first_time: Timestamp,
     pub samples: u64,
-    /// How much the value changes each millisecond.
-    pub slope_per_ms: f64,
+    /// How much the value changes each second.
+    pub slope_per_sec: f64,
 }
 
 /// What the headline numbers come from.
@@ -4357,13 +4377,7 @@ fn current_values(
 ) -> BTreeMap<String, CurrentValues> {
     let mut hosts: BTreeMap<String, CurrentValues> = last_samples
         .into_iter()
-        .map(|sample| {
-            let values = CurrentValues {
-                time_ms: sample.time_ms,
-                ..CurrentValues::default()
-            };
-            (sample.host_id, values)
-        })
+        .map(|sample| (sample.host_id, CurrentValues::at(sample.time)))
         .collect();
 
     for reading in cpu.into_iter().filter(|cpu| cpu.series == CPU_SERIES) {
@@ -4432,10 +4446,14 @@ impl Metrics {
     }
 
     /// The newest value of each series, across every agent.
-    pub async fn newest(&self, metric: &'static Metric, now_ms: i64) -> Result<Vec<NewestReading>> {
+    pub async fn newest(
+        &self,
+        metric: &'static Metric,
+        now: Timestamp,
+    ) -> Result<Vec<NewestReading>> {
         let reader = self.reader.clone();
         tokio::task::spawn_blocking(move || {
-            reader.newest(metric, now_ms - CURRENT_WINDOW_MS, now_ms + CLOCK_SKEW_MS)
+            reader.newest(metric, now - CURRENT_WINDOW, now + CLOCK_SKEW)
         })
         .await
         .context("reading metrics")?
@@ -4446,18 +4464,18 @@ impl Metrics {
     pub async fn trends(
         &self,
         metric: &'static Metric,
-        since_ms: i64,
-        until_ms: i64,
+        since: Timestamp,
+        until: Timestamp,
     ) -> Result<Vec<Trend>> {
         let reader = self.reader.clone();
-        tokio::task::spawn_blocking(move || reader.trends(metric, since_ms, until_ms))
+        tokio::task::spawn_blocking(move || reader.trends(metric, since, until))
             .await
             .context("reading metrics")?
     }
 
-    pub async fn stats(&self, hour_ago_ms: i64) -> Result<StoreStats> {
+    pub async fn stats(&self, hour_ago: Timestamp) -> Result<StoreStats> {
         let reader = self.reader.clone();
-        tokio::task::spawn_blocking(move || reader.stats(hour_ago_ms))
+        tokio::task::spawn_blocking(move || reader.stats(hour_ago))
             .await
             .context("reading metrics")?
     }
@@ -4467,17 +4485,12 @@ impl Metrics {
         &self,
         host_id: &str,
         collector: &str,
-        now_ms: i64,
+        now: Timestamp,
     ) -> Result<Option<Value>> {
         let reader = self.reader.clone();
         let (host_id, collector) = (host_id.to_string(), collector.to_string());
         tokio::task::spawn_blocking(move || {
-            reader.latest_output(
-                &host_id,
-                &collector,
-                now_ms - CURRENT_WINDOW_MS,
-                now_ms + CLOCK_SKEW_MS,
-            )
+            reader.latest_output(&host_id, &collector, now - CURRENT_WINDOW, now + CLOCK_SKEW)
         })
         .await
         .context("reading metrics")?
@@ -4493,16 +4506,16 @@ impl Metrics {
         tokio::task::spawn_blocking(move || reader.series_count()).await?
     }
 
-    pub async fn current(&self, now_ms: i64) -> Result<BTreeMap<String, CurrentValues>> {
+    pub async fn current(&self, now: Timestamp) -> Result<BTreeMap<String, CurrentValues>> {
         let reader = self.reader.clone();
         tokio::task::spawn_blocking(move || {
-            let (since_ms, until_ms) = (now_ms - CURRENT_WINDOW_MS, now_ms + CLOCK_SKEW_MS);
+            let (since, until) = (now - CURRENT_WINDOW, now + CLOCK_SKEW);
             let newest = |name| {
                 let metric = find(name).context("unknown metric")?;
-                reader.newest(metric, since_ms, until_ms)
+                reader.newest(metric, since, until)
             };
             Ok(current_values(
-                reader.last_samples(since_ms, until_ms)?,
+                reader.last_samples(since, until)?,
                 newest(CPU_USAGE)?,
                 newest(MEMORY_USAGE)?,
                 newest(DISK_USAGE)?,
@@ -4517,7 +4530,10 @@ impl Metrics {
 mod tests {
     use super::*;
 
-    const HOUR_MS: i64 = 3_600_000;
+    use crate::times::from_ms;
+
+    const HOUR: TimeDelta = TimeDelta::hours(1);
+    const DAY: TimeDelta = TimeDelta::days(1);
 
     #[test]
     fn a_service_or_container_that_is_down_says_what_state_it_is_in() {
@@ -4561,33 +4577,49 @@ mod tests {
 
     #[test]
     fn the_step_keeps_a_range_within_the_point_limit() {
-        for (range_ms, step_ms) in [
-            (HOUR_MS, 15_000),
-            (6 * HOUR_MS, 120_000),
-            (24 * HOUR_MS, 600_000),
-            (7 * DAY_MS, 3_600_000),
-            (30 * DAY_MS, 10_800_000),
-            (MAX_RANGE_MS, 2 * DAY_MS),
+        for (range, step) in [
+            (HOUR, TimeDelta::seconds(15)),
+            (HOUR * 6, TimeDelta::minutes(2)),
+            (HOUR * 24, TimeDelta::minutes(10)),
+            (DAY * 7, HOUR),
+            (DAY * 30, HOUR * 3),
+            (MAX_RANGE, DAY * 2),
         ] {
-            assert_eq!(step_for(range_ms), step_ms, "{range_ms}");
-            assert!(range_ms / step_ms <= MAX_POINTS, "{range_ms}");
+            assert_eq!(step_for(range), step, "{range}");
+            assert!(
+                range.num_milliseconds() / step.num_milliseconds() <= i64::from(MAX_POINTS),
+                "{range}"
+            );
         }
     }
 
     #[test]
     fn a_tiny_range_still_gets_the_smallest_step() {
-        assert_eq!(step_for(1), 15_000);
+        assert_eq!(step_for(TimeDelta::milliseconds(1)), TimeDelta::seconds(15));
     }
 
     #[test]
     fn ranges_that_make_no_sense_are_refused() {
-        assert!(TimeRange::new(0, HOUR_MS).is_some());
-        assert!(TimeRange::new(HOUR_MS, HOUR_MS).is_none(), "empty");
-        assert!(TimeRange::new(HOUR_MS, 0).is_none(), "backwards");
-        assert!(TimeRange::new(-1, HOUR_MS).is_none(), "before 1970");
-        assert!(TimeRange::new(0, MAX_RANGE_MS + 1).is_none(), "too long");
-        assert!(TimeRange::new(MAX_TIME_MS - 1, MAX_TIME_MS + 1).is_none());
-        assert!(TimeRange::new(i64::MIN, i64::MAX).is_none());
+        let start = DateTime::UNIX_EPOCH;
+        let millisecond = TimeDelta::milliseconds(1);
+        assert!(TimeRange::new(start, start + HOUR).is_some());
+        assert!(
+            TimeRange::new(start + HOUR, start + HOUR).is_none(),
+            "empty"
+        );
+        assert!(TimeRange::new(start + HOUR, start).is_none(), "backwards");
+        assert!(
+            TimeRange::new(start - millisecond, start + HOUR).is_none(),
+            "before 1970"
+        );
+        assert!(
+            TimeRange::new(start, start + MAX_RANGE + millisecond).is_none(),
+            "too long"
+        );
+        let latest = latest_sample();
+        assert!(TimeRange::new(latest - HOUR, latest).is_some());
+        assert!(TimeRange::new(latest - HOUR, latest + millisecond).is_none());
+        assert!(TimeRange::new(Timestamp::MIN_UTC, Timestamp::MAX_UTC).is_none());
     }
 
     #[test]
@@ -4601,7 +4633,7 @@ mod tests {
         NewestReading {
             host_id: host_id.to_string(),
             series: series.to_string(),
-            time_ms: 1,
+            time: from_ms(1),
             value,
         }
     }
@@ -4609,7 +4641,7 @@ mod tests {
     fn last(host_id: &str, time_ms: i64) -> LastSample {
         LastSample {
             host_id: host_id.to_string(),
-            time_ms,
+            time: from_ms(time_ms),
         }
     }
 
@@ -4625,7 +4657,7 @@ mod tests {
         assert_eq!(
             values["a"],
             CurrentValues {
-                time_ms: 40,
+                last_sample_at: from_ms(40),
                 cpu_percent: Some(12.5),
                 memory_percent: Some(25.0),
                 disk_percent: Some(90.0),
@@ -4638,13 +4670,7 @@ mod tests {
     fn an_agent_with_nothing_to_show_still_has_a_time() {
         let values = current_values(vec![last("a", 1)], Vec::new(), Vec::new(), Vec::new());
 
-        assert_eq!(
-            values["a"],
-            CurrentValues {
-                time_ms: 1,
-                ..CurrentValues::default()
-            }
-        );
+        assert_eq!(values["a"], CurrentValues::at(from_ms(1)));
     }
 
     #[test]

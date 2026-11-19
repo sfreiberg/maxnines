@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use chrono::TimeDelta;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -85,9 +86,9 @@ fn scheduler(server: &TestServer) -> Scheduler {
     )
 }
 
-/// Reads everything that's due at `now_ms`, and waits for it to be done.
-async fn read_due(scheduler: &mut Scheduler, now_ms: i64) -> usize {
-    let started = scheduler.start_due(now_ms).await.unwrap();
+/// Reads everything that's due at `now`, and waits for it to be done.
+async fn read_due(scheduler: &mut Scheduler, now: Timestamp) -> usize {
+    let started = scheduler.start_due(now).await.unwrap();
     let count = started.len();
     for read in started {
         read.await.unwrap();
@@ -186,7 +187,7 @@ async fn a_pages_password_can_be_set_but_never_read_back() {
         .await
         .unwrap();
     let saved = saved.unwrap().input;
-    assert_eq!(saved.interval_secs, 300);
+    assert_eq!(saved.interval, Duration::from_secs(300));
     assert_eq!(saved.password.as_deref(), Some("s3cret"));
 
     // A variable takes its place, and only one set aside for secrets will do.
@@ -253,12 +254,15 @@ async fn the_server_reads_a_hosts_pages_and_says_whether_it_is_there() {
     });
     let page_id = add_page(&server, &id, &page).await;
     let mut scheduler = scheduler(&server);
-    let now = now_ms();
+    let now = crate::times::now();
 
     assert!(server.state.presence.get(&id).is_none());
     assert_eq!(read_due(&mut scheduler, now).await, 1);
     // Not due again until its interval has passed.
-    assert_eq!(read_due(&mut scheduler, now + 59_000).await, 0);
+    assert_eq!(
+        read_due(&mut scheduler, now + TimeDelta::seconds(59)).await,
+        0
+    );
 
     let presence = server.state.presence.get(&id).unwrap();
     assert!(presence.online);
@@ -288,7 +292,10 @@ async fn the_server_reads_a_hosts_pages_and_says_whether_it_is_there() {
 
     // Its only page stops answering, so the host is gone.
     served.answering.store(false, Ordering::Relaxed);
-    assert_eq!(read_due(&mut scheduler, now + 60_000).await, 1);
+    assert_eq!(
+        read_due(&mut scheduler, now + TimeDelta::minutes(1)).await,
+        1
+    );
     assert!(!server.state.presence.get(&id).unwrap().online);
     let result = server.state.page_reads.result(page_id).unwrap();
     assert_eq!(result["up"], 0);
@@ -302,7 +309,10 @@ async fn the_server_reads_a_hosts_pages_and_says_whether_it_is_there() {
     });
     let page_path = format!("/api/v1/metrics-pages/{page_id}");
     assert_eq!(api(&server, "PUT", &page_path, &off).await.0, 204);
-    assert_eq!(read_due(&mut scheduler, now + 120_000).await, 0);
+    assert_eq!(
+        read_due(&mut scheduler, now + TimeDelta::minutes(2)).await,
+        0
+    );
     assert!(server.state.presence.get(&id).is_none());
     assert_eq!(server.state.page_reads.result(page_id), None);
 }
@@ -318,7 +328,7 @@ async fn a_password_that_is_wrong_or_missing_shows_as_the_page_not_answering() {
     });
     let page_id = add_page(&server, &id, &wrong).await;
     let mut scheduler = scheduler(&server);
-    let now = now_ms();
+    let now = crate::times::now();
 
     read_due(&mut scheduler, now).await;
     let result = server.state.page_reads.result(page_id).unwrap();
@@ -334,7 +344,10 @@ async fn a_password_that_is_wrong_or_missing_shows_as_the_page_not_answering() {
     // How the page was before says nothing about it now, so that's forgotten and
     // it's read again without waiting out its interval.
     assert_eq!(server.state.page_reads.result(page_id), None);
-    assert_eq!(read_due(&mut scheduler, now + 1_000).await, 1);
+    assert_eq!(
+        read_due(&mut scheduler, now + TimeDelta::seconds(1)).await,
+        1
+    );
     let result = server.state.page_reads.result(page_id).unwrap();
     assert_eq!(
         result["error"],
@@ -356,7 +369,7 @@ async fn a_page_is_signed_in_to_with_a_token_that_is_never_read_back() {
     let typed = json!({ "url": url, "interval_secs": 60, "token": "abc.DEF-123" });
     let page_id = add_page(&server, &id, &typed).await;
     let mut scheduler = scheduler(&server);
-    let now = now_ms();
+    let now = crate::times::now();
 
     read_due(&mut scheduler, now).await;
     let result = server.state.page_reads.result(page_id).unwrap();
@@ -394,7 +407,7 @@ async fn a_page_is_signed_in_to_with_a_token_that_is_never_read_back() {
     });
     assert_eq!(api(&server, "PUT", &page_path, &unset).await.0, 204);
     assert_eq!(saved_token().await, None);
-    read_due(&mut scheduler, now + 60_000).await;
+    read_due(&mut scheduler, now + TimeDelta::minutes(1)).await;
     let result = server.state.page_reads.result(page_id).unwrap();
     assert_eq!(
         result["error"],
@@ -406,7 +419,7 @@ async fn a_page_is_signed_in_to_with_a_token_that_is_never_read_back() {
     assert_eq!(api(&server, "PUT", &page_path, &plain).await.0, 204);
     let (_, page) = api(&server, "GET", &page_path, &Value::Null).await;
     assert_eq!(page["sign_in"], "none");
-    read_due(&mut scheduler, now + 120_000).await;
+    read_due(&mut scheduler, now + TimeDelta::minutes(2)).await;
     let result = server.state.page_reads.result(page_id).unwrap();
     assert_eq!(result["error"], "the page returned status 401");
 }
@@ -432,7 +445,7 @@ async fn a_host_that_stops_answering_is_offline_and_one_with_nothing_to_read_is_
         .create_alert_rule(&offline.rule)
         .await
         .unwrap();
-    let started = now_ms();
+    let started = crate::times::now();
     let mut evaluator = Evaluator::new(
         state.database.clone(),
         state.registry.clone(),
@@ -440,7 +453,7 @@ async fn a_host_that_stops_answering_is_offline_and_one_with_nothing_to_read_is_
         state.metrics.clone(),
         state.status.clone(),
         state.actions.clone(),
-        started - 600_000,
+        started - TimeDelta::minutes(10),
     );
 
     read_due(&mut scheduler, started).await;
@@ -448,8 +461,11 @@ async fn a_host_that_stops_answering_is_offline_and_one_with_nothing_to_read_is_
     assert_eq!(state.database.open_alerts().await.unwrap(), []);
 
     served.answering.store(false, Ordering::Relaxed);
-    read_due(&mut scheduler, started + 60_000).await;
-    evaluator.evaluate(now_ms() + 61_000).await.unwrap();
+    read_due(&mut scheduler, started + TimeDelta::minutes(1)).await;
+    evaluator
+        .evaluate(crate::times::now() + TimeDelta::seconds(61))
+        .await
+        .unwrap();
 
     let open = state.database.open_alerts().await.unwrap();
     assert_eq!(open.len(), 1, "{open:?}");
@@ -591,8 +607,8 @@ fn check_scheduler(server: &TestServer) -> crate::remote_checks::Scheduler {
     )
 }
 
-async fn run_due(scheduler: &mut crate::remote_checks::Scheduler, now_ms: i64) -> usize {
-    let started = scheduler.start_due(now_ms).await.unwrap();
+async fn run_due(scheduler: &mut crate::remote_checks::Scheduler, now: Timestamp) -> usize {
+    let started = scheduler.start_due(now).await.unwrap();
     let count = started.len();
     for check in started {
         check.await.unwrap();
@@ -620,7 +636,7 @@ async fn a_check_about_a_host_is_saved_under_it_and_says_whether_it_is_there() {
     let (_, saved) = api(&server, "GET", &check_path, &Value::Null).await;
     assert_eq!(saved["host_id"], id.as_str());
     let mut scheduler = check_scheduler(&server);
-    let now = now_ms();
+    let now = crate::times::now();
 
     assert!(server.state.presence.get(&id).is_none());
     assert_eq!(run_due(&mut scheduler, now).await, 1);
@@ -644,13 +660,19 @@ async fn a_check_about_a_host_is_saved_under_it_and_says_whether_it_is_there() {
     // Nothing listens on port 1, so the only thing reaching the host fails.
     let closed = tcp_check(&id, "orders port", "127.0.0.1:1");
     assert_eq!(api(&server, "PUT", &check_path, &closed).await.0, 204);
-    assert_eq!(run_due(&mut scheduler, now + 60_000).await, 1);
+    assert_eq!(
+        run_due(&mut scheduler, now + TimeDelta::minutes(1)).await,
+        1
+    );
     assert!(!server.state.presence.get(&id).unwrap().online);
 
     // A check that's no longer about the host says nothing about it.
     let about_server = tcp_check("server", "orders port", "127.0.0.1:1");
     assert_eq!(api(&server, "PUT", &check_path, &about_server).await.0, 204);
-    assert_eq!(run_due(&mut scheduler, now + 120_000).await, 1);
+    assert_eq!(
+        run_due(&mut scheduler, now + TimeDelta::minutes(2)).await,
+        1
+    );
     assert!(server.state.presence.get(&id).is_none());
 }
 
@@ -721,7 +743,7 @@ async fn two_hosts_can_each_have_a_check_of_the_same_name() {
 
     // Each has its own result, and its own row on its host's page.
     let mut scheduler = check_scheduler(&server);
-    assert_eq!(run_due(&mut scheduler, now_ms()).await, 3);
+    assert_eq!(run_due(&mut scheduler, crate::times::now()).await, 3);
     assert_eq!(server.state.check_results.all().len(), 3);
     let (_, checks) = api(&server, "GET", "/api/v1/remote-checks", &Value::Null).await;
     for check in checks.as_array().unwrap() {
@@ -758,7 +780,7 @@ async fn a_check_has_a_page_of_its_own_with_only_its_charts() {
         ids.push(added["id"].as_i64().unwrap());
     }
     let mut scheduler = check_scheduler(&server);
-    assert_eq!(run_due(&mut scheduler, now_ms()).await, 2);
+    assert_eq!(run_due(&mut scheduler, crate::times::now()).await, 2);
     let mut browser = Browser::default();
 
     // Its results are charted on its own page once they're saved: whether it
@@ -838,8 +860,8 @@ async fn a_check_is_run_paused_and_quieted_from_its_page() {
         "{}",
         page.body
     );
-    assert!(server.state.check_results.ran_ms(ids[0]).is_some());
-    assert_eq!(server.state.check_results.ran_ms(ids[1]), None);
+    assert!(server.state.check_results.ran_at(ids[0]).is_some());
+    assert_eq!(server.state.check_results.ran_at(ids[1]), None);
 
     // Quieting it holds back alerts about it alone, not the host's other check.
     let fields = [("duration_secs", "3600"), ("reason", "Redeploying")];
@@ -853,7 +875,7 @@ async fn a_check_is_run_paused_and_quieted_from_its_page() {
         series: series.to_string(),
         ..crate::channels::testing::alert()
     };
-    let quiet = crate::silences::ActiveSilences::load(&server.state.database, now_ms())
+    let quiet = crate::silences::ActiveSilences::load(&server.state.database, crate::times::now())
         .await
         .unwrap();
     assert!(quiet.covering(&about("site")).is_some());
@@ -876,7 +898,7 @@ async fn a_check_is_run_paused_and_quieted_from_its_page() {
         .submit(&server, &path, &format!("{path}/maintenance/end"), &[])
         .await;
     assert_eq!(ended.status, 303);
-    let quiet = crate::silences::ActiveSilences::load(&server.state.database, now_ms())
+    let quiet = crate::silences::ActiveSilences::load(&server.state.database, crate::times::now())
         .await
         .unwrap();
     assert!(quiet.covering(&about("site")).is_none());
@@ -954,7 +976,7 @@ async fn a_checks_password_is_kept_but_never_given_back() {
     // One read from the server's environment says when it isn't there.
     let unset = check(json!({ "username": "a", "password_env": "MAXNINES_SECRET_NEVER_SET" }));
     assert_eq!(api(&server, "PUT", &path, &unset).await.0, 204);
-    run_due(&mut check_scheduler(&server), now_ms()).await;
+    run_due(&mut check_scheduler(&server), crate::times::now()).await;
     let result = &server.state.check_results.all()[&id];
     assert_eq!(
         result["error"],
@@ -1164,7 +1186,7 @@ async fn a_database_check_reads_its_stats_as_the_hosts() {
     let (status, added) = api(&server, "POST", "/api/v1/remote-checks", &check).await;
     assert_eq!(status, 201, "{added}");
     let mut scheduler = check_scheduler(&server);
-    assert_eq!(run_due(&mut scheduler, now_ms()).await, 1);
+    assert_eq!(run_due(&mut scheduler, crate::times::now()).await, 1);
 
     // Saved as the host's, as an agent's would be.
     // Under its kind, as an agent's would be.

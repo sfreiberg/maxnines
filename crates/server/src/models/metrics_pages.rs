@@ -1,5 +1,7 @@
 //! OpenMetrics pages the server reads for hosts with no agent.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
@@ -17,7 +19,7 @@ fn to_page(row: metrics_page::Model) -> Result<MetricsPage> {
         input: MetricsPageInput {
             url: row.url,
             names: row.names.lines().map(str::to_string).collect(),
-            interval_secs: u64::try_from(row.interval_secs)?,
+            interval: Duration::from_secs(u64::try_from(row.interval_secs)?),
             enabled: row.enabled,
             username: row.username,
             password: row.password,
@@ -33,7 +35,7 @@ fn to_row(host_id: &str, input: &MetricsPageInput) -> Result<metrics_page::Activ
         host_id: Set(host_id.to_string()),
         url: Set(input.url.clone()),
         names: Set(input.names.join("\n")),
-        interval_secs: Set(i64::try_from(input.interval_secs)?),
+        interval_secs: Set(i64::try_from(input.interval.as_secs())?),
         enabled: Set(input.enabled),
         username: Set(input.username.clone()),
         password: Set(input.password.clone()),

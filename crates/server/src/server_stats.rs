@@ -3,11 +3,12 @@
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use chrono::TimeDelta;
 use maxnines_collectors::{Collector, WARMUP, host};
 use maxnines_protocol::Sample;
 use serde::Serialize;
@@ -19,7 +20,6 @@ use tokio::time::MissedTickBehavior;
 use tracing::{error, warn};
 
 use crate::app_state::AppState;
-use crate::metrics::now_ms;
 use crate::models::DatabaseStats;
 use crate::presence::Reach;
 use crate::registration::{HostRecord, HostState};
@@ -27,7 +27,7 @@ use crate::remote_checks::{LOCAL_HOST_ID, LOCAL_HOSTNAME};
 use crate::store::{NewSample, StoreStats, WriteCounts, WriterCommand};
 use crate::times::{self, Timestamp};
 
-const HOUR_MS: i64 = 3_600_000;
+const HOUR: TimeDelta = TimeDelta::hours(1);
 
 /// What's kept between requests, and what background work reports back.
 pub struct ServerStatus {
@@ -35,8 +35,8 @@ pub struct ServerStatus {
     pub writes: Arc<WriteCounts>,
     /// How many alerts are firing, for the navigation on every page.
     pub firing: AtomicUsize,
-    /// When alert rules were last checked. Zero means not yet.
-    pub last_alert_pass_ms: AtomicI64,
+    /// When alert rules were last checked, if they have been.
+    last_alert_pass: Mutex<Option<Timestamp>>,
     /// Where metrics are kept, to report the space left there.
     data_path: Option<PathBuf>,
     pid: Pid,
@@ -52,13 +52,30 @@ impl ServerStatus {
             started_at: times::now(),
             writes: Arc::default(),
             firing: AtomicUsize::new(0),
-            last_alert_pass_ms: AtomicI64::new(0),
+            last_alert_pass: Mutex::new(None),
             data_path,
             pid: sysinfo::get_current_pid()
                 .map_err(|error| anyhow::anyhow!("{error}"))
                 .context("finding this process")?,
             system: Mutex::new((system, None)),
         })
+    }
+
+    /// Notes that alert rules were checked at `now`.
+    pub fn alert_pass_finished(&self, now: Timestamp) {
+        let mut last = self
+            .last_alert_pass
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *last = Some(now);
+    }
+
+    /// When alert rules were last checked, if they have been.
+    pub fn last_alert_pass(&self) -> Option<Timestamp> {
+        *self
+            .last_alert_pass
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -175,7 +192,7 @@ async fn own_numbers(state: &AppState, recorded: &mut Recorded) -> Value {
         "samples_written": new_written,
         "samples_failed": new_failed,
         "values_written": new_values,
-        "slowest_write_ms": status.writes.slowest_write_ms.swap(0, Ordering::Relaxed),
+        "slowest_write_ms": slowest_write_ms(&status.writes),
         "series": state.metrics.series_count().await.ok(),
         "write_queue": state.writer.max_capacity() - state.writer.capacity(),
         "hosts_online": real().filter(online).count(),
@@ -190,11 +207,18 @@ async fn own_numbers(state: &AppState, recorded: &mut Recorded) -> Value {
     })
 }
 
+/// The longest write since the last look, in milliseconds as charts show it, starting
+/// again for the next look.
+fn slowest_write_ms(writes: &WriteCounts) -> f64 {
+    let micros = writes.slowest_write_micros.swap(0, Ordering::Relaxed);
+    micros as f64 / 1000.0
+}
+
 pub async fn record_once(state: &AppState, recorded: &mut Recorded) {
     let mut metrics = read_host(recorded).await;
     metrics.insert("server".to_string(), own_numbers(state, recorded).await);
     let sample = Sample {
-        timestamp_ms: now_ms() as u64,
+        time: times::now(),
         metrics,
     };
     let command = WriterCommand::Save(NewSample {
@@ -333,7 +357,7 @@ fn os_name() -> Option<String> {
 
 pub async fn gather(state: &AppState) -> ServerStats {
     let status = state.status.clone();
-    let now = now_ms();
+    let now = times::now();
     let build = maxnines_protocol::build_info!();
 
     let looked = status.clone();
@@ -344,7 +368,7 @@ pub async fn gather(state: &AppState) -> ServerStats {
     .await
     .unwrap_or((None, None));
 
-    let metrics = state.metrics.stats(now - HOUR_MS).await;
+    let metrics = state.metrics.stats(now - HOUR).await;
     let database = state.database.stats().await;
     for error in [metrics.as_ref().err(), database.as_ref().err()]
         .into_iter()
@@ -355,7 +379,6 @@ pub async fn gather(state: &AppState) -> ServerStats {
 
     let hosts = state.registry.list().await;
     let real = || hosts.iter().filter(|host| !host.is_local());
-    let last_pass = status.last_alert_pass_ms.load(Ordering::Relaxed);
     let capacity = state.writer.max_capacity();
 
     ServerStats {
@@ -364,7 +387,7 @@ pub async fn gather(state: &AppState) -> ServerStats {
         built_at: build.built_at.to_string(),
         rust_version: build.rust_version.to_string(),
         started_at: status.started_at,
-        uptime_secs: u64::try_from(now - status.started_at.timestamp_millis()).unwrap_or(0) / 1000,
+        uptime_secs: u64::try_from((now - status.started_at).num_seconds()).unwrap_or(0),
         os: os_name(),
         process,
         disk,
@@ -388,7 +411,7 @@ pub async fn gather(state: &AppState) -> ServerStats {
             samples_queued: capacity - state.writer.capacity(),
             queue_capacity: capacity,
             alerts_open: status.firing.load(Ordering::Relaxed),
-            last_alert_pass_at: (last_pass > 0).then(|| times::from_ms(last_pass)),
+            last_alert_pass_at: status.last_alert_pass(),
         },
     }
 }

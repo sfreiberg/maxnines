@@ -21,7 +21,7 @@ use crate::dashboards::{
     self, COLUMNS, Dashboard, KINDS, Placed, Placement, WidgetInput, check_layout, check_name,
     grouping_fields,
 };
-use crate::metrics::{METRICS, now_ms};
+use crate::metrics::METRICS;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -88,7 +88,11 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
             };
         }
     };
-    match state.database.create_dashboard(&name, now_ms()).await {
+    match state
+        .database
+        .create_dashboard(&name, crate::times::now())
+        .await
+    {
         Ok(id) => (form.token, Redirect::to(&format!("/dashboards/{id}/edit"))).into_response(),
         Err(error) => server_error(&error),
     }
@@ -369,8 +373,8 @@ async fn show_widget(
     let Some(widget) = dashboard.widgets.iter().find(|w| w.id == widget_id) else {
         return not_found(&state, &token);
     };
-    let (_, _, length_ms) = selected_range(&range_params(&params));
-    let Some(range) = time_range(length_ms) else {
+    let (_, _, length) = selected_range(&range_params(&params));
+    let Some(range) = time_range(length) else {
         return not_found(&state, &token);
     };
     let picks = match Picks::from_params(&state.sources(), &dashboard.variables, &params).await {

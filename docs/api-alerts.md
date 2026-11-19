@@ -88,8 +88,8 @@ an offline alert, or one whose rule has been deleted.
 
 | Parameter | Description |
 | --- | --- |
-| `from_ms` | The start. Defaults to a quarter as long again before the alert started as since, and at least an hour before `to_ms` |
-| `to_ms` | The end. Defaults to now |
+| `from` | The start. Defaults to a quarter as long again before the alert started as since, and at least an hour before `to` |
+| `to` | The end. Defaults to now |
 
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
@@ -105,14 +105,14 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
     { "severity": "warning", "value": 80.0 },
     { "severity": "critical", "value": 90.0 }
   ],
-  "from_ms": 1793936685969,
-  "to_ms": 1793940285969,
-  "step_ms": 15000,
+  "from": "2026-11-06T03:44:45.969Z",
+  "to": "2026-11-06T04:44:45.969Z",
+  "step_secs": 15,
   "series": [
     {
       "name": "/",
       "points": [
-        { "occurred_at": "2026-11-06T04:44:30Z", "avg": 83.9, "min": 83.9, "max": 83.9 }
+        { "time": "2026-11-06T04:44:30Z", "avg": 83.9, "min": 83.9, "max": 83.9 }
       ]
     }
   ],

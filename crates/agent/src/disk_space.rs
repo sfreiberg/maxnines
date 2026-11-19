@@ -9,9 +9,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, Metadata, ReadDir};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::builtin_actions::{Asked, size, table};
@@ -331,7 +332,7 @@ struct Remembered {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct Earlier {
-    at_ms: u64,
+    looked_at: DateTime<Utc>,
     /// Everything in each folder that had a line.
     totals: BTreeMap<String, u64>,
 }
@@ -343,14 +344,6 @@ static IN_MEMORY: Mutex<Remembered> = Mutex::new(Remembered {
 
 fn remembered_file(state_dir: &Path) -> PathBuf {
     state_dir.join("disk_space.json")
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| {
-            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
-        })
 }
 
 /// How long ago, roughly, in words.
@@ -453,7 +446,9 @@ fn describe(
 
     text.push_str("\nA folder's size leaves out any folder listed on a line of its own.\n");
     if let Some(earlier) = earlier {
-        let since = Duration::from_millis(now_ms().saturating_sub(earlier.at_ms));
+        let since = (maxnines_protocol::time::now() - earlier.looked_at)
+            .to_std()
+            .unwrap_or_default();
         text.push_str(&format!(
             "Changes are since the last look, {} ago, and count everything in the folder.\n",
             ago(since)
@@ -554,8 +549,8 @@ pub fn report(asked: &Asked) -> Result<String> {
             .into_iter()
             .map(|line| (line.path.to_string_lossy().into_owned(), line.total))
             .collect();
-        let at_ms = now_ms();
-        remembered.disks.insert(name, Earlier { at_ms, totals });
+        let looked_at = maxnines_protocol::time::now();
+        remembered.disks.insert(name, Earlier { looked_at, totals });
         match &file {
             // Only the comparison next time is lost if this can't be saved.
             Some(file) => {

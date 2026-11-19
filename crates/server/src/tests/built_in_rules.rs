@@ -11,7 +11,7 @@ async fn with_every_built_in_rule() -> TestServer {
     server
         .state
         .database
-        .sync_built_in_rules(&all(), now_ms())
+        .sync_built_in_rules(&all(), crate::times::now())
         .await
         .unwrap();
     server.state.config_changed();
@@ -114,7 +114,7 @@ async fn an_upgrade_brings_its_changes_to_built_in_rules_but_never_to_peoples_ow
         },
     });
     let changed = database
-        .sync_built_in_rules(&later, now_ms())
+        .sync_built_in_rules(&later, crate::times::now())
         .await
         .unwrap();
     assert_eq!(changed, ["macOS", "Linux"]);
@@ -134,7 +134,7 @@ async fn an_upgrade_brings_its_changes_to_built_in_rules_but_never_to_peoples_ow
     // Nothing more to do the next time it starts.
     assert!(
         database
-            .sync_built_in_rules(&later, now_ms())
+            .sync_built_in_rules(&later, crate::times::now())
             .await
             .unwrap()
             .is_empty()
@@ -142,7 +142,7 @@ async fn an_upgrade_brings_its_changes_to_built_in_rules_but_never_to_peoples_ow
 
     // A built-in rule no longer shipped goes.
     let changed = database
-        .sync_built_in_rules(&all(), now_ms())
+        .sync_built_in_rules(&all(), crate::times::now())
         .await
         .unwrap();
     assert!(changed.contains(&"Linux".to_string()), "{changed:?}");
@@ -175,7 +175,7 @@ async fn an_unchanged_default_rule_becomes_the_built_in_one_and_a_changed_one_st
         "a new database's Default isn't marked yet"
     );
     database
-        .sync_built_in_rules(&all(), now_ms())
+        .sync_built_in_rules(&all(), crate::times::now())
         .await
         .unwrap();
     let rules = database.list_rules().await.unwrap();
@@ -190,7 +190,10 @@ async fn an_unchanged_default_rule_becomes_the_built_in_one_and_a_changed_one_st
     let mut edited = changed.list_rules().await.unwrap().remove(0);
     edited.rule.settings["interval_secs"] = json!(60);
     changed.update_rule(edited.id, &edited.rule).await.unwrap();
-    changed.sync_built_in_rules(&all(), now_ms()).await.unwrap();
+    changed
+        .sync_built_in_rules(&all(), crate::times::now())
+        .await
+        .unwrap();
     let rules = changed.list_rules().await.unwrap();
     let theirs = rules.iter().find(|rule| rule.id == edited.id).unwrap();
     assert_eq!(theirs.rule.name, "Default (yours)");
@@ -323,7 +326,7 @@ async fn a_rule_can_be_limited_to_some_operating_systems() {
     TestServer::next_config(&mut client).await;
     send(&mut client, &facts_of("linux")).await;
     let (_, config) = TestServer::next_config(&mut client).await;
-    assert_eq!(config.interval_secs, 20);
+    assert_eq!(config.interval, Duration::from_secs(20));
 
     let unknown = json!({
         "name": "Plan 9",

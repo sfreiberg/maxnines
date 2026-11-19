@@ -28,8 +28,8 @@ use crate::background::{Background, probe_all};
 use crate::collector::Collector;
 use crate::custom::stop_group;
 
-const DEFAULT_TIMEOUT_SECS: u64 = 30;
-const MAX_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_DEFINITIONS: usize = 64;
 
 /// What's read of a plugin's output, as Nagios itself reads no more.
@@ -62,12 +62,17 @@ const NOT_READ: &str = "couldn't read the command's output";
 pub struct CheckCommand {
     /// The program, then its arguments.
     pub command: Vec<String>,
-    pub timeout_secs: Option<u64>,
+    #[serde(
+        rename = "timeout_secs",
+        default,
+        with = "maxnines_protocol::time::optional_seconds"
+    )]
+    pub timeout: Option<Duration>,
 }
 
 impl CheckCommand {
     fn limit(&self) -> Duration {
-        Duration::from_secs(self.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS))
+        self.timeout.unwrap_or(DEFAULT_TIMEOUT)
     }
 }
 
@@ -93,9 +98,10 @@ pub fn check_commands(commands: &CheckCommands) -> Result<()> {
         );
         ensure!(
             command
-                .timeout_secs
-                .is_none_or(|secs| (1..=MAX_TIMEOUT_SECS).contains(&secs)),
-            "check command {name:?} needs a timeout_secs from 1 to {MAX_TIMEOUT_SECS}"
+                .timeout
+                .is_none_or(|timeout| (Duration::from_secs(1)..=MAX_TIMEOUT).contains(&timeout)),
+            "check command {name:?} needs a timeout_secs from 1 to {}",
+            MAX_TIMEOUT.as_secs()
         );
     }
     Ok(())
@@ -365,7 +371,7 @@ mod tests {
     fn command(command: &[&str]) -> CheckCommand {
         CheckCommand {
             command: command.iter().map(ToString::to_string).collect(),
-            timeout_secs: None,
+            timeout: None,
         }
     }
 
@@ -441,7 +447,7 @@ mod tests {
         assert!(defined("raid", command(&[])).is_err());
         assert!(defined("two words", command(&["/bin/true"])).is_err());
         let slow = CheckCommand {
-            timeout_secs: Some(MAX_TIMEOUT_SECS + 1),
+            timeout: Some(MAX_TIMEOUT + Duration::from_secs(1)),
             ..command(&["/bin/true"])
         };
         assert!(defined("raid", slow).is_err());
@@ -480,7 +486,7 @@ mod tests {
             (UNKNOWN, NOT_STARTED)
         );
         let slow = CheckCommand {
-            timeout_secs: Some(1),
+            timeout: Some(Duration::from_secs(1)),
             ..command(&["/bin/sleep", "30"])
         };
         let started = std::time::Instant::now();

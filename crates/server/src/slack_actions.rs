@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use chrono::TimeDelta;
 use futures_util::FutureExt;
 use slack_morphism::prelude::{
     SlackApiAppsConnectionOpenRequest, SlackApiPostWebhookMessageRequest, SlackApiUsersInfoRequest,
@@ -34,13 +35,13 @@ use crate::audit::{self, Actor, Via};
 use crate::channels::slack::{
     self, ACKNOWLEDGE_ACTION, SILENCE_HOUR_ACTION, SlackControls, explain as explain_slack,
 };
-use crate::metrics::now_ms;
 use crate::models::Database;
 use crate::notifier::{Notice, format_utc};
 use crate::roles::Role;
 use crate::silences::{self, ActiveSilences, Cover};
+use crate::times::Timestamp;
 
-const SILENCE_SECS: u64 = 3600;
+const SILENCE_FOR: TimeDelta = TimeDelta::hours(1);
 const SILENCE_REASON: &str = "Silenced from Slack";
 
 /// How long what Slack said about someone's email is trusted before asking again.
@@ -174,7 +175,7 @@ impl SlackActions {
             return Ok(Some(Reply::Tell(Refusal::RoleTooLow.message())));
         }
 
-        let now = now_ms();
+        let now = crate::times::now();
         let actor = Actor::Person {
             id: account.id,
             email: account.email.clone(),
@@ -213,7 +214,7 @@ impl SlackActions {
     }
 
     /// Silences just this alert, unless something already covers it or it's over.
-    async fn silence(&self, alert_id: i64, by: &str, now: i64) -> Result<()> {
+    async fn silence(&self, alert_id: i64, by: &str, now: Timestamp) -> Result<()> {
         let Some(alert) = self.database.get_alert(alert_id).await? else {
             return Ok(());
         };
@@ -224,7 +225,7 @@ impl SlackActions {
         if quiet.covering(&alert).is_some() {
             return Ok(());
         }
-        let Some(input) = silences::silence_for(&alert, SILENCE_REASON, SILENCE_SECS) else {
+        let Some(input) = silences::silence_for(&alert, SILENCE_REASON, SILENCE_FOR) else {
             return Ok(());
         };
         silences::check_silence(&input)?;
@@ -236,7 +237,7 @@ impl SlackActions {
     async fn content(
         &self,
         alert: &Alert,
-        now: i64,
+        now: Timestamp,
         chart: Option<&SlackFileId>,
     ) -> Result<SlackMessageContent> {
         let event = if alert.resolved_at.is_some() {

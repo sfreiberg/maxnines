@@ -4,6 +4,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::get;
 use axum_csrf::CsrfToken;
+use chrono::TimeDelta;
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -14,18 +15,16 @@ use super::{Page, fleet, local_time, server_error, viewer_zone};
 use crate::app_state::AppState;
 use crate::events::TimelineEvent;
 use crate::metric_charts::{self, Chart, MAX_SERIES};
-use crate::metrics::{self, METRICS, Metric, SeriesResult, ShowChart, TimeRange, Unit, now_ms};
-use crate::times::from_ms;
-
-const HOUR_MS: i64 = 3_600_000;
+use crate::metrics::{self, METRICS, Metric, SeriesResult, ShowChart, TimeRange, Unit};
+use crate::times::{self, Timestamp};
 
 /// The ranges pages offer: what's in the URL, what's on the link, and its length.
-const RANGES: [(&str, &str, i64); 5] = [
-    ("1h", "1 hour", HOUR_MS),
-    ("6h", "6 hours", 6 * HOUR_MS),
-    ("24h", "24 hours", 24 * HOUR_MS),
-    ("7d", "7 days", 7 * 24 * HOUR_MS),
-    ("30d", "30 days", 30 * 24 * HOUR_MS),
+const RANGES: [(&str, &str, TimeDelta); 5] = [
+    ("1h", "1 hour", TimeDelta::hours(1)),
+    ("6h", "6 hours", TimeDelta::hours(6)),
+    ("24h", "24 hours", TimeDelta::hours(24)),
+    ("7d", "7 days", TimeDelta::days(7)),
+    ("30d", "30 days", TimeDelta::days(30)),
 ];
 
 pub fn routes() -> Router<AppState> {
@@ -291,27 +290,27 @@ pub(super) struct RangeLink {
 }
 
 /// A range nobody offered falls back to the shortest.
-pub(super) fn selected_range(params: &RangeParams) -> (&'static str, &'static str, i64) {
+pub(super) fn selected_range(params: &RangeParams) -> (&'static str, &'static str, TimeDelta) {
     RANGES
         .into_iter()
         .find(|(key, _, _)| params.range.as_deref() == Some(*key))
         .unwrap_or(RANGES[0])
 }
 
-/// The shortest range that reaches back to `since_ms` with a quarter as long again
+/// The shortest range that reaches back to `since` with a quarter as long again
 /// before it, to show what led up to it, or the longest when none does.
-pub(super) fn range_reaching(since_ms: i64, now_ms: i64) -> &'static str {
-    let wanted = now_ms.saturating_sub(since_ms).saturating_mul(5) / 4;
+pub(super) fn range_reaching(since: Timestamp, now: Timestamp) -> &'static str {
+    let wanted = (now - since) * 5 / 4;
     RANGES
         .into_iter()
-        .find(|(_, _, length_ms)| *length_ms >= wanted)
+        .find(|(_, _, length)| *length >= wanted)
         .unwrap_or(RANGES[RANGES.len() - 1])
         .0
 }
 
-pub(super) fn time_range(length_ms: i64) -> Option<TimeRange> {
-    let now = now_ms();
-    TimeRange::new(now - length_ms, now)
+/// The range of this length that ends now.
+pub(super) fn time_range(length: TimeDelta) -> Option<TimeRange> {
+    TimeRange::ending(times::now(), length)
 }
 
 async fn chart(
@@ -382,8 +381,8 @@ async fn show(
     let range_params = RangeParams {
         range: params.range.clone(),
     };
-    let (selected, _, length_ms) = selected_range(&range_params);
-    let Some(range) = time_range(length_ms) else {
+    let (selected, _, length) = selected_range(&range_params);
+    let Some(range) = time_range(length) else {
         return not_found(&state, &token);
     };
 
@@ -398,10 +397,7 @@ async fn show(
         Ok(charts) => charts,
         Err(error) => return server_error(&error),
     };
-    let events = match state
-        .timeline(&host.id, from_ms(range.from_ms), from_ms(range.to_ms))
-        .await
-    {
+    let events = match state.timeline(&host.id, range.from, range.to).await {
         Ok(events) => events,
         Err(error) => return server_error(&error),
     };
@@ -440,7 +436,7 @@ async fn show(
     } else {
         let output = state
             .metrics
-            .latest_output(&host.id, "checks", now_ms())
+            .latest_output(&host.id, "checks", times::now())
             .await;
         output.map(|output| match output {
             Some(Value::Array(checks)) => checks,
@@ -457,7 +453,7 @@ async fn show(
     for collector in ["custom", "counters"] {
         match state
             .metrics
-            .latest_output(&host.id, collector, now_ms())
+            .latest_output(&host.id, collector, times::now())
             .await
         {
             Ok(Some(Value::Array(items))) => {
@@ -469,19 +465,25 @@ async fn show(
     }
     let counters = readings.pop().unwrap_or_default();
     let custom_metrics = readings.pop().unwrap_or_default();
-    let latest = state.metrics.latest_output(&host.id, "commands", now_ms());
+    let latest = state
+        .metrics
+        .latest_output(&host.id, "commands", times::now());
     let commands: Vec<CommandRow> = match latest.await {
         Ok(Some(Value::Array(items))) => items.iter().filter_map(command_row).collect(),
         Ok(_) => Vec::new(),
         Err(error) => return server_error(&error),
     };
-    let latest = state.metrics.latest_output(&host.id, "databases", now_ms());
+    let latest = state
+        .metrics
+        .latest_output(&host.id, "databases", times::now());
     let databases: Vec<DatabaseRow> = match latest.await {
         Ok(Some(Value::Array(items))) => items.iter().filter_map(database_row).collect(),
         Ok(_) => Vec::new(),
         Err(error) => return server_error(&error),
     };
-    let latest = state.metrics.latest_output(&host.id, "services", now_ms());
+    let latest = state
+        .metrics
+        .latest_output(&host.id, "services", times::now());
     let services: Vec<ServiceRow> = match latest.await {
         Ok(Some(Value::Array(items))) => items.iter().filter_map(service_row).collect(),
         Ok(_) => Vec::new(),
@@ -519,8 +521,8 @@ async fn data(
     let range_params = RangeParams {
         range: params.range,
     };
-    let (selected, label, length_ms) = selected_range(&range_params);
-    let Some(range) = time_range(length_ms) else {
+    let (selected, label, length) = selected_range(&range_params);
+    let Some(range) = time_range(length) else {
         return not_found(&state, &token);
     };
 
@@ -560,14 +562,15 @@ mod tests {
 
     #[test]
     fn the_range_reaching_a_moment_leaves_room_before_it() {
-        let now = 100 * 24 * HOUR_MS;
-        assert_eq!(range_reaching(now - 10 * 60_000, now), "1h");
-        assert_eq!(range_reaching(now - 50 * 60_000, now), "6h");
-        assert_eq!(range_reaching(now - 4 * HOUR_MS, now), "6h");
-        assert_eq!(range_reaching(now - 18 * HOUR_MS, now), "24h");
-        assert_eq!(range_reaching(now - 20 * HOUR_MS, now), "7d");
-        assert_eq!(range_reaching(now - 3 * 24 * HOUR_MS, now), "7d");
-        assert_eq!(range_reaching(now - 90 * 24 * HOUR_MS, now), "30d");
+        let now = times::from_ms(100 * 86_400_000);
+        let (minutes, hours, days) = (TimeDelta::minutes, TimeDelta::hours, TimeDelta::days);
+        assert_eq!(range_reaching(now - minutes(10), now), "1h");
+        assert_eq!(range_reaching(now - minutes(50), now), "6h");
+        assert_eq!(range_reaching(now - hours(4), now), "6h");
+        assert_eq!(range_reaching(now - hours(18), now), "24h");
+        assert_eq!(range_reaching(now - hours(20), now), "7d");
+        assert_eq!(range_reaching(now - days(3), now), "7d");
+        assert_eq!(range_reaching(now - days(90), now), "30d");
     }
 
     #[test]

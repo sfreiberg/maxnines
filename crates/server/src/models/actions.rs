@@ -1,6 +1,7 @@
 //! Action runs, and which actions each host's agent says it has.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use maxnines_protocol::actions::ActionOutcome;
@@ -15,6 +16,7 @@ use super::audit::record;
 use super::{Database, action_run, host, host_fact};
 use crate::actions::{ActionRun, Finished, KnownActions, NewRun};
 use crate::audit::{Action, Change, Kind, Record, Subject};
+use crate::times::Timestamp;
 
 /// Where an agent lists its actions among its facts, and what each needs.
 const NAMES: &str = "agent.actions[";
@@ -30,13 +32,17 @@ pub(super) fn to_run(row: action_run::Model) -> Result<ActionRun> {
         variables: serde_json::from_str(&row.variables).context("reading a run's variables")?,
         requested_by: row.requested_by,
         requested_at: row.requested_at,
-        timeout_secs: u64::try_from(row.timeout_secs)?,
+        timeout: Duration::from_secs(u64::try_from(row.timeout_secs)?),
         outcome: row.outcome.as_deref().and_then(ActionOutcome::parse),
         exit_code: row.exit_code,
         error: row.error,
         output: row.output,
         truncated: row.truncated,
-        duration_ms: row.duration_ms.map(u64::try_from).transpose()?,
+        duration: row
+            .duration_ms
+            .map(u64::try_from)
+            .transpose()?
+            .map(Duration::from_millis),
         finished_at: row.finished_at,
     })
 }
@@ -107,7 +113,7 @@ impl Database {
             variables: Set(serde_json::to_string(&new.variables)?),
             requested_by: Set(new.requested_by.clone()),
             requested_at: Set(new.requested_at),
-            timeout_secs: Set(i64::try_from(new.timeout_secs)?),
+            timeout_secs: Set(i64::try_from(new.timeout.as_secs())?),
             outcome: Set(None),
             exit_code: Set(None),
             error: Set(None),
@@ -152,9 +158,12 @@ impl Database {
         id: i64,
         host_id: &str,
         finished: &Finished,
-        now_ms: i64,
+        now: Timestamp,
     ) -> Result<bool> {
-        let duration_ms = finished.duration_ms.map(i64::try_from).transpose()?;
+        let duration_ms = finished
+            .duration
+            .map(|duration| i64::try_from(duration.as_millis()))
+            .transpose()?;
         let transaction = self.connection.begin().await;
         let transaction = transaction.context("saving an action's result")?;
         let changed = action_run::Entity::update_many()
@@ -179,10 +188,7 @@ impl Database {
                 Expr::value(finished.truncated),
             )
             .col_expr(action_run::Column::DurationMs, Expr::value(duration_ms))
-            .col_expr(
-                action_run::Column::FinishedAt,
-                Expr::value(crate::times::from_ms(now_ms)),
-            )
+            .col_expr(action_run::Column::FinishedAt, Expr::value(now))
             .filter(action_run::Column::Id.eq(id))
             .filter(action_run::Column::HostId.eq(host_id))
             .filter(action_run::Column::FinishedAt.is_null())
@@ -191,7 +197,7 @@ impl Database {
             .context("saving an action's result")?;
         let recorded = changed.rows_affected > 0;
         if recorded {
-            queue_action_output(&transaction, id, now_ms).await?;
+            queue_action_output(&transaction, id, now).await?;
         }
         transaction
             .commit()

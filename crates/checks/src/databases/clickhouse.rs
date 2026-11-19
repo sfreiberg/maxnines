@@ -37,7 +37,7 @@ pub(crate) struct Clickhouse {
     /// Such as `https://db.example.com:8443`.
     base: String,
     insecure: Option<bool>,
-    timeout_secs: Option<u64>,
+    timeout: Option<Duration>,
     login: Option<Login>,
     /// What's read every few minutes, kept for the samples in between.
     slow: Option<Slow>,
@@ -100,7 +100,7 @@ impl Clickhouse {
         Ok(Self {
             base: format!("{}://{host}:{port}", if tls { "https" } else { "http" }),
             insecure: check.insecure,
-            timeout_secs: check.timeout_secs,
+            timeout: check.timeout,
             login,
             slow: None,
             memory: (None, None),
@@ -115,7 +115,7 @@ impl Clickhouse {
             &format!("{}{path}", self.base),
         );
         check.insecure = self.insecure;
-        check.timeout_secs = self.timeout_secs;
+        check.timeout = self.timeout;
         let answer = request(&check, &mut Findings::default(), self.login.as_ref())
             .await
             .map_err(|error| Failure {

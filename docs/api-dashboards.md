@@ -73,8 +73,8 @@ Takes a list of widgets' `id`, `x`, `y`, `w` and `h`, and saves them together.
 `GET /api/v1/dashboards/{id}/widgets/{widget}`
 
 The widget's answer, as `GET /api/v1/query` gives it, with its `title`, its `kind`
-and its `filter` with variables filled in. `from_ms` and `to_ms` pick the time, and
-default to the last hour. Each variable is picked with `var-<name>`, as the
+and its `filter` with variables filled in. `from` and `to` pick the time, in ISO 8601,
+and default to the last hour. Each variable is picked with `var-<name>`, as the
 dashboard's address does: a value that isn't offered is the same as none, which is
 the first host for a host variable and every value for a fact. A host
 variable with no host to offer is refused with 422.

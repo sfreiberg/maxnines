@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, bail};
+use chrono::TimeDelta;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -15,12 +16,12 @@ use crate::host_filter::HostFilter;
 use crate::maintenance::MaintenanceWindow;
 use crate::models::Database;
 use crate::remote_checks::FLEET_HOST_ID;
-use crate::times::{Timestamp, from_ms};
+use crate::times::Timestamp;
 
 const MAX_REASON_CHARS: usize = 255;
 const MAX_FILTER_CHARS: usize = 500;
 const MAX_SERIES_CHARS: usize = 255;
-const MAX_DURATION_SECS: u64 = 30 * 24 * 3600;
+const MAX_DURATION: TimeDelta = TimeDelta::days(30);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Silence {
@@ -52,14 +53,15 @@ pub struct SilenceInput {
     #[serde(default)]
     pub all_alerts: bool,
     pub reason: String,
-    pub duration_secs: u64,
+    #[serde(rename = "duration_secs", with = "crate::times::whole_seconds")]
+    pub duration: TimeDelta,
 }
 
 /// A silence covering just this alert: its rule, on its host, by ID, as names
 /// needn't be unique, for its series. An alert about the fleet has no host, and a
 /// filter would leave it out, so it has none. One whose rule has been deleted has
 /// nothing to name, and none.
-pub fn silence_for(alert: &Alert, reason: &str, duration_secs: u64) -> Option<SilenceInput> {
+pub fn silence_for(alert: &Alert, reason: &str, duration: TimeDelta) -> Option<SilenceInput> {
     let filter = if alert.host_id == FLEET_HOST_ID {
         String::new()
     } else {
@@ -71,7 +73,7 @@ pub fn silence_for(alert: &Alert, reason: &str, duration_secs: u64) -> Option<Si
         series: alert.series.clone(),
         all_alerts: false,
         reason: reason.to_string(),
-        duration_secs,
+        duration,
     })
 }
 
@@ -117,7 +119,7 @@ pub fn check_silence(input: &SilenceInput) -> Result<()> {
     if input.series.chars().count() > MAX_SERIES_CHARS {
         bail!("The series is too long. It can be up to {MAX_SERIES_CHARS} characters.");
     }
-    if input.duration_secs == 0 || input.duration_secs > MAX_DURATION_SECS {
+    if input.duration <= TimeDelta::zero() || input.duration > MAX_DURATION {
         bail!("A silence can last up to 30 days.");
     }
     check_covers(
@@ -191,17 +193,17 @@ pub struct ActiveSilences {
 }
 
 impl ActiveSilences {
-    pub async fn load(database: &Database, now_ms: i64) -> Result<Self> {
-        let silences = database.active_silences(now_ms).await?;
+    pub async fn load(database: &Database, now: Timestamp) -> Result<Self> {
+        let silences = database.active_silences(now).await?;
         let windows = database.list_maintenance_windows().await?;
-        Self::load_from(database, silences, windows, now_ms).await
+        Self::load_from(database, silences, windows, now).await
     }
 
     async fn load_from(
         database: &Database,
         silences: Vec<Silence>,
         windows: Vec<MaintenanceWindow>,
-        now_ms: i64,
+        now: Timestamp,
     ) -> Result<Self> {
         let silences = silences.into_iter().filter_map(|silence| {
             let cover = Cover::Silence {
@@ -213,7 +215,7 @@ impl ActiveSilences {
         let windows = windows.into_iter().filter_map(|window| {
             let cover = Cover::Window {
                 id: window.id,
-                ends_at: from_ms(window.ends_at(now_ms)?),
+                ends_at: window.ends_at(now)?,
             };
             Quiet::new(cover, window.window.rule_id, &window.window.filter, "")
         });
@@ -299,7 +301,7 @@ mod tests {
             series: String::new(),
             all_alerts: false,
             reason: "Upgrading Postgres".to_string(),
-            duration_secs: 3600,
+            duration: TimeDelta::hours(1),
         }
     }
 
@@ -377,14 +379,14 @@ mod tests {
             ),
             (
                 SilenceInput {
-                    duration_secs: 0,
+                    duration: TimeDelta::zero(),
                     ..input()
                 },
                 "up to 30 days",
             ),
             (
                 SilenceInput {
-                    duration_secs: MAX_DURATION_SECS + 1,
+                    duration: MAX_DURATION + TimeDelta::seconds(1),
                     ..input()
                 },
                 "up to 30 days",

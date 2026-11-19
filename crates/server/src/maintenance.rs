@@ -3,12 +3,13 @@
 //! day when the clocks change.
 
 use anyhow::{Result, bail};
-use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeDelta, TimeZone};
+use chrono::{Datelike, NaiveDate, NaiveTime, TimeDelta, TimeZone};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
 use crate::alerting::format_duration;
 use crate::silences::{check_covers, check_filter};
+use crate::times::Timestamp;
 
 /// The days a window can run on, in the order they're shown.
 pub const DAYS: [(&str, &str); 7] = [
@@ -22,8 +23,7 @@ pub const DAYS: [(&str, &str); 7] = [
 ];
 
 const MAX_NAME_CHARS: usize = 255;
-const MAX_DURATION_SECS: u32 = 7 * SECS_IN_A_DAY;
-const SECS_IN_A_DAY: u32 = 24 * 60 * 60;
+const MAX_DURATION: TimeDelta = TimeDelta::days(7);
 const TIME_FORMAT: &str = "%H:%M";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,7 +44,8 @@ pub struct MaintenanceWindowInput {
     /// When it starts, like `02:00`.
     pub start_time: String,
     /// How long it lasts.
-    pub duration_secs: u32,
+    #[serde(rename = "duration_secs", with = "crate::times::whole_seconds")]
+    pub duration: TimeDelta,
     /// A name from the time zone database, like `Europe/London`.
     pub time_zone: String,
 }
@@ -74,11 +75,11 @@ pub fn check_window(input: &MaintenanceWindowInput) -> Result<()> {
     if NaiveTime::parse_from_str(&input.start_time, TIME_FORMAT).is_err() {
         bail!("The start time should look like 02:00.");
     }
-    if input.duration_secs == 0 || input.duration_secs > MAX_DURATION_SECS {
+    if input.duration <= TimeDelta::zero() || input.duration > MAX_DURATION {
         bail!("A maintenance window can last up to 7 days.");
     }
     // It starts on a minute, so it ends on one too.
-    if !input.duration_secs.is_multiple_of(60) {
+    if input.duration.num_seconds() % 60 != 0 || input.duration.subsec_nanos() != 0 {
         bail!("A maintenance window lasts a whole number of minutes.");
     }
     if input.time_zone.parse::<Tz>().is_err() {
@@ -102,28 +103,26 @@ fn is_day(text: &str) -> bool {
 
 /// A wall clock time as a real moment. When the clocks go back it happens twice, and
 /// this is the first. When they go forward it may not happen at all, so it's an hour on.
-pub fn moment(zone: Tz, date: NaiveDate, time: NaiveTime) -> Option<i64> {
+pub fn moment(zone: Tz, date: NaiveDate, time: NaiveTime) -> Option<Timestamp> {
     let local = date.and_time(time);
     let found = zone.from_local_datetime(&local).earliest().or_else(|| {
         let later = local.checked_add_signed(TimeDelta::hours(1))?;
         zone.from_local_datetime(&later).earliest()
     })?;
-    Some(found.timestamp_millis())
+    Some(found.to_utc())
 }
 
 impl MaintenanceWindow {
     /// When it ends, if it's running at this moment.
-    pub fn ends_at(&self, now_ms: i64) -> Option<i64> {
+    pub fn ends_at(&self, now: Timestamp) -> Option<Timestamp> {
         let window = &self.window;
         let zone: Tz = window.time_zone.parse().ok()?;
         let time = NaiveTime::parse_from_str(&window.start_time, TIME_FORMAT).ok()?;
-        let today = DateTime::from_timestamp_millis(now_ms)?
-            .with_timezone(&zone)
-            .date_naive();
-        let lasts_ms = i64::from(window.duration_secs) * 1000;
+        let today = now.with_timezone(&zone).date_naive();
+        let lasts = window.duration;
 
         // One that started on an earlier day may not have finished.
-        let days_back = i64::from(window.duration_secs.div_ceil(SECS_IN_A_DAY)) + 1;
+        let days_back = (lasts + TimeDelta::days(1) - TimeDelta::nanoseconds(1)).num_days() + 1;
         (0..=days_back)
             .filter_map(|back| today.checked_sub_signed(TimeDelta::days(back)))
             .filter(|date| {
@@ -131,8 +130,8 @@ impl MaintenanceWindow {
                 window.days.contains(&day)
             })
             .filter_map(|date| moment(zone, date, time))
-            .filter(|start| *start <= now_ms && now_ms < start + lasts_ms)
-            .map(|start| start + lasts_ms)
+            .filter(|start| *start <= now && now < *start + lasts)
+            .map(|start| start + lasts)
             .max()
     }
 
@@ -148,7 +147,7 @@ impl MaintenanceWindow {
             "{} at {} for {}, {}",
             days.join(", "),
             window.start_time,
-            format_duration(u64::from(window.duration_secs)),
+            format_duration(window.duration),
             window.time_zone
         )
     }
@@ -166,7 +165,7 @@ mod tests {
             all_alerts: true,
             days: vec!["sun".to_string()],
             start_time: "02:00".to_string(),
-            duration_secs: 7200,
+            duration: TimeDelta::hours(2),
             time_zone: "UTC".to_string(),
         }
     }
@@ -179,10 +178,8 @@ mod tests {
     }
 
     /// A moment in UTC, like `2026-11-08T03:00:00Z`.
-    fn at(text: &str) -> i64 {
-        DateTime::parse_from_rfc3339(text)
-            .unwrap()
-            .timestamp_millis()
+    fn at(text: &str) -> Timestamp {
+        crate::times::parse_moment(text).unwrap()
     }
 
     #[test]
@@ -216,7 +213,7 @@ mod tests {
     #[test]
     fn it_can_last_for_days() {
         let long = window(MaintenanceWindowInput {
-            duration_secs: 3 * SECS_IN_A_DAY,
+            duration: TimeDelta::days(3),
             ..input()
         });
 
@@ -245,7 +242,7 @@ mod tests {
     fn a_start_the_clocks_skip_moves_an_hour_on() {
         let skipped = window(MaintenanceWindowInput {
             start_time: "02:30".to_string(),
-            duration_secs: 1800,
+            duration: TimeDelta::minutes(30),
             time_zone: "America/New_York".to_string(),
             ..input()
         });
@@ -260,7 +257,7 @@ mod tests {
     fn a_start_the_clocks_repeat_is_the_first_one() {
         let repeated = window(MaintenanceWindowInput {
             start_time: "01:30".to_string(),
-            duration_secs: 1800,
+            duration: TimeDelta::minutes(30),
             time_zone: "America/New_York".to_string(),
             ..input()
         });
@@ -322,21 +319,21 @@ mod tests {
             ),
             (
                 MaintenanceWindowInput {
-                    duration_secs: 0,
+                    duration: TimeDelta::zero(),
                     ..input()
                 },
                 "up to 7 days",
             ),
             (
                 MaintenanceWindowInput {
-                    duration_secs: 90,
+                    duration: TimeDelta::seconds(90),
                     ..input()
                 },
                 "whole number of minutes",
             ),
             (
                 MaintenanceWindowInput {
-                    duration_secs: MAX_DURATION_SECS + 1,
+                    duration: MAX_DURATION + TimeDelta::seconds(60),
                     ..input()
                 },
                 "up to 7 days",

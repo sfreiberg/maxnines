@@ -14,7 +14,6 @@ use std::sync::atomic::Ordering;
 
 use crate::app_state::AppState;
 use crate::audit;
-use crate::metrics::now_ms;
 use crate::models::{THEMES, User, UserChange, check_new_password, check_new_user, is_theme};
 use crate::passwords::{hash_password, password_matches};
 use crate::roles::Role;
@@ -165,7 +164,7 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
     };
     match state
         .database
-        .create_user(&email, &name, role, now_ms())
+        .create_user(&email, &name, role, crate::times::now())
         .await
     {
         Ok(Some((_, link))) => {
@@ -224,7 +223,7 @@ async fn disable(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfF
         let error = "You can't disable yourself.";
         return page(&state, &form.token, None, Some(error)).await;
     }
-    let change = state.database.disable_user(id, now_ms()).await;
+    let change = state.database.disable_user(id, crate::times::now()).await;
     after_change(&state, &form.token, change).await
 }
 
@@ -244,7 +243,7 @@ async fn new_link(State(state): State<AppState>, Path(id): Path<i64>, form: Csrf
         Ok(None) => return Redirect::to(USERS_PAGE).into_response(),
         Err(error) => return server_error(&error),
     };
-    match state.database.new_setup_link(id, now_ms()).await {
+    match state.database.new_setup_link(id, crate::times::now()).await {
         Ok(Some(link)) => {
             let url = setup_url(&state, &link);
             let new_link = NewLink {
@@ -330,7 +329,7 @@ async fn profile_page(
             chosen: *value == user.theme,
         })
         .collect();
-    let now = crate::metrics::now_ms();
+    let now = crate::times::now();
     let sign_ins = match super::sign_ins::sign_ins(state, Some(user.id), now).await {
         Ok(found) => super::sign_ins::rows(found, now),
         Err(error) => return server_error(&error),
@@ -426,7 +425,7 @@ async fn confirm_two_factor(State(state): State<AppState>, form: CsrfForm) -> Re
     let code = form.fields.get("code").map_or("", String::as_str);
     match state
         .database
-        .confirm_two_factor(user.id, code, now_ms())
+        .confirm_two_factor(user.id, code, crate::times::now())
         .await
     {
         Ok(Some(codes)) => {

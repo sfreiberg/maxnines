@@ -6,6 +6,7 @@ use std::net::IpAddr;
 use std::path::Path;
 
 use anyhow::Result;
+use chrono::DateTime;
 use serde_json::{Value, json};
 use sysinfo::{Disk, Disks, InterfaceOperationalState, Networks, System};
 use systemstat::Platform;
@@ -24,9 +25,12 @@ impl Collector for HostCollector {
     }
 
     fn collect(&mut self) -> Result<Value> {
+        let booted_at = System::boot_time()
+            .ok()
+            .and_then(|seconds| DateTime::from_timestamp(i64::try_from(seconds).ok()?, 0));
         Ok(json!({
             "uptime_secs": System::uptime().ok(),
-            "boot_time_secs": System::boot_time().ok(),
+            "booted_at": booted_at,
         }))
     }
 }

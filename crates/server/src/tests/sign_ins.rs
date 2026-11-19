@@ -30,14 +30,26 @@ async fn admins_see_everyone_signed_in_and_from_where() {
     let database = &server.state.database;
     let (editor, _browser) = person(&server, "editor@example.com", Role::Editor).await;
     let (_, app) = database
-        .create_app_sign_in(editor, "maxnines-cli", "laptop", Role::Viewer, now_ms())
+        .create_app_sign_in(
+            editor,
+            "maxnines-cli",
+            "laptop",
+            Role::Viewer,
+            crate::times::now(),
+        )
         .await
         .unwrap();
     // Used once, so the address it came from is noted.
     let (status, _) = call_json(&server, &app.access_token, "GET", "/api/v1/me").await;
     assert_eq!(status, 200);
     let (unused, _) = database
-        .create_api_key("never used", editor, Role::Viewer, None, now_ms())
+        .create_api_key(
+            "never used",
+            editor,
+            Role::Viewer,
+            None,
+            crate::times::now(),
+        )
         .await
         .unwrap();
 
@@ -83,7 +95,7 @@ async fn a_browser_is_named_and_noted_where_it_was_last_used() {
     let database = &server.state.database;
     let owner = database.list_users().await.unwrap()[0].id;
     database
-        .start_session(owner, now_ms(), Some(CHROME_ON_MAC))
+        .start_session(owner, crate::times::now(), Some(CHROME_ON_MAC))
         .await
         .unwrap();
     let (_, listed) = call_json(&server, &server.api_key, "GET", "/api/v1/sign-ins").await;
@@ -101,13 +113,13 @@ async fn a_browser_that_updates_is_named_by_its_new_version() {
     let database = &server.state.database;
     let owner = database.list_users().await.unwrap()[0].id;
     let token = database
-        .start_session(owner, now_ms(), Some(CHROME_ON_MAC))
+        .start_session(owner, crate::times::now(), Some(CHROME_ON_MAC))
         .await
         .unwrap();
     let updated = CHROME_ON_MAC.replace("Chrome/131", "Chrome/132");
     // Straight after signing in, so only the new version makes it worth saving.
     database
-        .session(&token, Some(&updated), now_ms())
+        .session(&token, Some(&updated), crate::times::now())
         .await
         .unwrap()
         .unwrap();
@@ -138,7 +150,13 @@ async fn people_see_and_end_only_their_own() {
     let page = second.submit(&server, "/login", "/login", &fields).await;
     assert_eq!(page.status, 303, "{}", page.body);
     let (_, app) = database
-        .create_app_sign_in(viewer, "maxnines-cli", "laptop", Role::Viewer, now_ms())
+        .create_app_sign_in(
+            viewer,
+            "maxnines-cli",
+            "laptop",
+            Role::Viewer,
+            crate::times::now(),
+        )
         .await
         .unwrap();
 
@@ -232,7 +250,7 @@ async fn session_id(browser: &Browser, server: &TestServer) -> i64 {
     let found = server
         .state
         .database
-        .session(token, None, now_ms())
+        .session(token, None, crate::times::now())
         .await
         .unwrap();
     found.unwrap().1
