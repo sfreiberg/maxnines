@@ -21,6 +21,7 @@ use tracing::{info, warn};
 use crate::alerting::{Alert, AlertRule, AlertRuleInput, RuleKind, Severity};
 use crate::metrics::{Metric, Source};
 use crate::models::Database;
+use crate::times::{Timestamp, from_ms};
 
 /// How many actions one rule can run.
 pub const MAX_RULE_ACTIONS: usize = 8;
@@ -229,7 +230,7 @@ pub struct ActionRun {
     pub variables: BTreeMap<String, String>,
     /// Who asked, for one a person started.
     pub requested_by: Option<String>,
-    pub requested_ms: i64,
+    pub requested_at: Timestamp,
     pub timeout_secs: u64,
     /// Empty until the agent answers or is given up on.
     pub outcome: Option<ActionOutcome>,
@@ -238,7 +239,7 @@ pub struct ActionRun {
     pub output: String,
     pub truncated: bool,
     pub duration_ms: Option<u64>,
-    pub finished_ms: Option<i64>,
+    pub finished_at: Option<Timestamp>,
 }
 
 /// What's needed to ask for an action.
@@ -250,7 +251,7 @@ pub struct NewRun {
     pub run_on: String,
     pub variables: BTreeMap<String, String>,
     pub requested_by: Option<String>,
-    pub requested_ms: i64,
+    pub requested_at: Timestamp,
     pub timeout_secs: u64,
 }
 
@@ -348,7 +349,7 @@ impl Actions {
             Some(needed) => self.ask(id, &new, needed),
         };
         if let Some(finished) = refusal {
-            let now_ms = new.requested_ms;
+            let now_ms = new.requested_at.timestamp_millis();
             self.database
                 .finish_action_run(id, &new.host_id, &finished, now_ms)
                 .await?;
@@ -426,7 +427,7 @@ impl Actions {
             let limit_ms = i64::try_from(run.timeout_secs)
                 .unwrap_or(i64::MAX / 1000)
                 .saturating_mul(1000);
-            if now_ms - run.requested_ms < limit_ms + ANSWER_GRACE_MS {
+            if now_ms - run.requested_at.timestamp_millis() < limit_ms + ANSWER_GRACE_MS {
                 continue;
             }
             let finished =
@@ -466,7 +467,7 @@ impl Actions {
                 run_on: run_on.to_string(),
                 variables: alert_variables(&rule.rule, alert),
                 requested_by: None,
-                requested_ms: now_ms,
+                requested_at: from_ms(now_ms),
                 timeout_secs: wanted.timeout(),
             };
             self.run(new).await?;

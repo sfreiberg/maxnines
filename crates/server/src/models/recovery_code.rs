@@ -8,7 +8,7 @@ pub struct Model {
     pub user_id: i64,
     /// Only the hash is kept.
     pub code_hash: String,
-    pub used_ms: Option<i64>,
+    pub used_at: Option<DateTimeUtc>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

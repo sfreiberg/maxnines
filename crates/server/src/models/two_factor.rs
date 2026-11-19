@@ -39,7 +39,7 @@ async fn replace_recovery_codes<C: ConnectionTrait>(
     let rows = codes.iter().map(|code| recovery_code::ActiveModel {
         user_id: Set(id),
         code_hash: Set(code_hash(code)),
-        used_ms: Set(None),
+        used_at: Set(None),
         ..Default::default()
     });
     recovery_code::Entity::insert_many(rows)
@@ -155,10 +155,13 @@ impl Database {
             return Ok(updated.rows_affected == 1);
         }
         let used = recovery_code::Entity::update_many()
-            .col_expr(recovery_code::Column::UsedMs, Expr::value(now_ms))
+            .col_expr(
+                recovery_code::Column::UsedAt,
+                Expr::value(crate::times::from_ms(now_ms)),
+            )
             .filter(recovery_code::Column::UserId.eq(id))
             .filter(recovery_code::Column::CodeHash.eq(code_hash(code)))
-            .filter(recovery_code::Column::UsedMs.is_null())
+            .filter(recovery_code::Column::UsedAt.is_null())
             .exec(&self.connection)
             .await
             .context("using a recovery code")?;
@@ -169,7 +172,7 @@ impl Database {
     pub async fn recovery_codes_left(&self, id: i64) -> Result<u64> {
         recovery_code::Entity::find()
             .filter(recovery_code::Column::UserId.eq(id))
-            .filter(recovery_code::Column::UsedMs.is_null())
+            .filter(recovery_code::Column::UsedAt.is_null())
             .count(&self.connection)
             .await
             .context("counting recovery codes")
@@ -219,7 +222,7 @@ impl Database {
     /// gives back the only copy of the token their browser keeps meanwhile.
     pub async fn start_sign_in_challenge(&self, user_id: i64, now_ms: i64) -> Result<String> {
         sign_in_challenge::Entity::delete_many()
-            .filter(sign_in_challenge::Column::ExpiresMs.lte(now_ms))
+            .filter(sign_in_challenge::Column::ExpiresAt.lte(crate::times::from_ms(now_ms)))
             .exec(&self.connection)
             .await
             .context("clearing old sign in challenges")?;
@@ -227,7 +230,7 @@ impl Database {
         sign_in_challenge::ActiveModel {
             user_id: Set(user_id),
             token_hash: Set(token_hash(&token)),
-            expires_ms: Set(now_ms + CHALLENGE_LIFETIME_MS),
+            expires_at: Set(crate::times::from_ms(now_ms + CHALLENGE_LIFETIME_MS)),
             ..Default::default()
         }
         .insert(&self.connection)
@@ -240,7 +243,7 @@ impl Database {
     pub async fn sign_in_challenge_user(&self, token: &str, now_ms: i64) -> Result<Option<User>> {
         let challenge = sign_in_challenge::Entity::find()
             .filter(sign_in_challenge::Column::TokenHash.eq(token_hash(token)))
-            .filter(sign_in_challenge::Column::ExpiresMs.gt(now_ms))
+            .filter(sign_in_challenge::Column::ExpiresAt.gt(crate::times::from_ms(now_ms)))
             .one(&self.connection)
             .await
             .context("checking a sign in challenge")?;
@@ -248,7 +251,7 @@ impl Database {
             return Ok(None);
         };
         let row = load(&self.connection, challenge.user_id).await?;
-        Ok(row.filter(|row| row.disabled_ms.is_none()).map(User::from))
+        Ok(row.filter(|row| row.disabled_at.is_none()).map(User::from))
     }
 
     pub async fn end_sign_in_challenge(&self, token: &str) -> Result<()> {

@@ -16,15 +16,15 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/proxies"
   "configured": ["127.0.0.0/8", "::1/128"],
   "from_config": false,
   "decisions": [
-    { "id": 1, "address": "10.0.1.0/24", "trusted": true, "created_ms": 1793940265767 },
-    { "id": 2, "address": "cloudflare", "trusted": true, "created_ms": 1793940285797 }
+    { "id": 1, "address": "10.0.1.0/24", "trusted": true, "created_at": "2026-11-06T04:44:25.767Z" },
+    { "id": 2, "address": "cloudflare", "trusted": true, "created_at": "2026-11-06T04:44:45.797Z" }
   ],
   "waiting": [
     {
       "address": "10.0.2.14",
       "forwarded_for": "203.0.113.7",
-      "first_ms": 1793940265767,
-      "last_ms": 1793940285797,
+      "first_seen_at": "2026-11-06T04:44:25.767Z",
+      "last_seen_at": "2026-11-06T04:44:45.797Z",
       "requests": 12,
       "people": ["you@example.com"],
       "kind": "private",

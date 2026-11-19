@@ -344,7 +344,7 @@ async fn a_password_that_is_wrong_or_missing_shows_as_the_page_not_answering() {
     assert!(!presence.online);
     // It has never answered, so it has never been seen.
     let (_, host) = api(&server, "GET", &format!("/api/v1/hosts/{id}"), &Value::Null).await;
-    assert_eq!(host["last_seen_ms"], Value::Null, "{host}");
+    assert_eq!(host["last_seen_at"], Value::Null, "{host}");
 }
 
 #[tokio::test]
@@ -726,7 +726,7 @@ async fn two_hosts_can_each_have_a_check_of_the_same_name() {
     let (_, checks) = api(&server, "GET", "/api/v1/remote-checks", &Value::Null).await;
     for check in checks.as_array().unwrap() {
         assert_eq!(check["latest"]["up"], true, "{check}");
-        assert!(check["latest"]["ran_ms"].as_i64().unwrap() > 0, "{check}");
+        assert!(check["latest"]["ran_at"].is_string(), "{check}");
         let one = format!("/api/v1/remote-checks/{}", check["id"]);
         let (_, alone) = api(&server, "GET", &one, &Value::Null).await;
         assert_eq!(alone["latest"], check["latest"]);

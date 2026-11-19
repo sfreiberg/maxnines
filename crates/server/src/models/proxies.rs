@@ -17,7 +17,7 @@ impl From<proxy::Model> for Decision {
             id: row.id,
             address: row.address,
             trusted: row.trusted,
-            created_ms: row.created_ms,
+            created_at: row.created_at,
         }
     }
 }
@@ -80,7 +80,7 @@ impl Database {
                 let row = proxy::ActiveModel {
                     address: Set(address.to_string()),
                     trusted: Set(trusted),
-                    created_ms: Set(now_ms),
+                    created_at: Set(crate::times::from_ms(now_ms)),
                     ..Default::default()
                 }
                 .insert(&transaction)

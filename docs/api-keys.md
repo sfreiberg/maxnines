@@ -26,17 +26,17 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/api-keys
     "owner": "you@example.com",
     "role": "admin",
     "hint": "mxn_9689a740",
-    "created_ms": 1793940265767,
-    "expires_ms": 1793943865767,
-    "last_used_ms": 1793940285797,
+    "created_at": "2026-11-06T04:44:25.767Z",
+    "expires_at": "2026-11-06T05:44:25.767Z",
+    "last_used_at": "2026-11-06T04:44:45.797Z",
     "last_address": "192.168.0.20",
     "last_forwarded_for": null,
-    "revoked_ms": null
+    "revoked_at": null
   }
 ]
 ```
 
-`last_used_ms` is accurate to about a minute. `last_address` is where it was last used
+`last_used_at` is accurate to about a minute. `last_address` is where it was last used
 from, and `last_forwarded_for` what a proxy that isn't trusted said, unconfirmed.
 
 ## Add an API key
@@ -65,12 +65,12 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "role": "admin",
   "hint": "mxn_6ffd6467",
   "key": "mxn_6ffd6467588f1ad1cbdca9b9961ff4be70e64ef4ff330c805ee3015463c00357",
-  "created_ms": 1793940286623,
-  "expires_ms": 1793943886623,
-  "last_used_ms": null,
+  "created_at": "2026-11-06T04:44:46.623Z",
+  "expires_at": "2026-11-06T05:44:46.623Z",
+  "last_used_at": null,
   "last_address": null,
   "last_forwarded_for": null,
-  "revoked_ms": null
+  "revoked_at": null
 }
 ```
 

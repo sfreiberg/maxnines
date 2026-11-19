@@ -15,6 +15,7 @@ use crate::app_state::AppState;
 use crate::events::TimelineEvent;
 use crate::metric_charts::{self, Chart, MAX_SERIES};
 use crate::metrics::{self, METRICS, Metric, SeriesResult, ShowChart, TimeRange, Unit, now_ms};
+use crate::times::from_ms;
 
 const HOUR_MS: i64 = 3_600_000;
 
@@ -273,7 +274,7 @@ struct EventRow {
 fn event_row(event: TimelineEvent) -> EventRow {
     EventRow {
         id: event.id,
-        time: local_time(event.time_ms),
+        time: local_time(event.occurred_at),
         kind: event.kind.as_str(),
         kind_label: event.kind.label(),
         title: event.title,
@@ -397,7 +398,10 @@ async fn show(
         Ok(charts) => charts,
         Err(error) => return server_error(&error),
     };
-    let events = match state.timeline(&host.id, range.from_ms, range.to_ms).await {
+    let events = match state
+        .timeline(&host.id, from_ms(range.from_ms), from_ms(range.to_ms))
+        .await
+    {
         Ok(events) => events,
         Err(error) => return server_error(&error),
     };

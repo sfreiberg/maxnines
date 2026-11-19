@@ -28,6 +28,7 @@ use crate::remote_checks::{
     LOCAL_HOST_ID, LOCAL_HOSTNAME, RemoteCheck, RemoteCheckInput, SignIn, SignInWith,
 };
 use crate::silences::{ActiveSilences, SilenceInput};
+use crate::times::from_ms;
 
 const KINDS: [CheckKind; 14] = [
     CheckKind::Http,
@@ -652,7 +653,7 @@ fn ran_text(ran_ms: i64, now_ms: i64) -> String {
     if secs < 60 {
         format!("{secs} s ago")
     } else {
-        crate::times::ago(ran_ms as u64, now_ms as u64)
+        crate::times::ago(from_ms(ran_ms), from_ms(now_ms))
     }
 }
 
@@ -787,7 +788,7 @@ async fn page(
             tiles.push(Tile {
                 label: "Certificate",
                 value: format!("{days} day{}", if days == 1 { "" } else { "s" }),
-                note: format!("left, until about {}", super::local_date(until)),
+                note: format!("left, until about {}", super::local_date(from_ms(until))),
                 tone: if days < 14 { "bad" } else { "" },
             });
         }
@@ -807,7 +808,7 @@ async fn page(
             tiles.push(Tile {
                 label: "Domain",
                 value: format!("{days} day{}", if days == 1 { "" } else { "s" }),
-                note: format!("left, until about {}", super::local_date(until)),
+                note: format!("left, until about {}", super::local_date(from_ms(until))),
                 tone: if days < 30 { "bad" } else { "" },
             });
         }

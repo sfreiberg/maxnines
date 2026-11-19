@@ -14,7 +14,7 @@ pub struct Model {
     /// Which built-in rule it is, for one that ships with the server.
     pub built_in: Option<String>,
     /// When an upgrade last changed a built-in rule.
-    pub built_in_changed_ms: Option<i64>,
+    pub built_in_changed_at: Option<DateTimeUtc>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

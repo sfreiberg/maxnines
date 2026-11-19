@@ -174,7 +174,7 @@ impl RuleForm {
     fn from_saved(saved: &ConfigRule) -> Self {
         Self {
             built_in: saved.built_in.is_some(),
-            built_in_changed: saved.built_in_changed_ms.map(local_date),
+            built_in_changed: saved.built_in_changed_at.map(local_date),
             ..Self::from_rule(&saved.rule)
         }
     }
@@ -639,7 +639,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
             summary: summarize(&rule.rule.settings),
             systems: systems_label(&rule.rule.operating_systems),
             built_in: rule.built_in.is_some(),
-            built_in_changed: rule.built_in_changed_ms.map(local_date),
+            built_in_changed: rule.built_in_changed_at.map(local_date),
             description: rule
                 .rule
                 .condition

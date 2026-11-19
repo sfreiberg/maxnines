@@ -96,8 +96,8 @@ impl From<Alert> for AlertRow {
             id: alert.id,
             acknowledged_by: alert.acknowledged_by,
             severity: alert.severity.as_str(),
-            started: local_time(alert.started_ms),
-            resolved: alert.resolved_ms.map(local_time),
+            started: local_time(alert.started_at),
+            resolved: alert.resolved_at.map(local_time),
             reason: alert.resolved_summary.or(alert.resolve_reason),
             short_id: if alert.host_id == FLEET_HOST_ID || alert.host_id == LOCAL_HOST_ID {
                 String::new()
@@ -129,7 +129,7 @@ impl From<DeliveryProblem> for ProblemRow {
         Self {
             event: problem.event.as_str(),
             failed: problem.state == "failed",
-            created: local_time(problem.created_ms),
+            created: local_time(problem.created_at),
             channel: problem.channel,
             summary: problem.summary,
             attempts: problem.attempts,
@@ -183,7 +183,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
         .map(|alert| {
             let silence = silences
                 .covering(&alert)
-                .map(|cover| local_time(cover.ends_ms()));
+                .map(|cover| local_time(cover.ends_at()));
             AlertRow {
                 silenced_until: silence,
                 chart: alert.rule_id.is_some_and(|id| charted.contains(&id)),
@@ -223,7 +223,7 @@ async fn show(
     let asked = RangeParams {
         range: params
             .range
-            .or_else(|| Some(range_reaching(alert.started_ms, now).to_string())),
+            .or_else(|| Some(range_reaching(alert.started_at.timestamp_millis(), now).to_string())),
     };
     let (selected, _, length_ms) = selected_range(&asked);
     let Some(range) = time_range(length_ms) else {
@@ -264,14 +264,14 @@ async fn show(
             &levels,
         );
         let moments = [
-            Some((alert.started_ms, EventKind::Alert)),
-            alert.resolved_ms.map(|time| (time, EventKind::Resolved)),
+            Some((alert.started_at, EventKind::Alert)),
+            alert.resolved_at.map(|time| (time, EventKind::Resolved)),
         ];
         let events: Vec<TimelineEvent> = moments
             .into_iter()
             .flatten()
-            .map(|(time_ms, kind)| TimelineEvent {
-                time_ms,
+            .map(|(occurred_at, kind)| TimelineEvent {
+                occurred_at,
                 kind,
                 title: alert.rule_name.clone(),
                 detail: None,

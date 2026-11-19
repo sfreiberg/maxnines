@@ -937,7 +937,7 @@ mod health {
         let server = start().await;
         let long_ago = now_ms() - 120_000;
         let mut stale = ServerStatus::new(None).unwrap();
-        stale.started_ms = long_ago;
+        stale.started_at = crate::times::from_ms(long_ago);
         let mut state = server.state.clone();
         state.status = Arc::new(stale);
         state
@@ -4742,12 +4742,15 @@ async fn a_key_can_be_short_lived() {
     )
     .await;
 
-    let expires = created["expires_ms"].as_i64().unwrap();
+    let expires = crate::times::parse_moment(created["expires_at"].as_str().unwrap()).unwrap();
     let hour = 3_600_000;
-    assert!((expires - now_ms() - hour).abs() < 5000, "{created}");
+    assert!(
+        (expires.timestamp_millis() - now_ms() - hour).abs() < 5000,
+        "{created}"
+    );
 
     let forever = new_key(&server, json!({ "name": "ci" })).await;
-    assert!(forever["expires_ms"].is_null(), "{forever}");
+    assert!(forever["expires_at"].is_null(), "{forever}");
 }
 
 #[tokio::test]
@@ -4760,7 +4763,7 @@ async fn a_key_that_has_run_out_is_refused() {
             "old",
             server.user_id().await,
             crate::roles::Role::Admin,
-            Some(now_ms() - 1000),
+            Some(crate::times::from_ms(now_ms() - 1000)),
             now_ms() - 5000,
         )
         .await

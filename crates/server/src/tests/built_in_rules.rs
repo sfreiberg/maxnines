@@ -122,7 +122,7 @@ async fn an_upgrade_brings_its_changes_to_built_in_rules_but_never_to_peoples_ow
     let mac = rule_named(&server, "macOS").await;
     assert!(!mac.rule.enabled, "turning it off outlasts the upgrade");
     assert_eq!(mac.rule.settings["collectors"]["sensors"]["enabled"], true);
-    assert!(mac.built_in_changed_ms.is_some());
+    assert!(mac.built_in_changed_at.is_some());
     let theirs = rule_named(&server, "Linux (yours)").await;
     assert_eq!(theirs.built_in, None);
     assert_eq!(theirs.rule.settings, json!({ "interval_secs": 9 }));
@@ -182,7 +182,7 @@ async fn an_unchanged_default_rule_becomes_the_built_in_one_and_a_changed_one_st
     assert_eq!(rules[0].id, default.id);
     assert_eq!(rules[0].built_in.as_deref(), Some("default"));
     assert_eq!(
-        rules[0].built_in_changed_ms, None,
+        rules[0].built_in_changed_at, None,
         "adopting it isn't a change"
     );
 

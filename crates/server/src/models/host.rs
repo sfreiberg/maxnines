@@ -11,8 +11,8 @@ pub struct Model {
     pub hostname: String,
     pub state: String,
     pub decided_by: Option<String>,
-    pub first_seen_ms: i64,
-    pub decided_ms: Option<i64>,
+    pub first_seen_at: DateTimeUtc,
+    pub decided_at: Option<DateTimeUtc>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

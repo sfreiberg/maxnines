@@ -93,7 +93,7 @@ fn with_rule(rules: &[ConfigRule], id: Option<i64>, rule: &RuleInput) -> Vec<Con
     proposed.push(ConfigRule {
         id: id.unwrap_or(NEW_RULE_ID),
         built_in: replaced.and_then(|saved| saved.built_in.clone()),
-        built_in_changed_ms: None,
+        built_in_changed_at: None,
         rule: rule.clone(),
     });
     proposed.sort_by_key(|saved| (saved.rule.priority, saved.built_in.is_none(), saved.id));
@@ -345,7 +345,7 @@ mod tests {
         ConfigRule {
             id,
             built_in: None,
-            built_in_changed_ms: None,
+            built_in_changed_at: None,
             rule: input(name, priority, condition, settings),
         }
     }

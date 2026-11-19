@@ -26,6 +26,7 @@ use crate::alerting::{
 use crate::audit::{Action, Kind, Record, Snapshot, Subject};
 use crate::calculations::Calculation;
 use crate::channels;
+use crate::times::{self, Timestamp};
 
 const PENDING: &str = "pending";
 const SENT: &str = "sent";
@@ -225,13 +226,13 @@ fn to_alert(row: alert::Model) -> Result<Alert> {
         series: row.series,
         value: row.value,
         summary: row.summary,
-        started_ms: row.started_ms,
-        breached_ms: row.breached_ms,
-        resolved_ms: row.resolved_ms,
+        started_at: row.started_at,
+        breached_at: row.breached_at,
+        resolved_at: row.resolved_at,
         resolve_reason: row.resolve_reason,
         resolved_summary: row.resolved_summary,
         acknowledged_by: row.acknowledged_by,
-        acknowledged_ms: row.acknowledged_ms,
+        acknowledged_at: row.acknowledged_at,
     })
 }
 
@@ -303,10 +304,10 @@ fn queued(alert_id: i64, channel_id: i64, event: Event, now_ms: i64) -> notifica
         event: Set(event.as_str().to_string()),
         state: Set(PENDING.to_string()),
         attempts: Set(0),
-        next_attempt_ms: Set(now_ms),
+        next_attempt_at: Set(times::from_ms(now_ms)),
         last_error: Set(None),
-        created_ms: Set(now_ms),
-        sent_ms: Set(None),
+        created_at: Set(times::from_ms(now_ms)),
+        sent_at: Set(None),
         external_id: Set(None),
         action_run_id: Set(None),
         ..Default::default()
@@ -340,7 +341,7 @@ pub(super) async fn queue_action_output<C: ConnectionTrait>(
         .collect();
     let channels = notification_channel::Entity::find()
         .filter(notification_channel::Column::Id.is_in(told))
-        .filter(notification_channel::Column::DeletedMs.is_null())
+        .filter(notification_channel::Column::DeletedAt.is_null())
         .order_by_asc(notification_channel::Column::Id)
         .all(connection)
         .await
@@ -372,7 +373,7 @@ impl Database {
     /// Sorted by name.
     pub async fn list_alert_rules(&self) -> Result<Vec<AlertRule>> {
         let rows = alert_rule::Entity::find()
-            .filter(alert_rule::Column::DeletedMs.is_null())
+            .filter(alert_rule::Column::DeletedAt.is_null())
             .order_by_asc(alert_rule::Column::Name)
             .all(&self.connection)
             .await
@@ -481,7 +482,7 @@ impl Database {
         Ok(rows
             .into_iter()
             .map(|row| {
-                let name = match row.deleted_ms {
+                let name = match row.deleted_at {
                     Some(_) => format!("{} (deleted)", row.name),
                     None => row.name,
                 };
@@ -507,7 +508,7 @@ impl Database {
         };
         let open = alert::Entity::find()
             .filter(alert::Column::RuleId.eq(id))
-            .filter(alert::Column::ResolvedMs.is_null())
+            .filter(alert::Column::ResolvedAt.is_null())
             .all(&transaction)
             .await
             .context("loading alerts")?;
@@ -519,7 +520,7 @@ impl Database {
         }
         silence::Entity::delete_many()
             .filter(silence::Column::RuleId.eq(id))
-            .filter(silence::Column::EndsMs.gt(now_ms))
+            .filter(silence::Column::EndsAt.gt(times::from_ms(now_ms)))
             .exec(&transaction)
             .await
             .context("deleting the rule's silences")?;
@@ -529,7 +530,10 @@ impl Database {
             .await
             .context("deleting the rule's maintenance windows")?;
         alert_rule::Entity::update_many()
-            .col_expr(alert_rule::Column::DeletedMs, Expr::value(now_ms))
+            .col_expr(
+                alert_rule::Column::DeletedAt,
+                Expr::value(times::from_ms(now_ms)),
+            )
             .filter(alert_rule::Column::Id.eq(id))
             .exec(&transaction)
             .await
@@ -552,7 +556,7 @@ impl Database {
     /// Sorted by name.
     pub async fn list_channels(&self) -> Result<Vec<Channel>> {
         let rows = notification_channel::Entity::find()
-            .filter(notification_channel::Column::DeletedMs.is_null())
+            .filter(notification_channel::Column::DeletedAt.is_null())
             .order_by_asc(notification_channel::Column::Name)
             .all(&self.connection)
             .await
@@ -613,7 +617,10 @@ impl Database {
             .await
             .context("deleting the channel from rules")?;
         notification_channel::Entity::update_many()
-            .col_expr(notification_channel::Column::DeletedMs, Expr::value(now_ms))
+            .col_expr(
+                notification_channel::Column::DeletedAt,
+                Expr::value(times::from_ms(now_ms)),
+            )
             .filter(notification_channel::Column::Id.eq(id))
             .exec(&transaction)
             .await
@@ -628,7 +635,7 @@ impl Database {
 /// A rule that hasn't been deleted.
 async fn load_alert_rule<C: ConnectionTrait>(connection: &C, id: i64) -> Result<Option<AlertRule>> {
     let Some(row) = alert_rule::Entity::find_by_id(id)
-        .filter(alert_rule::Column::DeletedMs.is_null())
+        .filter(alert_rule::Column::DeletedAt.is_null())
         .one(connection)
         .await
         .context("loading alert rule")?
@@ -702,7 +709,7 @@ async fn record_alert_rule<C: ConnectionTrait>(
 /// A channel that hasn't been deleted.
 async fn load_channel<C: ConnectionTrait>(connection: &C, id: i64) -> Result<Option<Channel>> {
     let row = notification_channel::Entity::find_by_id(id)
-        .filter(notification_channel::Column::DeletedMs.is_null())
+        .filter(notification_channel::Column::DeletedAt.is_null())
         .one(connection)
         .await
         .context("loading channel")?;
@@ -770,11 +777,14 @@ async fn resolve_in<C: ConnectionTrait>(
     summary: Option<&str>,
 ) -> Result<()> {
     let result = alert::Entity::update_many()
-        .col_expr(alert::Column::ResolvedMs, Expr::value(now_ms))
+        .col_expr(
+            alert::Column::ResolvedAt,
+            Expr::value(times::from_ms(now_ms)),
+        )
         .col_expr(alert::Column::ResolveReason, Expr::value(reason))
         .col_expr(alert::Column::ResolvedSummary, Expr::value(summary))
         .filter(alert::Column::Id.eq(id))
-        .filter(alert::Column::ResolvedMs.is_null())
+        .filter(alert::Column::ResolvedAt.is_null())
         .exec(connection)
         .await
         .context("resolving alert")?;
@@ -814,8 +824,8 @@ impl Database {
     /// Newest first.
     pub async fn open_alerts(&self) -> Result<Vec<Alert>> {
         let rows = alert::Entity::find()
-            .filter(alert::Column::ResolvedMs.is_null())
-            .order_by_desc(alert::Column::StartedMs)
+            .filter(alert::Column::ResolvedAt.is_null())
+            .order_by_desc(alert::Column::StartedAt)
             .order_by_desc(alert::Column::Id)
             .all(&self.connection)
             .await
@@ -826,8 +836,8 @@ impl Database {
     /// The newest alerts that have ended.
     pub async fn resolved_alerts(&self, limit: u64) -> Result<Vec<Alert>> {
         let rows = alert::Entity::find()
-            .filter(alert::Column::ResolvedMs.is_not_null())
-            .order_by_desc(alert::Column::StartedMs)
+            .filter(alert::Column::ResolvedAt.is_not_null())
+            .order_by_desc(alert::Column::StartedAt)
             .order_by_desc(alert::Column::Id)
             .limit(limit)
             .all(&self.connection)
@@ -848,13 +858,13 @@ impl Database {
             series: Set(new.series.clone()),
             value: Set(new.value),
             summary: Set(new.summary.clone()),
-            started_ms: Set(new.started_ms),
-            breached_ms: Set(new.breached_ms),
-            resolved_ms: Set(None),
+            started_at: Set(new.started_at),
+            breached_at: Set(new.breached_at),
+            resolved_at: Set(None),
             resolve_reason: Set(None),
             resolved_summary: Set(None),
             acknowledged_by: Set(None),
-            acknowledged_ms: Set(None),
+            acknowledged_at: Set(None),
             ..Default::default()
         };
 
@@ -868,7 +878,14 @@ impl Database {
 
         let rows: Vec<_> = hearing
             .into_iter()
-            .map(|channel| queued(id, channel, Event::Firing, new.started_ms))
+            .map(|channel| {
+                queued(
+                    id,
+                    channel,
+                    Event::Firing,
+                    new.started_at.timestamp_millis(),
+                )
+            })
             .collect();
         if !rows.is_empty() {
             notification::Entity::insert_many(rows)
@@ -894,7 +911,7 @@ impl Database {
         };
         let transaction = self.connection.begin().await.context("saving alert")?;
         let Some(alert) = alert::Entity::find_by_id(change.alert_id)
-            .filter(alert::Column::ResolvedMs.is_null())
+            .filter(alert::Column::ResolvedAt.is_null())
             .one(&transaction)
             .await
             .context("loading alert")?
@@ -918,7 +935,10 @@ impl Database {
         if worse {
             update = update
                 .col_expr(alert::Column::AcknowledgedBy, Expr::value(None::<String>))
-                .col_expr(alert::Column::AcknowledgedMs, Expr::value(None::<i64>));
+                .col_expr(
+                    alert::Column::AcknowledgedAt,
+                    Expr::value(None::<Timestamp>),
+                );
         }
         update.exec(&transaction).await.context("saving alert")?;
 
@@ -1002,7 +1022,7 @@ impl Database {
         }
         let rows = notification_channel::Entity::find()
             .filter(notification_channel::Column::Id.is_in(wanted))
-            .filter(notification_channel::Column::DeletedMs.is_null())
+            .filter(notification_channel::Column::DeletedAt.is_null())
             .all(&self.connection)
             .await
             .context("loading channels")?;
@@ -1017,7 +1037,7 @@ impl Database {
         alert::Entity::update_many()
             .col_expr(alert::Column::Summary, Expr::value(summary))
             .filter(alert::Column::Id.eq(id))
-            .filter(alert::Column::ResolvedMs.is_null())
+            .filter(alert::Column::ResolvedAt.is_null())
             .exec(&self.connection)
             .await
             .context("rewording alert")?;
@@ -1066,7 +1086,7 @@ impl Database {
             .to_owned();
         let due = notification::Entity::find()
             .filter(notification::Column::State.eq(PENDING))
-            .filter(notification::Column::NextAttemptMs.lte(now_ms))
+            .filter(notification::Column::NextAttemptAt.lte(times::from_ms(now_ms)))
             .filter(Expr::not_exists(waiting_behind_another))
             .order_by_asc(notification::Column::Id)
             .limit(limit as u64)
@@ -1134,7 +1154,7 @@ impl Database {
                     id: row.id,
                     event: Event::parse(&row.event)?,
                     attempts: row.attempts,
-                    created_ms: row.created_ms,
+                    created_at: row.created_at,
                     alert: alerts.get(&row.alert_id).context("missing alert")?.clone(),
                     channel: channels
                         .get(&row.channel_id)
@@ -1162,7 +1182,7 @@ impl Database {
     pub async fn acknowledge_alert(&self, id: i64, by: &str, now_ms: i64) -> Result<bool> {
         let transaction = self.connection.begin().await.context("saving alert")?;
         let firing = alert::Entity::find_by_id(id)
-            .filter(alert::Column::ResolvedMs.is_null())
+            .filter(alert::Column::ResolvedAt.is_null())
             .one(&transaction)
             .await
             .context("loading alert")?;
@@ -1171,9 +1191,12 @@ impl Database {
         };
         let updated = alert::Entity::update_many()
             .col_expr(alert::Column::AcknowledgedBy, Expr::value(by))
-            .col_expr(alert::Column::AcknowledgedMs, Expr::value(now_ms))
+            .col_expr(
+                alert::Column::AcknowledgedAt,
+                Expr::value(times::from_ms(now_ms)),
+            )
             .filter(alert::Column::Id.eq(id))
-            .filter(alert::Column::AcknowledgedMs.is_null())
+            .filter(alert::Column::AcknowledgedAt.is_null())
             .exec(&transaction)
             .await
             .context("saving alert")?;
@@ -1189,7 +1212,7 @@ impl Database {
     pub async fn unacknowledge_alert(&self, id: i64) -> Result<bool> {
         let transaction = self.connection.begin().await.context("saving alert")?;
         let firing = alert::Entity::find_by_id(id)
-            .filter(alert::Column::ResolvedMs.is_null())
+            .filter(alert::Column::ResolvedAt.is_null())
             .one(&transaction)
             .await
             .context("loading alert")?;
@@ -1198,12 +1221,15 @@ impl Database {
         };
         alert::Entity::update_many()
             .col_expr(alert::Column::AcknowledgedBy, Expr::value(None::<String>))
-            .col_expr(alert::Column::AcknowledgedMs, Expr::value(None::<i64>))
+            .col_expr(
+                alert::Column::AcknowledgedAt,
+                Expr::value(None::<Timestamp>),
+            )
             .filter(alert::Column::Id.eq(id))
             .exec(&transaction)
             .await
             .context("saving alert")?;
-        if firing.acknowledged_ms.is_some() {
+        if firing.acknowledged_at.is_some() {
             let entry = Record::new(Action::Unacknowledged, alert_subject(&firing));
             record(&transaction, entry).await?;
         }
@@ -1215,7 +1241,7 @@ impl Database {
     pub async fn alerts_to_remind(&self) -> Result<Vec<(Alert, i64)>> {
         let rules: BTreeMap<i64, i64> = alert_rule::Entity::find()
             .filter(alert_rule::Column::RemindEverySecs.is_not_null())
-            .filter(alert_rule::Column::DeletedMs.is_null())
+            .filter(alert_rule::Column::DeletedAt.is_null())
             .all(&self.connection)
             .await
             .context("loading alert rules")?
@@ -1228,8 +1254,8 @@ impl Database {
 
         let rows = alert::Entity::find()
             .filter(alert::Column::RuleId.is_in(rules.keys().copied()))
-            .filter(alert::Column::ResolvedMs.is_null())
-            .filter(alert::Column::AcknowledgedMs.is_null())
+            .filter(alert::Column::ResolvedAt.is_null())
+            .filter(alert::Column::AcknowledgedAt.is_null())
             .all(&self.connection)
             .await
             .context("loading alerts")?;
@@ -1256,10 +1282,10 @@ impl Database {
         let mut waiting = BTreeSet::new();
         for row in rows {
             let key = (row.alert_id, row.channel_id);
-            match row.sent_ms {
+            match row.sent_at {
                 Some(sent) => {
                     let last = last_told.entry(key).or_default();
-                    *last = std::cmp::max(sent, *last);
+                    *last = std::cmp::max(sent.timestamp_millis(), *last);
                 }
                 None if row.state != FAILED => {
                     waiting.insert(key);
@@ -1316,7 +1342,7 @@ impl Database {
             .column(alert::Column::Id)
             .from(alert::Entity)
             .and_where(alert::Column::Id.eq(delivery.alert.id))
-            .and_where(alert::Column::ResolvedMs.is_null())
+            .and_where(alert::Column::ResolvedAt.is_null())
             .to_owned();
         let held = notification::Entity::update_many()
             .col_expr(notification::Column::State, Expr::value(HELD))
@@ -1396,10 +1422,11 @@ impl Database {
     /// Lets held notifications go. The day they get to arrive starts now, however long
     /// they waited.
     pub async fn release_deliveries(&self, ids: &[i64], now_ms: i64) -> Result<()> {
+        let now = times::from_ms(now_ms);
         notification::Entity::update_many()
             .col_expr(notification::Column::State, Expr::value(PENDING))
-            .col_expr(notification::Column::NextAttemptMs, Expr::value(now_ms))
-            .col_expr(notification::Column::CreatedMs, Expr::value(now_ms))
+            .col_expr(notification::Column::NextAttemptAt, Expr::value(now))
+            .col_expr(notification::Column::CreatedAt, Expr::value(now))
             .filter(notification::Column::Id.is_in(ids.iter().copied()))
             .exec(&self.connection)
             .await
@@ -1418,7 +1445,10 @@ impl Database {
         notification::Entity::update_many()
             .col_expr(notification::Column::State, Expr::value(SENT))
             .col_expr(notification::Column::Attempts, Expr::value(attempts))
-            .col_expr(notification::Column::SentMs, Expr::value(now_ms))
+            .col_expr(
+                notification::Column::SentAt,
+                Expr::value(times::from_ms(now_ms)),
+            )
             .col_expr(
                 notification::Column::ExternalId,
                 Expr::value(external_id.map(String::from)),
@@ -1431,19 +1461,19 @@ impl Database {
         Ok(())
     }
 
-    /// Tries again at `next_attempt_ms`, or gives up if there's no such time.
+    /// Tries again at `next_attempt_at`, or gives up if there's no such time.
     pub async fn delivery_failed(
         &self,
         id: i64,
         attempts: i32,
         error: &str,
-        next_attempt_ms: Option<i64>,
+        next_attempt_at: Option<Timestamp>,
     ) -> Result<()> {
         let mut update = notification::Entity::update_many()
             .col_expr(notification::Column::Attempts, Expr::value(attempts))
             .col_expr(notification::Column::LastError, Expr::value(error));
-        update = match next_attempt_ms {
-            Some(time) => update.col_expr(notification::Column::NextAttemptMs, Expr::value(time)),
+        update = match next_attempt_at {
+            Some(time) => update.col_expr(notification::Column::NextAttemptAt, Expr::value(time)),
             None => update.col_expr(notification::Column::State, Expr::value(FAILED)),
         };
         update
@@ -1502,7 +1532,7 @@ impl Database {
                     state: row.state,
                     attempts: row.attempts,
                     error: row.last_error.unwrap_or_default(),
-                    created_ms: row.created_ms,
+                    created_at: row.created_at,
                 })
             })
             .collect()

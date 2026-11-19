@@ -248,13 +248,13 @@ pub(crate) mod testing {
             series: "CPU".to_string(),
             value: Some(97.0),
             summary: "CPU usage on web-1 is 97%, above 90%".to_string(),
-            started_ms: 1_000,
-            breached_ms: 1_000,
-            resolved_ms: None,
+            started_at: crate::times::from_ms(1_000),
+            breached_at: crate::times::from_ms(1_000),
+            resolved_at: None,
             resolve_reason: None,
             resolved_summary: None,
             acknowledged_by: None,
-            acknowledged_ms: None,
+            acknowledged_at: None,
         }
     }
 
@@ -280,7 +280,7 @@ pub(crate) mod testing {
             run_on: "first".to_string(),
             variables: BTreeMap::from([("disk".to_string(), "/var".to_string())]),
             requested_by: None,
-            requested_ms: 2_000,
+            requested_at: crate::times::from_ms(2_000),
             timeout_secs: 30,
             outcome: Some(ActionOutcome::Succeeded),
             exit_code: None,
@@ -288,7 +288,7 @@ pub(crate) mod testing {
             output: output.to_string(),
             truncated: false,
             duration_ms: Some(1_500),
-            finished_ms: Some(3_500),
+            finished_at: Some(crate::times::from_ms(3_500)),
         };
         Notice {
             id: 4,

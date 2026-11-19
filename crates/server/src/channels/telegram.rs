@@ -8,7 +8,7 @@ use super::{
     ChannelType, Response, alerts_link, blocking, chart_part, explain_http, post, post_form,
 };
 use crate::alerting::{Channel, ChannelInput, Event};
-use crate::notifier::{Notice, Senders, format_ms};
+use crate::notifier::{Notice, Senders, format_utc};
 use crate::registration::short_id;
 use crate::remote_checks::FLEET_HOST_ID;
 
@@ -100,7 +100,7 @@ fn text(notice: &Notice, web_url: Option<&str>) -> String {
     lines.push(format!(
         "Rule: {} · {place} · Started: {}",
         clip(&alert.rule_name),
-        format_ms(alert.started_ms)
+        format_utc(alert.started_at)
     ));
     if let Some(fired) = notice.fired_summary() {
         lines.push(format!("When it fired: {}", clip(fired)));
@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn a_resolved_telegram_message_says_why() {
         let alert = Alert {
-            resolved_ms: Some(61_000),
+            resolved_at: Some(crate::times::from_ms(61_000)),
             resolve_reason: Some("The problem cleared".to_string()),
             resolved_summary: None,
             ..alert()

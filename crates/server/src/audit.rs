@@ -17,6 +17,8 @@ use std::net::IpAddr;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::times::Timestamp;
+
 /// What a secret is recorded as, in place of its value.
 pub const HIDDEN: &str = "hidden";
 
@@ -469,10 +471,8 @@ pub fn changes(before: Option<&Snapshot>, after: Option<&Snapshot>) -> Vec<Chang
 }
 
 /// A time as a snapshot keeps it: UTC, readable, and in an order that sorts.
-pub fn time(ms: i64) -> Value {
-    chrono::DateTime::from_timestamp_millis(ms).map_or(Value::from(ms), |time| {
-        Value::from(time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
-    })
+pub fn time(time: Timestamp) -> Value {
+    Value::from(time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
 /// Something to add to the log.
@@ -555,7 +555,7 @@ pub struct EntrySubject {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Entry {
     pub id: i64,
-    pub time_ms: i64,
+    pub occurred_at: Timestamp,
     pub actor: EntryActor,
     pub via: Option<EntryVia>,
     /// The address the request came from.
@@ -697,7 +697,10 @@ mod tests {
 
     #[test]
     fn times_are_kept_readable() {
-        assert_eq!(time(0), json!("1970-01-01T00:00:00Z"));
+        assert_eq!(
+            time(crate::times::from_ms(0)),
+            json!("1970-01-01T00:00:00Z")
+        );
     }
 
     #[test]

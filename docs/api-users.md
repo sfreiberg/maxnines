@@ -53,9 +53,9 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/sign-ins
     "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "address": "192.168.0.20",
     "forwarded_for": null,
-    "signed_in_ms": 1793940265767,
-    "last_used_ms": 1793940285797,
-    "expires_ms": 1796532265767,
+    "signed_in_at": "2026-11-06T04:44:25.767Z",
+    "last_used_at": "2026-11-06T04:44:45.797Z",
+    "expires_at": "2026-12-06T04:44:25.767Z",
     "current": false
   }
 ]
@@ -69,10 +69,10 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/sign-ins
 | `user_agent` | Everything a browser last said about itself, up to 255 characters. `null` for apps and keys |
 | `address` | Where it was last used from. Behind a proxy, the address the proxy passed on once the proxy is [trusted](proxies.md), and otherwise the proxy's own |
 | `forwarded_for` | The address a proxy that isn't trusted said it was passing on, so unconfirmed. `null` otherwise |
-| `expires_ms` | When it stops working unless it's used. `null` for a key that never expires |
+| `expires_at` | When it stops working unless it's used. `null` for a key that never expires |
 | `current` | Whether it's the browser asking |
 
-`last_used_ms` is accurate to about a minute, or to the moment the address changed.
+`last_used_at` is accurate to about a minute, or to the moment the address changed.
 
 ## End a sign-in
 
@@ -104,9 +104,9 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/users"
     "theme": "carbon",
     "time_zone": "Europe/London",
     "has_password": true,
-    "created_ms": 1793977895109,
-    "last_sign_in_ms": 1793978000000,
-    "disabled_ms": null
+    "created_at": "2026-11-06T15:11:35.109Z",
+    "last_sign_in_at": "2026-11-06T15:13:20Z",
+    "disabled_at": null
   }
 ]
 ```
@@ -137,9 +137,9 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
     "time_zone": "UTC",
     "has_password": false,
     "two_factor": false,
-    "created_ms": 1793977895109,
-    "last_sign_in_ms": null,
-    "disabled_ms": null
+    "created_at": "2026-11-06T15:11:35.109Z",
+    "last_sign_in_at": null,
+    "disabled_at": null
   },
   "setup_url": "http://localhost:9000/setup/8f3a…"
 }

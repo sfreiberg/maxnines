@@ -10,7 +10,7 @@ use super::{Database, audit_entry};
 use crate::audit::{
     self, Action, Change, Entry, EntryActor, EntrySubject, EntryVia, Kind, Record, Snapshot, Via,
 };
-use crate::metrics::now_ms;
+use crate::times;
 
 /// The longest name kept, in characters, as the columns allow.
 const MAX_NAME_CHARS: usize = 255;
@@ -25,7 +25,7 @@ pub(super) async fn record<C: ConnectionTrait>(connection: &C, record: Record) -
     let acting = audit::current();
     let actor = record.actor.unwrap_or(acting.actor);
     let row = audit_entry::ActiveModel {
-        time_ms: Set(now_ms()),
+        occurred_at: Set(times::now()),
         actor_kind: Set(actor.kind().to_string()),
         actor_id: Set(actor.id()),
         actor_name: Set(clip(&actor.name(), MAX_NAME_CHARS)),
@@ -72,7 +72,7 @@ fn to_entry(row: audit_entry::Model) -> Entry {
     let changes: Vec<Change> = serde_json::from_str(&row.changes).unwrap_or_default();
     Entry {
         id: row.id,
-        time_ms: row.time_ms,
+        occurred_at: row.occurred_at,
         actor: EntryActor {
             kind: row.actor_kind,
             id: row.actor_id,

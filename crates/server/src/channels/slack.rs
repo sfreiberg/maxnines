@@ -28,7 +28,7 @@ use tracing::warn;
 
 use super::{CHART_FILE, ChannelType};
 use crate::alerting::{Channel, ChannelInput, Event};
-use crate::notifier::{Notice, Senders, Tone, format_ms};
+use crate::notifier::{Notice, Senders, Tone, format_utc};
 use crate::registration::short_id;
 use crate::remote_checks::FLEET_HOST_ID;
 
@@ -130,7 +130,7 @@ fn text(notice: &Notice, web_url: Option<&str>) -> String {
                 short_id(&alert.host_id)
             )
         },
-        format!("Started: {}", format_ms(alert.started_ms)),
+        format!("Started: {}", format_utc(alert.started_at)),
     ];
     if let Some(url) = web_url {
         details.push(format!("<{url}/alerts|View alerts>"));
@@ -195,7 +195,7 @@ fn buttons(notice: &Notice, controls: Option<&SlackControls>) -> Vec<SlackAction
         notice.event,
         Event::Firing | Event::Escalated | Event::Eased | Event::Reminder
     );
-    if !firing || alert.resolved_ms.is_some() {
+    if !firing || alert.resolved_at.is_some() {
         return Vec::new();
     }
     let button = |action: &str, label: &str| {
@@ -710,7 +710,7 @@ mod tests {
         );
 
         let resolved = Alert {
-            resolved_ms: Some(2_000),
+            resolved_at: Some(crate::times::from_ms(2_000)),
             ..alert()
         };
         let shown = content(

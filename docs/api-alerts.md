@@ -23,13 +23,13 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/alerts"
       "series": "",
       "value": 97.2,
       "summary": "High CPU on web-1",
-      "started_ms": 1793940279545,
-      "breached_ms": 1793939979545,
-      "resolved_ms": null,
+      "started_at": "2026-11-06T04:44:39.545Z",
+      "breached_at": "2026-11-06T04:39:39.545Z",
+      "resolved_at": null,
       "resolve_reason": null,
       "resolved_summary": null,
       "acknowledged_by": null,
-      "acknowledged_ms": null,
+      "acknowledged_at": null,
       "silence_id": null,
       "maintenance_window_id": null
     }
@@ -38,9 +38,9 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/alerts"
 }
 ```
 
-`started_ms` is when the alert fired, and `breached_ms` when its problem began, such
+`started_at` is when the alert fired, and `breached_at` when its problem began, such
 as when a host went offline. An alert fires once its rule's condition has held for the
-rule's `for_secs`, so `breached_ms` is that much earlier, or more, as checks run on a
+rule's `for_secs`, so `breached_at` is that much earlier, or more, as checks run on a
 schedule. It's when the page says the problem has lasted since.
 
 `silence_id` is the ID of the silence keeping an open alert's notifications back, and
@@ -71,7 +71,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
     "state": "pending",
     "attempts": 3,
     "error": "the webhook returned status 500",
-    "created_ms": 1793940279545
+    "created_at": "2026-11-06T04:44:39.545Z"
   }
 ]
 ```
@@ -112,7 +112,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
     {
       "name": "/",
       "points": [
-        { "time_ms": 1793940270000, "avg": 83.9, "min": 83.9, "max": 83.9 }
+        { "occurred_at": "2026-11-06T04:44:30Z", "avg": 83.9, "min": 83.9, "max": 83.9 }
       ]
     }
   ],

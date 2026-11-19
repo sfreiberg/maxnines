@@ -19,6 +19,7 @@ use serde::Serialize;
 
 use crate::config::parse_network;
 use crate::controllers::agent_socket::client_ip;
+use crate::times::{Timestamp, from_ms};
 
 /// The most proxies waiting for a decision that are kept, so a busy network can't
 /// grow the list for ever.
@@ -191,7 +192,7 @@ pub struct Decision {
     pub address: String,
     /// Whether it's a proxy to believe, or something that isn't a proxy at all.
     pub trusted: bool,
-    pub created_ms: i64,
+    pub created_at: Timestamp,
 }
 
 /// An address that's passed on forwarded addresses without being trusted.
@@ -200,8 +201,8 @@ pub struct Seen {
     pub address: IpAddr,
     /// The last address it said it was passing on.
     pub forwarded_for: IpAddr,
-    pub first_ms: i64,
-    pub last_ms: i64,
+    pub first_seen_at: Timestamp,
+    pub last_seen_at: Timestamp,
     /// How many signed-in requests came through it.
     pub requests: u64,
     /// Who came through it, by email address: the first few.
@@ -317,7 +318,7 @@ impl Proxies {
         if !seen.contains_key(&peer) && seen.len() >= MAX_SEEN {
             let oldest = seen
                 .values()
-                .min_by_key(|seen| seen.last_ms)
+                .min_by_key(|seen| seen.last_seen_at)
                 .map(|seen| seen.address);
             if let Some(oldest) = oldest {
                 seen.remove(&oldest);
@@ -326,8 +327,8 @@ impl Proxies {
         let entry = seen.entry(peer).or_insert_with(|| Seen {
             address: peer,
             forwarded_for,
-            first_ms: now_ms,
-            last_ms: now_ms,
+            first_seen_at: from_ms(now_ms),
+            last_seen_at: from_ms(now_ms),
             requests: 0,
             people: BTreeSet::new(),
             kind: kind_of(&peer),
@@ -335,7 +336,7 @@ impl Proxies {
             suggested: suggested_range(&peer),
         });
         entry.forwarded_for = forwarded_for;
-        entry.last_ms = now_ms;
+        entry.last_seen_at = from_ms(now_ms);
         entry.requests += 1;
         if entry.people.len() < MAX_PEOPLE {
             entry.people.insert(person.to_string());
@@ -349,7 +350,7 @@ impl Proxies {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let mut all: Vec<Seen> = seen.values().cloned().collect();
-        all.sort_by_key(|seen| std::cmp::Reverse(seen.last_ms));
+        all.sort_by_key(|seen| std::cmp::Reverse(seen.last_seen_at));
         all
     }
 }
@@ -451,7 +452,7 @@ mod tests {
             id,
             address: address.to_string(),
             trusted,
-            created_ms: 0,
+            created_at: crate::times::from_ms(0),
         }
     }
 

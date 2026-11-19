@@ -17,7 +17,7 @@ A run looks like this, with `outcome` empty until the agent answers:
 | `run_on` | `first`, `warning` or `critical` for an alert's, and `manual` for a person's |
 | `variables` | What it was given, by name |
 | `requested_by` | Who asked, for one a person started |
-| `requested_ms`, `finished_ms` | When it was asked for, and when the answer came |
+| `requested_at`, `finished_at` | When it was asked for, and when the answer came |
 | `timeout_secs` | How long it was given |
 | `outcome` | `succeeded`, `failed`, `timed_out`, `not_defined` if the host has no such action, or `refused` if it wasn't run, as when the host isn't connected |
 | `exit_code` | What a command exited with |

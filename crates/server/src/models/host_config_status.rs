@@ -7,7 +7,7 @@ pub struct Model {
     pub host_id: String,
     pub version: String,
     pub error: Option<String>,
-    pub reported_ms: i64,
+    pub reported_at: DateTimeUtc,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

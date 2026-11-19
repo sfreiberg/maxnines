@@ -86,7 +86,7 @@ pub fn role_choices(up_to: Role) -> Vec<RoleChoice> {
 }
 
 fn row(user: User, you: Option<i64>) -> UserRow {
-    let status = if user.disabled_ms.is_some() {
+    let status = if user.disabled_at.is_some() {
         "Disabled"
     } else if user.has_password {
         "Active"
@@ -94,8 +94,8 @@ fn row(user: User, you: Option<i64>) -> UserRow {
         "Invited"
     };
     UserRow {
-        last_sign_in: user.last_sign_in_ms.map(local_time),
-        disabled: user.disabled_ms.is_some(),
+        last_sign_in: user.last_sign_in_at.map(local_time),
+        disabled: user.disabled_at.is_some(),
         is_you: you == Some(user.id),
         role: user.role.as_str(),
         two_factor: user.two_factor,

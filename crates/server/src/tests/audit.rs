@@ -421,8 +421,8 @@ async fn an_agent_asking_to_join_is_recorded_as_maxnines() {
         hostname: "web-1".into(),
         state: HostState::Pending,
         decided_by: None,
-        first_seen_ms: 0,
-        decided_ms: None,
+        first_seen_at: crate::times::from_ms(0),
+        decided_at: None,
     };
 
     server.state.database.save_host(&record).await.unwrap();

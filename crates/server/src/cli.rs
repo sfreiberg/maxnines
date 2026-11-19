@@ -23,7 +23,7 @@ use crate::models::{
 };
 use crate::notifier::web_url;
 use crate::roles::Role;
-use crate::times::format_time;
+use crate::times::format_moment;
 
 /// Where scripts and these commands find a key for the running server's API.
 const API_KEY_VARIABLE: &str = "MAXNINES_API_KEY";
@@ -175,7 +175,7 @@ pub fn print_facts_history(config: &Config, id: &str) -> Result<()> {
         println!("no facts reported yet");
     }
     for (time, changes) in describe_history(&history) {
-        println!("{}", format_time(time, Tz::UTC));
+        println!("{}", format_moment(time, Tz::UTC));
         for change in changes {
             println!("  {change}");
         }
@@ -236,7 +236,7 @@ pub fn print_api_keys(config: &Config) -> Result<()> {
         "ID", "KEY", "STATE", "EXPIRES", "OWNER", "ROLE"
     );
     for key in keys {
-        let state = if key.revoked_ms.is_some() {
+        let state = if key.revoked_at.is_some() {
             "revoked"
         } else if key.has_expired(now) {
             "expired"
@@ -248,9 +248,8 @@ pub fn print_api_keys(config: &Config) -> Result<()> {
             key.id,
             format!("{}...", key.hint),
             state,
-            key.expires_ms
-                .and_then(|time| u64::try_from(time).ok())
-                .map_or_else(|| "never".to_string(), |time| format_time(time, Tz::UTC)),
+            key.expires_at
+                .map_or_else(|| "never".to_string(), |time| format_moment(time, Tz::UTC)),
             key.owner,
             key.role.as_str(),
             key.name,
@@ -270,7 +269,7 @@ pub fn create_api_key(
     let name = name.trim();
     check_api_key_name(name)?;
     let now = now_ms();
-    let expires_ms = expires_in
+    let expires_at = expires_in
         .map(|time| expiry_after(time.as_secs(), now))
         .transpose()?;
     let (_, key) = with_database(config, |database| async move {
@@ -280,7 +279,7 @@ pub fn create_api_key(
             .with_context(|| format!("no user who can sign in has the address {owner}"))?;
         let role = role.unwrap_or(owner.role);
         database
-            .create_api_key(name, owner.id, role, expires_ms, now)
+            .create_api_key(name, owner.id, role, expires_at, now)
             .await
     })?;
 
@@ -306,7 +305,7 @@ pub fn print_users(config: &Config) -> Result<()> {
         |database| async move { database.list_users().await },
     )?;
     for user in users {
-        let status = if user.disabled_ms.is_some() {
+        let status = if user.disabled_at.is_some() {
             "disabled"
         } else if user.has_password {
             "active"

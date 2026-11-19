@@ -9,8 +9,8 @@ pub struct Model {
     pub name: String,
     pub value: String,
     pub value_type: String,
-    pub valid_from_ms: i64,
-    pub valid_to_ms: Option<i64>,
+    pub valid_from: DateTimeUtc,
+    pub valid_to: Option<DateTimeUtc>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -15,6 +15,7 @@ use crate::host_filter::HostFilter;
 use crate::maintenance::MaintenanceWindow;
 use crate::models::Database;
 use crate::remote_checks::FLEET_HOST_ID;
+use crate::times::{Timestamp, from_ms};
 
 const MAX_REASON_CHARS: usize = 255;
 const MAX_FILTER_CHARS: usize = 500;
@@ -34,8 +35,8 @@ pub struct Silence {
     pub all_alerts: bool,
     pub reason: String,
     pub created_by: String,
-    pub starts_ms: i64,
-    pub ends_ms: i64,
+    pub starts_at: Timestamp,
+    pub ends_at: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -142,14 +143,14 @@ pub fn check_filter(filter: &str) -> Result<()> {
 /// What's keeping an alert's notifications back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cover {
-    Silence { id: i64, ends_ms: i64 },
-    Window { id: i64, ends_ms: i64 },
+    Silence { id: i64, ends_at: Timestamp },
+    Window { id: i64, ends_at: Timestamp },
 }
 
 impl Cover {
-    pub fn ends_ms(self) -> i64 {
+    pub fn ends_at(self) -> Timestamp {
         match self {
-            Self::Silence { ends_ms, .. } | Self::Window { ends_ms, .. } => ends_ms,
+            Self::Silence { ends_at, .. } | Self::Window { ends_at, .. } => ends_at,
         }
     }
 }
@@ -205,19 +206,19 @@ impl ActiveSilences {
         let silences = silences.into_iter().filter_map(|silence| {
             let cover = Cover::Silence {
                 id: silence.id,
-                ends_ms: silence.ends_ms,
+                ends_at: silence.ends_at,
             };
             Quiet::new(cover, silence.rule_id, &silence.filter, &silence.series)
         });
         let windows = windows.into_iter().filter_map(|window| {
             let cover = Cover::Window {
                 id: window.id,
-                ends_ms: window.ends_at(now_ms)?,
+                ends_at: from_ms(window.ends_at(now_ms)?),
             };
             Quiet::new(cover, window.window.rule_id, &window.window.filter, "")
         });
         let mut quiet: Vec<Quiet> = silences.chain(windows).collect();
-        quiet.sort_by_key(|entry| std::cmp::Reverse(entry.cover.ends_ms()));
+        quiet.sort_by_key(|entry| std::cmp::Reverse(entry.cover.ends_at()));
 
         let names: BTreeSet<&str> = quiet
             .iter()

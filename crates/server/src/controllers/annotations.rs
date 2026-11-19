@@ -18,6 +18,7 @@ use crate::events::EventInput;
 use crate::host_filter;
 use crate::maintenance::moment;
 use crate::metrics::now_ms;
+use crate::times::{self, Timestamp};
 
 /// How far back the list goes.
 const LIST_DAYS: i64 = 30;
@@ -68,11 +69,11 @@ async fn page(
     form: &AnnotationForm,
     error: Option<&str>,
 ) -> Response {
-    let now = now_ms();
-    let since = now - LIST_DAYS * TimeDelta::days(1).num_milliseconds();
+    let now = times::now();
+    let since = now - TimeDelta::days(LIST_DAYS);
     let annotations = match state
         .database
-        .list_events(since, now + 3_600_000, LIST_LIMIT)
+        .list_events(since, now + TimeDelta::hours(1), LIST_LIMIT)
         .await
     {
         Ok(annotations) => annotations,
@@ -82,7 +83,7 @@ async fn page(
         .into_iter()
         .map(|annotation| AnnotationRow {
             id: annotation.id,
-            time: local_time(annotation.time_ms),
+            time: local_time(annotation.occurred_at),
             kind: annotation.kind.as_str(),
             kind_label: annotation.kind.label(),
             title: annotation.title,
@@ -117,7 +118,7 @@ async fn index(
 }
 
 /// A time from the form, in the viewer's time zone.
-fn when(text: &str) -> Result<Option<i64>, String> {
+fn when(text: &str) -> Result<Option<Timestamp>, String> {
     let text = text.trim();
     if text.is_empty() {
         return Ok(None);
@@ -125,7 +126,7 @@ fn when(text: &str) -> Result<Option<i64>, String> {
     let local = NaiveDateTime::parse_from_str(text, FORM_TIME)
         .map_err(|_| "Give the time as a date and time, or leave it empty for now.".to_string())?;
     moment(viewer_zone(), local.date(), local.time())
-        .map(Some)
+        .map(|time| Some(times::from_ms(time)))
         .ok_or_else(|| "That time doesn't exist in your time zone.".to_string())
 }
 
@@ -138,7 +139,7 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
         filter: text("filter"),
         when: text("when"),
     };
-    let time_ms = match when(&filled.when) {
+    let occurred_at = match when(&filled.when) {
         Ok(time) => time,
         Err(error) => return page(&state, &form.token, &filled, Some(&error)).await,
     };
@@ -146,7 +147,7 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
         kind: Some(filled.kind.clone()),
         title: filled.title.clone(),
         detail: Some(filled.detail.clone()),
-        time_ms,
+        occurred_at,
         filter: Some(filled.filter.clone()),
     };
     match state.record_event(input, &recorded_by(), now_ms()).await {
@@ -192,7 +193,7 @@ async fn create_for_host(
         kind: text("kind"),
         title: text("title").unwrap_or_default(),
         detail: text("detail"),
-        time_ms: None,
+        occurred_at: None,
         filter: Some(host_filter::only(&host.id)),
     };
     match state.record_event(input, &recorded_by(), now_ms()).await {

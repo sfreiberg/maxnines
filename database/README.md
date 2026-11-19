@@ -22,8 +22,10 @@ These diagrams have to change with every change to a table.
 ## Main database
 
 Every line is a foreign key the database enforces. Types are shown simply:
-`string` has a length limit, `text` doesn't, and every time ending `_ms` is
-milliseconds since 1970 in UTC.
+`string` has a length limit, `text` doesn't, and every `timestamp` is a moment in UTC to
+the millisecond: `timestamptz` on PostgreSQL, `DATETIME(3)` on MySQL and MariaDB, and ISO
+8601 text such as `2026-11-19T01:57:17.828+00:00` on SQLite, which has no type for it
+and sorts it as text. A length of time ending `_ms` or `_secs` is a number.
 
 ```mermaid
 erDiagram
@@ -60,8 +62,8 @@ erDiagram
         string hostname
         string state "pending, approved or revoked"
         text decided_by
-        int first_seen_ms
-        int decided_ms
+        timestamp first_seen_at
+        timestamp decided_at
     }
     metrics_pages {
         int id PK
@@ -82,18 +84,18 @@ erDiagram
         string name "like os.family"
         string value
         string value_type
-        int valid_from_ms
-        int valid_to_ms "empty while current"
+        timestamp valid_from
+        timestamp valid_to "empty while current"
     }
     host_config_status {
         string host_id PK, FK
         string version
         text error
-        int reported_ms
+        timestamp reported_at
     }
     host_boots {
         string host_id PK, FK
-        int boot_ms
+        timestamp booted_at
     }
     alert_rules {
         int id PK
@@ -116,7 +118,7 @@ erDiagram
         int remind_every_secs
         int forecast_secs
         int warning_forecast_secs
-        int deleted_ms "kept so alerts can name it"
+        timestamp deleted_at "kept so alerts can name it"
     }
     alerts {
         int id PK
@@ -128,13 +130,13 @@ erDiagram
         string series
         double value
         text summary
-        int started_ms "when it fired"
-        int breached_ms "when the problem began"
-        int resolved_ms "empty while open"
+        timestamp started_at "when it fired"
+        timestamp breached_at "when the problem began"
+        timestamp resolved_at "empty while open"
         text resolve_reason
         text resolved_summary
         string acknowledged_by
-        int acknowledged_ms
+        timestamp acknowledged_at
     }
     notification_channels {
         int id PK
@@ -153,7 +155,7 @@ erDiagram
         string request_method
         string request_content_type
         text request_body
-        int deleted_ms "kept so notifications can name it"
+        timestamp deleted_at "kept so notifications can name it"
     }
     alert_rule_channels {
         int rule_id PK, FK
@@ -175,7 +177,7 @@ erDiagram
         string run_on "first, warning, critical or manual"
         text variables "JSON, what it was given"
         string requested_by
-        int requested_ms
+        timestamp requested_at
         int timeout_secs
         string outcome "empty while waiting"
         int exit_code
@@ -183,7 +185,7 @@ erDiagram
         text output "what it printed"
         boolean truncated
         int duration_ms
-        int finished_ms
+        timestamp finished_at
     }
     notifications {
         int id PK
@@ -192,10 +194,10 @@ erDiagram
         string event
         string state "pending, sent or failed"
         int attempts
-        int next_attempt_ms
+        timestamp next_attempt_at
         text last_error
-        int created_ms
-        int sent_ms
+        timestamp created_at
+        timestamp sent_at
         string external_id
         int action_run_id "the run it's about, for what an action printed"
     }
@@ -206,8 +208,8 @@ erDiagram
         string series "the one series it's for, or empty"
         string reason
         string created_by
-        int starts_ms
-        int ends_ms
+        timestamp starts_at
+        timestamp ends_at
     }
     maintenance_windows {
         int id PK
@@ -239,7 +241,7 @@ erDiagram
     dashboards {
         int id PK
         string name
-        int created_ms
+        timestamp created_at
     }
     dashboard_widgets {
         int id PK
@@ -274,21 +276,21 @@ erDiagram
         string theme
         string time_zone
         string setup_token_hash UK
-        int setup_expires_ms
+        timestamp setup_expires_at
         string totp_secret
         boolean totp_enabled
         int totp_last_step
-        int created_ms
-        int last_sign_in_ms
-        int disabled_ms
+        timestamp created_at
+        timestamp last_sign_in_at
+        timestamp disabled_at
     }
     user_sessions {
         int id PK
         int user_id FK
         string token_hash UK
-        int created_ms
-        int expires_ms
-        int last_used_ms
+        timestamp created_at
+        timestamp expires_at
+        timestamp last_used_at
         string last_address
         string user_agent
         string last_forwarded_for
@@ -300,12 +302,12 @@ erDiagram
         string hint
         string token_hash UK
         string role
-        int created_ms
-        int expires_ms
-        int last_used_ms
+        timestamp created_at
+        timestamp expires_at
+        timestamp last_used_at
         string last_address
         string last_forwarded_for
-        int revoked_ms
+        timestamp revoked_at
     }
     app_sign_ins {
         int id PK
@@ -314,28 +316,28 @@ erDiagram
         string device
         string role
         string access_hash UK
-        int access_expires_ms
+        timestamp access_expires_at
         string refresh_hash UK
         string previous_refresh_hash
-        int rotated_ms
-        int refresh_expires_ms
-        int created_ms
-        int last_used_ms
+        timestamp rotated_at
+        timestamp refresh_expires_at
+        timestamp created_at
+        timestamp last_used_at
         string last_address
         string last_forwarded_for
-        int revoked_ms
+        timestamp revoked_at
     }
     recovery_codes {
         int id PK
         int user_id FK
         string code_hash
-        int used_ms
+        timestamp used_at
     }
     sign_in_challenges {
         int id PK
         int user_id FK
         string token_hash UK
-        int expires_ms
+        timestamp expires_at
     }
 ```
 
@@ -347,13 +349,13 @@ they're settings:
 erDiagram
     events {
         int id PK
-        int time_ms
+        timestamp occurred_at
         string kind "deploy, note or restart"
         string title
         text detail
         string filter "which hosts"
         string created_by
-        int created_ms
+        timestamp created_at
     }
     location_rules {
         int id PK
@@ -394,7 +396,7 @@ erDiagram
     }
     audit_log {
         int id PK
-        int time_ms
+        timestamp occurred_at
         string actor_kind
         string actor_id
         string actor_name
@@ -413,7 +415,7 @@ erDiagram
         int id PK
         string address UK "an address, a range or a provider"
         bool trusted
-        int created_ms
+        timestamp created_at
     }
     server_settings {
         string name PK

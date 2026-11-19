@@ -42,7 +42,7 @@ use crate::remote_checks::{LatestResults, RemoteCheck, RemoteCheckInput, SignInW
 use crate::roles::Role;
 use crate::rule_engine::{self, ResolvedConfig};
 use crate::silences::{ActiveSilences, Cover, SilenceInput};
-use crate::times::zone_named;
+use crate::times::{self, Timestamp, millis, zone_named};
 
 /// An agent as admins see it.
 #[derive(Debug, Serialize, Deserialize)]
@@ -51,7 +51,13 @@ pub struct HostView {
     pub host: HostRecord,
     pub online: bool,
     pub health: Health,
-    pub last_seen_ms: Option<u64>,
+    pub last_seen_at: Option<Timestamp>,
+}
+
+/// When the server last heard from a host, which presence keeps in milliseconds.
+fn last_seen_at(presence: Option<HostPresence>) -> Option<Timestamp> {
+    let ms = presence?.last_seen_ms?;
+    Some(times::from_ms(i64::try_from(ms).ok()?))
 }
 
 /// Facts come in two kinds. `trusted` is what the server knows for itself, and
@@ -471,7 +477,7 @@ async fn create_api_key(State(state): State<AppState>, Json(input): Json<NewApiK
         return refused(&error);
     }
     let now = now_ms();
-    let expires_ms = match input.expires_in_secs.map(|secs| expiry_after(secs, now)) {
+    let expires_at = match input.expires_in_secs.map(|secs| expiry_after(secs, now)) {
         Some(Ok(expires)) => Some(expires),
         Some(Err(error)) => return refused(&error),
         None => None,
@@ -489,7 +495,7 @@ async fn create_api_key(State(state): State<AppState>, Json(input): Json<NewApiK
     }
     match state
         .database
-        .create_api_key(name, owner.id, role, expires_ms, now)
+        .create_api_key(name, owner.id, role, expires_at, now)
         .await
     {
         Ok((details, key)) => {
@@ -634,7 +640,7 @@ async fn list(State(state): State<AppState>, Query(params): Query<ListParams>) -
             HostView {
                 online: reach == Reach::Online,
                 health: Health::of(reach, mine),
-                last_seen_ms: presence.and_then(|p| p.last_seen_ms),
+                last_seen_at: last_seen_at(presence),
                 host,
             }
         })
@@ -656,7 +662,7 @@ async fn show_host(State(state): State<AppState>, UrlPath(id): UrlPath<String>) 
     Json(HostView {
         online: reach == Reach::Online,
         health: Health::of(reach, &mine),
-        last_seen_ms: presence.and_then(|p| p.last_seen_ms),
+        last_seen_at: last_seen_at(presence),
         host,
     })
     .into_response()
@@ -1535,25 +1541,31 @@ const MAX_EVENTS: u64 = 1000;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EventParams {
-    from_ms: Option<i64>,
-    to_ms: Option<i64>,
+    #[serde(
+        default,
+        deserialize_with = "crate::times::optional_moment::deserialize"
+    )]
+    from: Option<Timestamp>,
+    #[serde(
+        default,
+        deserialize_with = "crate::times::optional_moment::deserialize"
+    )]
+    to: Option<Timestamp>,
     limit: Option<u64>,
 }
 
 impl EventParams {
-    fn span(&self, default_ms: i64) -> (i64, i64) {
-        let to_ms = self.to_ms.unwrap_or_else(now_ms);
-        let from_ms = self
-            .from_ms
-            .unwrap_or_else(|| to_ms.saturating_sub(default_ms));
-        (from_ms, to_ms)
+    fn span(&self, default_ms: i64) -> (Timestamp, Timestamp) {
+        let to = self.to.unwrap_or_else(times::now);
+        let from = self.from.unwrap_or_else(|| to - millis(default_ms));
+        (from, to)
     }
 }
 
 async fn list_events(State(state): State<AppState>, Query(params): Query<EventParams>) -> Response {
-    let (from_ms, to_ms) = params.span(DEFAULT_EVENTS_MS);
+    let (from, to) = params.span(DEFAULT_EVENTS_MS);
     let limit = params.limit.unwrap_or(200).min(MAX_EVENTS);
-    match state.database.list_events(from_ms, to_ms, limit).await {
+    match state.database.list_events(from, to, limit).await {
         Ok(events) => Json(events).into_response(),
         Err(error) => server_error(&error),
     }
@@ -1596,8 +1608,8 @@ async fn host_events(
     if state.registry.get(&id).await.is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let (from_ms, to_ms) = params.span(24 * 3_600_000);
-    match state.timeline(&id, from_ms, to_ms).await {
+    let (from, to) = params.span(24 * 3_600_000);
+    match state.timeline(&id, from, to).await {
         Ok(events) => Json(events).into_response(),
         Err(error) => server_error(&error),
     }
@@ -1650,10 +1662,10 @@ async fn alert_series(
         Err(error) => return server_error(&error),
     };
     let to_ms = params.to_ms.unwrap_or_else(now_ms);
+    let started_ms = alert.started_at.timestamp_millis();
     let from_ms = params.from_ms.unwrap_or_else(|| {
-        let lead = to_ms.saturating_sub(alert.started_ms) / 4;
-        alert
-            .started_ms
+        let lead = to_ms.saturating_sub(started_ms) / 4;
+        started_ms
             .saturating_sub(lead)
             .min(to_ms.saturating_sub(DEFAULT_RANGE_MS))
     });
@@ -1743,7 +1755,7 @@ async fn run_action(
         run_on: crate::actions::RUN_BY_HAND.to_string(),
         variables: input.variables,
         requested_by: Some(super::recorded_by()),
-        requested_ms: now_ms(),
+        requested_at: times::now(),
         timeout_secs,
     };
     let run = async {
@@ -1969,7 +1981,7 @@ struct RemoteCheckView {
 #[derive(Debug, Serialize)]
 struct LatestCheck {
     up: bool,
-    ran_ms: i64,
+    ran_at: Timestamp,
     /// Why it was down.
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -1981,7 +1993,7 @@ impl RemoteCheckView {
             .latest(check.id)
             .map(|(result, ran_ms)| LatestCheck {
                 up: result["up"] == 1,
-                ran_ms,
+                ran_at: times::from_ms(ran_ms),
                 error: result["error"].as_str().map(String::from),
             });
         let input = check.input;

@@ -14,6 +14,7 @@ use crate::app_state::AppState;
 use crate::metrics::now_ms;
 use crate::models::{ApiKey, check_api_key_name, expiry_after};
 use crate::roles::Role;
+use crate::times::{self, millis};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -87,34 +88,31 @@ fn chosen_lifetime(value: &str) -> Option<Option<u64>> {
 }
 
 fn row(key: ApiKey, now_ms: i64) -> KeyRow {
-    let status = if key.revoked_ms.is_some() {
+    let status = if key.revoked_at.is_some() {
         "Revoked"
     } else if key.has_expired(now_ms) {
         "Expired"
     } else {
         "Active"
     };
+    let now = times::from_ms(now_ms);
     let usable = status == "Active";
-    let expiry = match key.expires_ms {
+    let expiry = match key.expires_at {
         None => "Never expires".to_string(),
-        Some(expires) if expires <= now_ms => format!("Expired {}", local_date(expires)),
+        Some(expires) if expires <= now => format!("Expired {}", local_date(expires)),
         Some(expires) => format!("Expires {}", local_date(expires)),
     };
-    let ago = |ms: i64| {
-        let (then, now) = (u64::try_from(ms).ok()?, u64::try_from(now_ms).ok()?);
-        Some(crate::times::ago(then, now))
-    };
     KeyRow {
-        created: local_date(key.created_ms),
-        created_at: local_time(key.created_ms),
+        created: local_date(key.created_at),
+        created_at: local_time(key.created_at),
         expiry,
-        expires_at: key.expires_ms.map(local_time),
+        expires_at: key.expires_at.map(local_time),
         expires_soon: usable
             && key
-                .expires_ms
-                .is_some_and(|expires| expires - now_ms <= EXPIRES_SOON_MS),
-        last_used: key.last_used_ms.and_then(ago),
-        last_used_at: key.last_used_ms.map(local_time),
+                .expires_at
+                .is_some_and(|expires| expires - now <= millis(EXPIRES_SOON_MS)),
+        last_used: key.last_used_at.map(|used| times::ago(used, now)),
+        last_used_at: key.last_used_at.map(local_time),
         status,
         usable,
         id: key.id,
@@ -191,7 +189,7 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
         return page(&state, &form.token, None, Some(error)).await;
     };
     let now = now_ms();
-    let expires_ms = match lifetime.map(|secs| expiry_after(secs, now)).transpose() {
+    let expires_at = match lifetime.map(|secs| expiry_after(secs, now)).transpose() {
         Ok(expires) => expires,
         Err(error) => return server_error(&error),
     };
@@ -210,7 +208,7 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
     };
     match state
         .database
-        .create_api_key(name, owner.id, role, expires_ms, now)
+        .create_api_key(name, owner.id, role, expires_at, now)
         .await
     {
         Ok((_, key)) => {
@@ -244,6 +242,7 @@ mod tests {
         assert_eq!(chosen_lifetime("soon"), None);
     }
 
+    /// A key, with when it expires and was revoked in milliseconds.
     fn key(expires_ms: Option<i64>, revoked_ms: Option<i64>) -> ApiKey {
         ApiKey {
             id: 1,
@@ -252,12 +251,12 @@ mod tests {
             owner: "a@example.com".to_string(),
             role: Role::Admin,
             hint: "mxn_".to_string(),
-            created_ms: 0,
-            expires_ms,
-            last_used_ms: None,
+            created_at: times::from_ms(0),
+            expires_at: expires_ms.map(times::from_ms),
+            last_used_at: None,
             last_address: None,
             last_forwarded_for: None,
-            revoked_ms,
+            revoked_at: revoked_ms.map(times::from_ms),
         }
     }
 
@@ -294,7 +293,7 @@ mod tests {
         assert!(!expired.expires_soon);
 
         let mut used = key(None, None);
-        used.last_used_ms = Some(now - 5 * 60_000);
+        used.last_used_at = Some(times::from_ms(now - 5 * 60_000));
         let used = row(used, now);
         assert_eq!(used.last_used.as_deref(), Some("5 minutes ago"));
         assert_eq!(

@@ -21,7 +21,7 @@ pub struct Model {
     pub request_content_type: Option<String>,
     pub request_body: Option<String>,
     /// When it was deleted. Its notifications keep pointing at it.
-    pub deleted_ms: Option<i64>,
+    pub deleted_at: Option<DateTimeUtc>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

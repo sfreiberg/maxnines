@@ -12,7 +12,7 @@ async-trait = "0.1"
 anyhow.workspace = true
 clap.workspace = true
 axum = { version = "0.8.9", features = ["ws"] }
-chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock", "serde"] }
 chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
 # Stay on DuckDB 1.5: 1.20000.x bundles a pre-release 2.0 with a development
 # storage format. Tilde because a minor bump changes the bundled DuckDB.
@@ -30,7 +30,7 @@ maxnines-checks.workspace = true
 maxnines-collectors.workspace = true
 maxnines-protocol.workspace = true
 ring.workspace = true
-sea-orm = { version = "2.0.4", default-features = false, features = ["macros", "runtime-tokio-rustls", "sqlx-mysql", "sqlx-postgres", "sqlx-sqlite"] }
+sea-orm = { version = "2.0.4", default-features = false, features = ["macros", "with-chrono", "runtime-tokio-rustls", "sqlx-mysql", "sqlx-postgres", "sqlx-sqlite"] }
 sea-orm-migration = { version = "2.0.4", default-features = false, features = ["runtime-tokio-rustls", "sqlx-mysql", "sqlx-postgres", "sqlx-sqlite"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http2", "ring", "tls12", "webpki-tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

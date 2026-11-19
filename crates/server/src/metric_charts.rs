@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::events::TimelineEvent;
 use crate::metrics::{Metric, Point, Series, SeriesResult, TimeRange, Unit};
-use crate::times::format_time;
+use crate::times::{format_moment, format_time};
 
 /// The chart palette has this many colors, and a chart shows no more series.
 pub const MAX_SERIES: usize = 8;
@@ -370,9 +370,11 @@ pub fn mark(chart: &mut Chart, events: &[TimelineEvent], range: TimeRange, zone:
     let room = ((widest - TOOLTIP_PADDING) / TOOLTIP_CHAR_WIDTH) as usize;
     chart.markers = events
         .iter()
-        .filter(|event| (range.from_ms..=range.to_ms).contains(&event.time_ms))
+        .filter(|event| {
+            (range.from_ms..=range.to_ms).contains(&event.occurred_at.timestamp_millis())
+        })
         .map(|event| {
-            let x = x_for(event.time_ms, range, frame);
+            let x = x_for(event.occurred_at.timestamp_millis(), range, frame);
             let kind_label = event.kind.label();
             let room = room.saturating_sub(kind_label.chars().count() + 1);
             let mut title: String = event.title.chars().take(room).collect();
@@ -392,7 +394,7 @@ pub fn mark(chart: &mut Chart, events: &[TimelineEvent], range: TimeRange, zone:
             Marker {
                 x,
                 kind: event.kind.as_str(),
-                time: format_time(u64::try_from(event.time_ms).unwrap_or(0), zone),
+                time: format_moment(event.occurred_at, zone),
                 kind_label,
                 title,
                 hit_x: x - MARKER_REACH,
@@ -1088,7 +1090,7 @@ mod tests {
     fn events_are_marked_where_they_happened_and_only_in_range() {
         use crate::events::{EventKind, TimelineEvent};
         let event = |time_ms: i64, kind: EventKind| TimelineEvent {
-            time_ms,
+            occurred_at: crate::times::from_ms(time_ms),
             kind,
             title: "Deployed".into(),
             detail: None,
@@ -1120,7 +1122,7 @@ mod tests {
     fn what_an_event_was_fits_on_the_chart_wherever_it_happened() {
         use crate::events::{EventKind, TimelineEvent};
         let event = |time_ms: i64, title: &str| TimelineEvent {
-            time_ms,
+            occurred_at: crate::times::from_ms(time_ms),
             kind: EventKind::Restart,
             title: title.into(),
             detail: None,

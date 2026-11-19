@@ -13,13 +13,13 @@ pub struct Model {
     pub series: String,
     pub value: Option<f64>,
     pub summary: String,
-    pub started_ms: i64,
-    pub breached_ms: i64,
-    pub resolved_ms: Option<i64>,
+    pub started_at: DateTimeUtc,
+    pub breached_at: DateTimeUtc,
+    pub resolved_at: Option<DateTimeUtc>,
     pub resolve_reason: Option<String>,
     pub resolved_summary: Option<String>,
     pub acknowledged_by: Option<String>,
-    pub acknowledged_ms: Option<i64>,
+    pub acknowledged_at: Option<DateTimeUtc>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

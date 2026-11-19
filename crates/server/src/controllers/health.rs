@@ -60,7 +60,7 @@ struct Health {
 fn alerts_running(state: &AppState) -> bool {
     let status = &state.status;
     let last_pass = status.last_alert_pass_ms.load(Ordering::Relaxed);
-    now_ms() - last_pass.max(status.started_ms) < ALERTS_STALE_MS
+    now_ms() - last_pass.max(status.started_at.timestamp_millis()) < ALERTS_STALE_MS
 }
 
 async fn show(State(state): State<AppState>) -> Response {

@@ -111,7 +111,8 @@ async fn an_annotation_of_the_servers_own_kind_or_with_a_broken_filter_is_refuse
         json!({ "title": "Broken", "filter": "role=\"unclosed" }),
         json!({ "title": "Fake", "kind": "restart" }),
         json!({ "title": "" }),
-        json!({ "title": "Old", "time_ms": 1000 }),
+        json!({ "title": "Old", "occurred_at": "1970-01-01T00:00:01Z" }),
+        json!({ "title": "Vague", "occurred_at": "last Tuesday" }),
         json!({ "title": "Typo", "unknown": true }),
     ] {
         let (status, refusal) = api(&server, "POST", "/api/v1/annotations", &body).await;
@@ -128,15 +129,19 @@ async fn an_annotation_of_the_servers_own_kind_or_with_a_broken_filter_is_refuse
 async fn an_event_can_be_dated_when_it_happened() {
     let server = start().await;
     let (web, _client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
-    let earlier = now_ms() - 2 * 3_600_000;
+    let earlier = crate::times::from_ms(now_ms() - 2 * 3_600_000);
 
-    let body = json!({ "title": "Deployed before lunch", "kind": "deploy", "time_ms": earlier });
+    let body =
+        json!({ "title": "Deployed before lunch", "kind": "deploy", "occurred_at": earlier });
     let (status, _) = api(&server, "POST", "/api/v1/annotations", &body).await;
 
     assert_eq!(status, 201);
-    assert_eq!(timeline(&server, &web).await[0]["time_ms"], earlier);
+    assert_eq!(
+        timeline(&server, &web).await[0]["occurred_at"],
+        json!(earlier)
+    );
     let (_, listed) = api(&server, "GET", "/api/v1/annotations", &Value::Null).await;
-    assert_eq!(listed[0]["time_ms"], earlier);
+    assert_eq!(listed[0]["occurred_at"], json!(earlier));
 }
 
 #[tokio::test]
@@ -187,7 +192,10 @@ async fn a_restart_is_noticed_from_the_boot_time_and_a_backlog_is_not_one() {
     let second_boot = now_ms() / 1000 - 120;
     send(&mut client, &with_boot(second_boot)).await;
     let events = wait_for_kind(&server, &host, "restart").await;
-    assert_eq!(events[0]["time_ms"], second_boot * 1000);
+    assert_eq!(
+        events[0]["occurred_at"],
+        json!(crate::times::from_ms(second_boot * 1000))
+    );
     assert_eq!(events[0]["created_by"], Value::Null);
 
     // Samples kept from before the restart arrive after the live ones.
@@ -304,8 +312,8 @@ async fn alerts_and_updates_are_on_the_timeline_too() {
         series: "/".into(),
         value: Some(85.0),
         summary: "Disk usage of / is 85%".into(),
-        started_ms: started,
-        breached_ms: started,
+        started_at: crate::times::from_ms(started),
+        breached_at: crate::times::from_ms(started),
     };
     let alert = server.state.database.fire_alert(&new, &[]).await.unwrap();
     server
@@ -521,7 +529,7 @@ async fn the_annotations_tab_adds_one_for_a_filter_at_a_time_given() {
     let (_, listed) = api(
         &server,
         "GET",
-        "/api/v1/annotations?from_ms=0",
+        "/api/v1/annotations?from=1970-01-01T00:00:00Z",
         &Value::Null,
     )
     .await;
@@ -535,8 +543,8 @@ async fn the_annotations_tab_adds_one_for_a_filter_at_a_time_given() {
     )
     .earliest()
     .unwrap()
-    .timestamp_millis();
-    assert_eq!(listed[0]["time_ms"], expected);
+    .to_utc();
+    assert_eq!(listed[0]["occurred_at"], json!(expected));
 }
 
 #[tokio::test]

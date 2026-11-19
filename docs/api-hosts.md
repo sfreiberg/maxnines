@@ -29,16 +29,16 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
     "hostname": "web-1",
     "state": "approved",
     "decided_by": "you@example.com",
-    "first_seen_ms": 1793940264215,
-    "decided_ms": 1793940265752,
+    "first_seen_at": "2026-11-06T04:44:24.215Z",
+    "decided_at": "2026-11-06T04:44:25.752Z",
     "online": true,
     "health": "online",
-    "last_seen_ms": 1793940282225
+    "last_seen_at": "2026-11-06T04:44:42.225Z"
   }
 ]
 ```
 
-`last_seen_ms` is `null` for a host the server hasn't heard from since it started,
+`last_seen_at` is `null` for a host the server hasn't heard from since it started,
 which for one with no agent means none of its pages or checks has answered yet.
 
 ## Add a host without an agent
@@ -64,8 +64,8 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "hostname": "orders-db",
   "state": "approved",
   "decided_by": "you@example.com",
-  "first_seen_ms": 1793940264215,
-  "decided_ms": 1793940264215
+  "first_seen_at": "2026-11-06T04:44:24.215Z",
+  "decided_at": "2026-11-06T04:44:24.215Z"
 }
 ```
 
@@ -167,7 +167,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 `GET /api/v1/hosts/{id}/facts/history`
 
-Every value each fact has had, oldest first. `valid_to_ms` is empty for current values.
+Every value each fact has had, oldest first. `valid_to` is empty for current values.
 
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
@@ -179,8 +179,8 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
   {
     "name": "os.version",
     "value": "24.04",
-    "valid_from_ms": 1793940267223,
-    "valid_to_ms": null
+    "valid_from": "2026-11-06T04:44:27.223Z",
+    "valid_to": null
   }
 ]
 ```
@@ -212,7 +212,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "reported": {
     "version": "3810e917a2f5c7e9",
     "error": null,
-    "reported_ms": 1793940267263
+    "reported_at": "2026-11-06T04:44:27.263Z"
   }
 }
 ```
@@ -249,7 +249,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
     {
       "name": "CPU",
       "points": [
-        { "time_ms": 1793940270000, "avg": 19.4, "min": 19.4, "max": 19.4 }
+        { "occurred_at": "2026-11-06T04:44:30Z", "avg": 19.4, "min": 19.4, "max": 19.4 }
       ]
     }
   ],

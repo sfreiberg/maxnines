@@ -54,8 +54,8 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/silences
       "all_alerts": false,
       "reason": "Upgrading Postgres",
       "created_by": "you@example.com",
-      "starts_ms": 1793940279545,
-      "ends_ms": 1793947479545
+      "starts_at": "2026-11-06T04:44:39.545Z",
+      "ends_at": "2026-11-06T06:44:39.545Z"
     }
   ],
   "ended": []

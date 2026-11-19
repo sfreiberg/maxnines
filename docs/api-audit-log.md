@@ -23,7 +23,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 [
   {
     "id": 42,
-    "time_ms": 1794180214377,
+    "occurred_at": "2026-11-08T23:23:34.377Z",
     "actor": { "kind": "person", "id": "1", "name": "sam@example.com" },
     "via": { "kind": "api_key", "id": "3", "name": "Deploy job" },
     "source": "192.168.0.20",
@@ -37,7 +37,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
   },
   {
     "id": 41,
-    "time_ms": 1794180190012,
+    "occurred_at": "2026-11-08T23:23:10.012Z",
     "actor": { "kind": "person", "id": "1", "name": "sam@example.com" },
     "via": null,
     "source": "192.168.0.20",

@@ -15,19 +15,19 @@ pub struct Model {
     pub role: String,
     /// Only hashes are kept, so reading the database doesn't sign anything in.
     pub access_hash: String,
-    pub access_expires_ms: i64,
+    pub access_expires_at: DateTimeUtc,
     pub refresh_hash: String,
     /// The refresh token this one replaced, which still works for a moment.
     pub previous_refresh_hash: Option<String>,
-    pub rotated_ms: Option<i64>,
-    pub refresh_expires_ms: i64,
-    pub created_ms: i64,
-    pub last_used_ms: Option<i64>,
+    pub rotated_at: Option<DateTimeUtc>,
+    pub refresh_expires_at: DateTimeUtc,
+    pub created_at: DateTimeUtc,
+    pub last_used_at: Option<DateTimeUtc>,
     /// The address it was last used from.
     pub last_address: Option<String>,
     /// The address an untrusted proxy said it was passing on, so unconfirmed.
     pub last_forwarded_for: Option<String>,
-    pub revoked_ms: Option<i64>,
+    pub revoked_at: Option<DateTimeUtc>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

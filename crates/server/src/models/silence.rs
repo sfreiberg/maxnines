@@ -11,8 +11,8 @@ pub struct Model {
     pub series: String,
     pub reason: String,
     pub created_by: String,
-    pub starts_ms: i64,
-    pub ends_ms: i64,
+    pub starts_at: DateTimeUtc,
+    pub ends_at: DateTimeUtc,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

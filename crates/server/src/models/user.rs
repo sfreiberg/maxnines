@@ -17,10 +17,10 @@ pub struct Model {
     pub time_zone: String,
     /// The link for setting a password. Only the hash is kept.
     pub setup_token_hash: Option<String>,
-    pub setup_expires_ms: Option<i64>,
-    pub created_ms: i64,
-    pub last_sign_in_ms: Option<i64>,
-    pub disabled_ms: Option<i64>,
+    pub setup_expires_at: Option<DateTimeUtc>,
+    pub created_at: DateTimeUtc,
+    pub last_sign_in_at: Option<DateTimeUtc>,
+    pub disabled_at: Option<DateTimeUtc>,
     /// The secret shared with their authenticator app.
     pub totp_secret: Option<String>,
     pub totp_enabled: bool,

@@ -610,8 +610,8 @@ mod tests {
             hostname: hostname.to_string(),
             state: HostState::Approved,
             decided_by: None,
-            first_seen_ms: 0,
-            decided_ms: None,
+            first_seen_at: crate::times::from_ms(0),
+            decided_at: None,
         };
         let choices = host_choices(&[
             host("ffff00001111", "web"),

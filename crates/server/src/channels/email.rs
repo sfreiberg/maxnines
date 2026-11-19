@@ -8,7 +8,7 @@ use lettre::{Address, Message, SmtpTransport, Transport};
 
 use super::{ChannelType, SEND_TIMEOUT, blocking};
 use crate::alerting::{Channel, ChannelInput, Mail, MailSecurity, MailServer};
-use crate::notifier::{Notice, Senders, format_ms};
+use crate::notifier::{Notice, Senders, format_utc};
 use crate::remote_checks::FLEET_HOST_ID;
 
 pub(crate) const MAX_RECIPIENTS: usize = 20;
@@ -149,10 +149,10 @@ fn details(notice: &Notice) -> String {
         } else {
             format!("Host: {} ({})", alert.hostname, alert.host_id)
         },
-        format!("Started: {}", format_ms(alert.started_ms)),
+        format!("Started: {}", format_utc(alert.started_at)),
     ]);
-    if let Some(resolved) = alert.resolved_ms {
-        lines.push(format!("Resolved: {}", format_ms(resolved)));
+    if let Some(resolved) = alert.resolved_at {
+        lines.push(format!("Resolved: {}", format_utc(resolved)));
     }
     if let Some(fired) = notice.fired_summary() {
         lines.push(format!("When it fired: {fired}"));
@@ -387,7 +387,7 @@ mod tests {
     #[test]
     fn a_resolved_email_leads_with_where_things_stand_now() {
         let alert = Alert {
-            resolved_ms: Some(61_000),
+            resolved_at: Some(crate::times::from_ms(61_000)),
             resolve_reason: Some("The problem cleared".to_string()),
             resolved_summary: Some(
                 "CPU usage on web-1 is now 12%, no longer above 90%".to_string(),
@@ -410,7 +410,7 @@ mod tests {
     #[test]
     fn a_resolved_email_says_when_and_why() {
         let alert = Alert {
-            resolved_ms: Some(61_000),
+            resolved_at: Some(crate::times::from_ms(61_000)),
             resolve_reason: Some("The problem cleared".to_string()),
             resolved_summary: None,
             ..alert()

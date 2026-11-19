@@ -124,11 +124,11 @@ What a template can use:
 | `alert.hostname`, `alert.host_id` | The host |
 | `alert.series` | The disk, container or other series it's about, if any |
 | `alert.value`, `alert.summary` | The reading that started it, and what's wrong in words |
-| `alert.started`, `alert.resolved` | Times like `2026-11-10T14:03:00Z`, with `alert.started_ms` and `alert.resolved_ms` in milliseconds |
-| `alert.breached` | When the problem began, which is before it started by the rule's wait, with `alert.breached_ms` |
+| `alert.started`, `alert.resolved` | Times like `2026-11-10T14:03:00Z`, also as `alert.started_at` and `alert.resolved_at` to the millisecond |
+| `alert.breached` | When the problem began, which is before it started by the rule's wait, also as `alert.breached_at` |
 | `alert.resolve_reason` | Why it resolved, such as `The problem cleared` or the rule being deleted |
 | `alert.resolved_summary` | Where things stood as the problem cleared, like `CPU usage on web-1 is now 42%, no longer above 90%`. Empty when it resolved for another reason |
-| `alert.acknowledged_by`, `alert.acknowledged` | Who acknowledged it, if anyone, and `alert.acknowledged_ms` |
+| `alert.acknowledged_by`, `alert.acknowledged` | Who acknowledged it, if anyone, and `alert.acknowledged_at` |
 | `action.name`, `action.outcome` | For the event `action`: which of the alert's [actions](#what-actions-print) ran, and `succeeded`, `failed`, `timed_out`, `not_defined` or `refused`. `action` is missing for other events, so test for it with `{% if action %}` |
 | `action.output`, `action.truncated` | What it printed, up to 64 KiB, and whether that was cut |
 | `action.exit_code`, `action.error`, `action.duration_ms` | How it ended, where there's something to say |

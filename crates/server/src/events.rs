@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::host_filter::HostFilter;
+use crate::times::Timestamp;
 
 pub const MAX_TITLE_LEN: usize = 200;
 pub const MAX_DETAIL_LEN: usize = 2000;
@@ -87,8 +88,11 @@ pub struct EventInput {
     #[serde(default)]
     pub detail: Option<String>,
     /// When it happened. Defaults to now.
-    #[serde(default)]
-    pub time_ms: Option<i64>,
+    #[serde(
+        default,
+        deserialize_with = "crate::times::optional_moment::deserialize"
+    )]
+    pub occurred_at: Option<Timestamp>,
     /// Which hosts, as a host filter, matched whenever a chart is drawn. Empty means
     /// every host.
     #[serde(default)]
@@ -137,8 +141,9 @@ impl EventInput {
                 "Detail can be at most {MAX_DETAIL_LEN} characters."
             ));
         }
-        if let Some(time) = self.time_ms
-            && !(now_ms - LONGEST_AGO_MS..=now_ms + FURTHEST_AHEAD_MS).contains(&time)
+        if let Some(time) = self.occurred_at
+            && !(now_ms - LONGEST_AGO_MS..=now_ms + FURTHEST_AHEAD_MS)
+                .contains(&time.timestamp_millis())
         {
             return Err("An event's time has to be within the last year.".into());
         }
@@ -157,20 +162,20 @@ impl EventInput {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Event {
     pub id: i64,
-    pub time_ms: i64,
+    pub occurred_at: Timestamp,
     pub kind: EventKind,
     pub title: String,
     pub detail: Option<String>,
     pub filter: String,
     pub created_by: String,
-    pub created_ms: i64,
+    pub created_at: Timestamp,
 }
 
 /// One thing on a host's timeline, from wherever it came from. Only those that were
 /// recorded have an `id`, and only they can be deleted.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TimelineEvent {
-    pub time_ms: i64,
+    pub occurred_at: Timestamp,
     pub kind: EventKind,
     pub title: String,
     pub detail: Option<String>,
@@ -242,7 +247,7 @@ mod tests {
     #[test]
     fn an_event_can_be_recorded_late_but_not_far_off() {
         let at = |time_ms| EventInput {
-            time_ms: Some(time_ms),
+            occurred_at: Some(crate::times::from_ms(time_ms)),
             ..input("x")
         };
         assert!(at(NOW - 30 * DAY_MS).check(NOW).is_ok());

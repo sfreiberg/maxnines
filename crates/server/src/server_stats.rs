@@ -25,12 +25,13 @@ use crate::presence::Reach;
 use crate::registration::{HostRecord, HostState};
 use crate::remote_checks::{LOCAL_HOST_ID, LOCAL_HOSTNAME};
 use crate::store::{NewSample, StoreStats, WriteCounts, WriterCommand};
+use crate::times::{self, Timestamp};
 
 const HOUR_MS: i64 = 3_600_000;
 
 /// What's kept between requests, and what background work reports back.
 pub struct ServerStatus {
-    pub started_ms: i64,
+    pub started_at: Timestamp,
     pub writes: Arc<WriteCounts>,
     /// How many alerts are firing, for the navigation on every page.
     pub firing: AtomicUsize,
@@ -48,7 +49,7 @@ impl ServerStatus {
         let mut system = System::new().context("reading system information")?;
         system.refresh_cpu_list(CpuRefreshKind::nothing());
         Ok(Self {
-            started_ms: now_ms(),
+            started_at: times::now(),
             writes: Arc::default(),
             firing: AtomicUsize::new(0),
             last_alert_pass_ms: AtomicI64::new(0),
@@ -252,7 +253,7 @@ pub struct Activity {
     pub samples_queued: usize,
     pub queue_capacity: usize,
     pub alerts_open: usize,
-    pub last_alert_pass_ms: Option<i64>,
+    pub last_alert_pass_at: Option<Timestamp>,
 }
 
 /// Each part is read on its own, because this matters most when something is
@@ -263,7 +264,7 @@ pub struct ServerStats {
     pub commit: String,
     pub built_at: String,
     pub rust_version: String,
-    pub started_ms: i64,
+    pub started_at: Timestamp,
     pub uptime_secs: u64,
     pub os: Option<String>,
     pub process: Option<ProcessStats>,
@@ -362,8 +363,8 @@ pub async fn gather(state: &AppState) -> ServerStats {
         commit: build.commit.to_string(),
         built_at: build.built_at.to_string(),
         rust_version: build.rust_version.to_string(),
-        started_ms: status.started_ms,
-        uptime_secs: u64::try_from(now - status.started_ms).unwrap_or(0) / 1000,
+        started_at: status.started_at,
+        uptime_secs: u64::try_from(now - status.started_at.timestamp_millis()).unwrap_or(0) / 1000,
         os: os_name(),
         process,
         disk,
@@ -387,7 +388,7 @@ pub async fn gather(state: &AppState) -> ServerStats {
             samples_queued: capacity - state.writer.capacity(),
             queue_capacity: capacity,
             alerts_open: status.firing.load(Ordering::Relaxed),
-            last_alert_pass_ms: (last_pass > 0).then_some(last_pass),
+            last_alert_pass_at: (last_pass > 0).then(|| times::from_ms(last_pass)),
         },
     }
 }

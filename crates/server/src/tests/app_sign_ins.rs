@@ -785,7 +785,7 @@ async fn only_your_own_apps_can_be_revoked_and_old_ones_are_cleared_away() {
             .await
             .unwrap()
             .unwrap()
-            .revoked_ms
+            .revoked_at
             .is_none()
     );
 

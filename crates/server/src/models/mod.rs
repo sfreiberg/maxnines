@@ -86,18 +86,19 @@ use crate::host_filter;
 use crate::migrations::Migrator;
 use crate::registration::{HostKind, HostRecord, HostState};
 use crate::roles::Role;
+use crate::times::{self, Timestamp};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Registry calls run one at a time, so a small pool is plenty.
 const MAX_CONNECTIONS: u32 = 5;
 
-/// A value a fact held for a period. `valid_to_ms` is empty while it's current.
+/// A value a fact held for a period. `valid_to` is empty while it's current.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FactVersion {
     pub name: String,
     pub value: Value,
-    pub valid_from_ms: u64,
-    pub valid_to_ms: Option<u64>,
+    pub valid_from: Timestamp,
+    pub valid_to: Option<Timestamp>,
 }
 
 /// A rule as stored, with its settings in their natural shape.
@@ -110,7 +111,7 @@ pub struct ConfigRule {
     pub built_in: Option<String>,
     /// When an upgrade last changed a built-in rule.
     #[serde(skip)]
-    pub built_in_changed_ms: Option<i64>,
+    pub built_in_changed_at: Option<Timestamp>,
     #[serde(flatten)]
     pub rule: RuleInput,
 }
@@ -140,7 +141,7 @@ fn default_enabled() -> bool {
 pub struct ConfigStatus {
     pub version: String,
     pub error: Option<String>,
-    pub reported_ms: u64,
+    pub reported_at: Timestamp,
 }
 
 #[derive(Clone)]
@@ -212,8 +213,8 @@ impl Database {
             hostname: Set(record.hostname.clone()),
             state: Set(record.state.as_str().to_string()),
             decided_by: Set(record.decided_by.clone()),
-            first_seen_ms: Set(record.first_seen_ms as i64),
-            decided_ms: Set(record.decided_ms.map(|ms| ms as i64)),
+            first_seen_at: Set(record.first_seen_at),
+            decided_at: Set(record.decided_at),
         };
 
         let on_conflict = OnConflict::column(host::Column::Id)
@@ -222,8 +223,8 @@ impl Database {
                 host::Column::Hostname,
                 host::Column::State,
                 host::Column::DecidedBy,
-                host::Column::FirstSeenMs,
-                host::Column::DecidedMs,
+                host::Column::FirstSeenAt,
+                host::Column::DecidedAt,
             ])
             .to_owned();
 
@@ -314,11 +315,12 @@ impl Database {
         now_ms: u64,
     ) -> Result<bool> {
         let _only_writer = self.facts_lock.lock().await;
+        let now = times::from_ms(i64::try_from(now_ms).unwrap_or(i64::MAX));
         let transaction = self.connection.begin().await.context("saving facts")?;
 
         let current = host_fact::Entity::find()
             .filter(host_fact::Column::HostId.eq(host_id))
-            .filter(host_fact::Column::ValidToMs.is_null())
+            .filter(host_fact::Column::ValidTo.is_null())
             .all(&transaction)
             .await
             .context("loading facts")?;
@@ -347,8 +349,8 @@ impl Database {
                     name: Set(name.clone()),
                     value: Set(text),
                     value_type: Set(value_type.to_string()),
-                    valid_from_ms: Set(now_ms as i64),
-                    valid_to_ms: Set(None),
+                    valid_from: Set(now),
+                    valid_to: Set(None),
                     ..Default::default()
                 }
             })
@@ -358,7 +360,7 @@ impl Database {
 
         if !closed.is_empty() {
             host_fact::Entity::update_many()
-                .col_expr(host_fact::Column::ValidToMs, Expr::value(now_ms as i64))
+                .col_expr(host_fact::Column::ValidTo, Expr::value(now))
                 .filter(host_fact::Column::Id.is_in(closed))
                 .exec(&transaction)
                 .await
@@ -378,7 +380,7 @@ impl Database {
     pub async fn current_facts(&self, host_id: &str) -> Result<Vec<FactVersion>> {
         let rows = host_fact::Entity::find()
             .filter(host_fact::Column::HostId.eq(host_id))
-            .filter(host_fact::Column::ValidToMs.is_null())
+            .filter(host_fact::Column::ValidTo.is_null())
             .order_by_asc(host_fact::Column::Name)
             .all(&self.connection)
             .await
@@ -390,7 +392,7 @@ impl Database {
     /// agents doesn't cost a query each.
     pub async fn all_current_facts(&self) -> Result<BTreeMap<String, FlatFacts>> {
         let rows = host_fact::Entity::find()
-            .filter(host_fact::Column::ValidToMs.is_null())
+            .filter(host_fact::Column::ValidTo.is_null())
             .all(&self.connection)
             .await
             .context("loading facts")?;
@@ -400,7 +402,7 @@ impl Database {
     /// The current facts of some agents, for when a page only shows those.
     pub async fn facts_of(&self, host_ids: &[&str]) -> Result<BTreeMap<String, FlatFacts>> {
         let rows = host_fact::Entity::find()
-            .filter(host_fact::Column::ValidToMs.is_null())
+            .filter(host_fact::Column::ValidTo.is_null())
             .filter(host_fact::Column::HostId.is_in(host_ids.iter().copied()))
             .all(&self.connection)
             .await
@@ -411,7 +413,7 @@ impl Database {
     /// Every agent's current values of some facts, including the items of lists.
     pub async fn facts_named(&self, names: &[&str]) -> Result<BTreeMap<String, FlatFacts>> {
         let rows = host_fact::Entity::find()
-            .filter(host_fact::Column::ValidToMs.is_null())
+            .filter(host_fact::Column::ValidTo.is_null())
             .filter(fact_or_its_items(names))
             .all(&self.connection)
             .await
@@ -425,7 +427,7 @@ impl Database {
             .select_only()
             .column(host_fact::Column::Name)
             .distinct()
-            .filter(host_fact::Column::ValidToMs.is_null())
+            .filter(host_fact::Column::ValidTo.is_null())
             .into_tuple()
             .all(&self.connection)
             .await
@@ -440,7 +442,7 @@ impl Database {
             .select_only()
             .column(host_fact::Column::Value)
             .distinct()
-            .filter(host_fact::Column::ValidToMs.is_null())
+            .filter(host_fact::Column::ValidTo.is_null())
             .filter(fact_or_its_items(&[name]))
             .filter(host_fact::Column::Value.contains(text))
             .order_by_asc(host_fact::Column::Value)
@@ -455,7 +457,7 @@ impl Database {
     /// forms. A list appears once under its own name, as a list item's type.
     pub async fn known_facts(&self) -> Result<BTreeMap<String, String>> {
         let rows = host_fact::Entity::find()
-            .filter(host_fact::Column::ValidToMs.is_null())
+            .filter(host_fact::Column::ValidTo.is_null())
             .all(&self.connection)
             .await
             .context("loading fact names")?;
@@ -473,7 +475,7 @@ impl Database {
     /// own config allows, each once and in order.
     pub async fn listed_by_agents(&self, list: &str) -> Result<Vec<String>> {
         let rows = host_fact::Entity::find()
-            .filter(host_fact::Column::ValidToMs.is_null())
+            .filter(host_fact::Column::ValidTo.is_null())
             .filter(host_fact::Column::Name.starts_with(format!("{list}[")))
             .all(&self.connection)
             .await
@@ -525,16 +527,20 @@ impl UsedFrom {
 /// What to note about a session, key or app being used now, if anything: when, and
 /// where from. Nothing while it was noted under a minute ago from the same place, or
 /// for a use with no request behind it.
-fn noted_use(last_used_ms: Option<i64>, last: &UsedFrom, now_ms: i64) -> Option<(i64, UsedFrom)> {
+fn noted_use(
+    last_used_at: Option<Timestamp>,
+    last: &UsedFrom,
+    now_ms: i64,
+) -> Option<(Timestamp, UsedFrom)> {
     let now = UsedFrom::now();
-    let stale = last_used_ms.is_none_or(|used| now_ms - used >= USE_ACCURACY_MS);
+    let stale = last_used_at.is_none_or(|used| now_ms - used.timestamp_millis() >= USE_ACCURACY_MS);
     let moved = now.address.is_some() && now != *last;
     let from = if now.address.is_some() {
         now
     } else {
         last.clone()
     };
-    (stale || moved).then_some((now_ms, from))
+    (stale || moved).then_some((times::from_ms(now_ms), from))
 }
 
 /// A key for the API, without the key itself, which only exists when it's created.
@@ -549,20 +555,21 @@ pub struct ApiKey {
     /// The most it can do. It never does more than its owner can either.
     pub role: Role,
     pub hint: String,
-    pub created_ms: i64,
+    pub created_at: Timestamp,
     /// Empty means it never expires.
-    pub expires_ms: Option<i64>,
-    pub last_used_ms: Option<i64>,
+    pub expires_at: Option<Timestamp>,
+    pub last_used_at: Option<Timestamp>,
     /// The address it was last used from.
     pub last_address: Option<String>,
     /// What an untrusted proxy there said it was passing on, so unconfirmed.
     pub last_forwarded_for: Option<String>,
-    pub revoked_ms: Option<i64>,
+    pub revoked_at: Option<Timestamp>,
 }
 
 impl ApiKey {
     pub fn has_expired(&self, now_ms: i64) -> bool {
-        self.expires_ms.is_some_and(|expires| now_ms >= expires)
+        self.expires_at
+            .is_some_and(|expires| now_ms >= expires.timestamp_millis())
     }
 }
 
@@ -575,12 +582,12 @@ impl ApiKey {
             owner,
             role: Role::parse(&row.role).unwrap_or(Role::Viewer),
             hint: row.hint,
-            created_ms: row.created_ms,
-            expires_ms: row.expires_ms,
-            last_used_ms: row.last_used_ms,
+            created_at: row.created_at,
+            expires_at: row.expires_at,
+            last_used_at: row.last_used_at,
             last_address: row.last_address,
             last_forwarded_for: row.last_forwarded_for,
-            revoked_ms: row.revoked_ms,
+            revoked_at: row.revoked_at,
         }
     }
 }
@@ -594,13 +601,15 @@ pub fn check_api_key_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// When a key lasting this long from now runs out.
-pub fn expiry_after(secs: u64, now_ms: i64) -> Result<i64> {
+/// When a key lasting this long from now runs out. Every database keeps times up to
+/// the end of the year 9999, so one that would last longer than that is refused.
+pub fn expiry_after(secs: u64, now_ms: i64) -> Result<Timestamp> {
     anyhow::ensure!(secs > 0, "A key has to last longer than that.");
     i64::try_from(secs)
         .ok()
-        .and_then(|secs| secs.checked_mul(1000))
-        .and_then(|ms| now_ms.checked_add(ms))
+        .and_then(chrono::TimeDelta::try_seconds)
+        .and_then(|lasting| times::from_ms(now_ms).checked_add_signed(lasting))
+        .filter(|expires| chrono::Datelike::year(expires) <= 9999)
         .context("That's too long for a key to last. Leave it out for a key that never expires.")
 }
 
@@ -623,8 +632,8 @@ fn api_key_snapshot(row: &api_key::Model, owner: &str) -> Snapshot {
         "owner": owner,
         "role": row.role,
         "hint": row.hint,
-        "expires": row.expires_ms.map(crate::audit::time),
-        "revoked": row.revoked_ms.is_some(),
+        "expires": row.expires_at.map(crate::audit::time),
+        "revoked": row.revoked_at.is_some(),
     });
     Snapshot::new(row.name.clone(), fields)
 }
@@ -643,13 +652,13 @@ impl Database {
         name: &str,
         user_id: i64,
         role: Role,
-        expires_ms: Option<i64>,
+        expires_at: Option<Timestamp>,
         now_ms: i64,
     ) -> Result<(ApiKey, String)> {
         let key = format!("mxn_{}", new_nonce()?);
         let transaction = self.connection.begin().await.context("saving an API key")?;
         let owner = user::Entity::find_by_id(user_id)
-            .filter(user::Column::DisabledMs.is_null())
+            .filter(user::Column::DisabledAt.is_null())
             .one(&transaction)
             .await
             .context("loading the key's owner")?
@@ -662,8 +671,8 @@ impl Database {
             role: Set(role.as_str().to_string()),
             hint: Set(key[..API_KEY_HINT_LEN].to_string()),
             token_hash: Set(api_key_hash(&key)),
-            created_ms: Set(now_ms),
-            expires_ms: Set(expires_ms),
+            created_at: Set(times::from_ms(now_ms)),
+            expires_at: Set(expires_at),
             ..Default::default()
         }
         .insert(&transaction)
@@ -701,7 +710,7 @@ impl Database {
         else {
             return Ok(false);
         };
-        if row.revoked_ms.is_none() {
+        if row.revoked_at.is_none() {
             let transaction = self
                 .connection
                 .begin()
@@ -713,7 +722,7 @@ impl Database {
                 .unwrap_or_default();
             let before = api_key_snapshot(&row, &owner);
             let mut row: api_key::ActiveModel = row.into();
-            row.revoked_ms = Set(Some(now_ms));
+            row.revoked_at = Set(Some(times::from_ms(now_ms)));
             let row = row
                 .update(&transaction)
                 .await
@@ -738,12 +747,14 @@ impl Database {
     pub async fn accept_api_key(&self, key: &str, now_ms: i64) -> Result<Option<(ApiKey, User)>> {
         let row = api_key::Entity::find()
             .filter(api_key::Column::TokenHash.eq(api_key_hash(key)))
-            .filter(api_key::Column::RevokedMs.is_null())
+            .filter(api_key::Column::RevokedAt.is_null())
             .one(&self.connection)
             .await
             .context("checking an API key")?;
-        let Some(row) = row.filter(|row| row.expires_ms.is_none_or(|expires| now_ms < expires))
-        else {
+        let Some(row) = row.filter(|row| {
+            row.expires_at
+                .is_none_or(|expires| now_ms < expires.timestamp_millis())
+        }) else {
             return Ok(None);
         };
         let Some(mut owner) = users::enabled_user(&self.connection, row.user_id).await? else {
@@ -756,9 +767,9 @@ impl Database {
             address: row.last_address.clone(),
             forwarded_for: row.last_forwarded_for.clone(),
         };
-        let row = if let Some((used, from)) = noted_use(row.last_used_ms, &last, now_ms) {
+        let row = if let Some((used, from)) = noted_use(row.last_used_at, &last, now_ms) {
             let mut row: api_key::ActiveModel = row.into();
-            row.last_used_ms = Set(Some(used));
+            row.last_used_at = Set(Some(used));
             row.last_address = Set(from.address);
             row.last_forwarded_for = Set(from.forwarded_for);
             row.update(&self.connection)
@@ -926,13 +937,13 @@ impl Database {
             host_id: Set(host_id.to_string()),
             version: Set(status.version.clone()),
             error: Set(status.error.clone()),
-            reported_ms: Set(status.reported_ms as i64),
+            reported_at: Set(status.reported_at),
         };
         let on_conflict = OnConflict::column(host_config_status::Column::HostId)
             .update_columns([
                 host_config_status::Column::Version,
                 host_config_status::Column::Error,
-                host_config_status::Column::ReportedMs,
+                host_config_status::Column::ReportedAt,
             ])
             .to_owned();
 
@@ -952,7 +963,7 @@ impl Database {
         Ok(row.map(|row| ConfigStatus {
             version: row.version,
             error: row.error,
-            reported_ms: row.reported_ms as u64,
+            reported_at: row.reported_at,
         }))
     }
 }
@@ -1041,7 +1052,7 @@ fn to_rule<'a>(
     Ok(ConfigRule {
         id: row.id,
         built_in: row.built_in,
-        built_in_changed_ms: row.built_in_changed_ms,
+        built_in_changed_at: row.built_in_changed_at,
         rule: RuleInput {
             name: row.name,
             priority: row.priority,
@@ -1098,8 +1109,8 @@ fn to_fact_version(row: host_fact::Model) -> Result<FactVersion> {
         value: decode(&row.value, &row.value_type)
             .with_context(|| format!("fact {} has an invalid value", row.name))?,
         name: row.name,
-        valid_from_ms: row.valid_from_ms as u64,
-        valid_to_ms: row.valid_to_ms.map(|ms| ms as u64),
+        valid_from: row.valid_from,
+        valid_to: row.valid_to,
     })
 }
 
@@ -1136,8 +1147,8 @@ fn to_record(row: host::Model) -> Result<HostRecord> {
         public_key: row.public_key,
         hostname: row.hostname,
         decided_by: row.decided_by,
-        first_seen_ms: row.first_seen_ms as u64,
-        decided_ms: row.decided_ms.map(|ms| ms as u64),
+        first_seen_at: row.first_seen_at,
+        decided_at: row.decided_at,
     })
 }
 
@@ -1282,8 +1293,8 @@ mod tests {
             hostname: "web-1".to_string(),
             state: HostState::Pending,
             decided_by: None,
-            first_seen_ms: 1_789_000_000_123,
-            decided_ms: None,
+            first_seen_at: crate::times::from_ms(1_789_000_000_123),
+            decided_at: None,
         }
     }
 
@@ -1495,17 +1506,17 @@ mod tests {
             )
             .await
             .unwrap();
-        let used = async || database.list_api_keys().await.unwrap()[0].last_used_ms;
+        let used = async || database.list_api_keys().await.unwrap()[0].last_used_at;
         assert_eq!(used().await, None);
 
         database.accept_api_key(&secret, 100_000).await.unwrap();
-        assert_eq!(used().await, Some(100_000));
+        assert_eq!(used().await, Some(crate::times::from_ms(100_000)));
 
         database.accept_api_key(&secret, 100_500).await.unwrap();
-        assert_eq!(used().await, Some(100_000));
+        assert_eq!(used().await, Some(crate::times::from_ms(100_000)));
 
         database.accept_api_key(&secret, 170_000).await.unwrap();
-        assert_eq!(used().await, Some(170_000));
+        assert_eq!(used().await, Some(crate::times::from_ms(170_000)));
     }
 
     #[tokio::test]
@@ -1526,7 +1537,7 @@ mod tests {
         database.revoke_api_key(key.id, 200).await.unwrap();
 
         let keys = database.list_api_keys().await.unwrap();
-        assert_eq!(keys[0].revoked_ms, Some(100));
+        assert_eq!(keys[0].revoked_at, Some(crate::times::from_ms(100)));
         assert!(!database.revoke_api_key(999, 300).await.unwrap());
     }
 
@@ -1538,7 +1549,7 @@ mod tests {
                 "deploy",
                 owner(&database).await,
                 crate::roles::Role::Admin,
-                Some(5000),
+                Some(crate::times::from_ms(5000)),
                 1000,
             )
             .await
@@ -1583,9 +1594,11 @@ mod tests {
             .await
             .unwrap();
 
+        // 2100, as far ahead as there's any need to look.
+        let much_later = 4_102_444_800_000;
         assert!(
             database
-                .accept_api_key(&secret, i64::MAX)
+                .accept_api_key(&secret, much_later)
                 .await
                 .unwrap()
                 .is_some()
@@ -1595,9 +1608,14 @@ mod tests {
 
     #[test]
     fn expiry_is_counted_from_now() {
-        assert_eq!(expiry_after(60, 1000).unwrap(), 61_000);
+        assert_eq!(
+            expiry_after(60, 1000).unwrap(),
+            crate::times::from_ms(61_000)
+        );
         assert!(expiry_after(0, 1000).is_err());
         assert!(expiry_after(u64::MAX, 1000).is_err());
+        // Ten thousand years is more than any database keeps.
+        assert!(expiry_after(10_000 * 366 * 86_400, 1000).is_err());
     }
 
     #[test]
@@ -1684,7 +1702,7 @@ mod tests {
             kind: crate::registration::HostKind::Agent,
             state: HostState::Approved,
             decided_by: Some("rule:production-subnet".to_string()),
-            decided_ms: Some(1_789_000_000_456),
+            decided_at: Some(crate::times::from_ms(1_789_000_000_456)),
             ..pending.clone()
         };
         database.save_host(&approved).await.unwrap();
@@ -1730,7 +1748,7 @@ mod tests {
     fn current(versions: &[FactVersion]) -> Vec<(&str, &Value)> {
         versions
             .iter()
-            .filter(|version| version.valid_to_ms.is_none())
+            .filter(|version| version.valid_to.is_none())
             .map(|version| (version.name.as_str(), &version.value))
             .collect()
     }
@@ -1841,7 +1859,7 @@ mod tests {
         let failed = ConfigStatus {
             version: "v1".to_string(),
             error: Some("unknown collector".to_string()),
-            reported_ms: 100,
+            reported_at: crate::times::from_ms(100),
         };
         database.save_config_status(host, &failed).await.unwrap();
         assert_eq!(
@@ -1855,7 +1873,7 @@ mod tests {
         let applied = ConfigStatus {
             version: "v2".to_string(),
             error: None,
-            reported_ms: 200,
+            reported_at: crate::times::from_ms(200),
         };
         database.save_config_status(host, &applied).await.unwrap();
         assert_eq!(database.config_status(host).await.unwrap(), Some(applied));
@@ -1898,13 +1916,14 @@ mod tests {
         let history = database.facts_history(host).await.unwrap();
         assert_eq!(history.len(), 7);
         let family = history.iter().find(|f| f.name == "os.family").unwrap();
-        assert_eq!((family.valid_from_ms, family.valid_to_ms), (100, None));
+        let at = crate::times::from_ms;
+        assert_eq!((family.valid_from, family.valid_to), (at(100), None));
         let old = history.iter().find(|f| f.value == json!("24.04")).unwrap();
-        assert_eq!((old.valid_from_ms, old.valid_to_ms), (100, Some(300)));
+        assert_eq!((old.valid_from, old.valid_to), (at(100), Some(at(300))));
         let new = history.iter().find(|f| f.value == json!("24.10")).unwrap();
-        assert_eq!((new.valid_from_ms, new.valid_to_ms), (300, None));
+        assert_eq!((new.valid_from, new.valid_to), (at(300), None));
         let gone = history.iter().find(|f| f.name == "custom.note").unwrap();
-        assert_eq!(gone.valid_to_ms, Some(300));
+        assert_eq!(gone.valid_to, Some(at(300)));
         assert_eq!(database.current_facts(host).await.unwrap().len(), 5);
         assert_eq!(current(&history).len(), 5);
 
@@ -2096,7 +2115,7 @@ mod tests {
             input
         );
 
-        let started_ms = suffix;
+        let started_at = suffix;
         let new = NewAlert {
             rule_id: rule,
             rule_name: input.name.clone(),
@@ -2106,8 +2125,8 @@ mod tests {
             series: "é".repeat(255),
             value: Some(91.5),
             summary: "x".repeat(5000),
-            started_ms,
-            breached_ms: started_ms,
+            started_at: crate::times::from_ms(started_at),
+            breached_at: crate::times::from_ms(started_at),
         };
         let alert = database.fire_alert(&new, &[channel]).await.unwrap();
         let open = database.open_alerts().await.unwrap();
@@ -2115,7 +2134,7 @@ mod tests {
         assert_eq!(saved.hostname, new.hostname);
         assert_eq!(saved.value, Some(91.5));
 
-        let due = database.due_deliveries(started_ms, 500).await.unwrap();
+        let due = database.due_deliveries(started_at, 500).await.unwrap();
         let firing = due.iter().find(|d| d.alert.id == alert).unwrap();
         assert_eq!(firing.event, Event::Firing);
         database
@@ -2123,22 +2142,22 @@ mod tests {
                 firing.id,
                 1,
                 "the webhook returned status 500",
-                Some(started_ms + 5),
+                Some(crate::times::from_ms(started_at + 5)),
             )
             .await
             .unwrap();
         let problems = database.delivery_problems(10).await.unwrap();
         assert_eq!(problems[0].error, "the webhook returned status 500");
         database
-            .delivery_sent(firing.id, 2, started_ms + 5, Some("C123:1.2"))
+            .delivery_sent(firing.id, 2, started_at + 5, Some("C123:1.2"))
             .await
             .unwrap();
 
         database
-            .resolve_alert(alert, started_ms + 10, "The problem cleared", None)
+            .resolve_alert(alert, started_at + 10, "The problem cleared", None)
             .await
             .unwrap();
-        let due = database.due_deliveries(started_ms + 10, 500).await.unwrap();
+        let due = database.due_deliveries(started_at + 10, 500).await.unwrap();
         let resolved = due.iter().find(|d| d.alert.id == alert).unwrap();
         assert_eq!(resolved.event, Event::Resolved);
         assert_eq!(resolved.reply_to.as_deref(), Some("C123:1.2"));
@@ -2151,7 +2170,7 @@ mod tests {
         // deleted channel goes.
         assert!(
             database
-                .delete_alert_rule(rule, started_ms + 20)
+                .delete_alert_rule(rule, started_at + 20)
                 .await
                 .unwrap()
         );
@@ -2160,11 +2179,11 @@ mod tests {
         assert_eq!(ended.rule_id, Some(rule));
         assert!(
             database
-                .delete_channel(channel, started_ms + 5)
+                .delete_channel(channel, started_at + 5)
                 .await
                 .unwrap()
         );
-        let due = database.due_deliveries(started_ms + 10, 500).await.unwrap();
+        let due = database.due_deliveries(started_at + 10, 500).await.unwrap();
         assert!(!due.iter().any(|d| d.alert.id == alert));
     }
 
@@ -2263,8 +2282,8 @@ mod tests {
         database
             .connection
             .execute_unprepared(
-                "INSERT INTO hosts (id, public_key, hostname, state, first_seen_ms)
-                 VALUES ('a', 'b', 'c', 'trusted', 1)",
+                "INSERT INTO hosts (id, public_key, hostname, state, first_seen_at)
+                 VALUES ('a', 'b', 'c', 'trusted', '2026-11-19T00:00:00+00:00')",
             )
             .await
             .unwrap();

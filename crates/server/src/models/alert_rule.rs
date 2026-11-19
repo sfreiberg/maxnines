@@ -25,7 +25,7 @@ pub struct Model {
     pub forecast_secs: Option<i64>,
     pub warning_forecast_secs: Option<i64>,
     /// When it was deleted. Its alerts keep pointing at it.
-    pub deleted_ms: Option<i64>,
+    pub deleted_at: Option<DateTimeUtc>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

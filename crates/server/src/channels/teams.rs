@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use super::{ChannelType, alerts_link, blocking, post_json, url_preview};
 use crate::alerting::{Channel, ChannelInput, Event, Severity};
-use crate::notifier::{Notice, Senders, format_ms};
+use crate::notifier::{Notice, Senders, format_utc};
 use crate::registration::short_id;
 use crate::remote_checks::FLEET_HOST_ID;
 
@@ -54,7 +54,7 @@ fn body(notice: &Notice, web_url: Option<&str>) -> Value {
                 let host = format!("{} ({})", alert.hostname, short_id(&alert.host_id));
                 json!({ "title": "Host", "value": unlinked(&host) })
             },
-            json!({ "title": "Started", "value": format_ms(alert.started_ms) }),
+            json!({ "title": "Started", "value": format_utc(alert.started_at) }),
         ];
         if let Some(fired) = notice.fired_summary() {
             facts.push(json!({ "title": "When it fired", "value": unlinked(fired) }));

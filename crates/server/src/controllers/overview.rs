@@ -81,8 +81,8 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
             } else {
                 short_id(&alert.host_id).to_string()
             },
-            lasted: lasting(u64::try_from(now - alert.breached_ms).unwrap_or(0)),
-            began: local_time(alert.breached_ms),
+            lasted: lasting(u64::try_from(now - alert.breached_at.timestamp_millis()).unwrap_or(0)),
+            began: local_time(alert.breached_at),
             summary: alert.summary,
             host_id: alert.host_id,
             hostname: alert.hostname,

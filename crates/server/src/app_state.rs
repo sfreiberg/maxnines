@@ -26,6 +26,7 @@ use crate::rule_preview::{self, Preview, PreviewHost};
 use crate::server_stats::ServerStatus;
 use crate::silences::{self, SilenceInput};
 use crate::store::{self, WriterCommand};
+use crate::times::{self, Timestamp};
 use crate::views::Views;
 
 /// What came of deleting an agent.
@@ -110,7 +111,7 @@ impl AppState {
         let filter = input.filter.clone().unwrap_or_default();
         let new = NewEvent {
             kind,
-            time_ms: input.time_ms.unwrap_or(now_ms),
+            occurred_at: input.occurred_at.unwrap_or(times::from_ms(now_ms)),
             title: &input.title,
             detail: input.detail.as_deref(),
             filter: &filter,
@@ -126,8 +127,8 @@ impl AppState {
     pub async fn timeline(
         &self,
         host_id: &str,
-        from_ms: i64,
-        to_ms: i64,
+        from: Timestamp,
+        to: Timestamp,
     ) -> Result<Vec<TimelineEvent>> {
         let hostname = self
             .registry
@@ -140,7 +141,7 @@ impl AppState {
         let picks = |filter: &str| {
             HostFilter::parse(filter).is_ok_and(|filter| filter.matches(host_id, &hostname, facts))
         };
-        self.database.timeline(host_id, from_ms, to_ms, picks).await
+        self.database.timeline(host_id, from, to, picks).await
     }
 
     /// Deletes a revoked agent and everything kept about it. Metrics go first: if

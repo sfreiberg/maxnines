@@ -3995,6 +3995,7 @@ version = "0.1.0-alpha.7"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "chrono",
  "clap",
  "clap_complete",
  "comfy-table",

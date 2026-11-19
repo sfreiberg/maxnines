@@ -400,7 +400,7 @@ fn issued(sign_in: &AppSignIn, tokens: &AppTokens) -> Response {
 /// try again, and says nothing about how the server works inside.
 async fn sign_in_approved(state: &AppState, approval: Approval) -> Response {
     let user = match state.database.user(approval.user_id).await {
-        Ok(Some(user)) if user.disabled_ms.is_none() => user,
+        Ok(Some(user)) if user.disabled_at.is_none() => user,
         Ok(_) => {
             return oauth_error(
                 StatusCode::BAD_REQUEST,
@@ -639,26 +639,25 @@ struct SignInRow {
 
 fn row(sign_in: AppSignIn, now_ms: i64) -> SignInRow {
     let active = sign_in.is_active(now_ms);
-    let status = if sign_in.revoked_ms.is_some() {
+    let status = if sign_in.revoked_at.is_some() {
         "Revoked"
     } else if active {
         "Signed in"
     } else {
         "Expired"
     };
-    let ago = |ms: i64| {
-        let (then, now) = (u64::try_from(ms).ok()?, u64::try_from(now_ms).ok()?);
-        Some(crate::times::ago(then, now))
-    };
+    let now = crate::times::from_ms(now_ms);
     SignInRow {
         id: sign_in.id,
         title: sign_in.title(),
         role: sign_in.role.label(),
-        created: local_date(sign_in.created_ms),
-        created_at: local_time(sign_in.created_ms),
-        last_used: sign_in.last_used_ms.and_then(ago),
-        last_used_at: sign_in.last_used_ms.map(local_time),
-        expires: local_date(sign_in.expires_ms),
+        created: local_date(sign_in.created_at),
+        created_at: local_time(sign_in.created_at),
+        last_used: sign_in
+            .last_used_at
+            .map(|used| crate::times::ago(used, now)),
+        last_used_at: sign_in.last_used_at.map(local_time),
+        expires: local_date(sign_in.expires_at),
         status,
         active,
         owner: sign_in.owner,

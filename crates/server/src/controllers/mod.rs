@@ -62,7 +62,7 @@ use crate::app_state::AppState;
 use crate::audit::{self, Acting, Actor, Via};
 use crate::models::{DEFAULT_THEME, User};
 use crate::roles::{self, Role};
-use crate::times::{DEFAULT_TIME_ZONE, format_time};
+use crate::times::{DEFAULT_TIME_ZONE, Timestamp, format_moment};
 
 const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; connect-src 'self'; \
      style-src 'self'; font-src 'self'; img-src 'self'; manifest-src 'self'; form-action 'self'; \
@@ -169,17 +169,14 @@ fn viewer_zone() -> Tz {
     signed_in_user().map_or(DEFAULT_TIME_ZONE, |user| user.zone())
 }
 
-/// A time as whoever's signed in reads it, or nothing for one before 1970.
-fn local_time(ms: i64) -> String {
-    u64::try_from(ms).map_or_else(|_| String::new(), |ms| format_time(ms, viewer_zone()))
+/// A time as whoever's signed in reads it.
+fn local_time(time: Timestamp) -> String {
+    format_moment(time, viewer_zone())
 }
 
 /// Just the day of a time, where whoever's reading is.
-fn local_date(ms: i64) -> String {
-    u64::try_from(ms).map_or_else(
-        |_| String::new(),
-        |ms| crate::times::format_date(ms, viewer_zone()),
-    )
+fn local_date(time: Timestamp) -> String {
+    crate::times::format_date(time, viewer_zone())
 }
 
 /// Where a request came from: the address connecting, or for a trusted proxy, the

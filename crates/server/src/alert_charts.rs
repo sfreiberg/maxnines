@@ -281,11 +281,14 @@ fn svg(alert: &Alert, watched: &Watched, range: TimeRange) -> String {
     // When the alert started and ended, if within the hour, each label on its own
     // row so the two never cover each other.
     let moments = [
-        (Some(alert.started_ms), "Started", colour("muted"), 6.0),
-        (alert.resolved_ms, "Resolved", colour("good"), 18.0),
+        (Some(alert.started_at), "Started", colour("muted"), 6.0),
+        (alert.resolved_at, "Resolved", colour("good"), 18.0),
     ];
     for (time, label, paint, above) in moments {
-        let Some(time) = time.filter(|time| (range.from_ms..=range.to_ms).contains(time)) else {
+        let Some(time) = time
+            .map(|time| time.timestamp_millis())
+            .filter(|time| (range.from_ms..=range.to_ms).contains(time))
+        else {
             continue;
         };
         let x = metric_charts::x_of(time, range, frame);
@@ -408,13 +411,13 @@ mod tests {
             series: "/".to_string(),
             value: Some(85.0),
             summary: String::new(),
-            started_ms: 1_700_000_000_000 - 600_000,
-            breached_ms: 1_700_000_000_000 - 600_000,
-            resolved_ms: None,
+            started_at: crate::times::from_ms(1_700_000_000_000 - 600_000),
+            breached_at: crate::times::from_ms(1_700_000_000_000 - 600_000),
+            resolved_at: None,
             resolve_reason: None,
             resolved_summary: None,
             acknowledged_by: None,
-            acknowledged_ms: None,
+            acknowledged_at: None,
         }
     }
 
@@ -518,8 +521,8 @@ mod tests {
         let (range, result) = hour();
         // Started a moment ago and ended now, both at the right edge.
         let alert = Alert {
-            started_ms: range.to_ms - 1000,
-            resolved_ms: Some(range.to_ms),
+            started_at: crate::times::from_ms(range.to_ms - 1000),
+            resolved_at: Some(crate::times::from_ms(range.to_ms)),
             ..alert()
         };
         let svg = svg(&alert, &disk(result), range);

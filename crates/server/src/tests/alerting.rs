@@ -19,6 +19,7 @@ use crate::channels::slack::{ACKNOWLEDGE_ACTION, SILENCE_HOUR_ACTION};
 use crate::metrics::{Metric, NewestReading};
 use crate::notifier::{Notice, Notifier, Senders};
 use crate::slack_actions::SlackActions;
+use crate::times::{from_ms, millis};
 use hyper_util::client::legacy::connect::HttpConnector;
 use slack_morphism::SlackClient;
 use slack_morphism::prelude::{SlackClientHyperConnector, SlackInteractionBlockActionsEvent};
@@ -286,7 +287,10 @@ async fn a_metric_alert_fires_once_and_resolves_when_it_clears() {
         resolved[0].resolved_summary.as_deref(),
         Some("CPU usage on web-1 is now 10%, no longer above 90%")
     );
-    assert_eq!(resolved[0].resolved_ms, Some(test.now + 4 * MINUTE_MS));
+    assert_eq!(
+        resolved[0].resolved_at,
+        Some(from_ms(test.now + 4 * MINUTE_MS))
+    );
 
     // Back over, it has to last all over again, and then it's a new alert.
     test.cpu(5 * MINUTE_MS, 95.0).await;
@@ -882,14 +886,22 @@ async fn a_stopped_service_alerts_in_its_service_managers_words() {
         open[0].summary,
         "Service nginx.service on web-1 is activating"
     );
-    let told = test.database().due_deliveries(i64::MAX, 10).await.unwrap();
+    let told = test
+        .database()
+        .due_deliveries(everything_due(), 10)
+        .await
+        .unwrap();
     assert_eq!(told.len(), 1);
 
     // Its state changing while it's still down rewords the alert and tells nobody.
     let open = report(&mut test, 2, "failed").await;
     assert_eq!(open.len(), 1, "{open:?}");
     assert_eq!(open[0].summary, "Service nginx.service on web-1 is failed");
-    let told = test.database().due_deliveries(i64::MAX, 10).await.unwrap();
+    let told = test
+        .database()
+        .due_deliveries(everything_due(), 10)
+        .await
+        .unwrap();
     assert_eq!(told.len(), 1);
 }
 
@@ -953,7 +965,11 @@ async fn the_built_in_rule_tells_every_channel_once_an_agent_is_gone_a_minute() 
     let open = test.open().await;
     assert_eq!(open.len(), 1);
     assert_eq!(open[0].summary, "web-1 is offline");
-    let deliveries = test.database().due_deliveries(i64::MAX, 10).await.unwrap();
+    let deliveries = test
+        .database()
+        .due_deliveries(everything_due(), 10)
+        .await
+        .unwrap();
     let told: Vec<i64> = deliveries
         .iter()
         .map(|delivery| delivery.channel.id)
@@ -1008,7 +1024,11 @@ async fn every_server_starts_with_a_rule_for_inodes_running_out() {
 
 /// Marks everything due as sent, as if it had been delivered, and says what it was.
 async fn deliver_all(test: &Harness) -> Vec<Event> {
-    let due = test.database().due_deliveries(i64::MAX, 100).await.unwrap();
+    let due = test
+        .database()
+        .due_deliveries(everything_due(), 100)
+        .await
+        .unwrap();
     for delivery in &due {
         test.database()
             .delivery_sent(delivery.id, 1, test.now, None)
@@ -1092,7 +1112,11 @@ async fn a_channel_not_told_yet_hears_of_the_alert_as_it_is_when_it_does() {
     disk_at(&mut test, 0, 85.0).await;
     disk_at(&mut test, 1, 95.0).await;
 
-    let due = test.database().due_deliveries(i64::MAX, 10).await.unwrap();
+    let due = test
+        .database()
+        .due_deliveries(everything_due(), 10)
+        .await
+        .unwrap();
     let events: Vec<Event> = due.iter().map(|delivery| delivery.event).collect();
     assert_eq!(events, [Event::Firing]);
     assert_eq!(due[0].alert.severity, Severity::Critical);
@@ -1109,7 +1133,11 @@ fn pager(url: &str) -> ChannelInput {
 
 /// What's due for each channel, marked sent, by channel.
 async fn deliver_by_channel(test: &Harness) -> Vec<(i64, Event)> {
-    let due = test.database().due_deliveries(i64::MAX, 100).await.unwrap();
+    let due = test
+        .database()
+        .due_deliveries(everything_due(), 100)
+        .await
+        .unwrap();
     for delivery in &due {
         test.database()
             .delivery_sent(delivery.id, 1, test.now, None)
@@ -1898,6 +1926,11 @@ impl Hook {
             .map(|body| body["event"].as_str().unwrap().to_string())
             .collect()
     }
+}
+
+/// A time long enough from now that every notification queued is due by then.
+fn everything_due() -> i64 {
+    now_ms() + 365 * 24 * 3_600_000
 }
 
 fn webhook_channel(url: &str) -> ChannelInput {
@@ -3055,7 +3088,7 @@ async fn silencing_from_slack_covers_just_that_alert_for_an_hour() {
     );
     assert_eq!(silence.created_by, SLACK_MEMBER);
     assert_eq!(silence.reason, "Silenced from Slack");
-    assert_eq!(silence.ends_ms - silence.starts_ms, 3_600_000);
+    assert_eq!(silence.ends_at - silence.starts_at, millis(3_600_000));
 
     let answer = slack.answer();
     assert!(
@@ -3632,8 +3665,8 @@ async fn a_channel_that_is_down_does_not_hold_up_the_others() {
         series: series.to_string(),
         value: Some(99.0),
         summary: format!("{series} on web-1 is 99% full"),
-        started_ms: test.now,
-        breached_ms: test.now,
+        started_at: crate::times::from_ms(test.now),
+        breached_at: crate::times::from_ms(test.now),
     };
     for n in 0..600 {
         test.database()
@@ -4829,8 +4862,8 @@ async fn names_from_agents_are_escaped_on_the_alerts_page() {
                 series: "<i>series</i>".to_string(),
                 value: None,
                 summary: format!("{hostname} is offline"),
-                started_ms: 1000,
-                breached_ms: 1000,
+                started_at: crate::times::from_ms(1000),
+                breached_at: crate::times::from_ms(1000),
             },
             &[],
         )
@@ -4894,7 +4927,7 @@ async fn deleting_an_agent_takes_everything_about_it_once_it_is_revoked() {
     test.cpu(0, 95.0).await;
     assert_eq!(test.open().await.len(), 1);
     let database = test.database().clone();
-    let deliveries = || async { database.due_deliveries(i64::MAX, 10).await.unwrap() };
+    let deliveries = || async { database.due_deliveries(everything_due(), 10).await.unwrap() };
     assert_eq!(deliveries().await.len(), 1);
     let client = test.client.as_mut().unwrap();
     let facts = AgentMessage::Facts {
@@ -6114,8 +6147,8 @@ mod silences {
             series: "nginx.service".to_string(),
             value: Some(0.0),
             summary: "Service nginx.service is failed".to_string(),
-            started_ms: now_ms() - 30_000,
-            breached_ms: now_ms() - 30_000,
+            started_at: crate::times::from_ms(now_ms() - 30_000),
+            breached_at: crate::times::from_ms(now_ms() - 30_000),
         };
         database.fire_alert(&new, &[]).await.unwrap();
 
@@ -6517,7 +6550,7 @@ mod reminders {
 
         let open = test.open().await;
         assert_eq!(open[0].acknowledged_by.as_deref(), Some("sam"));
-        assert_eq!(open[0].acknowledged_ms, Some(test.now));
+        assert_eq!(open[0].acknowledged_at, Some(from_ms(test.now)));
     }
 
     #[tokio::test]
@@ -6737,8 +6770,8 @@ mod pages {
             series: String::new(),
             value: None,
             summary: summary.to_string(),
-            started_ms: 1000,
-            breached_ms: 1000,
+            started_at: crate::times::from_ms(1000),
+            breached_at: crate::times::from_ms(1000),
         }
     }
 
@@ -7516,8 +7549,8 @@ mod charts {
             series: series.to_string(),
             value: Some(95.0),
             summary: format!("Disk usage ({series}) on web-1 is 95%, above 90%"),
-            started_ms: now_ms() - 30_000,
-            breached_ms: now_ms() - 30_000,
+            started_at: crate::times::from_ms(now_ms() - 30_000),
+            breached_at: crate::times::from_ms(now_ms() - 30_000),
         };
         let id = database.fire_alert(&new, channels).await.unwrap();
         database.get_alert(id).await.unwrap().unwrap()
@@ -7674,8 +7707,8 @@ mod charts {
             series: String::new(),
             value: None,
             summary: "web-1 is offline".to_string(),
-            started_ms: now_ms() - 30_000,
-            breached_ms: now_ms() - 30_000,
+            started_at: crate::times::from_ms(now_ms() - 30_000),
+            breached_at: crate::times::from_ms(now_ms() - 30_000),
         };
         let id = database.fire_alert(&new, &[]).await.unwrap();
 
@@ -7723,7 +7756,7 @@ mod charts {
             body["to_ms"].as_i64().unwrap(),
         );
         assert!(to - from >= 3_600_000);
-        assert!(from < alert.started_ms);
+        assert!(from < alert.started_at.timestamp_millis());
 
         let missing = "/api/v1/alerts/999999/series";
         assert_eq!(api(&server, "GET", missing, &Value::Null).await.0, 404);
@@ -8602,7 +8635,7 @@ async fn a_host_can_be_quieted_from_its_page_and_brought_back() {
     assert_eq!(silence.rule_id, None);
     assert_eq!(silence.filter, crate::host_filter::only(&id));
     assert_eq!(silence.reason, "Maintenance on web-1");
-    assert_eq!(silence.ends_ms - silence.starts_ms, 2 * 3600 * 1000);
+    assert_eq!(silence.ends_at - silence.starts_at, millis(2 * 3600 * 1000));
     assert!(held(&server, &alert_about(&id, 1)).await);
     assert!(!held(&server, &alert_about(&other.id(), 1)).await);
 
@@ -8895,7 +8928,7 @@ mod actions {
             run_on: RUN_BY_HAND.to_string(),
             variables: BTreeMap::new(),
             requested_by: Some("you@example.com".to_string()),
-            requested_ms: test.now,
+            requested_at: crate::times::from_ms(test.now),
             timeout_secs: 30,
         };
         test.server.state.actions.run(by_hand).await.unwrap();
@@ -9015,7 +9048,10 @@ mod actions {
         let mut told = deliver_by_channel(&test).await;
         told.sort_by_key(|(channel, _)| *channel);
         assert_eq!(told, [(ops, Event::Firing), (pager, Event::Firing)]);
-        let due = database.due_deliveries(i64::MAX, 100).await.unwrap();
+        let due = database
+            .due_deliveries(everything_due(), 100)
+            .await
+            .unwrap();
         assert_eq!(due.len(), 1, "{due:?}");
         assert_eq!((due[0].channel.id, due[0].event), (ops, Event::Action));
         let run = due[0].action.as_ref().unwrap();
@@ -9152,7 +9188,7 @@ mod actions {
                 .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
                 .collect(),
             requested_by: Some("you@example.com".to_string()),
-            requested_ms: now,
+            requested_at: crate::times::from_ms(now),
             timeout_secs: 30,
         };
         let actions = test.server.state.actions.clone();

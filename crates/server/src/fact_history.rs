@@ -6,14 +6,15 @@ use serde_json::Value;
 
 use crate::facts::{FlatFacts, unflatten};
 use crate::models::FactVersion;
+use crate::times::Timestamp;
 
 /// Turns stored versions into what happened and when, in order. Comparing whole
 /// rebuilt states, not rows, means a list reads as one change even though each
 /// of its items is stored separately.
-pub fn describe_history(history: &[FactVersion]) -> BTreeMap<u64, Vec<String>> {
-    let mut times: Vec<u64> = history
+pub fn describe_history(history: &[FactVersion]) -> BTreeMap<Timestamp, Vec<String>> {
+    let mut times: Vec<Timestamp> = history
         .iter()
-        .flat_map(|version| [Some(version.valid_from_ms), version.valid_to_ms])
+        .flat_map(|version| [Some(version.valid_from), version.valid_to])
         .flatten()
         .collect();
     times.sort_unstable();
@@ -42,10 +43,10 @@ pub fn describe_history(history: &[FactVersion]) -> BTreeMap<u64, Vec<String>> {
     events
 }
 
-fn facts_at(history: &[FactVersion], time: u64) -> FlatFacts {
+fn facts_at(history: &[FactVersion], time: Timestamp) -> FlatFacts {
     history
         .iter()
-        .filter(|f| f.valid_from_ms <= time && f.valid_to_ms.is_none_or(|end| end > time))
+        .filter(|f| f.valid_from <= time && f.valid_to.is_none_or(|end| end > time))
         .map(|f| (f.name.clone(), f.value.clone()))
         .collect()
 }
@@ -94,13 +95,14 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::times::from_ms;
 
-    fn version(name: &str, value: Value, from: u64, to: Option<u64>) -> FactVersion {
+    fn version(name: &str, value: Value, from: i64, to: Option<i64>) -> FactVersion {
         FactVersion {
             name: name.to_string(),
             value,
-            valid_from_ms: from,
-            valid_to_ms: to,
+            valid_from: from_ms(from),
+            valid_to: to.map(from_ms),
         }
     }
 
@@ -116,9 +118,9 @@ mod tests {
 
         let events = describe_history(&history);
 
-        assert_eq!(events[&100], ["first report, 3 facts"]);
+        assert_eq!(events[&from_ms(100)], ["first report, 3 facts"]);
         assert_eq!(
-            events[&300],
+            events[&from_ms(300)],
             [
                 r#"custom.datacenter: added "fra1""#,
                 r#"custom.role: removed (was "web")"#,
@@ -141,7 +143,7 @@ mod tests {
         ];
 
         assert_eq!(
-            describe_history(&history)[&200],
+            describe_history(&history)[&from_ms(200)],
             [r#"custom.tags: ["web","prod","eu"] -> ["prod","eu"]"#]
         );
     }
@@ -156,8 +158,11 @@ mod tests {
 
         let events = describe_history(&history);
 
-        assert_eq!(events[&200], [r#"custom.role: removed (was "web")"#]);
-        assert_eq!(events[&300], [r#"custom.role: added "db""#]);
+        assert_eq!(
+            events[&from_ms(200)],
+            [r#"custom.role: removed (was "web")"#]
+        );
+        assert_eq!(events[&from_ms(300)], [r#"custom.role: added "db""#]);
     }
 
     #[test]
@@ -169,7 +174,7 @@ mod tests {
         ];
 
         assert_eq!(
-            describe_history(&history)[&200],
+            describe_history(&history)[&from_ms(200)],
             ["custom.a: added 1", "custom.b.c: added 2"]
         );
     }
@@ -182,12 +187,18 @@ mod tests {
             version("web.id", json!("1"), 200, None),
         ];
 
-        assert_eq!(describe_history(&history)[&200], [r#"web.id: 1 -> "1""#]);
+        assert_eq!(
+            describe_history(&history)[&from_ms(200)],
+            [r#"web.id: 1 -> "1""#]
+        );
     }
 
     #[test]
     fn a_first_report_is_summarized() {
         let history = [version("a", json!(1), 100, None)];
-        assert_eq!(describe_history(&history)[&100], ["first report, 1 facts"]);
+        assert_eq!(
+            describe_history(&history)[&from_ms(100)],
+            ["first report, 1 facts"]
+        );
     }
 }

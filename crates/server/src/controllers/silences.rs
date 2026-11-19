@@ -68,8 +68,8 @@ async fn rows(state: &AppState, silences: Vec<Silence>) -> anyhow::Result<Vec<Si
             series: Some(silence.series).filter(|series| !series.is_empty()),
             reason: silence.reason,
             created_by: silence.created_by,
-            starts: local_time(silence.starts_ms),
-            ends: local_time(silence.ends_ms),
+            starts: local_time(silence.starts_at),
+            ends: local_time(silence.ends_at),
         })
         .collect())
 }

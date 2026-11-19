@@ -36,7 +36,7 @@ use crate::channels::slack::{
 };
 use crate::metrics::now_ms;
 use crate::models::Database;
-use crate::notifier::{Notice, format_ms};
+use crate::notifier::{Notice, format_utc};
 use crate::roles::Role;
 use crate::silences::{self, ActiveSilences, Cover};
 
@@ -217,7 +217,7 @@ impl SlackActions {
         let Some(alert) = self.database.get_alert(alert_id).await? else {
             return Ok(());
         };
-        if alert.resolved_ms.is_some() || alert.rule_id.is_none() {
+        if alert.resolved_at.is_some() || alert.rule_id.is_none() {
             return Ok(());
         }
         let quiet = ActiveSilences::load(&self.database, now).await?;
@@ -239,23 +239,23 @@ impl SlackActions {
         now: i64,
         chart: Option<&SlackFileId>,
     ) -> Result<SlackMessageContent> {
-        let event = if alert.resolved_ms.is_some() {
+        let event = if alert.resolved_at.is_some() {
             Event::Resolved
         } else {
             Event::Firing
         };
         let quiet = ActiveSilences::load(&self.database, now).await?;
         let silenced = match quiet.covering(alert) {
-            Some(Cover::Silence { id, ends_ms }) => {
+            Some(Cover::Silence { id, ends_at }) => {
                 let by = self.database.get_silence(id).await?.map(|s| s.created_by);
                 Some(match by {
-                    Some(by) => format!("Silenced by {by} until {}", format_ms(ends_ms)),
-                    None => format!("Silenced until {}", format_ms(ends_ms)),
+                    Some(by) => format!("Silenced by {by} until {}", format_utc(ends_at)),
+                    None => format!("Silenced until {}", format_utc(ends_at)),
                 })
             }
-            Some(Cover::Window { ends_ms, .. }) => Some(format!(
+            Some(Cover::Window { ends_at, .. }) => Some(format!(
                 "In a maintenance window until {}",
-                format_ms(ends_ms)
+                format_utc(ends_at)
             )),
             None => None,
         };

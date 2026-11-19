@@ -14,6 +14,7 @@ use crate::calculations::{Calculation, Grouping, Question};
 use crate::channels;
 use crate::metric_charts::format_value;
 use crate::metrics::{self, Metric, Source, Unit};
+use crate::times::Timestamp;
 
 /// Why an alert ends when its rule goes, however it goes.
 pub const RULE_GONE_REASON: &str = "The rule was deleted or disabled";
@@ -991,18 +992,18 @@ pub struct Alert {
     pub value: Option<f64>,
     pub summary: String,
     /// When the alert fired.
-    pub started_ms: i64,
+    pub started_at: Timestamp,
     /// When the problem began, such as when a host went offline: earlier than the
     /// alert started by however long its rule waited before firing.
-    pub breached_ms: i64,
-    pub resolved_ms: Option<i64>,
+    pub breached_at: Timestamp,
+    pub resolved_at: Option<Timestamp>,
     pub resolve_reason: Option<String>,
     /// Where things stood as the problem cleared, such as the reading then. Nothing
     /// for an alert closed for another reason, such as its rule being deleted.
     pub resolved_summary: Option<String>,
     /// Who said they're dealing with it.
     pub acknowledged_by: Option<String>,
-    pub acknowledged_ms: Option<i64>,
+    pub acknowledged_at: Option<Timestamp>,
 }
 
 /// What's needed to start an alert.
@@ -1016,9 +1017,9 @@ pub struct NewAlert {
     pub series: String,
     pub value: Option<f64>,
     pub summary: String,
-    pub started_ms: i64,
+    pub started_at: Timestamp,
     /// When the problem began, which the rule waited on before firing.
-    pub breached_ms: i64,
+    pub breached_at: Timestamp,
 }
 
 /// An open alert becoming a warning or critical, with what it says then.
@@ -1080,7 +1081,7 @@ pub struct Delivery {
     pub reply_to: Option<String>,
     pub event: Event,
     pub attempts: i32,
-    pub created_ms: i64,
+    pub created_at: Timestamp,
     pub alert: Alert,
     pub channel: Channel,
     /// The run whose output this sends, for an `action` notification.
@@ -1096,7 +1097,7 @@ pub struct DeliveryProblem {
     pub state: String,
     pub attempts: i32,
     pub error: String,
-    pub created_ms: i64,
+    pub created_at: Timestamp,
 }
 
 #[cfg(test)]

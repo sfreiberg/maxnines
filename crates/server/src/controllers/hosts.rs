@@ -28,7 +28,7 @@ use crate::presence::Reach;
 use crate::registration::{HostRecord, HostState, short_id};
 use crate::rule_engine;
 use crate::silences::{ActiveSilences, Cover, Silence, SilenceInput};
-use crate::times::{format_time, lasting};
+use crate::times::{format_moment, from_ms, lasting};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -183,7 +183,7 @@ fn row(state: &AppState, host: HostRecord, facts: Option<&FlatFacts>, health: He
         os_family: facts.and_then(OsFamily::of),
         seen: presence
             .and_then(|p| p.last_seen_ms)
-            .map(|seen_ms| crate::times::ago(seen_ms, now_ms() as u64)),
+            .map(|seen_ms| crate::times::ago(from_ms(seen_ms as i64), crate::times::now())),
         config: None,
         state: host.state.as_str(),
         agentless: host.is_agentless(),
@@ -295,7 +295,7 @@ async fn index(
             // Waiting agents never get as far as presence, so the registry remembers.
             let asked = state.registry.last_asked_ms(&host.id);
             waiting.push(WaitingHost {
-                seen: asked.map(|ms| crate::times::ago(ms, now_ms() as u64)),
+                seen: asked.map(|ms| crate::times::ago(from_ms(ms as i64), crate::times::now())),
                 id: host.id,
                 hostname: host.hostname,
             });
@@ -492,12 +492,14 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         Err(error) => return server_error(&error),
     };
     let here: Vec<&Alert> = open.iter().filter(|alert| alert.host_id == id).collect();
-    let now = now_ms();
+    let now = crate::times::now();
     let alerts: Vec<OpenAlert> = here
         .iter()
         .map(|&alert| OpenAlert {
-            lasted: lasting(u64::try_from(now - alert.breached_ms).unwrap_or(0)),
-            began: local_time(alert.breached_ms),
+            lasted: lasting(
+                u64::try_from((now - alert.breached_at).num_milliseconds()).unwrap_or(0),
+            ),
+            began: local_time(alert.breached_at),
             alert,
         })
         .collect();
@@ -557,7 +559,7 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         .into_iter()
         .rev()
         .map(|(time, changes)| HistoryEntry {
-            time: format_time(time, zone),
+            time: format_moment(time, zone),
             changes,
         })
         .collect();
@@ -693,7 +695,7 @@ pub(super) async fn described(
         return Ok(None);
     };
     let now = now_ms();
-    let until = super::local_time(cover.ends_ms());
+    let until = super::local_time(cover.ends_at());
     Ok(match cover {
         Cover::Silence { id, .. } => {
             let silences = state.database.active_silences(now).await?;
@@ -842,7 +844,7 @@ mod tests {
         ConfigStatus {
             version: version.to_string(),
             error: error.map(String::from),
-            reported_ms: 1,
+            reported_at: crate::times::from_ms(1),
         }
     }
 

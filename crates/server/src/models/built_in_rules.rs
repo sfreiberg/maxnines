@@ -80,7 +80,7 @@ impl Database {
                 active.priority = Set(built_in.rule.priority);
                 active.condition_expr = Set(built_in.rule.condition.clone());
                 active.operating_systems = Set(systems_text(&built_in.rule.operating_systems));
-                active.built_in_changed_ms = Set(Some(now_ms));
+                active.built_in_changed_at = Set(Some(crate::times::from_ms(now_ms)));
                 active
                     .update(&transaction)
                     .await
@@ -136,7 +136,7 @@ impl Database {
                 enabled: Set(built_in.rule.enabled),
                 operating_systems: Set(systems_text(&built_in.rule.operating_systems)),
                 built_in: Set(Some(built_in.key.to_string())),
-                built_in_changed_ms: Set(Some(now_ms)),
+                built_in_changed_at: Set(Some(crate::times::from_ms(now_ms))),
                 ..Default::default()
             }
             .insert(&transaction)

@@ -57,7 +57,9 @@ fn idempotency_key(channel: &Channel, notice: &Notice) -> Option<String> {
     let alert = notice.alert.as_ref().filter(|_| notice.id > 0)?;
     Some(format!(
         "maxnines-{}-{}-{}",
-        alert.started_ms, channel.id, notice.id
+        alert.started_at.timestamp_millis(),
+        channel.id,
+        notice.id
     ))
 }
 

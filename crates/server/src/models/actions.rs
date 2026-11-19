@@ -29,7 +29,7 @@ pub(super) fn to_run(row: action_run::Model) -> Result<ActionRun> {
         run_on: row.run_on,
         variables: serde_json::from_str(&row.variables).context("reading a run's variables")?,
         requested_by: row.requested_by,
-        requested_ms: row.requested_ms,
+        requested_at: row.requested_at,
         timeout_secs: u64::try_from(row.timeout_secs)?,
         outcome: row.outcome.as_deref().and_then(ActionOutcome::parse),
         exit_code: row.exit_code,
@@ -37,7 +37,7 @@ pub(super) fn to_run(row: action_run::Model) -> Result<ActionRun> {
         output: row.output,
         truncated: row.truncated,
         duration_ms: row.duration_ms.map(u64::try_from).transpose()?,
-        finished_ms: row.finished_ms,
+        finished_at: row.finished_at,
     })
 }
 
@@ -77,7 +77,7 @@ impl Database {
     pub async fn host_actions(&self, host_id: &str) -> Result<KnownActions> {
         let facts = host_fact::Entity::find()
             .filter(host_fact::Column::HostId.eq(host_id))
-            .filter(host_fact::Column::ValidToMs.is_null())
+            .filter(host_fact::Column::ValidTo.is_null())
             .filter(action_facts())
             .all(&self.connection)
             .await
@@ -88,7 +88,7 @@ impl Database {
     /// Every action any host has.
     pub async fn known_actions(&self) -> Result<KnownActions> {
         let facts = host_fact::Entity::find()
-            .filter(host_fact::Column::ValidToMs.is_null())
+            .filter(host_fact::Column::ValidTo.is_null())
             .filter(action_facts())
             .all(&self.connection)
             .await
@@ -106,7 +106,7 @@ impl Database {
             run_on: Set(new.run_on.clone()),
             variables: Set(serde_json::to_string(&new.variables)?),
             requested_by: Set(new.requested_by.clone()),
-            requested_ms: Set(new.requested_ms),
+            requested_at: Set(new.requested_at),
             timeout_secs: Set(i64::try_from(new.timeout_secs)?),
             outcome: Set(None),
             exit_code: Set(None),
@@ -114,7 +114,7 @@ impl Database {
             output: Set(String::new()),
             truncated: Set(false),
             duration_ms: Set(None),
-            finished_ms: Set(None),
+            finished_at: Set(None),
             ..Default::default()
         };
         let transaction = self.connection.begin().await;
@@ -179,10 +179,13 @@ impl Database {
                 Expr::value(finished.truncated),
             )
             .col_expr(action_run::Column::DurationMs, Expr::value(duration_ms))
-            .col_expr(action_run::Column::FinishedMs, Expr::value(now_ms))
+            .col_expr(
+                action_run::Column::FinishedAt,
+                Expr::value(crate::times::from_ms(now_ms)),
+            )
             .filter(action_run::Column::Id.eq(id))
             .filter(action_run::Column::HostId.eq(host_id))
-            .filter(action_run::Column::FinishedMs.is_null())
+            .filter(action_run::Column::FinishedAt.is_null())
             .exec(&transaction)
             .await
             .context("saving an action's result")?;
@@ -248,7 +251,7 @@ impl Database {
     /// Runs still waiting for an answer.
     pub async fn unanswered_action_runs(&self) -> Result<Vec<ActionRun>> {
         action_run::Entity::find()
-            .filter(action_run::Column::FinishedMs.is_null())
+            .filter(action_run::Column::FinishedAt.is_null())
             .all(&self.connection)
             .await
             .context("loading unanswered action runs")?

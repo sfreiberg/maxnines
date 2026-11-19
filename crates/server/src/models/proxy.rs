@@ -10,7 +10,7 @@ pub struct Model {
     pub address: String,
     /// A proxy to believe, or not a proxy.
     pub trusted: bool,
-    pub created_ms: i64,
+    pub created_at: DateTimeUtc,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

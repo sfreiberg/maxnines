@@ -19,6 +19,7 @@ use crate::app_state::AppState;
 use crate::metrics::now_ms;
 use crate::models::User;
 use crate::roles::Role;
+use crate::times::{self, Timestamp};
 
 pub const SIGN_INS_PAGE: &str = "/settings/users/sign-ins";
 const PROFILE_PAGE: &str = "/profile";
@@ -88,10 +89,10 @@ pub struct SignIn {
     pub address: Option<String>,
     /// What an untrusted proxy at `address` said it was passing on, so unconfirmed.
     pub forwarded_for: Option<String>,
-    pub signed_in_ms: i64,
-    pub last_used_ms: Option<i64>,
+    pub signed_in_at: Timestamp,
+    pub last_used_at: Option<Timestamp>,
     /// When it stops working unless it's used, or for a key that never expires, nothing.
-    pub expires_ms: Option<i64>,
+    pub expires_at: Option<Timestamp>,
     /// Whether it's the browser asking.
     pub current: bool,
 }
@@ -111,7 +112,7 @@ pub async fn sign_ins(state: &AppState, user_id: Option<i64>, now: i64) -> Resul
         .list_users()
         .await?
         .into_iter()
-        .filter(|user| user.disabled_ms.is_none())
+        .filter(|user| user.disabled_at.is_none())
         .map(|user| (user.id, user))
         .collect();
     let current = this_session();
@@ -130,9 +131,9 @@ pub async fn sign_ins(state: &AppState, user_id: Option<i64>, now: i64) -> Resul
             user_agent: session.user_agent,
             address: session.last_address,
             forwarded_for: session.last_forwarded_for,
-            signed_in_ms: session.created_ms,
-            last_used_ms: session.last_used_ms,
-            expires_ms: Some(session.expires_ms),
+            signed_in_at: session.created_at,
+            last_used_at: session.last_used_at,
+            expires_at: Some(session.expires_at),
             current: current == Some(session.id),
         });
     }
@@ -150,18 +151,18 @@ pub async fn sign_ins(state: &AppState, user_id: Option<i64>, now: i64) -> Resul
             user_agent: None,
             address: app.last_address,
             forwarded_for: app.last_forwarded_for,
-            signed_in_ms: app.created_ms,
-            last_used_ms: app.last_used_ms,
-            expires_ms: Some(app.expires_ms),
+            signed_in_at: app.created_at,
+            last_used_at: app.last_used_at,
+            expires_at: Some(app.expires_at),
             current: false,
         });
     }
     for key in state.database.list_api_keys().await? {
-        let in_use = key.revoked_ms.is_none()
+        let in_use = key.revoked_at.is_none()
             && !key.has_expired(now)
             && key
-                .last_used_ms
-                .is_some_and(|used| now - used < KEY_IN_USE_MS)
+                .last_used_at
+                .is_some_and(|used| now - used.timestamp_millis() < KEY_IN_USE_MS)
             && user_id.is_none_or(|user_id| key.user_id == user_id);
         let Some(person) = people.get(&key.user_id).filter(|_| in_use) else {
             continue;
@@ -176,14 +177,14 @@ pub async fn sign_ins(state: &AppState, user_id: Option<i64>, now: i64) -> Resul
             user_agent: None,
             address: key.last_address,
             forwarded_for: key.last_forwarded_for,
-            signed_in_ms: key.created_ms,
-            last_used_ms: key.last_used_ms,
-            expires_ms: key.expires_ms,
+            signed_in_at: key.created_at,
+            last_used_at: key.last_used_at,
+            expires_at: key.expires_at,
             current: false,
         });
     }
     all.sort_by_key(|sign_in| {
-        std::cmp::Reverse(sign_in.last_used_ms.unwrap_or(sign_in.signed_in_ms))
+        std::cmp::Reverse(sign_in.last_used_at.unwrap_or(sign_in.signed_in_at))
     });
     Ok(all)
 }
@@ -302,11 +303,8 @@ pub struct Row {
     current: bool,
 }
 
-pub fn rows(sign_ins: Vec<SignIn>, now: i64) -> Vec<Row> {
-    let ago = |ms: i64| {
-        let (then, now) = (u64::try_from(ms).ok()?, u64::try_from(now).ok()?);
-        Some(crate::times::ago(then, now))
-    };
+pub fn rows(sign_ins: Vec<SignIn>, now_ms: i64) -> Vec<Row> {
+    let now = times::from_ms(now_ms);
     sign_ins
         .into_iter()
         .map(|sign_in| Row {
@@ -316,12 +314,12 @@ pub fn rows(sign_ins: Vec<SignIn>, now: i64) -> Vec<Row> {
             role: sign_in.role.label(),
             address: sign_in.address.unwrap_or_else(|| "–".to_string()),
             forwarded_for: sign_in.forwarded_for,
-            since: local_date(sign_in.signed_in_ms),
-            since_at: local_time(sign_in.signed_in_ms),
-            last_used: sign_in.last_used_ms.and_then(ago),
-            last_used_at: sign_in.last_used_ms.map(local_time),
+            since: local_date(sign_in.signed_in_at),
+            since_at: local_time(sign_in.signed_in_at),
+            last_used: sign_in.last_used_at.map(|used| times::ago(used, now)),
+            last_used_at: sign_in.last_used_at.map(local_time),
             expires: sign_in
-                .expires_ms
+                .expires_at
                 .map_or_else(|| "Never".to_string(), local_date),
             current: sign_in.current,
             user: sign_in.user,

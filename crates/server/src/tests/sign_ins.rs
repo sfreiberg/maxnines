@@ -47,7 +47,7 @@ async fn admins_see_everyone_signed_in_and_from_where() {
     assert_eq!(browser["role"], "editor");
     assert_eq!(browser["address"], "127.0.0.1");
     assert_eq!(browser["current"], false);
-    assert!(browser["last_used_ms"].is_i64(), "{browser}");
+    assert!(browser["last_used_at"].is_string(), "{browser}");
     let app_row = find(&listed, "app", "editor@example.com");
     assert_eq!(app_row["name"], "MaxNines command line on laptop");
     // An app does no more than it was allowed, even for someone who could.

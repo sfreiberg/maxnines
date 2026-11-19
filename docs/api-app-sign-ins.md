@@ -186,17 +186,17 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/app-sign
     "app": "MaxNines command line",
     "device": "sam-laptop",
     "role": "responder",
-    "created_ms": 1793940265767,
-    "last_used_ms": 1793940285797,
+    "created_at": "2026-11-06T04:44:25.767Z",
+    "last_used_at": "2026-11-06T04:44:45.797Z",
     "last_address": "192.168.0.20",
     "last_forwarded_for": null,
-    "expires_ms": 1801716285797,
-    "revoked_ms": null
+    "expires_at": "2027-02-04T04:44:45.797Z",
+    "revoked_at": null
   }
 ]
 ```
 
-`expires_ms` is when it stops working unless it's used before then. `last_used_ms` is
+`expires_at` is when it stops working unless it's used before then. `last_used_at` is
 accurate to about a minute.
 
 ## Revoke a signed-in app

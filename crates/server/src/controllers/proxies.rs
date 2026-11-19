@@ -173,8 +173,8 @@ async fn page(state: &AppState, token: &CsrfToken, error: Option<&str>) -> Respo
             },
             people: seen.people.iter().cloned().collect(),
             requests: seen.requests,
-            first_seen: local_time(seen.first_ms),
-            last_seen: local_time(seen.last_ms),
+            first_seen: local_time(seen.first_seen_at),
+            last_seen: local_time(seen.last_seen_at),
             yours: mine == Some(seen.address),
             suggested_label: label_of(&seen.suggested),
             wider: seen.suggested != seen.address.to_string(),
@@ -188,7 +188,7 @@ async fn page(state: &AppState, token: &CsrfToken, error: Option<&str>) -> Respo
             id: decision.id,
             label: label_of(&decision.address),
             trusted: decision.trusted,
-            created: local_time(decision.created_ms),
+            created: local_time(decision.created_at),
         })
         .collect();
     let providers: Vec<serde_json::Value> = PROVIDERS

@@ -124,7 +124,7 @@ fn row(
         disk_mount_point: values.disk_mount_point,
         updated: Some(values.time_ms)
             .filter(|time| *time > 0)
-            .map(local_time),
+            .map(|time| local_time(crate::times::from_ms(time))),
         short_id: short_id(&host.id).to_string(),
         id: host.id,
         hostname: host.hostname,

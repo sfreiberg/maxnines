@@ -8,10 +8,10 @@ pub struct Model {
     pub user_id: i64,
     /// Only the hash is kept, so reading the database doesn't sign anyone in.
     pub token_hash: String,
-    pub created_ms: i64,
-    pub expires_ms: i64,
+    pub created_at: DateTimeUtc,
+    pub expires_at: DateTimeUtc,
     /// When it was last used, to about a minute.
-    pub last_used_ms: Option<i64>,
+    pub last_used_at: Option<DateTimeUtc>,
     /// The address it was last used from.
     pub last_address: Option<String>,
     /// What the browser said it was when it signed in.

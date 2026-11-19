@@ -32,6 +32,7 @@ use crate::registration::{HostRecord, HostState, Registry};
 use crate::remote_checks::{FLEET_HOST_ID, FLEET_HOSTNAME};
 use crate::rule_engine;
 use crate::server_stats::ServerStatus;
+use crate::times::from_ms;
 
 /// How often rules are checked. Matches the default sample interval.
 const INTERVAL: Duration = Duration::from_secs(15);
@@ -971,8 +972,8 @@ impl Evaluator {
                     series: key.series,
                     value,
                     summary,
-                    started_ms: snapshot.now_ms,
-                    breached_ms,
+                    started_at: from_ms(snapshot.now_ms),
+                    breached_at: from_ms(breached_ms),
                 };
                 let channels = self.channels_for(rule).await?;
                 let id = self.database.fire_alert(&new, &channels).await?;

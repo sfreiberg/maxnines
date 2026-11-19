@@ -17,6 +17,7 @@ use crate::app_sign_ins::{
 };
 use crate::audit::{Kind, Snapshot};
 use crate::roles::Role;
+use crate::times::{self, Timestamp, millis};
 
 /// An app someone signed in, as the pages and the API show it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -31,15 +32,15 @@ pub struct AppSignIn {
     pub device: String,
     /// The most it may do. It never does more than its owner can now.
     pub role: Role,
-    pub created_ms: i64,
-    pub last_used_ms: Option<i64>,
+    pub created_at: Timestamp,
+    pub last_used_at: Option<Timestamp>,
     /// The address it was last used from.
     pub last_address: Option<String>,
     /// What an untrusted proxy there said it was passing on, so unconfirmed.
     pub last_forwarded_for: Option<String>,
     /// When it stops working unless it's used before then.
-    pub expires_ms: i64,
-    pub revoked_ms: Option<i64>,
+    pub expires_at: Timestamp,
+    pub revoked_at: Option<Timestamp>,
 }
 
 impl AppSignIn {
@@ -53,17 +54,17 @@ impl AppSignIn {
             role: Role::parse(&row.role).unwrap_or(Role::Viewer),
             client_id: row.client_id,
             device: row.device,
-            created_ms: row.created_ms,
-            last_used_ms: row.last_used_ms,
+            created_at: row.created_at,
+            last_used_at: row.last_used_at,
             last_address: row.last_address,
             last_forwarded_for: row.last_forwarded_for,
-            expires_ms: row.refresh_expires_ms,
-            revoked_ms: row.revoked_ms,
+            expires_at: row.refresh_expires_at,
+            revoked_at: row.revoked_at,
         }
     }
 
     pub fn is_active(&self, now_ms: i64) -> bool {
-        self.revoked_ms.is_none() && now_ms < self.expires_ms
+        self.revoked_at.is_none() && now_ms < self.expires_at.timestamp_millis()
     }
 
     /// What it's called where it's listed, and in the audit log.
@@ -100,7 +101,7 @@ fn snapshot(row: &app_sign_in::Model, owner: &str) -> Snapshot {
         "device": row.device,
         "owner": owner,
         "role": row.role,
-        "revoked": row.revoked_ms.is_some(),
+        "revoked": row.revoked_at.is_some(),
     });
     let name = if row.device.is_empty() {
         app.to_string()
@@ -146,12 +147,14 @@ impl Database {
             "there's no app called {client_id}"
         );
         let tokens = new_tokens()?;
+        let now = times::from_ms(now_ms);
         // Ones that ended long ago go, so the list doesn't grow with every sign in.
+        let ended = now - millis(KEPT_AFTER_ENDING_MS);
         app_sign_in::Entity::delete_many()
             .filter(
                 sea_orm::Condition::any()
-                    .add(app_sign_in::Column::RevokedMs.lt(now_ms - KEPT_AFTER_ENDING_MS))
-                    .add(app_sign_in::Column::RefreshExpiresMs.lt(now_ms - KEPT_AFTER_ENDING_MS)),
+                    .add(app_sign_in::Column::RevokedAt.lt(ended))
+                    .add(app_sign_in::Column::RefreshExpiresAt.lt(ended)),
             )
             .exec(&self.connection)
             .await
@@ -167,11 +170,11 @@ impl Database {
             device: Set(device.to_string()),
             role: Set(role.as_str().to_string()),
             access_hash: Set(secret_hash(&tokens.access_token)),
-            access_expires_ms: Set(now_ms + ACCESS_LIFETIME_MS),
+            access_expires_at: Set(now + millis(ACCESS_LIFETIME_MS)),
             refresh_hash: Set(secret_hash(&tokens.refresh_token)),
-            refresh_expires_ms: Set(now_ms + REFRESH_LIFETIME_MS),
-            created_ms: Set(now_ms),
-            last_used_ms: Set(Some(now_ms)),
+            refresh_expires_at: Set(now + millis(REFRESH_LIFETIME_MS)),
+            created_at: Set(now),
+            last_used_at: Set(Some(now)),
             last_address: Set(crate::audit::source().map(|address| address.to_string())),
             last_forwarded_for: Set(
                 crate::audit::forwarded_for().map(|address| address.to_string())
@@ -205,11 +208,11 @@ impl Database {
     ) -> Result<Option<(AppSignIn, User)>> {
         let row = app_sign_in::Entity::find()
             .filter(app_sign_in::Column::AccessHash.eq(secret_hash(access_token)))
-            .filter(app_sign_in::Column::RevokedMs.is_null())
+            .filter(app_sign_in::Column::RevokedAt.is_null())
             .one(&self.connection)
             .await
             .context("checking an app's token")?;
-        let Some(row) = row.filter(|row| now_ms < row.access_expires_ms) else {
+        let Some(row) = row.filter(|row| now_ms < row.access_expires_at.timestamp_millis()) else {
             return Ok(None);
         };
         let Some(mut owner) = enabled_user(&self.connection, row.user_id).await? else {
@@ -221,9 +224,9 @@ impl Database {
             address: row.last_address.clone(),
             forwarded_for: row.last_forwarded_for.clone(),
         };
-        let row = if let Some((used, from)) = super::noted_use(row.last_used_ms, &last, now_ms) {
+        let row = if let Some((used, from)) = super::noted_use(row.last_used_at, &last, now_ms) {
             let mut row: app_sign_in::ActiveModel = row.into();
-            row.last_used_ms = Set(Some(used));
+            row.last_used_at = Set(Some(used));
             row.last_address = Set(from.address);
             row.last_forwarded_for = Set(from.forwarded_for);
             row.update(&self.connection)
@@ -280,10 +283,10 @@ impl Database {
                     return Ok(Some(Refreshed::Refused));
                 };
                 let in_grace = row
-                    .rotated_ms
-                    .is_some_and(|rotated| now_ms - rotated < REFRESH_GRACE_MS);
+                    .rotated_at
+                    .is_some_and(|rotated| now_ms - rotated.timestamp_millis() < REFRESH_GRACE_MS);
                 if !in_grace {
-                    if row.revoked_ms.is_none() {
+                    if row.revoked_at.is_none() {
                         revoke_row(&transaction, row, now_ms).await?;
                         transaction.commit().await.context("revoking an app")?;
                         return Ok(Some(Refreshed::Reused));
@@ -294,8 +297,8 @@ impl Database {
             }
         };
         let usable = row.client_id == client_id
-            && row.revoked_ms.is_none()
-            && now_ms < row.refresh_expires_ms;
+            && row.revoked_at.is_none()
+            && now_ms < row.refresh_expires_at.timestamp_millis();
         if !usable {
             return Ok(Some(Refreshed::Refused));
         }
@@ -303,26 +306,27 @@ impl Database {
             return Ok(Some(Refreshed::Refused));
         };
         let tokens = new_tokens()?;
+        let now = times::from_ms(now_ms);
         let mut changes = app_sign_in::ActiveModel {
             access_hash: Set(secret_hash(&tokens.access_token)),
-            access_expires_ms: Set(now_ms + ACCESS_LIFETIME_MS),
+            access_expires_at: Set(now + millis(ACCESS_LIFETIME_MS)),
             refresh_hash: Set(secret_hash(&tokens.refresh_token)),
-            refresh_expires_ms: Set(now_ms + REFRESH_LIFETIME_MS),
-            last_used_ms: Set(Some(now_ms)),
+            refresh_expires_at: Set(now + millis(REFRESH_LIFETIME_MS)),
+            last_used_at: Set(Some(now)),
             ..Default::default()
         };
         // Within the grace, the token being swapped is still the one swapped before,
         // and its minute still counts from then, so using it again can't stretch it.
         if !in_grace {
             changes.previous_refresh_hash = Set(Some(hash));
-            changes.rotated_ms = Set(Some(now_ms));
+            changes.rotated_at = Set(Some(now));
         }
         // Only if nothing has swapped it since it was read.
         let swapped = app_sign_in::Entity::update_many()
             .set(changes)
             .filter(app_sign_in::Column::Id.eq(row.id))
             .filter(app_sign_in::Column::RefreshHash.eq(row.refresh_hash.as_str()))
-            .filter(app_sign_in::Column::RevokedMs.is_null())
+            .filter(app_sign_in::Column::RevokedAt.is_null())
             .exec(&transaction)
             .await
             .context("refreshing an app")?;
@@ -382,8 +386,8 @@ impl Database {
         now_ms: i64,
     ) -> Result<u64> {
         let mut query = app_sign_in::Entity::find()
-            .filter(app_sign_in::Column::RevokedMs.is_null())
-            .filter(app_sign_in::Column::RefreshExpiresMs.gt(now_ms));
+            .filter(app_sign_in::Column::RevokedAt.is_null())
+            .filter(app_sign_in::Column::RefreshExpiresAt.gt(times::from_ms(now_ms)));
         if let Some(user_id) = user_id {
             query = query.filter(app_sign_in::Column::UserId.eq(user_id));
         }
@@ -403,7 +407,7 @@ impl Database {
         else {
             return Ok(false);
         };
-        if row.revoked_ms.is_none() {
+        if row.revoked_at.is_none() {
             revoke_row(&transaction, row, now_ms).await?;
             transaction.commit().await.context("revoking an app")?;
         }
@@ -440,7 +444,7 @@ async fn revoke_row<C: ConnectionTrait>(
     let owner = owner_email(connection, row.user_id).await?;
     let before = snapshot(&row, &owner);
     let mut active: app_sign_in::ActiveModel = row.into();
-    active.revoked_ms = Set(Some(now_ms));
+    active.revoked_at = Set(Some(times::from_ms(now_ms)));
     let row = active.update(connection).await.context("revoking an app")?;
     let after = snapshot(&row, &owner);
     record_change(

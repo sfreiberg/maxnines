@@ -161,7 +161,7 @@ impl Database {
     pub async fn create_dashboard(&self, name: &str, now_ms: i64) -> Result<i64> {
         let row = dashboard::ActiveModel {
             name: Set(name.to_string()),
-            created_ms: Set(now_ms),
+            created_at: Set(crate::times::from_ms(now_ms)),
             ..Default::default()
         };
         let transaction = self.connection.begin().await.context("saving dashboard")?;

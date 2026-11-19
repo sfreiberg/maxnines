@@ -20,6 +20,7 @@ use wildmatch::WildMatch;
 use crate::config::{RegistrationConfig, RuleAction, RuleConfig, parse_network};
 use crate::models::Database;
 use crate::remote_checks::{FLEET_HOST_ID, LOCAL_HOST_ID};
+use crate::times::{self, Timestamp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -126,8 +127,8 @@ pub struct HostRecord {
     pub state: HostState,
     /// Who approved it: "admin", someone's address, or "rule:<name>".
     pub decided_by: Option<String>,
-    pub first_seen_ms: u64,
-    pub decided_ms: Option<u64>,
+    pub first_seen_at: Timestamp,
+    pub decided_at: Option<Timestamp>,
 }
 
 /// Enough of an agent's ID to tell it from another with the same name, where the
@@ -305,7 +306,7 @@ impl Registry {
             self.note_asked(request.id);
         }
 
-        let now = now_ms();
+        let now = times::now();
         let mut host = existing.clone().unwrap_or_else(|| HostRecord {
             id: request.id.to_string(),
             kind: HostKind::Agent,
@@ -313,8 +314,8 @@ impl Registry {
             hostname: request.hostname.to_string(),
             state: HostState::Pending,
             decided_by: None,
-            first_seen_ms: now,
-            decided_ms: None,
+            first_seen_at: now,
+            decided_at: None,
         });
         host.hostname = request.hostname.to_string();
 
@@ -322,7 +323,7 @@ impl Registry {
             info!(host_id = request.id, rule = rule.name, "approved by rule");
             host.state = HostState::Approved;
             host.decided_by = Some(format!("rule:{}", rule.name));
-            host.decided_ms = Some(now);
+            host.decided_at = Some(now);
         }
 
         let status = match host.state {
@@ -383,7 +384,7 @@ impl Registry {
 
         host.state = state;
         host.decided_by = Some(by.to_string());
-        host.decided_ms = Some(now_ms());
+        host.decided_at = Some(times::now());
         self.save(&mut hosts, host.clone()).await?;
         drop(hosts);
         self.asked_ms
@@ -405,7 +406,7 @@ impl Registry {
         SystemRandom::new()
             .fill(&mut id)
             .map_err(|_| anyhow::anyhow!("no random numbers to make an ID from"))?;
-        let now = now_ms();
+        let now = times::now();
         let host = HostRecord {
             id: hex::encode(id),
             kind: HostKind::Agentless,
@@ -413,8 +414,8 @@ impl Registry {
             hostname,
             state: HostState::Approved,
             decided_by: Some(by.to_string()),
-            first_seen_ms: now,
-            decided_ms: Some(now),
+            first_seen_at: now,
+            decided_at: Some(now),
         };
         let mut hosts = self.hosts.lock().await;
         self.save(&mut hosts, host.clone()).await?;
@@ -555,7 +556,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(record.decided_by.as_deref(), Some("admin"));
-        assert!(record.decided_ms.is_some());
+        assert!(record.decided_at.is_some());
         assert_eq!(
             registry.admit(&host).await.unwrap(),
             RegistrationStatus::Approved

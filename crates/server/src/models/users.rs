@@ -21,16 +21,16 @@ use super::audit::{record, record_change};
 use super::{Database, api_key, api_key_snapshot, user, user_session};
 use crate::audit::{Action, Actor, Kind, Record, Snapshot, Subject};
 use crate::roles::Role;
-use crate::times::{DEFAULT_TIME_ZONE, zone_named};
+use crate::times::{DEFAULT_TIME_ZONE, Timestamp, from_ms, zone_named};
 
 /// A browser someone's signed in on, as the list of sign-ins shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserSession {
     pub id: i64,
     pub user_id: i64,
-    pub created_ms: i64,
-    pub expires_ms: i64,
-    pub last_used_ms: Option<i64>,
+    pub created_at: Timestamp,
+    pub expires_at: Timestamp,
+    pub last_used_at: Option<Timestamp>,
     pub last_address: Option<String>,
     /// What an untrusted proxy there said it was passing on, so unconfirmed.
     pub last_forwarded_for: Option<String>,
@@ -43,9 +43,9 @@ impl From<user_session::Model> for BrowserSession {
         Self {
             id: row.id,
             user_id: row.user_id,
-            created_ms: row.created_ms,
-            expires_ms: row.expires_ms,
-            last_used_ms: row.last_used_ms,
+            created_at: row.created_at,
+            expires_at: row.expires_at,
+            last_used_at: row.last_used_at,
             last_address: row.last_address,
             last_forwarded_for: row.last_forwarded_for,
             user_agent: row.user_agent,
@@ -96,9 +96,9 @@ pub struct User {
     pub has_password: bool,
     /// Whether signing in also takes a code from their authenticator app.
     pub two_factor: bool,
-    pub created_ms: i64,
-    pub last_sign_in_ms: Option<i64>,
-    pub disabled_ms: Option<i64>,
+    pub created_at: Timestamp,
+    pub last_sign_in_at: Option<Timestamp>,
+    pub disabled_at: Option<Timestamp>,
 }
 
 impl From<user::Model> for User {
@@ -114,9 +114,9 @@ impl From<user::Model> for User {
             name: row.name,
             theme: row.theme,
             time_zone: row.time_zone,
-            created_ms: row.created_ms,
-            last_sign_in_ms: row.last_sign_in_ms,
-            disabled_ms: row.disabled_ms,
+            created_at: row.created_at,
+            last_sign_in_at: row.last_sign_in_at,
+            disabled_at: row.disabled_at,
         }
     }
 }
@@ -187,7 +187,7 @@ pub(super) async fn enabled_user<C: ConnectionTrait>(
     id: i64,
 ) -> Result<Option<User>> {
     let row = user::Entity::find_by_id(id)
-        .filter(user::Column::DisabledMs.is_null())
+        .filter(user::Column::DisabledAt.is_null())
         .one(connection)
         .await
         .context("loading a user who can sign in")?;
@@ -204,7 +204,7 @@ fn snapshot(row: &user::Model) -> Snapshot {
         "theme": row.theme,
         "time_zone": row.time_zone,
         "password": row.password_hash,
-        "disabled": row.disabled_ms.is_some(),
+        "disabled": row.disabled_at.is_some(),
         "two_factor": row.totp_enabled,
     });
     Snapshot::new(row.email.clone(), fields).with_secrets(&["password"])
@@ -301,8 +301,8 @@ impl Database {
             theme: Set(DEFAULT_THEME.to_string()),
             time_zone: Set(DEFAULT_TIME_ZONE.name().to_string()),
             setup_token_hash: Set(Some(token_hash(&token))),
-            setup_expires_ms: Set(Some(now_ms + SETUP_LINK_LIFETIME_MS)),
-            created_ms: Set(now_ms),
+            setup_expires_at: Set(Some(from_ms(now_ms + SETUP_LINK_LIFETIME_MS))),
+            created_at: Set(from_ms(now_ms)),
             ..Default::default()
         }
         .insert(&transaction)
@@ -336,7 +336,7 @@ impl Database {
         let transaction = self.connection.begin().await.context("starting a save")?;
         let mut row: user::ActiveModel = row.into();
         row.setup_token_hash = Set(Some(token_hash(&token)));
-        row.setup_expires_ms = Set(Some(now_ms + SETUP_LINK_LIFETIME_MS));
+        row.setup_expires_at = Set(Some(from_ms(now_ms + SETUP_LINK_LIFETIME_MS)));
         row.update(&transaction)
             .await
             .context("saving a setup link")?;
@@ -349,8 +349,8 @@ impl Database {
     pub async fn setup_link_user(&self, token: &str, now_ms: i64) -> Result<Option<User>> {
         let row = user::Entity::find()
             .filter(user::Column::SetupTokenHash.eq(token_hash(token)))
-            .filter(user::Column::SetupExpiresMs.gt(now_ms))
-            .filter(user::Column::DisabledMs.is_null())
+            .filter(user::Column::SetupExpiresAt.gt(from_ms(now_ms)))
+            .filter(user::Column::DisabledAt.is_null())
             .one(&self.connection)
             .await
             .context("checking a setup link")?;
@@ -376,13 +376,13 @@ impl Database {
                 Expr::value(Option::<String>::None),
             )
             .col_expr(
-                user::Column::SetupExpiresMs,
-                Expr::value(Option::<i64>::None),
+                user::Column::SetupExpiresAt,
+                Expr::value(Option::<Timestamp>::None),
             )
             .filter(user::Column::Id.eq(user_id))
             .filter(user::Column::SetupTokenHash.eq(token_hash(token)))
-            .filter(user::Column::SetupExpiresMs.gt(now_ms))
-            .filter(user::Column::DisabledMs.is_null())
+            .filter(user::Column::SetupExpiresAt.gt(from_ms(now_ms)))
+            .filter(user::Column::DisabledAt.is_null())
             .exec(&transaction)
             .await
             .context("saving a password")?;
@@ -406,7 +406,7 @@ impl Database {
     pub async fn active_user_by_email(&self, email: &str) -> Result<Option<User>> {
         let row = user::Entity::find()
             .filter(user::Column::Email.eq(normalise_email(email)))
-            .filter(user::Column::DisabledMs.is_null())
+            .filter(user::Column::DisabledAt.is_null())
             .one(&self.connection)
             .await
             .context("loading a user")?;
@@ -416,7 +416,7 @@ impl Database {
     pub async fn sign_in_details(&self, email: &str) -> Result<Option<(User, Option<String>)>> {
         let row = user::Entity::find()
             .filter(user::Column::Email.eq(normalise_email(email)))
-            .filter(user::Column::DisabledMs.is_null())
+            .filter(user::Column::DisabledAt.is_null())
             .one(&self.connection)
             .await
             .context("loading a user")?;
@@ -485,7 +485,7 @@ impl Database {
     async fn is_last_enabled_admin(&self, id: i64) -> Result<bool> {
         let others = user::Entity::find()
             .filter(user::Column::Id.ne(id))
-            .filter(user::Column::DisabledMs.is_null())
+            .filter(user::Column::DisabledAt.is_null())
             .filter(user::Column::Role.eq(Role::Admin.as_str()))
             .count(&self.connection)
             .await
@@ -499,7 +499,7 @@ impl Database {
         let Some(before) = load(&self.connection, id).await? else {
             return Ok(UserChange::NoSuchUser);
         };
-        let was_admin = before.role == Role::Admin.as_str() && before.disabled_ms.is_none();
+        let was_admin = before.role == Role::Admin.as_str() && before.disabled_at.is_none();
         if was_admin && role != Role::Admin && self.is_last_enabled_admin(id).await? {
             return Ok(UserChange::LastAdmin);
         }
@@ -524,7 +524,7 @@ impl Database {
         else {
             return Ok(UserChange::NoSuchUser);
         };
-        if row.disabled_ms.is_some() {
+        if row.disabled_at.is_some() {
             return Ok(UserChange::Done);
         }
         if row.role == Role::Admin.as_str() && self.is_last_enabled_admin(id).await? {
@@ -533,7 +533,7 @@ impl Database {
         let transaction = self.connection.begin().await.context("starting a save")?;
         let before = row.clone();
         let mut row: user::ActiveModel = row.into();
-        row.disabled_ms = Set(Some(now_ms));
+        row.disabled_at = Set(Some(from_ms(now_ms)));
         row.update(&transaction).await.context("disabling a user")?;
         record_user(&transaction, id, Some(&before), None).await?;
         user_session::Entity::delete_many()
@@ -549,7 +549,10 @@ impl Database {
         let transaction = self.connection.begin().await.context("starting a save")?;
         let before = load(&transaction, id).await?;
         let updated = user::Entity::update_many()
-            .col_expr(user::Column::DisabledMs, Expr::value(Option::<i64>::None))
+            .col_expr(
+                user::Column::DisabledAt,
+                Expr::value(Option::<Timestamp>::None),
+            )
             .filter(user::Column::Id.eq(id))
             .exec(&transaction)
             .await
@@ -571,7 +574,7 @@ impl Database {
         else {
             return Ok(UserChange::NoSuchUser);
         };
-        if row.disabled_ms.is_none() {
+        if row.disabled_at.is_none() {
             return Ok(UserChange::StillEnabled);
         }
         let transaction = self.connection.begin().await.context("starting a save")?;
@@ -624,7 +627,7 @@ impl Database {
         user_agent: Option<&str>,
     ) -> Result<String> {
         user_session::Entity::delete_many()
-            .filter(user_session::Column::ExpiresMs.lte(now_ms))
+            .filter(user_session::Column::ExpiresAt.lte(from_ms(now_ms)))
             .exec(&self.connection)
             .await
             .context("clearing old sessions")?;
@@ -636,9 +639,9 @@ impl Database {
         user_session::ActiveModel {
             user_id: Set(user_id),
             token_hash: Set(token_hash(&token)),
-            created_ms: Set(now_ms),
-            expires_ms: Set(now_ms + SESSION_LIFETIME_MS),
-            last_used_ms: Set(Some(now_ms)),
+            created_at: Set(from_ms(now_ms)),
+            expires_at: Set(from_ms(now_ms + SESSION_LIFETIME_MS)),
+            last_used_at: Set(Some(from_ms(now_ms))),
             last_address: Set(crate::audit::source().map(|address| address.to_string())),
             last_forwarded_for: Set(
                 crate::audit::forwarded_for().map(|address| address.to_string())
@@ -650,7 +653,7 @@ impl Database {
         .await
         .context("saving a session")?;
         user::Entity::update_many()
-            .col_expr(user::Column::LastSignInMs, Expr::value(now_ms))
+            .col_expr(user::Column::LastSignInAt, Expr::value(from_ms(now_ms)))
             .filter(user::Column::Id.eq(user_id))
             .exec(&transaction)
             .await
@@ -680,7 +683,7 @@ impl Database {
     ) -> Result<Option<(User, i64)>> {
         let session = user_session::Entity::find()
             .filter(user_session::Column::TokenHash.eq(token_hash(token)))
-            .filter(user_session::Column::ExpiresMs.gt(now_ms))
+            .filter(user_session::Column::ExpiresAt.gt(from_ms(now_ms)))
             .one(&self.connection)
             .await
             .context("checking a session")?;
@@ -688,7 +691,7 @@ impl Database {
             return Ok(None);
         };
         let row = user::Entity::find_by_id(session.user_id)
-            .filter(user::Column::DisabledMs.is_null())
+            .filter(user::Column::DisabledAt.is_null())
             .one(&self.connection)
             .await
             .context("loading a session's user")?;
@@ -703,11 +706,11 @@ impl Database {
         let new_agent = user_agent
             .map(trimmed_user_agent)
             .filter(|agent| session.user_agent.as_ref() != Some(agent));
-        let noted = super::noted_use(session.last_used_ms, &last, now_ms);
+        let noted = super::noted_use(session.last_used_at, &last, now_ms);
         if noted.is_some() || new_agent.is_some() {
             let mut session: user_session::ActiveModel = session.into();
             if let Some((used, from)) = noted {
-                session.last_used_ms = Set(Some(used));
+                session.last_used_at = Set(Some(used));
                 session.last_address = Set(from.address);
                 session.last_forwarded_for = Set(from.forwarded_for);
             }
@@ -770,7 +773,7 @@ impl Database {
         now_ms: i64,
     ) -> Result<Vec<BrowserSession>> {
         let mut query = user_session::Entity::find()
-            .filter(user_session::Column::ExpiresMs.gt(now_ms))
+            .filter(user_session::Column::ExpiresAt.gt(from_ms(now_ms)))
             .order_by_desc(user_session::Column::Id);
         if let Some(user_id) = user_id {
             query = query.filter(user_session::Column::UserId.eq(user_id));

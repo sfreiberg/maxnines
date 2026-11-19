@@ -20,7 +20,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/server"
   "commit": "770de39",
   "built_at": "2026-11-06T04:42:04.427542000Z",
   "rust_version": "1.100.0",
-  "started_ms": 1793940264095,
+  "started_at": "2026-11-06T04:44:24.095Z",
   "uptime_secs": 22,
   "os": "Ubuntu 24.04",
   "process": {
@@ -70,7 +70,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/server"
     "samples_queued": 0,
     "queue_capacity": 1024,
     "alerts_open": 0,
-    "last_alert_pass_ms": 1793937144561
+    "last_alert_pass_at": "2026-11-06T03:52:24.561Z"
   }
 }
 ```

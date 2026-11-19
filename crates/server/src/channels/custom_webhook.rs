@@ -103,13 +103,13 @@ fn example_alert() -> Alert {
         series: String::new(),
         value: None,
         summary: Notice::test().text,
-        started_ms: chrono::Utc::now().timestamp_millis(),
-        breached_ms: chrono::Utc::now().timestamp_millis(),
-        resolved_ms: None,
+        started_at: crate::times::now(),
+        breached_at: crate::times::now(),
+        resolved_at: None,
         resolve_reason: None,
         resolved_summary: None,
         acknowledged_by: None,
-        acknowledged_ms: None,
+        acknowledged_at: None,
     }
 }
 
@@ -123,7 +123,7 @@ fn example_run() -> ActionRun {
         run_on: "first".to_string(),
         variables: BTreeMap::new(),
         requested_by: None,
-        requested_ms: 0,
+        requested_at: crate::times::from_ms(0),
         timeout_secs: 30,
         outcome: Some(ActionOutcome::Succeeded),
         exit_code: Some(0),
@@ -131,7 +131,7 @@ fn example_run() -> ActionRun {
         output: "PID  NAME\n  1  init\n".to_string(),
         truncated: false,
         duration_ms: Some(1000),
-        finished_ms: Some(1000),
+        finished_at: Some(crate::times::from_ms(1000)),
     }
 }
 
@@ -143,16 +143,16 @@ fn context(notice: &Notice, web_url: Option<&str>) -> Result<Context> {
         Value::Object(fields) => fields,
         _ => Map::new(),
     };
-    fields.insert("started".into(), crate::audit::time(alert.started_ms));
-    fields.insert("breached".into(), crate::audit::time(alert.breached_ms));
+    fields.insert("started".into(), crate::audit::time(alert.started_at));
+    fields.insert("breached".into(), crate::audit::time(alert.breached_at));
     fields.insert(
         "resolved".into(),
-        alert.resolved_ms.map_or(Value::Null, crate::audit::time),
+        alert.resolved_at.map_or(Value::Null, crate::audit::time),
     );
     fields.insert(
         "acknowledged".into(),
         alert
-            .acknowledged_ms
+            .acknowledged_at
             .map_or(Value::Null, crate::audit::time),
     );
     let values = json!({
@@ -321,7 +321,7 @@ impl ChannelType for CustomWebhook {
         // Filled in for each kind of message, so a mistake shows now rather than
         // when an alert fires.
         let mut resolved = example_alert();
-        resolved.resolved_ms = Some(resolved.started_ms);
+        resolved.resolved_at = Some(resolved.started_at);
         let examples = [
             Notice::for_alert(example_alert(), Event::Firing),
             Notice::for_alert(resolved, Event::Resolved),
@@ -508,13 +508,16 @@ mod tests {
         let body = render(
             &request(
                 "text/plain",
-                "{{ alert.started }} {{ alert.started_ms }} {{ alert.breached }}",
+                "{{ alert.started }} {{ alert.started_at }} {{ alert.breached }}",
             ),
             &notice(Event::Firing, alert()),
             None,
         )
         .unwrap();
-        assert_eq!(body, "1970-01-01T00:00:01Z 1000 1970-01-01T00:00:01Z");
+        assert_eq!(
+            body,
+            "1970-01-01T00:00:01Z 1970-01-01T00:00:01Z 1970-01-01T00:00:01Z"
+        );
     }
 
     #[test]

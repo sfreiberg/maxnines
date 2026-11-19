@@ -14,15 +14,15 @@ pub struct Model {
     pub hint: String,
     /// Only the hash is kept, so reading the database doesn't give anyone a key.
     pub token_hash: String,
-    pub created_ms: i64,
+    pub created_at: DateTimeUtc,
     /// Empty means it never expires.
-    pub expires_ms: Option<i64>,
-    pub last_used_ms: Option<i64>,
+    pub expires_at: Option<DateTimeUtc>,
+    pub last_used_at: Option<DateTimeUtc>,
     /// The address it was last used from.
     pub last_address: Option<String>,
     /// The address an untrusted proxy said it was passing on, so unconfirmed.
     pub last_forwarded_for: Option<String>,
-    pub revoked_ms: Option<i64>,
+    pub revoked_at: Option<DateTimeUtc>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

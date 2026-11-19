@@ -5,7 +5,7 @@ use sea_orm::entity::prelude::*;
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i64,
-    pub time_ms: i64,
+    pub occurred_at: DateTimeUtc,
     pub actor_kind: String,
     pub actor_id: Option<String>,
     pub actor_name: String,

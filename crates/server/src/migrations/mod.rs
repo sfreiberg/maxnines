@@ -8,63 +8,360 @@ pub struct Migrator;
 
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(CreateTables), Box::new(AddAlertsBreachedMs)]
+        vec![Box::new(CreateTables), Box::new(ConvertMoments)]
     }
 }
 
-/// When the problem behind an alert began, which is earlier than the alert started
-/// by however long its rule waits before firing. Alerts from before this have it
-/// worked out from their rule's wait as it is now, or the start, if their rule's gone.
-struct AddAlertsBreachedMs;
+/// Every moment kept as milliseconds since 1970, the column it becomes, and whether it
+/// can be empty. Durations, such as how long an action ran, stay numbers.
+const MOMENTS: &[(&str, &str, &str, bool)] = &[
+    ("action_runs", "finished_ms", "finished_at", false),
+    ("action_runs", "requested_ms", "requested_at", true),
+    ("alert_rules", "deleted_ms", "deleted_at", false),
+    ("alerts", "acknowledged_ms", "acknowledged_at", false),
+    ("alerts", "resolved_ms", "resolved_at", false),
+    ("alerts", "started_ms", "started_at", true),
+    ("api_keys", "created_ms", "created_at", true),
+    ("api_keys", "expires_ms", "expires_at", false),
+    ("api_keys", "last_used_ms", "last_used_at", false),
+    ("api_keys", "revoked_ms", "revoked_at", false),
+    (
+        "app_sign_ins",
+        "access_expires_ms",
+        "access_expires_at",
+        true,
+    ),
+    ("app_sign_ins", "created_ms", "created_at", true),
+    ("app_sign_ins", "last_used_ms", "last_used_at", false),
+    (
+        "app_sign_ins",
+        "refresh_expires_ms",
+        "refresh_expires_at",
+        true,
+    ),
+    ("app_sign_ins", "revoked_ms", "revoked_at", false),
+    ("app_sign_ins", "rotated_ms", "rotated_at", false),
+    ("audit_log", "time_ms", "occurred_at", true),
+    (
+        "config_rules",
+        "built_in_changed_ms",
+        "built_in_changed_at",
+        false,
+    ),
+    ("dashboards", "created_ms", "created_at", true),
+    ("events", "created_ms", "created_at", true),
+    ("events", "time_ms", "occurred_at", true),
+    ("host_boots", "boot_ms", "booted_at", true),
+    ("host_config_status", "reported_ms", "reported_at", true),
+    ("host_facts", "valid_from_ms", "valid_from", true),
+    ("host_facts", "valid_to_ms", "valid_to", false),
+    ("hosts", "decided_ms", "decided_at", false),
+    ("hosts", "first_seen_ms", "first_seen_at", true),
+    ("notification_channels", "deleted_ms", "deleted_at", false),
+    ("notifications", "created_ms", "created_at", true),
+    ("notifications", "next_attempt_ms", "next_attempt_at", true),
+    ("notifications", "sent_ms", "sent_at", false),
+    ("proxies", "created_ms", "created_at", true),
+    ("recovery_codes", "used_ms", "used_at", false),
+    ("sign_in_challenges", "expires_ms", "expires_at", true),
+    ("silences", "ends_ms", "ends_at", true),
+    ("silences", "starts_ms", "starts_at", true),
+    ("user_sessions", "created_ms", "created_at", true),
+    ("user_sessions", "expires_ms", "expires_at", true),
+    ("user_sessions", "last_used_ms", "last_used_at", false),
+    ("users", "created_ms", "created_at", true),
+    ("users", "disabled_ms", "disabled_at", false),
+    ("users", "last_sign_in_ms", "last_sign_in_at", false),
+    ("users", "setup_expires_ms", "setup_expires_at", false),
+];
 
-impl MigrationName for AddAlertsBreachedMs {
+/// The indexes on those columns, which are made again on the new ones: their name,
+/// table, and columns before and after.
+const MOMENT_INDEXES: &[(&str, &str, &[&str], &[&str])] = &[
+    (
+        "idx_alerts_resolved",
+        "alerts",
+        &["resolved_ms"],
+        &["resolved_at"],
+    ),
+    (
+        "idx_alerts_started",
+        "alerts",
+        &["started_ms"],
+        &["started_at"],
+    ),
+    ("idx_silences_ends", "silences", &["ends_ms"], &["ends_at"]),
+    (
+        "idx_notifications_due",
+        "notifications",
+        &["state", "next_attempt_ms"],
+        &["state", "next_attempt_at"],
+    ),
+    ("idx_events_time", "events", &["time_ms"], &["occurred_at"]),
+    (
+        "idx_host_facts_host",
+        "host_facts",
+        &["host_id", "valid_to_ms"],
+        &["host_id", "valid_to"],
+    ),
+    (
+        "idx_action_runs_host",
+        "action_runs",
+        &["host_id", "requested_ms"],
+        &["host_id", "requested_at"],
+    ),
+    (
+        "idx_action_runs_finished",
+        "action_runs",
+        &["finished_ms"],
+        &["finished_at"],
+    ),
+];
+
+/// Every moment becomes a timestamp: `timestamptz` on PostgreSQL, `DATETIME(3)` in UTC
+/// on MySQL, which has no time zone to shift it by and lasts past 2038 as `TIMESTAMP`
+/// doesn't, and ISO 8601 text in UTC on SQLite, which has no type for it, written as
+/// the server writes them, so they sort and compare as text as they do as times. The
+/// data is converted, not lost, and alerts learn when their problem began, as their
+/// start less their rule's wait, or their start if their rule's gone.
+struct ConvertMoments;
+
+impl MigrationName for ConvertMoments {
     fn name(&self) -> &str {
-        "m20261119_000001_add_alerts_breached_ms"
+        "m20261119_000001_convert_moments"
     }
+}
+
+/// `column` as the timestamp text the server writes on SQLite: to the second, then the
+/// milliseconds only if there are any, and `+00:00`.
+fn sqlite_moment(column: &str) -> String {
+    format!(
+        "strftime('%Y-%m-%dT%H:%M:%S', {column} / 1000, 'unixepoch') || \
+         CASE WHEN {column} % 1000 = 0 THEN '' ELSE printf('.%03d', {column} % 1000) END \
+         || '+00:00'"
+    )
 }
 
 #[async_trait::async_trait]
-impl MigrationTrait for AddAlertsBreachedMs {
+impl MigrationTrait for ConvertMoments {
     fn use_transaction(&self) -> Option<bool> {
         Some(true)
     }
 
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        // Every database can only add a column that can't be empty with a default
-        // for the rows already there, which are filled in properly next.
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(Alerts::Table)
-                    .add_column(
-                        ColumnDef::new(Alerts::BreachedMs)
-                            .big_integer()
-                            .not_null()
-                            .default(0),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-        manager
-            .get_connection()
-            .execute_unprepared(
-                "UPDATE alerts SET breached_ms = started_ms - 1000 * COALESCE(
-                    (SELECT for_secs FROM alert_rules WHERE alert_rules.id = alerts.rule_id), 0)",
-            )
-            .await?;
-        Ok(())
+        let db = manager.get_connection();
+        let backend = manager.get_database_backend();
+        add_stand_ins(manager).await?;
+        for (name, table, _, _) in MOMENT_INDEXES {
+            manager
+                .drop_index(
+                    Index::drop()
+                        .name(*name)
+                        .table(Alias::new(*table))
+                        .to_owned(),
+                )
+                .await?;
+        }
+        // When each alert's problem began, from what's there before it changes.
+        let mut moments: Vec<(&str, &str, &str, bool)> = MOMENTS.to_vec();
+        db.execute_unprepared(
+            "ALTER TABLE alerts ADD COLUMN breached_ms BIGINT NOT NULL DEFAULT 0",
+        )
+        .await?;
+        db.execute_unprepared(
+            "UPDATE alerts SET breached_ms = started_ms - 1000 * COALESCE(
+                (SELECT for_secs FROM alert_rules WHERE alert_rules.id = alerts.rule_id), 0)",
+        )
+        .await?;
+        if backend == sea_orm::DatabaseBackend::Postgres {
+            db.execute_unprepared("ALTER TABLE alerts ALTER COLUMN breached_ms DROP DEFAULT")
+                .await?;
+        }
+        moments.push(("alerts", "breached_ms", "breached_at", true));
+
+        for (table, from, to, required) in moments {
+            match backend {
+                sea_orm::DatabaseBackend::Postgres => {
+                    db.execute_unprepared(&format!(
+                        "ALTER TABLE \"{table}\" ALTER COLUMN \"{from}\" TYPE timestamptz \
+                         USING TIMESTAMPTZ 'epoch' + \"{from}\" * INTERVAL '1 millisecond'"
+                    ))
+                    .await?;
+                    db.execute_unprepared(&format!(
+                        "ALTER TABLE \"{table}\" RENAME COLUMN \"{from}\" TO \"{to}\""
+                    ))
+                    .await?;
+                }
+                sea_orm::DatabaseBackend::MySql => {
+                    db.execute_unprepared(&format!(
+                        "ALTER TABLE `{table}` ADD COLUMN `{to}` DATETIME(3) NULL"
+                    ))
+                    .await?;
+                    db.execute_unprepared(&format!(
+                        "UPDATE `{table}` SET `{to}` = \
+                         TIMESTAMPADD(MICROSECOND, `{from}` * 1000, '1970-01-01 00:00:00')"
+                    ))
+                    .await?;
+                    let required = if required { " NOT NULL" } else { " NULL" };
+                    db.execute_unprepared(&format!(
+                        "ALTER TABLE `{table}` DROP COLUMN `{from}`, \
+                         MODIFY `{to}` DATETIME(3){required}"
+                    ))
+                    .await?;
+                }
+                _ => {
+                    // SQLite can only add a column that can't be empty with a default,
+                    // for the rows already there, which are all filled in next.
+                    let required = if required {
+                        " NOT NULL DEFAULT '1970-01-01T00:00:00+00:00'"
+                    } else {
+                        ""
+                    };
+                    db.execute_unprepared(&format!(
+                        "ALTER TABLE \"{table}\" ADD COLUMN \"{to}\" TEXT{required}"
+                    ))
+                    .await?;
+                    db.execute_unprepared(&format!(
+                        "UPDATE \"{table}\" SET \"{to}\" = {} WHERE \"{from}\" IS NOT NULL",
+                        sqlite_moment(&format!("\"{from}\""))
+                    ))
+                    .await?;
+                    db.execute_unprepared(&format!(
+                        "ALTER TABLE \"{table}\" DROP COLUMN \"{from}\""
+                    ))
+                    .await?;
+                }
+            }
+        }
+        for (name, table, _, after) in MOMENT_INDEXES {
+            let mut index = Index::create();
+            index.name(*name).table(Alias::new(*table));
+            for column in *after {
+                index.col(Alias::new(*column));
+            }
+            manager.create_index(index.to_owned()).await?;
+        }
+        drop_stand_ins(manager).await
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(Alerts::Table)
-                    .drop_column(Alerts::BreachedMs)
-                    .to_owned(),
-            )
-            .await
+        let db = manager.get_connection();
+        let backend = manager.get_database_backend();
+        add_stand_ins(manager).await?;
+        for (name, table, _, _) in MOMENT_INDEXES {
+            manager
+                .drop_index(
+                    Index::drop()
+                        .name(*name)
+                        .table(Alias::new(*table))
+                        .to_owned(),
+                )
+                .await?;
+        }
+        let mut moments: Vec<(&str, &str, &str, bool)> = MOMENTS.to_vec();
+        moments.push(("alerts", "breached_ms", "breached_at", true));
+        for (table, from, to, required) in moments {
+            match backend {
+                sea_orm::DatabaseBackend::Postgres => {
+                    db.execute_unprepared(&format!(
+                        "ALTER TABLE \"{table}\" ALTER COLUMN \"{to}\" TYPE bigint \
+                         USING (EXTRACT(EPOCH FROM \"{to}\") * 1000)::bigint"
+                    ))
+                    .await?;
+                    db.execute_unprepared(&format!(
+                        "ALTER TABLE \"{table}\" RENAME COLUMN \"{to}\" TO \"{from}\""
+                    ))
+                    .await?;
+                }
+                sea_orm::DatabaseBackend::MySql => {
+                    db.execute_unprepared(&format!(
+                        "ALTER TABLE `{table}` ADD COLUMN `{from}` BIGINT NULL"
+                    ))
+                    .await?;
+                    db.execute_unprepared(&format!(
+                        "UPDATE `{table}` SET `{from}` = \
+                         TIMESTAMPDIFF(MICROSECOND, '1970-01-01 00:00:00', `{to}`) DIV 1000"
+                    ))
+                    .await?;
+                    let required = if required { " NOT NULL" } else { " NULL" };
+                    db.execute_unprepared(&format!(
+                        "ALTER TABLE `{table}` DROP COLUMN `{to}`, MODIFY `{from}` BIGINT{required}"
+                    ))
+                    .await?;
+                }
+                _ => {
+                    let required = if required { " NOT NULL DEFAULT 0" } else { "" };
+                    db.execute_unprepared(&format!(
+                        "ALTER TABLE \"{table}\" ADD COLUMN \"{from}\" INTEGER{required}"
+                    ))
+                    .await?;
+                    db.execute_unprepared(&format!(
+                        "UPDATE \"{table}\" SET \"{from}\" = \
+                         CAST(strftime('%s', \"{to}\") AS INTEGER) * 1000 \
+                         + CAST(substr(strftime('%f', \"{to}\"), 4) AS INTEGER) \
+                         WHERE \"{to}\" IS NOT NULL"
+                    ))
+                    .await?;
+                    db.execute_unprepared(&format!("ALTER TABLE \"{table}\" DROP COLUMN \"{to}\""))
+                        .await?;
+                }
+            }
+        }
+        db.execute_unprepared("ALTER TABLE alerts DROP COLUMN breached_ms")
+            .await?;
+        for (name, table, before, _) in MOMENT_INDEXES {
+            let mut index = Index::create();
+            index.name(*name).table(Alias::new(*table));
+            for column in *before {
+                index.col(Alias::new(*column));
+            }
+            manager.create_index(index.to_owned()).await?;
+        }
+        drop_stand_ins(manager).await
     }
+}
+
+/// MySQL won't drop an index a foreign key needs, and those on a host's facts and its
+/// actions lead with the host. While they're made again, a stand-in on the columns
+/// ahead of the moment covers for each index that has any.
+fn stand_ins() -> impl Iterator<Item = (String, &'static str, &'static [&'static str])> {
+    MOMENT_INDEXES
+        .iter()
+        .filter(|(_, _, before, _)| before.len() > 1)
+        .map(|(name, table, before, _)| {
+            (
+                format!("{name}_meanwhile"),
+                *table,
+                &before[..before.len() - 1],
+            )
+        })
+}
+
+async fn add_stand_ins(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    if manager.get_database_backend() != sea_orm::DatabaseBackend::MySql {
+        return Ok(());
+    }
+    for (name, table, columns) in stand_ins() {
+        let mut index = Index::create();
+        index.name(name).table(Alias::new(table));
+        for column in columns {
+            index.col(Alias::new(*column));
+        }
+        manager.create_index(index.to_owned()).await?;
+    }
+    Ok(())
+}
+
+async fn drop_stand_ins(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    if manager.get_database_backend() != sea_orm::DatabaseBackend::MySql {
+        return Ok(());
+    }
+    for (name, table, _) in stand_ins() {
+        manager
+            .drop_index(Index::drop().name(name).table(Alias::new(table)).to_owned())
+            .await?;
+    }
+    Ok(())
 }
 
 /// A big integer that counts up from 1, which is what every `id` column is.
@@ -1852,7 +2149,6 @@ enum Alerts {
     Value,
     Summary,
     StartedMs,
-    BreachedMs,
     ResolvedMs,
     ResolveReason,
     ResolvedSummary,
@@ -2180,15 +2476,115 @@ mod tests {
         let wait_ms: i64 = wait[0].parse::<i64>().unwrap() * 1000;
 
         Migrator::up(&connection, None).await.unwrap();
-        let began = texts(
+        let began = texts(&connection, "SELECT breached_at FROM alerts ORDER BY id").await;
+        let at = |ms| as_sqlx_writes(crate::times::from_ms(ms));
+        assert_eq!(began, [at(600_000 - wait_ms), at(700_000)]);
+        assert_eq!(began[1], "1970-01-01T00:11:40+00:00");
+    }
+
+    /// A moment as sqlx writes it to SQLite, which keeps it as text.
+    fn as_sqlx_writes(time: crate::times::Timestamp) -> String {
+        time.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, false)
+    }
+
+    #[tokio::test]
+    async fn milliseconds_become_the_same_moments() {
+        // 2026-11-19 01:57:17.828 UTC, and 02:30 that day, on the second.
+        const WITH_MILLISECONDS: i64 = 1_795_053_437_828;
+        const ON_THE_SECOND: i64 = 1_795_055_400_000;
+        let folder = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            folder.path().join("maxnines.db").display()
+        );
+        let options = ConnectOptions::new(&url).max_connections(1).to_owned();
+        let connection = Database::connect(options).await.unwrap();
+        Migrator::up(&connection, Some(1)).await.unwrap();
+        let rows = format!(
+            "INSERT INTO alerts (rule_id, rule_name, severity, host_id, hostname, series,
+                 summary, started_ms, acknowledged_by, acknowledged_ms)
+             SELECT r.id, r.name, 'critical', 'fleet', 'Fleet', '', 'x', {WITH_MILLISECONDS},
+                 'sam', {ON_THE_SECOND}
+             FROM alert_rules r WHERE r.name = 'Host offline';
+             INSERT INTO host_facts (host_id, name, value, value_type, valid_from_ms)
+             VALUES ('fleet', 'os.family', 'linux', 'string', {WITH_MILLISECONDS});"
+        );
+        connection.execute_unprepared(&rows).await.unwrap();
+        let wait = texts(
             &connection,
-            "SELECT CAST(breached_ms AS TEXT) FROM alerts ORDER BY id",
+            "SELECT CAST(for_secs AS TEXT) FROM alert_rules WHERE name = 'Host offline'",
+        )
+        .await;
+        let wait_ms = wait[0].parse::<i64>().unwrap() * 1000;
+        connection.close().await.unwrap();
+
+        // Connecting runs the rest of the migrations, and the rows read back through
+        // the entities as the moments they were.
+        let database = crate::models::Database::connect(&url).await.unwrap();
+        let alert = database.open_alerts().await.unwrap().remove(0);
+        let at = crate::times::from_ms;
+        assert_eq!(alert.started_at, at(WITH_MILLISECONDS));
+        assert_eq!(alert.breached_at, at(WITH_MILLISECONDS - wait_ms));
+        assert_eq!(alert.acknowledged_at, Some(at(ON_THE_SECOND)));
+        assert_eq!(alert.resolved_at, None);
+        let facts = database.facts_history("fleet").await.unwrap();
+        assert_eq!(
+            (facts[0].valid_from, facts[0].valid_to),
+            (at(WITH_MILLISECONDS), None)
+        );
+        drop(database);
+
+        // On SQLite they're text, exactly as sqlx writes them, so that they sort and
+        // compare with the ones written from now on.
+        let options = ConnectOptions::new(&url).max_connections(1).to_owned();
+        let connection = Database::connect(options).await.unwrap();
+        let saved = texts(
+            &connection,
+            "SELECT started_at || ' ' || acknowledged_at || ' ' || COALESCE(resolved_at, 'empty')
+             FROM alerts",
         )
         .await;
         assert_eq!(
-            began,
-            [(600_000 - wait_ms).to_string(), "700000".to_string()]
+            saved,
+            ["2026-11-19T01:57:17.828+00:00 2026-11-19T02:30:00+00:00 empty"]
         );
+        let written = Statement::from_sql_and_values(
+            connection.get_database_backend(),
+            "SELECT ? || ' ' || ?",
+            [at(WITH_MILLISECONDS).into(), at(ON_THE_SECOND).into()],
+        );
+        let written: String = connection
+            .query_one_raw(written)
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get_by_index(0)
+            .unwrap();
+        assert_eq!(
+            saved[0],
+            format!("{written} empty"),
+            "the migration and sqlx write moments differently"
+        );
+        assert_eq!(
+            written,
+            format!(
+                "{} {}",
+                as_sqlx_writes(at(WITH_MILLISECONDS)),
+                as_sqlx_writes(at(ON_THE_SECOND))
+            )
+        );
+        let fact = texts(&connection, "SELECT valid_from FROM host_facts").await;
+        assert_eq!(fact, ["2026-11-19T01:57:17.828+00:00"]);
+
+        // And back again.
+        Migrator::down(&connection, Some(1)).await.unwrap();
+        let kept = texts(
+            &connection,
+            "SELECT CAST(started_ms AS TEXT) || ' ' || CAST(acknowledged_ms AS TEXT) FROM alerts",
+        )
+        .await;
+        assert_eq!(kept, [format!("{WITH_MILLISECONDS} {ON_THE_SECOND}")]);
+        Migrator::up(&connection, None).await.unwrap();
     }
 
     #[tokio::test]
@@ -2221,8 +2617,8 @@ mod tests {
         assert!(add("Nowhere", "nobody").await.is_err());
         connection
             .execute_unprepared(
-                "INSERT INTO hosts (id, hostname, public_key, state, first_seen_ms, kind)
-                 VALUES ('abc', 'db', '', 'approved', 1, 'agentless')",
+                "INSERT INTO hosts (id, hostname, public_key, state, first_seen_at, kind)
+                 VALUES ('abc', 'db', '', 'approved', '1970-01-01T00:00:00.001+00:00', 'agentless')",
             )
             .await
             .unwrap();

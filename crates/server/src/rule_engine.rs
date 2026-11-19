@@ -190,7 +190,7 @@ mod tests {
         ConfigRule {
             id: 1,
             built_in: None,
-            built_in_changed_ms: None,
+            built_in_changed_at: None,
             rule: RuleInput {
                 name: name.to_string(),
                 priority: 0,

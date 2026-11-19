@@ -12,6 +12,7 @@ use super::audit::record_change;
 use super::{Database, silence};
 use crate::audit::{self, Kind, Snapshot};
 use crate::silences::{Silence, SilenceInput};
+use crate::times::from_ms;
 
 fn to_silence(row: silence::Model) -> Silence {
     Silence {
@@ -22,8 +23,8 @@ fn to_silence(row: silence::Model) -> Silence {
         series: row.series,
         reason: row.reason,
         created_by: row.created_by,
-        starts_ms: row.starts_ms,
-        ends_ms: row.ends_ms,
+        starts_at: row.starts_at,
+        ends_at: row.ends_at,
     }
 }
 
@@ -34,8 +35,8 @@ fn snapshot(row: &silence::Model) -> Snapshot {
         "filter": row.filter,
         "series": row.series,
         "reason": row.reason,
-        "starts": audit::time(row.starts_ms),
-        "ends": audit::time(row.ends_ms),
+        "starts": audit::time(row.starts_at),
+        "ends": audit::time(row.ends_at),
     });
     let name = if row.reason.is_empty() {
         "Silence"
@@ -56,9 +57,9 @@ impl Database {
     /// The one that lasts longest comes first.
     pub async fn active_silences(&self, now_ms: i64) -> Result<Vec<Silence>> {
         let rows = silence::Entity::find()
-            .filter(silence::Column::StartsMs.lte(now_ms))
-            .filter(silence::Column::EndsMs.gt(now_ms))
-            .order_by_desc(silence::Column::EndsMs)
+            .filter(silence::Column::StartsAt.lte(from_ms(now_ms)))
+            .filter(silence::Column::EndsAt.gt(from_ms(now_ms)))
+            .order_by_desc(silence::Column::EndsAt)
             .order_by_desc(silence::Column::Id)
             .all(&self.connection)
             .await
@@ -69,8 +70,8 @@ impl Database {
     /// The ones that ended most recently.
     pub async fn ended_silences(&self, now_ms: i64, limit: u64) -> Result<Vec<Silence>> {
         let rows = silence::Entity::find()
-            .filter(silence::Column::EndsMs.lte(now_ms))
-            .order_by_desc(silence::Column::EndsMs)
+            .filter(silence::Column::EndsAt.lte(from_ms(now_ms)))
+            .order_by_desc(silence::Column::EndsAt)
             .order_by_desc(silence::Column::Id)
             .limit(limit)
             .all(&self.connection)
@@ -98,8 +99,8 @@ impl Database {
             series: Set(input.series.trim().to_string()),
             reason: Set(input.reason.trim().to_string()),
             created_by: Set(by.to_string()),
-            starts_ms: Set(now_ms),
-            ends_ms: Set(now_ms.saturating_add(lasts_ms)),
+            starts_at: Set(from_ms(now_ms)),
+            ends_at: Set(from_ms(now_ms.saturating_add(lasts_ms))),
             ..Default::default()
         };
         let transaction = self.connection.begin().await.context("saving silence")?;
@@ -123,9 +124,9 @@ impl Database {
         let transaction = self.connection.begin().await.context("ending silence")?;
         let before = load(&transaction, id).await?;
         let result = silence::Entity::update_many()
-            .col_expr(silence::Column::EndsMs, Expr::value(now_ms))
+            .col_expr(silence::Column::EndsAt, Expr::value(from_ms(now_ms)))
             .filter(silence::Column::Id.eq(id))
-            .filter(silence::Column::EndsMs.gt(now_ms))
+            .filter(silence::Column::EndsAt.gt(from_ms(now_ms)))
             .exec(&transaction)
             .await
             .context("ending silence")?;

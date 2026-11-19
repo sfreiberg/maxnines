@@ -18,6 +18,7 @@ use super::{Database, alert, event, host_boot, host_fact, to_fact_version};
 use crate::audit::{self, Kind, Snapshot};
 use crate::events::{Event, EventKind, SERVER, TimelineEvent, UPDATE_FACTS};
 use crate::host_filter;
+use crate::times::{self, Timestamp};
 
 /// The most of a host's events a timeline holds, newest first.
 pub const MAX_TIMELINE: u64 = 500;
@@ -30,7 +31,7 @@ fn snapshot(row: &event::Model) -> Snapshot {
         "kind": row.kind,
         "title": row.title,
         "detail": row.detail,
-        "time": audit::time(row.time_ms),
+        "time": audit::time(row.occurred_at),
         "filter": row.filter,
     });
     Snapshot::new(&row.title, fields)
@@ -39,13 +40,13 @@ fn snapshot(row: &event::Model) -> Snapshot {
 fn to_event(row: event::Model) -> Event {
     Event {
         id: row.id,
-        time_ms: row.time_ms,
+        occurred_at: row.occurred_at,
         kind: EventKind::parse(&row.kind).unwrap_or(EventKind::Note),
         title: row.title,
         detail: row.detail,
         filter: row.filter,
         created_by: row.created_by,
-        created_ms: row.created_ms,
+        created_at: row.created_at,
     }
 }
 
@@ -60,7 +61,7 @@ fn written(value: &serde_json::Value) -> String {
 /// What someone records, ready to save.
 pub struct NewEvent<'a> {
     pub kind: EventKind,
-    pub time_ms: i64,
+    pub occurred_at: Timestamp,
     pub title: &'a str,
     pub detail: Option<&'a str>,
     /// Which hosts it's for, as a host filter. Empty for every host.
@@ -74,13 +75,13 @@ async fn insert_event<C: ConnectionTrait>(
     now_ms: i64,
 ) -> Result<event::Model> {
     let row = event::ActiveModel {
-        time_ms: Set(new.time_ms),
+        occurred_at: Set(new.occurred_at),
         kind: Set(new.kind.as_str().to_string()),
         title: Set(new.title.to_string()),
         detail: Set(new.detail.map(str::to_string)),
         filter: Set(new.filter.to_string()),
         created_by: Set(by.to_string()),
-        created_ms: Set(now_ms),
+        created_at: Set(times::from_ms(now_ms)),
         ..Default::default()
     };
     row.insert(connection).await.context("saving event")
@@ -119,7 +120,7 @@ impl Database {
         let filter = host_filter::only(host_id);
         let new = NewEvent {
             kind,
-            time_ms,
+            occurred_at: times::from_ms(time_ms),
             title,
             detail,
             filter: &filter,
@@ -165,12 +166,17 @@ impl Database {
     }
 
     /// Annotations people and their scripts recorded between two times, newest first.
-    pub async fn list_events(&self, from_ms: i64, to_ms: i64, limit: u64) -> Result<Vec<Event>> {
+    pub async fn list_events(
+        &self,
+        from: Timestamp,
+        to: Timestamp,
+        limit: u64,
+    ) -> Result<Vec<Event>> {
         let rows = event::Entity::find()
-            .filter(event::Column::TimeMs.gte(from_ms))
-            .filter(event::Column::TimeMs.lt(to_ms))
+            .filter(event::Column::OccurredAt.gte(from))
+            .filter(event::Column::OccurredAt.lt(to))
             .filter(event::Column::CreatedBy.ne(SERVER))
-            .order_by_desc(event::Column::TimeMs)
+            .order_by_desc(event::Column::OccurredAt)
             .order_by_desc(event::Column::Id)
             .limit(limit)
             .all(&self.connection)
@@ -185,16 +191,16 @@ impl Database {
     pub async fn timeline(
         &self,
         host_id: &str,
-        from_ms: i64,
-        to_ms: i64,
+        from: Timestamp,
+        to: Timestamp,
         picks: impl Fn(&str) -> bool,
     ) -> Result<Vec<TimelineEvent>> {
         let mut timeline = Vec::new();
 
         let recorded = event::Entity::find()
-            .filter(event::Column::TimeMs.gte(from_ms))
-            .filter(event::Column::TimeMs.lt(to_ms))
-            .order_by_desc(event::Column::TimeMs)
+            .filter(event::Column::OccurredAt.gte(from))
+            .filter(event::Column::OccurredAt.lt(to))
+            .order_by_desc(event::Column::OccurredAt)
             .limit(MAX_CANDIDATES)
             .all(&self.connection)
             .await
@@ -205,7 +211,7 @@ impl Database {
                 .filter(|row| picks(&row.filter))
                 .take(MAX_TIMELINE as usize)
                 .map(|row| TimelineEvent {
-                    time_ms: row.time_ms,
+                    occurred_at: row.occurred_at,
                     kind: EventKind::parse(&row.kind).unwrap_or(EventKind::Note),
                     title: row.title,
                     detail: row.detail,
@@ -214,28 +220,25 @@ impl Database {
                 }),
         );
 
-        let in_range = |column: alert::Column| {
-            Condition::all()
-                .add(column.gte(from_ms))
-                .add(column.lt(to_ms))
-        };
+        let in_range =
+            |column: alert::Column| Condition::all().add(column.gte(from)).add(column.lt(to));
         let alerts = alert::Entity::find()
             .filter(alert::Column::HostId.eq(host_id))
             .filter(
                 Condition::any()
-                    .add(in_range(alert::Column::StartedMs))
-                    .add(in_range(alert::Column::ResolvedMs)),
+                    .add(in_range(alert::Column::StartedAt))
+                    .add(in_range(alert::Column::ResolvedAt)),
             )
-            .order_by_desc(alert::Column::StartedMs)
+            .order_by_desc(alert::Column::StartedAt)
             .limit(MAX_TIMELINE)
             .all(&self.connection)
             .await
             .context("loading a host's alerts")?;
         for row in alerts {
             let title = format!("{} ({})", row.rule_name, row.severity);
-            if (from_ms..to_ms).contains(&row.started_ms) {
+            if (from..to).contains(&row.started_at) {
                 timeline.push(TimelineEvent {
-                    time_ms: row.started_ms,
+                    occurred_at: row.started_at,
                     kind: EventKind::Alert,
                     title: title.clone(),
                     detail: Some(row.summary.clone()),
@@ -243,12 +246,9 @@ impl Database {
                     id: None,
                 });
             }
-            if let Some(resolved) = row
-                .resolved_ms
-                .filter(|time| (from_ms..to_ms).contains(time))
-            {
+            if let Some(resolved) = row.resolved_at.filter(|time| (from..to).contains(time)) {
                 timeline.push(TimelineEvent {
-                    time_ms: resolved,
+                    occurred_at: resolved,
                     kind: EventKind::Resolved,
                     title,
                     detail: row
@@ -266,17 +266,16 @@ impl Database {
         let rows = host_fact::Entity::find()
             .filter(host_fact::Column::HostId.eq(host_id))
             .filter(host_fact::Column::Name.is_in(names))
-            .filter(host_fact::Column::ValidFromMs.lt(to_ms))
-            .order_by_asc(host_fact::Column::ValidFromMs)
+            .filter(host_fact::Column::ValidFrom.lt(to))
+            .order_by_asc(host_fact::Column::ValidFrom)
             .all(&self.connection)
             .await
             .context("loading a host's updates")?;
         let mut before: HashMap<String, serde_json::Value> = HashMap::new();
         for row in rows {
             let version = to_fact_version(row)?;
-            let from = version.valid_from_ms as i64;
             if let Some(previous) = before.get(&version.name)
-                && from >= from_ms
+                && version.valid_from >= from
                 && *previous != version.value
             {
                 let label = UPDATE_FACTS
@@ -284,7 +283,7 @@ impl Database {
                     .find(|(name, _)| *name == version.name)
                     .map_or("Software", |(_, label)| label);
                 timeline.push(TimelineEvent {
-                    time_ms: from,
+                    occurred_at: version.valid_from,
                     kind: EventKind::Update,
                     title: format!("{label} updated to {}", written(&version.value)),
                     detail: Some(format!("It was {}.", written(previous))),
@@ -295,7 +294,7 @@ impl Database {
             before.insert(version.name, version.value);
         }
 
-        timeline.sort_by_key(|event| std::cmp::Reverse(event.time_ms));
+        timeline.sort_by_key(|event| std::cmp::Reverse(event.occurred_at));
         timeline.truncate(MAX_TIMELINE as usize);
         Ok(timeline)
     }
@@ -306,7 +305,7 @@ impl Database {
             .one(&self.connection)
             .await
             .context("loading a boot time")?;
-        Ok(row.map(|row| row.boot_ms))
+        Ok(row.map(|row| row.booted_at.timestamp_millis()))
     }
 
     /// Notes when a host started, and marks a restart if it had started before.
@@ -324,12 +323,12 @@ impl Database {
             .context("saving a boot time")?;
         let row = host_boot::ActiveModel {
             host_id: Set(host_id.to_string()),
-            boot_ms: Set(boot_ms),
+            booted_at: Set(times::from_ms(boot_ms)),
         };
         host_boot::Entity::insert(row)
             .on_conflict(
                 OnConflict::column(host_boot::Column::HostId)
-                    .update_column(host_boot::Column::BootMs)
+                    .update_column(host_boot::Column::BootedAt)
                     .to_owned(),
             )
             .exec_without_returning(&transaction)
@@ -339,7 +338,7 @@ impl Database {
             let filter = host_filter::only(host_id);
             let new = NewEvent {
                 kind: EventKind::Restart,
-                time_ms: boot_ms,
+                occurred_at: times::from_ms(boot_ms),
                 title: "Host started",
                 detail: None,
                 filter: &filter,

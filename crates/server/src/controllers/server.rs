@@ -18,6 +18,7 @@ use crate::metrics::{self, Metric, Unit, now_ms};
 use crate::remote_checks::LOCAL_HOST_ID;
 use crate::server_stats::{self, ServerStats};
 use crate::store::StoreStats;
+use crate::times::from_ms;
 
 /// Alert rules are checked every 15 seconds, so this means they've stopped.
 const ALERT_PASS_STALE_MS: i64 = 60_000;
@@ -196,10 +197,10 @@ fn server_page(stats: ServerStats, now_ms: i64) -> ServerPage {
                 .sum()
         });
     let activity = &stats.activity;
-    let last_pass = activity.last_alert_pass_ms;
+    let last_pass = activity.last_alert_pass_at;
 
     ServerPage {
-        started: local_time(stats.started_ms),
+        started: local_time(stats.started_at),
         uptime: format_uptime(stats.uptime_secs),
         process_memory: process.map(|p| bytes(p.memory_bytes as f64)),
         process_cpu: process
@@ -226,8 +227,8 @@ fn server_page(stats: ServerStats, now_ms: i64) -> ServerPage {
                     .rows
                     .map_or_else(|| "–".to_string(), |rows| count(rows.max(0) as u64)),
                 last_hour: count(collector.rows_last_hour.max(0) as u64),
-                oldest: local_time(collector.oldest_ms),
-                newest: local_time(collector.newest_ms),
+                oldest: local_time(from_ms(collector.oldest_ms)),
+                newest: local_time(from_ms(collector.newest_ms)),
             })
             .collect(),
         total_rows: count(total_rows.max(0) as u64),
@@ -258,7 +259,8 @@ fn server_page(stats: ServerStats, now_ms: i64) -> ServerPage {
         hosts_waiting: activity.hosts_waiting,
         alerts_open: activity.alerts_open,
         last_alert_pass: last_pass.map(local_time),
-        alert_rules_stalled: last_pass.is_some_and(|ms| now_ms - ms > ALERT_PASS_STALE_MS),
+        alert_rules_stalled: last_pass
+            .is_some_and(|pass| now_ms - pass.timestamp_millis() > ALERT_PASS_STALE_MS),
         metrics: stats.metrics,
         version: stats.version,
         commit: stats.commit,

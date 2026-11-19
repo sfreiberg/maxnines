@@ -15,7 +15,6 @@ use serde::Serialize;
 use super::{CsrfForm, Page, local_time, recorded_by, server_error};
 use crate::actions::{ActionRun, NewRun, RUN_BY_HAND, check_timeout};
 use crate::app_state::AppState;
-use crate::metrics::now_ms;
 
 /// How many of a host's runs its page shows.
 const HISTORY: u64 = 20;
@@ -81,7 +80,7 @@ pub(super) fn run_row(run: ActionRun) -> RunRow {
         id: run.id,
         action: run.action,
         why,
-        asked: local_time(run.requested_ms),
+        asked: local_time(run.requested_at),
         class,
         status: status.to_string(),
         detail: detail.join(", "),
@@ -180,7 +179,7 @@ async fn run_now(
         run_on: RUN_BY_HAND.to_string(),
         variables,
         requested_by: Some(recorded_by()),
-        requested_ms: now_ms(),
+        requested_at: crate::times::now(),
         timeout_secs,
     };
     match state.actions.run(new).await {
@@ -205,7 +204,7 @@ async fn alert(State(state): State<AppState>, token: CsrfToken, Path(id): Path<i
         .with("rule_name", &alert.rule_name)
         .with("host_id", &alert.host_id)
         .with("hostname", &alert.hostname)
-        .with("started", &local_time(alert.started_ms))
+        .with("started", &local_time(alert.started_at))
         .with("runs", &runs)
         .render()
 }

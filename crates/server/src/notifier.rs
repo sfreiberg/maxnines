@@ -24,6 +24,7 @@ use crate::channels::{self, pagerduty, resend, telegram};
 use crate::metrics::now_ms;
 use crate::models::Database;
 use crate::silences::ActiveSilences;
+use crate::times::{Timestamp, from_ms};
 
 /// How often the queue is checked.
 const INTERVAL: Duration = Duration::from_secs(5);
@@ -260,11 +261,9 @@ fn said_as(alert: &Alert, event: Event) -> &str {
     }
 }
 
-pub fn format_ms(ms: i64) -> String {
-    u64::try_from(ms).map_or_else(
-        |_| ms.to_string(),
-        |ms| crate::times::format_time(ms, chrono_tz::Tz::UTC),
-    )
+/// A time in a message, which has no one person reading it, so is in UTC.
+pub fn format_utc(time: Timestamp) -> String {
+    crate::times::format_moment(time, chrono_tz::Tz::UTC)
 }
 
 /// What sending needs beyond the channel itself.
@@ -461,7 +460,7 @@ impl Notifier {
     async fn release_held(&self, silences: &ActiveSilences, now_ms: i64) -> Result<()> {
         let mut ids = Vec::new();
         for (alert, held) in self.database.held_deliveries().await? {
-            if alert.resolved_ms.is_some() {
+            if alert.resolved_at.is_some() {
                 self.database.drop_held_for(alert.id).await?;
             } else if silences.covering(&alert).is_none() {
                 ids.extend(held);
@@ -476,8 +475,8 @@ impl Notifier {
     /// Whether a reminder queued a moment ago still has a point.
     fn reminder_is_stale(delivery: &Delivery, silences: &ActiveSilences) -> bool {
         let alert = &delivery.alert;
-        alert.resolved_ms.is_some()
-            || alert.acknowledged_ms.is_some()
+        alert.resolved_at.is_some()
+            || alert.acknowledged_at.is_some()
             || silences.covering(alert).is_some()
     }
 
@@ -574,8 +573,8 @@ impl Notifier {
             }
             Err(error) => {
                 let message = format!("{error:#}");
-                let next = (now_ms - delivery.created_ms < GIVE_UP_AFTER_MS)
-                    .then(|| now_ms + retry_delay_ms(attempts));
+                let next = (now_ms - delivery.created_at.timestamp_millis() < GIVE_UP_AFTER_MS)
+                    .then(|| from_ms(now_ms + retry_delay_ms(attempts)));
                 warn!(
                     channel,
                     attempts,

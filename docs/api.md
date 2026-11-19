@@ -48,7 +48,10 @@ host, keys shouldn't cross the network in the clear.
 **Requests and responses.** Requests with a body are JSON, with
 `Content-Type: application/json`. Responses are JSON unless noted.
 
-**Times** are milliseconds since the Unix epoch, in fields ending in `_ms`.
+**Times** are ISO 8601 in UTC, to the millisecond, such as `2026-11-19T01:57:17.828Z`,
+in fields ending in `_at`, and are given the same way. Metric data and its time ranges
+are still in milliseconds since the Unix epoch, in fields ending in `_ms`, and lengths
+of time are numbers ending in their unit, such as `timeout_secs`.
 
 **Versions.** A change that would break a client goes in a new version, such as
 `/api/v2`. Adding a field isn't a breaking change, so ignore fields you don't know.

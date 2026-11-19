@@ -8,7 +8,7 @@ pub struct Model {
     pub user_id: i64,
     /// Only the hash is kept.
     pub token_hash: String,
-    pub expires_ms: i64,
+    pub expires_at: DateTimeUtc,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

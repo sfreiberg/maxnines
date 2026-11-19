@@ -10,10 +10,10 @@ pub struct Model {
     pub event: String,
     pub state: String,
     pub attempts: i32,
-    pub next_attempt_ms: i64,
+    pub next_attempt_at: DateTimeUtc,
     pub last_error: Option<String>,
-    pub created_ms: i64,
-    pub sent_ms: Option<i64>,
+    pub created_at: DateTimeUtc,
+    pub sent_at: Option<DateTimeUtc>,
     pub external_id: Option<String>,
     /// The action run whose output this sends, for an `action` notification.
     pub action_run_id: Option<i64>,

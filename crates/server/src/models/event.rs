@@ -5,13 +5,13 @@ use sea_orm::entity::prelude::*;
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i64,
-    pub time_ms: i64,
+    pub occurred_at: DateTimeUtc,
     pub kind: String,
     pub title: String,
     pub detail: Option<String>,
     pub filter: String,
     pub created_by: String,
-    pub created_ms: i64,
+    pub created_at: DateTimeUtc,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

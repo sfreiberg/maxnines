@@ -11,7 +11,7 @@ pub struct Model {
     pub run_on: String,
     pub variables: String,
     pub requested_by: Option<String>,
-    pub requested_ms: i64,
+    pub requested_at: DateTimeUtc,
     pub timeout_secs: i64,
     pub outcome: Option<String>,
     pub exit_code: Option<i32>,
@@ -19,7 +19,7 @@ pub struct Model {
     pub output: String,
     pub truncated: bool,
     pub duration_ms: Option<i64>,
-    pub finished_ms: Option<i64>,
+    pub finished_at: Option<DateTimeUtc>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

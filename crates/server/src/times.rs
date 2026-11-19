@@ -2,8 +2,73 @@
 //! chooses on their profile. The command line and alert messages have no one person
 //! reading them, so they use UTC.
 
-use chrono::DateTime;
+use chrono::{DateTime, DurationRound, TimeDelta, Utc};
 use chrono_tz::Tz;
+
+/// A moment, as the database keeps them, always in UTC and to the millisecond: the
+/// database's timestamp types, and the API's ISO 8601 times.
+pub type Timestamp = DateTime<Utc>;
+
+/// Now, to the millisecond, as everything kept is. Finer than that, SQLite, which keeps
+/// times as text, would write some with more digits than others, and they'd no longer
+/// sort or compare as text the way they do as times.
+pub fn now() -> Timestamp {
+    Utc::now()
+        .duration_trunc(TimeDelta::milliseconds(1))
+        .unwrap_or_else(|_| Utc::now())
+}
+
+/// The moment `ms` milliseconds after 1970, as agents and the metric stores count, or
+/// the nearest one there can be.
+pub fn from_ms(ms: i64) -> Timestamp {
+    DateTime::from_timestamp_millis(ms).unwrap_or(if ms < 0 {
+        DateTime::<Utc>::MIN_UTC
+    } else {
+        DateTime::<Utc>::MAX_UTC
+    })
+}
+
+/// A moment written in ISO 8601, as the API takes them, such as
+/// `2026-11-19T01:57:17.828Z`, to the millisecond, as everything kept is.
+pub fn parse_moment(text: &str) -> Option<Timestamp> {
+    let time = DateTime::parse_from_rfc3339(text.trim()).ok()?.to_utc();
+    time.duration_trunc(TimeDelta::milliseconds(1)).ok()
+}
+
+/// For serde, a moment the API or a page may leave out, written in ISO 8601. An
+/// empty one, as a form sends for a field left blank, is left out too.
+pub mod optional_moment {
+    use serde::{Deserialize, Deserializer, de::Error};
+
+    use super::{Timestamp, parse_moment};
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Timestamp>, D::Error> {
+        match Option::<String>::deserialize(deserializer)? {
+            None => Ok(None),
+            Some(text) if text.trim().is_empty() => Ok(None),
+            Some(text) => parse_moment(&text).map(Some).ok_or_else(|| {
+                D::Error::custom(format!(
+                    "{text:?} isn't a time in ISO 8601, such as 2026-11-19T01:57:17Z"
+                ))
+            }),
+        }
+    }
+}
+
+/// How long `ms` milliseconds is.
+pub fn millis(ms: i64) -> TimeDelta {
+    TimeDelta::milliseconds(ms)
+}
+
+/// A moment to the second in `zone`, ending with the zone's abbreviation, such as
+/// `PST`.
+pub fn format_moment(time: Timestamp, zone: Tz) -> String {
+    time.with_timezone(&zone)
+        .format("%Y-%m-%d %H:%M:%S %Z")
+        .to_string()
+}
 
 /// Where everyone starts, until they choose their own.
 pub const DEFAULT_TIME_ZONE: Tz = Tz::UTC;
@@ -14,23 +79,14 @@ pub fn format_time(ms: u64, zone: Tz) -> String {
         .ok()
         .and_then(DateTime::from_timestamp_millis);
     match time {
-        Some(time) => time
-            .with_timezone(&zone)
-            .format("%Y-%m-%d %H:%M:%S %Z")
-            .to_string(),
+        Some(time) => format_moment(time, zone),
         None => format!("{ms} ms"),
     }
 }
 
 /// Just the day, for where the time of day is more than anyone needs.
-pub fn format_date(ms: u64, zone: Tz) -> String {
-    let time = i64::try_from(ms)
-        .ok()
-        .and_then(DateTime::from_timestamp_millis);
-    match time {
-        Some(time) => time.with_timezone(&zone).format("%Y-%m-%d").to_string(),
-        None => format!("{ms} ms"),
-    }
+pub fn format_date(time: Timestamp, zone: Tz) -> String {
+    time.with_timezone(&zone).format("%Y-%m-%d").to_string()
 }
 
 /// How long something has lasted, in its two largest units, such as "1 day and 13
@@ -57,8 +113,8 @@ pub fn lasting(ms: u64) -> String {
 
 /// In the largest unit that makes sense, as "3 minutes ago" reads better than a
 /// timestamp when you're only asking how recent something is.
-pub fn ago(ms: u64, now_ms: u64) -> String {
-    let secs = now_ms.saturating_sub(ms) / 1000;
+pub fn ago(then: Timestamp, now: Timestamp) -> String {
+    let secs = u64::try_from((now - then).num_seconds()).unwrap_or(0);
     let plural = |count: u64, unit: &str| match count {
         1 => format!("1 {unit} ago"),
         _ => format!("{count} {unit}s ago"),
@@ -108,10 +164,32 @@ mod tests {
     }
 
     #[test]
+    fn moments_are_read_in_iso_8601_to_the_millisecond() {
+        let time = parse_moment("2026-11-19T01:57:17.828Z").unwrap();
+        assert_eq!(time, from_ms(1_795_053_437_828));
+        // Any offset, as long as it says which, and anything finer is dropped.
+        assert_eq!(parse_moment("2026-11-18T17:57:17.8289-08:00"), Some(time));
+        assert_eq!(
+            parse_moment(" 2026-11-19T01:57:17Z "),
+            Some(time - millis(828))
+        );
+        for vague in [
+            "2026-11-19",
+            "2026-11-19T01:57:17",
+            "1795053437828",
+            "soon",
+            "",
+        ] {
+            assert_eq!(parse_moment(vague), None, "{vague}");
+        }
+    }
+
+    #[test]
     fn a_date_is_the_day_in_the_zone() {
-        assert_eq!(format_date(NOV_14_2023, Tz::UTC), "2023-11-14");
+        let time = from_ms(NOV_14_2023 as i64);
+        assert_eq!(format_date(time, Tz::UTC), "2023-11-14");
         // Already the next day there.
-        assert_eq!(format_date(NOV_14_2023, Tz::Asia__Kolkata), "2023-11-15");
+        assert_eq!(format_date(time, Tz::Asia__Kolkata), "2023-11-15");
     }
 
     #[test]
@@ -132,12 +210,12 @@ mod tests {
 
     #[test]
     fn times_ago_use_the_largest_unit() {
-        let now = 100 * 86_400_000;
-        assert_eq!(ago(now - 5_000, now), "just now");
-        assert_eq!(ago(now - 60_000, now), "1 minute ago");
-        assert_eq!(ago(now - 7_200_000, now), "2 hours ago");
-        assert_eq!(ago(now - 3 * 86_400_000, now), "3 days ago");
-        assert_eq!(ago(now + 5_000, now), "just now");
+        let now = from_ms(100 * 86_400_000);
+        assert_eq!(ago(now - millis(5_000), now), "just now");
+        assert_eq!(ago(now - millis(60_000), now), "1 minute ago");
+        assert_eq!(ago(now - millis(7_200_000), now), "2 hours ago");
+        assert_eq!(ago(now - millis(3 * 86_400_000), now), "3 days ago");
+        assert_eq!(ago(now + millis(5_000), now), "just now");
     }
 
     #[test]
