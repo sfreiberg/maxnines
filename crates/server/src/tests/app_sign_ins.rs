@@ -232,14 +232,96 @@ async fn nothing_is_given_without_the_right_proof_or_address() {
     let (status, refused) = app_post(
         &server,
         "/oauth/token",
-        &[
-            ("grant_type", "refresh_token"),
-            ("client_id", "someone-else"),
-        ],
+        &[("grant_type", "refresh_token"), ("client_id", "Not An ID")],
     )
     .await;
     assert_eq!(status, 401);
     assert_eq!(refused["error"], "invalid_client");
+}
+
+#[tokio::test]
+async fn an_app_that_isnt_maxnines_own_signs_in_marked_as_such() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    let path =
+        authorize_path(BACK, "viewer").replace("client_id=maxnines-cli", "client_id=my-script");
+
+    // The page says it isn't one of MaxNines' own, and that its name proves nothing.
+    let page = browser.get(&server, &path).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(
+        page.body
+            .contains("Sign in an app calling itself my-script?"),
+        "{}",
+        page.body
+    );
+    assert!(
+        page.body.contains("any program can give itself any name"),
+        "{}",
+        page.body
+    );
+
+    let mut fields = approval_fields("viewer", "allow");
+    fields[1] = ("client_id", "my-script");
+    let page = browser
+        .submit(&server, &path, "/oauth/authorize", &fields)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    let code = query_value(page.header("location").unwrap(), "code").unwrap();
+    // Swapped by the app it was given to, and no other.
+    let swap = |client_id: &'static str| {
+        let code = code.clone();
+        let server = &server;
+        async move {
+            let fields = [
+                ("grant_type", "authorization_code"),
+                ("code", code.as_str()),
+                ("redirect_uri", BACK),
+                ("client_id", client_id),
+                ("code_verifier", VERIFIER),
+            ];
+            app_post(server, "/oauth/token", &fields).await
+        }
+    };
+    let (status, issued) = swap("my-script").await;
+    assert_eq!(status, 200, "{issued}");
+    let access = issued["access_token"].as_str().unwrap();
+    assert_eq!(call(&server, access, "GET", "/api/v1/hosts").await, 200);
+
+    let (status, listed) = call_json(&server, access, "GET", "/api/v1/app-sign-ins").await;
+    assert_eq!(status, 200);
+    assert_eq!(listed[0]["app"], "my-script (not one of MaxNines' own)");
+    let page = browser.get(&server, "/settings/apps").await;
+    assert!(
+        page.body
+            .contains("my-script (not one of MaxNines&#39; own) on laptop"),
+        "{}",
+        page.body
+    );
+
+    // A code typed on another device is only for MaxNines' own apps.
+    let (status, refused) = app_post(
+        &server,
+        "/oauth/device",
+        &[("client_id", "my-script"), ("device", "build box")],
+    )
+    .await;
+    assert_eq!(status, 401);
+    assert_eq!(refused["error"], "invalid_client");
+
+    // An ID that isn't one an app can have is turned away at the door.
+    let page = browser
+        .get(
+            &server,
+            &path.replace("client_id=my-script", "client_id=My%20Script"),
+        )
+        .await;
+    assert_eq!(page.status, 400);
+    assert!(
+        page.body.contains("give an ID MaxNines can take"),
+        "{}",
+        page.body
+    );
 }
 
 #[tokio::test]

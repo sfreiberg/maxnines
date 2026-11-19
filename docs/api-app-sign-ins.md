@@ -30,7 +30,8 @@ keys, and it can't approve another app. Only a person signed in to the pages in 
 browser can approve an app, so neither an app nor an API key can sign in something that
 would outlast being revoked.
 
-Only these apps can sign in, as `client_id`:
+Each app says what it is with a `client_id`. These are MaxNines' own, which the
+approval page and Signed-in apps show by name:
 
 | `client_id` | App |
 | --- | --- |
@@ -38,6 +39,16 @@ Only these apps can sign in, as `client_id`:
 | `maxnines-menubar` | MaxNines Desktop for Mac, a menu bar app |
 | `maxnines-tray` | MaxNines Desktop for Windows, a notification area app |
 | `maxnines-desktop-linux` | MaxNines Desktop for Linux, a tray app |
+
+Any other app, such as your own script, can sign in through the browser with an ID of
+its own: up to 64 lowercase letters, digits, dots, dashes and underscores, starting
+with a letter or digit, such as `deploy-bot`. As nothing proves what an app is, the
+approval page warns that it isn't one of MaxNines' own, and Signed-in apps and the
+audit log show it as `deploy-bot (not one of MaxNines' own)`. The browser only ever
+answers on the computer the person is at, so such an app can't be signed in from
+anywhere else. Signing in from another device is only for MaxNines' own apps: with
+nothing tying it to the person's computer, it's the one someone could be talked into
+approving for a stranger, so other IDs get `401` with `invalid_client`.
 
 ## Sign in through the browser
 

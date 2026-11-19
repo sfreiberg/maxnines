@@ -13,7 +13,7 @@ use super::users::enabled_user;
 use super::{Database, User, app_sign_in, owner_emails, user};
 use crate::app_sign_ins::{
     ACCESS_LIFETIME_MS, ACCESS_PREFIX, REFRESH_GRACE_MS, REFRESH_LIFETIME_MS, REFRESH_PREFIX,
-    client, new_secret, secret_hash,
+    app_name, client, new_secret, secret_hash,
 };
 use crate::audit::{Kind, Snapshot};
 use crate::roles::Role;
@@ -44,8 +44,7 @@ pub struct AppSignIn {
 
 impl AppSignIn {
     fn from_row(row: app_sign_in::Model, owner: String) -> Self {
-        let app = client(&row.client_id)
-            .map_or_else(|| row.client_id.clone(), |app| app.name.to_string());
+        let app = app_name(&row.client_id);
         Self {
             id: row.id,
             user_id: row.user_id,
@@ -95,7 +94,7 @@ pub enum Refreshed {
 }
 
 fn snapshot(row: &app_sign_in::Model, owner: &str) -> Snapshot {
-    let app = client(&row.client_id).map_or(row.client_id.as_str(), |app| app.name);
+    let app = app_name(&row.client_id);
     let fields = json!({
         "app": app,
         "device": row.device,

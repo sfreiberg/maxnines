@@ -46,35 +46,85 @@ const DEVICE_CODE_PREFIX: &str = "mxd_";
 /// The most a device's name can be.
 pub const MAX_DEVICE_CHARS: usize = 100;
 
-/// An app that can be signed in. They're public clients: they can't keep a secret,
-/// so they prove themselves with PKCE instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// An app being signed in. They're public clients: they can't keep a secret, so they
+/// prove themselves with PKCE instead, and their ID is only what they call themselves.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppClient {
-    pub id: &'static str,
-    pub name: &'static str,
+    pub id: String,
+    /// What people are shown it as: MaxNines' name for one of its own apps, or for any
+    /// other, the ID it gave and that it isn't one of MaxNines' own.
+    pub name: String,
+    /// Whether it's one of MaxNines' own apps.
+    pub known: bool,
 }
 
-pub const CLIENTS: [AppClient; 4] = [
-    AppClient {
+struct KnownApp {
+    id: &'static str,
+    name: &'static str,
+}
+
+/// MaxNines' own apps, which are shown by name.
+const KNOWN_APPS: [KnownApp; 4] = [
+    KnownApp {
         id: "maxnines-cli",
         name: "MaxNines command line",
     },
-    AppClient {
+    KnownApp {
         id: "maxnines-menubar",
         name: "MaxNines Desktop for Mac",
     },
-    AppClient {
+    KnownApp {
         id: "maxnines-tray",
         name: "MaxNines Desktop for Windows",
     },
-    AppClient {
+    KnownApp {
         id: "maxnines-desktop-linux",
         name: "MaxNines Desktop for Linux",
     },
 ];
 
+/// The longest ID an app can give.
+pub const MAX_CLIENT_ID_CHARS: usize = 64;
+
+/// One of MaxNines' own apps. Only these can sign in with a code typed on another
+/// device, as nothing ties that sign-in to the computer the person is at, which makes
+/// it the one someone could be talked into approving for a stranger.
+pub fn known_client(id: &str) -> Option<AppClient> {
+    KNOWN_APPS
+        .iter()
+        .find(|app| app.id == id)
+        .map(|app| AppClient {
+            id: app.id.to_string(),
+            name: app.name.to_string(),
+            known: true,
+        })
+}
+
+/// Any app that can sign in through the browser: one of MaxNines' own, or another
+/// with an ID of up to 64 lowercase letters, digits, dots, dashes and underscores,
+/// starting with a letter or digit. The browser only ever answers on this computer,
+/// so another app can't be signed in from elsewhere, whatever it calls itself.
 pub fn client(id: &str) -> Option<AppClient> {
-    CLIENTS.into_iter().find(|client| client.id == id)
+    known_client(id).or_else(|| {
+        let usable = id.len() <= MAX_CLIENT_ID_CHARS
+            && id
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+            && id.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.')
+            });
+        usable.then(|| AppClient {
+            id: id.to_string(),
+            name: format!("{id} (not one of MaxNines' own)"),
+            known: false,
+        })
+    })
+}
+
+/// How an app that's been signed in is shown, in lists and the audit log.
+pub fn app_name(id: &str) -> String {
+    client(id).map_or_else(|| id.to_string(), |client| client.name)
 }
 
 /// What an app's name for the device it's on can be, trimmed. Empty is fine.
@@ -365,7 +415,7 @@ impl PendingSignIns {
             .find(|request| request.user_code == user_code && request.state == DeviceState::Waiting)
             .map(|request| DeviceAsk {
                 user_code: request.user_code.clone(),
-                client: request.client,
+                client: request.client.clone(),
                 device: request.device.clone(),
                 role: request.role,
             })
@@ -391,7 +441,7 @@ impl PendingSignIns {
         request.state = match approver {
             Some((user_id, role)) => DeviceState::Allowed(Approval {
                 user_id,
-                client: request.client,
+                client: request.client.clone(),
                 device: request.device.clone(),
                 role,
             }),
@@ -445,22 +495,50 @@ mod tests {
     fn approval() -> Approval {
         Approval {
             user_id: 1,
-            client: CLIENTS[0],
+            client: known_client("maxnines-cli").unwrap(),
             device: "laptop".to_string(),
             role: Role::Viewer,
         }
     }
 
     #[test]
-    fn each_desktop_app_signs_in_under_its_own_name() {
-        let named = |id| client(id).map(|client| client.name);
-        assert_eq!(named("maxnines-menubar"), Some("MaxNines Desktop for Mac"));
-        assert_eq!(named("maxnines-tray"), Some("MaxNines Desktop for Windows"));
+    fn maxnines_own_apps_are_named_and_others_say_what_they_call_themselves() {
+        let named = |id: &str| client(id).map(|client| (client.name, client.known));
+        let own = |name: &str| Some((name.to_string(), true));
+        assert_eq!(named("maxnines-menubar"), own("MaxNines Desktop for Mac"));
+        assert_eq!(named("maxnines-tray"), own("MaxNines Desktop for Windows"));
         assert_eq!(
             named("maxnines-desktop-linux"),
-            Some("MaxNines Desktop for Linux")
+            own("MaxNines Desktop for Linux")
         );
-        assert_eq!(named("maxnines-desktop"), None);
+        assert_eq!(
+            named("grafana.sync_2"),
+            Some((
+                "grafana.sync_2 (not one of MaxNines' own)".to_string(),
+                false
+            ))
+        );
+        assert_eq!(
+            app_name("my-script"),
+            "my-script (not one of MaxNines' own)"
+        );
+        // Only MaxNines' own apps can use a code typed on another device.
+        assert!(known_client("maxnines-cli").is_some());
+        assert!(known_client("my-script").is_none());
+        // An ID is checked at the door.
+        let too_long = "a".repeat(MAX_CLIENT_ID_CHARS + 1);
+        for bad in [
+            "",
+            "-dash-first",
+            "Capital",
+            "has space",
+            "emoji-🔔",
+            "a/b",
+            too_long.as_str(),
+        ] {
+            assert_eq!(client(bad), None, "{bad}");
+        }
+        assert!(client(&"a".repeat(MAX_CLIENT_ID_CHARS)).is_some());
     }
 
     #[test]
@@ -550,7 +628,12 @@ mod tests {
     fn a_device_waits_slows_down_and_is_answered_once() {
         let pending = PendingSignIns::default();
         let start = pending
-            .start_device(CLIENTS[0], "build box", Some(Role::Responder), 0)
+            .start_device(
+                known_client("maxnines-cli").unwrap(),
+                "build box",
+                Some(Role::Responder),
+                0,
+            )
             .unwrap()
             .unwrap();
         let code = &start.device_code;
@@ -592,19 +675,24 @@ mod tests {
         for _ in 0..MAX_WAITING_DEVICES {
             assert!(
                 pending
-                    .start_device(CLIENTS[0], "", None, 0)
+                    .start_device(known_client("maxnines-cli").unwrap(), "", None, 0)
                     .unwrap()
                     .is_some()
             );
         }
         assert!(
             pending
-                .start_device(CLIENTS[0], "", None, 0)
+                .start_device(known_client("maxnines-cli").unwrap(), "", None, 0)
                 .unwrap()
                 .is_none()
         );
         // Room comes back as they run out.
-        let later = pending.start_device(CLIENTS[0], "", None, PENDING_LIFETIME_MS);
+        let later = pending.start_device(
+            known_client("maxnines-cli").unwrap(),
+            "",
+            None,
+            PENDING_LIFETIME_MS,
+        );
         assert!(later.unwrap().is_some());
     }
 
@@ -612,7 +700,7 @@ mod tests {
     fn a_device_turned_down_or_left_too_long_hears_so() {
         let pending = PendingSignIns::default();
         let start = pending
-            .start_device(CLIENTS[1], "", None, 0)
+            .start_device(known_client("maxnines-menubar").unwrap(), "", None, 0)
             .unwrap()
             .unwrap();
         assert!(pending.decide_device(&start.user_code, None, 1));
@@ -622,7 +710,7 @@ mod tests {
         );
 
         let start = pending
-            .start_device(CLIENTS[1], "", None, 0)
+            .start_device(known_client("maxnines-menubar").unwrap(), "", None, 0)
             .unwrap()
             .unwrap();
         assert_eq!(

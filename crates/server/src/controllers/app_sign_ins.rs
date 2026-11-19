@@ -17,7 +17,7 @@ use super::users::role_choices;
 use super::{CsrfForm, Page, local_date, local_time, server_error, signed_in_user};
 use crate::app_sign_ins::{
     ACCESS_LIFETIME_MS, AppClient, Approval, DEVICE_INTERVAL_SECS, DevicePoll, PENDING_LIFETIME_MS,
-    REFRESH_LIFETIME_MS, check_challenge, check_device, check_redirect, client,
+    REFRESH_LIFETIME_MS, check_challenge, check_device, check_redirect, client, known_client,
 };
 use crate::app_state::AppState;
 use crate::audit::{self, Actor};
@@ -126,7 +126,10 @@ enum Checked {
 
 fn check_ask(fields: &Fields) -> Checked {
     let Some(client) = client(field(fields, "client_id")) else {
-        return Checked::Refused("That isn't an app MaxNines knows, so it can't be signed in.");
+        return Checked::Refused(
+            "The app didn't give an ID MaxNines can take, so it can't be signed in. An ID is up \
+             to 64 lowercase letters, digits, dots, dashes and underscores.",
+        );
     };
     let redirect_uri = field(fields, "redirect_uri").to_string();
     let Ok(origin) = check_redirect(&redirect_uri) else {
@@ -169,7 +172,9 @@ fn approval_page(
     let role = asked.role.map_or("", Role::as_str);
     let page = Page::new(state, token, "app_sign_ins/approve.html")
         .with("action", "/oauth/authorize")
-        .with("app", asked.client.name)
+        .with("app", &asked.client.name)
+        .with("app_id", &asked.client.id)
+        .with("known", &asked.client.known)
         .with("device", &asked.device)
         .with("email", &signed_in_user().map(|user| user.email.clone()))
         .with("error", &error)
@@ -177,7 +182,7 @@ fn approval_page(
             "hidden",
             &hidden(&[
                 ("response_type", "code"),
-                ("client_id", asked.client.id),
+                ("client_id", &asked.client.id),
                 ("redirect_uri", &asked.redirect_uri),
                 ("state", &asked.state),
                 ("code_challenge", &asked.challenge),
@@ -256,7 +261,7 @@ async fn authorize(State(state): State<AppState>, form: CsrfForm) -> Response {
     };
     let approval = Approval {
         user_id: user.id,
-        client: asked.client,
+        client: asked.client.clone(),
         device: asked.device.clone(),
         role,
     };
@@ -316,7 +321,8 @@ fn device_approval(
     };
     let page = Page::new(state, token, "app_sign_ins/approve.html")
         .with("action", "/device/decide")
-        .with("app", asking.client.name)
+        .with("app", &asking.client.name)
+        .with("known", &true)
         .with("device", &asking.device)
         .with("user_code", &asking.user_code)
         .with("email", &signed_in_user().map(|user| user.email.clone()))
@@ -352,7 +358,8 @@ async fn device_decide(State(state): State<AppState>, form: CsrfForm) -> Respons
         return device_approval(&state, &form.token, user_code, None);
     }
     Page::new(&state, &form.token, "app_sign_ins/done.html")
-        .with("app", asking.client.name)
+        .with("app", &asking.client.name)
+        .with("known", &true)
         .with("device", &asking.device)
         .with("approved", &approved)
         .render()
@@ -412,7 +419,7 @@ async fn sign_in_approved(state: &AppState, approval: Approval) -> Response {
         None,
         state.database.create_app_sign_in(
             approval.user_id,
-            approval.client.id,
+            &approval.client.id,
             &approval.device,
             approval.role.min(user.role),
             now_ms(),
@@ -431,7 +438,7 @@ async fn token(State(state): State<AppState>, Form(fields): Form<Fields>) -> Res
         return oauth_error(
             StatusCode::UNAUTHORIZED,
             "invalid_client",
-            "That isn't an app MaxNines knows",
+            "That isn't an ID an app can have",
         );
     }
     match field(&fields, "grant_type") {
@@ -504,11 +511,11 @@ async fn token(State(state): State<AppState>, Form(fields): Form<Fields>) -> Res
 }
 
 async fn start_device(State(state): State<AppState>, Form(fields): Form<Fields>) -> Response {
-    let Some(client) = client(field(&fields, "client_id")) else {
+    let Some(client) = known_client(field(&fields, "client_id")) else {
         return oauth_error(
             StatusCode::UNAUTHORIZED,
             "invalid_client",
-            "That isn't an app MaxNines knows",
+            "Only MaxNines' own apps can sign in with a code. Others sign in through the browser",
         );
     };
     let (Ok(device), Ok(role)) = (check_device(field(&fields, "device")), asked_role(&fields))
@@ -553,7 +560,7 @@ async fn revoke_token(State(state): State<AppState>, Form(fields): Form<Fields>)
         return oauth_error(
             StatusCode::UNAUTHORIZED,
             "invalid_client",
-            "That isn't an app MaxNines knows",
+            "That isn't an ID an app can have",
         );
     }
     let revoked = audit::acting_as(
