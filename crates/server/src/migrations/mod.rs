@@ -1,849 +1,18 @@
 //! The main database's tables, made by one migration: what `database/README.md`
 //! draws. A change to a table is a new migration after this one, with the README
-//! changed to match.
+//! changed to match. Until the first release, those are squashed back into this one
+//! now and then, as if the design had been right from the start, and a database made
+//! before then has its `seaql_migrations` rows changed to name this one alone.
 
+use sea_orm::DatabaseBackend;
 use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
 
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![
-            Box::new(CreateTables),
-            Box::new(ConvertMoments),
-            Box::new(NoneJsonAndAlertNames),
-        ]
+        vec![Box::new(CreateTables)]
     }
-}
-
-/// Text columns that held an empty string to mean none, which now hold NULL: their
-/// table, column, type, and whether an empty string was their default.
-const NONE_AS_NULL: &[(&str, &str, &str, bool)] = &[
-    ("alerts", "series", "varchar(255)", false),
-    ("app_sign_ins", "device", "varchar(100)", false),
-    ("dashboard_variables", "fact", "varchar(200)", false),
-    ("dashboard_variables", "filter", "varchar(500)", false),
-    ("dashboard_variables", "label", "varchar(100)", false),
-    ("dashboard_widgets", "filter", "varchar(500)", false),
-    ("dashboard_widgets", "title", "varchar(100)", false),
-    ("events", "filter", "varchar(500)", false),
-    ("hosts", "public_key", "varchar(64)", false),
-    ("location_rules", "filter", "varchar(500)", false),
-    ("location_rules", "place", "varchar(255)", false),
-    ("maintenance_windows", "filter", "varchar(500)", false),
-    ("metrics_pages", "names", "text", false),
-    ("silences", "filter", "varchar(500)", false),
-    ("silences", "series", "varchar(255)", true),
-];
-
-/// Text columns that could already be NULL for none, but took an empty string from
-/// the API too.
-const BLANK_AS_NULL: &[(&str, &str)] = &[
-    ("alert_rules", "condition_expr"),
-    ("alert_rules", "filter"),
-    ("alert_rules", "group_by"),
-    ("alert_rules", "series"),
-    ("config_rules", "condition_expr"),
-];
-
-/// Columns holding JSON as text, and the text type they had on MySQL.
-const JSON_TEXT: &[(&str, &str, &str)] = &[
-    ("action_runs", "variables", "text"),
-    ("audit_log", "changes", "longtext"),
-];
-
-/// Three tidy-ups. None is NULL, not an empty string, so a column says plainly when
-/// there's nothing in it. JSON is kept as JSON: `jsonb` on PostgreSQL and `json` on
-/// MySQL, which both check it, and text on SQLite, which has no type for it, checked
-/// here as it's converted; JSON that doesn't read stops the migration, as the server
-/// wrote it all. And an alert no longer keeps copies of its rule's name and its host's,
-/// which only went stale when either was renamed: rules are only ever marked deleted,
-/// and a host's alerts go with it, so both are always there to be read. Alerts whose
-/// rule went before rules were kept are deleted, with their notifications and runs.
-struct NoneJsonAndAlertNames;
-
-impl MigrationName for NoneJsonAndAlertNames {
-    fn name(&self) -> &str {
-        "m20261120_000001_none_json_and_alert_names"
-    }
-}
-
-#[async_trait::async_trait]
-impl MigrationTrait for NoneJsonAndAlertNames {
-    /// SQLite can only change a foreign key by making the table again, which it can
-    /// only do with foreign keys off, and that can't be done inside a transaction, so
-    /// this starts its own.
-    fn use_transaction(&self) -> Option<bool> {
-        Some(false)
-    }
-
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        without_foreign_keys(manager, |db| Box::pin(none_json_and_alert_names_up(db))).await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        without_foreign_keys(manager, |db| Box::pin(none_json_and_alert_names_down(db))).await
-    }
-}
-
-type Step<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DbErr>> + Send + 'a>>;
-
-/// Runs `step` in a transaction, with SQLite's foreign keys off around it, as its way of
-/// making a table again needs. They're checked before it commits instead, and turned
-/// back on whether it worked or not. The server's SQLite has one connection, so the
-/// transaction is on the connection they were turned off for, which is checked too.
-async fn without_foreign_keys<F>(manager: &SchemaManager<'_>, step: F) -> Result<(), DbErr>
-where
-    F: for<'a> FnOnce(&'a SchemaManager<'static>) -> Step<'a>,
-{
-    let sqlite = manager.get_database_backend() == sea_orm::DatabaseBackend::Sqlite;
-    let db = manager.get_connection();
-    if sqlite {
-        db.execute_unprepared("PRAGMA foreign_keys = OFF").await?;
-    }
-    let result = async {
-        let transaction = manager.begin().await?;
-        if sqlite {
-            let on: i64 = one_value(transaction.get_connection(), "PRAGMA foreign_keys").await?;
-            if on != 0 {
-                return Err(DbErr::Migration(
-                    "SQLite's foreign keys have to be off to make tables again".to_string(),
-                ));
-            }
-        }
-        step(&transaction).await?;
-        if sqlite {
-            let broken = transaction
-                .get_connection()
-                .query_all_raw(sea_orm::Statement::from_string(
-                    sea_orm::DatabaseBackend::Sqlite,
-                    "PRAGMA foreign_key_check",
-                ))
-                .await?;
-            if !broken.is_empty() {
-                return Err(DbErr::Migration(format!(
-                    "{} rows would break a foreign key",
-                    broken.len()
-                )));
-            }
-        }
-        transaction.commit().await
-    }
-    .await;
-    if sqlite {
-        db.execute_unprepared("PRAGMA foreign_keys = ON").await?;
-    }
-    result
-}
-
-/// The first column of the one row `sql` gives.
-async fn one_value<T: sea_orm::TryGetable>(
-    db: &impl ConnectionTrait,
-    sql: &str,
-) -> Result<T, DbErr> {
-    let row = db
-        .query_one_raw(sea_orm::Statement::from_string(
-            db.get_database_backend(),
-            sql,
-        ))
-        .await?
-        .ok_or_else(|| DbErr::Migration(format!("no answer to {sql}")))?;
-    row.try_get_by_index(0)
-        .map_err(|error| DbErr::Migration(error.to_string()))
-}
-
-async fn none_json_and_alert_names_up(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
-    let db = manager.get_connection();
-    let backend = db.get_database_backend();
-    for (table, column, kind, _) in NONE_AS_NULL {
-        match backend {
-            sea_orm::DatabaseBackend::Postgres => {
-                db.execute_unprepared(&format!(
-                    "ALTER TABLE \"{table}\" ALTER COLUMN \"{column}\" DROP NOT NULL, \
-                     ALTER COLUMN \"{column}\" DROP DEFAULT"
-                ))
-                .await?;
-            }
-            sea_orm::DatabaseBackend::MySql => {
-                db.execute_unprepared(&format!(
-                    "ALTER TABLE `{table}` MODIFY `{column}` {kind} NULL"
-                ))
-                .await?;
-            }
-            _ => {
-                // SQLite can't change whether a column can be empty, so a new one
-                // takes its place. None of these is indexed or a foreign key.
-                let new = format!("{column}_new");
-                db.execute_unprepared(&format!(
-                    "ALTER TABLE \"{table}\" ADD COLUMN \"{new}\" {kind}"
-                ))
-                .await?;
-                db.execute_unprepared(&format!("UPDATE \"{table}\" SET \"{new}\" = \"{column}\""))
-                    .await?;
-                db.execute_unprepared(&format!("ALTER TABLE \"{table}\" DROP COLUMN \"{column}\""))
-                    .await?;
-                db.execute_unprepared(&format!(
-                    "ALTER TABLE \"{table}\" RENAME COLUMN \"{new}\" TO \"{column}\""
-                ))
-                .await?;
-            }
-        }
-    }
-    let blanks = NONE_AS_NULL
-        .iter()
-        .map(|(table, column, _, _)| (*table, *column))
-        .chain(BLANK_AS_NULL.iter().copied());
-    for (table, column) in blanks {
-        let (table, column) = (quoted(backend, table), quoted(backend, column));
-        db.execute_unprepared(&format!(
-            "UPDATE {table} SET {column} = NULL WHERE TRIM({column}) = ''"
-        ))
-        .await?;
-    }
-
-    for (table, column, _) in JSON_TEXT {
-        match backend {
-            sea_orm::DatabaseBackend::Postgres => {
-                db.execute_unprepared(&format!(
-                    "ALTER TABLE \"{table}\" ALTER COLUMN \"{column}\" TYPE jsonb \
-                     USING \"{column}\"::jsonb"
-                ))
-                .await?;
-            }
-            sea_orm::DatabaseBackend::MySql => {
-                db.execute_unprepared(&format!(
-                    "ALTER TABLE `{table}` MODIFY `{column}` json NOT NULL"
-                ))
-                .await?;
-            }
-            _ => {
-                // json() refuses what isn't JSON, and writes what is compactly.
-                db.execute_unprepared(&format!(
-                    "UPDATE \"{table}\" SET \"{column}\" = json(\"{column}\")"
-                ))
-                .await?;
-            }
-        }
-    }
-
-    // What went with an alert by cascade goes first, as SQLite's foreign keys are off.
-    for child in ["notifications", "action_runs"] {
-        db.execute_unprepared(&format!(
-            "DELETE FROM {child} WHERE alert_id IN (SELECT id FROM alerts WHERE rule_id IS NULL)"
-        ))
-        .await?;
-    }
-    db.execute_unprepared("DELETE FROM alerts WHERE rule_id IS NULL")
-        .await?;
-    match backend {
-        sea_orm::DatabaseBackend::Postgres => {
-            db.execute_unprepared(
-                "ALTER TABLE alerts DROP COLUMN rule_name, DROP COLUMN hostname, \
-                 ALTER COLUMN rule_id SET NOT NULL, DROP CONSTRAINT fk_alerts_rule_id",
-            )
-            .await?;
-            db.execute_unprepared(
-                "ALTER TABLE alerts ADD CONSTRAINT fk_alerts_rule_id \
-                 FOREIGN KEY (rule_id) REFERENCES alert_rules (id)",
-            )
-            .await?;
-        }
-        sea_orm::DatabaseBackend::MySql => {
-            // The index MySQL made for the foreign key stays, so the new one has it
-            // throughout.
-            db.execute_unprepared("ALTER TABLE alerts DROP FOREIGN KEY fk_alerts_rule_id")
-                .await?;
-            db.execute_unprepared(
-                "ALTER TABLE alerts DROP COLUMN rule_name, DROP COLUMN hostname, \
-                 MODIFY rule_id BIGINT NOT NULL",
-            )
-            .await?;
-            db.execute_unprepared(
-                "ALTER TABLE alerts ADD CONSTRAINT fk_alerts_rule_id \
-                 FOREIGN KEY (rule_id) REFERENCES alert_rules (id)",
-            )
-            .await?;
-        }
-        _ => {
-            let columns = ALERT_COLUMNS.join(", ");
-            remake_sqlite_alerts(
-                db,
-                "\"rule_id\" integer NOT NULL, \"severity\" varchar(16) NOT NULL, \
-                 \"host_id\" varchar(32) NOT NULL, \"series\" varchar(255), \
-                 \"value\" double, \"summary\" text NOT NULL, \
-                 \"started_at\" TEXT NOT NULL, \"breached_at\" TEXT NOT NULL, \
-                 \"resolved_at\" TEXT, \"resolve_reason\" text, \"resolved_summary\" text, \
-                 \"acknowledged_by\" varchar(255), \"acknowledged_at\" TEXT, \
-                 FOREIGN KEY (\"host_id\") REFERENCES \"hosts\" (\"id\"), \
-                 FOREIGN KEY (\"rule_id\") REFERENCES \"alert_rules\" (\"id\")",
-                &format!("INSERT INTO alerts_new (id, {columns}) SELECT id, {columns} FROM alerts"),
-            )
-            .await?;
-        }
-    }
-    Ok(())
-}
-
-async fn none_json_and_alert_names_down(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
-    let db = manager.get_connection();
-    let backend = db.get_database_backend();
-    let names = "UPDATE alerts SET \
-                 rule_name = (SELECT name FROM alert_rules WHERE alert_rules.id = alerts.rule_id), \
-                 hostname = (SELECT hostname FROM hosts WHERE hosts.id = alerts.host_id)";
-    match backend {
-        sea_orm::DatabaseBackend::Postgres => {
-            db.execute_unprepared(
-                "ALTER TABLE alerts ADD COLUMN rule_name varchar(255), \
-                 ADD COLUMN hostname varchar(255)",
-            )
-            .await?;
-            db.execute_unprepared(names).await?;
-            db.execute_unprepared(
-                "ALTER TABLE alerts ALTER COLUMN rule_name SET NOT NULL, \
-                 ALTER COLUMN hostname SET NOT NULL, ALTER COLUMN rule_id DROP NOT NULL, \
-                 DROP CONSTRAINT fk_alerts_rule_id",
-            )
-            .await?;
-            db.execute_unprepared(
-                "ALTER TABLE alerts ADD CONSTRAINT fk_alerts_rule_id \
-                 FOREIGN KEY (rule_id) REFERENCES alert_rules (id) ON DELETE SET NULL",
-            )
-            .await?;
-        }
-        sea_orm::DatabaseBackend::MySql => {
-            db.execute_unprepared("ALTER TABLE alerts DROP FOREIGN KEY fk_alerts_rule_id")
-                .await?;
-            db.execute_unprepared(
-                "ALTER TABLE alerts ADD COLUMN rule_name varchar(255) NULL, \
-                 ADD COLUMN hostname varchar(255) NULL, MODIFY rule_id BIGINT NULL",
-            )
-            .await?;
-            db.execute_unprepared(names).await?;
-            db.execute_unprepared(
-                "ALTER TABLE alerts MODIFY rule_name varchar(255) NOT NULL, \
-                 MODIFY hostname varchar(255) NOT NULL",
-            )
-            .await?;
-            db.execute_unprepared(
-                "ALTER TABLE alerts ADD CONSTRAINT fk_alerts_rule_id \
-                 FOREIGN KEY (rule_id) REFERENCES alert_rules (id) ON DELETE SET NULL",
-            )
-            .await?;
-        }
-        _ => {
-            let columns = ALERT_COLUMNS.join(", ");
-            let from = ALERT_COLUMNS
-                .iter()
-                .map(|column| format!("a.{column}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            remake_sqlite_alerts(
-                db,
-                "\"rule_id\" integer, \"rule_name\" varchar(255) NOT NULL, \
-                 \"severity\" varchar(16) NOT NULL, \"host_id\" varchar(32) NOT NULL, \
-                 \"hostname\" varchar(255) NOT NULL, \"series\" varchar(255), \
-                 \"value\" double, \"summary\" text NOT NULL, \
-                 \"started_at\" TEXT NOT NULL, \"breached_at\" TEXT NOT NULL, \
-                 \"resolved_at\" TEXT, \"resolve_reason\" text, \"resolved_summary\" text, \
-                 \"acknowledged_by\" varchar(255), \"acknowledged_at\" TEXT, \
-                 FOREIGN KEY (\"host_id\") REFERENCES \"hosts\" (\"id\"), \
-                 FOREIGN KEY (\"rule_id\") REFERENCES \"alert_rules\" (\"id\") ON DELETE SET NULL",
-                &format!(
-                    "INSERT INTO alerts_new (id, rule_name, hostname, {columns}) \
-                     SELECT a.id, r.name, h.hostname, {from} FROM alerts a \
-                     JOIN alert_rules r ON r.id = a.rule_id JOIN hosts h ON h.id = a.host_id"
-                ),
-            )
-            .await?;
-        }
-    }
-
-    for (table, column, text) in JSON_TEXT {
-        match backend {
-            sea_orm::DatabaseBackend::Postgres => {
-                db.execute_unprepared(&format!(
-                    "ALTER TABLE \"{table}\" ALTER COLUMN \"{column}\" TYPE text \
-                     USING \"{column}\"::text"
-                ))
-                .await?;
-            }
-            sea_orm::DatabaseBackend::MySql => {
-                db.execute_unprepared(&format!(
-                    "ALTER TABLE `{table}` MODIFY `{column}` {text} NOT NULL"
-                ))
-                .await?;
-            }
-            // It was always text.
-            _ => {}
-        }
-    }
-
-    for (table, column, kind, empty_default) in NONE_AS_NULL {
-        let (quoted_table, quoted_column) = (quoted(backend, table), quoted(backend, column));
-        let default = if *empty_default { " DEFAULT ''" } else { "" };
-        match backend {
-            sea_orm::DatabaseBackend::Postgres => {
-                db.execute_unprepared(&format!(
-                    "UPDATE {quoted_table} SET {quoted_column} = '' WHERE {quoted_column} IS NULL"
-                ))
-                .await?;
-                db.execute_unprepared(&format!(
-                    "ALTER TABLE \"{table}\" ALTER COLUMN \"{column}\" SET NOT NULL"
-                ))
-                .await?;
-                if *empty_default {
-                    db.execute_unprepared(&format!(
-                        "ALTER TABLE \"{table}\" ALTER COLUMN \"{column}\" SET DEFAULT ''"
-                    ))
-                    .await?;
-                }
-            }
-            sea_orm::DatabaseBackend::MySql => {
-                db.execute_unprepared(&format!(
-                    "UPDATE {quoted_table} SET {quoted_column} = '' WHERE {quoted_column} IS NULL"
-                ))
-                .await?;
-                db.execute_unprepared(&format!(
-                    "ALTER TABLE `{table}` MODIFY `{column}` {kind} NOT NULL{default}"
-                ))
-                .await?;
-            }
-            _ => {
-                // As on the way up, but a column that can't be empty can only be added
-                // with a default, for the rows already there.
-                let old = format!("{column}_old");
-                db.execute_unprepared(&format!(
-                    "ALTER TABLE \"{table}\" ADD COLUMN \"{old}\" {kind} NOT NULL DEFAULT ''"
-                ))
-                .await?;
-                db.execute_unprepared(&format!(
-                    "UPDATE \"{table}\" SET \"{old}\" = COALESCE(\"{column}\", '')"
-                ))
-                .await?;
-                db.execute_unprepared(&format!("ALTER TABLE \"{table}\" DROP COLUMN \"{column}\""))
-                    .await?;
-                db.execute_unprepared(&format!(
-                    "ALTER TABLE \"{table}\" RENAME COLUMN \"{old}\" TO \"{column}\""
-                ))
-                .await?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// An alert's columns that are the same before and after, apart from its ID.
-const ALERT_COLUMNS: &[&str] = &[
-    "rule_id",
-    "severity",
-    "host_id",
-    "series",
-    "value",
-    "summary",
-    "started_at",
-    "breached_at",
-    "resolved_at",
-    "resolve_reason",
-    "resolved_summary",
-    "acknowledged_by",
-    "acknowledged_at",
-];
-
-/// Makes SQLite's alerts table again with `columns` after its ID, filled by `copy`
-/// from the old one into `alerts_new`, as SQLite can't change a foreign key any other
-/// way. Its numbering carries on from where it was, so a deleted alert's ID is never
-/// used again, as notifications already sent may name it.
-async fn remake_sqlite_alerts(
-    db: &impl ConnectionTrait,
-    columns: &str,
-    copy: &str,
-) -> Result<(), DbErr> {
-    db.execute_unprepared(&format!(
-        "CREATE TABLE \"alerts_new\" ( \"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \
-         {columns} )"
-    ))
-    .await?;
-    db.execute_unprepared(copy).await?;
-    db.execute_unprepared("DELETE FROM sqlite_sequence WHERE name = 'alerts_new'")
-        .await?;
-    db.execute_unprepared(
-        "INSERT INTO sqlite_sequence (name, seq) \
-         SELECT 'alerts_new', seq FROM sqlite_sequence WHERE name = 'alerts'",
-    )
-    .await?;
-    db.execute_unprepared("DROP TABLE alerts").await?;
-    db.execute_unprepared("ALTER TABLE alerts_new RENAME TO alerts")
-        .await?;
-    for (name, column) in [
-        ("idx_alerts_resolved", "resolved_at"),
-        ("idx_alerts_started", "started_at"),
-    ] {
-        db.execute_unprepared(&format!(
-            "CREATE INDEX \"{name}\" ON \"alerts\" (\"{column}\")"
-        ))
-        .await?;
-    }
-    Ok(())
-}
-
-/// A table or column's name, quoted as `backend` quotes them.
-fn quoted(backend: sea_orm::DatabaseBackend, name: &str) -> String {
-    match backend {
-        sea_orm::DatabaseBackend::MySql => format!("`{name}`"),
-        _ => format!("\"{name}\""),
-    }
-}
-
-/// Every moment kept as milliseconds since 1970, the column it becomes, and whether it
-/// can be empty. Durations, such as how long an action ran, stay numbers.
-const MOMENTS: &[(&str, &str, &str, bool)] = &[
-    ("action_runs", "finished_ms", "finished_at", false),
-    ("action_runs", "requested_ms", "requested_at", true),
-    ("alert_rules", "deleted_ms", "deleted_at", false),
-    ("alerts", "acknowledged_ms", "acknowledged_at", false),
-    ("alerts", "resolved_ms", "resolved_at", false),
-    ("alerts", "started_ms", "started_at", true),
-    ("api_keys", "created_ms", "created_at", true),
-    ("api_keys", "expires_ms", "expires_at", false),
-    ("api_keys", "last_used_ms", "last_used_at", false),
-    ("api_keys", "revoked_ms", "revoked_at", false),
-    (
-        "app_sign_ins",
-        "access_expires_ms",
-        "access_expires_at",
-        true,
-    ),
-    ("app_sign_ins", "created_ms", "created_at", true),
-    ("app_sign_ins", "last_used_ms", "last_used_at", false),
-    (
-        "app_sign_ins",
-        "refresh_expires_ms",
-        "refresh_expires_at",
-        true,
-    ),
-    ("app_sign_ins", "revoked_ms", "revoked_at", false),
-    ("app_sign_ins", "rotated_ms", "rotated_at", false),
-    ("audit_log", "time_ms", "occurred_at", true),
-    (
-        "config_rules",
-        "built_in_changed_ms",
-        "built_in_changed_at",
-        false,
-    ),
-    ("dashboards", "created_ms", "created_at", true),
-    ("events", "created_ms", "created_at", true),
-    ("events", "time_ms", "occurred_at", true),
-    ("host_boots", "boot_ms", "booted_at", true),
-    ("host_config_status", "reported_ms", "reported_at", true),
-    ("host_facts", "valid_from_ms", "valid_from", true),
-    ("host_facts", "valid_to_ms", "valid_to", false),
-    ("hosts", "decided_ms", "decided_at", false),
-    ("hosts", "first_seen_ms", "first_seen_at", true),
-    ("notification_channels", "deleted_ms", "deleted_at", false),
-    ("notifications", "created_ms", "created_at", true),
-    ("notifications", "next_attempt_ms", "next_attempt_at", true),
-    ("notifications", "sent_ms", "sent_at", false),
-    ("proxies", "created_ms", "created_at", true),
-    ("recovery_codes", "used_ms", "used_at", false),
-    ("sign_in_challenges", "expires_ms", "expires_at", true),
-    ("silences", "ends_ms", "ends_at", true),
-    ("silences", "starts_ms", "starts_at", true),
-    ("user_sessions", "created_ms", "created_at", true),
-    ("user_sessions", "expires_ms", "expires_at", true),
-    ("user_sessions", "last_used_ms", "last_used_at", false),
-    ("users", "created_ms", "created_at", true),
-    ("users", "disabled_ms", "disabled_at", false),
-    ("users", "last_sign_in_ms", "last_sign_in_at", false),
-    ("users", "setup_expires_ms", "setup_expires_at", false),
-];
-
-/// The indexes on those columns, which are made again on the new ones: their name,
-/// table, and columns before and after.
-const MOMENT_INDEXES: &[(&str, &str, &[&str], &[&str])] = &[
-    (
-        "idx_alerts_resolved",
-        "alerts",
-        &["resolved_ms"],
-        &["resolved_at"],
-    ),
-    (
-        "idx_alerts_started",
-        "alerts",
-        &["started_ms"],
-        &["started_at"],
-    ),
-    ("idx_silences_ends", "silences", &["ends_ms"], &["ends_at"]),
-    (
-        "idx_notifications_due",
-        "notifications",
-        &["state", "next_attempt_ms"],
-        &["state", "next_attempt_at"],
-    ),
-    ("idx_events_time", "events", &["time_ms"], &["occurred_at"]),
-    (
-        "idx_host_facts_host",
-        "host_facts",
-        &["host_id", "valid_to_ms"],
-        &["host_id", "valid_to"],
-    ),
-    (
-        "idx_action_runs_host",
-        "action_runs",
-        &["host_id", "requested_ms"],
-        &["host_id", "requested_at"],
-    ),
-    (
-        "idx_action_runs_finished",
-        "action_runs",
-        &["finished_ms"],
-        &["finished_at"],
-    ),
-];
-
-/// Every moment becomes a timestamp: `timestamptz` on PostgreSQL, `DATETIME(3)` in UTC
-/// on MySQL, which has no time zone to shift it by and lasts past 2038 as `TIMESTAMP`
-/// doesn't, and ISO 8601 text in UTC on SQLite, which has no type for it, written as
-/// the server writes them, so they sort and compare as text as they do as times. The
-/// data is converted, not lost, and alerts learn when their problem began, as their
-/// start less their rule's wait, or their start if their rule's gone.
-struct ConvertMoments;
-
-impl MigrationName for ConvertMoments {
-    fn name(&self) -> &str {
-        "m20261119_000001_convert_moments"
-    }
-}
-
-/// `column` as the timestamp text the server writes on SQLite: to the second, then the
-/// milliseconds only if there are any, and `+00:00`.
-fn sqlite_moment(column: &str) -> String {
-    format!(
-        "strftime('%Y-%m-%dT%H:%M:%S', {column} / 1000, 'unixepoch') || \
-         CASE WHEN {column} % 1000 = 0 THEN '' ELSE printf('.%03d', {column} % 1000) END \
-         || '+00:00'"
-    )
-}
-
-#[async_trait::async_trait]
-impl MigrationTrait for ConvertMoments {
-    fn use_transaction(&self) -> Option<bool> {
-        Some(true)
-    }
-
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let db = manager.get_connection();
-        let backend = manager.get_database_backend();
-        add_stand_ins(manager).await?;
-        for (name, table, _, _) in MOMENT_INDEXES {
-            manager
-                .drop_index(
-                    Index::drop()
-                        .name(*name)
-                        .table(Alias::new(*table))
-                        .to_owned(),
-                )
-                .await?;
-        }
-        // When each alert's problem began, from what's there before it changes.
-        let mut moments: Vec<(&str, &str, &str, bool)> = MOMENTS.to_vec();
-        db.execute_unprepared(
-            "ALTER TABLE alerts ADD COLUMN breached_ms BIGINT NOT NULL DEFAULT 0",
-        )
-        .await?;
-        db.execute_unprepared(
-            "UPDATE alerts SET breached_ms = started_ms - 1000 * COALESCE(
-                (SELECT for_secs FROM alert_rules WHERE alert_rules.id = alerts.rule_id), 0)",
-        )
-        .await?;
-        if backend == sea_orm::DatabaseBackend::Postgres {
-            db.execute_unprepared("ALTER TABLE alerts ALTER COLUMN breached_ms DROP DEFAULT")
-                .await?;
-        }
-        moments.push(("alerts", "breached_ms", "breached_at", true));
-
-        for (table, from, to, required) in moments {
-            match backend {
-                sea_orm::DatabaseBackend::Postgres => {
-                    db.execute_unprepared(&format!(
-                        "ALTER TABLE \"{table}\" ALTER COLUMN \"{from}\" TYPE timestamptz \
-                         USING TIMESTAMPTZ 'epoch' + \"{from}\" * INTERVAL '1 millisecond'"
-                    ))
-                    .await?;
-                    db.execute_unprepared(&format!(
-                        "ALTER TABLE \"{table}\" RENAME COLUMN \"{from}\" TO \"{to}\""
-                    ))
-                    .await?;
-                }
-                sea_orm::DatabaseBackend::MySql => {
-                    db.execute_unprepared(&format!(
-                        "ALTER TABLE `{table}` ADD COLUMN `{to}` DATETIME(3) NULL"
-                    ))
-                    .await?;
-                    db.execute_unprepared(&format!(
-                        "UPDATE `{table}` SET `{to}` = \
-                         TIMESTAMPADD(MICROSECOND, `{from}` * 1000, '1970-01-01 00:00:00')"
-                    ))
-                    .await?;
-                    let required = if required { " NOT NULL" } else { " NULL" };
-                    db.execute_unprepared(&format!(
-                        "ALTER TABLE `{table}` DROP COLUMN `{from}`, \
-                         MODIFY `{to}` DATETIME(3){required}"
-                    ))
-                    .await?;
-                }
-                _ => {
-                    // SQLite can only add a column that can't be empty with a default,
-                    // for the rows already there, which are all filled in next.
-                    let required = if required {
-                        " NOT NULL DEFAULT '1970-01-01T00:00:00+00:00'"
-                    } else {
-                        ""
-                    };
-                    db.execute_unprepared(&format!(
-                        "ALTER TABLE \"{table}\" ADD COLUMN \"{to}\" TEXT{required}"
-                    ))
-                    .await?;
-                    db.execute_unprepared(&format!(
-                        "UPDATE \"{table}\" SET \"{to}\" = {} WHERE \"{from}\" IS NOT NULL",
-                        sqlite_moment(&format!("\"{from}\""))
-                    ))
-                    .await?;
-                    db.execute_unprepared(&format!(
-                        "ALTER TABLE \"{table}\" DROP COLUMN \"{from}\""
-                    ))
-                    .await?;
-                }
-            }
-        }
-        for (name, table, _, after) in MOMENT_INDEXES {
-            let mut index = Index::create();
-            index.name(*name).table(Alias::new(*table));
-            for column in *after {
-                index.col(Alias::new(*column));
-            }
-            manager.create_index(index.to_owned()).await?;
-        }
-        drop_stand_ins(manager).await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let db = manager.get_connection();
-        let backend = manager.get_database_backend();
-        add_stand_ins(manager).await?;
-        for (name, table, _, _) in MOMENT_INDEXES {
-            manager
-                .drop_index(
-                    Index::drop()
-                        .name(*name)
-                        .table(Alias::new(*table))
-                        .to_owned(),
-                )
-                .await?;
-        }
-        let mut moments: Vec<(&str, &str, &str, bool)> = MOMENTS.to_vec();
-        moments.push(("alerts", "breached_ms", "breached_at", true));
-        for (table, from, to, required) in moments {
-            match backend {
-                sea_orm::DatabaseBackend::Postgres => {
-                    db.execute_unprepared(&format!(
-                        "ALTER TABLE \"{table}\" ALTER COLUMN \"{to}\" TYPE bigint \
-                         USING (EXTRACT(EPOCH FROM \"{to}\") * 1000)::bigint"
-                    ))
-                    .await?;
-                    db.execute_unprepared(&format!(
-                        "ALTER TABLE \"{table}\" RENAME COLUMN \"{to}\" TO \"{from}\""
-                    ))
-                    .await?;
-                }
-                sea_orm::DatabaseBackend::MySql => {
-                    db.execute_unprepared(&format!(
-                        "ALTER TABLE `{table}` ADD COLUMN `{from}` BIGINT NULL"
-                    ))
-                    .await?;
-                    db.execute_unprepared(&format!(
-                        "UPDATE `{table}` SET `{from}` = \
-                         TIMESTAMPDIFF(MICROSECOND, '1970-01-01 00:00:00', `{to}`) DIV 1000"
-                    ))
-                    .await?;
-                    let required = if required { " NOT NULL" } else { " NULL" };
-                    db.execute_unprepared(&format!(
-                        "ALTER TABLE `{table}` DROP COLUMN `{to}`, MODIFY `{from}` BIGINT{required}"
-                    ))
-                    .await?;
-                }
-                _ => {
-                    let required = if required { " NOT NULL DEFAULT 0" } else { "" };
-                    db.execute_unprepared(&format!(
-                        "ALTER TABLE \"{table}\" ADD COLUMN \"{from}\" INTEGER{required}"
-                    ))
-                    .await?;
-                    db.execute_unprepared(&format!(
-                        "UPDATE \"{table}\" SET \"{from}\" = \
-                         CAST(strftime('%s', \"{to}\") AS INTEGER) * 1000 \
-                         + CAST(substr(strftime('%f', \"{to}\"), 4) AS INTEGER) \
-                         WHERE \"{to}\" IS NOT NULL"
-                    ))
-                    .await?;
-                    db.execute_unprepared(&format!("ALTER TABLE \"{table}\" DROP COLUMN \"{to}\""))
-                        .await?;
-                }
-            }
-        }
-        db.execute_unprepared("ALTER TABLE alerts DROP COLUMN breached_ms")
-            .await?;
-        for (name, table, before, _) in MOMENT_INDEXES {
-            let mut index = Index::create();
-            index.name(*name).table(Alias::new(*table));
-            for column in *before {
-                index.col(Alias::new(*column));
-            }
-            manager.create_index(index.to_owned()).await?;
-        }
-        drop_stand_ins(manager).await
-    }
-}
-
-/// MySQL won't drop an index a foreign key needs, and those on a host's facts and its
-/// actions lead with the host. While they're made again, a stand-in on the columns
-/// ahead of the moment covers for each index that has any.
-fn stand_ins() -> impl Iterator<Item = (String, &'static str, &'static [&'static str])> {
-    MOMENT_INDEXES
-        .iter()
-        .filter(|(_, _, before, _)| before.len() > 1)
-        .map(|(name, table, before, _)| {
-            (
-                format!("{name}_meanwhile"),
-                *table,
-                &before[..before.len() - 1],
-            )
-        })
-}
-
-async fn add_stand_ins(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
-    if manager.get_database_backend() != sea_orm::DatabaseBackend::MySql {
-        return Ok(());
-    }
-    for (name, table, columns) in stand_ins() {
-        let mut index = Index::create();
-        index.name(name).table(Alias::new(table));
-        for column in columns {
-            index.col(Alias::new(*column));
-        }
-        manager.create_index(index.to_owned()).await?;
-    }
-    Ok(())
-}
-
-async fn drop_stand_ins(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
-    if manager.get_database_backend() != sea_orm::DatabaseBackend::MySql {
-        return Ok(());
-    }
-    for (name, table, _) in stand_ins() {
-        manager
-            .drop_index(Index::drop().name(name).table(Alias::new(table)).to_owned())
-            .await?;
-    }
-    Ok(())
 }
 
 /// A big integer that counts up from 1, which is what every `id` column is.
@@ -856,17 +25,44 @@ fn id(column: impl IntoIden) -> ColumnDef {
         .to_owned()
 }
 
+/// A moment in UTC to the millisecond: `timestamptz` on PostgreSQL, `DATETIME(3)` on
+/// MySQL, which has no time zone to shift it by and lasts past 2038 as `TIMESTAMP`
+/// doesn't, and text on SQLite, which has no type for it. There it's ISO 8601 as sqlx
+/// writes it, so moments sort and compare as text as they do as times.
+fn moment(backend: DatabaseBackend, column: impl IntoIden) -> ColumnDef {
+    let mut moment = ColumnDef::new(column);
+    match backend {
+        DatabaseBackend::Postgres => moment.timestamp_with_time_zone(),
+        DatabaseBackend::MySql => moment.custom(Alias::new("DATETIME(3)")),
+        _ => moment.custom(Alias::new("TEXT")),
+    };
+    moment
+}
+
+/// JSON: `jsonb` on PostgreSQL and `json` on MySQL, which both check it, and text on
+/// SQLite, which has no type for it.
+fn json(backend: DatabaseBackend, column: impl IntoIden) -> ColumnDef {
+    let mut json = ColumnDef::new(column);
+    match backend {
+        DatabaseBackend::Postgres => json.json_binary(),
+        DatabaseBackend::MySql => json.json(),
+        _ => json.text(),
+    };
+    json
+}
+
 struct CreateTables;
 
 impl MigrationName for CreateTables {
     fn name(&self) -> &str {
-        "m20261117_000001_create_tables"
+        "m20261119_000001_create_tables"
     }
 }
 
 /// Every table, in the order their foreign keys need, and what a new server starts
 /// with: the server itself and the fleet as hosts, a default config rule, and the
-/// built-in alert rules.
+/// built-in alert rules. A column that can be empty is NULL when it is, never an empty
+/// string, so it says plainly when there's nothing in it.
 #[async_trait::async_trait]
 impl MigrationTrait for CreateTables {
     fn use_transaction(&self) -> Option<bool> {
@@ -874,15 +70,7 @@ impl MigrationTrait for CreateTables {
     }
 
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        // MySQL's text holds 64 KB, which a big config rule's before and after could
-        // pass, and a change mustn't fail for want of room to record it.
-        let mut changes = ColumnDef::new(AuditLog::Changes);
-        match manager.get_database_backend() {
-            sea_orm::DatabaseBackend::MySql => changes.custom(Alias::new("LONGTEXT")),
-            _ => changes.text(),
-        };
-        changes.not_null();
-
+        let backend = manager.get_database_backend();
         manager
             .create_table(
                 Table::create()
@@ -899,12 +87,12 @@ impl MigrationTrait for CreateTables {
                             .not_null()
                             .default("agent"),
                     )
-                    .col(ColumnDef::new(Hosts::PublicKey).string_len(64).not_null())
+                    .col(ColumnDef::new(Hosts::PublicKey).string_len(64))
                     .col(ColumnDef::new(Hosts::Hostname).string_len(255).not_null())
                     .col(ColumnDef::new(Hosts::State).string_len(16).not_null())
                     .col(ColumnDef::new(Hosts::DecidedBy).text())
-                    .col(ColumnDef::new(Hosts::FirstSeenMs).big_integer().not_null())
-                    .col(ColumnDef::new(Hosts::DecidedMs).big_integer())
+                    .col(moment(backend, Hosts::FirstSeenAt).not_null())
+                    .col(moment(backend, Hosts::DecidedAt))
                     .to_owned(),
             )
             .await?;
@@ -921,12 +109,8 @@ impl MigrationTrait for CreateTables {
                             .string_len(16)
                             .not_null(),
                     )
-                    .col(
-                        ColumnDef::new(HostFacts::ValidFromMs)
-                            .big_integer()
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(HostFacts::ValidToMs).big_integer())
+                    .col(moment(backend, HostFacts::ValidFrom).not_null())
+                    .col(moment(backend, HostFacts::ValidTo))
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_host_facts_host_id")
@@ -942,7 +126,7 @@ impl MigrationTrait for CreateTables {
                     .name("idx_host_facts_host")
                     .table(HostFacts::Table)
                     .col(HostFacts::HostId)
-                    .col(HostFacts::ValidToMs)
+                    .col(HostFacts::ValidTo)
                     .to_owned(),
             )
             .await?;
@@ -972,11 +156,7 @@ impl MigrationTrait for CreateTables {
                             .not_null(),
                     )
                     .col(ColumnDef::new(HostConfigStatus::Error).text())
-                    .col(
-                        ColumnDef::new(HostConfigStatus::ReportedMs)
-                            .big_integer()
-                            .not_null(),
-                    )
+                    .col(moment(backend, HostConfigStatus::ReportedAt).not_null())
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_host_config_status_host_id")
@@ -996,7 +176,7 @@ impl MigrationTrait for CreateTables {
                             .not_null()
                             .primary_key(),
                     )
-                    .col(ColumnDef::new(HostBoots::BootMs).big_integer().not_null())
+                    .col(moment(backend, HostBoots::BootedAt).not_null())
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_host_boots_host_id")
@@ -1017,7 +197,7 @@ impl MigrationTrait for CreateTables {
                             .not_null(),
                     )
                     .col(ColumnDef::new(MetricsPages::Url).string_len(255).not_null())
-                    .col(ColumnDef::new(MetricsPages::Names).text().not_null())
+                    .col(ColumnDef::new(MetricsPages::Names).text())
                     .col(
                         ColumnDef::new(MetricsPages::IntervalSecs)
                             .big_integer()
@@ -1063,7 +243,7 @@ impl MigrationTrait for CreateTables {
                     .col(ColumnDef::new(ConfigRules::Enabled).boolean().not_null())
                     .col(ColumnDef::new(ConfigRules::OperatingSystems).string_len(64))
                     .col(ColumnDef::new(ConfigRules::BuiltIn).string_len(32))
-                    .col(ColumnDef::new(ConfigRules::BuiltInChangedMs).big_integer())
+                    .col(moment(backend, ConfigRules::BuiltInChangedAt))
                     .to_owned(),
             )
             .await?;
@@ -1149,7 +329,7 @@ impl MigrationTrait for CreateTables {
                             .string_len(64)
                             .unique_key(),
                     )
-                    .col(ColumnDef::new(Users::SetupExpiresMs).big_integer())
+                    .col(moment(backend, Users::SetupExpiresAt))
                     .col(ColumnDef::new(Users::TotpSecret).string_len(128))
                     .col(
                         ColumnDef::new(Users::TotpEnabled)
@@ -1158,9 +338,9 @@ impl MigrationTrait for CreateTables {
                             .default(false),
                     )
                     .col(ColumnDef::new(Users::TotpLastStep).big_integer())
-                    .col(ColumnDef::new(Users::CreatedMs).big_integer().not_null())
-                    .col(ColumnDef::new(Users::LastSignInMs).big_integer())
-                    .col(ColumnDef::new(Users::DisabledMs).big_integer())
+                    .col(moment(backend, Users::CreatedAt).not_null())
+                    .col(moment(backend, Users::LastSignInAt))
+                    .col(moment(backend, Users::DisabledAt))
                     .to_owned(),
             )
             .await?;
@@ -1180,17 +360,9 @@ impl MigrationTrait for CreateTables {
                             .not_null()
                             .unique_key(),
                     )
-                    .col(
-                        ColumnDef::new(UserSessions::CreatedMs)
-                            .big_integer()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(UserSessions::ExpiresMs)
-                            .big_integer()
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(UserSessions::LastUsedMs).big_integer())
+                    .col(moment(backend, UserSessions::CreatedAt).not_null())
+                    .col(moment(backend, UserSessions::ExpiresAt).not_null())
+                    .col(moment(backend, UserSessions::LastUsedAt))
                     .col(ColumnDef::new(UserSessions::LastAddress).string_len(64))
                     .col(ColumnDef::new(UserSessions::LastForwardedFor).string_len(64))
                     .col(ColumnDef::new(UserSessions::UserAgent).string_len(255))
@@ -1233,10 +405,10 @@ impl MigrationTrait for CreateTables {
                             .not_null()
                             .default("admin"),
                     )
-                    .col(ColumnDef::new(ApiKeys::CreatedMs).big_integer().not_null())
-                    .col(ColumnDef::new(ApiKeys::ExpiresMs).big_integer())
-                    .col(ColumnDef::new(ApiKeys::LastUsedMs).big_integer())
-                    .col(ColumnDef::new(ApiKeys::RevokedMs).big_integer())
+                    .col(moment(backend, ApiKeys::CreatedAt).not_null())
+                    .col(moment(backend, ApiKeys::ExpiresAt))
+                    .col(moment(backend, ApiKeys::LastUsedAt))
+                    .col(moment(backend, ApiKeys::RevokedAt))
                     .col(ColumnDef::new(ApiKeys::LastAddress).string_len(64))
                     .col(ColumnDef::new(ApiKeys::LastForwardedFor).string_len(64))
                     .foreign_key(
@@ -1258,17 +430,17 @@ impl MigrationTrait for CreateTables {
                         .col(id(T::Id))
                         .col(ColumnDef::new(T::UserId).big_integer().not_null())
                         .col(ColumnDef::new(T::ClientId).string_len(64).not_null())
-                        .col(ColumnDef::new(T::Device).string_len(100).not_null())
+                        .col(ColumnDef::new(T::Device).string_len(100))
                         .col(ColumnDef::new(T::Role).string_len(16).not_null())
                         .col(hash(T::AccessHash).unique_key().to_owned())
-                        .col(ColumnDef::new(T::AccessExpiresMs).big_integer().not_null())
+                        .col(moment(backend, T::AccessExpiresAt).not_null())
                         .col(hash(T::RefreshHash).unique_key().to_owned())
                         .col(ColumnDef::new(T::PreviousRefreshHash).string_len(64))
-                        .col(ColumnDef::new(T::RotatedMs).big_integer())
-                        .col(ColumnDef::new(T::RefreshExpiresMs).big_integer().not_null())
-                        .col(ColumnDef::new(T::CreatedMs).big_integer().not_null())
-                        .col(ColumnDef::new(T::LastUsedMs).big_integer())
-                        .col(ColumnDef::new(T::RevokedMs).big_integer())
+                        .col(moment(backend, T::RotatedAt))
+                        .col(moment(backend, T::RefreshExpiresAt).not_null())
+                        .col(moment(backend, T::CreatedAt).not_null())
+                        .col(moment(backend, T::LastUsedAt))
+                        .col(moment(backend, T::RevokedAt))
                         .col(ColumnDef::new(T::LastAddress).string_len(64))
                         .col(ColumnDef::new(T::LastForwardedFor).string_len(64))
                         .foreign_key(
@@ -1313,7 +485,7 @@ impl MigrationTrait for CreateTables {
                             .string_len(64)
                             .not_null(),
                     )
-                    .col(ColumnDef::new(RecoveryCodes::UsedMs).big_integer())
+                    .col(moment(backend, RecoveryCodes::UsedAt))
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_recovery_codes_user_id")
@@ -1339,11 +511,7 @@ impl MigrationTrait for CreateTables {
                             .not_null()
                             .unique_key(),
                     )
-                    .col(
-                        ColumnDef::new(SignInChallenges::ExpiresMs)
-                            .big_integer()
-                            .not_null(),
-                    )
+                    .col(moment(backend, SignInChallenges::ExpiresAt).not_null())
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_sign_in_challenges_user_id")
@@ -1395,7 +563,7 @@ impl MigrationTrait for CreateTables {
                     .col(ColumnDef::new(NotificationChannels::RequestMethod).string_len(8))
                     .col(ColumnDef::new(NotificationChannels::RequestContentType).string_len(255))
                     .col(ColumnDef::new(NotificationChannels::RequestBody).text())
-                    .col(ColumnDef::new(NotificationChannels::DeletedMs).big_integer())
+                    .col(moment(backend, NotificationChannels::DeletedAt))
                     .to_owned(),
             )
             .await?;
@@ -1432,7 +600,7 @@ impl MigrationTrait for CreateTables {
                     .col(ColumnDef::new(AlertRules::RemindEverySecs).big_integer())
                     .col(ColumnDef::new(AlertRules::ForecastSecs).big_integer())
                     .col(ColumnDef::new(AlertRules::WarningForecastSecs).big_integer())
-                    .col(ColumnDef::new(AlertRules::DeletedMs).big_integer())
+                    .col(moment(backend, AlertRules::DeletedAt))
                     .to_owned(),
             )
             .await?;
@@ -1472,25 +640,27 @@ impl MigrationTrait for CreateTables {
                     .to_owned(),
             )
             .await?;
+        // An alert keeps no copy of its rule's name or its host's, which would only go
+        // stale when either was renamed. Rules are only ever marked deleted, and a
+        // host's alerts go with it, so both are always there to be read.
         manager
             .create_table(
                 Table::create()
                     .table(Alerts::Table)
                     .col(id(Alerts::Id))
-                    .col(ColumnDef::new(Alerts::RuleId).big_integer())
-                    .col(ColumnDef::new(Alerts::RuleName).string_len(255).not_null())
+                    .col(ColumnDef::new(Alerts::RuleId).big_integer().not_null())
                     .col(ColumnDef::new(Alerts::Severity).string_len(16).not_null())
                     .col(ColumnDef::new(Alerts::HostId).string_len(32).not_null())
-                    .col(ColumnDef::new(Alerts::Hostname).string_len(255).not_null())
-                    .col(ColumnDef::new(Alerts::Series).string_len(255).not_null())
+                    .col(ColumnDef::new(Alerts::Series).string_len(255))
                     .col(ColumnDef::new(Alerts::Value).double())
                     .col(ColumnDef::new(Alerts::Summary).text().not_null())
-                    .col(ColumnDef::new(Alerts::StartedMs).big_integer().not_null())
-                    .col(ColumnDef::new(Alerts::ResolvedMs).big_integer())
+                    .col(moment(backend, Alerts::StartedAt).not_null())
+                    .col(moment(backend, Alerts::BreachedAt).not_null())
+                    .col(moment(backend, Alerts::ResolvedAt))
                     .col(ColumnDef::new(Alerts::ResolveReason).text())
                     .col(ColumnDef::new(Alerts::ResolvedSummary).text())
                     .col(ColumnDef::new(Alerts::AcknowledgedBy).string_len(255))
-                    .col(ColumnDef::new(Alerts::AcknowledgedMs).big_integer())
+                    .col(moment(backend, Alerts::AcknowledgedAt))
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_alerts_host_id")
@@ -1501,8 +671,7 @@ impl MigrationTrait for CreateTables {
                         ForeignKey::create()
                             .name("fk_alerts_rule_id")
                             .from(Alerts::Table, Alerts::RuleId)
-                            .to(AlertRules::Table, AlertRules::Id)
-                            .on_delete(ForeignKeyAction::SetNull),
+                            .to(AlertRules::Table, AlertRules::Id),
                     )
                     .to_owned(),
             )
@@ -1512,7 +681,7 @@ impl MigrationTrait for CreateTables {
                 Index::create()
                     .name("idx_alerts_resolved")
                     .table(Alerts::Table)
-                    .col(Alerts::ResolvedMs)
+                    .col(Alerts::ResolvedAt)
                     .to_owned(),
             )
             .await?;
@@ -1521,7 +690,7 @@ impl MigrationTrait for CreateTables {
                 Index::create()
                     .name("idx_alerts_started")
                     .table(Alerts::Table)
-                    .col(Alerts::StartedMs)
+                    .col(Alerts::StartedAt)
                     .to_owned(),
             )
             .await?;
@@ -1551,18 +720,10 @@ impl MigrationTrait for CreateTables {
                             .not_null(),
                     )
                     .col(ColumnDef::new(Notifications::Attempts).integer().not_null())
-                    .col(
-                        ColumnDef::new(Notifications::NextAttemptMs)
-                            .big_integer()
-                            .not_null(),
-                    )
+                    .col(moment(backend, Notifications::NextAttemptAt).not_null())
                     .col(ColumnDef::new(Notifications::LastError).text())
-                    .col(
-                        ColumnDef::new(Notifications::CreatedMs)
-                            .big_integer()
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(Notifications::SentMs).big_integer())
+                    .col(moment(backend, Notifications::CreatedAt).not_null())
+                    .col(moment(backend, Notifications::SentAt))
                     .col(ColumnDef::new(Notifications::ExternalId).string_len(128))
                     .col(ColumnDef::new(Notifications::ActionRunId).big_integer())
                     .foreign_key(
@@ -1597,7 +758,7 @@ impl MigrationTrait for CreateTables {
                     .name("idx_notifications_due")
                     .table(Notifications::Table)
                     .col(Notifications::State)
-                    .col(Notifications::NextAttemptMs)
+                    .col(Notifications::NextAttemptAt)
                     .to_owned(),
             )
             .await?;
@@ -1607,21 +768,16 @@ impl MigrationTrait for CreateTables {
                     .table(Silences::Table)
                     .col(id(Silences::Id))
                     .col(ColumnDef::new(Silences::RuleId).big_integer())
-                    .col(ColumnDef::new(Silences::Filter).string_len(500).not_null())
+                    .col(ColumnDef::new(Silences::Filter).string_len(500))
                     .col(ColumnDef::new(Silences::Reason).string_len(255).not_null())
                     .col(
                         ColumnDef::new(Silences::CreatedBy)
                             .string_len(255)
                             .not_null(),
                     )
-                    .col(ColumnDef::new(Silences::StartsMs).big_integer().not_null())
-                    .col(ColumnDef::new(Silences::EndsMs).big_integer().not_null())
-                    .col(
-                        ColumnDef::new(Silences::Series)
-                            .string_len(255)
-                            .not_null()
-                            .default(""),
-                    )
+                    .col(moment(backend, Silences::StartsAt).not_null())
+                    .col(moment(backend, Silences::EndsAt).not_null())
+                    .col(ColumnDef::new(Silences::Series).string_len(255))
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_silences_rule_id")
@@ -1637,7 +793,7 @@ impl MigrationTrait for CreateTables {
                 Index::create()
                     .name("idx_silences_ends")
                     .table(Silences::Table)
-                    .col(Silences::EndsMs)
+                    .col(Silences::EndsAt)
                     .to_owned(),
             )
             .await?;
@@ -1652,11 +808,7 @@ impl MigrationTrait for CreateTables {
                             .not_null(),
                     )
                     .col(ColumnDef::new(MaintenanceWindows::RuleId).big_integer())
-                    .col(
-                        ColumnDef::new(MaintenanceWindows::Filter)
-                            .string_len(500)
-                            .not_null(),
-                    )
+                    .col(ColumnDef::new(MaintenanceWindows::Filter).string_len(500))
                     .col(
                         ColumnDef::new(MaintenanceWindows::Days)
                             .string_len(32)
@@ -1737,10 +889,10 @@ impl MigrationTrait for CreateTables {
             )
             .await?;
 
-        // As with the audit log, MySQL's text is too small for what this holds.
+        // MySQL's text holds 64 KB, which what an action prints can pass.
         let mut output = ColumnDef::new(ActionRuns::Output);
-        match manager.get_database_backend() {
-            sea_orm::DatabaseBackend::MySql => output.custom(Alias::new("LONGTEXT")),
+        match backend {
+            DatabaseBackend::MySql => output.custom(Alias::new("LONGTEXT")),
             _ => output.text(),
         };
         output.not_null();
@@ -1753,13 +905,9 @@ impl MigrationTrait for CreateTables {
                     .col(ColumnDef::new(ActionRuns::AlertId).big_integer())
                     .col(ColumnDef::new(ActionRuns::Action).string_len(64).not_null())
                     .col(ColumnDef::new(ActionRuns::RunOn).string_len(16).not_null())
-                    .col(ColumnDef::new(ActionRuns::Variables).text().not_null())
+                    .col(json(backend, ActionRuns::Variables).not_null())
                     .col(ColumnDef::new(ActionRuns::RequestedBy).string_len(255))
-                    .col(
-                        ColumnDef::new(ActionRuns::RequestedMs)
-                            .big_integer()
-                            .not_null(),
-                    )
+                    .col(moment(backend, ActionRuns::RequestedAt).not_null())
                     .col(
                         ColumnDef::new(ActionRuns::TimeoutSecs)
                             .big_integer()
@@ -1771,7 +919,7 @@ impl MigrationTrait for CreateTables {
                     .col(output)
                     .col(ColumnDef::new(ActionRuns::Truncated).boolean().not_null())
                     .col(ColumnDef::new(ActionRuns::DurationMs).big_integer())
-                    .col(ColumnDef::new(ActionRuns::FinishedMs).big_integer())
+                    .col(moment(backend, ActionRuns::FinishedAt))
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_action_runs_host_id")
@@ -1804,7 +952,7 @@ impl MigrationTrait for CreateTables {
                     .name("idx_action_runs_host")
                     .table(ActionRuns::Table)
                     .col(ActionRuns::HostId)
-                    .col(ActionRuns::RequestedMs)
+                    .col(ActionRuns::RequestedAt)
                     .to_owned(),
             )
             .await?;
@@ -1814,7 +962,7 @@ impl MigrationTrait for CreateTables {
                 Index::create()
                     .name("idx_action_runs_finished")
                     .table(ActionRuns::Table)
-                    .col(ActionRuns::FinishedMs)
+                    .col(ActionRuns::FinishedAt)
                     .to_owned(),
             )
             .await?;
@@ -1893,11 +1041,7 @@ impl MigrationTrait for CreateTables {
                     .table(Dashboards::Table)
                     .col(id(Dashboards::Id))
                     .col(ColumnDef::new(Dashboards::Name).string_len(100).not_null())
-                    .col(
-                        ColumnDef::new(Dashboards::CreatedMs)
-                            .big_integer()
-                            .not_null(),
-                    )
+                    .col(moment(backend, Dashboards::CreatedAt).not_null())
                     .to_owned(),
             )
             .await?;
@@ -1911,11 +1055,7 @@ impl MigrationTrait for CreateTables {
                             .big_integer()
                             .not_null(),
                     )
-                    .col(
-                        ColumnDef::new(DashboardWidgets::Title)
-                            .string_len(100)
-                            .not_null(),
-                    )
+                    .col(ColumnDef::new(DashboardWidgets::Title).string_len(100))
                     .col(
                         ColumnDef::new(DashboardWidgets::Kind)
                             .string_len(16)
@@ -1936,11 +1076,7 @@ impl MigrationTrait for CreateTables {
                             .string_len(255)
                             .not_null(),
                     )
-                    .col(
-                        ColumnDef::new(DashboardWidgets::Filter)
-                            .string_len(500)
-                            .not_null(),
-                    )
+                    .col(ColumnDef::new(DashboardWidgets::Filter).string_len(500))
                     .col(ColumnDef::new(DashboardWidgets::X).integer().not_null())
                     .col(ColumnDef::new(DashboardWidgets::Y).integer().not_null())
                     .col(ColumnDef::new(DashboardWidgets::W).integer().not_null())
@@ -1984,26 +1120,14 @@ impl MigrationTrait for CreateTables {
                             .string_len(32)
                             .not_null(),
                     )
-                    .col(
-                        ColumnDef::new(DashboardVariables::Label)
-                            .string_len(100)
-                            .not_null(),
-                    )
+                    .col(ColumnDef::new(DashboardVariables::Label).string_len(100))
                     .col(
                         ColumnDef::new(DashboardVariables::Kind)
                             .string_len(16)
                             .not_null(),
                     )
-                    .col(
-                        ColumnDef::new(DashboardVariables::Fact)
-                            .string_len(200)
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(DashboardVariables::Filter)
-                            .string_len(500)
-                            .not_null(),
-                    )
+                    .col(ColumnDef::new(DashboardVariables::Fact).string_len(200))
+                    .col(ColumnDef::new(DashboardVariables::Filter).string_len(500))
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_dashboard_variables_dashboard_id")
@@ -2033,16 +1157,8 @@ impl MigrationTrait for CreateTables {
                             .string_len(255)
                             .not_null(),
                     )
-                    .col(
-                        ColumnDef::new(LocationRules::Filter)
-                            .string_len(500)
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(LocationRules::Place)
-                            .string_len(255)
-                            .not_null(),
-                    )
+                    .col(ColumnDef::new(LocationRules::Filter).string_len(500))
+                    .col(ColumnDef::new(LocationRules::Place).string_len(255))
                     .col(ColumnDef::new(LocationRules::Latitude).double().not_null())
                     .col(ColumnDef::new(LocationRules::Longitude).double().not_null())
                     .col(ColumnDef::new(LocationRules::Priority).integer().not_null())
@@ -2054,13 +1170,13 @@ impl MigrationTrait for CreateTables {
                 Table::create()
                     .table(Events::Table)
                     .col(id(Events::Id))
-                    .col(ColumnDef::new(Events::TimeMs).big_integer().not_null())
+                    .col(moment(backend, Events::OccurredAt).not_null())
                     .col(ColumnDef::new(Events::Kind).string_len(16).not_null())
                     .col(ColumnDef::new(Events::Title).string_len(200).not_null())
                     .col(ColumnDef::new(Events::Detail).text())
-                    .col(ColumnDef::new(Events::Filter).string_len(500).not_null())
+                    .col(ColumnDef::new(Events::Filter).string_len(500))
                     .col(ColumnDef::new(Events::CreatedBy).string_len(255).not_null())
-                    .col(ColumnDef::new(Events::CreatedMs).big_integer().not_null())
+                    .col(moment(backend, Events::CreatedAt).not_null())
                     .to_owned(),
             )
             .await?;
@@ -2069,7 +1185,7 @@ impl MigrationTrait for CreateTables {
                 Index::create()
                     .name("idx_events_time")
                     .table(Events::Table)
-                    .col(Events::TimeMs)
+                    .col(Events::OccurredAt)
                     .to_owned(),
             )
             .await?;
@@ -2078,7 +1194,7 @@ impl MigrationTrait for CreateTables {
                 Table::create()
                     .table(AuditLog::Table)
                     .col(id(AuditLog::Id))
-                    .col(ColumnDef::new(AuditLog::TimeMs).big_integer().not_null())
+                    .col(moment(backend, AuditLog::OccurredAt).not_null())
                     .col(
                         ColumnDef::new(AuditLog::ActorKind)
                             .string_len(16)
@@ -2107,7 +1223,7 @@ impl MigrationTrait for CreateTables {
                             .string_len(255)
                             .not_null(),
                     )
-                    .col(changes)
+                    .col(json(backend, AuditLog::Changes).not_null())
                     .to_owned(),
             )
             .await?;
@@ -2155,7 +1271,7 @@ impl MigrationTrait for CreateTables {
                             .unique_key(),
                     )
                     .col(ColumnDef::new(Proxies::Trusted).boolean().not_null())
-                    .col(ColumnDef::new(Proxies::CreatedMs).big_integer().not_null())
+                    .col(moment(backend, Proxies::CreatedAt).not_null())
                     .to_owned(),
             )
             .await?;
@@ -2331,22 +1447,21 @@ async fn add_built_ins(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         .columns([
             Hosts::Id,
             Hosts::Kind,
-            Hosts::PublicKey,
             Hosts::Hostname,
             Hosts::State,
             Hosts::DecidedBy,
-            Hosts::FirstSeenMs,
+            Hosts::FirstSeenAt,
         ])
         .to_owned();
+    // They have no key, and were there from the start, which they're given as 1970.
     for (id, hostname) in BUILT_IN_HOSTS {
         hosts.values_panic([
             id.into(),
             "built_in".into(),
-            "".into(),
             hostname.into(),
             "approved".into(),
             "built-in".into(),
-            0i64.into(),
+            chrono::DateTime::<chrono::Utc>::UNIX_EPOCH.into(),
         ]);
     }
     manager.exec_stmt(hosts).await?;
@@ -2439,8 +1554,8 @@ enum Hosts {
     Hostname,
     State,
     DecidedBy,
-    FirstSeenMs,
-    DecidedMs,
+    FirstSeenAt,
+    DecidedAt,
 }
 
 #[derive(Iden)]
@@ -2451,8 +1566,8 @@ enum HostFacts {
     Name,
     Value,
     ValueType,
-    ValidFromMs,
-    ValidToMs,
+    ValidFrom,
+    ValidTo,
 }
 
 #[derive(Iden)]
@@ -2461,14 +1576,14 @@ enum HostConfigStatus {
     HostId,
     Version,
     Error,
-    ReportedMs,
+    ReportedAt,
 }
 
 #[derive(Iden)]
 enum HostBoots {
     Table,
     HostId,
-    BootMs,
+    BootedAt,
 }
 
 #[derive(Iden)]
@@ -2481,7 +1596,7 @@ enum ConfigRules {
     Enabled,
     OperatingSystems,
     BuiltIn,
-    BuiltInChangedMs,
+    BuiltInChangedAt,
 }
 
 #[derive(Iden)]
@@ -2505,13 +1620,13 @@ enum Users {
     Theme,
     TimeZone,
     SetupTokenHash,
-    SetupExpiresMs,
+    SetupExpiresAt,
     TotpSecret,
     TotpEnabled,
     TotpLastStep,
-    CreatedMs,
-    LastSignInMs,
-    DisabledMs,
+    CreatedAt,
+    LastSignInAt,
+    DisabledAt,
 }
 
 #[derive(Iden)]
@@ -2520,9 +1635,9 @@ enum UserSessions {
     Id,
     UserId,
     TokenHash,
-    CreatedMs,
-    ExpiresMs,
-    LastUsedMs,
+    CreatedAt,
+    ExpiresAt,
+    LastUsedAt,
     LastAddress,
     UserAgent,
     LastForwardedFor,
@@ -2539,10 +1654,10 @@ enum ApiKeys {
     Hint,
     TokenHash,
     Role,
-    CreatedMs,
-    ExpiresMs,
-    LastUsedMs,
-    RevokedMs,
+    CreatedAt,
+    ExpiresAt,
+    LastUsedAt,
+    RevokedAt,
 }
 
 #[derive(Iden)]
@@ -2551,7 +1666,7 @@ enum RecoveryCodes {
     Id,
     UserId,
     CodeHash,
-    UsedMs,
+    UsedAt,
 }
 
 #[derive(Iden)]
@@ -2560,7 +1675,7 @@ enum SignInChallenges {
     Id,
     UserId,
     TokenHash,
-    ExpiresMs,
+    ExpiresAt,
 }
 
 #[derive(Iden)]
@@ -2582,7 +1697,7 @@ enum NotificationChannels {
     RequestMethod,
     RequestContentType,
     RequestBody,
-    DeletedMs,
+    DeletedAt,
 }
 
 #[derive(Iden)]
@@ -2608,7 +1723,7 @@ enum AlertRules {
     RemindEverySecs,
     ForecastSecs,
     WarningForecastSecs,
-    DeletedMs,
+    DeletedAt,
 }
 
 #[derive(Iden)]
@@ -2623,19 +1738,18 @@ enum Alerts {
     Table,
     Id,
     RuleId,
-    RuleName,
     Severity,
     HostId,
-    Hostname,
     Series,
     Value,
     Summary,
-    StartedMs,
-    ResolvedMs,
+    StartedAt,
+    BreachedAt,
+    ResolvedAt,
     ResolveReason,
     ResolvedSummary,
     AcknowledgedBy,
-    AcknowledgedMs,
+    AcknowledgedAt,
 }
 
 #[derive(Iden)]
@@ -2647,10 +1761,10 @@ enum Notifications {
     Event,
     State,
     Attempts,
-    NextAttemptMs,
+    NextAttemptAt,
     LastError,
-    CreatedMs,
-    SentMs,
+    CreatedAt,
+    SentAt,
     ExternalId,
     ActionRunId,
 }
@@ -2664,8 +1778,8 @@ enum Silences {
     Series,
     Reason,
     CreatedBy,
-    StartsMs,
-    EndsMs,
+    StartsAt,
+    EndsAt,
 }
 
 #[derive(Iden)]
@@ -2717,7 +1831,7 @@ enum Dashboards {
     Table,
     Id,
     Name,
-    CreatedMs,
+    CreatedAt,
 }
 
 #[derive(Iden)]
@@ -2766,20 +1880,20 @@ enum LocationRules {
 enum Events {
     Table,
     Id,
-    TimeMs,
+    OccurredAt,
     Kind,
     Title,
     Detail,
     Filter,
     CreatedBy,
-    CreatedMs,
+    CreatedAt,
 }
 
 #[derive(Iden)]
 enum AuditLog {
     Table,
     Id,
-    TimeMs,
+    OccurredAt,
     ActorKind,
     ActorId,
     ActorName,
@@ -2818,14 +1932,14 @@ enum AppSignIns {
     Device,
     Role,
     AccessHash,
-    AccessExpiresMs,
+    AccessExpiresAt,
     RefreshHash,
     PreviousRefreshHash,
-    RotatedMs,
-    RefreshExpiresMs,
-    CreatedMs,
-    LastUsedMs,
-    RevokedMs,
+    RotatedAt,
+    RefreshExpiresAt,
+    CreatedAt,
+    LastUsedAt,
+    RevokedAt,
     LastAddress,
     LastForwardedFor,
 }
@@ -2836,7 +1950,7 @@ enum Proxies {
     Id,
     Address,
     Trusted,
-    CreatedMs,
+    CreatedAt,
 }
 
 #[derive(DeriveIden)]
@@ -2876,7 +1990,7 @@ enum ActionRuns {
     RunOn,
     Variables,
     RequestedBy,
-    RequestedMs,
+    RequestedAt,
     TimeoutSecs,
     Outcome,
     ExitCode,
@@ -2884,12 +1998,11 @@ enum ActionRuns {
     Output,
     Truncated,
     DurationMs,
-    FinishedMs,
+    FinishedAt,
 }
 
 #[cfg(test)]
 mod tests {
-    use sea_orm::sea_query::Value;
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
 
     use super::*;
@@ -2899,6 +2012,19 @@ mod tests {
             .max_connections(1)
             .to_owned();
         Database::connect(options).await.unwrap()
+    }
+
+    /// An empty database of its own on the server `MAXNINES_TEST_DATABASE_URL` names,
+    /// or SQLite in memory.
+    async fn empty() -> sea_orm::DatabaseConnection {
+        match std::env::var("MAXNINES_TEST_DATABASE_URL") {
+            Ok(server) => {
+                let url = crate::models::fresh_test_database(&server).await;
+                let options = ConnectOptions::new(url).max_connections(1).to_owned();
+                Database::connect(options).await.unwrap()
+            }
+            Err(_) => fresh().await,
+        }
     }
 
     async fn texts(connection: &impl ConnectionTrait, sql: &str) -> Vec<String> {
@@ -2911,11 +2037,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_database_starts_with_the_built_ins() {
-        let connection = fresh().await;
+        let connection = empty().await;
         Migrator::up(&connection, None).await.unwrap();
 
         let hosts = texts(&connection, "SELECT hostname FROM hosts ORDER BY id").await;
         assert_eq!(hosts, ["Fleet", "MaxNines server"]);
+        let keyless = "SELECT id FROM hosts WHERE public_key IS NULL ORDER BY id";
+        assert_eq!(texts(&connection, keyless).await, ["fleet", "server"]);
         let rules = texts(&connection, "SELECT name FROM alert_rules ORDER BY id").await;
         assert_eq!(
             rules,
@@ -2938,569 +2066,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn alerts_from_before_learn_when_their_problem_began() {
-        let connection = fresh().await;
-        Migrator::up(&connection, Some(1)).await.unwrap();
-        // Host offline waits a minute before firing; the other rule has gone.
-        let sql = "INSERT INTO alerts (rule_id, rule_name, severity, host_id, hostname,
-                       series, summary, started_ms)
-                   SELECT r.id, r.name, 'critical', h.id, h.hostname, '', 'x', 600000
-                   FROM alert_rules r, hosts h
-                   WHERE r.name = 'Host offline' AND h.hostname = 'Fleet'
-                   UNION ALL
-                   SELECT NULL, 'Gone', 'warning', h.id, h.hostname, '', 'y', 700000
-                   FROM hosts h WHERE h.hostname = 'Fleet'";
-        connection.execute_unprepared(sql).await.unwrap();
-        let wait = texts(
-            &connection,
-            "SELECT CAST(for_secs AS TEXT) FROM alert_rules WHERE name = 'Host offline'",
-        )
-        .await;
-        let wait_ms: i64 = wait[0].parse::<i64>().unwrap() * 1000;
-
-        // The alert whose rule is gone only lasts until the next migration.
-        Migrator::up(&connection, Some(1)).await.unwrap();
-        let began = texts(&connection, "SELECT breached_at FROM alerts ORDER BY id").await;
-        let at = |ms| as_sqlx_writes(crate::times::from_ms(ms));
-        assert_eq!(began, [at(600_000 - wait_ms), at(700_000)]);
-        assert_eq!(began[1], "1970-01-01T00:11:40+00:00");
-    }
-
-    /// A moment as sqlx writes it to SQLite, which keeps it as text.
-    fn as_sqlx_writes(time: crate::times::Timestamp) -> String {
-        time.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, false)
-    }
-
-    #[tokio::test]
-    async fn milliseconds_become_the_same_moments() {
-        // 2026-11-19 01:57:17.828 UTC, and 02:30 that day, on the second.
-        const WITH_MILLISECONDS: i64 = 1_795_053_437_828;
-        const ON_THE_SECOND: i64 = 1_795_055_400_000;
-        let folder = tempfile::tempdir().unwrap();
-        let url = format!(
-            "sqlite://{}?mode=rwc",
-            folder.path().join("maxnines.db").display()
-        );
-        let options = ConnectOptions::new(&url).max_connections(1).to_owned();
-        let connection = Database::connect(options).await.unwrap();
-        Migrator::up(&connection, Some(1)).await.unwrap();
-        let rows = format!(
-            "INSERT INTO alerts (rule_id, rule_name, severity, host_id, hostname, series,
-                 summary, started_ms, acknowledged_by, acknowledged_ms)
-             SELECT r.id, r.name, 'critical', 'fleet', 'Fleet', '', 'x', {WITH_MILLISECONDS},
-                 'sam', {ON_THE_SECOND}
-             FROM alert_rules r WHERE r.name = 'Host offline';
-             INSERT INTO host_facts (host_id, name, value, value_type, valid_from_ms)
-             VALUES ('fleet', 'os.family', 'linux', 'string', {WITH_MILLISECONDS});"
-        );
-        connection.execute_unprepared(&rows).await.unwrap();
-        let wait = texts(
-            &connection,
-            "SELECT CAST(for_secs AS TEXT) FROM alert_rules WHERE name = 'Host offline'",
-        )
-        .await;
-        let wait_ms = wait[0].parse::<i64>().unwrap() * 1000;
-        connection.close().await.unwrap();
-
-        // Connecting runs the rest of the migrations, and the rows read back through
-        // the entities as the moments they were.
-        let database = crate::models::Database::connect(&url).await.unwrap();
-        let alert = database.open_alerts().await.unwrap().remove(0);
-        let at = crate::times::from_ms;
-        assert_eq!(alert.started_at, at(WITH_MILLISECONDS));
-        assert_eq!(alert.breached_at, at(WITH_MILLISECONDS - wait_ms));
-        assert_eq!(alert.acknowledged_at, Some(at(ON_THE_SECOND)));
-        assert_eq!(alert.resolved_at, None);
-        let facts = database.facts_history("fleet").await.unwrap();
-        assert_eq!(
-            (facts[0].valid_from, facts[0].valid_to),
-            (at(WITH_MILLISECONDS), None)
-        );
-        drop(database);
-
-        // On SQLite they're text, exactly as sqlx writes them, so that they sort and
-        // compare with the ones written from now on.
-        let options = ConnectOptions::new(&url).max_connections(1).to_owned();
-        let connection = Database::connect(options).await.unwrap();
-        let saved = texts(
-            &connection,
-            "SELECT started_at || ' ' || acknowledged_at || ' ' || COALESCE(resolved_at, 'empty')
-             FROM alerts",
-        )
-        .await;
-        assert_eq!(
-            saved,
-            ["2026-11-19T01:57:17.828+00:00 2026-11-19T02:30:00+00:00 empty"]
-        );
-        let written = Statement::from_sql_and_values(
-            connection.get_database_backend(),
-            "SELECT ? || ' ' || ?",
-            [at(WITH_MILLISECONDS).into(), at(ON_THE_SECOND).into()],
-        );
-        let written: String = connection
-            .query_one_raw(written)
-            .await
-            .unwrap()
-            .unwrap()
-            .try_get_by_index(0)
-            .unwrap();
-        assert_eq!(
-            saved[0],
-            format!("{written} empty"),
-            "the migration and sqlx write moments differently"
-        );
-        assert_eq!(
-            written,
-            format!(
-                "{} {}",
-                as_sqlx_writes(at(WITH_MILLISECONDS)),
-                as_sqlx_writes(at(ON_THE_SECOND))
-            )
-        );
-        let fact = texts(&connection, "SELECT valid_from FROM host_facts").await;
-        assert_eq!(fact, ["2026-11-19T01:57:17.828+00:00"]);
-
-        // And back again.
-        Migrator::down(&connection, Some(2)).await.unwrap();
-        let kept = texts(
-            &connection,
-            "SELECT CAST(started_ms AS TEXT) || ' ' || CAST(acknowledged_ms AS TEXT) FROM alerts",
-        )
-        .await;
-        assert_eq!(kept, [format!("{WITH_MILLISECONDS} {ON_THE_SECOND}")]);
-        Migrator::up(&connection, None).await.unwrap();
-    }
-
-    /// A database to migrate: one of its own on the server `MAXNINES_TEST_DATABASE_URL`
-    /// names, or SQLite in a file, which outlives its connections as one in memory
-    /// doesn't. The folder holds the file.
-    async fn database_to_migrate() -> (String, Option<tempfile::TempDir>) {
-        match std::env::var("MAXNINES_TEST_DATABASE_URL") {
-            Ok(server) => (crate::models::fresh_test_database(&server).await, None),
-            Err(_) => {
-                let folder = tempfile::tempdir().unwrap();
-                let path = folder.path().join("maxnines.db");
-                (
-                    format!("sqlite://{}?mode=rwc", path.display()),
-                    Some(folder),
-                )
-            }
-        }
-    }
-
-    async fn insert(connection: &impl ConnectionTrait, table: &str, row: Vec<(&str, Value)>) {
-        let mut insert = Query::insert();
-        insert
-            .into_table(Alias::new(table))
-            .columns(row.iter().map(|(column, _)| Alias::new(*column)))
-            .values_panic(row.into_iter().map(|(_, value)| Expr::val(value)));
-        connection.execute(&insert).await.unwrap();
-    }
-
-    async fn number(connection: &impl ConnectionTrait, sql: &str) -> i64 {
-        one_value(connection, sql).await.unwrap()
-    }
-
-    #[tokio::test]
-    async fn empty_text_becomes_none_json_becomes_json_and_alerts_lose_their_copies() {
-        let (url, _folder) = database_to_migrate().await;
-        let options = ConnectOptions::new(&url).max_connections(1).to_owned();
-        let connection = Database::connect(options).await.unwrap();
-        Migrator::up(&connection, Some(2)).await.unwrap();
-        let now = crate::times::now();
-        let hour = chrono::TimeDelta::hours(1);
-        let empty = || Value::from("");
-
-        // Everything as it was written before: empty text for none, and JSON as text.
-        insert(
-            &connection,
-            "hosts",
-            vec![
-                ("id", "web".into()),
-                ("kind", "agentless".into()),
-                ("public_key", empty()),
-                ("hostname", "web-1".into()),
-                ("state", "approved".into()),
-                ("first_seen_at", now.into()),
-            ],
-        )
-        .await;
-        let rule = |name: &str| format!("SELECT id FROM alert_rules WHERE name = '{name}'");
-        let offline = number(&connection, &rule("Host offline")).await;
-        let disk = number(&connection, &rule("Disk filling up")).await;
-        connection
-            .execute_unprepared(&format!(
-                "UPDATE alert_rules SET filter = '', condition_expr = ' ' WHERE id = {disk}"
-            ))
-            .await
-            .unwrap();
-        connection
-            .execute_unprepared(
-                "UPDATE config_rules SET condition_expr = '' WHERE name = 'Default'",
-            )
-            .await
-            .unwrap();
-        let alert = |rule: Option<i64>, name: &str, series: &str| {
-            vec![
-                ("rule_id", rule.into()),
-                ("rule_name", name.into()),
-                ("severity", "critical".into()),
-                ("host_id", "web".into()),
-                ("hostname", "web-1".into()),
-                ("series", series.into()),
-                ("summary", format!("{name} on web-1").into()),
-                ("started_at", now.into()),
-                ("breached_at", now.into()),
-            ]
-        };
-        insert(
-            &connection,
-            "alerts",
-            alert(Some(offline), "Host offline", ""),
-        )
-        .await;
-        insert(
-            &connection,
-            "alerts",
-            alert(Some(disk), "Disk filling up", "/data"),
-        )
-        .await;
-        // From a rule deleted before rules were kept, with what went with it.
-        insert(&connection, "alerts", alert(None, "Gone", "")).await;
-        let gone = number(
-            &connection,
-            "SELECT id FROM alerts WHERE rule_name = 'Gone'",
-        )
-        .await;
-        let on_disk = number(&connection, "SELECT id FROM alerts WHERE series = '/data'").await;
-        insert(
-            &connection,
-            "notification_channels",
-            vec![
-                ("name", "Ops".into()),
-                ("kind", "webhook".into()),
-                ("target", "https://example.com/hook".into()),
-            ],
-        )
-        .await;
-        let channel = number(&connection, "SELECT id FROM notification_channels").await;
-        insert(
-            &connection,
-            "notifications",
-            vec![
-                ("alert_id", gone.into()),
-                ("channel_id", channel.into()),
-                ("event", "firing".into()),
-                ("state", "pending".into()),
-                ("attempts", 0.into()),
-                ("next_attempt_at", now.into()),
-                ("created_at", now.into()),
-            ],
-        )
-        .await;
-        for alert in [gone, on_disk] {
-            insert(
-                &connection,
-                "action_runs",
-                vec![
-                    ("host_id", "web".into()),
-                    ("alert_id", alert.into()),
-                    ("action", "restart".into()),
-                    ("run_on", "first".into()),
-                    ("variables", r#"{"service": "nginx"}"#.into()),
-                    ("requested_at", now.into()),
-                    ("timeout_secs", 60.into()),
-                    ("output", empty()),
-                    ("truncated", false.into()),
-                ],
-            )
-            .await;
-        }
-        insert(
-            &connection,
-            "audit_log",
-            vec![
-                ("occurred_at", now.into()),
-                ("actor_kind", "user".into()),
-                ("actor_name", "sam".into()),
-                ("action", "created".into()),
-                ("subject_kind", "silence".into()),
-                ("subject_name", "Upgrading".into()),
-                (
-                    "changes",
-                    r#"[{"field": "reason", "after": "Upgrading"}]"#.into(),
-                ),
-            ],
-        )
-        .await;
-        for (filter, series) in [("", ""), ("os=linux", "/data")] {
-            insert(
-                &connection,
-                "silences",
-                vec![
-                    ("filter", filter.into()),
-                    ("series", series.into()),
-                    ("reason", "Upgrading".into()),
-                    ("created_by", "sam".into()),
-                    ("starts_at", (now - hour).into()),
-                    ("ends_at", (now + hour).into()),
-                ],
-            )
-            .await;
-        }
-        insert(
-            &connection,
-            "maintenance_windows",
-            vec![
-                ("name", "Patching".into()),
-                ("filter", empty()),
-                ("days", "sun".into()),
-                ("start_time", "02:00".into()),
-                ("duration_secs", 3600.into()),
-                ("time_zone", "UTC".into()),
-            ],
-        )
-        .await;
-        insert(
-            &connection,
-            "events",
-            vec![
-                ("occurred_at", now.into()),
-                ("kind", "note".into()),
-                ("title", "Note".into()),
-                ("filter", empty()),
-                ("created_by", "sam".into()),
-                ("created_at", now.into()),
-            ],
-        )
-        .await;
-        insert(
-            &connection,
-            "location_rules",
-            vec![
-                ("name", "Leeds".into()),
-                ("filter", empty()),
-                ("place", empty()),
-                ("latitude", 53.8.into()),
-                ("longitude", (-1.5).into()),
-                ("priority", 0.into()),
-            ],
-        )
-        .await;
-        insert(
-            &connection,
-            "dashboards",
-            vec![("name", "Fleet".into()), ("created_at", now.into())],
-        )
-        .await;
-        let dashboard = number(&connection, "SELECT id FROM dashboards").await;
-        insert(
-            &connection,
-            "dashboard_widgets",
-            vec![
-                ("dashboard_id", dashboard.into()),
-                ("title", empty()),
-                ("kind", "chart".into()),
-                ("metric", "cpu.usage".into()),
-                ("calculation", "avg".into()),
-                ("group_by", "host".into()),
-                ("filter", empty()),
-                ("x", 0.into()),
-                ("y", 0.into()),
-                ("w", 6.into()),
-                ("h", 4.into()),
-            ],
-        )
-        .await;
-        insert(
-            &connection,
-            "dashboard_variables",
-            vec![
-                ("dashboard_id", dashboard.into()),
-                ("position", 0.into()),
-                ("name", "host".into()),
-                ("label", empty()),
-                ("kind", "host".into()),
-                ("fact", empty()),
-                ("filter", empty()),
-            ],
-        )
-        .await;
-        insert(
-            &connection,
-            "users",
-            vec![
-                ("email", "sam@example.com".into()),
-                ("name", "Sam".into()),
-                ("created_at", now.into()),
-            ],
-        )
-        .await;
-        let user = number(&connection, "SELECT id FROM users").await;
-        insert(
-            &connection,
-            "app_sign_ins",
-            vec![
-                ("user_id", user.into()),
-                ("client_id", "maxnines-cli".into()),
-                ("device", empty()),
-                ("role", "viewer".into()),
-                ("access_hash", "a".repeat(64).into()),
-                ("access_expires_at", (now + hour).into()),
-                ("refresh_hash", "r".repeat(64).into()),
-                ("refresh_expires_at", (now + hour).into()),
-                ("created_at", now.into()),
-            ],
-        )
-        .await;
-        insert(
-            &connection,
-            "metrics_pages",
-            vec![
-                ("host_id", "web".into()),
-                ("url", "http://web-1:9100/metrics".into()),
-                ("names", empty()),
-                ("interval_secs", 60.into()),
-                ("enabled", true.into()),
-            ],
-        )
-        .await;
-        connection.close().await.unwrap();
-
-        // Connecting runs the rest of the migrations, and the rows read back through
-        // the models with none for empty and JSON as what it held.
-        let database = crate::models::Database::connect(&url).await.unwrap();
-        let hosts = database.load_hosts().await.unwrap();
-        let web = hosts.iter().find(|host| host.id == "web").unwrap();
-        assert_eq!(web.public_key, None);
-
-        let alerts = database.open_alerts().await.unwrap();
-        assert_eq!(
-            alerts.len(),
-            2,
-            "the alert with no rule is gone: {alerts:?}"
-        );
-        let alert = |rule: i64| alerts.iter().find(|alert| alert.rule_id == rule).unwrap();
-        assert_eq!(alert(offline).series, None);
-        assert_eq!(alert(offline).rule_name, "Host offline");
-        assert_eq!(alert(offline).hostname, "web-1");
-        assert_eq!(alert(disk).series.as_deref(), Some("/data"));
-        // The deleted alert's ID isn't used again, as what was sent about it may name it.
-        let new = crate::alerting::NewAlert {
-            rule_id: offline,
-            severity: crate::alerting::Severity::Critical,
-            host_id: "fleet".to_string(),
-            series: None,
-            value: None,
-            summary: "Fleet".to_string(),
-            started_at: now,
-            breached_at: now,
-        };
-        assert!(database.fire_alert(&new, &[]).await.unwrap() > gone);
-        let left = "SELECT COUNT(*) FROM notifications";
-        assert_eq!(number(database.connection(), left).await, 0);
-        let left = "SELECT COUNT(*) FROM action_runs";
-        assert_eq!(number(database.connection(), left).await, 1);
-        let runs = database.action_runs_for_alert(on_disk).await.unwrap();
-        assert_eq!(runs[0].variables["service"], "nginx");
-
-        let entries = database.audit_log(None, 10).await.unwrap();
-        assert_eq!(entries[0].changes[0].field, "reason");
-        assert_eq!(
-            entries[0].changes[0].after,
-            Some(serde_json::json!("Upgrading"))
-        );
-
-        let silences = database.active_silences(now).await.unwrap();
-        let every = silences
-            .iter()
-            .find(|silence| silence.filter.is_none())
-            .unwrap();
-        assert_eq!(every.series, None);
-        assert!(every.all_alerts);
-        let some = silences
-            .iter()
-            .find(|silence| silence.filter.is_some())
-            .unwrap();
-        assert_eq!(some.series.as_deref(), Some("/data"));
-        let windows = database.list_maintenance_windows().await.unwrap();
-        assert_eq!(windows[0].window.filter, None);
-        assert!(windows[0].window.all_alerts);
-
-        let event = number(database.connection(), "SELECT id FROM events").await;
-        let event = database.get_event(event).await.unwrap().unwrap();
-        assert_eq!(event.filter, None);
-        let places = database.list_location_rules().await.unwrap();
-        assert_eq!(
-            (&places[0].rule.filter, &places[0].rule.place),
-            (&None, &None)
-        );
-        let dashboard = database.get_dashboard(dashboard).await.unwrap().unwrap();
-        let widget = &dashboard.widgets[0].input;
-        assert_eq!((&widget.title, &widget.filter), (&None, &None));
-        let variable = &dashboard.variables[0];
-        assert_eq!(
-            (&variable.label, &variable.fact, &variable.filter),
-            (&None, &None, &None)
-        );
-        let sign_ins = database.list_app_sign_ins(None).await.unwrap();
-        assert_eq!(sign_ins[0].device, None);
-        let none = "SELECT COUNT(*) FROM metrics_pages WHERE names IS NULL";
-        assert_eq!(number(database.connection(), none).await, 1);
-        assert!(
-            database.list_metrics_pages().await.unwrap()[0]
-                .input
-                .names
-                .is_empty()
-        );
-        let rule = database.get_alert_rule(disk).await.unwrap().unwrap().rule;
-        assert_eq!((rule.filter, rule.condition), (None, None));
-        let rules = database.list_rules().await.unwrap();
-        let default = rules
-            .iter()
-            .find(|rule| rule.rule.name == "Default")
-            .unwrap();
-        assert_eq!(default.rule.condition, None);
-
-        // An alert goes by what its rule and host are called now, even once the rule
-        // is deleted.
-        database
-            .connection()
-            .execute_unprepared("UPDATE hosts SET hostname = 'web-2' WHERE id = 'web'")
-            .await
-            .unwrap();
-        assert!(database.delete_alert_rule(disk, now).await.unwrap());
-        let ended = database.resolved_alerts(10).await.unwrap();
-        assert_eq!(ended[0].rule_name, "Disk filling up");
-        assert_eq!(ended[0].hostname, "web-2");
-        drop(database);
-
-        // And back again, with the names copied in once more.
-        let options = ConnectOptions::new(&url).max_connections(1).to_owned();
-        let connection = Database::connect(options).await.unwrap();
-        Migrator::down(&connection, Some(1)).await.unwrap();
-        let copied = "SELECT COUNT(*) FROM alerts
-                      WHERE hostname = 'web-2' AND series = '' AND rule_name = 'Host offline'";
-        assert_eq!(number(&connection, copied).await, 1);
-        let empty_again = "SELECT COUNT(*) FROM hosts WHERE public_key = ''";
-        assert_eq!(number(&connection, empty_again).await, 3);
-        let text = texts(&connection, "SELECT variables FROM action_runs").await;
-        let variables: serde_json::Value = serde_json::from_str(&text[0]).unwrap();
-        assert_eq!(variables, serde_json::json!({ "service": "nginx" }));
-        Migrator::up(&connection, None).await.unwrap();
-    }
-
-    #[tokio::test]
     async fn the_tables_can_be_dropped_and_made_again() {
-        let connection = fresh().await;
+        let connection = empty().await;
         Migrator::up(&connection, None).await.unwrap();
         Migrator::down(&connection, None).await.unwrap();
-        let left = texts(
-            &connection,
-            "SELECT name FROM sqlite_master WHERE type = 'table'
-             AND name NOT IN ('seaql_migrations', 'sqlite_sequence')",
-        )
-        .await;
+        let tables = match connection.get_database_backend() {
+            DatabaseBackend::Postgres => {
+                "SELECT table_name::text FROM information_schema.tables
+                 WHERE table_schema = current_schema()"
+            }
+            DatabaseBackend::MySql => {
+                "SELECT CAST(table_name AS CHAR) FROM information_schema.tables
+                 WHERE table_schema = DATABASE()"
+            }
+            _ => "SELECT name FROM sqlite_master WHERE type = 'table'",
+        };
+        let left: Vec<String> = texts(&connection, tables)
+            .await
+            .into_iter()
+            .filter(|table| !["seaql_migrations", "sqlite_sequence"].contains(&table.as_str()))
+            .collect();
         assert!(left.is_empty(), "{left:?}");
         Migrator::up(&connection, None).await.unwrap();
     }

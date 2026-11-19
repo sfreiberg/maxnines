@@ -45,14 +45,14 @@ const BATCH_EVERY: Duration = Duration::from_secs(1);
 const MAX_QUERY_BYTES: &str = "67108864";
 
 /// Tables are made here, as ClickHouse has no transactions to make them all at once,
-/// so each statement can safely run again, and so can a migration stopped partway. Months keep partitions to a number that
-/// can't grow out of hand, whatever times agents send. The hour in the sort order lets
-/// a query for what's recent skip everything older.
-const MIGRATIONS: &[(&str, &[&str])] = &[
-    (
-        "0001_create_tables",
-        &[
-            "CREATE TABLE IF NOT EXISTS samples (
+/// so each statement can safely run again, and so can a migration stopped partway.
+/// Months keep partitions to a number that can't grow out of hand, whatever times
+/// agents send. The hour in the sort order lets a query for what's recent skip
+/// everything older.
+const MIGRATIONS: &[(&str, &[&str])] = &[(
+    "0001_create_tables",
+    &[
+        "CREATE TABLE IF NOT EXISTS samples (
              metric  String,
              host_id String,
              labels  Map(String, String),
@@ -63,8 +63,8 @@ const MIGRATIONS: &[(&str, &[&str])] = &[
          ENGINE = ReplacingMergeTree
          PARTITION BY toStartOfMonth(time)
          ORDER BY (metric, toStartOfHour(time), host_id, labels, time)",
-            // Text, only when it changes. Nothing means it stopped being reported.
-            "CREATE TABLE IF NOT EXISTS texts (
+        // Text, only when it changes. Nothing means it stopped being reported.
+        "CREATE TABLE IF NOT EXISTS texts (
              metric  String,
              host_id String,
              labels  Map(String, String),
@@ -74,27 +74,27 @@ const MIGRATIONS: &[(&str, &[&str])] = &[
          ENGINE = ReplacingMergeTree
          PARTITION BY toStartOfMonth(time)
          ORDER BY (host_id, metric, labels, time)",
-            // What exists, to limit what a host can create without reading the samples.
-            "CREATE TABLE IF NOT EXISTS series (
+        // What exists, to limit what a host can create without reading the samples.
+        "CREATE TABLE IF NOT EXISTS series (
              host_id String,
              metric  String,
              labels  Map(String, String)
          )
          ENGINE = ReplacingMergeTree
          ORDER BY (host_id, metric, labels)",
-            // When each host reported, so asking who's current doesn't read the samples.
-            "CREATE TABLE IF NOT EXISTS reports (
+        // When each host reported, so asking who's current doesn't read the samples.
+        "CREATE TABLE IF NOT EXISTS reports (
              time    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
              host_id String
          )
          ENGINE = ReplacingMergeTree
          PARTITION BY toStartOfMonth(time)
          ORDER BY (time, host_id)",
-            // What each chart in the catalog showed, 5 minutes and an hour at a time, as the
-            // lowest, highest and total value and how many there were. A span rolled up
-            // again is written again with a higher version, which replaces the old rows
-            // when ClickHouse merges them, and reads say FINAL until then.
-            "CREATE TABLE IF NOT EXISTS rollups_five_minute (
+        // What each chart in the catalog showed, 5 minutes and an hour at a time, as the
+        // lowest, highest and total value and how many there were. A span rolled up
+        // again is written again with a higher version, which replaces the old rows
+        // when ClickHouse merges them, and reads say FINAL until then.
+        "CREATE TABLE IF NOT EXISTS rollups_five_minute (
              metric  LowCardinality(String),
              host_id String,
              series  String,
@@ -108,7 +108,7 @@ const MIGRATIONS: &[(&str, &[&str])] = &[
          ENGINE = ReplacingMergeTree(version)
          PARTITION BY toStartOfMonth(time)
          ORDER BY (metric, host_id, series, time)",
-            "CREATE TABLE IF NOT EXISTS rollups_hour (
+        "CREATE TABLE IF NOT EXISTS rollups_hour (
              metric  LowCardinality(String),
              host_id String,
              series  String,
@@ -122,74 +122,21 @@ const MIGRATIONS: &[(&str, &[&str])] = &[
          ENGINE = ReplacingMergeTree(version)
          PARTITION BY toStartOfYear(time)
          ORDER BY (metric, host_id, series, time)",
-            // How far each metric is rolled up: every hour before this, in milliseconds.
-            "CREATE TABLE IF NOT EXISTS rollup_progress (
-             metric        String,
-             done_until_ms Int64,
-             version       UInt64
-         )
-         ENGINE = ReplacingMergeTree(version)
-         ORDER BY metric",
-            // Hours that got samples after they were rolled up, to roll up again.
-            "CREATE TABLE IF NOT EXISTS rollup_redo (hour_ms Int64)
-         ENGINE = ReplacingMergeTree
-         ORDER BY hour_ms",
-        ],
-    ),
-    // How far each metric is rolled up, and the hours to roll up again, become times like
-    // everything else here. A column in the sort order can't change its type, so the
-    // tables are made again: copied first, then replaced from the copies, then the copies
-    // go, each a migration of its own, so a migration run again always has what it reads.
-    // A row copied twice is the same row, which the engine keeps once.
-    (
-        "0002_copy_rollup_progress_as_times",
-        &[
-            "CREATE TABLE IF NOT EXISTS rollup_progress_copy (
+        // How far each metric is rolled up: every hour before this.
+        "CREATE TABLE IF NOT EXISTS rollup_progress (
              metric     String,
              done_until DateTime64(3, 'UTC'),
              version    UInt64
          )
          ENGINE = ReplacingMergeTree(version)
          ORDER BY metric",
-            "CREATE TABLE IF NOT EXISTS rollup_redo_copy (hour DateTime64(3, 'UTC'))
+        // Hours that got samples after they were rolled up, to roll up again, by
+        // when each starts.
+        "CREATE TABLE IF NOT EXISTS rollup_redo (hour DateTime64(3, 'UTC'))
          ENGINE = ReplacingMergeTree
          ORDER BY hour",
-            "INSERT INTO rollup_progress_copy
-         SELECT metric, fromUnixTimestamp64Milli(done_until_ms, 'UTC'), version
-         FROM rollup_progress",
-            "INSERT INTO rollup_redo_copy
-         SELECT fromUnixTimestamp64Milli(hour_ms, 'UTC') FROM rollup_redo",
-        ],
-    ),
-    (
-        "0003_rollup_progress_as_times",
-        &[
-            "DROP TABLE IF EXISTS rollup_progress SYNC",
-            "DROP TABLE IF EXISTS rollup_redo SYNC",
-            // How far each metric is rolled up: every hour before this.
-            "CREATE TABLE IF NOT EXISTS rollup_progress (
-             metric     String,
-             done_until DateTime64(3, 'UTC'),
-             version    UInt64
-         )
-         ENGINE = ReplacingMergeTree(version)
-         ORDER BY metric",
-            // Hours that got samples after they were rolled up, to roll up again.
-            "CREATE TABLE IF NOT EXISTS rollup_redo (hour DateTime64(3, 'UTC'))
-         ENGINE = ReplacingMergeTree
-         ORDER BY hour",
-            "INSERT INTO rollup_progress SELECT * FROM rollup_progress_copy FINAL",
-            "INSERT INTO rollup_redo SELECT * FROM rollup_redo_copy FINAL",
-        ],
-    ),
-    (
-        "0004_drop_rollup_progress_copies",
-        &[
-            "DROP TABLE IF EXISTS rollup_progress_copy SYNC",
-            "DROP TABLE IF EXISTS rollup_redo_copy SYNC",
-        ],
-    ),
-];
+    ],
+)];
 
 /// One runtime for every store, as the client is async and stores aren't. It's never
 /// shut down, because that isn't allowed from the async code a store can be dropped in.
@@ -1939,65 +1886,6 @@ mod tests {
         assert_eq!(stats.collectors[0].rows_last_hour, 2);
         assert_eq!(stats.collectors[0].oldest_sample_at, at(5000));
         assert_eq!(stats.collectors[0].newest_sample_at, at(9000));
-    }
-
-    fn run(client: &Client, statements: &[&str]) {
-        for statement in statements {
-            wait(client.query_raw(statement).execute()).unwrap();
-        }
-    }
-
-    /// A database made before rollups kept their times as times, when they were
-    /// milliseconds since 1970, keeps the same moments once it's migrated, even if
-    /// copying them was stopped partway and done again.
-    #[test]
-    fn rollup_progress_in_milliseconds_becomes_times() {
-        let database = new_database();
-        let client = Client::default().with_url(url());
-        run(&client, &[&format!("CREATE DATABASE `{database}`")]);
-        let client = client.with_database(&database);
-        wait(migrate(&client, &MIGRATIONS[..1])).unwrap();
-        run(
-            &client,
-            &[
-                "INSERT INTO rollup_progress VALUES
-                     ('cpu.usage', 1795053600000, 1), ('disk.usage', 1795050000000, 1)",
-                "INSERT INTO rollup_redo VALUES (1795046400000), (1795042800000)",
-            ],
-        );
-        // As if the first copy had stopped partway, so it all runs again.
-        wait(migrate(&client, &MIGRATIONS[..2])).unwrap();
-        run(&client, MIGRATIONS[1].1);
-
-        let store = opened(&database);
-
-        let moment = |text| crate::times::parse_moment(text).unwrap();
-        assert_eq!(
-            store.progress,
-            HashMap::from([
-                ("cpu.usage".to_string(), moment("2026-11-19T02:00:00Z")),
-                ("disk.usage".to_string(), moment("2026-11-19T01:00:00Z")),
-            ])
-        );
-        assert_eq!(
-            store.redo,
-            BTreeSet::from([
-                moment("2026-11-19T00:00:00Z"),
-                moment("2026-11-18T23:00:00Z")
-            ])
-        );
-        let copies = "SELECT count() FROM system.tables
-                      WHERE database = currentDatabase() AND name LIKE '%copy'";
-        assert_eq!(count(&store, copies), 0);
-        let reader = ClickHouseReader {
-            client: store.client.clone(),
-            retention: store.retention,
-        };
-        let cpu = find("cpu.usage").unwrap();
-        assert_eq!(
-            reader.rolled_up_until(cpu).unwrap(),
-            Some(moment("2026-11-19T02:00:00Z"))
-        );
     }
 
     #[test]

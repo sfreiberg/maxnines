@@ -86,13 +86,14 @@ CREATE TABLE rollups_hour (
     samples     BIGINT    NOT NULL
 );
 
--- How far each metric is rolled up: every hour before this, in milliseconds.
+-- How far each metric is rolled up: every hour before this.
 CREATE TABLE rollup_progress (
-    metric        VARCHAR NOT NULL,
-    done_until_ms BIGINT  NOT NULL
+    metric     VARCHAR   NOT NULL,
+    done_until TIMESTAMP NOT NULL
 );
 
--- Hours that got samples after they were rolled up, to be rolled up again.
+-- Hours that got samples after they were rolled up, to be rolled up again, by when
+-- each starts.
 CREATE TABLE rollup_redo (
-    hour_ms BIGINT NOT NULL
+    hour TIMESTAMP NOT NULL
 );

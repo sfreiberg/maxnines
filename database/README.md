@@ -4,11 +4,12 @@ MaxNines keeps its data in two places:
 
 - **The main database** holds everything people set up and everything the server
   decides: hosts, facts, rules, alerts, users and the rest. It's SQLite by default,
-  or PostgreSQL, MySQL or MariaDB, through sea-orm. Its migrations are in
+  or PostgreSQL, MySQL or MariaDB, through sea-orm. One migration,
+  `m20261119_000001_create_tables`, makes its tables, in
   [`crates/server/src/migrations`](../crates/server/src/migrations/mod.rs).
 - **The metrics store** holds the numbers hosts report. It's DuckDB for a single
-  server or ClickHouse for a big one, and only one of them is used. Their
-  migrations are in
+  server or ClickHouse for a big one, and only one of them is used. Each has one
+  migration, `0001_create_tables`, which makes its tables: in
   [`crates/server/src/store/migrations`](../crates/server/src/store/migrations) for
   DuckDB, and at the top of
   [`crates/server/src/store/clickhouse.rs`](../crates/server/src/store/clickhouse.rs)
@@ -17,7 +18,9 @@ MaxNines keeps its data in two places:
 The two only meet through a host's ID: the main database's `hosts.id` is the
 metrics store's `host_id`.
 
-These diagrams have to change with every change to a table.
+These diagrams have to change with every change to a table. Until the first
+release, later migrations are squashed back into these, and a database made before
+then has its migrations table changed to name only them.
 
 ## Main database
 

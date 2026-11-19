@@ -34,16 +34,10 @@ struct Migration {
 
 /// Every schema change, in order. Applied ones are recorded in the database, so
 /// never edit one that has shipped: add a new one instead.
-const MIGRATIONS: &[Migration] = &[
-    Migration {
-        name: "0001_create_tables",
-        sql: include_str!("migrations/0001_create_tables.sql"),
-    },
-    Migration {
-        name: "0002_rollup_times",
-        sql: include_str!("migrations/0002_rollup_times.sql"),
-    },
-];
+const MIGRATIONS: &[Migration] = &[Migration {
+    name: "0001_create_tables",
+    sql: include_str!("migrations/0001_create_tables.sql"),
+}];
 
 /// Only the bookkeeping table is created outside a migration, because it is
 /// what records them.
@@ -1654,60 +1648,6 @@ mod tests {
             Retention::KEEP_EVERYTHING,
         )
         .unwrap()
-    }
-
-    /// A database made before rollups kept their times as times, when they were
-    /// milliseconds since 1970, keeps the same moments once it's migrated.
-    #[test]
-    fn rollup_progress_in_milliseconds_becomes_times() {
-        let mut connection = Connection::open_in_memory().unwrap();
-        migrate(&mut connection, &MIGRATIONS[..1]).unwrap();
-        connection
-            .execute_batch(
-                "INSERT INTO rollup_progress VALUES
-                     ('cpu.usage', 1795053600000), ('disk.usage', 1795050000000);
-                 INSERT INTO rollup_redo VALUES (1795046400000), (1795042800000);",
-            )
-            .unwrap();
-
-        let store = DuckDbStore::with_connection(connection, Retention::default()).unwrap();
-
-        let moment = |text| crate::times::parse_moment(text).unwrap();
-        assert_eq!(
-            store.progress,
-            HashMap::from([
-                ("cpu.usage".to_string(), moment("2026-11-19T02:00:00Z")),
-                ("disk.usage".to_string(), moment("2026-11-19T01:00:00Z")),
-            ])
-        );
-        assert_eq!(
-            store.redo,
-            BTreeSet::from([
-                moment("2026-11-19T00:00:00Z"),
-                moment("2026-11-18T23:00:00Z")
-            ])
-        );
-        let columns: Vec<(String, String)> = store
-            .connection
-            .prepare(
-                "SELECT column_name, data_type FROM information_schema.columns
-                 WHERE table_name IN ('rollup_progress', 'rollup_redo')
-                 ORDER BY table_name, ordinal_position",
-            )
-            .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
-        let named = |name: &str, kind: &str| (name.to_string(), kind.to_string());
-        assert_eq!(
-            columns,
-            [
-                named("metric", "VARCHAR"),
-                named("done_until", "TIMESTAMP"),
-                named("hour", "TIMESTAMP"),
-            ]
-        );
     }
 
     #[test]
