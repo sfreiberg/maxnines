@@ -8,10 +8,13 @@ pub struct Model {
     pub dashboard_id: i64,
     pub position: i32,
     pub name: String,
-    pub label: String,
+    /// None uses the name.
+    pub label: Option<String>,
     pub kind: String,
-    pub fact: String,
-    pub filter: String,
+    /// None for a host variable, which offers hosts rather than a fact's values.
+    pub fact: Option<String>,
+    /// None for every host.
+    pub filter: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

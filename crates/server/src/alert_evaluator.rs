@@ -77,16 +77,23 @@ struct Trends {
 struct Key {
     rule_id: i64,
     host_id: String,
-    series: String,
+    /// None for the host as a whole.
+    series: Option<String>,
+}
+
+/// A reading's series as an alert keeps it. A metric reported once for the whole host
+/// has a series with no name, and its alerts have none.
+fn alert_series(series: &str) -> Option<String> {
+    (!series.is_empty()).then(|| series.to_string())
 }
 
 impl Key {
-    fn of(alert: &Alert) -> Option<Self> {
-        Some(Self {
-            rule_id: alert.rule_id?,
+    fn of(alert: &Alert) -> Self {
+        Self {
+            rule_id: alert.rule_id,
             host_id: alert.host_id.clone(),
             series: alert.series.clone(),
-        })
+        }
     }
 }
 
@@ -226,9 +233,9 @@ impl Snapshot {
     /// Missing data is never a reason: the agent may just be offline, and that's
     /// exactly when a disk alert shouldn't quietly close itself.
     fn reason_to_close(&self, alert: &Alert) -> Option<&'static str> {
-        let Some(rule) = alert
-            .rule_id
-            .and_then(|id| self.rules.get(&id))
+        let Some(rule) = self
+            .rules
+            .get(&alert.rule_id)
             .filter(|rule| rule.rule.enabled)
         else {
             return Some(RULE_GONE_REASON);
@@ -257,16 +264,19 @@ impl Snapshot {
                     let trends = trends.by_host.get(&alert.host_id)?;
                     trends
                         .iter()
-                        .any(|trend| clean(&trend.series) == alert.series)
+                        .any(|trend| alert_series(&clean(&trend.series)) == alert.series)
                 } else {
                     let readings = self.readings.get(metric.name)?.get(&alert.host_id)?;
                     readings
                         .iter()
-                        .any(|reading| clean(&reading.series) == alert.series)
+                        .any(|reading| alert_series(&clean(&reading.series)) == alert.series)
                 };
                 Some(if !reported {
                     "This series is no longer reported"
-                } else if !rule.rule.watches_series(&alert.series) {
+                } else if !rule
+                    .rule
+                    .watches_series(alert.series.as_deref().unwrap_or_default())
+                {
                     "The rule no longer covers this series"
                 } else {
                     "This agent reports more series than a rule can watch"
@@ -464,16 +474,10 @@ impl Evaluator {
     pub async fn evaluate(&mut self, now: Timestamp) -> Result<()> {
         let snapshot = self.snapshot(now).await?;
         let open_alerts = self.database.open_alerts().await?;
-        let mut open: HashMap<Key, Alert> = HashMap::new();
-        let mut orphans = Vec::new();
-        for alert in open_alerts {
-            match Key::of(&alert) {
-                Some(key) => {
-                    open.insert(key, alert);
-                }
-                None => orphans.push(alert),
-            }
-        }
+        let mut open: HashMap<Key, Alert> = open_alerts
+            .into_iter()
+            .map(|alert| (Key::of(&alert), alert))
+            .collect();
 
         let mut checked = HashSet::new();
         for rule in snapshot.rules.values().filter(|rule| rule.rule.enabled) {
@@ -507,9 +511,6 @@ impl Evaluator {
             }
         }
 
-        for alert in orphans {
-            self.close(&alert, now, RULE_GONE_REASON, None).await?;
-        }
         for (key, alert) in &open {
             if !checked.contains(key)
                 && let Some(reason) = snapshot.reason_to_close(alert)
@@ -537,7 +538,7 @@ impl Evaluator {
         let key = Key {
             rule_id: rule.id,
             host_id: host.id.clone(),
-            series: String::new(),
+            series: None,
         };
         checked.insert(key.clone());
 
@@ -643,7 +644,7 @@ impl Evaluator {
         let key_of = |line: &str| Key {
             rule_id: rule.id,
             host_id: FLEET_HOST_ID.to_string(),
-            series: line.to_string(),
+            series: alert_series(line),
         };
         for (line, value) in &lines {
             let key = key_of(line);
@@ -728,7 +729,7 @@ impl Evaluator {
             let key = Key {
                 rule_id: rule.id,
                 host_id: host.id.clone(),
-                series: series.clone(),
+                series: alert_series(&series),
             };
             checked.insert(key.clone());
 
@@ -836,7 +837,7 @@ impl Evaluator {
             let key = Key {
                 rule_id: rule.id,
                 host_id: host.id.clone(),
-                series: series.clone(),
+                series: alert_series(&series),
             };
             checked.insert(key.clone());
             let trusted = trend.samples >= MIN_FORECAST_SAMPLES
@@ -954,10 +955,8 @@ impl Evaluator {
                     .unwrap_or(snapshot.now);
                 let new = NewAlert {
                     rule_id: rule.id,
-                    rule_name: rule.rule.name.clone(),
                     severity,
                     host_id: key.host_id,
-                    hostname: hostname.to_string(),
                     series: key.series,
                     value,
                     summary,

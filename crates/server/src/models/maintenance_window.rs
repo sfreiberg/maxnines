@@ -7,7 +7,8 @@ pub struct Model {
     pub id: i64,
     pub name: String,
     pub rule_id: Option<i64>,
-    pub filter: String,
+    /// None for every host.
+    pub filter: Option<String>,
     pub days: String,
     pub start_time: String,
     pub duration_secs: i64,

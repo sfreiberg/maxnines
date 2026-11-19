@@ -1546,8 +1546,8 @@ async fn widget_data(
     };
     let input = &widget.input;
     let question = picks
-        .fill_filter(&input.filter)
-        .and_then(|filter| input.question_for(&filter));
+        .fill_filter(input.filter.as_deref())
+        .and_then(|filter| input.question_for(filter.as_deref()));
     let question = match question {
         Ok(question) => question,
         Err(error) => return refused(&anyhow::anyhow!(error)),

@@ -112,6 +112,11 @@ pub fn fact_name(name: &str) -> &str {
 }
 
 impl HostFilter {
+    /// A filter that can be left out, which picks every host.
+    pub fn parse_optional(text: Option<&str>) -> Result<Self, String> {
+        text.map_or_else(|| Ok(Self::default()), Self::parse)
+    }
+
     /// The error says what's wrong in a way that can be shown to whoever typed it.
     pub fn parse(text: &str) -> Result<Self, String> {
         let terms = split_terms(text)?;

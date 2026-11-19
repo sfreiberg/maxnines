@@ -1,6 +1,9 @@
 use sea_orm::entity::prelude::*;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+use crate::audit::Change;
+
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
 #[sea_orm(table_name = "audit_log")]
 pub struct Model {
     #[sea_orm(primary_key)]
@@ -19,9 +22,13 @@ pub struct Model {
     pub subject_kind: String,
     pub subject_id: Option<String>,
     pub subject_name: String,
-    /// JSON, a list of [`crate::audit::Change`].
-    pub changes: String,
+    #[sea_orm(column_type = "JsonBinary")]
+    pub changes: Changes,
 }
+
+/// What changed, kept as a JSON list.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, FromJsonQueryResult)]
+pub struct Changes(pub Vec<Change>);
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {}

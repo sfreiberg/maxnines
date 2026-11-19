@@ -123,10 +123,7 @@ pub async fn watched(
     alert: &Alert,
     range: TimeRange,
 ) -> Result<Option<Watched>> {
-    let Some(rule_id) = alert.rule_id else {
-        return Ok(None);
-    };
-    let Some(rule) = sources.database.get_alert_rule(rule_id).await? else {
+    let Some(rule) = sources.database.get_alert_rule(alert.rule_id).await? else {
         return Ok(None);
     };
     let rule = rule.rule;
@@ -150,15 +147,19 @@ pub async fn watched(
             // One line for everything is named after the metric in the alert.
             if question.grouping == Grouping::Nothing {
                 for series in &mut result.series {
-                    series.name = alert.series.clone();
+                    // A chart's line has a name, which is empty for the host as a whole.
+                    series.name = alert.series.clone().unwrap_or_default();
                 }
             }
             (question.metric, question.unit(), result)
         }
     };
-    result
-        .series
-        .retain(|series| alert.series.is_empty() || clean(&series.name) == alert.series);
+    result.series.retain(|series| {
+        alert
+            .series
+            .as_ref()
+            .is_none_or(|only| clean(&series.name) == *only)
+    });
     result.series.truncate(MAX_SERIES);
     result.hidden = 0;
     Ok(Some(Watched {
@@ -189,8 +190,10 @@ fn xml(text: &str) -> String {
 fn heading(alert: &Alert, metric: &Metric) -> String {
     let watched = match metric.source {
         Source::Fields([_]) => metric.title.to_string(),
-        _ if alert.series.is_empty() => metric.title.to_string(),
-        _ => format!("{} ({})", metric.title, alert.series),
+        _ => match &alert.series {
+            Some(series) => format!("{} ({series})", metric.title),
+            None => metric.title.to_string(),
+        },
     };
     format!("{watched} on {}", alert.hostname)
 }
@@ -402,12 +405,12 @@ mod tests {
     fn alert() -> Alert {
         Alert {
             id: 1,
-            rule_id: Some(1),
+            rule_id: 1,
             rule_name: "Disk filling up".to_string(),
             severity: Severity::Warning,
             host_id: "abc".to_string(),
             hostname: "web-<1>".to_string(),
-            series: "/".to_string(),
+            series: Some("/".to_string()),
             value: Some(85.0),
             summary: String::new(),
             started_at: crate::times::from_ms(1_700_000_000_000 - 600_000),

@@ -5,7 +5,8 @@ that the server reads from itself. Its `kind` says which: `agent` or `agentless`
 host's `state` is `pending`, `approved` or `revoked`. Its `health` is `critical`,
 `warning`, `offline`, `online` or `not_read`, and problems outrank being online. A
 host with no agent is `not_read` while it has no page being read or check being run,
-as it's then neither online nor offline.
+as it's then neither online nor offline. Its `public_key` is `null`, as it has no agent
+to hold one.
 
 ## List hosts
 
@@ -60,7 +61,7 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
 {
   "id": "5f0c1d6f2a8e4b7790d3c1a2b4e6f809",
   "kind": "agentless",
-  "public_key": "",
+  "public_key": null,
   "hostname": "orders-db",
   "state": "approved",
   "decided_by": "you@example.com",

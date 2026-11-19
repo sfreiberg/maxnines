@@ -10,7 +10,7 @@ pub struct Model {
     /// Which app, such as `maxnines-cli`.
     pub client_id: String,
     /// What the app calls the computer it's on.
-    pub device: String,
+    pub device: Option<String>,
     /// The most it may do: `viewer`, `responder`, `editor` or `admin`.
     pub role: String,
     /// Only hashes are kept, so reading the database doesn't sign anything in.

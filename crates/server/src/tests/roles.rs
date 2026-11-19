@@ -516,8 +516,8 @@ async fn the_pages_only_offer_what_a_role_allows() {
     let database = &server.state.database;
     let rule = crate::locations::LocationRuleInput {
         name: "Office".into(),
-        filter: String::new(),
-        place: "London".into(),
+        filter: None,
+        place: Some("London".into()),
         latitude: 51.5,
         longitude: -0.1,
         priority: 0,

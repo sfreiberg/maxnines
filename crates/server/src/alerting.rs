@@ -147,8 +147,8 @@ pub struct AlertRuleInput {
     #[serde(default)]
     pub metric: Option<String>,
     /// Limits a metric rule to matching series, with `*` and `?` wildcards.
-    /// Every series is watched separately, so empty means each one.
-    #[serde(default)]
+    /// Every series is watched separately, so none means each one.
+    #[serde(default, deserialize_with = "crate::text::optional")]
     pub series: Option<String>,
     #[serde(default)]
     pub comparison: Option<Comparison>,
@@ -164,8 +164,8 @@ pub struct AlertRuleInput {
     #[serde(rename = "for_secs", with = "crate::times::whole_seconds")]
     pub hold: TimeDelta,
     pub severity: Severity,
-    /// A CEL expression over facts. An empty condition matches every agent.
-    #[serde(default)]
+    /// A CEL expression over facts. No condition matches every agent.
+    #[serde(default, deserialize_with = "crate::text::optional")]
     pub condition: Option<String>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -179,10 +179,10 @@ pub struct AlertRuleInput {
     #[serde(default)]
     pub calculation: Option<Calculation>,
     /// What's watched separately, for calculation rules, as in a dashboard widget.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::text::optional")]
     pub group_by: Option<String>,
-    /// Which hosts, for calculation rules, as on the Hosts list. Empty is all.
-    #[serde(default)]
+    /// Which hosts, for calculation rules, as on the Hosts list. None is all.
+    #[serde(default, deserialize_with = "crate::text::optional")]
     pub filter: Option<String>,
     /// How far back a calculation rule looks, so one busy moment isn't a problem.
     #[serde(
@@ -998,14 +998,15 @@ impl ChannelInput {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Alert {
     pub id: i64,
-    /// Empty once the rule is deleted.
-    pub rule_id: Option<i64>,
+    pub rule_id: i64,
+    /// What the rule's called now, even once it's deleted.
     pub rule_name: String,
     pub severity: Severity,
     pub host_id: String,
+    /// What the host's called now.
     pub hostname: String,
-    /// Empty for alerts about the agent as a whole.
-    pub series: String,
+    /// None for alerts about the agent as a whole.
+    pub series: Option<String>,
     /// The reading that started the alert.
     pub value: Option<f64>,
     pub summary: String,
@@ -1028,11 +1029,9 @@ pub struct Alert {
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewAlert {
     pub rule_id: i64,
-    pub rule_name: String,
     pub severity: Severity,
     pub host_id: String,
-    pub hostname: String,
-    pub series: String,
+    pub series: Option<String>,
     pub value: Option<f64>,
     pub summary: String,
     pub started_at: Timestamp,

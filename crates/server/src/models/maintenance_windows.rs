@@ -14,7 +14,7 @@ fn to_window(row: maintenance_window::Model) -> MaintenanceWindow {
         id: row.id,
         window: MaintenanceWindowInput {
             name: row.name,
-            all_alerts: row.rule_id.is_none() && row.filter.is_empty(),
+            all_alerts: row.rule_id.is_none() && row.filter.is_none(),
             rule_id: row.rule_id,
             filter: row.filter,
             days: row.days.split(',').map(String::from).collect(),
@@ -29,7 +29,7 @@ fn window_row(input: &MaintenanceWindowInput) -> maintenance_window::ActiveModel
     maintenance_window::ActiveModel {
         name: Set(input.name.trim().to_string()),
         rule_id: Set(input.rule_id),
-        filter: Set(input.filter.trim().to_string()),
+        filter: Set(input.filter.as_deref().and_then(crate::text::trimmed)),
         days: Set(input.days.join(",")),
         start_time: Set(input.start_time.clone()),
         duration_secs: Set(input.duration.num_seconds()),

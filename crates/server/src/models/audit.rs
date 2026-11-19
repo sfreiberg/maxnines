@@ -8,7 +8,7 @@ use sea_orm::{
 
 use super::{Database, audit_entry};
 use crate::audit::{
-    self, Action, Change, Entry, EntryActor, EntrySubject, EntryVia, Kind, Record, Snapshot, Via,
+    self, Action, Entry, EntryActor, EntrySubject, EntryVia, Kind, Record, Snapshot, Via,
 };
 use crate::times;
 
@@ -41,7 +41,7 @@ pub(super) async fn record<C: ConnectionTrait>(connection: &C, record: Record) -
         subject_kind: Set(record.subject.kind.as_str().to_string()),
         subject_id: Set(record.subject.id.map(|id| clip(&id, MAX_ID_CHARS))),
         subject_name: Set(clip(&record.subject.name, MAX_NAME_CHARS)),
-        changes: Set(serde_json::to_string(&record.changes).context("recording changes")?),
+        changes: Set(audit_entry::Changes(record.changes)),
         ..Default::default()
     };
     audit_entry::Entity::insert(row)
@@ -68,8 +68,6 @@ pub(super) async fn record_change<C: ConnectionTrait>(
 }
 
 fn to_entry(row: audit_entry::Model) -> Entry {
-    // Written here from a list of changes, so it reads back as one.
-    let changes: Vec<Change> = serde_json::from_str(&row.changes).unwrap_or_default();
     Entry {
         id: row.id,
         occurred_at: row.occurred_at,
@@ -91,7 +89,7 @@ fn to_entry(row: audit_entry::Model) -> Entry {
             id: row.subject_id,
             name: row.subject_name,
         },
-        changes,
+        changes: row.changes.0,
     }
 }
 

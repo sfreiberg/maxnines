@@ -122,7 +122,8 @@ pub struct RuleInput {
     pub name: String,
     /// Higher priorities apply later, so they win.
     pub priority: i32,
-    /// A CEL expression. An empty condition matches every agent.
+    /// A CEL expression. No condition matches every agent.
+    #[serde(default, deserialize_with = "crate::text::optional")]
     pub condition: Option<String>,
     /// The operating systems it's for, by `os.family`, or none for all of them.
     #[serde(default)]
@@ -1179,7 +1180,7 @@ async fn hold_all<DB: sea_orm::sqlx::Database>(
 
 /// Makes a new database on a test server, and returns the URL to reach it.
 #[cfg(test)]
-async fn fresh_test_database(server: &str) -> String {
+pub(crate) async fn fresh_test_database(server: &str) -> String {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use sea_orm::ConnectionTrait;
@@ -1223,6 +1224,11 @@ impl Database {
         Self::connect_waiting(&url, Duration::from_secs(60))
             .await
             .unwrap()
+    }
+
+    /// The connection itself, for tests that look at the rows as they're kept.
+    pub fn connection(&self) -> &DatabaseConnection {
+        &self.connection
     }
 
     /// Takes every connection, so that queries wait until it's dropped, as they do on a
@@ -1294,7 +1300,7 @@ mod tests {
         HostRecord {
             kind: crate::registration::HostKind::Agent,
             id: id.to_string(),
-            public_key: "ab".repeat(32),
+            public_key: Some("ab".repeat(32)),
             hostname: "web-1".to_string(),
             state: HostState::Pending,
             decided_by: None,
@@ -2195,11 +2201,9 @@ mod tests {
         let started_at = at(suffix);
         let new = NewAlert {
             rule_id: rule,
-            rule_name: input.name.clone(),
             severity: input.severity,
             host_id: host.to_string(),
-            hostname: "é".repeat(255),
-            series: "é".repeat(255),
+            series: Some("é".repeat(255)),
             value: Some(91.5),
             summary: "x".repeat(5000),
             started_at,
@@ -2208,7 +2212,12 @@ mod tests {
         let alert = database.fire_alert(&new, &[channel]).await.unwrap();
         let open = database.open_alerts().await.unwrap();
         let saved = open.iter().find(|a| a.id == alert).unwrap();
-        assert_eq!(saved.hostname, new.hostname);
+        // Named by its rule and host as they're called now.
+        assert_eq!(saved.rule_name, input.name);
+        let hostname = database.load_hosts().await.unwrap();
+        let hostname = &hostname.iter().find(|h| h.id == host).unwrap().hostname;
+        assert_eq!(&saved.hostname, hostname);
+        assert_eq!(saved.series, new.series);
         assert_eq!(saved.value, Some(91.5));
 
         let due = database.due_deliveries(started_at, 500).await.unwrap();
@@ -2266,7 +2275,8 @@ mod tests {
         );
         let history = database.resolved_alerts(10).await.unwrap();
         let ended = history.iter().find(|a| a.id == alert).unwrap();
-        assert_eq!(ended.rule_id, Some(rule));
+        assert_eq!(ended.rule_id, rule);
+        assert_eq!(ended.rule_name, input.name);
         assert!(
             database
                 .delete_channel(channel, started_at + TimeDelta::milliseconds(5))

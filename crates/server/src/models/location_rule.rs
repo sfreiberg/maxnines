@@ -6,8 +6,10 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i64,
     pub name: String,
-    pub filter: String,
-    pub place: String,
+    /// None for every host.
+    pub filter: Option<String>,
+    /// Where it is in words, if anyone said.
+    pub place: Option<String>,
     pub latitude: f64,
     pub longitude: f64,
     pub priority: i32,

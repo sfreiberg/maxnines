@@ -151,8 +151,7 @@ every host**: leaving the rule, hosts and series empty isn't enough, so a silenc
 quiet everything by accident. Maintenance windows work the same way.
 
 **Silence** on a firing alert covers that alert alone: its rule, on its host, and only
-the series it's about, such as one disk or one container. An alert whose rule has been
-deleted has no **Silence**, as there's no rule left to name.
+the series it's about, such as one disk or one container.
 
 Alerts still fire and show while they're silenced. If one is still firing when the
 silence ends, the notifications go out then, and if it ends first, nobody hears about it.

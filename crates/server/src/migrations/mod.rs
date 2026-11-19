@@ -8,7 +8,489 @@ pub struct Migrator;
 
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(CreateTables), Box::new(ConvertMoments)]
+        vec![
+            Box::new(CreateTables),
+            Box::new(ConvertMoments),
+            Box::new(NoneJsonAndAlertNames),
+        ]
+    }
+}
+
+/// Text columns that held an empty string to mean none, which now hold NULL: their
+/// table, column, type, and whether an empty string was their default.
+const NONE_AS_NULL: &[(&str, &str, &str, bool)] = &[
+    ("alerts", "series", "varchar(255)", false),
+    ("app_sign_ins", "device", "varchar(100)", false),
+    ("dashboard_variables", "fact", "varchar(200)", false),
+    ("dashboard_variables", "filter", "varchar(500)", false),
+    ("dashboard_variables", "label", "varchar(100)", false),
+    ("dashboard_widgets", "filter", "varchar(500)", false),
+    ("dashboard_widgets", "title", "varchar(100)", false),
+    ("events", "filter", "varchar(500)", false),
+    ("hosts", "public_key", "varchar(64)", false),
+    ("location_rules", "filter", "varchar(500)", false),
+    ("location_rules", "place", "varchar(255)", false),
+    ("maintenance_windows", "filter", "varchar(500)", false),
+    ("metrics_pages", "names", "text", false),
+    ("silences", "filter", "varchar(500)", false),
+    ("silences", "series", "varchar(255)", true),
+];
+
+/// Text columns that could already be NULL for none, but took an empty string from
+/// the API too.
+const BLANK_AS_NULL: &[(&str, &str)] = &[
+    ("alert_rules", "condition_expr"),
+    ("alert_rules", "filter"),
+    ("alert_rules", "group_by"),
+    ("alert_rules", "series"),
+    ("config_rules", "condition_expr"),
+];
+
+/// Columns holding JSON as text, and the text type they had on MySQL.
+const JSON_TEXT: &[(&str, &str, &str)] = &[
+    ("action_runs", "variables", "text"),
+    ("audit_log", "changes", "longtext"),
+];
+
+/// Three tidy-ups. None is NULL, not an empty string, so a column says plainly when
+/// there's nothing in it. JSON is kept as JSON: `jsonb` on PostgreSQL and `json` on
+/// MySQL, which both check it, and text on SQLite, which has no type for it, checked
+/// here as it's converted; JSON that doesn't read stops the migration, as the server
+/// wrote it all. And an alert no longer keeps copies of its rule's name and its host's,
+/// which only went stale when either was renamed: rules are only ever marked deleted,
+/// and a host's alerts go with it, so both are always there to be read. Alerts whose
+/// rule went before rules were kept are deleted, with their notifications and runs.
+struct NoneJsonAndAlertNames;
+
+impl MigrationName for NoneJsonAndAlertNames {
+    fn name(&self) -> &str {
+        "m20261120_000001_none_json_and_alert_names"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for NoneJsonAndAlertNames {
+    /// SQLite can only change a foreign key by making the table again, which it can
+    /// only do with foreign keys off, and that can't be done inside a transaction, so
+    /// this starts its own.
+    fn use_transaction(&self) -> Option<bool> {
+        Some(false)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        without_foreign_keys(manager, |db| Box::pin(none_json_and_alert_names_up(db))).await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        without_foreign_keys(manager, |db| Box::pin(none_json_and_alert_names_down(db))).await
+    }
+}
+
+type Step<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DbErr>> + Send + 'a>>;
+
+/// Runs `step` in a transaction, with SQLite's foreign keys off around it, as its way of
+/// making a table again needs. They're checked before it commits instead, and turned
+/// back on whether it worked or not. The server's SQLite has one connection, so the
+/// transaction is on the connection they were turned off for, which is checked too.
+async fn without_foreign_keys<F>(manager: &SchemaManager<'_>, step: F) -> Result<(), DbErr>
+where
+    F: for<'a> FnOnce(&'a SchemaManager<'static>) -> Step<'a>,
+{
+    let sqlite = manager.get_database_backend() == sea_orm::DatabaseBackend::Sqlite;
+    let db = manager.get_connection();
+    if sqlite {
+        db.execute_unprepared("PRAGMA foreign_keys = OFF").await?;
+    }
+    let result = async {
+        let transaction = manager.begin().await?;
+        if sqlite {
+            let on: i64 = one_value(transaction.get_connection(), "PRAGMA foreign_keys").await?;
+            if on != 0 {
+                return Err(DbErr::Migration(
+                    "SQLite's foreign keys have to be off to make tables again".to_string(),
+                ));
+            }
+        }
+        step(&transaction).await?;
+        if sqlite {
+            let broken = transaction
+                .get_connection()
+                .query_all_raw(sea_orm::Statement::from_string(
+                    sea_orm::DatabaseBackend::Sqlite,
+                    "PRAGMA foreign_key_check",
+                ))
+                .await?;
+            if !broken.is_empty() {
+                return Err(DbErr::Migration(format!(
+                    "{} rows would break a foreign key",
+                    broken.len()
+                )));
+            }
+        }
+        transaction.commit().await
+    }
+    .await;
+    if sqlite {
+        db.execute_unprepared("PRAGMA foreign_keys = ON").await?;
+    }
+    result
+}
+
+/// The first column of the one row `sql` gives.
+async fn one_value<T: sea_orm::TryGetable>(
+    db: &impl ConnectionTrait,
+    sql: &str,
+) -> Result<T, DbErr> {
+    let row = db
+        .query_one_raw(sea_orm::Statement::from_string(
+            db.get_database_backend(),
+            sql,
+        ))
+        .await?
+        .ok_or_else(|| DbErr::Migration(format!("no answer to {sql}")))?;
+    row.try_get_by_index(0)
+        .map_err(|error| DbErr::Migration(error.to_string()))
+}
+
+async fn none_json_and_alert_names_up(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let db = manager.get_connection();
+    let backend = db.get_database_backend();
+    for (table, column, kind, _) in NONE_AS_NULL {
+        match backend {
+            sea_orm::DatabaseBackend::Postgres => {
+                db.execute_unprepared(&format!(
+                    "ALTER TABLE \"{table}\" ALTER COLUMN \"{column}\" DROP NOT NULL, \
+                     ALTER COLUMN \"{column}\" DROP DEFAULT"
+                ))
+                .await?;
+            }
+            sea_orm::DatabaseBackend::MySql => {
+                db.execute_unprepared(&format!(
+                    "ALTER TABLE `{table}` MODIFY `{column}` {kind} NULL"
+                ))
+                .await?;
+            }
+            _ => {
+                // SQLite can't change whether a column can be empty, so a new one
+                // takes its place. None of these is indexed or a foreign key.
+                let new = format!("{column}_new");
+                db.execute_unprepared(&format!(
+                    "ALTER TABLE \"{table}\" ADD COLUMN \"{new}\" {kind}"
+                ))
+                .await?;
+                db.execute_unprepared(&format!("UPDATE \"{table}\" SET \"{new}\" = \"{column}\""))
+                    .await?;
+                db.execute_unprepared(&format!("ALTER TABLE \"{table}\" DROP COLUMN \"{column}\""))
+                    .await?;
+                db.execute_unprepared(&format!(
+                    "ALTER TABLE \"{table}\" RENAME COLUMN \"{new}\" TO \"{column}\""
+                ))
+                .await?;
+            }
+        }
+    }
+    let blanks = NONE_AS_NULL
+        .iter()
+        .map(|(table, column, _, _)| (*table, *column))
+        .chain(BLANK_AS_NULL.iter().copied());
+    for (table, column) in blanks {
+        let (table, column) = (quoted(backend, table), quoted(backend, column));
+        db.execute_unprepared(&format!(
+            "UPDATE {table} SET {column} = NULL WHERE TRIM({column}) = ''"
+        ))
+        .await?;
+    }
+
+    for (table, column, _) in JSON_TEXT {
+        match backend {
+            sea_orm::DatabaseBackend::Postgres => {
+                db.execute_unprepared(&format!(
+                    "ALTER TABLE \"{table}\" ALTER COLUMN \"{column}\" TYPE jsonb \
+                     USING \"{column}\"::jsonb"
+                ))
+                .await?;
+            }
+            sea_orm::DatabaseBackend::MySql => {
+                db.execute_unprepared(&format!(
+                    "ALTER TABLE `{table}` MODIFY `{column}` json NOT NULL"
+                ))
+                .await?;
+            }
+            _ => {
+                // json() refuses what isn't JSON, and writes what is compactly.
+                db.execute_unprepared(&format!(
+                    "UPDATE \"{table}\" SET \"{column}\" = json(\"{column}\")"
+                ))
+                .await?;
+            }
+        }
+    }
+
+    // What went with an alert by cascade goes first, as SQLite's foreign keys are off.
+    for child in ["notifications", "action_runs"] {
+        db.execute_unprepared(&format!(
+            "DELETE FROM {child} WHERE alert_id IN (SELECT id FROM alerts WHERE rule_id IS NULL)"
+        ))
+        .await?;
+    }
+    db.execute_unprepared("DELETE FROM alerts WHERE rule_id IS NULL")
+        .await?;
+    match backend {
+        sea_orm::DatabaseBackend::Postgres => {
+            db.execute_unprepared(
+                "ALTER TABLE alerts DROP COLUMN rule_name, DROP COLUMN hostname, \
+                 ALTER COLUMN rule_id SET NOT NULL, DROP CONSTRAINT fk_alerts_rule_id",
+            )
+            .await?;
+            db.execute_unprepared(
+                "ALTER TABLE alerts ADD CONSTRAINT fk_alerts_rule_id \
+                 FOREIGN KEY (rule_id) REFERENCES alert_rules (id)",
+            )
+            .await?;
+        }
+        sea_orm::DatabaseBackend::MySql => {
+            // The index MySQL made for the foreign key stays, so the new one has it
+            // throughout.
+            db.execute_unprepared("ALTER TABLE alerts DROP FOREIGN KEY fk_alerts_rule_id")
+                .await?;
+            db.execute_unprepared(
+                "ALTER TABLE alerts DROP COLUMN rule_name, DROP COLUMN hostname, \
+                 MODIFY rule_id BIGINT NOT NULL",
+            )
+            .await?;
+            db.execute_unprepared(
+                "ALTER TABLE alerts ADD CONSTRAINT fk_alerts_rule_id \
+                 FOREIGN KEY (rule_id) REFERENCES alert_rules (id)",
+            )
+            .await?;
+        }
+        _ => {
+            let columns = ALERT_COLUMNS.join(", ");
+            remake_sqlite_alerts(
+                db,
+                "\"rule_id\" integer NOT NULL, \"severity\" varchar(16) NOT NULL, \
+                 \"host_id\" varchar(32) NOT NULL, \"series\" varchar(255), \
+                 \"value\" double, \"summary\" text NOT NULL, \
+                 \"started_at\" TEXT NOT NULL, \"breached_at\" TEXT NOT NULL, \
+                 \"resolved_at\" TEXT, \"resolve_reason\" text, \"resolved_summary\" text, \
+                 \"acknowledged_by\" varchar(255), \"acknowledged_at\" TEXT, \
+                 FOREIGN KEY (\"host_id\") REFERENCES \"hosts\" (\"id\"), \
+                 FOREIGN KEY (\"rule_id\") REFERENCES \"alert_rules\" (\"id\")",
+                &format!("INSERT INTO alerts_new (id, {columns}) SELECT id, {columns} FROM alerts"),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn none_json_and_alert_names_down(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let db = manager.get_connection();
+    let backend = db.get_database_backend();
+    let names = "UPDATE alerts SET \
+                 rule_name = (SELECT name FROM alert_rules WHERE alert_rules.id = alerts.rule_id), \
+                 hostname = (SELECT hostname FROM hosts WHERE hosts.id = alerts.host_id)";
+    match backend {
+        sea_orm::DatabaseBackend::Postgres => {
+            db.execute_unprepared(
+                "ALTER TABLE alerts ADD COLUMN rule_name varchar(255), \
+                 ADD COLUMN hostname varchar(255)",
+            )
+            .await?;
+            db.execute_unprepared(names).await?;
+            db.execute_unprepared(
+                "ALTER TABLE alerts ALTER COLUMN rule_name SET NOT NULL, \
+                 ALTER COLUMN hostname SET NOT NULL, ALTER COLUMN rule_id DROP NOT NULL, \
+                 DROP CONSTRAINT fk_alerts_rule_id",
+            )
+            .await?;
+            db.execute_unprepared(
+                "ALTER TABLE alerts ADD CONSTRAINT fk_alerts_rule_id \
+                 FOREIGN KEY (rule_id) REFERENCES alert_rules (id) ON DELETE SET NULL",
+            )
+            .await?;
+        }
+        sea_orm::DatabaseBackend::MySql => {
+            db.execute_unprepared("ALTER TABLE alerts DROP FOREIGN KEY fk_alerts_rule_id")
+                .await?;
+            db.execute_unprepared(
+                "ALTER TABLE alerts ADD COLUMN rule_name varchar(255) NULL, \
+                 ADD COLUMN hostname varchar(255) NULL, MODIFY rule_id BIGINT NULL",
+            )
+            .await?;
+            db.execute_unprepared(names).await?;
+            db.execute_unprepared(
+                "ALTER TABLE alerts MODIFY rule_name varchar(255) NOT NULL, \
+                 MODIFY hostname varchar(255) NOT NULL",
+            )
+            .await?;
+            db.execute_unprepared(
+                "ALTER TABLE alerts ADD CONSTRAINT fk_alerts_rule_id \
+                 FOREIGN KEY (rule_id) REFERENCES alert_rules (id) ON DELETE SET NULL",
+            )
+            .await?;
+        }
+        _ => {
+            let columns = ALERT_COLUMNS.join(", ");
+            let from = ALERT_COLUMNS
+                .iter()
+                .map(|column| format!("a.{column}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            remake_sqlite_alerts(
+                db,
+                "\"rule_id\" integer, \"rule_name\" varchar(255) NOT NULL, \
+                 \"severity\" varchar(16) NOT NULL, \"host_id\" varchar(32) NOT NULL, \
+                 \"hostname\" varchar(255) NOT NULL, \"series\" varchar(255), \
+                 \"value\" double, \"summary\" text NOT NULL, \
+                 \"started_at\" TEXT NOT NULL, \"breached_at\" TEXT NOT NULL, \
+                 \"resolved_at\" TEXT, \"resolve_reason\" text, \"resolved_summary\" text, \
+                 \"acknowledged_by\" varchar(255), \"acknowledged_at\" TEXT, \
+                 FOREIGN KEY (\"host_id\") REFERENCES \"hosts\" (\"id\"), \
+                 FOREIGN KEY (\"rule_id\") REFERENCES \"alert_rules\" (\"id\") ON DELETE SET NULL",
+                &format!(
+                    "INSERT INTO alerts_new (id, rule_name, hostname, {columns}) \
+                     SELECT a.id, r.name, h.hostname, {from} FROM alerts a \
+                     JOIN alert_rules r ON r.id = a.rule_id JOIN hosts h ON h.id = a.host_id"
+                ),
+            )
+            .await?;
+        }
+    }
+
+    for (table, column, text) in JSON_TEXT {
+        match backend {
+            sea_orm::DatabaseBackend::Postgres => {
+                db.execute_unprepared(&format!(
+                    "ALTER TABLE \"{table}\" ALTER COLUMN \"{column}\" TYPE text \
+                     USING \"{column}\"::text"
+                ))
+                .await?;
+            }
+            sea_orm::DatabaseBackend::MySql => {
+                db.execute_unprepared(&format!(
+                    "ALTER TABLE `{table}` MODIFY `{column}` {text} NOT NULL"
+                ))
+                .await?;
+            }
+            // It was always text.
+            _ => {}
+        }
+    }
+
+    for (table, column, kind, empty_default) in NONE_AS_NULL {
+        let (quoted_table, quoted_column) = (quoted(backend, table), quoted(backend, column));
+        let default = if *empty_default { " DEFAULT ''" } else { "" };
+        match backend {
+            sea_orm::DatabaseBackend::Postgres => {
+                db.execute_unprepared(&format!(
+                    "UPDATE {quoted_table} SET {quoted_column} = '' WHERE {quoted_column} IS NULL"
+                ))
+                .await?;
+                db.execute_unprepared(&format!(
+                    "ALTER TABLE \"{table}\" ALTER COLUMN \"{column}\" SET NOT NULL"
+                ))
+                .await?;
+                if *empty_default {
+                    db.execute_unprepared(&format!(
+                        "ALTER TABLE \"{table}\" ALTER COLUMN \"{column}\" SET DEFAULT ''"
+                    ))
+                    .await?;
+                }
+            }
+            sea_orm::DatabaseBackend::MySql => {
+                db.execute_unprepared(&format!(
+                    "UPDATE {quoted_table} SET {quoted_column} = '' WHERE {quoted_column} IS NULL"
+                ))
+                .await?;
+                db.execute_unprepared(&format!(
+                    "ALTER TABLE `{table}` MODIFY `{column}` {kind} NOT NULL{default}"
+                ))
+                .await?;
+            }
+            _ => {
+                // As on the way up, but a column that can't be empty can only be added
+                // with a default, for the rows already there.
+                let old = format!("{column}_old");
+                db.execute_unprepared(&format!(
+                    "ALTER TABLE \"{table}\" ADD COLUMN \"{old}\" {kind} NOT NULL DEFAULT ''"
+                ))
+                .await?;
+                db.execute_unprepared(&format!(
+                    "UPDATE \"{table}\" SET \"{old}\" = COALESCE(\"{column}\", '')"
+                ))
+                .await?;
+                db.execute_unprepared(&format!("ALTER TABLE \"{table}\" DROP COLUMN \"{column}\""))
+                    .await?;
+                db.execute_unprepared(&format!(
+                    "ALTER TABLE \"{table}\" RENAME COLUMN \"{old}\" TO \"{column}\""
+                ))
+                .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// An alert's columns that are the same before and after, apart from its ID.
+const ALERT_COLUMNS: &[&str] = &[
+    "rule_id",
+    "severity",
+    "host_id",
+    "series",
+    "value",
+    "summary",
+    "started_at",
+    "breached_at",
+    "resolved_at",
+    "resolve_reason",
+    "resolved_summary",
+    "acknowledged_by",
+    "acknowledged_at",
+];
+
+/// Makes SQLite's alerts table again with `columns` after its ID, filled by `copy`
+/// from the old one into `alerts_new`, as SQLite can't change a foreign key any other
+/// way. Its numbering carries on from where it was, so a deleted alert's ID is never
+/// used again, as notifications already sent may name it.
+async fn remake_sqlite_alerts(
+    db: &impl ConnectionTrait,
+    columns: &str,
+    copy: &str,
+) -> Result<(), DbErr> {
+    db.execute_unprepared(&format!(
+        "CREATE TABLE \"alerts_new\" ( \"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \
+         {columns} )"
+    ))
+    .await?;
+    db.execute_unprepared(copy).await?;
+    db.execute_unprepared("DELETE FROM sqlite_sequence WHERE name = 'alerts_new'")
+        .await?;
+    db.execute_unprepared(
+        "INSERT INTO sqlite_sequence (name, seq) \
+         SELECT 'alerts_new', seq FROM sqlite_sequence WHERE name = 'alerts'",
+    )
+    .await?;
+    db.execute_unprepared("DROP TABLE alerts").await?;
+    db.execute_unprepared("ALTER TABLE alerts_new RENAME TO alerts")
+        .await?;
+    for (name, column) in [
+        ("idx_alerts_resolved", "resolved_at"),
+        ("idx_alerts_started", "started_at"),
+    ] {
+        db.execute_unprepared(&format!(
+            "CREATE INDEX \"{name}\" ON \"alerts\" (\"{column}\")"
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
+/// A table or column's name, quoted as `backend` quotes them.
+fn quoted(backend: sea_orm::DatabaseBackend, name: &str) -> String {
+    match backend {
+        sea_orm::DatabaseBackend::MySql => format!("`{name}`"),
+        _ => format!("\"{name}\""),
     }
 }
 
@@ -2407,6 +2889,7 @@ enum ActionRuns {
 
 #[cfg(test)]
 mod tests {
+    use sea_orm::sea_query::Value;
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
 
     use super::*;
@@ -2475,7 +2958,8 @@ mod tests {
         .await;
         let wait_ms: i64 = wait[0].parse::<i64>().unwrap() * 1000;
 
-        Migrator::up(&connection, None).await.unwrap();
+        // The alert whose rule is gone only lasts until the next migration.
+        Migrator::up(&connection, Some(1)).await.unwrap();
         let began = texts(&connection, "SELECT breached_at FROM alerts ORDER BY id").await;
         let at = |ms| as_sqlx_writes(crate::times::from_ms(ms));
         assert_eq!(began, [at(600_000 - wait_ms), at(700_000)]);
@@ -2577,13 +3061,432 @@ mod tests {
         assert_eq!(fact, ["2026-11-19T01:57:17.828+00:00"]);
 
         // And back again.
-        Migrator::down(&connection, Some(1)).await.unwrap();
+        Migrator::down(&connection, Some(2)).await.unwrap();
         let kept = texts(
             &connection,
             "SELECT CAST(started_ms AS TEXT) || ' ' || CAST(acknowledged_ms AS TEXT) FROM alerts",
         )
         .await;
         assert_eq!(kept, [format!("{WITH_MILLISECONDS} {ON_THE_SECOND}")]);
+        Migrator::up(&connection, None).await.unwrap();
+    }
+
+    /// A database to migrate: one of its own on the server `MAXNINES_TEST_DATABASE_URL`
+    /// names, or SQLite in a file, which outlives its connections as one in memory
+    /// doesn't. The folder holds the file.
+    async fn database_to_migrate() -> (String, Option<tempfile::TempDir>) {
+        match std::env::var("MAXNINES_TEST_DATABASE_URL") {
+            Ok(server) => (crate::models::fresh_test_database(&server).await, None),
+            Err(_) => {
+                let folder = tempfile::tempdir().unwrap();
+                let path = folder.path().join("maxnines.db");
+                (
+                    format!("sqlite://{}?mode=rwc", path.display()),
+                    Some(folder),
+                )
+            }
+        }
+    }
+
+    async fn insert(connection: &impl ConnectionTrait, table: &str, row: Vec<(&str, Value)>) {
+        let mut insert = Query::insert();
+        insert
+            .into_table(Alias::new(table))
+            .columns(row.iter().map(|(column, _)| Alias::new(*column)))
+            .values_panic(row.into_iter().map(|(_, value)| Expr::val(value)));
+        connection.execute(&insert).await.unwrap();
+    }
+
+    async fn number(connection: &impl ConnectionTrait, sql: &str) -> i64 {
+        one_value(connection, sql).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn empty_text_becomes_none_json_becomes_json_and_alerts_lose_their_copies() {
+        let (url, _folder) = database_to_migrate().await;
+        let options = ConnectOptions::new(&url).max_connections(1).to_owned();
+        let connection = Database::connect(options).await.unwrap();
+        Migrator::up(&connection, Some(2)).await.unwrap();
+        let now = crate::times::now();
+        let hour = chrono::TimeDelta::hours(1);
+        let empty = || Value::from("");
+
+        // Everything as it was written before: empty text for none, and JSON as text.
+        insert(
+            &connection,
+            "hosts",
+            vec![
+                ("id", "web".into()),
+                ("kind", "agentless".into()),
+                ("public_key", empty()),
+                ("hostname", "web-1".into()),
+                ("state", "approved".into()),
+                ("first_seen_at", now.into()),
+            ],
+        )
+        .await;
+        let rule = |name: &str| format!("SELECT id FROM alert_rules WHERE name = '{name}'");
+        let offline = number(&connection, &rule("Host offline")).await;
+        let disk = number(&connection, &rule("Disk filling up")).await;
+        connection
+            .execute_unprepared(&format!(
+                "UPDATE alert_rules SET filter = '', condition_expr = ' ' WHERE id = {disk}"
+            ))
+            .await
+            .unwrap();
+        connection
+            .execute_unprepared(
+                "UPDATE config_rules SET condition_expr = '' WHERE name = 'Default'",
+            )
+            .await
+            .unwrap();
+        let alert = |rule: Option<i64>, name: &str, series: &str| {
+            vec![
+                ("rule_id", rule.into()),
+                ("rule_name", name.into()),
+                ("severity", "critical".into()),
+                ("host_id", "web".into()),
+                ("hostname", "web-1".into()),
+                ("series", series.into()),
+                ("summary", format!("{name} on web-1").into()),
+                ("started_at", now.into()),
+                ("breached_at", now.into()),
+            ]
+        };
+        insert(
+            &connection,
+            "alerts",
+            alert(Some(offline), "Host offline", ""),
+        )
+        .await;
+        insert(
+            &connection,
+            "alerts",
+            alert(Some(disk), "Disk filling up", "/data"),
+        )
+        .await;
+        // From a rule deleted before rules were kept, with what went with it.
+        insert(&connection, "alerts", alert(None, "Gone", "")).await;
+        let gone = number(
+            &connection,
+            "SELECT id FROM alerts WHERE rule_name = 'Gone'",
+        )
+        .await;
+        let on_disk = number(&connection, "SELECT id FROM alerts WHERE series = '/data'").await;
+        insert(
+            &connection,
+            "notification_channels",
+            vec![
+                ("name", "Ops".into()),
+                ("kind", "webhook".into()),
+                ("target", "https://example.com/hook".into()),
+            ],
+        )
+        .await;
+        let channel = number(&connection, "SELECT id FROM notification_channels").await;
+        insert(
+            &connection,
+            "notifications",
+            vec![
+                ("alert_id", gone.into()),
+                ("channel_id", channel.into()),
+                ("event", "firing".into()),
+                ("state", "pending".into()),
+                ("attempts", 0.into()),
+                ("next_attempt_at", now.into()),
+                ("created_at", now.into()),
+            ],
+        )
+        .await;
+        for alert in [gone, on_disk] {
+            insert(
+                &connection,
+                "action_runs",
+                vec![
+                    ("host_id", "web".into()),
+                    ("alert_id", alert.into()),
+                    ("action", "restart".into()),
+                    ("run_on", "first".into()),
+                    ("variables", r#"{"service": "nginx"}"#.into()),
+                    ("requested_at", now.into()),
+                    ("timeout_secs", 60.into()),
+                    ("output", empty()),
+                    ("truncated", false.into()),
+                ],
+            )
+            .await;
+        }
+        insert(
+            &connection,
+            "audit_log",
+            vec![
+                ("occurred_at", now.into()),
+                ("actor_kind", "user".into()),
+                ("actor_name", "sam".into()),
+                ("action", "created".into()),
+                ("subject_kind", "silence".into()),
+                ("subject_name", "Upgrading".into()),
+                (
+                    "changes",
+                    r#"[{"field": "reason", "after": "Upgrading"}]"#.into(),
+                ),
+            ],
+        )
+        .await;
+        for (filter, series) in [("", ""), ("os=linux", "/data")] {
+            insert(
+                &connection,
+                "silences",
+                vec![
+                    ("filter", filter.into()),
+                    ("series", series.into()),
+                    ("reason", "Upgrading".into()),
+                    ("created_by", "sam".into()),
+                    ("starts_at", (now - hour).into()),
+                    ("ends_at", (now + hour).into()),
+                ],
+            )
+            .await;
+        }
+        insert(
+            &connection,
+            "maintenance_windows",
+            vec![
+                ("name", "Patching".into()),
+                ("filter", empty()),
+                ("days", "sun".into()),
+                ("start_time", "02:00".into()),
+                ("duration_secs", 3600.into()),
+                ("time_zone", "UTC".into()),
+            ],
+        )
+        .await;
+        insert(
+            &connection,
+            "events",
+            vec![
+                ("occurred_at", now.into()),
+                ("kind", "note".into()),
+                ("title", "Note".into()),
+                ("filter", empty()),
+                ("created_by", "sam".into()),
+                ("created_at", now.into()),
+            ],
+        )
+        .await;
+        insert(
+            &connection,
+            "location_rules",
+            vec![
+                ("name", "Leeds".into()),
+                ("filter", empty()),
+                ("place", empty()),
+                ("latitude", 53.8.into()),
+                ("longitude", (-1.5).into()),
+                ("priority", 0.into()),
+            ],
+        )
+        .await;
+        insert(
+            &connection,
+            "dashboards",
+            vec![("name", "Fleet".into()), ("created_at", now.into())],
+        )
+        .await;
+        let dashboard = number(&connection, "SELECT id FROM dashboards").await;
+        insert(
+            &connection,
+            "dashboard_widgets",
+            vec![
+                ("dashboard_id", dashboard.into()),
+                ("title", empty()),
+                ("kind", "chart".into()),
+                ("metric", "cpu.usage".into()),
+                ("calculation", "avg".into()),
+                ("group_by", "host".into()),
+                ("filter", empty()),
+                ("x", 0.into()),
+                ("y", 0.into()),
+                ("w", 6.into()),
+                ("h", 4.into()),
+            ],
+        )
+        .await;
+        insert(
+            &connection,
+            "dashboard_variables",
+            vec![
+                ("dashboard_id", dashboard.into()),
+                ("position", 0.into()),
+                ("name", "host".into()),
+                ("label", empty()),
+                ("kind", "host".into()),
+                ("fact", empty()),
+                ("filter", empty()),
+            ],
+        )
+        .await;
+        insert(
+            &connection,
+            "users",
+            vec![
+                ("email", "sam@example.com".into()),
+                ("name", "Sam".into()),
+                ("created_at", now.into()),
+            ],
+        )
+        .await;
+        let user = number(&connection, "SELECT id FROM users").await;
+        insert(
+            &connection,
+            "app_sign_ins",
+            vec![
+                ("user_id", user.into()),
+                ("client_id", "maxnines-cli".into()),
+                ("device", empty()),
+                ("role", "viewer".into()),
+                ("access_hash", "a".repeat(64).into()),
+                ("access_expires_at", (now + hour).into()),
+                ("refresh_hash", "r".repeat(64).into()),
+                ("refresh_expires_at", (now + hour).into()),
+                ("created_at", now.into()),
+            ],
+        )
+        .await;
+        insert(
+            &connection,
+            "metrics_pages",
+            vec![
+                ("host_id", "web".into()),
+                ("url", "http://web-1:9100/metrics".into()),
+                ("names", empty()),
+                ("interval_secs", 60.into()),
+                ("enabled", true.into()),
+            ],
+        )
+        .await;
+        connection.close().await.unwrap();
+
+        // Connecting runs the rest of the migrations, and the rows read back through
+        // the models with none for empty and JSON as what it held.
+        let database = crate::models::Database::connect(&url).await.unwrap();
+        let hosts = database.load_hosts().await.unwrap();
+        let web = hosts.iter().find(|host| host.id == "web").unwrap();
+        assert_eq!(web.public_key, None);
+
+        let alerts = database.open_alerts().await.unwrap();
+        assert_eq!(
+            alerts.len(),
+            2,
+            "the alert with no rule is gone: {alerts:?}"
+        );
+        let alert = |rule: i64| alerts.iter().find(|alert| alert.rule_id == rule).unwrap();
+        assert_eq!(alert(offline).series, None);
+        assert_eq!(alert(offline).rule_name, "Host offline");
+        assert_eq!(alert(offline).hostname, "web-1");
+        assert_eq!(alert(disk).series.as_deref(), Some("/data"));
+        // The deleted alert's ID isn't used again, as what was sent about it may name it.
+        let new = crate::alerting::NewAlert {
+            rule_id: offline,
+            severity: crate::alerting::Severity::Critical,
+            host_id: "fleet".to_string(),
+            series: None,
+            value: None,
+            summary: "Fleet".to_string(),
+            started_at: now,
+            breached_at: now,
+        };
+        assert!(database.fire_alert(&new, &[]).await.unwrap() > gone);
+        let left = "SELECT COUNT(*) FROM notifications";
+        assert_eq!(number(database.connection(), left).await, 0);
+        let left = "SELECT COUNT(*) FROM action_runs";
+        assert_eq!(number(database.connection(), left).await, 1);
+        let runs = database.action_runs_for_alert(on_disk).await.unwrap();
+        assert_eq!(runs[0].variables["service"], "nginx");
+
+        let entries = database.audit_log(None, 10).await.unwrap();
+        assert_eq!(entries[0].changes[0].field, "reason");
+        assert_eq!(
+            entries[0].changes[0].after,
+            Some(serde_json::json!("Upgrading"))
+        );
+
+        let silences = database.active_silences(now).await.unwrap();
+        let every = silences
+            .iter()
+            .find(|silence| silence.filter.is_none())
+            .unwrap();
+        assert_eq!(every.series, None);
+        assert!(every.all_alerts);
+        let some = silences
+            .iter()
+            .find(|silence| silence.filter.is_some())
+            .unwrap();
+        assert_eq!(some.series.as_deref(), Some("/data"));
+        let windows = database.list_maintenance_windows().await.unwrap();
+        assert_eq!(windows[0].window.filter, None);
+        assert!(windows[0].window.all_alerts);
+
+        let event = number(database.connection(), "SELECT id FROM events").await;
+        let event = database.get_event(event).await.unwrap().unwrap();
+        assert_eq!(event.filter, None);
+        let places = database.list_location_rules().await.unwrap();
+        assert_eq!(
+            (&places[0].rule.filter, &places[0].rule.place),
+            (&None, &None)
+        );
+        let dashboard = database.get_dashboard(dashboard).await.unwrap().unwrap();
+        let widget = &dashboard.widgets[0].input;
+        assert_eq!((&widget.title, &widget.filter), (&None, &None));
+        let variable = &dashboard.variables[0];
+        assert_eq!(
+            (&variable.label, &variable.fact, &variable.filter),
+            (&None, &None, &None)
+        );
+        let sign_ins = database.list_app_sign_ins(None).await.unwrap();
+        assert_eq!(sign_ins[0].device, None);
+        let none = "SELECT COUNT(*) FROM metrics_pages WHERE names IS NULL";
+        assert_eq!(number(database.connection(), none).await, 1);
+        assert!(
+            database.list_metrics_pages().await.unwrap()[0]
+                .input
+                .names
+                .is_empty()
+        );
+        let rule = database.get_alert_rule(disk).await.unwrap().unwrap().rule;
+        assert_eq!((rule.filter, rule.condition), (None, None));
+        let rules = database.list_rules().await.unwrap();
+        let default = rules
+            .iter()
+            .find(|rule| rule.rule.name == "Default")
+            .unwrap();
+        assert_eq!(default.rule.condition, None);
+
+        // An alert goes by what its rule and host are called now, even once the rule
+        // is deleted.
+        database
+            .connection()
+            .execute_unprepared("UPDATE hosts SET hostname = 'web-2' WHERE id = 'web'")
+            .await
+            .unwrap();
+        assert!(database.delete_alert_rule(disk, now).await.unwrap());
+        let ended = database.resolved_alerts(10).await.unwrap();
+        assert_eq!(ended[0].rule_name, "Disk filling up");
+        assert_eq!(ended[0].hostname, "web-2");
+        drop(database);
+
+        // And back again, with the names copied in once more.
+        let options = ConnectOptions::new(&url).max_connections(1).to_owned();
+        let connection = Database::connect(options).await.unwrap();
+        Migrator::down(&connection, Some(1)).await.unwrap();
+        let copied = "SELECT COUNT(*) FROM alerts
+                      WHERE hostname = 'web-2' AND series = '' AND rule_name = 'Host offline'";
+        assert_eq!(number(&connection, copied).await, 1);
+        let empty_again = "SELECT COUNT(*) FROM hosts WHERE public_key = ''";
+        assert_eq!(number(&connection, empty_again).await, 3);
+        let text = texts(&connection, "SELECT variables FROM action_runs").await;
+        let variables: serde_json::Value = serde_json::from_str(&text[0]).unwrap();
+        assert_eq!(variables, serde_json::json!({ "service": "nginx" }));
         Migrator::up(&connection, None).await.unwrap();
     }
 

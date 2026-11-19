@@ -7,8 +7,8 @@ pub struct Model {
     pub id: i64,
     pub host_id: String,
     pub url: String,
-    /// The metrics to keep, one to a line. Empty keeps them all.
-    pub names: String,
+    /// The metrics to keep, one to a line. None keeps them all.
+    pub names: Option<String>,
     pub interval_secs: i64,
     pub enabled: bool,
     pub username: Option<String>,

@@ -130,7 +130,8 @@ pub fn app_name(id: &str) -> String {
 }
 
 /// What an app's name for the device it's on can be, trimmed. Empty is fine.
-pub fn check_device(device: &str) -> Result<String> {
+/// What an app calls the computer it's on, which it needn't say: none if it's left out.
+pub fn check_device(device: &str) -> Result<Option<String>> {
     let device = device.trim();
     ensure!(
         device.chars().count() <= MAX_DEVICE_CHARS,
@@ -140,7 +141,7 @@ pub fn check_device(device: &str) -> Result<String> {
         !device.chars().any(char::is_control),
         "The device name can't have control characters in it."
     );
-    Ok(device.to_string())
+    Ok(crate::text::non_blank(device))
 }
 
 /// Where a browser may be sent back to: a port on 127.0.0.1, written as an IP address,
@@ -233,7 +234,7 @@ pub fn normalise_user_code(typed: &str) -> String {
 pub struct Approval {
     pub user_id: i64,
     pub client: AppClient,
-    pub device: String,
+    pub device: Option<String>,
     pub role: Role,
 }
 
@@ -256,7 +257,7 @@ enum DeviceState {
 struct DeviceRequest {
     user_code: String,
     client: AppClient,
-    device: String,
+    device: Option<String>,
     /// The role the app asked for, which the person can lower.
     role: Option<Role>,
     expires_at: Timestamp,
@@ -272,7 +273,7 @@ struct DeviceRequest {
 pub struct DeviceAsk {
     pub user_code: String,
     pub client: AppClient,
-    pub device: String,
+    pub device: Option<String>,
     pub role: Option<Role>,
 }
 
@@ -367,7 +368,7 @@ impl PendingSignIns {
     pub fn start_device(
         &self,
         client: AppClient,
-        device: &str,
+        device: Option<&str>,
         role: Option<Role>,
         now: Timestamp,
     ) -> Result<Option<DeviceStart>> {
@@ -393,7 +394,7 @@ impl PendingSignIns {
             DeviceRequest {
                 user_code: user_code.clone(),
                 client,
-                device: device.to_string(),
+                device: device.map(str::to_string),
                 role,
                 expires_at: now + PENDING_LIFETIME,
                 next_poll_at: now,
@@ -505,7 +506,7 @@ mod tests {
         Approval {
             user_id: 1,
             client: known_client("maxnines-cli").unwrap(),
-            device: "laptop".to_string(),
+            device: Some("laptop".to_string()),
             role: Role::Viewer,
         }
     }
@@ -651,7 +652,7 @@ mod tests {
         let start = pending
             .start_device(
                 known_client("maxnines-cli").unwrap(),
-                "build box",
+                Some("build box"),
                 Some(Role::Responder),
                 at(0),
             )
@@ -675,7 +676,7 @@ mod tests {
 
         let typed = start.user_code.to_lowercase().replace('-', " ");
         let asking = pending.device_asking(&typed, at(20_000)).unwrap();
-        assert_eq!(asking.device, "build box");
+        assert_eq!(asking.device.as_deref(), Some("build box"));
         assert_eq!(asking.role, Some(Role::Responder));
         assert!(pending.decide_device(&typed, Some((1, Role::Viewer)), at(20_000)));
         assert!(!pending.decide_device(&typed, Some((1, Role::Viewer)), at(20_000)));
@@ -684,7 +685,7 @@ mod tests {
         else {
             panic!("not allowed");
         };
-        assert_eq!(allowed.device, "build box");
+        assert_eq!(allowed.device.as_deref(), Some("build box"));
         assert_eq!(
             pending.poll_device(code, "maxnines-cli", at(60_000)),
             DevicePoll::Expired
@@ -697,21 +698,21 @@ mod tests {
         for _ in 0..MAX_WAITING_DEVICES {
             assert!(
                 pending
-                    .start_device(known_client("maxnines-cli").unwrap(), "", None, at(0))
+                    .start_device(known_client("maxnines-cli").unwrap(), None, None, at(0))
                     .unwrap()
                     .is_some()
             );
         }
         assert!(
             pending
-                .start_device(known_client("maxnines-cli").unwrap(), "", None, at(0))
+                .start_device(known_client("maxnines-cli").unwrap(), None, None, at(0))
                 .unwrap()
                 .is_none()
         );
         // Room comes back as they run out.
         let later = pending.start_device(
             known_client("maxnines-cli").unwrap(),
-            "",
+            None,
             None,
             at(0) + PENDING_LIFETIME,
         );
@@ -724,7 +725,7 @@ mod tests {
         let start = pending
             .start_device(
                 known_client("maxnines-desktop-mac").unwrap(),
-                "",
+                None,
                 None,
                 at(0),
             )
@@ -739,7 +740,7 @@ mod tests {
         let start = pending
             .start_device(
                 known_client("maxnines-desktop-mac").unwrap(),
-                "",
+                None,
                 None,
                 at(0),
             )

@@ -8,7 +8,7 @@ use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
 use crate::alerting::format_duration;
-use crate::silences::{check_covers, check_filter};
+use crate::silences::{Covered, check_covers, check_filter};
 use crate::times::Timestamp;
 
 /// The days a window can run on, in the order they're shown.
@@ -32,9 +32,9 @@ pub struct MaintenanceWindowInput {
     /// Every rule, if empty.
     #[serde(default)]
     pub rule_id: Option<i64>,
-    /// Which hosts, in the same form as the Hosts list. Every host, if empty.
-    #[serde(default)]
-    pub filter: String,
+    /// Which hosts, in the same form as the Hosts list. Every host, if none.
+    #[serde(default, deserialize_with = "crate::text::optional")]
+    pub filter: Option<String>,
     /// Has to be said to cover every alert, with no rule or filter, so that leaving
     /// them out never does by accident.
     #[serde(default)]
@@ -65,7 +65,7 @@ pub fn check_window(input: &MaintenanceWindowInput) -> Result<()> {
     if input.name.chars().count() > MAX_NAME_CHARS {
         bail!("The name is too long. It can be up to {MAX_NAME_CHARS} characters.");
     }
-    check_filter(&input.filter)?;
+    check_filter(input.filter.as_deref())?;
     if input.days.is_empty() {
         bail!("Choose at least one day.");
     }
@@ -91,8 +91,8 @@ pub fn check_window(input: &MaintenanceWindowInput) -> Result<()> {
     check_covers(
         "maintenance window",
         input.rule_id,
-        &input.filter,
-        None,
+        input.filter.as_deref(),
+        Covered::NoSeries,
         input.all_alerts,
     )
 }
@@ -161,7 +161,7 @@ mod tests {
         MaintenanceWindowInput {
             name: "Patching".to_string(),
             rule_id: None,
-            filter: String::new(),
+            filter: None,
             all_alerts: true,
             days: vec!["sun".to_string()],
             start_time: "02:00".to_string(),
@@ -347,7 +347,7 @@ mod tests {
             ),
             (
                 MaintenanceWindowInput {
-                    filter: "hostname=\"web".to_string(),
+                    filter: Some("hostname=\"web".to_string()),
                     ..input()
                 },
                 "quote",

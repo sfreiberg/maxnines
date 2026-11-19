@@ -483,7 +483,7 @@ struct HistoryEntry {
 struct Location {
     rule_id: i64,
     name: String,
-    place: String,
+    place: Option<String>,
     just_this_one: bool,
 }
 
@@ -549,7 +549,7 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         rule_id: rule.id,
         name: rule.rule.name.clone(),
         place: rule.rule.place.clone(),
-        just_this_one: rule.rule.filter == own_filter,
+        just_this_one: rule.rule.filter.as_ref() == Some(&own_filter),
     });
     let maintenance = match maintenance_of(&state, &host).await {
         Ok(maintenance) => maintenance,
@@ -688,7 +688,7 @@ async fn maintenance_of(state: &AppState, host: &HostRecord) -> Result<Option<Ma
     let cover = active.covering_host(&host.id, &host.hostname);
     let own = host_filter::only(&host.id);
     described(state, cover, |silence| {
-        silence.filter == own && silence.series.is_empty()
+        silence.filter.as_ref() == Some(&own) && silence.series.is_none()
     })
     .await
 }
@@ -760,8 +760,8 @@ async fn start_maintenance(
     };
     let input = SilenceInput {
         rule_id: None,
-        filter: host_filter::only(&host.id),
-        series: String::new(),
+        filter: Some(host_filter::only(&host.id)),
+        series: None,
         all_alerts: false,
         reason,
         duration,
@@ -795,8 +795,8 @@ async fn end_maintenance(
     let own = host_filter::only(&id);
     for silence in silences
         .iter()
-        .filter(|silence| silence.rule_id.is_none() && silence.filter == own)
-        .filter(|silence| silence.series.is_empty())
+        .filter(|silence| silence.rule_id.is_none() && silence.filter.as_ref() == Some(&own))
+        .filter(|silence| silence.series.is_none())
     {
         if let Err(error) = state.database.end_silence(silence.id, now).await {
             return server_error(&error);

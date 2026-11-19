@@ -102,8 +102,9 @@ fn default_group_by() -> String {
 /// [`WidgetInput::question`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WidgetInput {
-    #[serde(default)]
-    pub title: String,
+    /// None uses the metric's name.
+    #[serde(default, deserialize_with = "crate::text::optional")]
+    pub title: Option<String>,
     #[serde(default = "default_kind")]
     pub kind: String,
     pub metric: String,
@@ -111,8 +112,9 @@ pub struct WidgetInput {
     pub calculation: String,
     #[serde(default = "default_group_by")]
     pub group_by: String,
-    #[serde(default)]
-    pub filter: String,
+    /// None for every host.
+    #[serde(default, deserialize_with = "crate::text::optional")]
+    pub filter: Option<String>,
     #[serde(flatten)]
     pub placement: Placement,
 }
@@ -120,16 +122,18 @@ pub struct WidgetInput {
 impl WidgetInput {
     /// A number shows one value, so nothing gets a line of its own.
     pub fn question(&self) -> Result<Question, String> {
-        self.question_for(&self.filter)
+        self.question_for(self.filter.as_deref())
     }
 
     /// The question with its filter as variables fill it in.
-    pub fn question_for(&self, filter: &str) -> Result<Question, String> {
+    pub fn question_for(&self, filter: Option<&str>) -> Result<Question, String> {
         let group_by = if self.kind == "number" {
             "nothing"
         } else {
             self.group_by.as_str()
         };
+        // The question's own filter is text, as typed for a query, where none is empty.
+        let filter = filter.unwrap_or_default();
         Question::new(&self.metric, &self.calculation, group_by, filter)
     }
 
@@ -145,7 +149,11 @@ impl WidgetInput {
     /// The error says what's wrong, to show whoever chose it. Its filter can only use
     /// the dashboard's `variables`.
     pub fn check(&self, variables: &[Variable]) -> Result<(), String> {
-        if self.title.chars().count() > MAX_NAME_LEN {
+        if self
+            .title
+            .as_ref()
+            .is_some_and(|title| title.chars().count() > MAX_NAME_LEN)
+        {
             return Err(format!("A title can be up to {MAX_NAME_LEN} characters."));
         }
         if !KINDS.contains(&self.kind.as_str()) {
@@ -154,14 +162,16 @@ impl WidgetInput {
         if !self.placement.is_valid() {
             return Err("That doesn't fit on the grid.".to_string());
         }
-        check_uses(&self.filter, variables)?;
+        if let Some(filter) = &self.filter {
+            check_uses(filter, variables)?;
+        }
         self.question().map(|_| ())
     }
 
     pub fn title(&self, question: &Question, picks: &Picks) -> String {
-        match self.title.trim() {
-            "" => question.metric.title.to_string(),
-            title => picks.fill_title(title),
+        match &self.title {
+            Some(title) => picks.fill_title(title),
+            None => question.metric.title.to_string(),
         }
     }
 }
@@ -200,14 +210,17 @@ impl Dashboard {
     pub fn check_variables(&self, variables: &[Variable]) -> Result<(), String> {
         check_variables(variables)?;
         for widget in &self.widgets {
-            if let Some(name) = uses(&widget.input.filter)
+            let used = widget.input.filter.as_deref().map(uses);
+            if let Some(name) = used
                 .into_iter()
+                .flatten()
                 .find(|name| !variables.iter().any(|variable| variable.name == *name))
             {
-                let title = match widget.input.title.trim() {
-                    "" => widget.input.metric.as_str(),
-                    title => title,
-                };
+                let title = widget
+                    .input
+                    .title
+                    .as_deref()
+                    .unwrap_or(&widget.input.metric);
                 return Err(format!(
                     "The widget \u{201c}{title}\u{201d} uses ${name}. Change its filter first."
                 ));
@@ -268,18 +281,18 @@ pub async fn view(
     zone: Tz,
 ) -> WidgetView {
     let input = &widget.input;
-    let filter = match picks.fill_filter(&input.filter) {
+    let filter = match picks.fill_filter(input.filter.as_deref()) {
         Ok(filter) => filter,
         Err(missing) => {
             return WidgetView {
-                title: picks.fill_title(&input.title),
+                title: picks.fill_title(input.title.as_deref().unwrap_or_default()),
                 missing: Some(missing),
                 failed: false,
                 ..failed_view(input)
             };
         }
     };
-    let question = match input.question_for(&filter) {
+    let question = match input.question_for(filter.as_deref()) {
         Ok(question) => question,
         Err(error) => {
             warn!(
@@ -321,7 +334,7 @@ pub async fn view(
 fn failed_view(input: &WidgetInput) -> WidgetView {
     WidgetView {
         kind: input.kind.clone(),
-        title: input.title.clone(),
+        title: input.title.clone().unwrap_or_default(),
         chart: None,
         hidden: 0,
         failed: true,
@@ -344,12 +357,12 @@ mod tests {
 
     fn input() -> WidgetInput {
         WidgetInput {
-            title: String::new(),
+            title: None,
             kind: "chart".to_string(),
             metric: "cpu.usage".to_string(),
             calculation: "avg".to_string(),
             group_by: "host".to_string(),
-            filter: String::new(),
+            filter: None,
             placement: Placement::default(),
         }
     }
@@ -382,7 +395,7 @@ mod tests {
         assert!(widget.check(&[]).is_err());
 
         let mut widget = input();
-        widget.title = "x".repeat(101);
+        widget.title = Some("x".repeat(101));
         assert!(widget.check(&[]).is_err());
     }
 
@@ -434,17 +447,17 @@ mod tests {
     fn host() -> Variable {
         Variable {
             name: "host".to_string(),
-            label: String::new(),
+            label: None,
             kind: crate::dashboard_variables::VariableKind::Host,
-            fact: String::new(),
-            filter: String::new(),
+            fact: None,
+            filter: None,
         }
     }
 
     #[test]
     fn a_widget_can_only_use_the_dashboards_variables() {
         let mut widget = input();
-        widget.filter = "$host os=linux".to_string();
+        widget.filter = Some("$host os=linux".to_string());
         assert!(widget.check(&[host()]).is_ok());
         assert_eq!(
             widget.check(&[]),
@@ -455,8 +468,8 @@ mod tests {
     #[test]
     fn a_variable_a_widget_uses_stays() {
         let mut widget = input();
-        widget.title = "Busy".to_string();
-        widget.filter = "$host".to_string();
+        widget.title = Some("Busy".to_string());
+        widget.filter = Some("$host".to_string());
         let dashboard = Dashboard {
             id: 1,
             name: "Host".to_string(),

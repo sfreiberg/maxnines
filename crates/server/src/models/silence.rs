@@ -6,9 +6,10 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i64,
     pub rule_id: Option<i64>,
-    pub filter: String,
-    /// The one series it's for. Empty for every series.
-    pub series: String,
+    /// None for every host.
+    pub filter: Option<String>,
+    /// The one series it's for. None for every series.
+    pub series: Option<String>,
     pub reason: String,
     pub created_by: String,
     pub starts_at: DateTimeUtc,

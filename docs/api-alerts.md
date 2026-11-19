@@ -20,7 +20,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/alerts"
       "severity": "warning",
       "host_id": "22ad9264b6eb708ffdbedcd5cc073e5c",
       "hostname": "web-1",
-      "series": "",
+      "series": null,
       "value": 97.2,
       "summary": "High CPU on web-1",
       "started_at": "2026-11-06T04:44:39.545Z",
@@ -37,6 +37,11 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/alerts"
   "resolved": []
 }
 ```
+
+`rule_name` and `hostname` are what the rule and host are called now, so an alert
+from before either was renamed shows the new name, and one whose rule was deleted
+still names it. `series` is the disk, interface or check it's about, or `null` for an
+alert about the host as a whole.
 
 `started_at` is when the alert fired, and `breached_at` when its problem began, such
 as when a host went offline. An alert fires once its rule's condition has held for the

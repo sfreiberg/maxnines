@@ -112,7 +112,7 @@ struct Asked {
     origin: String,
     state: String,
     challenge: String,
-    device: String,
+    device: Option<String>,
     role: Option<Role>,
 }
 
@@ -187,7 +187,7 @@ fn approval_page(
                 ("state", &asked.state),
                 ("code_challenge", &asked.challenge),
                 ("code_challenge_method", "S256"),
-                ("device", &asked.device),
+                ("device", asked.device.as_deref().unwrap_or_default()),
                 ("role", role),
             ]),
         );
@@ -426,7 +426,7 @@ async fn sign_in_approved(state: &AppState, approval: Approval) -> Response {
         state.database.create_app_sign_in(
             approval.user_id,
             &approval.client.id,
-            &approval.device,
+            approval.device.as_deref(),
             approval.role.min(user.role),
             crate::times::now(),
         ),
@@ -532,21 +532,22 @@ async fn start_device(State(state): State<AppState>, Form(fields): Form<Fields>)
             "The device name or role isn't one that works",
         );
     };
-    let started =
-        match state
-            .pending_sign_ins
-            .start_device(client, &device, role, crate::times::now())
-        {
-            Ok(Some(started)) => started,
-            Ok(None) => {
-                return oauth_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "temporarily_unavailable",
-                    "Too many devices are waiting to be signed in. Try again in a few minutes",
-                );
-            }
-            Err(error) => return server_error(&error),
-        };
+    let started = match state.pending_sign_ins.start_device(
+        client,
+        device.as_deref(),
+        role,
+        crate::times::now(),
+    ) {
+        Ok(Some(started)) => started,
+        Ok(None) => {
+            return oauth_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily_unavailable",
+                "Too many devices are waiting to be signed in. Try again in a few minutes",
+            );
+        }
+        Err(error) => return server_error(&error),
+    };
     let page = format!("{}/device", state.web_url.trim_end_matches('/'));
     let body: Value = json!({
         "device_code": started.device_code,

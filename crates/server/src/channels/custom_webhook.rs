@@ -97,12 +97,12 @@ impl Write for Limited {
 fn example_alert() -> Alert {
     Alert {
         id: 0,
-        rule_id: None,
+        rule_id: 0,
         rule_name: "Test notification".to_string(),
         severity: Severity::Warning,
         host_id: String::new(),
         hostname: "maxnines-test".to_string(),
-        series: String::new(),
+        series: None,
         value: None,
         summary: Notice::test().text,
         started_at: crate::times::now(),
@@ -214,12 +214,12 @@ pub struct Preview {
 pub fn preview(request: &WebhookRequest, web_url: Option<&str>) -> Preview {
     let alert = Alert {
         id: 42,
-        rule_id: Some(1),
+        rule_id: 1,
         rule_name: "High CPU".to_string(),
         severity: Severity::Critical,
         host_id: "example-host-id".to_string(),
         hostname: "web-1".to_string(),
-        series: String::new(),
+        series: None,
         value: Some(97.0),
         summary: "CPU usage on web-1 is 97%, above 90%".to_string(),
         ..example_alert()
@@ -647,9 +647,9 @@ mod tests {
     #[test]
     fn templates_are_checked_when_saved() {
         assert!(CustomWebhook.check(&channel(EXAMPLE_BODY)).is_ok());
-        // Fine for an alert, but a test has no rule, so it'd be broken JSON then.
+        // Fine for most alerts, but a test has no reading, so it'd be broken JSON then.
         let error = CustomWebhook
-            .check(&channel(r#"{"rule": {{ alert.rule_id }}}"#))
+            .check(&channel(r#"{"value": {{ alert.value }}}"#))
             .unwrap_err();
         assert!(error.to_string().contains("valid JSON"), "{error}");
         assert!(CustomWebhook.check(&channel(" ")).is_err());

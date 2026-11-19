@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::calculations::Sources;
@@ -58,28 +58,29 @@ impl VariableKind {
 pub struct Variable {
     /// Written as `$name` in filters and titles.
     pub name: String,
-    /// What the picker is called. Empty uses the name.
-    #[serde(default)]
-    pub label: String,
+    /// What the picker is called. None uses the name.
+    #[serde(default, deserialize_with = "crate::text::optional")]
+    pub label: Option<String>,
     pub kind: VariableKind,
-    /// The fact whose values are offered, for a fact variable.
-    #[serde(default)]
-    pub fact: String,
-    /// Which hosts are offered, or whose values are, in the Hosts list's filter.
-    #[serde(default)]
-    pub filter: String,
+    /// The fact whose values are offered, for a fact variable. A host variable has none.
+    #[serde(default, deserialize_with = "crate::text::optional")]
+    pub fact: Option<String>,
+    /// Which hosts are offered, or whose values are, in the Hosts list's filter. None
+    /// for every host.
+    #[serde(default, deserialize_with = "crate::text::optional")]
+    pub filter: Option<String>,
 }
 
 impl Variable {
     /// Trims what was typed, and drops a fact a host variable has no use for.
     pub fn tidy(mut self) -> Self {
         self.name = self.name.trim().trim_start_matches('$').to_string();
-        self.label = self.label.trim().to_string();
+        self.label = self.label.as_deref().and_then(crate::text::trimmed);
         self.fact = match self.kind {
-            VariableKind::Host => String::new(),
-            VariableKind::Fact => self.fact.trim().to_string(),
+            VariableKind::Host => None,
+            VariableKind::Fact => self.fact.as_deref().and_then(crate::text::trimmed),
         };
-        self.filter = self.filter.trim().to_string();
+        self.filter = self.filter.as_deref().and_then(crate::text::trimmed);
         self
     }
 
@@ -99,40 +100,43 @@ impl Variable {
                 "A variable's name can be up to {MAX_NAME_LEN} characters."
             ));
         }
-        if self.label.chars().count() > MAX_LABEL_LEN {
+        if self
+            .label
+            .as_ref()
+            .is_some_and(|label| label.chars().count() > MAX_LABEL_LEN)
+        {
             return Err(format!("A label can be up to {MAX_LABEL_LEN} characters."));
         }
         if self.kind == VariableKind::Fact {
-            if self.fact.is_empty() {
+            let Some(fact) = &self.fact else {
                 return Err("Choose which fact's values to offer.".to_string());
-            }
-            if self.fact.len() > MAX_FACT_LEN {
+            };
+            if fact.len() > MAX_FACT_LEN {
                 return Err(format!(
                     "A fact's name can be up to {MAX_FACT_LEN} characters."
                 ));
             }
-            if self.fact.contains(['=', '"', '$']) || self.fact.contains(char::is_whitespace) {
+            if fact.contains(['=', '"', '$']) || fact.contains(char::is_whitespace) {
                 return Err("That isn't a fact's name.".to_string());
             }
         }
-        if self.filter.len() > MAX_FILTER_LEN {
+        let Some(filter) = &self.filter else {
+            return Ok(());
+        };
+        if filter.len() > MAX_FILTER_LEN {
             return Err(format!(
                 "A filter can be up to {MAX_FILTER_LEN} characters."
             ));
         }
-        if !uses(&self.filter).is_empty() {
+        if !uses(filter).is_empty() {
             return Err("Which hosts a variable offers can't depend on a variable.".to_string());
         }
-        HostFilter::parse(&self.filter).map(|_| ())
+        HostFilter::parse(filter).map(|_| ())
     }
 
     /// What its picker is called.
     pub fn title(&self) -> &str {
-        if self.label.is_empty() {
-            &self.name
-        } else {
-            &self.label
-        }
+        self.label.as_deref().unwrap_or(&self.name)
     }
 
     /// The parameter that carries its value in an address.
@@ -225,7 +229,7 @@ fn fleet(hosts: Vec<HostRecord>) -> impl Iterator<Item = HostRecord> {
 /// What a variable's picker offers, in order. A fact variable also offers All,
 /// which isn't in the list.
 pub async fn choices(sources: &Sources<'_>, variable: &Variable) -> Result<Vec<Choice>> {
-    let search = HostSearch::from_database(sources.database, Some(&variable.filter)).await?;
+    let search = HostSearch::from_database(sources.database, variable.filter.as_deref()).await?;
     let hosts: Vec<HostRecord> = fleet(sources.registry.list().await)
         .filter(|host| search.includes(&host.id, &host.hostname))
         .collect();
@@ -269,7 +273,8 @@ async fn fact_values(
     variable: &Variable,
     hosts: &[HostRecord],
 ) -> Result<Vec<Choice>> {
-    let fact = host_filter::fact_name(&variable.fact);
+    // A fact variable is only saved with a fact.
+    let fact = host_filter::fact_name(variable.fact.as_deref().context("no fact to offer")?);
     let facts = sources.database.facts_named(&[fact]).await?;
     let items = format!("{fact}[");
     let is_value = |name: &str| {
@@ -394,8 +399,12 @@ impl Picks {
         self.0.get(name).map(|(_, pick)| pick)
     }
 
-    /// The filter with each variable written in, or why there's nothing to show.
-    pub fn fill_filter(&self, filter: &str) -> Result<String, String> {
+    /// The filter with each variable written in, or why there's nothing to show. None
+    /// is every host.
+    pub fn fill_filter(&self, filter: Option<&str>) -> Result<Option<String>, String> {
+        let Some(filter) = filter else {
+            return Ok(None);
+        };
         let mut filled = Vec::new();
         for span in term_spans(filter) {
             let term = &filter[span];
@@ -408,10 +417,13 @@ impl Picks {
             };
             match pick {
                 Pick::All => {}
-                Pick::One(choice) => filled.push(match variable.kind {
-                    VariableKind::Host => host_filter::only(&choice.value),
-                    VariableKind::Fact => {
-                        format!("{}={}", variable.fact, written_value(&choice.value))
+                Pick::One(choice) => filled.push(match (variable.kind, &variable.fact) {
+                    (VariableKind::Host, _) => host_filter::only(&choice.value),
+                    (VariableKind::Fact, Some(fact)) => {
+                        format!("{fact}={}", written_value(&choice.value))
+                    }
+                    (VariableKind::Fact, None) => {
+                        return Err(format!("{} offers no fact.", variable.title()));
                     }
                 }),
                 Pick::Nothing => {
@@ -419,7 +431,7 @@ impl Picks {
                 }
             }
         }
-        Ok(filled.join(" "))
+        Ok(crate::text::non_blank(&filled.join(" ")))
     }
 
     /// A title with each variable's name replaced by what's picked. Longer names go
@@ -443,20 +455,20 @@ mod tests {
     fn host() -> Variable {
         Variable {
             name: "host".to_string(),
-            label: String::new(),
+            label: None,
             kind: VariableKind::Host,
-            fact: String::new(),
-            filter: String::new(),
+            fact: None,
+            filter: None,
         }
     }
 
     fn environment() -> Variable {
         Variable {
             name: "env".to_string(),
-            label: "Environment".to_string(),
+            label: Some("Environment".to_string()),
             kind: VariableKind::Fact,
-            fact: "environment".to_string(),
-            filter: String::new(),
+            fact: Some("environment".to_string()),
+            filter: None,
         }
     }
 
@@ -488,25 +500,25 @@ mod tests {
     #[test]
     fn a_fact_variable_needs_a_fact_and_a_host_variable_drops_one() {
         let mut variable = environment();
-        variable.fact = " ".to_string();
+        variable.fact = Some(" ".to_string());
         assert!(variable.tidy().check().is_err());
         let mut variable = environment();
-        variable.fact = "os name".to_string();
+        variable.fact = Some("os name".to_string());
         assert!(variable.check().is_err());
 
         let mut variable = host();
-        variable.fact = "anything".to_string();
-        assert_eq!(variable.tidy().fact, "");
+        variable.fact = Some("anything".to_string());
+        assert_eq!(variable.tidy().fact, None);
     }
 
     #[test]
     fn what_a_variable_offers_cant_depend_on_another() {
         let mut variable = host();
-        variable.filter = "os=windows".to_string();
+        variable.filter = Some("os=windows".to_string());
         assert!(variable.check().is_ok());
-        variable.filter = "$env".to_string();
+        variable.filter = Some("$env".to_string());
         assert!(variable.check().is_err());
-        variable.filter = "os=\"windows".to_string();
+        variable.filter = Some("os=\"windows".to_string());
         assert!(variable.check().is_err());
     }
 
@@ -556,8 +568,8 @@ mod tests {
             (environment(), Pick::One(choice("live east", "live east"))),
         ]);
         assert_eq!(
-            picks.fill_filter("$host os=linux $env").unwrap(),
-            "id=ab12 os=linux environment=\"live east\""
+            picks.fill_filter(Some("$host os=linux $env")).unwrap(),
+            Some("id=ab12 os=linux environment=\"live east\"".to_string())
         );
         assert_eq!(
             picks.fill_title("CPU on $host in $env"),
@@ -565,10 +577,16 @@ mod tests {
         );
 
         let picks = Picks::new([(environment(), Pick::All), (host(), Pick::Nothing)]);
-        assert_eq!(picks.fill_filter("$env os=linux").unwrap(), "os=linux");
+        assert_eq!(
+            picks.fill_filter(Some("$env os=linux")).unwrap(),
+            Some("os=linux".to_string())
+        );
+        // All of everything is every host.
+        assert_eq!(picks.fill_filter(Some("$env")).unwrap(), None);
+        assert_eq!(picks.fill_filter(None).unwrap(), None);
         assert_eq!(picks.fill_title("CPU in $env"), "CPU in All");
-        assert!(picks.fill_filter("$host").is_err());
-        assert!(picks.fill_filter("$other").is_err());
+        assert!(picks.fill_filter(Some("$host")).is_err());
+        assert!(picks.fill_filter(Some("$other")).is_err());
     }
 
     #[test]
@@ -606,7 +624,7 @@ mod tests {
         let host = |id: &str, hostname: &str| HostRecord {
             kind: crate::registration::HostKind::Agent,
             id: id.to_string(),
-            public_key: String::new(),
+            public_key: None,
             hostname: hostname.to_string(),
             state: HostState::Approved,
             decided_by: None,

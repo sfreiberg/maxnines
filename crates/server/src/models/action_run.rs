@@ -1,4 +1,7 @@
+use std::collections::BTreeMap;
+
 use sea_orm::entity::prelude::*;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "action_runs")]
@@ -9,7 +12,8 @@ pub struct Model {
     pub alert_id: Option<i64>,
     pub action: String,
     pub run_on: String,
-    pub variables: String,
+    #[sea_orm(column_type = "JsonBinary")]
+    pub variables: Variables,
     pub requested_by: Option<String>,
     pub requested_at: DateTimeUtc,
     pub timeout_secs: i64,
@@ -26,3 +30,7 @@ pub struct Model {
 pub enum Relation {}
 
 impl ActiveModelBehavior for ActiveModel {}
+
+/// What a run was given, by name, kept as a JSON object.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, FromJsonQueryResult)]
+pub struct Variables(pub BTreeMap<String, String>);

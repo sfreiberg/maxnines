@@ -25,7 +25,9 @@ Every line is a foreign key the database enforces. Types are shown simply:
 `string` has a length limit, `text` doesn't, and every `timestamp` is a moment in UTC to
 the millisecond: `timestamptz` on PostgreSQL, `DATETIME(3)` on MySQL and MariaDB, and ISO
 8601 text such as `2026-11-19T01:57:17.828+00:00` on SQLite, which has no type for it
-and sorts it as text. A length of time ending `_ms` or `_secs` is a number.
+and sorts it as text. A length of time ending `_ms` or `_secs` is a number. `json` is
+`jsonb` on PostgreSQL, `json` on MySQL and MariaDB, and text on SQLite. A column that
+can be empty is NULL when it is, never an empty string.
 
 ```mermaid
 erDiagram
@@ -35,7 +37,7 @@ erDiagram
     hosts ||--o{ metrics_pages : "is read from"
     hosts ||--o{ remote_checks : "is checked by"
     hosts ||--o{ alerts : "has"
-    alert_rules |o--o{ alerts : "raised"
+    alert_rules ||--o{ alerts : "raised"
     alert_rules ||--o{ alert_rule_channels : "tells"
     notification_channels ||--o{ alert_rule_channels : "told by"
     alert_rules ||--o{ alert_rule_actions : "runs"
@@ -69,7 +71,7 @@ erDiagram
         int id PK
         string host_id FK
         string url
-        text names "the metrics to keep, one to a line"
+        text names "the metrics to keep, one to a line, or empty for all"
         int interval_secs
         boolean enabled
         string username
@@ -123,11 +125,9 @@ erDiagram
     alerts {
         int id PK
         int rule_id FK "the rule that raised it, even once deleted"
-        string rule_name
         string severity
         string host_id FK
-        string hostname
-        string series
+        string series "empty for the host as a whole"
         double value
         text summary
         timestamp started_at "when it fired"
@@ -175,7 +175,7 @@ erDiagram
         int alert_id FK "empty for one a person started"
         string action
         string run_on "first, warning, critical or manual"
-        text variables "JSON, what it was given"
+        json variables "what it was given"
         string requested_by
         timestamp requested_at
         int timeout_secs
@@ -204,7 +204,7 @@ erDiagram
     silences {
         int id PK
         int rule_id FK "empty for every rule"
-        string filter
+        string filter "which hosts, or empty for every host"
         string series "the one series it's for, or empty"
         string reason
         string created_by
@@ -215,7 +215,7 @@ erDiagram
         int id PK
         string name
         int rule_id FK "empty for every rule"
-        string filter
+        string filter "which hosts, or empty for every host"
         string days
         string start_time
         int duration_secs
@@ -229,7 +229,7 @@ erDiagram
         boolean enabled
         string operating_systems "comma separated, or null for all"
         string built_in "key of a rule that ships with the server"
-        bigint built_in_changed_ms "when an upgrade last changed it"
+        timestamp built_in_changed_at "when an upgrade last changed it"
     }
     config_rule_settings {
         int id PK
@@ -246,12 +246,12 @@ erDiagram
     dashboard_widgets {
         int id PK
         int dashboard_id FK
-        string title
+        string title "empty uses the metric's name"
         string kind
         string metric
         string calculation
         string group_by
-        string filter
+        string filter "which hosts, or empty for every host"
         int x
         int y
         int w
@@ -262,10 +262,10 @@ erDiagram
         int dashboard_id FK
         int position
         string name
-        string label
+        string label "empty uses the name"
         string kind "host or fact"
-        string fact
-        string filter
+        string fact "empty for a host variable"
+        string filter "which hosts, or empty for every host"
     }
     users {
         int id PK
@@ -313,7 +313,7 @@ erDiagram
         int id PK
         int user_id FK
         string client_id
-        string device
+        string device "what the app calls its computer, if it said"
         string role
         string access_hash UK
         timestamp access_expires_at
@@ -353,15 +353,15 @@ erDiagram
         string kind "deploy, note or restart"
         string title
         text detail
-        string filter "which hosts"
+        string filter "which hosts, or empty for every host"
         string created_by
         timestamp created_at
     }
     location_rules {
         int id PK
         string name
-        string filter "which hosts"
-        string place
+        string filter "which hosts, or empty for every host"
+        string place "in words, if anyone said"
         double latitude
         double longitude
         int priority
@@ -409,7 +409,7 @@ erDiagram
         string subject_kind "what was changed"
         string subject_id
         string subject_name
-        text changes "before and after"
+        json changes "before and after"
     }
     proxies {
         int id PK
@@ -435,8 +435,8 @@ erDiagram
 | `host_config_status` | The config each host's agent last applied, and why if it refused one |
 | `host_boots` | When each host last started, to notice restarts |
 | `config_rules`, `config_rule_settings` | What agents monitor, chosen by operating system and facts. The server writes its built-in rules, marked by `built_in`, each time it starts |
-| `alert_rules`, `alert_rule_channels` | What raises an alert, and who hears of it. A deleted rule is kept, marked by `deleted_ms`, so its alerts still name it |
-| `alerts` | Every alert, open or resolved, with the hostname it had at the time |
+| `alert_rules`, `alert_rule_channels` | What raises an alert, and who hears of it. A deleted rule is kept, marked by `deleted_at`, so its alerts still name it |
+| `alerts` | Every alert, open or resolved. Its rule's name and its host's are read from them, so it shows what they're called now. Deleting a host deletes its alerts first |
 | `alert_rule_actions` | The actions each rule runs on an alert's host, and when in the alert's life |
 | `action_runs` | Every time an action was asked of a host, by an alert or a person, and what it printed. They go with their alert or their host |
 | `notification_channels`, `notifications` | Where alerts are sent, and each delivery with its retries. A deleted channel is kept the same way, so what was sent through it still names it |

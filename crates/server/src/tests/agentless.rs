@@ -872,7 +872,7 @@ async fn a_check_is_run_paused_and_quieted_from_its_page() {
     let about = |series: &str| crate::alerting::Alert {
         host_id: id.clone(),
         hostname: "orders-db".to_string(),
-        series: series.to_string(),
+        series: Some(series.to_string()),
         ..crate::channels::testing::alert()
     };
     let quiet = crate::silences::ActiveSilences::load(&server.state.database, crate::times::now())

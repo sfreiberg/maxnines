@@ -7,7 +7,7 @@ asks one question, using the same `metric`, `calculation`, `group_by` and `filte
 
 | Widget field | Meaning |
 | --- | --- |
-| `title` | What it's called. Empty uses the metric's name. |
+| `title` | What it's called. Left out or `null` uses the metric's name. |
 | `kind` | `chart`, `number` or `table`. Defaults to `chart`. A number always combines everything. |
 | `x`, `y`, `w`, `h` | Where it sits, in grid cells. Defaults to the top left, 6 wide and 4 high. |
 
@@ -98,10 +98,10 @@ variable that would be gone.
 | Field | Meaning |
 | --- | --- |
 | `name` | Written as `$name` in a widget's filter or title. Letters, digits and `_`, starting with a letter, up to 32. |
-| `label` | What the picker is called. Empty uses the name. |
+| `label` | What the picker is called. Left out or `null` uses the name. |
 | `kind` | `host` picks one host. `fact` picks a value of a fact, or all of them. |
-| `fact` | Which fact's values a `fact` variable offers. |
-| `filter` | Which hosts it offers, or whose values it offers. Empty for every host. |
+| `fact` | Which fact's values a `fact` variable offers. `null` for a `host` variable. |
+| `filter` | Which hosts it offers, or whose values it offers. Left out or `null` for every host. |
 
 ```sh
 curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \

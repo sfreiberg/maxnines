@@ -163,7 +163,7 @@ fn monitoring() -> FakeServer {
         ("GET", "/api/v1/alert-rules") => (200, "[]".to_string()),
         ("GET", "/api/v1/silences") => (
             200,
-            json!({"active": [], "ended": [{"id": 9, "rule_id": null, "filter": "hostname=db*", "series": "", "all_alerts": false, "reason": "Done", "created_by": "you@example.com", "starts_at": "1970-01-01T00:00:00.001Z", "ends_at": "1970-01-01T00:00:00.002Z"}]}).to_string(),
+            json!({"active": [], "ended": [{"id": 9, "rule_id": null, "filter": "hostname=db*", "series": null, "all_alerts": false, "reason": "Done", "created_by": "you@example.com", "starts_at": "1970-01-01T00:00:00.001Z", "ends_at": "1970-01-01T00:00:00.002Z"}]}).to_string(),
         ),
         ("POST", "/api/v1/silences") => (201, json!({"id": 57}).to_string()),
         ("POST", "/api/v1/alerts/41/acknowledge") => (204, String::new()),

@@ -833,7 +833,7 @@ mod variables {
         assert_eq!(page.status, 303, "{}", page.body);
         let saved = &database.get_dashboard(id).await.unwrap().unwrap().variables;
         assert_eq!(saved[0].name, "env");
-        assert_eq!(saved[0].fact, "environment");
+        assert_eq!(saved[0].fact.as_deref(), Some("environment"));
 
         let edit = browser
             .get(&server, &format!("/dashboards/{id}/edit"))
@@ -1058,7 +1058,7 @@ mod calculation_alerts {
 
         let alerts = open_alerts(&server).await;
         assert_eq!(alerts.len(), 1, "web averages 20%, and db 80%");
-        assert_eq!(alerts[0].series, "db");
+        assert_eq!(alerts[0].series.as_deref(), Some("db"));
     }
 
     #[tokio::test]

@@ -17,7 +17,7 @@ use crate::times::Timestamp;
 fn to_silence(row: silence::Model) -> Silence {
     Silence {
         id: row.id,
-        all_alerts: row.rule_id.is_none() && row.filter.is_empty() && row.series.is_empty(),
+        all_alerts: row.rule_id.is_none() && row.filter.is_none() && row.series.is_none(),
         rule_id: row.rule_id,
         filter: row.filter,
         series: row.series,
@@ -97,8 +97,8 @@ impl Database {
     ) -> Result<i64> {
         let row = silence::ActiveModel {
             rule_id: Set(input.rule_id),
-            filter: Set(input.filter.trim().to_string()),
-            series: Set(input.series.trim().to_string()),
+            filter: Set(input.filter.as_deref().and_then(crate::text::trimmed)),
+            series: Set(input.series.as_deref().and_then(crate::text::trimmed)),
             reason: Set(input.reason.trim().to_string()),
             created_by: Set(by.to_string()),
             starts_at: Set(now),

@@ -305,17 +305,18 @@ async fn alerts_and_updates_are_on_the_timeline_too() {
     let rule = server
         .state
         .database
-        .create_alert_rule(&super::alerting::cpu_rule())
+        .create_alert_rule(&crate::alerting::AlertRuleInput {
+            name: "Disk getting full".to_string(),
+            ..super::alerting::cpu_rule()
+        })
         .await
         .unwrap();
     let started = crate::times::now() - TimeDelta::minutes(1);
     let new = NewAlert {
         rule_id: rule,
-        rule_name: "Disk filling up".into(),
         severity: Severity::Warning,
         host_id: host.id(),
-        hostname: "web-1".into(),
-        series: "/".into(),
+        series: Some("/".into()),
         value: Some(85.0),
         summary: "Disk usage of / is 85%".into(),
         started_at: started,
@@ -337,7 +338,7 @@ async fn alerts_and_updates_are_on_the_timeline_too() {
     assert_eq!(kinds, ["update", "resolved", "alert"], "{events:?}");
     assert_eq!(events[0]["title"], "Agent updated to 0.2.0");
     assert_eq!(events[0]["detail"], "It was 0.1.0.");
-    assert_eq!(events[2]["title"], "Disk filling up (warning)");
+    assert_eq!(events[2]["title"], "Disk getting full (warning)");
     assert_eq!(events[2]["detail"], "Disk usage of / is 85%");
     // Only recorded events can be deleted.
     assert!(events.iter().all(|event| event["id"].is_null()));

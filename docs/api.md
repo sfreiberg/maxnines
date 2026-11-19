@@ -48,6 +48,10 @@ host, keys shouldn't cross the network in the clear.
 **Requests and responses.** Requests with a body are JSON, with
 `Content-Type: application/json`. Responses are JSON unless noted.
 
+**Nothing** is `null`. Text that can be left out, such as a filter or a series, is
+`null` when there's none, never an empty string. Sending it, leave it out, send `null`,
+or send it empty or only spaces, which all mean none.
+
 **Times** are ISO 8601 in UTC, to the millisecond, such as `2026-11-19T01:57:17.828Z`,
 and are given the same way, with any offset. They're in fields ending in `_at`, except
 where a word reads better: a range of time is `from` and `to`, and a metric's point is

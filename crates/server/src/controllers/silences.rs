@@ -61,12 +61,8 @@ async fn rows(state: &AppState, silences: Vec<Silence>) -> anyhow::Result<Vec<Si
             rule: silence.rule_id.map_or("Every rule".to_string(), |id| {
                 rule_name(id).unwrap_or_default()
             }),
-            hosts: if silence.filter.is_empty() {
-                "Every host".to_string()
-            } else {
-                silence.filter
-            },
-            series: Some(silence.series).filter(|series| !series.is_empty()),
+            hosts: silence.filter.unwrap_or_else(|| "Every host".to_string()),
+            series: silence.series,
             reason: silence.reason,
             created_by: silence.created_by,
             starts: local_time(silence.starts_at),
@@ -102,11 +98,10 @@ async fn window_rows(
                 .window
                 .rule_id
                 .map_or("Every rule".to_string(), rule_name),
-            hosts: if window.window.filter.is_empty() {
-                "Every host".to_string()
-            } else {
-                window.window.filter
-            },
+            hosts: window
+                .window
+                .filter
+                .unwrap_or_else(|| "Every host".to_string()),
             name: window.window.name,
         })
         .collect())
@@ -224,8 +219,8 @@ fn input_from(silence: &SilenceForm) -> Result<SilenceInput, String> {
         .ok_or_else(|| "Choose how long it lasts.".to_string())?;
     Ok(SilenceInput {
         rule_id,
-        filter: silence.filter.clone(),
-        series: silence.series.clone(),
+        filter: crate::text::non_blank(&silence.filter),
+        series: crate::text::non_blank(&silence.series),
         all_alerts: silence.all_alerts,
         reason: silence.reason.clone(),
         duration,

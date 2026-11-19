@@ -13,6 +13,7 @@ use sea_orm::{
 };
 use serde_json::json;
 
+use super::alerting::to_alerts;
 use super::audit::record_change;
 use super::{Database, alert, event, host_boot, host_fact, to_fact_version};
 use crate::audit::{self, Kind, Snapshot};
@@ -64,8 +65,8 @@ pub struct NewEvent<'a> {
     pub occurred_at: Timestamp,
     pub title: &'a str,
     pub detail: Option<&'a str>,
-    /// Which hosts it's for, as a host filter. Empty for every host.
-    pub filter: &'a str,
+    /// Which hosts it's for, as a host filter. None for every host.
+    pub filter: Option<&'a str>,
 }
 
 async fn insert_event<C: ConnectionTrait>(
@@ -79,7 +80,7 @@ async fn insert_event<C: ConnectionTrait>(
         kind: Set(new.kind.as_str().to_string()),
         title: Set(new.title.to_string()),
         detail: Set(new.detail.map(str::to_string)),
-        filter: Set(new.filter.to_string()),
+        filter: Set(new.filter.map(str::to_string)),
         created_by: Set(by.to_string()),
         created_at: Set(now),
         ..Default::default()
@@ -123,7 +124,7 @@ impl Database {
             occurred_at,
             title,
             detail,
-            filter: &filter,
+            filter: Some(&filter),
         };
         insert_event(&self.connection, &new, SERVER, now).await?;
         Ok(())
@@ -193,7 +194,7 @@ impl Database {
         host_id: &str,
         from: Timestamp,
         to: Timestamp,
-        picks: impl Fn(&str) -> bool,
+        picks: impl Fn(Option<&str>) -> bool,
     ) -> Result<Vec<TimelineEvent>> {
         let mut timeline = Vec::new();
 
@@ -208,7 +209,7 @@ impl Database {
         timeline.extend(
             recorded
                 .into_iter()
-                .filter(|row| picks(&row.filter))
+                .filter(|row| picks(row.filter.as_deref()))
                 .take(MAX_TIMELINE as usize)
                 .map(|row| TimelineEvent {
                     occurred_at: row.occurred_at,
@@ -234,8 +235,8 @@ impl Database {
             .all(&self.connection)
             .await
             .context("loading a host's alerts")?;
-        for row in alerts {
-            let title = format!("{} ({})", row.rule_name, row.severity);
+        for row in to_alerts(&self.connection, alerts).await? {
+            let title = format!("{} ({})", row.rule_name, row.severity.as_str());
             if (from..to).contains(&row.started_at) {
                 timeline.push(TimelineEvent {
                     occurred_at: row.started_at,
@@ -341,7 +342,7 @@ impl Database {
                 occurred_at: booted_at,
                 title: "Host started",
                 detail: None,
-                filter: &filter,
+                filter: Some(&filter),
             };
             insert_event(&transaction, &new, SERVER, now).await?;
         }

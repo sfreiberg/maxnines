@@ -29,7 +29,8 @@ pub struct AppSignIn {
     pub client_id: String,
     /// The app's name, such as "MaxNines command line".
     pub app: String,
-    pub device: String,
+    /// What the app calls the computer it's on, if it said.
+    pub device: Option<String>,
     /// The most it may do. It never does more than its owner can now.
     pub role: Role,
     pub created_at: Timestamp,
@@ -69,10 +70,9 @@ impl AppSignIn {
 
     /// What it's called where it's listed, and in the audit log.
     pub fn title(&self) -> String {
-        if self.device.is_empty() {
-            self.app.clone()
-        } else {
-            format!("{} on {}", self.app, self.device)
+        match &self.device {
+            Some(device) => format!("{} on {device}", self.app),
+            None => self.app.clone(),
         }
     }
 }
@@ -103,10 +103,9 @@ fn snapshot(row: &app_sign_in::Model, owner: &str) -> Snapshot {
         "role": row.role,
         "revoked": row.revoked_at.is_some(),
     });
-    let name = if row.device.is_empty() {
-        app.to_string()
-    } else {
-        format!("{app} on {}", row.device)
+    let name = match &row.device {
+        Some(device) => format!("{app} on {device}"),
+        None => app.to_string(),
     };
     Snapshot::new(name, fields)
 }
@@ -138,7 +137,7 @@ impl Database {
         &self,
         user_id: i64,
         client_id: &str,
-        device: &str,
+        device: Option<&str>,
         role: Role,
         now: Timestamp,
     ) -> Result<(AppSignIn, AppTokens)> {
@@ -166,7 +165,7 @@ impl Database {
         let row = app_sign_in::ActiveModel {
             user_id: Set(user_id),
             client_id: Set(client_id.to_string()),
-            device: Set(device.to_string()),
+            device: Set(device.map(str::to_string)),
             role: Set(role.as_str().to_string()),
             access_hash: Set(secret_hash(&tokens.access_token)),
             access_expires_at: Set(now + ACCESS_LIFETIME),

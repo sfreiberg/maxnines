@@ -20,12 +20,12 @@ const MAX_PLACE_CHARS: usize = 255;
 pub struct LocationRuleInput {
     /// What the map calls the hosts it covers, such as "Leeds office".
     pub name: String,
-    /// Which hosts, in the same form as the Hosts list. Every host, if empty.
-    #[serde(default)]
-    pub filter: String,
-    /// Where it is in words, such as "Leeds, England, United Kingdom".
-    #[serde(default)]
-    pub place: String,
+    /// Which hosts, in the same form as the Hosts list. Every host, if none.
+    #[serde(default, deserialize_with = "crate::text::optional")]
+    pub filter: Option<String>,
+    /// Where it is in words, such as "Leeds, England, United Kingdom", if anyone said.
+    #[serde(default, deserialize_with = "crate::text::optional")]
+    pub place: Option<String>,
     pub latitude: f64,
     pub longitude: f64,
     /// When several rules match a host, the highest wins.
@@ -47,10 +47,14 @@ pub fn check_rule(input: &LocationRuleInput) -> Result<()> {
     if input.name.chars().count() > MAX_NAME_CHARS {
         bail!("The name is too long. It can be up to {MAX_NAME_CHARS} characters.");
     }
-    if input.place.chars().count() > MAX_PLACE_CHARS {
+    if input
+        .place
+        .as_ref()
+        .is_some_and(|place| place.chars().count() > MAX_PLACE_CHARS)
+    {
         bail!("The place is too long. It can be up to {MAX_PLACE_CHARS} characters.");
     }
-    check_filter(&input.filter)?;
+    check_filter(input.filter.as_deref())?;
     if !(input.latitude.is_finite() && (-90.0..=90.0).contains(&input.latitude)) {
         bail!("The latitude has to be between -90 and 90.");
     }
@@ -78,7 +82,7 @@ impl Locator {
             // A rule's filter was checked when it was saved. One that no longer reads,
             // after the filter language changed, places nothing rather than everything.
             .filter_map(|rule| {
-                let filter = HostFilter::parse(&rule.rule.filter).ok()?;
+                let filter = HostFilter::parse_optional(rule.rule.filter.as_deref()).ok()?;
                 Some((rule, filter))
             })
             .collect();
@@ -120,8 +124,8 @@ mod tests {
     fn input(name: &str, filter: &str, priority: i32) -> LocationRuleInput {
         LocationRuleInput {
             name: name.to_string(),
-            filter: filter.to_string(),
-            place: "Leeds, England, United Kingdom".to_string(),
+            filter: crate::text::non_blank(filter),
+            place: Some("Leeds, England, United Kingdom".to_string()),
             latitude: 53.8,
             longitude: -1.55,
             priority,

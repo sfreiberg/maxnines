@@ -52,7 +52,7 @@ struct AnnotationRow {
     kind_label: &'static str,
     title: String,
     detail: Option<String>,
-    filter: String,
+    filter: Option<String>,
     created_by: String,
 }
 

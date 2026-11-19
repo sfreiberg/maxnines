@@ -16,7 +16,7 @@ use serde_json::json;
 use super::actions::to_run;
 use super::audit::{record, record_change};
 use super::{
-    Database, action_run, alert, alert_rule, alert_rule_action, alert_rule_channel,
+    Database, action_run, alert, alert_rule, alert_rule_action, alert_rule_channel, host,
     maintenance_window, notification, notification_channel, silence,
 };
 use crate::actions::{ActionRun, RuleAction, RunOn};
@@ -210,14 +210,70 @@ fn to_channel(row: notification_channel::Model) -> Result<Channel> {
     })
 }
 
-fn to_alert(row: alert::Model) -> Result<Alert> {
+/// Alerts as they're shown, named by their rule and host as those are called now. The
+/// names are read for every alert at once, rather than for each in turn.
+pub(super) async fn to_alerts<C: ConnectionTrait>(
+    connection: &C,
+    rows: Vec<alert::Model>,
+) -> Result<Vec<Alert>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rule_ids: BTreeSet<i64> = rows.iter().map(|row| row.rule_id).collect();
+    let host_ids: BTreeSet<&str> = rows.iter().map(|row| row.host_id.as_str()).collect();
+    // A deleted rule is only marked so, and its alerts still go by its name.
+    let rule_names: BTreeMap<i64, String> = alert_rule::Entity::find()
+        .select_only()
+        .column(alert_rule::Column::Id)
+        .column(alert_rule::Column::Name)
+        .filter(alert_rule::Column::Id.is_in(rule_ids))
+        .into_tuple()
+        .all(connection)
+        .await
+        .context("loading the names of alerts' rules")?
+        .into_iter()
+        .collect();
+    let hostnames: BTreeMap<String, String> = host::Entity::find()
+        .select_only()
+        .column(host::Column::Id)
+        .column(host::Column::Hostname)
+        .filter(host::Column::Id.is_in(host_ids))
+        .into_tuple()
+        .all(connection)
+        .await
+        .context("loading the names of alerts' hosts")?
+        .into_iter()
+        .collect();
+    rows.into_iter()
+        .map(|row| to_alert(row, &rule_names, &hostnames))
+        .collect()
+}
+
+/// One alert, as [`to_alerts`] reads them.
+async fn to_one_alert<C: ConnectionTrait>(connection: &C, row: alert::Model) -> Result<Alert> {
+    let mut alerts = to_alerts(connection, vec![row]).await?;
+    alerts.pop().context("reading an alert")
+}
+
+fn to_alert(
+    row: alert::Model,
+    rule_names: &BTreeMap<i64, String>,
+    hostnames: &BTreeMap<String, String>,
+) -> Result<Alert> {
+    // Foreign keys keep both there.
+    let rule_name = rule_names
+        .get(&row.rule_id)
+        .with_context(|| format!("alert {} has no rule", row.id))?;
+    let hostname = hostnames
+        .get(&row.host_id)
+        .with_context(|| format!("alert {} has no host", row.id))?;
     Ok(Alert {
         id: row.id,
         rule_id: row.rule_id,
-        rule_name: row.rule_name,
+        rule_name: rule_name.clone(),
         severity: Severity::parse(&row.severity)?,
         host_id: row.host_id,
-        hostname: row.hostname,
+        hostname: hostname.clone(),
         series: row.series,
         value: row.value,
         summary: row.summary,
@@ -754,12 +810,13 @@ async fn record_channel<C: ConnectionTrait>(
 }
 
 /// An alert, named by its rule and host as the alerts page shows it.
-fn alert_subject(row: &alert::Model) -> Subject {
-    Subject::new(
+async fn alert_subject<C: ConnectionTrait>(connection: &C, row: alert::Model) -> Result<Subject> {
+    let alert = to_one_alert(connection, row).await?;
+    Ok(Subject::new(
         Kind::Alert,
-        row.id,
-        format!("{} on {}", row.rule_name, row.hostname),
-    )
+        alert.id,
+        format!("{} on {}", alert.rule_name, alert.hostname),
+    ))
 }
 
 /// Ends an alert within a transaction: see [`Database::resolve_alert`].
@@ -821,7 +878,7 @@ impl Database {
             .all(&self.connection)
             .await
             .context("loading alerts")?;
-        rows.into_iter().map(to_alert).collect()
+        to_alerts(&self.connection, rows).await
     }
 
     /// The newest alerts that have ended.
@@ -834,18 +891,16 @@ impl Database {
             .all(&self.connection)
             .await
             .context("loading alerts")?;
-        rows.into_iter().map(to_alert).collect()
+        to_alerts(&self.connection, rows).await
     }
 
     /// Starts an alert and queues its notifications together, so an alert can't
     /// exist without them.
     pub async fn fire_alert(&self, new: &NewAlert, channels: &[i64]) -> Result<i64> {
         let row = alert::ActiveModel {
-            rule_id: Set(Some(new.rule_id)),
-            rule_name: Set(new.rule_name.clone()),
+            rule_id: Set(new.rule_id),
             severity: Set(new.severity.as_str().to_string()),
             host_id: Set(new.host_id.clone()),
-            hostname: Set(new.hostname.clone()),
             series: Set(new.series.clone()),
             value: Set(new.value),
             summary: Set(new.summary.clone()),
@@ -1082,14 +1137,16 @@ impl Database {
         }
 
         let alert_ids: BTreeSet<i64> = due.iter().map(|row| row.alert_id).collect();
-        let alerts: BTreeMap<i64, Alert> = alert::Entity::find()
+        let rows = alert::Entity::find()
             .filter(alert::Column::Id.is_in(alert_ids))
             .all(&self.connection)
             .await
-            .context("loading alerts")?
+            .context("loading alerts")?;
+        let alerts: BTreeMap<i64, Alert> = to_alerts(&self.connection, rows)
+            .await?
             .into_iter()
-            .map(|row| to_alert(row).map(|alert| (alert.id, alert)))
-            .collect::<Result<_>>()?;
+            .map(|alert| (alert.id, alert))
+            .collect();
         let channels: BTreeMap<i64, Channel> = self
             .list_channels()
             .await?
@@ -1160,7 +1217,10 @@ impl Database {
             .one(&self.connection)
             .await
             .context("loading alert")?;
-        row.map(to_alert).transpose()
+        match row {
+            Some(row) => Ok(Some(to_one_alert(&self.connection, row).await?)),
+            None => Ok(None),
+        }
     }
 
     pub async fn acknowledge_alert(&self, id: i64, by: &str, now: Timestamp) -> Result<bool> {
@@ -1182,7 +1242,8 @@ impl Database {
             .await
             .context("saving alert")?;
         if updated.rows_affected > 0 {
-            let entry = Record::new(Action::Acknowledged, alert_subject(&firing));
+            let subject = alert_subject(&transaction, firing).await?;
+            let entry = Record::new(Action::Acknowledged, subject);
             record(&transaction, entry).await?;
         }
         transaction.commit().await.context("saving alert")?;
@@ -1211,7 +1272,8 @@ impl Database {
             .await
             .context("saving alert")?;
         if firing.acknowledged_at.is_some() {
-            let entry = Record::new(Action::Unacknowledged, alert_subject(&firing));
+            let subject = alert_subject(&transaction, firing).await?;
+            let entry = Record::new(Action::Unacknowledged, subject);
             record(&transaction, entry).await?;
         }
         transaction.commit().await.context("saving alert")?;
@@ -1240,10 +1302,12 @@ impl Database {
             .all(&self.connection)
             .await
             .context("loading alerts")?;
-        rows.into_iter()
-            .filter_map(|row| Some((rules.get(&row.rule_id?).copied()?, row)))
-            .map(|(every, row)| Ok((to_alert(row)?, every)))
-            .collect()
+        let alerts = to_alerts(&self.connection, rows).await?;
+        Ok(alerts
+            .into_iter()
+            .filter_map(|alert| Some((rules.get(&alert.rule_id).copied()?, alert)))
+            .map(|(every, alert)| (alert, every))
+            .collect())
     }
 
     /// Queues a reminder for each channel that was told an alert started and hasn't heard
@@ -1386,13 +1450,14 @@ impl Database {
             .all(&self.connection)
             .await
             .context("loading alerts")?;
-        alerts
+        let alerts = to_alerts(&self.connection, alerts).await?;
+        Ok(alerts
             .into_iter()
-            .map(|row| {
-                let ids = held.remove(&row.id).unwrap_or_default();
-                Ok((to_alert(row)?, ids))
+            .map(|alert| {
+                let ids = held.remove(&alert.id).unwrap_or_default();
+                (alert, ids)
             })
-            .collect()
+            .collect())
     }
 
     /// Lets held notifications go. The day they get to arrive starts now, however long

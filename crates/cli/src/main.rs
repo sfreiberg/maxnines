@@ -711,9 +711,11 @@ fn silence(api: &Api, args: SilenceArgs, format: Format) -> Result<()> {
         (Some(SilenceKind::Alert), Some(id)) => {
             let found = kinds::fetch(api, Kind::Alerts, &[id.to_string()], &Options::default())?;
             let alert = &found[0];
+            // Every alert has a rule, even once it's deleted. Without one this would be
+            // a silence for every rule on the host.
             let Some(rule) = alert["rule_id"].as_i64() else {
                 return Err(Failure::refused(
-                    "That alert's rule has been deleted, so a silence has nothing to name",
+                    "The server didn't say which rule that alert is from",
                 )
                 .into());
             };

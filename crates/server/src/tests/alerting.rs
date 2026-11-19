@@ -365,7 +365,12 @@ async fn each_series_alerts_separately() {
     test.script.set(readings);
     test.evaluate(TimeDelta::zero()).await;
 
-    let mut series: Vec<String> = test.open().await.into_iter().map(|a| a.series).collect();
+    let mut series: Vec<String> = test
+        .open()
+        .await
+        .into_iter()
+        .filter_map(|a| a.series)
+        .collect();
     series.sort();
     assert_eq!(series, ["/", "/data"]);
 }
@@ -390,7 +395,7 @@ async fn a_rule_can_be_limited_to_some_series() {
 
     let open = test.open().await;
     assert_eq!(open.len(), 1);
-    assert_eq!(open[0].series, "/data/logs");
+    assert_eq!(open[0].series.as_deref(), Some("/data/logs"));
 }
 
 #[tokio::test]
@@ -471,9 +476,9 @@ async fn deleting_a_rule_closes_its_alerts_and_keeps_the_history_pointing_at_it(
     test.cpu(TimeDelta::zero(), 95.0).await;
     let silence = SilenceInput {
         rule_id: Some(id),
-        filter: String::new(),
+        filter: None,
         all_alerts: false,
-        series: String::new(),
+        series: None,
         reason: "Upgrading".to_string(),
         duration: TimeDelta::seconds(3600),
     };
@@ -489,7 +494,7 @@ async fn deleting_a_rule_closes_its_alerts_and_keeps_the_history_pointing_at_it(
     let window = MaintenanceWindowInput {
         name: "Patching".to_string(),
         rule_id: Some(id),
-        filter: String::new(),
+        filter: None,
         all_alerts: false,
         days: vec!["sun".to_string()],
         start_time: "02:00".to_string(),
@@ -503,7 +508,7 @@ async fn deleting_a_rule_closes_its_alerts_and_keeps_the_history_pointing_at_it(
 
     assert!(test.open().await.is_empty());
     let resolved = test.resolved().await;
-    assert_eq!(resolved[0].rule_id, Some(id), "it still says which rule");
+    assert_eq!(resolved[0].rule_id, id, "it still says which rule");
     assert_eq!(resolved[0].rule_name, "High CPU");
 
     let database = test.database();
@@ -728,9 +733,10 @@ async fn names_agents_choose_are_cleaned_before_they_are_kept() {
 
     let open = test.open().await;
     assert_eq!(open.len(), 1, "the cleaned name still matches itself");
-    assert!(!open[0].series.chars().any(char::is_control));
+    let series = open[0].series.as_deref().unwrap();
+    assert!(!series.chars().any(char::is_control));
     assert!(!open[0].summary.chars().any(char::is_control));
-    assert_eq!(open[0].series.chars().count(), 255);
+    assert_eq!(series.chars().count(), 255);
 }
 
 #[tokio::test]
@@ -779,7 +785,7 @@ async fn an_agent_going_offline_alerts_after_the_wait() {
     let open = test.open().await;
     assert_eq!(open.len(), 1);
     assert_eq!(open[0].summary, "web-1 is offline");
-    assert_eq!(open[0].series, "");
+    assert_eq!(open[0].series, None);
 
     // The pages say how long, and since when in the viewer's time zone, which is
     // UTC here. The clock hasn't moved on as far as the test pretends.
@@ -933,7 +939,7 @@ async fn a_failing_container_alerts_after_a_minute() {
 
     let open = test.open().await;
     assert_eq!(open.len(), 1, "{open:?}");
-    assert_eq!(open[0].series, "web");
+    assert_eq!(open[0].series.as_deref(), Some("web"));
     assert_eq!(open[0].severity, Severity::Critical);
 }
 
@@ -3136,10 +3142,10 @@ async fn silencing_from_slack_covers_just_that_alert_for_an_hour() {
         .unwrap();
     assert_eq!(silences.len(), 1, "{silences:?}");
     let silence = &silences[0];
-    assert_eq!(silence.rule_id, test.open().await[0].rule_id);
+    assert_eq!(silence.rule_id, Some(test.open().await[0].rule_id));
     assert_eq!(
         silence.filter,
-        format!("id={}", test.open().await[0].host_id),
+        Some(format!("id={}", test.open().await[0].host_id)),
         "by ID, as another machine could share the name"
     );
     assert_eq!(silence.created_by, SLACK_MEMBER);
@@ -3734,11 +3740,9 @@ async fn a_channel_that_is_down_does_not_hold_up_the_others() {
     // One alert per disk on the test's agent, as alerts belong to registered agents.
     let alert = |series: &str| NewAlert {
         rule_id: rule,
-        rule_name: "Disk full".to_string(),
         severity: Severity::Critical,
         host_id: test.id(),
-        hostname: "web-1".to_string(),
-        series: series.to_string(),
+        series: Some(series.to_string()),
         value: Some(99.0),
         summary: format!("{series} on web-1 is 99% full"),
         started_at: test.now,
@@ -4933,6 +4937,7 @@ async fn names_from_agents_are_escaped_on_the_alerts_page() {
         .state
         .database
         .create_alert_rule(&AlertRuleInput {
+            name: "<b>rule</b>".to_string(),
             hold: TimeDelta::seconds(0),
             ..offline_rule()
         })
@@ -4944,11 +4949,9 @@ async fn names_from_agents_are_escaped_on_the_alerts_page() {
         .fire_alert(
             &crate::alerting::NewAlert {
                 rule_id,
-                rule_name: "<b>rule</b>".to_string(),
                 severity: Severity::Warning,
                 host_id: host.id(),
-                hostname: hostname.to_string(),
-                series: "<i>series</i>".to_string(),
+                series: Some("<i>series</i>".to_string()),
                 value: None,
                 summary: format!("{hostname} is offline"),
                 started_at: crate::times::from_ms(1000),
@@ -5024,11 +5027,11 @@ async fn deleting_an_agent_takes_everything_about_it_once_it_is_revoked() {
     };
     send(client, &facts).await;
     test.server.wait_for_facts(&id, 1).await;
-    for filter in [crate::host_filter::only(&id), String::new()] {
+    for filter in [Some(crate::host_filter::only(&id)), None] {
         let place = crate::locations::LocationRuleInput {
             name: "Leeds".to_string(),
             filter,
-            place: String::new(),
+            place: None,
             latitude: 53.8,
             longitude: -1.5,
             priority: 0,
@@ -5744,9 +5747,9 @@ mod silences {
     fn silence(filter: &str) -> SilenceInput {
         SilenceInput {
             rule_id: None,
-            filter: filter.to_string(),
+            filter: crate::text::non_blank(filter),
             all_alerts: filter.is_empty(),
-            series: String::new(),
+            series: None,
             reason: "Upgrading".to_string(),
             duration: HOUR,
         }
@@ -5793,7 +5796,7 @@ mod silences {
         let mut test = Harness::start().await;
         let hook = FakeOnCall::default();
         let notifier = on_a_webhook(&mut test, &hook).await;
-        let rule = test.open().await[0].rule_id.unwrap();
+        let rule = test.open().await[0].rule_id;
         let silence = SilenceInput {
             rule_id: Some(rule),
             ..silence("")
@@ -6321,11 +6324,9 @@ mod silences {
         let rule = database.create_alert_rule(&cpu_rule()).await.unwrap();
         let new = crate::alerting::NewAlert {
             rule_id: rule,
-            rule_name: "Service stopped".to_string(),
             severity: crate::alerting::Severity::Critical,
             host_id: crate::remote_checks::FLEET_HOST_ID.to_string(),
-            hostname: "Fleet".to_string(),
-            series: "nginx.service".to_string(),
+            series: Some("nginx.service".to_string()),
             value: Some(0.0),
             summary: "Service nginx.service is failed".to_string(),
             started_at: crate::times::now() - TimeDelta::seconds(30),
@@ -6371,7 +6372,7 @@ mod maintenance_windows {
         MaintenanceWindowInput {
             name: "Patching".to_string(),
             rule_id: None,
-            filter: String::new(),
+            filter: None,
             all_alerts: true,
             days: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
                 .map(String::from)
@@ -6414,7 +6415,7 @@ mod maintenance_windows {
     async fn a_window_only_covers_its_hosts() {
         let mut test = Harness::start().await;
         let input = MaintenanceWindowInput {
-            filter: "hostname=db*".to_string(),
+            filter: Some("hostname=db*".to_string()),
             ..all_day()
         };
         test.database()
@@ -6780,9 +6781,9 @@ mod reminders {
         let notifier = firing(&mut test, &hook, ChannelKind::Webhook, "").await;
         let input = SilenceInput {
             rule_id: None,
-            filter: String::new(),
+            filter: None,
             all_alerts: true,
-            series: String::new(),
+            series: None,
             reason: "Upgrading".to_string(),
             duration: TimeDelta::seconds(3 * 3600),
         };
@@ -6950,11 +6951,9 @@ mod pages {
     fn alert(rule_id: i64, host: &Identity, severity: Severity, summary: &str) -> NewAlert {
         NewAlert {
             rule_id,
-            rule_name: "Rule".to_string(),
             severity,
             host_id: host.id(),
-            hostname: "web-1".to_string(),
-            series: String::new(),
+            series: None,
             value: None,
             summary: summary.to_string(),
             started_at: crate::times::from_ms(1000),
@@ -7741,11 +7740,9 @@ mod charts {
         let rule_id = database.create_alert_rule(&rule).await.unwrap();
         let new = NewAlert {
             rule_id,
-            rule_name: rule.name,
             severity: Severity::Critical,
             host_id: host.id(),
-            hostname: "web-1".to_string(),
-            series: series.to_string(),
+            series: Some(series.to_string()),
             value: Some(95.0),
             summary: format!("Disk usage ({series}) on web-1 is 95%, above 90%"),
             started_at: crate::times::now() - TimeDelta::seconds(30),
@@ -7821,8 +7818,8 @@ mod charts {
             .await
             .unwrap();
         let offline = Alert {
-            rule_id: Some(rule),
-            series: String::new(),
+            rule_id: rule,
+            series: None,
             ..alert
         };
         assert!(charts.draw(&offline, now).await.unwrap().is_none());
@@ -7899,11 +7896,9 @@ mod charts {
         let rule_id = database.create_alert_rule(&offline_rule()).await.unwrap();
         let new = NewAlert {
             rule_id,
-            rule_name: "Gone".to_string(),
             severity: Severity::Critical,
             host_id: host.id(),
-            hostname: "web-1".to_string(),
-            series: String::new(),
+            series: None,
             value: None,
             summary: "web-1 is offline".to_string(),
             started_at: crate::times::now() - TimeDelta::seconds(30),
@@ -8578,7 +8573,7 @@ async fn the_built_in_forecast_warns_a_day_ahead_and_goes_critical_four_hours_ah
     assert_eq!(open.len(), 1, "{open:?}");
     assert_eq!(open[0].rule_name, DISK_FORECAST);
     assert_eq!(open[0].severity, Severity::Warning);
-    assert_eq!(open[0].series, "/");
+    assert_eq!(open[0].series.as_deref(), Some("/"));
     assert_eq!(open[0].value, Some(90.0));
     assert_eq!(
         open[0].summary,
@@ -8779,7 +8774,7 @@ async fn a_forecast_rule_can_be_made_on_the_form_and_through_the_api() {
 fn alert_about(host_id: &str, rule_id: i64) -> crate::alerting::Alert {
     crate::alerting::Alert {
         host_id: host_id.to_string(),
-        rule_id: Some(rule_id),
+        rule_id,
         ..crate::channels::testing::alert()
     }
 }
@@ -8830,7 +8825,7 @@ async fn a_host_can_be_quieted_from_its_page_and_brought_back() {
         panic!("{silences:?}");
     };
     assert_eq!(silence.rule_id, None);
-    assert_eq!(silence.filter, crate::host_filter::only(&id));
+    assert_eq!(silence.filter, Some(crate::host_filter::only(&id)));
     assert_eq!(silence.reason, "Maintenance on web-1");
     assert_eq!(silence.ends_at - silence.starts_at, TimeDelta::hours(2));
     assert!(held(&server, &alert_about(&id, 1)).await);
@@ -8882,9 +8877,9 @@ async fn a_host_page_names_a_wider_silence_but_leaves_ending_it_to_its_page() {
     let id = host.id();
     let everything = crate::silences::SilenceInput {
         rule_id: None,
-        filter: String::new(),
+        filter: None,
         all_alerts: true,
-        series: String::new(),
+        series: None,
         reason: "Moving data centres".to_string(),
         duration: TimeDelta::seconds(3600),
     };
@@ -8903,9 +8898,9 @@ async fn a_host_page_names_a_wider_silence_but_leaves_ending_it_to_its_page() {
         .unwrap();
     let one_rule = crate::silences::SilenceInput {
         rule_id: Some(rule),
-        filter: crate::host_filter::only(&id),
+        filter: Some(crate::host_filter::only(&id)),
         all_alerts: false,
-        series: String::new(),
+        series: None,
         reason: "Noisy CPU rule".to_string(),
         duration: TimeDelta::seconds(7200),
     };

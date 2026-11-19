@@ -321,8 +321,8 @@ async fn nothing_is_recorded_for_a_change_that_changes_nothing() {
     let database = &server.state.database;
     let input = LocationRuleInput {
         name: "Office".into(),
-        filter: String::new(),
-        place: "London".into(),
+        filter: None,
+        place: Some("London".into()),
         latitude: 51.5,
         longitude: -0.1,
         priority: 0,
@@ -428,7 +428,7 @@ async fn an_agent_asking_to_join_is_recorded_as_maxnines() {
     let record = HostRecord {
         kind: crate::registration::HostKind::Agent,
         id: "ab".repeat(16),
-        public_key: "cd".repeat(32),
+        public_key: Some("cd".repeat(32)),
         hostname: "web-1".into(),
         state: HostState::Pending,
         decided_by: None,

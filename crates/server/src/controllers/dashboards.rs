@@ -222,13 +222,13 @@ impl WidgetForm {
     fn from_input(input: &WidgetInput) -> Self {
         let (group_by, fact) = grouping_fields(&input.group_by);
         Self {
-            title: input.title.clone(),
+            title: input.title.clone().unwrap_or_default(),
             kind: input.kind.clone(),
             metric: input.metric.clone(),
             calculation: input.calculation.clone(),
             group_by,
             fact,
-            filter: input.filter.clone(),
+            filter: input.filter.clone().unwrap_or_default(),
         }
     }
 
@@ -247,7 +247,7 @@ impl WidgetForm {
 
     fn to_input(&self, placement: Placement) -> WidgetInput {
         WidgetInput {
-            title: self.title.clone(),
+            title: crate::text::non_blank(&self.title),
             kind: self.kind.clone(),
             metric: self.metric.clone(),
             calculation: self.calculation.clone(),
@@ -256,7 +256,7 @@ impl WidgetForm {
             } else {
                 self.group_by.clone()
             },
-            filter: self.filter.clone(),
+            filter: crate::text::non_blank(&self.filter),
             placement,
         }
     }
@@ -460,20 +460,20 @@ impl VariableForm {
     fn blank() -> Self {
         Self::from_variable(&Variable {
             name: "host".to_string(),
-            label: "Host".to_string(),
+            label: Some("Host".to_string()),
             kind: VariableKind::Host,
-            fact: String::new(),
-            filter: String::new(),
+            fact: None,
+            filter: None,
         })
     }
 
     fn from_variable(variable: &Variable) -> Self {
         Self {
             name: variable.name.clone(),
-            label: variable.label.clone(),
+            label: variable.label.clone().unwrap_or_default(),
             kind: variable.kind.as_str().to_string(),
-            fact: variable.fact.clone(),
-            filter: variable.filter.clone(),
+            fact: variable.fact.clone().unwrap_or_default(),
+            filter: variable.filter.clone().unwrap_or_default(),
         }
     }
 
@@ -492,10 +492,10 @@ impl VariableForm {
         let kind = VariableKind::parse(&self.kind).ok_or("Choose what it picks.")?;
         Ok(Variable {
             name: self.name.clone(),
-            label: self.label.clone(),
+            label: crate::text::non_blank(&self.label),
             kind,
-            fact: self.fact.clone(),
-            filter: self.filter.clone(),
+            fact: crate::text::non_blank(&self.fact),
+            filter: crate::text::non_blank(&self.filter),
         }
         .tidy())
     }

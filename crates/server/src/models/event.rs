@@ -9,7 +9,8 @@ pub struct Model {
     pub kind: String,
     pub title: String,
     pub detail: Option<String>,
-    pub filter: String,
+    /// None for every host.
+    pub filter: Option<String>,
     pub created_by: String,
     pub created_at: DateTimeUtc,
 }

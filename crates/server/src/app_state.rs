@@ -108,13 +108,12 @@ impl AppState {
     ) -> Result<i64, EventRefusal> {
         input.tidy();
         let kind = input.check(now).map_err(EventRefusal::Invalid)?;
-        let filter = input.filter.clone().unwrap_or_default();
         let new = NewEvent {
             kind,
             occurred_at: input.occurred_at.unwrap_or(now),
             title: &input.title,
             detail: input.detail.as_deref(),
-            filter: &filter,
+            filter: input.filter.as_deref(),
         };
         self.database
             .record_event(&new, by, now)
@@ -138,8 +137,9 @@ impl AppState {
             .unwrap_or_default();
         let facts = self.database.facts_of(&[host_id]).await?;
         let facts = facts.get(host_id);
-        let picks = |filter: &str| {
-            HostFilter::parse(filter).is_ok_and(|filter| filter.matches(host_id, &hostname, facts))
+        let picks = |filter: Option<&str>| {
+            HostFilter::parse_optional(filter)
+                .is_ok_and(|filter| filter.matches(host_id, &hostname, facts))
         };
         self.database.timeline(host_id, from, to, picks).await
     }

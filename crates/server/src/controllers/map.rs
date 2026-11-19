@@ -91,7 +91,7 @@ impl Counts {
 pub struct Site {
     pub rule_id: i64,
     pub name: String,
-    pub place: String,
+    pub place: Option<String>,
     pub latitude: f64,
     pub longitude: f64,
     pub health: Health,
@@ -179,7 +179,7 @@ fn site_for(rule: &LocationRule) -> Site {
 struct SiteRow {
     rule_id: i64,
     name: String,
-    place: String,
+    place: Option<String>,
     health: Health,
     total: usize,
     breakdown: String,
@@ -291,8 +291,8 @@ pub(super) async fn nearest_place(Query(point): Query<PointQuery>) -> Response {
 struct RuleRow {
     id: i64,
     name: String,
-    place: String,
-    filter: String,
+    place: Option<String>,
+    filter: Option<String>,
     priority: i32,
     hosts: usize,
 }
@@ -345,8 +345,8 @@ impl RuleForm {
     fn from_rule(rule: &LocationRuleInput) -> Self {
         Self {
             name: rule.name.clone(),
-            filter: rule.filter.clone(),
-            place: rule.place.clone(),
+            filter: rule.filter.clone().unwrap_or_default(),
+            place: rule.place.clone().unwrap_or_default(),
             latitude: rule.latitude.to_string(),
             longitude: rule.longitude.to_string(),
             priority: rule.priority.to_string(),
@@ -383,8 +383,8 @@ impl RuleForm {
         };
         let input = LocationRuleInput {
             name: self.name.clone(),
-            filter: self.filter.clone(),
-            place: self.place.clone(),
+            filter: crate::text::non_blank(&self.filter),
+            place: crate::text::non_blank(&self.place),
             latitude: number(&self.latitude, "latitude")?,
             longitude: number(&self.longitude, "longitude")?,
             priority,

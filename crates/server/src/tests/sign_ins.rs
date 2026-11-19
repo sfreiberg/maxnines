@@ -33,7 +33,7 @@ async fn admins_see_everyone_signed_in_and_from_where() {
         .create_app_sign_in(
             editor,
             "maxnines-cli",
-            "laptop",
+            Some("laptop"),
             Role::Viewer,
             crate::times::now(),
         )
@@ -153,7 +153,7 @@ async fn people_see_and_end_only_their_own() {
         .create_app_sign_in(
             viewer,
             "maxnines-cli",
-            "laptop",
+            Some("laptop"),
             Role::Viewer,
             crate::times::now(),
         )

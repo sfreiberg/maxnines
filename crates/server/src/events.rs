@@ -93,9 +93,9 @@ pub struct EventInput {
         deserialize_with = "crate::times::optional_moment::deserialize"
     )]
     pub occurred_at: Option<Timestamp>,
-    /// Which hosts, as a host filter, matched whenever a chart is drawn. Empty means
+    /// Which hosts, as a host filter, matched whenever a chart is drawn. None means
     /// every host.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::text::optional")]
     pub filter: Option<String>,
 }
 
@@ -108,10 +108,7 @@ impl EventInput {
             .map(str::trim)
             .filter(|detail| !detail.is_empty())
             .map(str::to_string);
-        self.filter = self
-            .filter
-            .as_deref()
-            .map(|filter| filter.trim().to_string());
+        self.filter = self.filter.as_deref().and_then(crate::text::trimmed);
         self.kind = self.kind.as_deref().map(|kind| kind.trim().to_lowercase());
     }
 
@@ -146,13 +143,14 @@ impl EventInput {
         {
             return Err("An event's time has to be within the last year.".into());
         }
-        let filter = self.filter.as_deref().unwrap_or_default();
-        if filter.chars().count() > MAX_FILTER_LEN {
-            return Err(format!(
-                "A filter can be at most {MAX_FILTER_LEN} characters."
-            ));
+        if let Some(filter) = &self.filter {
+            if filter.chars().count() > MAX_FILTER_LEN {
+                return Err(format!(
+                    "A filter can be at most {MAX_FILTER_LEN} characters."
+                ));
+            }
+            HostFilter::parse(filter)?;
         }
-        HostFilter::parse(filter)?;
         Ok(kind)
     }
 }
@@ -165,7 +163,8 @@ pub struct Event {
     pub kind: EventKind,
     pub title: String,
     pub detail: Option<String>,
-    pub filter: String,
+    /// None for every host.
+    pub filter: Option<String>,
     pub created_by: String,
     pub created_at: Timestamp,
 }

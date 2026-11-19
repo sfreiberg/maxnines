@@ -240,12 +240,12 @@ pub(crate) mod testing {
     pub fn alert() -> Alert {
         Alert {
             id: 7,
-            rule_id: Some(1),
+            rule_id: 1,
             rule_name: "High CPU".to_string(),
             severity: Severity::Critical,
             host_id: "abc".to_string(),
             hostname: "web-1".to_string(),
-            series: "CPU".to_string(),
+            series: Some("CPU".to_string()),
             value: Some(97.0),
             summary: "CPU usage on web-1 is 97%, above 90%".to_string(),
             started_at: crate::times::from_ms(1_000),

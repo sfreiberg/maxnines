@@ -493,7 +493,13 @@ async fn tokens_expire_and_stop_with_their_owner() {
     let (id, _) = person(&server, "someone@example.com", Role::Responder).await;
     let now = crate::times::now();
     let (_, tokens) = database
-        .create_app_sign_in(id, "maxnines-desktop-mac", "Mac", Role::Responder, now)
+        .create_app_sign_in(
+            id,
+            "maxnines-desktop-mac",
+            Some("Mac"),
+            Role::Responder,
+            now,
+        )
         .await
         .unwrap();
 
@@ -533,7 +539,7 @@ async fn tokens_expire_and_stop_with_their_owner() {
     // An app can't be signed in to do more than its person.
     assert!(
         database
-            .create_app_sign_in(id, "maxnines-cli", "", Role::Admin, now)
+            .create_app_sign_in(id, "maxnines-cli", None, Role::Admin, now)
             .await
             .is_err()
     );
@@ -546,14 +552,14 @@ async fn signed_in_apps_are_listed_and_revoked() {
     let owner = database.list_users().await.unwrap()[0].id;
     let now = crate::times::now();
     let (first, first_tokens) = database
-        .create_app_sign_in(owner, "maxnines-cli", "laptop", Role::Viewer, now)
+        .create_app_sign_in(owner, "maxnines-cli", Some("laptop"), Role::Viewer, now)
         .await
         .unwrap();
     let (_, second_tokens) = database
         .create_app_sign_in(
             owner,
             "maxnines-desktop-windows",
-            "office PC",
+            Some("office PC"),
             Role::Viewer,
             now,
         )
@@ -680,7 +686,7 @@ async fn using_a_swapped_token_again_never_stretches_its_minute() {
     let owner = database.list_users().await.unwrap()[0].id;
     let now = crate::times::now();
     let (_, first) = database
-        .create_app_sign_in(owner, "maxnines-cli", "", Role::Viewer, now)
+        .create_app_sign_in(owner, "maxnines-cli", None, Role::Viewer, now)
         .await
         .unwrap();
     let refresh = |token: String, at: Timestamp| async move {
@@ -718,7 +724,7 @@ async fn two_refreshes_at_once_both_get_tokens_and_the_newest_works() {
     let owner = database.list_users().await.unwrap()[0].id;
     let now = crate::times::now();
     let (_, first) = database
-        .create_app_sign_in(owner, "maxnines-cli", "", Role::Viewer, now)
+        .create_app_sign_in(owner, "maxnines-cli", None, Role::Viewer, now)
         .await
         .unwrap();
     let (one, two) = tokio::join!(
@@ -769,7 +775,13 @@ async fn only_your_own_apps_can_be_revoked_and_old_ones_are_cleared_away() {
     let admin = database.list_users().await.unwrap()[0].id;
     let now = crate::times::now();
     let (theirs, _) = database
-        .create_app_sign_in(admin, "maxnines-cli", "admin's laptop", Role::Viewer, now)
+        .create_app_sign_in(
+            admin,
+            "maxnines-cli",
+            Some("admin's laptop"),
+            Role::Viewer,
+            now,
+        )
         .await
         .unwrap();
     let (viewer, _) = person(&server, "viewer@example.com", Role::Viewer).await;
@@ -798,7 +810,7 @@ async fn only_your_own_apps_can_be_revoked_and_old_ones_are_cleared_away() {
         .create_app_sign_in(
             admin,
             "maxnines-cli",
-            "new laptop",
+            Some("new laptop"),
             Role::Viewer,
             much_later,
         )

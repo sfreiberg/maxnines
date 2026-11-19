@@ -218,16 +218,14 @@ impl SlackActions {
         let Some(alert) = self.database.get_alert(alert_id).await? else {
             return Ok(());
         };
-        if alert.resolved_at.is_some() || alert.rule_id.is_none() {
+        if alert.resolved_at.is_some() {
             return Ok(());
         }
         let quiet = ActiveSilences::load(&self.database, now).await?;
         if quiet.covering(&alert).is_some() {
             return Ok(());
         }
-        let Some(input) = silences::silence_for(&alert, SILENCE_REASON, SILENCE_FOR) else {
-            return Ok(());
-        };
+        let input = silences::silence_for(&alert, SILENCE_REASON, SILENCE_FOR);
         silences::check_silence(&input)?;
         self.database.create_silence(&input, by, now).await?;
         Ok(())

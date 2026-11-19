@@ -10,7 +10,7 @@ priority the older one. A host placed from its own page is a rule whose filter i
 |---|---|
 | `name` | Required. What the map calls the hosts the rule covers, such as `Leeds office`. |
 | `filter` | Which hosts, as in the Hosts list. Leave it out for every host. |
-| `place` | Where it is in words, such as `Leeds, England, United Kingdom`. |
+| `place` | Where it is in words, such as `Leeds, England, United Kingdom`. Leave it out if it has none, and it's `null`. |
 | `latitude` | Required. From -90 to 90. |
 | `longitude` | Required. From -180 to 180. |
 | `priority` | A whole number. Defaults to 0. |

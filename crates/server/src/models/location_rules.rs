@@ -25,8 +25,8 @@ fn to_rule(row: location_rule::Model) -> LocationRule {
 fn rule_row(input: &LocationRuleInput) -> location_rule::ActiveModel {
     location_rule::ActiveModel {
         name: Set(input.name.trim().to_string()),
-        filter: Set(input.filter.trim().to_string()),
-        place: Set(input.place.trim().to_string()),
+        filter: Set(input.filter.as_deref().and_then(crate::text::trimmed)),
+        place: Set(input.place.as_deref().and_then(crate::text::trimmed)),
         latitude: Set(input.latitude),
         longitude: Set(input.longitude),
         priority: Set(input.priority),

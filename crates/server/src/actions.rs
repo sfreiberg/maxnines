@@ -230,9 +230,11 @@ pub fn alert_variables(rule: &AlertRuleInput, alert: &Alert) -> BTreeMap<String,
     }
     if let Some(metric) = rule.metric() {
         set("metric", metric.name.to_string());
-        set("series", alert.series.clone());
+        // A variable is text, so an alert about the host as a whole gives an empty one.
+        let series = alert.series.clone().unwrap_or_default();
+        set("series", series.clone());
         if let Some(kind) = series_variable(metric) {
-            set(kind, alert.series.clone());
+            set(kind, series);
         }
     }
     values

@@ -5131,14 +5131,14 @@ async fn location_rules_can_be_managed_through_the_api() {
 
     let shown = body_of(&server.request("GET", &path, "").await);
     assert_eq!(shown["priority"], 0);
-    assert_eq!(shown["place"], "");
+    assert_eq!(shown["place"], Value::Null);
 
     let changed = json!({ "name": "Leeds", "latitude": 53.8, "longitude": -1.55, "priority": 5 });
     let updated = server.request("PUT", &path, &changed.to_string()).await;
     assert_eq!(status_of(&updated), "204", "{updated}");
     let listed = body_of(&server.request("GET", "/api/v1/location-rules", "").await);
     assert_eq!(listed[0]["name"], "Leeds");
-    assert_eq!(listed[0]["filter"], "");
+    assert_eq!(listed[0]["filter"], Value::Null);
 
     for (bad, reason) in [
         (

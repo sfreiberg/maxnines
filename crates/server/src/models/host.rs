@@ -7,7 +7,8 @@ pub struct Model {
     pub id: String,
     /// `agent`, `agentless` or `built_in`.
     pub kind: String,
-    pub public_key: String,
+    /// None for a host with no agent, which has no key.
+    pub public_key: Option<String>,
     pub hostname: String,
     pub state: String,
     pub decided_by: Option<String>,

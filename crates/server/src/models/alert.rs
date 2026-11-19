@@ -5,12 +5,12 @@ use sea_orm::entity::prelude::*;
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i64,
-    pub rule_id: Option<i64>,
-    pub rule_name: String,
+    /// Rules are only ever marked deleted, so it's always there to name the alert.
+    pub rule_id: i64,
     pub severity: String,
     pub host_id: String,
-    pub hostname: String,
-    pub series: String,
+    /// None for an alert about the host as a whole.
+    pub series: Option<String>,
     pub value: Option<f64>,
     pub summary: String,
     pub started_at: DateTimeUtc,

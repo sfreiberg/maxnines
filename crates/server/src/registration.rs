@@ -120,8 +120,8 @@ pub struct HostRecord {
     pub id: String,
     #[serde(default)]
     pub kind: HostKind,
-    /// Empty for a host with no agent, which has no key.
-    pub public_key: String,
+    /// None for a host with no agent, which has no key.
+    pub public_key: Option<String>,
     pub hostname: String,
     pub state: HostState,
     /// Who approved it: "admin", someone's address, or "rule:<name>".
@@ -309,7 +309,7 @@ impl Registry {
         let mut host = existing.clone().unwrap_or_else(|| HostRecord {
             id: request.id.to_string(),
             kind: HostKind::Agent,
-            public_key: request.public_key.to_string(),
+            public_key: Some(request.public_key.to_string()),
             hostname: request.hostname.to_string(),
             state: HostState::Pending,
             decided_by: None,
@@ -409,7 +409,7 @@ impl Registry {
         let host = HostRecord {
             id: hex::encode(id),
             kind: HostKind::Agentless,
-            public_key: String::new(),
+            public_key: None,
             hostname,
             state: HostState::Approved,
             decided_by: Some(by.to_string()),

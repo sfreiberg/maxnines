@@ -868,7 +868,7 @@ async fn page(
         .open_alerts()
         .await?
         .into_iter()
-        .filter(|alert| alert.host_id == input.host_id && alert.series == *name)
+        .filter(|alert| alert.host_id == input.host_id && alert.series.as_ref() == Some(name))
         .collect();
     let rules: Vec<WatchingRule> = state
         .database
@@ -887,11 +887,7 @@ async fn page(
         })
         .map(|rule| WatchingRule {
             id: rule.id,
-            conditional: rule
-                .rule
-                .condition
-                .as_deref()
-                .is_some_and(|c| !c.trim().is_empty()),
+            conditional: rule.rule.condition.is_some(),
             name: rule.rule.name,
             severity: rule.rule.severity.as_str(),
         })
@@ -901,7 +897,9 @@ async fn page(
     let cover = quiet.covering_series(&input.host_id, &hostname, name);
     let own = host_filter::only(&input.host_id);
     let maintenance = described(state, cover, |silence| {
-        silence.rule_id.is_none() && silence.filter == own && silence.series == *name
+        silence.rule_id.is_none()
+            && silence.filter.as_ref() == Some(&own)
+            && silence.series.as_ref() == Some(name)
     })
     .await?;
 
@@ -998,8 +996,8 @@ async fn start_maintenance(
     };
     let input = SilenceInput {
         rule_id: None,
-        filter: host_filter::only(&check.input.host_id),
-        series: name,
+        filter: Some(host_filter::only(&check.input.host_id)),
+        series: Some(name),
         all_alerts: false,
         reason,
         duration,
@@ -1037,8 +1035,8 @@ async fn end_maintenance(
     let own = host_filter::only(&check.input.host_id);
     for silence in silences.iter().filter(|silence| {
         silence.rule_id.is_none()
-            && silence.filter == own
-            && silence.series == check.input.check.name
+            && silence.filter.as_ref() == Some(&own)
+            && silence.series.as_ref() == Some(&check.input.check.name)
     }) {
         if let Err(error) = state.database.end_silence(silence.id, now).await {
             return server_error(&error);

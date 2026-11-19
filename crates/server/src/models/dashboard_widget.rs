@@ -6,12 +6,14 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i64,
     pub dashboard_id: i64,
-    pub title: String,
+    /// None uses the metric's name.
+    pub title: Option<String>,
     pub kind: String,
     pub metric: String,
     pub calculation: String,
     pub group_by: String,
-    pub filter: String,
+    /// None for every host.
+    pub filter: Option<String>,
     pub x: i32,
     pub y: i32,
     pub w: i32,

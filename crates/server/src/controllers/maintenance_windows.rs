@@ -55,7 +55,7 @@ impl WindowForm {
             rule_id: window.rule_id.map(|id| id.to_string()).unwrap_or_default(),
             duration_minutes: window.duration.num_minutes().to_string(),
             name: window.name,
-            filter: window.filter,
+            filter: window.filter.unwrap_or_default(),
             all_alerts: window.all_alerts,
             start_time: window.start_time,
             time_zone: window.time_zone,
@@ -94,7 +94,7 @@ impl WindowForm {
         Ok(MaintenanceWindowInput {
             name: self.name.clone(),
             rule_id,
-            filter: self.filter.clone(),
+            filter: crate::text::non_blank(&self.filter),
             all_alerts: self.all_alerts,
             days: self.days.clone(),
             start_time: self.start_time.clone(),

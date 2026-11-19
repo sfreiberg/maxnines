@@ -563,7 +563,7 @@ mod tests {
         let hostnames = BTreeMap::from([("9fcd430c".to_string(), "orders-db".to_string())]);
         assert_eq!(
             covers(
-                &json!({"rule_id": 1, "filter": "hostname=web*", "series": ""}),
+                &json!({"rule_id": 1, "filter": "hostname=web*", "series": null}),
                 &rules,
                 &hostnames
             ),

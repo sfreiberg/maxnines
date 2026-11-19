@@ -18,7 +18,12 @@ fn to_page(row: metrics_page::Model) -> Result<MetricsPage> {
         host_id: row.host_id,
         input: MetricsPageInput {
             url: row.url,
-            names: row.names.lines().map(str::to_string).collect(),
+            names: row
+                .names
+                .iter()
+                .flat_map(|names| names.lines())
+                .map(str::to_string)
+                .collect(),
             interval: Duration::from_secs(u64::try_from(row.interval_secs)?),
             enabled: row.enabled,
             username: row.username,
@@ -34,7 +39,7 @@ fn to_row(host_id: &str, input: &MetricsPageInput) -> Result<metrics_page::Activ
     Ok(metrics_page::ActiveModel {
         host_id: Set(host_id.to_string()),
         url: Set(input.url.clone()),
-        names: Set(input.names.join("\n")),
+        names: Set((!input.names.is_empty()).then(|| input.names.join("\n"))),
         interval_secs: Set(i64::try_from(input.interval.as_secs())?),
         enabled: Set(input.enabled),
         username: Set(input.username.clone()),

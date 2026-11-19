@@ -69,7 +69,7 @@ $MAXNINES_URL/oauth/authorize?response_type=code&client_id=maxnines-cli
 | `redirect_uri` | Required. Where the answer comes back, on this computer |
 | `code_challenge`, `code_challenge_method` | Required. The challenge, and `S256` |
 | `state` | Sent back unchanged, to check the answer is to this request |
-| `device` | The computer's name, up to 100 characters, shown when approving and under Settings |
+| `device` | The computer's name, up to 100 characters, shown when approving and under Settings. Optional: one left out is `null` in the list of signed-in apps |
 | `role` | `viewer`, `responder`, `editor` or `admin`: the most to offer, and what's picked to begin with. The person can choose lower, and never more than their own. Left out, any role up to theirs is offered, with Viewer picked |
 
 The person signs in if they aren't already, and chooses **Allow** or **Deny**. The

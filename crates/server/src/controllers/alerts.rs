@@ -60,8 +60,7 @@ struct AlertRow {
     started: String,
     resolved: Option<String>,
     reason: Option<String>,
-    /// None when its rule has been deleted, leaving a silence nothing to name.
-    silence_link: Option<String>,
+    silence_link: String,
     silenced_until: Option<String>,
     /// How many actions its rule ran for it.
     actions: u64,
@@ -71,20 +70,20 @@ struct AlertRow {
 
 /// Where to start a silence for just this alert. Agents choose their own names, which
 /// is fine here because it only fills in a form for someone to read.
-fn silence_link(alert: &Alert) -> Option<String> {
-    let silence = silences::silence_for(alert, "", TimeDelta::zero())?;
+fn silence_link(alert: &Alert) -> String {
+    let silence = silences::silence_for(alert, "", TimeDelta::zero());
     let mut fields = Vec::new();
     if let Some(id) = silence.rule_id {
         fields.push(("rule_id", id.to_string()));
     }
-    if !silence.filter.is_empty() {
-        fields.push(("filter", silence.filter));
+    if let Some(filter) = silence.filter {
+        fields.push(("filter", filter));
     }
-    if !silence.series.is_empty() {
-        fields.push(("series", silence.series));
+    if let Some(series) = silence.series {
+        fields.push(("series", series));
     }
     let query = serde_urlencoded::to_string(fields).unwrap_or_default();
-    Some(format!("/alerts/silences/new?{query}"))
+    format!("/alerts/silences/new?{query}")
 }
 
 impl From<Alert> for AlertRow {
@@ -187,7 +186,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
                 .map(|cover| local_time(cover.ends_at()));
             AlertRow {
                 silenced_until: silence,
-                chart: alert.rule_id.is_some_and(|id| charted.contains(&id)),
+                chart: charted.contains(&alert.rule_id),
                 ..row(alert)
             }
         })
@@ -243,8 +242,10 @@ async fn show(
     let chart = watched.as_ref().map(|watched| {
         let title = match watched.metric.source {
             Source::Fields([_]) => watched.metric.title.to_string(),
-            _ if alert.series.is_empty() => watched.metric.title.to_string(),
-            _ => format!("{} ({})", watched.metric.title, alert.series),
+            _ => match &alert.series {
+                Some(series) => format!("{} ({series})", watched.metric.title),
+                None => watched.metric.title.to_string(),
+            },
         };
         // A forecast's level is where it's heading, the same for either severity.
         let forecast = watched.rule.kind == RuleKind::Forecast;
@@ -290,8 +291,8 @@ async fn show(
         .filter(|_| alert.host_id != FLEET_HOST_ID)
         .map(|watched| {
             let mut fields = vec![("range", selected.to_string())];
-            if !alert.series.is_empty() {
-                fields.push(("series", alert.series.clone()));
+            if let Some(series) = &alert.series {
+                fields.push(("series", series.clone()));
             }
             let query = serde_urlencoded::to_string(fields).unwrap_or_default();
             format!(

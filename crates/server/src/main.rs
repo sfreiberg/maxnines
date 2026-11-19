@@ -46,6 +46,7 @@ mod server_stats;
 mod silences;
 mod slack_actions;
 mod store;
+mod text;
 mod times;
 mod tls;
 mod two_factor;

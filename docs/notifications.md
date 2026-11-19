@@ -119,9 +119,9 @@ What a template can use:
 | `text` | The notification in one line, like `Resolved: CPU usage on web-1 is now 42%, no longer above 90%` |
 | `id` | The same for every attempt at one notification, so a receiver can spot a repeat |
 | `link` | The alerts page, when the server knows the address people reach it at |
-| `alert.id`, `alert.rule_id`, `alert.rule_name` | The alert, and the rule that started it |
+| `alert.id`, `alert.rule_id`, `alert.rule_name` | The alert, and the rule that started it, by the name it has now |
 | `alert.severity` | `warning` or `critical` |
-| `alert.hostname`, `alert.host_id` | The host |
+| `alert.hostname`, `alert.host_id` | The host, by the name it has now |
 | `alert.series` | The disk, container or other series it's about, if any |
 | `alert.value`, `alert.summary` | The reading that started it, and what's wrong in words |
 | `alert.started`, `alert.resolved` | Times like `2026-11-10T14:03:00Z`, also as `alert.started_at` and `alert.resolved_at` to the millisecond |

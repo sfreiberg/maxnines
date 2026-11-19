@@ -28,10 +28,10 @@ pub struct Silence {
     pub id: i64,
     /// Every rule, if empty.
     pub rule_id: Option<i64>,
-    /// Which hosts, in the same form as the Hosts list. Every host, if empty.
-    pub filter: String,
-    /// The one series it's for, such as a check's name. Every series, if empty.
-    pub series: String,
+    /// Which hosts, in the same form as the Hosts list. Every host, if none.
+    pub filter: Option<String>,
+    /// The one series it's for, such as a check's name. Every series, if none.
+    pub series: Option<String>,
     /// Whether it covers every alert there is, having no rule, filter or series.
     pub all_alerts: bool,
     pub reason: String,
@@ -44,10 +44,10 @@ pub struct Silence {
 pub struct SilenceInput {
     #[serde(default)]
     pub rule_id: Option<i64>,
-    #[serde(default)]
-    pub filter: String,
-    #[serde(default)]
-    pub series: String,
+    #[serde(default, deserialize_with = "crate::text::optional")]
+    pub filter: Option<String>,
+    #[serde(default, deserialize_with = "crate::text::optional")]
+    pub series: Option<String>,
     /// Has to be said to cover every alert, with no rule, filter or series, so that
     /// leaving them out never does by accident.
     #[serde(default)]
@@ -59,22 +59,17 @@ pub struct SilenceInput {
 
 /// A silence covering just this alert: its rule, on its host, by ID, as names
 /// needn't be unique, for its series. An alert about the fleet has no host, and a
-/// filter would leave it out, so it has none. One whose rule has been deleted has
-/// nothing to name, and none.
-pub fn silence_for(alert: &Alert, reason: &str, duration: TimeDelta) -> Option<SilenceInput> {
-    let filter = if alert.host_id == FLEET_HOST_ID {
-        String::new()
-    } else {
-        crate::host_filter::only(&alert.host_id)
-    };
-    Some(SilenceInput {
-        rule_id: Some(alert.rule_id?),
+/// filter would leave it out, so it has none.
+pub fn silence_for(alert: &Alert, reason: &str, duration: TimeDelta) -> SilenceInput {
+    let filter = (alert.host_id != FLEET_HOST_ID).then(|| crate::host_filter::only(&alert.host_id));
+    SilenceInput {
+        rule_id: Some(alert.rule_id),
         filter,
         series: alert.series.clone(),
         all_alerts: false,
         reason: reason.to_string(),
         duration,
-    })
+    }
 }
 
 /// Whether what a silence or maintenance window covers is said plainly: every alert
@@ -83,17 +78,14 @@ pub fn silence_for(alert: &Alert, reason: &str, duration: TimeDelta) -> Option<S
 pub fn check_covers(
     what: &str,
     rule_id: Option<i64>,
-    filter: &str,
-    series: Option<&str>,
+    filter: Option<&str>,
+    series: Covered,
     all_alerts: bool,
 ) -> Result<()> {
-    let names_nothing = rule_id.is_none()
-        && filter.trim().is_empty()
-        && series.is_none_or(|series| series.trim().is_empty());
-    let choices = if series.is_some() {
-        "a rule, hosts or a series"
-    } else {
-        "a rule or hosts"
+    let names_nothing = rule_id.is_none() && filter.is_none() && !matches!(series, Covered::One);
+    let choices = match series {
+        Covered::NoSeries => "a rule or hosts",
+        Covered::Every | Covered::One => "a rule, hosts or a series",
     };
     if names_nothing && !all_alerts {
         bail!(
@@ -107,6 +99,15 @@ pub fn check_covers(
     Ok(())
 }
 
+/// Which series something covers, for [`check_covers`].
+#[derive(Debug, Clone, Copy)]
+pub enum Covered {
+    /// It has no series to name, as a maintenance window hasn't.
+    NoSeries,
+    Every,
+    One,
+}
+
 /// Whether a silence makes sense, apart from whether its rule exists.
 pub fn check_silence(input: &SilenceInput) -> Result<()> {
     if input.reason.trim().is_empty() {
@@ -115,8 +116,12 @@ pub fn check_silence(input: &SilenceInput) -> Result<()> {
     if input.reason.chars().count() > MAX_REASON_CHARS {
         bail!("The reason is too long. It can be up to {MAX_REASON_CHARS} characters.");
     }
-    check_filter(&input.filter)?;
-    if input.series.chars().count() > MAX_SERIES_CHARS {
+    check_filter(input.filter.as_deref())?;
+    if input
+        .series
+        .as_ref()
+        .is_some_and(|series| series.chars().count() > MAX_SERIES_CHARS)
+    {
         bail!("The series is too long. It can be up to {MAX_SERIES_CHARS} characters.");
     }
     if input.duration <= TimeDelta::zero() || input.duration > MAX_DURATION {
@@ -125,14 +130,21 @@ pub fn check_silence(input: &SilenceInput) -> Result<()> {
     check_covers(
         "silence",
         input.rule_id,
-        &input.filter,
-        Some(&input.series),
+        input.filter.as_deref(),
+        if input.series.is_some() {
+            Covered::One
+        } else {
+            Covered::Every
+        },
         input.all_alerts,
     )
 }
 
 /// Whether a filter can be saved for a silence or a maintenance window.
-pub fn check_filter(filter: &str) -> Result<()> {
+pub fn check_filter(filter: Option<&str>) -> Result<()> {
+    let Some(filter) = filter else {
+        return Ok(());
+    };
     if filter.chars().count() > MAX_FILTER_CHARS {
         bail!("The filter is too long. It can be up to {MAX_FILTER_CHARS} characters.");
     }
@@ -160,15 +172,20 @@ impl Cover {
 struct Quiet {
     cover: Cover,
     rule_id: Option<i64>,
-    /// Empty if it covers every host.
+    /// None if it covers every host.
     filter: Option<HostFilter>,
-    /// Empty if it covers every series.
+    /// None if it covers every series.
     series: Option<String>,
 }
 
 impl Quiet {
-    fn new(cover: Cover, rule_id: Option<i64>, filter: &str, series: &str) -> Option<Self> {
-        let parsed = match HostFilter::parse(filter) {
+    fn new(
+        cover: Cover,
+        rule_id: Option<i64>,
+        filter: Option<&str>,
+        series: Option<&str>,
+    ) -> Option<Self> {
+        let filter = match filter.map(HostFilter::parse).transpose() {
             Ok(parsed) => parsed,
             // Filters are checked when saved, so only a change to filters gets here.
             Err(error) => {
@@ -179,8 +196,8 @@ impl Quiet {
         Some(Self {
             cover,
             rule_id,
-            filter: (!filter.is_empty()).then_some(parsed),
-            series: (!series.is_empty()).then(|| series.to_string()),
+            filter,
+            series: series.map(str::to_string),
         })
     }
 }
@@ -210,14 +227,24 @@ impl ActiveSilences {
                 id: silence.id,
                 ends_at: silence.ends_at,
             };
-            Quiet::new(cover, silence.rule_id, &silence.filter, &silence.series)
+            Quiet::new(
+                cover,
+                silence.rule_id,
+                silence.filter.as_deref(),
+                silence.series.as_deref(),
+            )
         });
         let windows = windows.into_iter().filter_map(|window| {
             let cover = Cover::Window {
                 id: window.id,
                 ends_at: window.ends_at(now)?,
             };
-            Quiet::new(cover, window.window.rule_id, &window.window.filter, "")
+            Quiet::new(
+                cover,
+                window.window.rule_id,
+                window.window.filter.as_deref(),
+                None,
+            )
         });
         let mut quiet: Vec<Quiet> = silences.chain(windows).collect();
         quiet.sort_by_key(|entry| std::cmp::Reverse(entry.cover.ends_at()));
@@ -271,7 +298,7 @@ impl ActiveSilences {
     /// a filter never covers one.
     pub fn covering(&self, alert: &Alert) -> Option<Cover> {
         let covers = |entry: &&Quiet| {
-            let rule = entry.rule_id.is_none_or(|id| alert.rule_id == Some(id));
+            let rule = entry.rule_id.is_none_or(|id| alert.rule_id == id);
             let hostname = entry.filter.as_ref().is_none_or(|filter| {
                 alert.host_id != FLEET_HOST_ID
                     && filter.matches(
@@ -283,7 +310,7 @@ impl ActiveSilences {
             let series = entry
                 .series
                 .as_deref()
-                .is_none_or(|only| only == alert.series);
+                .is_none_or(|only| alert.series.as_deref() == Some(only));
             rule && hostname && series
         };
         self.quiet.iter().find(covers).map(|entry| entry.cover)
@@ -297,8 +324,8 @@ mod tests {
     fn input() -> SilenceInput {
         SilenceInput {
             rule_id: None,
-            filter: "os=linux".to_string(),
-            series: String::new(),
+            filter: Some("os=linux".to_string()),
+            series: None,
             all_alerts: false,
             reason: "Upgrading Postgres".to_string(),
             duration: TimeDelta::hours(1),
@@ -313,7 +340,7 @@ mod tests {
     #[test]
     fn every_alert_is_only_silenced_when_asked_for() {
         let everything = SilenceInput {
-            filter: "  ".to_string(),
+            filter: None,
             all_alerts: true,
             ..input()
         };
@@ -333,11 +360,11 @@ mod tests {
                 ..everything.clone()
             },
             SilenceInput {
-                series: "/var".to_string(),
+                series: Some("/var".to_string()),
                 ..everything.clone()
             },
             SilenceInput {
-                filter: "os=linux".to_string(),
+                filter: Some("os=linux".to_string()),
                 ..everything.clone()
             },
         ] {
@@ -365,14 +392,14 @@ mod tests {
             ),
             (
                 SilenceInput {
-                    filter: "x".repeat(501),
+                    filter: Some("x".repeat(501)),
                     ..input()
                 },
                 "too long",
             ),
             (
                 SilenceInput {
-                    filter: "hostname=\"web".to_string(),
+                    filter: Some("hostname=\"web".to_string()),
                     ..input()
                 },
                 "quote",
