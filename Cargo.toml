@@ -10,6 +10,9 @@ repository = "https://github.com/sfreiberg/maxnines"
 
 [workspace.dependencies]
 anyhow = "1.0.104"
+# Moments and lengths of time, everywhere they're kept or sent. Without the default
+# features, which bring time zone data the agent has no use for.
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock", "serde"] }
 clap = { version = "4.6.7", features = ["derive"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 hcl-rs = "0.20.0"
