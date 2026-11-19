@@ -51,6 +51,9 @@ pub enum RuleKind {
     /// A metric heading for a level soon, such as a disk filling up, judged by the
     /// line through its recent readings.
     Forecast,
+    /// A connected agent whose samples have stopped being stored, such as when the
+    /// server refuses everything it sends. One that isn't connected is offline.
+    NoMetrics,
 }
 
 impl RuleKind {
@@ -60,7 +63,14 @@ impl RuleKind {
             Self::Offline => "offline",
             Self::Calculation => "calculation",
             Self::Forecast => "forecast",
+            Self::NoMetrics => "no_metrics",
         }
+    }
+
+    /// Whether the rule is about a host's agent as a whole, so it has no metric,
+    /// threshold or series, and its alerts have no chart.
+    pub fn is_about_the_agent(self) -> bool {
+        matches!(self, Self::Offline | Self::NoMetrics)
     }
 
     pub fn parse(text: &str) -> Result<Self> {
@@ -69,6 +79,7 @@ impl RuleKind {
             "offline" => Ok(Self::Offline),
             "calculation" => Ok(Self::Calculation),
             "forecast" => Ok(Self::Forecast),
+            "no_metrics" => Ok(Self::NoMetrics),
             other => bail!("unknown rule kind {other:?}"),
         }
     }
@@ -276,13 +287,14 @@ pub fn check_rule(rule: &AlertRuleInput) -> Result<()> {
                 "a calculation picks its hosts with a filter"
             );
         }
-        RuleKind::Offline => {
+        RuleKind::Offline | RuleKind::NoMetrics => {
             ensure!(
                 rule.metric.is_none()
                     && rule.series.is_none()
                     && rule.comparison.is_none()
                     && rule.threshold.is_none(),
-                "an offline rule doesn't take a metric or threshold"
+                "{} doesn't take a metric or threshold",
+                agent_rule(rule.kind)
             );
         }
         RuleKind::Forecast => check_forecast(rule)?,
@@ -295,8 +307,9 @@ pub fn check_rule(rule: &AlertRuleInput) -> Result<()> {
     }
     if let Some(warning) = rule.warning_threshold {
         ensure!(
-            rule.kind != RuleKind::Offline,
-            "an offline rule doesn't take a warning threshold"
+            !rule.kind.is_about_the_agent(),
+            "{} doesn't take a warning threshold",
+            agent_rule(rule.kind)
         );
         ensure!(
             warning.is_finite(),
@@ -328,6 +341,14 @@ pub fn check_rule(rule: &AlertRuleInput) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// A rule about a host's agent as a whole, in words, for what it's told it can't take.
+fn agent_rule(kind: RuleKind) -> &'static str {
+    match kind {
+        RuleKind::NoMetrics => "a no-metrics rule",
+        _ => "an offline rule",
+    }
 }
 
 fn check_forecast(rule: &AlertRuleInput) -> Result<()> {
@@ -383,7 +404,7 @@ impl AlertRuleInput {
     }
 
     /// Each threshold with how bad crossing it is, mildest first. Empty for an
-    /// offline rule.
+    /// offline or no-metrics rule.
     pub fn levels(&self) -> Vec<(Severity, f64)> {
         let Some(threshold) = self.threshold else {
             return Vec::new();
@@ -454,6 +475,9 @@ impl AlertRuleInput {
             hold if hold.is_zero() => text,
             hold => format!("{text} for {}", format_duration(hold)),
         };
+        if self.kind == RuleKind::NoMetrics {
+            return wait("Sending no metrics".to_string());
+        }
         let (Some(metric), Some(comparison), Some(level)) =
             (self.metric(), self.comparison, self.threshold)
         else {
@@ -617,6 +641,17 @@ impl AlertRuleInput {
     /// What an offline alert says as it clears.
     pub fn online_summary(hostname: &str) -> String {
         format!("{hostname} is back online")
+    }
+
+    /// What a no-metrics alert says when it fires. Like an offline alert's, it says
+    /// nothing about how long, as it's kept while the alert is open.
+    pub fn no_metrics_summary(hostname: &str) -> String {
+        format!("{hostname} is connected but sending no metrics")
+    }
+
+    /// What a no-metrics alert says as it clears.
+    pub fn metrics_again_summary(hostname: &str) -> String {
+        format!("{hostname} is sending metrics again")
     }
 
     /// What a metric alert says as it clears: the reading now, beside the mildest
@@ -1194,6 +1229,14 @@ mod tests {
         }
     }
 
+    fn no_metrics_rule() -> AlertRuleInput {
+        AlertRuleInput {
+            kind: RuleKind::NoMetrics,
+            hold: TimeDelta::minutes(5),
+            ..offline_rule()
+        }
+    }
+
     fn webhook(target: &str) -> ChannelInput {
         ChannelInput {
             name: "Ops".to_string(),
@@ -1259,6 +1302,47 @@ mod tests {
     fn good_rules_pass() {
         check_rule(&metric_rule()).unwrap();
         check_rule(&offline_rule()).unwrap();
+        check_rule(&no_metrics_rule()).unwrap();
+    }
+
+    #[test]
+    fn a_no_metrics_rule_takes_no_metric_or_threshold() {
+        assert_eq!(RuleKind::parse("no_metrics").unwrap(), RuleKind::NoMetrics);
+        assert_eq!(RuleKind::NoMetrics.as_str(), "no_metrics");
+        for (rule, expected) in [
+            (
+                AlertRuleInput {
+                    metric: Some("cpu.usage".to_string()),
+                    ..no_metrics_rule()
+                },
+                "a no-metrics rule doesn't take a metric or threshold",
+            ),
+            (
+                AlertRuleInput {
+                    threshold: Some(1.0),
+                    ..no_metrics_rule()
+                },
+                "a no-metrics rule doesn't take a metric or threshold",
+            ),
+            (
+                AlertRuleInput {
+                    warning_threshold: Some(1.0),
+                    ..no_metrics_rule()
+                },
+                "a no-metrics rule doesn't take a warning threshold",
+            ),
+            (
+                AlertRuleInput {
+                    window: Some(TimeDelta::minutes(5)),
+                    ..no_metrics_rule()
+                },
+                "only a calculation or forecast looks back",
+            ),
+        ] {
+            let error = check_rule(&rule).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+        assert!(no_metrics_rule().levels().is_empty());
     }
 
     #[test]
@@ -1381,6 +1465,10 @@ mod tests {
             "CPU usage above 90% for 5 minutes"
         );
         assert_eq!(offline_rule().describe(), "Offline for 1 minute");
+        assert_eq!(
+            no_metrics_rule().describe(),
+            "Sending no metrics for 5 minutes"
+        );
         let rule = AlertRuleInput {
             metric: Some("disk.usage".to_string()),
             series: Some("/".to_string()),
@@ -1521,6 +1609,18 @@ mod tests {
     #[test]
     fn an_offline_summary_says_nothing_that_goes_stale() {
         assert_eq!(AlertRuleInput::offline_summary("web-1"), "web-1 is offline");
+    }
+
+    #[test]
+    fn a_no_metrics_summary_says_nothing_that_goes_stale() {
+        assert_eq!(
+            AlertRuleInput::no_metrics_summary("web-1"),
+            "web-1 is connected but sending no metrics"
+        );
+        assert_eq!(
+            AlertRuleInput::metrics_again_summary("web-1"),
+            "web-1 is sending metrics again"
+        );
     }
 
     #[test]

@@ -112,7 +112,9 @@ pub trait MetricsReader: Send + Sync {
     /// that aren't usable numbers are skipped.
     fn series(&self, query: &SeriesQuery) -> Result<SeriesResult>;
 
-    /// When each agent last sent anything, between two times.
+    /// When each host last reported anything, between two times. The server's
+    /// readings of an agent's clock don't count, as they're saved whether or not
+    /// anything the agent sends is.
     fn last_samples(&self, since: Timestamp, until: Timestamp) -> Result<Vec<LastSample>>;
 
     /// What one of an agent's collectors last sent between two times, including

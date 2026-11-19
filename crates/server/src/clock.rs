@@ -21,6 +21,10 @@ use tokio::time::Instant;
 use crate::store::NewSample;
 use crate::times::Timestamp;
 
+/// What the readings are saved as. No agent has a collector of this name, so these
+/// are the only samples under an agent's host that the agent didn't send.
+pub const COLLECTOR: &str = "clock";
+
 /// How often each connected agent is asked. Clocks drift slowly.
 pub const ASK_EVERY: Duration = Duration::from_secs(60);
 
@@ -93,7 +97,7 @@ impl Reading {
             hostname: hostname.to_string(),
             sample: Sample {
                 time: now,
-                metrics: BTreeMap::from([("clock".to_string(), clock)]),
+                metrics: BTreeMap::from([(COLLECTOR.to_string(), clock)]),
             },
         }
     }

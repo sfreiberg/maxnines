@@ -34,6 +34,8 @@ struct Script {
     trends: Arc<Mutex<Vec<crate::metrics::Trend>>>,
     /// What each collector last sent, by its name.
     outputs: Arc<Mutex<BTreeMap<String, serde_json::Value>>>,
+    /// When each host's newest current sample was taken.
+    last_samples: Arc<Mutex<Vec<crate::metrics::LastSample>>>,
     broken: Arc<Mutex<bool>>,
 }
 
@@ -50,6 +52,15 @@ impl Script {
     fn set_broken(&self, broken: bool) {
         *self.broken.lock().unwrap() = broken;
     }
+
+    /// Says `host_id` sent a sample taken at `time`, or nothing still current.
+    fn set_last_sample(&self, host_id: &str, time: Option<Timestamp>) {
+        let samples = time.map(|time| crate::metrics::LastSample {
+            host_id: host_id.to_string(),
+            time,
+        });
+        *self.last_samples.lock().unwrap() = samples.into_iter().collect();
+    }
 }
 
 impl MetricsReader for Script {
@@ -65,7 +76,10 @@ impl MetricsReader for Script {
         _since: Timestamp,
         _until: Timestamp,
     ) -> anyhow::Result<Vec<crate::metrics::LastSample>> {
-        Ok(Vec::new())
+        if *self.broken.lock().unwrap() {
+            anyhow::bail!("deliberate test failure");
+        }
+        Ok(self.last_samples.lock().unwrap().clone())
     }
 
     fn latest_output(
@@ -837,6 +851,7 @@ async fn every_server_starts_with_rules_for_agents_going_offline_and_disks_filli
             "Disk running out of inodes",
             "Disk will be full soon",
             "Host offline",
+            "Host sending no metrics",
             "Service stopped"
         ]
     );
@@ -1923,6 +1938,425 @@ async fn charts_keep_the_catalog_order_however_their_queries_finish() {
     assert!(position("Memory usage") < position("Disk usage"));
     assert!(position("Disk usage") < position("Network received"));
     assert!(position("Network received") < position("Network sent"));
+}
+
+// ---- agents connected but sending no metrics
+
+fn no_metrics_rule() -> AlertRuleInput {
+    AlertRuleInput {
+        name: "Silent".to_string(),
+        kind: RuleKind::NoMetrics,
+        hold: TimeDelta::minutes(5),
+        ..offline_rule()
+    }
+}
+
+impl Harness {
+    /// When the agent connected, which a host that's sent nothing since counts from.
+    fn connected_at(&self) -> Timestamp {
+        self.server.state.presence.get(&self.id()).unwrap().since
+    }
+
+    /// Checks rules at `at`, with the store saying the host's newest current sample
+    /// was taken at `sent`, or that it has none.
+    async fn evaluate_at(&mut self, at: Timestamp, sent: Option<Timestamp>) {
+        self.script.set_last_sample(&self.id(), sent);
+        self.evaluator.evaluate(at).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_connected_agent_sending_no_metrics_alerts_after_the_wait() {
+    let mut test = Harness::start().await;
+    test.database()
+        .create_alert_rule(&no_metrics_rule())
+        .await
+        .unwrap();
+    let connected = test.connected_at();
+
+    test.evaluate_at(connected + TimeDelta::seconds(299), None)
+        .await;
+    assert!(test.open().await.is_empty(), "it hasn't been long enough");
+
+    test.evaluate_at(connected + TimeDelta::minutes(5), None)
+        .await;
+    let open = test.open().await;
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].summary, "web-1 is connected but sending no metrics");
+    assert_eq!((open[0].series.as_deref(), open[0].value), (None, None));
+    // It's sent nothing at all, so the silence began when it connected.
+    assert_eq!(open[0].breached_at, connected);
+}
+
+#[tokio::test]
+async fn an_agent_whose_samples_keep_arriving_does_not_alert() {
+    let mut test = Harness::start().await;
+    test.database()
+        .create_alert_rule(&no_metrics_rule())
+        .await
+        .unwrap();
+    let connected = test.connected_at();
+
+    for minute in 1..=20 {
+        let now = connected + MINUTE * minute;
+        test.evaluate_at(now, Some(now - TimeDelta::seconds(15)))
+            .await;
+    }
+
+    assert!(test.open().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_no_metrics_alert_counts_from_the_newest_sample_and_resolves_once_they_resume() {
+    let mut test = Harness::start().await;
+    test.database()
+        .create_alert_rule(&no_metrics_rule())
+        .await
+        .unwrap();
+    let connected = test.connected_at();
+    let last = connected + MINUTE;
+    test.evaluate_at(last + TimeDelta::seconds(5), Some(last))
+        .await;
+
+    // A sample is only current for a few minutes, after which the store says nothing.
+    test.evaluate_at(last + TimeDelta::seconds(299), None).await;
+    assert!(test.open().await.is_empty(), "{:?}", test.open().await);
+    test.evaluate_at(last + TimeDelta::minutes(5), None).await;
+    let open = test.open().await;
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].breached_at, last);
+
+    test.evaluate_at(last + MINUTE * 7, None).await;
+    assert_eq!(test.open().await.len(), 1, "still nothing");
+
+    let resumed = last + MINUTE * 8;
+    test.evaluate_at(resumed + TimeDelta::seconds(5), Some(resumed))
+        .await;
+    assert!(test.open().await.is_empty());
+    let resolved = test.resolved().await;
+    assert_eq!(resolved.len(), 1, "{resolved:?}");
+    assert_eq!(
+        resolved[0].resolved_summary.as_deref(),
+        Some("web-1 is sending metrics again")
+    );
+    assert_eq!(
+        resolved[0].resolve_reason.as_deref(),
+        Some("The problem cleared")
+    );
+}
+
+#[tokio::test]
+async fn an_offline_agent_is_left_to_the_offline_rule() {
+    let mut test = Harness::start().await;
+    test.database()
+        .create_alert_rule(&no_metrics_rule())
+        .await
+        .unwrap();
+    test.go_offline().await;
+    let gone = test.connected_at();
+
+    test.evaluate_at(gone + TimeDelta::hours(1), None).await;
+
+    assert!(test.open().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_no_metrics_alert_lasts_while_the_agent_is_away_and_after_it_reconnects() {
+    let mut test = Harness::start().await;
+    test.database()
+        .create_alert_rule(&no_metrics_rule())
+        .await
+        .unwrap();
+    let connected = test.connected_at();
+    test.evaluate_at(connected + TimeDelta::minutes(5), None)
+        .await;
+    assert_eq!(test.open().await.len(), 1);
+
+    // Going offline doesn't mean its samples arrive, so it isn't over.
+    test.go_offline().await;
+    test.evaluate_at(connected + TimeDelta::minutes(6), None)
+        .await;
+    assert_eq!(test.open().await.len(), 1);
+
+    // Nor is connecting again, though a new connection starts the count again.
+    let mut client = test.server.connect().await;
+    handshake(&mut client, &test.host, "web-1", None).await;
+    test.server.wait_for_online(&test.id(), true).await;
+    let back = test.connected_at();
+    test.evaluate_at(back + MINUTE, None).await;
+    assert_eq!(test.open().await.len(), 1);
+
+    test.evaluate_at(back + MINUTE * 2, Some(back + MINUTE))
+        .await;
+    assert!(test.open().await.is_empty());
+    assert_eq!(test.resolved().await.len(), 1);
+}
+
+#[tokio::test]
+async fn hosts_without_an_agent_and_the_servers_own_never_alert_about_metrics() {
+    let mut test = Harness::start().await;
+    test.database()
+        .create_alert_rule(&no_metrics_rule())
+        .await
+        .unwrap();
+    let state = &test.server.state;
+    let database = state
+        .registry
+        .add_agentless("orders-db", "test@example.com")
+        .await
+        .unwrap();
+    state
+        .presence
+        .reached(&database.id, crate::presence::Reached::Check(1), true);
+    assert!(state.presence.get(&database.id).unwrap().online);
+
+    // web-1 keeps sending, and nothing at all is stored for the others.
+    let now = test.connected_at() + TimeDelta::hours(1);
+    test.evaluate_at(now, Some(now)).await;
+
+    assert!(test.open().await.is_empty(), "{:?}", test.open().await);
+}
+
+#[tokio::test]
+async fn a_store_that_can_not_be_read_does_not_look_like_silence() {
+    let mut test = Harness::start().await;
+    test.database()
+        .create_alert_rule(&no_metrics_rule())
+        .await
+        .unwrap();
+    test.script.set_broken(true);
+
+    test.evaluate_at(test.connected_at() + TimeDelta::hours(1), None)
+        .await;
+
+    assert!(test.open().await.is_empty());
+}
+
+#[tokio::test]
+async fn nothing_about_missing_metrics_fires_just_after_a_start() {
+    let test = Harness::start().await;
+    let rule = AlertRuleInput {
+        hold: MINUTE,
+        ..no_metrics_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    let connected = test.connected_at();
+    let mut restarted = evaluator(&test.server, connected);
+
+    restarted
+        .evaluate(connected + TimeDelta::seconds(119))
+        .await
+        .unwrap();
+    assert!(test.open().await.is_empty(), "agents are still settling");
+
+    restarted
+        .evaluate(connected + TimeDelta::minutes(2))
+        .await
+        .unwrap();
+    let open = test.open().await;
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].breached_at, connected);
+}
+
+#[tokio::test]
+async fn an_open_no_metrics_alert_outlasts_a_restart_and_ends_when_samples_come() {
+    let mut test = Harness::start().await;
+    test.database()
+        .create_alert_rule(&no_metrics_rule())
+        .await
+        .unwrap();
+    let connected = test.connected_at();
+    test.evaluate_at(connected + TimeDelta::minutes(5), None)
+        .await;
+    assert_eq!(test.open().await.len(), 1);
+
+    let restart = connected + TimeDelta::minutes(6);
+    let mut restarted = evaluator(&test.server, restart);
+    restarted
+        .evaluate(restart + TimeDelta::seconds(1))
+        .await
+        .unwrap();
+    assert_eq!(test.open().await.len(), 1);
+
+    // Still within the grace period, and a sample is plain enough.
+    test.script
+        .set_last_sample(&test.id(), Some(restart + TimeDelta::seconds(2)));
+    restarted
+        .evaluate(restart + TimeDelta::seconds(5))
+        .await
+        .unwrap();
+    assert!(test.open().await.is_empty());
+}
+
+#[tokio::test]
+async fn an_agent_that_sends_seldom_has_a_few_of_its_intervals_to_send_in() {
+    let mut test = Harness::start().await;
+    test.database()
+        .create_alert_rule(&no_metrics_rule())
+        .await
+        .unwrap();
+    let every_ten_minutes = RuleInput {
+        name: "Every ten minutes".to_string(),
+        priority: 10,
+        condition: None,
+        operating_systems: Vec::new(),
+        enabled: true,
+        settings: json!({ "interval_secs": 600 }),
+    };
+    test.database()
+        .create_rule(&every_ten_minutes)
+        .await
+        .unwrap();
+    let sent = test.connected_at() + MINUTE;
+    test.evaluate_at(sent + TimeDelta::seconds(5), Some(sent))
+        .await;
+
+    // Long after the sample stopped being current, the newest seen still counts.
+    test.evaluate_at(sent + MINUTE * 29, None).await;
+    assert!(
+        test.open().await.is_empty(),
+        "three intervals haven't passed"
+    );
+
+    test.evaluate_at(sent + MINUTE * 30, None).await;
+    let open = test.open().await;
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].breached_at, sent);
+}
+
+#[tokio::test]
+async fn every_server_starts_with_a_rule_for_agents_sending_no_metrics() {
+    let rules = built_in_rules().await;
+    let rule = rules
+        .iter()
+        .find(|rule| rule.kind == RuleKind::NoMetrics)
+        .unwrap();
+
+    assert_eq!(rule.name, "Host sending no metrics");
+    assert_eq!(rule.hold, TimeDelta::minutes(5));
+    assert_eq!(rule.severity, Severity::Critical);
+    assert!(rule.enabled);
+    assert!(rule.all_channels);
+    assert_eq!(rule.condition, None);
+    check_rule(rule).unwrap();
+}
+
+/// Waits until the store has the server's reading of a host's clock.
+async fn wait_for_clock_reading(server: &TestServer, at: Timestamp) {
+    let clock = crate::metrics::find("clock.difference").unwrap();
+    let deadline = Instant::now() + std::time::Duration::from_secs(30);
+    while server
+        .state
+        .metrics
+        .newest(clock, at)
+        .await
+        .unwrap()
+        .is_empty()
+    {
+        assert!(Instant::now() < deadline, "the clock reading never arrived");
+        sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn an_agent_whose_samples_are_all_refused_alerts_until_they_are_stored_again() {
+    let server = start_with_metrics().await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
+    let rule = built_in_rules()
+        .await
+        .into_iter()
+        .find(|rule| rule.kind == RuleKind::NoMetrics)
+        .unwrap();
+    server
+        .state
+        .database
+        .create_alert_rule(&rule)
+        .await
+        .unwrap();
+    let connected = server.state.presence.get(&host.id()).unwrap().since;
+    let mut evaluator = evaluator(&server, connected - MINUTE * 10);
+
+    // Samples in a shape this server doesn't read, as from an agent on the other
+    // side of a change to them, are refused and never stored.
+    let refused = json!({
+        "type": "sample",
+        "taken_at": connected + MINUTE,
+        "metrics": { "cpu": { "usage_percent": 5.0 } },
+    });
+    client
+        .send(Message::text(refused.to_string()))
+        .await
+        .unwrap();
+    // The server still reads the host's clock, and saves that under the host, but
+    // that's not the agent sending anything.
+    let reading = crate::clock::Reading {
+        offset: TimeDelta::zero(),
+        round_trip: std::time::Duration::from_millis(3),
+    };
+    let checked = connected + MINUTE * 4;
+    let sample = reading.sample(&host.id(), "web-1", checked);
+    server
+        .state
+        .writer
+        .send(crate::store::WriterCommand::Save(sample))
+        .await
+        .unwrap();
+    wait_for_clock_reading(&server, checked).await;
+
+    evaluator
+        .evaluate(connected + TimeDelta::seconds(299))
+        .await
+        .unwrap();
+    assert!(
+        server
+            .state
+            .database
+            .open_alerts()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    evaluator
+        .evaluate(connected + TimeDelta::minutes(5))
+        .await
+        .unwrap();
+    let open = server.state.database.open_alerts().await.unwrap();
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].summary, "web-1 is connected but sending no metrics");
+    assert_eq!(open[0].breached_at, connected);
+
+    // An agent that sends what the server reads is stored, and that ends it.
+    let taken = connected + MINUTE * 6;
+    let sample = AgentMessage::Sample(Sample {
+        time: taken,
+        metrics: BTreeMap::from([("cpu".to_string(), json!({ "usage_percent": 5.0 }))]),
+    });
+    send(&mut client, &sample).await;
+    loop {
+        if let ServerMessage::Ack { time } = read_server_message(&mut client).await {
+            assert_eq!(time, taken);
+            break;
+        }
+    }
+    evaluator
+        .evaluate(taken + TimeDelta::seconds(15))
+        .await
+        .unwrap();
+    assert!(
+        server
+            .state
+            .database
+            .open_alerts()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let resolved = server.state.database.resolved_alerts(10).await.unwrap();
+    assert_eq!(
+        resolved[0].resolved_summary.as_deref(),
+        Some("web-1 is sending metrics again")
+    );
 }
 
 // ---- delivery
@@ -4437,6 +4871,46 @@ async fn an_offline_rule_can_be_made_from_the_form() {
 }
 
 #[tokio::test]
+async fn a_no_metrics_rule_can_be_made_from_the_form() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    let form = browser.get(&server, "/alerts/rules/new").await;
+    assert!(
+        form.body.contains(r#"<option value="no_metrics">"#),
+        "{}",
+        form.body
+    );
+    let mut fields = ALERT_RULE_FIELDS.to_vec();
+    fields[0] = ("name", "Silent");
+    fields[1] = ("kind", "no_metrics");
+    fields[4] = ("critical_threshold", "");
+    fields[6] = ("for_secs", "300");
+
+    let page = browser
+        .submit(&server, "/alerts/rules/new", "/alerts/rules", &fields)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    let rules = server.state.database.list_alert_rules().await.unwrap();
+    assert_eq!(rules[0].rule, no_metrics_rule());
+
+    let list = browser.get(&server, "/alerts/rules").await;
+    assert!(
+        list.body.contains("Sending no metrics for 5 minutes"),
+        "{}",
+        list.body
+    );
+    let edit = browser
+        .get(&server, &format!("/alerts/rules/{}/edit", rules[0].id))
+        .await;
+    assert!(
+        edit.body
+            .contains(r#"<option value="no_metrics" selected>"#),
+        "{}",
+        edit.body
+    );
+}
+
+#[tokio::test]
 async fn a_rejected_rule_keeps_what_was_typed_and_says_why() {
     let server = start().await;
     let mut browser = Browser::default();
@@ -5183,6 +5657,38 @@ async fn alert_rules_can_be_managed_through_the_api() {
     let (status, again) = api(&server, "POST", "/api/v1/alert-rules", &rule).await;
     assert_eq!(status, 201, "{again}");
     assert_ne!(again["id"], created["id"]);
+}
+
+#[tokio::test]
+async fn a_no_metrics_rule_can_be_managed_through_the_api() {
+    let server = start().await;
+    let rule = json!({
+        "name": "Silent",
+        "kind": "no_metrics",
+        "for_secs": 300,
+        "severity": "critical",
+    });
+
+    let (status, created) = api(&server, "POST", "/api/v1/alert-rules", &rule).await;
+    assert_eq!(status, 201, "{created}");
+    let path = format!("/api/v1/alert-rules/{}", created["id"]);
+    let (_, shown) = api(&server, "GET", &path, &Value::Null).await;
+    assert_eq!(shown["kind"], "no_metrics");
+    assert_eq!(shown["for_secs"], 300);
+    assert_eq!(shown["metric"], Value::Null);
+
+    let mut with_metric = rule.clone();
+    with_metric["name"] = json!("Silent CPU");
+    with_metric["metric"] = json!("cpu.usage");
+    let (status, body) = api(&server, "POST", "/api/v1/alert-rules", &with_metric).await;
+    assert_eq!(status, 422);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("a no-metrics rule doesn't take a metric"),
+        "{body}"
+    );
 }
 
 #[tokio::test]

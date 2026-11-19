@@ -319,10 +319,19 @@ impl Memory {
         let time = new.sample.time;
         anyhow::ensure!(can_store(time), "a sample's time is out of range");
         let host = new.host_id.as_str();
-        rows.reports.push(ReportRow {
-            time,
-            host_id: host.to_string(),
-        });
+        // The server's reading of an agent's clock is saved whether or not anything
+        // the agent sends is, so it doesn't say the host reported.
+        let from_host = new
+            .sample
+            .metrics
+            .keys()
+            .any(|collector| collector != crate::clock::COLLECTOR);
+        if from_host {
+            rows.reports.push(ReportRow {
+                time,
+                host_id: host.to_string(),
+            });
+        }
 
         for (collector, output) in &new.sample.metrics {
             if collector.len() > MAX_NAME_BYTES {

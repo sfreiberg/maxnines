@@ -533,7 +533,7 @@ pub const METRICS: &[Metric] = &[
         name: "clock.difference",
         title: "Clock difference from the server",
         unit: Unit::Seconds,
-        collector: "clock",
+        collector: crate::clock::COLLECTOR,
         source: Source::Fields(&[("Difference", Reading::Field("$.difference_secs"))]),
         chart: ShowChart::WithData,
     },
@@ -4454,6 +4454,16 @@ impl Metrics {
         let reader = self.reader.clone();
         tokio::task::spawn_blocking(move || {
             reader.newest(metric, now - CURRENT_WINDOW, now + CLOCK_SKEW)
+        })
+        .await
+        .context("reading metrics")?
+    }
+
+    /// When each host last sent a sample that's still current, by the host's clock.
+    pub async fn last_samples(&self, now: Timestamp) -> Result<Vec<LastSample>> {
+        let reader = self.reader.clone();
+        tokio::task::spawn_blocking(move || {
+            reader.last_samples(now - CURRENT_WINDOW, now + CLOCK_SKEW)
         })
         .await
         .context("reading metrics")?

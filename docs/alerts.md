@@ -2,11 +2,12 @@
 
 ## The built-in rules
 
-Every server starts with seven alert rules:
+Every server starts with eight alert rules:
 
 | Rule | Fires when | Severity |
 | --- | --- | --- |
 | **Host offline** | An approved host's agent has been gone for a minute | Critical |
+| **Host sending no metrics** | A host's agent has been [connected but sending no metrics](#connected-but-sending-no-metrics) for 5 minutes | Critical |
 | **Disk filling up** | A disk has been over 80% full for 5 minutes, or over 90% | Warning, then critical |
 | **Disk running out of inodes** | A disk has used over 80% of its [inodes](agents.md#disks) for 5 minutes, or over 90% | Warning, then critical |
 | **Container down** | A container has been failing for a minute, on hosts that report [containers](agents.md#containers) | Critical |
@@ -21,12 +22,34 @@ agent reconnecting, even just after the server restarts. They tell every notific
 as there's a channel to tell. Until then they show on the Alerts page and the overview.
 
 They're ordinary rules from then on: change them, turn them off or delete them under
-**Settings > Alert rules**, and upgrades leave them alone. A server that already had an
-offline rule of its own when it upgraded doesn't get a second one, and one with a
-disk usage, inodes or containers rule of its own doesn't get that one.
+**Settings > Alert rules**, and upgrades leave them alone. A server that already had a
+rule called Host sending no metrics when it upgraded keeps that one instead.
 
 Any rule can tell every channel this way, with **Every channel, including ones added
 later**, or tell only the channels chosen.
+
+## Connected but sending no metrics
+
+An agent can stay connected while nothing it sends is stored, such as when the server
+can't read samples from an agent on the other side of a change to them. It never goes
+offline, so the Host offline rule can't see it. A rule of the kind **A host stays
+connected but sends no metrics** alerts when the newest sample stored from a connected
+host is older than its **For at least** time, like *web-1 is connected but sending no
+metrics*, and resolves as soon as one is stored again, saying *web-1 is sending metrics
+again*.
+
+- A host that hasn't sent anything since it connected counts from when it connected.
+- A host that sends seldom gets at least three of its intervals, from the
+  [config rules](agents.md#config-rules) that apply to it, so one set to send a sample
+  every 10 minutes alerts after 30 minutes, not after 5.
+- Only connected agents are watched. One that's gone is the Host offline rule's to
+  alert on, and a host without an agent, or the server itself, never alerts. An alert
+  that's already open stays open while its agent is away and after it reconnects,
+  until a sample is stored.
+- The server's own readings of a host's [clock](agents.md#clock) don't count, as
+  they're saved whether or not anything the agent sends is.
+- Nothing starts in the first two minutes after the server starts, while agents
+  reconnect and send what they kept meanwhile.
 
 ## Forecasts
 
@@ -176,8 +199,8 @@ Press **Chart** on an open alert to see just what it's about: its own series, su
 the one disk that's filling, with the rule's thresholds across it and lines where the
 alert started and, once it has, resolved. The chart reaches back past the start to
 show what led up to it, and the ranges above it look further. A forecast's chart has
-its level, such as 100%, across it instead. Offline alerts have no chart, as they
-don't watch a metric.
+its level, such as 100%, across it instead. Offline and no-metrics alerts have no
+chart, as they don't watch a metric.
 
 ## Reminders and acknowledging
 

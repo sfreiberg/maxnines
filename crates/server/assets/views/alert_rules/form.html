@@ -22,6 +22,7 @@
       <select name="kind">
         <option value="metric"{% if rule.kind == "metric" %} selected{% endif %}>A metric crosses a threshold</option>
         <option value="offline"{% if rule.kind == "offline" %} selected{% endif %}>A host goes offline</option>
+        <option value="no_metrics"{% if rule.kind == "no_metrics" %} selected{% endif %}>A host stays connected but sends no metrics</option>
         <option value="calculation"{% if rule.kind == "calculation" %} selected{% endif %}>A calculation across hosts crosses a threshold</option>
         <option value="forecast"{% if rule.kind == "forecast" %} selected{% endif %}>A metric is on course to reach a level soon, like a disk filling up</option>
       </select>
@@ -118,7 +119,7 @@
 
     <label>For at least (seconds)
       <input type="number" name="for_secs" value="{{ rule.for_secs }}" min="0" required>
-      <small>The problem has to last this long to alert. The alert resolves as soon as it's gone.</small>
+      <small>The problem has to last this long to alert. The alert resolves as soon as it's gone. A host sending no metrics gets at least three of its intervals, for one that sends seldom.</small>
     </label>
 
     <label>Remind every (minutes)
@@ -136,7 +137,7 @@
         <option value="warning"{% if rule.severity == "warning" %} selected{% endif %}>Warning</option>
         <option value="critical"{% if rule.severity == "critical" %} selected{% endif %}>Critical</option>
       </select>
-      <small>Only for a host going offline. A metric or calculation takes its severity from the thresholds, and a forecast from how soon.</small>
+      <small>Only for a host going offline or sending no metrics. A metric or calculation takes its severity from the thresholds, and a forecast from how soon.</small>
     </label>
   </fieldset>
 

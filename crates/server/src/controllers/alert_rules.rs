@@ -285,7 +285,7 @@ impl AlertRuleForm {
 
         // The form always sends these, and they only mean something for metrics.
         let (metric, series, comparison) = match kind {
-            RuleKind::Offline => (None, None, None),
+            RuleKind::Offline | RuleKind::NoMetrics => (None, None, None),
             RuleKind::Calculation => (
                 Some(self.metric.clone()),
                 None,
@@ -303,7 +303,9 @@ impl AlertRuleForm {
         let mut forecast = None;
         let mut warning_forecast = None;
         let (threshold, warning_threshold, severity) = match kind {
-            RuleKind::Offline => (None, None, Severity::parse(&self.severity)?),
+            RuleKind::Offline | RuleKind::NoMetrics => {
+                (None, None, Severity::parse(&self.severity)?)
+            }
             RuleKind::Forecast => {
                 let level: f64 = match self.level.as_str() {
                     "" => bail!("a forecast needs a level to watch for"),

@@ -1290,10 +1290,15 @@ impl MetricsReader for DuckDbReader {
                  SELECT se.host_number, max(s.time) AS time
                  FROM all_samples s JOIN series se ON se.id = s.series_id
                  WHERE s.time >= $1::TIMESTAMP AND s.time <= $2::TIMESTAMP
+                   AND s.metric_id NOT IN (
+                       SELECT m.id FROM metrics m JOIN collectors c ON c.id = m.collector_id
+                       WHERE c.name = $3
+                   )
                  GROUP BY se.host_number
              ) newest JOIN hosts h ON h.number = newest.host_number",
         )?;
-        let rows = statement.query_map([timestamp(since), timestamp(until)], |row| {
+        let parameters = params![timestamp(since), timestamp(until), crate::clock::COLLECTOR];
+        let rows = statement.query_map(parameters, |row| {
             Ok(LastSample {
                 host_id: row.get(0)?,
                 time: row.get(1)?,

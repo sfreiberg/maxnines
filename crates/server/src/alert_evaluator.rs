@@ -25,7 +25,7 @@ use crate::alerting::{
 use crate::calculations::{
     self, Calculation, Grouping, Question, SMALLEST_STEP, Sources, over_window,
 };
-use crate::facts::unflatten;
+use crate::facts::{FlatFacts, unflatten};
 use crate::metrics::{self, Metrics, NewestReading, TimeRange, Trend};
 use crate::models::Database;
 use crate::presence::Presence;
@@ -62,6 +62,12 @@ const MIN_FORECAST_SAMPLES: u64 = 10;
 /// A series not heard from for this long has no forecast, as with any missing
 /// reading, which says nothing about whether anything is wrong.
 const FORECAST_FRESH: TimeDelta = TimeDelta::minutes(10);
+
+/// A no-metrics rule waits at least this many of an agent's intervals, so a host set to
+/// send a sample every ten minutes isn't silent between them. A first sample can take
+/// up to an interval longer than the rest, and a write can be held back to batch it,
+/// so this many means samples really have stopped, not that one is late.
+const MISSED_SAMPLES: i32 = 3;
 
 /// What a forecast reads: a metric over how far back it looks.
 type TrendKey = (&'static str, TimeDelta);
@@ -135,7 +141,7 @@ struct Tracker {
     /// One for each level, mildest first.
     holds: Vec<Hold>,
     /// Each sample is only counted once, as checks run more often than some
-    /// agents report.
+    /// agents report. For a no-metrics rule, the newest sample seen from the host.
     last_sample: Option<Timestamp>,
 }
 
@@ -217,6 +223,9 @@ struct Snapshot {
     readings: BTreeMap<&'static str, BTreeMap<String, Vec<NewestReading>>>,
     /// For forecasts, the same way.
     trends: HashMap<TrendKey, Trends>,
+    /// For no-metrics rules, when each host's newest current sample was taken. None
+    /// if that couldn't be read, which says nothing about whether anything is wrong.
+    last_samples: Option<BTreeMap<String, Timestamp>>,
 }
 
 impl Snapshot {
@@ -254,6 +263,10 @@ impl Snapshot {
         match rule.rule.kind {
             RuleKind::Offline if self.in_grace => None,
             RuleKind::Offline => Some("The rule changed"),
+            // Only a connected agent is checked. One that's gone, or not back yet after
+            // a restart, still isn't sending anything: the offline rule says it's gone,
+            // and this alert ends once its samples are stored again.
+            RuleKind::NoMetrics => None,
             RuleKind::Calculation => None,
             RuleKind::Metric | RuleKind::Forecast => {
                 // The agent still reports the metric, so one of three things has
@@ -423,6 +436,13 @@ impl Evaluator {
             self.read_trends(key, now).await?;
         }
 
+        let watches_samples = active().any(|rule| rule.rule.kind == RuleKind::NoMetrics);
+        let last_samples = if watches_samples {
+            self.read_last_samples(now).await
+        } else {
+            None
+        };
+
         Ok(Snapshot {
             now,
             in_grace: now - self.started_at < STARTUP_GRACE,
@@ -431,7 +451,44 @@ impl Evaluator {
             facts,
             readings,
             trends: self.trends.clone(),
+            last_samples,
         })
+    }
+
+    /// When each host's newest current sample was taken, in one query for them all.
+    /// If it can't be read, no-metrics rules wait until it can.
+    async fn read_last_samples(&self, now: Timestamp) -> Option<BTreeMap<String, Timestamp>> {
+        match self.metrics.last_samples(now).await {
+            Ok(rows) => Some(
+                rows.into_iter()
+                    .map(|row| (row.host_id, row.time))
+                    .collect(),
+            ),
+            Err(error) => {
+                error!(
+                    error = format!("{error:#}"),
+                    "reading when hosts last sent samples failed"
+                );
+                None
+            }
+        }
+    }
+
+    /// How often an agent is set to send a sample, by the config rules that apply to
+    /// it now, or nothing if its config can't be worked out.
+    async fn interval(&self, host_id: &str) -> Result<Option<TimeDelta>> {
+        let rules = self.database.list_rules().await?;
+        let facts: FlatFacts = self
+            .database
+            .current_facts(host_id)
+            .await?
+            .into_iter()
+            .map(|fact| (fact.name, fact.value))
+            .collect();
+        let resolved = rule_engine::resolve(&rules, &unflatten(&facts), host_id);
+        Ok(resolved
+            .ok()
+            .and_then(|resolved| TimeDelta::from_std(resolved.config.interval).ok()))
     }
 
     /// Reads which way a metric has been heading, if it's been long enough since
@@ -496,6 +553,13 @@ impl Evaluator {
                     RuleKind::Offline if host.is_local() => {}
                     RuleKind::Offline => {
                         self.check_offline(rule, host, &snapshot, &mut open, &mut checked)
+                            .await?;
+                    }
+                    // The server reads what it has of these hosts itself, so there's
+                    // no agent whose samples could stop.
+                    RuleKind::NoMetrics if host.is_local() || host.is_agentless() => {}
+                    RuleKind::NoMetrics => {
+                        self.check_no_metrics(rule, host, &snapshot, &mut open, &mut checked)
                             .await?;
                     }
                     RuleKind::Metric => {
@@ -569,6 +633,77 @@ impl Evaluator {
         let summary = match change {
             Some(Change::Resolve) => crate::alerting::AlertRuleInput::online_summary(&hostname),
             _ => crate::alerting::AlertRuleInput::offline_summary(&hostname),
+        };
+        self.apply(change, rule, &hostname, key, None, summary, snapshot, open)
+            .await
+    }
+
+    /// Alerts on a connected agent whose samples have stopped being stored, as when the
+    /// server refuses everything it sends. One that isn't connected is the offline
+    /// rule's to alert on, so it's left alone.
+    async fn check_no_metrics(
+        &mut self,
+        rule: &AlertRule,
+        host: &HostRecord,
+        snapshot: &Snapshot,
+        open: &mut HashMap<Key, Alert>,
+        checked: &mut HashSet<Key>,
+    ) -> Result<()> {
+        let Some(presence) = self.presence.get(&host.id).filter(|p| p.online) else {
+            return Ok(());
+        };
+        let key = Key {
+            rule_id: rule.id,
+            host_id: host.id.clone(),
+            series: None,
+        };
+        checked.insert(key.clone());
+        let Some(last_samples) = &snapshot.last_samples else {
+            return Ok(());
+        };
+
+        // A sample is only current for a few minutes, so the newest one seen is kept
+        // while the agent stays connected, for one that sends less often than that.
+        let tracker = self.trackers.entry(key.clone()).or_default();
+        if let Some(&taken) = last_samples.get(&host.id) {
+            tracker.last_sample = tracker.last_sample.max(Some(taken));
+        }
+        let newest = tracker.last_sample;
+        // The silence began with the newest sample, or with connecting if none has
+        // come since, as an agent that was away can't have sent anything meanwhile.
+        let since = newest.map_or(presence.since, |taken| taken.max(presence.since));
+        let quiet_for = snapshot.now - since;
+        let silent = match open.get(&key) {
+            // It's over once anything newer than the silence is stored, even if the
+            // agent has reconnected since, which starts the count above again.
+            Some(alert) => !newest.is_some_and(|taken| taken > alert.breached_at),
+            // One that sends seldom gets a few of its intervals too. They're only
+            // worked out for a host quiet for longer than the hold, which is rare.
+            None if quiet_for >= rule.rule.hold => match self.interval(&host.id).await? {
+                Some(every) => quiet_for >= every * MISSED_SAMPLES,
+                None => true,
+            },
+            None => false,
+        };
+
+        let tracker = self.trackers.entry(key.clone()).or_default();
+        let hold = tracker.only_hold();
+        hold.breached_since = silent.then_some(since);
+        let levels = [(rule.rule.severity, silent)];
+        let current = open.get(&key).map(|alert| alert.severity);
+        let change = tracker.observe(&levels, snapshot.now, rule.rule.hold, current);
+        // Just after a start, agents are still reconnecting and sending what they
+        // kept meanwhile, so nothing starts. Samples arriving still end an alert.
+        if snapshot.in_grace && matches!(change, Some(Change::Fire(_))) {
+            return Ok(());
+        }
+
+        let hostname = clean(&host.hostname);
+        let summary = match change {
+            Some(Change::Resolve) => {
+                crate::alerting::AlertRuleInput::metrics_again_summary(&hostname)
+            }
+            _ => crate::alerting::AlertRuleInput::no_metrics_summary(&hostname),
         };
         self.apply(change, rule, &hostname, key, None, summary, snapshot, open)
             .await

@@ -149,7 +149,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
             .list_alert_rules()
             .await?
             .into_iter()
-            .filter(|rule| rule.rule.kind != RuleKind::Offline)
+            .filter(|rule| !rule.rule.kind.is_about_the_agent())
             .map(|rule| rule.id)
             .collect();
         anyhow::Ok((open, resolved, problems, silences, charted))

@@ -11,7 +11,7 @@ pub struct Migrator;
 
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(CreateTables)]
+        vec![Box::new(CreateTables), Box::new(AddNoMetricsRule)]
     }
 }
 
@@ -1545,6 +1545,78 @@ async fn add_built_in_rule(manager: &SchemaManager<'_>, rule: &BuiltInRule) -> R
     }
 }
 
+struct AddNoMetricsRule;
+
+impl MigrationName for AddNoMetricsRule {
+    fn name(&self) -> &str {
+        "m20261119_000002_add_no_metrics_rule"
+    }
+}
+
+/// A connected agent whose samples all stop being stored, such as after a change to
+/// what agents send, never goes offline, so nothing else notices.
+const NO_METRICS_RULE: BuiltInRule = BuiltInRule {
+    name: "Host sending no metrics",
+    kind: "no_metrics",
+    metric: None,
+    comparison: None,
+    threshold: None,
+    warning_threshold: None,
+    for_secs: 300,
+    window_secs: None,
+    forecast_secs: None,
+    warning_forecast_secs: None,
+};
+
+/// Adds the built-in rule for an agent that's connected but sending no metrics, to
+/// new servers and ones made before it, as upgrades leave the rules a server has
+/// alone. One that already has a rule of that name keeps it rather than getting a
+/// second, as names are each used once.
+#[async_trait::async_trait]
+impl MigrationTrait for AddNoMetricsRule {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let same = Query::select()
+            .column(AlertRules::Id)
+            .from(AlertRules::Table)
+            .and_where(Expr::col(AlertRules::DeletedAt).is_null())
+            .and_where(
+                Expr::col(AlertRules::Name)
+                    .eq(NO_METRICS_RULE.name)
+                    .or(Expr::col(AlertRules::Kind).eq(NO_METRICS_RULE.kind)),
+            )
+            .limit(1)
+            .to_owned();
+        if manager.get_connection().query_one(&same).await?.is_some() {
+            return Ok(());
+        }
+        add_built_in_rule(manager, &NO_METRICS_RULE).await
+    }
+
+    /// The server before this can't read a rule of this kind, so every one goes, with
+    /// its alerts, whose notifications and action runs go with them.
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let rules = Query::select()
+            .column(AlertRules::Id)
+            .from(AlertRules::Table)
+            .and_where(Expr::col(AlertRules::Kind).eq(NO_METRICS_RULE.kind))
+            .to_owned();
+        let alerts = Query::delete()
+            .from_table(Alerts::Table)
+            .and_where(Expr::col(Alerts::RuleId).in_subquery(rules))
+            .to_owned();
+        manager.exec_stmt(alerts).await?;
+        let rules = Query::delete()
+            .from_table(AlertRules::Table)
+            .and_where(Expr::col(AlertRules::Kind).eq(NO_METRICS_RULE.kind))
+            .to_owned();
+        manager.exec_stmt(rules).await
+    }
+}
+
 #[derive(Iden)]
 enum Hosts {
     Table,
@@ -2055,6 +2127,7 @@ mod tests {
                 "Disk running out of inodes",
                 "Clock is wrong",
                 "Service stopped",
+                "Host sending no metrics",
             ]
         );
         let settings = "SELECT s.name FROM config_rule_settings s
@@ -2063,6 +2136,36 @@ mod tests {
         let names = texts(&connection, settings).await;
         assert_eq!(names.len(), DEFAULT_SETTINGS.len());
         assert_eq!(names[0], "interval_secs");
+    }
+
+    #[tokio::test]
+    async fn a_server_made_before_the_no_metrics_rule_gets_it_on_upgrading() {
+        let connection = empty().await;
+        Migrator::up(&connection, Some(1)).await.unwrap();
+        Migrator::up(&connection, None).await.unwrap();
+
+        let added = "SELECT kind FROM alert_rules
+                     WHERE name = 'Host sending no metrics' AND for_secs = 300
+                     AND severity = 'critical' AND enabled AND all_channels";
+        assert_eq!(texts(&connection, added).await, ["no_metrics"]);
+    }
+
+    #[tokio::test]
+    async fn a_rule_of_its_own_by_that_name_is_kept_instead() {
+        let connection = empty().await;
+        Migrator::up(&connection, Some(1)).await.unwrap();
+        connection
+            .execute_unprepared(
+                "UPDATE alert_rules SET name = 'Host sending no metrics'
+                 WHERE name = 'Clock is wrong'",
+            )
+            .await
+            .unwrap();
+
+        Migrator::up(&connection, None).await.unwrap();
+
+        let named = "SELECT kind FROM alert_rules WHERE name = 'Host sending no metrics'";
+        assert_eq!(texts(&connection, named).await, ["metric"]);
     }
 
     #[tokio::test]

@@ -6,7 +6,9 @@ MaxNines keeps its data in two places:
   decides: hosts, facts, rules, alerts, users and the rest. It's SQLite by default,
   or PostgreSQL, MySQL or MariaDB, through sea-orm. One migration,
   `m20261119_000001_create_tables`, makes its tables, in
-  [`crates/server/src/migrations`](../crates/server/src/migrations/mod.rs).
+  [`crates/server/src/migrations`](../crates/server/src/migrations/mod.rs), and
+  `m20261119_000002_add_no_metrics_rule` adds the built-in Host sending no metrics
+  rule, which the first doesn't have.
 - **The metrics store** holds the numbers hosts report. It's DuckDB for a single
   server or ClickHouse for a big one, and only one of them is used. Each has one
   migration, `0001_create_tables`, which makes its tables: in
@@ -105,7 +107,7 @@ erDiagram
     alert_rules {
         int id PK
         string name "unique among those not deleted"
-        string kind "metric, calculation, forecast or offline"
+        string kind "metric, calculation, forecast, offline or no_metrics"
         string metric
         string series
         string comparison
@@ -616,5 +618,6 @@ erDiagram
 ```
 
 `series` lists what exists, to limit what a host can create without reading the
-samples, and `reports` says when each host last reported. `schema_migrations`
-records the migrations that have run.
+samples, and `reports` says when each host last reported. A sample holding only the
+server's reading of an agent's clock isn't a report, as that's saved whether or not
+anything the agent sends is. `schema_migrations` records the migrations that have run.

@@ -585,9 +585,10 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
   .preview td:last-child { grid-column: 1 / -1; }
 }
 
-/* An offline rule has no metric to choose, and a calculation picks its hosts with
-   a filter rather than a condition. Without :has() the fields just stay. */
-.alert-rule:has(select[name="kind"] option[value="offline"]:checked) .metric-fields { display: none; }
+/* An offline or no-metrics rule has no metric to choose, and a calculation picks its
+   hosts with a filter rather than a condition. Without :has() the fields just stay. */
+.alert-rule:has(select[name="kind"] option[value="offline"]:checked) .metric-fields,
+.alert-rule:has(select[name="kind"] option[value="no_metrics"]:checked) .metric-fields { display: none; }
 .alert-rule:has(select[name="kind"] option[value="calculation"]:checked) .applies-to { display: none; }
 .metric-fields { display: contents; }
 /* A metrics page's form shows only the boxes for the way of signing in chosen. */

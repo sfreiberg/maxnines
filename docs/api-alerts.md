@@ -44,9 +44,10 @@ still names it. `series` is the disk, interface or check it's about, or `null` f
 alert about the host as a whole.
 
 `started_at` is when the alert fired, and `breached_at` when its problem began, such
-as when a host went offline. An alert fires once its rule's condition has held for the
-rule's `for_secs`, so `breached_at` is that much earlier, or more, as checks run on a
-schedule. It's when the page says the problem has lasted since.
+as when a host went offline, or when a connected host's newest stored sample was
+taken. An alert fires once its rule's condition has held for the rule's `for_secs`,
+so `breached_at` is that much earlier, or more, as checks run on a schedule. It's
+when the page says the problem has lasted since.
 
 `silence_id` is the ID of the silence keeping an open alert's notifications back, and
 `maintenance_window_id` is the ID of the [window](api-maintenance-windows.md) doing so.
@@ -89,7 +90,7 @@ What an alert watches over a period of time, as its chart on the Alerts page sho
 only the alert's own series, with the rule's `thresholds`. Points are as for
 [a host's metric](api-hosts.md#get-a-hosts-metric), and for a calculation rule they're
 the calculation's answer. Returns `404` if there's no such alert, or nothing to chart:
-an offline alert, or one whose rule has been deleted.
+an offline or no-metrics alert, or one whose rule has been deleted.
 
 | Parameter | Description |
 | --- | --- |

@@ -7,7 +7,7 @@ Telegram, Slack, email and Resend get a chart with it: the last hour of what the
 watches, on that host or for that calculation, with the rule's thresholds and the
 moments the alert started and resolved. Times on it are in UTC, like the rest of the
 message. Other notifications, and other channels, are text only. An alert about a host
-going offline has nothing to chart.
+going offline or sending no metrics has nothing to chart.
 
 In Slack, a resolved alert's chart replaces the one in the message it fired with.
 

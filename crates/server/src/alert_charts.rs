@@ -128,7 +128,7 @@ pub async fn watched(
     };
     let rule = rule.rule;
     let (metric, unit, mut result) = match rule.kind {
-        RuleKind::Offline => return Ok(None),
+        RuleKind::Offline | RuleKind::NoMetrics => return Ok(None),
         RuleKind::Metric | RuleKind::Forecast => {
             let Some(metric) = rule.metric() else {
                 return Ok(None);
