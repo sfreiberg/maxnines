@@ -1,7 +1,11 @@
 # Builds the agent and server for every supported platform, packages them, and
-# publishes a GitHub release when a version tag such as v0.1.0 is pushed. A tag
-# with a suffix, such as v0.1.0-rc.1, makes a pre-release. The tag has to match
-# the version in Cargo.toml.
+# publishes a GitHub release when a version tag is pushed.
+#
+# Every MaxNines repo releases the same way. A tag v1.2.3 is a production release,
+# and v1.2.3-alpha.N, v1.2.3-beta.N or v1.2.3-rc.N a pre-release, published as one;
+# only production releases become the latest. The tag has to match the version in
+# the workspace Cargo.toml. Each release is titled "MaxNines 1.2.3", with notes
+# from the commits, its files, and their SHA256SUMS.
 #
 # A pull request that changes the release machinery runs everything except
 # publishing, so it's known to work before a tag needs it. So does starting this
@@ -47,6 +51,10 @@ jobs:
         run: |
           version=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "maxnines-server") | .version')
+          if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[1-9][0-9]*)?$'; then
+            echo "::error::$version can't be released: a version is 1.2.3, or 1.2.3-alpha.N, -beta.N or -rc.N"
+            exit 1
+          fi
           if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
             echo "::error::The tag $GITHUB_REF_NAME doesn't match the version in Cargo.toml, $version"
             exit 1
