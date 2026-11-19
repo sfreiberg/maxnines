@@ -491,7 +491,7 @@ async fn tokens_expire_and_stop_with_their_owner() {
     let (id, _) = person(&server, "someone@example.com", Role::Responder).await;
     let now = now_ms();
     let (_, tokens) = database
-        .create_app_sign_in(id, "maxnines-menubar", "Mac", Role::Responder, now)
+        .create_app_sign_in(id, "maxnines-desktop-mac", "Mac", Role::Responder, now)
         .await
         .unwrap();
 
@@ -506,7 +506,7 @@ async fn tokens_expire_and_stop_with_their_owner() {
     let late = database
         .refresh_app_sign_in(
             &tokens.refresh_token,
-            "maxnines-menubar",
+            "maxnines-desktop-mac",
             now + REFRESH_LIFETIME_MS,
         )
         .await
@@ -523,7 +523,7 @@ async fn tokens_expire_and_stop_with_their_owner() {
     database.disable_user(id, now).await.unwrap();
     assert!(accepted(now).await.unwrap().is_none());
     let disabled = database
-        .refresh_app_sign_in(&tokens.refresh_token, "maxnines-menubar", now)
+        .refresh_app_sign_in(&tokens.refresh_token, "maxnines-desktop-mac", now)
         .await
         .unwrap();
     assert_eq!(disabled, Refreshed::Refused);
@@ -548,7 +548,13 @@ async fn signed_in_apps_are_listed_and_revoked() {
         .await
         .unwrap();
     let (_, second_tokens) = database
-        .create_app_sign_in(owner, "maxnines-tray", "office PC", Role::Viewer, now)
+        .create_app_sign_in(
+            owner,
+            "maxnines-desktop-windows",
+            "office PC",
+            Role::Viewer,
+            now,
+        )
         .await
         .unwrap();
 
@@ -569,7 +575,7 @@ async fn signed_in_apps_are_listed_and_revoked() {
     // An app signs itself out with what it holds.
     let fields = [
         ("token", second_tokens.refresh_token.as_str()),
-        ("client_id", "maxnines-tray"),
+        ("client_id", "maxnines-desktop-windows"),
     ];
     let (status, _) = app_post(&server, "/oauth/revoke", &fields).await;
     assert_eq!(status, 200);

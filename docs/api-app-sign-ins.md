@@ -36,8 +36,8 @@ approval page and Signed-in apps show by name:
 | `client_id` | App |
 | --- | --- |
 | `maxnines-cli` | The command line |
-| `maxnines-menubar` | MaxNines Desktop for Mac, a menu bar app |
-| `maxnines-tray` | MaxNines Desktop for Windows, a notification area app |
+| `maxnines-desktop-mac` | MaxNines Desktop for Mac, a menu bar app |
+| `maxnines-desktop-windows` | MaxNines Desktop for Windows, a notification area app |
 | `maxnines-desktop-linux` | MaxNines Desktop for Linux, a tray app |
 
 Any other app, such as your own script, can sign in through the browser with an ID of

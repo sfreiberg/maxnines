@@ -70,11 +70,11 @@ const KNOWN_APPS: [KnownApp; 4] = [
         name: "MaxNines command line",
     },
     KnownApp {
-        id: "maxnines-menubar",
+        id: "maxnines-desktop-mac",
         name: "MaxNines Desktop for Mac",
     },
     KnownApp {
-        id: "maxnines-tray",
+        id: "maxnines-desktop-windows",
         name: "MaxNines Desktop for Windows",
     },
     KnownApp {
@@ -505,8 +505,14 @@ mod tests {
     fn maxnines_own_apps_are_named_and_others_say_what_they_call_themselves() {
         let named = |id: &str| client(id).map(|client| (client.name, client.known));
         let own = |name: &str| Some((name.to_string(), true));
-        assert_eq!(named("maxnines-menubar"), own("MaxNines Desktop for Mac"));
-        assert_eq!(named("maxnines-tray"), own("MaxNines Desktop for Windows"));
+        assert_eq!(
+            named("maxnines-desktop-mac"),
+            own("MaxNines Desktop for Mac")
+        );
+        assert_eq!(
+            named("maxnines-desktop-windows"),
+            own("MaxNines Desktop for Windows")
+        );
         assert_eq!(
             named("maxnines-desktop-linux"),
             own("MaxNines Desktop for Linux")
@@ -597,7 +603,7 @@ mod tests {
             .unwrap();
         assert!(
             pending
-                .take_code(&code, "maxnines-tray", redirect, VERIFIER, 1)
+                .take_code(&code, "maxnines-desktop-windows", redirect, VERIFIER, 1)
                 .is_none()
         );
         let code = pending
@@ -700,21 +706,25 @@ mod tests {
     fn a_device_turned_down_or_left_too_long_hears_so() {
         let pending = PendingSignIns::default();
         let start = pending
-            .start_device(known_client("maxnines-menubar").unwrap(), "", None, 0)
+            .start_device(known_client("maxnines-desktop-mac").unwrap(), "", None, 0)
             .unwrap()
             .unwrap();
         assert!(pending.decide_device(&start.user_code, None, 1));
         assert_eq!(
-            pending.poll_device(&start.device_code, "maxnines-menubar", 2),
+            pending.poll_device(&start.device_code, "maxnines-desktop-mac", 2),
             DevicePoll::Denied
         );
 
         let start = pending
-            .start_device(known_client("maxnines-menubar").unwrap(), "", None, 0)
+            .start_device(known_client("maxnines-desktop-mac").unwrap(), "", None, 0)
             .unwrap()
             .unwrap();
         assert_eq!(
-            pending.poll_device(&start.device_code, "maxnines-menubar", PENDING_LIFETIME_MS),
+            pending.poll_device(
+                &start.device_code,
+                "maxnines-desktop-mac",
+                PENDING_LIFETIME_MS
+            ),
             DevicePoll::Expired
         );
         assert!(
