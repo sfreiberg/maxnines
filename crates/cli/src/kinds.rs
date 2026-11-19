@@ -225,9 +225,7 @@ pub fn show(
     let wide = format == Format::Wide;
     let now = now_ms();
     let ago = |item: &Value, field: &str| {
-        item[field]
-            .as_i64()
-            .map_or_else(|| "-".to_string(), |ms| span(now - ms))
+        moment(item, field).map_or_else(|| "-".to_string(), |ms| span(now - ms))
     };
     let (headings, rows): (Vec<&str>, Vec<Vec<String>>) = match kind {
         Kind::Hosts => {
@@ -242,7 +240,7 @@ pub fn show(
                         text(host, "hostname"),
                         text(host, "id").chars().take(8).collect(),
                         host_status(host),
-                        ago(host, "last_seen_ms"),
+                        ago(host, "last_seen_at"),
                     ];
                     if wide {
                         row.extend([text(host, "kind"), text(host, "id")]);
@@ -257,9 +255,9 @@ pub fn show(
             let rows = items
                 .iter()
                 .map(|alert| {
-                    let lasted = match alert["resolved_ms"].as_i64() {
-                        Some(ended) => span(ended - alert["started_ms"].as_i64().unwrap_or(ended)),
-                        None => ago(alert, "started_ms"),
+                    let lasted = match moment(alert, "resolved_at") {
+                        Some(ended) => span(ended - moment(alert, "started_at").unwrap_or(ended)),
+                        None => ago(alert, "started_at"),
                     };
                     vec![
                         text(alert, "id"),
@@ -281,15 +279,13 @@ pub fn show(
             let rows = items
                 .iter()
                 .map(|silence| {
-                    let ends = silence["ends_ms"]
-                        .as_i64()
-                        .map_or_else(String::new, |ends| {
-                            if ends > now {
-                                format!("in {}", span(ends - now))
-                            } else {
-                                format!("{} ago", span(now - ends))
-                            }
-                        });
+                    let ends = moment(silence, "ends_at").map_or_else(String::new, |ends| {
+                        if ends > now {
+                            format!("in {}", span(ends - now))
+                        } else {
+                            format!("{} ago", span(now - ends))
+                        }
+                    });
                     vec![
                         text(silence, "id"),
                         text(silence, "reason"),
@@ -352,9 +348,18 @@ fn host_status(host: &Value) -> String {
     }
 }
 
+/// A moment the API gives as an ISO 8601 time, such as `2026-11-19T01:57:17.828Z`, in
+/// milliseconds since 1970 to work out spans with. Nothing if it's missing or empty.
+fn moment(item: &Value, field: &str) -> Option<i64> {
+    let text = item[field].as_str()?;
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|time| time.timestamp_millis())
+}
+
 fn alert_state(alert: &Value) -> String {
     let mut state = Vec::new();
-    if alert["resolved_ms"].is_i64() {
+    if moment(alert, "resolved_at").is_some() {
         state.push("resolved".to_string());
     }
     if let Some(who) = alert["acknowledged_by"].as_str() {
@@ -459,7 +464,7 @@ pub fn describe(api: &Api, kind: Kind, name: &str) -> Result<String> {
         ("Kind".to_string(), text(host, "kind")),
         (
             "Status".to_string(),
-            match host["last_seen_ms"].as_i64() {
+            match moment(host, "last_seen_at") {
                 Some(seen) => format!("{}, last seen {} ago", host_status(host), span(now - seen)),
                 None => host_status(host),
             },
@@ -474,7 +479,7 @@ pub fn describe(api: &Api, kind: Kind, name: &str) -> Result<String> {
                 "{} ({}, {})",
                 text(alert, "summary"),
                 text(alert, "severity"),
-                span(now - alert["started_ms"].as_i64().unwrap_or(now))
+                span(now - moment(alert, "started_at").unwrap_or(now))
             )
         })
         .collect();

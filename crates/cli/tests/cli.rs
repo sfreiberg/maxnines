@@ -131,9 +131,9 @@ fn stderr(output: &Output) -> String {
 
 fn hosts_json() -> Value {
     json!([
-        {"id": "3f2a1c9d4e6b0000", "kind": "agent", "hostname": "web-1", "state": "approved", "online": true, "health": "online", "last_seen_ms": null},
-        {"id": "8be04471aaaa0000", "kind": "agent", "hostname": "web-1", "state": "approved", "online": false, "health": "offline", "last_seen_ms": null},
-        {"id": "22ad9264b6eb0000", "kind": "agentless", "hostname": "db-1", "state": "pending", "online": false, "health": null, "last_seen_ms": null}
+        {"id": "3f2a1c9d4e6b0000", "kind": "agent", "hostname": "web-1", "state": "approved", "online": true, "health": "online", "last_seen_at": null},
+        {"id": "8be04471aaaa0000", "kind": "agent", "hostname": "web-1", "state": "approved", "online": false, "health": "offline", "last_seen_at": null},
+        {"id": "22ad9264b6eb0000", "kind": "agentless", "hostname": "db-1", "state": "pending", "online": false, "health": null, "last_seen_at": null}
     ])
 }
 
@@ -142,8 +142,8 @@ fn alerts_json() -> Value {
         "open": [{
             "id": 41, "rule_id": 2, "rule_name": "Container down", "severity": "critical",
             "host_id": "22ad9264b6eb0000", "hostname": "db-1", "series": "web",
-            "summary": "Container web on db-1 is exited", "started_ms": 1,
-            "resolved_ms": null, "acknowledged_by": null, "silence_id": null, "maintenance_window_id": null
+            "summary": "Container web on db-1 is exited", "started_at": "1970-01-01T00:00:00.001Z",
+            "resolved_at": null, "acknowledged_by": null, "silence_id": null, "maintenance_window_id": null
         }],
         "resolved": []
     })
@@ -163,7 +163,7 @@ fn monitoring() -> FakeServer {
         ("GET", "/api/v1/alert-rules") => (200, "[]".to_string()),
         ("GET", "/api/v1/silences") => (
             200,
-            json!({"active": [], "ended": [{"id": 9, "rule_id": null, "filter": "hostname=db*", "series": "", "all_alerts": false, "reason": "Done", "created_by": "you@example.com", "starts_ms": 1, "ends_ms": 2}]}).to_string(),
+            json!({"active": [], "ended": [{"id": 9, "rule_id": null, "filter": "hostname=db*", "series": "", "all_alerts": false, "reason": "Done", "created_by": "you@example.com", "starts_at": "1970-01-01T00:00:00.001Z", "ends_at": "1970-01-01T00:00:00.002Z"}]}).to_string(),
         ),
         ("POST", "/api/v1/silences") => (201, json!({"id": 57}).to_string()),
         ("POST", "/api/v1/alerts/41/acknowledge") => (204, String::new()),
