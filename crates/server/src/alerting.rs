@@ -1140,6 +1140,25 @@ pub struct Delivery {
     pub action: Option<ActionRun>,
 }
 
+/// A name another alert rule or channel that isn't deleted already has. The database
+/// keeps each to one, so two saved at once can't both have it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NameTaken {
+    AlertRule(String),
+    Channel(String),
+}
+
+impl std::fmt::Display for NameTaken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlertRule(name) => write!(f, "an alert rule named {name:?} already exists"),
+            Self::Channel(name) => write!(f, "a channel named {name:?} already exists"),
+        }
+    }
+}
+
+impl std::error::Error for NameTaken {}
+
 /// A notification that was given up on, or is still being retried.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DeliveryProblem {

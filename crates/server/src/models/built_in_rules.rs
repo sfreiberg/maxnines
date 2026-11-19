@@ -153,13 +153,9 @@ impl Database {
                 .as_deref()
                 .is_some_and(|key| !shipped.iter().any(|built_in| built_in.key == key))
         });
+        // Their settings go with them.
         for row in gone {
             let before = load_rule(&transaction, row.id).await?;
-            config_rule_setting::Entity::delete_many()
-                .filter(config_rule_setting::Column::RuleId.eq(row.id))
-                .exec(&transaction)
-                .await
-                .context("removing a built-in rule's settings")?;
             config_rule::Entity::delete_by_id(row.id)
                 .exec(&transaction)
                 .await

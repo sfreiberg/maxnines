@@ -15,7 +15,7 @@ use crate::app_sign_ins::{
     ACCESS_LIFETIME, ACCESS_PREFIX, REFRESH_GRACE, REFRESH_LIFETIME, REFRESH_PREFIX, app_name,
     client, new_secret, secret_hash,
 };
-use crate::audit::{Kind, Snapshot};
+use crate::audit::{Kind, Record, Snapshot};
 use crate::roles::Role;
 use crate::times::Timestamp;
 
@@ -459,33 +459,23 @@ async fn revoke_row<C: ConnectionTrait>(
     .await
 }
 
-/// Deletes the apps a user signed in, as when the user is deleted, recording each.
-pub(super) async fn delete_for_user<C: ConnectionTrait>(
+/// What the audit log says of the apps a user signed in when the user is deleted,
+/// which they go with.
+pub(super) async fn deleted_with_user<C: ConnectionTrait>(
     connection: &C,
     user_id: i64,
     email: &str,
-) -> Result<()> {
+) -> Result<Vec<Record>> {
     let rows = app_sign_in::Entity::find()
         .filter(app_sign_in::Column::UserId.eq(user_id))
         .all(connection)
         .await
         .context("loading their signed in apps")?;
-    app_sign_in::Entity::delete_many()
-        .filter(app_sign_in::Column::UserId.eq(user_id))
-        .exec(connection)
-        .await
-        .context("deleting their signed in apps")?;
-    for row in &rows {
-        let before = snapshot(row, email);
-        record_change(
-            connection,
-            Kind::AppSignIn,
-            row.id,
-            Some(&before),
-            None,
-            None,
-        )
-        .await?;
-    }
-    Ok(())
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            let before = snapshot(row, email);
+            Record::of_change(Kind::AppSignIn, row.id, Some(&before), None, None)
+        })
+        .collect())
 }

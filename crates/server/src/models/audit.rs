@@ -22,9 +22,30 @@ fn clip(text: &str, chars: usize) -> String {
 
 /// Adds to the log through `connection`, which should be the change's transaction.
 pub(super) async fn record<C: ConnectionTrait>(connection: &C, record: Record) -> Result<()> {
+    record_all(connection, [record]).await
+}
+
+/// Adds entries to the log in one statement, in order, as [`record`] adds one.
+pub(super) async fn record_all<C: ConnectionTrait>(
+    connection: &C,
+    records: impl IntoIterator<Item = Record>,
+) -> Result<()> {
+    let rows: Vec<_> = records.into_iter().map(entry_row).collect();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    audit_entry::Entity::insert_many(rows)
+        .exec_without_returning(connection)
+        .await
+        .context("adding to the audit log")?;
+    Ok(())
+}
+
+/// An entry as it's kept, by whoever is acting now unless it says otherwise.
+fn entry_row(record: Record) -> audit_entry::ActiveModel {
     let acting = audit::current();
     let actor = record.actor.unwrap_or(acting.actor);
-    let row = audit_entry::ActiveModel {
+    audit_entry::ActiveModel {
         occurred_at: Set(times::now()),
         actor_kind: Set(actor.kind().to_string()),
         actor_id: Set(actor.id()),
@@ -43,12 +64,7 @@ pub(super) async fn record<C: ConnectionTrait>(connection: &C, record: Record) -
         subject_name: Set(clip(&record.subject.name, MAX_NAME_CHARS)),
         changes: Set(audit_entry::Changes(record.changes)),
         ..Default::default()
-    };
-    audit_entry::Entity::insert(row)
-        .exec_without_returning(connection)
-        .await
-        .context("adding to the audit log")?;
-    Ok(())
+    }
 }
 
 /// Records the difference between two snapshots, if there is one. A missing

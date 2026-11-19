@@ -255,8 +255,10 @@ impl Database {
     }
 
     /// Deletes an agent and everything kept about it: its facts, what it said about
-    /// its config, its alerts with their notifications, events about it alone, and a
-    /// place on the map made for it alone. All or nothing. Returns false if there was no such agent.
+    /// its config and when it started, its checks and metrics pages, its alerts with
+    /// their notifications and action runs, which all go with it, and the events
+    /// about it alone and a place on the map made for it alone, which only name it in
+    /// a filter. All or nothing. Returns false if there was no such agent.
     pub async fn delete_host(&self, id: &str) -> Result<bool> {
         let _only_writer = self.facts_lock.lock().await;
         let transaction = self.connection.begin().await.context("deleting a host")?;
@@ -264,31 +266,6 @@ impl Database {
             .one(&transaction)
             .await
             .context("loading host")?;
-        // Their notifications go with them.
-        alert::Entity::delete_many()
-            .filter(alert::Column::HostId.eq(id))
-            .exec(&transaction)
-            .await
-            .context("deleting a host's alerts")?;
-        host_fact::Entity::delete_many()
-            .filter(host_fact::Column::HostId.eq(id))
-            .exec(&transaction)
-            .await
-            .context("deleting a host's facts")?;
-        host_config_status::Entity::delete_by_id(id)
-            .exec(&transaction)
-            .await
-            .context("deleting a host's config status")?;
-        remote_check::Entity::delete_many()
-            .filter(remote_check::Column::HostId.eq(id))
-            .exec(&transaction)
-            .await
-            .context("deleting a host's checks")?;
-        metrics_page::Entity::delete_many()
-            .filter(metrics_page::Column::HostId.eq(id))
-            .exec(&transaction)
-            .await
-            .context("deleting a host's metrics pages")?;
         events::delete_host_events(&transaction, id).await?;
         location_rule::Entity::delete_many()
             .filter(location_rule::Column::Filter.eq(host_filter::only(id)))
@@ -916,12 +893,8 @@ impl Database {
     /// Returns false if there's no such rule.
     pub async fn delete_rule(&self, id: i64) -> Result<bool> {
         let transaction = self.connection.begin().await.context("deleting rule")?;
+        // Its settings go with it.
         let before = load_rule(&transaction, id).await?;
-        config_rule_setting::Entity::delete_many()
-            .filter(config_rule_setting::Column::RuleId.eq(id))
-            .exec(&transaction)
-            .await
-            .context("deleting rule settings")?;
         let deleted = config_rule::Entity::delete_by_id(id)
             .exec(&transaction)
             .await

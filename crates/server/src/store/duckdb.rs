@@ -34,10 +34,16 @@ struct Migration {
 
 /// Every schema change, in order. Applied ones are recorded in the database, so
 /// never edit one that has shipped: add a new one instead.
-const MIGRATIONS: &[Migration] = &[Migration {
-    name: "0001_create_tables",
-    sql: include_str!("migrations/0001_create_tables.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        name: "0001_create_tables",
+        sql: include_str!("migrations/0001_create_tables.sql"),
+    },
+    Migration {
+        name: "0002_keys",
+        sql: include_str!("migrations/0002_keys.sql"),
+    },
+];
 
 /// Only the bookkeeping table is created outside a migration, because it is
 /// what records them.
@@ -195,18 +201,19 @@ impl Names {
 
     /// JSON can't always tell `5` from `5.0`, so a metric that's ever had a fraction
     /// stays a float. Types other than that are whatever it first was.
-    fn metric(&mut self, collector: i32, name: &str, kind: DataType, rows: &mut Rows) -> i32 {
+    fn metric(&mut self, collector: i32, name: &str, data_type: DataType, rows: &mut Rows) -> i32 {
         let next = i32::try_from(self.metrics.len()).unwrap_or(i32::MAX) + 1;
         let key = (collector, name.to_string());
         if let Some((id, known)) = self.metrics.get_mut(&key) {
-            if *known == DataType::Int && kind == DataType::Float {
+            if *known == DataType::Int && data_type == DataType::Float {
                 *known = DataType::Float;
                 rows.now_float.push(*id);
             }
             return *id;
         }
-        self.metrics.insert(key, (next, kind));
-        rows.metrics.push((next, collector, name.to_string(), kind));
+        self.metrics.insert(key, (next, data_type));
+        rows.metrics
+            .push((next, collector, name.to_string(), data_type));
         next
     }
 
@@ -264,11 +271,11 @@ impl Names {
                 }
                 let item = labels_key(&reading.labels);
                 items.insert(item.clone());
-                let kind = match reading.value {
-                    Reported::Number(_, kind) => kind,
+                let data_type = match reading.value {
+                    Reported::Number(_, data_type) => data_type,
                     Reported::Text(_) => DataType::Text,
                 };
-                let metric = self.metric(collector, &reading.metric, kind, rows);
+                let metric = self.metric(collector, &reading.metric, data_type, rows);
                 let Some(series) = self.series(metric, host, &reading.labels, rows) else {
                     continue;
                 };
@@ -347,8 +354,8 @@ fn write_rows(transaction: &Transaction<'_>, rows: &Rows) -> Result<()> {
     }
     if !rows.metrics.is_empty() {
         let mut appender = transaction.appender("metrics")?;
-        for (id, collector, name, kind) in &rows.metrics {
-            appender.append_row(params![id, collector, name, kind.as_str()])?;
+        for (id, collector, name, data_type) in &rows.metrics {
+            appender.append_row(params![id, collector, name, data_type.as_str()])?;
         }
         appender.flush()?;
     }
@@ -1912,12 +1919,12 @@ mod tests {
         );
         write_metric(&mut store, "a", 3000, "cpu", json!({ "usage_percent": 6 }));
 
-        let kind: String = store
+        let data_type: String = store
             .connection
             .query_row("SELECT data_type FROM metrics", [], |row| row.get(0))
             .unwrap();
 
-        assert_eq!(kind, "float");
+        assert_eq!(data_type, "float");
         assert_eq!(
             averages(&query(&store, "a", "cpu.usage", 8).series[0]).len(),
             1
@@ -2571,6 +2578,55 @@ mod tests {
             applied_migrations(&store.connection),
             MIGRATIONS.len() as i64
         );
+    }
+
+    #[test]
+    fn the_keys_keep_what_was_there_and_refuse_a_number_used_twice() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("db");
+        let mut connection = Connection::open(&path).unwrap();
+        migrate(&mut connection, &MIGRATIONS[..1]).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO collectors VALUES (1, 'cpu');
+                 INSERT INTO metrics VALUES (1, 1, 'usage', 'float');
+                 INSERT INTO hosts VALUES (1, 'host-1');
+                 INSERT INTO series VALUES (1, 1, 1);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut store = DuckDbStore::open(&path, "1GB", Retention::default()).unwrap();
+        assert_eq!(
+            applied_migrations(&store.connection),
+            MIGRATIONS.len() as i64
+        );
+        for table in ["collectors", "metrics", "hosts", "series"] {
+            let rows: i64 = store
+                .connection
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 1, "{table}");
+        }
+        for repeat in [
+            "INSERT INTO collectors VALUES (1, 'memory')",
+            "INSERT INTO metrics VALUES (1, 1, 'idle', 'float')",
+            "INSERT INTO hosts VALUES (1, 'host-2')",
+            "INSERT INTO series VALUES (1, 1, 2)",
+        ] {
+            assert!(store.connection.execute_batch(repeat).is_err(), "{repeat}");
+        }
+
+        // The writer carries on numbering from what's there.
+        write_one(&mut store, "host-1", "web-1", &sample()).unwrap();
+        write_one(&mut store, "host-2", "web-2", &sample()).unwrap();
+        let hosts: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM hosts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(hosts, 2);
     }
 
     #[test]

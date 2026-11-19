@@ -18,7 +18,7 @@ use sea_orm::{
 use serde::Serialize;
 use serde_json::json;
 
-use super::audit::{record, record_change};
+use super::audit::{record, record_all, record_change};
 use super::{Database, api_key, api_key_snapshot, user, user_session};
 use crate::audit::{Action, Actor, Kind, Record, Snapshot, Subject};
 use crate::roles::Role;
@@ -579,41 +579,26 @@ impl Database {
             return Ok(UserChange::StillEnabled);
         }
         let transaction = self.connection.begin().await.context("starting a save")?;
-        user_session::Entity::delete_many()
-            .filter(user_session::Column::UserId.eq(id))
-            .exec(&transaction)
-            .await
-            .context("ending sessions")?;
-        super::two_factor::forget(&transaction, id).await?;
-        // Their keys act as them, so they go too.
+        // Everything of theirs goes with them: sessions, two-factor, and their keys
+        // and the apps they signed in, which act as them, and are recorded as gone.
         let keys = api_key::Entity::find()
             .filter(api_key::Column::UserId.eq(id))
             .all(&transaction)
             .await
             .context("loading their API keys")?;
-        api_key::Entity::delete_many()
-            .filter(api_key::Column::UserId.eq(id))
-            .exec(&transaction)
-            .await
-            .context("deleting their API keys")?;
-        for key in &keys {
-            let before = api_key_snapshot(key, &row.email);
-            record_change(
-                &transaction,
-                Kind::ApiKey,
-                key.id,
-                Some(&before),
-                None,
-                None,
-            )
-            .await?;
-        }
-        // So do the apps they signed in.
-        super::app_sign_ins::delete_for_user(&transaction, id, &row.email).await?;
+        let mut gone: Vec<Record> = keys
+            .iter()
+            .filter_map(|key| {
+                let before = api_key_snapshot(key, &row.email);
+                Record::of_change(Kind::ApiKey, key.id, Some(&before), None, None)
+            })
+            .collect();
+        gone.extend(super::app_sign_ins::deleted_with_user(&transaction, id, &row.email).await?);
         user::Entity::delete_by_id(id)
             .exec(&transaction)
             .await
             .context("deleting a user")?;
+        record_all(&transaction, gone).await?;
         record_user(&transaction, id, Some(&row), None).await?;
         transaction.commit().await.context("deleting a user")?;
         Ok(UserChange::Done)

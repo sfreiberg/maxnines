@@ -351,8 +351,8 @@ impl Database {
     }
 }
 
-/// Forgets what was recorded about one host alone, and when it started, as part of
-/// deleting it. Events for many hosts stay.
+/// Forgets what was recorded about one host alone, as part of deleting it. Events for
+/// many hosts stay.
 pub(super) async fn delete_host_events<C: ConnectionTrait>(
     connection: &C,
     host_id: &str,
@@ -362,9 +362,5 @@ pub(super) async fn delete_host_events<C: ConnectionTrait>(
         .exec(connection)
         .await
         .context("deleting a host's events")?;
-    host_boot::Entity::delete_by_id(host_id)
-        .exec(connection)
-        .await
-        .context("deleting a host's boot time")?;
     Ok(())
 }

@@ -16,7 +16,9 @@ use maxnines_protocol::actions::DEFAULT_ACTION_TIMEOUT;
 use super::condition_form::{ConditionForm, operators};
 use super::{CsrfForm, Page, server_error};
 use crate::actions::{RuleAction, RunOn};
-use crate::alerting::{AlertRuleInput, Comparison, DEFAULT_FORECAST_WINDOW, RuleKind, Severity};
+use crate::alerting::{
+    AlertRuleInput, Comparison, DEFAULT_FORECAST_WINDOW, NameTaken, RuleKind, Severity,
+};
 use crate::app_state::AppState;
 use crate::calculations::Calculation;
 use crate::condition_builder::Builder;
@@ -641,13 +643,9 @@ async fn edit(State(state): State<AppState>, Path(id): Path<i64>, token: CsrfTok
 }
 
 /// Turns the form into a valid rule, or explains what's wrong with it.
-async fn validate(
-    state: &AppState,
-    form: &AlertRuleForm,
-    id: Option<i64>,
-) -> Result<AlertRuleInput> {
+async fn validate(state: &AppState, form: &AlertRuleForm) -> Result<AlertRuleInput> {
     let input = form.to_rule(&known_facts(state).await)?;
-    state.check_alert_rule(&input, id).await?;
+    state.check_alert_rule(&input).await?;
     Ok(input)
 }
 
@@ -673,7 +671,7 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
         return response;
     }
 
-    let input = match validate(&state, &fields, None).await {
+    let input = match validate(&state, &fields).await {
         Ok(input) => input,
         Err(error) => {
             let message = format!("{error:#}");
@@ -683,6 +681,10 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
 
     match state.database.create_alert_rule(&input).await {
         Ok(_) => (form.token, Redirect::to("/alerts/rules")).into_response(),
+        Err(error) if error.is::<NameTaken>() => {
+            let message = format!("{error:#}");
+            form_page(&state, &form.token, None, &fields, Some(&message)).await
+        }
         Err(error) => server_error(&error),
     }
 }
@@ -693,7 +695,7 @@ async fn update(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfFo
         return response;
     }
 
-    let input = match validate(&state, &fields, Some(id)).await {
+    let input = match validate(&state, &fields).await {
         Ok(input) => input,
         Err(error) => {
             let message = format!("{error:#}");
@@ -704,6 +706,10 @@ async fn update(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfFo
     match state.database.update_alert_rule(id, &input).await {
         Ok(true) => (form.token, Redirect::to("/alerts/rules")).into_response(),
         Ok(false) => not_found(&state, &form.token),
+        Err(error) if error.is::<NameTaken>() => {
+            let message = format!("{error:#}");
+            form_page(&state, &form.token, Some(id), &fields, Some(&message)).await
+        }
         Err(error) => server_error(&error),
     }
 }

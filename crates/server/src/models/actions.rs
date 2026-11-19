@@ -272,15 +272,18 @@ impl Database {
         if alert_ids.is_empty() {
             return Ok(counts);
         }
-        let rows = action_run::Entity::find()
+        let rows: Vec<(i64, i64)> = action_run::Entity::find()
+            .select_only()
+            .column(action_run::Column::AlertId)
+            .column_as(action_run::Column::Id.count(), "runs")
             .filter(action_run::Column::AlertId.is_in(alert_ids.to_vec()))
+            .group_by(action_run::Column::AlertId)
+            .into_tuple()
             .all(&self.connection)
             .await
             .context("counting action runs")?;
-        for row in rows {
-            if let Some(alert_id) = row.alert_id {
-                *counts.entry(alert_id).or_default() += 1;
-            }
+        for (alert_id, runs) in rows {
+            counts.insert(alert_id, u64::try_from(runs)?);
         }
         Ok(counts)
     }

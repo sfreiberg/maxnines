@@ -21,7 +21,7 @@ use super::host_list::HostSearch;
 use super::hosts::suggestions;
 use super::users::{refusal, setup_url};
 use crate::alert_charts;
-use crate::alerting::{Alert, AlertRuleInput, ChannelInput, ChannelKind};
+use crate::alerting::{self, Alert, AlertRuleInput, ChannelInput, ChannelKind, NameTaken};
 use crate::app_state::{AppState, EventRefusal, HostDeletion};
 use crate::audit::Via;
 use crate::calculations::{self, Calculation, Question};
@@ -1958,11 +1958,12 @@ async fn create_alert_rule(
     State(state): State<AppState>,
     Json(input): Json<AlertRuleInput>,
 ) -> Response {
-    if let Err(error) = state.check_alert_rule(&input, None).await {
+    if let Err(error) = state.check_alert_rule(&input).await {
         return refused(&error);
     }
     match state.database.create_alert_rule(&input).await {
         Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
+        Err(error) if error.is::<NameTaken>() => refused(&error),
         Err(error) => server_error(&error),
     }
 }
@@ -1972,12 +1973,13 @@ async fn update_alert_rule(
     UrlPath(id): UrlPath<i64>,
     Json(input): Json<AlertRuleInput>,
 ) -> Response {
-    if let Err(error) = state.check_alert_rule(&input, Some(id)).await {
+    if let Err(error) = state.check_alert_rule(&input).await {
         return refused(&error);
     }
     match state.database.update_alert_rule(id, &input).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) if error.is::<NameTaken>() => refused(&error),
         Err(error) => server_error(&error),
     }
 }
@@ -2190,11 +2192,12 @@ async fn create_channel(
     State(state): State<AppState>,
     Json(input): Json<ChannelInput>,
 ) -> Response {
-    if let Err(error) = state.check_channel(&input, None).await {
+    if let Err(error) = alerting::check_channel(&input) {
         return refused(&error);
     }
     match state.database.create_channel(&input).await {
         Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
+        Err(error) if error.is::<NameTaken>() => refused(&error),
         Err(error) => server_error(&error),
     }
 }
@@ -2204,12 +2207,13 @@ async fn update_channel(
     UrlPath(id): UrlPath<i64>,
     Json(input): Json<ChannelInput>,
 ) -> Response {
-    if let Err(error) = state.check_channel(&input, Some(id)).await {
+    if let Err(error) = alerting::check_channel(&input) {
         return refused(&error);
     }
     match state.database.update_channel(id, &input).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) if error.is::<NameTaken>() => refused(&error),
         Err(error) => server_error(&error),
     }
 }

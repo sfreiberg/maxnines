@@ -14,7 +14,7 @@ use super::*;
 use crate::alert_evaluator::Evaluator;
 use crate::alerting::{
     AlertRuleInput, Channel, ChannelInput, ChannelKind, Comparison, Delivery, Event, Mail,
-    MailSecurity, MailServer, NewAlert, RuleKind, Severity, check_rule,
+    MailSecurity, MailServer, NameTaken, NewAlert, RuleKind, Severity, check_rule,
 };
 use crate::channels::slack::{ACKNOWLEDGE_ACTION, SILENCE_HOUR_ACTION};
 use crate::metrics::{Metric, NewestReading};
@@ -553,8 +553,12 @@ async fn deleting_a_rule_closes_its_alerts_and_keeps_the_history_pointing_at_it(
 
     // Its name is free for a new rule.
     test.database().create_alert_rule(&rule).await.unwrap();
-    let names = test.server.state.check_alert_rule(&rule, None).await;
-    assert!(names.is_err(), "but only once");
+    let again = test.database().create_alert_rule(&rule).await.unwrap_err();
+    assert_eq!(
+        again.to_string(),
+        "an alert rule named \"High CPU\" already exists",
+        "but only once"
+    );
 }
 
 #[tokio::test]
@@ -4381,12 +4385,14 @@ async fn a_deleted_channel_keeps_what_it_sent_and_frees_its_name() {
         .await
         .unwrap();
     assert_ne!(id, channel.id);
-    assert!(
-        test.server
-            .state
-            .check_channel(&channel.channel, None)
-            .await
-            .is_err(),
+    let again = test
+        .database()
+        .create_channel(&channel.channel)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        again.downcast_ref::<NameTaken>(),
+        Some(&NameTaken::Channel("Ops".to_string())),
         "only one live channel can have a name"
     );
 }
@@ -5085,6 +5091,32 @@ async fn a_rule_can_tell_every_channel_from_the_form() {
     let path = format!("/api/v1/alert-rules/{}", created["id"]);
     let (_, rule) = api(&server, "GET", &path, &Value::Null).await;
     assert_eq!(rule["all_channels"], true, "{rule}");
+}
+
+/// The database keeps names to one among rules and channels that aren't deleted,
+/// and the API says so as it does for anything else it refuses.
+#[tokio::test]
+async fn the_api_refuses_a_name_another_rule_or_channel_has() {
+    let server = start().await;
+    let rule = json!({
+        "name": "Gone", "kind": "offline", "for_secs": 300, "severity": "critical",
+    });
+    let (status, _) = api(&server, "POST", "/api/v1/alert-rules", &rule).await;
+    assert_eq!(status, 201);
+    let (status, refused) = api(&server, "POST", "/api/v1/alert-rules", &rule).await;
+    assert_eq!(status, 422, "{refused}");
+    assert_eq!(
+        refused["error"],
+        "an alert rule named \"Gone\" already exists"
+    );
+
+    let channel = json!({ "name": "Ops", "kind": "webhook", "target": "https://example.com/x" });
+    let path = "/api/v1/notification-channels";
+    let (status, first) = api(&server, "POST", path, &channel).await;
+    assert_eq!(status, 201, "{first}");
+    let (status, refused) = api(&server, "POST", path, &channel).await;
+    assert_eq!(status, 422, "{refused}");
+    assert_eq!(refused["error"], "a channel named \"Ops\" already exists");
 }
 
 #[tokio::test]
@@ -10100,5 +10132,398 @@ mod actions {
             .await;
         assert_eq!(page.status, 422, "{}", page.body);
         assert!(page.body.contains("t an option, in"), "{}", page.body);
+    }
+}
+
+// ---- deleted channels, and ending many alerts at once
+
+mod deleted_channels {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    use super::*;
+    use crate::alerting::{RULE_GONE_REASON, SeverityChange};
+    use crate::silences::SilenceInput;
+
+    async fn run(test: &Harness, sql: &str) {
+        let connection = test.database().connection();
+        connection.execute_unprepared(sql).await.unwrap();
+    }
+
+    async fn texts(test: &Harness, sql: &str) -> Vec<String> {
+        let connection = test.database().connection();
+        let query = Statement::from_string(connection.get_database_backend(), sql);
+        let rows = connection.query_all_raw(query).await.unwrap();
+        rows.iter()
+            .map(|row| row.try_get_by_index(0).unwrap())
+            .collect()
+    }
+
+    /// Marks a channel deleted without anything else deleting it does, as if it was
+    /// deleted while something was being queued for it.
+    async fn mark_deleted(test: &Harness, channel: i64) {
+        run(
+            test,
+            &format!(
+                "UPDATE notification_channels SET deleted_at = (SELECT MAX(started_at) FROM alerts)
+                 WHERE id = {channel}"
+            ),
+        )
+        .await;
+    }
+
+    fn named(name: &str) -> ChannelInput {
+        ChannelInput {
+            name: name.to_string(),
+            ..webhook_channel(&format!("http://{CLOSED_ADDRESS}/x"))
+        }
+    }
+
+    /// An alert told to the one channel, with that sent, and the channel deleted.
+    async fn told_then_deleted(test: &mut Harness, rule: AlertRuleInput) -> (i64, i64) {
+        let channel = test.database().create_channel(&named("Ops")).await.unwrap();
+        let rule = AlertRuleInput {
+            hold: TimeDelta::seconds(0),
+            channels: vec![channel],
+            ..rule
+        };
+        test.database().create_alert_rule(&rule).await.unwrap();
+        test.cpu(TimeDelta::zero(), 95.0).await;
+        assert_eq!(deliver_all(test).await, [Event::Firing]);
+        assert!(
+            test.database()
+                .delete_channel(channel, test.now)
+                .await
+                .unwrap()
+        );
+        (test.open().await[0].id, channel)
+    }
+
+    #[tokio::test]
+    async fn a_deleted_channel_is_not_told_an_alert_ended() {
+        let mut test = Harness::start().await;
+        let (_, channel) = told_then_deleted(&mut test, cpu_rule()).await;
+
+        test.cpu(MINUTE, 10.0).await;
+
+        assert!(test.open().await.is_empty());
+        assert!(due(&test, everything_due()).await.is_empty());
+        assert_eq!(test.database().notifications_of(channel).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_channel_is_not_told_an_alert_got_worse() {
+        let mut test = Harness::start().await;
+        let rule = AlertRuleInput {
+            warning_threshold: Some(80.0),
+            ..cpu_rule()
+        };
+        let (alert, channel) = told_then_deleted(&mut test, rule).await;
+
+        let change = SeverityChange {
+            alert_id: alert,
+            severity: Severity::Warning,
+            value: Some(85.0),
+            summary: "easing".to_string(),
+            changed_at: test.now + MINUTE,
+        };
+        let changed = test.database().change_severity(&change, &[channel]).await;
+        assert!(changed.unwrap());
+
+        assert!(due(&test, everything_due()).await.is_empty());
+        assert_eq!(test.database().notifications_of(channel).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_channel_is_not_reminded() {
+        let mut test = Harness::start().await;
+        let rule = AlertRuleInput {
+            remind_every: Some(MINUTE),
+            ..cpu_rule()
+        };
+        let (alert, channel) = told_then_deleted(&mut test, rule).await;
+
+        let later = test.now + MINUTE * 10;
+        let reminding = [(alert, MINUTE)];
+        let reminders = test.database().queue_reminders(&reminding, later);
+        reminders.await.unwrap();
+
+        assert!(due(&test, everything_due()).await.is_empty());
+        assert_eq!(test.database().notifications_of(channel).await, 1);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_channel_drops_what_a_silence_held_for_it() {
+        let mut test = Harness::start().await;
+        let silence = SilenceInput {
+            rule_id: None,
+            filter: None,
+            all_alerts: true,
+            series: None,
+            reason: "Upgrading".to_string(),
+            duration: TimeDelta::hours(1),
+        };
+        test.database()
+            .create_silence(&silence, "sam", test.now)
+            .await
+            .unwrap();
+        let notifier = firing_with_channel(&mut test, &format!("http://{CLOSED_ADDRESS}/x")).await;
+        notifier.deliver_due(test.now).await.unwrap();
+        let held = test.database().held_deliveries().await.unwrap();
+        assert_eq!(held.len(), 1, "the silence holds it");
+
+        let channel = test.database().list_channels().await.unwrap()[0].id;
+        assert!(
+            test.database()
+                .delete_channel(channel, test.now)
+                .await
+                .unwrap()
+        );
+
+        assert!(test.database().held_deliveries().await.unwrap().is_empty());
+        assert_eq!(test.database().notifications_of(channel).await, 0);
+        // The silence ending finds nothing to let go.
+        notifier
+            .deliver_due(test.now + TimeDelta::hours(2))
+            .await
+            .unwrap();
+        assert!(due(&test, everything_due()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn what_a_silence_held_is_not_let_go_to_a_channel_deleted_meanwhile() {
+        let mut test = Harness::start().await;
+        let silence = SilenceInput {
+            rule_id: None,
+            filter: None,
+            all_alerts: true,
+            series: None,
+            reason: "Upgrading".to_string(),
+            duration: TimeDelta::hours(1),
+        };
+        test.database()
+            .create_silence(&silence, "sam", test.now)
+            .await
+            .unwrap();
+        let notifier = firing_with_channel(&mut test, &format!("http://{CLOSED_ADDRESS}/x")).await;
+        notifier.deliver_due(test.now).await.unwrap();
+        let (_, held) = test.database().held_deliveries().await.unwrap().remove(0);
+        let channel = test.database().list_channels().await.unwrap()[0].id;
+        mark_deleted(&test, channel).await;
+
+        test.database()
+            .release_deliveries(&held, test.now + TimeDelta::hours(2))
+            .await
+            .unwrap();
+
+        assert!(due(&test, everything_due()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_notification_that_cannot_be_sent_does_not_hold_up_the_rest() {
+        let mut test = Harness::start().await;
+        let hook = Hook::default();
+        let url = format!("{}/secret-token", hook.start().await);
+        let gone = test
+            .database()
+            .create_channel(&named("Gone"))
+            .await
+            .unwrap();
+        let live = ChannelInput {
+            name: "Live".to_string(),
+            ..webhook_channel(&url)
+        };
+        let live = test.database().create_channel(&live).await.unwrap();
+        let rule = AlertRuleInput {
+            hold: TimeDelta::seconds(0),
+            channels: vec![gone, live],
+            ..cpu_rule()
+        };
+        test.database().create_alert_rule(&rule).await.unwrap();
+        test.cpu(TimeDelta::zero(), 95.0).await;
+        mark_deleted(&test, gone).await;
+
+        let notifier = Notifier::new(test.database().clone(), Senders::default());
+        notifier.deliver_due(test.now).await.unwrap();
+
+        assert_eq!(hook.events(), ["firing"]);
+        let given_up = texts(
+            &test,
+            &format!("SELECT last_error FROM notifications WHERE channel_id = {gone} AND state = 'failed'"),
+        )
+        .await;
+        assert_eq!(given_up, ["its channel has been deleted"]);
+        notifier.deliver_due(test.now + MINUTE).await.unwrap();
+        assert_eq!(hook.events(), ["firing"], "it isn't tried again");
+    }
+
+    /// Deleting a rule ends every alert it has open in one step, telling each channel
+    /// that heard one start, unless that was given up on or the channel is gone.
+    #[tokio::test]
+    async fn deleting_a_rule_ends_all_its_alerts_at_once() {
+        let mut test = Harness::start().await;
+        let mut channels = Vec::new();
+        for name in ["Told", "Given up", "Deleted"] {
+            channels.push(test.database().create_channel(&named(name)).await.unwrap());
+        }
+        let [told, given_up, deleted] = channels[..] else {
+            unreachable!()
+        };
+        let rule = AlertRuleInput {
+            metric: Some("disk.usage".to_string()),
+            hold: TimeDelta::seconds(0),
+            channels: channels.clone(),
+            ..cpu_rule()
+        };
+        let rule = test.database().create_alert_rule(&rule).await.unwrap();
+        let readings = vec![
+            test.reading("/", test.now, 95.0),
+            test.reading("/data", test.now, 96.0),
+        ];
+        test.script.set(readings);
+        test.evaluate(TimeDelta::zero()).await;
+        assert_eq!(test.open().await.len(), 2);
+        for delivery in due(&test, everything_due()).await {
+            let id = delivery.id;
+            if delivery.channel.id == given_up {
+                test.database()
+                    .delivery_failed(id, 9, "down", None)
+                    .await
+                    .unwrap();
+            } else {
+                test.database()
+                    .delivery_sent(id, 1, test.now, None)
+                    .await
+                    .unwrap();
+            }
+        }
+        assert!(
+            test.database()
+                .delete_channel(deleted, test.now)
+                .await
+                .unwrap()
+        );
+
+        let later = test.now + MINUTE;
+        assert!(
+            test.database()
+                .delete_alert_rule(rule, later)
+                .await
+                .unwrap()
+        );
+
+        assert!(test.open().await.is_empty());
+        let resolved = test.resolved().await;
+        assert_eq!(resolved.len(), 2);
+        for alert in &resolved {
+            assert_eq!(alert.resolved_at, Some(later));
+            assert_eq!(alert.resolve_reason.as_deref(), Some(RULE_GONE_REASON));
+        }
+        let mut queued: Vec<(i64, i64, Event)> = due(&test, everything_due())
+            .await
+            .iter()
+            .map(|delivery| (delivery.alert.id, delivery.channel.id, delivery.event))
+            .collect();
+        queued.sort_by_key(|(alert, _, _)| *alert);
+        let mut ended: Vec<i64> = resolved.iter().map(|alert| alert.id).collect();
+        ended.sort();
+        assert_eq!(
+            queued,
+            [
+                (ended[0], told, Event::Resolved),
+                (ended[1], told, Event::Resolved)
+            ]
+        );
+        let deletions = texts(
+            &test,
+            &format!(
+                "SELECT action FROM audit_log
+                 WHERE subject_kind = 'alert_rule' AND subject_id = '{rule}'
+                 ORDER BY id"
+            ),
+        )
+        .await;
+        assert_eq!(deletions, ["created", "deleted"]);
+    }
+
+    #[tokio::test]
+    async fn problems_of_deleted_channels_do_not_crowd_out_the_others() {
+        let mut test = Harness::start().await;
+        let live = test
+            .database()
+            .create_channel(&named("Live"))
+            .await
+            .unwrap();
+        let gone = test
+            .database()
+            .create_channel(&named("Gone"))
+            .await
+            .unwrap();
+        let rule = AlertRuleInput {
+            hold: TimeDelta::seconds(0),
+            channels: vec![live, gone],
+            ..cpu_rule()
+        };
+        test.database().create_alert_rule(&rule).await.unwrap();
+        test.cpu(TimeDelta::zero(), 95.0).await;
+        // The deleted channel's problem is the newest.
+        let mut due = due(&test, everything_due()).await;
+        due.sort_by_key(|delivery| delivery.channel.id == gone);
+        for delivery in &due {
+            test.database()
+                .delivery_failed(delivery.id, 9, "down", None)
+                .await
+                .unwrap();
+        }
+        assert!(
+            test.database()
+                .delete_channel(gone, test.now)
+                .await
+                .unwrap()
+        );
+
+        let problems = test.database().delivery_problems(1).await.unwrap();
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].channel, "Live");
+        assert_eq!(problems[0].summary, test.open().await[0].summary);
+    }
+
+    #[tokio::test]
+    async fn the_server_page_counts_only_rules_and_channels_not_deleted() {
+        let mut test = Harness::start().await;
+        let count = |stats: &crate::models::DatabaseStats, name: &str| {
+            stats
+                .tables
+                .iter()
+                .find(|table| table.name == name)
+                .unwrap()
+                .rows
+        };
+        let before = test.database().stats().await.unwrap();
+        let (_, channel) = told_then_deleted(&mut test, cpu_rule()).await;
+        let rule = test.open().await[0].rule_id;
+        let after = test.database().stats().await.unwrap();
+        assert_eq!(
+            count(&after, "Alert rules"),
+            count(&before, "Alert rules") + 1
+        );
+        assert_eq!(count(&after, "Notification channels"), 0);
+        assert_eq!(count(&after, "Notifications"), 1);
+        assert_eq!(count(&after, "Alerts"), 1);
+        assert!(
+            test.database()
+                .get_channel(channel)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        test.database()
+            .delete_alert_rule(rule, test.now)
+            .await
+            .unwrap();
+        let after = test.database().stats().await.unwrap();
+        assert_eq!(count(&after, "Alert rules"), count(&before, "Alert rules"));
+        assert_eq!(after.notifications_waiting, 0);
+        assert_eq!(after.notifications_failed, 0);
     }
 }

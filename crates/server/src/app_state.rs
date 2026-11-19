@@ -7,7 +7,7 @@ use axum_csrf::CsrfConfig;
 use tokio::sync::{mpsc, watch};
 
 use crate::actions::Actions;
-use crate::alerting::{self, AlertRuleInput, ChannelInput};
+use crate::alerting::{self, AlertRuleInput};
 use crate::calculations::Sources;
 use crate::events::{EventInput, TimelineEvent};
 use crate::facts::{FlatFacts, unflatten};
@@ -214,30 +214,19 @@ impl AppState {
             .context("working out the preview")
     }
 
-    /// Everything that has to be true for an alert rule to be saved. `id` is the
-    /// saved rule it would replace.
-    pub async fn check_alert_rule(&self, input: &AlertRuleInput, id: Option<i64>) -> Result<()> {
+    /// Everything that has to be true for an alert rule to be saved.
+    pub async fn check_alert_rule(&self, input: &AlertRuleInput) -> Result<()> {
         alerting::check_rule(input)?;
         if !input.actions.is_empty() {
             let known = self.database.known_actions().await?;
             crate::actions::check_against_hosts(input, &known)?;
         }
 
-        let rules = self.database.list_alert_rules().await?;
-        let taken = rules
-            .iter()
-            .any(|rule| rule.rule.name == input.name && Some(rule.id) != id);
-        ensure!(
-            !taken,
-            "an alert rule named {:?} already exists",
-            input.name
-        );
-
-        let channels = self.database.list_channels().await?;
-        for wanted in &input.channels {
-            if !channels.iter().any(|channel| channel.id == *wanted) {
-                bail!("there's no notification channel {wanted}");
-            }
+        // A name another rule has is refused as the rule is saved, as only the
+        // database can tell for certain.
+        let live = self.database.live_channel_ids(&input.channels).await?;
+        if let Some(wanted) = input.channels.iter().find(|id| !live.contains(id)) {
+            bail!("there's no notification channel {wanted}");
         }
         Ok(())
     }
@@ -263,18 +252,6 @@ impl AppState {
                 "there's no alert rule {id}"
             );
         }
-        Ok(())
-    }
-
-    /// Everything that has to be true for a channel to be saved. `id` is the
-    /// saved channel it would replace.
-    pub async fn check_channel(&self, input: &ChannelInput, id: Option<i64>) -> Result<()> {
-        alerting::check_channel(input)?;
-        let channels = self.database.list_channels().await?;
-        let taken = channels
-            .iter()
-            .any(|channel| channel.channel.name == input.name && Some(channel.id) != id);
-        ensure!(!taken, "a channel named {:?} already exists", input.name);
         Ok(())
     }
 

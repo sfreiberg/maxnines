@@ -49,10 +49,11 @@ const MAX_QUERY_BYTES: &str = "67108864";
 /// Months keep partitions to a number that can't grow out of hand, whatever times
 /// agents send. The hour in the sort order lets a query for what's recent skip
 /// everything older.
-const MIGRATIONS: &[(&str, &[&str])] = &[(
-    "0001_create_tables",
-    &[
-        "CREATE TABLE IF NOT EXISTS samples (
+const MIGRATIONS: &[(&str, &[&str])] = &[
+    (
+        "0001_create_tables",
+        &[
+            "CREATE TABLE IF NOT EXISTS samples (
              metric  String,
              host_id String,
              labels  Map(String, String),
@@ -63,8 +64,8 @@ const MIGRATIONS: &[(&str, &[&str])] = &[(
          ENGINE = ReplacingMergeTree
          PARTITION BY toStartOfMonth(time)
          ORDER BY (metric, toStartOfHour(time), host_id, labels, time)",
-        // Text, only when it changes. Nothing means it stopped being reported.
-        "CREATE TABLE IF NOT EXISTS texts (
+            // Text, only when it changes. Nothing means it stopped being reported.
+            "CREATE TABLE IF NOT EXISTS texts (
              metric  String,
              host_id String,
              labels  Map(String, String),
@@ -74,27 +75,27 @@ const MIGRATIONS: &[(&str, &[&str])] = &[(
          ENGINE = ReplacingMergeTree
          PARTITION BY toStartOfMonth(time)
          ORDER BY (host_id, metric, labels, time)",
-        // What exists, to limit what a host can create without reading the samples.
-        "CREATE TABLE IF NOT EXISTS series (
+            // What exists, to limit what a host can create without reading the samples.
+            "CREATE TABLE IF NOT EXISTS series (
              host_id String,
              metric  String,
              labels  Map(String, String)
          )
          ENGINE = ReplacingMergeTree
          ORDER BY (host_id, metric, labels)",
-        // When each host reported, so asking who's current doesn't read the samples.
-        "CREATE TABLE IF NOT EXISTS reports (
+            // When each host reported, so asking who's current doesn't read the samples.
+            "CREATE TABLE IF NOT EXISTS reports (
              time    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
              host_id String
          )
          ENGINE = ReplacingMergeTree
          PARTITION BY toStartOfMonth(time)
          ORDER BY (time, host_id)",
-        // What each chart in the catalog showed, 5 minutes and an hour at a time, as the
-        // lowest, highest and total value and how many there were. A span rolled up
-        // again is written again with a higher version, which replaces the old rows
-        // when ClickHouse merges them, and reads say FINAL until then.
-        "CREATE TABLE IF NOT EXISTS rollups_five_minute (
+            // What each chart in the catalog showed, 5 minutes and an hour at a time, as the
+            // lowest, highest and total value and how many there were. A span rolled up
+            // again is written again with a higher version, which replaces the old rows
+            // when ClickHouse merges them, and reads say FINAL until then.
+            "CREATE TABLE IF NOT EXISTS rollups_five_minute (
              metric  LowCardinality(String),
              host_id String,
              series  String,
@@ -108,7 +109,7 @@ const MIGRATIONS: &[(&str, &[&str])] = &[(
          ENGINE = ReplacingMergeTree(version)
          PARTITION BY toStartOfMonth(time)
          ORDER BY (metric, host_id, series, time)",
-        "CREATE TABLE IF NOT EXISTS rollups_hour (
+            "CREATE TABLE IF NOT EXISTS rollups_hour (
              metric  LowCardinality(String),
              host_id String,
              series  String,
@@ -122,21 +123,27 @@ const MIGRATIONS: &[(&str, &[&str])] = &[(
          ENGINE = ReplacingMergeTree(version)
          PARTITION BY toStartOfYear(time)
          ORDER BY (metric, host_id, series, time)",
-        // How far each metric is rolled up: every hour before this.
-        "CREATE TABLE IF NOT EXISTS rollup_progress (
+            // How far each metric is rolled up: every hour before this.
+            "CREATE TABLE IF NOT EXISTS rollup_progress (
              metric     String,
              done_until DateTime64(3, 'UTC'),
              version    UInt64
          )
          ENGINE = ReplacingMergeTree(version)
          ORDER BY metric",
-        // Hours that got samples after they were rolled up, to roll up again, by
-        // when each starts.
-        "CREATE TABLE IF NOT EXISTS rollup_redo (hour DateTime64(3, 'UTC'))
+            // Hours that got samples after they were rolled up, to roll up again, by
+            // when each starts.
+            "CREATE TABLE IF NOT EXISTS rollup_redo (hour DateTime64(3, 'UTC'))
          ENGINE = ReplacingMergeTree
          ORDER BY hour",
-    ],
-)];
+        ],
+    ),
+    // What a number really is goes by the name the other store gives it.
+    (
+        "0002_data_type",
+        &["ALTER TABLE samples RENAME COLUMN IF EXISTS kind TO data_type"],
+    ),
+];
 
 /// One runtime for every store, as the client is async and stores aren't. It's never
 /// shut down, because that isn't allowed from the async code a store can be dropped in.
@@ -172,7 +179,7 @@ struct SampleRow {
     #[serde(with = "millis")]
     time: Timestamp,
     value: f64,
-    kind: &'static str,
+    data_type: &'static str,
 }
 
 #[derive(Row, Serialize)]
@@ -354,13 +361,13 @@ impl Memory {
                     continue;
                 }
                 match reading.value {
-                    Reported::Number(value, kind) => rows.samples.push(SampleRow {
+                    Reported::Number(value, data_type) => rows.samples.push(SampleRow {
                         metric,
                         host_id: host.to_string(),
                         labels: labelled(&reading.labels),
                         time,
                         value,
-                        kind: kind.as_str(),
+                        data_type: data_type.as_str(),
                     }),
                     Reported::Text(text) => {
                         let text = shortened(text);
@@ -1156,7 +1163,7 @@ struct LatestRow {
     metric: String,
     labels: Labels,
     value: f64,
-    kind: String,
+    data_type: String,
 }
 
 #[derive(Row, Deserialize)]
@@ -1349,7 +1356,7 @@ impl MetricsReader for ClickHouseReader {
             time_between(since, until, "<=")
         );
         let sql = format!(
-            "SELECT metric, labels, value, kind FROM samples WHERE {scope}
+            "SELECT metric, labels, value, data_type FROM samples WHERE {scope}
              AND time = (SELECT max(time) FROM samples WHERE {scope})"
         );
         let latest: Vec<LatestRow> = wait(self.client.query_raw(&sql).fetch_all())?;
@@ -1378,11 +1385,11 @@ impl MetricsReader for ClickHouseReader {
             .iter()
             .filter_map(|row| Some((*places.get(&key(&row.metric, &row.labels))?, row.value)))
             .collect();
-        let kinds: HashMap<i64, DataType> = latest
+        let data_types: HashMap<i64, DataType> = latest
             .iter()
             .filter_map(|row| {
                 let place = *places.get(&key(&row.metric, &row.labels))?;
-                Some((place, DataType::parse(&row.kind)))
+                Some((place, DataType::parse(&row.data_type)))
             })
             .collect();
         let texts: HashMap<i64, String> = current
@@ -1397,10 +1404,10 @@ impl MetricsReader for ClickHouseReader {
             .enumerate()
             .map(|(place, series)| {
                 let place = place as i64;
-                let kind = kinds.get(&place).copied().unwrap_or(DataType::Text);
+                let data_type = data_types.get(&place).copied().unwrap_or(DataType::Text);
                 let label = series.labels.iter().next();
                 let label = label.map(|(name, value)| (name.clone(), value.clone()));
-                (place, field(&series.metric), kind, label)
+                (place, field(&series.metric), data_type, label)
             })
             .collect();
         Ok(rebuilt_output(&series, &numbers, &texts))
@@ -1877,6 +1884,57 @@ mod tests {
             count(&store, "SELECT count() FROM schema_migrations"),
             MIGRATIONS.len() as u64
         );
+    }
+
+    /// A store made before samples said `data_type` keeps what it has under the
+    /// new name, and a migration stopped partway can run again.
+    #[test]
+    fn samples_kept_as_kind_are_read_as_data_type() {
+        let database = new_database();
+        let client = Client::default().with_url(url());
+        wait(async {
+            client
+                .query_raw(&format!("CREATE DATABASE `{database}`"))
+                .execute()
+                .await?;
+            let client = client.with_database(&database);
+            migrate(&client, &MIGRATIONS[..1]).await?;
+            client
+                .query_raw(
+                    "INSERT INTO samples (metric, host_id, labels, time, value, kind)
+                     VALUES ('cpu.usage_percent', 'a', map(), fromUnixTimestamp64Milli(1000), 5, 'int')",
+                )
+                .execute()
+                .await?;
+            client
+                .query_raw("INSERT INTO series VALUES ('a', 'cpu.usage_percent', map())")
+                .execute()
+                .await?;
+            // As if it stopped after renaming the column and before recording it.
+            for (_, statements) in &MIGRATIONS[1..] {
+                for statement in *statements {
+                    client.query_raw(statement).execute().await?;
+                }
+            }
+            anyhow::Ok(())
+        })
+        .unwrap();
+
+        let store = opened(&database);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count() FROM samples WHERE data_type = 'int'"
+            ),
+            1
+        );
+        let output = store
+            .reader()
+            .unwrap()
+            .latest_output("a", "cpu", at(0), at(2000))
+            .unwrap()
+            .unwrap();
+        assert_eq!(output, json!({ "usage_percent": 5 }));
     }
 
     #[test]

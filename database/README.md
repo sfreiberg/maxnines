@@ -6,16 +6,21 @@ MaxNines keeps its data in two places:
   decides: hosts, facts, rules, alerts, users and the rest. It's SQLite by default,
   or PostgreSQL, MySQL or MariaDB, through sea-orm. One migration,
   `m20261119_000001_create_tables`, makes its tables, in
-  [`crates/server/src/migrations`](../crates/server/src/migrations/mod.rs), and
+  [`crates/server/src/migrations`](../crates/server/src/migrations/mod.rs),
   `m20261119_000002_add_no_metrics_rule` adds the built-in Host sending no metrics
-  rule, which the first doesn't have.
+  rule, which the first doesn't have, and `m20261119_000003_keys_and_indexes` makes
+  deleting a host or user delete what's theirs, adds the notifications' key to their
+  action runs, keeps names unique among rules and channels that aren't deleted, and
+  adds the indexes below that the first didn't have.
 - **The metrics store** holds the numbers hosts report. It's DuckDB for a single
-  server or ClickHouse for a big one, and only one of them is used. Each has one
-  migration, `0001_create_tables`, which makes its tables: in
+  server or ClickHouse for a big one, and only one of them is used. Each has a
+  migration, `0001_create_tables`, which makes its tables, and a second: in
   [`crates/server/src/store/migrations`](../crates/server/src/store/migrations) for
-  DuckDB, and at the top of
+  DuckDB, where `0002_keys` gives the numbered tables their primary keys, and at the
+  top of
   [`crates/server/src/store/clickhouse.rs`](../crates/server/src/store/clickhouse.rs)
-  for ClickHouse.
+  for ClickHouse, where `0002_data_type` renames `samples.kind` to `data_type`, as
+  DuckDB calls it.
 
 The two only meet through a host's ID: the main database's `hosts.id` is the
 metrics store's `host_id`.
@@ -33,6 +38,16 @@ the millisecond: `timestamptz` on PostgreSQL, `DATETIME(3)` on MySQL and MariaDB
 and sorts it as text. A length of time ending `_ms` or `_secs` is a number. `json` is
 `jsonb` on PostgreSQL, `json` on MySQL and MariaDB, and text on SQLite. A column that
 can be empty is NULL when it is, never an empty string.
+
+What a row goes with is the database's to say. Deleting a host deletes its facts,
+config status, boot time, metrics pages, checks, alerts and action runs; deleting a
+user deletes their sessions, keys, app sign-ins, recovery codes and sign-in
+challenges; deleting an alert deletes its notifications and action runs, and deleting
+an action run the notifications of what it printed. Alert rules and channels are only
+ever marked deleted, so what they raised and sent still names them: the database
+refuses to delete one an alert or notification points at. A link between a rule and a
+channel, a rule's actions, silences and maintenance windows, a config rule's settings
+and a dashboard's widgets and variables go with what they belong to.
 
 ```mermaid
 erDiagram
@@ -65,7 +80,7 @@ erDiagram
     hosts {
         string id PK "from its agent's public key, or random"
         string kind "agent, agentless or built_in"
-        string public_key "empty without an agent"
+        string public_key "NULL without an agent"
         string hostname
         string state "pending, approved or revoked"
         text decided_by
@@ -76,7 +91,7 @@ erDiagram
         int id PK
         string host_id FK
         string url
-        text names "the metrics to keep, one to a line, or empty for all"
+        text names "the metrics to keep, one to a line, or NULL for all"
         int interval_secs
         boolean enabled
         string username
@@ -92,7 +107,7 @@ erDiagram
         string value
         string value_type
         timestamp valid_from
-        timestamp valid_to "empty while current"
+        timestamp valid_to "NULL while current"
     }
     host_config_status {
         string host_id PK, FK
@@ -132,12 +147,12 @@ erDiagram
         int rule_id FK "the rule that raised it, even once deleted"
         string severity
         string host_id FK
-        string series "empty for the host as a whole"
+        string series "NULL for the host as a whole"
         double value
         text summary
         timestamp started_at "when it fired"
         timestamp breached_at "when the problem began"
-        timestamp resolved_at "empty while open"
+        timestamp resolved_at "NULL while open"
         text resolve_reason
         text resolved_summary
         string acknowledged_by
@@ -177,14 +192,14 @@ erDiagram
     action_runs {
         int id PK
         string host_id FK
-        int alert_id FK "empty for one a person started"
+        int alert_id FK "NULL for one a person started"
         string action
         string run_on "first, warning, critical or manual"
         json variables "what it was given"
         string requested_by
         timestamp requested_at
         int timeout_secs
-        string outcome "empty while waiting"
+        string outcome "NULL while waiting"
         int exit_code
         text error
         text output "what it printed"
@@ -204,13 +219,13 @@ erDiagram
         timestamp created_at
         timestamp sent_at
         string external_id
-        int action_run_id "the run it's about, for what an action printed"
+        int action_run_id FK "the run it's about, for what an action printed"
     }
     silences {
         int id PK
-        int rule_id FK "empty for every rule"
-        string filter "which hosts, or empty for every host"
-        string series "the one series it's for, or empty"
+        int rule_id FK "NULL for every rule"
+        string filter "which hosts, or NULL for every host"
+        string series "the one series it's for, or NULL"
         string reason
         string created_by
         timestamp starts_at
@@ -219,8 +234,8 @@ erDiagram
     maintenance_windows {
         int id PK
         string name
-        int rule_id FK "empty for every rule"
-        string filter "which hosts, or empty for every host"
+        int rule_id FK "NULL for every rule"
+        string filter "which hosts, or NULL for every host"
         string days
         string start_time
         int duration_secs
@@ -251,12 +266,12 @@ erDiagram
     dashboard_widgets {
         int id PK
         int dashboard_id FK
-        string title "empty uses the metric's name"
+        string title "NULL uses the metric's name"
         string kind
         string metric
         string calculation
         string group_by
-        string filter "which hosts, or empty for every host"
+        string filter "which hosts, or NULL for every host"
         int x
         int y
         int w
@@ -267,10 +282,10 @@ erDiagram
         int dashboard_id FK
         int position
         string name
-        string label "empty uses the name"
+        string label "NULL uses the name"
         string kind "host or fact"
-        string fact "empty for a host variable"
-        string filter "which hosts, or empty for every host"
+        string fact "NULL for a host variable"
+        string filter "which hosts, or NULL for every host"
     }
     users {
         int id PK
@@ -358,14 +373,14 @@ erDiagram
         string kind "deploy, note or restart"
         string title
         text detail
-        string filter "which hosts, or empty for every host"
+        string filter "which hosts, or NULL for every host"
         string created_by
         timestamp created_at
     }
     location_rules {
         int id PK
         string name
-        string filter "which hosts, or empty for every host"
+        string filter "which hosts, or NULL for every host"
         string place "in words, if anyone said"
         double latitude
         double longitude
@@ -419,7 +434,7 @@ erDiagram
     proxies {
         int id PK
         string address UK "an address, a range or a provider"
-        bool trusted
+        boolean trusted
         timestamp created_at
     }
     server_settings {
@@ -441,7 +456,7 @@ erDiagram
 | `host_boots` | When each host last started, to notice restarts |
 | `config_rules`, `config_rule_settings` | What agents monitor, chosen by operating system and facts. The server writes its built-in rules, marked by `built_in`, each time it starts |
 | `alert_rules`, `alert_rule_channels` | What raises an alert, and who hears of it. A deleted rule is kept, marked by `deleted_at`, so its alerts still name it |
-| `alerts` | Every alert, open or resolved. Its rule's name and its host's are read from them, so it shows what they're called now. Deleting a host deletes its alerts first |
+| `alerts` | Every alert, open or resolved. Its rule's name and its host's are read from them, so it shows what they're called now. A host's alerts go with it |
 | `alert_rule_actions` | The actions each rule runs on an alert's host, and when in the alert's life |
 | `action_runs` | Every time an action was asked of a host, by an alert or a person, and what it printed. They go with their alert or their host |
 | `notification_channels`, `notifications` | Where alerts are sent, and each delivery with its retries. A deleted channel is kept the same way, so what was sent through it still names it |
@@ -449,7 +464,7 @@ erDiagram
 | `events` | Annotations people and automations add, and restarts the server notices |
 | `dashboards`, `dashboard_widgets`, `dashboard_variables` | Dashboards and what's on them |
 | `location_rules` | Where hosts are on the map |
-| `remote_checks` | Checks the server runs itself, each about a host without an agent or the server, with a name no other check about that host has. Deleting a host deletes its checks first |
+| `remote_checks` | Checks the server runs itself, each about a host without an agent or the server, with a name no other check about that host has. A host's checks go with it |
 | `users`, `user_sessions`, `api_keys`, `recovery_codes`, `sign_in_challenges` | People, how they sign in, and their keys. Each browser session, key and app sign-in keeps where it was last used from, for the list of who's signed in |
 | `app_sign_ins` | Apps people signed in through the browser, such as the command line, with hashes of the tokens each holds. A refresh token that's been swapped is kept a moment, so using it again can be told apart from a lost answer |
 | `audit_log` | Who changed what |
@@ -457,6 +472,51 @@ erDiagram
 | `proxies` | What admins decided about proxies in front of the server: trusted, or not a proxy. Where a proxy that isn't trusted said a request came from is kept beside the address that connected, as `forwarded_for`, in the audit log and on sessions, keys and app sign-ins |
 
 sea-orm adds `seaql_migrations`, which records the migrations that have run.
+
+### Indexes
+
+Besides each table's primary key and the unique columns marked `UK`, these are what
+the server's queries and foreign keys use. The two kept unique only among rows that
+aren't deleted index those rows alone on PostgreSQL and SQLite. MySQL and MariaDB
+can't, so those tables also have a column the database works out, `live_name`,
+holding the name while the row isn't deleted and NULL once it is, with a unique index
+that lets NULL repeat, comparing names as the table's collation does. MySQL and
+MariaDB also make an index for each foreign key that no index here starts with.
+
+| Index | Columns | For |
+| --- | --- | --- |
+| `idx_host_facts_host` | `host_facts (host_id, valid_to)` | A host's current facts |
+| `idx_host_facts_name_value` | `host_facts (name, value)` | Hosts with a fact |
+| `idx_metrics_pages_host` | `metrics_pages (host_id)` | A host's pages |
+| `idx_config_rule_settings_rule_name` | `config_rule_settings (rule_id, name)`, unique | A config rule's settings |
+| `idx_user_sessions_user_id` | `user_sessions (user_id)` | A user's sessions |
+| `idx_user_sessions_expires` | `user_sessions (expires_at)` | Clearing sessions that ran out, on every sign in |
+| `idx_api_keys_user_id` | `api_keys (user_id)` | A user's keys |
+| `idx_app_sign_ins_user_id` | `app_sign_ins (user_id)` | A user's apps |
+| `idx_app_sign_ins_previous_refresh_hash` | `app_sign_ins (previous_refresh_hash)` | A refresh token used again |
+| `idx_recovery_codes_user_id` | `recovery_codes (user_id)` | A user's recovery codes |
+| `idx_sign_in_challenges_user_id` | `sign_in_challenges (user_id)` | A user's challenges |
+| `idx_alert_rules_live_name` | `alert_rules (name)` where `deleted_at` is NULL, unique | One rule to a name |
+| `idx_notification_channels_live_name` | `notification_channels (name)` where `deleted_at` is NULL, unique | One channel to a name |
+| `idx_alert_rule_channels_channel` | `alert_rule_channels (channel_id)` | The rules telling a channel |
+| `idx_alert_rule_actions_rule` | `alert_rule_actions (rule_id)` | A rule's actions |
+| `idx_alerts_resolved` | `alerts (resolved_at)` | Open alerts |
+| `idx_alerts_started` | `alerts (started_at)` | Alerts newest first |
+| `idx_alerts_host_started` | `alerts (host_id, started_at)` | A host's timeline, and its alerts |
+| `idx_alerts_rule_resolved` | `alerts (rule_id, resolved_at)` | A rule's open alerts, to remind people or end them |
+| `idx_notifications_alert` | `notifications (alert_id)` | An alert's notifications |
+| `idx_notifications_due` | `notifications (state, next_attempt_at)` | What's due to be sent |
+| `idx_notifications_channel` | `notifications (channel_id, state)` | What's waiting for a channel |
+| `idx_notifications_action_run` | `notifications (action_run_id)` | What an action printed |
+| `idx_notifications_problems` | `notifications (id)` where `last_error` isn't NULL | Deliveries that went wrong, newest first, on PostgreSQL and SQLite |
+| `idx_action_runs_alert` | `action_runs (alert_id)` | An alert's runs |
+| `idx_action_runs_host` | `action_runs (host_id, requested_at)` | A host's runs |
+| `idx_action_runs_finished` | `action_runs (finished_at)` | Runs still waiting for an answer |
+| `idx_remote_checks_host_name` | `remote_checks (host_id, name)`, unique | One check to a name for each host |
+| `idx_silences_ends` | `silences (ends_at)` | Silences still running |
+| `idx_dashboard_widgets_dashboard` | `dashboard_widgets (dashboard_id)` | A dashboard's widgets |
+| `idx_dashboard_variables_dashboard` | `dashboard_variables (dashboard_id)` | A dashboard's variables |
+| `idx_events_time` | `events (occurred_at)` | Events in a range of time |
 
 ## Metrics store: DuckDB
 
@@ -466,8 +526,10 @@ each host, for each thing it describes, is a series. New numbers land in
 query only reads what it needs. Rollups keep the lowest, highest, total and count
 of each chart's line, 5 minutes and an hour at a time, so long ranges are quick
 and spikes survive. A host is numbered here to keep series small. Every moment is a
-`TIMESTAMP` in UTC, to the millisecond. The lines are references the server keeps:
-there are no foreign keys, as DuckDB checks them slowly.
+`TIMESTAMP` in UTC, to the millisecond. The numbers marked `PK` are primary keys,
+which DuckDB keeps unique. The lines are references the server keeps: there are no
+foreign keys, as DuckDB checks them slowly, and the tables of numbers have no keys or
+indexes, as sorting them is what makes reading them quick.
 
 ```mermaid
 erDiagram
@@ -518,7 +580,7 @@ erDiagram
     texts {
         timestamp time
         bigint series_id
-        string value "empty when it stopped being reported"
+        string value "NULL when it stopped being reported"
     }
     rollups_five_minute {
         string metric "the catalog's name, like cpu.usage"
@@ -567,7 +629,7 @@ erDiagram
         map labels
         datetime time
         double value
-        string kind
+        string data_type "int, float or bool"
     }
     texts {
         string metric

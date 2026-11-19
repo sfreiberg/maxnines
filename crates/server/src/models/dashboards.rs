@@ -1,6 +1,7 @@
 //! Dashboards and their widgets.
 
 use anyhow::{Context, Result};
+use sea_orm::sea_query::{CaseStatement, Expr};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set,
     TransactionTrait,
@@ -191,21 +192,11 @@ impl Database {
         Ok(result.rows_affected > 0)
     }
 
-    /// Returns false if there's no such dashboard. Not every database enforces the
-    /// link between the tables the same way, so its widgets are removed here.
+    /// Returns false if there's no such dashboard. Its widgets and variables go
+    /// with it.
     pub async fn delete_dashboard(&self, id: i64) -> Result<bool> {
         let transaction = self.connection.begin().await?;
         let before = load(&transaction, id).await?;
-        dashboard_widget::Entity::delete_many()
-            .filter(dashboard_widget::Column::DashboardId.eq(id))
-            .exec(&transaction)
-            .await
-            .context("removing widgets")?;
-        dashboard_variable::Entity::delete_many()
-            .filter(dashboard_variable::Column::DashboardId.eq(id))
-            .exec(&transaction)
-            .await
-            .context("removing variables")?;
         let result = dashboard::Entity::delete_by_id(id)
             .exec(&transaction)
             .await
@@ -288,8 +279,9 @@ impl Database {
             .exec(&transaction)
             .await
             .context("saving variables")?;
-        for (position, variable) in (0..).zip(variables) {
-            let row = dashboard_variable::ActiveModel {
+        let rows: Vec<_> = (0..)
+            .zip(variables)
+            .map(|(position, variable)| dashboard_variable::ActiveModel {
                 dashboard_id: Set(dashboard_id),
                 position: Set(position),
                 name: Set(variable.name.clone()),
@@ -298,9 +290,11 @@ impl Database {
                 fact: Set(variable.fact.clone()),
                 filter: Set(variable.filter.clone()),
                 ..Default::default()
-            };
-            dashboard_variable::Entity::insert(row)
-                .exec(&transaction)
+            })
+            .collect();
+        if !rows.is_empty() {
+            dashboard_variable::Entity::insert_many(rows)
+                .exec_without_returning(&transaction)
                 .await
                 .context("saving variables")?;
         }
@@ -309,23 +303,43 @@ impl Database {
         Ok(true)
     }
 
-    /// Moves widgets together, so a layout is never left half saved. Widgets that
-    /// aren't on this dashboard are left alone.
+    /// Moves widgets together, in one statement, so a layout is never left half
+    /// saved. Widgets that aren't on this dashboard are left alone.
     pub async fn place_widgets(&self, dashboard_id: i64, widgets: &[Placed]) -> Result<()> {
         let transaction = self.connection.begin().await?;
         let before = load(&transaction, dashboard_id).await?;
-        for widget in widgets {
-            let placement = widget.placement;
+        if !widgets.is_empty() {
+            // Each widget's new value for a column, by its ID.
+            let placed = |column: dashboard_widget::Column, value: fn(&Placement) -> i32| {
+                let moved = widgets.iter().fold(CaseStatement::new(), |moved, widget| {
+                    let id = dashboard_widget::Column::Id.eq(widget.id);
+                    moved.case(id, value(&widget.placement))
+                });
+                let moved: Expr = moved.finally(Expr::col(column)).into();
+                moved
+            };
             dashboard_widget::Entity::update_many()
-                .col_expr(dashboard_widget::Column::X, placement.x.into())
-                .col_expr(dashboard_widget::Column::Y, placement.y.into())
-                .col_expr(dashboard_widget::Column::W, placement.w.into())
-                .col_expr(dashboard_widget::Column::H, placement.h.into())
-                .filter(dashboard_widget::Column::Id.eq(widget.id))
+                .col_expr(
+                    dashboard_widget::Column::X,
+                    placed(dashboard_widget::Column::X, |placement| placement.x),
+                )
+                .col_expr(
+                    dashboard_widget::Column::Y,
+                    placed(dashboard_widget::Column::Y, |placement| placement.y),
+                )
+                .col_expr(
+                    dashboard_widget::Column::W,
+                    placed(dashboard_widget::Column::W, |placement| placement.w),
+                )
+                .col_expr(
+                    dashboard_widget::Column::H,
+                    placed(dashboard_widget::Column::H, |placement| placement.h),
+                )
+                .filter(dashboard_widget::Column::Id.is_in(widgets.iter().map(|widget| widget.id)))
                 .filter(dashboard_widget::Column::DashboardId.eq(dashboard_id))
                 .exec(&transaction)
                 .await
-                .context("moving widget")?;
+                .context("moving widgets")?;
         }
         record(&transaction, dashboard_id, before.as_ref()).await?;
         transaction.commit().await?;

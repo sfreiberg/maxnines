@@ -11,8 +11,8 @@ use serde::Serialize;
 
 use super::{CsrfForm, Page, server_error};
 use crate::alerting::{
-    Channel, ChannelInput, ChannelKind, Mail, MailSecurity, MailServer, Severity, WebhookMethod,
-    WebhookRequest,
+    self, Channel, ChannelInput, ChannelKind, Mail, MailSecurity, MailServer, NameTaken, Severity,
+    WebhookMethod, WebhookRequest,
 };
 use crate::app_state::AppState;
 use crate::channels;
@@ -464,12 +464,11 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
     if wants_preview(&form) {
         return preview_page(&state, &form, None, &fields);
     }
-    let checked = async {
-        let input = fields.to_channel(None)?;
-        state.check_channel(&input, None).await?;
+    let checked = fields.to_channel(None).and_then(|input| {
+        alerting::check_channel(&input)?;
         anyhow::Ok(input)
-    };
-    let input = match checked.await {
+    });
+    let input = match checked {
         Ok(input) => input,
         Err(error) => {
             let message = format!("{error:#}");
@@ -479,6 +478,10 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
 
     match state.database.create_channel(&input).await {
         Ok(_) => (form.token, Redirect::to("/alerts/channels")).into_response(),
+        Err(error) if error.is::<NameTaken>() => {
+            let message = format!("{error:#}");
+            form_page(&state, &form.token, None, &fields, Some(&message))
+        }
         Err(error) => server_error(&error),
     }
 }
@@ -502,27 +505,28 @@ async fn update(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfFo
         }
         return preview_page(&state, &form, Some(id), &fields);
     }
-    let checked = async {
-        let input = fields.to_channel(Some(&saved.channel))?;
-        state.check_channel(&input, Some(id)).await?;
+    let checked = fields.to_channel(Some(&saved.channel)).and_then(|input| {
+        alerting::check_channel(&input)?;
         anyhow::Ok(input)
-    };
-    let input = match checked.await {
-        Ok(input) => input,
-        Err(error) => {
-            let message = format!("{error:#}");
-            if saved.channel.kind.as_str() == fields.kind
-                && channels::of(saved.channel.kind).hides_target()
-            {
-                fields.preview = Some(saved.channel.target_preview());
-            }
-            return form_page(&state, &form.token, Some(id), &fields, Some(&message));
+    });
+    let refused = |error: anyhow::Error, mut fields: ChannelForm| {
+        let message = format!("{error:#}");
+        if saved.channel.kind.as_str() == fields.kind
+            && channels::of(saved.channel.kind).hides_target()
+        {
+            fields.preview = Some(saved.channel.target_preview());
         }
+        form_page(&state, &form.token, Some(id), &fields, Some(&message))
+    };
+    let input = match checked {
+        Ok(input) => input,
+        Err(error) => return refused(error, fields),
     };
 
     match state.database.update_channel(id, &input).await {
         Ok(true) => (form.token, Redirect::to("/alerts/channels")).into_response(),
         Ok(false) => not_found(&state, &form.token),
+        Err(error) if error.is::<NameTaken>() => refused(error, fields),
         Err(error) => server_error(&error),
     }
 }
