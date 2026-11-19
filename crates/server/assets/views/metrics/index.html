@@ -21,7 +21,7 @@
       <td>{% if host.cpu %}<span class="meters single"><svg class="meter" aria-hidden="true"><rect class="track" width="100%" height="7" rx="3.5"/><rect class="fill" width="{{ host.cpu.width }}%" height="7" rx="3.5"/></svg><span class="value">{{ host.cpu.text }}</span></span>{% else %}–{% endif %}</td>
       <td>{% if host.memory %}<span class="meters single"><svg class="meter" aria-hidden="true"><rect class="track" width="100%" height="7" rx="3.5"/><rect class="fill" width="{{ host.memory.width }}%" height="7" rx="3.5"/></svg><span class="value">{{ host.memory.text }}</span></span>{% else %}–{% endif %}</td>
       <td>{% if host.disk %}<span class="meters single"><svg class="meter" aria-hidden="true"><rect class="track" width="100%" height="7" rx="3.5"/><rect class="fill{% if host.disk_is_full %} hot{% endif %}" width="{{ host.disk.width }}%" height="7" rx="3.5"/></svg><span class="value">{{ host.disk.text }}</span></span><span class="note">{{ host.disk_mount_point }}</span>{% else %}–{% endif %}</td>
-      <td>{% if host.updated %}{{ host.updated }}{% else %}<span class="hint">None in the last 5 minutes</span>{% endif %}</td>
+      <td>{% if host.updated %}{{ host.updated }}{% else %}<span class="hint" title="No metrics in the last 5 minutes">&gt; 5 minutes</span>{% endif %}</td>
     </tr>
     {% endfor %}
   </tbody>

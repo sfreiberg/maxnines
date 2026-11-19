@@ -3668,11 +3668,7 @@ async fn an_agent_with_no_metrics_gets_empty_charts() {
     assert_eq!(page.body.matches("No data in this range").count(), 5);
 
     let page = browser.get(&server, "/metrics").await;
-    assert!(
-        page.body.contains("None in the last 5 minutes"),
-        "{}",
-        page.body
-    );
+    assert!(page.body.contains(">&gt; 5 minutes<"), "{}", page.body);
 }
 
 #[tokio::test]
