@@ -462,7 +462,7 @@ fn signing_in_with_a_code_keeps_the_tokens_refreshes_them_and_signs_out() {
     let tokens_file = folder.path().join("tokens.json");
     let mut saved: Value =
         serde_json::from_str(&std::fs::read_to_string(&tokens_file).unwrap()).unwrap();
-    saved["lan"]["access_expires_ms"] = json!(0);
+    saved["lan"]["access_expires_at"] = json!("1970-01-01T00:00:00Z");
     std::fs::write(&tokens_file, saved.to_string()).unwrap();
     let refreshed = maxnines(folder.path(), &[], &["get", "hosts", "-o", "name"]);
     assert!(refreshed.status.success(), "{}", stderr(&refreshed));

@@ -3,10 +3,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use clap::ValueEnum;
 use serde_json::Value;
 
-use crate::api::{Api, now_ms};
+use crate::api::Api;
 use crate::failure::Failure;
 use crate::output::{self, Format, span, text};
 
@@ -223,7 +224,7 @@ pub fn show(
         return Ok(nothing(kind, options).to_string());
     }
     let wide = format == Format::Wide;
-    let now = now_ms();
+    let now = Utc::now();
     let ago = |item: &Value, field: &str| {
         moment(item, field).map_or_else(|| "-".to_string(), |ms| span(now - ms))
     };
@@ -348,13 +349,13 @@ fn host_status(host: &Value) -> String {
     }
 }
 
-/// A moment the API gives as an ISO 8601 time, such as `2026-11-19T01:57:17.828Z`, in
-/// milliseconds since 1970 to work out spans with. Nothing if it's missing or empty.
-fn moment(item: &Value, field: &str) -> Option<i64> {
+/// A moment the API gives as an ISO 8601 time, such as `2026-11-19T01:57:17.828Z`.
+/// Nothing if it's missing or empty.
+fn moment(item: &Value, field: &str) -> Option<DateTime<Utc>> {
     let text = item[field].as_str()?;
-    chrono::DateTime::parse_from_rfc3339(text)
+    DateTime::parse_from_rfc3339(text)
         .ok()
-        .map(|time| time.timestamp_millis())
+        .map(|time| time.with_timezone(&Utc))
 }
 
 fn alert_state(alert: &Value) -> String {
@@ -457,7 +458,7 @@ pub fn describe(api: &Api, kind: Kind, name: &str) -> Result<String> {
     let host = find_host(&all, name)?;
     let id = text(host, "id");
     let facts = api.get(&format!("/hosts/{id}/facts"))?;
-    let now = now_ms();
+    let now = Utc::now();
     let mut lines = vec![
         ("Hostname".to_string(), text(host, "hostname")),
         ("ID".to_string(), id.clone()),

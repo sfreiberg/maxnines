@@ -6,14 +6,15 @@ use std::fs::File;
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// What a sign in keeps between commands.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tokens {
     pub access_token: String,
-    /// When the access token stops working, in milliseconds since 1970.
-    pub access_expires_ms: i64,
+    /// When the access token stops working.
+    pub access_expires_at: DateTime<Utc>,
     /// Swapped for new tokens before the access token runs out. Only the newest works.
     pub refresh_token: String,
     /// Who it acts as, and the most it may do.
@@ -168,7 +169,7 @@ mod tests {
     fn tokens(refresh: &str) -> Tokens {
         Tokens {
             access_token: "mxa_1".to_string(),
-            access_expires_ms: 1,
+            access_expires_at: DateTime::UNIX_EPOCH,
             refresh_token: refresh.to_string(),
             user: "you@example.com".to_string(),
             role: "responder".to_string(),

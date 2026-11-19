@@ -1,5 +1,6 @@
 //! How what comes back is shown.
 
+use chrono::TimeDelta;
 use clap::ValueEnum;
 use comfy_table::{ContentArrangement, Table, presets};
 use serde_json::Value;
@@ -39,8 +40,8 @@ pub fn json(value: &Value) -> String {
 }
 
 /// How long ago, or how long until, in the largest whole unit, such as `3m` or `2d`.
-pub fn span(ms: i64) -> String {
-    let secs = ms.max(0) / 1000;
+pub fn span(length: TimeDelta) -> String {
+    let secs = length.num_seconds().max(0);
     match secs {
         0..60 => format!("{secs}s"),
         60..3600 => format!("{}m", secs / 60),
@@ -115,11 +116,11 @@ mod tests {
 
     #[test]
     fn spans_use_the_largest_whole_unit() {
-        assert_eq!(span(-5), "0s");
-        assert_eq!(span(59_000), "59s");
-        assert_eq!(span(60_000), "1m");
-        assert_eq!(span(7_200_000), "2h");
-        assert_eq!(span(200_000_000), "2d");
+        assert_eq!(span(TimeDelta::seconds(-5)), "0s");
+        assert_eq!(span(TimeDelta::seconds(59)), "59s");
+        assert_eq!(span(TimeDelta::minutes(1)), "1m");
+        assert_eq!(span(TimeDelta::hours(2)), "2h");
+        assert_eq!(span(TimeDelta::seconds(200_000)), "2d");
     }
 
     #[test]

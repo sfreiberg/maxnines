@@ -2,9 +2,10 @@
 
 use std::cell::RefCell;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::Result;
+use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::Value;
 
 use crate::failure::Failure;
@@ -14,14 +15,14 @@ use crate::signin::{self, REFRESH_RETRIES, Refreshed};
 use crate::tokens::{self, Store, Tokens};
 
 /// How long before the access token runs out that it's refreshed.
-const REFRESH_EARLY_MS: i64 = 60_000;
+const REFRESH_EARLY: TimeDelta = TimeDelta::minutes(1);
 
-pub fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| {
-            i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
-        })
+/// When a token the server says lasts `secs` seconds runs out. One that would last
+/// past what can be counted runs out then.
+pub fn expires_after(secs: i64) -> DateTime<Utc> {
+    TimeDelta::try_seconds(secs)
+        .and_then(|lasts| Utc::now().checked_add_signed(lasts))
+        .unwrap_or(DateTime::<Utc>::MAX_UTC)
 }
 
 /// How the API is told who's asking.
@@ -126,7 +127,7 @@ impl Api {
                 store,
                 tokens,
             } => {
-                let fresh = |held: &Tokens| held.access_expires_ms - now_ms() > REFRESH_EARLY_MS;
+                let fresh = |held: &Tokens| held.access_expires_at - Utc::now() > REFRESH_EARLY;
                 if !stale && fresh(&tokens.borrow()) {
                     return Ok(tokens.borrow().access_token.clone());
                 }
@@ -155,7 +156,7 @@ impl Api {
                     Refreshed::Issued(issued) => {
                         let renewed = Tokens {
                             access_token: issued.access_token,
-                            access_expires_ms: now_ms() + issued.expires_in * 1000,
+                            access_expires_at: expires_after(issued.expires_in),
                             refresh_token: issued.refresh_token,
                             user: issued.user,
                             role: issued.role,

@@ -18,10 +18,11 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
+use chrono::TimeDelta;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 
-use crate::api::{Api, Auth, now_ms};
+use crate::api::{Api, Auth, expires_after};
 use crate::config::{Config, Context};
 use crate::failure::Failure;
 use crate::kinds::{Kind, Options};
@@ -393,7 +394,7 @@ fn login(folder: &Path, args: LoginArgs) -> Result<u8> {
     };
     let held = Tokens {
         access_token: issued.access_token,
-        access_expires_ms: now_ms() + issued.expires_in * 1000,
+        access_expires_at: expires_after(issued.expires_in),
         refresh_token: issued.refresh_token,
         user: issued.user.clone(),
         role: issued.role.clone(),
@@ -768,7 +769,12 @@ fn silence(api: &Api, args: SilenceArgs, format: Format) -> Result<()> {
         Format::Json => println!("{}", output::json(&created)),
         Format::Table | Format::Wide => println!(
             "{name} started, for {}",
-            output::span(i64::try_from(args.duration).unwrap_or(i64::MAX) * 1000)
+            output::span(
+                i64::try_from(args.duration)
+                    .ok()
+                    .and_then(TimeDelta::try_seconds)
+                    .unwrap_or(TimeDelta::MAX)
+            )
         ),
     }
     Ok(())
