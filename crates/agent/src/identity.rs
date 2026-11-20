@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use maxnines_protocol::auth::{Identity, write_private_file};
@@ -22,16 +23,16 @@ pub fn load(path: &Path) -> Result<Identity> {
 
 /// Writes a new key. Replacing a key creates a new identity, which the server
 /// has to approve again, so that takes `force`.
+///
+/// The new key is written beside the old one and then takes its place, so a key
+/// that can't be written leaves the old one as it was.
 pub fn generate(path: &Path, force: bool) -> Result<Identity> {
-    if path.exists() {
-        if !force {
-            bail!(
-                "key file {} already exists. Replacing it makes this a new host that must be \
-                 approved again. Use --force to replace it.",
-                path.display()
-            );
-        }
-        fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
+    if path.exists() && !force {
+        bail!(
+            "key file {} already exists. Replacing it makes this a new host that must be \
+             approved again. Use --force to replace it.",
+            path.display()
+        );
     }
 
     if let Some(parent) = path.parent() {
@@ -40,8 +41,22 @@ pub fn generate(path: &Path, force: bool) -> Result<Identity> {
     }
 
     let bytes = Identity::generate()?;
-    write_private_file(path, &bytes).with_context(|| format!("writing {}", path.display()))?;
-    Identity::from_pkcs8(&bytes)
+    let identity = Identity::from_pkcs8(&bytes)?;
+    let mut new = path.as_os_str().to_owned();
+    new.push(".new");
+    let new = PathBuf::from(new);
+    // Left by a run that stopped part way, and never the key in use.
+    match fs::remove_file(&new) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            return Err(error).with_context(|| format!("removing {}", new.display()));
+        }
+        _ => {}
+    }
+    write_private_file(&new, &bytes)
+        .and_then(|()| fs::OpenOptions::new().write(true).open(&new)?.sync_all())
+        .with_context(|| format!("writing {}", new.display()))?;
+    fs::rename(&new, path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(identity)
 }
 
 #[cfg(test)]
@@ -79,6 +94,32 @@ mod tests {
 
         assert_ne!(replaced.id(), original.id());
         assert_eq!(load(&path).unwrap().id(), replaced.id());
+    }
+
+    #[test]
+    fn a_new_key_that_cannot_be_written_leaves_the_old_one() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("agent.key");
+        let original = generate(&path, false).unwrap();
+        // A folder where the new key would be written first.
+        fs::create_dir(folder.path().join("agent.key.new")).unwrap();
+        fs::write(folder.path().join("agent.key.new/x"), "").unwrap();
+
+        assert!(generate(&path, true).is_err());
+
+        assert_eq!(load(&path).unwrap().id(), original.id());
+    }
+
+    #[test]
+    fn a_key_left_half_written_is_replaced() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("agent.key");
+        fs::write(folder.path().join("agent.key.new"), "half").unwrap();
+
+        let created = generate(&path, false).unwrap();
+
+        assert_eq!(load(&path).unwrap().id(), created.id());
+        assert!(!folder.path().join("agent.key.new").exists());
     }
 
     #[test]
