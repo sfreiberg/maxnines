@@ -368,6 +368,49 @@ async fn an_admin_can_require_it_for_everyone() {
 }
 
 #[tokio::test]
+async fn keys_and_apps_wait_for_two_factor_while_everyone_has_to_have_it() {
+    let server = start().await;
+    let database = &server.state.database;
+    let id = person(&server, EMAIL).await;
+    let now = crate::times::now();
+    let (_, key) = database
+        .create_api_key("script", id, Role::Admin, None, now)
+        .await
+        .unwrap();
+    let (_, app) = database
+        .create_app_sign_in(id, "maxnines-cli", None, Role::Admin, now)
+        .await
+        .unwrap();
+    let tokens = [key.as_str(), app.access_token.as_str()];
+    for token in tokens {
+        let response = server.http("GET", "/api/v1/hosts", Some(token)).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+
+    database.require_two_factor(true).await.unwrap();
+    server
+        .state
+        .require_two_factor
+        .store(true, Ordering::Relaxed);
+    for token in tokens {
+        let response = server.http("GET", "/api/v1/hosts", Some(token)).await;
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(
+            response.contains(crate::controllers::SET_UP_TWO_FACTOR),
+            "{response}"
+        );
+        let page = server.http("GET", "/hosts", Some(token)).await;
+        assert!(page.starts_with("HTTP/1.1 403"), "{page}");
+    }
+
+    with_two_factor(&server, id, EMAIL).await;
+    for token in tokens {
+        let response = server.http("GET", "/api/v1/hosts", Some(token)).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+}
+
+#[tokio::test]
 async fn an_admin_resets_it_for_someone_who_lost_their_phone() {
     let server = start().await;
     let id = person(&server, EMAIL).await;

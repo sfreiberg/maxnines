@@ -274,6 +274,14 @@ pub fn create_api_key(
             .active_user_by_email(owner)
             .await?
             .with_context(|| format!("no user who can sign in has the address {owner}"))?;
+        // It would be refused every time it was used.
+        if database.two_factor_required().await? && !owner.two_factor {
+            bail!(
+                "this server requires two-factor sign-in, which {} hasn't set up yet: \
+                 they can on their profile page",
+                owner.email
+            );
+        }
         let role = role.unwrap_or(owner.role);
         database
             .create_api_key(name, owner.id, role, expires_at, now)

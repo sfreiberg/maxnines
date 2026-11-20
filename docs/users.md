@@ -125,8 +125,10 @@ They then sign in with their password alone and can set it up again.
 
 An admin can also require it for everyone, from the Users page. Anyone without it is
 sent to their profile to set it up before they can open anything else. The admin
-turning this on has to have two-factor themselves first. API keys aren't affected:
-they keep working whether or not their owner has two-factor.
+turning this on has to have two-factor themselves first. Their API keys and signed-in
+apps answer `403` until they've set it up, saying so, and they can't make new ones
+meanwhile, on the pages or with `maxnines-server api-keys create`. Those of people
+who have two-factor carry on as before.
 
 Codes depend on the time, so the server's clock has to be right to within about 30
 seconds. The secret each app shares is kept in the main database as it is, because

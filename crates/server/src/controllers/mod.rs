@@ -87,6 +87,11 @@ fn recorded_by() -> String {
 /// Runs a request as `user`, for the page's frame and the audit log, `via` an API
 /// key or the like if that's how they came.
 /// Nothing runs for someone whose role doesn't allow it: see [`roles::required`].
+/// Why a key or an app of someone without two-factor is refused while everyone has to
+/// have it.
+pub const SET_UP_TWO_FACTOR: &str = "This server requires two-factor sign-in, so API \
+    keys and apps only work once you've set it up on your profile page";
+
 async fn run_as(
     state: &AppState,
     user: User,
@@ -115,7 +120,12 @@ async fn run_as(
     } else {
         "key"
     };
-    let refused = roles::refused_via(via.as_ref(), request.method(), route);
+    let refused = roles::refused_via(via.as_ref(), request.method(), route).or_else(|| {
+        // Someone who has to set up two-factor can only do that, at the pages, so
+        // nothing they made before then works meanwhile.
+        let required = state.require_two_factor.load(Ordering::Relaxed);
+        (via.is_some() && required && !user.two_factor).then_some(SET_UP_TWO_FACTOR)
+    });
     let answer = async {
         if let Some(reason) = refused {
             if is_api {

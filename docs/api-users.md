@@ -193,7 +193,8 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 Whether everyone has to set up two-factor before using the pages, as
 `{"required": true}`. Requiring it gives `409` unless the key's owner has two-factor
-themselves. API keys keep working either way.
+themselves. While it's required, the API keys and signed-in apps of anyone without it
+answer `403` until they set it up.
 
 ```sh
 curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \
