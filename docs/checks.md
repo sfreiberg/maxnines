@@ -23,8 +23,8 @@ are defined in the agent's own config, as [below](#on-an-agent).
 | **Mail sending** (`smtp`) | `host:port` | That it greets as a mail server, or that an account can sign in to send |
 | **Mailbox** (`imap`, `pop3`) | `host:port` | That it greets as one, or that an account can sign in |
 
-Agents older than this version don't know the database, Redis, SSH and mail checks. Upgrade
-them before giving those kinds to them in a config rule.
+An agent older than a kind of check doesn't know it. It runs the rest of its checks,
+and reports that one as down, saying the agent needs upgrading.
 
 ## What's timed
 

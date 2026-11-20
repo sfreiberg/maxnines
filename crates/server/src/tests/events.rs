@@ -339,6 +339,7 @@ async fn a_new_config_is_marked_but_not_the_first() {
     let applied = |version: String| AgentMessage::ConfigResult {
         version,
         error: None,
+        skipped_collectors: Vec::new(),
     };
     send(&mut client, &applied(first.clone())).await;
     let deadline = Instant::now() + Duration::from_secs(10);

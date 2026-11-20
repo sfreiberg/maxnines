@@ -279,15 +279,34 @@ fn print_identity(identity: &Identity) {
 /// What a config turns on, ready to collect.
 type Collectors = Vec<Box<dyn Collector + Send>>;
 
+/// What a config built: its collectors, and the ones it named that this agent
+/// doesn't know, which a newer server can send.
+struct Built {
+    collectors: Collectors,
+    skipped_collectors: Vec<String>,
+}
+
 /// Builds what a config turns on. It fails without side effects, so a bad config
 /// leaves the old one running. Everything that could go wrong with a config happens
-/// in here, so a bad one is refused rather than taking the agent down.
-fn build(config: &AgentConfig, local: Local<'_>) -> Result<Collectors> {
+/// in here, so a bad one is refused rather than taking the agent down. What this
+/// agent doesn't know is left out, and the rest runs.
+fn build(config: &AgentConfig, local: Local<'_>) -> Result<Built> {
     catch_unwind(AssertUnwindSafe(|| {
-        config.validate()?;
-        let mut collectors = collector::build_all(config, local)?;
+        let mut config = config.clone();
+        let skipped_collectors = config.remove_unknown_collectors();
+        if !skipped_collectors.is_empty() {
+            warn!(
+                skipped = skipped_collectors.join(", "),
+                "the server asked for collectors this agent doesn't know, upgrade it to run them"
+            );
+        }
+        config.validate_sent()?;
+        let mut collectors = collector::build_all(&config, local)?;
         collectors.push(Box::new(OwnUsageCollector::new()?));
-        anyhow::Ok(collectors)
+        anyhow::Ok(Built {
+            collectors,
+            skipped_collectors,
+        })
     }))
     .map_err(|_| anyhow!("building collectors panicked"))?
 }
@@ -299,14 +318,14 @@ async fn build_apart(
     update: ConfigUpdate,
     config: &Arc<Config>,
     saving: bool,
-) -> Result<(ConfigUpdate, Collectors)> {
+) -> Result<(ConfigUpdate, Built)> {
     let config = config.clone();
     tokio::task::spawn_blocking(move || {
-        let collectors = build(&update.config, config.local())?;
+        let built = build(&update.config, config.local())?;
         if saving && let Err(error) = saved_config::save(&config.saved_config_file(), &update) {
             warn!(error = format!("{error:#}"), "saving the config failed");
         }
-        Ok((update, collectors))
+        Ok((update, built))
     })
     .await
     .context("building collectors stopped")?
@@ -377,11 +396,11 @@ async fn run_agent(path: PathBuf, config: Arc<Config>) -> Result<()> {
     let mut monitoring = None;
     if let Some(update) = saved_config::load(&config.saved_config_file()) {
         match build_apart(update, &config, false).await {
-            Ok((update, collectors)) => {
+            Ok((update, built)) => {
                 info!(version = update.version, "using the saved config");
                 link.set_facts_interval(update.config.facts_interval);
                 let period = update.config.interval;
-                monitoring = Some(Monitoring::new(update.version, collectors, period));
+                monitoring = Some(Monitoring::new(update.version, built.collectors, period));
             }
             Err(error) => warn!(error = format!("{error:#}"), "saved config is unusable"),
         }
@@ -456,14 +475,16 @@ async fn apply(
         .as_ref()
         .is_some_and(|active| active.version == update.version);
     if already_running {
-        return link.report_config(&update.version, None);
+        let mut config = update.config;
+        let skipped_collectors = config.remove_unknown_collectors();
+        return link.report_config(&update.version, None, skipped_collectors);
     }
 
     let version = update.version.clone();
     match build_apart(update, config, true).await {
-        Ok((update, collectors)) => {
+        Ok((update, built)) => {
             let period = update.config.interval;
-            let started = Monitoring::new(update.version.clone(), collectors, period);
+            let started = Monitoring::new(update.version.clone(), built.collectors, period);
             info!(
                 version = update.version,
                 collectors = started.collector_count(),
@@ -473,12 +494,12 @@ async fn apply(
             // Anything the old one was still collecting is let go.
             *monitoring = Some(started);
             link.set_facts_interval(update.config.facts_interval);
-            link.report_config(&update.version, None)
+            link.report_config(&update.version, None, built.skipped_collectors)
         }
         Err(error) => {
             let error = format!("{error:#}");
             warn!(version, error, "config rejected");
-            link.report_config(&version, Some(error))
+            link.report_config(&version, Some(error), Vec::new())
         }
     }
 }
@@ -664,17 +685,29 @@ mod tests {
         let built = build(&config, Local::none()).unwrap();
 
         // What was asked for, and the agent reporting on itself.
-        assert_eq!(built.len(), 2);
+        assert_eq!(built.collectors.len(), 2);
+        assert!(built.skipped_collectors.is_empty());
     }
 
     #[test]
     fn a_bad_config_is_refused() {
         for config in [
             json!({ "interval_secs": 0 }),
-            json!({ "collectors": { "nope": {} } }),
+            json!({ "collectors": { "processes": { "names": [""] } } }),
         ] {
             assert!(build(&update("v1", config).config, Local::none()).is_err());
         }
+    }
+
+    /// A newer server can add a collector without older agents turning down every
+    /// config it sends from then on.
+    #[test]
+    fn a_collector_this_agent_does_not_know_is_skipped_and_the_rest_run() {
+        let config = json!({ "collectors": { "cpu": {}, "zfs": { "pools": ["tank"] } } });
+        let built = build(&update("v1", config).config, Local::none()).unwrap();
+
+        assert_eq!(built.collectors.len(), 2);
+        assert_eq!(built.skipped_collectors, ["zfs"]);
     }
 
     /// Blocks until it's let go, as reading a hung network drive does.

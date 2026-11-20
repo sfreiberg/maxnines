@@ -300,7 +300,11 @@ impl SimulatedAgent {
                                     .push(began.elapsed());
                             }
                             counters.configs.fetch_add(1, Relaxed);
-                            let result = AgentMessage::ConfigResult { version, error: None };
+                            let result = AgentMessage::ConfigResult {
+                                version,
+                                error: None,
+                                skipped_collectors: Vec::new(),
+                            };
                             socket
                                 .send(Message::text(serde_json::to_string(&result)?))
                                 .await?;

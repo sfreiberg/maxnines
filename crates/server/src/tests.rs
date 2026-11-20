@@ -1110,6 +1110,18 @@ async fn invalid_messages_do_not_end_the_connection() {
     assert_eq!(server.wait_for_sample().await.2, at(42));
 }
 
+#[tokio::test]
+async fn a_message_from_a_newer_agent_is_ignored() {
+    let server = start().await;
+    let mut client = server.connect_approved(&identity(), "web-1").await;
+
+    let newer = json!({ "type": "logs", "lines": ["started"] });
+    client.send(Message::text(newer.to_string())).await.unwrap();
+    send(&mut client, &sample(at(42))).await;
+
+    assert_eq!(server.wait_for_sample().await.2, at(42));
+}
+
 // ---- facts
 
 impl TestServer {
@@ -1508,6 +1520,7 @@ async fn an_agents_config_result_is_recorded_and_shown() {
     let result = AgentMessage::ConfigResult {
         version: version.clone(),
         error: Some("x".repeat(5000)),
+        skipped_collectors: Vec::new(),
     };
     send(&mut client, &result).await;
 
@@ -2317,6 +2330,7 @@ async fn agent_reported_text_can_not_inject_html() {
     let rejected = AgentMessage::ConfigResult {
         version: "v1".to_string(),
         error: Some(attack.to_string()),
+        skipped_collectors: Vec::new(),
     };
     send(&mut client, &rejected).await;
     let deadline = Instant::now() + Duration::from_secs(5);

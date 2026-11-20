@@ -180,7 +180,23 @@ enum Ready {
     Broken { name: String, why: String },
 }
 
+/// What a check of a kind this agent doesn't know, which a newer server can send,
+/// reports instead of running.
+const UNKNOWN_KIND: &str =
+    "this agent doesn't know this kind of check, which is newer, so it needs upgrading";
+
 impl Ready {
+    /// A check the server sent whole.
+    fn sent(check: Check) -> Self {
+        if check.kind == CheckKind::Unknown {
+            return Self::Broken {
+                name: check.name,
+                why: UNKNOWN_KIND.to_string(),
+            };
+        }
+        Self::Run(Box::new(check), None)
+    }
+
     fn local(choice: &LocalCheck, definitions: &CheckDefinitions) -> Self {
         let name = &choice.name;
         let Some(definition) = definitions.get(name) else {
@@ -218,7 +234,7 @@ impl CheckCollector {
     ) -> Result<Self> {
         let ready = checks
             .into_iter()
-            .map(|check| Ready::Run(Box::new(check), None))
+            .map(Ready::sent)
             .chain(local.iter().map(|choice| Ready::local(choice, definitions)));
         let mut background = Background::new();
         for item in ready {
@@ -286,6 +302,48 @@ mod tests {
             assert!(Instant::now() < deadline, "{output}");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// A newer server can add a kind of check without the other checks stopping.
+    #[test]
+    fn a_check_of_a_kind_it_does_not_know_says_so_and_the_others_run() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap().to_string();
+        let config: maxnines_protocol::AgentConfig = serde_json::from_value(json!({
+            "collectors": { "checks": { "checks": [
+                { "name": "directory", "kind": "ldap", "target": "ldap.example.com:389" },
+                { "name": "port", "kind": "tcp", "target": target },
+            ] } },
+        }))
+        .unwrap();
+        config.validate_sent().unwrap();
+        let checks = config.collectors["checks"].checks.clone().unwrap();
+        let mut collector = CheckCollector::new(
+            checks,
+            &[],
+            &CheckDefinitions::new(),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+
+        let output = collect_until(&mut collector, |output| {
+            output
+                .as_array()
+                .is_some_and(|rows| rows.iter().any(|row| row["up"] == 1))
+        });
+        let row = |name: &str| {
+            output
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(row("port")["up"], 1, "{output}");
+        assert_eq!(row("directory")["up"], 0, "{output}");
+        assert_eq!(row("directory")["error"], UNKNOWN_KIND, "{output}");
+        assert!(UNKNOWN_KIND.contains("upgrading"));
     }
 
     #[test]

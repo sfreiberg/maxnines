@@ -22,7 +22,7 @@ use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::actions::{Actions, Runner};
 use crate::config::Config;
@@ -42,6 +42,10 @@ const SEND_LIMIT: Duration = SERVER_SILENCE_LIMIT;
 const HANDSHAKE_LIMIT: Duration = Duration::from_secs(15);
 /// Configs arrive rarely, and only the newest one matters.
 const CONFIG_QUEUE_SIZE: usize = 8;
+/// How long an agent the server turned away waits before trying again. Trying sooner
+/// wouldn't help, as something has to be upgraded first, and that restarts whichever
+/// side it was.
+const REFUSED_WAIT: Duration = Duration::from_secs(600);
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -136,6 +140,13 @@ struct Connection {
 
 impl ServerLink {
     pub fn start(config: &Config, hostname: &str, identity: Identity) -> Result<Self> {
+        let (link, connection) = Self::new(config, hostname, identity)?;
+        tokio::spawn(stay_connected(connection));
+        Ok(link)
+    }
+
+    /// The link, and the connection for a task of its own to keep up.
+    fn new(config: &Config, hostname: &str, identity: Identity) -> Result<(Self, Connection)> {
         let url = config.server.url.clone();
         if url.starts_with("ws://") {
             warn!(
@@ -177,13 +188,13 @@ impl ServerLink {
             configs: config_sender,
         };
 
-        tokio::spawn(stay_connected(connection));
-        Ok(Self {
+        let link = Self {
             spool,
             outbox,
             configs,
             facts_every,
-        })
+        };
+        Ok((link, connection))
     }
 
     pub fn send_sample(&self, sample: Sample) -> Result<()> {
@@ -194,10 +205,16 @@ impl ServerLink {
     }
 
     /// Goes once the connection is up, however long that takes.
-    pub fn report_config(&self, version: &str, error: Option<String>) -> Result<()> {
+    pub fn report_config(
+        &self,
+        version: &str,
+        error: Option<String>,
+        skipped_collectors: Vec<String>,
+    ) -> Result<()> {
         let message = AgentMessage::ConfigResult {
             version: version.to_string(),
             error,
+            skipped_collectors,
         };
         self.outbox.push(serde_json::to_string(&message)?);
         Ok(())
@@ -252,17 +269,74 @@ fn tls_connector(ca_file: Option<&Path>) -> Result<Connector> {
     Ok(Connector::Rustls(Arc::new(config)))
 }
 
+/// Why the server turned this agent away, in its own words, which waiting a little
+/// won't change.
+#[derive(Debug)]
+struct Refused(String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the server turned this agent away: {}", self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// What the agent says about being turned away: the server's whole reason the first
+/// time, and a short line on later tries while nothing changes.
+#[derive(Default)]
+struct Refusals {
+    last: Option<String>,
+}
+
+impl Refusals {
+    /// Logs a refusal, and gives how long to wait before trying again.
+    fn refused(&mut self, refused: &Refused) -> Duration {
+        error!("{}", self.line(refused));
+        REFUSED_WAIT
+    }
+
+    fn line(&mut self, refused: &Refused) -> String {
+        let minutes = REFUSED_WAIT.as_secs() / 60;
+        if self.last.as_ref() == Some(&refused.0) {
+            return format!(
+                "the server still turns this agent away, as above. Trying again in {minutes} \
+                 minutes."
+            );
+        }
+        self.last = Some(refused.0.clone());
+        format!("{refused} Trying again in {minutes} minutes.")
+    }
+
+    /// Anything else happening is a change, after which a refusal is told in full.
+    fn clear(&mut self) {
+        self.last = None;
+    }
+}
+
 /// Reconnects forever, backing off while the server stays unreachable. This is
 /// also how a pending agent checks for approval. A panic in a session is
-/// treated like any other lost connection.
+/// treated like any other lost connection. An agent the server turns away waits far
+/// longer, as only an upgrade changes that.
 async fn stay_connected(connection: Connection) {
     let mut backoff = Backoff::new();
+    let mut refusals = Refusals::default();
 
     loop {
         let started = Instant::now();
         let outcome = AssertUnwindSafe(session(&connection)).catch_unwind().await;
         connection.spool.set_online(false);
 
+        let refused = match &outcome {
+            Ok(Err(error)) => error.downcast_ref::<Refused>(),
+            _ => None,
+        };
+        if let Some(refused) = refused {
+            sleep(refusals.refused(refused)).await;
+            backoff.reset();
+            continue;
+        }
+        refusals.clear();
         match outcome {
             Ok(Ok(())) => {}
             Ok(Err(error)) => warn!(error = format!("{error:#}"), "not connected to server"),
@@ -417,6 +491,7 @@ async fn receive(text: &str, connection: &Connection) -> Option<String> {
             }
         }
         Ok(ServerMessage::Ack { time }) => connection.spool.acked(time),
+        Ok(ServerMessage::Unknown) => debug!("ignoring a message from a newer server"),
         Ok(ServerMessage::RunAction {
             id,
             action,
@@ -464,14 +539,24 @@ async fn authenticate(socket: &mut Socket, connection: &Connection) -> Result<()
         RegistrationStatus::Approved => Ok(()),
         RegistrationStatus::Pending => bail!("waiting for the server to approve host ID {id}"),
         RegistrationStatus::Rejected => bail!("the server rejected host ID {id}"),
+        RegistrationStatus::Unknown => Err(Refused(
+            "it answered in a way this agent doesn't understand, so the agent may need \
+             upgrading."
+                .to_string(),
+        )
+        .into()),
     }
 }
 
+/// The next message the agent knows, skipping any from a newer server.
 async fn read_server_message(socket: &mut Socket) -> Result<ServerMessage> {
     loop {
         match socket.next().await {
             Some(Ok(Message::Text(text))) => {
-                return serde_json::from_str(&text).context("invalid message from server");
+                match serde_json::from_str(&text).context("invalid message from server")? {
+                    ServerMessage::Unknown => debug!("ignoring a message from a newer server"),
+                    message => return Ok(message),
+                }
             }
             Some(Ok(Message::Close(_))) | None => bail!("server closed the connection"),
             Some(Ok(_)) => {}
@@ -755,13 +840,14 @@ mod tests {
         assert_eq!(update.version, "v1");
         assert_eq!(update.config, sent);
 
-        link.report_config("v1", Some("broken".to_string()))
+        link.report_config("v1", Some("broken".to_string()), Vec::new())
             .unwrap();
         assert_eq!(
             next_message(&mut socket).await,
             AgentMessage::ConfigResult {
                 version: "v1".to_string(),
                 error: Some("broken".to_string()),
+                skipped_collectors: Vec::new(),
             }
         );
     }
@@ -778,6 +864,83 @@ mod tests {
         send_to_agent(&mut socket, &message).await;
 
         assert_eq!(link.next_config().await.unwrap().version, "v1");
+    }
+
+    #[tokio::test]
+    async fn a_message_from_a_newer_server_is_ignored() {
+        let (mut link, mut socket) = connected().await;
+
+        socket
+            .send(Message::text(
+                json!({ "type": "reboot_soon", "at": "later" }).to_string(),
+            ))
+            .await
+            .unwrap();
+        let message = ServerMessage::Config {
+            version: "v1".to_string(),
+            config: serde_json::from_value(json!({})).unwrap(),
+        };
+        send_to_agent(&mut socket, &message).await;
+
+        assert_eq!(link.next_config().await.unwrap().version, "v1");
+    }
+
+    /// Plays a server that answers the hello with `replies`, and returns how one
+    /// session of the agent's ended.
+    async fn session_answered_with(replies: Vec<Value>) -> anyhow::Error {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        let (_link, connection) = ServerLink::new(&config(&url), "web-1", identity()).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let challenge = ServerMessage::Challenge {
+                nonce: "n".to_string(),
+            };
+            send_to_agent(&mut socket, &challenge).await;
+            socket.next().await.unwrap().unwrap();
+            for reply in replies {
+                socket.send(Message::text(reply.to_string())).await.unwrap();
+            }
+            // Held until the agent is done with it.
+            socket.next().await;
+        });
+        let error = session(&connection).await.unwrap_err();
+        server.await.unwrap();
+        error
+    }
+
+    #[tokio::test]
+    async fn a_status_from_a_newer_server_is_taken_as_being_turned_away() {
+        let error = session_answered_with(vec![
+            json!({ "type": "something_new" }),
+            json!({ "type": "registration", "status": "quarantined" }),
+        ])
+        .await;
+
+        let refused = error.downcast_ref::<Refused>().expect("a refusal");
+        assert!(refused.0.contains("may need upgrading"), "{refused}");
+    }
+
+    #[test]
+    fn a_refusal_waits_long_and_is_told_in_full_once_until_something_changes() {
+        let mut refusals = Refusals::default();
+        let too_old = Refused("This agent is too old. Upgrade it.".to_string());
+        let other = Refused("Something else.".to_string());
+
+        let first = refusals.line(&too_old);
+        assert_eq!(
+            first,
+            "the server turned this agent away: This agent is too old. Upgrade it. Trying \
+             again in 10 minutes."
+        );
+        assert!(!refusals.line(&too_old).contains("too old"));
+        assert!(refusals.line(&other).contains("Something else."));
+        assert!(!refusals.line(&other).contains("Something else."));
+        refusals.clear();
+        assert!(refusals.line(&other).contains("Something else."));
+        assert_eq!(refusals.refused(&too_old), Duration::from_secs(600));
+        assert!(REFUSED_WAIT > Backoff::MAX * 10);
     }
 
     #[tokio::test]
@@ -950,7 +1113,8 @@ mod tests {
 
         // Many at once, more than were ever kept before.
         for version in 0..20 {
-            link.report_config(&format!("v{version}"), None).unwrap();
+            link.report_config(&format!("v{version}"), None, Vec::new())
+                .unwrap();
         }
 
         let mut socket = reconnected(&listener, &url).await;
@@ -960,6 +1124,7 @@ mod tests {
                 AgentMessage::ConfigResult {
                     version: format!("v{version}"),
                     error: None,
+                    skipped_collectors: Vec::new(),
                 }
             );
         }

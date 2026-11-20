@@ -98,6 +98,10 @@ async fn register_all(options: &Options, server: &Server, identities: &[Identity
                         "the server rejected {hostname}, probably after an earlier --revoke. Use a \
                          new --keys-file"
                     ),
+                    RegistrationStatus::Unknown => bail!(
+                        "the server answered {hostname} in a way this load tester doesn't \
+                         understand, so it needs upgrading"
+                    ),
                 }
             }
         })

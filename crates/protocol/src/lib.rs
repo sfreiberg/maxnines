@@ -247,7 +247,6 @@ pub struct CollectorSettings {
 /// A check the agent's own config defines, which a rule asks it to run. The
 /// config says what it reaches and how it signs in; this says when.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct LocalCheck {
     pub name: String,
     /// How long it gets. Defaults to [`DEFAULT_CHECK_TIMEOUT`].
@@ -325,7 +324,6 @@ const MAX_DATABASES: usize = 16;
 
 /// A database the agent's own config defines, which a rule asks it to read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DatabaseChoice {
     pub name: String,
     /// From [`DATABASE_EXTRAS`].
@@ -400,7 +398,7 @@ pub fn check_metrics_pages(urls: &[String], names: &[String]) -> Result<()> {
         databases: None,
         urls: Some(urls.to_vec()),
     };
-    settings.validate("openmetrics")
+    settings.validate("openmetrics", Checking::Saved)
 }
 
 /// A status page has to be a plain web address. A username or password in it
@@ -516,9 +514,32 @@ pub enum CheckKind {
     Smtp,
     Imap,
     Pop3,
+    /// A kind this build doesn't know, from a newer server. The server never saves
+    /// one, and an agent reports that it can't run it rather than turning down the
+    /// whole of its config.
+    #[serde(other)]
+    Unknown,
 }
 
 impl CheckKind {
+    /// Every kind this build can run.
+    pub const KNOWN: [Self; 14] = [
+        Self::Tcp,
+        Self::Http,
+        Self::Tls,
+        Self::Dns,
+        Self::Ping,
+        Self::Postgres,
+        Self::Mysql,
+        Self::Redis,
+        Self::Mongodb,
+        Self::Clickhouse,
+        Self::Ssh,
+        Self::Smtp,
+        Self::Imap,
+        Self::Pop3,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Tcp => "tcp",
@@ -535,6 +556,7 @@ impl CheckKind {
             Self::Smtp => "smtp",
             Self::Imap => "imap",
             Self::Pop3 => "pop3",
+            Self::Unknown => "unknown",
         }
     }
 
@@ -554,24 +576,9 @@ impl CheckKind {
         )
     }
 
+    /// One of the kinds this build knows, by its name.
     pub fn parse(text: &str) -> Option<Self> {
-        match text {
-            "tcp" => Some(Self::Tcp),
-            "http" => Some(Self::Http),
-            "tls" => Some(Self::Tls),
-            "dns" => Some(Self::Dns),
-            "ping" => Some(Self::Ping),
-            "postgres" => Some(Self::Postgres),
-            "mysql" => Some(Self::Mysql),
-            "redis" => Some(Self::Redis),
-            "mongodb" => Some(Self::Mongodb),
-            "clickhouse" => Some(Self::Clickhouse),
-            "ssh" => Some(Self::Ssh),
-            "smtp" => Some(Self::Smtp),
-            "imap" => Some(Self::Imap),
-            "pop3" => Some(Self::Pop3),
-            _ => None,
-        }
+        Self::KNOWN.into_iter().find(|kind| kind.as_str() == text)
     }
 }
 
@@ -649,6 +656,10 @@ impl Check {
             "check {name:?} has spaces in its target"
         );
         match self.kind {
+            CheckKind::Unknown => anyhow::bail!(
+                "check {name:?} needs a kind this version knows: {}",
+                CheckKind::KNOWN.map(CheckKind::as_str).join(", ")
+            ),
             CheckKind::Tcp
             | CheckKind::Tls
             | CheckKind::Postgres
@@ -828,8 +839,45 @@ pub const MIN_FACTS_INTERVAL: Duration = Duration::from_secs(60);
 /// A week between fact reports, on top of one on every connection.
 pub const MAX_FACTS_INTERVAL: Duration = Duration::from_secs(7 * 86_400);
 
+/// Whose config is being checked: one a server is saving, which has to be all
+/// known, or one an agent was sent, which can be from a newer server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Checking {
+    Saved,
+    Sent,
+}
+
 impl AgentConfig {
+    /// Checks a config as a server saves it, where everything in it has to be known.
     pub fn validate(&self) -> Result<()> {
+        self.check(Checking::Saved)
+    }
+
+    /// Takes out the collectors this build doesn't know, returning their names. A
+    /// newer server can name collectors an older agent doesn't have, and the agent
+    /// runs the rest.
+    pub fn remove_unknown_collectors(&mut self) -> Vec<String> {
+        let unknown: Vec<String> = self
+            .collectors
+            .keys()
+            .filter(|name| !COLLECTORS.contains(&name.as_str()))
+            .cloned()
+            .collect();
+        for name in &unknown {
+            self.collectors.remove(name);
+        }
+        unknown
+    }
+
+    /// Checks a config an agent was sent, once
+    /// [`AgentConfig::remove_unknown_collectors`] has taken out what it can't run.
+    /// It's as [`AgentConfig::validate`], except that a check of a kind this build
+    /// doesn't know is let through, for the agent to report that it can't run it.
+    pub fn validate_sent(&self) -> Result<()> {
+        self.check(Checking::Sent)
+    }
+
+    fn check(&self, checking: Checking) -> Result<()> {
         ensure!(
             self.interval >= Duration::from_secs(1),
             "interval_secs must be at least 1"
@@ -854,7 +902,7 @@ impl AgentConfig {
                 COLLECTORS.contains(&name.as_str()),
                 "unknown collector {name:?}"
             );
-            settings.validate(name)?;
+            settings.validate(name, checking)?;
         }
         Ok(())
     }
@@ -869,7 +917,7 @@ impl AgentConfig {
 }
 
 impl CollectorSettings {
-    fn validate(&self, collector: &str) -> Result<()> {
+    fn validate(&self, collector: &str, checking: Checking) -> Result<()> {
         let names = self.names.as_deref().unwrap_or_default();
         ensure!(
             names.len() <= MAX_WATCHED,
@@ -983,7 +1031,12 @@ impl CollectorSettings {
             "a collector can run at most {MAX_CHECKS} checks"
         );
         for check in checks {
-            check.validate()?;
+            // Its name is still a series, so it has to be one.
+            if check.kind == CheckKind::Unknown && checking == Checking::Sent {
+                validate_check_name(&check.name)?;
+            } else {
+                check.validate()?;
+            }
         }
         for check in local {
             check.validate()?;
@@ -1041,6 +1094,10 @@ pub enum AgentMessage {
         version: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// Collectors in an applied config that this agent doesn't know, and
+        /// left out, as a newer server can name them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skipped_collectors: Vec<String>,
     },
     /// How an action the server asked for went.
     ActionResult(actions::ActionResult),
@@ -1050,6 +1107,10 @@ pub enum AgentMessage {
         nonce: String,
         answered_at: DateTime<Utc>,
     },
+    /// A message this build doesn't know, from a newer agent, which the server
+    /// ignores.
+    #[serde(other)]
+    Unknown,
 }
 
 /// What the server sends to an agent.
@@ -1086,6 +1147,10 @@ pub enum ServerMessage {
     /// and the server times how long that took, which is how far out the
     /// comparison can be.
     AskTime { nonce: String },
+    /// A message this build doesn't know, from a newer server, which the agent
+    /// ignores.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1095,6 +1160,11 @@ pub enum RegistrationStatus {
     /// Waiting for an admin. The agent should try again later.
     Pending,
     Rejected,
+    /// A status this build doesn't know, from a newer server. The agent can't tell
+    /// what it's being told, so it waits a long while before trying again, as it
+    /// does when it's refused.
+    #[serde(other)]
+    Unknown,
 }
 
 #[cfg(test)]
@@ -1502,16 +1572,107 @@ mod tests {
 
     #[test]
     fn check_kinds_read_back_as_written() {
-        for kind in [
-            CheckKind::Tcp,
-            CheckKind::Http,
-            CheckKind::Tls,
-            CheckKind::Dns,
-            CheckKind::Ping,
-        ] {
+        for kind in CheckKind::KNOWN {
             assert_eq!(CheckKind::parse(kind.as_str()), Some(kind));
+            let text = serde_json::to_string(&kind).unwrap();
+            assert_eq!(serde_json::from_str::<CheckKind>(&text).unwrap(), kind);
         }
         assert_eq!(CheckKind::parse("carrier-pigeon"), None);
+        assert_eq!(CheckKind::parse("unknown"), None);
+    }
+
+    fn with_unknown_kind() -> AgentConfig {
+        serde_json::from_value(json!({
+            "collectors": {
+                "checks": {
+                    "checks": [
+                        { "name": "directory", "kind": "ldap", "target": "ldap.example.com:389" },
+                        { "name": "site", "kind": "http", "target": "https://example.com/" },
+                    ],
+                },
+            },
+        }))
+        .unwrap()
+    }
+
+    /// A newer server can add a kind of check without older agents turning down
+    /// every config it sends from then on.
+    #[test]
+    fn a_check_of_a_kind_from_a_newer_server_is_read_and_let_through_by_an_agent() {
+        let config = with_unknown_kind();
+        let checks = config.collectors["checks"].checks.as_ref().unwrap();
+        assert_eq!(checks[0].kind, CheckKind::Unknown);
+        assert_eq!(checks[1].kind, CheckKind::Http);
+        config.validate_sent().unwrap();
+    }
+
+    #[test]
+    fn a_server_never_saves_a_check_of_a_kind_it_does_not_know() {
+        let error = with_unknown_kind().validate().unwrap_err().to_string();
+        assert!(error.contains("\"directory\" needs a kind"), "{error}");
+        assert!(error.contains("tcp, http"), "{error}");
+    }
+
+    #[test]
+    fn a_check_of_an_unknown_kind_still_needs_a_name_that_can_be_a_series() {
+        let config = check("ldap", "x");
+        config.validate_sent().unwrap();
+        let bad = serde_json::from_value::<AgentConfig>(json!({
+            "collectors": { "checks": { "checks": [
+                { "name": "a\nb", "kind": "ldap", "target": "x" },
+            ] } },
+        }))
+        .unwrap();
+        assert!(bad.validate_sent().is_err());
+    }
+
+    #[test]
+    fn an_agent_leaves_out_collectors_it_does_not_know_and_says_which() {
+        let mut config: AgentConfig = serde_json::from_value(json!({
+            "collectors": { "cpu": {}, "zfs": { "pools": ["tank"] }, "ebpf": {} },
+        }))
+        .unwrap();
+        // A server saving it would turn it down.
+        assert!(config.validate().is_err());
+
+        assert_eq!(config.remove_unknown_collectors(), ["ebpf", "zfs"]);
+        assert_eq!(config.collectors.keys().collect::<Vec<_>>(), ["cpu"]);
+        config.validate_sent().unwrap();
+        assert!(config.remove_unknown_collectors().is_empty());
+    }
+
+    /// Both are sent inside a config, so a field a newer server adds to either
+    /// mustn't turn the whole of it down.
+    #[test]
+    fn local_checks_and_databases_take_fields_from_a_newer_server() {
+        let config: AgentConfig = serde_json::from_value(json!({
+            "collectors": {
+                "checks": { "local_checks": [{ "name": "db", "retries": 3 }] },
+                "databases": { "databases": [{ "name": "orders", "sample_rate": 0.5 }] },
+            },
+        }))
+        .unwrap();
+        config.validate_sent().unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn messages_from_a_newer_side_are_read_as_unknown() {
+        let server: ServerMessage =
+            serde_json::from_value(json!({ "type": "reboot_soon", "at": "later" })).unwrap();
+        assert_eq!(server, ServerMessage::Unknown);
+        let agent: AgentMessage =
+            serde_json::from_value(json!({ "type": "logs", "lines": ["a"] })).unwrap();
+        assert_eq!(agent, AgentMessage::Unknown);
+        let status: ServerMessage =
+            serde_json::from_value(json!({ "type": "registration", "status": "quarantined" }))
+                .unwrap();
+        assert_eq!(
+            status,
+            ServerMessage::Registration {
+                status: RegistrationStatus::Unknown
+            }
+        );
     }
 
     #[test]
@@ -1576,6 +1737,7 @@ mod tests {
             AgentMessage::ConfigResult {
                 version: "abc".to_string(),
                 error: Some("nope".to_string()),
+                skipped_collectors: vec!["zfs".to_string()],
             },
             AgentMessage::Time {
                 nonce: "ab".to_string(),

@@ -15,7 +15,7 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{Instant, MissedTickBehavior, interval, interval_at, timeout};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::actions::Actions;
 use crate::app_state::AppState;
@@ -246,6 +246,7 @@ enum Job {
     ConfigResult {
         version: String,
         error: Option<String>,
+        skipped_collectors: Vec<String>,
     },
     /// When the host started, as a sample said.
     Boot(Timestamp),
@@ -406,7 +407,15 @@ async fn do_jobs(
                         send_config(&configs, agent, state, &mut sent_version).await;
                     }
                 }
-                Some(Job::ConfigResult { version, error }) => {
+                Some(Job::ConfigResult { version, error, skipped_collectors }) => {
+                    if !skipped_collectors.is_empty() {
+                        warn!(
+                            id = agent.id,
+                            version,
+                            skipped = skipped_collectors.join(", "),
+                            "agent doesn't know these collectors, and runs the rest of its config"
+                        );
+                    }
                     save_config_result(version, error, agent, state).await;
                 }
                 Some(Job::Boot(booted_at)) => {
@@ -535,12 +544,24 @@ fn receive(
             return None;
         }
         Ok(AgentMessage::Facts { facts }) => Job::Facts(facts),
-        Ok(AgentMessage::ConfigResult { version, error }) => Job::ConfigResult { version, error },
+        Ok(AgentMessage::ConfigResult {
+            version,
+            error,
+            skipped_collectors,
+        }) => Job::ConfigResult {
+            version,
+            error,
+            skipped_collectors,
+        },
         Ok(AgentMessage::Hello { .. }) => {
             warn!(id = agent.id, "ignoring repeated hello");
             return None;
         }
         Ok(AgentMessage::ActionResult(result)) => Job::ActionResult(result),
+        Ok(AgentMessage::Unknown) => {
+            debug!(id = agent.id, "ignoring a message from a newer agent");
+            return None;
+        }
         Err(error) => {
             warn!(id = agent.id, %error, "skipping invalid message");
             return None;
