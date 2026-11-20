@@ -6,7 +6,8 @@
 //! which actions it has in its facts, so nothing is asked of a host that lacks it.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Result, ensure};
@@ -307,7 +308,7 @@ struct Link {
 pub struct Actions {
     database: Database,
     links: Mutex<HashMap<String, Link>>,
-    connections: Mutex<u64>,
+    connections: AtomicU64,
 }
 
 impl Actions {
@@ -315,30 +316,32 @@ impl Actions {
         Arc::new(Self {
             database,
             links: Mutex::default(),
-            connections: Mutex::new(0),
+            connections: AtomicU64::new(0),
         })
+    }
+
+    /// A panic elsewhere while it was held leaves nothing half done, so it carries on,
+    /// as a connection ending has to be forgotten.
+    fn links(&self) -> MutexGuard<'_, HashMap<String, Link>> {
+        self.links.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Called when an agent connects. Gives what to send it, and a number to
     /// hand back when the connection ends.
     pub fn connected(&self, host_id: &str) -> (u64, mpsc::Receiver<String>) {
-        let connection = {
-            let mut connections = self.connections.lock().unwrap();
-            *connections += 1;
-            *connections
-        };
+        let connection = self.connections.fetch_add(1, Ordering::Relaxed) + 1;
         let (requests, receiver) = mpsc::channel(REQUEST_QUEUE_SIZE);
         let link = Link {
             connection,
             requests,
         };
-        self.links.lock().unwrap().insert(host_id.to_string(), link);
+        self.links().insert(host_id.to_string(), link);
         (connection, receiver)
     }
 
     /// Ignored if the agent has already reconnected on a newer connection.
     pub fn disconnected(&self, host_id: &str, connection: u64) {
-        let mut links = self.links.lock().unwrap();
+        let mut links = self.links();
         if links
             .get(host_id)
             .is_some_and(|link| link.connection == connection)
@@ -399,7 +402,7 @@ impl Actions {
         let Ok(text) = serde_json::to_string(&message) else {
             return refused("the request couldn't be written".to_string());
         };
-        let links = self.links.lock().unwrap();
+        let links = self.links();
         let Some(link) = links.get(&new.host_id) else {
             return refused("the host's agent isn't connected".to_string());
         };

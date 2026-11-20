@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::net::IpAddr;
 use std::num::NonZeroU32;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
 use serde::Serialize;
@@ -154,8 +154,14 @@ pub struct Connected {
 }
 
 impl Presence {
+    /// A panic elsewhere while it was held leaves nothing half done that matters
+    /// here, so it carries on, as a connection ending has to mark its agent offline.
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub fn connected(&self, id: &str, source: IpAddr) -> Connected {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         state.next_connection += 1;
         let connection = state.next_connection;
         let now = crate::times::now();
@@ -214,7 +220,7 @@ impl Presence {
     /// answered. The host is online while anything does, which is all there is to
     /// say about whether something with no agent is there.
     pub fn reached(&self, id: &str, what: Reached, answered: bool) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         state
             .reached
             .entry(id.to_string())
@@ -238,7 +244,7 @@ impl Presence {
     /// A host that loses what it had is judged by what's left, and one left with
     /// nothing is neither online nor offline.
     fn keep_reached(&self, keep: impl Fn(&Reached) -> bool) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         let mut changed = Vec::new();
         for (id, reached) in &mut state.reached {
             let before = reached.len();
@@ -255,14 +261,14 @@ impl Presence {
     }
 
     pub fn seen(&self, id: &str) {
-        if let Some(entry) = self.state.lock().unwrap().hosts.get_mut(id) {
+        if let Some(entry) = self.state().hosts.get_mut(id) {
             entry.presence.last_seen_at = Some(crate::times::now());
         }
     }
 
     /// Ignored if the agent has already reconnected on a newer connection.
     pub fn disconnected(&self, id: &str, connection: u64) {
-        if let Some(entry) = self.state.lock().unwrap().hosts.get_mut(id)
+        if let Some(entry) = self.state().hosts.get_mut(id)
             && entry.connection == connection
         {
             entry.presence.online = false;
@@ -272,13 +278,13 @@ impl Presence {
 
     /// For a host that's been deleted.
     pub fn forget(&self, id: &str) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         state.hosts.remove(id);
         state.reached.remove(id);
     }
 
     pub fn get(&self, id: &str) -> Option<HostPresence> {
-        let state = self.state.lock().unwrap();
+        let state = self.state();
         state.hosts.get(id).map(|entry| entry.presence)
     }
 
@@ -301,6 +307,20 @@ mod tests {
     use super::*;
 
     const SOURCE: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    #[test]
+    fn a_panic_while_it_was_held_does_not_stop_agents_going_offline() {
+        let presence = Presence::default();
+        let connected = presence.connected("a", SOURCE);
+        let poisoning = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = presence.state();
+            panic!("deliberate test panic");
+        }));
+        assert!(poisoning.is_err());
+
+        presence.disconnected("a", connected.connection);
+        assert!(!presence.get("a").unwrap().online);
+    }
 
     #[test]
     fn a_host_with_no_agent_is_online_while_anything_of_it_answers() {
