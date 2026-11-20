@@ -416,6 +416,15 @@ impl State {
         true
     }
 
+    /// Keeps the oldest saved sample, read while the lock wasn't held. A sample
+    /// confirmed meanwhile may be the one that was read, and it's only removed on
+    /// the next catching up, which reads again, so the read is let go.
+    fn read_ahead(&mut self, text: Utf8Bytes, place: SavedPlace) {
+        if self.backlog.is_none() && self.removals.is_empty() {
+            self.backlog = Some((text, place));
+        }
+    }
+
     fn note_drops(&mut self) {
         if !self.warned_of_drops {
             self.warned_of_drops = true;
@@ -445,33 +454,23 @@ fn use_disk(
             None
         }
     };
-    loop {
+    // Once to begin with, for whatever was waiting while the folder opened, and
+    // then once for each time it's asked.
+    let mut asking = Some(Ask::Work);
+    while let Some(ask) = asking {
         if let Some(disk) = &mut saved
             && let Err(error) = catch_up(shared, disk)
         {
             give_up_on_disk(shared, &error);
             saved = None;
         }
-        match asked.recv() {
-            Ok(Ask::Work) => {}
-            Ok(Ask::Flush(done)) => {
-                if let Some(disk) = &mut saved
-                    && let Err(error) = catch_up(shared, disk)
-                {
-                    give_up_on_disk(shared, &error);
-                    saved = None;
-                }
-                done();
-            }
-            Ok(Ask::Stop) | Err(_) => {
-                if let Some(disk) = &mut saved
-                    && let Err(error) = catch_up(shared, disk)
-                {
-                    give_up_on_disk(shared, &error);
-                }
-                return;
-            }
+        match ask {
+            Ask::Work => {}
+            Ask::Flush(done) => done(),
+            Ask::Stop => return,
         }
+        // Gone only when the queue is, which is a stop too.
+        asking = Some(asked.recv().unwrap_or(Ask::Stop));
     }
 }
 
@@ -520,7 +519,7 @@ fn catch_up(shared: &Shared, saved: &mut Saved) -> Result<()> {
     let mut state = shared.state();
     state.saved_bytes = saved.bytes;
     if let Some((text, place)) = oldest {
-        state.backlog = Some((text.into(), place));
+        state.read_ahead(text.into(), place);
     }
     drop(state);
     shared.arrived.notify_one();
@@ -697,7 +696,8 @@ impl Saved {
         let Some(oldest) = self.files.front().copied() else {
             return Ok(());
         };
-        if oldest.number != number {
+        // Somewhere already gone past.
+        if oldest.number != number || end <= self.offset {
             return Ok(());
         }
         self.bytes = self.bytes.saturating_sub(end - self.offset);
@@ -1341,6 +1341,48 @@ mod tests {
         settle(&second);
         assert_eq!(second.state().disk, Disk::Usable);
         assert_eq!(drain(&second), ["1"]);
+    }
+
+    #[test]
+    fn a_sample_confirmed_while_the_next_was_being_read_is_not_read_again() {
+        let (_parent, path) = folder();
+        let spool = unpaced(&path);
+        spool.push(sample(1), at(1));
+        spool.push(sample(2), at(2));
+        settle(&spool);
+        spool.set_online(true);
+        let (text, place) = spool.state().backlog.clone().unwrap();
+        assert_eq!(next(&spool), Some(sample(1)));
+
+        // The disk's thread read the oldest just before it was confirmed, and
+        // keeps it once the confirmation is in, before it's removed.
+        let mut state = spool.state();
+        state.remove_saved(place);
+        state.backlog_due = Instant::now();
+        state.read_ahead(text, place);
+        assert!(state.backlog.is_none());
+        drop(state);
+        spool.disk.send(Ask::Work).unwrap();
+
+        assert_eq!(drain(&spool), ["2"]);
+    }
+
+    #[test]
+    fn removing_a_saved_sample_twice_changes_nothing() {
+        let (_parent, path) = folder();
+        let spool = unpaced(&path);
+        spool.push(sample(1), at(1));
+        spool.push(sample(2), at(2));
+        settle(&spool);
+        let (_, place) = spool.state().backlog.clone().unwrap();
+
+        for _ in 0..2 {
+            spool.state().remove_saved(place);
+            spool.disk.send(Ask::Work).unwrap();
+            settle(&spool);
+        }
+
+        assert_eq!(drain(&spool), ["2"]);
     }
 
     #[test]
