@@ -32,6 +32,14 @@ impl Kind {
             Self::Checks => "check",
         }
     }
+
+    /// `name` without the `kind/` that `-o name` puts before an ID, so what it prints
+    /// can be given back.
+    pub fn bare(self, name: &str) -> &str {
+        name.strip_prefix(self.singular())
+            .and_then(|rest| rest.strip_prefix('/'))
+            .unwrap_or(name)
+    }
 }
 
 /// What `get` was asked for, besides the kind and names.
@@ -63,61 +71,94 @@ pub fn hosts(api: &Api, filter: Option<&str>) -> Result<Vec<Value>> {
     Ok(array(api.get(&path)?))
 }
 
-/// IDs of the hosts a filter matches, to narrow alerts and checks to them.
-fn host_ids(api: &Api, filter: &str) -> Result<BTreeSet<String>> {
-    Ok(hosts(api, Some(filter))?
-        .iter()
-        .map(|host| text(host, "id"))
-        .collect())
+/// `items` narrowed to those about hosts matching `filter`, with those hosts.
+fn about(
+    api: &Api,
+    filter: Option<&str>,
+    items: Vec<Value>,
+) -> Result<(Vec<Value>, Option<Vec<Value>>)> {
+    let Some(filter) = filter else {
+        return Ok((items, None));
+    };
+    let matching = hosts(api, Some(filter))?;
+    let ids: BTreeSet<String> = matching.iter().map(|host| text(host, "id")).collect();
+    let items = items
+        .into_iter()
+        .filter(|item| ids.contains(&text(item, "host_id")))
+        .collect();
+    Ok((items, Some(matching)))
 }
 
 /// Hostnames by ID, for showing what other things are about.
-fn hostnames(api: &Api) -> Result<BTreeMap<String, String>> {
-    Ok(hosts(api, None)?
+fn hostnames(hosts: &[Value]) -> BTreeMap<String, String> {
+    hosts
         .iter()
         .map(|host| (text(host, "id"), text(host, "hostname")))
-        .collect())
+        .collect()
 }
 
-/// The one host `name` means: its hostname, or the start of its ID. Hostnames needn't
-/// be unique, so two by the same name is an error that lists them.
+/// The start of each host's ID, long enough to tell them apart when `asked`
+/// characters of one weren't.
+fn short_ids(hosts: &[&Value], asked: usize) -> String {
+    let length = 8.max(asked + 4);
+    let ids: Vec<String> = hosts
+        .iter()
+        .map(|host| {
+            let id = text(host, "id");
+            format!("{}…", id.chars().take(length).collect::<String>())
+        })
+        .collect();
+    ids.join(", ")
+}
+
+/// The one host `name` means: its hostname, or the start of its ID, as `-o name`
+/// gives it or not. Hostnames needn't be unique, so two by the same name is an error
+/// that lists them.
 pub fn find_host<'a>(hosts: &'a [Value], name: &str) -> Result<&'a Value, Failure> {
     let named: Vec<&Value> = hosts
         .iter()
         .filter(|host| text(host, "hostname") == name)
         .collect();
-    let matches = if named.is_empty() && name.len() >= 4 {
+    match named.as_slice() {
+        [host] => return Ok(host),
+        [] => {}
+        many => {
+            return Err(Failure::not_found(format!(
+                "{} hosts are called {name}: {}. Use the start of an ID instead",
+                many.len(),
+                short_ids(many, 0)
+            )));
+        }
+    }
+    let start = Kind::Hosts.bare(name);
+    let started: Vec<&Value> = if start.len() >= 4 {
         hosts
             .iter()
-            .filter(|host| text(host, "id").starts_with(name))
+            .filter(|host| text(host, "id").starts_with(start))
             .collect()
     } else {
-        named
+        Vec::new()
     };
-    match matches.as_slice() {
+    match started.as_slice() {
         [host] => Ok(host),
         [] => Err(Failure::not_found(format!(
             "There's no host called {name:?}"
         ))),
-        many => {
-            let ids: Vec<String> = many
-                .iter()
-                .map(|host| format!("{}…", &text(host, "id")[..8.min(text(host, "id").len())]))
-                .collect();
-            Err(Failure::not_found(format!(
-                "{} hosts are called {name}: {}. Use the start of an ID instead",
-                many.len(),
-                ids.join(", ")
-            )))
-        }
+        many => Err(Failure::not_found(format!(
+            "{} hosts' IDs start with {start}: {}. Use more of the ID",
+            many.len(),
+            short_ids(many, start.len())
+        ))),
     }
 }
 
-/// The one check `name` means: its number, or its name, if no other check has it.
+/// The one check `name` means: its number, as `-o name` gives it or not, or its
+/// name, if no other check has it.
 pub fn find_check<'a>(checks: &'a [Value], name: &str) -> Result<&'a Value, Failure> {
+    let id = Kind::Checks.bare(name);
     let matches: Vec<&Value> = checks
         .iter()
-        .filter(|check| text(check, "id") == name || text(&check["check"], "name") == name)
+        .filter(|check| text(check, "id") == id || text(&check["check"], "name") == name)
         .collect();
     match matches.as_slice() {
         [check] => Ok(check),
@@ -135,14 +176,27 @@ pub fn find_check<'a>(checks: &'a [Value], name: &str) -> Result<&'a Value, Fail
 type Finder<'a> = &'a dyn Fn(&[Value], &str) -> Result<Value, Failure>;
 
 fn find_by_id<'a>(items: &'a [Value], name: &str, kind: Kind) -> Result<&'a Value, Failure> {
+    let id = kind.bare(name);
     items
         .iter()
-        .find(|item| text(item, "id") == name)
+        .find(|item| text(item, "id") == id)
         .ok_or_else(|| Failure::not_found(format!("There's no {} {name}", kind.singular())))
+}
+
+/// What `get` found, with the hosts a filter matched on the way, so showing it
+/// needn't ask for them again.
+pub struct Found {
+    pub items: Vec<Value>,
+    hosts: Option<Vec<Value>>,
 }
 
 /// Everything of `kind`, as the API gives it, narrowed to `names` if there are any.
 pub fn fetch(api: &Api, kind: Kind, names: &[String], options: &Options) -> Result<Vec<Value>> {
+    Ok(find(api, kind, names, options)?.items)
+}
+
+/// As [`fetch`], keeping the hosts it asked for.
+pub fn find(api: &Api, kind: Kind, names: &[String], options: &Options) -> Result<Found> {
     let only = |items: Vec<Value>, find: Finder<'_>| -> Result<Vec<Value>> {
         if names.is_empty() {
             return Ok(items);
@@ -152,22 +206,14 @@ pub fn fetch(api: &Api, kind: Kind, names: &[String], options: &Options) -> Resu
             .map(|name| find(&items, name).map_err(Into::into))
             .collect()
     };
-    let about = |items: Vec<Value>| -> Result<Vec<Value>> {
-        match &options.filter {
-            Some(filter) => {
-                let ids = host_ids(api, filter)?;
-                Ok(items
-                    .into_iter()
-                    .filter(|item| ids.contains(&text(item, "host_id")))
-                    .collect())
-            }
-            None => Ok(items),
+    let filter = options.filter.as_deref();
+    let (items, hosts) = match kind {
+        Kind::Hosts => {
+            let items = only(hosts(api, filter)?, &|items, name| {
+                find_host(items, name).cloned()
+            })?;
+            (items, None)
         }
-    };
-    match kind {
-        Kind::Hosts => only(hosts(api, options.filter.as_deref())?, &|items, name| {
-            find_host(items, name).cloned()
-        }),
         Kind::Alerts => {
             let mut all = api.get("/alerts")?;
             let list = if options.ended {
@@ -175,48 +221,55 @@ pub fn fetch(api: &Api, kind: Kind, names: &[String], options: &Options) -> Resu
             } else {
                 all["open"].take()
             };
-            only(about(array(list))?, &|items, name| {
-                find_by_id(items, name, kind).cloned()
-            })
+            let (items, hosts) = about(api, filter, array(list))?;
+            let items = only(items, &|items, name| find_by_id(items, name, kind).cloned())?;
+            (items, hosts)
         }
         Kind::Silences => {
+            // A silence says which hosts it covers with a filter of its own, which
+            // only the server can match, so one about a host can't be picked out here.
+            if filter.is_some() {
+                return Err(Failure::usage(
+                    "--filter picks hosts, and alerts and checks about them, but not silences",
+                )
+                .into());
+            }
             let mut all = api.get("/silences")?;
             let list = if options.ended {
                 all["ended"].take()
             } else {
                 all["active"].take()
             };
-            only(array(list), &|items, name| {
+            let items = only(array(list), &|items, name| {
                 find_by_id(items, name, kind).cloned()
-            })
+            })?;
+            (items, None)
         }
-        Kind::Checks => only(about(array(api.get("/remote-checks")?))?, &|items, name| {
-            find_check(items, name).cloned()
-        }),
-    }
+        Kind::Checks => {
+            let (items, hosts) = about(api, filter, array(api.get("/remote-checks")?))?;
+            let items = only(items, &|items, name| find_check(items, name).cloned())?;
+            (items, hosts)
+        }
+    };
+    Ok(Found { items, hosts })
 }
 
-/// Shows what `fetch` found. Gives back how many there were.
+/// Shows what `find` found.
 pub fn show(
     api: &Api,
     kind: Kind,
-    items: &[Value],
+    found: Found,
     format: Format,
     options: &Options,
 ) -> Result<String> {
+    let Found { items, hosts } = found;
     if format == Format::Json {
-        return Ok(output::json(&Value::Array(items.to_vec())));
+        return Ok(output::json(&Value::Array(items)));
     }
     if format == Format::Name {
         let names: Vec<String> = items
             .iter()
-            .map(|item| {
-                let name = match kind {
-                    Kind::Hosts => text(item, "hostname"),
-                    _ => text(item, "id"),
-                };
-                format!("{}/{name}", kind.singular())
-            })
+            .map(|item| format!("{}/{}", kind.singular(), text(item, "id")))
             .collect();
         return Ok(names.join("\n"));
     }
@@ -274,8 +327,20 @@ pub fn show(
             (headings, rows)
         }
         Kind::Silences => {
-            let rules = rule_names(api)?;
-            let hostnames = hostnames(api)?;
+            // Rules and hosts are only asked for if a silence names one.
+            let rules = if items.iter().any(|silence| silence["rule_id"].is_i64()) {
+                rule_names(api)?
+            } else {
+                BTreeMap::new()
+            };
+            let hostnames = if items
+                .iter()
+                .any(|silence| text(silence, "filter").starts_with("id="))
+            {
+                hostnames(&self::hosts(api, None)?)
+            } else {
+                BTreeMap::new()
+            };
             let headings = vec!["id", "reason", "covers", "ends"];
             let rows = items
                 .iter()
@@ -298,7 +363,11 @@ pub fn show(
             (headings, rows)
         }
         Kind::Checks => {
-            let hostnames = hostnames(api)?;
+            // A filter already asked for the hosts every check shown is about.
+            let hostnames = match &hosts {
+                Some(hosts) => hostnames(hosts),
+                None => hostnames(&self::hosts(api, None)?),
+            };
             let mut headings = vec!["name", "host", "kind", "status"];
             if wide {
                 headings.extend(["target", "id"]);
@@ -339,10 +408,8 @@ fn nothing(kind: Kind, options: &Options) -> &'static str {
 
 fn host_status(host: &Value) -> String {
     match text(host, "state").as_str() {
-        "approved" | "" => match text(host, "health").as_str() {
+        "approved" => match text(host, "health").as_str() {
             "not_read" => "not read yet".to_string(),
-            "" if host["online"] == Value::Bool(true) => "online".to_string(),
-            "" => "offline".to_string(),
             health => health.to_string(),
         },
         state => state.to_string(),
@@ -426,27 +493,24 @@ fn covers(
     if !series.is_empty() {
         parts.push(series);
     }
-    if parts.is_empty() {
-        "every alert".to_string()
-    } else {
-        parts.join(" · ")
-    }
+    parts.join(" · ")
 }
 
 /// One thing by name, as the API gives it. An alert or silence that's ended isn't in
-/// what's happening now, so it's looked for among those that have ended too.
+/// what's happening now, so it's looked for among those that have ended too, which
+/// the same answer holds.
 pub fn find_one(api: &Api, kind: Kind, name: &str) -> Result<Value> {
-    match fetch(api, kind, &[name.to_string()], &Options::default()) {
-        Ok(mut items) => Ok(items.remove(0)),
-        Err(_) if matches!(kind, Kind::Alerts | Kind::Silences) => {
-            let ended = Options {
-                ended: true,
-                ..Options::default()
-            };
-            Ok(fetch(api, kind, &[name.to_string()], &ended)?.remove(0))
+    let (path, now, ended) = match kind {
+        Kind::Alerts => ("/alerts", "open", "resolved"),
+        Kind::Silences => ("/silences", "active", "ended"),
+        Kind::Hosts | Kind::Checks => {
+            return Ok(fetch(api, kind, &[name.to_string()], &Options::default())?.remove(0));
         }
-        Err(error) => Err(error),
-    }
+    };
+    let mut all = api.get(path)?;
+    let mut items = array(all[now].take());
+    items.extend(array(all[ended].take()));
+    Ok(find_by_id(&items, name, kind)?.clone())
 }
 
 /// Everything about one thing, with what's related, for people to read.
@@ -471,8 +535,8 @@ pub fn describe(api: &Api, kind: Kind, name: &str) -> Result<String> {
             },
         ),
     ];
-    let alerts = api.get("/alerts")?;
-    let firing: Vec<String> = array(alerts["open"].clone())
+    let mut alerts = api.get("/alerts")?;
+    let firing: Vec<String> = array(alerts["open"].take())
         .iter()
         .filter(|alert| text(alert, "host_id") == id)
         .map(|alert| {
@@ -540,6 +604,43 @@ mod tests {
         );
         // Too short to be the start of an ID.
         assert!(find_host(&hosts, "3f2").is_err());
+        // As -o name gives it back.
+        assert_eq!(
+            text(find_host(&hosts, "host/8be04471aaaa").unwrap(), "id"),
+            "8be04471aaaa"
+        );
+    }
+
+    #[test]
+    fn the_start_of_an_id_that_fits_two_asks_for_more_of_it() {
+        let hosts = vec![
+            json!({"id": "3f2a1c9d4e6b", "hostname": "web-1"}),
+            json!({"id": "3f2a77d04e6b", "hostname": "web-2"}),
+        ];
+        let both = find_host(&hosts, "3f2a").unwrap_err();
+        assert_eq!(both.code, Failure::NOT_FOUND);
+        assert_eq!(
+            both.message,
+            "2 hosts' IDs start with 3f2a: 3f2a1c9d…, 3f2a77d0…. Use more of the ID"
+        );
+        assert_eq!(
+            text(find_host(&hosts, "3f2a7").unwrap(), "hostname"),
+            "web-2"
+        );
+    }
+
+    #[test]
+    fn what_name_output_gives_is_taken_back() {
+        assert_eq!(Kind::Alerts.bare("alert/41"), "41");
+        assert_eq!(Kind::Alerts.bare("41"), "41");
+        // Another kind's isn't this kind's.
+        assert_eq!(Kind::Alerts.bare("silence/41"), "silence/41");
+        let checks = vec![
+            json!({"id": 7, "check": {"name": "Home page"}}),
+            json!({"id": 8, "check": {"name": "check/odd"}}),
+        ];
+        assert_eq!(text(find_check(&checks, "check/7").unwrap(), "id"), "7");
+        assert_eq!(text(find_check(&checks, "check/odd").unwrap(), "id"), "8");
     }
 
     #[test]

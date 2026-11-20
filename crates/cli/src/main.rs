@@ -74,15 +74,15 @@ enum Command {
         kind: Kind,
         name: String,
     },
-    /// Acknowledge alerts, by ID
+    /// Acknowledge alerts, as `41` or `alert/41`
     Ack {
         #[arg(required = true)]
-        ids: Vec<i64>,
+        ids: Vec<String>,
     },
-    /// Undo acknowledging alerts, by ID
+    /// Undo acknowledging alerts, as `41` or `alert/41`
     Unack {
         #[arg(required = true)]
-        ids: Vec<i64>,
+        ids: Vec<String>,
     },
     /// Keep notifications back for a while
     Silence(SilenceArgs),
@@ -178,7 +178,8 @@ struct GetArgs {
     kind: Kind,
     /// Only these, by hostname, name or ID.
     names: Vec<String>,
-    /// Only what's about hosts matching this filter, as on the Hosts page.
+    /// Only hosts matching this filter, as on the Hosts page, or alerts and checks
+    /// about them.
     #[arg(long)]
     filter: Option<String>,
     /// Alerts that have resolved, or silences that have ended, instead.
@@ -557,12 +558,13 @@ fn act(api: &Api, command: Command, format: Format) -> Result<u8> {
                 filter: args.filter,
                 ended: args.ended,
             };
-            let items = kinds::fetch(api, args.kind, &args.names, &options)?;
-            let shown = kinds::show(api, args.kind, &items, format, &options)?;
+            let found = kinds::find(api, args.kind, &args.names, &options)?;
+            let any = !found.items.is_empty();
+            let shown = kinds::show(api, args.kind, found, format, &options)?;
             if !shown.is_empty() {
                 println!("{shown}");
             }
-            if args.exit_code && !items.is_empty() {
+            if args.exit_code && any {
                 return Ok(Failure::FOUND);
             }
         }
@@ -580,8 +582,8 @@ fn act(api: &Api, command: Command, format: Format) -> Result<u8> {
         Command::Silence(args) => silence(api, args, format)?,
         Command::End { what } => {
             for id in silence_ids(&what)? {
-                api.call("POST", &format!("/silences/{id}/end"), None)?;
-                print_done(format, &format!("silence/{id}"), "ended");
+                let answer = api.call("POST", &format!("/silences/{id}/end"), None)?;
+                print_done(format, &format!("silence/{id}"), "ended", &answer);
             }
         }
         Command::Approve {
@@ -590,16 +592,9 @@ fn act(api: &Api, command: Command, format: Format) -> Result<u8> {
         } => {
             let all = kinds::hosts(api, None)?;
             let host = kinds::find_host(&all, &name)?;
-            api.call(
-                "POST",
-                &format!("/hosts/{}/approve", text(host, "id")),
-                None,
-            )?;
-            print_done(
-                format,
-                &format!("host/{}", text(host, "hostname")),
-                "approved",
-            );
+            let id = text(host, "id");
+            let answer = api.call("POST", &format!("/hosts/{id}/approve"), None)?;
+            print_done(format, &format!("host/{id}"), "approved", &answer);
         }
         Command::Open { kind, name } => {
             let path = page(api, kind, name.as_deref())?;
@@ -673,18 +668,29 @@ fn act(api: &Api, command: Command, format: Format) -> Result<u8> {
     Ok(0)
 }
 
-fn print_done(format: Format, name: &str, done: &str) {
+/// Says a change was made. JSON is the API's own answer, as everywhere, which for
+/// most changes is nothing.
+fn print_done(format: Format, name: &str, done: &str, answer: &Value) {
     match format {
         Format::Name => println!("{name}"),
-        Format::Json => println!("{}", json!({ "name": name, "done": done })),
+        Format::Json if answer.is_null() => {}
+        Format::Json => println!("{}", output::json(answer)),
         Format::Table | Format::Wide => println!("{name} {done}"),
     }
 }
 
-fn acknowledge(api: &Api, ids: &[i64], action: &str, done: &str, format: Format) -> Result<()> {
+fn acknowledge(api: &Api, ids: &[String], action: &str, done: &str, format: Format) -> Result<()> {
+    let ids: Vec<i64> = ids
+        .iter()
+        .map(|id| {
+            Kind::Alerts.bare(id).parse().map_err(|_| {
+                Failure::usage(format!("{id:?} isn't an alert: use its ID, or alert/41"))
+            })
+        })
+        .collect::<Result<_, _>>()?;
     for id in ids {
-        api.call("POST", &format!("/alerts/{id}/{action}"), None)?;
-        print_done(format, &format!("alert/{id}"), done);
+        let answer = api.call("POST", &format!("/alerts/{id}/{action}"), None)?;
+        print_done(format, &format!("alert/{id}"), done, &answer);
     }
     Ok(())
 }
@@ -703,14 +709,11 @@ fn silence_ids(what: &[String]) -> Result<Vec<i64>, Failure> {
     words
         .iter()
         .map(|word| {
-            word.strip_prefix("silence/")
-                .unwrap_or(word)
-                .parse()
-                .map_err(|_| {
-                    Failure::usage(format!(
-                        "{word:?} isn't a silence: use its number, or silence/12"
-                    ))
-                })
+            Kind::Silences.bare(word).parse().map_err(|_| {
+                Failure::usage(format!(
+                    "{word:?} isn't a silence: use its number, or silence/12"
+                ))
+            })
         })
         .collect()
 }
@@ -829,12 +832,12 @@ fn page(api: &Api, kind: Kind, name: Option<&str>) -> Result<String> {
         }
         .to_string());
     };
-    let item = &kinds::fetch(api, kind, &[name.to_string()], &Options::default())?[0];
+    let item = kinds::find_one(api, kind, name)?;
     Ok(match kind {
-        Kind::Hosts => format!("/hosts/{}", text(item, "id")),
-        Kind::Alerts => format!("/hosts/{}", text(item, "host_id")),
+        Kind::Hosts => format!("/hosts/{}", text(&item, "id")),
+        Kind::Alerts => format!("/alerts/{}", text(&item, "id")),
         Kind::Silences => "/alerts/silences".to_string(),
-        Kind::Checks => format!("/checks/{}", text(item, "id")),
+        Kind::Checks => format!("/checks/{}", text(&item, "id")),
     })
 }
 

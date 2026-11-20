@@ -167,6 +167,14 @@ fn monitoring() -> FakeServer {
         ),
         ("POST", "/api/v1/silences") => (201, json!({"id": 57}).to_string()),
         ("POST", "/api/v1/alerts/41/acknowledge") => (204, String::new()),
+        ("POST", "/api/v1/hosts/22ad9264b6eb0000/approve") => (
+            200,
+            json!({"id": "22ad9264b6eb0000", "kind": "agentless", "hostname": "db-1", "state": "approved"}).to_string(),
+        ),
+        ("GET", "/api/v1/remote-checks") => (
+            200,
+            json!([{"id": 7, "host_id": "3f2a1c9d4e6b0000", "enabled": true, "check": {"name": "Home page", "kind": "http", "target": "http://web-1"}, "latest": {"up": true}}]).to_string(),
+        ),
         ("GET", "/api/v1/me") => (200, json!({"email": "you@example.com", "role": "responder", "via": {"kind": "api_key", "id": 3, "name": "ci"}}).to_string()),
         _ => (404, json!({"error": "There's nothing at this address"}).to_string()),
     }
@@ -191,12 +199,29 @@ fn hosts_are_listed_for_people_and_for_scripts() {
         Some("Bearer mxn_test")
     );
 
+    // By ID, as hostnames needn't be unique, in a form every command takes back.
     let names = maxnines(
         folder.path(),
         &with_key(&server.url),
         &["get", "hosts", "-o", "name", "db-1"],
     );
-    assert_eq!(stdout(&names), "host/db-1");
+    assert_eq!(stdout(&names), "host/22ad9264b6eb0000");
+    let back = maxnines(
+        folder.path(),
+        &with_key(&server.url),
+        &["get", "hosts", "-o", "name", &stdout(&names)],
+    );
+    assert_eq!(stdout(&back), "host/22ad9264b6eb0000", "{}", stderr(&back));
+
+    // Approving gives the API's answer as JSON: the host, approved.
+    let approved = maxnines(
+        folder.path(),
+        &with_key(&server.url),
+        &["approve", "host", "host/22ad9264b6eb0000", "-o", "json"],
+    );
+    assert!(approved.status.success(), "{}", stderr(&approved));
+    let host: Value = serde_json::from_str(&stdout(&approved)).unwrap();
+    assert_eq!(host["state"], "approved");
 
     let json = maxnines(
         folder.path(),
@@ -373,6 +398,14 @@ fn a_script_can_ask_whether_anything_is_firing() {
     let posted = &server.requests_to("/api/v1/alerts/41/acknowledge")[0];
     assert_eq!(posted.method, "POST");
     assert_eq!(posted.body, "");
+    // As -o name gives it, and with JSON the API's own answer, which is nothing.
+    let quiet = maxnines(
+        folder.path(),
+        &with_key(&server.url),
+        &["ack", "alert/41", "-o", "json"],
+    );
+    assert!(quiet.status.success(), "{}", stderr(&quiet));
+    assert_eq!(stdout(&quiet), "");
 
     // Something that's ended is still found by describe, as text or as JSON.
     let ended = maxnines(
@@ -383,6 +416,8 @@ fn a_script_can_ask_whether_anything_is_firing() {
     assert!(ended.status.success(), "{}", stderr(&ended));
     let described: Value = serde_json::from_str(&stdout(&ended)).unwrap();
     assert_eq!(described["reason"], "Done");
+    // Found in the one answer, without asking again.
+    assert_eq!(server.requests_to("/api/v1/silences").len(), 1);
 
     let me = maxnines(folder.path(), &with_key(&server.url), &["whoami"]);
     assert_eq!(
@@ -516,6 +551,56 @@ fn signing_in_with_a_code_keeps_the_tokens_refreshes_them_and_signs_out() {
     let again = maxnines(folder.path(), &[], &["login", "lan", "--device"]);
     assert!(again.status.success(), "{}", stderr(&again));
     assert_eq!(server.requests_to("/oauth/device").len(), 2);
+}
+
+#[test]
+fn silences_and_checks_ask_only_for_what_they_show() {
+    let folder = tempfile::tempdir().unwrap();
+    let server = monitoring();
+
+    // A silence that names no rule or host by ID needs neither looked up.
+    let ended = maxnines(
+        folder.path(),
+        &with_key(&server.url),
+        &["get", "silences", "--ended"],
+    );
+    assert!(ended.status.success(), "{}", stderr(&ended));
+    assert!(
+        stdout(&ended).contains("hostname=db*"),
+        "{}",
+        stdout(&ended)
+    );
+    assert!(server.requests_to("/api/v1/alert-rules").is_empty());
+    assert!(server.requests_to("/api/v1/hosts").is_empty());
+
+    // A silence's own filter says which hosts it covers, so --filter can't pick them.
+    let filtered = maxnines(
+        folder.path(),
+        &with_key(&server.url),
+        &[
+            "get",
+            "silences",
+            "--filter",
+            "hostname=web-1",
+            "--exit-code",
+        ],
+    );
+    assert_eq!(filtered.status.code(), Some(2), "{}", stderr(&filtered));
+    assert_eq!(server.requests_to("/api/v1/silences").len(), 1);
+
+    // The hosts a filter matched name the checks shown.
+    let checks = maxnines(
+        folder.path(),
+        &with_key(&server.url),
+        &["get", "checks", "--filter", "hostname=web-1"],
+    );
+    assert!(checks.status.success(), "{}", stderr(&checks));
+    assert!(
+        stdout(&checks).contains("Home page  web-1"),
+        "{}",
+        stdout(&checks)
+    );
+    assert_eq!(server.requests_to("/api/v1/hosts").len(), 1);
 }
 
 #[test]
