@@ -29,7 +29,8 @@ const MAX_FACT_NAME_LEN: usize = 255 - "custom.".len();
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub server: ServerConfig,
-    /// Where the agent keeps its key and the last config it received.
+    /// Where the agent keeps its key and the last config it received. A relative
+    /// path is from the config file's folder, wherever the agent was started.
     #[serde(default = "default_state_dir")]
     pub state_dir: PathBuf,
     /// Your own facts by full name, reported under `custom`. These are gathered
@@ -136,7 +137,14 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config file {}", path.display()))?;
-        Self::parse(&text).with_context(|| format!("invalid config file {}", path.display()))
+        let mut config = Self::parse(&text)
+            .with_context(|| format!("invalid config file {}", path.display()))?;
+        // The key in there is the host's identity, so it mustn't depend on where a
+        // command happened to be run from.
+        if let Some(folder) = path.parent() {
+            config.state_dir = folder.join(&config.state_dir);
+        }
+        Ok(config)
     }
 
     pub(crate) fn parse(text: &str) -> Result<Self> {
@@ -460,6 +468,20 @@ mod tests {
             PathBuf::from("state/config.json")
         );
         assert!(config.facts.is_empty());
+    }
+
+    #[test]
+    fn a_relative_state_dir_is_beside_the_config_file() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("agent.hcl");
+        std::fs::write(&path, SERVER).unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.key_file(), folder.path().join("state/agent.key"));
+
+        let absolute = folder.path().join("elsewhere");
+        let text = format!("{SERVER}state_dir = {:?}\n", absolute.to_str().unwrap());
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(Config::load(&path).unwrap().state_dir, absolute);
     }
 
     #[test]

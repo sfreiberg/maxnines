@@ -27,7 +27,8 @@ Then start it:
 ./maxnines-agent
 ```
 
-It creates a key in `state`, logs its host ID, and waits to be approved. Approve it
+It creates a key in `state`, logs its host ID, and waits to be approved. A relative
+`state_dir` is in the config file's folder, wherever the agent is started from. Approve it
 on the Hosts page, or from the command line with an API key:
 
 ```sh
