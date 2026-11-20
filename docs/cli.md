@@ -28,10 +28,13 @@ maxnines logout prod
 
 `--role` is the most it asks for. The page offers that or less, and never more than
 your own role. With `--device` it shows an address and a code to enter on any device,
-for a machine without a browser.
+for a machine without a browser. The code works for as long as the server says, and
+a network that drops while you type it only means maxnines asks again.
 
 Each server is a context, by name. The last one signed in to is the one used, until
-`maxnines config use` or `--context` says otherwise:
+`maxnines config use` or `--context` says otherwise. `login` with no server signs in
+to that context again, so `maxnines --context prod login` signs in to prod. Signing
+in to a context again revokes its earlier sign-in on the server:
 
 ```sh
 maxnines config list
@@ -43,11 +46,14 @@ maxnines --context prod get alerts
 maxnines config remove lan
 ```
 
-Contexts are kept in `~/.config/maxnines/config.hcl`, or `%APPDATA%\maxnines` on
-Windows. Tokens are kept in the Keychain on macOS and Credential Manager on Windows,
-and on Linux and FreeBSD in `tokens.json` beside the config, readable only by you. Each
-sign-in is listed under **Settings > Signed-in apps** on the server, where it can be
-revoked. `MAXNINES_CONFIG_DIR` keeps everything, tokens included, in another folder.
+Contexts are kept in `config.hcl`, in `~/.config/maxnines`, or
+`$XDG_CONFIG_HOME/maxnines` when that's set, or `%APPDATA%\maxnines` on Windows.
+Tokens are kept in the Keychain on macOS and Credential Manager on Windows, and on
+Linux and FreeBSD in `tokens.json` beside the config, readable only by you. Anyone with
+a copy of `tokens.json` is signed in as you, so keep it out of backups and shares.
+Each sign-in is listed under **Settings > Signed-in apps** on the server, where it can
+be revoked. `MAXNINES_CONFIG_DIR` keeps everything, tokens included, in another folder,
+on every system.
 
 Plain `http` is refused beyond your local network, so a sign-in never crosses the
 internet unencrypted.
@@ -67,6 +73,9 @@ Or name a context that reads its key from a variable:
 maxnines config add ci --server https://monitor.example.com --key-env CI_MAXNINES_KEY
 ```
 
+Adding a context by the name of one that's signed in replaces it, and signs it out
+first.
+
 ## Reading
 
 ```sh
@@ -84,9 +93,10 @@ maxnines describe host web-1
 maxnines describe check "Home page"
 ```
 
-The kinds are `hosts`, `alerts`, `silences` and `checks`, or `host`, `h`, `al`, `sil`
-and `ck`. Names are hostnames, check names, or IDs. Hostnames needn't be unique, so if
-two hosts share one, maxnines lists their IDs and the start of one picks it:
+The kinds are `hosts`, `alerts`, `silences` and `checks`, or `host`, `h`, `alert`,
+`al`, `silence`, `sil`, `check` and `ck`. Names are hostnames, check names, or IDs.
+Hostnames needn't be unique, so if two hosts share one, maxnines lists their IDs and
+the start of one picks it. If that start fits more than one, give more of it:
 
 ```sh
 maxnines get host web-1
@@ -94,15 +104,21 @@ maxnines get host web-1
 maxnines get host 3f2a
 ```
 
-`--filter` uses the same [filters](api-filters.md) as the Hosts page, and for alerts
-and checks it keeps those about matching hosts.
+`describe` and `open` find alerts that have resolved and silences that have ended too.
+
+`--filter` uses the same [filters](api-filters.md) as the Hosts page. It keeps the hosts
+that match, and alerts and checks about them. Silences have filters of their own that
+only the server can match, so `--filter` with silences is an error.
 
 `-o` picks the output: `table`, `wide` for more columns, `json` for the API's own JSON,
-or `name` for one `kind/name` a line.
+or `name` for one `kind/ID` a line, such as `host/3f2a1c9d4e6b…` or `alert/41`. Every
+command takes those back as names.
 
 ```sh
 maxnines get alerts -o json | jq '.[] | select(.severity == "critical") | .summary'
-maxnines get hosts --filter 'hostname=db*' -o name
+for host in $(maxnines get hosts --filter 'hostname=db*' -o name); do
+  maxnines silence host "$host" --for 1h --reason "Backups"
+done
 ```
 
 ## Changing
@@ -118,13 +134,21 @@ maxnines silence --all-alerts --for 1h --reason "Moving data centres"
 maxnines end silence 12
 maxnines approve host 44cf
 maxnines open host web-1                                     # its page in the browser
+maxnines open alert 41
 ```
 
-`--for` takes `30m`, `2h`, `1d` or `2h30m`. Silencing everything has to be said with
-`--all-alerts`: leaving out what a silence covers is an error, not every alert.
+`--for` takes a length such as `90s`, `30m`, `2h30m` or `1d`, up to the 30 days a
+silence can last. Silencing everything has to be said with `--all-alerts`: leaving out
+what a silence covers is an error, not every alert.
+
+With `-o json`, a change shows the API's answer: the host for `approve`, the new
+silence's ID for `silence`, and nothing for `ack`, `unack` and `end`, which the API
+answers with no content.
 
 Anything else in the API is there through `maxnines api`, which shows its JSON.
-`name=value` pairs are the query for `GET` and `DELETE`, and a JSON object otherwise:
+`name=value` pairs are the query for `GET` and `DELETE`, added to any the path already
+has. Otherwise they're a JSON object to send, or `--data` sends one as it is, but not
+both:
 
 ```sh
 maxnines api GET /hosts/filter-options text=os
@@ -143,7 +167,9 @@ maxnines get alerts --filter 'hostname=web-1' --exit-code   # 1 if any are firin
 maxnines end "$silence"
 ```
 
-It never prompts, so it's safe without a terminal.
+maxnines never asks anything on the terminal. On macOS, though, the Keychain may show
+a dialog asking to let a new version of maxnines read its tokens, which nobody can
+answer in CI. Use an API key there, which never touches the Keychain.
 
 | Exit code | Means |
 | --- | --- |
