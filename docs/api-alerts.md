@@ -4,7 +4,8 @@
 
 `GET /api/v1/alerts`
 
-Everything firing now, and the latest 200 that have ended.
+Everything firing now, newest first, and the 200 that ended most recently, the latest
+to end first.
 
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/alerts"

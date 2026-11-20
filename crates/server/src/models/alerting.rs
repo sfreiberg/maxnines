@@ -1064,11 +1064,12 @@ impl Database {
             .context("counting alerts")
     }
 
-    /// The newest alerts that have ended.
+    /// The alerts that ended most recently, newest first, however long ago each
+    /// started.
     pub async fn resolved_alerts(&self, limit: u64) -> Result<Vec<Alert>> {
         let rows = alert::Entity::find()
             .filter(alert::Column::ResolvedAt.is_not_null())
-            .order_by_desc(alert::Column::StartedAt)
+            .order_by_desc(alert::Column::ResolvedAt)
             .order_by_desc(alert::Column::Id)
             .limit(limit)
             .all(&self.connection)

@@ -16,7 +16,7 @@ impl MigratorTrait for Migrator {
             Box::new(AddNoMetricsRule),
             Box::new(KeysAndIndexes),
             Box::new(NamesAndUniqueness),
-            Box::new(ExactFacts),
+            Box::new(ExactFactsAndEndedAlerts),
         ]
     }
 }
@@ -2758,11 +2758,11 @@ async fn mysql_generates_from(
     Ok(count > 0)
 }
 
-struct ExactFacts;
+struct ExactFactsAndEndedAlerts;
 
-impl MigrationName for ExactFacts {
+impl MigrationName for ExactFactsAndEndedAlerts {
     fn name(&self) -> &str {
-        "m20261119_000005_exact_facts"
+        "m20261119_000005_exact_facts_and_ended_alerts"
     }
 }
 
@@ -2774,21 +2774,51 @@ const FACT_TEXT: [&str; 2] = ["name", "value"];
 /// them by the table's collation, usually ignoring case and accents, so looking one
 /// up, or listing each value once, found or merged others. They compare them
 /// exactly now too, and going back gives them the table's collation again. Nothing
-/// changes on the other databases. Each change can be made again, as MySQL commits
-/// it as it's made.
+/// changes on the other databases.
+///
+/// Ended alerts are listed by when they ended, newest first, so the index of when
+/// alerts ended takes their IDs too, for ones that ended at the same moment.
+///
+/// MySQL commits each change as it's made, so each can be made again.
 #[async_trait::async_trait]
-impl MigrationTrait for ExactFacts {
+impl MigrationTrait for ExactFactsAndEndedAlerts {
     fn use_transaction(&self) -> Option<bool> {
-        Some(false)
+        Some(true)
     }
 
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        fact_text_collation(manager, "CHARACTER SET utf8mb4 COLLATE utf8mb4_bin").await
+        fact_text_collation(manager, "CHARACTER SET utf8mb4 COLLATE utf8mb4_bin").await?;
+        index_when_alerts_ended(manager, &["resolved_at", "id"]).await
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        index_when_alerts_ended(manager, &["resolved_at"]).await?;
         fact_text_collation(manager, "").await
     }
+}
+
+/// Makes `idx_alerts_resolved` of these columns, unless MySQL already has.
+async fn index_when_alerts_ended(
+    manager: &SchemaManager<'_>,
+    columns: &[&str],
+) -> Result<(), DbErr> {
+    let db = manager.get_connection();
+    let (index, list) = ("idx_alerts_resolved", columns.join(", "));
+    if manager.get_database_backend() == DatabaseBackend::MySql {
+        let with_id = mysql_index_has_column(db, "alerts", index, "id").await?;
+        if with_id != columns.contains(&"id") {
+            db.execute_unprepared(&format!(
+                "ALTER TABLE alerts DROP INDEX {index}, ADD INDEX {index} ({list})"
+            ))
+            .await?;
+        }
+        return Ok(());
+    }
+    db.execute_unprepared(&format!("DROP INDEX {index}"))
+        .await?;
+    db.execute_unprepared(&format!("CREATE INDEX {index} ON alerts ({list})"))
+        .await?;
+    Ok(())
 }
 
 /// Defines MySQL's fact names and values with `collation`, or the table's own when
@@ -4078,5 +4108,12 @@ mod tests {
         Migrator::up(&connection, None).await.unwrap();
         let channels = "SELECT name FROM notification_channels ORDER BY id";
         assert_eq!(texts(&connection, channels).await, ["Ops", " OPS (2)"]);
+
+        let manager = SchemaManager::new(&connection);
+        ExactFactsAndEndedAlerts.up(&manager).await.unwrap();
+        let indexed = "SELECT CAST(column_name AS CHAR) FROM information_schema.statistics
+                       WHERE table_schema = DATABASE() AND index_name = 'idx_alerts_resolved'
+                       ORDER BY seq_in_index";
+        assert_eq!(texts(&connection, indexed).await, ["resolved_at", "id"]);
     }
 }

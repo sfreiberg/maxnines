@@ -5811,6 +5811,61 @@ async fn the_api_lists_open_and_resolved_alerts() {
     );
 }
 
+/// A long-running alert that just ended is among the latest to have ended, however
+/// long ago it started.
+#[tokio::test]
+async fn ended_alerts_are_listed_by_when_they_ended() {
+    let test = Harness::start().await;
+    let rule = test
+        .database()
+        .create_alert_rule(&cpu_rule())
+        .await
+        .unwrap();
+    let at = |minutes: i64| test.now + TimeDelta::minutes(minutes);
+    let mut ids = Vec::new();
+    for (series, started) in [("/long", at(0)), ("/short", at(10))] {
+        let new = crate::alerting::NewAlert {
+            rule_id: rule,
+            severity: Severity::Critical,
+            host_id: test.host.id(),
+            series: Some(series.to_string()),
+            value: None,
+            summary: format!("{series} is full"),
+            started_at: started,
+            breached_at: started,
+        };
+        ids.push(
+            test.database()
+                .fire_alert(&new, &[])
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    let (long, short) = (ids[0], ids[1]);
+    let reason = "The problem cleared";
+    let database = test.database();
+    database
+        .resolve_alert(short, at(11), reason, None)
+        .await
+        .unwrap();
+    database
+        .resolve_alert(long, at(60), reason, None)
+        .await
+        .unwrap();
+
+    let latest = database.resolved_alerts(1).await.unwrap();
+    assert_eq!(latest[0].id, long);
+    let (_, alerts) = api(&test.server, "GET", "/api/v1/alerts", &Value::Null).await;
+    let ended: Vec<i64> = alerts["resolved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|alert| alert["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ended, [long, short]);
+}
+
 #[tokio::test]
 async fn the_api_lists_notifications_that_have_not_arrived() {
     let mut test = Harness::start().await;

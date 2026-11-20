@@ -16,8 +16,9 @@ MaxNines keeps its data in two places:
   - `m20261119_000004_names_and_uniqueness` compares names ignoring case, the same
     way on every database, keeps one current value of each fact and one open alert
     for each problem, and adds the rest of the indexes below.
-  - `m20261119_000005_exact_facts` has MySQL and MariaDB compare facts' names and
-    values exactly, as the others do.
+  - `m20261119_000005_exact_facts_and_ended_alerts` has MySQL and MariaDB compare
+    facts' names and values exactly, as the others do, and indexes alerts by when
+    they ended and their IDs, the order ended ones are listed in.
 - **The metrics store** holds the numbers hosts report. It's DuckDB for a single
   server or ClickHouse for a big one, and only one of them is used. Each has a
   migration, `0001_create_tables`, which makes its tables, and a second: in
@@ -526,7 +527,7 @@ index here starts with.
 | `idx_notification_channels_live_name` | `notification_channels (name_key)` where `deleted_at` is NULL, unique | One channel to a name |
 | `idx_alert_rule_channels_channel` | `alert_rule_channels (channel_id)` | The rules telling a channel |
 | `idx_alert_rule_actions_rule` | `alert_rule_actions (rule_id)` | A rule's actions |
-| `idx_alerts_resolved` | `alerts (resolved_at)` | Open alerts |
+| `idx_alerts_resolved` | `alerts (resolved_at, id)` | Open alerts, and those that ended most recently |
 | `idx_alerts_started` | `alerts (started_at)` | Alerts newest first |
 | `idx_alerts_host_started` | `alerts (host_id, started_at)` | A host's timeline, and its alerts |
 | `idx_alerts_rule_resolved` | `alerts (rule_id, resolved_at)` | A rule's open alerts, to remind people or end them |
