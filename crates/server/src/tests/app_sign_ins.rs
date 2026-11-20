@@ -650,10 +650,7 @@ async fn only_someone_at_the_pages_can_approve_an_app_and_apps_cant_make_keys() 
 
     let (status, refused) = call_json(&server, access, "POST", "/api/v1/api-keys").await;
     assert_eq!(status, 403);
-    assert_eq!(
-        refused["error"],
-        "An app signed in through the browser can't make API keys"
-    );
+    assert_eq!(refused["error"], crate::roles::KEYS_ARE_MADE_BY_PEOPLE);
     assert!(server.state.database.list_api_keys().await.unwrap().len() == 1);
 
     // Neither an app nor a key can approve another app.
@@ -664,19 +661,6 @@ async fn only_someone_at_the_pages_can_approve_an_app_and_apps_cant_make_keys() 
         );
         assert_eq!(call(&server, token, "POST", "/device/decide").await, 403);
     }
-    // A key can still make a key.
-    let mut stream = TcpStream::connect(server.address).await.unwrap();
-    let body = r#"{"name": "another"}"#;
-    let request = format!(
-        "POST /api/v1/api-keys HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {}\r\n\
-         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        server.api_key,
-        body.len()
-    );
-    stream.write_all(request.as_bytes()).await.unwrap();
-    let mut response = String::new();
-    stream.read_to_string(&mut response).await.unwrap();
-    assert!(response.starts_with("HTTP/1.1 201"), "{response}");
 }
 
 #[tokio::test]

@@ -1,6 +1,8 @@
 # API keys
 
-Keys can also be managed on the Settings page, and with `maxnines-server api-keys`.
+Keys are made by a person, on the Settings page or with `maxnines-server api-keys
+create`. The API lists and revokes them, but never makes one: a key or an app that
+could make keys could leave one behind that goes on working after it's revoked.
 Only a hash of each key is kept, so a key can only be seen when it's created. `hint` is
 the start of it, to tell keys apart. Each key acts as its owner, `user_id`, whose
 email address is `owner`, with at most its `role`. Deleting a user deletes their keys.
@@ -41,40 +43,8 @@ from, and `last_forwarded_for` what a proxy that isn't trusted said, unconfirmed
 
 ## Add an API key
 
-`POST /api/v1/api-keys`
-
-| Field | Description |
-| --- | --- |
-| `name` | Required. What the key is for, up to 100 characters. The key belongs to whoever owns the key making it |
-| `expires_in_secs` | How long it lasts. Leave it out for a key that never expires |
-| `role` | `viewer`, `responder`, `editor` or `admin`: the most it can do, up to the role of the key making it, which is what it gets if left out. More than that gives `403` |
-
-```sh
-curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "Deploy job", "expires_in_secs": 3600}' \
-  "$MAXNINES_URL/api/v1/api-keys"
-```
-
-```json
-{
-  "id": 2,
-  "name": "Deploy job",
-  "user_id": 1,
-  "owner": "you@example.com",
-  "role": "admin",
-  "hint": "mxn_6ffd6467",
-  "key": "mxn_6ffd6467588f1ad1cbdca9b9961ff4be70e64ef4ff330c805ee3015463c00357",
-  "created_at": "2026-11-06T04:44:46.623Z",
-  "expires_at": "2026-11-06T05:44:46.623Z",
-  "last_used_at": null,
-  "last_address": null,
-  "last_forwarded_for": null,
-  "revoked_at": null
-}
-```
-
-Save `key` now, because this is the only time it's shown.
+`POST /api/v1/api-keys` always answers `403`, as only a person makes keys, on the
+Settings page or with `maxnines-server api-keys create`.
 
 ## Revoke an API key
 

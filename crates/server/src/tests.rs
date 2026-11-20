@@ -4720,32 +4720,62 @@ async fn request_with_key(server: &TestServer, key: &str, path: &str) -> String 
     response
 }
 
-async fn new_key(server: &TestServer, details: Value) -> Value {
-    let response = server
-        .request("POST", "/api/v1/api-keys", &details.to_string())
-        .await;
-    assert_eq!(status_of(&response), "201", "{response}");
-    body_of(&response)
+/// A key of the test user's, as the Settings page or the command line makes one, with
+/// its ID.
+async fn new_key(server: &TestServer, name: &str) -> (i64, String) {
+    let now = crate::times::now();
+    let owner = server.user_id().await;
+    let role = crate::roles::Role::Admin;
+    let database = &server.state.database;
+    let (details, key) = database
+        .create_api_key(name, owner, role, None, now)
+        .await
+        .unwrap();
+    (details.id, key)
 }
 
 #[tokio::test]
-async fn a_key_from_the_api_opens_the_api_until_it_is_revoked() {
+async fn a_key_opens_the_api_until_it_is_revoked() {
     let server = start().await;
-    let created = new_key(&server, json!({ "name": "backup" })).await;
-    // A key made with a key belongs to the same person.
-    assert_eq!(created["owner"], "test@example.com", "{created}");
-    let key = created["key"].as_str().unwrap();
-    assert!(key.starts_with("mxn_"));
+    let (id, key) = new_key(&server, "backup").await;
 
-    let using = request_with_key(&server, key, "/api/v1/hosts").await;
+    let using = request_with_key(&server, &key, "/api/v1/hosts").await;
     assert_eq!(status_of(&using), "200", "{using}");
 
-    let path = format!("/api/v1/api-keys/{}", created["id"]);
-    let revoked = server.request("DELETE", &path, "").await;
+    let revoked = server
+        .request("DELETE", &format!("/api/v1/api-keys/{id}"), "")
+        .await;
     assert_eq!(status_of(&revoked), "204", "{revoked}");
 
-    let refused = request_with_key(&server, key, "/api/v1/hosts").await;
+    let refused = request_with_key(&server, &key, "/api/v1/hosts").await;
     assert_eq!(status_of(&refused), "401", "{refused}");
+}
+
+#[tokio::test]
+async fn a_key_cannot_make_a_key() {
+    let server = start().await;
+    let details = json!({ "name": "child" });
+
+    let response = server
+        .request("POST", "/api/v1/api-keys", &details.to_string())
+        .await;
+
+    assert_eq!(status_of(&response), "403", "{response}");
+    let error = body_of(&response)["error"].clone();
+    assert_eq!(error, crate::roles::KEYS_ARE_MADE_BY_PEOPLE);
+    assert_eq!(
+        server.state.database.list_api_keys().await.unwrap().len(),
+        1
+    );
+    // Nor on the pages, which a key can reach too.
+    let page = server
+        .request("POST", "/settings/api-keys", "name=child")
+        .await;
+    assert_eq!(status_of(&page), "403", "{page}");
+    assert_eq!(
+        server.state.database.list_api_keys().await.unwrap().len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -4760,34 +4790,13 @@ async fn a_made_up_key_is_refused() {
 #[tokio::test]
 async fn listing_keys_never_shows_them() {
     let server = start().await;
-    let created = new_key(&server, json!({ "name": "backup" })).await;
-    let key = created["key"].as_str().unwrap();
+    let (_, key) = new_key(&server, "backup").await;
 
     let list = server.request("GET", "/api/v1/api-keys", "").await;
 
-    assert!(!list.contains(key), "{list}");
+    assert!(!list.contains(&key), "{list}");
     assert!(!list.contains("token_hash"), "{list}");
     assert_eq!(body_of(&list)[0]["name"], "backup");
-}
-
-#[tokio::test]
-async fn a_key_can_be_short_lived() {
-    let server = start().await;
-    let created = new_key(
-        &server,
-        json!({ "name": "deploy", "expires_in_secs": 3600 }),
-    )
-    .await;
-
-    let expires = crate::times::parse_moment(created["expires_at"].as_str().unwrap()).unwrap();
-    let hour = chrono::TimeDelta::hours(1);
-    assert!(
-        (expires - crate::times::now() - hour).abs() < chrono::TimeDelta::seconds(5),
-        "{created}"
-    );
-
-    let forever = new_key(&server, json!({ "name": "ci" })).await;
-    assert!(forever["expires_at"].is_null(), "{forever}");
 }
 
 #[tokio::test]
@@ -4809,21 +4818,6 @@ async fn a_key_that_has_run_out_is_refused() {
     let response = request_with_key(&server, &key, "/api/v1/hosts").await;
 
     assert_eq!(status_of(&response), "401", "{response}");
-}
-
-#[tokio::test]
-async fn impossible_key_lifetimes_are_refused() {
-    let server = start().await;
-    for details in [
-        json!({ "name": "a", "expires_in_secs": 0 }),
-        json!({ "name": "a", "expires_in_secs": u64::MAX }),
-        json!({ "name": "  " }),
-    ] {
-        let response = server
-            .request("POST", "/api/v1/api-keys", &details.to_string())
-            .await;
-        assert_eq!(status_of(&response), "422", "{response}");
-    }
 }
 
 #[tokio::test]
@@ -4928,20 +4922,19 @@ async fn the_keys_page_offers_only_set_lifetimes() {
 #[tokio::test]
 async fn a_key_can_be_revoked_from_its_page() {
     let server = start().await;
-    let created = new_key(&server, json!({ "name": "old" })).await;
-    let key = created["key"].as_str().unwrap();
+    let (id, key) = new_key(&server, "old").await;
     let mut browser = Browser::default();
     let token = browser.get(&server, "/settings/api-keys").await.token();
 
     browser
         .post(
             &server,
-            &format!("/settings/api-keys/{}/revoke", created["id"]),
+            &format!("/settings/api-keys/{id}/revoke"),
             &[("authenticity_token", token.as_str())],
         )
         .await;
 
-    let response = request_with_key(&server, key, "/api/v1/hosts").await;
+    let response = request_with_key(&server, &key, "/api/v1/hosts").await;
     assert_eq!(status_of(&response), "401", "{response}");
     let page = browser.get(&server, "/settings/api-keys").await;
     assert!(page.body.contains("Revoked"), "{}", page.body);

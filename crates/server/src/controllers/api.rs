@@ -34,9 +34,7 @@ use crate::maintenance::MaintenanceWindowInput;
 use crate::metrics::{self, METRICS, Metric, SeriesResult, TimeRange, Unit};
 use crate::metrics_pages::{MetricsPage, MetricsPageInput, SignIn};
 use crate::models::User;
-use crate::models::{
-    ConfigStatus, RuleInput, UserChange, check_api_key_name, check_new_user, expiry_after, is_theme,
-};
+use crate::models::{ConfigStatus, RuleInput, UserChange, check_new_user, is_theme};
 use crate::notifier::{self, Notice};
 use crate::presence::{HostPresence, Reach};
 use crate::registration::{HostRecord, HostState};
@@ -462,51 +460,9 @@ async fn list_api_keys(State(state): State<AppState>) -> Response {
     }
 }
 
-#[derive(Deserialize)]
-struct NewApiKey {
-    name: String,
-    /// How long it lasts. Leaving this out makes a key that doesn't expire.
-    expires_in_secs: Option<u64>,
-    /// The most it can do, up to what the key making it can. That, if left out.
-    role: Option<Role>,
-}
-
-/// The only time a key can be seen.
-async fn create_api_key(State(state): State<AppState>, Json(input): Json<NewApiKey>) -> Response {
-    let name = input.name.trim();
-    if let Err(error) = check_api_key_name(name) {
-        return refused(&error);
-    }
-    let now = times::now();
-    let lasting = input.expires_in_secs.map(Duration::from_secs);
-    let expires_at = match lasting.map(|lasting| expiry_after(lasting, now)) {
-        Some(Ok(expires)) => Some(expires),
-        Some(Err(error)) => return refused(&error),
-        None => None,
-    };
-    // Always someone, as every request here comes with a key that acts as its owner.
-    let Some(owner) = super::signed_in_user() else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-    let role = input.role.unwrap_or(owner.role);
-    if role > owner.role {
-        return failed(
-            StatusCode::FORBIDDEN,
-            "A key can't do more than the key making it",
-        );
-    }
-    match state
-        .database
-        .create_api_key(name, owner.id, role, expires_at, now)
-        .await
-    {
-        Ok((details, key)) => {
-            let mut body = json!(details);
-            body["key"] = json!(key);
-            (StatusCode::CREATED, Json(body)).into_response()
-        }
-        Err(error) => server_error(&error),
-    }
+/// Keys are only ever made by a person, and the API only ever has a key or an app.
+async fn create_api_key() -> Response {
+    failed(StatusCode::FORBIDDEN, crate::roles::KEYS_ARE_MADE_BY_PEOPLE)
 }
 
 async fn revoke_api_key(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {

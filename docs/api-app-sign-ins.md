@@ -25,10 +25,10 @@ The minute counts from the swap, however often the old one is used in it. So an 
 should keep only the newest, refresh once at a time, and when an answer doesn't arrive,
 try again within the minute.
 
-A signed-in app can do what its role allows, with two exceptions: it can't make API
-keys, and it can't approve another app. Only a person signed in to the pages in a
-browser can approve an app, so neither an app nor an API key can sign in something that
-would outlast being revoked.
+A signed-in app can do what its role allows, with two exceptions, which apply to API
+keys too: it can't make API keys, and it can't approve another app. Only a person
+signed in to the pages in a browser can do those, so neither an app nor an API key can
+leave behind something that would outlast being revoked.
 
 Each app says what it is with a `client_id`. These are MaxNines' own, which the
 approval page and Signed-in apps show by name:

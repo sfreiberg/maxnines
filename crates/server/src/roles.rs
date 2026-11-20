@@ -121,21 +121,26 @@ const RESPONDING: [&str; 18] = [
 /// or a key doing it would make a sign in that outlives revoking the app or the key.
 const APPROVING_APPS: [&str; 2] = ["/oauth/authorize", "/device"];
 
-/// Making API keys, which a signed-in app may not: a key it made would go on working
-/// after the app was signed out or revoked.
-const MAKING_KEYS: [&str; 2] = ["/api-keys", "/settings/api-keys"];
+/// Making API keys on the pages, which only a person signed in there may do. The API
+/// never makes them, as nothing reaches it but keys and apps.
+const MAKING_KEYS: &str = "/settings/api-keys";
+
+/// Why a key or an app can't make a key: one it made would go on working after it was
+/// revoked or signed out.
+pub const KEYS_ARE_MADE_BY_PEOPLE: &str = "Only a person can make API keys, on the \
+    Settings page or with maxnines-server api-keys create, not an API key or an app";
 
 /// Why a request isn't allowed however it came, whatever the role: not as an API key
 /// or a signed-in app, as `via` says, if that's how it came. `route` is as for
 /// [`required`].
 pub fn refused_via(via: Option<&Via>, method: &Method, route: &str) -> Option<&'static str> {
-    let via = via?;
+    via?;
     if APPROVING_APPS.iter().any(|prefix| starts(route, prefix)) {
         return Some("Only someone signed in to the pages in a browser can approve an app");
     }
     let changes = method != Method::GET && method != Method::HEAD;
-    if matches!(via, Via::App { .. }) && changes && MAKING_KEYS.contains(&route) {
-        return Some("An app signed in through the browser can't make API keys");
+    if changes && route == MAKING_KEYS {
+        return Some(KEYS_ARE_MADE_BY_PEOPLE);
     }
     None
 }
@@ -284,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn apps_and_keys_cant_approve_apps_and_apps_cant_make_keys() {
+    fn apps_and_keys_cant_approve_apps_or_make_keys() {
         let key = Via::ApiKey {
             id: 1,
             name: "script".to_string(),
@@ -300,13 +305,12 @@ mod tests {
                 assert!(refused_via(None, &method, route).is_none(), "{route}");
             }
         }
-        for route in ["/api-keys", "/settings/api-keys"] {
-            assert!(refused_via(Some(&app), &Method::POST, route).is_some());
-            assert!(refused_via(Some(&app), &Method::GET, route).is_none());
-            // A key can still make a key, which can't do more than it can.
-            assert!(refused_via(Some(&key), &Method::POST, route).is_none());
-            assert!(refused_via(None, &Method::POST, route).is_none());
+        let route = "/settings/api-keys";
+        for via in [&key, &app] {
+            assert!(refused_via(Some(via), &Method::POST, route).is_some());
+            assert!(refused_via(Some(via), &Method::GET, route).is_none());
         }
+        assert!(refused_via(None, &Method::POST, route).is_none());
         // An app can still revoke a key, or itself.
         assert!(refused_via(Some(&app), &Method::DELETE, "/api-keys/{id}").is_none());
         assert!(refused_via(Some(&app), &Method::DELETE, "/app-sign-ins/{id}").is_none());

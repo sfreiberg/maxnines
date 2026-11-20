@@ -36,9 +36,9 @@ what that role can: reading needs a viewer, acknowledging and silencing a respon
 changing the setup an editor, and users, the audit log and deleting hosts an admin. Anything else gives `403`.
 Give each key the lowest role that does its job, as described under
 [API keys and roles](users.md#api-keys-and-roles): an editor key, not an admin one, for
-a tool that manages rules. Keys are made on the Settings page, through this API, or with
-`maxnines-server api-keys create --user <email>`, which writes to the main database
-directly, so it works while the server is stopped. For a script that isn't anyone's,
+a tool that manages rules. Keys are made by a person, on the Settings page or with
+`maxnines-server api-keys create --user <email>`, never through this API. The command
+writes to the main database directly, so it works while the server is stopped. For a script that isn't anyone's,
 add a user for it, such as `ci@example.com`, which never needs a password.
 
 **Encryption.** Use the server's own TLS, either your certificates or automatic ones

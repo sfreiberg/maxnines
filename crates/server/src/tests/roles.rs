@@ -321,40 +321,8 @@ async fn a_key_does_no_more_than_it_was_given_or_its_owner_can() {
 }
 
 #[tokio::test]
-async fn a_key_cannot_make_a_key_that_does_more() {
+async fn the_keys_page_cannot_make_a_key_that_does_more() {
     let server = start().await;
-    let (_, editor) = key_as(&server, Role::Editor).await;
-
-    let (status, _) = api(
-        &server,
-        &editor,
-        "POST",
-        "/api/v1/api-keys",
-        r#"{"name":"up","role":"admin"}"#,
-    )
-    .await;
-    assert_eq!(status, 403);
-    let (status, made) = api(
-        &server,
-        &editor,
-        "POST",
-        "/api/v1/api-keys",
-        r#"{"name":"same"}"#,
-    )
-    .await;
-    assert_eq!(status, 201);
-    assert_eq!(made["role"], "editor");
-    let (status, made) = api(
-        &server,
-        &editor,
-        "POST",
-        "/api/v1/api-keys",
-        r#"{"name":"less","role":"viewer"}"#,
-    )
-    .await;
-    assert_eq!(status, 201);
-    assert_eq!(made["role"], "viewer");
-    // The page refuses the same.
     let mut browser = browser_as(&server, Role::Responder).await;
     let fields = [("name", "up"), ("role", "admin"), ("lifetime", "")];
     let page = browser
