@@ -638,7 +638,7 @@ async fn create_host(
     State(state): State<AppState>,
     Json(input): Json<AgentlessHostInput>,
 ) -> Response {
-    if let Err(error) = crate::registration::agentless_hostname(&input.hostname) {
+    if let Err(error) = crate::registration::checked_hostname(&input.hostname) {
         return refused(&error);
     }
     let Some(owner) = super::signed_in_user() else {
@@ -658,7 +658,7 @@ async fn rename_host(
     UrlPath(id): UrlPath<String>,
     Json(input): Json<AgentlessHostInput>,
 ) -> Response {
-    if let Err(error) = crate::registration::agentless_hostname(&input.hostname) {
+    if let Err(error) = crate::registration::checked_hostname(&input.hostname) {
         return refused(&error);
     }
     match state.registry.rename_agentless(&id, &input.hostname).await {

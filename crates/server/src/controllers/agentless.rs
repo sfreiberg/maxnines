@@ -38,7 +38,7 @@ pub async fn new(State(state): State<AppState>, token: CsrfToken) -> Response {
 pub async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
     let hostname = form.fields.get("hostname").cloned().unwrap_or_default();
     // Only a name that won't do can stop this, short of the database failing.
-    if let Err(error) = crate::registration::agentless_hostname(&hostname) {
+    if let Err(error) = crate::registration::checked_hostname(&hostname) {
         let message = format!("{error:#}");
         return host_form(&state, &form.token, &hostname, Some(&message));
     }
@@ -58,7 +58,7 @@ pub async fn rename(
     form: CsrfForm,
 ) -> Response {
     let hostname = form.fields.get("hostname").cloned().unwrap_or_default();
-    if crate::registration::agentless_hostname(&hostname).is_err() {
+    if crate::registration::checked_hostname(&hostname).is_err() {
         let message = "A host's name can't be empty or over 255 characters.";
         return (StatusCode::UNPROCESSABLE_ENTITY, message).into_response();
     }

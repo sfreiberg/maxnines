@@ -1,7 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail};
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
@@ -28,8 +28,6 @@ use crate::registration::Admission;
 use crate::store::{NewSample, WriterCommand, can_store};
 use crate::times::{self, Timestamp};
 
-/// The longest hostname DNS allows, and what the database column holds.
-const MAX_HOST_LEN: usize = 255;
 /// Far more than real facts need, so one agent can't fill the database.
 const MAX_FACTS_LEN: usize = 64 * 1024;
 
@@ -196,7 +194,8 @@ async fn authenticate(
         bail!("expected hello");
     };
 
-    ensure!(hostname.len() <= MAX_HOST_LEN, "hostname is too long");
+    let hostname = crate::registration::checked_hostname(&hostname)
+        .context("the agent's hostname won't do")?;
 
     let id = match auth::verify(&public_key, &state.audience, &nonce, &signature) {
         Ok(id) => id,

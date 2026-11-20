@@ -62,8 +62,9 @@ impl HostKind {
 /// How long a host's name can be, which is what the database's column holds.
 const MAX_HOSTNAME_LEN: usize = 255;
 
-/// A name someone typed for a host with no agent, tidied, or why it won't do.
-pub fn agentless_hostname(typed: &str) -> Result<String> {
+/// A host's name, tidied, or why it won't do: one typed for a host with no agent, or
+/// the one an agent says its host has, checked as it arrives.
+pub fn checked_hostname(typed: &str) -> Result<String> {
     let hostname = typed.trim();
     ensure!(!hostname.is_empty(), "the host needs a name");
     ensure!(
@@ -415,7 +416,7 @@ impl Registry {
     /// agent to vouch for, so whoever adds it has approved it. Its ID is random,
     /// and looks like any other.
     pub async fn add_agentless(&self, hostname: &str, by: &str) -> Result<HostRecord> {
-        let hostname = agentless_hostname(hostname)?;
+        let hostname = checked_hostname(hostname)?;
         let mut id = [0_u8; 16];
         SystemRandom::new()
             .fill(&mut id)
@@ -442,7 +443,7 @@ impl Registry {
     /// Renames a host with no agent, as it has no agent to say what it's called.
     /// Returns `None` for any other host, or none at all.
     pub async fn rename_agentless(&self, id: &str, hostname: &str) -> Result<Option<HostRecord>> {
-        let hostname = agentless_hostname(hostname)?;
+        let hostname = checked_hostname(hostname)?;
         let _changing = self.changing.lock().await;
         let agentless =
             self.read(|hosts| hosts.get(id).filter(|host| host.is_agentless()).cloned());

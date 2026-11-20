@@ -578,21 +578,27 @@ async fn a_sample_before_the_handshake_ends_the_connection() {
 }
 
 #[tokio::test]
-async fn an_oversized_hostname_ends_the_connection() {
+async fn a_hostname_that_will_not_do_ends_the_connection() {
     let server = start().await;
-    let host = identity();
-    let mut client = server.connect().await;
+    for hostname in [
+        "x".repeat(256),
+        String::new(),
+        "  ".to_string(),
+        "web\u{1b}[2J".to_string(),
+    ] {
+        let host = identity();
+        let mut client = server.connect().await;
 
-    let nonce = read_nonce(&mut client).await;
-    let signature = host.sign(AUDIENCE, &nonce);
-    send(
-        &mut client,
-        &hello(&host, &"x".repeat(256), signature, None),
-    )
-    .await;
+        let nonce = read_nonce(&mut client).await;
+        let signature = host.sign(AUDIENCE, &nonce);
+        send(&mut client, &hello(&host, &hostname, signature, None)).await;
 
-    assert!(is_closed(&mut client).await);
-    assert!(server.state.registry.list().await.is_empty());
+        assert!(is_closed(&mut client).await, "{hostname:?}");
+        assert!(
+            server.state.registry.list().await.is_empty(),
+            "{hostname:?}"
+        );
+    }
 }
 
 /// Anyone can open a connection, so what one can make the server hold in memory
