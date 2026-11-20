@@ -1,7 +1,8 @@
 //! Moments and lengths of time as agents and the server send them. A moment is an
 //! ISO 8601 time in UTC to the millisecond, such as `2026-11-19T01:57:17.828Z`, as
-//! the API gives them. A length of time is a whole number, with its unit at the end
-//! of its name, such as `timeout_secs`, as settings are written by hand.
+//! the API gives them. A length of time is seconds, named so, such as `timeout_secs`:
+//! a whole number for a setting, as settings are written by hand, and with a
+//! fraction for what's measured.
 
 use chrono::{DateTime, DurationRound, TimeDelta, Utc};
 
@@ -56,19 +57,20 @@ pub mod optional_seconds {
     }
 }
 
-/// For serde, a length of time in whole milliseconds, for what's measured rather
-/// than chosen.
-pub mod milliseconds {
+/// For serde, a length of time in seconds with a fraction, for what's measured
+/// rather than chosen.
+pub mod fractional_seconds {
     use std::time::Duration;
 
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
 
     pub fn serialize<S: Serializer>(length: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_u64(u64::try_from(length.as_millis()).unwrap_or(u64::MAX))
+        serializer.serialize_f64(length.as_secs_f64())
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
-        u64::deserialize(deserializer).map(Duration::from_millis)
+        let seconds = f64::deserialize(deserializer)?;
+        Duration::try_from_secs_f64(seconds).map_err(D::Error::custom)
     }
 }
 

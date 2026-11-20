@@ -204,7 +204,7 @@ pub struct ActionResult {
     #[serde(default)]
     pub truncated: bool,
     /// How long it took.
-    #[serde(rename = "duration_ms", with = "crate::time::milliseconds")]
+    #[serde(rename = "duration_secs", with = "crate::time::fractional_seconds")]
     pub duration: Duration,
 }
 
