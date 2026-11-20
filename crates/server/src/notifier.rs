@@ -543,13 +543,25 @@ impl Notifier {
             });
         }
 
+        // Every send that finishes is recorded, whatever happens to the others, or
+        // one that arrived would be sent again.
+        let mut unrecorded = 0;
         while let Some(finished) = sends.join_next().await {
             match finished {
-                Ok((delivery, result)) => self.record(&delivery, result, now).await?,
-                // The rest of the batch still gets recorded.
+                Ok((delivery, result)) => {
+                    if let Err(error) = self.record(&delivery, result, now).await {
+                        let error = format!("{error:#}");
+                        error!(error, "recording how a notification went failed");
+                        unrecorded += 1;
+                    }
+                }
                 Err(error) => error!(%error, "a delivery stopped unexpectedly"),
             }
         }
+        anyhow::ensure!(
+            unrecorded == 0,
+            "how {unrecorded} notifications went couldn't be recorded"
+        );
         Ok(())
     }
 
