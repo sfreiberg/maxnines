@@ -7,22 +7,15 @@
 # the workspace Cargo.toml. Each release is titled "MaxNines 1.2.3", with notes
 # from the commits, its files, and their SHA256SUMS.
 #
-# A pull request that changes the release machinery runs everything except
-# publishing, so it's known to work before a tag needs it. So does starting this
-# by hand from the Actions tab.
+# It runs only for a version tag, or by hand from the Actions tab, which runs
+# everything except publishing, to try the release machinery before a tag needs
+# it. Either way it runs the whole of CI on that commit first, and nothing is
+# pushed or published unless that passes.
 name: Release
 
 on:
   push:
     tags: ["v*"]
-  pull_request:
-    paths:
-      - .github/workflows/release.yml
-      - .github/workflows/ci.yml
-      - packaging/**
-      - Cargo.toml
-      - Cargo.lock
-      - crates/*/Cargo.toml
   workflow_dispatch:
 
 permissions:
@@ -66,8 +59,8 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
 
-  # The same checks as every push, on every system. They run alongside the
-  # builds, and nothing is pushed or published unless they pass.
+  # The whole of CI, on every system, for this commit. It runs alongside the
+  # builds, and nothing is pushed or published unless it passes.
   tests:
     name: Tests
     uses: ./.github/workflows/ci.yml
@@ -214,7 +207,7 @@ jobs:
         run: |
           if ! command -v clang >/dev/null; then
             choco install -y llvm
-            echo "C:\Program Files\LLVM\bin" >> "$GITHUB_PATH"
+            printf '%s\n' 'C:\Program Files\LLVM\bin' >> "$GITHUB_PATH"
           fi
       - run: cargo build --release --locked -p maxnines-agent -p maxnines-server --target "$TARGET"
       - run: |
@@ -228,7 +221,7 @@ jobs:
       # Source Maintenance Fee, and won't build until its terms are accepted.
       - name: Install WiX
         run: |
-          echo "$USERPROFILE\.dotnet\tools" >> "$GITHUB_PATH"
+          printf '%s\n' "$USERPROFILE\.dotnet\tools" >> "$GITHUB_PATH"
           dotnet tool install --global wix --version 7.0.1
           export PATH="$USERPROFILE/.dotnet/tools:$PATH"
           # Before anything else, as every command refuses to run until then.
@@ -494,7 +487,7 @@ jobs:
           # Everything but the bare binaries, which are only there for packaging.
           find artifacts -type f ! -path '*/target.nosync/*' -exec cp {} release/ \;
           cd release
-          sha256sum * > SHA256SUMS
+          sha256sum -- * > SHA256SUMS
           ls -l
       # Lets anyone check a download was built here, from this repository.
       - uses: actions/attest-build-provenance@v2

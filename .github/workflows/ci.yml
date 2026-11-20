@@ -1,23 +1,26 @@
 # Checks formatting, runs clippy and runs every test, on each system the agent
 # and server are built for. Much of the agent only compiles on one system, so each
-# gets its own clippy and tests. The release workflow runs this too, before it
-# builds anything.
+# gets its own clippy and tests.
+#
+# It runs for pull requests, for pushes to main, and by hand from the Actions tab.
+# A branch's commits are checked through its pull request, so each runs once. The
+# release workflow runs this too, for the tagged commit, and publishes nothing
+# unless it passes.
 name: CI
 
 on:
-  push:
-    branches: ["**"]
   pull_request:
+  push:
+    branches: [main]
   workflow_call:
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# When the release workflow runs this, github.workflow is "Release", so the two
-# don't cancel each other.
+# A newer commit on the same branch or pull request replaces a run still going.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -26,9 +29,6 @@ env:
 jobs:
   format:
     name: Formatting
-    # A pull request from a branch here is already covered by its push. Only when
-    # this runs by itself, though: the release workflow needs these to run.
-    if: github.workflow != 'CI' || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -39,7 +39,6 @@ jobs:
 
   test:
     name: Clippy and tests on ${{ matrix.name }}
-    if: github.workflow != 'CI' || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
