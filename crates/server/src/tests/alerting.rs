@@ -8288,7 +8288,7 @@ mod charts {
             started_at: crate::times::now() - TimeDelta::seconds(30),
             breached_at: crate::times::now() - TimeDelta::seconds(30),
         };
-        let id = database.fire_alert(&new, channels).await.unwrap();
+        let id = database.fire_alert(&new, channels).await.unwrap().unwrap();
         database.get_alert(id).await.unwrap().unwrap()
     }
 
@@ -8444,7 +8444,7 @@ mod charts {
             started_at: crate::times::now() - TimeDelta::seconds(30),
             breached_at: crate::times::now() - TimeDelta::seconds(30),
         };
-        let id = database.fire_alert(&new, &[]).await.unwrap();
+        let id = database.fire_alert(&new, &[]).await.unwrap().unwrap();
 
         let list = Browser::default().get(&server, "/alerts").await;
         assert!(list.body.contains("web-1 is offline"), "{}", list.body);

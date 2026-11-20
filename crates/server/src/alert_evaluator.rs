@@ -1099,7 +1099,10 @@ impl Evaluator {
                     breached_at,
                 };
                 let channels = self.channels_for(rule).await?;
-                let id = self.database.fire_alert(&new, &channels).await?;
+                // A rule deleted since this pass read it fires nothing.
+                let Some(id) = self.database.fire_alert(&new, &channels).await? else {
+                    return Ok(());
+                };
                 info!(rule = rule.rule.name, hostname, "alert fired");
                 if let Some(alert) = self.database.get_alert(id).await? {
                     self.run_actions(rule, &alert, true, snapshot.now).await;

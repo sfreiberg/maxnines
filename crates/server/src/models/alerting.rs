@@ -31,11 +31,11 @@ use crate::calculations::Calculation;
 use crate::channels;
 use crate::times::Timestamp;
 
-const PENDING: &str = "pending";
+pub(super) const PENDING: &str = "pending";
 const SENT: &str = "sent";
-const FAILED: &str = "failed";
+pub(super) const FAILED: &str = "failed";
 /// Kept back by a silence.
-const HELD: &str = "held";
+pub(super) const HELD: &str = "held";
 
 fn to_alert_rule(
     row: alert_rule::Model,
@@ -340,15 +340,42 @@ async fn save_actions<C: ConnectionTrait>(
     Ok(())
 }
 
-fn links(rule_id: i64, channels: &[i64]) -> Vec<alert_rule_channel::ActiveModel> {
-    let unique: BTreeSet<i64> = channels.iter().copied().collect();
-    unique
+/// Links a rule to each of `channels` that hasn't been deleted. They're locked as
+/// [`live_channels`] locks them, so one being deleted meanwhile is waited for and
+/// left out, and one deleted after can't miss the link to drop it.
+async fn save_links<C: ConnectionTrait>(
+    connection: &C,
+    rule_id: i64,
+    channels: &[i64],
+) -> Result<()> {
+    let wanted: BTreeSet<i64> = channels.iter().copied().collect();
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    let live: Vec<i64> = notification_channel::Entity::find()
+        .select_only()
+        .column(notification_channel::Column::Id)
+        .filter(notification_channel::Column::Id.is_in(wanted))
+        .filter(notification_channel::Column::DeletedAt.is_null())
+        .lock_shared()
+        .into_tuple()
+        .all(connection)
+        .await
+        .context("loading alert rule channels")?;
+    let rows: Vec<_> = live
         .into_iter()
         .map(|channel_id| alert_rule_channel::ActiveModel {
             rule_id: Set(rule_id),
             channel_id: Set(channel_id),
         })
-        .collect()
+        .collect();
+    if !rows.is_empty() {
+        alert_rule_channel::Entity::insert_many(rows)
+            .exec_without_returning(connection)
+            .await
+            .context("saving alert rule channels")?;
+    }
+    Ok(())
 }
 
 fn queued(
@@ -374,19 +401,23 @@ fn queued(
 }
 
 /// The channels that haven't been deleted, which are the only ones anything is
-/// queued for.
+/// queued for. They're locked until the transaction ends, so a channel being deleted
+/// meanwhile is waited for, and left out, and one can't be deleted until what's
+/// queued for it is there to be dropped. Deleting one marks it first for that.
 fn live_channels() -> SelectStatement {
     Query::select()
         .column(notification_channel::Column::Id)
         .from(notification_channel::Entity)
         .and_where(notification_channel::Column::DeletedAt.is_null())
+        .lock_shared()
         .to_owned()
 }
 
 /// Queues `event` about an alert for each of `channels` that hasn't been deleted, in
 /// the order of their IDs. Whether one has been is decided by the statement that
-/// queues, so one deleted since they were chosen is left out.
-async fn queue_for_live_channels<C: ConnectionTrait>(
+/// queues, which locks them as [`live_channels`] does, so one deleted since they were
+/// chosen is left out.
+pub(super) async fn queue_for_live_channels<C: ConnectionTrait>(
     connection: &C,
     alert_id: i64,
     channels: impl IntoIterator<Item = i64>,
@@ -404,6 +435,7 @@ async fn queue_for_live_channels<C: ConnectionTrait>(
         .and_where(notification_channel::Column::Id.is_in(channels))
         .and_where(notification_channel::Column::DeletedAt.is_null())
         .order_by(notification_channel::Column::Id, Order::Asc)
+        .lock_shared()
         .to_owned();
     queue_selected(connection, live, event, now).await
 }
@@ -453,25 +485,30 @@ pub(super) async fn queue_action_output<C: ConnectionTrait>(
     run_id: i64,
     now: Timestamp,
 ) -> Result<()> {
-    let run = action_run::Entity::find_by_id(run_id)
+    let alert_id: Option<Option<i64>> = action_run::Entity::find_by_id(run_id)
+        .select_only()
+        .column(action_run::Column::AlertId)
+        .into_tuple()
         .one(connection)
         .await
         .context("loading an action run")?;
-    let Some(alert_id) = run.and_then(|run| run.alert_id) else {
+    let Some(alert_id) = alert_id.flatten() else {
         return Ok(());
     };
-    let told: BTreeSet<i64> = notification::Entity::find()
+    let told: Vec<i64> = notification::Entity::find()
+        .select_only()
+        .column(notification::Column::ChannelId)
+        .distinct()
         .filter(notification::Column::AlertId.eq(alert_id))
+        .into_tuple()
         .all(connection)
         .await
-        .context("loading notifications")?
-        .into_iter()
-        .map(|row| row.channel_id)
-        .collect();
+        .context("loading notifications")?;
     let channels = notification_channel::Entity::find()
         .filter(notification_channel::Column::Id.is_in(told))
         .filter(notification_channel::Column::DeletedAt.is_null())
         .order_by_asc(notification_channel::Column::Id)
+        .lock_shared()
         .all(connection)
         .await
         .context("loading channels")?;
@@ -558,13 +595,7 @@ impl Database {
             })?
             .last_insert_id;
 
-        let rows = links(id, &input.channels);
-        if !rows.is_empty() {
-            alert_rule_channel::Entity::insert_many(rows)
-                .exec_without_returning(&transaction)
-                .await
-                .context("saving alert rule channels")?;
-        }
+        save_links(&transaction, id, &input.channels).await?;
         save_actions(&transaction, id, &input.actions).await?;
         record_alert_rule(&transaction, id, None).await?;
         transaction.commit().await.context("saving alert rule")?;
@@ -594,13 +625,7 @@ impl Database {
             .exec(&transaction)
             .await
             .context("saving alert rule channels")?;
-        let rows = links(id, &input.channels);
-        if !rows.is_empty() {
-            alert_rule_channel::Entity::insert_many(rows)
-                .exec_without_returning(&transaction)
-                .await
-                .context("saving alert rule channels")?;
-        }
+        save_links(&transaction, id, &input.channels).await?;
         save_actions(&transaction, id, &input.actions).await?;
         record_alert_rule(&transaction, id, Some(&before)).await?;
         transaction.commit().await.context("saving alert rule")?;
@@ -637,29 +662,58 @@ impl Database {
             .begin()
             .await
             .context("deleting alert rule")?;
+        // Locked first, so an alert can't start for it meanwhile: firing one waits
+        // for this, and then finds the rule deleted.
+        let live = alert_rule::Entity::find_by_id(id)
+            .select_only()
+            .column(alert_rule::Column::Id)
+            .filter(alert_rule::Column::DeletedAt.is_null())
+            .lock_exclusive()
+            .into_tuple::<i64>()
+            .one(&transaction)
+            .await
+            .context("loading alert rule")?;
+        if live.is_none() {
+            return Ok(false);
+        }
         let Some(rule) = load_alert_rule(&transaction, id).await? else {
             return Ok(false);
         };
         let before = alert_rule_snapshot(&transaction, &rule).await?;
-        alert::Entity::update_many()
-            .col_expr(alert::Column::ResolvedAt, Expr::value(now))
-            .col_expr(alert::Column::ResolveReason, Expr::value(RULE_GONE_REASON))
-            .col_expr(alert::Column::ResolvedSummary, Expr::value(None::<String>))
-            .filter(alert::Column::RuleId.eq(id))
-            .filter(alert::Column::ResolvedAt.is_null())
+        alert_rule::Entity::update_many()
+            .col_expr(alert_rule::Column::DeletedAt, Expr::value(now))
+            .filter(alert_rule::Column::Id.eq(id))
             .exec(&transaction)
             .await
-            .context("resolving the rule's alerts")?;
-        // The alerts that just ended: nothing else ends this rule's alerts at the same
-        // moment for the same reason, and one that ended before stays as it was.
-        let ended = Query::select()
+            .context("deleting alert rule")?;
+        // Its open alerts, locked, so one ending some other way meanwhile is either
+        // waited for and left out, or waits and then finds it ended.
+        let open: Vec<i64> = alert::Entity::find()
+            .select_only()
             .column(alert::Column::Id)
-            .from(alert::Entity)
-            .and_where(alert::Column::RuleId.eq(id))
-            .and_where(alert::Column::ResolvedAt.eq(now))
-            .and_where(alert::Column::ResolveReason.eq(RULE_GONE_REASON))
-            .to_owned();
-        tell_of_ending(&transaction, ended, now).await?;
+            .filter(alert::Column::RuleId.eq(id))
+            .filter(alert::Column::ResolvedAt.is_null())
+            .lock_exclusive()
+            .into_tuple()
+            .all(&transaction)
+            .await
+            .context("loading the rule's alerts")?;
+        if !open.is_empty() {
+            alert::Entity::update_many()
+                .col_expr(alert::Column::ResolvedAt, Expr::value(now))
+                .col_expr(alert::Column::ResolveReason, Expr::value(RULE_GONE_REASON))
+                .col_expr(alert::Column::ResolvedSummary, Expr::value(None::<String>))
+                .filter(alert::Column::Id.is_in(open.iter().copied()))
+                .exec(&transaction)
+                .await
+                .context("resolving the rule's alerts")?;
+            let ended = Query::select()
+                .column(alert::Column::Id)
+                .from(alert::Entity)
+                .and_where(alert::Column::Id.is_in(open))
+                .to_owned();
+            tell_of_ending(&transaction, ended, now).await?;
+        }
         silence::Entity::delete_many()
             .filter(silence::Column::RuleId.eq(id))
             .filter(silence::Column::EndsAt.gt(now))
@@ -671,12 +725,6 @@ impl Database {
             .exec(&transaction)
             .await
             .context("deleting the rule's maintenance windows")?;
-        alert_rule::Entity::update_many()
-            .col_expr(alert_rule::Column::DeletedAt, Expr::value(now))
-            .filter(alert_rule::Column::Id.eq(id))
-            .exec(&transaction)
-            .await
-            .context("deleting alert rule")?;
         record_change(&transaction, Kind::AlertRule, id, Some(&before), None, None).await?;
         transaction.commit().await.context("deleting alert rule")?;
         Ok(true)
@@ -736,20 +784,26 @@ impl Database {
 
     /// The channel is kept, marked deleted, so what was sent through it still says
     /// where it went. Anything still waiting to go, or held back by a silence, goes,
-    /// and rules stop naming it. It's marked first, so whatever was queued for it
-    /// before then is there to be dropped, and nothing is queued for it after.
+    /// and rules stop naming it. It's marked first, which locks it, so whatever was
+    /// queued for it before then is there to be dropped, and anything queuing for it
+    /// meanwhile waits and then leaves it out: see [`live_channels`].
     /// Returns false if there's no such channel.
     pub async fn delete_channel(&self, id: i64, now: Timestamp) -> Result<bool> {
         let transaction = self.connection.begin().await.context("deleting channel")?;
         let Some(before) = load_channel(&transaction, id).await? else {
             return Ok(false);
         };
-        notification_channel::Entity::update_many()
+        // Only one of two deletes at once does it.
+        let marked = notification_channel::Entity::update_many()
             .col_expr(notification_channel::Column::DeletedAt, Expr::value(now))
             .filter(notification_channel::Column::Id.eq(id))
+            .filter(notification_channel::Column::DeletedAt.is_null())
             .exec(&transaction)
             .await
             .context("deleting channel")?;
+        if marked.rows_affected == 0 {
+            return Ok(false);
+        }
         notification::Entity::delete_many()
             .filter(notification::Column::ChannelId.eq(id))
             .filter(notification::Column::State.is_in([PENDING, HELD]))
@@ -989,8 +1043,9 @@ impl Database {
     }
 
     /// Starts an alert and queues its notifications together, so an alert can't
-    /// exist without them.
-    pub async fn fire_alert(&self, new: &NewAlert, channels: &[i64]) -> Result<i64> {
+    /// exist without them. Gives `None` if the rule has been deleted, which it waits
+    /// for if that's happening now, so a rule's alerts can't outlast it.
+    pub async fn fire_alert(&self, new: &NewAlert, channels: &[i64]) -> Result<Option<i64>> {
         let row = alert::ActiveModel {
             rule_id: Set(new.rule_id),
             severity: Set(new.severity.as_str().to_string()),
@@ -1010,6 +1065,18 @@ impl Database {
 
         let hearing = self.channels_hearing(channels, new.severity).await?;
         let transaction = self.connection.begin().await.context("saving alert")?;
+        let rule = alert_rule::Entity::find_by_id(new.rule_id)
+            .select_only()
+            .column(alert_rule::Column::Id)
+            .filter(alert_rule::Column::DeletedAt.is_null())
+            .lock_shared()
+            .into_tuple::<i64>()
+            .one(&transaction)
+            .await
+            .context("loading the alert's rule")?;
+        if rule.is_none() {
+            return Ok(None);
+        }
         let id = alert::Entity::insert(row)
             .exec(&transaction)
             .await
@@ -1018,7 +1085,7 @@ impl Database {
 
         queue_for_live_channels(&transaction, id, hearing, Event::Firing, new.started_at).await?;
         transaction.commit().await.context("saving alert")?;
-        Ok(id)
+        Ok(Some(id))
     }
 
     /// Makes an open alert a warning or critical, with what it says now, and tells
@@ -1434,54 +1501,95 @@ impl Database {
 
     /// Queues a reminder for each channel that was told an alert started and hasn't heard
     /// about it for as long as the alert's rule says. Each alert comes with that time.
-    /// On-call services are left out.
+    /// On-call services are left out, and so is a channel whose kind can't be read, as
+    /// it can't be sent to. Only alerts still open that nobody has acknowledged are
+    /// reminded of: they're locked first, so one ending or acknowledged meanwhile is
+    /// waited for and left out, and one ending after waits, so it's said to have ended
+    /// after the reminder.
     pub async fn queue_reminders(&self, alerts: &[(i64, TimeDelta)], now: Timestamp) -> Result<()> {
         if alerts.is_empty() {
             return Ok(());
         }
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("queueing reminders")?;
+        let still: Vec<i64> = alert::Entity::find()
+            .select_only()
+            .column(alert::Column::Id)
+            .filter(alert::Column::Id.is_in(alerts.iter().map(|(id, _)| *id)))
+            .filter(alert::Column::ResolvedAt.is_null())
+            .filter(alert::Column::AcknowledgedAt.is_null())
+            .lock_shared()
+            .into_tuple()
+            .all(&transaction)
+            .await
+            .context("loading alerts")?;
+        if still.is_empty() {
+            return Ok(());
+        }
         // A deleted channel hears nothing more.
-        let rows = notification::Entity::find()
-            .filter(notification::Column::AlertId.is_in(alerts.iter().map(|(id, _)| *id)))
+        let rows: Vec<(i64, i64, Option<Timestamp>, String)> = notification::Entity::find()
+            .select_only()
+            .column(notification::Column::AlertId)
+            .column(notification::Column::ChannelId)
+            .column(notification::Column::SentAt)
+            .column(notification::Column::State)
+            .filter(notification::Column::AlertId.is_in(still))
             .filter(notification::Column::ChannelId.in_subquery(live_channels()))
-            .all(&self.connection)
+            .into_tuple()
+            .all(&transaction)
             .await
             .context("loading notifications")?;
 
         let mut last_told: BTreeMap<(i64, i64), Timestamp> = BTreeMap::new();
         let mut waiting = BTreeSet::new();
-        for row in rows {
-            let key = (row.alert_id, row.channel_id);
-            match row.sent_at {
+        for (alert_id, channel_id, sent_at, state) in rows {
+            let key = (alert_id, channel_id);
+            match sent_at {
                 Some(sent) => {
                     let last = last_told.entry(key).or_insert(sent);
                     *last = std::cmp::max(sent, *last);
                 }
-                None if row.state != FAILED => {
+                None if state != FAILED => {
                     waiting.insert(key);
                 }
                 None => {}
             }
         }
+        if last_told.is_empty() {
+            return Ok(());
+        }
 
         let every: BTreeMap<i64, TimeDelta> = alerts.iter().copied().collect();
+        let told: BTreeSet<i64> = last_told.keys().map(|(_, channel)| *channel).collect();
         let kinds: Vec<(i64, String)> = notification_channel::Entity::find()
             .select_only()
             .column(notification_channel::Column::Id)
             .column(notification_channel::Column::Kind)
-            .filter(notification_channel::Column::DeletedAt.is_null())
+            .filter(notification_channel::Column::Id.is_in(told))
             .into_tuple()
-            .all(&self.connection)
+            .all(&transaction)
             .await
             .context("loading channels")?;
-        let mut on_call = BTreeSet::new();
+        let mut reminded = BTreeSet::new();
         for (id, kind) in kinds {
-            if ChannelKind::parse(&kind)?.is_on_call() {
-                on_call.insert(id);
+            match ChannelKind::parse(&kind) {
+                Ok(kind) if !kind.is_on_call() => {
+                    reminded.insert(id);
+                }
+                Ok(_) => {}
+                Err(error) => warn!(
+                    channel = id,
+                    error = format!("{error:#}"),
+                    "a channel can't be read, so it isn't reminded of alerts"
+                ),
             }
         }
         let rows: Vec<_> = last_told
             .into_iter()
-            .filter(|(key, _)| !waiting.contains(key) && !on_call.contains(&key.1))
+            .filter(|(key, _)| !waiting.contains(key) && reminded.contains(&key.1))
             .filter(|((alert, _), told)| {
                 every.get(alert).is_some_and(|every| now - *told >= *every)
             })
@@ -1489,10 +1597,11 @@ impl Database {
             .collect();
         if !rows.is_empty() {
             notification::Entity::insert_many(rows)
-                .exec_without_returning(&self.connection)
+                .exec_without_returning(&transaction)
                 .await
                 .context("queueing notifications")?;
         }
+        transaction.commit().await.context("queueing reminders")?;
         Ok(())
     }
 

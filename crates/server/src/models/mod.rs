@@ -12,6 +12,8 @@ mod alerting;
 mod api_key;
 mod app_sign_in;
 mod app_sign_ins;
+#[cfg(test)]
+mod at_once;
 mod audit;
 mod audit_entry;
 mod built_in_rules;
@@ -677,21 +679,24 @@ impl Database {
             .collect())
     }
 
-    /// Stops a key working. Returns false if there's no such key.
+    /// Stops a key working. Returns false if there's no such key. Revoking it again
+    /// keeps the first time: it's locked first, so a second revoke at once waits, and
+    /// then finds it revoked.
     pub async fn revoke_api_key(&self, id: i64, now: Timestamp) -> Result<bool> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("revoking an API key")?;
         let Some(row) = api_key::Entity::find_by_id(id)
-            .one(&self.connection)
+            .lock_exclusive()
+            .one(&transaction)
             .await
             .context("loading an API key")?
         else {
             return Ok(false);
         };
         if row.revoked_at.is_none() {
-            let transaction = self
-                .connection
-                .begin()
-                .await
-                .context("revoking an API key")?;
             let owner = owner_emails(&transaction)
                 .await?
                 .remove(&row.user_id)
@@ -713,8 +718,8 @@ impl Database {
                 None,
             )
             .await?;
-            transaction.commit().await.context("revoking an API key")?;
         }
+        transaction.commit().await.context("revoking an API key")?;
         Ok(true)
     }
 
@@ -2206,7 +2211,11 @@ mod tests {
             started_at,
             breached_at: started_at,
         };
-        let alert = database.fire_alert(&new, &[channel]).await.unwrap();
+        let alert = database
+            .fire_alert(&new, &[channel])
+            .await
+            .unwrap()
+            .unwrap();
         let open = database.open_alerts().await.unwrap();
         let saved = open.iter().find(|a| a.id == alert).unwrap();
         // Named by its rule and host as they're called now.

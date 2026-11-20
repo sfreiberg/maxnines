@@ -13,7 +13,7 @@ use maxnines_protocol::auth::new_nonce;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, Set, TransactionTrait,
+    QueryOrder, QuerySelect, Set, SqlErr, TransactionTrait,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -162,6 +162,23 @@ pub fn check_new_user(email: &str, name: &str) -> Result<(String, String)> {
     Ok((email, name.to_string()))
 }
 
+/// How many admins other than `id` can sign in. Every one, `id` too, is locked until
+/// the transaction ends, so two changes at once can't each leave the other as the
+/// only admin: the second waits, and then counts what the first left.
+async fn other_enabled_admins<C: ConnectionTrait>(connection: &C, id: i64) -> Result<usize> {
+    let admins: Vec<i64> = user::Entity::find()
+        .select_only()
+        .column(user::Column::Id)
+        .filter(user::Column::DisabledAt.is_null())
+        .filter(user::Column::Role.eq(Role::Admin.as_str()))
+        .lock_exclusive()
+        .into_tuple()
+        .all(connection)
+        .await
+        .context("counting admins")?;
+    Ok(admins.into_iter().filter(|admin| *admin != id).count())
+}
+
 /// Length is what makes a password strong, so that's all this asks for.
 pub fn check_new_password(password: &str) -> Result<()> {
     ensure!(
@@ -277,7 +294,8 @@ impl Database {
     }
 
     /// Adds someone, and gives back the link token for setting their password.
-    /// Returns `None` if the address is taken. Expects `check_new_user`'s results.
+    /// Returns `None` if the address is taken, which only the database can tell for
+    /// certain, as two could be added at once. Expects `check_new_user`'s results.
     pub async fn create_user(
         &self,
         email: &str,
@@ -285,14 +303,6 @@ impl Database {
         role: Role,
         now: Timestamp,
     ) -> Result<Option<(User, String)>> {
-        let taken = user::Entity::find()
-            .filter(user::Column::Email.eq(email))
-            .one(&self.connection)
-            .await
-            .context("checking a user's address")?;
-        if taken.is_some() {
-            return Ok(None);
-        }
         let token = new_nonce()?;
         let transaction = self.connection.begin().await.context("starting a save")?;
         let row = user::ActiveModel {
@@ -307,8 +317,16 @@ impl Database {
             ..Default::default()
         }
         .insert(&transaction)
-        .await
-        .context("saving a user")?;
+        .await;
+        let row = match row {
+            Ok(row) => row,
+            Err(error) => {
+                if let Some(SqlErr::UniqueConstraintViolation(_)) = error.sql_err() {
+                    return Ok(None);
+                }
+                return Err(anyhow::Error::new(error).context("saving a user"));
+            }
+        };
         record_change(
             &transaction,
             Kind::User,
@@ -482,29 +500,18 @@ impl Database {
         Ok(updated.rows_affected == 1)
     }
 
-    /// Whether no other admin could still sign in without this user.
-    async fn is_last_enabled_admin(&self, id: i64) -> Result<bool> {
-        let others = user::Entity::find()
-            .filter(user::Column::Id.ne(id))
-            .filter(user::Column::DisabledAt.is_null())
-            .filter(user::Column::Role.eq(Role::Admin.as_str()))
-            .count(&self.connection)
-            .await
-            .context("counting admins")?;
-        Ok(others == 0)
-    }
-
     /// Changes what someone may do. There's always an admin who can sign in, so the
     /// last one can't be given less.
     pub async fn set_role(&self, id: i64, role: Role) -> Result<UserChange> {
-        let Some(before) = load(&self.connection, id).await? else {
+        let transaction = self.connection.begin().await.context("starting a save")?;
+        let others = other_enabled_admins(&transaction, id).await?;
+        let Some(before) = load(&transaction, id).await? else {
             return Ok(UserChange::NoSuchUser);
         };
         let was_admin = before.role == Role::Admin.as_str() && before.disabled_at.is_none();
-        if was_admin && role != Role::Admin && self.is_last_enabled_admin(id).await? {
+        if was_admin && role != Role::Admin && others == 0 {
             return Ok(UserChange::LastAdmin);
         }
-        let transaction = self.connection.begin().await.context("starting a save")?;
         user::Entity::update_many()
             .col_expr(user::Column::Role, Expr::value(role.as_str()))
             .filter(user::Column::Id.eq(id))
@@ -516,22 +523,20 @@ impl Database {
         Ok(UserChange::Done)
     }
 
-    /// Stops someone signing in, and signs them out.
+    /// Stops someone signing in, and signs them out. The last admin who can sign in
+    /// can't be.
     pub async fn disable_user(&self, id: i64, now: Timestamp) -> Result<UserChange> {
-        let Some(row) = user::Entity::find_by_id(id)
-            .one(&self.connection)
-            .await
-            .context("loading a user")?
-        else {
+        let transaction = self.connection.begin().await.context("starting a save")?;
+        let others = other_enabled_admins(&transaction, id).await?;
+        let Some(row) = load(&transaction, id).await? else {
             return Ok(UserChange::NoSuchUser);
         };
         if row.disabled_at.is_some() {
             return Ok(UserChange::Done);
         }
-        if row.role == Role::Admin.as_str() && self.is_last_enabled_admin(id).await? {
+        if row.role == Role::Admin.as_str() && others == 0 {
             return Ok(UserChange::LastAdmin);
         }
-        let transaction = self.connection.begin().await.context("starting a save")?;
         let before = row.clone();
         let mut row: user::ActiveModel = row.into();
         row.disabled_at = Set(Some(now));
@@ -567,9 +572,13 @@ impl Database {
         })
     }
 
+    /// Only someone disabled can be deleted. They're locked first, so being enabled
+    /// meanwhile is either waited for, or waits and then finds them gone.
     pub async fn delete_user(&self, id: i64) -> Result<UserChange> {
+        let transaction = self.connection.begin().await.context("starting a save")?;
         let Some(row) = user::Entity::find_by_id(id)
-            .one(&self.connection)
+            .lock_exclusive()
+            .one(&transaction)
             .await
             .context("loading a user")?
         else {
@@ -578,7 +587,6 @@ impl Database {
         if row.disabled_at.is_none() {
             return Ok(UserChange::StillEnabled);
         }
-        let transaction = self.connection.begin().await.context("starting a save")?;
         // Everything of theirs goes with them: sessions, two-factor, and their keys
         // and the apps they signed in, which act as them, and are recorded as gone.
         let keys = api_key::Entity::find()

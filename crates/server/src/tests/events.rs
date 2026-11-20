@@ -322,7 +322,13 @@ async fn alerts_and_updates_are_on_the_timeline_too() {
         started_at: started,
         breached_at: started,
     };
-    let alert = server.state.database.fire_alert(&new, &[]).await.unwrap();
+    let alert = server
+        .state
+        .database
+        .fire_alert(&new, &[])
+        .await
+        .unwrap()
+        .unwrap();
     server
         .state
         .database
