@@ -91,9 +91,8 @@ async fn echoes(pinger: system::Pinger, count: u32, deadline: Instant) -> Replie
             break;
         }
         replies.sent += 1;
-        // The sequence number only tells requests apart, so it wraps.
         let left = deadline - started;
-        if let Some(took) = pinger.echo(sequence as u16, &token, wait.min(left)).await {
+        if let Some(took) = pinger.echo(&token, wait.min(left)).await {
             replies.times.push(took);
         }
         if sequence + 1 < count {
@@ -175,14 +174,10 @@ mod system {
         }
 
         /// How long the reply took, or nothing if none came in time, a router
-        /// said the target can't be reached, or Windows couldn't send it. Windows
-        /// only waits by blocking, so each wait has a thread of its own.
-        pub async fn echo(
-            &self,
-            _sequence: u16,
-            token: &[u8; 8],
-            wait: Duration,
-        ) -> Option<Duration> {
+        /// said the target can't be reached, it didn't echo the token, or Windows
+        /// couldn't send it. Windows only waits by blocking, so each wait has a
+        /// thread of its own.
+        pub async fn echo(&self, token: &[u8; 8], wait: Duration) -> Option<Duration> {
             let handle = Arc::clone(&self.handle);
             let target = self.target;
             let token = *token;
@@ -194,15 +189,22 @@ mod system {
         }
     }
 
-    /// Whether the target itself replied.
+    /// Where the echoed data starts in an IPv6 reply: after the reply itself and
+    /// the ICMP header of the echo.
+    const ICMPV6_DATA_OFFSET: usize = std::mem::size_of::<ICMPV6_ECHO_REPLY_LH>() + 8;
+
+    /// Whether the target itself replied, echoing the token.
     fn send(handle: &Handle, target: SocketAddr, token: &[u8; 8], wait: Duration) -> bool {
         let mut reply = [0u64; REPLY_WORDS];
         let reply_size = std::mem::size_of_val(&reply) as u32;
         let timeout_ms = u32::try_from(wait.as_millis()).unwrap_or(u32::MAX).max(1);
+        let buffer = reply.as_ptr().cast::<u8>();
+        let buffer_size = std::mem::size_of_val(&reply);
         // SAFETY: the request and reply buffers outlive the calls, the sizes given
         // are theirs, and the reply is only read where Windows said it wrote one,
-        // at the start of the buffer, which is aligned for it.
-        let status = unsafe {
+        // at the start of the buffer, which is aligned for it. The echoed data is
+        // only read inside the buffer.
+        let (status, echoed) = unsafe {
             match target {
                 SocketAddr::V4(target) => {
                     let replies = IcmpSendEcho(
@@ -218,7 +220,13 @@ mod system {
                     if replies == 0 {
                         return false;
                     }
-                    (*reply.as_ptr().cast::<ICMP_ECHO_REPLY>()).Status
+                    let answer = &*reply.as_ptr().cast::<ICMP_ECHO_REPLY>();
+                    let data = answer.Data.cast::<u8>().cast_const();
+                    let size = usize::from(answer.DataSize);
+                    let inside = data >= buffer
+                        && data.wrapping_add(size) <= buffer.wrapping_add(buffer_size);
+                    let echoed = inside && std::slice::from_raw_parts(data, size) == token;
+                    (answer.Status, echoed)
                 }
                 SocketAddr::V6(target) => {
                     let mut source: SOCKADDR_IN6 = std::mem::zeroed();
@@ -244,13 +252,16 @@ mod system {
                     if replies == 0 {
                         return false;
                     }
-                    (*reply.as_ptr().cast::<ICMPV6_ECHO_REPLY_LH>()).Status
+                    let answer = &*reply.as_ptr().cast::<ICMPV6_ECHO_REPLY_LH>();
+                    let data =
+                        std::slice::from_raw_parts(buffer.add(ICMPV6_DATA_OFFSET), token.len());
+                    (answer.Status, data == token)
                 }
             }
         };
         // Anything but success, such as a router saying the target can't be
-        // reached, isn't a reply from it.
-        status == IP_SUCCESS
+        // reached, isn't a reply from it, and nor is one to another's ping.
+        status == IP_SUCCESS && echoed
     }
 }
 
@@ -293,6 +304,12 @@ mod tests {
     #[test]
     fn this_host_answers() {
         let replies = ping_now(&["127.0.0.1:0"], 2, Duration::from_secs(5)).unwrap();
+        assert_eq!((replies.sent, replies.received()), (2, 2));
+    }
+
+    #[test]
+    fn this_host_answers_over_ipv6() {
+        let replies = ping_now(&["[::1]:0"], 2, Duration::from_secs(5)).unwrap();
         assert_eq!((replies.sent, replies.received()), (2, 2));
     }
 
