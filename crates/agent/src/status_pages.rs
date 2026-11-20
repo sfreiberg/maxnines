@@ -45,15 +45,6 @@ struct Reading {
 }
 
 impl Software {
-    pub fn from_collector(name: &str) -> Option<Self> {
-        match name {
-            "apache" => Some(Self::Apache),
-            "nginx" => Some(Self::Nginx),
-            "php_fpm" => Some(Self::PhpFpm),
-            _ => None,
-        }
-    }
-
     fn collector(self) -> &'static str {
         match self {
             Self::Apache => "apache",

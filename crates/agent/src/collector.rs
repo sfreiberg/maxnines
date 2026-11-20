@@ -137,13 +137,9 @@ fn build(
             let paths = config.paths.clone().unwrap_or_default();
             Box::new(FileCollector::new(paths, interval))
         }
-        "apache" | "nginx" | "php_fpm" => {
-            let urls = config.urls.clone().unwrap_or_default();
-            match Software::from_collector(name) {
-                Some(software) => Box::new(StatusPageCollector::new(software, urls, interval)),
-                None => bail!("unknown collector {name:?}"),
-            }
-        }
+        "apache" => status_pages(Software::Apache, config, interval),
+        "nginx" => status_pages(Software::Nginx, config, interval),
+        "php_fpm" => status_pages(Software::PhpFpm, config, interval),
         "databases" => {
             let chosen = config.databases.as_deref().unwrap_or_default();
             Box::new(DatabaseCollector::new(chosen, local.databases, interval))
@@ -159,6 +155,15 @@ fn build(
         }
         other => bail!("unknown collector {other:?}"),
     })
+}
+
+fn status_pages(
+    software: Software,
+    config: &CollectorSettings,
+    interval: Duration,
+) -> Box<dyn Collector> {
+    let urls = config.urls.clone().unwrap_or_default();
+    Box::new(StatusPageCollector::new(software, urls, interval))
 }
 
 /// Some sensors report raw values that aren't temperatures, such as -9200 on

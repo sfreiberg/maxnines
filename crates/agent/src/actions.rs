@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
-use tokio::sync::Semaphore;
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tracing::info;
 
@@ -230,7 +230,7 @@ impl Executor {
 /// several heavy jobs at once.
 pub struct Runner {
     executor: Executor,
-    turn: Semaphore,
+    turn: Mutex<()>,
     waiting: AtomicUsize,
 }
 
@@ -238,7 +238,7 @@ impl Runner {
     pub fn new(actions: Actions, built_ins: bool, state_dir: &Path) -> Arc<Self> {
         Arc::new(Self {
             executor: Executor::new(actions, built_ins, Some(state_dir)),
-            turn: Semaphore::new(1),
+            turn: Mutex::new(()),
             waiting: AtomicUsize::new(0),
         })
     }
@@ -284,11 +284,8 @@ impl Runner {
             self.waiting.fetch_sub(1, Ordering::Relaxed);
             return Ended::refused("too many actions are already waiting to run");
         }
-        let turn = self.turn.acquire().await;
+        let _turn = self.turn.lock().await;
         self.waiting.fetch_sub(1, Ordering::Relaxed);
-        let Ok(_turn) = turn else {
-            return Ended::refused("the agent is stopping");
-        };
         let executor = &self.executor;
         executor.run_here(found, name, variables, timeout).await
     }
