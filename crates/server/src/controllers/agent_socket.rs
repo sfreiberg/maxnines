@@ -27,7 +27,7 @@ use crate::events::{BOOT_TIME_SLACK, EventKind, restarted};
 use crate::facts::flatten;
 use crate::models::ConfigStatus;
 use crate::presence::Presence;
-use crate::registration::Admission;
+use crate::registration::{Admission, LastHello};
 use crate::store::{NewSample, WriterCommand, can_store};
 use crate::times::{self, Timestamp};
 
@@ -229,9 +229,26 @@ async fn authenticate(
         })
         .await?;
     // A revoked agent is told no more than that.
-    if status != RegistrationStatus::Rejected
-        && let Some(reason) = refusal(protocol, &agent_version)
-    {
+    if status == RegistrationStatus::Rejected {
+        send_status(socket, status).await?;
+        return Ok(None);
+    }
+    let refused = refusal(protocol, &agent_version);
+    let hello = LastHello {
+        agent_protocol: Some(protocol),
+        agent_version: Some(agent_version.clone()).filter(|version| !version.is_empty()),
+        refused_at: refused.as_ref().map(|_| times::now()),
+        refuse_reason: refused.clone(),
+    };
+    // Kept for people to see. The agent is answered the same either way.
+    if let Err(error) = state.registry.heard(&id, hello).await {
+        warn!(
+            id,
+            error = format!("{error:#}"),
+            "couldn't save what the agent said in its hello"
+        );
+    }
+    if let Some(reason) = refused {
         let supported = Protocols::SUPPORTED;
         warn!(
             id,

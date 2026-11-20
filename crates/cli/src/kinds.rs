@@ -407,12 +407,24 @@ fn nothing(kind: Kind, options: &Options) -> &'static str {
 }
 
 fn host_status(host: &Value) -> String {
-    match text(host, "state").as_str() {
+    let status = match text(host, "state").as_str() {
         "approved" => match text(host, "health").as_str() {
             "not_read" => "not read yet".to_string(),
             health => health.to_string(),
         },
         state => state.to_string(),
+    };
+    match text(host, "needs_upgrading").as_str() {
+        "" => status,
+        side => format!("{status}, {side} needs upgrading"),
+    }
+}
+
+/// An agent's version, with the protocol it speaks.
+fn agent_line(version: &str, host: &Value) -> String {
+    match host["agent_protocol"].as_u64() {
+        Some(protocol) => format!("{version}, protocol {protocol}"),
+        None => version.to_string(),
     }
 }
 
@@ -535,6 +547,14 @@ pub fn describe(api: &Api, kind: Kind, name: &str) -> Result<String> {
             },
         ),
     ];
+    if let Some(version) = host["agent_version"].as_str() {
+        lines.push(("Agent".to_string(), agent_line(version, host)));
+    }
+    if let Some(reason) = host["refuse_reason"].as_str() {
+        let when = moment(host, "refused_at")
+            .map_or_else(String::new, |at| format!(" ({} ago)", span(now - at)));
+        lines.push(("Turned away".to_string(), format!("{reason}{when}")));
+    }
     let mut alerts = api.get("/alerts")?;
     let firing: Vec<String> = array(alerts["open"].take())
         .iter()
@@ -656,6 +676,20 @@ mod tests {
         );
         assert_eq!(check_status(&json!({"enabled": false})), "paused");
         assert_eq!(host_status(&json!({"state": "pending"})), "pending");
+        assert_eq!(
+            host_status(
+                &json!({"state": "approved", "health": "offline", "needs_upgrading": "agent"})
+            ),
+            "offline, agent needs upgrading"
+        );
+        assert_eq!(
+            host_status(&json!({"state": "pending", "needs_upgrading": "server"})),
+            "pending, server needs upgrading"
+        );
+        assert_eq!(
+            agent_line("0.1.0", &json!({"agent_protocol": 1})),
+            "0.1.0, protocol 1"
+        );
         assert_eq!(
             host_status(&json!({"state": "approved", "health": "not_read"})),
             "not read yet"

@@ -25,7 +25,7 @@ use crate::metric_charts::format_value;
 use crate::metrics::Unit;
 use crate::models::ConfigStatus;
 use crate::presence::Reach;
-use crate::registration::{HostRecord, HostState, short_id};
+use crate::registration::{HostRecord, HostState, Upgrade, short_id};
 use crate::rule_engine::Host;
 use crate::silences::{ActiveSilences, Cover, Silence, SilenceInput};
 use crate::times::{self, format_moment, lasting};
@@ -72,10 +72,23 @@ struct HostRow {
     os_family: Option<OsFamily>,
     seen: Option<String>,
     config: Option<ConfigState>,
-    /// The agent's own version, as it reports it.
+    /// The agent's own version, as it said in its last hello.
     version: Option<String>,
     /// Nothing when it hasn't said, or what it said isn't a version.
     version_state: Option<VersionState>,
+    /// The version of the protocol the agent speaks, as it said in its last hello.
+    agent_protocol: Option<u32>,
+    /// Which side has to be upgraded before the agent is taken again.
+    needs_upgrading: Option<Upgrade>,
+    /// When the agent was last turned away for its protocol, and why.
+    refused: Option<Refusal>,
+}
+
+/// Why a host's agent was last turned away, for its page.
+#[derive(Serialize)]
+struct Refusal {
+    reason: String,
+    ago: String,
 }
 
 /// How an agent's running config compares with what it should be running.
@@ -186,10 +199,21 @@ fn row(
     health: Health,
 ) -> HostRow {
     let presence = state.presence.get(&host.id);
-    let version = facts.and_then(|facts| text_fact(facts, "agent.version"));
+    let version = host.hello.agent_version.clone();
+    let refused = host
+        .hello
+        .refused_at
+        .zip(host.hello.refuse_reason.clone())
+        .map(|(at, reason)| Refusal {
+            reason,
+            ago: times::ago(at, times::now()),
+        });
     HostRow {
         version_state: version.as_deref().and_then(agent_versions::compare),
         version,
+        agent_protocol: host.hello.agent_protocol,
+        needs_upgrading: host.needs_upgrading(),
+        refused,
         online: reach == Reach::Online,
         health,
         os: facts.and_then(os_of),
@@ -229,6 +253,8 @@ struct WaitingHost {
     id: String,
     hostname: String,
     seen: Option<String>,
+    /// An agent can wait for approval and need upgrading too.
+    needs_upgrading: Option<Upgrade>,
 }
 
 /// An agent in the list, with only what it takes to sort and count them all.
@@ -321,6 +347,7 @@ async fn index(
             let asked = state.registry.last_asked_at(&host.id);
             waiting.push(WaitingHost {
                 seen: asked.map(|asked| times::ago(asked, times::now())),
+                needs_upgrading: host.needs_upgrading(),
                 id: host.id,
                 hostname: host.hostname,
             });
@@ -596,6 +623,7 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
     };
     let reach = state.presence.reach(&host);
     let health = Health::of(reach, &here);
+    let same_build = text_fact(&flat, "agent.version") == host.hello.agent_version;
     let mut row = row(&state, host.clone(), Some(&flat), reach, health);
     row.config = Some(config_state(
         Some(desired.version.as_str()),
@@ -627,10 +655,14 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
                 .map(|p| p.source.to_string()),
         )
         .with("newest_agent_version", NEWEST_AGENT_VERSION)
-        .with("agent_commit", &text_fact(&flat, "agent.commit"))
+        // Only while the facts are about the build that said hello.
+        .with(
+            "agent_commit",
+            &text_fact(&flat, "agent.commit").filter(|_| same_build),
+        )
         .with(
             "agent_rust_version",
-            &text_fact(&flat, "agent.rust_version"),
+            &text_fact(&flat, "agent.rust_version").filter(|_| same_build),
         )
         .with("facts", &facts)
         .with("config", &config)

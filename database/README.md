@@ -21,6 +21,9 @@ MaxNines keeps its data in two places:
     they ended and their IDs, the order ended ones are listed in.
   - `m20261119_000006_durations_in_seconds` keeps how long an action ran as
     `duration_secs`, with a fraction, in place of `duration_ms`.
+  - `m20261120_000001_agent_hellos` keeps what a host's agent said when it last
+    connected, the protocol it speaks and its own version, and when and why the
+    server last turned it away for its protocol.
 - **The metrics store** holds the numbers hosts report. It's DuckDB for a single
   server or ClickHouse for a big one, and only one of them is used. Each has a
   migration, `0001_create_tables`, which makes its tables, and a second: in
@@ -110,6 +113,10 @@ erDiagram
         text decided_by
         timestamp first_seen_at
         timestamp decided_at
+        int agent_protocol "from its agent's last hello, 0 from before protocol versions"
+        string agent_version "from its agent's last hello"
+        timestamp refused_at "when its agent was last turned away for its protocol"
+        text refuse_reason "why, until a hello of its is taken"
     }
     metrics_pages {
         int id PK

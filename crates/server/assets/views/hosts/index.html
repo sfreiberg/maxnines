@@ -20,7 +20,7 @@
   <h2>Waiting for approval</h2>
   {% for host in waiting %}
   <div class="problem">
-    <span class="text"><a href="/hosts/{{ host.id }}">{{ host.hostname }}</a>{% if host.seen %} <span class="note">asked {{ host.seen }}</span>{% endif %}</span>
+    <span class="text"><a href="/hosts/{{ host.id }}">{{ host.hostname }}</a>{% if host.seen %} <span class="note">asked {{ host.seen }}</span>{% endif %}{% if host.needs_upgrading == "agent" %} <span class="badge bad">Agent needs upgrading</span>{% elif host.needs_upgrading == "server" %} <span class="badge bad">Server needs upgrading</span>{% endif %}</span>
     {% if can_edit %}
     <div class="actions">
       <form method="post" action="/hosts/{{ host.id }}/approve">

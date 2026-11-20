@@ -37,7 +37,7 @@ use crate::models::User;
 use crate::models::{ConfigStatus, MAX_TIMELINE, RuleInput, UserChange, check_new_user, is_theme};
 use crate::notifier::{self, Notice};
 use crate::presence::{HostPresence, Reach};
-use crate::registration::{HostRecord, HostState};
+use crate::registration::{HostRecord, HostState, Upgrade};
 use crate::remote_checks::{LatestResults, RemoteCheck, RemoteCheckInput, SignInWith};
 use crate::roles::Role;
 use crate::rule_engine::{self, ResolvedConfig};
@@ -52,6 +52,8 @@ pub struct HostView {
     pub online: bool,
     pub health: Health,
     pub last_seen_at: Option<Timestamp>,
+    /// Which side has to be upgraded before the server takes the host's agent again.
+    pub needs_upgrading: Option<Upgrade>,
 }
 
 /// When the server last heard from a host.
@@ -599,6 +601,7 @@ async fn list(State(state): State<AppState>, Query(params): Query<ListParams>) -
                 online: reach == Reach::Online,
                 health: Health::of(reach, mine),
                 last_seen_at: last_seen_at(presence),
+                needs_upgrading: host.needs_upgrading(),
                 host,
             }
         })
@@ -621,6 +624,7 @@ async fn show_host(State(state): State<AppState>, UrlPath(id): UrlPath<String>) 
         online: reach == Reach::Online,
         health: Health::of(reach, &mine),
         last_seen_at: last_seen_at(presence),
+        needs_upgrading: host.needs_upgrading(),
         host,
     })
     .into_response()

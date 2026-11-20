@@ -21,6 +21,7 @@ use crate::models::{
     Database, FactVersion, UserChange, check_api_key_name, check_new_user, expiry_after,
 };
 use crate::notifier::web_url;
+use crate::registration::Upgrade;
 use crate::roles::Role;
 use crate::times::format_moment;
 
@@ -141,16 +142,22 @@ pub fn print_hosts(config: &Config) -> Result<()> {
     }
 
     println!(
-        "{:<32}  {:<9} {:<8} {:<24} HOST",
+        "{:<32}  {:<9} {:<26} {:<24} HOST",
         "ID", "STATE", "ONLINE", "DECIDED BY"
     );
     for view in hosts {
         let host = view.host;
+        let online = match (view.online, view.needs_upgrading) {
+            (true, _) => "yes",
+            (false, None) => "no",
+            (false, Some(Upgrade::Agent)) => "no, agent needs upgrading",
+            (false, Some(Upgrade::Server)) => "no, server needs upgrading",
+        };
         println!(
-            "{:<32}  {:<9} {:<8} {:<24} {}",
+            "{:<32}  {:<9} {:<26} {:<24} {}",
             host.id,
             host.state.as_str(),
-            if view.online { "yes" } else { "no" },
+            online,
             host.decided_by.as_deref().unwrap_or("-"),
             host.hostname,
         );

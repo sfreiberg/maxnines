@@ -8,7 +8,7 @@ use std::sync::{PoisonError, RwLock, RwLockWriteGuard};
 
 use anyhow::{Context, Result, ensure};
 use ipnet::IpNet;
-use maxnines_protocol::RegistrationStatus;
+use maxnines_protocol::{ProtocolFit, Protocols, RegistrationStatus};
 use ring::digest::{SHA256, digest};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -129,6 +129,50 @@ pub struct HostRecord {
     pub decided_by: Option<String>,
     pub first_seen_at: Timestamp,
     pub decided_at: Option<Timestamp>,
+    #[serde(flatten)]
+    pub hello: LastHello,
+}
+
+/// What a host's agent said in its last hello, and whether it was turned away for it.
+/// All empty for a host with no agent, or whose agent hasn't connected since the
+/// server began keeping them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastHello {
+    /// The version of the protocol it speaks, which is 0 for an agent from before
+    /// protocol versions.
+    pub agent_protocol: Option<u32>,
+    /// Its own version, which an agent from before protocol versions doesn't say.
+    pub agent_version: Option<String>,
+    /// When it was last turned away for the protocol it speaks, and why, until a
+    /// hello of its is taken.
+    pub refused_at: Option<Timestamp>,
+    pub refuse_reason: Option<String>,
+}
+
+/// Which side has to be upgraded before a host's agent is taken again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Upgrade {
+    Agent,
+    Server,
+}
+
+impl HostRecord {
+    /// Which side has to be upgraded, for a host whose agent was turned away and
+    /// still would be. An upgraded server can take an agent it turned away, which
+    /// then needs nothing more than to try again, and a revoked host needs nothing.
+    pub fn needs_upgrading(&self) -> Option<Upgrade> {
+        if self.state == HostState::Revoked {
+            return None;
+        }
+        self.hello.refused_at?;
+        let protocol = self.hello.agent_protocol?;
+        match Protocols::SUPPORTED.fit(protocol) {
+            ProtocolFit::TooOld => Some(Upgrade::Agent),
+            ProtocolFit::TooNew => Some(Upgrade::Server),
+            ProtocolFit::Supported => None,
+        }
+    }
 }
 
 /// Enough of an agent's ID to tell it from another with the same name, where the
@@ -331,6 +375,7 @@ impl Registry {
             decided_by: None,
             first_seen_at: now,
             decided_at: None,
+            hello: LastHello::default(),
         });
         host.hostname = request.hostname.to_string();
 
@@ -359,6 +404,26 @@ impl Registry {
             self.save(host).await?;
         }
         Ok(status)
+    }
+
+    /// Keeps what an agent said in its hello, for a host there's a record of. Most
+    /// hellos say just what the one before did, which saves nothing.
+    pub async fn heard(&self, id: &str, hello: LastHello) -> Result<()> {
+        let same = |hosts: &BTreeMap<String, HostRecord>| {
+            hosts.get(id).is_none_or(|host| host.hello == hello)
+        };
+        if self.read(same) {
+            return Ok(());
+        }
+        let _changing = self.changing.lock().await;
+        if self.read(same) {
+            return Ok(());
+        }
+        self.database.save_hello(id, &hello).await?;
+        if let Some(host) = self.write().get_mut(id) {
+            host.hello = hello;
+        }
+        Ok(())
     }
 
     fn note_asked(&self, id: &str) {
@@ -431,6 +496,7 @@ impl Registry {
             decided_by: Some(by.to_string()),
             first_seen_at: now,
             decided_at: Some(now),
+            hello: LastHello::default(),
         };
         let changing = self.changing.lock().await;
         self.save(host.clone()).await?;

@@ -14,6 +14,13 @@ pub struct Model {
     pub decided_by: Option<String>,
     pub first_seen_at: DateTimeUtc,
     pub decided_at: Option<DateTimeUtc>,
+    /// What its agent said in its last hello.
+    pub agent_protocol: Option<i64>,
+    pub agent_version: Option<String>,
+    /// When and why its agent was last turned away for its protocol, until one it
+    /// says is taken.
+    pub refused_at: Option<DateTimeUtc>,
+    pub refuse_reason: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -630,6 +630,7 @@ mod tests {
             decided_by: None,
             first_seen_at: crate::times::from_ms(0),
             decided_at: None,
+            hello: Default::default(),
         };
         let choices = host_choices(&[
             host("ffff00001111", "web"),

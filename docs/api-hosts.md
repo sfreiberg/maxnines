@@ -8,6 +8,15 @@ host with no agent is `not_read` while it has no page being read or check being 
 as it's then neither online nor offline. Its `public_key` is `null`, as it has no agent
 to hold one.
 
+`agent_protocol` and `agent_version` are what the host's agent said when it last
+connected: the version of the protocol it speaks, which is `0` for an agent from before
+protocol versions, and its own version. The server turns away an agent whose protocol it
+doesn't take, as described under [upgrading](agents.md#upgrading), and keeps when it
+last did and why in `refused_at` and `refuse_reason`, until the agent connects with one
+it takes. While it would still be turned away, `needs_upgrading` says what has to be
+upgraded first: `agent` or `server`. It's `null` otherwise, and its `health` is
+`offline`. All of these are `null` for a host with no agent.
+
 ## List hosts
 
 `GET /api/v1/hosts`
@@ -32,15 +41,40 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
     "decided_by": "you@example.com",
     "first_seen_at": "2026-11-06T04:44:24.215Z",
     "decided_at": "2026-11-06T04:44:25.752Z",
+    "agent_protocol": 1,
+    "agent_version": "0.1.0",
+    "refused_at": null,
+    "refuse_reason": null,
     "online": true,
     "health": "online",
-    "last_seen_at": "2026-11-06T04:44:42.225Z"
+    "last_seen_at": "2026-11-06T04:44:42.225Z",
+    "needs_upgrading": null
   }
 ]
 ```
 
 `last_seen_at` is `null` for a host the server hasn't heard from since it started,
 which for one with no agent means none of its pages or checks has answered yet.
+
+A host whose agent is too old for the server looks like this:
+
+```json
+{
+  "id": "8be04471aaaa4f0e9d3c2b1a09f8e7d6",
+  "kind": "agent",
+  "hostname": "db-1",
+  "state": "approved",
+  "agent_protocol": 0,
+  "agent_version": null,
+  "refused_at": "2026-11-20T18:02:11.408Z",
+  "refuse_reason": "This agent (from before protocol versions) is too old for this server (version 0.1.0), which takes agent protocol 1. Upgrade the agent to 0.1.0.",
+  "online": false,
+  "health": "offline",
+  "needs_upgrading": "agent"
+}
+```
+
+Only some of its fields are shown.
 
 ## Add a host without an agent
 
@@ -66,7 +100,11 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "state": "approved",
   "decided_by": "you@example.com",
   "first_seen_at": "2026-11-06T04:44:24.215Z",
-  "decided_at": "2026-11-06T04:44:24.215Z"
+  "decided_at": "2026-11-06T04:44:24.215Z",
+  "agent_protocol": null,
+  "agent_version": null,
+  "refused_at": null,
+  "refuse_reason": null
 }
 ```
 

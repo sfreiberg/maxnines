@@ -399,8 +399,8 @@ fn hello(host: &Identity, hostname: &str, signature: String, token: Option<&str>
     }
 }
 
-/// What the agents in these tests say they are.
-const AGENT_VERSION: &str = "0.1.0";
+/// What the agents in these tests say they are: the agent released with the server.
+const AGENT_VERSION: &str = crate::agent_versions::NEWEST_AGENT_VERSION;
 
 async fn handshake(
     client: &mut Client,
@@ -486,12 +486,19 @@ async fn the_challenge_says_which_protocols_the_server_takes() {
     assert_eq!(protocols, maxnines_protocol::Protocols::SUPPORTED);
 }
 
+/// The host as the API gives it.
+async fn host_from_api(server: &TestServer, id: &str) -> Value {
+    let path = format!("/api/v1/hosts/{id}");
+    json_body(&server.http("GET", &path, Some(&server.api_key)).await)
+}
+
 #[tokio::test]
 async fn an_agent_from_before_protocol_versions_is_turned_away_saying_to_upgrade_it() {
     let server = start().await;
     let host = identity();
+    let id = host.id();
     drop(server.connect_approved(&host, "web-1").await);
-    server.wait_for_online(&host.id(), false).await;
+    server.wait_for_online(&id, false).await;
 
     let mut client = server.connect().await;
     let reason = reason(hello_speaking(&mut client, &host, None).await);
@@ -499,7 +506,79 @@ async fn an_agent_from_before_protocol_versions_is_turned_away_saying_to_upgrade
     assert!(reason.contains("from before protocol versions"), "{reason}");
     assert!(reason.contains("Upgrade the agent"), "{reason}");
     assert!(is_closed(&mut client).await);
-    assert!(!server.state.presence.get(&host.id()).unwrap().online);
+    assert!(!server.state.presence.get(&id).unwrap().online);
+
+    // People see why, not just that it's offline.
+    let api = host_from_api(&server, &id).await;
+    assert_eq!(api["needs_upgrading"], "agent", "{api}");
+    assert_eq!(api["agent_protocol"], 0, "{api}");
+    assert_eq!(api["agent_version"], Value::Null, "{api}");
+    assert_eq!(api["refuse_reason"], reason.as_str(), "{api}");
+    assert!(api["refused_at"].is_string(), "{api}");
+    assert_eq!(api["health"], "offline", "{api}");
+    let mut browser = Browser::default();
+    let page = browser.get(&server, &format!("/hosts/{id}")).await;
+    assert!(
+        page.body.contains(">Agent needs upgrading</span>"),
+        "{}",
+        page.body
+    );
+    assert!(
+        page.body.contains("From before protocol versions"),
+        "{}",
+        page.body
+    );
+    let list = browser.get(&server, "/hosts?view=table").await;
+    assert!(
+        list.body.contains(">Agent needs upgrading</span>"),
+        "{}",
+        list.body
+    );
+    assert!(
+        !list.body.contains(r#"aria-label="Offline""#),
+        "{}",
+        list.body
+    );
+}
+
+#[tokio::test]
+async fn a_hello_that_is_taken_clears_the_refusal_and_keeps_what_the_agent_said() {
+    let server = start().await;
+    let host = identity();
+    let id = host.id();
+    let mut client = server.connect().await;
+    reason(hello_speaking(&mut client, &host, Some(0)).await);
+    assert_eq!(
+        server
+            .state
+            .registry
+            .get(&id)
+            .await
+            .unwrap()
+            .needs_upgrading(),
+        Some(crate::registration::Upgrade::Agent)
+    );
+
+    // Upgraded, it waits for approval like any other.
+    let mut client = server.connect().await;
+    assert_eq!(
+        handshake(&mut client, &host, "web-1", None).await,
+        RegistrationStatus::Pending
+    );
+    let hello = server.state.registry.get(&id).await.unwrap().hello;
+    assert_eq!(
+        hello.agent_protocol,
+        Some(maxnines_protocol::PROTOCOL_VERSION)
+    );
+    assert_eq!(hello.agent_version.as_deref(), Some(AGENT_VERSION));
+    assert_eq!((hello.refused_at, &hello.refuse_reason), (None, &None));
+    // And it's kept, not only remembered.
+    let saved = server.state.database.load_hosts().await.unwrap();
+    let saved = saved.into_iter().find(|saved| saved.id == id).unwrap();
+    assert_eq!(saved.hello, hello);
+    let api = host_from_api(&server, &id).await;
+    assert_eq!(api["needs_upgrading"], Value::Null, "{api}");
+    assert_eq!(api["agent_version"], AGENT_VERSION, "{api}");
 }
 
 #[tokio::test]
@@ -514,6 +593,14 @@ async fn a_new_agent_too_old_for_the_server_waits_for_approval_and_is_told_to_up
     assert!(is_closed(&mut client).await);
     let waiting = server.state.registry.get(&host.id()).await.unwrap();
     assert_eq!(waiting.state, HostState::Pending);
+    let mut browser = Browser::default();
+    let page = browser.get(&server, "/hosts").await;
+    assert!(page.body.contains("Waiting for approval"), "{}", page.body);
+    assert!(
+        page.body.contains(">Agent needs upgrading</span>"),
+        "{}",
+        page.body
+    );
 }
 
 #[tokio::test]
@@ -529,6 +616,15 @@ async fn an_agent_newer_than_the_server_is_told_to_upgrade_the_server_first() {
     assert!(reason.contains(&format!("protocol {newer}")), "{reason}");
     assert!(reason.contains("Upgrade the server first"), "{reason}");
     assert!(is_closed(&mut client).await);
+    let api = host_from_api(&server, &host.id()).await;
+    assert_eq!(api["needs_upgrading"], "server", "{api}");
+    let mut browser = Browser::default();
+    let page = browser.get(&server, &format!("/hosts/{}", host.id())).await;
+    assert!(
+        page.body.contains(">Server needs upgrading</span>"),
+        "{}",
+        page.body
+    );
 }
 
 #[tokio::test]
@@ -2916,13 +3012,33 @@ fn parses_commands() {
 
 // ---- agent versions
 
-async fn report_version(server: &TestServer, client: &mut Client, id: &str, version: &str) {
-    TestServer::next_config(client).await;
-    let facts = AgentMessage::Facts {
-        facts: json!({ "agent": { "version": version } }),
+/// Connects an approved agent again, saying it's `version` in its hello.
+async fn reconnect_as_version(server: &TestServer, host: &Identity, version: &str) -> Client {
+    server.wait_for_online(&host.id(), false).await;
+    let mut client = server.connect().await;
+    let nonce = read_nonce(&mut client).await;
+    let AgentMessage::Hello {
+        hostname,
+        public_key,
+        signature,
+        token,
+        protocol,
+        ..
+    } = hello(host, "web-1", host.sign(AUDIENCE, &nonce), None)
+    else {
+        unreachable!();
     };
-    send(client, &facts).await;
-    server.wait_for_facts(id, 1).await;
+    let said = AgentMessage::Hello {
+        hostname,
+        public_key,
+        signature,
+        token,
+        protocol,
+        agent_version: version.to_string(),
+    };
+    send(&mut client, &said).await;
+    assert_eq!(read_status(&mut client).await, RegistrationStatus::Approved);
+    client
 }
 
 #[tokio::test]
@@ -2936,9 +3052,8 @@ async fn the_hosts_page_shows_which_agents_have_an_update() {
         (&current, "current-1", newest),
         (&newer, "newer-1", "999.0.0"),
     ] {
-        let mut client = server.connect_approved(host, hostname).await;
-        report_version(&server, &mut client, &host.id(), version).await;
-        clients.push(client);
+        drop(server.connect_approved(host, hostname).await);
+        clients.push(reconnect_as_version(&server, host, version).await);
     }
     let mut browser = Browser::default();
 
@@ -5362,6 +5477,7 @@ async fn a_revoked_agent_still_connected_is_never_shown_online() {
             decided_by: Some("admin".to_string()),
             first_seen_at: now,
             decided_at: Some(now),
+            hello: Default::default(),
         })
         .await;
     // Its connection closes a moment after it's revoked.

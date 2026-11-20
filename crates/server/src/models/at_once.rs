@@ -449,6 +449,7 @@ async fn facts_saved_twice_at_once_keep_one_current_value() {
         decided_by: None,
         first_seen_at: now,
         decided_at: None,
+        hello: Default::default(),
     };
     database.save_host(&host).await.unwrap();
     let facts = |value: &str| FlatFacts::from([("os.name".to_string(), json!(value))]);

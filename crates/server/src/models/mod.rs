@@ -87,7 +87,7 @@ use crate::audit::{Kind, Snapshot};
 use crate::facts::{FlatFacts, decode, encode, flatten, unflatten};
 use crate::host_filter;
 use crate::migrations::Migrator;
-use crate::registration::{HostKind, HostRecord, HostState};
+use crate::registration::{HostKind, HostRecord, HostState, LastHello};
 use crate::roles::Role;
 use crate::times::Timestamp;
 
@@ -259,6 +259,10 @@ impl Database {
             decided_by: Set(record.decided_by.clone()),
             first_seen_at: Set(record.first_seen_at),
             decided_at: Set(record.decided_at),
+            agent_protocol: Set(record.hello.agent_protocol.map(i64::from)),
+            agent_version: Set(record.hello.agent_version.clone()),
+            refused_at: Set(record.hello.refused_at),
+            refuse_reason: Set(record.hello.refuse_reason.clone()),
         };
 
         let on_conflict = OnConflict::column(host::Column::Id)
@@ -269,6 +273,10 @@ impl Database {
                 host::Column::DecidedBy,
                 host::Column::FirstSeenAt,
                 host::Column::DecidedAt,
+                host::Column::AgentProtocol,
+                host::Column::AgentVersion,
+                host::Column::RefusedAt,
+                host::Column::RefuseReason,
             ])
             .to_owned();
 
@@ -294,6 +302,30 @@ impl Database {
         )
         .await?;
         transaction.commit().await.context("saving host")?;
+        Ok(())
+    }
+
+    /// Keeps what a host's agent said in its last hello. Nothing about who's allowed
+    /// in changes, so there's nothing for the audit log.
+    pub async fn save_hello(&self, id: &str, hello: &LastHello) -> Result<()> {
+        host::Entity::update_many()
+            .col_expr(
+                host::Column::AgentProtocol,
+                Expr::value(hello.agent_protocol.map(i64::from)),
+            )
+            .col_expr(
+                host::Column::AgentVersion,
+                Expr::value(hello.agent_version.clone()),
+            )
+            .col_expr(host::Column::RefusedAt, Expr::value(hello.refused_at))
+            .col_expr(
+                host::Column::RefuseReason,
+                Expr::value(hello.refuse_reason.clone()),
+            )
+            .filter(host::Column::Id.eq(id))
+            .exec(&self.connection)
+            .await
+            .context("saving what a host's agent said")?;
         Ok(())
     }
 
@@ -1264,6 +1296,11 @@ fn host_fields(hostname: &str, state: &str, decided_by: Option<&str>) -> Snapsho
 }
 
 fn to_record(row: host::Model) -> Result<HostRecord> {
+    let agent_protocol = row
+        .agent_protocol
+        .map(u32::try_from)
+        .transpose()
+        .with_context(|| format!("host {} has an impossible protocol", row.id))?;
     Ok(HostRecord {
         state: HostState::parse(&row.state)
             .with_context(|| format!("host {} has unknown state {:?}", row.id, row.state))?,
@@ -1275,6 +1312,12 @@ fn to_record(row: host::Model) -> Result<HostRecord> {
         decided_by: row.decided_by,
         first_seen_at: row.first_seen_at,
         decided_at: row.decided_at,
+        hello: LastHello {
+            agent_protocol,
+            agent_version: row.agent_version,
+            refused_at: row.refused_at,
+            refuse_reason: row.refuse_reason,
+        },
     })
 }
 
@@ -1433,6 +1476,7 @@ mod tests {
             decided_by: None,
             first_seen_at: crate::times::from_ms(1_789_000_000_123),
             decided_at: None,
+            hello: LastHello::default(),
         }
     }
 

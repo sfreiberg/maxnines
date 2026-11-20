@@ -18,6 +18,7 @@ impl MigratorTrait for Migrator {
             Box::new(NamesAndUniqueness),
             Box::new(ExactFactsAndEndedAlerts),
             Box::new(DurationsInSeconds),
+            Box::new(AgentHellos),
         ]
     }
 }
@@ -2902,6 +2903,75 @@ async fn move_column(
     Ok(())
 }
 
+struct AgentHellos;
+
+impl MigrationName for AgentHellos {
+    fn name(&self) -> &str {
+        "m20261120_000001_agent_hellos"
+    }
+}
+
+/// What a host's agent said in its last hello: the version of the protocol it
+/// speaks and its own version, and when and why it was last turned away for its
+/// protocol, until one it says is taken. Each is NULL until it's said, and always for
+/// a host with no agent.
+///
+/// MySQL commits each change as it's made, so each can be made again.
+#[async_trait::async_trait]
+impl MigrationTrait for AgentHellos {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let backend = manager.get_database_backend();
+        let columns = [
+            ColumnDef::new(Hosts::AgentProtocol)
+                .big_integer()
+                .to_owned(),
+            ColumnDef::new(Hosts::AgentVersion)
+                .string_len(64)
+                .to_owned(),
+            moment(backend, Hosts::RefusedAt),
+            ColumnDef::new(Hosts::RefuseReason).text().to_owned(),
+        ];
+        let db = manager.get_connection();
+        for mut column in columns {
+            let name = column.get_column_name();
+            if backend == DatabaseBackend::MySql && mysql_has_column(db, "hosts", &name).await? {
+                continue;
+            }
+            let add = Table::alter()
+                .table(Hosts::Table)
+                .add_column(&mut column)
+                .to_owned();
+            manager.alter_table(add).await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let backend = manager.get_database_backend();
+        let db = manager.get_connection();
+        for name in [
+            "agent_protocol",
+            "agent_version",
+            "refused_at",
+            "refuse_reason",
+        ] {
+            if backend == DatabaseBackend::MySql && !mysql_has_column(db, "hosts", name).await? {
+                continue;
+            }
+            let drop = Table::alter()
+                .table(Hosts::Table)
+                .drop_column(Alias::new(name))
+                .to_owned();
+            manager.alter_table(drop).await?;
+        }
+        Ok(())
+    }
+}
+
 /// How SQLite's definition of a table writes a foreign key, before what it does on
 /// delete.
 fn sqlite_key(key: &KeyChange) -> String {
@@ -3122,6 +3192,10 @@ enum Hosts {
     DecidedBy,
     FirstSeenAt,
     DecidedAt,
+    AgentProtocol,
+    AgentVersion,
+    RefusedAt,
+    RefuseReason,
 }
 
 #[derive(Iden)]
@@ -4230,8 +4304,51 @@ mod tests {
                 .await
                 .unwrap();
         }
-        Migrator::down(&connection, Some(1)).await.unwrap();
+        Migrator::down(&connection, Some(2)).await.unwrap();
         let ms = "SELECT duration_ms FROM action_runs WHERE duration_ms IS NOT NULL";
         assert_eq!(number(&connection, ms).await, 1500);
+    }
+
+    #[tokio::test]
+    async fn what_an_agent_said_in_its_hello_is_kept_with_its_host() {
+        let connection = empty().await;
+        Migrator::up(&connection, Some(6)).await.unwrap();
+        let at = "'2026-11-20 00:00:00+00:00'";
+        run(
+            &connection,
+            &format!(
+                "INSERT INTO hosts (id, kind, hostname, state, first_seen_at)
+                 VALUES ('h1', 'agent', 'web', 'approved', {at})"
+            ),
+        )
+        .await;
+
+        Migrator::up(&connection, None).await.unwrap();
+        let empty = "SELECT COUNT(*) FROM hosts WHERE id = 'h1' AND agent_protocol IS NULL
+                     AND agent_version IS NULL AND refused_at IS NULL AND refuse_reason IS NULL";
+        assert_eq!(number(&connection, empty).await, 1);
+        run(
+            &connection,
+            &format!(
+                "UPDATE hosts SET agent_protocol = 0, agent_version = '0.1.0',
+                     refused_at = {at}, refuse_reason = 'Upgrade the agent.'
+                 WHERE id = 'h1'"
+            ),
+        )
+        .await;
+        let reason = "SELECT refuse_reason FROM hosts WHERE id = 'h1'";
+        assert_eq!(texts(&connection, reason).await, ["Upgrade the agent."]);
+
+        // Running it again where MySQL stopped partway changes nothing more.
+        if connection.get_database_backend() == DatabaseBackend::MySql {
+            AgentHellos
+                .up(&SchemaManager::new(&connection))
+                .await
+                .unwrap();
+        }
+        Migrator::down(&connection, Some(1)).await.unwrap();
+        assert_eq!(count(&connection, "hosts").await, 3);
+        Migrator::up(&connection, None).await.unwrap();
+        assert_eq!(number(&connection, empty).await, 1);
     }
 }
