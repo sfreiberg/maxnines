@@ -26,7 +26,8 @@ MaxNines keeps its data in two places:
   top of
   [`crates/server/src/store/clickhouse.rs`](../crates/server/src/store/clickhouse.rs)
   for ClickHouse, where `0002_data_type` renames `samples.kind` to `data_type`, as
-  DuckDB calls it.
+  DuckDB calls it, and a third, `0003_migration_times`, keeps when each migration
+  was applied as a `DateTime64(3, 'UTC')` like every other moment.
 
 The two only meet through a host's ID: the main database's `hosts.id` is the
 metrics store's `host_id`.

@@ -749,9 +749,10 @@ fn migrate(connection: &mut Connection, migrations: &[Migration]) -> Result<()> 
         transaction
             .execute_batch(migration.sql)
             .with_context(|| format!("applying migration {}", migration.name))?;
+        // When it was applied, in UTC, as every moment here is.
         transaction.execute(
-            "INSERT INTO schema_migrations VALUES (?, now()::TIMESTAMP)",
-            params![migration.name],
+            "INSERT INTO schema_migrations VALUES (?, ?)",
+            params![migration.name, timestamp(times::now())],
         )?;
         transaction.commit()?;
     }
@@ -1797,6 +1798,61 @@ mod tests {
             count("SELECT count(*) FROM samples") > 0,
             "the other host's"
         );
+    }
+
+    /// The host deleted last had the highest numbers, which the next new host is
+    /// given again. A reader still reading from before the delete mustn't stop that.
+    #[test]
+    fn a_deleted_hosts_numbers_can_be_used_again_while_a_reader_reads() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut store =
+            DuckDbStore::open(&folder.path().join("m.duckdb"), "1GB", Retention::default())
+                .unwrap();
+        let cpu = || json!({ "usage_percent": 1.0 });
+        write_metric(&mut store, "kept", 1000, "cpu", cpu());
+        write_metric(&mut store, "gone", 1000, "cpu", cpu());
+        let reading = store.connection.try_clone().unwrap();
+        reading.execute_batch("BEGIN TRANSACTION").unwrap();
+        let count = |connection: &Connection, sql: &str| -> i64 {
+            connection.query_row(sql, [], |row| row.get(0)).unwrap()
+        };
+        assert_eq!(count(&reading, "SELECT count(*) FROM series"), 2);
+
+        store.delete_host("gone").unwrap();
+        write_metric(&mut store, "new", 2000, "cpu", cpu());
+
+        let numbered = "SELECT number FROM hosts WHERE host_id = 'new'";
+        assert_eq!(
+            count(&store.connection, numbered),
+            2,
+            "the number is used again"
+        );
+        assert_eq!(
+            count(&reading, "SELECT count(*) FROM series WHERE id = 2"),
+            1,
+            "the reader still sees what was there when it started"
+        );
+        reading.execute_batch("COMMIT").unwrap();
+        write_metric(&mut store, "new", 3000, "cpu", cpu());
+        assert_eq!(
+            count(&store.connection, "SELECT count(*) FROM all_samples"),
+            3
+        );
+    }
+
+    #[test]
+    fn a_migration_records_when_it_was_applied_in_utc() {
+        let store = in_memory();
+        let applied: i64 = store
+            .connection
+            .query_row(
+                "SELECT max(epoch_ms(applied_at)) FROM schema_migrations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let ago = crate::times::now().timestamp_millis() - applied;
+        assert!((0..60_000).contains(&ago), "applied {ago}ms ago");
     }
 
     #[test]

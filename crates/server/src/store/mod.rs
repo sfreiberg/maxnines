@@ -9,7 +9,7 @@ mod flatten;
 pub mod rollups;
 mod shared;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -315,6 +315,11 @@ fn run_writer(
 ) {
     let mut queued = Vec::with_capacity(WRITE_QUEUE_SIZE);
     let mut recent = RecentSamples::default();
+    // Hosts deleted since the writer started. What the server records about one,
+    // like a check that was already running when it was deleted, arrives too late to
+    // be deleted with it, and would make it again, so it's dropped. Samples from an
+    // agent mean it was approved again, so they're stored as ever.
+    let mut deleted: HashSet<String> = HashSet::new();
     let mut stopping = false;
     let mut next_tidy = Instant::now();
     let every = store.batch_every();
@@ -341,10 +346,14 @@ fn run_writer(
         for command in queued.drain(..end) {
             match command {
                 WriterCommand::Save(sample) => {
+                    if deleted.contains(&sample.host_id) {
+                        continue;
+                    }
                     samples.push(sample);
                     acks.push(Vec::new());
                 }
                 WriterCommand::SaveAndAck { sample, acks: ack } => {
+                    deleted.remove(&sample.host_id);
                     let time = sample.sample.time;
                     let key = (sample.host_id.clone(), time);
                     if let Some(&index) = in_batch.get(&key) {
@@ -385,6 +394,7 @@ fn run_writer(
             let result = delete_from(store.as_mut(), &host_id);
             if result.is_ok() {
                 recent.forget_host(&host_id);
+                deleted.insert(host_id);
             }
             done.send(result).ok();
         }
@@ -1046,6 +1056,26 @@ mod tests {
 
         let error = finished.try_recv().unwrap().unwrap_err();
         assert!(error.contains("deliberate test failure"), "{error}");
+    }
+
+    /// A check or page already being read when its host was deleted mustn't make
+    /// the host again in the store.
+    #[test]
+    fn what_the_server_records_about_a_deleted_host_is_dropped() {
+        let (deletion, _) = delete("host-1");
+        let (saved, _) = run_with(vec![deletion, save("a", 2), WriterCommand::Stop]);
+
+        assert!(timestamps(&saved).is_empty());
+    }
+
+    #[test]
+    fn a_deleted_agent_approved_again_is_stored_again_and_so_is_what_is_recorded_about_it() {
+        let (stored, _) = run(|acks| {
+            let (deletion, _) = delete("host-1");
+            vec![deletion, from_host("a", 1, acks), save("a", 2)]
+        });
+
+        assert_eq!(stored, [1, 2]);
     }
 
     #[test]

@@ -143,6 +143,13 @@ const MIGRATIONS: &[(&str, &[&str])] = &[
         "0002_data_type",
         &["ALTER TABLE samples RENAME COLUMN IF EXISTS kind TO data_type"],
     ),
+    // When each migration was applied is a moment like any other, which the table
+    // made before this kept to the second in the server's time zone.
+    (
+        "0003_migration_times",
+        &["ALTER TABLE schema_migrations
+         MODIFY COLUMN applied_at DateTime64(3, 'UTC') DEFAULT now64(3)"],
+    ),
 ];
 
 /// One runtime for every store, as the client is async and stores aren't. It's never
@@ -534,7 +541,7 @@ async fn migrate(client: &Client, migrations: &[(&str, &[&str])]) -> Result<()> 
         .query(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
                  name String,
-                 applied_at DateTime DEFAULT now()
+                 applied_at DateTime64(3, 'UTC') DEFAULT now64(3)
              ) ENGINE = MergeTree ORDER BY name",
         )
         .execute()

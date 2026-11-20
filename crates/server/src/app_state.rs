@@ -145,7 +145,10 @@ impl AppState {
     }
 
     /// Deletes a revoked agent and everything kept about it. Metrics go first: if
-    /// anything fails, the agent is still listed, revoked, to try again.
+    /// anything fails, the agent is still listed, revoked, to try again. A host
+    /// without an agent needn't be revoked, so its checks and pages can still be
+    /// running: the metrics writer drops what the server records about a host once
+    /// it has deleted it, so one that finishes afterwards can't put it back.
     pub async fn delete_host(&self, id: &str) -> Result<HostDeletion> {
         match self.registry.get(id).await {
             None => return Ok(HostDeletion::NoSuchHost),
