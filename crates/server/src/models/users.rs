@@ -420,7 +420,6 @@ impl Database {
         Ok(true)
     }
 
-    /// Someone who could sign in with this address, with their password's hash.
     /// Someone who can still sign in, by their email address.
     pub async fn active_user_by_email(&self, email: &str) -> Result<Option<User>> {
         let row = user::Entity::find()
@@ -432,6 +431,7 @@ impl Database {
         Ok(row.map(User::from))
     }
 
+    /// Someone who could sign in with this address, with their password's hash.
     pub async fn sign_in_details(&self, email: &str) -> Result<Option<(User, Option<String>)>> {
         let row = user::Entity::find()
             .filter(user::Column::Email.eq(normalise_email(email)))

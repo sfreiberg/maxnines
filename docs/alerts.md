@@ -152,7 +152,8 @@ An action can use values from the alert: `{disk}`, `{interface}`, `{process}`,
 and `{hostname}`, `{rule}`, `{severity}`, `{metric}`, `{value}` and `{threshold}`. A
 rule can't be saved with an action that needs something its alerts don't have, such as
 `disk_space` on a CPU rule, or with one no host has. A host that lacks an action
-other hosts have records that it couldn't run it.
+other hosts have records that it couldn't run it, and so does an alert about a whole
+host whose rule's action needs `{series}` or one of its kinds, as it has none to give.
 
 What an action printed is sent to the channels that heard the alert start, as
 [notification channels](notifications.md#what-actions-print) describes: a reply

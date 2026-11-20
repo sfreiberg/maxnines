@@ -1,7 +1,7 @@
 //! What each person may do. Roles build on each other: a viewer sees everything,
 //! a responder can also acknowledge and silence alerts and add and delete annotations, an
 //! editor can also change the setup, and an admin can also manage people, read the
-//! audit log and delete agents.
+//! audit log and delete hosts.
 //!
 //! [`required`] is the one place that says what a request needs, and every request
 //! from a person or an API key passes through it before its handler runs. Anything

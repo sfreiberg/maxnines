@@ -1,8 +1,9 @@
-//! Routes and request handling. Pages live in `overview`, `agents`, `alerts`,
-//! `alert_rules`, `metrics`, `notification_channels`, `remote_checks`, `rules`,
-//! `settings`, `audit_log` and `docs`, the token protected API in `api`, agent connections in
-//! `agent_socket`, signing in in `sessions`, people in `users`, and how an open page
-//! learns of a new build in `update_notice`.
+//! Routes and request handling, a module for each part of the site: its pages, such
+//! as `overview`, `hosts`, `alerts`, `dashboards`, `metrics` and `settings`, and what
+//! they share, such as `host_list` and `condition_form`. The token protected API is
+//! `api`, agent connections `agent_socket`, signing in `sessions`, apps signing in
+//! through the browser `app_sign_ins`, people `users`, and how an open page learns of
+//! a new build `update_notice`.
 
 mod actions;
 pub mod agent_socket;

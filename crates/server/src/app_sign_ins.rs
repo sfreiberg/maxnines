@@ -129,8 +129,8 @@ pub fn app_name(id: &str) -> String {
     client(id).map_or_else(|| id.to_string(), |client| client.name)
 }
 
-/// What an app's name for the device it's on can be, trimmed. Empty is fine.
-/// What an app calls the computer it's on, which it needn't say: none if it's left out.
+/// What an app calls the computer it's on, trimmed, which it needn't say: none if
+/// it's left out or empty.
 pub fn check_device(device: &str) -> Result<Option<String>> {
     let device = device.trim();
     ensure!(

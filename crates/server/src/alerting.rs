@@ -236,11 +236,11 @@ fn default_enabled() -> bool {
     true
 }
 
-/// Checks a rule before it's saved. Whether its channels exist is up to the
-/// caller, which can see them.
-/// Any more often and people stop reading them.
+/// The shortest time between reminders. Any more often and people stop reading them.
 const MIN_REMINDER: TimeDelta = TimeDelta::minutes(5);
 
+/// Checks a rule before it's saved. Whether its channels exist is up to the
+/// caller, which can see them.
 pub fn check_rule(rule: &AlertRuleInput) -> Result<()> {
     ensure!(!rule.name.trim().is_empty(), "a rule needs a name");
     ensure!(rule.name.len() <= MAX_NAME_LEN, "the rule name is too long");
