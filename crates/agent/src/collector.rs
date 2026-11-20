@@ -48,7 +48,7 @@ pub fn supported() -> Vec<&'static str> {
 pub fn host_name() -> String {
     System::host_name().map_or_else(
         |_| "unknown".to_string(),
-        |name| crate::facts::short_name(&name).to_string(),
+        |name| crate::facts::short_name(&name),
     )
 }
 

@@ -29,9 +29,14 @@ const AI_CANONNAME: i32 = 2;
 /// How long the resolver gets before the host is left with its short name.
 const FQDN_LOOKUP_LIMIT: Duration = Duration::from_secs(2);
 
-/// The part of a hostname before the first dot, which is what hosts are called.
-pub fn short_name(hostname: &str) -> &str {
-    hostname.split('.').next().unwrap_or(hostname)
+/// The part of a hostname before the first dot, which is what hosts are called. It's
+/// in lower case, as names are in DNS, so it's spelled the same as the `fqdn`.
+pub fn short_name(hostname: &str) -> String {
+    hostname
+        .split('.')
+        .next()
+        .unwrap_or(hostname)
+        .to_lowercase()
 }
 
 /// What the resolver calls this host, as `hostname -f` finds out. It can hang on a
@@ -59,6 +64,7 @@ fn canonical_name(hostname: &str) -> Option<String> {
 /// that already has dots in it is its own fully qualified name.
 fn name_facts(hostname: Option<&str>, canonical: Option<&str>) -> Value {
     let short = hostname.map(short_name);
+    let short = short.as_deref();
     let qualified = |name: &str| name.contains('.');
     let fqdn = canonical
         .filter(|name| qualified(name))
@@ -67,7 +73,7 @@ fn name_facts(hostname: Option<&str>, canonical: Option<&str>) -> Value {
         .map(|name| name.trim_end_matches('.').to_lowercase());
     let domain = match (&fqdn, short) {
         (Some(fqdn), Some(short)) => fqdn
-            .strip_prefix(&short.to_lowercase())
+            .strip_prefix(short)
             .and_then(|rest| rest.strip_prefix('.'))
             .map(str::to_string),
         _ => None,
@@ -288,11 +294,12 @@ mod tests {
             json!({ "hostname": "web-1", "fqdn": "web-1.example.com", "domain": "example.com" })
         );
 
-        // A hostname that was set fully qualified is its own answer.
+        // A hostname that was set fully qualified is its own answer, and every
+        // name is spelled one way.
         let names = name_facts(Some("Web-1.Example.com"), None);
         assert_eq!(
             names,
-            json!({ "hostname": "Web-1", "fqdn": "web-1.example.com", "domain": "example.com" })
+            json!({ "hostname": "web-1", "fqdn": "web-1.example.com", "domain": "example.com" })
         );
 
         // Nothing from the resolver, and nothing to add.
