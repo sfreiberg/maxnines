@@ -285,7 +285,7 @@ fn run(cli: Cli) -> Result<u8> {
     let folder = config::folder()?;
     let format = cli.output;
     match cli.command {
-        Command::Login(args) => login(&folder, args),
+        Command::Login(args) => login(&folder, args, cli.context.as_deref()),
         Command::Logout { name } => logout(&folder, name.as_deref().or(cli.context.as_deref())),
         Command::Config(command) => configure(&folder, command),
         Command::Completion { shell } => {
@@ -354,7 +354,12 @@ fn connect(folder: &Path, name: Option<&str>) -> Result<Api> {
     Ok(Api::new(server, name, auth))
 }
 
-fn login(folder: &Path, args: LoginArgs) -> Result<u8> {
+/// What to tell someone when the server couldn't be told a sign-in has ended.
+const REVOKE_BY_HAND: &str = "Revoke it in MaxNines under Settings, then Signed-in apps.";
+
+/// Signs in, to the server `args` names, or else the context `--context` names or
+/// the current one, again.
+fn login(folder: &Path, args: LoginArgs, context: Option<&str>) -> Result<u8> {
     let mut config = Config::load(folder)?;
     let (name, address) = match args.target.as_slice() {
         [name, address] => (Some(name.clone()), address.clone()),
@@ -364,7 +369,7 @@ fn login(folder: &Path, args: LoginArgs) -> Result<u8> {
         }
         [address] => (None, address.clone()),
         [] => {
-            let (name, context) = config.pick(None)?;
+            let (name, context) = config.pick(context)?;
             (Some(name), context.server)
         }
         _ => unreachable!("clap allows at most two"),
@@ -399,10 +404,28 @@ fn login(folder: &Path, args: LoginArgs) -> Result<u8> {
         user: issued.user.clone(),
         role: issued.role.clone(),
     };
-    {
-        // Others may be refreshing other contexts' tokens in the same store.
+    let replaced = {
+        // Others may be refreshing other contexts' tokens in the same store, and held
+        // throughout, so the sign-in replaced is its newest.
         let _lock = tokens::lock(folder)?;
-        tokens::system(folder).save(&name, &held)?;
+        let store = tokens::system(folder);
+        let replaced = store.load(&name)?;
+        store.save(&name, &held)?;
+        replaced
+    };
+    // Revoked once the new one is kept, so failing to never loses it. The earlier one
+    // is on the server the context was for, which the new one may not be.
+    if let Some(replaced) = replaced {
+        let earlier = match config.contexts.get(&name) {
+            Some(context) => Server::parse(&context.server)?,
+            None => server.clone(),
+        };
+        if let Err(failure) = signin::revoke(&http, &earlier, &replaced.refresh_token) {
+            eprintln!(
+                "The earlier sign-in to {name} couldn't be revoked on the server ({failure})."
+            );
+            eprintln!("{REVOKE_BY_HAND}");
+        }
     }
     config.contexts.insert(
         name.clone(),
@@ -423,26 +446,34 @@ fn login(folder: &Path, args: LoginArgs) -> Result<u8> {
 fn logout(folder: &Path, name: Option<&str>) -> Result<u8> {
     let config = Config::load(folder)?;
     let (name, context) = config.pick(name)?;
+    if !sign_out(folder, &name, &context)? {
+        println!("Not signed in to {name}.");
+    }
+    Ok(0)
+}
+
+/// Signs a context out here and on the server, saying how it went. False if it
+/// wasn't signed in.
+fn sign_out(folder: &Path, name: &str, context: &Context) -> Result<bool> {
     let store = tokens::system(folder);
     // Held throughout, so a refresh can't swap the token between reading it and
     // revoking it, as the server only revokes the newest.
     let lock = tokens::lock(folder)?;
-    let Some(held) = store.load(&name)? else {
-        println!("Not signed in to {name}.");
-        return Ok(0);
+    let Some(held) = store.load(name)? else {
+        return Ok(false);
     };
     let server = Server::parse(&context.server)?;
     let revoked = signin::revoke(&http::Http::new(), &server, &held.refresh_token);
-    store.forget(&name)?;
+    store.forget(name)?;
     drop(lock);
     match revoked {
         Ok(()) => println!("Signed out of {name}."),
         Err(failure) => {
             println!("Signed out of {name} here, but the server couldn't be told ({failure}).");
-            println!("Revoke it in MaxNines under Settings, then Signed-in apps.");
+            println!("{REVOKE_BY_HAND}");
         }
     }
-    Ok(0)
+    Ok(true)
 }
 
 fn configure(folder: &Path, command: ConfigCommand) -> Result<u8> {
@@ -492,6 +523,11 @@ fn configure(folder: &Path, command: ConfigCommand) -> Result<u8> {
             key_env,
         } => {
             let server = Server::parse(&server)?;
+            // A context replaced by one with a key no longer uses its sign-in, so
+            // nothing would ever sign it out.
+            if let Some(replaced) = config.contexts.get(&name) {
+                sign_out(folder, &name, replaced)?;
+            }
             config.contexts.insert(
                 name.clone(),
                 Context {

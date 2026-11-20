@@ -544,3 +544,90 @@ fn the_api_command_sends_what_it_was_given_and_reads_any_answer() {
     assert!(read.status.success(), "{}", stderr(&read));
     assert_eq!(stdout(&read).len(), (11 << 20) + 2);
 }
+
+#[test]
+fn signing_in_again_or_replacing_a_context_revokes_the_sign_in_it_replaces() {
+    let folder = tempfile::tempdir().unwrap();
+    let issues = Arc::new(Mutex::new(0));
+    let counted = Arc::clone(&issues);
+    let server = FakeServer::start(move |seen| {
+        match (seen.method.as_str(), seen.target.as_str()) {
+        ("POST", "/oauth/device") => (
+            200,
+            json!({
+                "device_code": "mxd_1", "user_code": "BCDF-GHJK",
+                "verification_uri": "http://x/device", "verification_uri_complete": "http://x/device?code=BCDF-GHJK",
+                "expires_in": 600, "interval": 1
+            })
+            .to_string(),
+        ),
+        ("POST", "/oauth/token") => {
+            let mut issues = counted.lock().unwrap();
+            *issues += 1;
+            (200, issued(&format!("mxa_{issues}"), &format!("mxr_{issues}")))
+        }
+        ("POST", "/oauth/revoke") => (200, String::new()),
+        _ => (404, String::new()),
+    }
+    });
+    let revoked = || -> Vec<String> {
+        server
+            .requests_to("/oauth/revoke")
+            .iter()
+            .map(|seen| seen.body.clone())
+            .collect()
+    };
+
+    for name in ["lan", "prod"] {
+        let signed_in = maxnines(
+            folder.path(),
+            &[],
+            &["login", name, &server.url, "--device"],
+        );
+        assert!(signed_in.status.success(), "{}", stderr(&signed_in));
+    }
+    assert!(revoked().is_empty());
+    let config = std::fs::read_to_string(folder.path().join("config.hcl")).unwrap();
+    assert!(config.contains("current = \"prod\""), "{config}");
+    assert!(config.contains("tokens.json beside this file"), "{config}");
+
+    // --context says which to sign in to again, and the sign-in it replaces ends.
+    let again = maxnines(
+        folder.path(),
+        &[],
+        &["--context", "lan", "login", "--device"],
+    );
+    assert!(again.status.success(), "{}", stderr(&again));
+    assert!(
+        stdout(&again).contains("Context \"lan\""),
+        "{}",
+        stdout(&again)
+    );
+    let revoked_now = revoked();
+    assert_eq!(revoked_now.len(), 1);
+    assert!(revoked_now[0].contains("token=mxr_1"), "{}", revoked_now[0]);
+
+    // A context replaced by one with a key is signed out first.
+    let added = maxnines(
+        folder.path(),
+        &[],
+        &[
+            "config",
+            "add",
+            "prod",
+            "--server",
+            &server.url,
+            "--key-env",
+            "CI_KEY",
+        ],
+    );
+    assert!(added.status.success(), "{}", stderr(&added));
+    let revoked_now = revoked();
+    assert_eq!(revoked_now.len(), 2);
+    assert!(revoked_now[1].contains("token=mxr_2"), "{}", revoked_now[1]);
+    let saved: Value =
+        serde_json::from_str(&std::fs::read_to_string(folder.path().join("tokens.json")).unwrap())
+            .unwrap();
+    assert!(saved.get("prod").is_none(), "{saved}");
+    assert_eq!(saved["lan"]["refresh_token"], "mxr_3");
+}
