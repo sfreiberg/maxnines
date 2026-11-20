@@ -10358,6 +10358,65 @@ mod deleted_channels {
         assert_eq!(hook.events(), ["firing"], "it isn't tried again");
     }
 
+    #[tokio::test]
+    async fn an_alert_that_cannot_be_read_does_not_hold_up_the_others() {
+        use sea_orm::ConnectionTrait;
+        let test = Harness::start().await;
+        let hook = Hook::default();
+        let url = format!("{}/secret-token", hook.start().await);
+        let channel = test
+            .database()
+            .create_channel(&webhook_channel(&url))
+            .await
+            .unwrap();
+        let rule = test
+            .database()
+            .create_alert_rule(&cpu_rule())
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for series in ["/broken", "/fine"] {
+            let new = crate::alerting::NewAlert {
+                rule_id: rule,
+                severity: Severity::Critical,
+                host_id: test.host.id(),
+                series: Some(series.to_string()),
+                value: None,
+                summary: format!("{series} is full"),
+                started_at: test.now,
+                breached_at: test.now,
+            };
+            let id = test.database().fire_alert(&new, &[channel]).await.unwrap();
+            ids.push(id.unwrap());
+        }
+        test.database()
+            .connection()
+            .execute_unprepared(&format!(
+                "UPDATE alerts SET severity = 'dire' WHERE id = {}",
+                ids[0]
+            ))
+            .await
+            .unwrap();
+
+        let notifier = Notifier::new(test.database().clone(), Senders::default());
+        notifier.deliver_due(test.now).await.unwrap();
+
+        assert_eq!(hook.events(), ["firing"]);
+        let given_up = texts(
+            &test,
+            &format!(
+                "SELECT last_error FROM notifications WHERE alert_id = {} AND state = 'failed'",
+                ids[0]
+            ),
+        )
+        .await;
+        assert_eq!(given_up.len(), 1, "{given_up:?}");
+        assert!(
+            given_up[0].starts_with("its alert can't be read"),
+            "{given_up:?}"
+        );
+    }
+
     /// Deleting a rule ends every alert it has open in one step, telling each channel
     /// that heard one start, unless that was given up on or the channel is gone.
     #[tokio::test]

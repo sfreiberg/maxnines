@@ -219,6 +219,15 @@ pub(super) async fn to_alerts<C: ConnectionTrait>(
     connection: &C,
     rows: Vec<alert::Model>,
 ) -> Result<Vec<Alert>> {
+    each_alert(connection, rows).await?.into_iter().collect()
+}
+
+/// Each alert as [`to_alerts`] reads them, or why it can't be read, for when one that
+/// can't shouldn't stop the rest.
+async fn each_alert<C: ConnectionTrait>(
+    connection: &C,
+    rows: Vec<alert::Model>,
+) -> Result<Vec<Result<Alert>>> {
     if rows.is_empty() {
         return Ok(Vec::new());
     }
@@ -247,9 +256,10 @@ pub(super) async fn to_alerts<C: ConnectionTrait>(
         .context("loading the names of alerts' hosts")?
         .into_iter()
         .collect();
-    rows.into_iter()
+    Ok(rows
+        .into_iter()
         .map(|row| to_alert(row, &rule_names, &hostnames))
-        .collect()
+        .collect())
 }
 
 /// One alert, as [`to_alerts`] reads them.
@@ -1303,10 +1313,11 @@ impl Database {
             .all(&self.connection)
             .await
             .context("loading alerts")?;
-        let alerts: BTreeMap<i64, Alert> = to_alerts(&self.connection, rows)
-            .await?
+        // Nor is an alert that can't be read.
+        let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+        let alerts: BTreeMap<i64, Result<Alert>> = ids
             .into_iter()
-            .map(|alert| (alert.id, alert))
+            .zip(each_alert(&self.connection, rows).await?)
             .collect();
         // A channel that can't be read is only a problem for what's going to it.
         let channel_ids: BTreeSet<i64> = due.iter().map(|row| row.channel_id).collect();
@@ -1360,16 +1371,18 @@ impl Database {
                 event: Event::parse(&row.event)?,
                 attempts: row.attempts,
                 created_at: row.created_at,
-                alert: alerts
-                    .get(&row.alert_id)
-                    .context("its alert is gone")?
-                    .clone(),
+                alert: match alerts.get(&row.alert_id) {
+                    Some(Ok(alert)) => alert.clone(),
+                    Some(Err(error)) => bail!("its alert can't be read: {error:#}"),
+                    None => bail!("its alert is gone"),
+                },
                 channel,
                 action,
             })
         };
         // One that can't be sent is given up on, so it can't hold up the rest.
         let mut deliveries = Vec::with_capacity(due.len());
+        let mut given_up: BTreeMap<String, Vec<i64>> = BTreeMap::new();
         for row in &due {
             match delivery(row) {
                 Ok(delivery) => deliveries.push(delivery),
@@ -1380,19 +1393,22 @@ impl Database {
                         error = why,
                         "a notification can't be sent"
                     );
-                    self.give_up_on(row.id, &why).await?;
+                    given_up.entry(why).or_default().push(row.id);
                 }
             }
+        }
+        for (why, ids) in given_up {
+            self.give_up_on(ids, &why).await?;
         }
         Ok(deliveries)
     }
 
-    /// Stops trying to send a notification that can't be.
-    async fn give_up_on(&self, id: i64, why: &str) -> Result<()> {
+    /// Stops trying to send notifications that can't be, all for the same reason.
+    async fn give_up_on(&self, ids: Vec<i64>, why: &str) -> Result<()> {
         notification::Entity::update_many()
             .col_expr(notification::Column::State, Expr::value(FAILED))
             .col_expr(notification::Column::LastError, Expr::value(why))
-            .filter(notification::Column::Id.eq(id))
+            .filter(notification::Column::Id.is_in(ids))
             .exec(&self.connection)
             .await
             .context("saving notification")?;
