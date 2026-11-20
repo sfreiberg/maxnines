@@ -177,13 +177,20 @@ pub fn format_uptime(uptime: TimeDelta) -> String {
 }
 
 /// Everything shown about an agent except its config, which takes more working out.
-fn row(state: &AppState, host: HostRecord, facts: Option<&FlatFacts>, health: Health) -> HostRow {
+/// Whether it's online is as `Presence::reach` says, as lists and counts have it.
+fn row(
+    state: &AppState,
+    host: HostRecord,
+    facts: Option<&FlatFacts>,
+    reach: Reach,
+    health: Health,
+) -> HostRow {
     let presence = state.presence.get(&host.id);
     let version = facts.and_then(|facts| text_fact(facts, "agent.version"));
     HostRow {
         version_state: version.as_deref().and_then(agent_versions::compare),
         version,
-        online: presence.as_ref().is_some_and(|p| p.online),
+        online: reach == Reach::Online,
         health,
         os: facts.and_then(os_of),
         os_family: facts.and_then(OsFamily::of),
@@ -227,17 +234,28 @@ struct WaitingHost {
 /// An agent in the list, with only what it takes to sort and count them all.
 struct Listed {
     host: HostRecord,
-    online: bool,
-    /// Neither online nor offline, as nothing is read for it.
-    not_read: bool,
+    reach: Reach,
     health: Health,
+}
+
+impl Listed {
+    fn online(&self) -> bool {
+        self.reach == Reach::Online
+    }
+
+    /// Neither online nor offline, as nothing is read for it.
+    fn not_read(&self) -> bool {
+        self.reach == Reach::NotRead
+    }
 }
 
 /// Whether an agent belongs under a filter on the list.
 fn matches(filter: &str, listed: &Listed) -> bool {
     match filter {
-        "online" => listed.online,
-        "offline" => !listed.online && !listed.not_read && listed.host.state == HostState::Approved,
+        "online" => listed.online(),
+        "offline" => {
+            !listed.online() && !listed.not_read() && listed.host.state == HostState::Approved
+        }
         "revoked" => listed.host.state == HostState::Revoked,
         _ => true,
     }
@@ -259,7 +277,7 @@ async fn page_rows(state: &AppState, listed: Vec<Listed>, as_table: bool) -> Res
     for item in listed {
         let id = item.host.id.clone();
         let mine = facts.get(&id);
-        let mut row = row(state, item.host, mine, item.health);
+        let mut row = row(state, item.host, mine, item.reach, item.health);
         if let Some((rules, reported)) = &configs {
             let shape = unflatten(&mine.cloned().unwrap_or_default());
             let desired = rules.resolve(&Host::new(&shape, &id)).ok();
@@ -310,8 +328,7 @@ async fn index(
             let reach = state.presence.reach(&host);
             let mine = alerts.get(host.id.as_str()).map_or(&[][..], Vec::as_slice);
             listed.push(Listed {
-                online: reach == Reach::Online,
-                not_read: reach == Reach::NotRead,
+                reach,
                 health: Health::of(reach, mine),
                 host,
             });
@@ -350,10 +367,10 @@ async fn index(
     })
     .collect();
 
-    let online = listed.iter().filter(|item| item.online).count();
+    let online = listed.iter().filter(|item| item.online()).count();
     let total = listed
         .iter()
-        .filter(|item| item.host.state == HostState::Approved && !item.not_read)
+        .filter(|item| item.host.state == HostState::Approved && !item.not_read())
         .count();
     listed.retain(|item| matches(selected, item));
 
@@ -577,8 +594,9 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         Ok(checks) => checks,
         Err(error) => return server_error(&error),
     };
-    let health = Health::of(state.presence.reach(&host), &here);
-    let mut row = row(&state, host.clone(), Some(&flat), health);
+    let reach = state.presence.reach(&host);
+    let health = Health::of(reach, &here);
+    let mut row = row(&state, host.clone(), Some(&flat), reach, health);
     row.config = Some(config_state(
         Some(desired.version.as_str()),
         reported.as_ref(),

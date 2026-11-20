@@ -5215,3 +5215,35 @@ async fn names_on_the_map_stay_text() {
     let page = browser.get(&server, &format!("/hosts/{}", host.id())).await;
     assert!(!page.body.contains("<b>Leeds"), "{}", page.body);
 }
+
+#[tokio::test]
+async fn a_revoked_agent_still_connected_is_never_shown_online() {
+    let server = start().await;
+    let now = crate::times::now();
+    server
+        .state
+        .registry
+        .insert_for_test(crate::registration::HostRecord {
+            id: "revoked".to_string(),
+            kind: crate::registration::HostKind::Agent,
+            public_key: Some("ab".repeat(32)),
+            hostname: "web-1".to_string(),
+            state: HostState::Revoked,
+            decided_by: Some("admin".to_string()),
+            first_seen_at: now,
+            decided_at: Some(now),
+        })
+        .await;
+    // Its connection closes a moment after it's revoked.
+    server
+        .state
+        .presence
+        .connected("revoked", "127.0.0.1".parse().unwrap());
+
+    let facts = server
+        .request("GET", "/api/v1/hosts/revoked/facts", "")
+        .await;
+    assert_eq!(body_of(&facts)["trusted"]["online"], false, "{facts}");
+    let page = Browser::default().get(&server, "/hosts/revoked").await;
+    assert!(page.body.contains("<dt>Online</dt><dd>No"), "{}", page.body);
+}

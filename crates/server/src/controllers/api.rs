@@ -836,12 +836,13 @@ async fn facts(State(state): State<AppState>, UrlPath(id): UrlPath<String>) -> R
     };
 
     let presence = state.presence.get(&id);
+    let online = state.presence.reach(&host) == Reach::Online;
     Json(FactsView {
         trusted: TrustedFacts {
             host_id: host.id,
             state: host.state,
             decided_by: host.decided_by,
-            online: presence.is_some_and(|p| p.online),
+            online,
             source_address: presence.map(|p| p.source),
         },
         reported: unflatten(&current.into_iter().map(|f| (f.name, f.value)).collect()),
