@@ -14,11 +14,6 @@ pub struct Drops {
     pub transmitted: Option<u64>,
 }
 
-/// The change since the last totals, which an interface that was reset makes 0.
-pub fn change(before: Option<u64>, after: Option<u64>) -> Option<u64> {
-    Some(after?.saturating_sub(before?))
-}
-
 /// A count of received packets dropped, if it could be true: each one dropped
 /// was first received, so there can't be more of them than that.
 #[cfg(any(target_os = "macos", target_os = "freebsd", test))]
@@ -217,14 +212,6 @@ pub fn totals() -> HashMap<String, Drops> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn drops_are_the_change_and_a_reset_is_none_rather_than_huge() {
-        assert_eq!(change(Some(10), Some(15)), Some(5));
-        assert_eq!(change(Some(10), Some(3)), Some(0));
-        assert_eq!(change(None, Some(3)), None);
-        assert_eq!(change(Some(3), None), None);
-    }
 
     #[test]
     fn a_count_of_drops_that_cannot_be_true_is_left_out() {

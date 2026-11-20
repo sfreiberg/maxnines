@@ -4019,6 +4019,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "libc",
+ "maxnines-protocol",
  "objc2-core-foundation",
  "objc2-io-kit",
  "rustix 1.1.6",

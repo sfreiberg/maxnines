@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
+use maxnines_protocol::totals::change;
 use maxnines_protocol::{Check, CheckKind};
 use serde_json::{Map, Value, json};
 use tokio::time::timeout;
@@ -323,7 +324,7 @@ impl Settle {
                         let key = (name.clone(), key);
                         let last = self.0.get(&key).copied().or(from_zero.then_some(0.0));
                         if let Some(last) = last {
-                            changes.insert(key.1.clone(), json!((total - last).max(0.0)));
+                            changes.insert(key.1.clone(), json!(change(last, total)));
                         }
                         seen.insert(key, total);
                     }

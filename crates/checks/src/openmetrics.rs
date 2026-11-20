@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use maxnines_protocol::metrics_page_name;
+use maxnines_protocol::totals::change;
 use serde_json::{Value, json};
 use wildmatch::WildMatch;
 
@@ -277,7 +278,7 @@ impl Totals {
                     None => (name.clone(), None),
                 };
                 seen.insert(key, total);
-                Some(json!({ "name": name, "change": (total - last?).max(0.0) }))
+                Some(json!({ "name": name, "change": change(last?, total) }))
             })
             .collect();
         self.0 = seen;

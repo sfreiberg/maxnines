@@ -29,21 +29,6 @@ pub struct Counters {
     pub swap_out_pages: Option<u64>,
 }
 
-/// Turns a running total into the change since last time, which is what the
-/// server expects for a rate.
-#[derive(Debug, Default)]
-pub struct Change(Option<u64>);
-
-impl Change {
-    /// The first reading has nothing to compare with. A total that went
-    /// backwards means a counter wrapped, which counts as no change.
-    pub fn update(&mut self, total: Option<u64>) -> Option<u64> {
-        let change = self.0.zip(total).map(|(old, new)| new.saturating_sub(old));
-        self.0 = total;
-        change
-    }
-}
-
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Limits {
     max_open_files: Option<u64>,
@@ -701,30 +686,6 @@ pgpgin 900
         assert_eq!(parse_file_nr("5\t9\t100"), Some(0));
         assert_eq!(parse_file_nr("nonsense"), None);
         assert_eq!(parse_file_nr(""), None);
-    }
-
-    #[test]
-    fn change_is_measured_from_the_previous_reading() {
-        let mut change = Change::default();
-        assert_eq!(change.update(Some(100)), None);
-        assert_eq!(change.update(Some(130)), Some(30));
-        assert_eq!(change.update(Some(130)), Some(0));
-    }
-
-    #[test]
-    fn a_counter_going_backwards_is_no_change() {
-        let mut change = Change::default();
-        change.update(Some(100));
-        assert_eq!(change.update(Some(5)), Some(0));
-        assert_eq!(change.update(Some(8)), Some(3));
-    }
-
-    #[test]
-    fn a_missing_reading_starts_over() {
-        let mut change = Change::default();
-        change.update(Some(100));
-        assert_eq!(change.update(None), None);
-        assert_eq!(change.update(Some(200)), None);
     }
 
     #[test]

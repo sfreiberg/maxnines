@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use maxnines_checks::fetch_page;
-use maxnines_collectors::system::Change;
 use maxnines_protocol::default_status_page;
+use maxnines_protocol::totals::Change;
 use serde_json::{Map, Value, json};
 
 use crate::background::Background;

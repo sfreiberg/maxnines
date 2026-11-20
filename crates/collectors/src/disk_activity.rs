@@ -13,6 +13,7 @@ use std::time::Duration;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::Instant;
 
+use maxnines_protocol::totals::change;
 use serde_json::{Map, Value, json};
 use sysinfo::Disk;
 
@@ -72,15 +73,15 @@ pub fn activity(before: &Totals, after: &Totals, elapsed: Duration) -> Option<Ac
     let reads = (after.reads - before.reads) as f64;
     let writes = (after.writes - before.writes) as f64;
     let per_op = |ms: f64, ops: f64| if ops > 0.0 { (ms / ops).max(0.0) } else { 0.0 };
-    let change = |before: Option<f64>, after: Option<f64>| Some((after? - before?).max(0.0));
+    let grown = |before: Option<f64>, after: Option<f64>| Some(change(before?, after?));
     Some(Activity {
         read_ops_per_sec: reads * 1000.0 / elapsed_ms,
         write_ops_per_sec: writes * 1000.0 / elapsed_ms,
         read_latency_ms: per_op(after.read_ms - before.read_ms, reads),
         write_latency_ms: per_op(after.write_ms - before.write_ms, writes),
-        busy_percent: change(before.busy_ms, after.busy_ms)
+        busy_percent: grown(before.busy_ms, after.busy_ms)
             .map(|busy| (busy / elapsed_ms * 100.0).min(100.0)),
-        queue_length: change(before.queued_ms, after.queued_ms).map(|queued| queued / elapsed_ms),
+        queue_length: grown(before.queued_ms, after.queued_ms).map(|queued| queued / elapsed_ms),
     })
 }
 

@@ -7,6 +7,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use chrono::DateTime;
+use maxnines_protocol::totals::{Change, change};
 use serde_json::{Value, json};
 use sysinfo::{Disk, Disks, InterfaceOperationalState, Networks, System};
 use systemstat::Platform;
@@ -15,7 +16,7 @@ use crate::Collector;
 use crate::disk_activity::DiskActivity;
 use crate::file_systems;
 use crate::interface_drops::{self, Drops};
-use crate::system::{self, Change, CpuTime};
+use crate::system::{self, CpuTime};
 
 pub struct HostCollector;
 
@@ -309,8 +310,10 @@ impl Collector for NetworkCollector {
                 if let (Some(before), Some(after), Some(fields)) =
                     (before, after, stats.as_object_mut())
                 {
-                    let received = interface_drops::change(before.received, after.received);
-                    let sent = interface_drops::change(before.transmitted, after.transmitted);
+                    let received = before.received.zip(after.received);
+                    let received = received.map(|(last, total)| change(last, total));
+                    let sent = before.transmitted.zip(after.transmitted);
+                    let sent = sent.map(|(last, total)| change(last, total));
                     for (field, value) in [("receive_drops", received), ("transmit_drops", sent)] {
                         if let Some(value) = value {
                             fields.insert(field.into(), json!(value));

@@ -9,6 +9,7 @@ pub mod logging;
 pub mod service;
 pub mod stopping;
 pub mod time;
+pub mod totals;
 
 use std::collections::BTreeMap;
 use std::time::Duration;
