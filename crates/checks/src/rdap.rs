@@ -4,13 +4,16 @@
 //!
 //! The answer changes about once a year, and registries don't like being asked
 //! often, so each domain is asked about at most twice a day however often its
-//! check runs, and the list once a day. Asking about the site's own host name,
-//! then each name above it, finds the registered domain: a registry knows
-//! `example.co.uk`, not `www.example.co.uk` or `co.uk`.
+//! checks run, and the list once a day. A failure is asked about again after an
+//! hour, as a registry can be down for a while. Asking about the site's own host
+//! name, then each name above it, finds the registered domain: a registry knows
+//! `example.co.uk`, not `www.example.co.uk` or `co.uk`. Once found, the domain's
+//! answer serves every host name under it, and checks of one host that run at
+//! once share one lookup.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -35,12 +38,42 @@ type Servers = Vec<(Vec<String>, String)>;
 /// such as an address or a name with no registry, or why it couldn't be found.
 type Answer = Result<Option<DateTime<Utc>>, String>;
 
+/// A name, with the list it was looked up with.
+type Key = (String, String);
+
 #[derive(Default)]
 struct Cache {
     /// Each list, by where it came from: top-level domains and their servers.
     lists: HashMap<String, (Instant, Servers)>,
-    /// Each host's answer, by the list it was looked up with.
-    hosts: HashMap<(String, String), (Instant, Answer)>,
+    /// Each host name's answer, and each registered domain's once it's found.
+    names: HashMap<Key, (Instant, Answer)>,
+    /// A lock for each host name being looked up, so checks of it that run at
+    /// once wait for one lookup rather than each asking.
+    asking: HashMap<Key, Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl Cache {
+    /// What's known of a name, while it's still fresh.
+    fn answer(&self, key: &Key) -> Option<Answer> {
+        let (asked, answer) = self.names.get(key)?;
+        (asked.elapsed() < kept(answer)).then(|| answer.clone())
+    }
+
+    /// Remembers an answer, and forgets those that have gone stale, so names
+    /// that are no longer checked don't pile up.
+    fn remember(&mut self, key: Key, answer: Answer) {
+        self.names
+            .retain(|_, (asked, answer)| asked.elapsed() < kept(answer));
+        self.names.insert(key, (Instant::now(), answer));
+    }
+}
+
+fn kept(answer: &Answer) -> Duration {
+    if answer.is_ok() {
+        FOUND_KEPT
+    } else {
+        MISSING_KEPT
+    }
 }
 
 fn cache() -> std::sync::MutexGuard<'static, Cache> {
@@ -56,29 +89,60 @@ pub(crate) async fn expiry(host: &str) -> Answer {
     expiry_from(BOOTSTRAP, host).await
 }
 
+/// The names a registry might know `host` by, from the whole name up to the one
+/// under the top-level domain.
+fn names_above(host: &str) -> Vec<String> {
+    let labels: Vec<&str> = host.split('.').collect();
+    (0..labels.len().saturating_sub(1))
+        .map(|start| labels[start..].join("."))
+        .collect()
+}
+
+/// A registered domain's answer that's already known, for any name above `host`.
+fn known_domain(cache: &Cache, list_url: &str, host: &str) -> Option<Answer> {
+    names_above(host).into_iter().find_map(|name| {
+        let answer = cache.answer(&(list_url.to_string(), name))?;
+        matches!(answer, Ok(Some(_))).then_some(answer)
+    })
+}
+
 pub(crate) async fn expiry_from(list_url: &str, host: &str) -> Answer {
     let host = host.trim_end_matches('.').to_lowercase();
     if host.parse::<IpAddr>().is_ok() || !host.contains('.') {
         return Ok(None);
     }
     let key = (list_url.to_string(), host.clone());
-    if let Some((asked, answer)) = cache().hosts.get(&key) {
-        let kept = if answer.is_ok() {
-            FOUND_KEPT
-        } else {
-            MISSING_KEPT
-        };
-        if asked.elapsed() < kept {
-            return answer.clone();
+    let asking = {
+        let mut cache = cache();
+        if let Some(answer) = cache
+            .answer(&key)
+            .or_else(|| known_domain(&cache, list_url, &host))
+        {
+            return answer;
         }
+        cache.asking.retain(|_, lock| Arc::strong_count(lock) > 1);
+        cache.asking.entry(key.clone()).or_default().clone()
+    };
+    let _asking = asking.lock().await;
+    // Another check may have looked it up while this one waited.
+    if let Some(answer) = cache().answer(&key) {
+        return answer;
     }
-    let answer = look_up(list_url, &host).await;
-    cache().hosts.insert(key, (Instant::now(), answer.clone()));
+    let (answer, domain) = look_up(list_url, &host).await;
+    let mut cache = cache();
+    if let Some(domain) = domain {
+        cache.remember((list_url.to_string(), domain), answer.clone());
+    }
+    cache.remember(key, answer.clone());
     answer
 }
 
-async fn look_up(list_url: &str, host: &str) -> Answer {
-    let services = servers(list_url).await?;
+/// The answer, and the registered domain it's for when one was found.
+async fn look_up(list_url: &str, host: &str) -> (Answer, Option<String>) {
+    let services = match servers(list_url).await {
+        Ok(services) => services,
+        Err(why) => return (Err(why), None),
+    };
     let top = host.rsplit('.').next().unwrap_or_default();
     let Some(server) = services
         .iter()
@@ -86,23 +150,24 @@ async fn look_up(list_url: &str, host: &str) -> Answer {
         .map(|(_, server)| server.trim_end_matches('/').to_string())
     else {
         // Not a public name, such as one for an intranet.
-        return Ok(None);
+        return (Ok(None), None);
     };
-    let labels: Vec<&str> = host.split('.').collect();
-    // From the whole name up to the one under the top-level domain.
-    for start in 0..labels.len().saturating_sub(1) {
-        let name = labels[start..].join(".");
+    for name in names_above(host) {
         let Ok(text) = fetch_page(&format!("{server}/domain/{name}"), LIMIT, None).await else {
             continue;
         };
         let Ok(record) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
-        return expiration(&record)
+        let answer = expiration(&record)
             .map(Some)
             .ok_or_else(|| format!("the registry doesn't say when {name} expires"));
+        return (answer, Some(name));
     }
-    Err("the domain's registration couldn't be found".to_string())
+    (
+        Err("the domain's registration couldn't be found".to_string()),
+        None,
+    )
 }
 
 /// The top-level domains each server answers for, from the list.
@@ -244,6 +309,9 @@ mod tests {
         // Asked again, it's remembered.
         assert_eq!(expiry_from(&list, "www.shop.example.test").await, expected);
         assert_eq!(asked.load(Ordering::Relaxed), 4);
+        // Another name under the same domain shares its answer.
+        assert_eq!(expiry_from(&list, "api.example.test").await, expected);
+        assert_eq!(asked.load(Ordering::Relaxed), 4);
 
         let quiet = expiry_from(&list, "quiet.test").await;
         assert_eq!(
@@ -255,6 +323,23 @@ mod tests {
             missing,
             Err("the domain's registration couldn't be found".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn checks_of_one_host_at_once_share_a_lookup() {
+        let (list, asked) = registry();
+        let expected = Ok(DateTime::from_timestamp(1_818_129_600, 0));
+        let lookups: Vec<_> = (0..4)
+            .map(|_| {
+                let list = list.clone();
+                tokio::spawn(async move { expiry_from(&list, "example.test").await })
+            })
+            .collect();
+        for lookup in lookups {
+            assert_eq!(lookup.await.unwrap(), expected);
+        }
+        // The list, then the domain, once.
+        assert_eq!(asked.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]

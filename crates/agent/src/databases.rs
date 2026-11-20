@@ -242,10 +242,10 @@ mod tests {
             (
                 "orders",
                 DatabaseDefinition {
-                    tls: Some(true),
-                    ..defined("postgres", "a:1")
+                    database: Some("sales".to_string()),
+                    ..defined("mysql", "a:1")
                 },
-                "can't use tls",
+                "can't use database",
             ),
         ] {
             let error = format!("{:#}", one(name, definition).unwrap_err());

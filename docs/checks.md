@@ -28,8 +28,9 @@ them before giving those kinds to them in a config rule.
 
 ## Ping
 
-A ping check reports a host as up only if the host itself replied, not when a
-router answers that it can't be reached. On Windows MaxNines sends the pings itself.
+A ping check reports a host as up if the host itself replied to any of its pings,
+not when a router answers that it can't be reached. Pings that went unanswered
+show in its packet loss. On Windows MaxNines sends the pings itself.
 On Linux, macOS and FreeBSD it runs the system's own `ping`, which every account can
 use there, and pings the name's IPv4 address if it has one.
 
@@ -43,8 +44,13 @@ recognises one, so `www.example.co.uk` finds `example.co.uk`.
 
 - Each domain is asked about at most twice a day, and IANA's list once a day, however
   often the check runs, as registries limit how often they're asked.
-- It happens after the check's own timing and never makes the check fail. If the
-  registry can't be reached, or doesn't say, the check's result says why.
+- It happens after the check's own timing, within the check's time limit, and never
+  makes the check fail. If the registry can't be reached, doesn't say, or doesn't
+  answer in time, the check's result says why, and a lookup that ran out of time
+  carries on so that the next run has its answer.
+- A domain's answer serves every name under it, so `www.example.com` and
+  `api.example.com` share one lookup. A registry that couldn't be asked is asked
+  again after an hour.
 - Addresses and names without a public registry, such as `printer.local`, are skipped,
   and so are domains whose registry doesn't offer RDAP, such as `.io`.
 - Untick **Look up when the domain expires** on the check to turn it off.
@@ -112,8 +118,10 @@ agent runs as. Restart the agent after changing any of these.
 
 ### Certificates
 
-A PostgreSQL check uses TLS whenever the server offers it, and MySQL, MariaDB,
-Redis and MongoDB checks when **Use TLS** is ticked. The certificate is checked as a website's
+A PostgreSQL check uses TLS whenever the server offers it, and with **Use TLS**
+ticked, only over TLS, so one that stops offering it, or someone in the middle
+answering for it, is never sent the password. MySQL, MariaDB, Redis and MongoDB
+checks use TLS when **Use TLS** is ticked. The certificate is checked as a website's
 is, during the handshake, so a password is never sent to a server whose certificate
 can't be trusted. For a server with a certificate from a private authority, tick
 **Don't count a bad certificate as down**.

@@ -84,7 +84,7 @@
 
   <label class="checkbox for-tls-option">
     <input type="checkbox" name="tls"{% if check.tls %} checked{% endif %}> Use TLS from the start
-    <small>For mail, as on ports 465, 993 and 995. Otherwise a mail check upgrades with STARTTLS before signing in, and never sends a password without TLS.</small>
+    <small>For mail, as on ports 465, 993 and 995. Otherwise a mail check upgrades with STARTTLS before signing in, and never sends a password without TLS. PostgreSQL uses TLS whenever it's offered, and with this ticked, only over TLS.</small>
   </label>
 
   <label class="checkbox for-certificate">

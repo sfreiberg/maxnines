@@ -3,7 +3,7 @@
 //!
 //! A [`Reader`] keeps its connection open between rounds, so each round costs a
 //! few queries rather than a sign-in, and opens a new one when the old one stops
-//! working. Each round gives rows: one for the database itself, named as it's
+//! working. ClickHouse, read over HTTP, has one for each round instead. Each round gives rows: one for the database itself, named as it's
 //! defined, and one for each thing it has several of, such as standbys or
 //! replication slots, named after it. A sample groups rows by their database's
 //! kind, as `{"pg": [...], "mysql": [...]}`, so each kind's values are its own,
@@ -31,6 +31,9 @@ use crate::sign_in::short;
 /// How long a round gets, unless the caller asks for less.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The most notes of what couldn't be read that a round keeps.
+const MAX_MISSING: usize = 4;
+
 /// Whether this kind of check is a database whose stats can be read.
 pub fn is_database(kind: CheckKind) -> bool {
     matches!(
@@ -52,7 +55,8 @@ enum Open {
     Postgres(postgres::Postgres),
     Mysql(mysql::Mysql),
     Mongodb(mongodb::Mongodb),
-    Clickhouse(clickhouse::Clickhouse),
+    /// Boxed, as it holds what it's read between rounds, and its connection.
+    Clickhouse(Box<clickhouse::Clickhouse>),
 }
 
 pub struct Reader {
@@ -145,10 +149,10 @@ impl Reader {
             CheckKind::Mongodb => Ok(Open::Mongodb(
                 mongodb::Mongodb::connect(check, credentials).await?,
             )),
-            CheckKind::Clickhouse => Ok(Open::Clickhouse(clickhouse::Clickhouse::new(
+            CheckKind::Clickhouse => Ok(Open::Clickhouse(Box::new(clickhouse::Clickhouse::new(
                 check,
                 credentials,
-            )?)),
+            )?))),
             other => bail!("{} isn't a database", other.as_str()),
         }
     }
@@ -243,8 +247,13 @@ impl Rows {
 
     /// Notes what couldn't be read, and why.
     fn missed(&mut self, what: &str, error: impl std::fmt::Display) {
-        if self.missing.len() < 4 {
-            self.missing.push(format!("{what}: {}", short(error)));
+        self.note(format!("{what}: {}", short(error)));
+    }
+
+    /// Keeps a note of what couldn't be read, up to as many as are shown.
+    fn note(&mut self, note: String) {
+        if self.missing.len() < MAX_MISSING {
+            self.missing.push(note);
         }
     }
 

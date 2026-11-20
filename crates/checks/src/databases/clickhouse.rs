@@ -5,6 +5,10 @@
 //!
 //! A password goes in basic authentication, so it's only sent over plain HTTP
 //! to the host itself, and anywhere else over HTTPS.
+//!
+//! A round's queries share one connection, which is closed when the round ends,
+//! as ClickHouse closes connections left idle for as long as there is between
+//! rounds.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -15,7 +19,7 @@ use maxnines_protocol::{Check, CheckKind};
 use serde_json::{Map, Value};
 
 use super::Rows;
-use crate::{Credentials, Findings, Login, decompress, host_and_port, request};
+use crate::{Credentials, Findings, Login, WebConnection, decompress, host_and_port, open_web};
 
 /// ClickHouse's codes for a table or database that isn't there, as in an older
 /// version, which isn't worth a note.
@@ -47,6 +51,8 @@ pub(crate) struct Clickhouse {
     /// Whether errors have been read before, after which a code that turns up
     /// is new.
     errors_read: bool,
+    /// The connection this round's queries go over, once one is open.
+    connection: Option<WebConnection>,
 }
 
 /// A query's text, made safe to go in an address.
@@ -105,10 +111,11 @@ impl Clickhouse {
             slow: None,
             memory: (None, None),
             errors_read: false,
+            connection: None,
         })
     }
 
-    async fn get(&self, path: &str) -> Result<(u16, String), Failure> {
+    async fn get(&mut self, path: &str) -> Result<(u16, String), Failure> {
         let mut check = Check::new(
             "clickhouse",
             CheckKind::Http,
@@ -116,17 +123,32 @@ impl Clickhouse {
         );
         check.insecure = self.insecure;
         check.timeout = self.timeout;
-        let answer = request(&check, &mut Findings::default(), self.login.as_ref())
+        let failed = |error: anyhow::Error| Failure {
+            code: None,
+            message: format!("{error:#}"),
+        };
+        let mut findings = Findings::default();
+        let kept = match self.connection.take() {
+            Some(mut open) => open.is_ready().await.then_some(open),
+            None => None,
+        };
+        let mut connection = match kept {
+            Some(open) => open,
+            None => open_web(&check, &mut findings).await.map_err(failed)?,
+        };
+        let answer = connection
+            .send(&check, &mut findings, self.login.as_ref())
             .await
-            .map_err(|error| Failure {
-                code: None,
-                message: format!("{error:#}"),
-            })?;
+            .map_err(failed)?;
+        // Only one that worked is used again.
+        self.connection = Some(connection);
         let body = if answer.compressed {
-            decompress(&answer.body).ok_or(Failure {
-                code: None,
-                message: "its answer couldn't be unpacked".to_string(),
-            })?
+            decompress(&answer.body)
+                .ok_or(Failure {
+                    code: None,
+                    message: "its answer couldn't be unpacked".to_string(),
+                })?
+                .0
         } else {
             answer.body
         };
@@ -134,7 +156,7 @@ impl Clickhouse {
     }
 
     /// Whether it answers, without signing in.
-    pub(crate) async fn ping(&self) -> Result<()> {
+    pub(crate) async fn ping(&mut self) -> Result<()> {
         let (status, body) = self
             .get("/ping")
             .await
@@ -147,7 +169,7 @@ impl Clickhouse {
     }
 
     /// A query's rows, each by column name.
-    async fn query(&self, sql: &str) -> Result<Vec<Map<String, Value>>, Failure> {
+    async fn query(&mut self, sql: &str) -> Result<Vec<Map<String, Value>>, Failure> {
         // No settings go with it: an account limited to reading, as it should be,
         // can't change them, and its own profile sets its limits.
         let path = format!("/?query={}", encoded(&format!("{sql} FORMAT JSON")));
@@ -183,7 +205,7 @@ impl Clickhouse {
     }
 
     /// The one row a query gives.
-    async fn one(&self, sql: &str) -> Result<Map<String, Value>, Failure> {
+    async fn one(&mut self, sql: &str) -> Result<Map<String, Value>, Failure> {
         self.query(sql).await?.into_iter().next().ok_or(Failure {
             code: None,
             message: "it gave nothing back".to_string(),
@@ -191,7 +213,7 @@ impl Clickhouse {
     }
 
     /// The version, which also says it can be signed in to and queried.
-    pub(crate) async fn version(&self) -> Result<String> {
+    pub(crate) async fn version(&mut self) -> Result<String> {
         let row = self
             .one("SELECT version() AS version")
             .await
@@ -209,6 +231,12 @@ impl Clickhouse {
     }
 
     pub(super) async fn read(&mut self, rows: &mut Rows, extras: &[String]) -> Result<()> {
+        let read = self.read_round(rows, extras).await;
+        self.connection = None;
+        read
+    }
+
+    async fn read_round(&mut self, rows: &mut Rows, extras: &[String]) -> Result<()> {
         let server = self
             .one("SELECT version() AS version, uptime() AS uptime")
             .await
@@ -244,7 +272,9 @@ impl Clickhouse {
         if let Some(slow) = &self.slow {
             rows.main.fields.extend(slow.rows.main.fields.clone());
             rows.others.extend(slow.rows.others.iter().cloned());
-            rows.missing.extend(slow.rows.missing.iter().cloned());
+            for note in &slow.rows.missing {
+                rows.note(note.clone());
+            }
             self.against_limits(rows, &slow.limits);
         }
         if extras.iter().any(|extra| extra == "sizes") {
@@ -258,7 +288,12 @@ impl Clickhouse {
 
     /// Named values from one of the tables that list them as rows, such as
     /// `system.metrics`, with an event that's never happened as 0.
-    async fn named(&self, rows: &mut Rows, what: &str, sql: &str) -> Option<HashMap<String, f64>> {
+    async fn named(
+        &mut self,
+        rows: &mut Rows,
+        what: &str,
+        sql: &str,
+    ) -> Option<HashMap<String, f64>> {
         match self.query(sql).await {
             Ok(found) => Some(
                 found
@@ -278,7 +313,7 @@ impl Clickhouse {
 
     /// What's going on now: queries, connections, memory, background pools,
     /// Distributed tables' backlog and the Keeper session.
-    async fn current(&self, rows: &mut Rows) {
+    async fn current(&mut self, rows: &mut Rows) {
         let sql = format!(
             "SELECT metric AS name, value FROM system.metrics WHERE metric IN ({}) \
              OR metric LIKE 'Background%Pool%'",
@@ -348,7 +383,7 @@ impl Clickhouse {
     }
 
     /// Running totals since it started.
-    async fn events(&self, rows: &mut Rows) {
+    async fn events(&mut self, rows: &mut Rows) {
         let sql = format!(
             "SELECT event AS name, value FROM system.events WHERE event IN ({}, \
              'MemoryOvercommitWaitTimeMicroseconds')",
@@ -423,7 +458,7 @@ impl Clickhouse {
     }
 
     /// Replicated tables, without the columns that ask Keeper for every table.
-    async fn replicas(&self, rows: &mut Rows) {
+    async fn replicas(&mut self, rows: &mut Rows) {
         let found = self
             .one(
                 "SELECT count() AS tables, countIf(is_readonly) AS readonly, \
@@ -498,7 +533,7 @@ impl Clickhouse {
 
     /// Its session with Keeper or ZooKeeper, from 23.5, and how many replicas
     /// of other shards it's recently failed to reach.
-    async fn keeper(&self, rows: &mut Rows) {
+    async fn keeper(&mut self, rows: &mut Rows) {
         match self
             .one(
                 "SELECT count() AS sessions, countIf(is_expired) AS expired, \
@@ -531,7 +566,7 @@ impl Clickhouse {
 
     /// Mutations still to finish and failing, the longest query, and
     /// dictionaries that won't load.
-    async fn work(&self, rows: &mut Rows) {
+    async fn work(&mut self, rows: &mut Rows) {
         match self
             .one(
                 "SELECT count() AS pending, countIf(latest_fail_reason != '') AS failing \
@@ -600,7 +635,7 @@ impl Clickhouse {
         self.errors_read = true;
     }
 
-    async fn disks(&self, rows: &mut Rows) {
+    async fn disks(&mut self, rows: &mut Rows) {
         // Every column, as `is_broken` and `is_read_only` only came later.
         let found = self.query("SELECT * FROM system.disks").await;
         let disks = match found {
@@ -630,7 +665,7 @@ impl Clickhouse {
     /// Every few minutes: its limits, what asks Keeper about every replicated
     /// table, and what lists files on disk. Gives the limits, kept to compare
     /// what's read every sample against.
-    async fn slow_reads(&self, rows: &mut Rows) -> Limits {
+    async fn slow_reads(&mut self, rows: &mut Rows) -> Limits {
         let mut limits = Limits::default();
         let settings = self
             .named(
@@ -798,7 +833,7 @@ impl Clickhouse {
     }
 
     /// Opt-in: each database's size on disk.
-    async fn sizes(&self, rows: &mut Rows) {
+    async fn sizes(&mut self, rows: &mut Rows) {
         let found = self
             .query(
                 "SELECT database, sum(bytes_on_disk) AS size FROM system.parts \
@@ -822,7 +857,7 @@ impl Clickhouse {
     /// how many failed, from `system.query_log`, which can be large. Its newest
     /// rows can be 7.5 seconds from being written, so those are left for later,
     /// and this account's own queries are left out.
-    async fn latency(&self, rows: &mut Rows) {
+    async fn latency(&mut self, rows: &mut Rows) {
         let found = self
             .query(
                 "SELECT query_kind AS kind, \
@@ -1070,6 +1105,56 @@ mod tests {
             ..login
         };
         assert!(Clickhouse::new(&check("db.example.com:8123", false), &username_only).is_ok());
+    }
+
+    /// A round's queries go over one connection, which ends with the round.
+    #[tokio::test]
+    async fn a_rounds_queries_share_one_connection() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(socket);
+                    loop {
+                        // Each request is a GET, so it ends with its headers.
+                        let mut line = String::new();
+                        loop {
+                            line.clear();
+                            match reader.read_line(&mut line).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(_) if line == "\r\n" => break,
+                                Ok(_) => {}
+                            }
+                        }
+                        let body = r#"{"data": [{"version": "24.8.1", "uptime": 5}]}"#;
+                        let answer = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if reader.get_mut().write_all(answer.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let check = Check::new("events", CheckKind::Clickhouse, &address.to_string());
+        let mut clickhouse = Clickhouse::new(&check, &Credentials::default()).unwrap();
+        for round in 1..=2 {
+            let mut rows = Rows::new("events");
+            clickhouse.read(&mut rows, &[]).await.unwrap();
+            assert_eq!(rows.main.fields["version"], "24.8.1");
+            assert_eq!(accepted.load(Ordering::Relaxed), round);
+        }
     }
 
     /// A real server, as `host:port [username [password]]`, on its HTTP port.

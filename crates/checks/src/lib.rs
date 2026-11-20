@@ -20,7 +20,7 @@ use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::process::Stdio;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -40,6 +40,7 @@ use maxnines_protocol::{Check, CheckKind, DEFAULT_CHECK_TIMEOUT};
 use regex_lite::Regex;
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::server::ParsedCertificate;
 use rustls::{
@@ -63,6 +64,9 @@ const CONNECT_ATTEMPT: Duration = Duration::from_secs(5);
 
 /// How much of a page is read. It's only measured and searched, never kept.
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// What a page fetched for a collector is refused for, when it's bigger than is read.
+const TOO_BIG: &str = "the page is bigger than the 10 MiB that's read";
 
 /// What's put in the logs of sites being checked.
 const AGENT_NAME: &str = concat!("MaxNines-Agent/", env!("CARGO_PKG_VERSION"));
@@ -194,12 +198,17 @@ pub async fn run_signed_in(check: &Check, credentials: Option<&Credentials>) -> 
     // After the timing, and never counting against the check: a registry being
     // slow or unsure says nothing about the site.
     if check.kind == CheckKind::Http && check.domain_expiry != Some(false) {
-        domain_expiry(check, &mut findings).await;
+        let left = limit(check).saturating_sub(started.elapsed());
+        domain_expiry(check, left, &mut findings).await;
     }
     report(check, findings, result)
 }
 
-async fn domain_expiry(check: &Check, findings: &mut Findings) {
+/// Looks up when the site's domain registration runs out, in whatever's left of
+/// the check's time, so a check never takes longer than its limit. A lookup that
+/// takes longer carries on by itself, and the next run finds its answer
+/// remembered.
+async fn domain_expiry(check: &Check, left: Duration, findings: &mut Findings) {
     let Some(host) = Uri::from_str(&check.target)
         .ok()
         .and_then(|uri| uri.host().map(String::from))
@@ -210,10 +219,12 @@ async fn domain_expiry(check: &Check, findings: &mut Findings) {
         .trim_start_matches('[')
         .trim_end_matches(']')
         .to_string();
-    // A few questions at most, each with its own limit, and all of it remembered.
-    let answer = timeout(rdap::LIMIT * 4, rdap::expiry(&host))
-        .await
-        .unwrap_or_else(|_| Err("the registry didn't answer in time".to_string()));
+    let lookup = tokio::spawn(async move { rdap::expiry(&host).await });
+    let answer = match timeout(left, lookup).await {
+        Ok(Ok(answer)) => answer,
+        Ok(Err(_)) => Err("the registry couldn't be asked".to_string()),
+        Err(_) => Err("the registry didn't answer in time".to_string()),
+    };
     match answer {
         Ok(Some(expires)) => {
             findings.domain_expires_at = Some(expires);
@@ -275,9 +286,14 @@ pub async fn fetch_page(url: &str, limit: Duration, login: Option<&Login>) -> Re
             (200..300).contains(&status),
             "the page returned status {status}"
         );
+        // A page cut short would be read as if it ended there.
+        ensure!(!answer.cut, TOO_BIG);
         tokio::task::spawn_blocking(move || {
             let body = if answer.compressed {
-                decompress(&answer.body).context("the page couldn't be unpacked")?
+                let (body, cut) =
+                    decompress(&answer.body).context("the page couldn't be unpacked")?;
+                ensure!(!cut, TOO_BIG);
+                body
             } else {
                 answer.body
             };
@@ -327,6 +343,16 @@ async fn check_tcp(check: &Check, findings: &mut Findings) -> Result<()> {
     Ok(())
 }
 
+/// What the real check of a certificate said, and the certificates it rests on:
+/// the path from the site's own to a trusted root, or the site's own alone when
+/// there's no such path. A server can send more than the path, such as an old
+/// cross-signed certificate, which says nothing about the site.
+#[derive(Debug, Default)]
+struct Verdict {
+    error: Option<TlsError>,
+    path: Vec<CertificateDer<'static>>,
+}
+
 /// Lets a handshake finish whatever the certificate's like, so that a site with a
 /// bad one can still have its certificate's dates and name read, and remembers what
 /// the real check said. Nothing is sent over the connection afterwards unless the
@@ -334,7 +360,46 @@ async fn check_tcp(check: &Check, findings: &mut Findings) -> Result<()> {
 #[derive(Debug)]
 struct RecordingVerifier {
     real: Arc<WebPkiServerVerifier>,
-    outcome: Arc<Mutex<Option<TlsError>>>,
+    outcome: Arc<Mutex<Verdict>>,
+}
+
+impl RecordingVerifier {
+    fn new() -> Result<(Arc<Self>, Arc<Mutex<Verdict>>)> {
+        let outcome = Arc::new(Mutex::new(Verdict::default()));
+        let verifier = Arc::new(Self {
+            real: site_verifier()?,
+            outcome: outcome.clone(),
+        });
+        Ok((verifier, outcome))
+    }
+}
+
+/// The certificates from the site's own to a trusted root, which is what the
+/// real check just accepted.
+fn verified_path(
+    end_entity: &CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>],
+    now: UnixTime,
+) -> Option<Vec<CertificateDer<'static>>> {
+    let certificate = webpki::EndEntityCert::try_from(end_entity).ok()?;
+    let path = certificate
+        .verify_for_usage(
+            provider().signature_verification_algorithms.all,
+            webpki_roots::TLS_SERVER_ROOTS,
+            intermediates,
+            now,
+            webpki::KeyUsage::server_auth(),
+            None,
+            None,
+        )
+        .ok()?;
+    let path = std::iter::once(end_entity.clone().into_owned())
+        .chain(
+            path.intermediate_certificates()
+                .map(|certificate| certificate.der().clone().into_owned()),
+        )
+        .collect();
+    Some(path)
 }
 
 impl ServerCertVerifier for RecordingVerifier {
@@ -353,7 +418,14 @@ impl ServerCertVerifier for RecordingVerifier {
             ocsp_response,
             now,
         );
-        *self.outcome.lock().unwrap_or_else(PoisonError::into_inner) = result.err();
+        let path = match result {
+            Ok(_) => verified_path(end_entity, intermediates, now),
+            Err(_) => None,
+        };
+        *self.outcome.lock().unwrap_or_else(PoisonError::into_inner) = Verdict {
+            error: result.err(),
+            path: path.unwrap_or_else(|| vec![end_entity.clone().into_owned()]),
+        };
         Ok(ServerCertVerified::assertion())
     }
 
@@ -400,8 +472,8 @@ fn describe_certificate_problem(error: &TlsError) -> &'static str {
     }
 }
 
-/// Reads the dates across the whole chain, as any certificate in it expiring
-/// breaks the site. So the start is the latest and the end is the earliest.
+/// Reads the dates across the certificates the site rests on, as any of them
+/// expiring breaks it. So the start is the latest and the end is the earliest.
 fn read_dates(chain: &[CertificateDer<'_>], now: DateTime<Utc>, findings: &mut Findings) {
     for certificate in chain {
         let Ok((_, parsed)) = parse_x509_certificate(certificate) else {
@@ -434,8 +506,7 @@ fn days_left(expires: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
 }
 
 fn tls_config(verifier: Arc<RecordingVerifier>) -> Result<ClientConfig> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = ClientConfig::builder_with_provider(provider)
+    let config = ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
@@ -443,10 +514,32 @@ fn tls_config(verifier: Arc<RecordingVerifier>) -> Result<ClientConfig> {
     Ok(config)
 }
 
-fn trusted_roots() -> RootCertStore {
-    RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    }
+/// The cryptography every connection uses, made once.
+fn provider() -> Arc<CryptoProvider> {
+    static PROVIDER: LazyLock<Arc<CryptoProvider>> =
+        LazyLock::new(|| Arc::new(rustls::crypto::ring::default_provider()));
+    PROVIDER.clone()
+}
+
+/// The roots certificates are checked against, made once rather than for every
+/// connection.
+fn trusted_roots() -> Arc<RootCertStore> {
+    static ROOTS: LazyLock<Arc<RootCertStore>> = LazyLock::new(|| {
+        Arc::new(RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        })
+    });
+    ROOTS.clone()
+}
+
+/// The check a site's certificate gets, made once.
+fn site_verifier() -> Result<Arc<WebPkiServerVerifier>> {
+    static VERIFIER: LazyLock<Option<Arc<WebPkiServerVerifier>>> = LazyLock::new(|| {
+        WebPkiServerVerifier::builder_with_provider(trusted_roots(), provider())
+            .build()
+            .ok()
+    });
+    VERIFIER.clone().context("setting up TLS")
 }
 
 /// A connection, and what's wrong with its certificate if anything is.
@@ -462,15 +555,7 @@ async fn secure(
     findings: &mut Findings,
 ) -> Result<Secured> {
     let name = ServerName::try_from(host.to_string()).map_err(|_| anyhow!("invalid host name"))?;
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let real = WebPkiServerVerifier::builder_with_provider(Arc::new(trusted_roots()), provider)
-        .build()
-        .context("setting up TLS")?;
-    let outcome = Arc::new(Mutex::new(None));
-    let verifier = Arc::new(RecordingVerifier {
-        real,
-        outcome: outcome.clone(),
-    });
+    let (verifier, outcome) = RecordingVerifier::new()?;
     let mut config = tls_config(verifier)?;
     config.alpn_protocols = alpn.iter().map(|protocol| protocol.to_vec()).collect();
 
@@ -487,16 +572,14 @@ async fn secure(
     let (_, connection) = stream.get_ref();
     findings.tls_version = version_name(connection.protocol_version());
     let chain = connection.peer_certificates().unwrap_or_default();
-    read_dates(chain, maxnines_protocol::time::now(), findings);
     findings.hostname_valid = chain.first().and_then(|certificate| {
         let parsed = ParsedCertificate::try_from(certificate).ok()?;
         Some(rustls::client::verify_server_name(&parsed, &name).is_ok())
     });
 
-    let error = outcome
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .take();
+    let Verdict { error, path } =
+        std::mem::take(&mut *outcome.lock().unwrap_or_else(PoisonError::into_inner));
+    read_dates(&path, maxnines_protocol::time::now(), findings);
     findings.cert_valid = Some(error.is_none());
     let problem = error.as_ref().map(describe_certificate_problem);
     Ok(Secured { stream, problem })
@@ -518,27 +601,104 @@ async fn check_tls(check: &Check, findings: &mut Findings) -> Result<()> {
     certificate_verdict(check, secured.problem)
 }
 
-/// Sends the request and waits for the response to start.
-async fn exchange<S>(
-    stream: S,
-    use_http2: bool,
-    request: Request<Full<Bytes>>,
-) -> Result<Response<Incoming>>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let io = TokioIo::new(stream);
-    let failed = |_| anyhow!("the request failed");
-    if use_http2 {
-        let (mut sender, connection) = http2::handshake(TokioExecutor::new(), io)
-            .await
-            .map_err(failed)?;
-        tokio::spawn(connection);
-        sender.send_request(request).await.map_err(failed)
-    } else {
-        let (mut sender, connection) = http1::handshake(io).await.map_err(failed)?;
-        tokio::spawn(connection);
-        sender.send_request(request).await.map_err(failed)
+/// Where requests go on an open web connection.
+enum Sender {
+    Http1(http1::SendRequest<Full<Bytes>>),
+    Http2(http2::SendRequest<Full<Bytes>>),
+}
+
+/// A web connection that's open, which can carry several requests one after
+/// another. What keeps it going stops when it's dropped, so a request given up
+/// on, as when a check runs out of time, leaves nothing running.
+pub(crate) struct WebConnection {
+    sender: Sender,
+    running: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for WebConnection {
+    fn drop(&mut self) {
+        self.running.abort();
+    }
+}
+
+impl WebConnection {
+    /// Speaks HTTP over a connection that's ready for it.
+    async fn start<S>(stream: S, use_http2: bool) -> Result<Self>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let io = TokioIo::new(stream);
+        let failed = |_| anyhow!("the request failed");
+        let (sender, running) = if use_http2 {
+            let (sender, connection) = http2::handshake(TokioExecutor::new(), io)
+                .await
+                .map_err(failed)?;
+            let running = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            (Sender::Http2(sender), running)
+        } else {
+            let (sender, connection) = http1::handshake(io).await.map_err(failed)?;
+            let running = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            (Sender::Http1(sender), running)
+        };
+        Ok(Self { sender, running })
+    }
+
+    /// Whether another request can go, which it can't once the server has closed
+    /// the connection.
+    pub(crate) async fn is_ready(&mut self) -> bool {
+        match &mut self.sender {
+            Sender::Http1(sender) => sender.ready().await.is_ok(),
+            Sender::Http2(sender) => sender.ready().await.is_ok(),
+        }
+    }
+
+    /// Sends a check's request and reads the answer, timing the wait for it to
+    /// start and the download.
+    pub(crate) async fn send(
+        &mut self,
+        check: &Check,
+        findings: &mut Findings,
+        login: Option<&Login>,
+    ) -> Result<Answer> {
+        let uri = target_uri(check)?;
+        let use_http2 = matches!(self.sender, Sender::Http2(_));
+        let request = build_request(check, &uri, use_http2, login)?;
+        let failed = |_| anyhow!("the request failed");
+        let sent = Instant::now();
+        let mut response = match &mut self.sender {
+            Sender::Http1(sender) => {
+                sender.ready().await.map_err(failed)?;
+                sender.send_request(request).await.map_err(failed)?
+            }
+            Sender::Http2(sender) => {
+                sender.ready().await.map_err(failed)?;
+                sender.send_request(request).await.map_err(failed)?
+            }
+        };
+        findings.first_byte_ms = Some(elapsed_ms(sent));
+
+        let downloading = Instant::now();
+        findings.protocol = Some(format!("{:?}", response.version()));
+        let status = response.status().as_u16();
+        findings.status = Some(status);
+        let compressed = response
+            .headers()
+            .get(CONTENT_ENCODING)
+            .is_some_and(|encoding| encoding.as_bytes().eq_ignore_ascii_case(b"gzip"));
+        findings.compressed = Some(compressed);
+
+        let (body, cut) = read_body(&mut response).await?;
+        findings.download_ms = Some(elapsed_ms(downloading));
+        Ok(Answer {
+            status,
+            compressed,
+            body,
+            cut,
+        })
     }
 }
 
@@ -578,28 +738,33 @@ fn build_request(
         .map_err(|_| anyhow!("invalid request"))
 }
 
-async fn read_body(response: &mut Response<Incoming>) -> Result<Vec<u8>> {
+/// The body, up to the limit, and whether there was more than that.
+async fn read_body(response: &mut Response<Incoming>) -> Result<(Vec<u8>, bool)> {
     let mut bytes = Vec::new();
-    while bytes.len() < MAX_BODY_BYTES {
+    while bytes.len() <= MAX_BODY_BYTES {
         let Some(frame) = response.body_mut().frame().await else {
-            break;
+            return Ok((bytes, false));
         };
         let frame = frame.map_err(|_| anyhow!("the response was cut off"))?;
         if let Some(data) = frame.data_ref() {
             bytes.extend_from_slice(data);
         }
     }
-    Ok(bytes)
+    bytes.truncate(MAX_BODY_BYTES);
+    Ok((bytes, true))
 }
 
-/// A small file can unpack to something enormous, so this stops at the limit.
-fn decompress(bytes: &[u8]) -> Option<Vec<u8>> {
+/// A small file can unpack to something enormous, so this stops at the limit, and
+/// says whether there was more.
+fn decompress(bytes: &[u8]) -> Option<(Vec<u8>, bool)> {
     let mut unpacked = Vec::new();
     GzDecoder::new(bytes)
-        .take(MAX_BODY_BYTES as u64)
+        .take(MAX_BODY_BYTES as u64 + 1)
         .read_to_end(&mut unpacked)
         .ok()?;
-    Some(unpacked)
+    let cut = unpacked.len() > MAX_BODY_BYTES;
+    unpacked.truncate(MAX_BODY_BYTES);
+    Some((unpacked, cut))
 }
 
 /// Gives a page's size and, if asked, whether it matches.
@@ -609,7 +774,9 @@ fn examine(
     pattern: Option<String>,
 ) -> Result<(usize, Option<bool>)> {
     let body = if compressed {
-        decompress(&body).context("the page couldn't be unpacked")?
+        decompress(&body)
+            .context("the page couldn't be unpacked")?
+            .0
     } else {
         body
     };
@@ -627,15 +794,21 @@ struct Answer {
     status: u16,
     compressed: bool,
     body: Vec<u8>,
+    /// Whether the body went on past what's read.
+    cut: bool,
 }
 
-/// Makes a web request, timing each stage. Redirects aren't followed, as a second
-/// request would muddle every timing.
-async fn request(check: &Check, findings: &mut Findings, login: Option<&Login>) -> Result<Answer> {
-    let uri: Uri = check
+fn target_uri(check: &Check) -> Result<Uri> {
+    check
         .target
         .parse()
-        .map_err(|_| anyhow!("the request failed"))?;
+        .map_err(|_| anyhow!("the request failed"))
+}
+
+/// Opens a web connection to a check's site, timing each stage, and checking the
+/// certificate before anything is sent.
+pub(crate) async fn open_web(check: &Check, findings: &mut Findings) -> Result<WebConnection> {
+    let uri = target_uri(check)?;
     let secure_site = uri.scheme_str() == Some("https");
     let host = uri.host().context("the request failed")?.to_string();
     let host = host
@@ -646,41 +819,23 @@ async fn request(check: &Check, findings: &mut Findings, login: Option<&Login>) 
 
     let addresses = resolve(&host, port, findings).await?;
     let socket = connect(&addresses, findings).await?;
+    if !secure_site {
+        return WebConnection::start(socket, false).await;
+    }
+    let alpn: [&[u8]; 2] = [b"h2", b"http/1.1"];
+    let secured = secure(&host, socket, &alpn, findings).await?;
+    // Before the request, which can hold a password, reaches whoever this is.
+    certificate_verdict(check, secured.problem)?;
+    let (_, connection) = secured.stream.get_ref();
+    let use_http2 = connection.alpn_protocol() == Some(b"h2");
+    WebConnection::start(secured.stream, use_http2).await
+}
 
-    let (sent, mut response) = if secure_site {
-        let alpn: [&[u8]; 2] = [b"h2", b"http/1.1"];
-        let secured = secure(&host, socket, &alpn, findings).await?;
-        // Before the request, which can hold a password, reaches whoever this is.
-        certificate_verdict(check, secured.problem)?;
-        let (_, connection) = secured.stream.get_ref();
-        let use_http2 = connection.alpn_protocol() == Some(b"h2");
-        let request = build_request(check, &uri, use_http2, login)?;
-        let sent = Instant::now();
-        (sent, exchange(secured.stream, use_http2, request).await?)
-    } else {
-        let request = build_request(check, &uri, false, login)?;
-        let sent = Instant::now();
-        (sent, exchange(socket, false, request).await?)
-    };
-    findings.first_byte_ms = Some(elapsed_ms(sent));
-
-    let downloading = Instant::now();
-    findings.protocol = Some(format!("{:?}", response.version()));
-    let status = response.status().as_u16();
-    findings.status = Some(status);
-    let compressed = response
-        .headers()
-        .get(CONTENT_ENCODING)
-        .is_some_and(|encoding| encoding.as_bytes().eq_ignore_ascii_case(b"gzip"));
-    findings.compressed = Some(compressed);
-
-    let body = read_body(&mut response).await?;
-    findings.download_ms = Some(elapsed_ms(downloading));
-    Ok(Answer {
-        status,
-        compressed,
-        body,
-    })
+/// Makes a web request on a connection of its own, timing each stage. Redirects
+/// aren't followed, as a second request would muddle every timing.
+async fn request(check: &Check, findings: &mut Findings, login: Option<&Login>) -> Result<Answer> {
+    let mut connection = open_web(check, findings).await?;
+    connection.send(check, findings, login).await
 }
 
 /// A redirect is an answer from a working site, so anything below 400 is up.
@@ -689,6 +844,7 @@ async fn check_http(check: &Check, findings: &mut Findings) -> Result<()> {
         status,
         compressed,
         body,
+        ..
     } = request(check, findings, None).await?;
 
     // Unpacking and searching a big page takes real time, so it can't run on a
@@ -904,7 +1060,14 @@ async fn check_ping(check: &Check, findings: &mut Findings) -> Result<()> {
         .await
         .map_err(|_| anyhow!("couldn't run {program}"))?;
     read_ping_summary(&String::from_utf8_lossy(&output.stdout), findings);
-    ensure!(output.status.success(), "no reply");
+    // Any reply means it's up, as on Windows. Linux's ping fails when fewer
+    // replies come than were sent, and the others only when none do.
+    ensure!(
+        findings
+            .packet_loss_percent
+            .is_some_and(|loss| loss < 100.0),
+        "no reply"
+    );
     Ok(())
 }
 
@@ -1142,7 +1305,34 @@ mod tests {
     #[test]
     fn a_huge_unpacked_page_stops_at_the_limit() {
         let packed = gzipped(&"x".repeat(MAX_BODY_BYTES + 1000));
-        assert_eq!(decompress(&packed).unwrap().len(), MAX_BODY_BYTES);
+        let (unpacked, cut) = decompress(&packed).unwrap();
+        assert_eq!((unpacked.len(), cut), (MAX_BODY_BYTES, true));
+        let packed = gzipped(&"x".repeat(MAX_BODY_BYTES));
+        assert!(!decompress(&packed).unwrap().1);
+    }
+
+    #[test]
+    fn a_page_too_big_to_read_whole_is_refused_rather_than_cut_short() {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        )
+        .into_bytes();
+        response.extend(std::iter::repeat_n(b'x', MAX_BODY_BYTES + 1));
+        let (address, _server) = serve_once(Box::leak(response.into_boxed_slice()));
+        let failure = fetch(&format!("http://{address}/metrics")).unwrap_err();
+        assert_eq!(failure.to_string(), TOO_BIG);
+
+        let packed = gzipped(&"x".repeat(MAX_BODY_BYTES + 1));
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+            packed.len()
+        )
+        .into_bytes();
+        response.extend(packed);
+        let (address, _server) = serve_once(Box::leak(response.into_boxed_slice()));
+        let failure = fetch(&format!("http://{address}/metrics")).unwrap_err();
+        assert_eq!(failure.to_string(), TOO_BIG);
     }
 
     #[test]
@@ -1251,11 +1441,17 @@ mod tests {
 
     /// A TLS server for one connection, with a certificate nothing trusts.
     fn serve_tls(names: &[&str]) -> String {
+        serve_tls_sending(names, Vec::new())
+    }
+
+    /// As [`serve_tls`], sending `extra` certificates after its own.
+    fn serve_tls_sending(names: &[&str], extra: Vec<CertificateDer<'static>>) -> String {
         let certified = rcgen::generate_simple_self_signed(
             names.iter().map(ToString::to_string).collect::<Vec<_>>(),
         )
         .unwrap();
-        let chain = vec![certified.cert.der().clone()];
+        let mut chain = vec![certified.cert.der().clone()];
+        chain.extend(extra);
         let key = rustls::pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der())
             .unwrap();
         let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -1308,6 +1504,16 @@ mod tests {
                 .starts_with("TLS 1.")
         );
         assert!(output["cert_days_left"].as_i64().unwrap() > 300);
+    }
+
+    /// A server can send certificates beyond the ones its own rests on, such as an
+    /// old cross-signed one long expired, which say nothing about the site.
+    #[test]
+    fn dates_come_only_from_the_certificates_the_site_rests_on() {
+        let expired = certificate(2000, 2001);
+        let address = serve_tls_sending(&["localhost"], vec![expired]);
+        let output = run(&check(CheckKind::Tls, &address));
+        assert!(output["cert_days_left"].as_i64().unwrap() > 300, "{output}");
     }
 
     #[test]

@@ -9,16 +9,14 @@
 
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use maxnines_protocol::Check;
 use rustls::ClientConfig;
-use rustls::client::WebPkiServerVerifier;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
-    Findings, RecordingVerifier, connect, elapsed_ms, host_and_port, resolve, trusted_roots,
+    Findings, RecordingVerifier, connect, host_and_port, provider, resolve, trusted_roots,
 };
 
 /// How to sign in. Usernames aren't secret; the rest never leaves the check.
@@ -47,18 +45,11 @@ impl Credentials {
 /// TLS for a driver: the certificate checked as for a site, or not at all for a
 /// check told not to mind.
 fn driver_tls(insecure: bool) -> Result<ClientConfig> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let builder = ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()?;
+    let builder =
+        ClientConfig::builder_with_provider(provider()).with_safe_default_protocol_versions()?;
     let config = if insecure {
-        let real = WebPkiServerVerifier::builder_with_provider(Arc::new(trusted_roots()), provider)
-            .build()
-            .context("setting up TLS")?;
         // Notes what's wrong and carries on regardless, which is what was asked.
-        let verifier = Arc::new(RecordingVerifier {
-            real,
-            outcome: Arc::new(Mutex::new(None)),
-        });
+        let (verifier, _) = RecordingVerifier::new()?;
         builder
             .dangerous()
             .with_custom_certificate_verifier(verifier)
@@ -89,6 +80,9 @@ pub(crate) fn pg_short(error: tokio_postgres::Error) -> anyhow::Error {
 }
 
 /// Opens a plain connection, timing the lookup and connecting as other checks do.
+/// A driver's own connection is opened after this one, so that what's timed is
+/// the same for every kind of check, and a closed port fails at once with the
+/// usual words.
 async fn open(check: &Check, findings: &mut Findings) -> Result<tokio::net::TcpStream> {
     let (host, port) = host_and_port(&check.target)?;
     let addresses = resolve(&host, port, findings).await?;
@@ -116,12 +110,16 @@ pub(crate) async fn check_postgres(
             matches!(answer[0], b'S' | b'N'),
             "it didn't answer as PostgreSQL does"
         );
-        findings.tls_offered = Some(answer[0] == b'S');
+        let offered = answer[0] == b'S';
+        findings.tls_offered = Some(offered);
+        ensure!(
+            offered || check.tls != Some(true),
+            "it doesn't offer TLS, which the check requires"
+        );
         return Ok(());
     };
-    let started = Instant::now();
-    let (client, running) = postgres_client(check, credentials, false).await?;
-    findings.connect_ms = Some(elapsed_ms(started));
+    drop(open(check, findings).await?);
+    let (client, running) = postgres_client(check, credentials, check.tls == Some(true)).await?;
     let version = client
         .query_one("SHOW server_version", &[])
         .await
@@ -207,9 +205,8 @@ pub(crate) async fn check_mysql(
         findings.server_version = Some(String::from_utf8_lossy(&greeting[1..=end]).into_owned());
         return Ok(());
     };
-    let started = Instant::now();
+    drop(open(check, findings).await?);
     let mut connection = mysql_connection(check, credentials).await?;
-    findings.connect_ms = Some(elapsed_ms(started));
     use mysql_async::prelude::Queryable;
     let version: Option<String> = connection
         .query_first("SELECT VERSION()")
@@ -304,12 +301,11 @@ pub(crate) async fn check_redis(
         .map_err(short)?
         .set_redis_settings(settings);
     let client = redis::Client::open(info).map_err(short)?;
-    let started = Instant::now();
+    drop(open(check, findings).await?);
     let mut connection = client
         .get_multiplexed_async_connection()
         .await
         .map_err(short)?;
-    findings.connect_ms = Some(elapsed_ms(started));
     let pong: redis::RedisResult<String> = redis::cmd("PING").query_async(&mut connection).await;
     match pong {
         Ok(_) => {}

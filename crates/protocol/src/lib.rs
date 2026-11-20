@@ -711,6 +711,7 @@ impl Check {
             self.tls.is_some(),
             "tls",
             &[
+                CheckKind::Postgres,
                 CheckKind::Mysql,
                 CheckKind::Redis,
                 CheckKind::Mongodb,
