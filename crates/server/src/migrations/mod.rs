@@ -3668,6 +3668,33 @@ mod tests {
         }
     }
 
+    /// Where a migration comes in the list.
+    fn place(migration: &dyn MigrationName) -> u32 {
+        let name = migration.name();
+        let place = Migrator::migrations()
+            .iter()
+            .position(|each| each.name() == name)
+            .unwrap_or_else(|| panic!("{name} isn't in the list"));
+        <u32 as std::convert::TryFrom<usize>>::try_from(place).unwrap()
+    }
+
+    async fn applied(connection: &sea_orm::DatabaseConnection) -> u32 {
+        let applied = Migrator::get_applied_migrations(connection).await.unwrap();
+        <u32 as std::convert::TryFrom<usize>>::try_from(applied.len()).unwrap()
+    }
+
+    /// Runs the migrations up to and including `migration`, whatever comes after it.
+    async fn up_to(connection: &sea_orm::DatabaseConnection, migration: &dyn MigrationName) {
+        let steps = place(migration) + 1 - applied(connection).await;
+        Migrator::up(connection, Some(steps)).await.unwrap();
+    }
+
+    /// Rolls back `migration` and everything after it, however many came after.
+    async fn down_through(connection: &sea_orm::DatabaseConnection, migration: &dyn MigrationName) {
+        let steps = applied(connection).await - place(migration);
+        Migrator::down(connection, Some(steps)).await.unwrap();
+    }
+
     async fn texts(connection: &impl ConnectionTrait, sql: &str) -> Vec<String> {
         let query = Statement::from_string(connection.get_database_backend(), sql);
         let rows = connection.query_all_raw(query).await.unwrap();
@@ -4259,7 +4286,7 @@ mod tests {
     #[tokio::test]
     async fn how_long_an_action_ran_is_kept_in_seconds_going_up_and_down() {
         let connection = empty().await;
-        Migrator::up(&connection, Some(5)).await.unwrap();
+        up_to(&connection, &ExactFactsAndEndedAlerts).await;
         let at = "'2026-11-19 00:00:00+00:00'";
         run(
             &connection,
@@ -4304,7 +4331,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        Migrator::down(&connection, Some(2)).await.unwrap();
+        down_through(&connection, &DurationsInSeconds).await;
         let ms = "SELECT duration_ms FROM action_runs WHERE duration_ms IS NOT NULL";
         assert_eq!(number(&connection, ms).await, 1500);
     }
@@ -4312,7 +4339,7 @@ mod tests {
     #[tokio::test]
     async fn what_an_agent_said_in_its_hello_is_kept_with_its_host() {
         let connection = empty().await;
-        Migrator::up(&connection, Some(6)).await.unwrap();
+        up_to(&connection, &DurationsInSeconds).await;
         let at = "'2026-11-20 00:00:00+00:00'";
         run(
             &connection,
@@ -4346,7 +4373,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        Migrator::down(&connection, Some(1)).await.unwrap();
+        down_through(&connection, &AgentHellos).await;
         assert_eq!(count(&connection, "hosts").await, 3);
         Migrator::up(&connection, None).await.unwrap();
         assert_eq!(number(&connection, empty).await, 1);
