@@ -275,11 +275,12 @@ async fn authenticate(
 
 /// Why an agent that speaks `protocol` is turned away, if it is, in words for whoever
 /// runs it.
-pub fn refusal(protocol: u32, agent_version: &str) -> Option<String> {
+fn refusal(protocol: u32, agent_version: &str) -> Option<String> {
     let supported = Protocols::SUPPORTED;
-    let agent = match agent_version {
-        "" => "from before protocol versions".to_string(),
-        version => format!("version {version}, protocol {protocol}"),
+    let agent = match (agent_version, protocol) {
+        ("", 0) => "from before protocol versions".to_string(),
+        ("", protocol) => format!("protocol {protocol}"),
+        (version, protocol) => format!("version {version}, protocol {protocol}"),
     };
     let server = env!("CARGO_PKG_VERSION");
     let takes = supported.describe();
@@ -877,6 +878,8 @@ mod tests {
                 Protocols::SUPPORTED.describe()
             )
         );
+        let unnamed = refusal(PROTOCOL_VERSION + 1, "").unwrap();
+        assert!(unnamed.starts_with("This agent (protocol "), "{unnamed}");
         let newer = PROTOCOL_VERSION + 1;
         let new = refusal(newer, "9.0.0").unwrap();
         assert_eq!(
