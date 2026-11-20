@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
-use futures_util::future::join_all;
 use maxnines_checks::Credentials;
 use maxnines_checks::databases::{
     Database, Reader, Settle, TIMEOUT, by_kind, is_database, namespace,
@@ -123,10 +122,6 @@ pub fn check_database_definitions(definitions: &DatabaseDefinitions) -> Result<(
 
 pub struct DatabaseCollector {
     background: Background,
-    settle: Settle,
-    /// Databases a rule asked for that the agent's config doesn't have, which
-    /// say so with every sample.
-    missing: Vec<Value>,
 }
 
 impl DatabaseCollector {
@@ -134,9 +129,9 @@ impl DatabaseCollector {
         chosen: &[DatabaseChoice],
         definitions: &DatabaseDefinitions,
         interval: Duration,
-    ) -> Self {
-        let mut readers = Vec::new();
-        let mut missing = Vec::new();
+    ) -> Result<Self> {
+        let mut background = Background::new();
+        let limit = interval.min(TIMEOUT);
         for choice in chosen {
             let name = &choice.name;
             let found = definitions
@@ -144,7 +139,21 @@ impl DatabaseCollector {
                 .context("the agent's config has no database by that name")
                 .and_then(|definition| definition.database(name));
             match found {
-                Ok(database) => readers.push(Reader::new(name, database, &choice.extras)),
+                Ok(database) => {
+                    // Rounds never overlap, so it keeps its connection between them.
+                    let reader = Arc::new(Mutex::new(Reader::new(name, database, &choice.extras)));
+                    // Its running totals become changes as it's read.
+                    let mut settle = Settle::default();
+                    background.repeat(
+                        interval,
+                        None,
+                        move || {
+                            let reader = reader.clone();
+                            async move { reader.lock().await.read(limit).await }
+                        },
+                        move |rows| Value::Array(settle.settle(rows.unwrap_or_default())),
+                    )?;
+                }
                 Err(error) => {
                     // Under its kind, if it says a real one.
                     let kind = definitions
@@ -152,7 +161,8 @@ impl DatabaseCollector {
                         .and_then(|definition| CheckKind::parse(&definition.kind))
                         .filter(|kind| is_database(*kind))
                         .map(namespace);
-                    missing.push(json!({
+                    // Says so with every sample.
+                    background.constant(json!({
                         "name": name,
                         "kind": kind,
                         "up": 0,
@@ -161,23 +171,7 @@ impl DatabaseCollector {
                 }
             }
         }
-        // Rounds never overlap, so each reader keeps its connection between them.
-        let readers = Arc::new(Mutex::new(readers));
-        let limit = interval.min(TIMEOUT);
-        let background = Background::start(interval, move || {
-            let readers = readers.clone();
-            async move {
-                let mut readers = readers.lock().await;
-                let reads = readers.iter_mut().map(|reader| reader.read(limit));
-                let rows: Vec<Vec<Value>> = join_all(reads).await;
-                Value::Array(rows.into_iter().flatten().collect())
-            }
-        });
-        Self {
-            background,
-            settle: Settle::default(),
-            missing,
-        }
+        Ok(Self { background })
     }
 }
 
@@ -187,13 +181,9 @@ impl Collector for DatabaseCollector {
     }
 
     fn collect(&mut self) -> Result<Value> {
-        Ok(match self.background.latest() {
-            Value::Array(rows) => {
-                let mut rows = self.settle.settle(rows);
-                rows.extend(self.missing.iter().cloned());
-                by_kind(rows)
-            }
-            // The first round hasn't finished.
+        Ok(match self.background.rows() {
+            Value::Array(rows) => by_kind(rows),
+            // Nothing has been read yet.
             waiting => waiting,
         })
     }
@@ -279,11 +269,11 @@ mod tests {
             },
         ];
         let mut collector =
-            DatabaseCollector::new(&chosen, &definitions, Duration::from_millis(100));
+            DatabaseCollector::new(&chosen, &definitions, Duration::from_millis(100)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         let output = loop {
             let output = collector.collect().unwrap();
-            if output.is_object() {
+            if output["pg"].is_array() {
                 break output;
             }
             assert!(Instant::now() < deadline, "no rows");

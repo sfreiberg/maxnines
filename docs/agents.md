@@ -178,6 +178,9 @@ them by:
 Each service is charted under **Services running** as 1 while it's running and 0 while
 it isn't. One that's starting, paused or failed counts as not running, and so does a
 name the system doesn't know, so a mistyped name shows as stopped, not as missing.
+When the service manager can't be asked, or doesn't answer within 10 seconds, the
+service has no value for that sample, as that says nothing about whether it's
+running, and an alert on it stays as it was.
 
 The host's metrics page lists them under **Watched services**, each as running or
 not, and one that isn't running with its service manager's own word for why, such as

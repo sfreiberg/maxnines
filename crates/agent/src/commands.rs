@@ -12,21 +12,16 @@
 //! separated by spaces. The status, that first line and the values are reported.
 
 use std::collections::BTreeMap;
-use std::process::{ExitStatus, Stdio};
-use std::sync::Arc;
+use std::process::ExitStatus;
 use std::time::Duration;
 
+use crate::background::Background;
+use crate::collector::Collector;
+use crate::custom::{Failure, run_command};
 use anyhow::{Result, ensure};
 use maxnines_protocol::is_custom_metric_name;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::AsyncReadExt;
-use tokio::process::{Child, Command};
-use tokio::time::timeout;
-
-use crate::background::{Background, probe_all};
-use crate::collector::Collector;
-use crate::custom::stop_group;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_TIMEOUT: Duration = Duration::from_secs(300);
@@ -52,9 +47,6 @@ const CRITICAL: u8 = 2;
 const UNKNOWN: u8 = 3;
 
 const NOT_DEFINED: &str = "not defined on this agent";
-const TIMED_OUT: &str = "timed out";
-const NOT_STARTED: &str = "couldn't start the command";
-const NOT_READ: &str = "couldn't read the command's output";
 
 /// One `check_command` block in the agent's config.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -107,47 +99,34 @@ pub fn check_commands(commands: &CheckCommands) -> Result<()> {
     Ok(())
 }
 
-/// A name the server asked for, and what it means on this agent, if anything.
-struct Wanted {
-    name: String,
-    command: Option<CheckCommand>,
-}
-
 pub struct CommandCollector {
     background: Background,
 }
 
 impl CommandCollector {
-    pub fn new(names: Vec<String>, commands: &CheckCommands, interval: Duration) -> Self {
-        let wanted: Vec<Arc<Wanted>> = names
-            .into_iter()
-            .map(|name| {
-                let command = commands.get(&name).cloned();
-                Arc::new(Wanted { name, command })
-            })
-            .collect();
-        let longest = wanted
-            .iter()
-            .filter_map(|item| item.command.as_ref().map(CheckCommand::limit))
-            .max()
-            .unwrap_or_default();
-
-        let background = Background::start(interval, move || {
-            let wanted = wanted.clone();
-            async move {
-                let probe = |item: Arc<Wanted>| async move {
-                    let outcome = match &item.command {
-                        Some(command) => run(command).await,
-                        None => Outcome::problem(NOT_DEFINED),
-                    };
-                    outcome.report(&item.name)
-                };
-                let failed = |item: &Wanted| Outcome::problem(TIMED_OUT).report(&item.name);
-                let results = probe_all(&wanted, interval, longest + GRACE, probe, failed).await;
-                Value::Array(results.into_iter().flatten().collect())
-            }
-        });
-        Self { background }
+    pub fn new(names: Vec<String>, commands: &CheckCommands, interval: Duration) -> Result<Self> {
+        let mut background = Background::new();
+        for name in names {
+            let Some(command) = commands.get(&name).cloned() else {
+                background.constant(Value::Array(Outcome::problem(NOT_DEFINED).report(&name)));
+                continue;
+            };
+            let late = Value::Array(Outcome::problem(&Failure::TimedOut.to_string()).report(&name));
+            let limit = command.limit();
+            background.repeat(
+                interval,
+                Some(limit + GRACE),
+                move || {
+                    let command = command.command.clone();
+                    async move { run(&command, limit).await }
+                },
+                move |found| match found {
+                    Some(outcome) => Value::Array(outcome.report(&name)),
+                    None => late.clone(),
+                },
+            )?;
+        }
+        Ok(Self { background })
     }
 }
 
@@ -157,7 +136,7 @@ impl Collector for CommandCollector {
     }
 
     fn collect(&mut self) -> Result<Value> {
-        Ok(self.background.latest())
+        Ok(self.background.rows())
     }
 }
 
@@ -201,47 +180,12 @@ impl Outcome {
     }
 }
 
-async fn run(definition: &CheckCommand) -> Outcome {
-    let Some((program, arguments)) = definition.command.split_first() else {
-        return Outcome::problem(NOT_STARTED);
-    };
-    let mut command = Command::new(program);
-    command
-        .args(arguments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    // Its own group, so that what it starts can be stopped along with it.
-    #[cfg(unix)]
-    command.process_group(0);
-
-    let Ok(mut child) = command.spawn() else {
-        return Outcome::problem(NOT_STARTED);
-    };
-    let id = child.id();
-    match timeout(definition.limit(), finish(&mut child)).await {
-        Ok(Ok((status, output))) => interpret(status, &output),
-        Ok(Err(())) => Outcome::problem(NOT_READ),
-        Err(_) => {
-            stop_group(id);
-            Outcome::problem(TIMED_OUT)
-        }
+/// Runs a plugin, reading as much of what it prints as Nagios itself would.
+async fn run(command: &[String], limit: Duration) -> Outcome {
+    match run_command(command, limit, MAX_OUTPUT_BYTES as u64).await {
+        Ok((status, output)) => interpret(status, &output),
+        Err(failure) => Outcome::problem(&failure.to_string()),
     }
-}
-
-/// Reads what Nagios would and lets the rest go, which also stops a plugin
-/// that's still writing from waiting on it.
-async fn finish(child: &mut Child) -> Result<(ExitStatus, Vec<u8>), ()> {
-    let stdout = child.stdout.take().ok_or(())?;
-    let mut output = Vec::new();
-    stdout
-        .take(MAX_OUTPUT_BYTES as u64)
-        .read_to_end(&mut output)
-        .await
-        .map_err(|_| ())?;
-    let status = child.wait().await.map_err(|_| ())?;
-    Ok((status, output))
 }
 
 fn interpret(status: ExitStatus, output: &[u8]) -> Outcome {
@@ -471,7 +415,8 @@ mod tests {
             (3, UNKNOWN),
             (7, UNKNOWN),
         ] {
-            let outcome = run(&script(code)).await;
+            let script = script(code);
+            let outcome = run(&script.command, script.limit()).await;
             assert_eq!(outcome.status, status, "{code}");
             assert_eq!(outcome.message, "THING CRITICAL - broke");
             assert_eq!(outcome.values["errors"], 3.0);
@@ -481,20 +426,21 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_plugin_that_cannot_run_or_takes_too_long_is_unknown() {
-        let missing = run(&command(&["/no/such/plugin"])).await;
+        let missing = command(&["/no/such/plugin"]);
+        let missing = run(&missing.command, missing.limit()).await;
         assert_eq!(
-            (missing.status, missing.message.as_str()),
-            (UNKNOWN, NOT_STARTED)
+            (missing.status, missing.message),
+            (UNKNOWN, Failure::NotStarted.to_string())
         );
         let slow = CheckCommand {
             timeout: Some(Duration::from_secs(1)),
             ..command(&["/bin/sleep", "30"])
         };
         let started = std::time::Instant::now();
-        let outcome = run(&slow).await;
+        let outcome = run(&slow.command, slow.limit()).await;
         assert_eq!(
-            (outcome.status, outcome.message.as_str()),
-            (UNKNOWN, TIMED_OUT)
+            (outcome.status, outcome.message),
+            (UNKNOWN, Failure::TimedOut.to_string())
         );
         assert!(started.elapsed() < Duration::from_secs(10));
     }

@@ -17,32 +17,40 @@ const UPDATES_EVERY: Duration = Duration::from_secs(15 * 60);
 /// How close the host is to its limits, how many people are on it, its TCP
 /// connections, services that failed, and whether it has updates or a restart waiting.
 pub struct SystemCollector {
+    /// The latest, then the slower round's findings.
     background: Background,
-    updates: Background,
 }
 
 impl SystemCollector {
-    pub fn new(interval: Duration) -> Self {
-        let background = Background::start(interval, || async {
-            report(
-                &limits(),
-                login_sessions().await,
-                tcp_states().await,
-                failed_services().await,
-            )
-        });
-        let updates = Background::start(UPDATES_EVERY, || async {
-            let updates = pending_updates().await;
-            json!({
-                "reboot_required": reboot_required().await.map(u8::from),
-                "pending_updates": updates.map(|updates| updates.pending),
-                "security_updates": updates.and_then(|updates| updates.security),
-            })
-        });
-        Self {
-            background,
-            updates,
-        }
+    pub fn new(interval: Duration) -> Result<Self> {
+        let mut background = Background::new();
+        background.repeat(
+            interval,
+            None,
+            || async {
+                report(
+                    &limits(),
+                    login_sessions().await,
+                    tcp_states().await,
+                    failed_services().await,
+                )
+            },
+            Option::unwrap_or_default,
+        )?;
+        background.repeat(
+            UPDATES_EVERY,
+            None,
+            || async {
+                let updates = pending_updates().await;
+                json!({
+                    "reboot_required": reboot_required().await.map(u8::from),
+                    "pending_updates": updates.map(|updates| updates.pending),
+                    "security_updates": updates.and_then(|updates| updates.security),
+                })
+            },
+            Option::unwrap_or_default,
+        )?;
+        Ok(Self { background })
     }
 }
 
@@ -61,7 +69,9 @@ impl Collector for SystemCollector {
     }
 
     fn collect(&mut self) -> Result<Value> {
-        Ok(merged(self.background.latest(), self.updates.latest()))
+        let mut results = self.background.latest().into_iter();
+        let latest = results.next().unwrap_or_default();
+        Ok(merged(latest, results.next().unwrap_or_default()))
     }
 }
 

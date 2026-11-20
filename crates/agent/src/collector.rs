@@ -147,36 +147,40 @@ fn build(
         "sensors" => Box::new(SensorCollector::new()?),
         #[cfg(target_os = "macos")]
         "gpu" => Box::new(maxnines_collectors::gpu::GpuCollector),
-        "system" => Box::new(SystemCollector::new(interval)),
+        "system" => Box::new(SystemCollector::new(interval)?),
         "checks" => {
             let checks = config.checks.clone().unwrap_or_default();
             let chosen = config.local_checks.as_deref().unwrap_or_default();
-            Box::new(CheckCollector::new(checks, chosen, local.checks, interval))
+            Box::new(CheckCollector::new(checks, chosen, local.checks, interval)?)
         }
         "custom" => {
             let names = config.names.clone().unwrap_or_default();
-            Box::new(CustomCollector::new(names, local.custom_metrics, interval))
+            Box::new(CustomCollector::new(names, local.custom_metrics, interval)?)
         }
         "commands" => {
             let names = config.names.clone().unwrap_or_default();
-            Box::new(CommandCollector::new(names, local.check_commands, interval))
+            Box::new(CommandCollector::new(
+                names,
+                local.check_commands,
+                interval,
+            )?)
         }
         "services" => {
             let names = config.names.clone().unwrap_or_default();
-            Box::new(ServiceCollector::new(names, interval))
+            Box::new(ServiceCollector::new(names, interval)?)
         }
         #[cfg(target_os = "linux")]
-        "containers" => Box::new(crate::containers::ContainerCollector::new(interval)),
+        "containers" => Box::new(crate::containers::ContainerCollector::new(interval)?),
         "files" => {
             let paths = config.paths.clone().unwrap_or_default();
-            Box::new(FileCollector::new(paths, interval))
+            Box::new(FileCollector::new(paths, interval)?)
         }
-        "apache" => status_pages(Software::Apache, config, interval),
-        "nginx" => status_pages(Software::Nginx, config, interval),
-        "php_fpm" => status_pages(Software::PhpFpm, config, interval),
+        "apache" => status_pages(Software::Apache, config, interval)?,
+        "nginx" => status_pages(Software::Nginx, config, interval)?,
+        "php_fpm" => status_pages(Software::PhpFpm, config, interval)?,
         "databases" => {
             let chosen = config.databases.as_deref().unwrap_or_default();
-            Box::new(DatabaseCollector::new(chosen, local.databases, interval))
+            Box::new(DatabaseCollector::new(chosen, local.databases, interval)?)
         }
         "openmetrics" => {
             let urls = config.urls.clone().unwrap_or_default();
@@ -195,9 +199,11 @@ fn status_pages(
     software: Software,
     config: &CollectorSettings,
     interval: Duration,
-) -> Box<dyn Collector> {
+) -> Result<Box<dyn Collector>> {
     let urls = config.urls.clone().unwrap_or_default();
-    Box::new(StatusPageCollector::new(software, urls, interval))
+    Ok(Box::new(StatusPageCollector::new(
+        software, urls, interval,
+    )?))
 }
 
 /// Some sensors report raw values that aren't temperatures, such as -9200 on

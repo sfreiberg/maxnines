@@ -8,30 +8,42 @@ use std::time::Duration;
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::background::{Background, probe_all};
+use crate::background::Background;
 use crate::collector::Collector;
 
 /// A service manager can stall, but it answers quickly when it's healthy.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+#[cfg(any(test, not(any(target_os = "macos", target_os = "freebsd"))))]
 const UNKNOWN: &str = "unknown";
+/// The service manager's own command couldn't be run.
+#[cfg(any(unix, windows))]
+const NOT_ASKED: &str = "couldn't ask the service manager";
 
 pub struct ServiceCollector {
     background: Background,
 }
 
 impl ServiceCollector {
-    pub fn new(names: Vec<String>, interval: Duration) -> Self {
-        let names: Vec<Arc<String>> = names.into_iter().map(Arc::new).collect();
-        let background = Background::start(interval, move || {
-            let names = names.clone();
-            async move {
-                let probe = |name: Arc<String>| async move { report(&name, query(&name).await) };
-                let failed = |name: &String| report(name, Status::stopped(UNKNOWN));
-                Value::Array(probe_all(&names, interval, TIMEOUT, probe, failed).await)
-            }
-        });
-        Self { background }
+    pub fn new(names: Vec<String>, interval: Duration) -> Result<Self> {
+        let mut background = Background::new();
+        for name in names {
+            let late = report(&name, Status::unknown("timed out"));
+            let watched = Arc::new(Watched::new(name));
+            let reported = watched.clone();
+            background.repeat(
+                interval,
+                Some(TIMEOUT),
+                move || {
+                    let watched = watched.clone();
+                    async move { query(&watched).await }
+                },
+                move |found| {
+                    found.map_or_else(|| late.clone(), |status| report(&reported.name, status))
+                },
+            )?;
+        }
+        Ok(Self { background })
     }
 }
 
@@ -41,39 +53,68 @@ impl Collector for ServiceCollector {
     }
 
     fn collect(&mut self) -> Result<Value> {
-        Ok(self.background.latest())
+        Ok(self.background.rows())
+    }
+}
+
+/// A service being watched.
+struct Watched {
+    name: String,
+    /// Whether it's still being asked about, as Windows can only be asked with a
+    /// call that can't be stopped.
+    #[cfg(windows)]
+    busy: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Watched {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            #[cfg(windows)]
+            busy: Arc::default(),
+        }
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct Status {
-    running: bool,
-    /// The service manager's own word for it.
+    /// Unknown when the service manager couldn't be asked, or didn't say.
+    running: Option<bool>,
+    /// The service manager's own word for it, or why it's not known.
     state: String,
 }
 
 impl Status {
     fn stopped(state: &str) -> Self {
         Self {
-            running: false,
+            running: Some(false),
             state: state.to_string(),
         }
     }
 
     fn running(state: &str) -> Self {
         Self {
-            running: true,
+            running: Some(true),
             state: state.to_string(),
+        }
+    }
+
+    fn unknown(why: &str) -> Self {
+        Self {
+            running: None,
+            state: why.to_string(),
         }
     }
 }
 
+/// A service that couldn't be asked about says nothing about whether it's running,
+/// so it has no `running` value, and an alert on it holds its state.
 fn report(name: &str, status: Status) -> Value {
-    json!({
-        "name": name,
-        "running": u8::from(status.running),
-        "state": status.state,
-    })
+    let mut report = json!({ "name": name, "state": status.state });
+    if let Some(running) = status.running {
+        report["running"] = json!(u8::from(running));
+    }
+    report
 }
 
 /// Reads `systemctl show`. A unit systemd has never heard of still gets an
@@ -91,7 +132,7 @@ fn parse_systemd(output: &str) -> Status {
     }
     match value("ActiveState") {
         "active" | "reloading" => Status::running(value("ActiveState")),
-        "" => Status::stopped(UNKNOWN),
+        "" => Status::unknown(UNKNOWN),
         other => Status::stopped(other),
     }
 }
@@ -148,19 +189,21 @@ async fn run_command(program: &str, arguments: &[&str]) -> std::io::Result<std::
 }
 
 #[cfg(target_os = "linux")]
-async fn query(name: &str) -> Status {
+async fn query(watched: &Watched) -> Status {
+    let name = watched.name.as_str();
     let arguments = ["show", "--property=LoadState,ActiveState", "--", name];
     let output = run_command("systemctl", &arguments).await;
     match output {
         Ok(output) => parse_systemd(&String::from_utf8_lossy(&output.stdout)),
-        Err(_) => Status::stopped(UNKNOWN),
+        Err(_) => Status::unknown(NOT_ASKED),
     }
 }
 
 /// The system's services first, as those are the ones a host is watched for, and
 /// then the agent's own user's: `launchctl list` only ever sees the second kind.
 #[cfg(target_os = "macos")]
-async fn query(name: &str) -> Status {
+async fn query(watched: &Watched) -> Status {
+    let name = watched.name.as_str();
     let system = format!("system/{name}");
     if let Ok(output) = run_command("launchctl", &["print", &system]).await
         && output.status.success()
@@ -174,29 +217,38 @@ async fn query(name: &str) -> Status {
             parse_launchd(&String::from_utf8_lossy(&output.stdout))
         }
         Ok(_) => Status::stopped("not found"),
-        Err(_) => Status::stopped(UNKNOWN),
+        Err(_) => Status::unknown(NOT_ASKED),
     }
 }
 
 #[cfg(target_os = "freebsd")]
-async fn query(name: &str) -> Status {
+async fn query(watched: &Watched) -> Status {
+    let name = watched.name.as_str();
     let output = run_command("service", &[name, "status"]).await;
     match output {
         Ok(output) => parse_rc(
             output.status.success(),
             &String::from_utf8_lossy(&output.stderr),
         ),
-        Err(_) => Status::stopped(UNKNOWN),
+        Err(_) => Status::unknown(NOT_ASKED),
     }
 }
 
-/// Windows only offers a blocking call for this.
+/// Windows only offers a blocking call for this. It can't be stopped once it's
+/// started, so a service still stuck from before isn't asked again, and a stalled
+/// service manager holds one thread per service rather than adding one each time.
 #[cfg(windows)]
-async fn query(name: &str) -> Status {
-    let name = name.to_string();
-    tokio::task::spawn_blocking(move || query_blocking(&name))
-        .await
-        .unwrap_or_else(|_| Status::stopped(UNKNOWN))
+async fn query(watched: &Watched) -> Status {
+    let Some(busy) = crate::background::Busy::try_start(&watched.busy) else {
+        return Status::unknown("timed out");
+    };
+    let name = watched.name.clone();
+    tokio::task::spawn_blocking(move || {
+        let _busy = busy;
+        query_blocking(&name)
+    })
+    .await
+    .unwrap_or_else(|_| Status::unknown(UNKNOWN))
 }
 
 #[cfg(windows)]
@@ -206,7 +258,7 @@ fn query_blocking(name: &str) -> Status {
 
     let Ok(manager) = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
     else {
-        return Status::stopped(UNKNOWN);
+        return Status::unknown(NOT_ASKED);
     };
     let Ok(service) = manager.open_service(name, ServiceAccess::QUERY_STATUS) else {
         return Status::stopped("not found");
@@ -216,7 +268,7 @@ fn query_blocking(name: &str) -> Status {
         Ok(ServiceState::StartPending) => Status::stopped("starting"),
         Ok(ServiceState::Paused) => Status::stopped("paused"),
         Ok(_) => Status::stopped("stopped"),
-        Err(_) => Status::stopped(UNKNOWN),
+        Err(_) => Status::unknown(UNKNOWN),
     }
 }
 
@@ -226,13 +278,17 @@ fn query_blocking(name: &str) -> Status {
     target_os = "freebsd",
     windows
 )))]
-async fn query(_name: &str) -> Status {
-    Status::stopped(UNKNOWN)
+async fn query(_watched: &Watched) -> Status {
+    Status::unknown(UNKNOWN)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn query_named(name: &str) -> Status {
+        query(&Watched::new(name.to_string())).await
+    }
 
     #[test]
     fn a_running_systemd_unit_is_running() {
@@ -264,7 +320,7 @@ mod tests {
 
     #[test]
     fn empty_systemd_output_is_not_a_guess() {
-        assert_eq!(parse_systemd(""), Status::stopped(UNKNOWN));
+        assert_eq!(parse_systemd(""), Status::unknown(UNKNOWN));
     }
 
     #[test]
@@ -292,10 +348,10 @@ mod tests {
     #[tokio::test]
     async fn this_macs_own_services_are_found_without_being_root() {
         // Every Mac runs this, and `launchctl list` can't see it as a user.
-        let found = query("com.apple.mDNSResponder.reloaded").await;
+        let found = query_named("com.apple.mDNSResponder.reloaded").await;
         assert_eq!(found, Status::running("running"));
         assert_eq!(
-            query("com.example.no-such-service").await,
+            query_named("com.example.no-such-service").await,
             Status::stopped("not found")
         );
     }
@@ -331,9 +387,17 @@ mod tests {
         assert_eq!(report("nginx", Status::stopped("failed"))["running"], 0);
     }
 
+    #[test]
+    fn a_service_that_could_not_be_asked_about_is_not_called_stopped() {
+        assert_eq!(
+            report("nginx", Status::unknown("timed out")),
+            json!({ "name": "nginx", "state": "timed out" })
+        );
+    }
+
     #[tokio::test]
     async fn a_service_that_does_not_exist_is_not_running() {
-        let status = query("maxnines-no-such-service").await;
-        assert!(!status.running, "{status:?}");
+        let status = query_named("maxnines-no-such-service").await;
+        assert_eq!(status.running, Some(false), "{status:?}");
     }
 }

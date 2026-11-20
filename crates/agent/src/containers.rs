@@ -39,16 +39,17 @@ const SOCKETS: [&str; 2] = ["/var/run/docker.sock", "/run/podman/podman.sock"];
 
 pub struct ContainerCollector {
     background: Background,
-    /// Each container's CPU time and the host's when last read, to measure use
-    /// from one sample to the next.
-    cpu: HashMap<String, (u64, u64)>,
 }
 
 impl ContainerCollector {
-    pub fn new(interval: Duration) -> Self {
+    pub fn new(interval: Duration) -> Result<Self> {
         let socket = find_socket(std::env::var("DOCKER_HOST").ok().as_deref());
         let complained = Arc::new(Mutex::new(None::<String>));
-        let background = Background::start(interval, move || {
+        // Each container's CPU time and the host's when last read, to measure use
+        // from one read to the next.
+        let mut cpu = HashMap::new();
+        let mut background = Background::new();
+        let round = move || {
             let socket = socket.clone();
             let complained = complained.clone();
             async move {
@@ -76,11 +77,20 @@ impl ContainerCollector {
                     }
                 }
             }
-        });
-        Self {
-            background,
-            cpu: HashMap::new(),
-        }
+        };
+        let settle = move |containers: Option<Value>| {
+            let mut containers = containers.unwrap_or_default();
+            let mut seen = HashMap::new();
+            if let Value::Array(rows) = &mut containers {
+                for row in rows {
+                    settle_cpu(row, &cpu, &mut seen);
+                }
+            }
+            cpu = seen;
+            containers
+        };
+        background.repeat(interval, None, round, settle)?;
+        Ok(Self { background })
     }
 }
 
@@ -90,15 +100,7 @@ impl Collector for ContainerCollector {
     }
 
     fn collect(&mut self) -> Result<Value> {
-        let mut containers = self.background.latest();
-        let mut seen = HashMap::new();
-        if let Value::Array(rows) = &mut containers {
-            for row in rows {
-                settle_cpu(row, &self.cpu, &mut seen);
-            }
-        }
-        self.cpu = seen;
-        Ok(containers)
+        Ok(self.background.latest().pop().unwrap_or_default())
     }
 }
 
@@ -277,7 +279,7 @@ fn describe(
 }
 
 /// Swaps a row's CPU totals for the share of the whole host it used since the last
-/// sample, as other CPU figures are, so one busy core of eight is 12.5%. Docker's
+/// read, as other CPU figures are, so one busy core of eight is 12.5%. Docker's
 /// host total counts every CPU. The first sample has nothing to compare with.
 fn settle_cpu(
     row: &mut Value,
@@ -493,7 +495,7 @@ mod tests {
 
     #[test]
     fn nothing_is_reported_until_containers_have_been_read() {
-        let mut collector = ContainerCollector::new(Duration::from_secs(3600));
+        let mut collector = ContainerCollector::new(Duration::from_secs(3600)).unwrap();
         assert_eq!(collector.name(), "containers");
         assert_eq!(collector.collect().unwrap(), Value::Null);
     }

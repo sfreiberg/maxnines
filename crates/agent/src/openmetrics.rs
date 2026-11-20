@@ -19,7 +19,7 @@ use maxnines_protocol::{check_metrics_pages, is_page_name};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::background::{Background, probe_all};
+use crate::background::Background;
 use crate::collector::Collector;
 
 /// How many pages the agent's config can define.
@@ -108,10 +108,6 @@ pub fn check_page_definitions(pages: &PageDefinitions) -> Result<()> {
 
 pub struct OpenMetricsCollector {
     background: Background,
-    totals: Totals,
-    /// Pages a rule asked for that the agent's config doesn't have, which say so
-    /// with every sample.
-    missing: Vec<Value>,
 }
 
 impl OpenMetricsCollector {
@@ -129,6 +125,7 @@ impl OpenMetricsCollector {
             .into_iter()
             .map(|url| Arc::new(Page::new(url, wanted, max_series, None)))
             .collect();
+        let mut background = Background::new();
         let mut missing = Vec::new();
         for name in local {
             match definitions.get(name) {
@@ -145,20 +142,29 @@ impl OpenMetricsCollector {
                 })),
             }
         }
-        let background = Background::start(interval, move || {
-            let pages = pages.clone();
-            async move {
-                let read = |page: Arc<Page>| async move { page.read().await };
-                let timed_out = |page: &Page| page.failed(TIMED_OUT);
-                let rows = probe_all(&pages, interval, TIMEOUT, read, timed_out).await;
-                Value::Array(rows.into_iter().flatten().collect())
-            }
-        });
-        Ok(Self {
-            background,
-            totals: Totals::default(),
-            missing,
-        })
+        for page in pages {
+            // Each page's running totals become changes as it's read.
+            let mut totals = Totals::default();
+            let read = page.clone();
+            background.repeat(
+                interval,
+                Some(TIMEOUT),
+                move || {
+                    let page = read.clone();
+                    async move { page.read().await }
+                },
+                move |rows| {
+                    let rows = rows.unwrap_or_else(|| page.failed(TIMED_OUT));
+                    Value::Array(totals.settle(rows))
+                },
+            )?;
+        }
+        // Pages a rule asked for that the agent's config doesn't have, which say so
+        // with every sample.
+        for row in missing {
+            background.constant(row);
+        }
+        Ok(Self { background })
     }
 }
 
@@ -168,15 +174,7 @@ impl Collector for OpenMetricsCollector {
     }
 
     fn collect(&mut self) -> Result<Value> {
-        Ok(match self.background.latest() {
-            Value::Array(kept) => {
-                let mut rows = self.totals.settle(kept);
-                rows.extend(self.missing.iter().cloned());
-                Value::Array(rows)
-            }
-            // The first round hasn't finished.
-            waiting => waiting,
-        })
+        Ok(self.background.rows())
     }
 }
 
@@ -259,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn totals_become_the_change_since_the_last_sample() {
+    fn totals_become_the_change_since_the_page_was_last_read() {
         let first = "# TYPE jobs_total counter\njobs_total 100\n# TYPE restarts_total counter\nrestarts_total 7\nqueue 1\n";
         let second = "# TYPE jobs_total counter\njobs_total 130\n# TYPE restarts_total counter\nrestarts_total 2\nqueue 2\n";
         let served = serve(vec![first, second]);
@@ -318,7 +316,9 @@ mod tests {
         )
         .unwrap();
 
-        let output = collect_until(&mut collector, |output| output.is_array());
+        let output = collect_until(&mut collector, |output| {
+            output.as_array().is_some_and(|rows| rows.len() == 2)
+        });
 
         assert_eq!(
             output[0],

@@ -9,6 +9,7 @@
 //! could hold secrets, so failures are described by fixed messages and nothing else.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,7 +22,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
 
-use crate::background::{Background, probe_all};
+use crate::background::Background;
 use crate::collector::Collector;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -95,47 +96,36 @@ pub fn check_definitions(definitions: &Definitions) -> Result<()> {
     Ok(())
 }
 
-/// A name the server asked for, and what it means on this agent, if anything.
-struct Wanted {
-    name: String,
-    metric: Option<CustomMetric>,
-}
-
 pub struct CustomCollector {
     background: Background,
 }
 
 impl CustomCollector {
-    pub fn new(names: Vec<String>, definitions: &Definitions, interval: Duration) -> Self {
-        let wanted: Vec<Arc<Wanted>> = names
-            .into_iter()
-            .map(|name| {
-                let metric = definitions.get(&name).cloned();
-                Arc::new(Wanted { name, metric })
-            })
-            .collect();
-        let longest = wanted
-            .iter()
-            .filter_map(|item| item.metric.as_ref().map(CustomMetric::limit))
-            .max()
-            .unwrap_or_default();
-
-        let background = Background::start(interval, move || {
-            let wanted = wanted.clone();
-            async move {
-                let probe = |item: Arc<Wanted>| async move {
-                    let result = match &item.metric {
-                        Some(metric) => measure(&item.name, metric, metric.limit()).await,
-                        None => Err(NOT_DEFINED.to_string()),
-                    };
-                    report(&item.name, result)
-                };
-                let failed = |item: &Wanted| report(&item.name, Err(TIMED_OUT.to_string()));
-                let results = probe_all(&wanted, interval, longest + GRACE, probe, failed).await;
-                Value::Array(results.into_iter().flatten().collect())
-            }
-        });
-        Self { background }
+    pub fn new(names: Vec<String>, definitions: &Definitions, interval: Duration) -> Result<Self> {
+        let mut background = Background::new();
+        for name in names {
+            let Some(metric) = definitions.get(&name).cloned() else {
+                background.constant(Value::Array(report(&name, Err(NOT_DEFINED.to_string()))));
+                continue;
+            };
+            let limit = metric.limit();
+            let wanted = Arc::new((name, metric));
+            let late = Value::Array(report(&wanted.0, Err(TIMED_OUT.to_string())));
+            let reported = wanted.clone();
+            background.repeat(
+                interval,
+                Some(limit + GRACE),
+                move || {
+                    let wanted = wanted.clone();
+                    async move { measure(&wanted.0, &wanted.1, limit).await }
+                },
+                move |found| match found {
+                    Some(result) => Value::Array(report(&reported.0, result)),
+                    None => late.clone(),
+                },
+            )?;
+        }
+        Ok(Self { background })
     }
 }
 
@@ -145,7 +135,7 @@ impl Collector for CustomCollector {
     }
 
     fn collect(&mut self) -> Result<Value> {
-        Ok(self.background.latest())
+        Ok(self.background.rows())
     }
 }
 
@@ -176,11 +166,43 @@ fn report(name: &str, result: Result<Reading, String>) -> Vec<Value> {
 
 /// Runs a command and gives what it printed.
 async fn measure(name: &str, metric: &CustomMetric, limit: Duration) -> Result<Reading, String> {
-    let (program, arguments) = metric
-        .command
-        .split_first()
-        .ok_or_else(|| NOT_STARTED.to_string())?;
+    // A little more than is allowed, to tell when there was too much.
+    match run_command(&metric.command, limit, MAX_OUTPUT_BYTES as u64 + 1).await {
+        Ok((status, output)) => interpret(name, status, &output),
+        Err(failure) => Err(failure.to_string()),
+    }
+}
 
+/// Why a command defined in the agent's config gave nothing to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Failure {
+    NotStarted,
+    NotRead,
+    TimedOut,
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotStarted => NOT_STARTED,
+            Self::NotRead => NOT_READ,
+            Self::TimedOut => TIMED_OUT,
+        })
+    }
+}
+
+/// Runs a command from the agent's config, as custom metrics and check commands
+/// both do: directly rather than through a shell, with nothing to read and its
+/// errors ignored, and in a process group of its own so that running out of time
+/// stops what it started too. Up to `max_output` bytes of what it prints are read,
+/// and the rest is let go, which also stops a command that's still writing from
+/// waiting on it.
+pub(crate) async fn run_command(
+    command: &[String],
+    limit: Duration,
+    max_output: u64,
+) -> Result<(ExitStatus, Vec<u8>), Failure> {
+    let (program, arguments) = command.split_first().ok_or(Failure::NotStarted)?;
     let mut command = Command::new(program);
     command
         .args(arguments)
@@ -188,30 +210,25 @@ async fn measure(name: &str, metric: &CustomMetric, limit: Duration) -> Result<R
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    // Its own group, so that what it starts can be stopped along with it.
     #[cfg(unix)]
     command.process_group(0);
 
-    let mut child = command.spawn().map_err(|_| NOT_STARTED.to_string())?;
+    let mut child = command.spawn().map_err(|_| Failure::NotStarted)?;
     let id = child.id();
-
-    match timeout(limit, finish(&mut child)).await {
-        Ok(Ok((status, output))) => interpret(name, status, &output),
-        Ok(Err(())) => Err(NOT_READ.to_string()),
+    match timeout(limit, finish(&mut child, max_output)).await {
+        Ok(finished) => finished.map_err(|()| Failure::NotRead),
         Err(_) => {
             stop_group(id);
-            Err(TIMED_OUT.to_string())
+            Err(Failure::TimedOut)
         }
     }
 }
 
-/// Reads a little more than is allowed, to tell when there was too much. Closing
-/// the output first stops a command that's still writing from waiting on it.
-async fn finish(child: &mut Child) -> Result<(ExitStatus, Vec<u8>), ()> {
+async fn finish(child: &mut Child, max_output: u64) -> Result<(ExitStatus, Vec<u8>), ()> {
     let stdout = child.stdout.take().ok_or(())?;
     let mut output = Vec::new();
     stdout
-        .take(MAX_OUTPUT_BYTES as u64 + 1)
+        .take(max_output)
         .read_to_end(&mut output)
         .await
         .map_err(|_| ())?;
@@ -585,7 +602,8 @@ mod tests {
             ]);
 
             let names = vec!["wanted".to_string()];
-            let mut collector = CustomCollector::new(names, &defined, Duration::from_millis(20));
+            let mut collector =
+                CustomCollector::new(names, &defined, Duration::from_millis(20)).unwrap();
             wait_until(|| collector.background_has_results());
 
             assert_eq!(
@@ -600,7 +618,8 @@ mod tests {
         fn a_name_the_agent_does_not_define_is_never_run() {
             let names = vec!["/bin/sh".to_string()];
             let mut collector =
-                CustomCollector::new(names, &Definitions::new(), Duration::from_millis(20));
+                CustomCollector::new(names, &Definitions::new(), Duration::from_millis(20))
+                    .unwrap();
             wait_until(|| collector.background_has_results());
             assert_eq!(
                 latest(&mut collector, "/bin/sh").unwrap()["error"],
@@ -611,7 +630,7 @@ mod tests {
         impl CustomCollector {
             fn background_has_results(&self) -> bool {
                 self.background
-                    .latest()
+                    .rows()
                     .as_array()
                     .is_some_and(|list| !list.is_empty())
             }

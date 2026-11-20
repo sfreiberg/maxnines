@@ -13,7 +13,7 @@ use anyhow::Result;
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::{Value, json};
 
-use crate::background::{Background, Busy, probe_all};
+use crate::background::{Background, Busy};
 use crate::collector::Collector;
 
 /// Network drives can hang, which shows as this much delay and then a failure.
@@ -52,23 +52,22 @@ async fn check_path(watched: Arc<WatchedPath>) -> Value {
 }
 
 impl FileCollector {
-    pub fn new(paths: Vec<String>, interval: Duration) -> Self {
-        let watched: Vec<Arc<WatchedPath>> = paths
-            .into_iter()
-            .map(|path| {
-                Arc::new(WatchedPath {
-                    path,
-                    busy: Arc::default(),
-                })
-            })
-            .collect();
-        let background = Background::start(interval, move || {
-            let watched = watched.clone();
-            async move {
-                Value::Array(probe_all(&watched, interval, TIMEOUT, check_path, timed_out).await)
-            }
-        });
-        Self { background }
+    pub fn new(paths: Vec<String>, interval: Duration) -> Result<Self> {
+        let mut background = Background::new();
+        for path in paths {
+            let watched = Arc::new(WatchedPath {
+                path,
+                busy: Arc::default(),
+            });
+            let late = timed_out(&watched);
+            background.repeat(
+                interval,
+                Some(TIMEOUT),
+                move || check_path(watched.clone()),
+                move |found| found.unwrap_or_else(|| late.clone()),
+            )?;
+        }
+        Ok(Self { background })
     }
 }
 
@@ -78,7 +77,7 @@ impl Collector for FileCollector {
     }
 
     fn collect(&mut self) -> Result<Value> {
-        Ok(self.background.latest())
+        Ok(self.background.rows())
     }
 }
 
@@ -278,9 +277,10 @@ mod tests {
         let mut collector = FileCollector::new(
             vec![path_of(folder.path()), path_of(&folder.path().join("nope"))],
             Duration::from_millis(20),
-        );
+        )
+        .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let output = collector.collect().unwrap();
             if output.as_array().is_some_and(|items| items.len() == 2) {

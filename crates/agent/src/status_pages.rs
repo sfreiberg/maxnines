@@ -4,8 +4,8 @@
 //! request gives everything a page has, however many numbers that is.
 //!
 //! Running totals, such as requests served, are turned into the change since the
-//! last sample here, as the server expects for a rate. A page that stops answering
-//! starts afresh when it's back, rather than counting the gap as one burst.
+//! page was last read here, as the server expects for a rate. A page that stops
+//! answering starts afresh when it's back, rather than counting the gap as one burst.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use maxnines_collectors::system::Change;
 use maxnines_protocol::default_status_page;
 use serde_json::{Map, Value, json};
 
-use crate::background::{Background, probe_all};
+use crate::background::Background;
 use crate::collector::Collector;
 
 /// A status page is a few lines served by the host itself, so anything slower
@@ -238,22 +238,10 @@ struct Page {
     label: String,
 }
 
-/// One row per page. Totals are kept to one side for [`StatusPageCollector`] to
-/// turn into changes.
-async fn read_page(page: Arc<Page>) -> Value {
-    let read = match fetch_page(&page.software.request_url(&page.url), TIMEOUT, None).await {
+async fn read_page(page: Arc<Page>) -> Result<Reading, String> {
+    match fetch_page(&page.software.request_url(&page.url), TIMEOUT, None).await {
         Ok(text) => page.software.read(&text).map_err(str::to_string),
         Err(error) => Err(format!("{error:#}")),
-    };
-    match read {
-        Ok(reading) => {
-            let mut row = json!({ "name": page.label, "up": 1, "totals": reading.totals });
-            for (name, value) in reading.levels {
-                row[name] = json!(value);
-            }
-            row
-        }
-        Err(error) => failed(&page.label, &error),
     }
 }
 
@@ -261,15 +249,42 @@ fn failed(label: &str, error: &str) -> Value {
     json!({ "name": label, "up": 0, "error": error })
 }
 
+/// The last running totals read from one page, to turn the next into changes.
+#[derive(Default)]
+struct Totals(BTreeMap<&'static str, Change>);
+
+impl Totals {
+    /// A page's row, with each running total as its change since the page was last
+    /// read. The first read has nothing to compare with, so it has none, and so
+    /// does the first after a failure.
+    fn row(&mut self, label: &str, read: Result<Reading, String>) -> Value {
+        let reading = match read {
+            Ok(reading) => reading,
+            Err(error) => {
+                self.0.clear();
+                return failed(label, &error);
+            }
+        };
+        let mut row = json!({ "name": label, "up": 1 });
+        for (name, value) in reading.levels {
+            row[name] = json!(value);
+        }
+        for (name, total) in reading.totals {
+            if let Some(change) = self.0.entry(name).or_default().update(Some(total)) {
+                row[name] = json!(change);
+            }
+        }
+        row
+    }
+}
+
 pub struct StatusPageCollector {
     software: Software,
     background: Background,
-    /// The last total seen for each page and number.
-    totals: BTreeMap<(String, String), Change>,
 }
 
 impl StatusPageCollector {
-    pub fn new(software: Software, urls: Vec<String>, interval: Duration) -> Self {
+    pub fn new(software: Software, urls: Vec<String>, interval: Duration) -> Result<Self> {
         let urls = if urls.is_empty() {
             default_status_page(software.collector())
                 .map(str::to_string)
@@ -278,56 +293,26 @@ impl StatusPageCollector {
         } else {
             urls
         };
-        let pages: Vec<Arc<Page>> = urls
-            .into_iter()
-            .map(|url| {
-                Arc::new(Page {
-                    software,
-                    label: label(&url),
-                    url,
-                })
-            })
-            .collect();
-        let background = Background::start(interval, move || {
-            let pages = pages.clone();
-            async move {
-                let timed_out = |page: &Page| failed(&page.label, TIMED_OUT);
-                Value::Array(probe_all(&pages, interval, TIMEOUT, read_page, timed_out).await)
-            }
-        });
-        Self {
+        let mut background = Background::new();
+        for url in urls {
+            let page = Arc::new(Page {
+                software,
+                label: label(&url),
+                url,
+            });
+            let label = page.label.clone();
+            let mut totals = Totals::default();
+            background.repeat(
+                interval,
+                Some(TIMEOUT),
+                move || read_page(page.clone()),
+                move |read| totals.row(&label, read.unwrap_or_else(|| Err(TIMED_OUT.to_string()))),
+            )?;
+        }
+        Ok(Self {
             software,
             background,
-            totals: BTreeMap::new(),
-        }
-    }
-
-    /// Swaps a row's running totals for the change since the last sample. The
-    /// first sample of a page has nothing to compare with, so it has none.
-    fn settle(&mut self, row: &mut Value) {
-        let Some(fields) = row.as_object_mut() else {
-            return;
-        };
-        let name = fields
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let totals = fields.remove("totals");
-        let Some(Value::Object(totals)) = totals else {
-            self.totals.retain(|(page, _), _| *page != name);
-            return;
-        };
-        for (field, value) in totals {
-            let change = self
-                .totals
-                .entry((name.clone(), field.clone()))
-                .or_default()
-                .update(value.as_u64());
-            if let Some(change) = change {
-                fields.insert(field, json!(change));
-            }
-        }
+        })
     }
 }
 
@@ -337,13 +322,7 @@ impl Collector for StatusPageCollector {
     }
 
     fn collect(&mut self) -> Result<Value> {
-        let mut pages = self.background.latest();
-        if let Value::Array(rows) = &mut pages {
-            for row in rows {
-                self.settle(row);
-            }
-        }
-        Ok(pages)
+        Ok(self.background.rows())
     }
 }
 
@@ -595,14 +574,15 @@ slow requests:        7
     }
 
     #[test]
-    fn totals_become_the_change_since_the_last_sample() {
+    fn totals_become_the_change_since_the_page_was_last_read() {
         let first = "Active connections: 1\nserver accepts handled requests\n 10 10 100\nReading: 0 Writing: 1 Waiting: 0\n";
         let second = "Active connections: 2\nserver accepts handled requests\n 15 14 130\nReading: 0 Writing: 1 Waiting: 1\n";
         let served = serve(vec![first, second]);
         let address = &served.address;
         let url = format!("http://{address}/nginx_status");
         let mut collector =
-            StatusPageCollector::new(Software::Nginx, vec![url], Duration::from_millis(200));
+            StatusPageCollector::new(Software::Nginx, vec![url], Duration::from_millis(200))
+                .unwrap();
 
         let output = collect_until(&mut collector, |output| output[0]["connections"] == 1.0);
         let page = &output[0];
@@ -625,7 +605,8 @@ slow requests:        7
         let address = serve(vec!["<html>It works!</html>"]).address;
         let url = format!("http://{address}/server-status");
         let mut collector =
-            StatusPageCollector::new(Software::Apache, vec![url], Duration::from_millis(200));
+            StatusPageCollector::new(Software::Apache, vec![url], Duration::from_millis(200))
+                .unwrap();
         let output = collect_until(&mut collector, |output| output.is_array());
         assert_eq!(output[0]["up"], 0);
         assert_eq!(output[0]["error"], NOT_APACHE);
@@ -633,24 +614,17 @@ slow requests:        7
 
     #[test]
     fn a_page_that_stops_answering_starts_its_totals_afresh() {
-        let address = serve(vec![]).address;
-        let page =
-            |requests: u64| json!({ "name": "p", "up": 1, "totals": { "requests": requests } });
-        let mut collector = StatusPageCollector::new(
-            Software::Nginx,
-            vec![format!("http://{address}/")],
-            Duration::from_secs(3600),
-        );
-        let mut row = page(100);
-        collector.settle(&mut row);
-        let mut row = page(150);
-        collector.settle(&mut row);
-        assert_eq!(row["requests"], 50);
+        let mut totals = Totals::default();
+        let requests = |requests: u64| Ok(reading(&[], &[("requests", requests)]));
+        assert!(totals.row("p", requests(100)).get("requests").is_none());
+        assert_eq!(totals.row("p", requests(150))["requests"], 50);
+        // Read again before the page changed, it changed by nothing since then.
+        assert_eq!(totals.row("p", requests(150))["requests"], 0);
 
-        let mut down = failed("p", TIMED_OUT);
-        collector.settle(&mut down);
-        let mut row = page(900);
-        collector.settle(&mut row);
+        let down = totals.row("p", Err(TIMED_OUT.to_string()));
+        assert_eq!(down, failed("p", TIMED_OUT));
+        let row = totals.row("p", requests(900));
         assert!(row.get("requests").is_none(), "{row}");
+        assert_eq!(row["up"], 1);
     }
 }

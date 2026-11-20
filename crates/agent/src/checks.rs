@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -20,7 +20,7 @@ use maxnines_protocol::{Check, CheckKind, LocalCheck, MAX_CHECK_NAME_LEN, is_che
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::background::{Background, probe_all};
+use crate::background::Background;
 use crate::collector::Collector;
 
 /// How long a check gets to report once its own time limit is up.
@@ -195,112 +195,52 @@ impl Ready {
             },
         }
     }
-
-    fn interval(&self) -> Option<Duration> {
-        match self {
-            Self::Run(check, _) => check.interval,
-            Self::Broken { .. } => None,
-        }
-    }
-
-    fn broken(name: &str, why: &str) -> Value {
-        json!({ "name": name, "up": 0, "error": why })
-    }
-
-    fn timed_out(&self) -> Value {
-        match self {
-            Self::Run(check, _) => timed_out_report(check),
-            Self::Broken { name, why } => Self::broken(name, why),
-        }
-    }
 }
 
-/// A check and how often it runs, in rounds of the agent's interval.
-struct Scheduled {
-    check: Arc<Ready>,
-    every: u64,
-    /// Which round of each `every` it runs in, so checks with the same interval
-    /// don't all run together.
-    offset: u64,
-}
-
-/// A check runs with every sample unless it asks for longer, rounded up to whole
-/// samples. It never runs more often than samples are sent.
-fn rounds(wanted: Option<Duration>, interval: Duration) -> u64 {
-    let Some(wanted) = wanted else {
-        return 1;
-    };
-    u64::try_from(wanted.as_nanos().div_ceil(interval.as_nanos().max(1)))
-        .unwrap_or(u64::MAX)
-        .max(1)
+/// A check runs with every sample unless it asks for longer. It never runs more
+/// often than samples are sent.
+fn every(wanted: Option<Duration>, interval: Duration) -> Duration {
+    wanted.unwrap_or(interval).max(interval)
 }
 
 impl CheckCollector {
     /// `checks` come whole from the server, and never sign in. `local` picks from
-    /// the checks the agent's config defines.
+    /// the checks the agent's config defines. Each check's newest result goes with
+    /// every sample until it runs again, so a page showing the newest sample still
+    /// shows every check.
     pub fn new(
         checks: Vec<Check>,
         local: &[LocalCheck],
         definitions: &CheckDefinitions,
         interval: Duration,
-    ) -> Self {
-        let ready: Vec<Ready> = checks
+    ) -> Result<Self> {
+        let ready = checks
             .into_iter()
             .map(|check| Ready::Run(Box::new(check), None))
-            .chain(local.iter().map(|choice| Ready::local(choice, definitions)))
-            .collect();
-        let longest = ready
-            .iter()
-            .filter_map(|item| match item {
-                Ready::Run(check, _) => Some(limit(check)),
-                Ready::Broken { .. } => None,
-            })
-            .max()
-            .unwrap_or_default();
-        let scheduled: Vec<Scheduled> = ready
-            .into_iter()
-            .map(|item| {
-                let every = rounds(item.interval(), interval);
-                let offset = (rand::random::<f64>() * every as f64) as u64;
-                Scheduled {
-                    check: Arc::new(item),
-                    every,
-                    offset: offset.min(every - 1),
+            .chain(local.iter().map(|choice| Ready::local(choice, definitions)));
+        let mut background = Background::new();
+        for item in ready {
+            let (check, credentials) = match item {
+                Ready::Run(check, credentials) => (check, credentials),
+                Ready::Broken { name, why } => {
+                    background.constant(json!({ "name": name, "up": 0, "error": why }));
+                    continue;
                 }
-            })
-            .collect();
-        // Each check's newest result, which goes with every sample until it runs
-        // again, so a page showing the newest sample still shows every check.
-        let results: Arc<Mutex<Vec<Option<Value>>>> =
-            Arc::new(Mutex::new(vec![None; scheduled.len()]));
-
-        let mut round: u64 = 0;
-        let background = Background::start(interval, move || {
-            let due: Vec<usize> = (0..scheduled.len())
-                .filter(|&i| round % scheduled[i].every == scheduled[i].offset)
-                .collect();
-            round = round.wrapping_add(1);
-            let checks: Vec<Arc<Ready>> = due.iter().map(|&i| scheduled[i].check.clone()).collect();
-            let results = results.clone();
-            async move {
-                let probe = |item: Arc<Ready>| async move {
-                    match &*item {
-                        Ready::Run(check, credentials) => {
-                            run_signed_in(check, credentials.as_ref()).await
-                        }
-                        Ready::Broken { name, why } => Ready::broken(name, why),
-                    }
-                };
-                let late = |item: &Ready| item.timed_out();
-                let found = probe_all(&checks, interval, longest + GRACE, probe, late).await;
-                let mut results = results.lock().unwrap_or_else(PoisonError::into_inner);
-                for (i, result) in due.into_iter().zip(found) {
-                    results[i] = Some(result);
-                }
-                Value::Array(results.iter().flatten().cloned().collect())
-            }
-        });
-        Self { background }
+            };
+            let late = timed_out_report(&check);
+            let (every, limit) = (every(check.interval, interval), limit(&check) + GRACE);
+            let check = Arc::new((check, credentials));
+            background.repeat(
+                every,
+                Some(limit),
+                move || {
+                    let check = check.clone();
+                    async move { run_signed_in(&check.0, check.1.as_ref()).await }
+                },
+                move |found| found.unwrap_or_else(|| late.clone()),
+            )?;
+        }
+        Ok(Self { background })
     }
 }
 
@@ -310,7 +250,7 @@ impl Collector for CheckCollector {
     }
 
     fn collect(&mut self) -> Result<Value> {
-        Ok(self.background.latest())
+        Ok(self.background.rows())
     }
 }
 
@@ -332,7 +272,8 @@ mod tests {
             &[],
             &CheckDefinitions::new(),
             Duration::from_millis(20),
-        );
+        )
+        .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -346,14 +287,14 @@ mod tests {
     }
 
     #[test]
-    fn a_check_runs_every_so_many_samples() {
+    fn a_check_runs_as_often_as_it_asks_but_never_more_than_samples_are_sent() {
         let interval = Duration::from_secs(15);
-        assert_eq!(rounds(None, interval), 1);
-        assert_eq!(rounds(Some(Duration::from_secs(1)), interval), 1);
-        assert_eq!(rounds(Some(Duration::from_secs(15)), interval), 1);
-        assert_eq!(rounds(Some(Duration::from_secs(60)), interval), 4);
-        assert_eq!(rounds(Some(Duration::from_secs(61)), interval), 5);
-        assert_eq!(rounds(Some(Duration::from_secs(86_400)), interval), 5760);
+        assert_eq!(every(None, interval), interval);
+        assert_eq!(every(Some(Duration::from_secs(1)), interval), interval);
+        assert_eq!(
+            every(Some(Duration::from_secs(61)), interval),
+            Duration::from_secs(61)
+        );
     }
 
     /// The names of the checks in one sample.
@@ -371,7 +312,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let target = listener.local_addr().unwrap().to_string();
         let fast = Check::new("fast", CheckKind::Tcp, &target);
-        // 50 rounds of 20ms each, so it runs once in the second it covers.
+        // Once a second, where the fast one runs every 20ms.
         let slow = Check {
             interval: Some(Duration::from_secs(1)),
             ..Check::new("slow", CheckKind::Tcp, &target)
@@ -381,7 +322,8 @@ mod tests {
             &[],
             &CheckDefinitions::new(),
             Duration::from_millis(20),
-        );
+        )
+        .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while names(&collector.collect().unwrap()) != ["fast", "slow"] {
@@ -420,26 +362,28 @@ mod tests {
                 ..Check::new("slow", CheckKind::Tcp, &slow_target)
             },
         ];
+        let started = Instant::now();
         let _collector = CheckCollector::new(
             checks,
             &[],
             &CheckDefinitions::new(),
             Duration::from_millis(20),
-        );
+        )
+        .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while fast.load(Relaxed) < 20 {
             assert!(Instant::now() < deadline, "the fast check stopped");
             thread::sleep(Duration::from_millis(5));
         }
-        // The slow one runs in one round of every 50, wherever its turn falls, and
-        // a connection from the round underway may not be counted yet. Running it
-        // every round would make it about as many as the fast one.
-        let slow_runs = slow.load(Relaxed);
+        // The slow one runs once a second, wherever in the first its turn falls.
+        // Running it with every sample would make it about as many as the fast one.
+        let slow_runs = slow.load(Relaxed) as u64;
         let fast_runs = fast.load(Relaxed);
+        let seconds = started.elapsed().as_secs();
         assert!(
-            slow_runs <= 2 + fast_runs / 50,
-            "{slow_runs} slow, {fast_runs} fast"
+            slow_runs <= 1 + seconds,
+            "{slow_runs} slow, {fast_runs} fast in {seconds}s"
         );
     }
 
@@ -561,7 +505,8 @@ mod tests {
             LocalCheck::new("nowhere"),
         ];
         let mut collector =
-            CheckCollector::new(Vec::new(), &local, &definitions, Duration::from_millis(50));
+            CheckCollector::new(Vec::new(), &local, &definitions, Duration::from_millis(50))
+                .unwrap();
 
         let output = collect_until(&mut collector, |output| {
             output.as_array().is_some_and(|rows| rows.len() == 2)
