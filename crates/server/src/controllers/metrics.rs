@@ -203,15 +203,15 @@ pub fn check_row(check: &Value) -> Option<CheckRow> {
     let text = |name: &str| check[name].as_str().map(String::from);
     let time = |name: &str| {
         let value = check[name].as_f64()?;
-        Some(metric_charts::format_value(Unit::Milliseconds, value))
+        Some(metric_charts::format_value(Unit::Seconds, value))
     };
     Some(CheckRow {
         name: text("name")?,
         kind: text("kind").unwrap_or_default(),
         up: check["up"].as_u64() == Some(1),
         error: text("error"),
-        response: time("response_ms"),
-        first_byte: time("first_byte_ms"),
+        response: time("response_secs"),
+        first_byte: time("first_byte_secs"),
         status: check["status"].as_u64(),
         protocol: text("protocol"),
         tls_version: text("tls_version"),

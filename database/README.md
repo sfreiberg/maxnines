@@ -31,6 +31,10 @@ MaxNines keeps its data in two places:
   for ClickHouse, where `0002_data_type` renames `samples.kind` to `data_type`, as
   DuckDB calls it, and a third, `0003_migration_times`, keeps when each migration
   was applied as a `DateTime64(3, 'UTC')` like every other moment.
+  - DuckDB's `0003_timings_in_seconds`, and ClickHouse's `0004_timings_in_seconds`
+    with `0005` and `0006` for its rollups, make timings that were kept in
+    milliseconds seconds, and rename their metrics to match, such as a check's
+    `response_ms` to `response_secs`. They change no table.
 
 The two only meet through a host's ID: the main database's `hosts.id` is the
 metrics store's `host_id`.

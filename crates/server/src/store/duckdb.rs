@@ -43,6 +43,10 @@ const MIGRATIONS: &[Migration] = &[
         name: "0002_keys",
         sql: include_str!("migrations/0002_keys.sql"),
     },
+    Migration {
+        name: "0003_timings_in_seconds",
+        sql: include_str!("migrations/0003_timings_in_seconds.sql"),
+    },
 ];
 
 /// Only the bookkeeping table is created outside a migration, because it is
@@ -2498,14 +2502,14 @@ mod tests {
             (
                 "checks".to_string(),
                 json!([{
-                    "name": "site", "kind": "http", "up": 1, "response_ms": 12.5, "dns_ms": 1.0,
-                    "connect_ms": 2.0, "tls_ms": 3.0, "first_byte_ms": 4.0, "download_ms": 2.5,
+                    "name": "site", "kind": "http", "up": 1, "response_secs": 12.5, "dns_secs": 1.0,
+                    "connect_secs": 2.0, "tls_secs": 3.0, "first_byte_secs": 4.0, "download_secs": 2.5,
                     "status": 200, "protocol": "HTTP/2", "content_length": 512,
                     "compressed": true, "regex_matched": true, "tls_version": "TLS 1.3",
                     "cert_valid": true, "hostname_valid": true, "cert_valid_from": "2026-01-01T00:00:00Z",
                     "cert_valid_until": "2027-01-01T00:00:00Z", "cert_days_left": 30, "records": 2,
-                    "packet_loss_percent": 0.0, "rtt_min_ms": 1.0, "rtt_max_ms": 2.0,
-                    "rtt_stddev_ms": 0.5,
+                    "packet_loss_percent": 0.0, "rtt_min_secs": 1.0, "rtt_max_secs": 2.0,
+                    "rtt_stddev_secs": 0.5,
                 }]),
             ),
         ])
@@ -2683,6 +2687,61 @@ mod tests {
             .query_row("SELECT count(*) FROM hosts", [], |row| row.get(0))
             .unwrap();
         assert_eq!(hosts, 2);
+    }
+
+    /// Timings kept in milliseconds are made seconds, under their new names, and
+    /// so is what was rolled up of them.
+    #[test]
+    fn timings_kept_in_milliseconds_become_seconds() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("db");
+        let mut connection = Connection::open(&path).unwrap();
+        migrate(&mut connection, &MIGRATIONS[..2]).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO collectors VALUES (1, 'checks'), (2, 'cpu');
+                 INSERT INTO metrics VALUES (1, 1, 'response_ms', 'float'),
+                     (2, 1, 'status', 'int'), (3, 2, 'usage_percent', 'float');
+                 INSERT INTO hosts VALUES (1, 'host-1');
+                 INSERT INTO series VALUES (1, 1, 1), (2, 2, 1), (3, 3, 1);
+                 INSERT INTO samples VALUES ('2026-11-20 10:00:00', 1, 1, 120.0),
+                     ('2026-11-20 10:00:00', 2, 2, 200), ('2026-11-20 10:00:00', 3, 3, 50);
+                 INSERT INTO samples_recent VALUES ('2026-11-20 11:00:00', 1, 1, 80.0);
+                 INSERT INTO rollups_hour VALUES
+                     ('check.response', 1, 'site', '2026-11-20 10:00:00', 100, 300, 400, 2),
+                     ('cpu.usage', 1, '', '2026-11-20 10:00:00', 40, 60, 100, 2);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = DuckDbStore::open(&path, "1GB", Retention::default()).unwrap();
+        let names: Vec<String> = store
+            .connection
+            .prepare("SELECT name FROM metrics ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(names, ["response_secs", "status", "usage_percent"]);
+        let values: Vec<f64> = store
+            .connection
+            .prepare("SELECT value FROM all_samples ORDER BY metric_id, time")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(values, [0.12, 0.08, 200.0, 50.0]);
+        let rolled: Vec<(f64, f64, f64)> = store
+            .connection
+            .prepare("SELECT low, high, summed FROM rollups_hour ORDER BY metric")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(rolled, [(0.1, 0.3, 0.4), (40.0, 60.0, 100.0)]);
     }
 
     #[test]

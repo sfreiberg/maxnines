@@ -233,7 +233,7 @@ works. A delayed replica's lag leaves out its delay.
 | Metric | What it is |
 |---|---|
 | **MongoDB operations** | Per second, for each kind, such as `documents operation insert` |
-| **MongoDB read latency**, **write latency** | The average time an operation took, in milliseconds |
+| **MongoDB read latency**, **write latency** | The average time an operation took |
 | **MongoDB reads queued**, **writes queued**, **read tickets free**, **write tickets free** | Work waiting its turn. Few tickets free means the storage engine is the bottleneck |
 | **MongoDB cache used**, **cache dirty** | As a percentage of WiredTiger's cache. Over 20% dirty starts slowing writes |
 | **MongoDB memory in use**, **cursors open**, **cursors timed out**, **assertions** | The server's own state |

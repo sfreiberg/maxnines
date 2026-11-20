@@ -135,12 +135,12 @@ impl Mongodb {
                 get(&["opLatencies", path, "latency"]),
             );
             main.total(&format!("_{kind}_done"), get(&["opLatencies", path, "ops"]));
-            // Microseconds in total over how many, in milliseconds.
+            // Microseconds in total over how many, in seconds.
             main.average(
-                &format!("{kind}_latency_ms"),
+                &format!("{kind}_latency_secs"),
                 &format!("_{kind}_latency"),
                 &format!("_{kind}_done"),
-                0.001,
+                1e-6,
             );
         }
         main.maybe(

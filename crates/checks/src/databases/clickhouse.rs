@@ -386,7 +386,7 @@ impl Clickhouse {
     async fn events(&mut self, rows: &mut Rows) {
         let sql = format!(
             "SELECT event AS name, value FROM system.events WHERE event IN ({}, \
-             'MemoryOvercommitWaitTimeMicroseconds')",
+             'MemoryOvercommitWaitTimeMicroseconds', 'DelayedInsertsMilliseconds')",
             quoted(&EVENTS.map(|(event, _)| event))
         );
         let Some(events) = self.named(rows, "events", &sql).await else {
@@ -397,23 +397,27 @@ impl Clickhouse {
             // An event that's never happened isn't listed.
             main.total(field, Some(events.get(event).copied().unwrap_or(0.0)));
         }
-        // Microseconds over how many, in milliseconds.
-        main.average("latency_ms", "_query_time", "queries", 0.001);
-        main.average("select_latency_ms", "_select_time", "selects", 0.001);
-        main.average("insert_latency_ms", "_insert_time", "inserts", 0.001);
+        // Microseconds over how many, in seconds.
+        main.average("latency_secs", "_query_time", "queries", 1e-6);
+        main.average("select_latency_secs", "_select_time", "selects", 1e-6);
+        main.average("insert_latency_secs", "_insert_time", "inserts", 1e-6);
         main.average("rows_per_insert", "inserted_rows", "inserts", 1.0);
         main.average(
-            "keeper_latency_ms",
+            "keeper_latency_secs",
             "_keeper_wait",
             "_keeper_transactions",
-            0.001,
+            1e-6,
         );
-        // In milliseconds, so its rate is milliseconds waited each second.
-        let waited = events
-            .get("MemoryOvercommitWaitTimeMicroseconds")
-            .copied()
-            .unwrap_or(0.0);
-        main.total("overcommit_wait_ms", Some(waited / 1000.0));
+        // In seconds, so their rates are seconds spent waiting each second.
+        let event = |name: &str| events.get(name).copied().unwrap_or(0.0);
+        main.total(
+            "overcommit_wait_secs",
+            Some(event("MemoryOvercommitWaitTimeMicroseconds") / 1e6),
+        );
+        main.total(
+            "insert_delay_secs",
+            Some(event("DelayedInsertsMilliseconds") / 1000.0),
+        );
     }
 
     /// What ClickHouse works out in the background, such as the most parts in one
@@ -883,10 +887,10 @@ impl Clickhouse {
             row.maybe("finished_5m", number(kind.get("finished")));
             row.maybe("failed_5m", number(kind.get("failed")));
             if let Some(Value::Array(took)) = kind.get("took") {
-                for (field, value) in ["p50_ms", "p95_ms", "p99_ms"].iter().zip(took) {
-                    // No finished queries leaves them as nan.
+                for (field, value) in ["p50_secs", "p95_secs", "p99_secs"].iter().zip(took) {
+                    // No finished queries leaves them as nan. They're in milliseconds.
                     if let Some(value) = number(Some(value)).filter(|value| value.is_finite()) {
-                        row.set(field, value);
+                        row.set(field, value / 1000.0);
                     }
                 }
             }
@@ -942,7 +946,7 @@ const CURRENT: [&str; 22] = [
 
 /// From `system.events`, each with the total it becomes. One starting with `_`
 /// is only there for an average.
-const EVENTS: [(&str, &str); 36] = [
+const EVENTS: [(&str, &str); 35] = [
     ("Query", "queries"),
     ("SelectQuery", "selects"),
     ("InsertQuery", "inserts"),
@@ -956,7 +960,6 @@ const EVENTS: [(&str, &str); 36] = [
     ("InsertedBytes", "inserted_bytes"),
     ("RejectedInserts", "rejected_inserts"),
     ("DelayedInserts", "inserts_delayed"),
-    ("DelayedInsertsMilliseconds", "insert_delay_ms"),
     ("QueryMemoryLimitExceeded", "memory_limit_exceeded"),
     ("DelayedMutations", "mutations_delayed"),
     ("RejectedMutations", "mutations_rejected"),

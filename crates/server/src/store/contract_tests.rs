@@ -217,9 +217,9 @@ fn each_disk_reports_how_hard_it_is_working() {
     let mut store = in_memory();
     let disks = json!([
         { "mount_point": "/", "busy_percent": 12.5, "read_ops_per_sec": 40.0,
-          "write_latency_ms": 3.25, "queue_length": 0.5 },
+          "write_latency_secs": 3.25, "queue_length": 0.5 },
         { "mount_point": "/data", "busy_percent": 90.0, "read_ops_per_sec": 800.0,
-          "write_latency_ms": 18.0 },
+          "write_latency_secs": 18.0 },
     ]);
     write_metric(&mut store, "a", 1000, "disk", disks);
 
@@ -531,7 +531,7 @@ fn the_latest_output_keeps_text_and_whole_numbers_as_they_were_sent() {
     let checks = json!([
         {
             "name": "site", "kind": "http", "up": 0, "error": "<refused>",
-            "status": 503, "cert_days_left": -2, "response_ms": 12.5,
+            "status": 503, "cert_days_left": -2, "response_secs": 12.5,
             "protocol": "HTTP/2", "cert_valid": false,
         },
         { "name": "dns", "kind": "dns", "up": 1 },
@@ -545,7 +545,7 @@ fn the_latest_output_keeps_text_and_whole_numbers_as_they_were_sent() {
         json!([
             {
                 "name": "site", "kind": "http", "up": 0, "error": "<refused>",
-                "status": 503, "cert_days_left": -2, "response_ms": 12.5,
+                "status": 503, "cert_days_left": -2, "response_secs": 12.5,
                 "protocol": "HTTP/2", "cert_valid": false,
             },
             { "name": "dns", "kind": "dns", "up": 1 },
@@ -887,9 +887,9 @@ fn new_metrics_read_what_the_agent_sends() {
     write_metric(&mut store, "a", 20_000, "sensors", sensors);
     let checks = json!([
         {
-            "name": "site", "up": 1, "response_ms": 12.5, "cert_days_left": 30,
-            "first_byte_ms": 8.0, "dns_ms": 1.0, "connect_ms": 2.0, "tls_ms": 3.0,
-            "download_ms": 4.0, "content_length": 512, "status": 200,
+            "name": "site", "up": 1, "response_secs": 12.5, "cert_days_left": 30,
+            "first_byte_secs": 8.0, "dns_secs": 1.0, "connect_secs": 2.0, "tls_secs": 3.0,
+            "download_secs": 4.0, "content_length": 512, "status": 200,
             "records": 2, "packet_loss_percent": 20.0,
         },
         { "name": "db", "up": 0, "error": "couldn't connect" },

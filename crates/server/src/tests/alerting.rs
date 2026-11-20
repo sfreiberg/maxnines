@@ -1718,8 +1718,8 @@ async fn an_hosts_page_shows_how_its_checks_last_went() {
             "checks".to_string(),
             json!([
                 {
-                    "name": "site", "kind": "http", "up": 1, "response_ms": 120.5,
-                    "first_byte_ms": 80.25, "status": 200, "protocol": "HTTP/2.0",
+                    "name": "site", "kind": "http", "up": 1, "response_secs": 0.1205,
+                    "first_byte_secs": 0.08025, "status": 200, "protocol": "HTTP/2.0",
                     "tls_version": "TLS 1.3", "cert_days_left": 42,
                 },
                 {

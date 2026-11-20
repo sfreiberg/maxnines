@@ -149,6 +149,149 @@ const MIGRATIONS: &[(&str, &[&str])] = &[
         "0003_migration_times",
         &["ALTER TABLE schema_migrations
          MODIFY COLUMN applied_at DateTime64(3, 'UTC') DEFAULT now64(3)"],
+    ),    // Timings were milliseconds, named so, and are now seconds: checks' stages and
+    // pings, disks' latency, and databases' latencies and waits. Each is copied under
+    // its new name as seconds, then the old is deleted, so a stop partway can run
+    // again. The catalog's names don't change, so what's rolled up is only made
+    // seconds, each table in a migration of its own, as that can't safely be repeated.
+    (
+        "0004_timings_in_seconds",
+        &[
+            "INSERT INTO samples (metric, host_id, labels, time, value, data_type)
+             SELECT transform(metric, ['checks.response_ms', 'checks.dns_ms', 'checks.connect_ms',
+             'checks.tls_ms', 'checks.first_byte_ms', 'checks.download_ms',
+             'checks.rtt_min_ms', 'checks.rtt_max_ms', 'checks.rtt_stddev_ms',
+             'disk.read_latency_ms', 'disk.write_latency_ms',
+             'databases.mongodb.reads_latency_ms',
+             'databases.mongodb.writes_latency_ms', 'databases.clickhouse.latency_ms',
+             'databases.clickhouse.select_latency_ms',
+             'databases.clickhouse.insert_latency_ms',
+             'databases.clickhouse.keeper_latency_ms',
+             'databases.clickhouse.overcommit_wait_ms',
+             'databases.clickhouse.insert_delay_ms', 'databases.clickhouse.p50_ms',
+             'databases.clickhouse.p95_ms', 'databases.clickhouse.p99_ms'],
+             ['checks.response_secs', 'checks.dns_secs', 'checks.connect_secs',
+             'checks.tls_secs', 'checks.first_byte_secs', 'checks.download_secs',
+             'checks.rtt_min_secs', 'checks.rtt_max_secs', 'checks.rtt_stddev_secs',
+             'disk.read_latency_secs', 'disk.write_latency_secs',
+             'databases.mongodb.reads_latency_secs',
+             'databases.mongodb.writes_latency_secs',
+             'databases.clickhouse.latency_secs',
+             'databases.clickhouse.select_latency_secs',
+             'databases.clickhouse.insert_latency_secs',
+             'databases.clickhouse.keeper_latency_secs',
+             'databases.clickhouse.overcommit_wait_secs',
+             'databases.clickhouse.insert_delay_secs', 'databases.clickhouse.p50_secs',
+             'databases.clickhouse.p95_secs', 'databases.clickhouse.p99_secs']),
+             host_id, labels, time, value / 1000, data_type
+             FROM samples
+             WHERE metric IN ['checks.response_ms', 'checks.dns_ms', 'checks.connect_ms',
+             'checks.tls_ms', 'checks.first_byte_ms', 'checks.download_ms',
+             'checks.rtt_min_ms', 'checks.rtt_max_ms', 'checks.rtt_stddev_ms',
+             'disk.read_latency_ms', 'disk.write_latency_ms',
+             'databases.mongodb.reads_latency_ms',
+             'databases.mongodb.writes_latency_ms', 'databases.clickhouse.latency_ms',
+             'databases.clickhouse.select_latency_ms',
+             'databases.clickhouse.insert_latency_ms',
+             'databases.clickhouse.keeper_latency_ms',
+             'databases.clickhouse.overcommit_wait_ms',
+             'databases.clickhouse.insert_delay_ms', 'databases.clickhouse.p50_ms',
+             'databases.clickhouse.p95_ms', 'databases.clickhouse.p99_ms']",
+            "ALTER TABLE samples DELETE
+             WHERE metric IN ['checks.response_ms', 'checks.dns_ms', 'checks.connect_ms',
+             'checks.tls_ms', 'checks.first_byte_ms', 'checks.download_ms',
+             'checks.rtt_min_ms', 'checks.rtt_max_ms', 'checks.rtt_stddev_ms',
+             'disk.read_latency_ms', 'disk.write_latency_ms',
+             'databases.mongodb.reads_latency_ms',
+             'databases.mongodb.writes_latency_ms', 'databases.clickhouse.latency_ms',
+             'databases.clickhouse.select_latency_ms',
+             'databases.clickhouse.insert_latency_ms',
+             'databases.clickhouse.keeper_latency_ms',
+             'databases.clickhouse.overcommit_wait_ms',
+             'databases.clickhouse.insert_delay_ms', 'databases.clickhouse.p50_ms',
+             'databases.clickhouse.p95_ms', 'databases.clickhouse.p99_ms']
+             SETTINGS mutations_sync = 2",
+            "INSERT INTO series (host_id, metric, labels)
+             SELECT host_id, transform(metric, ['checks.response_ms', 'checks.dns_ms', 'checks.connect_ms',
+             'checks.tls_ms', 'checks.first_byte_ms', 'checks.download_ms',
+             'checks.rtt_min_ms', 'checks.rtt_max_ms', 'checks.rtt_stddev_ms',
+             'disk.read_latency_ms', 'disk.write_latency_ms',
+             'databases.mongodb.reads_latency_ms',
+             'databases.mongodb.writes_latency_ms', 'databases.clickhouse.latency_ms',
+             'databases.clickhouse.select_latency_ms',
+             'databases.clickhouse.insert_latency_ms',
+             'databases.clickhouse.keeper_latency_ms',
+             'databases.clickhouse.overcommit_wait_ms',
+             'databases.clickhouse.insert_delay_ms', 'databases.clickhouse.p50_ms',
+             'databases.clickhouse.p95_ms', 'databases.clickhouse.p99_ms'],
+             ['checks.response_secs', 'checks.dns_secs', 'checks.connect_secs',
+             'checks.tls_secs', 'checks.first_byte_secs', 'checks.download_secs',
+             'checks.rtt_min_secs', 'checks.rtt_max_secs', 'checks.rtt_stddev_secs',
+             'disk.read_latency_secs', 'disk.write_latency_secs',
+             'databases.mongodb.reads_latency_secs',
+             'databases.mongodb.writes_latency_secs',
+             'databases.clickhouse.latency_secs',
+             'databases.clickhouse.select_latency_secs',
+             'databases.clickhouse.insert_latency_secs',
+             'databases.clickhouse.keeper_latency_secs',
+             'databases.clickhouse.overcommit_wait_secs',
+             'databases.clickhouse.insert_delay_secs', 'databases.clickhouse.p50_secs',
+             'databases.clickhouse.p95_secs', 'databases.clickhouse.p99_secs']),
+             labels
+             FROM series
+             WHERE metric IN ['checks.response_ms', 'checks.dns_ms', 'checks.connect_ms',
+             'checks.tls_ms', 'checks.first_byte_ms', 'checks.download_ms',
+             'checks.rtt_min_ms', 'checks.rtt_max_ms', 'checks.rtt_stddev_ms',
+             'disk.read_latency_ms', 'disk.write_latency_ms',
+             'databases.mongodb.reads_latency_ms',
+             'databases.mongodb.writes_latency_ms', 'databases.clickhouse.latency_ms',
+             'databases.clickhouse.select_latency_ms',
+             'databases.clickhouse.insert_latency_ms',
+             'databases.clickhouse.keeper_latency_ms',
+             'databases.clickhouse.overcommit_wait_ms',
+             'databases.clickhouse.insert_delay_ms', 'databases.clickhouse.p50_ms',
+             'databases.clickhouse.p95_ms', 'databases.clickhouse.p99_ms']",
+            "ALTER TABLE series DELETE
+             WHERE metric IN ['checks.response_ms', 'checks.dns_ms', 'checks.connect_ms',
+             'checks.tls_ms', 'checks.first_byte_ms', 'checks.download_ms',
+             'checks.rtt_min_ms', 'checks.rtt_max_ms', 'checks.rtt_stddev_ms',
+             'disk.read_latency_ms', 'disk.write_latency_ms',
+             'databases.mongodb.reads_latency_ms',
+             'databases.mongodb.writes_latency_ms', 'databases.clickhouse.latency_ms',
+             'databases.clickhouse.select_latency_ms',
+             'databases.clickhouse.insert_latency_ms',
+             'databases.clickhouse.keeper_latency_ms',
+             'databases.clickhouse.overcommit_wait_ms',
+             'databases.clickhouse.insert_delay_ms', 'databases.clickhouse.p50_ms',
+             'databases.clickhouse.p95_ms', 'databases.clickhouse.p99_ms']
+             SETTINGS mutations_sync = 2",
+        ],
+    ),
+    (
+        "0005_timings_in_seconds_five_minutes",
+        &["ALTER TABLE rollups_five_minute
+         UPDATE low = low / 1000, high = high / 1000, summed = summed / 1000
+         WHERE metric IN ['check.response', 'check.first_byte', 'check.dns', 'check.connect',
+             'check.tls', 'check.download', 'disk.read_latency', 'disk.write_latency',
+             'mongodb.read_latency', 'mongodb.write_latency', 'clickhouse.latency',
+             'clickhouse.select_latency', 'clickhouse.insert_latency',
+             'clickhouse.insert_delay', 'clickhouse.overcommit_wait',
+             'clickhouse.keeper_latency', 'clickhouse.query_p50',
+             'clickhouse.query_p95', 'clickhouse.query_p99']
+         SETTINGS mutations_sync = 2"],
+    ),
+    (
+        "0006_timings_in_seconds_hours",
+        &["ALTER TABLE rollups_hour
+         UPDATE low = low / 1000, high = high / 1000, summed = summed / 1000
+         WHERE metric IN ['check.response', 'check.first_byte', 'check.dns', 'check.connect',
+             'check.tls', 'check.download', 'disk.read_latency', 'disk.write_latency',
+             'mongodb.read_latency', 'mongodb.write_latency', 'clickhouse.latency',
+             'clickhouse.select_latency', 'clickhouse.insert_latency',
+             'clickhouse.insert_delay', 'clickhouse.overcommit_wait',
+             'clickhouse.keeper_latency', 'clickhouse.query_p50',
+             'clickhouse.query_p95', 'clickhouse.query_p99']
+         SETTINGS mutations_sync = 2"],
     ),
 ];
 
@@ -1942,6 +2085,80 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(output, json!({ "usage_percent": 5 }));
+    }
+
+    /// Timings kept in milliseconds are made seconds, under their new names, and
+    /// so is what was rolled up of them.
+    #[test]
+    fn timings_kept_in_milliseconds_become_seconds() {
+        let database = new_database();
+        let client = Client::default().with_url(url());
+        wait(async {
+            client
+                .query_raw(&format!("CREATE DATABASE `{database}`"))
+                .execute()
+                .await?;
+            let client = client.with_database(&database);
+            migrate(&client, &MIGRATIONS[..3]).await?;
+            for statement in [
+                "INSERT INTO samples (metric, host_id, labels, time, value, data_type) VALUES
+                 ('checks.response_ms', 'a', map('name', 'site'), fromUnixTimestamp64Milli(1000), 120, 'float'),
+                 ('checks.status', 'a', map('name', 'site'), fromUnixTimestamp64Milli(1000), 200, 'int')",
+                "INSERT INTO series VALUES ('a', 'checks.response_ms', map('name', 'site'))",
+                "INSERT INTO rollups_hour VALUES
+                 ('check.response', 'a', 'site', fromUnixTimestamp64Milli(0), 100, 300, 400, 2, 1),
+                 ('cpu.usage', 'a', '', fromUnixTimestamp64Milli(0), 40, 60, 100, 2, 1)",
+            ] {
+                client.query_raw(statement).execute().await?;
+            }
+            anyhow::Ok(())
+        })
+        .unwrap();
+
+        let store = opened(&database);
+        let value: f64 = wait(
+            store
+                .client
+                .query("SELECT value FROM samples FINAL WHERE metric = 'checks.response_secs'")
+                .fetch_one(),
+        )
+        .unwrap();
+        assert_eq!(value, 0.12);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count() FROM samples WHERE metric LIKE '%_ms'"
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count() FROM samples WHERE metric = 'checks.status'"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count() FROM series WHERE metric = 'checks.response_secs'"
+            ),
+            1
+        );
+        let rolled: Vec<(String, f64)> = wait(
+            store
+                .client
+                .query("SELECT metric, low FROM rollups_hour FINAL ORDER BY metric")
+                .fetch_all(),
+        )
+        .unwrap();
+        assert_eq!(
+            rolled,
+            [
+                ("check.response".to_string(), 0.1),
+                ("cpu.usage".to_string(), 40.0)
+            ]
+        );
     }
 
     #[test]

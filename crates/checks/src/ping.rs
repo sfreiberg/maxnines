@@ -32,14 +32,10 @@ impl Replies {
         lost / f64::from(self.sent) * 100.0
     }
 
-    /// The smallest, largest and standard deviation of the times, in
-    /// milliseconds, as `ping` reports them, if anything came back.
-    pub fn times_ms(&self) -> Option<(f64, f64, f64)> {
-        let times: Vec<f64> = self
-            .times
-            .iter()
-            .map(|time| time.as_secs_f64() * 1000.0)
-            .collect();
+    /// The smallest, largest and standard deviation of the times, in seconds, if
+    /// anything came back.
+    pub fn times_secs(&self) -> Option<(f64, f64, f64)> {
+        let times: Vec<f64> = self.times.iter().map(Duration::as_secs_f64).collect();
         let min = times.iter().copied().reduce(f64::min)?;
         let max = times.iter().copied().reduce(f64::max)?;
         let count = times.len() as f64;
@@ -280,16 +276,16 @@ mod tests {
             ],
         };
         assert_eq!(replies.loss_percent(), 25.0);
-        let (min, max, stddev) = replies.times_ms().unwrap();
-        assert!((min - 2.0).abs() < 1e-9 && (max - 6.0).abs() < 1e-9);
-        assert!((stddev - (8.0f64 / 3.0).sqrt()).abs() < 1e-9);
+        let (min, max, stddev) = replies.times_secs().unwrap();
+        assert!((min - 0.002).abs() < 1e-12 && (max - 0.006).abs() < 1e-12);
+        assert!((stddev - (8.0f64 / 3.0).sqrt() / 1000.0).abs() < 1e-12);
 
         let nothing = Replies {
             sent: 2,
             times: vec![],
         };
         assert_eq!(nothing.loss_percent(), 100.0);
-        assert_eq!(nothing.times_ms(), None);
+        assert_eq!(nothing.times_secs(), None);
     }
 
     fn ping_now(addresses: &[&str], count: u32, limit: Duration) -> Result<Replies> {

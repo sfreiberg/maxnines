@@ -26,6 +26,26 @@ are defined in the agent's own config, as [below](#on-an-agent).
 Agents older than this version don't know the database, Redis, SSH and mail checks. Upgrade
 them before giving those kinds to them in a config rule.
 
+## What's timed
+
+Each check says how long each stage took, in seconds, so a slow answer can be told
+apart from slow DNS. Each stage is timed the same way whatever the kind, and one a
+check doesn't go through is left out.
+
+| Field | Chart | What it is |
+|---|---|---|
+| `dns_secs` | **DNS lookup time** | Looking up the target's name, or asking the DNS server, for a DNS check |
+| `connect_secs` | **Connection time** | Opening the TCP connection, once the address is known, and nothing after it: no TLS, greeting or signing in |
+| `tls_secs` | **TLS handshake time** | The TLS handshake, for a website, a certificate, and mail over TLS |
+| `first_byte_secs` | **Time to first byte** | A website: from sending the request to the answer starting |
+| `download_secs` | **Download time** | A website: reading the rest of the page |
+| `response_secs` | **Check response time** | The whole check, when it worked, signing in included |
+| `rtt_min_secs`, `rtt_max_secs`, `rtt_stddev_secs` | | A ping's fastest and slowest replies, and how much they varied |
+
+A database or Redis check opens a connection to time it, then its driver connects
+again to do its work, so signing in shows in `response_secs` and never in
+`connect_secs`.
+
 ## Ping
 
 A ping check reports a host as up if the host itself replied to any of its pings,

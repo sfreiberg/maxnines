@@ -441,7 +441,7 @@ impl Axis {
             Unit::Number => (0.0, 1.0),
             Unit::BytesPerSecond => (0.0, 1000.0),
             Unit::Bytes => (0.0, KIB),
-            Unit::PerSecond | Unit::Seconds | Unit::Milliseconds => (0.0, 10.0),
+            Unit::PerSecond | Unit::Seconds => (0.0, 10.0),
             Unit::Celsius => (0.0, 100.0),
         };
         // A percentage reads best on its whole scale, and anything else on its
@@ -836,7 +836,6 @@ fn format_other(unit: Unit, value: f64, decimals: usize) -> String {
         Unit::PerSecond => format!("{}/s", trimmed(value, decimals)),
         Unit::Bytes => format_size(value, decimals),
         Unit::Seconds => format_age(value, decimals),
-        Unit::Milliseconds => format!("{} ms", trimmed(value, decimals)),
         Unit::Celsius => format!("{}°C", trimmed(value, decimals)),
         Unit::Percent | Unit::Number | Unit::BytesPerSecond => trimmed(value, decimals),
     }
@@ -1489,7 +1488,7 @@ mod tests {
             (Unit::Seconds, 90.0, "1.5 m"),
             (Unit::Seconds, 7200.0, "2 h"),
             (Unit::Seconds, 172_800.0, "2 d"),
-            (Unit::Milliseconds, 12.34, "12.3 ms"),
+            (Unit::Seconds, 0.01234, "12.3 ms"),
             (Unit::Celsius, 54.5, "54.5°C"),
         ] {
             assert_eq!(format_value(unit, value), text);

@@ -86,15 +86,15 @@ fn timed_out() -> anyhow::Error {
 }
 
 /// What a check found out. Stage times are how long each stage took on its own,
-/// so together they add up to about `response_ms`.
+/// so together they add up to about `response_secs`.
 #[derive(Debug, Default, Serialize)]
 struct Findings {
-    response_ms: Option<f64>,
-    dns_ms: Option<f64>,
-    connect_ms: Option<f64>,
-    tls_ms: Option<f64>,
-    first_byte_ms: Option<f64>,
-    download_ms: Option<f64>,
+    response_secs: Option<f64>,
+    dns_secs: Option<f64>,
+    connect_secs: Option<f64>,
+    tls_secs: Option<f64>,
+    first_byte_secs: Option<f64>,
+    download_secs: Option<f64>,
     status: Option<u16>,
     protocol: Option<String>,
     content_length: Option<usize>,
@@ -125,13 +125,13 @@ struct Findings {
     domain_days_left: Option<i64>,
     domain_error: Option<String>,
     packet_loss_percent: Option<f64>,
-    rtt_min_ms: Option<f64>,
-    rtt_max_ms: Option<f64>,
-    rtt_stddev_ms: Option<f64>,
+    rtt_min_secs: Option<f64>,
+    rtt_max_secs: Option<f64>,
+    rtt_stddev_secs: Option<f64>,
 }
 
-fn elapsed_ms(since: Instant) -> f64 {
-    since.elapsed().as_secs_f64() * 1000.0
+fn elapsed_secs(since: Instant) -> f64 {
+    since.elapsed().as_secs_f64()
 }
 
 fn report(check: &Check, findings: Findings, result: Result<()>) -> Value {
@@ -193,7 +193,7 @@ pub async fn run_signed_in(check: &Check, credentials: Option<&Credentials>) -> 
         .await
         .unwrap_or_else(|_| Err(timed_out()));
     if result.is_ok() {
-        findings.response_ms = Some(elapsed_ms(started));
+        findings.response_secs = Some(elapsed_secs(started));
     }
     // After the timing, and never counting against the check: a registry being
     // slow or unsure says nothing about the site.
@@ -319,7 +319,7 @@ async fn resolve(host: &str, port: u16, findings: &mut Findings) -> Result<Vec<S
         .await
         .map_err(|_| anyhow!("the name wasn't found"))?
         .collect();
-    findings.dns_ms = Some(elapsed_ms(started));
+    findings.dns_secs = Some(elapsed_secs(started));
     ensure!(!addresses.is_empty(), "the name wasn't found");
     Ok(addresses)
 }
@@ -329,7 +329,7 @@ async fn connect(addresses: &[SocketAddr], findings: &mut Findings) -> Result<Tc
     let started = Instant::now();
     for address in addresses {
         if let Ok(Ok(stream)) = timeout(CONNECT_ATTEMPT, TcpStream::connect(address)).await {
-            findings.connect_ms = Some(elapsed_ms(started));
+            findings.connect_secs = Some(elapsed_secs(started));
             return Ok(stream);
         }
     }
@@ -567,7 +567,7 @@ async fn secure(
             std::io::ErrorKind::TimedOut => timed_out(),
             _ => anyhow!("the TLS handshake failed"),
         })?;
-    findings.tls_ms = Some(elapsed_ms(started));
+    findings.tls_secs = Some(elapsed_secs(started));
 
     let (_, connection) = stream.get_ref();
     findings.tls_version = version_name(connection.protocol_version());
@@ -679,7 +679,7 @@ impl WebConnection {
                 sender.send_request(request).await.map_err(failed)?
             }
         };
-        findings.first_byte_ms = Some(elapsed_ms(sent));
+        findings.first_byte_secs = Some(elapsed_secs(sent));
 
         let downloading = Instant::now();
         findings.protocol = Some(format!("{:?}", response.version()));
@@ -692,7 +692,7 @@ impl WebConnection {
         findings.compressed = Some(compressed);
 
         let (body, cut) = read_body(&mut response).await?;
-        findings.download_ms = Some(elapsed_ms(downloading));
+        findings.download_secs = Some(elapsed_secs(downloading));
         Ok(Answer {
             status,
             compressed,
@@ -947,7 +947,7 @@ async fn query_server(check: &Check, server: &str, findings: &mut Findings) -> R
         .recv(&mut buffer)
         .await
         .map_err(|_| anyhow!("couldn't connect"))?;
-    findings.dns_ms = Some(elapsed_ms(started));
+    findings.dns_secs = Some(elapsed_secs(started));
     dns_answers(&buffer[..size], id)
 }
 
@@ -1001,10 +1001,12 @@ fn read_ping_summary(output: &str, findings: &mut Findings) {
                 .split('/')
                 .filter_map(|value| value.trim().parse().ok())
                 .collect();
-            if let [min, _, max, stddev] = numbers[..] {
-                findings.rtt_min_ms = Some(min);
-                findings.rtt_max_ms = Some(max);
-                findings.rtt_stddev_ms = Some(stddev);
+            // Pings give milliseconds.
+            let seconds: Vec<f64> = numbers.iter().map(|ms| ms / 1000.0).collect();
+            if let [min, _, max, stddev] = seconds[..] {
+                findings.rtt_min_secs = Some(min);
+                findings.rtt_max_secs = Some(max);
+                findings.rtt_stddev_secs = Some(stddev);
             }
         }
     }
@@ -1024,10 +1026,10 @@ async fn check_ping(check: &Check, findings: &mut Findings) -> Result<()> {
     let addresses = resolve(host, 0, findings).await?;
     let replies = ping::ping(&addresses, check.count.unwrap_or(1), deadline).await?;
     findings.packet_loss_percent = Some(replies.loss_percent());
-    if let Some((min, max, stddev)) = replies.times_ms() {
-        findings.rtt_min_ms = Some(min);
-        findings.rtt_max_ms = Some(max);
-        findings.rtt_stddev_ms = Some(stddev);
+    if let Some((min, max, stddev)) = replies.times_secs() {
+        findings.rtt_min_secs = Some(min);
+        findings.rtt_max_secs = Some(max);
+        findings.rtt_stddev_secs = Some(stddev);
     }
     ensure!(replies.received() > 0, "no reply");
     Ok(())
@@ -1157,9 +1159,9 @@ mod tests {
         assert_eq!(output["up"], 1, "{output}");
         assert_eq!(output["name"], "a");
         assert_eq!(output["kind"], "tcp");
-        assert!(output["response_ms"].as_f64().unwrap() >= 0.0);
-        assert!(output["connect_ms"].as_f64().unwrap() >= 0.0);
-        assert!(output["dns_ms"].as_f64().unwrap() >= 0.0);
+        assert!(output["response_secs"].as_f64().unwrap() >= 0.0);
+        assert!(output["connect_secs"].as_f64().unwrap() >= 0.0);
+        assert!(output["dns_secs"].as_f64().unwrap() >= 0.0);
     }
 
     #[test]
@@ -1167,13 +1169,13 @@ mod tests {
         let output = run(&check(CheckKind::Tcp, CLOSED_ADDRESS));
         assert_eq!(output["up"], 0);
         assert_eq!(output["error"], "couldn't connect");
-        assert!(output.get("response_ms").is_none());
+        assert!(output.get("response_secs").is_none());
     }
 
     #[test]
     fn a_failure_keeps_what_was_learned_before_it() {
         let output = run(&check(CheckKind::Tcp, CLOSED_ADDRESS));
-        assert!(output["dns_ms"].is_f64(), "{output}");
+        assert!(output["dns_secs"].is_f64(), "{output}");
     }
 
     #[test]
@@ -1194,15 +1196,15 @@ mod tests {
         assert_eq!(output["content_length"], 5);
         assert_eq!(output["compressed"], false);
         for stage in [
-            "dns_ms",
-            "connect_ms",
-            "first_byte_ms",
-            "download_ms",
-            "response_ms",
+            "dns_secs",
+            "connect_secs",
+            "first_byte_secs",
+            "download_secs",
+            "response_secs",
         ] {
             assert!(output[stage].is_f64(), "{stage}: {output}");
         }
-        assert!(output.get("tls_ms").is_none());
+        assert!(output.get("tls_secs").is_none());
     }
 
     #[test]
@@ -1425,7 +1427,7 @@ mod tests {
 
         assert_eq!(output["up"], 0);
         assert_eq!(output["error"], "timed out");
-        assert!(output["connect_ms"].is_f64(), "{output}");
+        assert!(output["connect_secs"].is_f64(), "{output}");
         // Well short of the 10 seconds a check gets when it doesn't say.
         assert!(started.elapsed() < Duration::from_secs(8));
         drop(listener);
@@ -1496,7 +1498,7 @@ mod tests {
         assert_eq!(output["error"], "the certificate isn't trusted");
         assert_eq!(output["cert_valid"], false);
         assert_eq!(output["hostname_valid"], true);
-        assert!(output["tls_ms"].is_f64(), "{output}");
+        assert!(output["tls_secs"].is_f64(), "{output}");
         assert!(
             output["tls_version"]
                 .as_str()
@@ -1543,9 +1545,9 @@ mod tests {
         assert_eq!(output["up"], 0, "{output}");
         assert_eq!(output["error"], "the certificate isn't trusted");
         assert_eq!(output["cert_valid"], false);
-        assert!(output["tls_ms"].is_f64(), "{output}");
+        assert!(output["tls_secs"].is_f64(), "{output}");
         assert!(output["status"].is_null(), "{output}");
-        assert!(output["first_byte_ms"].is_null(), "{output}");
+        assert!(output["first_byte_secs"].is_null(), "{output}");
     }
 
     #[test]
@@ -1690,7 +1692,7 @@ mod tests {
         let output = run(&dns_check(serve_dns(ResponseCode::NoError, 2)));
         assert_eq!(output["up"], 1, "{output}");
         assert_eq!(output["records"], 2);
-        assert!(output["dns_ms"].is_f64());
+        assert!(output["dns_secs"].is_f64());
     }
 
     #[test]
@@ -1771,16 +1773,17 @@ mod tests {
         let mut findings = Findings::default();
         read_ping_summary(linux, &mut findings);
         assert_eq!(findings.packet_loss_percent, Some(20.0));
-        assert_eq!(findings.rtt_min_ms, Some(1.1));
-        assert_eq!(findings.rtt_max_ms, Some(3.3));
-        assert_eq!(findings.rtt_stddev_ms, Some(0.4));
+        let close = |found: Option<f64>, secs: f64| (found.unwrap() - secs).abs() < 1e-12;
+        assert!(close(findings.rtt_min_secs, 0.0011), "{findings:?}");
+        assert!(close(findings.rtt_max_secs, 0.0033), "{findings:?}");
+        assert!(close(findings.rtt_stddev_secs, 0.0004), "{findings:?}");
 
         let bsd = "5 packets transmitted, 5 packets received, 0.0% packet loss\n\
                    round-trip min/avg/max/stddev = 0.1/0.2/0.3/0.05 ms\n";
         let mut findings = Findings::default();
         read_ping_summary(bsd, &mut findings);
         assert_eq!(findings.packet_loss_percent, Some(0.0));
-        assert_eq!(findings.rtt_min_ms, Some(0.1));
+        assert!((findings.rtt_min_secs.unwrap() - 0.0001).abs() < 1e-12);
     }
 
     #[cfg(unix)]
@@ -1792,7 +1795,7 @@ mod tests {
             &mut findings,
         );
         assert_eq!(findings.packet_loss_percent, None);
-        assert_eq!(findings.rtt_min_ms, None);
+        assert_eq!(findings.rtt_min_secs, None);
     }
 
     #[test]
@@ -1803,7 +1806,7 @@ mod tests {
         });
         assert_eq!(output["up"], 1, "{output}");
         assert_eq!(output["packet_loss_percent"], 0.0);
-        assert!(output["rtt_max_ms"].is_f64(), "{output}");
-        assert!(output["dns_ms"].is_f64(), "{output}");
+        assert!(output["rtt_max_secs"].is_f64(), "{output}");
+        assert!(output["dns_secs"].is_f64(), "{output}");
     }
 }

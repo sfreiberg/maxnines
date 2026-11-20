@@ -481,7 +481,6 @@ fn metric_options() -> Vec<MetricOption> {
                 Unit::PerSecond => format!("{} (per second)", metric.title),
                 Unit::Bytes => format!("{} (bytes)", metric.title),
                 Unit::Seconds => format!("{} (seconds)", metric.title),
-                Unit::Milliseconds => format!("{} (milliseconds)", metric.title),
                 Unit::Celsius => format!("{} (°C)", metric.title),
             },
         })

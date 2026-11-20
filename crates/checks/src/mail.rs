@@ -694,18 +694,18 @@ mod tests {
                     "{kind:?} {implicit} without signing in: {result}"
                 );
                 // Every kind is timed the same way, and says whether it offers TLS.
-                for stage in ["dns_ms", "connect_ms", "response_ms"] {
+                for stage in ["dns_secs", "connect_secs", "response_secs"] {
                     assert!(result[stage].is_f64(), "{kind:?} {stage}: {result}");
                 }
                 if implicit {
-                    assert!(result["tls_ms"].is_f64(), "{kind:?}: {result}");
+                    assert!(result["tls_secs"].is_f64(), "{kind:?}: {result}");
                     assert_eq!(result["cert_valid"], false, "{kind:?}: {result}");
                 } else {
                     assert_eq!(result["tls_offered"], true, "{kind:?}: {result}");
                 }
                 let result = run(&mail, Some(&login("s3cret"))).await;
                 assert_eq!(result["signed_in"], true, "{kind:?} {implicit}: {result}");
-                assert!(result["tls_ms"].is_f64(), "{kind:?} {implicit}: {result}");
+                assert!(result["tls_secs"].is_f64(), "{kind:?} {implicit}: {result}");
                 let result = run(&mail, Some(&login("guess"))).await;
                 assert_eq!(
                     result["up"], 0,

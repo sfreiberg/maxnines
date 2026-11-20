@@ -548,7 +548,7 @@ async fn charts(
             hidden: 0,
         };
         let frame = Frame::STANDARD;
-        let unit = Unit::Milliseconds;
+        let unit = Unit::Seconds;
         let chart =
             metric_charts::build_as(response, unit, "Response time", frame, &phases, range, zone);
         add(chart, false);
