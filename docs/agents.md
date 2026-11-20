@@ -58,8 +58,9 @@ reached, and sent when it's back.
   so it shouldn't be readable by others either, unless those come from the
   environment.
 - **Upgrade the server first.** Agents a release behind keep working with a newer
-  server, but a newer agent may need things an older server doesn't have. See
-  [Upgrading](#upgrading).
+  server, but a newer agent may need things an older server doesn't have. Agents from
+  before protocol versions are the exception, and have to be upgraded along with the
+  server. See [Upgrading](#upgrading).
 - **macOS and downloads:** a file that came through a browser or AirDrop is blocked
   until you run `xattr -d com.apple.quarantine maxnines-agent`.
 - **Other commands:** `./maxnines-agent facts` prints what it reports about the
@@ -447,17 +448,26 @@ Upgrade the server first, then its agents. An agent says which version of the
 protocol it speaks each time it connects, and the server checks it before anything
 else:
 
-- **The server's own version, or the one before.** The agent works as usual. A server
-  keeps taking the version before its own for one release, so agents carry on while
-  you upgrade them.
-- **Older than that.** The server turns the agent away with a message that names the
+- **The server's own version, or the one before.** The agent works as usual. When the
+  protocol's version goes up, a server keeps taking the version before its own for one
+  release, so agents carry on while you upgrade them. Versions began at protocol 1, so
+  this holds from there on.
+- **Older than that.** The server refuses the agent with a message that names the
   agent's version, the versions the server takes, and the version to upgrade the
-  agent to. The agent logs it and tries again every 10 minutes. The host shows
+  agent to. The agent logs it and tries again after 5 to 10 minutes. The host shows
   **Agent needs upgrading** on the Hosts page, not just Offline, with the message on
-  its page. An agent too old to say which version it speaks counts as older.
-- **Newer than the server.** The agent is turned away the same way, and the host shows
+  its page.
+- **Newer than the server.** The agent is refused the same way, and the host shows
   **Server needs upgrading**. Upgrade the server, and the agent connects on its next
   try.
+
+Agents from before protocol versions don't say which version they speak, and the
+server refuses them, as they speak an older protocol than version 1. Upgrade them
+along with the first server that has protocol versions. They don't know what being
+refused means, so they don't log the server's message: they log that its answer was
+invalid, or that it closed the connection, and try again as they do while it's
+unreachable, as often as every 30 seconds. Their hosts still show **Agent needs
+upgrading**, with the server's message on their pages.
 
 Most releases don't change the protocol's version, as adding something doesn't. An
 agent given a kind of [check](checks.md) it doesn't know reports that check as down,
@@ -465,7 +475,7 @@ saying the agent needs upgrading, and runs the rest. One given a collector it do
 know runs the others, and the host's page says which it skipped and that the agent
 needs upgrading to run them.
 
-Even when nothing is turned away, the Hosts page marks agents older than the one
+Even when no agent is refused, the Hosts page marks agents older than the one
 released with the server **Update available**, and any newer than the server **Newer
 than server**.
 

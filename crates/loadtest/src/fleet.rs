@@ -122,7 +122,7 @@ async fn introduce(
     match read(socket).await {
         Some(ServerMessage::Registration { status }) => Ok(status),
         Some(ServerMessage::Refused { reason }) => {
-            bail!("the server turned the agents away: {reason}")
+            bail!("the server refused the agents: {reason}")
         }
         _ => bail!("no registration status from the server"),
     }
