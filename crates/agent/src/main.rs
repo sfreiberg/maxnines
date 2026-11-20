@@ -570,10 +570,7 @@ mod tests {
     }
 
     fn update(version: &str, config: Value) -> ConfigUpdate {
-        ConfigUpdate {
-            version: version.to_string(),
-            config: serde_json::from_value(config).unwrap(),
-        }
+        ConfigUpdate::read(version.to_string(), config).unwrap()
     }
 
     fn parse(text: &str) -> Result<Cli, clap::Error> {

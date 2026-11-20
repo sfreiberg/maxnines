@@ -13,6 +13,7 @@ use maxnines_protocol::{
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
 use rustls::{ClientConfig, RootCertStore};
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio::sync::{Notify, mpsc, watch};
@@ -57,6 +58,28 @@ const DEFAULT_FACTS_INTERVAL: Duration = Duration::from_secs(3600);
 pub struct ConfigUpdate {
     pub version: String,
     pub config: AgentConfig,
+    /// The config just as the server sent it, which is what's saved. What this build
+    /// reads from it leaves out what it doesn't know, which a newer server can send,
+    /// and an upgraded agent reads the whole of it again.
+    pub sent: Value,
+}
+
+impl ConfigUpdate {
+    /// Reads a config as the server sent it.
+    pub fn read(version: String, sent: Value) -> Result<Self> {
+        let config = serde_json::from_value(sent.clone()).context("reading the config")?;
+        Ok(Self {
+            version,
+            config,
+            sent,
+        })
+    }
+}
+
+/// Just the config from a [`ServerMessage::Config`], as it was sent.
+#[derive(Deserialize)]
+struct SentConfig {
+    config: Value,
 }
 
 /// Talks to a background task that owns the connection, so a slow or missing
@@ -485,7 +508,18 @@ async fn receive(text: &str, connection: &Connection) -> Option<String> {
                 .ok();
         }
         Ok(ServerMessage::Config { version, config }) => {
-            let update = ConfigUpdate { version, config };
+            let sent = match serde_json::from_str::<SentConfig>(text) {
+                Ok(sent) => sent.config,
+                Err(error) => {
+                    warn!(%error, "ignoring a config that can't be kept as it was sent");
+                    return None;
+                }
+            };
+            let update = ConfigUpdate {
+                version,
+                config,
+                sent,
+            };
             if connection.configs.send(update).await.is_err() {
                 error!("config dropped, the agent has stopped");
             }
@@ -879,6 +913,29 @@ mod tests {
         send_to_agent(&mut socket, &message).await;
 
         assert_eq!(link.next_config().await.unwrap().version, "v1");
+    }
+
+    #[tokio::test]
+    async fn a_config_is_passed_on_with_what_this_agent_does_not_know() {
+        let (mut link, mut socket) = connected().await;
+
+        let config = json!({
+            "interval_secs": 9,
+            "collectors": { "checks": { "checks": [
+                { "name": "directory", "kind": "ldap", "target": "ldap.example.com:389" },
+            ] } },
+            "from_a_newer_server": true,
+        });
+        let message = json!({ "type": "config", "version": "v1", "config": config });
+        socket
+            .send(Message::text(message.to_string()))
+            .await
+            .unwrap();
+
+        let update = link.next_config().await.unwrap();
+        assert_eq!(update.sent, config);
+        let checks = update.config.collectors["checks"].checks.clone().unwrap();
+        assert_eq!(checks[0].kind, maxnines_protocol::CheckKind::Unknown);
     }
 
     #[tokio::test]

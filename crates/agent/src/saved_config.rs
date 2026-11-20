@@ -1,12 +1,13 @@
 //! The last config that worked, so the agent can keep monitoring if it restarts
-//! while the server is unreachable.
+//! while the server is unreachable. It's kept as the server sent it, and read again
+//! by whichever build loads it, so an upgraded agent runs what an older one couldn't.
 
 use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use maxnines_protocol::AgentConfig;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tracing::warn;
 
 use crate::websocket::ConfigUpdate;
@@ -14,19 +15,22 @@ use crate::websocket::ConfigUpdate;
 #[derive(Serialize, Deserialize)]
 struct Saved {
     version: String,
-    config: AgentConfig,
+    config: Value,
 }
 
 /// A missing or damaged file only means waiting for the server.
 pub fn load(path: &Path) -> Option<ConfigUpdate> {
     let text = fs::read_to_string(path).ok()?;
-    match serde_json::from_str::<Saved>(&text) {
-        Ok(saved) => Some(ConfigUpdate {
-            version: saved.version,
-            config: saved.config,
-        }),
+    let read = serde_json::from_str::<Saved>(&text)
+        .map_err(anyhow::Error::from)
+        .and_then(|saved| ConfigUpdate::read(saved.version, saved.config));
+    match read {
+        Ok(update) => Some(update),
         Err(error) => {
-            warn!(%error, "ignoring an unreadable saved config");
+            warn!(
+                error = format!("{error:#}"),
+                "ignoring an unreadable saved config"
+            );
             None
         }
     }
@@ -40,7 +44,7 @@ pub fn save(path: &Path, update: &ConfigUpdate) -> Result<()> {
     }
     let saved = Saved {
         version: update.version.clone(),
-        config: update.config.clone(),
+        config: update.sent.clone(),
     };
     let temporary = path.with_extension("json.new");
     fs::write(&temporary, serde_json::to_string_pretty(&saved)?)
@@ -55,10 +59,7 @@ mod tests {
     use super::*;
 
     fn update() -> ConfigUpdate {
-        ConfigUpdate {
-            version: "v1".to_string(),
-            config: serde_json::from_value(json!({ "interval_secs": 9 })).unwrap(),
-        }
+        ConfigUpdate::read("v1".to_string(), json!({ "interval_secs": 9 })).unwrap()
     }
 
     #[test]
@@ -71,6 +72,30 @@ mod tests {
 
         assert_eq!(loaded.version, "v1");
         assert_eq!(loaded.config, update().config);
+    }
+
+    /// Read as it was saved, an agent upgraded since would still take the check
+    /// for one it can't run, and the new setting would be lost.
+    #[test]
+    fn a_config_is_kept_as_it_was_sent_and_read_again_when_loaded() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("config.json");
+        let sent = json!({
+            "collectors": { "checks": { "checks": [
+                { "name": "directory", "kind": "ldap", "target": "ldap.example.com:389" },
+            ] } },
+            "from_a_newer_server": { "x": 1 },
+        });
+        let update = ConfigUpdate::read("v1".to_string(), sent.clone()).unwrap();
+        let checks = update.config.collectors["checks"].checks.clone().unwrap();
+        assert_eq!(checks[0].kind, maxnines_protocol::CheckKind::Unknown);
+
+        save(&path, &update).unwrap();
+        let loaded = load(&path).unwrap();
+
+        assert_eq!(loaded.sent, sent);
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["config"], sent);
     }
 
     #[test]
