@@ -655,9 +655,6 @@ fn api_key_snapshot(row: &api_key::Model, owner: &str) -> Snapshot {
 use crate::registration::hex_hash as api_key_hash;
 
 impl Database {
-    /// The token that protects the admin API, created the first time it's asked
-    /// for. Two servers starting at once can't end up with different tokens, as
-    /// only the first insert counts and both read the result.
     /// Makes a key that acts as `user_id` with at most `role`, and gives back the
     /// only copy of it there'll ever be. The owner has to be someone who can sign in,
     /// and can't make a key that does more than they can.
@@ -800,7 +797,8 @@ impl Database {
     }
 
     /// A secret the server made for itself, created the first time it's asked for.
-    /// Two servers starting on one database get the same one.
+    /// Two asking for it at once get the same one, as only the first insert counts
+    /// and both read what was saved.
     pub async fn server_secret(&self, name: &str) -> Result<String> {
         let saved = server_secret::Entity::find_by_id(name)
             .one(&self.connection)

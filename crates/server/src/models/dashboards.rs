@@ -318,13 +318,20 @@ impl Database {
     pub async fn place_widgets(&self, dashboard_id: i64, widgets: &[Placed]) -> Result<()> {
         let transaction = self.connection.begin().await?;
         let before = load(&transaction, dashboard_id).await?;
+        // A widget placed twice ends where it was placed last.
+        let widgets: BTreeMap<i64, &Placement> = widgets
+            .iter()
+            .map(|widget| (widget.id, &widget.placement))
+            .collect();
         if !widgets.is_empty() {
             // Each widget's new value for a column, by its ID.
             let placed = |column: dashboard_widget::Column, value: fn(&Placement) -> i32| {
-                let moved = widgets.iter().fold(CaseStatement::new(), |moved, widget| {
-                    let id = dashboard_widget::Column::Id.eq(widget.id);
-                    moved.case(id, value(&widget.placement))
-                });
+                let moved = widgets
+                    .iter()
+                    .fold(CaseStatement::new(), |moved, (id, placement)| {
+                        let id = dashboard_widget::Column::Id.eq(*id);
+                        moved.case(id, value(placement))
+                    });
                 let moved: Expr = moved.finally(Expr::col(column)).into();
                 moved
             };
@@ -345,7 +352,7 @@ impl Database {
                     dashboard_widget::Column::H,
                     placed(dashboard_widget::Column::H, |placement| placement.h),
                 )
-                .filter(dashboard_widget::Column::Id.is_in(widgets.iter().map(|widget| widget.id)))
+                .filter(dashboard_widget::Column::Id.is_in(widgets.keys().copied()))
                 .filter(dashboard_widget::Column::DashboardId.eq(dashboard_id))
                 .exec(&transaction)
                 .await

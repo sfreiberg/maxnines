@@ -265,8 +265,12 @@ mod dashboards_api {
         let change = json!({ "metric": "memory.usage", "title": "Memory", "kind": "table" });
         assert_eq!(api(&server, "PUT", &path, &change).await.0, 204);
 
+        // A widget placed twice ends where it was placed last.
         let layout = format!("/api/v1/dashboards/{id}/layout");
-        let moved = json!([{ "id": widget_id, "x": 6, "y": 2, "w": 3, "h": 5 }]);
+        let moved = json!([
+            { "id": widget_id, "x": 0, "y": 0, "w": 4, "h": 4 },
+            { "id": widget_id, "x": 6, "y": 2, "w": 3, "h": 5 },
+        ]);
         assert_eq!(api(&server, "PUT", &layout, &moved).await.0, 204);
 
         let shown = format!("/api/v1/dashboards/{id}");

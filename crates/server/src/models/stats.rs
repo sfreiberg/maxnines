@@ -4,35 +4,62 @@
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use sea_orm::{ConnectionTrait, DatabaseBackend, EntityTrait, Statement};
+use sea_orm::sea_query::{Asterisk, Expr, Func, IntoTableRef, Query, SelectStatement};
+use sea_orm::{ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, Statement};
 use serde::Serialize;
 
-use super::{Database, host};
+use super::alerting::{FAILED, PENDING};
+use super::{
+    Database, alert, alert_rule, config_rule, host, host_fact, notification, notification_channel,
+    remote_check,
+};
+
+/// How many rows a table has, of those `only` picks.
+fn count(table: impl IntoTableRef, only: Option<Expr>) -> SelectStatement {
+    let mut count = Query::select();
+    count.expr(Func::count(Expr::col(Asterisk))).from(table);
+    if let Some(only) = only {
+        count.and_where(only);
+    }
+    count
+}
 
 /// What the server page counts, by name and the query counting it. Rules and
 /// channels that were deleted are only kept for what names them, so aren't counted.
-const TABLE_COUNTS: [(&str, &str); 8] = [
-    ("Hosts", "SELECT COUNT(*) FROM hosts"),
-    ("Facts", "SELECT COUNT(*) FROM host_facts"),
-    ("Config rules", "SELECT COUNT(*) FROM config_rules"),
-    (
-        "Alert rules",
-        "SELECT COUNT(*) FROM alert_rules WHERE deleted_at IS NULL",
-    ),
-    ("Alerts", "SELECT COUNT(*) FROM alerts"),
-    (
-        "Notification channels",
-        "SELECT COUNT(*) FROM notification_channels WHERE deleted_at IS NULL",
-    ),
-    ("Notifications", "SELECT COUNT(*) FROM notifications"),
-    ("Server checks", "SELECT COUNT(*) FROM remote_checks"),
-];
+fn table_counts() -> [(&'static str, SelectStatement); 8] {
+    [
+        ("Hosts", count(host::Entity, None)),
+        ("Facts", count(host_fact::Entity, None)),
+        ("Config rules", count(config_rule::Entity, None)),
+        (
+            "Alert rules",
+            count(
+                alert_rule::Entity,
+                Some(alert_rule::Column::DeletedAt.is_null()),
+            ),
+        ),
+        ("Alerts", count(alert::Entity, None)),
+        (
+            "Notification channels",
+            count(
+                notification_channel::Entity,
+                Some(notification_channel::Column::DeletedAt.is_null()),
+            ),
+        ),
+        ("Notifications", count(notification::Entity, None)),
+        ("Server checks", count(remote_check::Entity, None)),
+    ]
+}
 
 /// How many notifications are waiting to go, and how many were given up on.
-const NOTIFICATION_COUNTS: [&str; 2] = [
-    "SELECT COUNT(*) FROM notifications WHERE state = 'pending'",
-    "SELECT COUNT(*) FROM notifications WHERE state = 'failed'",
-];
+fn notification_counts() -> [SelectStatement; 2] {
+    [PENDING, FAILED].map(|state| {
+        count(
+            notification::Entity,
+            Some(notification::Column::State.eq(state)),
+        )
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TableCount {
@@ -120,25 +147,28 @@ impl Database {
         let response_ms = started.elapsed().as_secs_f64() * 1000.0;
 
         // Every count in one trip, each a query of its own.
-        let counts: Vec<String> = TABLE_COUNTS
-            .iter()
-            .map(|(_, count)| *count)
-            .chain(NOTIFICATION_COUNTS)
-            .map(|count| format!("({count})"))
-            .collect();
-        let sql = format!("SELECT {}", counts.join(", "));
+        let tables = table_counts();
+        let names: Vec<&str> = tables.iter().map(|(name, _)| *name).collect();
+        let mut all = Query::select();
+        for each in tables
+            .into_iter()
+            .map(|(_, count)| count)
+            .chain(notification_counts())
+        {
+            all.expr(Expr::SubQuery(None, Box::new(each.into())));
+        }
         let row = self
             .connection
-            .query_one_raw(Statement::from_string(backend, sql))
+            .query_one(&all)
             .await
             .context("counting rows")?
             .context("counting rows")?;
-        let mut counts = (0..counts.len()).map(|column| {
+        let mut counts = (0..).map(|column| {
             let rows: i64 = row.try_get_by_index(column).context("counting rows")?;
             u64::try_from(rows).context("counting rows")
         });
-        let mut tables = Vec::with_capacity(TABLE_COUNTS.len());
-        for (name, _) in TABLE_COUNTS {
+        let mut tables = Vec::with_capacity(names.len());
+        for name in names {
             let rows = counts.next().context("counting rows")??;
             tables.push(TableCount { name, rows });
         }
