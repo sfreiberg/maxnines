@@ -4001,6 +4001,7 @@ dependencies = [
  "comfy-table",
  "gethostname",
  "hcl-rs",
+ "humantime",
  "keyring",
  "ring",
  "serde",

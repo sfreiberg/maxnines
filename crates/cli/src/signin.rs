@@ -260,8 +260,13 @@ fn issued(answer: &Answer, refused: &str) -> Result<Issued, Failure> {
     }
     if answer.status >= 500 {
         return Err(Failure::new(
-            1,
-            format!("The server answered with status {}", answer.status),
+            Failure::OTHER,
+            match answer.error() {
+                Some(error) => {
+                    format!("The server answered with status {}: {error}", answer.status)
+                }
+                None => format!("The server answered with status {}", answer.status),
+            },
         ));
     }
     Err(Failure::refused(match answer.error() {
@@ -353,6 +358,8 @@ pub fn with_device(
     let start: DeviceStart = serde_json::from_str(&answer.text)
         .map_err(|_| Failure::new(Failure::OTHER, "That didn't answer like a MaxNines server"))?;
     show(&start);
+    let lasts = Duration::from_secs(start.expires_in);
+    let deadline = Instant::now() + lasts;
     let mut interval = start.interval.max(1);
     loop {
         wait(Duration::from_secs(interval));
@@ -361,12 +368,20 @@ pub fn with_device(
             ("client_id", CLIENT_ID),
             ("device_code", start.device_code.as_str()),
         ];
-        let answer = http.send(
+        let answer = match http.send(
             "POST",
             &server.url("/oauth/token"),
             None,
             Body::Form(&fields),
-        )?;
+        ) {
+            Ok(answer) => answer,
+            // The network dropping while someone types the code doesn't end it: the
+            // code still works until it runs out, so ask again until then.
+            Err(failure) if failure.code == Failure::UNREACHABLE && Instant::now() < deadline => {
+                continue;
+            }
+            Err(failure) => return Err(failure),
+        };
         if answer.is_success() {
             return issued(&answer, "The server wouldn't sign it in");
         }
@@ -381,9 +396,10 @@ pub fn with_device(
                 return Err(Failure::not_allowed("Signing in was turned down"));
             }
             Some("expired_token") => {
-                return Err(Failure::unreachable(
-                    "Nobody entered the code within 10 minutes. Try again",
-                ));
+                return Err(Failure::unreachable(format!(
+                    "Nobody entered the code within {}. Try again",
+                    humantime::format_duration(lasts)
+                )));
             }
             _ => return Err(issued(&answer, "The server wouldn't sign it in").unwrap_err()),
         }
@@ -498,54 +514,124 @@ mod tests {
         );
     }
 
-    /// A token endpoint that answers every request with `status` and `body`, giving
-    /// back where it is and the forms posted to it.
-    fn token_server(
-        status: u16,
-        body: &'static str,
-    ) -> (Server, std::sync::mpsc::Receiver<String>) {
+    /// Reads a whole request, headers and form, giving back the form.
+    fn read_form(stream: &mut TcpStream) -> String {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let text = String::from_utf8_lossy(&buffer).to_string();
+            if let Some((head, form)) = text.split_once("\r\n\r\n") {
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        line.to_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                if form.len() >= length {
+                    return form.to_string();
+                }
+            }
+            let read = stream.read(&mut chunk).unwrap_or(0);
+            if read == 0 {
+                return String::new();
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    fn answer(stream: &mut TcpStream, status: u16, body: &str) {
+        let response = format!(
+            "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+    }
+
+    fn listen() -> (TcpListener, Server) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let server = Server::parse(&format!(
             "http://127.0.0.1:{}",
             listener.local_addr().unwrap().port()
         ))
         .unwrap();
+        (listener, server)
+    }
+
+    /// A token endpoint that answers every request with `status` and `body`, giving
+    /// back where it is and the forms posted to it.
+    fn token_server(
+        status: u16,
+        body: &'static str,
+    ) -> (Server, std::sync::mpsc::Receiver<String>) {
+        let (listener, server) = listen();
         let (posted, forms) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             for mut stream in listener.incoming().flatten() {
-                let mut buffer = Vec::new();
-                let mut chunk = [0u8; 4096];
-                // The whole request, headers and form, before answering.
-                loop {
-                    let text = String::from_utf8_lossy(&buffer).to_string();
-                    if let Some((head, form)) = text.split_once("\r\n\r\n") {
-                        let length = head
-                            .lines()
-                            .find_map(|line| {
-                                line.to_lowercase()
-                                    .strip_prefix("content-length:")
-                                    .map(|value| value.trim().parse::<usize>().unwrap_or(0))
-                            })
-                            .unwrap_or(0);
-                        if form.len() >= length {
-                            let _ = posted.send(form.to_string());
-                            break;
-                        }
-                    }
-                    let read = stream.read(&mut chunk).unwrap_or(0);
-                    if read == 0 {
-                        break;
-                    }
-                    buffer.extend_from_slice(&chunk[..read]);
-                }
-                let response = format!(
-                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes());
+                let _ = posted.send(read_form(&mut stream));
+                answer(&mut stream, status, body);
             }
         });
         (server, forms)
+    }
+
+    /// A server that answers each request in turn with the next of `answers`, once it
+    /// has read all of it. `None` closes the connection without answering, as a
+    /// network that drops would.
+    fn scripted_server(answers: Vec<Option<(u16, &'static str)>>) -> Server {
+        let (listener, server) = listen();
+        std::thread::spawn(move || {
+            for (mut stream, next) in listener.incoming().flatten().zip(answers) {
+                read_form(&mut stream);
+                if let Some((status, body)) = next {
+                    answer(&mut stream, status, body);
+                }
+            }
+        });
+        server
+    }
+
+    const DEVICE_START: &str = r#"{"device_code": "mxd_1", "user_code": "BCDF-GHJK", "verification_uri": "http://x/device", "verification_uri_complete": "http://x/device?code=BCDF-GHJK", "expires_in": 300, "interval": 1}"#;
+
+    fn sign_in_with_device(server: &Server) -> Result<Issued, Failure> {
+        with_device(&Http::new(), server, "laptop", None, &|_| {}, &|_| {})
+    }
+
+    #[test]
+    fn the_network_dropping_while_the_code_is_typed_only_means_asking_again() {
+        let server = scripted_server(vec![
+            Some((200, DEVICE_START)),
+            None,
+            Some((400, r#"{"error": "authorization_pending"}"#)),
+            Some((
+                200,
+                r#"{"access_token": "mxa_1", "expires_in": 3600, "refresh_token": "mxr_1", "role": "viewer", "user": "you@example.com"}"#,
+            )),
+        ]);
+        assert_eq!(sign_in_with_device(&server).unwrap().access_token, "mxa_1");
+    }
+
+    #[test]
+    fn a_code_that_runs_out_says_how_long_it_lasted() {
+        let server = scripted_server(vec![
+            Some((200, DEVICE_START)),
+            Some((400, r#"{"error": "expired_token"}"#)),
+        ]);
+        let expired = sign_in_with_device(&server).unwrap_err();
+        assert_eq!(expired.code, Failure::UNREACHABLE);
+        assert!(expired.message.contains("within 5m"), "{}", expired.message);
+    }
+
+    #[test]
+    fn a_failing_server_is_never_taken_for_found() {
+        let server = scripted_server(vec![Some((
+            503,
+            r#"{"error": "temporarily_unavailable", "error_description": "Starting up"}"#,
+        ))]);
+        let failed = sign_in_with_device(&server).unwrap_err();
+        assert_eq!(failed.code, Failure::OTHER);
+        assert!(failed.message.contains("Starting up"), "{}", failed.message);
     }
 
     /// Opens the page as a browser would, choosing Allow, and keeps what the app's

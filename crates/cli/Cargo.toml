@@ -19,6 +19,7 @@ clap_complete = "4"
 comfy-table = { version = "7.1.4", default-features = false }
 gethostname = "1"
 hcl-rs.workspace = true
+humantime = "2.3"
 ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
