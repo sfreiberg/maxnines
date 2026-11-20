@@ -24,20 +24,25 @@ use serde_json::Value;
 /// an agent says in its hello and a server checks before anything else.
 ///
 /// It goes up only for a change that breaks something: removing or renaming a
-/// message, field, status, check kind or collector, or changing what one means.
-/// Adding one doesn't, whether a message, an optional field, a check kind or a
-/// collector, as each side passes over what it doesn't know: an unknown message is
-/// ignored, an unknown check reports that the agent needs upgrading, and an unknown
-/// collector is skipped and reported.
+/// message, field, status, check kind or collector, changing what one means, or
+/// adding a [`RegistrationStatus`] that lets an agent in. Adding anything else
+/// doesn't, whether a message, an optional field, a check kind, a collector or a
+/// status that keeps an agent out, as each side passes over what it doesn't know: an
+/// unknown message is ignored, an unknown check reports that the agent needs
+/// upgrading, an unknown collector is skipped and reported, and an unknown status
+/// keeps the agent out, trying again as it does while it's pending.
 ///
 /// After it goes up, a server keeps taking the version before for one release, so
 /// that the usual order of upgrading, the server and then its agents, never cuts an
 /// agent off, and [`OLDEST_SUPPORTED_PROTOCOL`] moves up by one each release.
-/// An agent older than that is turned away with a message saying to upgrade it, and
+/// An agent older than that is refused with a message saying to upgrade it, and
 /// one newer than the server with a message saying to upgrade the server first.
 ///
-/// Version 1 is the protocol as it was when versions began. An agent from before
-/// then sends none, which reads as 0.
+/// Version 1 is the protocol as it was when versions began, and the release's grace
+/// starts from it. An agent from before then sends none, which reads as 0, and is
+/// refused: those agents speak an older protocol than version 1, as durations were
+/// renamed to `_secs` when versions began, so they have to be upgraded along with
+/// the first server that has protocol versions.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The oldest version of the protocol a server takes from its agents. See
@@ -1203,8 +1208,12 @@ pub enum AgentMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
     /// The first message on every connection, with the versions of the protocol the
-    /// server takes.
-    Challenge { nonce: String, protocols: Protocols },
+    /// server takes. A server from before protocol versions doesn't say them.
+    Challenge {
+        nonce: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocols: Option<Protocols>,
+    },
     /// The handshake result. The server closes the connection unless approved.
     Registration { status: RegistrationStatus },
     /// The other handshake result: the server won't take this agent until one of the
@@ -1251,9 +1260,10 @@ pub enum RegistrationStatus {
     /// Waiting for an admin. The agent should try again later.
     Pending,
     Rejected,
-    /// A status this build doesn't know, from a newer server. The agent can't tell
-    /// what it's being told, so it waits a long while before trying again, as it
-    /// does when it's refused.
+    /// A status this build doesn't know, from a newer server. It isn't approval, so
+    /// the agent tries again as it does while it's pending, saying it may need
+    /// upgrading. A newer server can add a status that keeps agents out without
+    /// changing [`PROTOCOL_VERSION`], but not one that lets them in.
     #[serde(other)]
     Unknown,
 }
@@ -1816,14 +1826,29 @@ mod tests {
         );
         let challenge = ServerMessage::Challenge {
             nonce: "n".to_string(),
-            protocols: Protocols {
+            protocols: Some(Protocols {
                 oldest: 1,
                 newest: 2,
-            },
+            }),
         };
         assert_eq!(
             serde_json::to_value(&challenge).unwrap(),
             json!({ "type": "challenge", "nonce": "n", "protocols": { "oldest": 1, "newest": 2 } })
+        );
+    }
+
+    /// A newer agent can still tell what an older server says, and that it didn't
+    /// say which protocols it takes.
+    #[test]
+    fn a_challenge_from_before_protocol_versions_says_none() {
+        let challenge: ServerMessage =
+            serde_json::from_value(json!({ "type": "challenge", "nonce": "n" })).unwrap();
+        assert_eq!(
+            challenge,
+            ServerMessage::Challenge {
+                nonce: "n".to_string(),
+                protocols: None,
+            }
         );
     }
 
@@ -2005,7 +2030,7 @@ mod tests {
         let messages = [
             ServerMessage::Challenge {
                 nonce: "ab".to_string(),
-                protocols: Protocols::SUPPORTED,
+                protocols: Some(Protocols::SUPPORTED),
             },
             ServerMessage::Registration {
                 status: RegistrationStatus::Pending,

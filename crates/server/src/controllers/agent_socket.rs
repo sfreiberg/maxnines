@@ -178,7 +178,7 @@ async fn authenticate(
     let nonce = auth::new_nonce()?;
     let challenge = ServerMessage::Challenge {
         nonce: nonce.clone(),
-        protocols: Protocols::SUPPORTED,
+        protocols: Some(Protocols::SUPPORTED),
     };
     send(socket, &challenge).await?;
 

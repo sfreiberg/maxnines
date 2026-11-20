@@ -483,7 +483,7 @@ async fn the_challenge_says_which_protocols_the_server_takes() {
     let ServerMessage::Challenge { protocols, .. } = read_server_message(&mut client).await else {
         panic!("expected a challenge");
     };
-    assert_eq!(protocols, maxnines_protocol::Protocols::SUPPORTED);
+    assert_eq!(protocols, Some(maxnines_protocol::Protocols::SUPPORTED));
 }
 
 /// The host as the API gives it.

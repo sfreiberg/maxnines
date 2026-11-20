@@ -43,10 +43,16 @@ const SEND_LIMIT: Duration = SERVER_SILENCE_LIMIT;
 const HANDSHAKE_LIMIT: Duration = Duration::from_secs(15);
 /// Configs arrive rarely, and only the newest one matters.
 const CONFIG_QUEUE_SIZE: usize = 8;
-/// How long an agent the server turned away waits before trying again. Trying sooner
+/// The longest an agent the server refused waits before trying again. Trying sooner
 /// wouldn't help, as something has to be upgraded first, and that restarts whichever
-/// side it was.
+/// side it was. The wait is anywhere from half of this to all of it, so that agents
+/// refused together don't all come back together.
 const REFUSED_WAIT: Duration = Duration::from_secs(600);
+
+/// Said when a server that didn't say which protocol versions it takes answers in a
+/// way this agent doesn't expect, as one from before protocol versions would.
+const OLD_SERVER: &str = "the server didn't say which protocol versions it takes, so it may be \
+                          from before protocol versions and need upgrading";
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -292,38 +298,40 @@ fn tls_connector(ca_file: Option<&Path>) -> Result<Connector> {
     Ok(Connector::Rustls(Arc::new(config)))
 }
 
-/// Why the server turned this agent away, in its own words, which waiting a little
-/// won't change.
+/// Why the server refused this agent, in its own words, which waiting a little won't
+/// change.
 #[derive(Debug)]
 struct Refused(String);
 
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the server turned this agent away: {}", self.0)
+        write!(f, "the server refused this agent: {}", self.0)
     }
 }
 
 impl std::error::Error for Refused {}
 
-/// What the agent says about being turned away: the server's whole reason the first
-/// time, and a short line on later tries while nothing changes.
+/// What the agent says about being refused: the server's whole reason the first time,
+/// and a short line on later tries while nothing changes.
 #[derive(Default)]
 struct Refusals {
     last: Option<String>,
 }
 
 impl Refusals {
-    /// Logs a refusal, and gives how long to wait before trying again.
-    fn refused(&mut self, refused: &Refused) -> Duration {
-        error!("{}", self.line(refused));
-        REFUSED_WAIT
+    /// Logs a refusal, and gives how long to wait before trying again, given a random
+    /// number from 0 to 1.
+    fn refused(&mut self, refused: &Refused, random: f64) -> Duration {
+        let wait = REFUSED_WAIT.mul_f64(0.5 + random.clamp(0.0, 1.0) / 2.0);
+        error!("{}", self.line(refused, wait));
+        wait
     }
 
-    fn line(&mut self, refused: &Refused) -> String {
-        let minutes = REFUSED_WAIT.as_secs() / 60;
+    fn line(&mut self, refused: &Refused, wait: Duration) -> String {
+        let minutes = wait.as_secs().div_ceil(60);
         if self.last.as_ref() == Some(&refused.0) {
             return format!(
-                "the server still turns this agent away, as above. Trying again in {minutes} \
+                "the server still refuses this agent, as above. Trying again in {minutes} \
                  minutes."
             );
         }
@@ -339,7 +347,7 @@ impl Refusals {
 
 /// Reconnects forever, backing off while the server stays unreachable. This is
 /// also how a pending agent checks for approval. A panic in a session is
-/// treated like any other lost connection. An agent the server turns away waits far
+/// treated like any other lost connection. An agent the server refuses waits far
 /// longer, as only an upgrade changes that.
 async fn stay_connected(connection: Connection) {
     let mut backoff = Backoff::new();
@@ -355,7 +363,7 @@ async fn stay_connected(connection: Connection) {
             _ => None,
         };
         if let Some(refused) = refused {
-            sleep(refusals.refused(refused)).await;
+            sleep(refusals.refused(refused, rand::random())).await;
             backoff.reset();
             continue;
         }
@@ -554,11 +562,14 @@ async fn authenticate(socket: &mut Socket, connection: &Connection) -> Result<()
         bail!("expected a challenge from the server");
     };
     // The server says whether it takes this agent's, after the hello.
-    debug!(
-        oldest = protocols.oldest,
-        newest = protocols.newest,
-        "the server takes these protocol versions"
-    );
+    match protocols {
+        Some(protocols) => debug!(
+            oldest = protocols.oldest,
+            newest = protocols.newest,
+            "the server takes these protocol versions"
+        ),
+        None => debug!("the server didn't say which protocol versions it takes"),
+    }
 
     let hello = AgentMessage::Hello {
         hostname: connection.hostname.clone(),
@@ -572,6 +583,20 @@ async fn authenticate(socket: &mut Socket, connection: &Connection) -> Result<()
         .send(Message::text(serde_json::to_string(&hello)?))
         .await?;
 
+    let answer = registration(socket, connection).await;
+    // A server from before protocol versions says none, and can't be told apart
+    // from one that's broken except by what it does next.
+    match answer {
+        Err(error) if protocols.is_none() => match error.downcast::<Refused>() {
+            Ok(Refused(reason)) => Err(Refused(format!("{reason} ({OLD_SERVER}.)")).into()),
+            Err(error) => Err(error.context(OLD_SERVER)),
+        },
+        answer => answer,
+    }
+}
+
+/// Reads how the server took the hello, returning once the agent is approved.
+async fn registration(socket: &mut Socket, connection: &Connection) -> Result<()> {
     let status = match read_server_message(socket).await? {
         ServerMessage::Registration { status } => status,
         ServerMessage::Refused { reason } => return Err(Refused(reason).into()),
@@ -583,12 +608,12 @@ async fn authenticate(socket: &mut Socket, connection: &Connection) -> Result<()
         RegistrationStatus::Approved => Ok(()),
         RegistrationStatus::Pending => bail!("waiting for the server to approve host ID {id}"),
         RegistrationStatus::Rejected => bail!("the server rejected host ID {id}"),
-        RegistrationStatus::Unknown => Err(Refused(
-            "it answered in a way this agent doesn't understand, so the agent may need \
-             upgrading."
-                .to_string(),
-        )
-        .into()),
+        // Whatever it is, it isn't approval, so the agent tries again as it does
+        // while it's waiting.
+        RegistrationStatus::Unknown => bail!(
+            "the server answered host ID {id} with a status this agent doesn't know, so the \
+             agent may need upgrading"
+        ),
     }
 }
 
@@ -696,7 +721,7 @@ mod tests {
     {
         let challenge = ServerMessage::Challenge {
             nonce: "test-nonce".to_string(),
-            protocols: maxnines_protocol::Protocols::SUPPORTED,
+            protocols: Some(maxnines_protocol::Protocols::SUPPORTED),
         };
         send_to_agent(socket, &challenge).await;
 
@@ -960,17 +985,29 @@ mod tests {
     /// Plays a server that answers the hello with `replies`, and returns how one
     /// session of the agent's ended.
     async fn session_answered_with(replies: Vec<Value>) -> anyhow::Error {
+        let challenge = json!({
+            "type": "challenge",
+            "nonce": "n",
+            "protocols": maxnines_protocol::Protocols::SUPPORTED,
+        });
+        session_challenged_and_answered_with(challenge, replies).await
+    }
+
+    /// As [`session_answered_with`], from a server that sends `challenge`.
+    async fn session_challenged_and_answered_with(
+        challenge: Value,
+        replies: Vec<Value>,
+    ) -> anyhow::Error {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/ws", listener.local_addr().unwrap());
         let (_link, connection) = ServerLink::new(&config(&url), "web-1", identity()).unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = accept_async(stream).await.unwrap();
-            let challenge = ServerMessage::Challenge {
-                nonce: "n".to_string(),
-                protocols: maxnines_protocol::Protocols::SUPPORTED,
-            };
-            send_to_agent(&mut socket, &challenge).await;
+            socket
+                .send(Message::text(challenge.to_string()))
+                .await
+                .unwrap();
             socket.next().await.unwrap().unwrap();
             for reply in replies {
                 socket.send(Message::text(reply.to_string())).await.unwrap();
@@ -983,16 +1020,62 @@ mod tests {
         error
     }
 
+    /// It isn't approval, so the agent tries again as it does while it waits, not as
+    /// it does when it's refused.
     #[tokio::test]
-    async fn a_status_from_a_newer_server_is_taken_as_being_turned_away() {
+    async fn a_status_from_a_newer_server_is_tried_again_soon() {
         let error = session_answered_with(vec![
             json!({ "type": "something_new" }),
             json!({ "type": "registration", "status": "quarantined" }),
         ])
         .await;
 
+        assert!(error.downcast_ref::<Refused>().is_none(), "{error:#}");
+        let error = format!("{error:#}");
+        assert!(error.contains("status this agent doesn't know"), "{error}");
+        assert!(error.contains("may need upgrading"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_server_that_does_not_say_its_protocols_is_one_that_may_need_upgrading() {
+        let challenge = json!({ "type": "challenge", "nonce": "n" });
+        let error = session_challenged_and_answered_with(
+            challenge.clone(),
+            vec![json!({ "type": "registration", "status": "quarantined" })],
+        )
+        .await;
+        let error = format!("{error:#}");
+        assert!(error.starts_with(OLD_SERVER), "{error}");
+
+        let error = session_challenged_and_answered_with(
+            challenge.clone(),
+            vec![
+                json!({ "type": "something_new" }),
+                json!({ "type": "ask_time", "nonce": "x" }),
+            ],
+        )
+        .await;
+        assert!(format!("{error:#}").starts_with(OLD_SERVER), "{error:#}");
+
+        let error = session_challenged_and_answered_with(
+            challenge,
+            vec![json!({ "type": "refused", "reason": "No." })],
+        )
+        .await;
         let refused = error.downcast_ref::<Refused>().expect("a refusal");
-        assert!(refused.0.contains("may need upgrading"), "{refused}");
+        assert_eq!(refused.0, format!("No. ({OLD_SERVER}.)"));
+    }
+
+    /// Approval doesn't depend on the server saying its protocols.
+    #[tokio::test]
+    async fn a_server_that_does_not_say_its_protocols_can_still_approve() {
+        let challenge = json!({ "type": "challenge", "nonce": "n" });
+        let error = session_challenged_and_answered_with(
+            challenge,
+            vec![json!({ "type": "registration", "status": "approved" })],
+        )
+        .await;
+        assert!(!format!("{error:#}").contains(OLD_SERVER), "{error:#}");
     }
 
     #[tokio::test]
@@ -1005,29 +1088,40 @@ mod tests {
         assert_eq!(refused.0, reason);
         assert_eq!(
             format!("{error:#}"),
-            format!("the server turned this agent away: {reason}")
+            format!("the server refused this agent: {reason}")
         );
     }
 
     #[test]
-    fn a_refusal_waits_long_and_is_told_in_full_once_until_something_changes() {
+    fn a_refusal_is_told_in_full_once_until_something_changes() {
         let mut refusals = Refusals::default();
         let too_old = Refused("This agent is too old. Upgrade it.".to_string());
         let other = Refused("Something else.".to_string());
+        let wait = Duration::from_secs(400);
 
-        let first = refusals.line(&too_old);
+        let first = refusals.line(&too_old, wait);
         assert_eq!(
             first,
-            "the server turned this agent away: This agent is too old. Upgrade it. Trying \
-             again in 10 minutes."
+            "the server refused this agent: This agent is too old. Upgrade it. Trying again \
+             in 7 minutes."
         );
-        assert!(!refusals.line(&too_old).contains("too old"));
-        assert!(refusals.line(&other).contains("Something else."));
-        assert!(!refusals.line(&other).contains("Something else."));
+        assert!(!refusals.line(&too_old, wait).contains("too old"));
+        assert!(refusals.line(&other, wait).contains("Something else."));
+        assert!(!refusals.line(&other, wait).contains("Something else."));
         refusals.clear();
-        assert!(refusals.line(&other).contains("Something else."));
-        assert_eq!(refusals.refused(&too_old), Duration::from_secs(600));
-        assert!(REFUSED_WAIT > Backoff::MAX * 10);
+        assert!(refusals.line(&other, wait).contains("Something else."));
+    }
+
+    /// Long, as only an upgrade helps, and spread out, so a fleet refused together
+    /// doesn't come back together.
+    #[test]
+    fn a_refusal_waits_long_and_spread_out() {
+        let mut refusals = Refusals::default();
+        let refused = Refused("No.".to_string());
+        assert_eq!(refusals.refused(&refused, 1.0), Duration::from_secs(600));
+        assert_eq!(refusals.refused(&refused, 0.0), Duration::from_secs(300));
+        assert_eq!(refusals.refused(&refused, 0.5), Duration::from_secs(450));
+        assert!(REFUSED_WAIT / 2 > Backoff::MAX * 5);
     }
 
     #[tokio::test]
@@ -1043,7 +1137,7 @@ mod tests {
         let mut socket = accept_async(stream).await.unwrap();
         let challenge = ServerMessage::Challenge {
             nonce: "n".to_string(),
-            protocols: maxnines_protocol::Protocols::SUPPORTED,
+            protocols: Some(maxnines_protocol::Protocols::SUPPORTED),
         };
         send_to_agent(&mut socket, &challenge).await;
         socket.next().await.unwrap().unwrap();
