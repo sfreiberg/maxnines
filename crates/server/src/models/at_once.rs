@@ -318,6 +318,33 @@ async fn two_admins_each_demoting_the_other_leave_one() {
 }
 
 #[tokio::test]
+async fn two_admins_each_disabling_the_other_leave_one() {
+    let Some(database) = several_connections().await else {
+        return;
+    };
+    let ann = admin(&database, "ann@example.com").await;
+    let bob = admin(&database, "bob@example.com").await;
+    let now = crate::times::now();
+
+    // Bob is being disabled, as disabling him would once it had checked.
+    let disabling = database.connection().begin().await.unwrap();
+    user::Entity::update_many()
+        .col_expr(user::Column::DisabledAt, Expr::value(now))
+        .filter(user::Column::Id.eq(bob))
+        .exec(&disabling)
+        .await
+        .unwrap();
+    let other = database.clone();
+    let task = tokio::spawn(async move { other.disable_user(ann, now).await.unwrap() });
+    until_done_or_waiting(&database, &task).await;
+    disabling.commit().await.unwrap();
+
+    assert_eq!(task.await.unwrap(), UserChange::LastAdmin);
+    let ann = database.user(ann).await.unwrap().unwrap();
+    assert!(ann.disabled_at.is_none());
+}
+
+#[tokio::test]
 async fn a_user_enabled_while_being_deleted_is_kept() {
     let Some(database) = several_connections().await else {
         return;
