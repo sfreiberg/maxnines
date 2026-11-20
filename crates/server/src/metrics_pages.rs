@@ -17,7 +17,7 @@ use maxnines_checks::openmetrics::{Page, Totals};
 use maxnines_protocol::{Sample, check_metrics_pages, metrics_page_name};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, warn};
@@ -426,18 +426,27 @@ impl Scheduler {
             let interval = TimeDelta::from_std(page.input.interval)?;
             self.next_run.insert(page.id, now + interval);
             let hostname = hostnames[&page.host_id].clone();
-            started.push(self.start(page, hostname));
+            // Waiting for a slot here, not in the read, keeps pages slower than their
+            // interval from piling up: the next pass starts once one is free.
+            let Ok(slot) = self.slots.clone().acquire_owned().await else {
+                break;
+            };
+            started.push(self.start(page, hostname, slot));
         }
         Ok(started)
     }
 
-    fn start(&self, page: MetricsPage, hostname: String) -> JoinHandle<()> {
-        let (slots, writer) = (self.slots.clone(), self.writer.clone());
+    /// Reads a page, holding one of the slots until it's done.
+    fn start(
+        &self,
+        page: MetricsPage,
+        hostname: String,
+        slot: OwnedSemaphorePermit,
+    ) -> JoinHandle<()> {
+        let writer = self.writer.clone();
         let (reads, presence) = (self.reads.clone(), self.presence.clone());
         tokio::spawn(async move {
-            let Ok(_slot) = slots.acquire_owned().await else {
-                return;
-            };
+            let _slot = slot;
             let kept = read(&page.input).await;
             let (rows, answered) = reads.settle(&page, kept);
             presence.reached(&page.host_id, Reached::Page(page.id), answered);

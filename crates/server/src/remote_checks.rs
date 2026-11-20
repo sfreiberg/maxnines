@@ -15,7 +15,7 @@ use maxnines_checks::databases::{self as stats, Reader, Settle, by_kind, is_data
 use maxnines_protocol::{Check, CheckKind, DATABASE_EXTRAS, Sample};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, warn};
@@ -41,7 +41,7 @@ const MIN_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_INTERVAL: Duration = Duration::from_secs(86_400);
 
 /// How many checks run at once. Anything over this waits its turn.
-const MAX_RUNNING: usize = 32;
+pub const MAX_RUNNING: usize = 32;
 
 /// A check the server runs, as stored.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -375,8 +375,9 @@ pub struct Scheduler {
     presence: Arc<Presence>,
     results: Arc<LatestResults>,
     slots: Arc<Semaphore>,
-    /// When each check is next due, by ID.
-    next_run: HashMap<i64, Timestamp>,
+    /// When each check is next due, by ID, and how it was then. A check that's been
+    /// changed since is run at once, with its new interval from then on.
+    next_run: HashMap<i64, (Timestamp, RemoteCheckInput)>,
     /// For each check that reads a database's stats, by ID.
     readers: HashMap<i64, StatsReader>,
 }
@@ -422,6 +423,7 @@ impl Scheduler {
         let checks = self.database.list_remote_checks().await?;
         let ids: BTreeSet<i64> = checks.iter().map(|check| check.id).collect();
         self.results.keep_only(&ids);
+        self.next_run.retain(|id, _| ids.contains(id));
         self.keep_readers(&checks);
 
         // A host with no agent is as present as its checks and pages say.
@@ -442,7 +444,11 @@ impl Scheduler {
 
         let mut started = Vec::new();
         for check in checks {
-            let due = *self.next_run.get(&check.id).unwrap_or(&now);
+            let due = self
+                .next_run
+                .get(&check.id)
+                .filter(|(_, then)| *then == check.input)
+                .map_or(now, |(due, _)| *due);
             if !check.input.enabled || due > now {
                 continue;
             }
@@ -453,8 +459,14 @@ impl Scheduler {
                 None => continue,
             };
             let interval = TimeDelta::from_std(check.input.interval)?;
-            self.next_run.insert(check.id, now + interval);
-            started.push(self.start(check, hostname));
+            self.next_run
+                .insert(check.id, (now + interval, check.input.clone()));
+            // Waiting for a slot here, not in the run, keeps checks slower than their
+            // interval from piling up: the next pass starts once one is free.
+            let Ok(slot) = self.slots.clone().acquire_owned().await else {
+                break;
+            };
+            started.push(self.start(check, hostname, slot));
         }
         Ok(started)
     }
@@ -494,14 +506,18 @@ impl Scheduler {
         }
     }
 
-    fn start(&self, check: RemoteCheck, hostname: String) -> JoinHandle<()> {
-        let (slots, writer) = (self.slots.clone(), self.writer.clone());
+    /// Runs a check, holding one of the slots until it's done.
+    fn start(
+        &self,
+        check: RemoteCheck,
+        hostname: String,
+        slot: OwnedSemaphorePermit,
+    ) -> JoinHandle<()> {
+        let writer = self.writer.clone();
         let (results, presence) = (self.results.clone(), self.presence.clone());
         let reader = self.readers.get(&check.id).map(|kept| kept.reader.clone());
         tokio::spawn(async move {
-            let Ok(_slot) = slots.acquire_owned().await else {
-                return;
-            };
+            let _slot = slot;
             run(&check, hostname.clone(), &writer, &results, &presence).await;
             if let Some(reader) = reader {
                 read_stats(&check, hostname, &writer, &reader).await;

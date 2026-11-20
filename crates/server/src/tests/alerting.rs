@@ -5981,6 +5981,64 @@ mod remote {
     }
 
     #[tokio::test]
+    async fn a_changed_check_runs_at_once_and_then_on_its_new_interval() {
+        let server = server().await;
+        let (_listener, target) = open_port();
+        let input = RemoteCheckInput {
+            interval: Duration::from_secs(86_400),
+            ..tcp_input("db", &target)
+        };
+        let database = &server.state.database;
+        let id = database.create_remote_check(&input).await.unwrap();
+        let mut scheduler = scheduler(&server);
+        let now = crate::times::now();
+        assert_eq!(run_due(&mut scheduler, now).await, 1);
+        let later = now + TimeDelta::seconds(10);
+        assert_eq!(run_due(&mut scheduler, later).await, 0);
+
+        let edited = RemoteCheckInput {
+            interval: Duration::from_secs(10),
+            ..input
+        };
+        assert!(database.update_remote_check(id, &edited).await.unwrap());
+
+        assert_eq!(run_due(&mut scheduler, later).await, 1);
+        let next = later + TimeDelta::seconds(10);
+        assert_eq!(run_due(&mut scheduler, next).await, 1);
+    }
+
+    #[tokio::test]
+    async fn checks_slower_than_their_interval_never_pile_up() {
+        let server = server().await;
+        // Connections are taken but never answered, so each check waits out its whole
+        // time limit.
+        let (_listener, target) = open_port();
+        let address = format!("http://{target}/");
+        let input = tcp_input("slow", &target);
+        let database = &server.state.database;
+        let checks = crate::remote_checks::MAX_RUNNING + 1;
+        for number in 0..checks {
+            let name = format!("slow {number}");
+            let input = RemoteCheckInput {
+                check: Check::new(&name, CheckKind::Http, &address),
+                ..input.clone()
+            };
+            database.create_remote_check(&input).await.unwrap();
+        }
+        let mut scheduler = scheduler(&server);
+
+        // The last has to wait for a slot, so this pass is still going.
+        let pass = tokio::time::timeout(
+            Duration::from_secs(1),
+            scheduler.start_due(crate::times::now()),
+        );
+        assert!(
+            pass.await.is_err(),
+            "it started more than there are slots for"
+        );
+    }
+
+    #[tokio::test]
     async fn a_disabled_check_does_not_run() {
         let server = server().await;
         let (_listener, target) = open_port();
