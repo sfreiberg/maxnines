@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::PoisonError;
+use std::sync::{PoisonError, RwLock, RwLockWriteGuard};
 
 use anyhow::{Context, Result, ensure};
 use ipnet::IpNet;
@@ -225,7 +225,11 @@ impl Rules {
 }
 
 pub struct Registry {
-    hosts: Mutex<BTreeMap<String, HostRecord>>,
+    /// Only ever held for a moment, never while waiting on the database.
+    hosts: RwLock<BTreeMap<String, HostRecord>>,
+    /// Held while a change is decided and saved, so changes are made one at a time,
+    /// each on what the last left. Reading never waits for it.
+    changing: Mutex<()>,
     /// When each waiting agent last tried to connect. In memory, as it asks again.
     asked: std::sync::Mutex<BTreeMap<String, Timestamp>>,
     rules: Rules,
@@ -243,7 +247,8 @@ impl Registry {
         database: Database,
     ) -> Self {
         Self {
-            hosts: Mutex::new(hosts.into_iter().map(|a| (a.id.clone(), a)).collect()),
+            hosts: RwLock::new(hosts.into_iter().map(|a| (a.id.clone(), a)).collect()),
+            changing: Mutex::new(()),
             asked: std::sync::Mutex::default(),
             rules,
             max_pending,
@@ -253,9 +258,20 @@ impl Registry {
     }
 
     pub async fn admit(&self, request: &Admission<'_>) -> Result<RegistrationStatus> {
-        let mut hosts = self.hosts.lock().await;
-        let existing = hosts.get(request.id).cloned();
+        // Most agents connecting are approved and called what they were, which needs
+        // nothing saved, so nothing waits for anything.
+        match self.read(|hosts| {
+            hosts
+                .get(request.id)
+                .map(|host| (host.state, host.hostname == request.hostname))
+        }) {
+            Some((HostState::Revoked, _)) => return Ok(RegistrationStatus::Rejected),
+            Some((HostState::Approved, true)) => return Ok(RegistrationStatus::Approved),
+            _ => {}
+        }
 
+        let _changing = self.changing.lock().await;
+        let existing = self.read(|hosts| hosts.get(request.id).cloned());
         match existing.as_ref().map(|host| host.state) {
             // No rule can bring back a revoked agent.
             Some(HostState::Revoked) => return Ok(RegistrationStatus::Rejected),
@@ -268,15 +284,12 @@ impl Registry {
                     host.hostname = request.hostname.to_string();
                     // An approved agent stays approved while the database is away.
                     // The old name stays in memory, so the save is tried again next time.
-                    match self.database.save_host(&host).await {
-                        Ok(()) => {
-                            hosts.insert(host.id.clone(), host);
-                        }
-                        Err(error) => warn!(
+                    if let Err(error) = self.save(host).await {
+                        warn!(
                             host_id = request.id,
                             error = format!("{error:#}"),
                             "couldn't save the host's new hostname, trying again next time"
-                        ),
+                        );
                     }
                 }
                 return Ok(RegistrationStatus::Approved);
@@ -290,10 +303,12 @@ impl Registry {
             return Ok(RegistrationStatus::Rejected);
         }
 
-        let pending = hosts
-            .values()
-            .filter(|a| a.state == HostState::Pending)
-            .count();
+        let pending = self.read(|hosts| {
+            hosts
+                .values()
+                .filter(|a| a.state == HostState::Pending)
+                .count()
+        });
         if existing.is_none() && pending >= self.max_pending {
             warn!(
                 host_id = request.id,
@@ -340,7 +355,7 @@ impl Registry {
                     "new host waiting for approval"
                 );
             }
-            self.save(&mut hosts, host).await?;
+            self.save(host).await?;
         }
         Ok(status)
     }
@@ -376,16 +391,16 @@ impl Registry {
         if is_built_in(id) {
             return Ok(None);
         }
-        let mut hosts = self.hosts.lock().await;
-        let Some(mut host) = hosts.get(id).cloned() else {
+        let changing = self.changing.lock().await;
+        let Some(mut host) = self.get(id).await else {
             return Ok(None);
         };
 
         host.state = state;
         host.decided_by = Some(by.to_string());
         host.decided_at = Some(times::now());
-        self.save(&mut hosts, host.clone()).await?;
-        drop(hosts);
+        self.save(host.clone()).await?;
+        drop(changing);
         self.asked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -416,9 +431,9 @@ impl Registry {
             first_seen_at: now,
             decided_at: Some(now),
         };
-        let mut hosts = self.hosts.lock().await;
-        self.save(&mut hosts, host.clone()).await?;
-        drop(hosts);
+        let changing = self.changing.lock().await;
+        self.save(host.clone()).await?;
+        drop(changing);
         info!(host_id = host.id, "added a host with no agent");
         self.revisions.send_modify(|revision| *revision += 1);
         Ok(host)
@@ -428,18 +443,21 @@ impl Registry {
     /// Returns `None` for any other host, or none at all.
     pub async fn rename_agentless(&self, id: &str, hostname: &str) -> Result<Option<HostRecord>> {
         let hostname = agentless_hostname(hostname)?;
-        let mut hosts = self.hosts.lock().await;
-        let Some(mut host) = hosts.get(id).filter(|host| host.is_agentless()).cloned() else {
+        let _changing = self.changing.lock().await;
+        let agentless =
+            self.read(|hosts| hosts.get(id).filter(|host| host.is_agentless()).cloned());
+        let Some(mut host) = agentless else {
             return Ok(None);
         };
         host.hostname = hostname;
-        self.save(&mut hosts, host.clone()).await?;
+        self.save(host.clone()).await?;
         Ok(Some(host))
     }
 
     /// Takes a deleted agent off the list. If it connects again, it's new.
     pub async fn forget(&self, id: &str) {
-        self.hosts.lock().await.remove(id);
+        let _changing = self.changing.lock().await;
+        self.write().remove(id);
         self.asked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -450,38 +468,52 @@ impl Registry {
     /// Adds an agent as if it had been loaded at startup.
     #[cfg(test)]
     pub async fn insert_for_test(&self, host: HostRecord) {
-        self.hosts.lock().await.insert(host.id.clone(), host);
+        self.write().insert(host.id.clone(), host);
+    }
+
+    /// Looks at every host without copying them, for whoever needs only a little of
+    /// each. `look` mustn't take long, as changes wait for it.
+    pub fn read<T>(&self, look: impl FnOnce(&BTreeMap<String, HostRecord>) -> T) -> T {
+        look(&self.hosts.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, BTreeMap<String, HostRecord>> {
+        self.hosts.write().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub async fn list(&self) -> Vec<HostRecord> {
-        self.hosts.lock().await.values().cloned().collect()
+        self.read(|hosts| hosts.values().cloned().collect())
     }
 
     pub async fn get(&self, id: &str) -> Option<HostRecord> {
-        self.hosts.lock().await.get(id).cloned()
+        self.read(|hosts| hosts.get(id).cloned())
     }
 
     pub async fn is_approved(&self, id: &str) -> bool {
-        let hosts = self.hosts.lock().await;
-        hosts
-            .get(id)
-            .is_some_and(|a| a.state == HostState::Approved)
+        self.read(|hosts| {
+            hosts
+                .get(id)
+                .is_some_and(|a| a.state == HostState::Approved)
+        })
     }
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.revisions.subscribe()
     }
 
-    /// Saves first, so memory never claims something the database doesn't have.
-    async fn save(&self, hosts: &mut BTreeMap<String, HostRecord>, host: HostRecord) -> Result<()> {
+    /// Saves first, so memory never claims something the database doesn't have. Only
+    /// while changing.
+    async fn save(&self, host: HostRecord) -> Result<()> {
         self.database.save_host(&host).await?;
-        hosts.insert(host.id.clone(), host);
+        self.write().insert(host.id.clone(), host);
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use crate::config::Config;
 
     use super::*;
@@ -534,6 +566,21 @@ mod tests {
 
         assert_eq!(status, RegistrationStatus::Pending);
         assert_eq!(registry.list().await[0].state, HostState::Pending);
+    }
+
+    #[tokio::test]
+    async fn an_approved_agent_is_let_in_while_another_change_is_saved() {
+        let registry = registry(SUBNET_RULE).await;
+        let host = request("a", "web-1", "10.0.0.1");
+        registry.admit(&host).await.unwrap();
+
+        let _changing = registry.changing.lock().await;
+        let admitted = tokio::time::timeout(Duration::from_secs(30), registry.admit(&host));
+        assert_eq!(
+            admitted.await.unwrap().unwrap(),
+            RegistrationStatus::Approved
+        );
+        assert_eq!(registry.list().await.len(), 1);
     }
 
     #[tokio::test]

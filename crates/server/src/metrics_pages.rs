@@ -394,14 +394,15 @@ impl Scheduler {
     /// Starts reading everything that's due, without waiting for any of it, and
     /// returns what it started so that tests can wait for them.
     pub async fn start_due(&mut self, now: Timestamp) -> Result<Vec<JoinHandle<()>>> {
-        let hostnames: BTreeMap<String, String> = self
-            .registry
-            .list()
-            .await
-            .into_iter()
-            .filter(|host| host.kind == HostKind::Agentless && host.state == HostState::Approved)
-            .map(|host| (host.id, host.hostname))
-            .collect();
+        let hostnames: BTreeMap<String, String> = self.registry.read(|hosts| {
+            hosts
+                .values()
+                .filter(|host| {
+                    host.kind == HostKind::Agentless && host.state == HostState::Approved
+                })
+                .map(|host| (host.id.clone(), host.hostname.clone()))
+                .collect()
+        });
         let pages: Vec<MetricsPage> = self
             .database
             .list_metrics_pages()

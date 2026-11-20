@@ -177,14 +177,21 @@ async fn own_numbers(state: &AppState, recorded: &mut Recorded) -> Value {
     recorded.failed = failed;
     recorded.values = values;
 
-    let hosts = state.registry.list().await;
-    let real = || hosts.iter().filter(|host| !host.is_local());
-    let online = |host: &&HostRecord| state.presence.reach(host) == Reach::Online;
-    // One with nothing read for it couldn't be online, so isn't counted with those
-    // that could.
-    let approved = |host: &&HostRecord| {
-        host.state == HostState::Approved && state.presence.reach(host) != Reach::NotRead
-    };
+    let (online, approved, waiting) = state.registry.read(|hosts| {
+        let real = || hosts.values().filter(|host| !host.is_local());
+        let reach = |host: &HostRecord| state.presence.reach(host);
+        (
+            real().filter(|host| reach(host) == Reach::Online).count(),
+            // One with nothing read for it couldn't be online, so isn't counted with
+            // those that could.
+            real()
+                .filter(|host| host.state == HostState::Approved && reach(host) != Reach::NotRead)
+                .count(),
+            real()
+                .filter(|host| host.state == HostState::Pending)
+                .count(),
+        )
+    });
     json!({
         "memory_bytes": process.as_ref().map(|process| process.memory_bytes),
         "cpu_percent": process.as_ref().and_then(|process| process.cpu_percent),
@@ -195,11 +202,9 @@ async fn own_numbers(state: &AppState, recorded: &mut Recorded) -> Value {
         "slowest_write_secs": slowest_write_secs(&status.writes),
         "series": state.metrics.series_count().await.ok(),
         "write_queue": state.writer.max_capacity() - state.writer.capacity(),
-        "hosts_online": real().filter(online).count(),
-        "hosts_approved": real().filter(approved).count(),
-        "hosts_waiting": real()
-            .filter(|host| host.state == HostState::Pending)
-            .count(),
+        "hosts_online": online,
+        "hosts_approved": approved,
+        "hosts_waiting": waiting,
         "alerts_firing": status.firing.load(Ordering::Relaxed),
         "metrics_database_bytes": metrics_bytes,
         "metrics_wal_bytes": wal_bytes,

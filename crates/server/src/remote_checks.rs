@@ -427,14 +427,13 @@ impl Scheduler {
         self.keep_readers(&checks);
 
         // A host with no agent is as present as its checks and pages say.
-        let agentless: BTreeMap<String, String> = self
-            .registry
-            .list()
-            .await
-            .into_iter()
-            .filter(|host| host.is_agentless() && host.state == HostState::Approved)
-            .map(|host| (host.id, host.hostname))
-            .collect();
+        let agentless: BTreeMap<String, String> = self.registry.read(|hosts| {
+            hosts
+                .values()
+                .filter(|host| host.is_agentless() && host.state == HostState::Approved)
+                .map(|host| (host.id.clone(), host.hostname.clone()))
+                .collect()
+        });
         let about_hosts: HashSet<i64> = checks
             .iter()
             .filter(|check| check.input.enabled && agentless.contains_key(&check.input.host_id))
