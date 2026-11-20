@@ -13,32 +13,46 @@ pub fn request() {
     REQUESTED.notify_one();
 }
 
-/// Listens from when it's made, so nothing's missed while a program gets on with its
-/// work.
+/// Listens from when it's made, for Ctrl+C as well as the rest, so nothing's missed
+/// while a program gets on with its work.
 pub struct StopSignal {
     #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
     terminate: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    interrupt: tokio::signal::windows::CtrlC,
 }
 
 impl StopSignal {
     pub fn listen() -> Result<Self> {
-        Ok(Self {
-            #[cfg(unix)]
-            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
-        })
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                interrupt: signal(SignalKind::interrupt())?,
+                terminate: signal(SignalKind::terminate())?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                interrupt: tokio::signal::windows::ctrl_c()?,
+            })
+        }
     }
 
     /// Waits until the program is asked to stop.
     pub async fn wait(&mut self) -> Result<()> {
         #[cfg(unix)]
         tokio::select! {
-            result = tokio::signal::ctrl_c() => result?,
+            _ = self.interrupt.recv() => {}
             _ = self.terminate.recv() => {}
             () = REQUESTED.notified() => {}
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         tokio::select! {
-            result = tokio::signal::ctrl_c() => result?,
+            _ = self.interrupt.recv() => {}
             () = REQUESTED.notified() => {}
         }
         Ok(())
@@ -59,16 +73,20 @@ mod tests {
     async fn a_plain_kill_or_a_request_asks_a_program_to_stop_instead_of_ending_it() {
         let mut stop = StopSignal::listen().unwrap();
 
-        let sent = Command::new("kill")
-            .args(["-TERM", &std::process::id().to_string()])
-            .status()
-            .unwrap();
-        assert!(sent.success());
+        // Ctrl+C sent before anything waits is still heard, rather than ending the
+        // program on the spot.
+        for signal in ["-TERM", "-INT"] {
+            let sent = Command::new("kill")
+                .args([signal, &std::process::id().to_string()])
+                .status()
+                .unwrap();
+            assert!(sent.success());
 
-        timeout(Duration::from_secs(5), stop.wait())
-            .await
-            .expect("the signal was missed")
-            .unwrap();
+            timeout(Duration::from_secs(5), stop.wait())
+                .await
+                .expect("the signal was missed")
+                .unwrap();
+        }
 
         request();
         timeout(Duration::from_secs(5), stop.wait())
