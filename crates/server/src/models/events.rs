@@ -130,18 +130,23 @@ impl Database {
         Ok(())
     }
 
-    pub async fn get_event(&self, id: i64) -> Result<Option<Event>> {
+    /// An annotation, or nothing for anything else, as only those are anyone's to
+    /// read or delete one at a time.
+    pub async fn get_annotation(&self, id: i64) -> Result<Option<Event>> {
         let row = event::Entity::find_by_id(id)
+            .filter(event::Column::CreatedBy.ne(SERVER))
             .one(&self.connection)
             .await
             .context("loading event")?;
         Ok(row.map(to_event))
     }
 
-    /// Returns false if there was no such event.
-    pub async fn delete_event(&self, id: i64) -> Result<bool> {
+    /// Returns false if there was no such annotation. What the server recorded about a
+    /// host is part of its history, so it isn't one.
+    pub async fn delete_annotation(&self, id: i64) -> Result<bool> {
         let transaction = self.connection.begin().await.context("deleting event")?;
         let Some(before) = event::Entity::find_by_id(id)
+            .filter(event::Column::CreatedBy.ne(SERVER))
             .one(&transaction)
             .await
             .context("loading event")?
@@ -167,7 +172,7 @@ impl Database {
     }
 
     /// Annotations people and their scripts recorded between two times, newest first.
-    pub async fn list_events(
+    pub async fn list_annotations(
         &self,
         from: Timestamp,
         to: Timestamp,

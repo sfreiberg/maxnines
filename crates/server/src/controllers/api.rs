@@ -1556,7 +1556,7 @@ impl EventParams {
 async fn list_events(State(state): State<AppState>, Query(params): Query<EventParams>) -> Response {
     let (from, to) = params.span(DEFAULT_EVENTS);
     let limit = params.limit.unwrap_or(200).min(MAX_EVENTS);
-    match state.database.list_events(from, to, limit).await {
+    match state.database.list_annotations(from, to, limit).await {
         Ok(events) => Json(events).into_response(),
         Err(error) => server_error(&error),
     }
@@ -1575,7 +1575,7 @@ async fn create_event(State(state): State<AppState>, Json(input): Json<EventInpu
 }
 
 async fn show_event(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
-    match state.database.get_event(id).await {
+    match state.database.get_annotation(id).await {
         Ok(Some(event)) => Json(event).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),
@@ -1583,7 +1583,7 @@ async fn show_event(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) ->
 }
 
 async fn delete_event(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
-    match state.database.delete_event(id).await {
+    match state.database.delete_annotation(id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),

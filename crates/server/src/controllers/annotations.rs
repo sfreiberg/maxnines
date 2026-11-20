@@ -72,7 +72,7 @@ async fn page(
     let since = now - TimeDelta::days(LIST_DAYS);
     let annotations = match state
         .database
-        .list_events(since, now + TimeDelta::hours(1), LIST_LIMIT)
+        .list_annotations(since, now + TimeDelta::hours(1), LIST_LIMIT)
         .await
     {
         Ok(annotations) => annotations,
@@ -224,7 +224,7 @@ async fn delete(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfFo
         },
         None => None,
     };
-    match state.database.delete_event(id).await {
+    match state.database.delete_annotation(id).await {
         Ok(true) => {
             let target = page_host.map_or_else(
                 || "/metrics/annotations".to_string(),

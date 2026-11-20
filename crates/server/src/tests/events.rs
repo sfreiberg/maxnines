@@ -5,6 +5,7 @@ use chrono::{DurationRound, TimeDelta};
 
 use super::*;
 use crate::alerting::{NewAlert, Severity};
+use crate::events::EventKind;
 use crate::times::Timestamp;
 
 /// Calls the API with the admin token, giving back the status and any JSON.
@@ -181,6 +182,39 @@ async fn deleting_an_event_takes_it_off_every_host_and_is_audited() {
         .map(|entry| entry["action"].as_str().unwrap())
         .collect();
     assert_eq!(actions, ["deleted", "created"]);
+}
+
+#[tokio::test]
+async fn what_the_server_recorded_is_no_annotation_to_read_or_delete() {
+    let server = start().await;
+    let (web, _client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
+    // A minute ago, as a timeline ends at the moment it's asked for.
+    let now = crate::times::now();
+    let started = now - TimeDelta::minutes(1);
+    server
+        .state
+        .database
+        .record_server_event(
+            EventKind::Restart,
+            &web.id(),
+            started,
+            "Host started",
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+    let id = timeline(&server, &web).await[0]["id"].clone();
+    let path = format!("/api/v1/annotations/{id}");
+
+    assert_eq!(api(&server, "GET", &path, &Value::Null).await.0, 404);
+    assert_eq!(api(&server, "DELETE", &path, &Value::Null).await.0, 404);
+    let page = server
+        .request("POST", &format!("/metrics/annotations/{id}/delete"), "")
+        .await;
+    assert!(!page.starts_with("HTTP/1.1 5"), "{page}");
+
+    assert_eq!(titles(&timeline(&server, &web).await), ["Host started"]);
 }
 
 #[tokio::test]

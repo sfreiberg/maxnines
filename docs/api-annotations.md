@@ -48,6 +48,10 @@ period, which is the last 7 days unless given, and `limit` how many, which is 20
 
 `GET /api/v1/annotations/{id}`
 
+Returns `404` if there's no such annotation. What the server records about a host,
+such as a restart, has an `id` in [the host's events](#get-a-hosts-events) but isn't an
+annotation, so it can't be read or deleted here.
+
 ## Delete an annotation
 
 `DELETE /api/v1/annotations/{id}`
