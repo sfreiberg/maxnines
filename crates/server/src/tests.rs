@@ -371,7 +371,7 @@ async fn read_server_message(client: &mut Client) -> ServerMessage {
 
 async fn read_nonce(client: &mut Client) -> String {
     match read_server_message(client).await {
-        ServerMessage::Challenge { nonce } => nonce,
+        ServerMessage::Challenge { nonce, .. } => nonce,
         other => panic!("expected a challenge, got {other:?}"),
     }
 }
@@ -394,8 +394,13 @@ fn hello(host: &Identity, hostname: &str, signature: String, token: Option<&str>
         public_key: host.public_key(),
         signature,
         token: token.map(String::from),
+        protocol: maxnines_protocol::PROTOCOL_VERSION,
+        agent_version: AGENT_VERSION.to_string(),
     }
 }
+
+/// What the agents in these tests say they are.
+const AGENT_VERSION: &str = "0.1.0";
 
 async fn handshake(
     client: &mut Client,
@@ -438,6 +443,115 @@ async fn is_closed(client: &mut Client) -> bool {
 }
 
 // ---- registration
+
+/// Answers the challenge as an agent speaking `protocol`, or as one from before
+/// protocol versions that says nothing of it, and gives the server's answer.
+async fn hello_speaking(
+    client: &mut Client,
+    host: &Identity,
+    protocol: Option<u32>,
+) -> ServerMessage {
+    let nonce = read_nonce(client).await;
+    let signature = host.sign(AUDIENCE, &nonce);
+    let mut said = serde_json::to_value(hello(host, "web-1", signature, None)).unwrap();
+    let fields = said.as_object_mut().unwrap();
+    match protocol {
+        Some(protocol) => {
+            fields.insert("protocol".to_string(), json!(protocol));
+        }
+        None => {
+            fields.remove("protocol");
+            fields.remove("agent_version");
+        }
+    }
+    client.send(Message::text(said.to_string())).await.unwrap();
+    read_server_message(client).await
+}
+
+fn reason(answer: ServerMessage) -> String {
+    match answer {
+        ServerMessage::Refused { reason } => reason,
+        other => panic!("expected to be turned away, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_challenge_says_which_protocols_the_server_takes() {
+    let server = start().await;
+    let mut client = server.connect().await;
+
+    let ServerMessage::Challenge { protocols, .. } = read_server_message(&mut client).await else {
+        panic!("expected a challenge");
+    };
+    assert_eq!(protocols, maxnines_protocol::Protocols::SUPPORTED);
+}
+
+#[tokio::test]
+async fn an_agent_from_before_protocol_versions_is_turned_away_saying_to_upgrade_it() {
+    let server = start().await;
+    let host = identity();
+    drop(server.connect_approved(&host, "web-1").await);
+    server.wait_for_online(&host.id(), false).await;
+
+    let mut client = server.connect().await;
+    let reason = reason(hello_speaking(&mut client, &host, None).await);
+
+    assert!(reason.contains("from before protocol versions"), "{reason}");
+    assert!(reason.contains("Upgrade the agent"), "{reason}");
+    assert!(is_closed(&mut client).await);
+    assert!(!server.state.presence.get(&host.id()).unwrap().online);
+}
+
+#[tokio::test]
+async fn a_new_agent_too_old_for_the_server_waits_for_approval_and_is_told_to_upgrade() {
+    let server = start().await;
+    let host = identity();
+    let mut client = server.connect().await;
+
+    let reason = reason(hello_speaking(&mut client, &host, Some(0)).await);
+
+    assert!(reason.contains("too old"), "{reason}");
+    assert!(is_closed(&mut client).await);
+    let waiting = server.state.registry.get(&host.id()).await.unwrap();
+    assert_eq!(waiting.state, HostState::Pending);
+}
+
+#[tokio::test]
+async fn an_agent_newer_than_the_server_is_told_to_upgrade_the_server_first() {
+    let server = start().await;
+    let host = identity();
+    drop(server.connect_approved(&host, "web-1").await);
+
+    let mut client = server.connect().await;
+    let newer = maxnines_protocol::PROTOCOL_VERSION + 1;
+    let reason = reason(hello_speaking(&mut client, &host, Some(newer)).await);
+
+    assert!(reason.contains(&format!("protocol {newer}")), "{reason}");
+    assert!(reason.contains("Upgrade the server first"), "{reason}");
+    assert!(is_closed(&mut client).await);
+}
+
+#[tokio::test]
+async fn a_revoked_agent_is_only_told_it_is_rejected_whatever_it_speaks() {
+    let server = start().await;
+    let host = identity();
+    drop(server.connect_approved(&host, "web-1").await);
+    let registry = &server.state.registry;
+    registry
+        .decide(&host.id(), HostState::Revoked)
+        .await
+        .unwrap();
+
+    let mut client = server.connect().await;
+    let answer = hello_speaking(&mut client, &host, None).await;
+
+    assert_eq!(
+        answer,
+        ServerMessage::Registration {
+            status: RegistrationStatus::Rejected
+        }
+    );
+}
 
 #[tokio::test]
 async fn a_new_agent_is_pending_and_disconnected() {

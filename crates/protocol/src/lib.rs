@@ -20,6 +20,77 @@ use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// The version of the protocol agents and their server speak to each other, which
+/// an agent says in its hello and a server checks before anything else.
+///
+/// It goes up only for a change that breaks something: removing or renaming a
+/// message, field, status, check kind or collector, or changing what one means.
+/// Adding one doesn't, whether a message, an optional field, a check kind or a
+/// collector, as each side passes over what it doesn't know: an unknown message is
+/// ignored, an unknown check reports that the agent needs upgrading, and an unknown
+/// collector is skipped and reported.
+///
+/// After it goes up, a server keeps taking the version before for one release, so
+/// that the usual order of upgrading, the server and then its agents, never cuts an
+/// agent off, and [`OLDEST_SUPPORTED_PROTOCOL`] moves up by one each release.
+/// An agent older than that is turned away with a message saying to upgrade it, and
+/// one newer than the server with a message saying to upgrade the server first.
+///
+/// Version 1 is the protocol as it was when versions began. An agent from before
+/// then sends none, which reads as 0.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// The oldest version of the protocol a server takes from its agents. See
+/// [`PROTOCOL_VERSION`].
+pub const OLDEST_SUPPORTED_PROTOCOL: u32 = 1;
+
+const _: () = assert!(OLDEST_SUPPORTED_PROTOCOL <= PROTOCOL_VERSION);
+
+/// The versions of the protocol a server takes from agents, from `oldest` to
+/// `newest`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Protocols {
+    pub oldest: u32,
+    pub newest: u32,
+}
+
+/// How an agent's protocol compares with what a server takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolFit {
+    Supported,
+    /// The agent needs upgrading.
+    TooOld,
+    /// The server needs upgrading.
+    TooNew,
+}
+
+impl Protocols {
+    /// What this build takes.
+    pub const SUPPORTED: Self = Self {
+        oldest: OLDEST_SUPPORTED_PROTOCOL,
+        newest: PROTOCOL_VERSION,
+    };
+
+    pub fn fit(self, protocol: u32) -> ProtocolFit {
+        if protocol < self.oldest {
+            ProtocolFit::TooOld
+        } else if protocol > self.newest {
+            ProtocolFit::TooNew
+        } else {
+            ProtocolFit::Supported
+        }
+    }
+
+    /// The versions in words, such as `protocol 1` or `protocols 1 to 2`.
+    pub fn describe(self) -> String {
+        if self.oldest == self.newest {
+            format!("protocol {}", self.oldest)
+        } else {
+            format!("protocols {} to {}", self.oldest, self.newest)
+        }
+    }
+}
+
 /// Every collector the project knows about. An agent reports the ones it can
 /// run in its facts, because older agents may not have them all.
 pub const COLLECTORS: [&str; 22] = [
@@ -1081,6 +1152,14 @@ pub enum AgentMessage {
         /// Enrollment token, for automatic approval rules.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
+        /// The [`PROTOCOL_VERSION`] the agent speaks. An agent from before protocol
+        /// versions sends none, which reads as 0.
+        #[serde(default)]
+        protocol: u32,
+        /// The agent's own version, as [`BuildInfo::version`], which an agent from
+        /// before protocol versions doesn't send either.
+        #[serde(default)]
+        agent_version: String,
     },
     Sample(Sample),
     /// What the agent reports about its host, as a JSON object. The server
@@ -1117,10 +1196,16 @@ pub enum AgentMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
-    /// The first message on every connection.
-    Challenge { nonce: String },
+    /// The first message on every connection, with the versions of the protocol the
+    /// server takes.
+    Challenge { nonce: String, protocols: Protocols },
     /// The handshake result. The server closes the connection unless approved.
     Registration { status: RegistrationStatus },
+    /// The other handshake result: the server won't take this agent until one of the
+    /// two is upgraded, as it doesn't speak a version of the protocol the server
+    /// takes. `reason` says which, in words for whoever runs the agent. The server
+    /// closes the connection, and the agent waits a long while before trying again.
+    Refused { reason: String },
     /// Sent after the handshake, and again whenever the agent's config changes.
     Config {
         version: String,
@@ -1657,6 +1742,73 @@ mod tests {
     }
 
     #[test]
+    fn a_hello_from_before_protocol_versions_reads_as_protocol_0() {
+        let hello: AgentMessage = serde_json::from_value(json!({
+            "type": "hello", "hostname": "web-1", "public_key": "ab", "signature": "cd",
+        }))
+        .unwrap();
+        let AgentMessage::Hello {
+            protocol,
+            agent_version,
+            ..
+        } = hello
+        else {
+            panic!("{hello:?}");
+        };
+        assert_eq!(protocol, 0);
+        assert_eq!(agent_version, "");
+        assert_eq!(Protocols::SUPPORTED.fit(protocol), ProtocolFit::TooOld);
+    }
+
+    #[test]
+    fn a_hello_and_challenge_carry_the_protocol() {
+        let hello = AgentMessage::Hello {
+            hostname: "web-1".to_string(),
+            public_key: "ab".to_string(),
+            signature: "cd".to_string(),
+            token: None,
+            protocol: 1,
+            agent_version: "0.1.0".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&hello).unwrap(),
+            json!({
+                "type": "hello", "hostname": "web-1", "public_key": "ab", "signature": "cd",
+                "protocol": 1, "agent_version": "0.1.0",
+            })
+        );
+        let challenge = ServerMessage::Challenge {
+            nonce: "n".to_string(),
+            protocols: Protocols {
+                oldest: 1,
+                newest: 2,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&challenge).unwrap(),
+            json!({ "type": "challenge", "nonce": "n", "protocols": { "oldest": 1, "newest": 2 } })
+        );
+    }
+
+    #[test]
+    fn a_server_takes_the_protocols_from_its_oldest_to_its_newest() {
+        let protocols = Protocols {
+            oldest: 2,
+            newest: 3,
+        };
+        assert_eq!(protocols.fit(1), ProtocolFit::TooOld);
+        assert_eq!(protocols.fit(2), ProtocolFit::Supported);
+        assert_eq!(protocols.fit(3), ProtocolFit::Supported);
+        assert_eq!(protocols.fit(4), ProtocolFit::TooNew);
+        assert_eq!(protocols.describe(), "protocols 2 to 3");
+        assert_eq!(Protocols::SUPPORTED.describe(), "protocol 1");
+        assert_eq!(
+            Protocols::SUPPORTED.fit(PROTOCOL_VERSION),
+            ProtocolFit::Supported
+        );
+    }
+
+    #[test]
     fn messages_from_a_newer_side_are_read_as_unknown() {
         let server: ServerMessage =
             serde_json::from_value(json!({ "type": "reboot_soon", "at": "later" })).unwrap();
@@ -1726,6 +1878,8 @@ mod tests {
                 public_key: "ab".to_string(),
                 signature: "cd".to_string(),
                 token: Some("secret".to_string()),
+                protocol: PROTOCOL_VERSION,
+                agent_version: "1.2.3".to_string(),
             },
             AgentMessage::Sample(Sample {
                 time: DateTime::from_timestamp_millis(1_789_000_000_123).unwrap(),
@@ -1814,9 +1968,13 @@ mod tests {
         let messages = [
             ServerMessage::Challenge {
                 nonce: "ab".to_string(),
+                protocols: Protocols::SUPPORTED,
             },
             ServerMessage::Registration {
                 status: RegistrationStatus::Pending,
+            },
+            ServerMessage::Refused {
+                reason: "Upgrade the agent.".to_string(),
             },
             ServerMessage::Config {
                 version: "abc".to_string(),

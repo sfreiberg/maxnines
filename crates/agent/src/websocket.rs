@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use futures_util::{FutureExt, Sink, SinkExt, StreamExt};
 use maxnines_protocol::auth::Identity;
 use maxnines_protocol::{
-    AgentConfig, AgentMessage, Backoff, RegistrationStatus, Sample, ServerMessage,
+    AgentConfig, AgentMessage, Backoff, PROTOCOL_VERSION, RegistrationStatus, Sample, ServerMessage,
 };
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
@@ -516,22 +516,32 @@ async fn receive(text: &str, connection: &Connection) -> Option<String> {
 
 /// Answers the server's challenge and returns once the agent is approved.
 async fn authenticate(socket: &mut Socket, connection: &Connection) -> Result<()> {
-    let ServerMessage::Challenge { nonce } = read_server_message(socket).await? else {
+    let ServerMessage::Challenge { nonce, protocols } = read_server_message(socket).await? else {
         bail!("expected a challenge from the server");
     };
+    // The server says whether it takes this agent's, after the hello.
+    debug!(
+        oldest = protocols.oldest,
+        newest = protocols.newest,
+        "the server takes these protocol versions"
+    );
 
     let hello = AgentMessage::Hello {
         hostname: connection.hostname.clone(),
         public_key: connection.identity.public_key(),
         signature: connection.identity.sign(&connection.url, &nonce),
         token: connection.token.clone(),
+        protocol: PROTOCOL_VERSION,
+        agent_version: maxnines_protocol::build_info!().version,
     };
     socket
         .send(Message::text(serde_json::to_string(&hello)?))
         .await?;
 
-    let ServerMessage::Registration { status } = read_server_message(socket).await? else {
-        bail!("expected a registration result from the server");
+    let status = match read_server_message(socket).await? {
+        ServerMessage::Registration { status } => status,
+        ServerMessage::Refused { reason } => return Err(Refused(reason).into()),
+        _ => bail!("expected a registration result from the server"),
     };
 
     let id = connection.identity.id();
@@ -652,17 +662,22 @@ mod tests {
     {
         let challenge = ServerMessage::Challenge {
             nonce: "test-nonce".to_string(),
+            protocols: maxnines_protocol::Protocols::SUPPORTED,
         };
         send_to_agent(socket, &challenge).await;
 
         let AgentMessage::Hello {
             public_key,
             signature,
+            protocol,
+            agent_version,
             ..
         } = next_message(socket).await
         else {
             panic!("expected hello");
         };
+        assert_eq!(protocol, PROTOCOL_VERSION);
+        assert_eq!(agent_version, env!("CARGO_PKG_VERSION"));
         let id = auth::verify(&public_key, url, "test-nonce", &signature).unwrap();
 
         let approved = ServerMessage::Registration {
@@ -896,6 +911,7 @@ mod tests {
             let mut socket = accept_async(stream).await.unwrap();
             let challenge = ServerMessage::Challenge {
                 nonce: "n".to_string(),
+                protocols: maxnines_protocol::Protocols::SUPPORTED,
             };
             send_to_agent(&mut socket, &challenge).await;
             socket.next().await.unwrap().unwrap();
@@ -920,6 +936,20 @@ mod tests {
 
         let refused = error.downcast_ref::<Refused>().expect("a refusal");
         assert!(refused.0.contains("may need upgrading"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_ends_the_session_with_the_servers_reason() {
+        let reason = "This agent (version 0.1.0, protocol 1) is too old. Upgrade the agent.";
+        let error =
+            session_answered_with(vec![json!({ "type": "refused", "reason": reason })]).await;
+
+        let refused = error.downcast_ref::<Refused>().expect("a refusal");
+        assert_eq!(refused.0, reason);
+        assert_eq!(
+            format!("{error:#}"),
+            format!("the server turned this agent away: {reason}")
+        );
     }
 
     #[test]
@@ -956,6 +986,7 @@ mod tests {
         let mut socket = accept_async(stream).await.unwrap();
         let challenge = ServerMessage::Challenge {
             nonce: "n".to_string(),
+            protocols: maxnines_protocol::Protocols::SUPPORTED,
         };
         send_to_agent(&mut socket, &challenge).await;
         socket.next().await.unwrap().unwrap();

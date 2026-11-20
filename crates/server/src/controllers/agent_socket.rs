@@ -1,7 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
@@ -9,7 +9,9 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use ipnet::IpNet;
 use maxnines_protocol::actions::ActionResult;
-use maxnines_protocol::{AgentMessage, RegistrationStatus, ServerMessage, auth};
+use maxnines_protocol::{
+    AgentMessage, ProtocolFit, Protocols, RegistrationStatus, ServerMessage, auth,
+};
 use serde_json::Value;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
@@ -18,6 +20,7 @@ use tokio::time::{Instant, MissedTickBehavior, interval, interval_at, timeout};
 use tracing::{debug, info, warn};
 
 use crate::actions::Actions;
+use crate::agent_versions::NEWEST_AGENT_VERSION;
 use crate::app_state::AppState;
 use crate::clock::Asked;
 use crate::events::{BOOT_TIME_SLACK, EventKind, restarted};
@@ -38,6 +41,8 @@ const MAX_FACTS_LEN: usize = 64 * 1024;
 const MAX_MESSAGE_LEN: usize = 1024 * 1024;
 /// What the database column holds.
 const MAX_VERSION_LEN: usize = 32;
+/// Longer than any real version, which is a version number and perhaps a little after it.
+const MAX_AGENT_VERSION_LEN: usize = 64;
 /// Plenty to explain a problem, without letting an agent store anything it likes.
 const MAX_ERROR_LEN: usize = 1000;
 /// Bigger than most messages, and they can still be larger than this. A busy server
@@ -173,6 +178,7 @@ async fn authenticate(
     let nonce = auth::new_nonce()?;
     let challenge = ServerMessage::Challenge {
         nonce: nonce.clone(),
+        protocols: Protocols::SUPPORTED,
     };
     send(socket, &challenge).await?;
 
@@ -189,6 +195,8 @@ async fn authenticate(
         public_key,
         signature,
         token,
+        protocol,
+        agent_version,
     } = serde_json::from_str(&text).context("invalid hello")?
     else {
         bail!("expected hello");
@@ -196,6 +204,11 @@ async fn authenticate(
 
     let hostname = crate::registration::checked_hostname(&hostname)
         .context("the agent's hostname won't do")?;
+    ensure!(
+        agent_version.len() <= MAX_AGENT_VERSION_LEN
+            && !agent_version.chars().any(char::is_control),
+        "the agent's version won't do"
+    );
 
     let id = match auth::verify(&public_key, &state.audience, &nonce, &signature) {
         Ok(id) => id,
@@ -215,6 +228,23 @@ async fn authenticate(
             token: token.as_deref(),
         })
         .await?;
+    // A revoked agent is told no more than that.
+    if status != RegistrationStatus::Rejected
+        && let Some(reason) = refusal(protocol, &agent_version)
+    {
+        let supported = Protocols::SUPPORTED;
+        warn!(
+            id,
+            hostname,
+            agent_protocol = protocol,
+            agent_version,
+            oldest_protocol = supported.oldest,
+            newest_protocol = supported.newest,
+            "turned away an agent that speaks a protocol this server doesn't take"
+        );
+        send(socket, &ServerMessage::Refused { reason }).await?;
+        return Ok(None);
+    }
     // Told to wait, as an agent is after any other refusal, rather than let one
     // key open connections as fast as it likes.
     if status == RegistrationStatus::Approved && !state.presence.allow_connection(&id) {
@@ -224,6 +254,29 @@ async fn authenticate(
     send_status(socket, status).await?;
 
     Ok((status == RegistrationStatus::Approved).then(|| Arc::new(Agent { id, hostname })))
+}
+
+/// Why an agent that speaks `protocol` is turned away, if it is, in words for whoever
+/// runs it.
+pub fn refusal(protocol: u32, agent_version: &str) -> Option<String> {
+    let supported = Protocols::SUPPORTED;
+    let agent = match agent_version {
+        "" => "from before protocol versions".to_string(),
+        version => format!("version {version}, protocol {protocol}"),
+    };
+    let server = env!("CARGO_PKG_VERSION");
+    let takes = supported.describe();
+    match supported.fit(protocol) {
+        ProtocolFit::Supported => None,
+        ProtocolFit::TooOld => Some(format!(
+            "This agent ({agent}) is too old for this server (version {server}), which takes \
+             agent {takes}. Upgrade the agent to {NEWEST_AGENT_VERSION}."
+        )),
+        ProtocolFit::TooNew => Some(format!(
+            "This agent ({agent}) is newer than this server (version {server}), which takes \
+             agent {takes}. Upgrade the server first."
+        )),
+    }
 }
 
 async fn send_status(socket: &mut WebSocket, status: RegistrationStatus) -> Result<()> {
@@ -789,7 +842,35 @@ async fn save_facts(facts: Value, agent: &Agent, state: &AppState) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use maxnines_protocol::PROTOCOL_VERSION;
+
     use super::*;
+
+    #[test]
+    fn an_agent_is_told_which_side_to_upgrade() {
+        assert_eq!(refusal(PROTOCOL_VERSION, "1.0.0"), None);
+
+        let server = env!("CARGO_PKG_VERSION");
+        let old = refusal(0, "").unwrap();
+        assert_eq!(
+            old,
+            format!(
+                "This agent (from before protocol versions) is too old for this server \
+                 (version {server}), which takes agent {}. Upgrade the agent to {server}.",
+                Protocols::SUPPORTED.describe()
+            )
+        );
+        let newer = PROTOCOL_VERSION + 1;
+        let new = refusal(newer, "9.0.0").unwrap();
+        assert_eq!(
+            new,
+            format!(
+                "This agent (version 9.0.0, protocol {newer}) is newer than this server \
+                 (version {server}), which takes agent {}. Upgrade the server first.",
+                Protocols::SUPPORTED.describe()
+            )
+        );
+    }
 
     fn ip(text: &str) -> IpAddr {
         text.parse().unwrap()

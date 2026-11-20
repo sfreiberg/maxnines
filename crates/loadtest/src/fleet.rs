@@ -105,7 +105,7 @@ async fn introduce(
     hostname: &str,
     url: &str,
 ) -> Result<RegistrationStatus> {
-    let Some(ServerMessage::Challenge { nonce }) = read(socket).await else {
+    let Some(ServerMessage::Challenge { nonce, .. }) = read(socket).await else {
         bail!("no challenge from the server");
     };
     let hello = AgentMessage::Hello {
@@ -113,12 +113,17 @@ async fn introduce(
         public_key: identity.public_key(),
         signature: identity.sign(url, &nonce),
         token: None,
+        protocol: maxnines_protocol::PROTOCOL_VERSION,
+        agent_version: env!("CARGO_PKG_VERSION").to_string(),
     };
     socket
         .send(Message::text(serde_json::to_string(&hello)?))
         .await?;
     match read(socket).await {
         Some(ServerMessage::Registration { status }) => Ok(status),
+        Some(ServerMessage::Refused { reason }) => {
+            bail!("the server turned the agents away: {reason}")
+        }
         _ => bail!("no registration status from the server"),
     }
 }
