@@ -5,7 +5,11 @@
 //! works everywhere. `(*)` in a path reads every instance, each as a series of its own.
 //!
 //! A path that isn't on a host is reported as failing, with a fixed message, and
-//! looked for again on the next sample, as some only appear once their software runs.
+//! looked for again each minute, as some only appear once their software runs.
+//!
+//! A wildcard path reports `_Total` first, then its other instances in order of
+//! their names, up to [`MAX_INSTANCES`], so each sample keeps the same ones, and
+//! says how many more there were.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -25,8 +29,12 @@ pub const NOT_WINDOWS: &str = "performance counters are only on Windows";
 /// What one configured path gave.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Reading {
-    /// Each instance's path and value. One with no wildcard has one.
-    Values(Vec<(String, f64)>),
+    /// Each instance's path and value, and how many instances there were beyond
+    /// the most reported. One with no wildcard has one.
+    Values {
+        values: Vec<(String, f64)>,
+        dropped: usize,
+    },
     /// A rate that has nothing to compare with yet.
     Waiting,
     Failed(&'static str),
@@ -57,8 +65,25 @@ pub fn numbered(instances: impl IntoIterator<Item = String>) -> Vec<String> {
         .collect()
 }
 
+/// The instances of a wildcard path to report: `_Total` first, then the rest by
+/// name, up to the most kept, each with its path, and how many weren't kept.
+/// Programs that share a name are numbered in the order Windows gives them.
+pub fn kept_instances(path: &str, instances: Vec<(String, f64)>) -> (Vec<(String, f64)>, usize) {
+    let (names, values): (Vec<String>, Vec<f64>) = instances.into_iter().unzip();
+    let mut instances: Vec<(String, f64)> = numbered(names).into_iter().zip(values).collect();
+    instances.sort_by(|(a, _), (b, _)| (a != "_Total", a).cmp(&(b != "_Total", b)));
+    let dropped = instances.len().saturating_sub(MAX_INSTANCES);
+    instances.truncate(MAX_INSTANCES);
+    let kept = instances
+        .into_iter()
+        .map(|(instance, value)| (instance_path(path, &instance), value))
+        .collect();
+    (kept, dropped)
+}
+
 /// The collector's output: an item for each configured path saying whether it works,
-/// and one for each value, by path. A path with no wildcard has both in one item.
+/// and one for each value, by path. A path with no wildcard has both in one item. A
+/// wildcard path's item says how many instances there were beyond the most reported.
 pub fn output(readings: &[(String, Reading)]) -> Value {
     fn item<'a>(
         items: &'a mut BTreeMap<String, Map<String, Value>>,
@@ -74,8 +99,12 @@ pub fn output(readings: &[(String, Reading)]) -> Value {
     let mut items = BTreeMap::new();
     for (path, reading) in readings {
         match reading {
-            Reading::Values(values) => {
-                item(&mut items, path).insert("ok".into(), json!(1));
+            Reading::Values { values, dropped } => {
+                let item_of_path = item(&mut items, path);
+                item_of_path.insert("ok".into(), json!(1));
+                if path.contains("(*)") {
+                    item_of_path.insert("dropped".into(), json!(dropped));
+                }
                 for (name, value) in values.iter().filter(|(_, value)| value.is_finite()) {
                     item(&mut items, name).insert("value".into(), json!(value));
                 }
@@ -128,7 +157,14 @@ pub(crate) mod pdh {
         PdhGetFormattedCounterArrayW, PdhOpenQueryW,
     };
 
-    use super::{MAX_INSTANCES, NOT_FOUND, NOT_READ, Reading, instance_path, numbered};
+    use std::time::{Duration, Instant};
+
+    use super::{NOT_FOUND, NOT_READ, Reading, kept_instances};
+    use crate::windows_text::{from_wide, wide};
+
+    /// How often a path a host doesn't have is looked for again. Looking up a name
+    /// that isn't there is slow.
+    const RETRY_EVERY: Duration = Duration::from_secs(60);
 
     /// Percentages of processor time can pass 100 on a host with several cores.
     const NO_CAP_AT_100: u32 = 0x8000;
@@ -138,15 +174,13 @@ pub(crate) mod pdh {
     pub struct Counters {
         query: Option<PDH_HQUERY>,
         counters: Vec<(String, Result<PDH_HCOUNTER, &'static str>)>,
+        /// When paths that weren't found were last looked for.
+        looked: Instant,
     }
 
     // SAFETY: a query's handles work from any thread. This only ever uses them from one
     // at a time, as `read` and `drop` take it mutably.
     unsafe impl Send for Counters {}
-
-    fn wide(text: &str) -> Vec<u16> {
-        text.encode_utf16().chain([0]).collect()
-    }
 
     fn added(query: PDH_HQUERY, path: &str) -> Result<PDH_HCOUNTER, &'static str> {
         let mut counter: PDH_HCOUNTER = null_mut();
@@ -163,23 +197,6 @@ pub(crate) mod pdh {
         }
     }
 
-    /// Reads up to a zero, as Windows' own strings end.
-    ///
-    /// # Safety
-    /// `text` has to be null or point to a string that ends with a zero.
-    unsafe fn from_wide(text: *const u16) -> String {
-        if text.is_null() {
-            return String::new();
-        }
-        let mut length = 0;
-        // SAFETY: the string ends with a zero, so nothing past it is read.
-        while unsafe { *text.add(length) } != 0 {
-            length += 1;
-        }
-        // SAFETY: those `length` characters were just read.
-        String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) })
-    }
-
     fn values(path: &str, counter: PDH_HCOUNTER) -> Reading {
         let (mut size, mut count) = (0u32, 0u32);
         // SAFETY: asking how much room the values need, with nowhere to put them yet.
@@ -188,7 +205,12 @@ pub(crate) mod pdh {
         };
         match status {
             PDH_MORE_DATA => {}
-            0 => return Reading::Values(Vec::new()),
+            0 => {
+                return Reading::Values {
+                    values: Vec::new(),
+                    dropped: 0,
+                };
+            }
             PDH_INVALID_DATA | PDH_CSTATUS_INVALID_DATA | PDH_NO_DATA => return Reading::Waiting,
             _ => return Reading::Failed(NOT_READ),
         }
@@ -220,23 +242,17 @@ pub(crate) mod pdh {
             })
             .collect();
         if !path.contains("(*)") {
-            return Reading::Values(
-                usable
+            return Reading::Values {
+                values: usable
                     .first()
                     .map(|(_, value)| (path.to_string(), *value))
                     .into_iter()
                     .collect(),
-            );
+                dropped: 0,
+            };
         }
-        let (names, values): (Vec<String>, Vec<f64>) =
-            usable.into_iter().take(MAX_INSTANCES).unzip();
-        Reading::Values(
-            numbered(names)
-                .into_iter()
-                .zip(values)
-                .map(|(instance, value)| (instance_path(path, &instance), value))
-                .collect(),
-        )
+        let (values, dropped) = kept_instances(path, usable);
+        Reading::Values { values, dropped }
     }
 
     impl Counters {
@@ -253,7 +269,11 @@ pub(crate) mod pdh {
                     (path, counter)
                 })
                 .collect();
-            let mut counters = Self { query, counters };
+            let mut counters = Self {
+                query,
+                counters,
+                looked: Instant::now(),
+            };
             // A rate is worked out between two collections, so the first is now.
             counters.collect();
             counters
@@ -268,7 +288,10 @@ pub(crate) mod pdh {
 
         pub fn read(&mut self) -> Vec<(String, Reading)> {
             // Software installed since may have brought its counters with it.
-            if let Some(query) = self.query {
+            if let Some(query) = self.query
+                && self.looked.elapsed() >= RETRY_EVERY
+            {
+                self.looked = Instant::now();
                 for (path, counter) in &mut self.counters {
                     if counter.is_err() {
                         *counter = added(query, path);
@@ -351,7 +374,13 @@ mod tests {
     #[test]
     fn a_path_without_a_wildcard_is_one_item_with_its_value() {
         let path = r"\Processor(_Total)\% Processor Time".to_string();
-        let readings = [(path.clone(), Reading::Values(vec![(path.clone(), 12.5)]))];
+        let readings = [(
+            path.clone(),
+            Reading::Values {
+                values: vec![(path.clone(), 12.5)],
+                dropped: 0,
+            },
+        )];
         assert_eq!(
             output(&readings),
             json!([{ "name": path, "ok": 1, "value": 12.5 }])
@@ -365,15 +394,37 @@ mod tests {
             (instance_path(&path, "0 C:"), 3.0),
             (instance_path(&path, "_Total"), 3.0),
         ];
-        let readings = [(path.clone(), Reading::Values(values))];
+        let readings = [(path.clone(), Reading::Values { values, dropped: 2 })];
         assert_eq!(
             output(&readings),
             json!([
-                { "name": r"\PhysicalDisk(*)\Disk Reads/sec", "ok": 1 },
+                { "name": r"\PhysicalDisk(*)\Disk Reads/sec", "ok": 1, "dropped": 2 },
                 { "name": r"\PhysicalDisk(0 C:)\Disk Reads/sec", "value": 3.0 },
                 { "name": r"\PhysicalDisk(_Total)\Disk Reads/sec", "value": 3.0 },
             ])
         );
+    }
+
+    #[test]
+    fn a_wildcard_keeps_the_total_and_the_same_instances_each_time() {
+        let path = r"\Process(*)\% Processor Time";
+        let mut instances: Vec<(String, f64)> = (0..MAX_INSTANCES + 5)
+            .map(|i| (format!("app{i:03}"), 1.0))
+            .collect();
+        instances.reverse();
+        instances.push(("_Total".to_string(), 50.0));
+        instances.push(("app000".to_string(), 2.0));
+        let (kept, dropped) = kept_instances(path, instances);
+        assert_eq!(kept.len(), MAX_INSTANCES);
+        assert_eq!(dropped, 7);
+        assert_eq!(
+            kept[0],
+            (r"\Process(_Total)\% Processor Time".to_string(), 50.0)
+        );
+        assert_eq!(kept[1].0, r"\Process(app000)\% Processor Time");
+        // The second program with that name, numbered as Windows numbers them.
+        assert_eq!(kept[2].0, r"\Process(app000#1)\% Processor Time");
+        assert_eq!(kept[3].0, r"\Process(app001)\% Processor Time");
     }
 
     #[test]
@@ -399,7 +450,10 @@ mod tests {
         let path = r"\X\Y".to_string();
         let readings = [(
             path.clone(),
-            Reading::Values(vec![(path.clone(), f64::NAN)]),
+            Reading::Values {
+                values: vec![(path.clone(), f64::NAN)],
+                dropped: 0,
+            },
         )];
         assert_eq!(output(&readings), json!([{ "name": path, "ok": 1 }]));
     }

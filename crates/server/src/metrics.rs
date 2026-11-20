@@ -4156,6 +4156,17 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::Never,
     },
     Metric {
+        name: "counter.dropped",
+        title: "Performance counter instances over the limit",
+        unit: Unit::Number,
+        collector: "counters",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.dropped"),
+        },
+        chart: ShowChart::Never,
+    },
+    Metric {
         name: "file.exists",
         title: "File exists",
         unit: Unit::Number,

@@ -287,12 +287,14 @@ rule under **Windows performance counters**, one per line, by their English path
 - **Names are in English** whatever language Windows is in, so one rule works on every
   host. Windows' `typeperf -q` lists what a host has, in its own language.
 - **`(*)` reports every instance,** such as each disk or each processor, as a series of its
-  own, up to 64 for one path. Programs sharing a name are numbered as Windows numbers
+  own, up to 64 for one path: `_Total` first, then the rest in order of their names, so
+  each sample keeps the same ones. **Performance counter instances over the limit** says
+  how many more there were. Programs sharing a name are numbered as Windows numbers
   them, like `svchost#1`.
 - **Rates are worked out by Windows** between one sample and the next, so a counter like
   `Disk Reads/sec` has a value from the first sample.
 - **A path a host doesn't have** is shown as failing on its page, and looked for again
-  on every sample, as software adds its own counters once it's installed.
+  each minute, as software adds its own counters once it's installed.
 
 Each host's page charts the busiest counters together and lists the latest value of
 each. An alert rule on **Performance counters** can watch one of them by its path.

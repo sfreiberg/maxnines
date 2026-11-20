@@ -104,7 +104,7 @@ pub async fn reboot_required() -> Option<bool> {
         r"SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending",
     ];
     let waiting = KEYS.iter().any(|key| {
-        let key: Vec<u16> = key.encode_utf16().chain([0]).collect();
+        let key = crate::windows_text::wide(key);
         let mut handle: HKEY = std::ptr::null_mut();
         // SAFETY: the key's name ends with a zero, and the handle has somewhere to go.
         let opened =
