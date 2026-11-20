@@ -1,7 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -15,10 +15,10 @@ use rustls::pki_types::pem::PemObject;
 use rustls::{ClientConfig, RootCertStore};
 use serde_json::Value;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc::{self, error::TrySendError};
-use tokio::sync::watch;
-use tokio::time::{Instant, interval_at, sleep, timeout};
-use tokio_tungstenite::tungstenite::Message;
+use tokio::sync::{Notify, mpsc, watch};
+use tokio::task::JoinHandle;
+use tokio::time::{Instant, Interval, interval_at, sleep, timeout};
+use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
 };
@@ -32,6 +32,10 @@ use crate::spool::Spool;
 
 /// The server pings regularly, so this much silence means the connection died.
 const SERVER_SILENCE_LIMIT: Duration = maxnines_protocol::AGENT_SILENCE_LIMIT;
+/// How long anything sent gets to go. Nothing is read while it's going, so a
+/// connection the server stopped reading is given up on in the time it takes to
+/// notice the server has gone quiet, rather than whenever TCP gives up.
+const SEND_LIMIT: Duration = SERVER_SILENCE_LIMIT;
 /// How long connecting, and then the handshake, each get. A server, firewall or load
 /// balancer that accepts the connection and then says nothing would otherwise hold
 /// the agent offline for good.
@@ -55,9 +59,63 @@ pub struct ConfigUpdate {
 /// server never holds up collection.
 pub struct ServerLink {
     spool: Arc<Spool>,
-    config_results: mpsc::Sender<String>,
+    outbox: Arc<Outbox>,
     configs: mpsc::Receiver<ConfigUpdate>,
     facts_every: watch::Sender<Duration>,
+}
+
+/// What the agent was asked to report about itself, gathered apart from the
+/// connection, as asking the resolver and the system can be slow.
+struct FactsAsked {
+    custom: BTreeMap<String, Value>,
+    allowed: Allowed,
+    actions: Actions,
+    built_in_actions: bool,
+}
+
+impl FactsAsked {
+    fn gather(&self) -> Result<Value> {
+        facts::gather(
+            &self.custom,
+            &self.allowed,
+            &self.actions,
+            self.built_in_actions,
+        )
+    }
+}
+
+/// Results the server is waiting for, such as an action's, kept until they've gone,
+/// so one isn't lost when the connection is.
+#[derive(Default)]
+struct Outbox {
+    waiting: Mutex<VecDeque<Utf8Bytes>>,
+    arrived: Notify,
+}
+
+impl Outbox {
+    fn waiting(&self) -> std::sync::MutexGuard<'_, VecDeque<Utf8Bytes>> {
+        self.waiting.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn push(&self, text: String) {
+        self.waiting().push_back(text.into());
+        self.arrived.notify_one();
+    }
+
+    /// Waits for the oldest result, which stays until [`Outbox::sent`].
+    async fn next(&self) -> Utf8Bytes {
+        loop {
+            if let Some(text) = self.waiting().front() {
+                return text.clone();
+            }
+            self.arrived.notified().await;
+        }
+    }
+
+    /// The oldest result has gone.
+    fn sent(&self) {
+        self.waiting().pop_front();
+    }
 }
 
 struct Connection {
@@ -67,15 +125,11 @@ struct Connection {
     token: Option<String>,
     connector: Connector,
     spool: Arc<Spool>,
-    custom_facts: BTreeMap<String, Value>,
-    allowed: Allowed,
-    actions: Actions,
-    built_in_actions: bool,
+    facts: Arc<FactsAsked>,
     /// Runs what the server asks for, apart from the connection, so a slow action
     /// never holds up samples or the server's pings.
     runner: Arc<Runner>,
-    /// For anything to send besides samples, whichever connection is open by then.
-    outgoing: mpsc::Sender<String>,
+    outbox: Arc<Outbox>,
     facts_every: watch::Receiver<Duration>,
     configs: mpsc::Sender<ConfigUpdate>,
 }
@@ -93,8 +147,8 @@ impl ServerLink {
 
         let (facts_every, facts_every_receiver) = watch::channel(DEFAULT_FACTS_INTERVAL);
         let (config_sender, configs) = mpsc::channel(CONFIG_QUEUE_SIZE);
-        let (config_results, pending) = mpsc::channel(CONFIG_QUEUE_SIZE);
         let spool = Arc::new(Spool::open(&config.sample_queue_folder()));
+        let outbox = Arc::new(Outbox::default());
         let connection = Connection {
             url,
             hostname: hostname.to_string(),
@@ -107,56 +161,61 @@ impl ServerLink {
                 .transpose()?,
             connector: tls_connector(config.server.ca_file.as_deref())?,
             spool: spool.clone(),
-            custom_facts: config.facts.clone(),
-            allowed: config.allowed(),
-            actions: config.actions.clone(),
-            built_in_actions: config.built_in_actions,
+            facts: Arc::new(FactsAsked {
+                custom: config.facts.clone(),
+                allowed: config.allowed(),
+                actions: config.actions.clone(),
+                built_in_actions: config.built_in_actions,
+            }),
             runner: Runner::new(
                 config.actions.clone(),
                 config.built_in_actions,
                 &config.state_dir,
             ),
-            outgoing: config_results.clone(),
+            outbox: outbox.clone(),
             facts_every: facts_every_receiver,
             configs: config_sender,
         };
 
-        tokio::spawn(stay_connected(connection, pending));
+        tokio::spawn(stay_connected(connection));
         Ok(Self {
             spool,
-            config_results,
+            outbox,
             configs,
             facts_every,
         })
     }
 
-    pub fn send_sample(&self, sample: &Sample) -> Result<()> {
-        let text = serde_json::to_string(&AgentMessage::Sample(sample.clone()))?;
-        self.spool.push(text);
+    pub fn send_sample(&self, sample: Sample) -> Result<()> {
+        let taken_at = sample.time;
+        let text = serde_json::to_string(&AgentMessage::Sample(sample))?;
+        self.spool.push(text, taken_at);
         Ok(())
     }
 
+    /// Goes once the connection is up, however long that takes.
     pub fn report_config(&self, version: &str, error: Option<String>) -> Result<()> {
         let message = AgentMessage::ConfigResult {
             version: version.to_string(),
             error,
         };
-        let text = serde_json::to_string(&message)?;
-        match self.config_results.try_send(text) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => warn!("too many config results, one was dropped"),
-            Err(TrySendError::Closed(_)) => error!("connection task gone, config result dropped"),
-        }
+        self.outbox.push(serde_json::to_string(&message)?);
         Ok(())
     }
 
+    /// Only a change restarts the wait for the next report.
     pub fn set_facts_interval(&self, every: Duration) {
-        self.facts_every.send_replace(every);
+        self.facts_every.send_if_modified(|current| {
+            let changed = *current != every;
+            *current = every;
+            changed
+        });
     }
 
     /// Saves what the server hasn't confirmed, for when the agent stops.
-    pub fn save_unconfirmed(&self) {
+    pub async fn save_unconfirmed(&self) {
         self.spool.set_online(false);
+        self.spool.flush().await;
     }
 
     /// Waits for the next config from the server.
@@ -196,14 +255,12 @@ fn tls_connector(ca_file: Option<&Path>) -> Result<Connector> {
 /// Reconnects forever, backing off while the server stays unreachable. This is
 /// also how a pending agent checks for approval. A panic in a session is
 /// treated like any other lost connection.
-async fn stay_connected(connection: Connection, mut pending: mpsc::Receiver<String>) {
+async fn stay_connected(connection: Connection) {
     let mut backoff = Backoff::new();
 
     loop {
         let started = Instant::now();
-        let outcome = AssertUnwindSafe(session(&connection, &mut pending))
-            .catch_unwind()
-            .await;
+        let outcome = AssertUnwindSafe(session(&connection)).catch_unwind().await;
         connection.spool.set_online(false);
 
         match outcome {
@@ -230,8 +287,43 @@ async fn connect(url: &str, connector: &Connector, limit: Duration) -> Result<So
     Ok(socket)
 }
 
+/// Sends one message, giving up if it doesn't go in [`SEND_LIMIT`].
+async fn send<S>(socket: &mut S, text: impl Into<Utf8Bytes>) -> Result<()>
+where
+    S: Sink<Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    timeout(SEND_LIMIT, socket.send(Message::Text(text.into())))
+        .await
+        .context("the server stopped taking what was sent")??;
+    Ok(())
+}
+
+/// Gathers facts on a thread of its own, as asking the resolver and the system can
+/// be slow, and the connection has to keep answering the server meanwhile.
+fn gather_facts(facts: &Arc<FactsAsked>) -> JoinHandle<Result<Value>> {
+    let facts = facts.clone();
+    tokio::task::spawn_blocking(move || facts.gather())
+}
+
+/// Waits for facts being gathered, if they are.
+async fn gathered(gathering: &mut Option<JoinHandle<Result<Value>>>) -> Result<Value> {
+    let Some(task) = gathering else {
+        return std::future::pending().await;
+    };
+    let found = task.await;
+    *gathering = None;
+    found.context("gathering facts panicked")?
+}
+
+/// Every `every`, starting `every` from now.
+fn from_now(every: Duration) -> Interval {
+    interval_at(Instant::now() + every, every)
+}
+
 /// Runs one connection until it fails. Reading also answers the server's pings.
-async fn session(connection: &Connection, pending: &mut mpsc::Receiver<String>) -> Result<()> {
+/// Facts go first, and nothing else is sent until they have.
+async fn session(connection: &Connection) -> Result<()> {
     let url = connection.url.as_str();
     let mut socket = connect(url, &connection.connector, HANDSHAKE_LIMIT).await?;
 
@@ -241,22 +333,40 @@ async fn session(connection: &Connection, pending: &mut mpsc::Receiver<String>) 
     info!(url, "connected to server");
     connection.spool.set_online(true);
 
-    send_facts(&mut socket, connection).await?;
+    let mut gathering = Some(gather_facts(&connection.facts));
+    let mut facts_sent = false;
     let mut facts_every = connection.facts_every.clone();
-    let every = *facts_every.borrow_and_update();
-    let mut facts_timer = interval_at(Instant::now() + every, every);
+    let mut facts_timer = from_now(*facts_every.borrow_and_update());
 
     let silence = sleep(SERVER_SILENCE_LIMIT);
     tokio::pin!(silence);
 
     loop {
         tokio::select! {
-            Some(text) = pending.recv() => socket.send(Message::text(text)).await?,
-            () = connection.spool.wait() => send_next(&mut socket, &connection.spool).await?,
-            _ = facts_timer.tick() => send_facts(&mut socket, connection).await?,
+            found = gathered(&mut gathering) => {
+                match found {
+                    Ok(facts) => {
+                        let text = serde_json::to_string(&AgentMessage::Facts { facts })?;
+                        send(&mut socket, text).await?;
+                    }
+                    Err(error) => warn!(error = format!("{error:#}"), "gathering facts failed"),
+                }
+                facts_sent = true;
+            }
+            text = connection.outbox.next(), if facts_sent => {
+                send(&mut socket, text).await?;
+                connection.outbox.sent();
+            }
+            () = connection.spool.wait(), if facts_sent => {
+                send_next(&mut socket, &connection.spool).await?;
+            }
+            _ = facts_timer.tick() => {
+                if gathering.is_none() {
+                    gathering = Some(gather_facts(&connection.facts));
+                }
+            }
             Ok(()) = facts_every.changed() => {
-                let every = *facts_every.borrow_and_update();
-                facts_timer = interval_at(Instant::now() + every, every);
+                facts_timer = from_now(*facts_every.borrow_and_update());
             }
             message = socket.next() => {
                 silence.as_mut().reset(Instant::now() + SERVER_SILENCE_LIMIT);
@@ -265,7 +375,7 @@ async fn session(connection: &Connection, pending: &mut mpsc::Receiver<String>) 
                         // Sent ahead of anything else that's waiting, as the server
                         // is timing it.
                         if let Some(answer) = receive(&text, connection).await {
-                            socket.send(Message::text(answer)).await?;
+                            send(&mut socket, answer).await?;
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => bail!("server closed the connection"),
@@ -279,12 +389,13 @@ async fn session(connection: &Connection, pending: &mut mpsc::Receiver<String>) 
 }
 
 /// A failed send ends the connection, which puts the sample back in line.
-async fn send_next<S>(socket: &mut S, spool: &Spool) -> Result<(), S::Error>
+async fn send_next<S>(socket: &mut S, spool: &Spool) -> Result<()>
 where
     S: Sink<Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
 {
     if let Some(text) = spool.next() {
-        socket.send(Message::text(text)).await?;
+        send(socket, text).await?;
     }
     Ok(())
 }
@@ -312,16 +423,12 @@ async fn receive(text: &str, connection: &Connection) -> Option<String> {
             variables,
             timeout,
         }) => {
-            let (runner, outgoing) = (connection.runner.clone(), connection.outgoing.clone());
+            let (runner, outbox) = (connection.runner.clone(), connection.outbox.clone());
             tokio::spawn(async move {
                 let result = runner.run(id, &action, &variables, timeout).await;
                 match serde_json::to_string(&AgentMessage::ActionResult(result)) {
                     // Waits its turn if the connection is down, and goes when it's back.
-                    Ok(text) => {
-                        if outgoing.send(text).await.is_err() {
-                            error!("an action's result was dropped, the agent has stopped");
-                        }
-                    }
+                    Ok(text) => outbox.push(text),
                     Err(error) => error!(%error, "an action's result couldn't be sent"),
                 }
             });
@@ -330,26 +437,6 @@ async fn receive(text: &str, connection: &Connection) -> Option<String> {
         Err(error) => warn!(%error, "ignoring an invalid message from the server"),
     }
     None
-}
-
-/// Sends everything each time and lets the server work out what changed, so a
-/// change can't be lost if the server couldn't save it the first time.
-async fn send_facts(socket: &mut Socket, connection: &Connection) -> Result<()> {
-    let facts = match facts::gather(
-        &connection.custom_facts,
-        &connection.allowed,
-        &connection.actions,
-        connection.built_in_actions,
-    ) {
-        Ok(facts) => facts,
-        Err(error) => {
-            warn!(error = format!("{error:#}"), "gathering facts failed");
-            return Ok(());
-        }
-    };
-    let text = serde_json::to_string(&AgentMessage::Facts { facts })?;
-    socket.send(Message::text(text)).await?;
-    Ok(())
 }
 
 /// Answers the server's challenge and returns once the agent is approved.
@@ -526,7 +613,7 @@ mod tests {
         let agent = identity();
         let host_id = agent.id();
         let link = ServerLink::start(&config(&url), "web-1", agent).unwrap();
-        link.send_sample(&sample()).unwrap();
+        link.send_sample(sample()).unwrap();
 
         // Let the first connection attempt run and fail.
         sleep(Duration::from_millis(100)).await;
@@ -700,7 +787,7 @@ mod tests {
         let url = format!("ws://{address}/ws");
 
         let link = ServerLink::start(&config(&url), "web-1", identity()).unwrap();
-        link.send_sample(&sample()).unwrap();
+        link.send_sample(sample()).unwrap();
 
         let (stream, _) = listener.accept().await.unwrap();
         let mut socket = accept_async(stream).await.unwrap();
@@ -734,7 +821,8 @@ mod tests {
         drop(socket);
         until(|| !link.spool.is_online()).await;
 
-        link.send_sample(&sample()).unwrap();
+        link.send_sample(sample()).unwrap();
+        link.spool.flush().await;
         assert!(link.spool.saved_bytes() > 0, "offline samples go to disk");
 
         let (stream, _) = listener.accept().await.unwrap();
@@ -751,7 +839,7 @@ mod tests {
     async fn a_connected_agent_sends_samples_without_saving_them() {
         let (link, mut socket) = connected().await;
 
-        link.send_sample(&sample()).unwrap();
+        link.send_sample(sample()).unwrap();
 
         assert_eq!(link.spool.saved_bytes(), 0);
         assert_eq!(
@@ -764,17 +852,19 @@ mod tests {
     async fn a_sample_that_fails_to_send_stays_queued() {
         let folder = tempfile::tempdir().unwrap();
         let spool = Spool::open(&folder.path().join("samples"));
+        spool.set_online(true);
         let text = serde_json::to_string(&sample()).unwrap();
-        spool.push(text.clone());
+        spool.push(text.clone(), taken_at());
         let broken = futures_util::sink::unfold((), |(), _: Message| async {
-            Err::<(), &str>("connection lost")
+            Err::<(), _>(std::io::Error::other("connection lost"))
         });
         let mut broken = std::pin::pin!(broken);
 
         assert!(send_next(&mut broken, &spool).await.is_err());
         spool.set_online(false);
+        spool.flush().await;
 
-        assert_eq!(spool.next().unwrap(), text);
+        assert_eq!(spool.next().unwrap(), text.as_str());
     }
 
     /// Waits for a new connection from the agent, and gets past its first facts.
@@ -794,7 +884,7 @@ mod tests {
         let link = ServerLink::start(&config(&url), "web-1", identity()).unwrap();
         let mut socket = reconnected(&listener, &url).await;
 
-        link.send_sample(&sample()).unwrap();
+        link.send_sample(sample()).unwrap();
         assert_eq!(
             next_message(&mut socket).await,
             AgentMessage::Sample(sample())
@@ -816,7 +906,7 @@ mod tests {
         let link = ServerLink::start(&config(&url), "web-1", identity()).unwrap();
         let mut socket = reconnected(&listener, &url).await;
 
-        link.send_sample(&sample()).unwrap();
+        link.send_sample(sample()).unwrap();
         next_message(&mut socket).await;
         let ack = ServerMessage::Ack { time: taken_at() };
         send_to_agent(&mut socket, &ack).await;
@@ -835,7 +925,7 @@ mod tests {
         let url = format!("ws://{address}/ws");
         let settings = config(&url);
         let saved = serde_json::to_string(&AgentMessage::Sample(sample())).unwrap();
-        Spool::open(&settings.sample_queue_folder()).push(saved);
+        Spool::open(&settings.sample_queue_folder()).push(saved, taken_at());
 
         let _link = ServerLink::start(&settings, "web-1", identity()).unwrap();
 
@@ -847,6 +937,71 @@ mod tests {
             next_message(&mut socket).await,
             AgentMessage::Sample(sample())
         );
+    }
+
+    #[tokio::test]
+    async fn a_result_waiting_when_the_connection_went_goes_on_the_next() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        let link = ServerLink::start(&config(&url), "web-1", identity()).unwrap();
+        let socket = reconnected(&listener, &url).await;
+        drop(socket);
+        until(|| !link.spool.is_online()).await;
+
+        // Many at once, more than were ever kept before.
+        for version in 0..20 {
+            link.report_config(&format!("v{version}"), None).unwrap();
+        }
+
+        let mut socket = reconnected(&listener, &url).await;
+        for version in 0..20 {
+            assert_eq!(
+                next_message(&mut socket).await,
+                AgentMessage::ConfigResult {
+                    version: format!("v{version}"),
+                    error: None,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_result_stays_until_it_has_gone() {
+        let outbox = Outbox::default();
+        outbox.push("first".to_string());
+        outbox.push("second".to_string());
+        let next = || futures_util::FutureExt::now_or_never(outbox.next()).unwrap();
+
+        // Taken but never sent, as when the connection drops while sending.
+        assert_eq!(next(), "first");
+        assert_eq!(next(), "first");
+        outbox.sent();
+        assert_eq!(next(), "second");
+    }
+
+    /// On a paused clock, so the limit passes as soon as nothing else can happen.
+    #[tokio::test(start_paused = true)]
+    async fn a_send_the_server_never_takes_is_given_up_on() {
+        let stalled = futures_util::sink::unfold((), |(), _: Message| async {
+            std::future::pending::<Result<(), std::io::Error>>().await
+        });
+        let mut stalled = std::pin::pin!(stalled);
+        let started = Instant::now();
+
+        let error = send(&mut stalled, "sample").await.unwrap_err();
+
+        assert_eq!(started.elapsed(), SEND_LIMIT);
+        assert!(format!("{error:#}").contains("stopped taking"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn the_same_facts_interval_again_changes_nothing() {
+        let (link, _socket) = connected().await;
+        let watching = link.facts_every.subscribe();
+        link.set_facts_interval(DEFAULT_FACTS_INTERVAL);
+        assert!(!watching.has_changed().unwrap());
+        link.set_facts_interval(Duration::from_secs(60));
+        assert!(watching.has_changed().unwrap());
     }
 
     #[test]

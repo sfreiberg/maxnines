@@ -34,17 +34,21 @@ mod websocket;
 
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use maxnines_protocol::Sample;
 use maxnines_protocol::auth::Identity;
 use maxnines_protocol::logging;
 #[cfg(windows)]
 use maxnines_protocol::service::{self, Service, ServiceCommand};
+use maxnines_protocol::{AgentConfig, Sample};
 use serde_json::Value;
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, Interval, MissedTickBehavior, interval_at};
 use tracing::{error, info, warn};
 
@@ -272,39 +276,80 @@ fn print_identity(identity: &Identity) {
     println!("public key: {}", identity.public_key());
 }
 
+/// What a config turns on, ready to collect.
+type Collectors = Vec<Box<dyn Collector + Send>>;
+
+/// Builds what a config turns on. It fails without side effects, so a bad config
+/// leaves the old one running. Everything that could go wrong with a config happens
+/// in here, so a bad one is refused rather than taking the agent down.
+fn build(config: &AgentConfig, local: Local<'_>) -> Result<Collectors> {
+    catch_unwind(AssertUnwindSafe(|| {
+        config.validate()?;
+        let mut collectors = collector::build_all(config, local)?;
+        collectors.push(Box::new(OwnUsageCollector::new()?));
+        anyhow::Ok(collectors)
+    }))
+    .map_err(|_| anyhow!("building collectors panicked"))?
+}
+
+/// Builds what a config turns on, apart from the connection, as reading the system
+/// can block, and the agent's one thread also keeps the connection alive. A config
+/// that's built is saved, so monitoring carries on through a server outage.
+async fn build_apart(
+    update: ConfigUpdate,
+    config: &Arc<Config>,
+    saving: bool,
+) -> Result<(ConfigUpdate, Collectors)> {
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || {
+        let collectors = build(&update.config, config.local())?;
+        if saving && let Err(error) = saved_config::save(&config.saved_config_file(), &update) {
+            warn!(error = format!("{error:#}"), "saving the config failed");
+        }
+        Ok((update, collectors))
+    })
+    .await
+    .context("building collectors stopped")?
+}
+
+/// Where the collectors are.
+enum Collecting {
+    Ready(Collectors),
+    /// Collecting a sample on a thread of their own, as reading the system can
+    /// block, on a hung network drive say, and the agent's one thread also keeps the
+    /// connection to the server alive.
+    Away(JoinHandle<(Collectors, Sample)>),
+}
+
 /// The monitoring the agent is currently doing.
 struct Monitoring {
     version: String,
-    collectors: Vec<Box<dyn Collector>>,
+    collecting: Collecting,
     ticker: Interval,
 }
 
 impl Monitoring {
-    /// Fails without side effects, so a bad config leaves the old one running.
-    fn start(update: &ConfigUpdate, local: Local<'_>) -> Result<Self> {
-        // Everything that could go wrong with a config happens in here, so a bad
-        // one is refused rather than taking the agent down.
-        let (collectors, ticker) = catch_unwind(AssertUnwindSafe(|| {
-            update.config.validate()?;
-            let mut collectors = collector::build_all(&update.config, local)?;
-            collectors.push(Box::new(OwnUsageCollector::new()?));
-
-            // CPU usage is measured between refreshes, so the first sample waits. The
-            // random part is because a config can reach every agent at the same moment,
-            // and they would then all collect together from then on.
-            let period = update.config.interval;
-            let first = Instant::now() + collector::WARMUP + jitter(period);
-            let mut ticker = interval_at(first, period);
-            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            anyhow::Ok((collectors, ticker))
-        }))
-        .map_err(|_| anyhow!("building collectors panicked"))??;
-
-        Ok(Self {
-            version: update.version.clone(),
-            collectors,
+    fn new(version: String, collectors: Collectors, period: Duration) -> Self {
+        // CPU usage is measured between refreshes, so the first sample waits. The
+        // random part is because a config can reach every agent at the same moment,
+        // and they would then all collect together from then on.
+        let first = Instant::now() + collector::WARMUP + jitter(period);
+        let mut ticker = interval_at(first, period);
+        // A sample that took longer than the interval is followed at once by the
+        // next, and the ones after keep to the schedule.
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        Self {
+            version,
+            collecting: Collecting::Ready(collectors),
             ticker,
-        })
+        }
+    }
+
+    fn collector_count(&self) -> usize {
+        match &self.collecting {
+            Collecting::Ready(collectors) => collectors.len(),
+            Collecting::Away(_) => 0,
+        }
     }
 }
 
@@ -314,24 +359,29 @@ fn run(path: PathBuf) -> Result<()> {
     let config = Config::load(&path)?;
     #[cfg(unix)]
     privileges::split(&config)?;
-    run_agent(path, config)
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run_agent(path, Arc::new(config)));
+    // A sample stuck on a hung drive mustn't keep the agent from stopping.
+    runtime.shutdown_background();
+    result
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn run_agent(path: PathBuf, config: Config) -> Result<()> {
+async fn run_agent(path: PathBuf, config: Arc<Config>) -> Result<()> {
     let identity = identity::load_or_create(&config.key_file())?;
     let mut link = ServerLink::start(&config, &collector::host_name(), identity)?;
     info!(config = %path.display(), "agent started");
 
     // The last good config means monitoring carries on through a server outage.
-    let saved_file = config.saved_config_file();
     let mut monitoring = None;
-    if let Some(update) = saved_config::load(&saved_file) {
-        match Monitoring::start(&update, config.local()) {
-            Ok(started) => {
+    if let Some(update) = saved_config::load(&config.saved_config_file()) {
+        match build_apart(update, &config, false).await {
+            Ok((update, collectors)) => {
                 info!(version = update.version, "using the saved config");
                 link.set_facts_interval(update.config.facts_interval);
-                monitoring = Some(started);
+                let period = update.config.interval;
+                monitoring = Some(Monitoring::new(update.version, collectors, period));
             }
             Err(error) => warn!(error = format!("{error:#}"), "saved config is unusable"),
         }
@@ -340,41 +390,67 @@ async fn run_agent(path: PathBuf, config: Config) -> Result<()> {
     let mut stop = StopSignal::listen().context("listening for being asked to stop")?;
     loop {
         tokio::select! {
-            () = next_tick(&mut monitoring) => {
-                if let Some(active) = &mut monitoring {
-                    link.send_sample(&collect(&mut active.collectors))?;
-                }
-            }
+            Some(sample) = next_sample(&mut monitoring) => link.send_sample(sample)?,
             Some(update) = link.next_config() => {
-                apply(update, config.local(), &mut monitoring, &link, &saved_file)?;
+                apply(update, &config, &mut monitoring, &link).await?;
             }
             result = stop.wait() => {
                 result?;
                 info!("shutting down");
-                link.save_unconfirmed();
+                link.save_unconfirmed().await;
                 return Ok(());
             }
         }
     }
 }
 
-/// Waits forever until there's a config, because only the server says what to do.
-async fn next_tick(monitoring: &mut Option<Monitoring>) {
-    match monitoring {
-        Some(active) => {
-            active.ticker.tick().await;
+/// Collects a sample when one is due, apart from the connection. Waits forever
+/// until there's a config, because only the server says what to do. It can be
+/// stopped at any await and carry on where it was.
+async fn next_sample(monitoring: &mut Option<Monitoring>) -> Option<Sample> {
+    let Some(active) = monitoring else {
+        return std::future::pending().await;
+    };
+    loop {
+        match &mut active.collecting {
+            Collecting::Ready(_) => {
+                active.ticker.tick().await;
+                let ready =
+                    std::mem::replace(&mut active.collecting, Collecting::Ready(Vec::new()));
+                let Collecting::Ready(mut collectors) = ready else {
+                    continue;
+                };
+                active.collecting = Collecting::Away(tokio::task::spawn_blocking(move || {
+                    let sample = collect(&mut collectors);
+                    (collectors, sample)
+                }));
+            }
+            Collecting::Away(task) => {
+                let collected = task.await;
+                match collected {
+                    Ok((collectors, sample)) => {
+                        active.collecting = Collecting::Ready(collectors);
+                        return Some(sample);
+                    }
+                    Err(error) => {
+                        // Collecting catches what a collector does wrong, so this
+                        // leaves nothing to collect with until the next config.
+                        error!(%error, "collecting stopped, waiting for a new config");
+                        *monitoring = None;
+                        return None;
+                    }
+                }
+            }
         }
-        None => std::future::pending().await,
     }
 }
 
 /// Swaps in a new config, or keeps the current one and tells the server why not.
-fn apply(
+async fn apply(
     update: ConfigUpdate,
-    local: Local<'_>,
+    config: &Arc<Config>,
     monitoring: &mut Option<Monitoring>,
     link: &ServerLink,
-    saved_file: &Path,
 ) -> Result<()> {
     let already_running = monitoring
         .as_ref()
@@ -383,25 +459,26 @@ fn apply(
         return link.report_config(&update.version, None);
     }
 
-    match Monitoring::start(&update, local) {
-        Ok(started) => {
+    let version = update.version.clone();
+    match build_apart(update, config, true).await {
+        Ok((update, collectors)) => {
+            let period = update.config.interval;
+            let started = Monitoring::new(update.version.clone(), collectors, period);
             info!(
                 version = update.version,
-                collectors = started.collectors.len(),
-                interval_secs = update.config.interval.as_secs(),
+                collectors = started.collector_count(),
+                interval_secs = period.as_secs(),
                 "config applied"
             );
+            // Anything the old one was still collecting is let go.
             *monitoring = Some(started);
             link.set_facts_interval(update.config.facts_interval);
-            if let Err(error) = saved_config::save(saved_file, &update) {
-                warn!(error = format!("{error:#}"), "saving the config failed");
-            }
             link.report_config(&update.version, None)
         }
         Err(error) => {
             let error = format!("{error:#}");
-            warn!(version = update.version, error, "config rejected");
-            link.report_config(&update.version, Some(error))
+            warn!(version, error, "config rejected");
+            link.report_config(&version, Some(error))
         }
     }
 }
@@ -409,7 +486,7 @@ fn apply(
 /// A collector that fails or panics is logged and skipped so the others still
 /// report, and it gets another chance on the next tick. Rust's panic hook has
 /// already written the panic message and location to stderr.
-fn collect(collectors: &mut [Box<dyn Collector>]) -> Sample {
+fn collect(collectors: &mut [Box<dyn Collector + Send>]) -> Sample {
     let mut metrics = BTreeMap::new();
     for collector in collectors {
         match catch_unwind(AssertUnwindSafe(|| collector.collect())) {
@@ -548,7 +625,7 @@ mod tests {
 
     #[test]
     fn panicking_collector_does_not_stop_the_others() {
-        let mut collectors: Vec<Box<dyn Collector>> = vec![Box::new(Panicking), Box::new(Working)];
+        let mut collectors: Collectors = vec![Box::new(Panicking), Box::new(Working)];
 
         // Twice, because the panicking collector must not break later ticks.
         for _ in 0..2 {
@@ -560,7 +637,7 @@ mod tests {
 
     #[test]
     fn a_collector_with_no_result_yet_is_left_out() {
-        let mut collectors: Vec<Box<dyn Collector>> = vec![Box::new(NothingYet), Box::new(Working)];
+        let mut collectors: Collectors = vec![Box::new(NothingYet), Box::new(Working)];
 
         let sample = collect(&mut collectors);
 
@@ -570,31 +647,80 @@ mod tests {
 
     #[tokio::test]
     async fn the_first_sample_waits_for_a_random_part_of_the_interval() {
-        let config = json!({ "interval_secs": 36_000, "collectors": { "cpu": {} } });
-        let mut started = Monitoring::start(&update("v1", config), Local::none()).unwrap();
+        let mut started = Monitoring::new(
+            "v1".to_string(),
+            vec![Box::new(Working)],
+            Duration::from_secs(36_000),
+        );
 
         let first = timeout(Duration::from_secs(1), started.ticker.tick()).await;
 
         assert!(first.is_err());
     }
 
-    #[tokio::test]
-    async fn a_good_config_starts_its_collectors() {
-        let config = json!({ "collectors": { "cpu": {} } });
-        let started = Monitoring::start(&update("v1", config), Local::none()).unwrap();
+    #[test]
+    fn a_good_config_builds_its_collectors() {
+        let config = update("v1", json!({ "collectors": { "cpu": {} } })).config;
+        let built = build(&config, Local::none()).unwrap();
 
-        assert_eq!(started.version, "v1");
         // What was asked for, and the agent reporting on itself.
-        assert_eq!(started.collectors.len(), 2);
+        assert_eq!(built.len(), 2);
     }
 
-    #[tokio::test]
-    async fn a_bad_config_is_refused() {
+    #[test]
+    fn a_bad_config_is_refused() {
         for config in [
             json!({ "interval_secs": 0 }),
             json!({ "collectors": { "nope": {} } }),
         ] {
-            assert!(Monitoring::start(&update("v1", config), Local::none()).is_err());
+            assert!(build(&update("v1", config).config, Local::none()).is_err());
         }
+    }
+
+    /// Blocks until it's let go, as reading a hung network drive does.
+    struct Stuck(std::sync::Mutex<std::sync::mpsc::Receiver<()>>);
+
+    impl Collector for Stuck {
+        fn name(&self) -> &'static str {
+            "stuck"
+        }
+
+        fn collect(&mut self) -> Result<Value> {
+            self.0.lock().unwrap().recv().ok();
+            Ok(json!(1))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_collector_that_blocks_does_not_hold_up_the_agent() {
+        let (release, stuck) = std::sync::mpsc::channel();
+        let collectors: Collectors = vec![Box::new(Stuck(std::sync::Mutex::new(stuck)))];
+        let mut monitoring = Some(Monitoring::new(
+            "v1".to_string(),
+            collectors,
+            Duration::from_millis(1),
+        ));
+        // Lets it go in the end, so a test that fails doesn't hang.
+        let watchdog_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watchdog = {
+            let (release, fired) = (release.clone(), watchdog_fired.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(60));
+                fired.store(true, std::sync::atomic::Ordering::Relaxed);
+                release.send(()).ok();
+            })
+        };
+        let collecting = tokio::spawn(async move { next_sample(&mut monitoring).await });
+
+        // This test's runtime has one thread, the same as the agent's, so this
+        // only wakes up if collecting left it free.
+        tokio::time::sleep(collector::WARMUP + Duration::from_millis(100)).await;
+        assert!(!watchdog_fired.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!collecting.is_finished());
+
+        release.send(()).unwrap();
+        let sample = collecting.await.unwrap().unwrap();
+        assert_eq!(sample.metrics["stuck"], json!(1));
+        drop(watchdog);
     }
 }

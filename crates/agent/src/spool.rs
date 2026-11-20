@@ -16,20 +16,24 @@ use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, oneshot};
 use tokio::time::{Instant, sleep_until};
+use tokio_tungstenite::tungstenite::Utf8Bytes;
 use tracing::warn;
 
 const EXTENSION: &str = "jsonl";
 
 /// Samples kept in memory. This only fills up if the server stops confirming them,
-/// which moves them to disk, or the disk can't be used, which drops the oldest.
+/// which moves them to disk, or the disk can't be used or keep up, which drops the
+/// oldest.
 const MAX_IN_MEMORY: usize = 64;
 /// How much to keep on disk. A sample is usually a few KB, so this covers at least
 /// a day at the default interval.
@@ -50,6 +54,14 @@ const MAX_SENDS: u32 = 5;
 const LOCK_WAIT: Duration = Duration::from_millis(500);
 const LOCK_RETRY_EVERY: Duration = Duration::from_millis(10);
 
+/// A sample as it's sent, which is cheap to copy, and when it was taken, which is how
+/// the server says which one it means.
+#[derive(Debug, Clone)]
+struct Entry {
+    text: Utf8Bytes,
+    taken_at: DateTime<Utc>,
+}
+
 /// A saved sample that's been sent, to remove it once the server confirms it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SavedPlace {
@@ -58,18 +70,53 @@ struct SavedPlace {
     end: u64,
 }
 
+/// What the disk is doing for the queue. It's only ever used from a thread of its
+/// own, so a slow or stuck disk never holds up the connection to the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disk {
+    Opening,
+    Usable,
+    Unusable,
+}
+
+/// Asks the disk's thread to do something.
+enum Ask {
+    /// Catch up with whatever there is to save or remove.
+    Work,
+    /// Catch up, then call this.
+    Flush(Box<dyn FnOnce() + Send>),
+    Stop,
+}
+
 pub struct Spool {
+    shared: Arc<Shared>,
+    disk: Sender<Ask>,
+    worker: Option<JoinHandle<()>>,
+}
+
+struct Shared {
     state: Mutex<State>,
+    /// Something new to send.
     arrived: Notify,
     backlog_gap: Duration,
     ack_wait: Duration,
 }
 
+/// Only ever held for a moment, and never while the disk is used.
 struct State {
-    memory: VecDeque<String>,
+    memory: VecDeque<Entry>,
     /// How many of the samples in memory have been sent, counting from the oldest.
     unconfirmed: usize,
-    saved: Option<Saved>,
+    disk: Disk,
+    /// Whether the disk's thread has samples it's still saving.
+    saving: bool,
+    /// Saved samples the server has confirmed, or that were given up on, for the
+    /// disk's thread to remove.
+    removals: Vec<SavedPlace>,
+    /// The oldest saved sample, read ahead by the disk's thread.
+    backlog: Option<(Utf8Bytes, SavedPlace)>,
+    /// How much is saved, as the disk's thread last said.
+    saved_bytes: u64,
     /// Goes one at a time, so the backlog only moves as fast as the server takes it.
     saved_unconfirmed: Option<SavedPlace>,
     /// How many times that sample went while the server was confirming others.
@@ -95,17 +142,15 @@ impl Spool {
         ack_wait: Duration,
         lock_wait: Duration,
     ) -> Self {
-        let saved = Saved::open(folder, max_bytes, lock_wait)
-            .inspect_err(|error| {
-                let error = format!("{error:#}");
-                warn!(error, "can't save samples to disk, keeping them in memory");
-            })
-            .ok();
-        Self {
+        let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 memory: VecDeque::new(),
                 unconfirmed: 0,
-                saved,
+                disk: Disk::Opening,
+                saving: false,
+                removals: Vec::new(),
+                backlog: None,
+                saved_bytes: 0,
                 saved_unconfirmed: None,
                 wasted_sends: 0,
                 others_confirmed: false,
@@ -117,29 +162,56 @@ impl Spool {
             arrived: Notify::new(),
             backlog_gap,
             ack_wait,
+        });
+        let (disk, asked) = mpsc::channel();
+        let worker = {
+            let (shared, folder) = (shared.clone(), folder.to_path_buf());
+            std::thread::Builder::new()
+                .name("sample queue".to_string())
+                .spawn(move || use_disk(&shared, &folder, max_bytes, lock_wait, &asked))
+        };
+        let worker = worker
+            .inspect_err(|error| {
+                warn!(%error, "can't save samples to disk, keeping them in memory");
+                shared.state().disk = Disk::Unusable;
+            })
+            .ok();
+        Self {
+            shared,
+            disk,
+            worker,
         }
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        self.shared.state()
     }
 
-    pub fn push(&self, text: String) {
+    fn ask_disk(&self) {
+        // Gone only if the disk can't be used, which leaves nothing for it to do.
+        self.disk.send(Ask::Work).ok();
+    }
+
+    pub fn push(&self, text: String, taken_at: DateTime<Utc>) {
+        let entry = Entry {
+            text: text.into(),
+            taken_at,
+        };
         let mut state = self.state();
-        state.memory.push_back(text);
-        if !state.online || state.memory.len() > MAX_IN_MEMORY {
-            state.save_memory();
+        state.memory.push_back(entry);
+        if state.memory.len() > MAX_IN_MEMORY && !state.can_save() {
+            state.drop_oldest();
         }
-        if state.memory.len() > MAX_IN_MEMORY {
-            state.memory.pop_front();
-            state.unconfirmed = state.unconfirmed.saturating_sub(1);
-            state.note_drops();
-        }
+        let save = state.wants_saving();
         drop(state);
-        self.arrived.notify_one();
+        if save {
+            self.ask_disk();
+        }
+        self.shared.arrived.notify_one();
     }
 
-    /// Going offline puts everything the server hadn't confirmed back in line.
+    /// Going offline puts everything the server hadn't confirmed back in line, and
+    /// saves it.
     pub fn set_online(&self, online: bool) {
         let mut state = self.state();
         state.online = online;
@@ -151,36 +223,45 @@ impl Spool {
             state.saved_unconfirmed = None;
             state.wasted_sends = 0;
             state.backlog_due = Instant::now();
-            state.save_memory();
+            drop(state);
+            self.ask_disk();
+        }
+    }
+
+    /// Waits until everything that was to be saved or removed has been.
+    pub async fn flush(&self) {
+        let (done, flushed) = oneshot::channel();
+        let done = Box::new(move || {
+            done.send(()).ok();
+        });
+        if self.disk.send(Ask::Flush(done)).is_ok() {
+            flushed.await.ok();
         }
     }
 
     /// The next sample to send, which stays here until [`Spool::acked`]. If sending it
     /// fails the connection ends, and that puts it back in line. Live samples come
     /// first, then saved ones when one is due.
-    pub fn next(&self) -> Option<String> {
+    pub fn next(&self) -> Option<Utf8Bytes> {
         let mut state = self.state();
         let unconfirmed = state.unconfirmed;
-        if let Some(text) = state.memory.get(unconfirmed).cloned() {
+        if let Some(entry) = state.memory.get(unconfirmed) {
+            let text = entry.text.clone();
             state.unconfirmed += 1;
             return Some(text);
         }
         if Instant::now() < state.backlog_due {
             return None;
         }
-        state.give_up_on_a_stuck_sample();
-        match state.saved.as_mut()?.oldest() {
-            Ok(Some((text, place))) => {
-                state.saved_unconfirmed = Some(place);
-                state.backlog_due = Instant::now() + self.ack_wait;
-                Some(text)
-            }
-            Ok(None) => None,
-            Err(error) => {
-                state.give_up_on_disk(&error);
-                None
-            }
+        if state.give_up_on_a_stuck_sample() {
+            drop(state);
+            self.ask_disk();
+            return None;
         }
+        let (text, place) = state.backlog.clone()?;
+        state.saved_unconfirmed = Some(place);
+        state.backlog_due = Instant::now() + self.shared.ack_wait;
+        Some(text)
     }
 
     /// The server has stored the sample taken at this time.
@@ -188,11 +269,10 @@ impl Spool {
         let mut state = self.state();
         let place = state.saved_unconfirmed.filter(|p| p.taken_at == taken_at);
         if let Some(place) = place {
-            state.backlog_due = Instant::now() + self.backlog_gap;
+            state.backlog_due = Instant::now() + self.shared.backlog_gap;
             state.remove_saved(place);
             drop(state);
-            // Whatever's waiting was waiting for longer than it needs to now.
-            self.arrived.notify_one();
+            self.ask_disk();
             return;
         }
 
@@ -201,7 +281,7 @@ impl Spool {
             .memory
             .iter()
             .take(sent)
-            .position(|text| sample_time(text) == Some(taken_at));
+            .position(|entry| entry.taken_at == taken_at);
         if let Some(index) = found {
             state.memory.remove(index);
             state.unconfirmed -= 1;
@@ -223,7 +303,7 @@ impl Spool {
 
     #[cfg(test)]
     pub fn saved_bytes(&self) -> u64 {
-        self.state().saved.as_ref().map_or(0, |saved| saved.bytes)
+        self.state().saved_bytes
     }
 
     /// Waits until there's something to send. Only one task may wait.
@@ -234,73 +314,106 @@ impl Spool {
                 if state.memory.len() > state.unconfirmed {
                     return;
                 }
-                state.has_backlog().then_some(state.backlog_due)
+                state.backlog.is_some().then_some(state.backlog_due)
             };
             match backlog_due {
                 Some(due) => tokio::select! {
                     () = sleep_until(due) => return,
-                    () = self.arrived.notified() => {}
+                    () = self.shared.arrived.notified() => {}
                 },
-                None => self.arrived.notified().await,
+                None => self.shared.arrived.notified().await,
             }
         }
     }
 }
 
+impl Drop for Spool {
+    /// Saves what's waiting to be saved, and lets go of the folder.
+    fn drop(&mut self) {
+        self.disk.send(Ask::Stop).ok();
+        if let Some(worker) = self.worker.take() {
+            worker.join().ok();
+        }
+    }
+}
+
+impl Shared {
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 impl State {
-    fn has_backlog(&self) -> bool {
-        self.saved.as_ref().is_some_and(|saved| saved.bytes > 0)
+    /// Whether samples over the limit in memory can go to disk, rather than the
+    /// oldest being dropped: not while the disk is still busy with the last ones.
+    fn can_save(&self) -> bool {
+        self.disk == Disk::Usable && !self.saving
     }
 
-    /// Anything that can't be saved stays in memory.
-    fn save_memory(&mut self) {
-        let Some(saved) = &mut self.saved else {
-            return;
-        };
-        if self.memory.is_empty() {
-            return;
+    fn wants_saving(&self) -> bool {
+        self.disk != Disk::Unusable
+            && !self.memory.is_empty()
+            && (!self.online || self.memory.len() > MAX_IN_MEMORY)
+    }
+
+    /// What's to be saved, which leaves memory as it goes.
+    fn take_for_saving(&mut self) -> Option<Vec<Entry>> {
+        if !self.wants_saving() {
+            return None;
         }
-        match saved.append(self.memory.make_contiguous()) {
-            Ok(dropped) => {
-                self.memory.clear();
-                self.unconfirmed = 0;
-                if dropped {
-                    self.note_drops();
-                }
-            }
-            Err(error) if !self.warned_of_saving => {
-                self.warned_of_saving = true;
-                let error = format!("{error:#}");
-                warn!(error, "saving samples failed, keeping them in memory");
-            }
-            Err(_) => {}
+        self.unconfirmed = 0;
+        self.saving = true;
+        Some(self.memory.drain(..).collect())
+    }
+
+    /// Samples that couldn't be saved stay in memory, behind those sent since, and
+    /// the newest are kept.
+    fn keep_unsaved(&mut self, samples: Vec<Entry>) {
+        let at = self.unconfirmed;
+        for (offset, entry) in samples.into_iter().enumerate() {
+            self.memory.insert(at + offset, entry);
         }
+        while self.memory.len() > MAX_IN_MEMORY {
+            self.drop_oldest();
+        }
+    }
+
+    fn drop_oldest(&mut self) {
+        self.memory.pop_front();
+        self.unconfirmed = self.unconfirmed.saturating_sub(1);
+        self.note_drops();
     }
 
     fn remove_saved(&mut self, place: SavedPlace) {
         self.saved_unconfirmed = None;
         self.wasted_sends = 0;
         self.others_confirmed = false;
-        if let Some(saved) = &mut self.saved
-            && let Err(error) = saved.remove_through(place.file, place.end)
+        if self
+            .backlog
+            .as_ref()
+            .is_some_and(|(_, ahead)| *ahead == place)
         {
-            self.give_up_on_disk(&error);
+            self.backlog = None;
         }
+        self.removals.push(place);
     }
 
     /// Called when a saved sample is due to go again, having gone unconfirmed.
-    fn give_up_on_a_stuck_sample(&mut self) {
+    /// Returns whether it was given up on.
+    fn give_up_on_a_stuck_sample(&mut self) -> bool {
         let Some(place) = self.saved_unconfirmed else {
-            return;
+            return false;
         };
         if self.others_confirmed {
             self.wasted_sends += 1;
             self.others_confirmed = false;
         }
-        if self.wasted_sends >= MAX_SENDS {
-            warn!("the server keeps refusing a saved sample, skipping it");
-            self.remove_saved(place);
+        if self.wasted_sends < MAX_SENDS {
+            return false;
         }
+        warn!("the server keeps refusing a saved sample, skipping it");
+        self.remove_saved(place);
+        true
     }
 
     fn note_drops(&mut self) {
@@ -309,16 +422,124 @@ impl State {
             warn!("the sample queue is full, dropping the oldest samples");
         }
     }
+}
 
-    /// Files that can't be read or updated would send the same sample forever.
-    fn give_up_on_disk(&mut self, error: &anyhow::Error) {
-        let error = format!("{error:#}");
-        warn!(
-            error,
-            "reading saved samples failed, keeping them in memory"
-        );
-        self.saved = None;
+/// The disk's thread: it saves samples, removes the ones that went, and reads the
+/// oldest ahead, for as long as the queue is open.
+fn use_disk(
+    shared: &Shared,
+    folder: &Path,
+    max_bytes: u64,
+    lock_wait: Duration,
+    asked: &Receiver<Ask>,
+) {
+    let mut saved = match Saved::open(folder, max_bytes, lock_wait) {
+        Ok(saved) => {
+            shared.state().disk = Disk::Usable;
+            Some(saved)
+        }
+        Err(error) => {
+            let error = format!("{error:#}");
+            warn!(error, "can't save samples to disk, keeping them in memory");
+            shared.state().disk = Disk::Unusable;
+            None
+        }
+    };
+    loop {
+        if let Some(disk) = &mut saved
+            && let Err(error) = catch_up(shared, disk)
+        {
+            give_up_on_disk(shared, &error);
+            saved = None;
+        }
+        match asked.recv() {
+            Ok(Ask::Work) => {}
+            Ok(Ask::Flush(done)) => {
+                if let Some(disk) = &mut saved
+                    && let Err(error) = catch_up(shared, disk)
+                {
+                    give_up_on_disk(shared, &error);
+                    saved = None;
+                }
+                done();
+            }
+            Ok(Ask::Stop) | Err(_) => {
+                if let Some(disk) = &mut saved
+                    && let Err(error) = catch_up(shared, disk)
+                {
+                    give_up_on_disk(shared, &error);
+                }
+                return;
+            }
+        }
     }
+}
+
+/// Saves and removes whatever's waiting, then reads the oldest sample ahead. An
+/// error means the files can't be read or updated, which would send the same sample
+/// forever.
+fn catch_up(shared: &Shared, saved: &mut Saved) -> Result<()> {
+    loop {
+        let (removals, samples) = {
+            let mut state = shared.state();
+            (std::mem::take(&mut state.removals), state.take_for_saving())
+        };
+        if removals.is_empty() && samples.is_none() {
+            break;
+        }
+        for place in removals {
+            saved.remove_through(place.file, place.end)?;
+        }
+        let Some(samples) = samples else { continue };
+        let appended = saved.append(&samples);
+        let mut state = shared.state();
+        state.saving = false;
+        match appended {
+            Ok(dropped) => {
+                if dropped {
+                    state.note_drops();
+                    // What was read ahead may have gone with them.
+                    state.backlog = None;
+                }
+            }
+            Err(error) => {
+                state.keep_unsaved(samples);
+                if !state.warned_of_saving {
+                    state.warned_of_saving = true;
+                    let error = format!("{error:#}");
+                    warn!(error, "saving samples failed, keeping them in memory");
+                }
+                // Tried again with the next sample, rather than at once.
+                break;
+            }
+        }
+    }
+
+    let needs_reading = shared.state().backlog.is_none();
+    let oldest = if needs_reading { saved.oldest()? } else { None };
+    let mut state = shared.state();
+    state.saved_bytes = saved.bytes;
+    if let Some((text, place)) = oldest {
+        state.backlog = Some((text.into(), place));
+    }
+    drop(state);
+    shared.arrived.notify_one();
+    Ok(())
+}
+
+fn give_up_on_disk(shared: &Shared, error: &anyhow::Error) {
+    let error = format!("{error:#}");
+    warn!(
+        error,
+        "reading saved samples failed, keeping them in memory"
+    );
+    let mut state = shared.state();
+    state.disk = Disk::Unusable;
+    state.saving = false;
+    state.backlog = None;
+    state.saved_unconfirmed = None;
+    state.removals.clear();
+    state.saved_bytes = 0;
 }
 
 #[derive(Clone, Copy)]
@@ -387,8 +608,11 @@ impl Saved {
 
     /// Saves samples, deleting the oldest file to stay in the limit, and returns
     /// whether it did.
-    fn append(&mut self, samples: &[String]) -> Result<bool> {
-        let lines: String = samples.iter().map(|text| format!("{text}\n")).collect();
+    fn append(&mut self, samples: &[Entry]) -> Result<bool> {
+        let lines: String = samples
+            .iter()
+            .map(|entry| format!("{}\n", entry.text.as_str()))
+            .collect();
 
         let full = self
             .files
@@ -404,8 +628,12 @@ impl Saved {
             .and_then(|()| writer.sync_data())
         {
             // The samples stay in memory to be saved again, so they mustn't stay
-            // here too. If this fails as well, the next write goes to a new file.
-            writer.set_len(start).ok();
+            // here too. Cut back, the file takes them next time. If even that
+            // fails, what's left of them is a line cut short, which the next
+            // samples mustn't follow, so they go to a new file.
+            if writer.set_len(start).is_ok() && writer.seek(SeekFrom::Start(start)).is_ok() {
+                self.writer = Some(writer);
+            }
             return Err(error).context("writing saved samples");
         }
         self.writer = Some(writer);
@@ -597,23 +825,41 @@ mod tests {
         limited(folder, MAX_SAVED_BYTES)
     }
 
+    /// Opened, once the disk's thread has caught up.
+    fn opened(spool: Spool) -> Spool {
+        settle(&spool);
+        spool
+    }
+
     fn limited(folder: &Path, max_bytes: u64) -> Spool {
-        Spool::with_limits(folder, max_bytes, Duration::ZERO, ACK_WAIT, LOCK_WAIT)
+        opened(Spool::with_limits(
+            folder,
+            max_bytes,
+            Duration::ZERO,
+            ACK_WAIT,
+            LOCK_WAIT,
+        ))
     }
 
     fn paced(folder: &Path, gap: Duration) -> Spool {
-        Spool::with_limits(folder, MAX_SAVED_BYTES, gap, ACK_WAIT, LOCK_WAIT)
+        opened(Spool::with_limits(
+            folder,
+            MAX_SAVED_BYTES,
+            gap,
+            ACK_WAIT,
+            LOCK_WAIT,
+        ))
     }
 
     /// Sends saved samples again as soon as asked for them.
     fn impatient(folder: &Path) -> Spool {
-        Spool::with_limits(
+        opened(Spool::with_limits(
             folder,
             MAX_SAVED_BYTES,
             Duration::ZERO,
             Duration::ZERO,
             LOCK_WAIT,
-        )
+        ))
     }
 
     /// The moment `number` milliseconds after 1970, which tells samples apart here.
@@ -627,10 +873,26 @@ mod tests {
         format!(r#"{{"time":"{time}"}}"#)
     }
 
+    /// Waits for the disk's thread to catch up, as it would in its own time.
+    fn settle(spool: &Spool) {
+        let (done, flushed) = std::sync::mpsc::channel();
+        let done = Box::new(move || done.send(()).unwrap());
+        spool.disk.send(Ask::Flush(done)).unwrap();
+        flushed.recv().unwrap();
+    }
+
+    /// The next sample to send, once the disk's thread has caught up.
+    fn next(spool: &Spool) -> Option<String> {
+        settle(spool);
+        spool.next().map(|text| text.to_string())
+    }
+
     /// Takes the next sample and has the server confirm it, and says which it was.
     fn deliver(spool: &Spool) -> Option<u64> {
-        let time = sample_time(&spool.next()?).unwrap();
+        settle(spool);
+        let time = sample_time(&next(spool)?).unwrap();
         spool.acked(time);
+        settle(spool);
         u64::try_from(time.timestamp_millis()).ok()
     }
 
@@ -658,23 +920,27 @@ mod tests {
         let (_parent, path) = folder();
         let spool = unpaced(&path);
         for time in 1..=3 {
-            spool.push(sample(time));
+            spool.push(sample(time), at(time));
+            settle(&spool);
         }
 
         assert_eq!(drain(&spool), ["1", "2", "3"]);
-        assert!(spool.next().is_none());
+        assert!(next(&spool).is_none());
     }
 
     #[test]
     fn samples_saved_while_disconnected_survive_a_restart() {
         let (_parent, path) = folder();
         let spool = unpaced(&path);
-        spool.push(sample(1));
-        spool.push(sample(2));
+        spool.push(sample(1), at(1));
+        settle(&spool);
+        spool.push(sample(2), at(2));
+        settle(&spool);
         drop(spool);
 
         let spool = unpaced(&path);
-        spool.push(sample(3));
+        spool.push(sample(3), at(3));
+        settle(&spool);
 
         assert_eq!(drain(&spool), ["1", "2", "3"]);
     }
@@ -685,7 +951,9 @@ mod tests {
         let spool = unpaced(&path);
         spool.set_online(true);
 
-        spool.push(sample(1));
+        spool.push(sample(1), at(1));
+
+        settle(&spool);
 
         assert!(files_in(&path).is_empty());
         assert_eq!(drain(&spool), ["1"]);
@@ -696,9 +964,12 @@ mod tests {
         let (_parent, path) = folder();
         let spool = unpaced(&path);
         spool.set_online(true);
-        spool.push(sample(1));
+        spool.push(sample(1), at(1));
+        settle(&spool);
 
         spool.set_online(false);
+
+        settle(&spool);
         drop(spool);
 
         assert_eq!(drain(&unpaced(&path)), ["1"]);
@@ -708,9 +979,11 @@ mod tests {
     fn live_samples_go_before_the_backlog() {
         let (_parent, path) = folder();
         let spool = unpaced(&path);
-        spool.push(sample(1));
+        spool.push(sample(1), at(1));
+        settle(&spool);
         spool.set_online(true);
-        spool.push(sample(2));
+        spool.push(sample(2), at(2));
+        settle(&spool);
 
         assert_eq!(drain(&spool), ["2", "1"]);
     }
@@ -721,13 +994,15 @@ mod tests {
         let (_parent, path) = folder();
         let gap = Duration::from_millis(200);
         let spool = paced(&path, gap);
-        spool.push(sample(1));
-        spool.push(sample(2));
+        spool.push(sample(1), at(1));
+        settle(&spool);
+        spool.push(sample(2), at(2));
+        settle(&spool);
         spool.set_online(true);
 
         assert_eq!(deliver(&spool), Some(1));
         let sent = Instant::now();
-        assert!(spool.next().is_none(), "the next one isn't due yet");
+        assert!(next(&spool).is_none(), "the next one isn't due yet");
 
         spool.wait().await;
 
@@ -739,8 +1014,10 @@ mod tests {
     async fn live_samples_do_not_wait_for_the_backlog_pace() {
         let (_parent, path) = folder();
         let spool = std::sync::Arc::new(paced(&path, Duration::from_secs(3600)));
-        spool.push(sample(1));
-        spool.push(sample(2));
+        spool.push(sample(1), at(1));
+        settle(&spool);
+        spool.push(sample(2), at(2));
+        settle(&spool);
         spool.set_online(true);
         deliver(&spool);
         let waiting = tokio::spawn({
@@ -749,7 +1026,8 @@ mod tests {
         });
 
         tokio::task::yield_now().await;
-        spool.push(sample(3));
+        spool.push(sample(3), at(3));
+        settle(&spool);
 
         timeout(Duration::from_secs(5), waiting)
             .await
@@ -763,12 +1041,15 @@ mod tests {
         let (_parent, path) = folder();
         let spool = unpaced(&path);
         spool.set_online(true);
-        spool.push(sample(1));
+        spool.push(sample(1), at(1));
+        settle(&spool);
 
-        assert_eq!(spool.next(), Some(sample(1)));
-        assert_eq!(spool.next(), None, "it's waiting to hear back");
+        assert_eq!(next(&spool), Some(sample(1)));
+        assert_eq!(next(&spool), None, "it's waiting to hear back");
 
         spool.set_online(false);
+
+        settle(&spool);
         assert_eq!(drain(&spool), ["1"], "the connection went before it did");
     }
 
@@ -777,13 +1058,16 @@ mod tests {
         let (_parent, path) = folder();
         let spool = unpaced(&path);
         spool.set_online(true);
-        spool.push(sample(1));
-        spool.next();
+        spool.push(sample(1), at(1));
+        settle(&spool);
+        next(&spool);
 
         spool.acked(at(1));
 
         spool.set_online(false);
-        assert!(spool.next().is_none());
+
+        settle(&spool);
+        assert!(next(&spool).is_none());
         assert!(files_in(&path).is_empty());
     }
 
@@ -793,12 +1077,14 @@ mod tests {
         let spool = unpaced(&path);
         spool.set_online(true);
         for time in 1..=3 {
-            spool.push(sample(time));
-            spool.next();
+            spool.push(sample(time), at(time));
+            settle(&spool);
+            next(&spool);
         }
 
         spool.acked(at(2));
         spool.set_online(false);
+        settle(&spool);
 
         assert_eq!(drain(&spool), ["1", "3"]);
     }
@@ -808,11 +1094,13 @@ mod tests {
         let (_parent, path) = folder();
         let spool = unpaced(&path);
         spool.set_online(true);
-        spool.push(sample(1));
-        spool.next();
+        spool.push(sample(1), at(1));
+        settle(&spool);
+        next(&spool);
 
         spool.acked(at(99));
         spool.set_online(false);
+        settle(&spool);
 
         assert_eq!(drain(&spool), ["1"]);
     }
@@ -821,9 +1109,10 @@ mod tests {
     fn a_saved_sample_survives_a_restart_until_it_is_confirmed() {
         let (_parent, path) = folder();
         let spool = unpaced(&path);
-        spool.push(sample(1));
+        spool.push(sample(1), at(1));
+        settle(&spool);
         spool.set_online(true);
-        assert_eq!(spool.next(), Some(sample(1)));
+        assert_eq!(next(&spool), Some(sample(1)));
         drop(spool);
 
         assert_eq!(drain(&unpaced(&path)), ["1"]);
@@ -833,40 +1122,44 @@ mod tests {
     fn the_backlog_waits_for_each_sample_to_be_confirmed() {
         let (_parent, path) = folder();
         let spool = unpaced(&path);
-        spool.push(sample(1));
-        spool.push(sample(2));
+        spool.push(sample(1), at(1));
+        settle(&spool);
+        spool.push(sample(2), at(2));
+        settle(&spool);
         spool.set_online(true);
 
-        assert_eq!(spool.next(), Some(sample(1)));
-        assert_eq!(spool.next(), None);
+        assert_eq!(next(&spool), Some(sample(1)));
+        assert_eq!(next(&spool), None);
 
         spool.acked(at(1));
-        assert_eq!(spool.next(), Some(sample(2)));
+        assert_eq!(next(&spool), Some(sample(2)));
     }
 
     #[test]
     fn a_saved_sample_goes_again_if_nothing_is_heard() {
         let (_parent, path) = folder();
         let spool = impatient(&path);
-        spool.push(sample(1));
+        spool.push(sample(1), at(1));
+        settle(&spool);
         spool.set_online(true);
 
-        assert_eq!(spool.next(), Some(sample(1)));
-        assert_eq!(spool.next(), Some(sample(1)));
+        assert_eq!(next(&spool), Some(sample(1)));
+        assert_eq!(next(&spool), Some(sample(1)));
 
         spool.acked(at(1));
-        assert_eq!(spool.next(), None);
+        assert_eq!(next(&spool), None);
     }
 
     #[test]
     fn a_server_confirming_nothing_never_uses_up_a_saved_samples_tries() {
         let (_parent, path) = folder();
         let spool = impatient(&path);
-        spool.push(sample(1));
+        spool.push(sample(1), at(1));
+        settle(&spool);
         spool.set_online(true);
 
         for _ in 0..MAX_SENDS * 3 {
-            assert_eq!(spool.next(), Some(sample(1)));
+            assert_eq!(next(&spool), Some(sample(1)));
         }
     }
 
@@ -874,17 +1167,22 @@ mod tests {
     fn a_saved_sample_the_server_will_not_take_stops_blocking_the_rest() {
         let (_parent, path) = folder();
         let spool = impatient(&path);
-        spool.push(sample(1));
-        spool.push(sample(2));
+        spool.push(sample(1), at(1));
+        settle(&spool);
+        spool.push(sample(2), at(2));
+        settle(&spool);
         spool.set_online(true);
 
         for live in 0..MAX_SENDS as u64 {
-            assert_eq!(spool.next(), Some(sample(1)));
-            spool.push(sample(100 + live));
+            assert_eq!(next(&spool), Some(sample(1)));
+            spool.push(sample(100 + live), at(100 + live));
+            settle(&spool);
             assert_eq!(deliver(&spool), Some(100 + live));
         }
 
-        assert_eq!(spool.next(), Some(sample(2)));
+        // It's given up on, and the next is read while the connection carries on.
+        assert_eq!(next(&spool), None);
+        assert_eq!(next(&spool), Some(sample(2)));
     }
 
     #[test]
@@ -894,12 +1192,14 @@ mod tests {
         spool.set_online(true);
         let total = MAX_IN_MEMORY as u64 + 1;
         for time in 0..total {
-            spool.push(sample(time));
-            spool.next();
+            spool.push(sample(time), at(time));
+            settle(&spool);
+            next(&spool);
         }
 
         assert!(spool.saved_bytes() > 0);
         spool.set_online(false);
+        settle(&spool);
         assert_eq!(drain(&spool).len() as u64, total, "none were dropped");
     }
 
@@ -908,7 +1208,8 @@ mod tests {
         let (_parent, path) = folder();
         let spool = limited(&path, 80);
         for number in 0..10 {
-            spool.push(sample(10_000_000 + number));
+            spool.push(sample(10_000_000 + number), at(10_000_000 + number));
+            settle(&spool);
         }
 
         assert_eq!(drain(&spool), ["10000008", "10000009"]);
@@ -918,12 +1219,15 @@ mod tests {
     fn the_limit_counts_samples_saved_before_a_restart() {
         let (_parent, path) = folder();
         let spool = limited(&path, 80);
-        spool.push(sample(10000000));
-        spool.push(sample(10000001));
+        spool.push(sample(10000000), at(10000000));
+        settle(&spool);
+        spool.push(sample(10000001), at(10000001));
+        settle(&spool);
         drop(spool);
 
         let spool = limited(&path, 80);
-        spool.push(sample(10000002));
+        spool.push(sample(10000002), at(10000002));
+        settle(&spool);
 
         assert_eq!(drain(&spool), ["10000001", "10000002"]);
     }
@@ -932,11 +1236,15 @@ mod tests {
     fn sending_a_backlog_frees_its_space() {
         let (_parent, path) = folder();
         let spool = limited(&path, 80);
-        spool.push(sample(10000000));
+        spool.push(sample(10000000), at(10000000));
+        settle(&spool);
         drain(&spool);
 
-        spool.push(sample(10000001));
-        spool.push(sample(10000002));
+        spool.push(sample(10000001), at(10000001));
+
+        settle(&spool);
+        spool.push(sample(10000002), at(10000002));
+        settle(&spool);
 
         assert_eq!(drain(&spool), ["10000001", "10000002"]);
     }
@@ -947,7 +1255,9 @@ mod tests {
         let spool = limited(&path, 1_000_000);
         for time in 0..5 {
             let padding = "x".repeat(100_000);
-            spool.push(serde_json::json!({ "time": at(time), "padding": padding }).to_string());
+            let text = serde_json::json!({ "time": at(time), "padding": padding }).to_string();
+            spool.push(text, at(time));
+            settle(&spool);
         }
         assert!(files_in(&path).len() > 1);
 
@@ -961,7 +1271,8 @@ mod tests {
         let (_parent, path) = folder();
         let spool = unpaced(&path);
         for number in 0..100 {
-            spool.push(sample(number));
+            spool.push(sample(number), at(number));
+            settle(&spool);
         }
         for _ in 0..50 {
             deliver(&spool);
@@ -979,10 +1290,14 @@ mod tests {
         let (_parent, path) = folder();
         std::fs::write(&path, "a file where the folder should be").unwrap();
         let spool = unpaced(&path);
-        assert!(spool.state().saved.is_none());
+        settle(&spool);
+        assert_eq!(spool.state().disk, Disk::Unusable);
 
-        spool.push(sample(1));
+        spool.push(sample(1), at(1));
+
+        settle(&spool);
         spool.set_online(false);
+        settle(&spool);
 
         assert_eq!(drain(&spool), ["1"]);
     }
@@ -991,11 +1306,13 @@ mod tests {
     fn a_file_another_agent_has_open_falls_back_to_memory() {
         let (_parent, path) = folder();
         let first = unpaced(&path);
-        first.push(sample(1));
+        first.push(sample(1), at(1));
+        settle(&first);
 
         let second = unpaced(&path);
 
-        assert!(second.state().saved.is_none());
+        settle(&second);
+        assert_eq!(second.state().disk, Disk::Unusable);
         assert_eq!(drain(&first), ["1"]);
     }
 
@@ -1003,7 +1320,8 @@ mod tests {
     fn a_lock_let_go_a_moment_later_is_still_taken() {
         let (_parent, path) = folder();
         let first = unpaced(&path);
-        first.push(sample(1));
+        first.push(sample(1), at(1));
+        settle(&first);
 
         let handover = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
@@ -1020,8 +1338,37 @@ mod tests {
         );
         handover.join().unwrap();
 
-        assert!(second.state().saved.is_some());
+        settle(&second);
+        assert_eq!(second.state().disk, Disk::Usable);
         assert_eq!(drain(&second), ["1"]);
+    }
+
+    #[test]
+    fn a_disk_that_is_slow_to_answer_never_holds_up_sending() {
+        let (_parent, path) = folder();
+        let first = unpaced(&path);
+        // Its disk's thread waits for the folder until the first lets go, as one
+        // waits for a hung drive.
+        let second = Spool::with_limits(
+            &path,
+            MAX_SAVED_BYTES,
+            Duration::ZERO,
+            ACK_WAIT,
+            Duration::from_secs(600),
+        );
+
+        let started = std::time::Instant::now();
+        second.push(sample(1), at(1));
+        second.set_online(false);
+        second.set_online(true);
+        assert_eq!(second.next().as_deref(), Some(sample(1).as_str()));
+        second.acked(at(1));
+        // Well short of the wait, however busy the host.
+        assert!(started.elapsed() < Duration::from_secs(60));
+
+        drop(first);
+        settle(&second);
+        assert_eq!(second.state().disk, Disk::Usable);
     }
 
     #[test]
@@ -1030,7 +1377,8 @@ mod tests {
         std::fs::write(&path, "a file where the folder should be").unwrap();
         let spool = unpaced(&path);
         for number in 0..MAX_IN_MEMORY + 3 {
-            spool.push(sample(number as u64));
+            spool.push(sample(number as u64), at(number as u64));
+            settle(&spool);
         }
 
         let kept = drain(&spool);
@@ -1043,12 +1391,14 @@ mod tests {
     fn a_line_cut_short_by_a_crash_is_skipped() {
         let (_parent, path) = folder();
         let spool = unpaced(&path);
-        spool.push(sample(1));
+        spool.push(sample(1), at(1));
+        settle(&spool);
         drop(spool);
         add_to_file(&files_in(&path)[0], b"{\"cut sho");
 
         let spool = unpaced(&path);
-        spool.push(sample(2));
+        spool.push(sample(2), at(2));
+        settle(&spool);
 
         assert_eq!(drain(&spool), ["1", "2"]);
         assert!(files_in(&path).is_empty());
@@ -1058,7 +1408,8 @@ mod tests {
     fn damaged_lines_are_skipped() {
         let (_parent, path) = folder();
         let spool = unpaced(&path);
-        spool.push(sample(1));
+        spool.push(sample(1), at(1));
+        settle(&spool);
         drop(spool);
         let damage = b"{\"cut\n\0\0\0\n\xff\xfe\n";
         add_to_file(
@@ -1075,7 +1426,8 @@ mod tests {
     fn samples_without_a_time_are_skipped() {
         let (_parent, path) = folder();
         let spool = unpaced(&path);
-        spool.push(sample(1));
+        spool.push(sample(1), at(1));
+        settle(&spool);
         drop(spool);
         let older = format!("{{\"timestamp_ms\":2}}\n{}\n", sample(3));
         add_to_file(&files_in(&path)[0], older.as_bytes());
@@ -1089,13 +1441,14 @@ mod tests {
     fn nothing_is_left_waiting_when_only_damage_remains() {
         let (_parent, path) = folder();
         let spool = unpaced(&path);
-        spool.push(sample(1));
+        spool.push(sample(1), at(1));
+        settle(&spool);
         drop(spool);
         std::fs::write(&files_in(&path)[0], b"{\"cut\n{\"short").unwrap();
 
         let spool = unpaced(&path);
 
-        assert!(spool.next().is_none());
+        assert!(next(&spool).is_none());
         assert_eq!(spool.saved_bytes(), 0);
         assert!(files_in(&path).is_empty());
     }
@@ -1104,8 +1457,10 @@ mod tests {
     fn a_damaged_position_sends_the_oldest_file_again() {
         let (_parent, path) = folder();
         let spool = unpaced(&path);
-        spool.push(sample(1));
-        spool.push(sample(2));
+        spool.push(sample(1), at(1));
+        settle(&spool);
+        spool.push(sample(2), at(2));
+        settle(&spool);
         deliver(&spool);
         drop(spool);
         std::fs::write(path.join("position"), "not a position").unwrap();
@@ -1117,13 +1472,16 @@ mod tests {
     fn an_old_position_does_not_apply_to_a_new_file() {
         let (_parent, path) = folder();
         let spool = unpaced(&path);
-        spool.push(sample(1000));
+        spool.push(sample(1000), at(1000));
+        settle(&spool);
         drain(&spool);
         drop(spool);
 
         let spool = unpaced(&path);
-        spool.push(sample(2000));
-        spool.push(sample(3000));
+        spool.push(sample(2000), at(2000));
+        settle(&spool);
+        spool.push(sample(3000), at(3000));
+        settle(&spool);
         drop(spool);
 
         assert_eq!(drain(&unpaced(&path)), ["2000", "3000"]);
@@ -1134,11 +1492,13 @@ mod tests {
         let (_parent, path) = folder();
         let spool = limited(&path, 2000);
         for number in 0..30 {
-            spool.push(sample(1000 + number));
+            spool.push(sample(1000 + number), at(1000 + number));
+            settle(&spool);
         }
         drop(spool);
         let spool = limited(&path, 2000);
-        spool.push(sample(2000));
+        spool.push(sample(2000), at(2000));
+        settle(&spool);
 
         let expected: Vec<String> = (1000..1030).chain([2000]).map(|n| n.to_string()).collect();
         assert!(files_in(&path).len() > 2);
@@ -1149,11 +1509,15 @@ mod tests {
     fn samples_saved_part_way_through_a_backlog_are_kept() {
         let (_parent, path) = folder();
         let spool = unpaced(&path);
-        spool.push(sample(1));
-        spool.push(sample(2));
+        spool.push(sample(1), at(1));
+        settle(&spool);
+        spool.push(sample(2), at(2));
+        settle(&spool);
         deliver(&spool);
 
-        spool.push(sample(3));
+        spool.push(sample(3), at(3));
+
+        settle(&spool);
 
         assert_eq!(drain(&spool), ["2", "3"]);
     }
@@ -1162,8 +1526,10 @@ mod tests {
     fn samples_are_saved_one_per_line() {
         let (_parent, path) = folder();
         let spool = unpaced(&path);
-        spool.push(sample(1));
-        spool.push(sample(2));
+        spool.push(sample(1), at(1));
+        settle(&spool);
+        spool.push(sample(2), at(2));
+        settle(&spool);
 
         let text = std::fs::read_to_string(&files_in(&path)[0]).unwrap();
 
@@ -1180,7 +1546,8 @@ mod tests {
         });
 
         tokio::task::yield_now().await;
-        spool.push(sample(1));
+        spool.push(sample(1), at(1));
+        settle(&spool);
 
         timeout(Duration::from_secs(5), waiting)
             .await
@@ -1191,7 +1558,7 @@ mod tests {
     #[tokio::test]
     async fn waiting_ends_at_once_for_samples_saved_earlier() {
         let (_parent, path) = folder();
-        unpaced(&path).push(sample(1));
+        unpaced(&path).push(sample(1), at(1));
 
         let spool = unpaced(&path);
 

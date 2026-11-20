@@ -84,7 +84,7 @@ impl Local<'static> {
 }
 
 /// Builds everything a config turns on.
-pub fn build_all(config: &AgentConfig, local: Local<'_>) -> Result<Vec<Box<dyn Collector>>> {
+pub fn build_all(config: &AgentConfig, local: Local<'_>) -> Result<Vec<Box<dyn Collector + Send>>> {
     let enabled = |name: &str| {
         config
             .collectors
@@ -129,7 +129,7 @@ fn build(
     local: Local<'_>,
     interval: Duration,
     processes: &mut Processes,
-) -> Result<Box<dyn Collector>> {
+) -> Result<Box<dyn Collector + Send>> {
     Ok(match name {
         "host" => Box::new(HostCollector),
         "cpu" => Box::new(CpuCollector::new()?),
@@ -199,7 +199,7 @@ fn status_pages(
     software: Software,
     config: &CollectorSettings,
     interval: Duration,
-) -> Result<Box<dyn Collector>> {
+) -> Result<Box<dyn Collector + Send>> {
     let urls = config.urls.clone().unwrap_or_default();
     Ok(Box::new(StatusPageCollector::new(
         software, urls, interval,
