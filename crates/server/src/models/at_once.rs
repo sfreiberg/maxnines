@@ -17,12 +17,15 @@ use tokio::task::JoinHandle;
 
 use super::alerting::{HELD, PENDING, queue_for_live_channels};
 use super::{Database, alert, alert_rule, alert_rule_channel, api_key, notification};
-use super::{UserChange, notification_channel, user};
+use super::{UserChange, host_fact, notification_channel, user};
 use crate::alerting::{
     AlertRuleInput, ChannelInput, ChannelKind, Event, NewAlert, RuleKind, Severity, every_severity,
 };
+use crate::facts::FlatFacts;
+use crate::registration::{HostKind, HostRecord, HostState};
 use crate::roles::Role;
 use crate::times::Timestamp;
+use serde_json::json;
 
 fn webhook() -> ChannelInput {
     ChannelInput {
@@ -429,4 +432,59 @@ async fn a_key_revoked_twice_at_once_keeps_the_first_time() {
 
     let keys = database.list_api_keys().await.unwrap();
     assert_eq!(keys[0].revoked_at, Some(then));
+}
+
+#[tokio::test]
+async fn facts_saved_twice_at_once_keep_one_current_value() {
+    let Some(database) = several_connections().await else {
+        return;
+    };
+    let now = crate::times::now();
+    let host = HostRecord {
+        kind: HostKind::Agent,
+        id: "web".to_string(),
+        public_key: Some("ab".repeat(32)),
+        hostname: "web-1".to_string(),
+        state: HostState::Approved,
+        decided_by: None,
+        first_seen_at: now,
+        decided_at: None,
+    };
+    database.save_host(&host).await.unwrap();
+    let facts = |value: &str| FlatFacts::from([("os.name".to_string(), json!(value))]);
+    database
+        .record_facts("web", &facts("a"), now)
+        .await
+        .unwrap();
+
+    // One connection is saving "b", as recording facts would once it had read them.
+    let saving = database.connection().begin().await.unwrap();
+    host_fact::Entity::update_many()
+        .col_expr(host_fact::Column::ValidTo, Expr::value(now))
+        .filter(host_fact::Column::HostId.eq("web"))
+        .exec(&saving)
+        .await
+        .unwrap();
+    host_fact::Entity::insert(host_fact::ActiveModel {
+        host_id: sea_orm::Set("web".to_string()),
+        name: sea_orm::Set("os.name".to_string()),
+        value: sea_orm::Set("b".to_string()),
+        value_type: sea_orm::Set("string".to_string()),
+        valid_from: sea_orm::Set(now),
+        valid_to: sea_orm::Set(None),
+        ..Default::default()
+    })
+    .exec(&saving)
+    .await
+    .unwrap();
+    let other = database.clone();
+    let task = tokio::spawn(async move { other.record_facts("web", &facts("c"), now).await });
+    until_done_or_waiting(&database, &task).await;
+    saving.commit().await.unwrap();
+
+    // The second is refused, and tried again with the agent's next facts.
+    assert!(task.await.unwrap().is_err());
+    let current = database.current_facts("web").await.unwrap();
+    assert_eq!(current.len(), 1, "{current:?}");
+    assert_eq!(current[0].value, json!("b"));
 }

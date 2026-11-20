@@ -53,9 +53,9 @@ mod user;
 mod user_session;
 mod users;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -70,7 +70,7 @@ use sea_orm::{
 use sea_orm_migration::MigratorTrait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 pub use self::app_sign_ins::{AppSignIn, AppTokens, Refreshed};
 use self::audit::record_change;
@@ -151,9 +151,49 @@ pub struct ConfigStatus {
 #[derive(Clone)]
 pub struct Database {
     connection: DatabaseConnection,
-    /// Two connections using one agent key must not both update its facts,
-    /// or a fact could end up with two current values.
-    facts_lock: Arc<Mutex<()>>,
+    /// Two connections using one agent's key mustn't both update its facts at once,
+    /// or each would close the same facts and add its own.
+    facts_locks: FactLocks,
+}
+
+/// A lock for each host whose facts are being saved, kept only while they are.
+#[derive(Clone, Default)]
+struct FactLocks(Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>>);
+
+impl FactLocks {
+    fn locks(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Mutex<()>>>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Waits for anything else saving this host's facts, then holds them until dropped.
+    async fn lock(&self, host_id: &str) -> FactLock {
+        let host = self.locks().entry(host_id.to_string()).or_default().clone();
+        FactLock {
+            locks: self.clone(),
+            host_id: host_id.to_string(),
+            held: Some(host.lock_owned().await),
+        }
+    }
+}
+
+struct FactLock {
+    locks: FactLocks,
+    host_id: String,
+    held: Option<OwnedMutexGuard<()>>,
+}
+
+impl Drop for FactLock {
+    /// Forgets the host's lock once nobody else holds or waits for it.
+    fn drop(&mut self) {
+        let mut locks = self.locks.locks();
+        self.held.take();
+        if locks
+            .get(&self.host_id)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            locks.remove(&self.host_id);
+        }
+    }
 }
 
 impl Database {
@@ -196,7 +236,7 @@ impl Database {
             .context("updating the database schema")?;
         Ok(Self {
             connection,
-            facts_lock: Arc::default(),
+            facts_locks: FactLocks::default(),
         })
     }
 
@@ -263,7 +303,7 @@ impl Database {
     /// about it alone and a place on the map made for it alone, which only name it in
     /// a filter. All or nothing. Returns false if there was no such agent.
     pub async fn delete_host(&self, id: &str) -> Result<bool> {
-        let _only_writer = self.facts_lock.lock().await;
+        let _saving_facts = self.facts_locks.lock(id).await;
         let transaction = self.connection.begin().await.context("deleting a host")?;
         let before = host::Entity::find_by_id(id)
             .one(&transaction)
@@ -295,7 +335,7 @@ impl Database {
         facts: &FlatFacts,
         now: Timestamp,
     ) -> Result<bool> {
-        let _only_writer = self.facts_lock.lock().await;
+        let _only_writer = self.facts_locks.lock(host_id).await;
         let transaction = self.connection.begin().await.context("saving facts")?;
 
         let current = host_fact::Entity::find()
@@ -2508,6 +2548,8 @@ mod tests {
         }
 
         assert_eq!(database.current_facts("host-1").await.unwrap().len(), 1);
+        // Each host's lock goes once nothing's saving its facts.
+        assert!(database.facts_locks.locks().is_empty());
     }
 
     #[tokio::test]
