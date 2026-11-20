@@ -182,19 +182,32 @@ fn try_action(
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Run) {
-        Command::Run => {
-            logging::to_stderr();
-            run(cli.config)
-        }
+        // A service logs to files, which it sets up once it knows where it is.
         #[cfg(windows)]
         Command::Service(ServiceCommand::Run) => service::run(&SERVICE, &cli.config, |path| {
             remember_for_installer(&path);
             run(path)
         }),
+        // Anything else says what went wrong where it was typed.
+        command => {
+            logging::to_stderr();
+            run_command(command, cli.config)
+        }
+    }
+}
+
+/// Runs what was typed, rather than what Windows starts.
+fn run_command(command: Command, path: PathBuf) -> Result<()> {
+    match command {
+        Command::Run => run(path),
+        #[cfg(windows)]
+        Command::Service(ServiceCommand::Run) => {
+            anyhow::bail!("only Windows starts the service this way")
+        }
         #[cfg(windows)]
         Command::Configure { server_url, token } => {
-            configure::write(&cli.config, &server_url, token.as_deref())?;
-            remember_for_installer(&cli.config);
+            configure::write(&path, &server_url, token.as_deref())?;
+            remember_for_installer(&path);
             service::restart_if_running(&SERVICE)
         }
         Command::Version => {
@@ -203,7 +216,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Facts => {
-            let config = Config::load(&cli.config)?;
+            let config = Config::load(&path)?;
             let facts = facts::gather(
                 &config.facts,
                 &config.allowed(),
@@ -218,12 +231,12 @@ fn main() -> Result<()> {
             variables,
             timeout,
         } => {
-            let config = Config::load(&cli.config)?;
+            let config = Config::load(&path)?;
             let timeout = timeout.unwrap_or(maxnines_protocol::actions::DEFAULT_ACTION_TIMEOUT);
             try_action(&config, &name, variables, timeout)
         }
         Command::Identity(command) => {
-            let config = Config::load(&cli.config)?;
+            let config = Config::load(&path)?;
             let identity = match command {
                 IdentityCommand::Generate { force } => {
                     identity::generate(&config.key_file(), force)?
