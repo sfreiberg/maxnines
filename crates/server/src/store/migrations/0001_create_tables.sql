@@ -52,7 +52,7 @@ CREATE TABLE samples (
 CREATE VIEW all_samples AS
     SELECT * FROM samples UNION ALL SELECT * FROM samples_recent;
 
--- Text, only when it changes. An empty value means it stopped being reported.
+-- Text, only when it changes. No value, NULL, means it stopped being reported.
 CREATE TABLE texts (
     time      TIMESTAMP NOT NULL,
     series_id BIGINT    NOT NULL,

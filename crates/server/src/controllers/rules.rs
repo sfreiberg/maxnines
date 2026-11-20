@@ -16,6 +16,7 @@ use serde_json::{Map, Value, json};
 
 use super::condition_form::{ConditionForm, operators};
 use super::{CsrfForm, Page, local_date, server_error};
+use crate::alerting::NameTaken;
 use crate::app_state::AppState;
 use crate::condition_builder::Builder;
 use crate::facts::unflatten;
@@ -806,17 +807,11 @@ fn not_found(state: &AppState, token: &CsrfToken) -> Response {
 }
 
 /// Turns the form into a valid rule, or explains what's wrong with it.
-async fn validate(state: &AppState, form: &RuleForm, id: Option<i64>) -> Result<RuleInput> {
+async fn validate(state: &AppState, form: &RuleForm) -> Result<RuleInput> {
     let input = form.to_rule(&known_facts(state).await)?;
     rule_engine::check_rule(&input)?;
-
-    let rules = state.database.list_rules().await?;
-    let taken = rules
-        .iter()
-        .any(|rule| rule.rule.name == input.name && Some(rule.id) != id);
-    if taken {
-        bail!("a rule named {:?} already exists", input.name);
-    }
+    // A name another rule has is refused as the rule is saved, as only the database
+    // can tell for certain.
     Ok(input)
 }
 
@@ -826,7 +821,7 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
         return response;
     }
 
-    let input = match validate(&state, &fields, None).await {
+    let input = match validate(&state, &fields).await {
         Ok(input) => input,
         Err(error) => {
             let message = format!("{error:#}");
@@ -838,6 +833,10 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
         Ok(_) => {
             state.config_changed();
             (form.token, Redirect::to("/rules")).into_response()
+        }
+        Err(error) if error.is::<NameTaken>() => {
+            let message = format!("{error:#}");
+            form_page(&state, &form.token, None, &fields, Some(&message)).await
         }
         Err(error) => server_error(&error),
     }
@@ -865,7 +864,7 @@ async fn update(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfFo
         return response;
     }
 
-    let input = match validate(&state, &fields, Some(id)).await {
+    let input = match validate(&state, &fields).await {
         Ok(input) => input,
         Err(error) => {
             let message = format!("{error:#}");
@@ -879,6 +878,10 @@ async fn update(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfFo
             (form.token, Redirect::to("/rules")).into_response()
         }
         Ok(false) => not_found(&state, &form.token),
+        Err(error) if error.is::<NameTaken>() => {
+            let message = format!("{error:#}");
+            form_page(&state, &form.token, Some(id), &fields, Some(&message)).await
+        }
         Err(error) => server_error(&error),
     }
 }

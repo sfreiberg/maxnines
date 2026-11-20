@@ -15,6 +15,7 @@ impl MigratorTrait for Migrator {
             Box::new(CreateTables),
             Box::new(AddNoMetricsRule),
             Box::new(KeysAndIndexes),
+            Box::new(NamesAndUniqueness),
         ]
     }
 }
@@ -1849,16 +1850,27 @@ async fn keys_and_indexes_up(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                 .await?;
             }
         }
+        // MySQL commits each change to a table as it's made, so one stopped partway
+        // carries on from where it got to when it's run again.
         _ => {
-            for change in &CHANGED_KEYS {
-                drop_key(manager, change).await?;
-                add_key(manager, change, change.now).await?;
+            for change in CHANGED_KEYS.iter().chain([&ADDED_KEY]) {
+                match key_on_delete(db, change).await? {
+                    Some(now) if now == change.now => {}
+                    Some(_) => {
+                        drop_key(manager, change).await?;
+                        add_key(manager, change, change.now).await?;
+                    }
+                    None => add_key(manager, change, change.now).await?,
+                }
             }
-            add_key(manager, &ADDED_KEY, ADDED_KEY.now).await?;
         }
     }
 
     for index in &NEW_INDEXES {
+        if backend == DatabaseBackend::MySql && mysql_has_index(db, index.table, index.name).await?
+        {
+            continue;
+        }
         let mut create = Index::create();
         create.name(index.name).table(Alias::new(index.table));
         for column in index.columns {
@@ -1892,6 +1904,9 @@ async fn keys_and_indexes_up(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         rename_repeated_live_names(manager, table).await?;
         let index = format!("idx_{table}_live_name");
         if backend == DatabaseBackend::MySql {
+            if mysql_has_column(db, table, "live_name").await? {
+                continue;
+            }
             db.execute_unprepared(&format!(
                 "ALTER TABLE `{table}` \
                  ADD COLUMN `live_name` varchar(255) \
@@ -2008,11 +2023,61 @@ async fn mysql_has_index(
     Ok(count > 0)
 }
 
-/// Each table with a foreign key that changes, once.
+/// Whether a MySQL table has a column of this name.
+async fn mysql_has_column(
+    db: &impl ConnectionTrait,
+    table: &str,
+    name: &str,
+) -> Result<bool, DbErr> {
+    let count: i64 = one_value(
+        db,
+        &format!(
+            "SELECT COUNT(*) FROM information_schema.columns \
+             WHERE table_schema = DATABASE() AND table_name = '{table}' AND column_name = '{name}'"
+        ),
+    )
+    .await?;
+    Ok(count > 0)
+}
+
+/// What a foreign key on PostgreSQL or MySQL does on delete, or `None` if there's
+/// no such key.
+async fn key_on_delete(
+    db: &impl ConnectionTrait,
+    key: &KeyChange,
+) -> Result<Option<OnDelete>, DbErr> {
+    let schema = match db.get_database_backend() {
+        DatabaseBackend::MySql => "DATABASE()",
+        _ => "current_schema()",
+    };
+    let rules: Vec<String> = all_values(
+        db,
+        &format!(
+            "SELECT CAST(delete_rule AS CHAR(16)) FROM information_schema.referential_constraints \
+             WHERE constraint_schema = {schema} AND constraint_name = '{}'",
+            key.name()
+        ),
+    )
+    .await?;
+    Ok(rules.first().map(|rule| match rule.trim() {
+        "CASCADE" => OnDelete::Cascade,
+        _ => OnDelete::Refuse,
+    }))
+}
+
+/// Each table with a foreign key that changes, once, in the order they're first
+/// named.
 fn tables_with_changed_keys() -> Vec<&'static str> {
-    let mut tables: Vec<&str> = CHANGED_KEYS.iter().map(|change| change.table).collect();
-    tables.push(ADDED_KEY.table);
-    tables.dedup();
+    let mut tables: Vec<&str> = Vec::new();
+    for table in CHANGED_KEYS
+        .iter()
+        .chain([&ADDED_KEY])
+        .map(|change| change.table)
+    {
+        if !tables.contains(&table) {
+            tables.push(table);
+        }
+    }
     tables
 }
 
@@ -2053,25 +2118,643 @@ async fn add_key(
 
 /// Adds a later rule's or channel's ID to its name where one before it that isn't
 /// deleted has the same name, so a unique index can be made. Names are compared as
-/// that index will compare them.
+/// that index will compare them. A name made that way that's already taken, as
+/// another rule could have been named like that, gets a number after the ID too.
 async fn rename_repeated_live_names(manager: &SchemaManager<'_>, table: &str) -> Result<(), DbErr> {
-    let sql = match manager.get_database_backend() {
-        DatabaseBackend::MySql => format!(
-            "UPDATE `{table}` later JOIN `{table}` earlier \
-             ON earlier.name = later.name AND earlier.id < later.id \
-             AND earlier.deleted_at IS NULL \
-             SET later.name = CONCAT(LEFT(later.name, 230), ' (', later.id, ')') \
-             WHERE later.deleted_at IS NULL"
-        ),
-        _ => format!(
-            "UPDATE \"{table}\" SET name = SUBSTR(name, 1, 230) || ' (' || id || ')' \
-             WHERE deleted_at IS NULL AND EXISTS (SELECT 1 FROM \"{table}\" earlier \
-             WHERE earlier.name = \"{table}\".name AND earlier.id < \"{table}\".id \
-             AND earlier.deleted_at IS NULL)"
-        ),
+    let db = manager.get_connection();
+    let (quote, backend) = match db.get_database_backend() {
+        DatabaseBackend::MySql => ('`', DatabaseBackend::MySql),
+        backend => ('"', backend),
     };
-    manager.get_connection().execute_unprepared(&sql).await?;
+    let table_name = format!("{quote}{table}{quote}");
+    let repeated = db
+        .query_all_raw(Statement::from_string(
+            backend,
+            format!(
+                "SELECT later.id, later.name FROM {table_name} later \
+                 WHERE later.deleted_at IS NULL AND EXISTS (SELECT 1 FROM {table_name} earlier \
+                 WHERE earlier.name = later.name AND earlier.id < later.id \
+                 AND earlier.deleted_at IS NULL) ORDER BY later.id"
+            ),
+        ))
+        .await?;
+    for row in repeated {
+        let id: i64 = column(&row, 0)?;
+        let name: String = column(&row, 1)?;
+        let base: String = name.chars().take(230).collect();
+        let mut number = 1;
+        let renamed = loop {
+            let candidate = match number {
+                1 => format!("{base} ({id})"),
+                _ => format!("{base} ({id}, {number})"),
+            };
+            let taken = Query::select()
+                .expr(Expr::col(Alias::new("id")).count())
+                .from(Alias::new(table))
+                .and_where(Expr::col(Alias::new("deleted_at")).is_null())
+                .and_where(Expr::col(Alias::new("name")).eq(candidate.as_str()))
+                .to_owned();
+            let row = db
+                .query_one(&taken)
+                .await?
+                .ok_or_else(|| DbErr::Migration(format!("counting names in {table}")))?;
+            let count: i64 = column(&row, 0)?;
+            if count == 0 {
+                break candidate;
+            }
+            number += 1;
+        };
+        let rename = Query::update()
+            .table(Alias::new(table))
+            .value(Alias::new("name"), renamed)
+            .and_where(Expr::col(Alias::new("id")).eq(id))
+            .to_owned();
+        db.execute(&rename).await?;
+    }
     Ok(())
+}
+
+struct NamesAndUniqueness;
+
+impl MigrationName for NamesAndUniqueness {
+    fn name(&self) -> &str {
+        "m20261119_000004_names_and_uniqueness"
+    }
+}
+
+/// How long a name can be as it's compared: lowercased, which can make it longer, from
+/// a name of up to 255 characters.
+const NAME_KEY_LEN: usize = 512;
+
+/// How the column holding a name as it's compared is added, with a default only so
+/// rows already there can have one until they're filled in.
+const NAME_KEY_ADDED: &str = "\"name_key\" varchar(512) NOT NULL DEFAULT ''";
+
+/// A table whose names are each used once, compared as [`crate::models::name_key`]
+/// compares them.
+struct NamedTable {
+    table: &'static str,
+    /// How many characters its names can have.
+    longest: usize,
+    /// Each host's names are its own.
+    per_host: bool,
+    /// Only rows that aren't deleted count.
+    live_only: bool,
+    /// The unique index of its names.
+    index: &'static str,
+}
+
+const NAMED_TABLES: [NamedTable; 4] = [
+    NamedTable {
+        table: "alert_rules",
+        longest: 255,
+        per_host: false,
+        live_only: true,
+        index: "idx_alert_rules_live_name",
+    },
+    NamedTable {
+        table: "notification_channels",
+        longest: 255,
+        per_host: false,
+        live_only: true,
+        index: "idx_notification_channels_live_name",
+    },
+    NamedTable {
+        table: "config_rules",
+        longest: 255,
+        per_host: false,
+        live_only: false,
+        index: "idx_config_rules_name",
+    },
+    NamedTable {
+        table: "remote_checks",
+        longest: 64,
+        per_host: true,
+        live_only: false,
+        index: "idx_remote_checks_host_name",
+    },
+];
+
+/// How SQLite's definition of `config_rules` writes its name, which was unique as
+/// written until this migration.
+const CONFIG_RULE_NAME: &str = "\"name\" varchar(255) NOT NULL";
+
+/// Indexes this adds for clearing what's run out, as each sign in does.
+const CLEARING_INDEXES: [(&str, &str, &str); 3] = [
+    (
+        "idx_sign_in_challenges_expires",
+        "sign_in_challenges",
+        "expires_at",
+    ),
+    ("idx_app_sign_ins_revoked", "app_sign_ins", "revoked_at"),
+    (
+        "idx_app_sign_ins_refresh_expires",
+        "app_sign_ins",
+        "refresh_expires_at",
+    ),
+];
+
+/// What the database keeps unique, it compares the same way on every database:
+///
+/// - Names of alert rules, channels, config rules and checks are compared ignoring
+///   case and the spaces around them, as people read them, by a column holding each
+///   name as it's compared, `name_key`, which the server fills in. MySQL compares it
+///   exactly, as the other databases do, rather than by its collation. A name that's
+///   now the same as an earlier one's gets its ID added, and more if that's taken.
+/// - A host has one current value of each fact, and a rule one open alert about each
+///   host and series. Any repeats a server before this made are closed: the earlier
+///   fact, as the later one is what the host said last, and the later alert.
+///   PostgreSQL and SQLite index those rows alone, and MySQL a column it works out,
+///   as it does for names.
+/// - The facts every host has now are indexed by name, rather than every value any
+///   host has had by name and value, which nothing looked up.
+/// - What's cleared on every sign in is indexed.
+///
+/// MySQL commits each change to a table as it's made, so this checks what's there
+/// before each change, and one stopped partway carries on when it's run again.
+#[async_trait::async_trait]
+impl MigrationTrait for NamesAndUniqueness {
+    /// SQLite can only drop a column's default by making the table again, which needs
+    /// its own transaction: see [`without_foreign_keys`].
+    fn use_transaction(&self) -> Option<bool> {
+        Some(false)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        without_foreign_keys(manager, |manager| {
+            Box::pin(names_and_uniqueness_up(manager))
+        })
+        .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        without_foreign_keys(manager, |manager| {
+            Box::pin(names_and_uniqueness_down(manager))
+        })
+        .await
+    }
+}
+
+async fn names_and_uniqueness_up(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let db = manager.get_connection();
+    let backend = manager.get_database_backend();
+    let mysql = backend == DatabaseBackend::MySql;
+
+    for named in &NAMED_TABLES {
+        let table = named.table;
+        if !mysql || !mysql_has_column(db, table, "name_key").await? {
+            let added = match backend {
+                DatabaseBackend::MySql => NAME_KEY_ADDED.replace('"', "`").replace(
+                    "NOT NULL",
+                    "CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL",
+                ),
+                _ => NAME_KEY_ADDED.to_string(),
+            };
+            db.execute_unprepared(&format!("ALTER TABLE {table} ADD COLUMN {added}"))
+                .await?;
+        }
+        fill_name_keys(db, named).await?;
+    }
+
+    // The default was only for the rows already there.
+    for named in &NAMED_TABLES {
+        let table = named.table;
+        if backend == DatabaseBackend::Sqlite {
+            remake_sqlite_table(db, table, |definition| {
+                let without = NAME_KEY_ADDED.replace(" DEFAULT ''", "");
+                let definition = replace_once(definition, NAME_KEY_ADDED, &without)?;
+                if table == "config_rules" {
+                    let unique = format!("{CONFIG_RULE_NAME} UNIQUE");
+                    return replace_once(&definition, &unique, CONFIG_RULE_NAME);
+                }
+                Ok(definition)
+            })
+            .await?;
+        } else {
+            db.execute_unprepared(&format!(
+                "ALTER TABLE {table} ALTER COLUMN name_key DROP DEFAULT"
+            ))
+            .await?;
+        }
+    }
+
+    for named in &NAMED_TABLES {
+        index_name_keys(db, named).await?;
+    }
+    one_current_fact(db).await?;
+    one_open_alert(db).await?;
+    for (index, table, column) in CLEARING_INDEXES {
+        if !mysql || !mysql_has_index(db, table, index).await? {
+            db.execute_unprepared(&format!("CREATE INDEX {index} ON {table} ({column})"))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// `definition` with `old` in it, just once, changed to `new`, or an error if it isn't
+/// there just once, when the table isn't the one this was written for.
+fn replace_once(definition: &str, old: &str, new: &str) -> Result<String, DbErr> {
+    if definition.matches(old).count() != 1 {
+        return Err(DbErr::Migration(format!(
+            "a table isn't made the way it's expected to be: no {old}"
+        )));
+    }
+    Ok(definition.replacen(old, new, 1))
+}
+
+/// Fills in each row's name as it's compared. Where one that counts has the same name
+/// as an earlier one, its ID is added to its name, and a number too if that's taken.
+async fn fill_name_keys(db: &impl ConnectionTrait, named: &NamedTable) -> Result<(), DbErr> {
+    let table = named.table;
+    let backend = db.get_database_backend();
+    let save = |id: i64, name: Option<&str>, key: &str| {
+        let mut update = Query::update();
+        update
+            .table(Alias::new(table))
+            .value(Alias::new("name_key"), key)
+            .and_where(Expr::col(Alias::new("id")).eq(id));
+        if let Some(name) = name {
+            update.value(Alias::new("name"), name);
+        }
+        update.to_owned()
+    };
+
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            backend,
+            format!("SELECT id, name, name_key FROM {table}"),
+        ))
+        .await?;
+    for row in rows {
+        let (id, name, saved): (i64, String, String) =
+            (column(&row, 0)?, column(&row, 1)?, column(&row, 2)?);
+        let key = crate::models::name_key(&name);
+        if key != saved {
+            db.execute(&save(id, None, &key)).await?;
+        }
+    }
+
+    let scope = if named.per_host { "host_id" } else { "id" };
+    let live = if named.live_only {
+        " WHERE deleted_at IS NULL"
+    } else {
+        ""
+    };
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            backend,
+            format!("SELECT id, name, name_key, {scope} FROM {table}{live} ORDER BY id"),
+        ))
+        .await?;
+    let mut counted = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: i64 = column(&row, 0)?;
+        let scope = if named.per_host {
+            column::<String>(&row, 3)?
+        } else {
+            String::new()
+        };
+        counted.push((
+            id,
+            column::<String>(&row, 1)?,
+            scope,
+            column::<String>(&row, 2)?,
+        ));
+    }
+    let mut taken: std::collections::HashSet<(String, String)> = counted
+        .iter()
+        .map(|(_, _, scope, key)| (scope.clone(), key.clone()))
+        .collect();
+    let mut kept: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for (id, name, scope, key) in counted {
+        if kept.insert((scope.clone(), key)) {
+            continue;
+        }
+        let mut number = 1;
+        let (renamed, key) = loop {
+            let suffix = match number {
+                1 => format!(" ({id})"),
+                _ => format!(" ({id}, {number})"),
+            };
+            let room = named.longest.saturating_sub(suffix.chars().count());
+            let candidate: String = name.chars().take(room).collect::<String>() + &suffix;
+            let key = crate::models::name_key(&candidate);
+            if !taken.contains(&(scope.clone(), key.clone())) {
+                break (candidate, key);
+            }
+            number += 1;
+        };
+        taken.insert((scope.clone(), key.clone()));
+        kept.insert((scope, key.clone()));
+        db.execute(&save(id, Some(&renamed), &key)).await?;
+    }
+    Ok(())
+}
+
+/// Makes the index that keeps each table's names unique use their `name_key`.
+async fn index_name_keys(db: &impl ConnectionTrait, named: &NamedTable) -> Result<(), DbErr> {
+    let (table, index) = (named.table, named.index);
+    let backend = db.get_database_backend();
+    match (backend, table) {
+        (DatabaseBackend::MySql, "config_rules") => {
+            if mysql_has_index(db, table, "name").await? {
+                db.execute_unprepared("ALTER TABLE config_rules DROP INDEX `name`")
+                    .await?;
+            }
+            if !mysql_has_index(db, table, index).await? {
+                db.execute_unprepared(&format!(
+                    "CREATE UNIQUE INDEX {index} ON {table} (name_key)"
+                ))
+                .await?;
+            }
+        }
+        (DatabaseBackend::MySql, "remote_checks") => {
+            if !mysql_index_has_column(db, table, index, "name_key").await? {
+                db.execute_unprepared(&format!(
+                    "ALTER TABLE {table} DROP INDEX {index}, \
+                     ADD UNIQUE INDEX {index} (host_id, name_key)"
+                ))
+                .await?;
+            }
+        }
+        (DatabaseBackend::MySql, _) => {
+            if !mysql_generates_from(db, table, "live_name", "name_key").await? {
+                db.execute_unprepared(&format!(
+                    "ALTER TABLE {table} DROP INDEX {index}, DROP COLUMN live_name, \
+                     ADD COLUMN live_name varchar({NAME_KEY_LEN}) \
+                     CHARACTER SET utf8mb4 COLLATE utf8mb4_bin \
+                     AS (CASE WHEN deleted_at IS NULL THEN name_key END) STORED, \
+                     ADD UNIQUE INDEX {index} (live_name)"
+                ))
+                .await?;
+            }
+        }
+        (_, "config_rules") => {
+            if backend == DatabaseBackend::Postgres {
+                // The constraint the first migration made, named by PostgreSQL.
+                let unique: Vec<String> = all_values(
+                    db,
+                    "SELECT conname::text FROM pg_constraint \
+                     WHERE conrelid = 'config_rules'::regclass AND contype = 'u'",
+                )
+                .await?;
+                for constraint in unique {
+                    db.execute_unprepared(&format!(
+                        "ALTER TABLE config_rules DROP CONSTRAINT \"{constraint}\""
+                    ))
+                    .await?;
+                }
+            }
+            db.execute_unprepared(&format!(
+                "CREATE UNIQUE INDEX {index} ON {table} (name_key)"
+            ))
+            .await?;
+        }
+        (_, "remote_checks") => {
+            db.execute_unprepared(&format!("DROP INDEX {index}"))
+                .await?;
+            db.execute_unprepared(&format!(
+                "CREATE UNIQUE INDEX {index} ON {table} (host_id, name_key)"
+            ))
+            .await?;
+        }
+        _ => {
+            db.execute_unprepared(&format!("DROP INDEX {index}"))
+                .await?;
+            db.execute_unprepared(&format!(
+                "CREATE UNIQUE INDEX {index} ON {table} (name_key) WHERE deleted_at IS NULL"
+            ))
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// One current value of each fact for each host, and the facts hosts have now
+/// indexed by name.
+async fn one_current_fact(db: &impl ConnectionTrait) -> Result<(), DbErr> {
+    let mysql = db.get_database_backend() == DatabaseBackend::MySql;
+    if mysql {
+        db.execute_unprepared(
+            "UPDATE host_facts earlier JOIN host_facts later \
+             ON later.host_id = earlier.host_id AND BINARY later.name = BINARY earlier.name \
+             AND later.valid_to IS NULL AND later.id > earlier.id \
+             SET earlier.valid_to = earlier.valid_from WHERE earlier.valid_to IS NULL",
+        )
+        .await?;
+        if !mysql_has_column(db, "host_facts", "current_name").await? {
+            db.execute_unprepared(
+                "ALTER TABLE host_facts ADD COLUMN current_name varchar(255) \
+                 CHARACTER SET utf8mb4 COLLATE utf8mb4_bin \
+                 AS (CASE WHEN valid_to IS NULL THEN name END) STORED, \
+                 ADD UNIQUE INDEX idx_host_facts_current (host_id, current_name)",
+            )
+            .await?;
+        }
+        if !mysql_has_index(db, "host_facts", "idx_host_facts_current_name").await? {
+            db.execute_unprepared(
+                "CREATE INDEX idx_host_facts_current_name ON host_facts (valid_to, name)",
+            )
+            .await?;
+        }
+        if mysql_has_index(db, "host_facts", "idx_host_facts_name_value").await? {
+            db.execute_unprepared("DROP INDEX idx_host_facts_name_value ON host_facts")
+                .await?;
+        }
+        return Ok(());
+    }
+    db.execute_unprepared(
+        "UPDATE host_facts SET valid_to = valid_from WHERE valid_to IS NULL \
+         AND EXISTS (SELECT 1 FROM host_facts later WHERE later.host_id = host_facts.host_id \
+         AND later.name = host_facts.name AND later.valid_to IS NULL \
+         AND later.id > host_facts.id)",
+    )
+    .await?;
+    for sql in [
+        "CREATE UNIQUE INDEX idx_host_facts_current ON host_facts (host_id, name) \
+         WHERE valid_to IS NULL",
+        "CREATE INDEX idx_host_facts_current_name ON host_facts (name) WHERE valid_to IS NULL",
+        "DROP INDEX idx_host_facts_name_value",
+    ] {
+        db.execute_unprepared(sql).await?;
+    }
+    Ok(())
+}
+
+/// Why an alert a server before this opened a second time was closed.
+const REPEAT_REASON: &str = "another alert was already open for this";
+
+/// One open alert from each rule about each host and series. A host as a whole has
+/// no series, which counts as one of its own.
+async fn one_open_alert(db: &impl ConnectionTrait) -> Result<(), DbErr> {
+    if db.get_database_backend() == DatabaseBackend::MySql {
+        db.execute_unprepared(&format!(
+            "UPDATE alerts later JOIN alerts earlier \
+             ON earlier.rule_id = later.rule_id AND earlier.host_id = later.host_id \
+             AND BINARY COALESCE(earlier.series, '') = BINARY COALESCE(later.series, '') \
+             AND earlier.resolved_at IS NULL AND earlier.id < later.id \
+             SET later.resolved_at = later.started_at, later.resolve_reason = '{REPEAT_REASON}' \
+             WHERE later.resolved_at IS NULL"
+        ))
+        .await?;
+        if !mysql_has_column(db, "alerts", "open_series").await? {
+            db.execute_unprepared(
+                "ALTER TABLE alerts ADD COLUMN open_series varchar(255) \
+                 CHARACTER SET utf8mb4 COLLATE utf8mb4_bin \
+                 AS (CASE WHEN resolved_at IS NULL THEN COALESCE(series, '') END) STORED, \
+                 ADD UNIQUE INDEX idx_alerts_open (rule_id, host_id, open_series)",
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+    db.execute_unprepared(&format!(
+        "UPDATE alerts SET resolved_at = started_at, resolve_reason = '{REPEAT_REASON}' \
+         WHERE resolved_at IS NULL AND EXISTS (SELECT 1 FROM alerts earlier \
+         WHERE earlier.rule_id = alerts.rule_id AND earlier.host_id = alerts.host_id \
+         AND COALESCE(earlier.series, '') = COALESCE(alerts.series, '') \
+         AND earlier.resolved_at IS NULL AND earlier.id < alerts.id)"
+    ))
+    .await?;
+    db.execute_unprepared(
+        "CREATE UNIQUE INDEX idx_alerts_open ON alerts (rule_id, host_id, COALESCE(series, '')) \
+         WHERE resolved_at IS NULL",
+    )
+    .await?;
+    Ok(())
+}
+
+async fn names_and_uniqueness_down(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let db = manager.get_connection();
+    let backend = manager.get_database_backend();
+    let mysql = backend == DatabaseBackend::MySql;
+    let dropped = |index: &str, table: &str| match backend {
+        DatabaseBackend::MySql => format!("DROP INDEX {index} ON {table}"),
+        _ => format!("DROP INDEX {index}"),
+    };
+
+    for (index, table, _) in CLEARING_INDEXES {
+        db.execute_unprepared(&dropped(index, table)).await?;
+    }
+    if mysql {
+        for sql in [
+            "ALTER TABLE alerts DROP INDEX idx_alerts_open, DROP COLUMN open_series",
+            "ALTER TABLE host_facts DROP INDEX idx_host_facts_current, DROP COLUMN current_name",
+        ] {
+            db.execute_unprepared(sql).await?;
+        }
+    } else {
+        db.execute_unprepared(&dropped("idx_alerts_open", "alerts"))
+            .await?;
+        db.execute_unprepared(&dropped("idx_host_facts_current", "host_facts"))
+            .await?;
+    }
+    db.execute_unprepared(&dropped("idx_host_facts_current_name", "host_facts"))
+        .await?;
+    db.execute_unprepared("CREATE INDEX idx_host_facts_name_value ON host_facts (name, value)")
+        .await?;
+
+    for named in &NAMED_TABLES {
+        let (table, index) = (named.table, named.index);
+        match (backend, table) {
+            (_, "config_rules") => {
+                db.execute_unprepared(&dropped(index, table)).await?;
+            }
+            (DatabaseBackend::MySql, "remote_checks") => {
+                db.execute_unprepared(&format!(
+                    "ALTER TABLE {table} DROP INDEX {index}, ADD UNIQUE INDEX {index} (host_id, name)"
+                ))
+                .await?;
+            }
+            (_, "remote_checks") => {
+                db.execute_unprepared(&dropped(index, table)).await?;
+                db.execute_unprepared(&format!(
+                    "CREATE UNIQUE INDEX {index} ON {table} (host_id, name)"
+                ))
+                .await?;
+            }
+            (DatabaseBackend::MySql, _) => {
+                db.execute_unprepared(&format!(
+                    "ALTER TABLE {table} DROP INDEX {index}, DROP COLUMN live_name, \
+                     ADD COLUMN live_name varchar(255) \
+                     AS (CASE WHEN deleted_at IS NULL THEN name END) STORED, \
+                     ADD UNIQUE INDEX {index} (live_name)"
+                ))
+                .await?;
+            }
+            _ => {
+                db.execute_unprepared(&dropped(index, table)).await?;
+                db.execute_unprepared(&format!(
+                    "CREATE UNIQUE INDEX {index} ON {table} (name) WHERE deleted_at IS NULL"
+                ))
+                .await?;
+            }
+        }
+        db.execute_unprepared(&format!("ALTER TABLE {table} DROP COLUMN name_key"))
+            .await?;
+    }
+    match backend {
+        DatabaseBackend::MySql => {
+            db.execute_unprepared("ALTER TABLE config_rules ADD UNIQUE INDEX `name` (name)")
+                .await?;
+        }
+        DatabaseBackend::Postgres => {
+            db.execute_unprepared(
+                "ALTER TABLE config_rules ADD CONSTRAINT config_rules_name_key UNIQUE (name)",
+            )
+            .await?;
+        }
+        _ => {
+            remake_sqlite_table(db, "config_rules", |definition| {
+                replace_once(
+                    definition,
+                    CONFIG_RULE_NAME,
+                    &format!("{CONFIG_RULE_NAME} UNIQUE"),
+                )
+            })
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether one of a MySQL table's indexes has this column.
+async fn mysql_index_has_column(
+    db: &impl ConnectionTrait,
+    table: &str,
+    index: &str,
+    name: &str,
+) -> Result<bool, DbErr> {
+    let count: i64 = one_value(
+        db,
+        &format!(
+            "SELECT COUNT(*) FROM information_schema.statistics \
+             WHERE table_schema = DATABASE() AND table_name = '{table}' \
+             AND index_name = '{index}' AND column_name = '{name}'"
+        ),
+    )
+    .await?;
+    Ok(count > 0)
+}
+
+/// Whether a column MySQL works out is worked out from `from`.
+async fn mysql_generates_from(
+    db: &impl ConnectionTrait,
+    table: &str,
+    name: &str,
+    from: &str,
+) -> Result<bool, DbErr> {
+    let count: i64 = one_value(
+        db,
+        &format!(
+            "SELECT COUNT(*) FROM information_schema.columns \
+             WHERE table_schema = DATABASE() AND table_name = '{table}' \
+             AND column_name = '{name}' AND generation_expression LIKE '%{from}%'"
+        ),
+    )
+    .await?;
+    Ok(count > 0)
 }
 
 /// How SQLite's definition of a table writes a foreign key, before what it does on
@@ -2247,6 +2930,12 @@ where
         db.execute_unprepared("PRAGMA foreign_keys = ON").await?;
     }
     result
+}
+
+/// One column of a row a query gave.
+fn column<T: sea_orm::TryGetable>(row: &sea_orm::QueryResult, index: usize) -> Result<T, DbErr> {
+    row.try_get_by_index(index)
+        .map_err(|error| DbErr::Migration(error.to_string()))
 }
 
 /// The first column of the one row `sql` gives.
@@ -2858,9 +3547,11 @@ mod tests {
         let connection = fresh().await;
         Migrator::up(&connection, None).await.unwrap();
         let add = |name: &str, host: &str| {
+            let key = crate::models::name_key(name);
             let sql = format!(
-                "INSERT INTO remote_checks (name, kind, target, interval_secs, enabled, host_id)
-                 VALUES ('{name}', 'ping', 'example.com', 60, TRUE, '{host}')"
+                "INSERT INTO remote_checks (name, name_key, kind, target, interval_secs, enabled,
+                     host_id)
+                 VALUES ('{name}', '{key}', 'ping', 'example.com', 60, TRUE, '{host}')"
             );
             let connection = &connection;
             async move { connection.execute_unprepared(&sql).await }
@@ -2878,17 +3569,19 @@ mod tests {
         // One with no host given is the server's.
         connection
             .execute_unprepared(
-                "INSERT INTO remote_checks (name, kind, target, interval_secs, enabled)
-                 VALUES ('Site', 'http', 'https://example.com', 60, TRUE)",
+                "INSERT INTO remote_checks (name, name_key, kind, target, interval_secs, enabled)
+                 VALUES ('Site', 'site', 'http', 'https://example.com', 60, TRUE)",
             )
             .await
             .unwrap();
         let about = "SELECT host_id FROM remote_checks WHERE name = 'Site'";
         assert_eq!(texts(&connection, about).await, ["server"]);
 
-        // A name only has to differ from the other checks about the same host.
+        // A name only has to differ from the other checks about the same host, as
+        // names are compared.
         add("Site", "abc").await.unwrap();
         assert!(add("Site", "abc").await.is_err(), "one to a host");
+        assert!(add("SITE", "abc").await.is_err(), "whatever the case");
         assert!(add("Site", "server").await.is_err());
 
         // A host's checks go with it.
@@ -3028,7 +3721,7 @@ mod tests {
         let connection = empty().await;
         Migrator::up(&connection, Some(2)).await.unwrap();
         fill_before_keys_and_indexes(&connection).await;
-        Migrator::up(&connection, None).await.unwrap();
+        Migrator::up(&connection, Some(1)).await.unwrap();
 
         assert_kept(&connection).await;
         let notifications = "SELECT event FROM notifications ORDER BY id";
@@ -3130,7 +3823,7 @@ mod tests {
 
         // Up again, a host's or user's rows go with them, and an action run's
         // notifications with it.
-        Migrator::up(&connection, None).await.unwrap();
+        Migrator::up(&connection, Some(1)).await.unwrap();
         assert_kept(&connection).await;
         run(&connection, "DELETE FROM action_runs WHERE id = 1").await;
         assert_eq!(count(&connection, "notifications").await, 2);
@@ -3141,5 +3834,198 @@ mod tests {
         }
         assert_eq!(count(&connection, "sign_in_challenges").await, 0);
         assert_eq!(count(&connection, "notifications").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_live_name_made_for_a_repeat_is_never_one_already_taken() {
+        let connection = empty().await;
+        Migrator::up(&connection, Some(2)).await.unwrap();
+        run(
+            &connection,
+            "INSERT INTO alert_rules (name, kind, for_secs, severity, enabled)
+             VALUES ('Disk', 'offline', 60, 'critical', TRUE),
+                    ('Disk (11)', 'offline', 60, 'critical', TRUE),
+                    ('Disk', 'offline', 60, 'critical', TRUE)",
+        )
+        .await;
+
+        Migrator::up(&connection, Some(1)).await.unwrap();
+
+        let rules = "SELECT name FROM alert_rules WHERE id > 8 ORDER BY id";
+        assert_eq!(
+            texts(&connection, rules).await,
+            ["Disk", "Disk (11)", "Disk (11, 2)"]
+        );
+    }
+
+    /// A server before names were compared ignoring case and the spaces around them,
+    /// with names that are the same but for those, facts that are current twice and
+    /// alerts open twice. MySQL already compared case, by its collation, but not
+    /// spaces before a name.
+    async fn fill_before_names_and_uniqueness(connection: &impl ConnectionTrait) {
+        let at = "'2026-11-19 00:00:00+00:00'";
+        let later = "'2026-11-19 00:01:00+00:00'";
+        for sql in [
+            format!(
+                "INSERT INTO hosts (id, kind, hostname, state, first_seen_at)
+                 VALUES ('h1', 'agentless', 'web', 'approved', {at})"
+            ),
+            format!(
+                "INSERT INTO alert_rules (name, kind, for_secs, severity, enabled, deleted_at)
+                 VALUES ('Disk', 'offline', 60, 'critical', TRUE, NULL),
+                        (' disk', 'offline', 60, 'critical', TRUE, NULL),
+                        ('disk (10)', 'offline', 60, 'critical', TRUE, NULL),
+                        ('DISK', 'offline', 60, 'critical', TRUE, {at})"
+            ),
+            "INSERT INTO notification_channels (name, kind, target)
+             VALUES ('Ops', 'webhook', 'http://ops'), (' OPS', 'webhook', 'http://ops')"
+                .to_string(),
+            "INSERT INTO config_rules (name, priority, enabled) VALUES (' default', 1, TRUE)"
+                .to_string(),
+            "INSERT INTO remote_checks (name, kind, target, interval_secs, enabled, host_id)
+             VALUES ('Ping', 'ping', 'web', 60, TRUE, 'h1'),
+                    (' PING', 'ping', 'web', 60, TRUE, 'h1'),
+                    ('ping', 'ping', 'web', 60, TRUE, 'server')"
+                .to_string(),
+            format!(
+                "INSERT INTO host_facts (host_id, name, value, value_type, valid_from)
+                 VALUES ('h1', 'os.family', 'linux', 'string', {at}),
+                        ('h1', 'os.family', 'bsd', 'string', {later}),
+                        ('h1', 'OS.family', 'linux', 'string', {at})"
+            ),
+            format!(
+                "INSERT INTO alerts (rule_id, severity, host_id, series, summary, started_at,
+                     breached_at)
+                 VALUES (9, 'critical', 'h1', NULL, 'first', {at}, {at}),
+                        (9, 'critical', 'h1', NULL, 'again', {later}, {later}),
+                        (9, 'critical', 'h1', '/', 'a disk', {at}, {at}),
+                        (9, 'critical', 'h1', '/data', 'a disk', {at}, {at}),
+                        (9, 'critical', 'h1', '/Data', 'another', {at}, {at})"
+            ),
+        ] {
+            run(connection, &sql).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn names_and_uniqueness_keep_what_was_there_and_are_enforced() {
+        let connection = empty().await;
+        Migrator::up(&connection, Some(3)).await.unwrap();
+        fill_before_names_and_uniqueness(&connection).await;
+        Migrator::up(&connection, None).await.unwrap();
+
+        let rules = "SELECT name FROM alert_rules WHERE id > 8 ORDER BY id";
+        assert_eq!(
+            texts(&connection, rules).await,
+            ["Disk", " disk (10, 2)", "disk (10)", "DISK"],
+            "a repeat gets its ID, and more when that's taken, and deleted ones don't count"
+        );
+        let keys = "SELECT name_key FROM alert_rules WHERE id > 8 ORDER BY id";
+        assert_eq!(
+            texts(&connection, keys).await,
+            ["disk", "disk (10, 2)", "disk (10)", "disk"]
+        );
+        let channels = "SELECT name FROM notification_channels ORDER BY id";
+        assert_eq!(texts(&connection, channels).await, ["Ops", " OPS (2)"]);
+        let rules = "SELECT name FROM config_rules ORDER BY id";
+        assert_eq!(texts(&connection, rules).await, ["Default", " default (2)"]);
+        let checks = "SELECT name FROM remote_checks ORDER BY id";
+        assert_eq!(
+            texts(&connection, checks).await,
+            ["Ping", " PING (2)", "ping"],
+            "each host's names are its own"
+        );
+        let current = "SELECT value FROM host_facts WHERE valid_to IS NULL ORDER BY id";
+        assert_eq!(
+            texts(&connection, current).await,
+            ["bsd", "linux"],
+            "the value said last stays current, and a name differing in case is another fact"
+        );
+        let open = "SELECT summary FROM alerts WHERE resolved_at IS NULL ORDER BY id";
+        assert_eq!(
+            texts(&connection, open).await,
+            ["first", "a disk", "a disk", "another"]
+        );
+
+        // Each is enforced, whatever the case.
+        let at = "'2026-11-19 00:00:00+00:00'";
+        let refused = [
+            "INSERT INTO alert_rules (name, name_key, kind, for_secs, severity, enabled)
+             VALUES ('DISK', 'disk', 'offline', 60, 'critical', TRUE)"
+                .to_string(),
+            "INSERT INTO notification_channels (name, name_key, kind, target)
+             VALUES ('ops', 'ops', 'webhook', 'http://ops')"
+                .to_string(),
+            "INSERT INTO config_rules (name, name_key, priority, enabled)
+             VALUES ('DEFAULT', 'default', 1, TRUE)"
+                .to_string(),
+            "INSERT INTO remote_checks (name, name_key, kind, target, interval_secs, enabled,
+                 host_id)
+             VALUES ('ping', 'ping', 'ping', 'web', 60, TRUE, 'h1')"
+                .to_string(),
+            format!(
+                "INSERT INTO host_facts (host_id, name, value, value_type, valid_from)
+                 VALUES ('h1', 'os.family', 'linux', 'string', {at})"
+            ),
+            format!(
+                "INSERT INTO alerts (rule_id, severity, host_id, summary, started_at, breached_at)
+                 VALUES (9, 'critical', 'h1', 'third', {at}, {at})"
+            ),
+        ];
+        for sql in &refused {
+            assert!(connection.execute_unprepared(sql).await.is_err(), "{sql}");
+        }
+        for sql in [
+            format!(
+                "INSERT INTO alert_rules (name, name_key, kind, for_secs, severity, enabled,
+                     deleted_at)
+                 VALUES ('DISK', 'disk', 'offline', 60, 'critical', TRUE, {at})"
+            ),
+            format!(
+                "INSERT INTO host_facts (host_id, name, value, value_type, valid_from, valid_to)
+                 VALUES ('h1', 'os.family', 'linux', 'string', {at}, {at})"
+            ),
+            format!(
+                "INSERT INTO alerts (rule_id, severity, host_id, summary, started_at, breached_at,
+                     resolved_at)
+                 VALUES (9, 'critical', 'h1', 'over', {at}, {at}, {at})"
+            ),
+        ] {
+            run(&connection, &sql).await;
+        }
+
+        // Back down and up again, everything is still there.
+        Migrator::down(&connection, Some(1)).await.unwrap();
+        assert_eq!(count(&connection, "remote_checks").await, 3);
+        Migrator::up(&connection, None).await.unwrap();
+        assert_eq!(texts(&connection, open).await.len(), 4);
+    }
+
+    /// MySQL commits each change to a table as it's made, so a migration that stopped
+    /// before it was recorded runs again over what it already did. Each of its steps
+    /// leaves alone what's already done, which this tries at its hardest: all of it.
+    #[tokio::test]
+    async fn on_mysql_a_migration_that_stopped_carries_on_when_run_again() {
+        let connection = empty().await;
+        if connection.get_database_backend() != DatabaseBackend::MySql {
+            return;
+        }
+        Migrator::up(&connection, Some(2)).await.unwrap();
+        fill_before_keys_and_indexes(&connection).await;
+        keys_and_indexes_up(&SchemaManager::new(&connection))
+            .await
+            .unwrap();
+        Migrator::up(&connection, Some(1)).await.unwrap();
+        assert_kept(&connection).await;
+
+        let connection = empty().await;
+        Migrator::up(&connection, Some(3)).await.unwrap();
+        fill_before_names_and_uniqueness(&connection).await;
+        names_and_uniqueness_up(&SchemaManager::new(&connection))
+            .await
+            .unwrap();
+        Migrator::up(&connection, None).await.unwrap();
+        let channels = "SELECT name FROM notification_channels ORDER BY id";
+        assert_eq!(texts(&connection, channels).await, ["Ops", " OPS (2)"]);
     }
 }

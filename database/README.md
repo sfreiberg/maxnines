@@ -8,10 +8,13 @@ MaxNines keeps its data in two places:
   `m20261119_000001_create_tables`, makes its tables, in
   [`crates/server/src/migrations`](../crates/server/src/migrations/mod.rs),
   `m20261119_000002_add_no_metrics_rule` adds the built-in Host sending no metrics
-  rule, which the first doesn't have, and `m20261119_000003_keys_and_indexes` makes
+  rule, which the first doesn't have, `m20261119_000003_keys_and_indexes` makes
   deleting a host or user delete what's theirs, adds the notifications' key to their
   action runs, keeps names unique among rules and channels that aren't deleted, and
-  adds the indexes below that the first didn't have.
+  adds the indexes below that the first didn't have, and
+  `m20261119_000004_names_and_uniqueness` compares names ignoring case, the same way
+  on every database, keeps one current value of each fact and one open alert for
+  each problem, and adds the rest of the indexes below.
 - **The metrics store** holds the numbers hosts report. It's DuckDB for a single
   server or ClickHouse for a big one, and only one of them is used. Each has a
   migration, `0001_create_tables`, which makes its tables, and a second: in
@@ -38,6 +41,11 @@ the millisecond: `timestamptz` on PostgreSQL, `DATETIME(3)` on MySQL and MariaDB
 and sorts it as text. A length of time ending `_ms` or `_secs` is a number. `json` is
 `jsonb` on PostgreSQL, `json` on MySQL and MariaDB, and text on SQLite. A column that
 can be empty is NULL when it is, never an empty string.
+
+Names people give alert rules, channels, config rules and checks are compared ignoring
+case and the spaces around them, as people read them. Each of those tables has a
+`name_key`, the name as it's compared, which the server fills in and the database
+keeps unique, comparing it exactly on every database, so they all agree.
 
 What a row goes with is the database's to say. Deleting a host deletes its facts,
 config status, boot time, metrics pages, checks, alerts and action runs; deleting a
@@ -121,7 +129,8 @@ erDiagram
     }
     alert_rules {
         int id PK
-        string name "unique among those not deleted"
+        string name
+        string name_key "unique among those not deleted"
         string kind "metric, calculation, forecast, offline or no_metrics"
         string metric
         string series
@@ -160,7 +169,8 @@ erDiagram
     }
     notification_channels {
         int id PK
-        string name "unique among those not deleted"
+        string name
+        string name_key "unique among those not deleted"
         string kind
         text target
         text credential "never shown back"
@@ -243,7 +253,8 @@ erDiagram
     }
     config_rules {
         int id PK
-        string name UK
+        string name
+        string name_key UK
         int priority
         text condition_expr "CEL, over facts"
         boolean enabled
@@ -286,6 +297,35 @@ erDiagram
         string kind "host or fact"
         string fact "NULL for a host variable"
         string filter "which hosts, or NULL for every host"
+    }
+    remote_checks {
+        int id PK
+        string host_id FK "the host it's about, or server"
+        string name
+        string name_key "one to a host"
+        string kind
+        string target
+        int timeout_secs
+        string method
+        text body
+        text regex
+        boolean insecure
+        string server
+        string record
+        int count
+        int interval_secs
+        boolean enabled
+        string database "postgres: which one to sign in to"
+        boolean tls "mysql, redis"
+        string host_key "ssh: the fingerprint expected"
+        string username
+        text password "as typed, when it was"
+        string password_env "the server's variable holding it"
+        text private_key "ssh: as typed, when it was"
+        string private_key_env "the server's variable holding it"
+        boolean domain_expiry "http: false to not look it up"
+        boolean read_stats "databases: read health and replication too"
+        string extras "what else to read, comma-separated"
     }
     users {
         int id PK
@@ -386,34 +426,6 @@ erDiagram
         double longitude
         int priority
     }
-    remote_checks {
-        int id PK
-        string host_id FK "the host it's about, or server"
-        string name "one to a host"
-        string kind
-        string target
-        int timeout_secs
-        string method
-        text body
-        text regex
-        boolean insecure
-        string server
-        string record
-        int count
-        int interval_secs
-        boolean enabled
-        string database "postgres: which one to sign in to"
-        boolean tls "mysql, redis"
-        string host_key "ssh: the fingerprint expected"
-        string username
-        text password "as typed, when it was"
-        string password_env "the server's variable holding it"
-        text private_key "ssh: as typed, when it was"
-        string private_key_env "the server's variable holding it"
-        boolean domain_expiry "http: false to not look it up"
-        boolean read_stats "databases: read health and replication too"
-        string extras "what else to read, comma-separated"
-    }
     audit_log {
         int id PK
         timestamp occurred_at
@@ -476,34 +488,43 @@ sea-orm adds `seaql_migrations`, which records the migrations that have run.
 ### Indexes
 
 Besides each table's primary key and the unique columns marked `UK`, these are what
-the server's queries and foreign keys use. The two kept unique only among rows that
-aren't deleted index those rows alone on PostgreSQL and SQLite. MySQL and MariaDB
-can't, so those tables also have a column the database works out, `live_name`,
-holding the name while the row isn't deleted and NULL once it is, with a unique index
-that lets NULL repeat, comparing names as the table's collation does. MySQL and
-MariaDB also make an index for each foreign key that no index here starts with.
+the server's queries and foreign keys use. Those kept unique only among some rows,
+such as rules that aren't deleted, index those rows alone on PostgreSQL and SQLite.
+MySQL and MariaDB can't, so those tables also have a column the database works out,
+holding what's kept unique for those rows and NULL for the rest, with a unique index
+that lets NULL repeat: `live_name` on `alert_rules` and `notification_channels`,
+`current_name` on `host_facts` and `open_series` on `alerts`. Each compares exactly,
+by the `utf8mb4_bin` collation, as the other databases do, rather than as the table's
+collation would. MySQL and MariaDB also make an index for each foreign key that no
+index here starts with.
 
 | Index | Columns | For |
 | --- | --- | --- |
 | `idx_host_facts_host` | `host_facts (host_id, valid_to)` | A host's current facts |
-| `idx_host_facts_name_value` | `host_facts (name, value)` | Hosts with a fact |
+| `idx_host_facts_current` | `host_facts (host_id, name)` where `valid_to` is NULL, unique | One current value of each fact for each host |
+| `idx_host_facts_current_name` | `host_facts (name)` where `valid_to` is NULL; `(valid_to, name)` on MySQL | The facts every host has now |
 | `idx_metrics_pages_host` | `metrics_pages (host_id)` | A host's pages |
+| `idx_config_rules_name` | `config_rules (name_key)`, unique | One config rule to a name |
 | `idx_config_rule_settings_rule_name` | `config_rule_settings (rule_id, name)`, unique | A config rule's settings |
 | `idx_user_sessions_user_id` | `user_sessions (user_id)` | A user's sessions |
 | `idx_user_sessions_expires` | `user_sessions (expires_at)` | Clearing sessions that ran out, on every sign in |
 | `idx_api_keys_user_id` | `api_keys (user_id)` | A user's keys |
 | `idx_app_sign_ins_user_id` | `app_sign_ins (user_id)` | A user's apps |
 | `idx_app_sign_ins_previous_refresh_hash` | `app_sign_ins (previous_refresh_hash)` | A refresh token used again |
+| `idx_app_sign_ins_revoked` | `app_sign_ins (revoked_at)` | Clearing apps revoked long ago, on every app sign in |
+| `idx_app_sign_ins_refresh_expires` | `app_sign_ins (refresh_expires_at)` | Clearing apps whose sign in ran out long ago |
 | `idx_recovery_codes_user_id` | `recovery_codes (user_id)` | A user's recovery codes |
 | `idx_sign_in_challenges_user_id` | `sign_in_challenges (user_id)` | A user's challenges |
-| `idx_alert_rules_live_name` | `alert_rules (name)` where `deleted_at` is NULL, unique | One rule to a name |
-| `idx_notification_channels_live_name` | `notification_channels (name)` where `deleted_at` is NULL, unique | One channel to a name |
+| `idx_sign_in_challenges_expires` | `sign_in_challenges (expires_at)` | Clearing challenges that ran out, on every sign in |
+| `idx_alert_rules_live_name` | `alert_rules (name_key)` where `deleted_at` is NULL, unique | One rule to a name |
+| `idx_notification_channels_live_name` | `notification_channels (name_key)` where `deleted_at` is NULL, unique | One channel to a name |
 | `idx_alert_rule_channels_channel` | `alert_rule_channels (channel_id)` | The rules telling a channel |
 | `idx_alert_rule_actions_rule` | `alert_rule_actions (rule_id)` | A rule's actions |
 | `idx_alerts_resolved` | `alerts (resolved_at)` | Open alerts |
 | `idx_alerts_started` | `alerts (started_at)` | Alerts newest first |
 | `idx_alerts_host_started` | `alerts (host_id, started_at)` | A host's timeline, and its alerts |
 | `idx_alerts_rule_resolved` | `alerts (rule_id, resolved_at)` | A rule's open alerts, to remind people or end them |
+| `idx_alerts_open` | `alerts (rule_id, host_id, series)` where `resolved_at` is NULL, unique, with no series counting as one | One open alert from a rule about each host and series |
 | `idx_notifications_alert` | `notifications (alert_id)` | An alert's notifications |
 | `idx_notifications_due` | `notifications (state, next_attempt_at)` | What's due to be sent |
 | `idx_notifications_channel` | `notifications (channel_id, state)` | What's waiting for a channel |
@@ -512,7 +533,7 @@ MariaDB also make an index for each foreign key that no index here starts with.
 | `idx_action_runs_alert` | `action_runs (alert_id)` | An alert's runs |
 | `idx_action_runs_host` | `action_runs (host_id, requested_at)` | A host's runs |
 | `idx_action_runs_finished` | `action_runs (finished_at)` | Runs still waiting for an answer |
-| `idx_remote_checks_host_name` | `remote_checks (host_id, name)`, unique | One check to a name for each host |
+| `idx_remote_checks_host_name` | `remote_checks (host_id, name_key)`, unique | One check to a name for each host |
 | `idx_silences_ends` | `silences (ends_at)` | Silences still running |
 | `idx_dashboard_widgets_dashboard` | `dashboard_widgets (dashboard_id)` | A dashboard's widgets |
 | `idx_dashboard_variables_dashboard` | `dashboard_variables (dashboard_id)` | A dashboard's variables |

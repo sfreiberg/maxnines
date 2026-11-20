@@ -1044,7 +1044,7 @@ async fn preview_rule(
     Query(params): Query<PreviewParams>,
     Json(input): Json<RuleInput>,
 ) -> Response {
-    if let Some(response) = refuse_rule(&state, &input, params.id).await {
+    if let Some(response) = refuse_rule(&input) {
         return response;
     }
     match state.preview_rule(params.id, input).await {
@@ -1062,7 +1062,7 @@ async fn show_rule(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> 
 }
 
 async fn create_rule(State(state): State<AppState>, Json(input): Json<RuleInput>) -> Response {
-    if let Some(response) = refuse_rule(&state, &input, None).await {
+    if let Some(response) = refuse_rule(&input) {
         return response;
     }
     match state.database.create_rule(&input).await {
@@ -1070,6 +1070,7 @@ async fn create_rule(State(state): State<AppState>, Json(input): Json<RuleInput>
             state.config_changed();
             (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
         }
+        Err(error) if error.is::<NameTaken>() => refused(&error),
         Err(error) => server_error(&error),
     }
 }
@@ -1099,7 +1100,7 @@ async fn update_rule(
         Ok(_) => {}
         Err(error) => return server_error(&error),
     }
-    if let Some(response) = refuse_rule(&state, &input, Some(id)).await {
+    if let Some(response) = refuse_rule(&input) {
         return response;
     }
     match state.database.update_rule(id, &input).await {
@@ -1108,6 +1109,7 @@ async fn update_rule(
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) if error.is::<NameTaken>() => refused(&error),
         Err(error) => server_error(&error),
     }
 }
@@ -2093,11 +2095,12 @@ async fn create_remote_check(
     Json(request): Json<RemoteCheckRequest>,
 ) -> Response {
     let input = request.input;
-    if let Err(error) = state.check_remote_check(&input, None).await {
+    if let Err(error) = state.check_remote_check(&input).await {
         return refused(&error);
     }
     match state.database.create_remote_check(&input).await {
         Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
+        Err(error) if error.is::<NameTaken>() => refused(&error),
         Err(error) => server_error(&error),
     }
 }
@@ -2116,12 +2119,13 @@ async fn update_remote_check(
     input.sign_in = input
         .sign_in
         .keeping_secrets_of(&saved.input.sign_in, request.sign_in);
-    if let Err(error) = state.check_remote_check(&input, Some(id)).await {
+    if let Err(error) = state.check_remote_check(&input).await {
         return refused(&error);
     }
     match state.database.update_remote_check(id, &input).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) if error.is::<NameTaken>() => refused(&error),
         Err(error) => server_error(&error),
     }
 }
@@ -2235,29 +2239,12 @@ fn refused_built_in(why: &str) -> Response {
         .into_response()
 }
 
-async fn refuse_rule(state: &AppState, input: &RuleInput, id: Option<i64>) -> Option<Response> {
-    let problem = match rule_engine::check_rule(input) {
-        Err(error) => format!("{error:#}"),
-        Ok(()) => match state.database.list_rules().await {
-            Err(error) => return Some(server_error(&error)),
-            Ok(rules) => {
-                let taken = rules
-                    .iter()
-                    .any(|rule| rule.rule.name == input.name && Some(rule.id) != id);
-                if !taken {
-                    return None;
-                }
-                format!("a rule named {:?} already exists", input.name)
-            }
-        },
-    };
-    Some(
-        (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({ "error": problem })),
-        )
-            .into_response(),
-    )
+/// A name another rule has is refused as the rule is saved, as only the database can
+/// tell for certain.
+fn refuse_rule(input: &RuleInput) -> Option<Response> {
+    rule_engine::check_rule(input)
+        .err()
+        .map(|error| refused(&error))
 }
 
 fn server_error(error: &anyhow::Error) -> Response {

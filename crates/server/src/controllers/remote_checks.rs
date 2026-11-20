@@ -20,7 +20,7 @@ use super::metrics::{
     CheckRow, RangeParams, check_row, one_series, range_links, selected_range, time_range,
 };
 use super::{CsrfForm, Page, recorded_by, server_error, viewer_zone};
-use crate::alerting::RuleKind;
+use crate::alerting::{NameTaken, RuleKind};
 use crate::app_state::AppState;
 use crate::check_history;
 use crate::host_filter;
@@ -1058,9 +1058,7 @@ async fn validate(
             .sign_in
             .keeping_secrets_of(&saved.input.sign_in, Some(with));
     }
-    state
-        .check_remote_check(&input, saved.map(|saved| saved.id))
-        .await?;
+    state.check_remote_check(&input).await?;
     Ok(input)
 }
 
@@ -1075,6 +1073,10 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
     };
     match state.database.create_remote_check(&input).await {
         Ok(_) => (form.token, Redirect::to(&back_to(&input.host_id))).into_response(),
+        Err(error) if error.is::<NameTaken>() => {
+            let message = format!("{error:#}");
+            form_page(&state, &form.token, None, &fields, Some(&message)).await
+        }
         Err(error) => server_error(&error),
     }
 }
@@ -1096,6 +1098,10 @@ async fn update(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfFo
     match state.database.update_remote_check(id, &input).await {
         Ok(true) => (form.token, Redirect::to(&format!("/checks/{id}"))).into_response(),
         Ok(false) => not_found(&state, &form.token),
+        Err(error) if error.is::<NameTaken>() => {
+            let message = format!("{error:#}");
+            form_page(&state, &form.token, Some(id), &fields, Some(&message)).await
+        }
         Err(error) => server_error(&error),
     }
 }

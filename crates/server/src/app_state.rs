@@ -255,28 +255,15 @@ impl AppState {
         Ok(())
     }
 
-    /// Everything that has to be true for a server check to be saved. `id` is the
-    /// saved check it would replace.
-    pub async fn check_remote_check(
-        &self,
-        input: &RemoteCheckInput,
-        id: Option<i64>,
-    ) -> Result<()> {
+    /// Everything that has to be true for a server check to be saved. A name another
+    /// check about the same host has is refused as the check is saved, as only the
+    /// database can tell for certain.
+    pub async fn check_remote_check(&self, input: &RemoteCheckInput) -> Result<()> {
         remote_checks::check_input(input)?;
         let about = &input.host_id;
         ensure!(
             about == remote_checks::LOCAL_HOST_ID || self.agentless_host(about).await.is_some(),
             "a check is about a host with no agent, or the server itself"
-        );
-        let checks = self.database.list_remote_checks().await?;
-        let name = &input.check.name;
-        // Names only have to differ among the checks about one host.
-        let taken = checks.iter().any(|check| {
-            check.input.check.name == *name && check.input.host_id == *about && Some(check.id) != id
-        });
-        ensure!(
-            !taken,
-            "a check named {name:?} already exists for this host"
         );
         Ok(())
     }

@@ -8,6 +8,9 @@ pub struct Model {
     /// The host it's about: one with no agent, or the server itself.
     pub host_id: String,
     pub name: String,
+    /// The name as it's compared, which is what's kept unique: see
+    /// [`super::name_key`].
+    pub name_key: String,
     pub kind: String,
     pub target: String,
     pub timeout_secs: Option<i64>,

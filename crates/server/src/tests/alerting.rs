@@ -7511,7 +7511,9 @@ mod pages {
         // Newest comes first otherwise, so this has to be sorted to pass.
         let new = alert(rule, &test.host, Severity::Critical, critical);
         test.database().fire_alert(&new, &[]).await.unwrap();
-        let new = alert(rule, &test.host, Severity::Warning, warning);
+        // A rule has one open alert about each series of a host.
+        let mut new = alert(rule, &test.host, Severity::Warning, warning);
+        new.series = Some("/".to_string());
         test.database().fire_alert(&new, &[]).await.unwrap();
 
         let page = Browser::default().get(&test.server, "/").await;

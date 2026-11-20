@@ -86,8 +86,8 @@ not changed or deleted. To change what one sets, open it and follow the link to 
 rule of your own after it: that rule applies to the same hosts, one priority higher,
 and holds only your changes, so upgrades never touch them.
 
-If an upgrade brings a built-in rule with the same name as one of yours, yours is
-kept as it is and renamed, such as `Default (yours)`.
+If an upgrade brings a built-in rule with the same name as one of yours, ignoring
+case, yours is kept as it is and renamed, such as `Default (yours)`.
 
 ## CPU
 

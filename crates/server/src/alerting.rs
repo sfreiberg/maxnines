@@ -1140,12 +1140,16 @@ pub struct Delivery {
     pub action: Option<ActionRun>,
 }
 
-/// A name another alert rule or channel that isn't deleted already has. The database
-/// keeps each to one, so two saved at once can't both have it.
+/// A name another of its kind already has, as names are compared: ignoring case and
+/// the spaces around them. Alert rules and channels that are deleted don't count, and
+/// a check's name only has to differ from the others about the same host. The
+/// database keeps each to one, so two saved at once can't both have it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NameTaken {
     AlertRule(String),
     Channel(String),
+    ConfigRule(String),
+    RemoteCheck(String),
 }
 
 impl std::fmt::Display for NameTaken {
@@ -1153,6 +1157,10 @@ impl std::fmt::Display for NameTaken {
         match self {
             Self::AlertRule(name) => write!(f, "an alert rule named {name:?} already exists"),
             Self::Channel(name) => write!(f, "a channel named {name:?} already exists"),
+            Self::ConfigRule(name) => write!(f, "a rule named {name:?} already exists"),
+            Self::RemoteCheck(name) => {
+                write!(f, "a check named {name:?} already exists for this host")
+            }
         }
     }
 }

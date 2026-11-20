@@ -7,7 +7,8 @@ use maxnines_protocol::{Check, CheckKind};
 use sea_orm::{ConnectionTrait, EntityTrait, QueryOrder, Set, TransactionTrait};
 
 use super::audit::record_change;
-use super::{Database, remote_check};
+use super::{Database, name_key, name_taken_or, remote_check};
+use crate::alerting::NameTaken;
 use crate::audit::{Kind, Snapshot};
 use crate::remote_checks::{RemoteCheck, RemoteCheckInput, SignIn};
 
@@ -58,6 +59,7 @@ fn to_row(input: &RemoteCheckInput) -> Result<remote_check::ActiveModel> {
     Ok(remote_check::ActiveModel {
         host_id: Set(input.host_id.clone()),
         name: Set(check.name.clone()),
+        name_key: Set(name_key(&check.name)),
         kind: Set(check.kind.as_str().to_string()),
         target: Set(check.target.clone()),
         timeout_secs: Set(check
@@ -86,6 +88,11 @@ fn to_row(input: &RemoteCheckInput) -> Result<remote_check::ActiveModel> {
         private_key_env: Set(input.sign_in.private_key_env.clone()),
         ..Default::default()
     })
+}
+
+/// What saving a check whose name another about the same host has is refused with.
+fn name_taken(input: &RemoteCheckInput) -> NameTaken {
+    NameTaken::RemoteCheck(input.check.name.clone())
 }
 
 async fn load<C: ConnectionTrait>(connection: &C, id: i64) -> Result<Option<RemoteCheck>> {
@@ -137,7 +144,7 @@ impl Database {
         let id = remote_check::Entity::insert(to_row(input)?)
             .exec(&transaction)
             .await
-            .context("saving check")?
+            .map_err(|error| name_taken_or(error, name_taken(input), "saving check"))?
             .last_insert_id;
         record(&transaction, id, None).await?;
         transaction.commit().await.context("saving check")?;
@@ -155,7 +162,7 @@ impl Database {
         remote_check::Entity::update(row)
             .exec(&transaction)
             .await
-            .context("saving check")?;
+            .map_err(|error| name_taken_or(error, name_taken(input), "saving check"))?;
         record(&transaction, id, Some(&before)).await?;
         transaction.commit().await.context("saving check")?;
         Ok(true)

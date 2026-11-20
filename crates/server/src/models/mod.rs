@@ -63,7 +63,7 @@ use sea_orm::sea_query::OnConflict;
 use sea_orm::sqlx::sqlite::{SqliteJournalMode, SqliteSynchronous};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectOptions, ConnectionTrait, DatabaseConnection,
-    EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+    DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, SqlErr, TransactionTrait,
 };
 use sea_orm_migration::MigratorTrait;
 use serde::{Deserialize, Serialize};
@@ -80,6 +80,7 @@ pub use self::users::{
     DEFAULT_THEME, SESSION_LIFETIME, THEMES, User, UserChange, check_new_password, check_new_user,
     is_theme,
 };
+use crate::alerting::NameTaken;
 use crate::audit::{Kind, Snapshot};
 use crate::facts::{FlatFacts, decode, encode, flatten, unflatten};
 use crate::host_filter;
@@ -842,6 +843,7 @@ impl Database {
         let transaction = self.connection.begin().await.context("saving rule")?;
         let row = config_rule::ActiveModel {
             name: Set(input.name.clone()),
+            name_key: Set(name_key(&input.name)),
             priority: Set(input.priority),
             condition_expr: Set(input.condition.clone()),
             enabled: Set(input.enabled),
@@ -850,7 +852,10 @@ impl Database {
         }
         .insert(&transaction)
         .await
-        .context("saving rule")?;
+        .map_err(|error| {
+            let taken = NameTaken::ConfigRule(input.name.clone());
+            name_taken_or(error, taken, "saving rule")
+        })?;
 
         save_settings(&transaction, row.id, &input.settings).await?;
         record_rule(&transaction, row.id, None).await?;
@@ -872,11 +877,15 @@ impl Database {
 
         let mut row: config_rule::ActiveModel = row.into();
         row.name = Set(input.name.clone());
+        row.name_key = Set(name_key(&input.name));
         row.priority = Set(input.priority);
         row.condition_expr = Set(input.condition.clone());
         row.enabled = Set(input.enabled);
         row.operating_systems = Set(systems_text(&input.operating_systems));
-        row.update(&transaction).await.context("saving rule")?;
+        row.update(&transaction).await.map_err(|error| {
+            let taken = NameTaken::ConfigRule(input.name.clone());
+            name_taken_or(error, taken, "saving rule")
+        })?;
 
         config_rule_setting::Entity::delete_many()
             .filter(config_rule_setting::Column::RuleId.eq(id))
@@ -1041,6 +1050,21 @@ fn to_rule<'a>(
             settings: unflatten(&flat),
         },
     })
+}
+
+/// A name another of its kind has is for whoever saved it to change, not a fault.
+/// It's the only thing these tables keep unique besides their IDs.
+fn name_taken_or(error: DbErr, taken: NameTaken, doing: &'static str) -> anyhow::Error {
+    match error.sql_err() {
+        Some(SqlErr::UniqueConstraintViolation(_)) => taken.into(),
+        _ => anyhow::Error::new(error).context(doing),
+    }
+}
+
+/// A name as it's compared with others of its kind, which is what the database keeps
+/// unique: ignoring case and the spaces around it, the same way on every database.
+pub fn name_key(name: &str) -> String {
+    name.trim().to_lowercase()
 }
 
 /// Operating systems as they're stored: comma separated, or nothing for all of them.

@@ -2,7 +2,7 @@
 
 | Field | Description |
 | --- | --- |
-| `name` | Required |
+| `name` | Required. No two rules can have the same name, ignoring case, or saving gives `422` |
 | `kind` | Required. `metric`, `offline`, `no_metrics`, `calculation` or `forecast` |
 | `metric` | For metric, calculation and forecast rules, a name from the [catalog](api-metrics.md#list-metrics) |
 | `series` | Limits a metric or forecast rule to matching series, with `*` and `?` wildcards |

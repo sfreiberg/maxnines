@@ -6,6 +6,9 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i64,
     pub name: String,
+    /// The name as it's compared, which is what's kept unique: see
+    /// [`super::name_key`].
+    pub name_key: String,
     pub priority: i32,
     pub condition_expr: Option<String>,
     pub enabled: bool,

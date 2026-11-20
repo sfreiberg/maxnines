@@ -1,6 +1,8 @@
 //! Keeping the built-in config rules in the database the same as the ones this
 //! version of the server ships with.
 
+use std::collections::BTreeSet;
+
 use anyhow::{Context, Result};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, TransactionTrait,
@@ -8,8 +10,8 @@ use sea_orm::{
 
 use super::audit::record;
 use super::{
-    ConfigRule, Database, RuleInput, config_rule, config_rule_setting, load_rule, rule_snapshot,
-    save_settings, systems_text,
+    ConfigRule, Database, RuleInput, config_rule, config_rule_setting, load_rule, name_key,
+    rule_snapshot, save_settings, systems_text,
 };
 use crate::audit::{Actor, Kind, Record};
 use crate::built_in_rules::BuiltInRule;
@@ -46,9 +48,10 @@ async fn record_by_server(
 impl Database {
     /// Writes `shipped` over the built-in rules, adding any that are new and
     /// removing any no longer shipped. Whether each is turned on stays as it was. A
-    /// rule of someone's own that has a new built-in rule's name becomes theirs under
-    /// another name, unless it's already just the same, when it becomes the built-in
-    /// one. Gives the names of the rules this changed.
+    /// rule of someone's own that has a built-in rule's name, as names are compared,
+    /// becomes theirs under another name, unless it's already just the same and the
+    /// built-in one is new, when it becomes the built-in one. Gives the names of the
+    /// rules this changed.
     pub async fn sync_built_in_rules(
         &self,
         shipped: &[BuiltInRule],
@@ -64,11 +67,51 @@ impl Database {
             .await
             .context("loading rules")?;
         let mut changed = Vec::new();
+        // Names in use, as they're compared, kept up to date as rules are renamed.
+        let mut taken: BTreeSet<String> = rows.iter().map(|row| row.name_key.clone()).collect();
 
         for built_in in shipped {
+            let key = name_key(&built_in.rule.name);
             let existing = rows
                 .iter()
                 .find(|row| row.built_in.as_deref() == Some(built_in.key));
+
+            // Someone's own rule with this name, as names are compared: the same rule
+            // is adopted when there's no built-in one yet, and a different one keeps
+            // everything it had under a name of its own.
+            let named = rows
+                .iter()
+                .find(|row| row.built_in.is_none() && row.name_key == key);
+            if let Some(row) = named {
+                let before = load_rule(&transaction, row.id)
+                    .await?
+                    .context("a rule went missing")?;
+                let mut active: config_rule::ActiveModel = row.clone().into();
+                if existing.is_none() && same_rule(&before.rule, &built_in.rule) {
+                    active.built_in = Set(Some(built_in.key.to_string()));
+                    active
+                        .update(&transaction)
+                        .await
+                        .context("marking a built-in rule")?;
+                    continue;
+                }
+                let mut name = format!("{} (yours)", built_in.rule.name);
+                let mut number = 2;
+                while taken.contains(&name_key(&name)) {
+                    name = format!("{} (yours {number})", built_in.rule.name);
+                    number += 1;
+                }
+                taken.insert(name_key(&name));
+                active.name_key = Set(name_key(&name));
+                active.name = Set(name);
+                active
+                    .update(&transaction)
+                    .await
+                    .context("renaming a rule")?;
+                record_by_server(&transaction, row.id, Some(&before)).await?;
+            }
+            taken.insert(key.clone());
+
             if let Some(row) = existing {
                 let before = load_rule(&transaction, row.id)
                     .await?
@@ -78,6 +121,7 @@ impl Database {
                 }
                 let mut active: config_rule::ActiveModel = row.clone().into();
                 active.name = Set(built_in.rule.name.clone());
+                active.name_key = Set(key);
                 active.priority = Set(built_in.rule.priority);
                 active.condition_expr = Set(built_in.rule.condition.clone());
                 active.operating_systems = Set(systems_text(&built_in.rule.operating_systems));
@@ -97,41 +141,9 @@ impl Database {
                 continue;
             }
 
-            // Someone's own rule with this name: the same rule is adopted, and a
-            // different one keeps everything it had under a name of its own.
-            let named = rows
-                .iter()
-                .find(|row| row.built_in.is_none() && row.name == built_in.rule.name);
-            if let Some(row) = named {
-                let before = load_rule(&transaction, row.id)
-                    .await?
-                    .context("a rule went missing")?;
-                let mut active: config_rule::ActiveModel = row.clone().into();
-                if same_rule(&before.rule, &built_in.rule) {
-                    active.built_in = Set(Some(built_in.key.to_string()));
-                    active
-                        .update(&transaction)
-                        .await
-                        .context("marking a built-in rule")?;
-                    continue;
-                }
-                let taken = |name: &str| rows.iter().any(|row| row.name == name);
-                let mut name = format!("{} (yours)", built_in.rule.name);
-                let mut number = 2;
-                while taken(&name) {
-                    name = format!("{} (yours {number})", built_in.rule.name);
-                    number += 1;
-                }
-                active.name = Set(name);
-                active
-                    .update(&transaction)
-                    .await
-                    .context("renaming a rule")?;
-                record_by_server(&transaction, row.id, Some(&before)).await?;
-            }
-
             let row = config_rule::ActiveModel {
                 name: Set(built_in.rule.name.clone()),
+                name_key: Set(key),
                 priority: Set(built_in.rule.priority),
                 condition_expr: Set(built_in.rule.condition.clone()),
                 enabled: Set(built_in.rule.enabled),

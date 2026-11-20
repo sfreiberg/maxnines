@@ -734,6 +734,10 @@ async fn two_hosts_can_each_have_a_check_of_the_same_name() {
     assert_eq!(status, 422);
     let why = refused["error"].as_str().unwrap();
     assert!(why.contains("already exists for this host"), "{why}");
+    // Names are compared ignoring case.
+    let shouted = tcp_check(&orders, "PORT", &served.address);
+    let (status, refused) = api(&server, "POST", "/api/v1/remote-checks", &shouted).await;
+    assert_eq!(status, 422, "{refused}");
 
     // Before running, the API says there's no result yet.
     let (_, checks) = api(&server, "GET", "/api/v1/remote-checks", &Value::Null).await;

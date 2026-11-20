@@ -30,7 +30,7 @@ started, and a paused check keeps the result from before it was paused.
 
 | `check` field | For | Description |
 | --- | --- | --- |
-| `name` | All | Required. What it's called on charts and in alerts. Two checks about the same host can't have the same one |
+| `name` | All | Required. What it's called on charts and in alerts. Two checks about the same host can't have the same one, which for checks the server runs is ignoring case |
 | `kind` | All | Required. `tcp`, `http`, `tls`, `dns`, `ping`, `postgres`, `mysql`, `redis`, `mongodb`, `clickhouse`, `ssh`, `smtp`, `imap` or `pop3` |
 | `target` | All | Required. An address for http, a host for dns and ping, and `host:port` for the rest, which for clickhouse is its HTTP port |
 | `timeout_secs` | All | How long it gets, up to a minute |

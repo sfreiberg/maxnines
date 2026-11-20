@@ -94,9 +94,10 @@ async fn an_upgrade_brings_its_changes_to_built_in_rules_but_never_to_peoples_ow
     assert_eq!(mac.built_in.as_deref(), Some("macos"));
     // Someone turned it off.
     database.set_rule_enabled(mac.id, false).await.unwrap();
-    // And someone has a rule of their own named like one a later version brings.
+    // And someone has a rule of their own named like one a later version brings, as
+    // names are compared.
     server
-        .create_rule("Linux", 50, "true", json!({ "interval_secs": 9 }))
+        .create_rule("linux", 50, "true", json!({ "interval_secs": 9 }))
         .await;
 
     let mut later = all();
@@ -338,4 +339,31 @@ async fn a_rule_can_be_limited_to_some_operating_systems() {
     let (status, body) = api(&server, "POST", "/api/v1/rules", &unknown).await;
     assert_eq!(status, 422, "{body}");
     assert!(body.contains("unknown operating system"), "{body}");
+}
+
+#[tokio::test]
+async fn a_rule_named_like_another_whatever_the_case_is_refused() {
+    let server = with_every_built_in_rule().await;
+    let rule = json!({
+        "name": " MACOS ",
+        "priority": 5,
+        "condition": "true",
+        "operating_systems": [],
+        "enabled": true,
+        "settings": { "interval_secs": 9 },
+    });
+    let (status, body) = api(&server, "POST", "/api/v1/rules", &rule).await;
+    assert_eq!(status, 422, "{body}");
+    assert!(
+        body.contains("a rule named \\\" MACOS \\\" already exists"),
+        "{body}"
+    );
+
+    let mut renamed = rule.clone();
+    renamed["name"] = json!("Mine");
+    let (status, body) = api(&server, "POST", "/api/v1/rules", &renamed).await;
+    assert_eq!(status, 201, "{body}");
+    let id = rule_named(&server, "Mine").await.id;
+    let (status, body) = api(&server, "PUT", &format!("/api/v1/rules/{id}"), &rule).await;
+    assert_eq!(status, 422, "{body}");
 }

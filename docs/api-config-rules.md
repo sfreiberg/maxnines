@@ -5,7 +5,7 @@ lowest priority first, so higher priorities win.
 
 | Field | Description |
 | --- | --- |
-| `name` | Required |
+| `name` | Required. No two rules can have the same name, ignoring case, or saving gives `422` |
 | `priority` | Required. Higher priorities apply later |
 | `condition` | A [CEL](https://cel.dev) expression over `facts`. Empty matches every host |
 | `operating_systems` | The systems it's for, from `freebsd`, `linux`, `macos` and `windows`, which `facts.os.family` has to be one of as well as the condition matching. Empty or left out for every system |

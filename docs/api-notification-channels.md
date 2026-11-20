@@ -6,7 +6,7 @@ and Telegram tokens, mail server passwords and Resend API keys can be set but ne
 
 | Field | Description |
 | --- | --- |
-| `name` | Required |
+| `name` | Required. No two channels can have the same name, ignoring case, or saving gives `422` |
 | `kind` | Required. `webhook`, `custom_webhook`, `email`, `resend`, `discord`, `slack`, `teams`, `pagerduty`, `alertops`, `signl4` or `telegram` |
 | `target` | Required. A webhook's address, a Teams workflow's URL, email addresses separated by commas for email and Resend, a Slack channel, a PagerDuty integration key, the URL from AlertOps or SIGNL4, or a Telegram chat ID such as `-1001234567890` or `@channel` |
 | `credential` | Slack's or Telegram's bot token, the mail server's password for email, the API key for Resend, or a custom webhook's headers, one to a line as `Name: value` |

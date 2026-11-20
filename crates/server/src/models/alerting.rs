@@ -7,8 +7,8 @@ use anyhow::{Context, Result, bail};
 use chrono::TimeDelta;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Order, Query, SelectStatement};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DbErr, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
-    QuerySelect, Set, SqlErr, TransactionTrait,
+    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
+    QuerySelect, Set, TransactionTrait,
 };
 use tracing::warn;
 
@@ -18,7 +18,7 @@ use super::actions::to_run;
 use super::audit::{record, record_change};
 use super::{
     Database, action_run, alert, alert_rule, alert_rule_action, alert_rule_channel, host,
-    maintenance_window, notification, notification_channel, silence,
+    maintenance_window, name_key, name_taken_or, notification, notification_channel, silence,
 };
 use crate::actions::{ActionRun, RuleAction, RunOn};
 use crate::alerting::{
@@ -102,6 +102,7 @@ fn whole_seconds(seconds: i64) -> Result<TimeDelta> {
 fn alert_rule_row(input: &AlertRuleInput) -> Result<alert_rule::ActiveModel> {
     Ok(alert_rule::ActiveModel {
         name: Set(input.name.clone()),
+        name_key: Set(name_key(&input.name)),
         kind: Set(input.kind.as_str().to_string()),
         metric: Set(input.metric.clone()),
         series: Set(input.series.clone()),
@@ -130,6 +131,7 @@ fn channel_row(input: &ChannelInput) -> notification_channel::ActiveModel {
     let request = input.request.as_ref();
     notification_channel::ActiveModel {
         name: Set(input.name.clone()),
+        name_key: Set(name_key(&input.name)),
         kind: Set(input.kind.as_str().to_string()),
         target: Set(input.target.clone()),
         credential: Set(input.credential.clone()),
@@ -439,15 +441,6 @@ async fn queue_selected<C: ConnectionTrait>(
         .await
         .context("queueing notifications")?;
     Ok(())
-}
-
-/// A name another rule or channel has is for whoever saved it to change, not a
-/// fault. It's the only thing either table keeps unique besides its ID.
-fn name_taken_or(error: DbErr, taken: NameTaken, doing: &'static str) -> anyhow::Error {
-    match error.sql_err() {
-        Some(SqlErr::UniqueConstraintViolation(_)) => taken.into(),
-        _ => anyhow::Error::new(error).context(doing),
-    }
 }
 
 /// Queues what an alert's action printed for every channel that was told about
