@@ -165,7 +165,10 @@ Each kind of database has metrics of its own, named for it, such as
 `pg.connections` and `mysql.connections`, so a chart or alert rule is always
 about one kind. Each value is a series named after the database, such as `orders`.
 Things a database has several of are named after both, such as `orders standby
-replica1`, `orders slot backups` or `shop database sales`.
+replica1`, `orders slot backups` or `shop database sales`. A PostgreSQL standby is
+named by its `application_name`, and standbys that share one, as they do when left
+at the default `walreceiver`, by their address too, such as `orders standby
+walreceiver 10.0.0.6`.
 
 ### What most kinds have
 

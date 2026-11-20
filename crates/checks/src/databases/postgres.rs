@@ -242,7 +242,7 @@ impl Postgres {
         let found = self
             .client
             .query(
-                "SELECT coalesce(nullif(application_name, ''), host(client_addr), 'unnamed'),
+                "SELECT nullif(application_name, ''), host(client_addr),
                         state, sync_state,
                         pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)::float8,
                         extract(epoch FROM replay_lag)::float8
@@ -254,11 +254,21 @@ impl Postgres {
             Ok(standbys) => standbys,
             Err(error) => return rows.missed("standbys", pg_short(error)),
         };
+        let names = standby_names(
+            standbys
+                .iter()
+                .map(|standby| {
+                    (
+                        standby.try_get(0).ok().flatten(),
+                        standby.try_get(1).ok().flatten(),
+                    )
+                })
+                .collect(),
+        );
         let mut synchronous = 0;
-        for standby in &standbys {
-            let name: String = standby.try_get(0).unwrap_or_default();
-            let state: Option<String> = standby.try_get(1).ok().flatten();
-            let sync: Option<String> = standby.try_get(2).ok().flatten();
+        for (standby, name) in standbys.iter().zip(names) {
+            let state: Option<String> = standby.try_get(2).ok().flatten();
+            let sync: Option<String> = standby.try_get(3).ok().flatten();
             let is_sync = matches!(sync.as_deref(), Some("sync" | "quorum"));
             synchronous += usize::from(is_sync);
             let row = rows.add("standby", &name);
@@ -267,13 +277,13 @@ impl Postgres {
             row.flag("synchronous", is_sync);
             row.maybe(
                 "lag_bytes",
-                standby.try_get::<_, Option<f64>>(3).ok().flatten(),
+                standby.try_get::<_, Option<f64>>(4).ok().flatten(),
             );
             // Unknown until it's replayed something, and again once it's caught up
             // with nothing new, when bytes behind say it's caught up.
             row.maybe(
                 "lag_secs",
-                standby.try_get::<_, Option<f64>>(4).ok().flatten(),
+                standby.try_get::<_, Option<f64>>(5).ok().flatten(),
             );
         }
         rows.main.set("standbys", standbys.len());
@@ -515,6 +525,46 @@ impl Postgres {
     }
 }
 
+/// A name for each standby, from its application name and address, which tells it
+/// apart from the others. Standbys left at the defaults all have the same
+/// application name, such as `walreceiver`, so a name several share gets the
+/// standby's address too, and an address several share on top of that gets a
+/// number, in the order they're listed.
+fn standby_names(standbys: Vec<(Option<String>, Option<String>)>) -> Vec<String> {
+    let count = |names: &[String], name: &str| names.iter().filter(|n| *n == name).count();
+    let applications: Vec<String> = standbys
+        .iter()
+        .map(|(application, address)| {
+            application
+                .clone()
+                .or_else(|| address.clone())
+                .unwrap_or_else(|| "unnamed".to_string())
+        })
+        .collect();
+    let named: Vec<String> = applications
+        .iter()
+        .zip(&standbys)
+        .map(|(name, (application, address))| {
+            match (count(&applications, name) > 1, application, address) {
+                (true, Some(_), Some(address)) => format!("{name} {address}"),
+                _ => name.clone(),
+            }
+        })
+        .collect();
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    named
+        .iter()
+        .map(|name| {
+            if count(&named, name) == 1 {
+                return name.clone();
+            }
+            let number = seen.entry(name).or_default();
+            *number += 1;
+            format!("{name} {number}")
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -523,7 +573,33 @@ mod tests {
     use serde_json::Value;
 
     use super::super::{Database, Reader, Settle};
+    use super::standby_names;
     use crate::Credentials;
+
+    #[test]
+    fn standbys_left_at_the_defaults_each_get_a_name_of_their_own() {
+        let standby = |application: Option<&str>, address: Option<&str>| {
+            (application.map(String::from), address.map(String::from))
+        };
+        assert_eq!(
+            standby_names(vec![
+                standby(Some("replica1"), Some("10.0.0.5")),
+                standby(Some("walreceiver"), Some("10.0.0.6")),
+                standby(Some("walreceiver"), Some("10.0.0.7")),
+                standby(Some("walreceiver"), Some("10.0.0.7")),
+                standby(None, Some("10.0.0.8")),
+                standby(None, None),
+            ]),
+            [
+                "replica1",
+                "walreceiver 10.0.0.6",
+                "walreceiver 10.0.0.7 1",
+                "walreceiver 10.0.0.7 2",
+                "10.0.0.8",
+                "unnamed",
+            ]
+        );
+    }
 
     /// A real server, as `host:port username`, such as the throwaway one tests
     /// use, signed in to with a role in pg_monitor or a superuser.
