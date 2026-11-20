@@ -18,7 +18,6 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use chrono::TimeDelta;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 
@@ -215,7 +214,7 @@ struct SilenceArgs {
     name: Option<String>,
     /// How long, such as 30m, 2h or 1d.
     #[arg(long = "for", value_parser = parse_duration)]
-    duration: u64,
+    duration: Duration,
     /// Why, which everyone sees.
     #[arg(long)]
     reason: String,
@@ -233,38 +232,15 @@ struct SilenceArgs {
     all_alerts: bool,
 }
 
-/// A length such as `90s`, `30m`, `2h30m` or `1d`, in seconds.
-fn parse_duration(text: &str) -> Result<u64, String> {
-    let mut total = 0u64;
-    let mut number = String::new();
-    for character in text.trim().chars() {
-        if character.is_ascii_digit() {
-            number.push(character);
-            continue;
-        }
-        let unit = match character {
-            's' => 1,
-            'm' => 60,
-            'h' => 3600,
-            'd' => 86_400,
-            _ => {
-                return Err(format!(
-                    "{text:?} isn't a length: use s, m, h or d, like 30m or 2h"
-                ));
-            }
-        };
-        let amount: u64 = number.parse().map_err(|_| {
-            format!("{text:?} isn't a length: use a number before each unit, like 30m")
-        })?;
-        total += amount * unit;
-        number.clear();
+/// A length such as `90s`, `30m`, `2h30m` or `1d`, read as the server reads its own.
+fn parse_duration(text: &str) -> Result<Duration, String> {
+    match humantime::parse_duration(text) {
+        Ok(length) if length.as_secs() > 0 => Ok(length),
+        Ok(_) => Err(format!(
+            "{text:?} is too short: a silence lasts a second or more"
+        )),
+        Err(error) => Err(format!("{text:?} isn't a length, like 30m or 2h: {error}")),
     }
-    if !number.is_empty() || total == 0 {
-        return Err(format!(
-            "{text:?} isn't a length: give it a unit, like 30m or 2h"
-        ));
-    }
-    Ok(total)
 }
 
 fn main() -> ExitCode {
@@ -740,7 +716,7 @@ fn silence_ids(what: &[String]) -> Result<Vec<i64>, Failure> {
 }
 
 fn silence(api: &Api, args: SilenceArgs, format: Format) -> Result<()> {
-    let mut body = json!({ "reason": args.reason, "duration_secs": args.duration });
+    let mut body = json!({ "reason": args.reason, "duration_secs": args.duration.as_secs() });
     let named_any =
         args.rule.is_some() || args.filter.is_some() || args.series.is_some() || args.all_alerts;
     match (args.kind, args.name.as_deref()) {
@@ -816,12 +792,7 @@ fn silence(api: &Api, args: SilenceArgs, format: Format) -> Result<()> {
         Format::Json => println!("{}", output::json(&created)),
         Format::Table | Format::Wide => println!(
             "{name} started, for {}",
-            output::span(
-                i64::try_from(args.duration)
-                    .ok()
-                    .and_then(TimeDelta::try_seconds)
-                    .unwrap_or(TimeDelta::MAX)
-            )
+            humantime::format_duration(args.duration)
         ),
     }
     Ok(())
@@ -873,13 +844,26 @@ mod tests {
 
     #[test]
     fn lengths_are_read_in_their_units() {
-        assert_eq!(parse_duration("90s"), Ok(90));
-        assert_eq!(parse_duration("30m"), Ok(1800));
-        assert_eq!(parse_duration("2h30m"), Ok(9000));
-        assert_eq!(parse_duration("1d"), Ok(86_400));
-        for bad in ["", "30", "m", "1w", "0m"] {
+        let secs = |text: &str| parse_duration(text).map(|length| length.as_secs());
+        assert_eq!(secs("90s"), Ok(90));
+        assert_eq!(secs("30m"), Ok(1800));
+        assert_eq!(secs("2h30m"), Ok(9000));
+        assert_eq!(secs("1d"), Ok(86_400));
+        // Too long to count is refused, never wrapped round to something shorter.
+        for bad in [
+            "",
+            "30",
+            "m",
+            "0m",
+            "213503982334602d",
+            "99999999999999999999s",
+        ] {
             assert!(parse_duration(bad).is_err(), "{bad}");
         }
+        assert_eq!(
+            humantime::format_duration(parse_duration("2h30m").unwrap()).to_string(),
+            "2h 30m"
+        );
     }
 
     #[test]

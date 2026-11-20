@@ -310,6 +310,27 @@ fn silencing_an_alert_names_only_that_alert() {
         json!({"rule_id": 2, "filter": "id=22ad9264b6eb0000", "series": "web", "reason": "Known", "duration_secs": 3600})
     );
 
+    // The length said back is the one asked for, not rounded down.
+    let host = maxnines(
+        folder.path(),
+        &with_key(&server.url),
+        &[
+            "silence",
+            "host",
+            "db-1",
+            "--for",
+            "2h30m",
+            "--reason",
+            "Rebooting",
+        ],
+    );
+    assert_eq!(
+        stdout(&host),
+        "silence/57 started, for 2h 30m",
+        "{}",
+        stderr(&host)
+    );
+
     // Saying nothing about what to silence isn't silencing everything.
     let unsaid = maxnines(
         folder.path(),
@@ -317,7 +338,7 @@ fn silencing_an_alert_names_only_that_alert() {
         &["silence", "--for", "1h", "--reason", "x"],
     );
     assert_eq!(unsaid.status.code(), Some(2));
-    assert_eq!(server.requests_to("/api/v1/silences").len(), 1);
+    assert_eq!(server.requests_to("/api/v1/silences").len(), 2);
 }
 
 #[test]
