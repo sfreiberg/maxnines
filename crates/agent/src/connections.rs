@@ -15,7 +15,7 @@ use netstat2::{
 };
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind, Users};
 
-use crate::builtin_actions::{name, owner, sees_everything, table};
+use crate::builtin_actions::{SEES_EVERYTHING, name, owner, sees_everything, table};
 
 /// How many processes are listed.
 const ROWS: usize = 20;
@@ -381,10 +381,10 @@ fn describe(sockets: &[Socket], holders: &BTreeMap<u32, Holder>, everything: boo
         ));
     }
     if !everything {
-        text.push_str(
-            "The agent isn't running as root, so it can only see which of its own user's \
-             processes hold sockets.\n",
-        );
+        text.push_str(&format!(
+            "The agent isn't running as {SEES_EVERYTHING}, so it can only see which of its \
+             own user's processes hold sockets.\n"
+        ));
     }
     text
 }
@@ -469,7 +469,10 @@ CONNECTIONS  ADDRESS   NAME
             text.contains("1 socket belongs to processes the agent can't see."),
             "{text}"
         );
-        assert!(text.contains("isn't running as root"), "{text}");
+        assert!(
+            text.contains(&format!("isn't running as {SEES_EVERYTHING}")),
+            "{text}"
+        );
         assert!(text.contains("2 TCP connections: 2 established. 1 process hold"));
 
         let nothing = describe(&[], &holders(), true);

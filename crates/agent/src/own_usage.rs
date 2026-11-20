@@ -63,45 +63,30 @@ fn own_memory() -> Option<u64> {
 }
 
 /// The agent's private working set, which is what Task Manager shows: the pages it
-/// has in memory that no other process can use. Windows lists the pages with whether
-/// each can be shared, and the count of the others is it. The resident size, which
-/// counts the system's libraries too, comes out around three times larger.
+/// has in memory that no other process can use. The resident size, which counts the
+/// system's libraries too, comes out around three times larger.
 #[cfg(windows)]
 fn own_memory() -> Option<u64> {
-    use windows_sys::Win32::Foundation::{ERROR_BAD_LENGTH, GetLastError};
-    use windows_sys::Win32::System::ProcessStatus::QueryWorkingSet;
-    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX2,
+    };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-    /// The bit of a page's entry that says it can be shared.
-    const SHAREABLE: usize = 1 << 8;
-
-    // The number of pages, then an entry for each. Asking with no room for entries
-    // gives the number, and the list is made with room to spare, as making it can add
-    // pages of its own.
-    let mut list: Vec<usize> = vec![0];
-    for _ in 0..3 {
-        let bytes = u32::try_from(std::mem::size_of_val(list.as_slice())).ok()?;
-        // SAFETY: the list is as long as it's said to be, and is laid out as Windows
-        // expects, a count and then entries, each the size of a pointer.
-        if unsafe { QueryWorkingSet(GetCurrentProcess(), list.as_mut_ptr().cast(), bytes) } != 0 {
-            let pages = list.get(1..=list[0])?;
-            let private = pages.iter().filter(|&page| page & SHAREABLE == 0).count();
-            // SAFETY: it fills in the whole struct and can't fail.
-            let page_size = unsafe {
-                let mut system = std::mem::zeroed::<SYSTEM_INFO>();
-                GetSystemInfo(&mut system);
-                system.dwPageSize
-            };
-            return Some(private as u64 * u64::from(page_size));
-        }
-        // SAFETY: always safe, and nothing has run since the call that failed.
-        if unsafe { GetLastError() } != ERROR_BAD_LENGTH {
-            return None;
-        }
-        list = vec![0; 1 + list[0] + list[0] / 8];
-    }
-    None
+    let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX2>() as u32;
+    let mut counters = PROCESS_MEMORY_COUNTERS_EX2 {
+        cb: size,
+        ..Default::default()
+    };
+    // SAFETY: the struct is as big as it's said to be, and the process's own handle
+    // needs no closing.
+    let filled = unsafe {
+        GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            std::ptr::from_mut(&mut counters).cast(),
+            size,
+        )
+    };
+    (filled != 0).then_some(counters.PrivateWorkingSetSize as u64)
 }
 
 /// FreeBSD has nothing as cheap to ask, so it reports the resident size.
