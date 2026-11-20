@@ -182,7 +182,8 @@ impl Outcome {
         }
     }
 
-    /// One item for the plugin, then one per value, named by the plugin and label.
+    /// One item for the plugin, then one per value, named by the plugin and label
+    /// joined by a dot, as a custom metric's several values are.
     fn report(self, name: &str) -> Vec<Value> {
         let own = json!({
             "name": name,
@@ -193,7 +194,7 @@ impl Outcome {
         std::iter::once(own)
             .chain(
                 self.values.into_iter().map(
-                    |(label, value)| json!({ "name": format!("{name} {label}"), "value": value }),
+                    |(label, value)| json!({ "name": format!("{name}.{label}"), "value": value }),
                 ),
             )
             .collect()
@@ -433,7 +434,7 @@ mod tests {
             outcome.report("load"),
             [
                 json!({ "name": "load", "status": 1, "ok": 0, "message": "LOAD WARNING" }),
-                json!({ "name": "load load1", "value": 4.5 }),
+                json!({ "name": "load.load1", "value": 4.5 }),
             ]
         );
     }

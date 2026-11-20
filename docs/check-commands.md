@@ -71,9 +71,9 @@ values separated by spaces, each as `label=value[unit];warn;crit;min;max`.
 DISK OK - free space: / 3326 MB (56%); | /=2643MB;5948;5958;0;5968 'root inodes'=12%
 ```
 
-Each value becomes a series named by the command and its label, such as `disk /` and
-`disk root inodes`. Times are kept in seconds and sizes in bytes, so `250ms` becomes
-0.25 and `2KB` becomes 2048. Percentages and counters (`c`) are kept as they are. The
+Each value becomes a series named by the command and its label, joined by a dot as a
+custom metric's values are, such as `disk./` and `disk.root inodes`. Times are kept in
+seconds and sizes in bytes, so `250ms` becomes 0.25 and `2KB` becomes 2048. Percentages and counters (`c`) are kept as they are. The
 warning and critical levels after the value are left out, as an alert rule sets its
 own. A value of `U`, meaning it couldn't be measured, is skipped, and so is anything
 that isn't a number. Up to 32 values are kept from each run.

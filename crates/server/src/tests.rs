@@ -4091,7 +4091,7 @@ async fn check_commands_report_their_status_message_and_values() {
     let id = host.id();
     let rows = json!([
         { "name": "raid", "status": 2, "ok": 0, "message": "RAID CRITICAL - md0 degraded" },
-        { "name": "raid failed_disks", "value": 1.0 },
+        { "name": "raid.failed_disks", "value": 1.0 },
         { "name": "ntp", "status": 0, "ok": 1, "message": "NTP OK: offset 0.002s" },
     ]);
     let message = AgentMessage::Sample(Sample {
@@ -4123,7 +4123,7 @@ async fn check_commands_report_their_status_message_and_values() {
     assert_eq!(raid["points"][0]["avg"], 2.0);
     let path = format!("/api/v1/hosts/{id}/metrics/command.value?range=1h");
     let values = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
-    assert_eq!(values["series"][0]["name"], "raid failed_disks", "{values}");
+    assert_eq!(values["series"][0]["name"], "raid.failed_disks", "{values}");
 
     // The host's page says how each last went, in its own words.
     let page = Browser::default()
