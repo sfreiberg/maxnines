@@ -27,7 +27,7 @@ use crate::events::{BOOT_TIME_SLACK, EventKind, restarted};
 use crate::facts::flatten;
 use crate::models::ConfigStatus;
 use crate::presence::Presence;
-use crate::registration::{Admission, LastHello};
+use crate::registration::Admission;
 use crate::store::{NewSample, WriterCommand, can_store};
 use crate::times::{self, Timestamp};
 
@@ -233,34 +233,41 @@ async fn authenticate(
         send_status(socket, status).await?;
         return Ok(None);
     }
-    let refused = refusal(protocol, &agent_version);
-    let hello = LastHello {
-        agent_protocol: Some(protocol),
-        agent_version: Some(agent_version.clone()).filter(|version| !version.is_empty()),
-        refused_at: refused.as_ref().map(|_| times::now()),
-        refuse_reason: refused.clone(),
-    };
-    // Kept for people to see. The agent is answered the same either way.
-    if let Err(error) = state.registry.heard(&id, hello).await {
+    if let Some(reason) = refusal(protocol, &agent_version) {
+        // Kept for people to see, unless the agent is trying too often to be worth
+        // keeping up with. It's told the same either way.
+        let kept = match state.presence.allow_connection(&id) {
+            true => state.registry.refused(&id, protocol, &reason).await,
+            false => Ok(false),
+        };
+        let supported = Protocols::SUPPORTED;
+        match kept {
+            Ok(true) => warn!(
+                id,
+                hostname,
+                agent_protocol = protocol,
+                agent_version,
+                oldest_protocol = supported.oldest,
+                newest_protocol = supported.newest,
+                "refused an agent that speaks a protocol this server doesn't take"
+            ),
+            Ok(false) => debug!(id, hostname, "refused an agent again"),
+            Err(error) => warn!(
+                id,
+                error = format!("{error:#}"),
+                "couldn't save why an agent is refused"
+            ),
+        }
+        send(socket, &ServerMessage::Refused { reason }).await?;
+        return Ok(None);
+    }
+    // The agent may have been refused before it was upgraded.
+    if let Err(error) = state.registry.not_refused(&id).await {
         warn!(
             id,
             error = format!("{error:#}"),
-            "couldn't save what the agent said in its hello"
+            "couldn't forget that an agent was refused"
         );
-    }
-    if let Some(reason) = refused {
-        let supported = Protocols::SUPPORTED;
-        warn!(
-            id,
-            hostname,
-            agent_protocol = protocol,
-            agent_version,
-            oldest_protocol = supported.oldest,
-            newest_protocol = supported.newest,
-            "turned away an agent that speaks a protocol this server doesn't take"
-        );
-        send(socket, &ServerMessage::Refused { reason }).await?;
-        return Ok(None);
     }
     // Told to wait, as an agent is after any other refusal, rather than let one
     // key open connections as fast as it likes.
@@ -273,8 +280,8 @@ async fn authenticate(
     Ok((status == RegistrationStatus::Approved).then(|| Arc::new(Agent { id, hostname })))
 }
 
-/// Why an agent that speaks `protocol` is turned away, if it is, in words for whoever
-/// runs it.
+/// Why an agent that speaks `protocol` is refused, if it is, in words for whoever runs
+/// it.
 fn refusal(protocol: u32, agent_version: &str) -> Option<String> {
     let supported = Protocols::SUPPORTED;
     let agent = match (agent_version, protocol) {

@@ -59,6 +59,7 @@ use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use maxnines_protocol::Protocols;
 use maxnines_protocol::auth::new_nonce;
 use sea_orm::sea_query::Expr;
 use sea_orm::sea_query::OnConflict;
@@ -87,7 +88,7 @@ use crate::audit::{Kind, Snapshot};
 use crate::facts::{FlatFacts, decode, encode, flatten, unflatten};
 use crate::host_filter;
 use crate::migrations::Migrator;
-use crate::registration::{HostKind, HostRecord, HostState, LastHello};
+use crate::registration::{HostKind, HostRecord, HostState, Refusal};
 use crate::roles::Role;
 use crate::times::Timestamp;
 
@@ -259,11 +260,12 @@ impl Database {
             decided_by: Set(record.decided_by.clone()),
             first_seen_at: Set(record.first_seen_at),
             decided_at: Set(record.decided_at),
-            agent_protocol: Set(record.hello.agent_protocol.map(i64::from)),
-            agent_version: Set(record.hello.agent_version.clone()),
-            refused_at: Set(record.hello.refused_at),
-            refuse_reason: Set(record.hello.refuse_reason.clone()),
+            refused_at: Set(record.refusal.refused_at),
+            refused_reason: Set(record.refusal.refused_reason.clone()),
+            refused_protocol: Set(record.refusal.refused_protocol.map(i64::from)),
         };
+
+        // A refusal is saved apart, by `save_refusal`, so it's left as it is.
 
         let on_conflict = OnConflict::column(host::Column::Id)
             .update_columns([
@@ -273,10 +275,6 @@ impl Database {
                 host::Column::DecidedBy,
                 host::Column::FirstSeenAt,
                 host::Column::DecidedAt,
-                host::Column::AgentProtocol,
-                host::Column::AgentVersion,
-                host::Column::RefusedAt,
-                host::Column::RefuseReason,
             ])
             .to_owned();
 
@@ -305,27 +303,46 @@ impl Database {
         Ok(())
     }
 
-    /// Keeps what a host's agent said in its last hello. Nothing about who's allowed
-    /// in changes, so there's nothing for the audit log.
-    pub async fn save_hello(&self, id: &str, hello: &LastHello) -> Result<()> {
+    /// Keeps why a host's agent is refused, or that it isn't. Nothing about who's
+    /// allowed in changes, so there's nothing for the audit log.
+    pub async fn save_refusal(&self, id: &str, refusal: &Refusal) -> Result<()> {
         host::Entity::update_many()
+            .col_expr(host::Column::RefusedAt, Expr::value(refusal.refused_at))
             .col_expr(
-                host::Column::AgentProtocol,
-                Expr::value(hello.agent_protocol.map(i64::from)),
+                host::Column::RefusedReason,
+                Expr::value(refusal.refused_reason.clone()),
             )
             .col_expr(
-                host::Column::AgentVersion,
-                Expr::value(hello.agent_version.clone()),
-            )
-            .col_expr(host::Column::RefusedAt, Expr::value(hello.refused_at))
-            .col_expr(
-                host::Column::RefuseReason,
-                Expr::value(hello.refuse_reason.clone()),
+                host::Column::RefusedProtocol,
+                Expr::value(refusal.refused_protocol.map(i64::from)),
             )
             .filter(host::Column::Id.eq(id))
             .exec(&self.connection)
             .await
-            .context("saving what a host's agent said")?;
+            .context("saving why a host's agent is refused")?;
+        Ok(())
+    }
+
+    /// Forgets the refusals this server wouldn't make: of agents that speak a
+    /// protocol it takes, as an older server refused them, and of revoked hosts,
+    /// whose agents are told no more than that. Run as the server starts.
+    pub async fn forget_old_refusals(&self, supported: Protocols) -> Result<()> {
+        host::Entity::update_many()
+            .col_expr(host::Column::RefusedAt, Expr::value(None::<Timestamp>))
+            .col_expr(host::Column::RefusedReason, Expr::value(None::<String>))
+            .col_expr(host::Column::RefusedProtocol, Expr::value(None::<i64>))
+            .filter(host::Column::RefusedProtocol.is_not_null())
+            .filter(
+                Condition::any()
+                    .add(host::Column::State.eq(HostState::Revoked.as_str()))
+                    .add(
+                        host::Column::RefusedProtocol
+                            .between(i64::from(supported.oldest), i64::from(supported.newest)),
+                    ),
+            )
+            .exec(&self.connection)
+            .await
+            .context("forgetting old refusals")?;
         Ok(())
     }
 
@@ -1296,8 +1313,8 @@ fn host_fields(hostname: &str, state: &str, decided_by: Option<&str>) -> Snapsho
 }
 
 fn to_record(row: host::Model) -> Result<HostRecord> {
-    let agent_protocol = row
-        .agent_protocol
+    let refused_protocol = row
+        .refused_protocol
         .map(u32::try_from)
         .transpose()
         .with_context(|| format!("host {} has an impossible protocol", row.id))?;
@@ -1312,11 +1329,10 @@ fn to_record(row: host::Model) -> Result<HostRecord> {
         decided_by: row.decided_by,
         first_seen_at: row.first_seen_at,
         decided_at: row.decided_at,
-        hello: LastHello {
-            agent_protocol,
-            agent_version: row.agent_version,
+        refusal: Refusal {
             refused_at: row.refused_at,
-            refuse_reason: row.refuse_reason,
+            refused_reason: row.refused_reason,
+            refused_protocol,
         },
     })
 }
@@ -1476,7 +1492,7 @@ mod tests {
             decided_by: None,
             first_seen_at: crate::times::from_ms(1_789_000_000_123),
             decided_at: None,
-            hello: LastHello::default(),
+            refusal: Refusal::default(),
         }
     }
 
@@ -1490,6 +1506,59 @@ mod tests {
     fn sorted(mut records: Vec<HostRecord>) -> Vec<HostRecord> {
         records.sort_by(|a, b| a.id.cmp(&b.id));
         records
+    }
+
+    /// A refusal is saved on its own, and saving the rest of a host leaves it be.
+    #[tokio::test]
+    async fn a_refusal_is_saved_apart_and_forgotten_once_it_no_longer_applies() {
+        let database = Database::for_test().await;
+        let refused = |protocol: u32| Refusal {
+            refused_at: Some(at(1_000)),
+            refused_reason: Some(format!("Speaks {protocol}.")),
+            refused_protocol: Some(protocol),
+        };
+        let mut revoked = record("c");
+        revoked.state = HostState::Revoked;
+        for (host, protocol) in [(record("a"), 0), (record("b"), 1), (revoked, 0)] {
+            database.save_host(&host).await.unwrap();
+            database
+                .save_refusal(&host.id, &refused(protocol))
+                .await
+                .unwrap();
+        }
+        let mut renamed = record("a");
+        renamed.hostname = "web-2".to_string();
+        database.save_host(&renamed).await.unwrap();
+        let refusals = |hosts: Vec<HostRecord>| -> Vec<(String, Refusal)> {
+            sorted(hosts)
+                .into_iter()
+                .map(|host| (host.id, host.refusal))
+                .collect()
+        };
+        assert_eq!(
+            refusals(hosts(&database).await),
+            [
+                ("a".to_string(), refused(0)),
+                ("b".to_string(), refused(1)),
+                ("c".to_string(), refused(0)),
+            ]
+        );
+
+        // As a server that takes protocol 1 starts.
+        let supported = Protocols {
+            oldest: 1,
+            newest: 2,
+        };
+        database.forget_old_refusals(supported).await.unwrap();
+
+        assert_eq!(
+            refusals(hosts(&database).await),
+            [
+                ("a".to_string(), refused(0)),
+                ("b".to_string(), Refusal::default()),
+                ("c".to_string(), Refusal::default()),
+            ]
+        );
     }
 
     /// Someone to own keys, made the first time it's asked for.

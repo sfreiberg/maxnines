@@ -18,7 +18,7 @@ impl MigratorTrait for Migrator {
             Box::new(NamesAndUniqueness),
             Box::new(ExactFactsAndEndedAlerts),
             Box::new(DurationsInSeconds),
-            Box::new(AgentHellos),
+            Box::new(RefusedAgents),
         ]
     }
 }
@@ -2903,22 +2903,22 @@ async fn move_column(
     Ok(())
 }
 
-struct AgentHellos;
+struct RefusedAgents;
 
-impl MigrationName for AgentHellos {
+impl MigrationName for RefusedAgents {
     fn name(&self) -> &str {
-        "m20261120_000001_agent_hellos"
+        "m20261120_000001_refused_agents"
     }
 }
 
-/// What a host's agent said in its last hello: the version of the protocol it
-/// speaks and its own version, and when and why it was last turned away for its
-/// protocol, until one it says is taken. Each is NULL until it's said, and always for
-/// a host with no agent.
+/// Why the server refuses a host's agent, while it does, for speaking a version of
+/// the protocol the server doesn't take: when it began, what the agent was told, and
+/// the protocol it speaks. Each is NULL while it isn't refused, and always for a host
+/// with no agent.
 ///
 /// MySQL commits each change as it's made, so each can be made again.
 #[async_trait::async_trait]
-impl MigrationTrait for AgentHellos {
+impl MigrationTrait for RefusedAgents {
     fn use_transaction(&self) -> Option<bool> {
         Some(true)
     }
@@ -2926,14 +2926,11 @@ impl MigrationTrait for AgentHellos {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let backend = manager.get_database_backend();
         let columns = [
-            ColumnDef::new(Hosts::AgentProtocol)
+            moment(backend, Hosts::RefusedAt),
+            ColumnDef::new(Hosts::RefusedReason).text().to_owned(),
+            ColumnDef::new(Hosts::RefusedProtocol)
                 .big_integer()
                 .to_owned(),
-            ColumnDef::new(Hosts::AgentVersion)
-                .string_len(64)
-                .to_owned(),
-            moment(backend, Hosts::RefusedAt),
-            ColumnDef::new(Hosts::RefuseReason).text().to_owned(),
         ];
         let db = manager.get_connection();
         for mut column in columns {
@@ -2953,12 +2950,7 @@ impl MigrationTrait for AgentHellos {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let backend = manager.get_database_backend();
         let db = manager.get_connection();
-        for name in [
-            "agent_protocol",
-            "agent_version",
-            "refused_at",
-            "refuse_reason",
-        ] {
+        for name in ["refused_at", "refused_reason", "refused_protocol"] {
             if backend == DatabaseBackend::MySql && !mysql_has_column(db, "hosts", name).await? {
                 continue;
             }
@@ -3192,10 +3184,9 @@ enum Hosts {
     DecidedBy,
     FirstSeenAt,
     DecidedAt,
-    AgentProtocol,
-    AgentVersion,
     RefusedAt,
-    RefuseReason,
+    RefusedReason,
+    RefusedProtocol,
 }
 
 #[derive(Iden)]
@@ -4337,7 +4328,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn what_an_agent_said_in_its_hello_is_kept_with_its_host() {
+    async fn why_an_agent_is_refused_is_kept_with_its_host() {
         let connection = empty().await;
         up_to(&connection, &DurationsInSeconds).await;
         let at = "'2026-11-20 00:00:00+00:00'";
@@ -4351,29 +4342,29 @@ mod tests {
         .await;
 
         Migrator::up(&connection, None).await.unwrap();
-        let empty = "SELECT COUNT(*) FROM hosts WHERE id = 'h1' AND agent_protocol IS NULL
-                     AND agent_version IS NULL AND refused_at IS NULL AND refuse_reason IS NULL";
+        let empty = "SELECT COUNT(*) FROM hosts WHERE id = 'h1' AND refused_at IS NULL
+                     AND refused_reason IS NULL AND refused_protocol IS NULL";
         assert_eq!(number(&connection, empty).await, 1);
         run(
             &connection,
             &format!(
-                "UPDATE hosts SET agent_protocol = 0, agent_version = '0.1.0',
-                     refused_at = {at}, refuse_reason = 'Upgrade the agent.'
+                "UPDATE hosts SET refused_at = {at}, refused_reason = 'Upgrade the agent.',
+                     refused_protocol = 0
                  WHERE id = 'h1'"
             ),
         )
         .await;
-        let reason = "SELECT refuse_reason FROM hosts WHERE id = 'h1'";
+        let reason = "SELECT refused_reason FROM hosts WHERE id = 'h1'";
         assert_eq!(texts(&connection, reason).await, ["Upgrade the agent."]);
 
         // Running it again where MySQL stopped partway changes nothing more.
         if connection.get_database_backend() == DatabaseBackend::MySql {
-            AgentHellos
+            RefusedAgents
                 .up(&SchemaManager::new(&connection))
                 .await
                 .unwrap();
         }
-        down_through(&connection, &AgentHellos).await;
+        down_through(&connection, &RefusedAgents).await;
         assert_eq!(count(&connection, "hosts").await, 3);
         Migrator::up(&connection, None).await.unwrap();
         assert_eq!(number(&connection, empty).await, 1);

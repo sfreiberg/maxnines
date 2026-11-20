@@ -471,7 +471,7 @@ async fn hello_speaking(
 fn reason(answer: ServerMessage) -> String {
     match answer {
         ServerMessage::Refused { reason } => reason,
-        other => panic!("expected to be turned away, got {other:?}"),
+        other => panic!("expected to be refused, got {other:?}"),
     }
 }
 
@@ -493,7 +493,7 @@ async fn host_from_api(server: &TestServer, id: &str) -> Value {
 }
 
 #[tokio::test]
-async fn an_agent_from_before_protocol_versions_is_turned_away_saying_to_upgrade_it() {
+async fn an_agent_from_before_protocol_versions_is_refused_saying_to_upgrade_it() {
     let server = start().await;
     let host = identity();
     let id = host.id();
@@ -511,9 +511,8 @@ async fn an_agent_from_before_protocol_versions_is_turned_away_saying_to_upgrade
     // People see why, not just that it's offline.
     let api = host_from_api(&server, &id).await;
     assert_eq!(api["needs_upgrading"], "agent", "{api}");
-    assert_eq!(api["agent_protocol"], 0, "{api}");
-    assert_eq!(api["agent_version"], Value::Null, "{api}");
-    assert_eq!(api["refuse_reason"], reason.as_str(), "{api}");
+    assert_eq!(api["refused_protocol"], 0, "{api}");
+    assert_eq!(api["refused_reason"], reason.as_str(), "{api}");
     assert!(api["refused_at"].is_string(), "{api}");
     assert_eq!(api["health"], "offline", "{api}");
     let mut browser = Browser::default();
@@ -523,11 +522,8 @@ async fn an_agent_from_before_protocol_versions_is_turned_away_saying_to_upgrade
         "{}",
         page.body
     );
-    assert!(
-        page.body.contains("From before protocol versions"),
-        "{}",
-        page.body
-    );
+    assert!(page.body.contains(&reason), "{}", page.body);
+    assert!(page.body.contains("Refused for "), "{}", page.body);
     let list = browser.get(&server, "/hosts?view=table").await;
     assert!(
         list.body.contains(">Agent needs upgrading</span>"),
@@ -541,8 +537,17 @@ async fn an_agent_from_before_protocol_versions_is_turned_away_saying_to_upgrade
     );
 }
 
+/// Why a host's agent is refused, as kept, and as the server would load it again.
+async fn refusal_of(server: &TestServer, id: &str) -> crate::registration::Refusal {
+    let kept = server.state.registry.get(id).await.unwrap().refusal;
+    let saved = server.state.database.load_hosts().await.unwrap();
+    let saved = saved.into_iter().find(|saved| saved.id == id).unwrap();
+    assert_eq!(saved.refusal, kept);
+    kept
+}
+
 #[tokio::test]
-async fn a_hello_that_is_taken_clears_the_refusal_and_keeps_what_the_agent_said() {
+async fn an_upgraded_agent_is_no_longer_refused() {
     let server = start().await;
     let host = identity();
     let id = host.id();
@@ -558,6 +563,7 @@ async fn a_hello_that_is_taken_clears_the_refusal_and_keeps_what_the_agent_said(
             .needs_upgrading(),
         Some(crate::registration::Upgrade::Agent)
     );
+    assert_eq!(refusal_of(&server, &id).await.refused_protocol, Some(0));
 
     // Upgraded, it waits for approval like any other.
     let mut client = server.connect().await;
@@ -565,20 +571,93 @@ async fn a_hello_that_is_taken_clears_the_refusal_and_keeps_what_the_agent_said(
         handshake(&mut client, &host, "web-1", None).await,
         RegistrationStatus::Pending
     );
-    let hello = server.state.registry.get(&id).await.unwrap().hello;
     assert_eq!(
-        hello.agent_protocol,
-        Some(maxnines_protocol::PROTOCOL_VERSION)
+        refusal_of(&server, &id).await,
+        crate::registration::Refusal::default()
     );
-    assert_eq!(hello.agent_version.as_deref(), Some(AGENT_VERSION));
-    assert_eq!((hello.refused_at, &hello.refuse_reason), (None, &None));
-    // And it's kept, not only remembered.
-    let saved = server.state.database.load_hosts().await.unwrap();
-    let saved = saved.into_iter().find(|saved| saved.id == id).unwrap();
-    assert_eq!(saved.hello, hello);
     let api = host_from_api(&server, &id).await;
     assert_eq!(api["needs_upgrading"], Value::Null, "{api}");
-    assert_eq!(api["agent_version"], AGENT_VERSION, "{api}");
+    assert_eq!(api["refused_reason"], Value::Null, "{api}");
+    assert_eq!(api["refused_at"], Value::Null, "{api}");
+}
+
+/// A refused agent tries again every few minutes, and a fleet of them shouldn't
+/// write each time.
+#[tokio::test]
+async fn a_refusal_is_kept_from_when_it_began_while_its_reason_stays_the_same() {
+    let server = start().await;
+    let host = identity();
+    let id = host.id();
+    let mut client = server.connect().await;
+    let first_reason = reason(hello_speaking(&mut client, &host, Some(0)).await);
+    let first = refusal_of(&server, &id).await;
+    assert_eq!(first.refused_reason.as_deref(), Some(first_reason.as_str()));
+
+    let mut client = server.connect().await;
+    reason(hello_speaking(&mut client, &host, Some(0)).await);
+    assert_eq!(refusal_of(&server, &id).await, first);
+    let registry = &server.state.registry;
+    assert!(!registry.refused(&id, 0, &first_reason).await.unwrap());
+
+    // A different reason is a new refusal.
+    let newer = maxnines_protocol::PROTOCOL_VERSION + 1;
+    let mut client = server.connect().await;
+    let reason = reason(hello_speaking(&mut client, &host, Some(newer)).await);
+    let now = refusal_of(&server, &id).await;
+    assert_eq!(now.refused_reason.as_deref(), Some(reason.as_str()));
+    assert_eq!(now.refused_protocol, Some(newer));
+    assert!(now.refused_at >= first.refused_at);
+}
+
+/// An agent trying too often is still told why, but nothing more is kept.
+#[tokio::test]
+async fn a_refusal_is_not_kept_for_an_agent_trying_too_often() {
+    let server = start().await;
+    let host = identity();
+    let id = host.id();
+    drop(server.connect_approved(&host, "web-1").await);
+    server.wait_for_online(&id, false).await;
+    while server.state.presence.allow_connection(&id) {}
+
+    let mut client = server.connect().await;
+    let reason = reason(hello_speaking(&mut client, &host, Some(0)).await);
+
+    assert!(reason.contains("Upgrade the agent"), "{reason}");
+    assert_eq!(
+        refusal_of(&server, &id).await,
+        crate::registration::Refusal::default()
+    );
+}
+
+#[tokio::test]
+async fn revoking_a_host_forgets_that_its_agent_was_refused() {
+    let server = start().await;
+    let host = identity();
+    let id = host.id();
+    drop(server.connect_approved(&host, "web-1").await);
+    server.wait_for_online(&id, false).await;
+    let mut client = server.connect().await;
+    reason(hello_speaking(&mut client, &host, Some(0)).await);
+    assert!(refusal_of(&server, &id).await.refused_at.is_some());
+
+    let revoked = server
+        .state
+        .registry
+        .decide(&id, HostState::Revoked)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(revoked.refusal, crate::registration::Refusal::default());
+    assert_eq!(
+        refusal_of(&server, &id).await,
+        crate::registration::Refusal::default()
+    );
+    let api = host_from_api(&server, &id).await;
+    assert_eq!(api["refused_reason"], Value::Null, "{api}");
+    let mut browser = Browser::default();
+    let page = browser.get(&server, &format!("/hosts/{id}")).await;
+    assert!(!page.body.contains("Refused for"), "{}", page.body);
 }
 
 #[tokio::test]
@@ -3012,33 +3091,13 @@ fn parses_commands() {
 
 // ---- agent versions
 
-/// Connects an approved agent again, saying it's `version` in its hello.
-async fn reconnect_as_version(server: &TestServer, host: &Identity, version: &str) -> Client {
-    server.wait_for_online(&host.id(), false).await;
-    let mut client = server.connect().await;
-    let nonce = read_nonce(&mut client).await;
-    let AgentMessage::Hello {
-        hostname,
-        public_key,
-        signature,
-        token,
-        protocol,
-        ..
-    } = hello(host, "web-1", host.sign(AUDIENCE, &nonce), None)
-    else {
-        unreachable!();
+async fn report_version(server: &TestServer, client: &mut Client, id: &str, version: &str) {
+    TestServer::next_config(client).await;
+    let facts = AgentMessage::Facts {
+        facts: json!({ "agent": { "version": version, "protocol": 1, "commit": "abc123" } }),
     };
-    let said = AgentMessage::Hello {
-        hostname,
-        public_key,
-        signature,
-        token,
-        protocol,
-        agent_version: version.to_string(),
-    };
-    send(&mut client, &said).await;
-    assert_eq!(read_status(&mut client).await, RegistrationStatus::Approved);
-    client
+    send(client, &facts).await;
+    server.wait_for_facts(id, 1).await;
 }
 
 #[tokio::test]
@@ -3052,8 +3111,9 @@ async fn the_hosts_page_shows_which_agents_have_an_update() {
         (&current, "current-1", newest),
         (&newer, "newer-1", "999.0.0"),
     ] {
-        drop(server.connect_approved(host, hostname).await);
-        clients.push(reconnect_as_version(&server, host, version).await);
+        let mut client = server.connect_approved(host, hostname).await;
+        report_version(&server, &mut client, &host.id(), version).await;
+        clients.push(client);
     }
     let mut browser = Browser::default();
 
@@ -3075,6 +3135,9 @@ async fn the_hosts_page_shows_which_agents_have_an_update() {
     let page = browser.get(&server, &format!("/hosts/{}", old.id())).await;
     assert!(page.body.contains(">Update available</span>"));
     assert!(page.body.contains(&format!("The newest is {newest}.")));
+    // All of it is what the agent reports about itself.
+    assert!(page.body.contains("0.0.1, commit <code>abc123</code>"));
+    assert!(page.body.contains("<dt>Agent protocol</dt><dd>1</dd>"));
     let page = browser
         .get(&server, &format!("/hosts/{}", current.id()))
         .await;
@@ -5477,7 +5540,7 @@ async fn a_revoked_agent_still_connected_is_never_shown_online() {
             decided_by: Some("admin".to_string()),
             first_seen_at: now,
             decided_at: Some(now),
-            hello: Default::default(),
+            refusal: Default::default(),
         })
         .await;
     // Its connection closes a moment after it's revoked.

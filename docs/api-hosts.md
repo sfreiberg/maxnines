@@ -8,14 +8,15 @@ host with no agent is `not_read` while it has no page being read or check being 
 as it's then neither online nor offline. Its `public_key` is `null`, as it has no agent
 to hold one.
 
-`agent_protocol` and `agent_version` are what the host's agent said when it last
-connected: the version of the protocol it speaks, which is `0` for an agent from before
-protocol versions, and its own version. The server turns away an agent whose protocol it
-doesn't take, as described under [upgrading](agents.md#upgrading), and keeps when it
-last did and why in `refused_at` and `refuse_reason`, until the agent connects with one
-it takes. While it would still be turned away, `needs_upgrading` says what has to be
-upgraded first: `agent` or `server`. It's `null` otherwise, and its `health` is
-`offline`. All of these are `null` for a host with no agent.
+The server refuses an agent that speaks a version of the protocol it doesn't take, as
+described under [upgrading](agents.md#upgrading). While it does, `needs_upgrading` says
+what has to be upgraded first, `agent` or `server`, and the host's `health` is `offline`.
+`refused_reason` is what the agent was told, `refused_at` is when the server began
+refusing it for that reason, and `refused_protocol` is the version of the protocol the
+agent speaks, which is `0` for an agent from before protocol versions. While the agent
+isn't refused, all four are `null`, as they always are for a host with no agent and for
+a revoked host. The agent's own version is in its [facts](#get-a-hosts-facts), as
+`agent.version`.
 
 ## List hosts
 
@@ -41,10 +42,9 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
     "decided_by": "you@example.com",
     "first_seen_at": "2026-11-06T04:44:24.215Z",
     "decided_at": "2026-11-06T04:44:25.752Z",
-    "agent_protocol": 1,
-    "agent_version": "0.1.0",
     "refused_at": null,
-    "refuse_reason": null,
+    "refused_reason": null,
+    "refused_protocol": null,
     "online": true,
     "health": "online",
     "last_seen_at": "2026-11-06T04:44:42.225Z",
@@ -64,10 +64,9 @@ A host whose agent is too old for the server looks like this:
   "kind": "agent",
   "hostname": "db-1",
   "state": "approved",
-  "agent_protocol": 0,
-  "agent_version": null,
   "refused_at": "2026-11-20T18:02:11.408Z",
-  "refuse_reason": "This agent (from before protocol versions) is too old for this server (version 0.1.0), which takes agent protocol 1. Upgrade the agent to 0.1.0.",
+  "refused_reason": "This agent (from before protocol versions) is too old for this server (version 0.1.0), which takes agent protocol 1. Upgrade the agent to 0.1.0.",
+  "refused_protocol": 0,
   "online": false,
   "health": "offline",
   "needs_upgrading": "agent"
@@ -101,10 +100,9 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "decided_by": "you@example.com",
   "first_seen_at": "2026-11-06T04:44:24.215Z",
   "decided_at": "2026-11-06T04:44:24.215Z",
-  "agent_protocol": null,
-  "agent_version": null,
   "refused_at": null,
-  "refuse_reason": null
+  "refused_reason": null,
+  "refused_protocol": null
 }
 ```
 

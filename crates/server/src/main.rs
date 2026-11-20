@@ -391,6 +391,9 @@ async fn serve(path: &Path) -> Result<()> {
     }
     let secure_site = config.audience().starts_with("wss://");
     let csrf = csrf::config(&database, secure_site).await?;
+    database
+        .forget_old_refusals(maxnines_protocol::Protocols::SUPPORTED)
+        .await?;
     let hosts = database.load_hosts().await.context("loading hosts")?;
     let store = store::open(&config.metrics, config.retention)?;
     let metrics = Metrics::new(store.reader()?);

@@ -202,6 +202,8 @@ fn gather_named(
         },
         "agent": {
             "version": build.version,
+            // Which version of the protocol it speaks with the server.
+            "protocol": maxnines_protocol::PROTOCOL_VERSION,
             "commit": build.commit,
             "built_at": build.built_at,
             "rust_version": build.rust_version,
@@ -425,6 +427,7 @@ mod tests {
             rust.starts_with("1.") && rust.split('.').count() >= 3,
             "{rust}"
         );
+        assert_eq!(agent["protocol"], maxnines_protocol::PROTOCOL_VERSION);
     }
 
     #[test]

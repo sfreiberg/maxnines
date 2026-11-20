@@ -434,7 +434,7 @@ async fn an_agent_asking_to_join_is_recorded_as_maxnines() {
         decided_by: None,
         first_seen_at: crate::times::from_ms(0),
         decided_at: None,
-        hello: Default::default(),
+        refusal: Default::default(),
     };
 
     server.state.database.save_host(&record).await.unwrap();

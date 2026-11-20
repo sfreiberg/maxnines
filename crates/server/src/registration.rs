@@ -130,23 +130,31 @@ pub struct HostRecord {
     pub first_seen_at: Timestamp,
     pub decided_at: Option<Timestamp>,
     #[serde(flatten)]
-    pub hello: LastHello,
+    pub refusal: Refusal,
 }
 
-/// What a host's agent said in its last hello, and whether it was turned away for it.
-/// All empty for a host with no agent, or whose agent hasn't connected since the
-/// server began keeping them.
+/// Why the server refuses a host's agent, while it does: for speaking a version of
+/// the protocol the server doesn't take. All empty while it doesn't, which is always
+/// for a host with no agent or one that's revoked.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LastHello {
+pub struct Refusal {
+    /// When the server began refusing it for this reason.
+    pub refused_at: Option<Timestamp>,
+    /// What the agent was told, which names the side to upgrade.
+    pub refused_reason: Option<String>,
     /// The version of the protocol it speaks, which is 0 for an agent from before
     /// protocol versions.
-    pub agent_protocol: Option<u32>,
-    /// Its own version, which an agent from before protocol versions doesn't say.
-    pub agent_version: Option<String>,
-    /// When it was last turned away for the protocol it speaks, and why, until a
-    /// hello of its is taken.
-    pub refused_at: Option<Timestamp>,
-    pub refuse_reason: Option<String>,
+    pub refused_protocol: Option<u32>,
+}
+
+impl Refusal {
+    fn new(protocol: u32, reason: String, at: Timestamp) -> Self {
+        Self {
+            refused_at: Some(at),
+            refused_reason: Some(reason),
+            refused_protocol: Some(protocol),
+        }
+    }
 }
 
 /// Which side has to be upgraded before a host's agent is taken again.
@@ -158,15 +166,12 @@ pub enum Upgrade {
 }
 
 impl HostRecord {
-    /// Which side has to be upgraded, for a host whose agent was turned away and
-    /// still would be. An upgraded server can take an agent it turned away, which
-    /// then needs nothing more than to try again, and a revoked host needs nothing.
+    /// Which side has to be upgraded, for a host whose agent the server refuses.
     pub fn needs_upgrading(&self) -> Option<Upgrade> {
         if self.state == HostState::Revoked {
             return None;
         }
-        self.hello.refused_at?;
-        let protocol = self.hello.agent_protocol?;
+        let protocol = self.refusal.refused_protocol?;
         match Protocols::SUPPORTED.fit(protocol) {
             ProtocolFit::TooOld => Some(Upgrade::Agent),
             ProtocolFit::TooNew => Some(Upgrade::Server),
@@ -275,6 +280,9 @@ pub struct Registry {
     /// Held while a change is decided and saved, so changes are made one at a time,
     /// each on what the last left. Reading never waits for it.
     changing: Mutex<()>,
+    /// As `changing`, for refusals alone, which are saved apart from the rest of a
+    /// host, so a fleet being refused never holds up anything else.
+    refusing: Mutex<()>,
     /// When each waiting agent last tried to connect. In memory, as it asks again.
     asked: std::sync::Mutex<BTreeMap<String, Timestamp>>,
     rules: Rules,
@@ -294,6 +302,7 @@ impl Registry {
         Self {
             hosts: RwLock::new(hosts.into_iter().map(|a| (a.id.clone(), a)).collect()),
             changing: Mutex::new(()),
+            refusing: Mutex::new(()),
             asked: std::sync::Mutex::default(),
             rules,
             max_pending,
@@ -375,7 +384,7 @@ impl Registry {
             decided_by: None,
             first_seen_at: now,
             decided_at: None,
-            hello: LastHello::default(),
+            refusal: Refusal::default(),
         });
         host.hostname = request.hostname.to_string();
 
@@ -406,24 +415,51 @@ impl Registry {
         Ok(status)
     }
 
-    /// Keeps what an agent said in its hello, for a host there's a record of. Most
-    /// hellos say just what the one before did, which saves nothing.
-    pub async fn heard(&self, id: &str, hello: LastHello) -> Result<()> {
-        let same = |hosts: &BTreeMap<String, HostRecord>| {
-            hosts.get(id).is_none_or(|host| host.hello == hello)
-        };
-        if self.read(same) {
-            return Ok(());
-        }
-        let _changing = self.changing.lock().await;
-        if self.read(same) {
-            return Ok(());
-        }
-        self.database.save_hello(id, &hello).await?;
-        if let Some(host) = self.write().get_mut(id) {
-            host.hello = hello;
-        }
+    /// Keeps that an agent is refused for speaking `protocol`, and why. While the
+    /// reason stays the same, the refusal is already kept, and nothing is saved, so
+    /// an agent trying again and again costs nothing. Returns whether it's new.
+    pub async fn refused(&self, id: &str, protocol: u32, reason: &str) -> Result<bool> {
+        let now = times::now();
+        self.change_refusal(id, |refusal| {
+            let same = refusal.refused_protocol == Some(protocol)
+                && refusal.refused_reason.as_deref() == Some(reason);
+            (!same).then(|| Refusal::new(protocol, reason.to_string(), now))
+        })
+        .await
+    }
+
+    /// Forgets that an agent was refused, as it isn't any more. Nothing's saved
+    /// unless it was.
+    pub async fn not_refused(&self, id: &str) -> Result<()> {
+        self.change_refusal(id, |refusal| {
+            (*refusal != Refusal::default()).then(Refusal::default)
+        })
+        .await?;
         Ok(())
+    }
+
+    /// Saves the refusal `change` gives for a host there's a record of, if it gives
+    /// one. Returns whether it did.
+    async fn change_refusal(
+        &self,
+        id: &str,
+        change: impl Fn(&Refusal) -> Option<Refusal>,
+    ) -> Result<bool> {
+        let next = |hosts: &BTreeMap<String, HostRecord>| {
+            hosts.get(id).and_then(|host| change(&host.refusal))
+        };
+        if self.read(next).is_none() {
+            return Ok(false);
+        }
+        let _refusing = self.refusing.lock().await;
+        let Some(refusal) = self.read(next) else {
+            return Ok(false);
+        };
+        self.database.save_refusal(id, &refusal).await?;
+        if let Some(host) = self.write().get_mut(id) {
+            host.refusal = refusal;
+        }
+        Ok(true)
     }
 
     fn note_asked(&self, id: &str) {
@@ -466,6 +502,11 @@ impl Registry {
         host.decided_by = Some(by.to_string());
         host.decided_at = Some(times::now());
         self.save(host.clone()).await?;
+        // A revoked host's agent is told no more than that, so it's never refused.
+        if state == HostState::Revoked {
+            self.not_refused(id).await?;
+            host.refusal = Refusal::default();
+        }
         drop(changing);
         self.asked
             .lock()
@@ -496,7 +537,7 @@ impl Registry {
             decided_by: Some(by.to_string()),
             first_seen_at: now,
             decided_at: Some(now),
-            hello: LastHello::default(),
+            refusal: Refusal::default(),
         };
         let changing = self.changing.lock().await;
         self.save(host.clone()).await?;
@@ -570,9 +611,14 @@ impl Registry {
 
     /// Saves first, so memory never claims something the database doesn't have. Only
     /// while changing.
-    async fn save(&self, host: HostRecord) -> Result<()> {
+    /// Saves everything about a host but its refusal, which is saved apart.
+    async fn save(&self, mut host: HostRecord) -> Result<()> {
         self.database.save_host(&host).await?;
-        self.write().insert(host.id.clone(), host);
+        let mut hosts = self.write();
+        if let Some(saved) = hosts.get(&host.id) {
+            host.refusal = saved.refusal.clone();
+        }
+        hosts.insert(host.id.clone(), host);
         Ok(())
     }
 }

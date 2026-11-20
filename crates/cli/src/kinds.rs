@@ -420,12 +420,13 @@ fn host_status(host: &Value) -> String {
     }
 }
 
-/// An agent's version, with the protocol it speaks.
-fn agent_line(version: &str, host: &Value) -> String {
-    match host["agent_protocol"].as_u64() {
+/// An agent's version, with the protocol it speaks, from what it reports about itself.
+fn agent_line(agent: &Value) -> Option<String> {
+    let version = agent["version"].as_str()?;
+    Some(match agent["protocol"].as_u64() {
         Some(protocol) => format!("{version}, protocol {protocol}"),
         None => version.to_string(),
-    }
+    })
 }
 
 /// A moment the API gives as an ISO 8601 time, such as `2026-11-19T01:57:17.828Z`.
@@ -547,13 +548,13 @@ pub fn describe(api: &Api, kind: Kind, name: &str) -> Result<String> {
             },
         ),
     ];
-    if let Some(version) = host["agent_version"].as_str() {
-        lines.push(("Agent".to_string(), agent_line(version, host)));
+    if let Some(agent) = agent_line(&facts["reported"]["agent"]) {
+        lines.push(("Agent".to_string(), agent));
     }
-    if let Some(reason) = host["refuse_reason"].as_str() {
-        let when = moment(host, "refused_at")
-            .map_or_else(String::new, |at| format!(" ({} ago)", span(now - at)));
-        lines.push(("Turned away".to_string(), format!("{reason}{when}")));
+    if let Some(reason) = host["refused_reason"].as_str() {
+        let lasted = moment(host, "refused_at")
+            .map_or_else(String::new, |at| format!(" (for {})", span(now - at)));
+        lines.push(("Refused".to_string(), format!("{reason}{lasted}")));
     }
     let mut alerts = api.get("/alerts")?;
     let firing: Vec<String> = array(alerts["open"].take())
@@ -687,9 +688,11 @@ mod tests {
             "pending, server needs upgrading"
         );
         assert_eq!(
-            agent_line("0.1.0", &json!({"agent_protocol": 1})),
+            agent_line(&json!({"version": "0.1.0", "protocol": 1})).unwrap(),
             "0.1.0, protocol 1"
         );
+        assert_eq!(agent_line(&json!({"version": "0.1.0"})).unwrap(), "0.1.0");
+        assert_eq!(agent_line(&Value::Null), None);
         assert_eq!(
             host_status(&json!({"state": "approved", "health": "not_read"})),
             "not read yet"
