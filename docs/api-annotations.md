@@ -42,7 +42,9 @@ Returns `201` with the new `id`. Reading it back gives:
 `GET /api/v1/annotations`
 
 Newest first. `from` and `to`, ISO 8601 times such as `2026-11-19T01:57:17Z`, choose the
-period, which is the last 7 days unless given, and `limit` how many, which is 200 unless given, up to 1,000.
+period, which is the last 7 days unless given, and `limit` how many, which is 200 unless
+given. `from` has to be before `to` and at most 366 days before it, and `limit` from 1 to
+1,000, or the answer is `400`.
 
 ## Get an annotation
 
@@ -65,8 +67,10 @@ Returns `204`, or `404` if there's no such annotation.
 Everything that happened to one host, newest first, as its page shows them: the
 annotations whose filter matches it, restarts, config changes, alerts starting
 (`alert`) and ending (`resolved`), and updates. `from` and `to`, ISO 8601 times, choose
-the period, which is the last 24 hours unless given. Only what was recorded has an `id`, and `created_by` is
-who added an annotation, or `null` for what the server worked out.
+the period, which is the last 24 hours unless given, and `limit` how many, the newest,
+which is 500 unless given. `from` has to be before `to` and at most 366 days before it,
+and `limit` from 1 to 500, or the answer is `400`. Only what was recorded has an `id`,
+and `created_by` is who added an annotation, or `null` for what the server worked out.
 
 ```json
 [

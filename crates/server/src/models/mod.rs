@@ -75,7 +75,7 @@ use tokio::sync::Mutex;
 pub use self::app_sign_ins::{AppSignIn, AppTokens, Refreshed};
 use self::audit::record_change;
 pub use self::built_in_rules::same_rule;
-pub use self::events::NewEvent;
+pub use self::events::{MAX_TIMELINE, NewEvent};
 pub use self::stats::DatabaseStats;
 pub use self::two_factor::CHALLENGE_LIFETIME;
 pub use self::users::{

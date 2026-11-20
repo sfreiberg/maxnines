@@ -34,7 +34,7 @@ use crate::maintenance::MaintenanceWindowInput;
 use crate::metrics::{self, METRICS, Metric, SeriesResult, TimeRange, Unit};
 use crate::metrics_pages::{MetricsPage, MetricsPageInput, SignIn};
 use crate::models::User;
-use crate::models::{ConfigStatus, RuleInput, UserChange, check_new_user, is_theme};
+use crate::models::{ConfigStatus, MAX_TIMELINE, RuleInput, UserChange, check_new_user, is_theme};
 use crate::notifier::{self, Notice};
 use crate::presence::{HostPresence, Reach};
 use crate::registration::{HostRecord, HostState};
@@ -1526,8 +1526,12 @@ async fn widget_data(
 const DEFAULT_EVENTS: TimeDelta = TimeDelta::days(7);
 /// How long a host's timeline covers unless asked.
 const DEFAULT_TIMELINE: TimeDelta = TimeDelta::days(1);
-/// The most events a list returns.
-const MAX_EVENTS: u64 = 1000;
+/// The longest time a list of events can cover, as for a metric.
+const MAX_EVENTS_SPAN: TimeDelta = TimeDelta::days(366);
+/// How many annotations a list returns unless asked, and the most it can.
+const ANNOTATIONS_LIMIT: (u64, u64) = (200, 1000);
+/// How many of a host's events a timeline returns unless asked, and the most it can.
+const TIMELINE_LIMIT: (u64, u64) = (MAX_TIMELINE, MAX_TIMELINE);
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1545,18 +1549,44 @@ struct EventParams {
     limit: Option<u64>,
 }
 
+/// Which events a list asks for.
+struct EventSpan {
+    from: Timestamp,
+    to: Timestamp,
+    limit: u64,
+}
+
 impl EventParams {
-    fn span(&self, usual: TimeDelta) -> (Timestamp, Timestamp) {
+    /// What's asked for, covering `usual` up to now unless given, and as many as the
+    /// first of `limits` unless given, up to the second. Or why it can't be answered.
+    fn span(&self, usual: TimeDelta, limits: (u64, u64)) -> Result<EventSpan, String> {
         let to = self.to.unwrap_or_else(times::now);
         let from = self.from.unwrap_or_else(|| to - usual);
-        (from, to)
+        if from >= to {
+            return Err("from has to be before to".to_string());
+        }
+        if to - from > MAX_EVENTS_SPAN {
+            let days = MAX_EVENTS_SPAN.num_days();
+            return Err(format!("from and to can be up to {days} days apart"));
+        }
+        let (usual_limit, max_limit) = limits;
+        let limit = self.limit.unwrap_or(usual_limit);
+        if !(1..=max_limit).contains(&limit) {
+            return Err(format!("limit has to be from 1 to {max_limit}"));
+        }
+        Ok(EventSpan { from, to, limit })
     }
 }
 
 async fn list_events(State(state): State<AppState>, Query(params): Query<EventParams>) -> Response {
-    let (from, to) = params.span(DEFAULT_EVENTS);
-    let limit = params.limit.unwrap_or(200).min(MAX_EVENTS);
-    match state.database.list_annotations(from, to, limit).await {
+    let span = match params.span(DEFAULT_EVENTS, ANNOTATIONS_LIMIT) {
+        Ok(span) => span,
+        Err(error) => return failed(StatusCode::BAD_REQUEST, &error),
+    };
+    let annotations = state
+        .database
+        .list_annotations(span.from, span.to, span.limit);
+    match annotations.await {
         Ok(events) => Json(events).into_response(),
         Err(error) => server_error(&error),
     }
@@ -1590,7 +1620,8 @@ async fn delete_event(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) 
     }
 }
 
-/// Everything that happened to one host, newest first: a day's worth unless asked.
+/// Everything that happened to one host, newest first: a day's worth unless asked, and
+/// the newest `limit` of it.
 async fn host_events(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
@@ -1599,9 +1630,15 @@ async fn host_events(
     if state.registry.get(&id).await.is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let (from, to) = params.span(DEFAULT_TIMELINE);
-    match state.timeline(&id, from, to).await {
-        Ok(events) => Json(events).into_response(),
+    let span = match params.span(DEFAULT_TIMELINE, TIMELINE_LIMIT) {
+        Ok(span) => span,
+        Err(error) => return failed(StatusCode::BAD_REQUEST, &error),
+    };
+    match state.timeline(&id, span.from, span.to).await {
+        Ok(mut events) => {
+            events.truncate(usize::try_from(span.limit).unwrap_or(usize::MAX));
+            Json(events).into_response()
+        }
         Err(error) => server_error(&error),
     }
 }

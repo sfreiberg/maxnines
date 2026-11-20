@@ -218,6 +218,51 @@ async fn what_the_server_recorded_is_no_annotation_to_read_or_delete() {
 }
 
 #[tokio::test]
+async fn a_list_of_events_has_to_be_one_that_can_be_answered() {
+    let server = start().await;
+    let (web, _client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
+    let timeline = format!("/api/v1/hosts/{}/events", web.id());
+    for list in ["/api/v1/annotations", timeline.as_str()] {
+        for asked in [
+            "from=2026-11-02T00:00:00Z&to=2026-11-01T00:00:00Z",
+            "from=2026-11-01T00:00:00Z&to=2026-11-01T00:00:00Z",
+            "from=2024-01-01T00:00:00Z&to=2026-01-01T00:00:00Z",
+            "limit=0",
+            "limit=1001",
+        ] {
+            let path = format!("{list}?{asked}");
+            let (status, error) = api(&server, "GET", &path, &Value::Null).await;
+            assert_eq!(status, 400, "{path}: {error}");
+            assert!(error["error"].is_string(), "{path}: {error}");
+        }
+        let path = format!("{list}?limit=1");
+        assert_eq!(
+            api(&server, "GET", &path, &Value::Null).await.0,
+            200,
+            "{path}"
+        );
+    }
+    let path = format!("{timeline}?limit=501");
+    assert_eq!(api(&server, "GET", &path, &Value::Null).await.0, 400);
+}
+
+#[tokio::test]
+async fn a_timeline_gives_the_newest_of_what_it_holds() {
+    let server = start().await;
+    let (web, _client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
+    for title in ["first", "second"] {
+        let annotation = json!({ "title": title });
+        let (status, _) = api(&server, "POST", "/api/v1/annotations", &annotation).await;
+        assert_eq!(status, 201);
+    }
+
+    let path = format!("/api/v1/hosts/{}/events?limit=1", web.id());
+    let (_, events) = api(&server, "GET", &path, &Value::Null).await;
+
+    assert_eq!(titles(events.as_array().unwrap()), ["second"]);
+}
+
+#[tokio::test]
 async fn a_restart_is_noticed_from_the_boot_time_and_a_backlog_is_not_one() {
     let server = start().await;
     let (host, mut client) = connect_host(&server, "web-1", json!({ "n": 1 })).await;
@@ -576,7 +621,7 @@ async fn the_annotations_tab_adds_one_for_a_filter_at_a_time_given() {
     let (_, listed) = api(
         &server,
         "GET",
-        "/api/v1/annotations?from=1970-01-01T00:00:00Z",
+        "/api/v1/annotations?from=2026-11-10T00:00:00Z&to=2026-11-11T00:00:00Z",
         &Value::Null,
     )
     .await;
