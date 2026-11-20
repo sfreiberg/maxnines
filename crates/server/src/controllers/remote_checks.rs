@@ -33,23 +33,6 @@ use crate::remote_checks::{
 use crate::silences::{ActiveSilences, SilenceInput};
 use crate::times::{self, Timestamp};
 
-const KINDS: [CheckKind; 14] = [
-    CheckKind::Http,
-    CheckKind::Tcp,
-    CheckKind::Tls,
-    CheckKind::Dns,
-    CheckKind::Ping,
-    CheckKind::Postgres,
-    CheckKind::Mysql,
-    CheckKind::Redis,
-    CheckKind::Mongodb,
-    CheckKind::Clickhouse,
-    CheckKind::Ssh,
-    CheckKind::Smtp,
-    CheckKind::Imap,
-    CheckKind::Pop3,
-];
-
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/checks", get(index).post(create))
@@ -390,7 +373,7 @@ async fn form_page(
     form: &CheckForm,
     error: Option<&str>,
 ) -> Response {
-    let kinds: Vec<&str> = KINDS.iter().map(|kind| kind.as_str()).collect();
+    let kinds: Vec<&str> = CheckKind::KNOWN.map(CheckKind::as_str).to_vec();
     let page = Page::new(state, token, "remote_checks/form.html")
         .with("id", &id)
         .with("check", form)

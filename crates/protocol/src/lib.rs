@@ -593,10 +593,16 @@ pub enum CheckKind {
 }
 
 impl CheckKind {
+    /// What a check of [`CheckKind::Unknown`] reports instead of running.
+    pub const UNKNOWN_MESSAGE: &str =
+        "this agent doesn't know this kind of check, which is newer, so it needs upgrading";
+
     /// Every kind this build can run.
+    /// In the order people are offered them. `Unknown` stays the last variant, which
+    /// a test relies on to check that nothing's missing here.
     pub const KNOWN: [Self; 14] = [
-        Self::Tcp,
         Self::Http,
+        Self::Tcp,
         Self::Tls,
         Self::Dns,
         Self::Ping,
@@ -1666,6 +1672,37 @@ mod tests {
         assert_eq!(CheckKind::parse("unknown"), None);
     }
 
+    /// `parse` only finds what's in `KNOWN`, so a kind left out of it could never be
+    /// saved or run.
+    #[test]
+    fn known_has_every_kind_but_unknown() {
+        // Exhaustive, so a new kind doesn't compile until it's thought about here.
+        let runs = |kind: CheckKind| match kind {
+            CheckKind::Tcp
+            | CheckKind::Http
+            | CheckKind::Tls
+            | CheckKind::Dns
+            | CheckKind::Ping
+            | CheckKind::Postgres
+            | CheckKind::Mysql
+            | CheckKind::Redis
+            | CheckKind::Mongodb
+            | CheckKind::Clickhouse
+            | CheckKind::Ssh
+            | CheckKind::Smtp
+            | CheckKind::Imap
+            | CheckKind::Pop3 => true,
+            CheckKind::Unknown => false,
+        };
+        assert!(CheckKind::KNOWN.into_iter().all(runs));
+        assert!(!runs(CheckKind::Unknown));
+        let names: std::collections::BTreeSet<&str> =
+            CheckKind::KNOWN.map(CheckKind::as_str).into();
+        assert_eq!(names.len(), CheckKind::KNOWN.len(), "listed twice");
+        // Unknown is the last variant, so every kind before it has to be listed.
+        assert_eq!(CheckKind::Unknown as usize, CheckKind::KNOWN.len());
+    }
+
     fn with_unknown_kind() -> AgentConfig {
         serde_json::from_value(json!({
             "collectors": {
@@ -1695,7 +1732,7 @@ mod tests {
     fn a_server_never_saves_a_check_of_a_kind_it_does_not_know() {
         let error = with_unknown_kind().validate().unwrap_err().to_string();
         assert!(error.contains("\"directory\" needs a kind"), "{error}");
-        assert!(error.contains("tcp, http"), "{error}");
+        assert!(error.contains("http, tcp"), "{error}");
     }
 
     #[test]

@@ -180,18 +180,13 @@ enum Ready {
     Broken { name: String, why: String },
 }
 
-/// What a check of a kind this agent doesn't know, which a newer server can send,
-/// reports instead of running.
-const UNKNOWN_KIND: &str =
-    "this agent doesn't know this kind of check, which is newer, so it needs upgrading";
-
 impl Ready {
     /// A check the server sent whole.
     fn sent(check: Check) -> Self {
         if check.kind == CheckKind::Unknown {
             return Self::Broken {
                 name: check.name,
-                why: UNKNOWN_KIND.to_string(),
+                why: CheckKind::UNKNOWN_MESSAGE.to_string(),
             };
         }
         Self::Run(Box::new(check), None)
@@ -342,8 +337,12 @@ mod tests {
         };
         assert_eq!(row("port")["up"], 1, "{output}");
         assert_eq!(row("directory")["up"], 0, "{output}");
-        assert_eq!(row("directory")["error"], UNKNOWN_KIND, "{output}");
-        assert!(UNKNOWN_KIND.contains("upgrading"));
+        assert_eq!(
+            row("directory")["error"],
+            CheckKind::UNKNOWN_MESSAGE,
+            "{output}"
+        );
+        assert!(CheckKind::UNKNOWN_MESSAGE.contains("upgrading"));
     }
 
     #[test]

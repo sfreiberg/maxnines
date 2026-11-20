@@ -187,7 +187,7 @@ pub async fn run_signed_in(check: &Check, credentials: Option<&Credentials>) -> 
             CheckKind::Smtp => mail::check_smtp(check, credentials, &mut findings).await,
             CheckKind::Imap => mail::check_imap(check, credentials, &mut findings).await,
             CheckKind::Pop3 => mail::check_pop3(check, credentials, &mut findings).await,
-            CheckKind::Unknown => Err(anyhow!("this version can't run this kind of check")),
+            CheckKind::Unknown => Err(anyhow!(CheckKind::UNKNOWN_MESSAGE)),
         }
     };
     let result = timeout(limit(check), work)
