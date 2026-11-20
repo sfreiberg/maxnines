@@ -903,6 +903,7 @@ mod tests {
             version: version.to_string(),
             error: error.map(String::from),
             reported_at: crate::times::from_ms(1),
+            skipped_collectors: Vec::new(),
         }
     }
 

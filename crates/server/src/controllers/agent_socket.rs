@@ -10,7 +10,7 @@ use axum::response::Response;
 use ipnet::IpNet;
 use maxnines_protocol::actions::ActionResult;
 use maxnines_protocol::{
-    AgentMessage, ProtocolFit, Protocols, RegistrationStatus, ServerMessage, auth,
+    AgentMessage, COLLECTORS, ProtocolFit, Protocols, RegistrationStatus, ServerMessage, auth,
 };
 use serde_json::Value;
 use tokio::sync::Notify;
@@ -486,15 +486,7 @@ async fn do_jobs(
                     }
                 }
                 Some(Job::ConfigResult { version, error, skipped_collectors }) => {
-                    if !skipped_collectors.is_empty() {
-                        warn!(
-                            id = agent.id,
-                            version,
-                            skipped = skipped_collectors.join(", "),
-                            "agent doesn't know these collectors, and runs the rest of its config"
-                        );
-                    }
-                    save_config_result(version, error, agent, state).await;
+                    save_config_result(version, error, skipped_collectors, agent, state).await;
                 }
                 Some(Job::Boot(booted_at)) => {
                     save_boot(booted_at, agent, state, &mut known_boot).await;
@@ -622,6 +614,20 @@ fn receive(
             return None;
         }
         Ok(AgentMessage::Facts { facts }) => Job::Facts(facts),
+        // Only collectors the server knows are ever sent, so an agent can only have
+        // skipped some of those.
+        Ok(AgentMessage::ConfigResult {
+            skipped_collectors, ..
+        }) if !skipped_collectors
+            .iter()
+            .all(|name| COLLECTORS.contains(&name.as_str())) =>
+        {
+            warn!(
+                id = agent.id,
+                "skipping a config result that names collectors this server doesn't have"
+            );
+            return None;
+        }
         Ok(AgentMessage::ConfigResult {
             version,
             error,
@@ -756,6 +762,7 @@ async fn save_boot(
 async fn save_config_result(
     version: String,
     error: Option<String>,
+    mut skipped_collectors: Vec<String>,
     agent: &Agent,
     state: &AppState,
 ) {
@@ -767,25 +774,40 @@ async fn save_config_result(
         return;
     }
 
+    skipped_collectors.sort();
+    skipped_collectors.dedup();
+
     // A config that took over from a different one is a change worth marking. The first
     // an agent ever applies isn't, and nor is one it turned down.
-    let changed = match state.database.config_status(&agent.id).await {
-        Ok(previous) => {
-            error.is_none() && previous.is_some_and(|previous| previous.version != version)
-        }
+    let previous = match state.database.config_status(&agent.id).await {
+        Ok(previous) => previous,
         Err(error) => {
             warn!(
                 id = agent.id,
                 error = format!("{error:#}"),
                 "loading config status failed"
             );
-            false
+            None
         }
     };
+    let changed = error.is_none()
+        && previous
+            .as_ref()
+            .is_some_and(|previous| previous.version != version);
+    let skipped_before = previous.map(|previous| previous.skipped_collectors);
+    if !skipped_collectors.is_empty() && skipped_before.as_ref() != Some(&skipped_collectors) {
+        warn!(
+            id = agent.id,
+            version,
+            skipped = skipped_collectors.join(", "),
+            "agent doesn't know these collectors, and runs the rest of its config"
+        );
+    }
     let status = ConfigStatus {
         version,
         error: error.map(|error| error.chars().take(MAX_ERROR_LEN).collect()),
         reported_at: crate::times::now(),
+        skipped_collectors,
     };
     if let Err(error) = state.database.save_config_status(&agent.id, &status).await {
         warn!(

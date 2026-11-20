@@ -1836,6 +1836,57 @@ async fn an_agents_config_result_is_recorded_and_shown() {
 }
 
 #[tokio::test]
+async fn collectors_an_agent_does_not_know_are_kept_and_shown() {
+    let server = start().await;
+    let host = identity();
+    let id = host.id();
+    let mut client = server.connect_approved(&host, "web-1").await;
+    let (version, _) = TestServer::next_config(&mut client).await;
+
+    // Only collectors this server has could have been sent.
+    let made_up = AgentMessage::ConfigResult {
+        version: "made-up".to_string(),
+        error: None,
+        skipped_collectors: vec!["zfs".to_string()],
+    };
+    send(&mut client, &made_up).await;
+    let result = AgentMessage::ConfigResult {
+        version: version.clone(),
+        error: None,
+        skipped_collectors: ["sensors", "gpu", "sensors"].map(String::from).to_vec(),
+    };
+    send(&mut client, &result).await;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = server.state.database.config_status(&id).await.unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "no status arrived");
+        sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(status.version, version);
+    assert_eq!(status.skipped_collectors, ["gpu", "sensors"]);
+
+    let path = format!("/api/v1/hosts/{id}/config");
+    let view = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
+    assert_eq!(
+        view["reported"]["skipped_collectors"],
+        json!(["gpu", "sensors"])
+    );
+    let mut browser = Browser::default();
+    let page = browser.get(&server, &format!("/hosts/{id}")).await;
+    assert!(
+        page.body.contains(
+            "This agent doesn't know gpu, sensors, which are newer, so it needs upgrading to \
+             run them."
+        ),
+        "{}",
+        page.body
+    );
+}
+
+#[tokio::test]
 async fn rules_can_be_managed_through_the_api() {
     let server = start().await;
 

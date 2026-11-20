@@ -19,6 +19,7 @@ impl MigratorTrait for Migrator {
             Box::new(ExactFactsAndEndedAlerts),
             Box::new(DurationsInSeconds),
             Box::new(RefusedAgents),
+            Box::new(SkippedCollectors),
         ]
     }
 }
@@ -2964,6 +2965,53 @@ impl MigrationTrait for RefusedAgents {
     }
 }
 
+struct SkippedCollectors;
+
+impl MigrationName for SkippedCollectors {
+    fn name(&self) -> &str {
+        "m20261120_000002_skipped_collectors"
+    }
+}
+
+/// The collectors in a config that a host's agent doesn't know, as it's older than
+/// the server, one to a line, or NULL for none.
+///
+/// MySQL commits each change as it's made, so it can be made again.
+#[async_trait::async_trait]
+impl MigrationTrait for SkippedCollectors {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let db = manager.get_connection();
+        if manager.get_database_backend() == DatabaseBackend::MySql
+            && mysql_has_column(db, "host_config_status", "skipped_collectors").await?
+        {
+            return Ok(());
+        }
+        let add = Table::alter()
+            .table(HostConfigStatus::Table)
+            .add_column(ColumnDef::new(HostConfigStatus::SkippedCollectors).text())
+            .to_owned();
+        manager.alter_table(add).await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let db = manager.get_connection();
+        if manager.get_database_backend() == DatabaseBackend::MySql
+            && !mysql_has_column(db, "host_config_status", "skipped_collectors").await?
+        {
+            return Ok(());
+        }
+        let drop = Table::alter()
+            .table(HostConfigStatus::Table)
+            .drop_column(HostConfigStatus::SkippedCollectors)
+            .to_owned();
+        manager.alter_table(drop).await
+    }
+}
+
 /// How SQLite's definition of a table writes a foreign key, before what it does on
 /// delete.
 fn sqlite_key(key: &KeyChange) -> String {
@@ -3208,6 +3256,7 @@ enum HostConfigStatus {
     Version,
     Error,
     ReportedAt,
+    SkippedCollectors,
 }
 
 #[derive(Iden)]
@@ -4368,5 +4417,45 @@ mod tests {
         assert_eq!(count(&connection, "hosts").await, 3);
         Migrator::up(&connection, None).await.unwrap();
         assert_eq!(number(&connection, empty).await, 1);
+    }
+
+    #[tokio::test]
+    async fn the_collectors_an_agent_does_not_know_are_kept_with_its_config_status() {
+        let connection = empty().await;
+        up_to(&connection, &RefusedAgents).await;
+        let at = "'2026-11-20 00:00:00+00:00'";
+        for sql in [
+            format!(
+                "INSERT INTO hosts (id, kind, hostname, state, first_seen_at)
+                 VALUES ('h1', 'agent', 'web', 'approved', {at})"
+            ),
+            format!(
+                "INSERT INTO host_config_status (host_id, version, reported_at)
+                 VALUES ('h1', 'v1', {at})"
+            ),
+        ] {
+            run(&connection, &sql).await;
+        }
+
+        Migrator::up(&connection, None).await.unwrap();
+        let none = "SELECT COUNT(*) FROM host_config_status WHERE skipped_collectors IS NULL";
+        assert_eq!(number(&connection, none).await, 1);
+        run(
+            &connection,
+            "UPDATE host_config_status SET skipped_collectors = 'zfs' WHERE host_id = 'h1'",
+        )
+        .await;
+
+        // Running it again where MySQL stopped partway changes nothing more.
+        if connection.get_database_backend() == DatabaseBackend::MySql {
+            SkippedCollectors
+                .up(&SchemaManager::new(&connection))
+                .await
+                .unwrap();
+        }
+        down_through(&connection, &SkippedCollectors).await;
+        assert_eq!(count(&connection, "host_config_status").await, 1);
+        Migrator::up(&connection, None).await.unwrap();
+        assert_eq!(number(&connection, none).await, 1);
     }
 }

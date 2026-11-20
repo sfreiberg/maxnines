@@ -462,7 +462,8 @@ else:
 Most releases don't change the protocol's version, as adding something doesn't. An
 agent given a kind of [check](checks.md) it doesn't know reports that check as down,
 saying the agent needs upgrading, and runs the rest. One given a collector it doesn't
-know runs the others, and the server logs which it skipped.
+know runs the others, and the host's page says which it skipped and that the agent
+needs upgrading to run them.
 
 Even when nothing is turned away, the Hosts page marks agents older than the one
 released with the server **Update available**, and any newer than the server **Newer

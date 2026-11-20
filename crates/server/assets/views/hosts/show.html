@@ -210,6 +210,9 @@
     {% if skipped_collectors %}
     <p class="notice">This agent can't run: {{ skipped_collectors | join(sep=", ") }}</p>
     {% endif %}
+    {% if reported and reported.skipped_collectors %}
+    <p class="notice">This agent doesn't know {{ reported.skipped_collectors | join(sep=", ") }}, which {% if reported.skipped_collectors | length == 1 %}is{% else %}are{% endif %} newer, so it needs upgrading to run {% if reported.skipped_collectors | length == 1 %}it{% else %}them{% endif %}. It runs the rest of its config.</p>
+    {% endif %}
     <details>
       <summary>Show the full config</summary>
       <pre>{{ config }}</pre>

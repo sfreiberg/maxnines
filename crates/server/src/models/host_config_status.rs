@@ -8,6 +8,9 @@ pub struct Model {
     pub version: String,
     pub error: Option<String>,
     pub reported_at: DateTimeUtc,
+    /// Collectors in the config that the agent doesn't know, one to a line, or NULL
+    /// for none.
+    pub skipped_collectors: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

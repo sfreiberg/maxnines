@@ -24,6 +24,8 @@ MaxNines keeps its data in two places:
   - `m20261120_000001_refused_agents` keeps why the server refuses a host's agent,
     while it does, for the protocol it speaks: since when, what the agent was told,
     and that protocol.
+  - `m20261120_000002_skipped_collectors` keeps which collectors in its config a
+    host's agent doesn't know, as it's older than the server.
 - **The metrics store** holds the numbers hosts report. It's DuckDB for a single
   server or ClickHouse for a big one, and only one of them is used. Each has a
   migration, `0001_create_tables`, which makes its tables, and a second: in
@@ -144,6 +146,7 @@ erDiagram
         string version
         text error
         timestamp reported_at
+        text skipped_collectors "the agent doesn't know them, one to a line, NULL for none"
     }
     host_boots {
         string host_id PK, FK
@@ -486,7 +489,7 @@ erDiagram
 | `hosts` | Every host whose agent has asked to join, with whether it's approved, and every host added without an agent. Two built-in hosts, `server` and `fleet`, stand for the server itself and for alerts about many hosts at once |
 | `metrics_pages` | The OpenMetrics pages the server reads for hosts without an agent, with how to sign in to each |
 | `host_facts` | What each host's agent reports about it, kept as history: a fact changing closes one row and starts another |
-| `host_config_status` | The config each host's agent last applied, and why if it refused one |
+| `host_config_status` | The config each host's agent last applied, why if it refused one, and the collectors in it the agent doesn't know |
 | `host_boots` | When each host last started, to notice restarts |
 | `config_rules`, `config_rule_settings` | What agents monitor, chosen by operating system and facts. The server writes its built-in rules, marked by `built_in`, each time it starts |
 | `alert_rules`, `alert_rule_channels` | What raises an alert, and who hears of it. A deleted rule is kept, marked by `deleted_at`, so its alerts still name it |

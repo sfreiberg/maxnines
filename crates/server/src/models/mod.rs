@@ -147,6 +147,23 @@ pub struct ConfigStatus {
     pub version: String,
     pub error: Option<String>,
     pub reported_at: Timestamp,
+    /// Collectors in the config that the agent doesn't know, as it's older than
+    /// the server, which it runs the rest of the config without.
+    pub skipped_collectors: Vec<String>,
+}
+
+impl ConfigStatus {
+    fn from_row(row: host_config_status::Model) -> Self {
+        Self {
+            version: row.version,
+            error: row.error,
+            reported_at: row.reported_at,
+            skipped_collectors: row
+                .skipped_collectors
+                .map(|names| names.lines().map(String::from).collect())
+                .unwrap_or_default(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1047,12 +1064,15 @@ impl Database {
             version: Set(status.version.clone()),
             error: Set(status.error.clone()),
             reported_at: Set(status.reported_at),
+            skipped_collectors: Set((!status.skipped_collectors.is_empty())
+                .then(|| status.skipped_collectors.join("\n"))),
         };
         let on_conflict = OnConflict::column(host_config_status::Column::HostId)
             .update_columns([
                 host_config_status::Column::Version,
                 host_config_status::Column::Error,
                 host_config_status::Column::ReportedAt,
+                host_config_status::Column::SkippedCollectors,
             ])
             .to_owned();
 
@@ -1076,14 +1096,7 @@ impl Database {
             .context("loading config statuses")?;
         Ok(rows
             .into_iter()
-            .map(|row| {
-                let status = ConfigStatus {
-                    version: row.version,
-                    error: row.error,
-                    reported_at: row.reported_at,
-                };
-                (row.host_id, status)
-            })
+            .map(|row| (row.host_id.clone(), ConfigStatus::from_row(row)))
             .collect())
     }
 
@@ -1092,11 +1105,7 @@ impl Database {
             .one(&self.connection)
             .await
             .context("loading config status")?;
-        Ok(row.map(|row| ConfigStatus {
-            version: row.version,
-            error: row.error,
-            reported_at: row.reported_at,
-        }))
+        Ok(row.map(ConfigStatus::from_row))
     }
 }
 
@@ -2208,6 +2217,7 @@ mod tests {
             version: "v1".to_string(),
             error: Some("unknown collector".to_string()),
             reported_at: crate::times::from_ms(100),
+            skipped_collectors: Vec::new(),
         };
         database.save_config_status(host, &failed).await.unwrap();
         assert_eq!(
@@ -2222,6 +2232,7 @@ mod tests {
             version: "v2".to_string(),
             error: None,
             reported_at: crate::times::from_ms(200),
+            skipped_collectors: vec!["zfs".to_string(), "ebpf".to_string()],
         };
         database.save_config_status(host, &applied).await.unwrap();
         assert_eq!(

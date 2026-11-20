@@ -9,14 +9,12 @@ as it's then neither online nor offline. Its `public_key` is `null`, as it has n
 to hold one.
 
 The server refuses an agent that speaks a version of the protocol it doesn't take, as
-described under [upgrading](agents.md#upgrading). While it does, `needs_upgrading` says
-what has to be upgraded first, `agent` or `server`, and the host's `health` is `offline`.
-`refused_reason` is what the agent was told, `refused_at` is when the server began
-refusing it for that reason, and `refused_protocol` is the version of the protocol the
-agent speaks, which is `0` for an agent from before protocol versions. While the agent
-isn't refused, all four are `null`, as they always are for a host with no agent and for
-a revoked host. The agent's own version is in its [facts](#get-a-hosts-facts), as
-`agent.version`.
+described under [upgrading](agents.md#upgrading). While it does, the host's `health` is
+`offline`, `needs_upgrading` says what to upgrade first, `agent` or `server`,
+`refused_reason` is what the agent was told, `refused_at` is when that began, and
+`refused_protocol` is the protocol the agent speaks, `0` from before protocol versions.
+Otherwise all four are `null`, as they always are for a host with no agent or a revoked
+one. The agent's own version is in its [facts](#get-a-hosts-facts), as `agent.version`.
 
 ## List hosts
 
@@ -56,7 +54,8 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 `last_seen_at` is `null` for a host the server hasn't heard from since it started,
 which for one with no agent means none of its pages or checks has answered yet.
 
-A host whose agent is too old for the server looks like this:
+A host whose agent is too old for the server looks like this, with only some of its
+fields shown:
 
 ```json
 {
@@ -72,8 +71,6 @@ A host whose agent is too old for the server looks like this:
   "needs_upgrading": "agent"
 }
 ```
-
-Only some of its fields are shown.
 
 ## Add a host without an agent
 
@@ -226,8 +223,11 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 `GET /api/v1/hosts/{id}/config`
 
-`desired` is what the [config rules](api-config-rules.md) come to for this host. `reported`
-is what its agent last said it's running, with `error` set if it refused the config.
+`desired` is what the [config rules](api-config-rules.md) come to for this host, with
+`skipped_collectors` naming any its agent doesn't say it can run, which are left out.
+`reported` is what its agent last said it's running, with `error` set if it refused the
+config, and `skipped_collectors` naming any collectors in it that the agent doesn't know,
+as it's older than the server, which it runs the rest of the config without.
 
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
@@ -249,7 +249,8 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "reported": {
     "version": "3810e917a2f5c7e9",
     "error": null,
-    "reported_at": "2026-11-06T04:44:27.263Z"
+    "reported_at": "2026-11-06T04:44:27.263Z",
+    "skipped_collectors": []
   }
 }
 ```
