@@ -51,9 +51,13 @@ impl TcpStates {
 
 /// Linux's tables have a header, then a connection a line, with its state in hex in
 /// the fourth column: 01 established, 06 time wait, 08 close wait, 0A listening.
+/// They're read a line at a time, as a busy host's run to tens of megabytes.
 #[cfg(any(target_os = "linux", test))]
-fn count_proc_net_tcp(text: &str, states: &mut TcpStates) {
-    for line in text.lines().skip(1) {
+fn count_proc_net_tcp(table: impl std::io::BufRead, states: &mut TcpStates) {
+    for line in table.lines().skip(1) {
+        let Ok(line) = line else {
+            break;
+        };
         let Some(code) = line.split_whitespace().nth(3) else {
             continue;
         };
@@ -84,17 +88,23 @@ fn count_netstat(text: &str) -> TcpStates {
     states
 }
 
+/// Reading files blocks, so it's done away from async tasks.
 #[cfg(target_os = "linux")]
 pub async fn tcp_states() -> Option<TcpStates> {
-    let mut states = TcpStates::default();
-    let mut read_any = false;
-    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        if let Ok(text) = std::fs::read_to_string(table) {
-            count_proc_net_tcp(&text, &mut states);
-            read_any = true;
+    tokio::task::spawn_blocking(|| {
+        let mut states = TcpStates::default();
+        let mut read_any = false;
+        for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+            if let Ok(file) = std::fs::File::open(table) {
+                count_proc_net_tcp(std::io::BufReader::new(file), &mut states);
+                read_any = true;
+            }
         }
-    }
-    read_any.then_some(states)
+        read_any.then_some(states)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
@@ -107,9 +117,17 @@ pub async fn tcp_states() -> Option<TcpStates> {
 }
 
 /// Windows names the states by number: 2 listening, 5 established, 8 close wait and
-/// 11 time wait.
+/// 11 time wait. Asking blocks, so it's done away from async tasks.
 #[cfg(windows)]
 pub async fn tcp_states() -> Option<TcpStates> {
+    tokio::task::spawn_blocking(windows_tcp_states)
+        .await
+        .ok()
+        .flatten()
+}
+
+#[cfg(windows)]
+fn windows_tcp_states() -> Option<TcpStates> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         GetExtendedTcpTable, MIB_TCP6TABLE_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
         TCP_TABLE_OWNER_PID_ALL,
@@ -211,7 +229,7 @@ mod tests {
    4: 0100007F:A2B8 0100007F:0CEA 02 00000000:00000000 01:00000064 00000002  1000
 ";
         let mut states = TcpStates::default();
-        count_proc_net_tcp(table, &mut states);
+        count_proc_net_tcp(table.as_bytes(), &mut states);
         assert_eq!(
             states,
             TcpStates {

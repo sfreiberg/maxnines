@@ -59,10 +59,10 @@ impl CpuCollector {
 
     /// Gives the changes since the last call, in the same order as the fields.
     fn count(&mut self) -> (Option<u64>, Option<u64>) {
-        let counters = system::counters();
+        let (context_switches, interrupts) = system::cpu_counters();
         (
-            self.context_switches.update(counters.context_switches),
-            self.interrupts.update(counters.interrupts),
+            self.context_switches.update(context_switches),
+            self.interrupts.update(interrupts),
         )
     }
 }
@@ -114,11 +114,8 @@ impl MemoryCollector {
 
     /// Gives the changes since the last call, as pages swapped in and out.
     fn count(&mut self) -> (Option<u64>, Option<u64>) {
-        let counters = system::counters();
-        (
-            self.swap_in.update(counters.swap_in_pages),
-            self.swap_out.update(counters.swap_out_pages),
-        )
+        let (swap_in, swap_out) = system::swap_counters();
+        (self.swap_in.update(swap_in), self.swap_out.update(swap_out))
     }
 }
 

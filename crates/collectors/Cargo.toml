@@ -11,7 +11,7 @@ maxnines-protocol.workspace = true
 serde_json.workspace = true
 sysinfo = "0.40.1"
 systemstat = "0.2.7"
-tokio = { version = "1.54.1", features = ["process", "time"] }
+tokio = { version = "1.54.1", features = ["process", "rt", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = ["fs", "std"] }
@@ -26,7 +26,7 @@ objc2-io-kit = { version = "0.3.2", default-features = false, features = ["std",
 # services, and whether a restart is waiting.
 # Already used by sysinfo, so nothing new is built.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_System_Performance", "Win32_System_Registry", "Win32_System_Services", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_System_Performance", "Win32_System_ProcessStatus", "Win32_System_Registry", "Win32_System_Services", "Win32_System_Threading"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "freebsd"))'.dependencies]
 sysctl = "0.7"

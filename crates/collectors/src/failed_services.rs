@@ -65,9 +65,13 @@ pub async fn failed_services() -> Option<Failed> {
         .then(|| parse_systemctl(&String::from_utf8_lossy(&output.stdout)))
 }
 
+/// Asking the service manager blocks, so it's done away from async tasks.
 #[cfg(windows)]
 pub async fn failed_services() -> Option<Failed> {
-    windows::failed()
+    tokio::task::spawn_blocking(windows::failed)
+        .await
+        .ok()
+        .flatten()
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
@@ -87,6 +91,7 @@ mod windows {
     };
 
     use super::Failed;
+    use crate::windows_text::from_wide;
 
     /// Closes a handle when it's no longer needed.
     struct Handle(SC_HANDLE);
@@ -96,23 +101,6 @@ mod windows {
             // SAFETY: the handle is open and only closed here.
             unsafe { CloseServiceHandle(self.0) };
         }
-    }
-
-    /// Reads up to a zero, as Windows' own strings end.
-    ///
-    /// # Safety
-    /// `text` has to be null or point to a string that ends with a zero.
-    unsafe fn from_wide(text: *const u16) -> String {
-        if text.is_null() {
-            return String::new();
-        }
-        let mut length = 0;
-        // SAFETY: the string ends with a zero, so nothing past it is read.
-        while unsafe { *text.add(length) } != 0 {
-            length += 1;
-        }
-        // SAFETY: those `length` characters were just read.
-        String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) })
     }
 
     fn starts_automatically(manager: &Handle, name: *const u16) -> bool {

@@ -28,12 +28,15 @@ impl SystemCollector {
             interval,
             None,
             || async {
-                report(
-                    &limits(),
-                    login_sessions().await,
-                    tcp_states().await,
-                    failed_services().await,
-                )
+                // Each is asked at once, and reading limits blocks, so it's done
+                // away from the other collectors' tasks.
+                let (limits, sessions, tcp, failed) = tokio::join!(
+                    tokio::task::spawn_blocking(limits),
+                    login_sessions(),
+                    tcp_states(),
+                    failed_services(),
+                );
+                report(&limits.unwrap_or_default(), sessions, tcp, failed)
             },
             Option::unwrap_or_default,
         )?;

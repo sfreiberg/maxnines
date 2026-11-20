@@ -22,9 +22,9 @@ use sysinfo::Disk;
 pub struct Activity {
     pub read_ops_per_sec: f64,
     pub write_ops_per_sec: f64,
-    /// The average time a read took, or 0 with none.
-    pub read_latency_ms: f64,
-    pub write_latency_ms: f64,
+    /// The average time a read took, or 0 with none, if it's known.
+    pub read_latency_ms: Option<f64>,
+    pub write_latency_ms: Option<f64>,
     pub busy_percent: Option<f64>,
     /// How many operations were waiting or under way, on average.
     pub queue_length: Option<f64>,
@@ -37,8 +37,8 @@ impl Activity {
         let fields = [
             ("read_ops_per_sec", finite(self.read_ops_per_sec)),
             ("write_ops_per_sec", finite(self.write_ops_per_sec)),
-            ("read_latency_ms", finite(self.read_latency_ms)),
-            ("write_latency_ms", finite(self.write_latency_ms)),
+            ("read_latency_ms", self.read_latency_ms.and_then(finite)),
+            ("write_latency_ms", self.write_latency_ms.and_then(finite)),
             ("busy_percent", self.busy_percent.and_then(finite)),
             ("queue_length", self.queue_length.and_then(finite)),
         ];
@@ -77,8 +77,8 @@ pub fn activity(before: &Totals, after: &Totals, elapsed: Duration) -> Option<Ac
     Some(Activity {
         read_ops_per_sec: reads * 1000.0 / elapsed_ms,
         write_ops_per_sec: writes * 1000.0 / elapsed_ms,
-        read_latency_ms: per_op(after.read_ms - before.read_ms, reads),
-        write_latency_ms: per_op(after.write_ms - before.write_ms, writes),
+        read_latency_ms: Some(per_op(after.read_ms - before.read_ms, reads)),
+        write_latency_ms: Some(per_op(after.write_ms - before.write_ms, writes)),
         busy_percent: grown(before.busy_ms, after.busy_ms)
             .map(|busy| (busy / elapsed_ms * 100.0).min(100.0)),
         queue_length: grown(before.queued_ms, after.queued_ms).map(|queued| queued / elapsed_ms),
@@ -344,7 +344,7 @@ impl DiskActivity {
 
         let mut by_drive: HashMap<String, [Option<f64>; 6]> = HashMap::new();
         for (index, (_, reading)) in self.counters.read().into_iter().enumerate() {
-            let Reading::Values(values) = reading else {
+            let Reading::Values { values, .. } = reading else {
                 continue;
             };
             for (path, value) in values {
@@ -362,8 +362,8 @@ impl DiskActivity {
                 let activity = Activity {
                     read_ops_per_sec: (*reads)?,
                     write_ops_per_sec: (*writes)?,
-                    read_latency_ms: read_secs.unwrap_or(0.0) * 1000.0,
-                    write_latency_ms: write_secs.unwrap_or(0.0) * 1000.0,
+                    read_latency_ms: read_secs.map(|secs| secs * 1000.0),
+                    write_latency_ms: write_secs.map(|secs| secs * 1000.0),
                     busy_percent: idle.map(|idle| (100.0 - idle).clamp(0.0, 100.0)),
                     queue_length: *queue,
                 };
@@ -465,9 +465,9 @@ mod tests {
 
         assert_eq!(activity.read_ops_per_sec, 200.0);
         assert_eq!(activity.write_ops_per_sec, 0.0);
-        assert_eq!(activity.read_latency_ms, 2.0);
+        assert_eq!(activity.read_latency_ms, Some(2.0));
         // No writes means nothing waited for one.
-        assert_eq!(activity.write_latency_ms, 0.0);
+        assert_eq!(activity.write_latency_ms, Some(0.0));
         assert_eq!(activity.busy_percent, Some(50.0));
         assert_eq!(activity.queue_length, Some(2.0));
     }

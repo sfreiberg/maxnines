@@ -9,7 +9,9 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use systemstat::{Platform, System};
+#[cfg(not(windows))]
+use systemstat::Platform;
+use systemstat::System;
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -19,15 +21,6 @@ use crate::tcp::TcpStates;
 /// How long a system tool, like `who`, gets to answer. They're quick when the host is
 /// healthy.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Running totals from the kernel, which only ever go up.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Counters {
-    pub context_switches: Option<u64>,
-    pub interrupts: Option<u64>,
-    pub swap_in_pages: Option<u64>,
-    pub swap_out_pages: Option<u64>,
-}
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Limits {
@@ -290,17 +283,16 @@ fn parse_file_nr(text: &str) -> Option<u64> {
     Some(allocated.saturating_sub(unused))
 }
 
+/// Context switches and interrupts since the host started, which only ever go up.
 #[cfg(target_os = "linux")]
-pub fn counters() -> Counters {
-    let read = |path: &str| std::fs::read_to_string(path).unwrap_or_default();
-    let (context_switches, interrupts) = parse_proc_stat(&read("/proc/stat"));
-    let (swap_in_pages, swap_out_pages) = parse_vmstat(&read("/proc/vmstat"));
-    Counters {
-        context_switches,
-        interrupts,
-        swap_in_pages,
-        swap_out_pages,
-    }
+pub fn cpu_counters() -> (Option<u64>, Option<u64>) {
+    parse_proc_stat(&std::fs::read_to_string("/proc/stat").unwrap_or_default())
+}
+
+/// Pages swapped in and out since the host started, which only ever go up.
+#[cfg(target_os = "linux")]
+pub fn swap_counters() -> (Option<u64>, Option<u64>) {
+    parse_vmstat(&std::fs::read_to_string("/proc/vmstat").unwrap_or_default())
 }
 
 #[cfg(target_os = "linux")]
@@ -331,13 +323,52 @@ pub fn limits() -> Limits {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// The process IDs the kernel lists, without asking about each process.
+#[cfg(target_os = "macos")]
 fn process_count() -> Option<u64> {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
+    // SAFETY: with nowhere to put them, this only says about how many there are.
+    let about = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    // With room for a few started since.
+    let mut ids: Vec<libc::pid_t> = vec![0; usize::try_from(about).ok()? + 64];
+    let room = libc::c_int::try_from(std::mem::size_of_val(ids.as_slice())).ok()?;
+    // SAFETY: the buffer holds `room` bytes.
+    let count = unsafe { libc::proc_listallpids(ids.as_mut_ptr().cast(), room) };
+    u64::try_from(count).ok()
+}
 
-    let mut system = sysinfo::System::new().ok()?;
-    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
-    Some(system.processes().len() as u64)
+/// The kernel's table of processes, whose entries each start with their own size,
+/// without asking about each process.
+#[cfg(target_os = "freebsd")]
+fn process_count() -> Option<u64> {
+    use sysctl::{Ctl, CtlValue, Sysctl};
+
+    let table = match Ctl::new("kern.proc.proc").ok()?.value().ok()? {
+        CtlValue::Struct(table) | CtlValue::Node(table) => table,
+        _ => return None,
+    };
+    let entry = usize::try_from(i32::from_ne_bytes(table.get(..4)?.try_into().ok()?)).ok()?;
+    (entry > 0).then(|| (table.len() / entry) as u64)
+}
+
+/// What Windows keeps of its memory and processes as a whole.
+#[cfg(windows)]
+fn performance() -> Option<windows_sys::Win32::System::ProcessStatus::PERFORMANCE_INFORMATION> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetPerformanceInfo, PERFORMANCE_INFORMATION,
+    };
+
+    // SAFETY: all zeroes is a valid value for this plain struct.
+    let mut information: PERFORMANCE_INFORMATION = unsafe { std::mem::zeroed() };
+    let size = u32::try_from(std::mem::size_of::<PERFORMANCE_INFORMATION>()).ok()?;
+    information.cb = size;
+    // SAFETY: the struct is as big as Windows is told.
+    let read = unsafe { K32GetPerformanceInfo(&mut information, size) };
+    (read != 0).then_some(information)
+}
+
+#[cfg(windows)]
+fn process_count() -> Option<u64> {
+    Some(u64::from(performance()?.ProcessCount))
 }
 
 /// Reads a whole number, whichever size the kernel declares it as.
@@ -355,13 +386,19 @@ fn sysctl_number(name: &str) -> Option<u64> {
 }
 
 #[cfg(target_os = "freebsd")]
-pub fn counters() -> Counters {
-    Counters {
-        context_switches: sysctl_number("vm.stats.sys.v_swtch"),
-        interrupts: sysctl_number("vm.stats.sys.v_intr"),
-        swap_in_pages: sysctl_number("vm.stats.vm.v_swappgsin"),
-        swap_out_pages: sysctl_number("vm.stats.vm.v_swappgsout"),
-    }
+pub fn cpu_counters() -> (Option<u64>, Option<u64>) {
+    (
+        sysctl_number("vm.stats.sys.v_swtch"),
+        sysctl_number("vm.stats.sys.v_intr"),
+    )
+}
+
+#[cfg(target_os = "freebsd")]
+pub fn swap_counters() -> (Option<u64>, Option<u64>) {
+    (
+        sysctl_number("vm.stats.vm.v_swappgsin"),
+        sysctl_number("vm.stats.vm.v_swappgsout"),
+    )
 }
 
 #[cfg(target_os = "freebsd")]
@@ -389,8 +426,13 @@ pub fn limits() -> Limits {
 /// macOS has no system-wide count of these, and Windows only has them as
 /// performance counters.
 #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-pub fn counters() -> Counters {
-    Counters::default()
+pub fn cpu_counters() -> (Option<u64>, Option<u64>) {
+    (None, None)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+pub fn swap_counters() -> (Option<u64>, Option<u64>) {
+    (None, None)
 }
 
 /// Windows has no system-wide limits like these.
@@ -403,8 +445,46 @@ pub fn limits() -> Limits {
 }
 
 /// What memory is being used for, in the categories each system keeps.
+#[cfg(not(windows))]
 pub fn memory_detail(stats: &System) -> Option<Value> {
     Some(describe_memory(&stats.memory().ok()?.platform_memory))
+}
+
+/// Windows says how much of its page files is in use. It has no figure for memory
+/// that's truly free, only what's available, which is reported already.
+#[cfg(windows)]
+pub fn memory_detail(_stats: &System) -> Option<Value> {
+    Some(json!({ "page_file_bytes": page_file_in_use() }))
+}
+
+/// How much of every page file is in use. What Windows calls its page file total
+/// elsewhere is the commit limit, memory and page files together.
+#[cfg(windows)]
+fn page_file_in_use() -> Option<u64> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        ENUM_PAGE_FILE_INFORMATION, K32EnumPageFilesW,
+    };
+    use windows_sys::core::{BOOL, PCWSTR};
+
+    unsafe extern "system" fn add(
+        pages: *mut std::ffi::c_void,
+        file: *mut ENUM_PAGE_FILE_INFORMATION,
+        _name: PCWSTR,
+    ) -> BOOL {
+        // SAFETY: `pages` is the count given below, and Windows filled in `file`.
+        unsafe { *pages.cast::<usize>() += (*file).TotalInUse };
+        // Carry on to the next.
+        1
+    }
+
+    let mut pages: usize = 0;
+    // SAFETY: the callback only adds to the count, which outlives the call.
+    let listed = unsafe { K32EnumPageFilesW(Some(add), (&raw mut pages).cast()) };
+    if listed == 0 {
+        return None;
+    }
+    let page_size = u64::try_from(performance()?.PageSize).ok()?;
+    Some(u64::try_from(pages).ok()? * page_size)
 }
 
 #[cfg(target_os = "linux")]
@@ -443,15 +523,6 @@ fn describe_memory(memory: &systemstat::PlatformMemory) -> Value {
         "free_bytes": memory.free.as_u64(),
         "cached_bytes": memory.cache.as_u64(),
         "zfs_arc_bytes": memory.zfs_arc.as_u64(),
-    })
-}
-
-#[cfg(windows)]
-fn describe_memory(memory: &systemstat::PlatformMemory) -> Value {
-    let page_file = memory.total_pagefile.as_u64();
-    json!({
-        "free_bytes": memory.avail_phys.as_u64(),
-        "page_file_bytes": page_file.saturating_sub(memory.avail_pagefile.as_u64()),
     })
 }
 
