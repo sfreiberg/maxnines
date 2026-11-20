@@ -446,15 +446,7 @@ async fn a_host_that_stops_answering_is_offline_and_one_with_nothing_to_read_is_
         .await
         .unwrap();
     let started = crate::times::now();
-    let mut evaluator = Evaluator::new(
-        state.database.clone(),
-        state.registry.clone(),
-        state.presence.clone(),
-        state.metrics.clone(),
-        state.status.clone(),
-        state.actions.clone(),
-        started - TimeDelta::minutes(10),
-    );
+    let mut evaluator = Evaluator::new(state, started - TimeDelta::minutes(10));
 
     read_due(&mut scheduler, started).await;
     evaluator.evaluate(started).await.unwrap();

@@ -954,15 +954,7 @@ mod calculation_alerts {
 
     fn evaluator(server: &TestServer, started_at: Timestamp) -> Evaluator {
         let state = &server.state;
-        Evaluator::new(
-            state.database.clone(),
-            state.registry.clone(),
-            state.presence.clone(),
-            state.metrics.clone(),
-            state.status.clone(),
-            state.actions.clone(),
-            started_at,
-        )
+        Evaluator::new(state, started_at)
     }
 
     /// Well after the start, so the wait for agents to come back is over.

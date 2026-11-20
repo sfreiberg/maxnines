@@ -445,16 +445,7 @@ async fn serve(path: &Path) -> Result<()> {
         "server started"
     );
 
-    Evaluator::new(
-        state.database.clone(),
-        state.registry.clone(),
-        state.presence.clone(),
-        state.metrics.clone(),
-        state.status.clone(),
-        state.actions.clone(),
-        crate::times::now(),
-    )
-    .spawn();
+    Evaluator::new(&state, crate::times::now()).spawn();
     Notifier::new(state.database.clone(), state.senders.clone())
         .with_charts(alert_charts::ChartSources {
             database: state.database.clone(),

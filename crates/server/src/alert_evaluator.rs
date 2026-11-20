@@ -17,11 +17,14 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info};
+use wildmatch::WildMatch;
 
 use crate::actions::Actions;
+use crate::agent_configs::AgentConfigs;
 use crate::alerting::{
     Alert, AlertRule, NewAlert, RULE_GONE_REASON, RuleKind, Severity, SeverityChange, clean,
 };
+use crate::app_state::AppState;
 use crate::calculations::{
     self, Calculation, Grouping, Question, SMALLEST_STEP, Sources, over_window,
 };
@@ -31,7 +34,7 @@ use crate::models::Database;
 use crate::presence::Presence;
 use crate::registration::{HostRecord, HostState, Registry};
 use crate::remote_checks::{FLEET_HOST_ID, FLEET_HOSTNAME};
-use crate::rule_engine;
+use crate::rule_engine::{Condition, Host};
 use crate::server_stats::ServerStatus;
 use crate::times::{self, Timestamp};
 
@@ -217,7 +220,10 @@ struct Snapshot {
     in_grace: bool,
     rules: BTreeMap<i64, AlertRule>,
     hosts: BTreeMap<String, HostRecord>,
-    facts: BTreeMap<String, Value>,
+    /// For each rule with a condition, the hosts it applies to.
+    applies: HashMap<i64, HashSet<String>>,
+    /// For each rule that watches only some series, which.
+    series: HashMap<i64, WildMatch>,
     /// By metric and agent. A metric that couldn't be read is missing, which
     /// says nothing about whether anything is wrong.
     readings: BTreeMap<&'static str, BTreeMap<String, Vec<NewestReading>>>,
@@ -229,13 +235,18 @@ struct Snapshot {
 }
 
 impl Snapshot {
-    /// A condition that can't be evaluated doesn't match, as with config rules.
     fn rule_applies(&self, rule: &AlertRule, host_id: &str) -> bool {
-        let Some(condition) = &rule.rule.condition else {
-            return true;
-        };
-        let facts = self.facts.get(host_id).unwrap_or(&Value::Null);
-        rule_engine::evaluate(condition, facts, host_id).unwrap_or(false)
+        rule.rule.condition.is_none()
+            || self
+                .applies
+                .get(&rule.id)
+                .is_some_and(|hosts| hosts.contains(host_id))
+    }
+
+    fn watches_series(&self, rule: &AlertRule, series: &str) -> bool {
+        self.series
+            .get(&rule.id)
+            .is_none_or(|pattern| pattern.matches(series))
     }
 
     /// Why an open alert that nothing checked this time should end, if it should.
@@ -286,10 +297,7 @@ impl Snapshot {
                 };
                 Some(if !reported {
                     "This series is no longer reported"
-                } else if !rule
-                    .rule
-                    .watches_series(alert.series.as_deref().unwrap_or_default())
-                {
+                } else if !self.watches_series(rule, alert.series.as_deref().unwrap_or_default()) {
                     "The rule no longer covers this series"
                 } else {
                     "This agent reports more series than a rule can watch"
@@ -299,8 +307,35 @@ impl Snapshot {
     }
 }
 
+/// For each rule's condition, by the rule's ID, the hosts it's true of. Each condition
+/// is compiled once, and each host's facts made ready for conditions once. One that
+/// can't be compiled or evaluated isn't true, as with config rules.
+fn hosts_each_applies_to(
+    conditions: &[(i64, String)],
+    host_ids: &[String],
+    facts: &BTreeMap<String, FlatFacts>,
+) -> HashMap<i64, HashSet<String>> {
+    let compiled: Vec<(i64, Condition)> = conditions
+        .iter()
+        .filter_map(|(id, text)| Some((*id, Condition::compile(text).ok()?)))
+        .collect();
+    let mut applies: HashMap<i64, HashSet<String>> = HashMap::new();
+    for id in host_ids {
+        let shape = facts.get(id).map_or(Value::Null, unflatten);
+        let host = Host::new(&shape, id);
+        for (rule, condition) in &compiled {
+            if condition.check(&host).unwrap_or(false) {
+                applies.entry(*rule).or_default().insert(id.clone());
+            }
+        }
+    }
+    applies
+}
+
 pub struct Evaluator {
     database: Database,
+    /// What agents are set to run, for how often they send samples.
+    configs: Arc<AgentConfigs>,
     registry: Arc<Registry>,
     presence: Arc<Presence>,
     metrics: Metrics,
@@ -315,22 +350,15 @@ pub struct Evaluator {
 }
 
 impl Evaluator {
-    pub fn new(
-        database: Database,
-        registry: Arc<Registry>,
-        presence: Arc<Presence>,
-        metrics: Metrics,
-        status: Arc<ServerStatus>,
-        actions: Arc<Actions>,
-        started_at: Timestamp,
-    ) -> Self {
+    pub fn new(state: &AppState, started_at: Timestamp) -> Self {
         Self {
-            database,
-            registry,
-            presence,
-            metrics,
-            status,
-            actions,
+            database: state.database.clone(),
+            configs: state.configs.clone(),
+            registry: state.registry.clone(),
+            presence: state.presence.clone(),
+            metrics: state.metrics.clone(),
+            status: state.status.clone(),
+            actions: state.actions.clone(),
             started_at,
             trackers: HashMap::new(),
             trends: HashMap::new(),
@@ -380,7 +408,7 @@ impl Evaluator {
             .map(|rule| (rule.id, rule))
             .collect();
 
-        let hosts = self
+        let hosts: BTreeMap<String, HostRecord> = self
             .registry
             .list()
             .await
@@ -391,15 +419,23 @@ impl Evaluator {
 
         let active = || rules.values().filter(|rule| rule.rule.enabled);
 
-        let needs_facts = active().any(|rule| rule.rule.condition.is_some());
-        let facts = if needs_facts {
-            let all = self.database.all_current_facts().await?;
-            all.iter()
-                .map(|(host, facts)| (host.clone(), unflatten(facts)))
-                .collect()
+        let conditions: Vec<(i64, String)> = active()
+            .filter_map(|rule| Some((rule.id, rule.rule.condition.clone()?)))
+            .collect();
+        let applies = if conditions.is_empty() {
+            HashMap::new()
         } else {
-            BTreeMap::new()
+            let facts = self.database.all_current_facts().await?;
+            let ids: Vec<String> = hosts.keys().cloned().collect();
+            // Every condition against every host is work for a thread of its own.
+            tokio::task::spawn_blocking(move || hosts_each_applies_to(&conditions, &ids, &facts))
+                .await
+                .context("checking alert rules' conditions")?
         };
+        let series = rules
+            .values()
+            .filter_map(|rule| Some((rule.id, rule.rule.series_pattern()?)))
+            .collect();
 
         let wanted: BTreeSet<&'static str> = active()
             .filter(|rule| rule.rule.kind == RuleKind::Metric)
@@ -448,7 +484,8 @@ impl Evaluator {
             in_grace: now - self.started_at < STARTUP_GRACE,
             rules,
             hosts,
-            facts,
+            applies,
+            series,
             readings,
             trends: self.trends.clone(),
             last_samples,
@@ -476,19 +513,18 @@ impl Evaluator {
 
     /// How often an agent is set to send a sample, by the config rules that apply to
     /// it now, or nothing if its config can't be worked out.
-    async fn interval(&self, host_id: &str) -> Result<Option<TimeDelta>> {
-        let rules = self.database.list_rules().await?;
-        let facts: FlatFacts = self
-            .database
-            .current_facts(host_id)
-            .await?
-            .into_iter()
-            .map(|fact| (fact.name, fact.value))
-            .collect();
-        let resolved = rule_engine::resolve(&rules, &unflatten(&facts), host_id);
-        Ok(resolved
-            .ok()
-            .and_then(|resolved| TimeDelta::from_std(resolved.config.interval).ok()))
+    async fn interval(&self, host_id: &str) -> Option<TimeDelta> {
+        match self.configs.config_for(host_id).await {
+            Ok(resolved) => TimeDelta::from_std(resolved.config.interval).ok(),
+            Err(error) => {
+                let error = format!("{error:#}");
+                error!(
+                    host_id,
+                    error, "working out how often a host sends samples failed"
+                );
+                None
+            }
+        }
     }
 
     /// Reads which way a metric has been heading, if it's been long enough since
@@ -681,7 +717,7 @@ impl Evaluator {
             Some(alert) => !newest.is_some_and(|taken| taken > alert.breached_at),
             // One that sends seldom gets a few of its intervals too. They're only
             // worked out for a host quiet for longer than the hold, which is rare.
-            None if quiet_for >= rule.rule.hold => match self.interval(&host.id).await? {
+            None if quiet_for >= rule.rule.hold => match self.interval(&host.id).await {
                 Some(every) => quiet_for >= every * MISSED_SAMPLES,
                 None => true,
             },
@@ -856,7 +892,7 @@ impl Evaluator {
         let watched = readings
             .iter()
             .map(|reading| (clean(&reading.series), reading))
-            .filter(|(series, _)| rule.rule.watches_series(series))
+            .filter(|(series, _)| snapshot.watches_series(rule, series))
             .take(MAX_SERIES_PER_HOST);
         // What the collector last sent, read once and only if an alert needs its words.
         let described = metrics::described(metric);
@@ -967,7 +1003,7 @@ impl Evaluator {
         let watched = host_trends
             .iter()
             .map(|trend| (clean(&trend.series), trend))
-            .filter(|(series, _)| rule.rule.watches_series(series))
+            .filter(|(series, _)| snapshot.watches_series(rule, series))
             .take(MAX_SERIES_PER_HOST);
 
         for (series, trend) in watched {

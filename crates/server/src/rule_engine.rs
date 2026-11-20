@@ -146,7 +146,8 @@ impl<'a> Host<'a> {
     }
 }
 
-/// `facts` is what the agent reports. `trusted` is what the server knows itself.
+/// Checks one condition against one host, for tests.
+#[cfg(test)]
 pub fn evaluate(condition: &str, facts: &Value, host_id: &str) -> Result<bool> {
     Condition::compile(condition)?.check(&Host::new(facts, host_id))
 }
@@ -232,7 +233,9 @@ impl ConfigRules {
     }
 }
 
-/// Works out the config for one agent, given its facts in their natural shape.
+/// Works out the config for one agent, given its facts in their natural shape, for
+/// tests.
+#[cfg(test)]
 pub fn resolve(rules: &[ConfigRule], facts: &Value, host_id: &str) -> Result<ResolvedConfig> {
     ConfigRules::new(rules.iter().cloned()).resolve(&Host::new(facts, host_id))
 }

@@ -207,15 +207,7 @@ impl Harness {
 }
 
 fn evaluator(server: &TestServer, started: Timestamp) -> Evaluator {
-    Evaluator::new(
-        server.state.database.clone(),
-        server.state.registry.clone(),
-        server.state.presence.clone(),
-        server.state.metrics.clone(),
-        server.state.status.clone(),
-        server.state.actions.clone(),
-        started,
-    )
+    Evaluator::new(&server.state, started)
 }
 
 pub(super) fn cpu_rule() -> AlertRuleInput {
@@ -1542,15 +1534,7 @@ async fn an_agent_never_seen_since_a_restart_counts_as_offline() {
         .unwrap();
 
     let started = crate::times::now();
-    let mut restarted = Evaluator::new(
-        state.database.clone(),
-        state.registry.clone(),
-        state.presence.clone(),
-        state.metrics.clone(),
-        state.status.clone(),
-        state.actions.clone(),
-        started,
-    );
+    let mut restarted = Evaluator::new(&state, started);
     restarted
         .evaluate(started + TimeDelta::minutes(2))
         .await
@@ -2211,6 +2195,7 @@ async fn an_agent_that_sends_seldom_has_a_few_of_its_intervals_to_send_in() {
         .create_rule(&every_ten_minutes)
         .await
         .unwrap();
+    test.server.state.config_changed();
     let sent = test.connected_at() + MINUTE;
     test.evaluate_at(sent + TimeDelta::seconds(5), Some(sent))
         .await;

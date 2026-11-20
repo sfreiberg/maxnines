@@ -464,9 +464,13 @@ impl AlertRuleInput {
     }
 
     pub fn watches_series(&self, series: &str) -> bool {
-        self.series
-            .as_deref()
-            .is_none_or(|pattern| WildMatch::new(pattern).matches(series))
+        self.series_pattern()
+            .is_none_or(|pattern| pattern.matches(series))
+    }
+
+    /// Which series the rule watches, if not all of them, made ready to match many.
+    pub fn series_pattern(&self) -> Option<WildMatch> {
+        self.series.as_deref().map(WildMatch::new)
     }
 
     /// What the rule watches, in a few words.
