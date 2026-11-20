@@ -493,7 +493,7 @@ fn last_samples_give_each_agents_newest_time_from_any_collector() {
 #[test]
 fn last_samples_leave_out_the_servers_readings_of_an_agents_clock() {
     let mut store = in_memory();
-    let clock = || json!({ "difference_secs": 0.5, "round_trip_ms": 3 });
+    let clock = || json!({ "difference_secs": 0.5, "round_trip_secs": 0.003 });
     write_metric(&mut store, "a", 1000, "cpu", json!({ "usage_percent": 1.0 }));
     write_metric(&mut store, "a", 4000, crate::clock::COLLECTOR, clock());
     write_metric(&mut store, "quiet", 4000, crate::clock::COLLECTOR, clock());

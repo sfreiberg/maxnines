@@ -39,10 +39,9 @@ pub(super) fn to_run(row: action_run::Model) -> Result<ActionRun> {
         output: row.output,
         truncated: row.truncated,
         duration: row
-            .duration_ms
-            .map(u64::try_from)
-            .transpose()?
-            .map(Duration::from_millis),
+            .duration_secs
+            .map(Duration::try_from_secs_f64)
+            .transpose()?,
         finished_at: row.finished_at,
     })
 }
@@ -120,7 +119,7 @@ impl Database {
             error: Set(None),
             output: Set(String::new()),
             truncated: Set(false),
-            duration_ms: Set(None),
+            duration_secs: Set(None),
             finished_at: Set(None),
             ..Default::default()
         };
@@ -161,10 +160,7 @@ impl Database {
         finished: &Finished,
         now: Timestamp,
     ) -> Result<bool> {
-        let duration_ms = finished
-            .duration
-            .map(|duration| i64::try_from(duration.as_millis()))
-            .transpose()?;
+        let duration_secs = finished.duration.map(|duration| duration.as_secs_f64());
         let transaction = self.connection.begin().await;
         let transaction = transaction.context("saving an action's result")?;
         let changed = action_run::Entity::update_many()
@@ -188,7 +184,7 @@ impl Database {
                 action_run::Column::Truncated,
                 Expr::value(finished.truncated),
             )
-            .col_expr(action_run::Column::DurationMs, Expr::value(duration_ms))
+            .col_expr(action_run::Column::DurationSecs, Expr::value(duration_secs))
             .col_expr(action_run::Column::FinishedAt, Expr::value(now))
             .filter(action_run::Column::Id.eq(id))
             .filter(action_run::Column::HostId.eq(host_id))

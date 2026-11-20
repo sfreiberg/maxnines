@@ -132,7 +132,7 @@
         <dt><code>alert.rule_name</code>, <code>alert.hostname</code>, <code>alert.severity</code></dt><dd>The rule, the host, and <code>warning</code> or <code>critical</code></dd>
         <dt><code>alert.summary</code>, <code>alert.value</code>, <code>alert.series</code></dt><dd>What's wrong, the reading that started it, and which disk or container, if it's about one</dd>
         <dt><code>alert.id</code>, <code>alert.host_id</code></dt><dd>For a receiver that needs to match the alert up later</dd>
-        <dt><code>alert.started</code>, <code>alert.resolved</code></dt><dd>Times like <code>2026-11-10T14:03:00Z</code>, with <code>_ms</code> versions in milliseconds</dd>
+        <dt><code>alert.started</code>, <code>alert.resolved</code></dt><dd>Times like <code>2026-11-10T14:03:00Z</code>, also as <code>alert.started_at</code> and <code>alert.resolved_at</code> to the millisecond</dd>
         <dt><code>alert.acknowledged_by</code></dt><dd>Who acknowledged it, if anyone</dd>
       </dl>
       <p class="note">A test fills in an example alert on <code>maxnines-test</code>, with the event <code>test</code>.</p>

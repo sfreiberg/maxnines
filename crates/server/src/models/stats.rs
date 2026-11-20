@@ -1,7 +1,7 @@
 //! How the database is doing, for the server page. Nothing here mentions the
 //! connection URL, because it can hold a password.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use sea_orm::sea_query::{Asterisk, Expr, Func, IntoTableRef, Query, SelectStatement};
@@ -72,7 +72,11 @@ pub struct DatabaseStats {
     pub engine: &'static str,
     pub size_bytes: Option<i64>,
     /// How long a trip to the database took just now.
-    pub response_ms: f64,
+    #[serde(
+        rename = "response_secs",
+        serialize_with = "crate::times::fractional_seconds::serialize"
+    )]
+    pub response: Duration,
     pub latest_migration: Option<String>,
     pub tables: Vec<TableCount>,
     pub notifications_waiting: u64,
@@ -144,7 +148,7 @@ impl Database {
             .ping()
             .await
             .context("reaching the database")?;
-        let response_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let response = started.elapsed();
 
         // Every count in one trip, each a query of its own.
         let tables = table_counts();
@@ -178,7 +182,7 @@ impl Database {
         Ok(DatabaseStats {
             engine: engine_name(backend),
             size_bytes: self.size_bytes(backend).await,
-            response_ms,
+            response,
             latest_migration: self.latest_migration(backend).await?,
             tables,
             notifications_waiting,

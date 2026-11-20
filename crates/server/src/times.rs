@@ -105,6 +105,34 @@ pub mod optional_whole_seconds {
     }
 }
 
+/// For serde, how long something took, in seconds with a fraction, as a length that's
+/// often under a second is given, such as `duration_secs`.
+pub mod fractional_seconds {
+    use std::time::Duration;
+
+    use serde::Serializer;
+
+    pub fn serialize<S: Serializer>(length: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_f64(length.as_secs_f64())
+    }
+}
+
+/// For serde, how long something took, in seconds with a fraction, if it's known.
+pub mod optional_fractional_seconds {
+    use std::time::Duration;
+
+    use serde::{Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        length: &Option<Duration>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        length
+            .map(|length| length.as_secs_f64())
+            .serialize(serializer)
+    }
+}
+
 /// How long `ms` milliseconds is. For tests, which count in round numbers.
 #[cfg(test)]
 pub fn millis(ms: i64) -> TimeDelta {

@@ -1047,9 +1047,9 @@ pub const METRICS: &[Metric] = &[
     Metric {
         name: "server.write_time",
         title: "Slowest write",
-        unit: Unit::Milliseconds,
+        unit: Unit::Seconds,
         collector: "server",
-        source: Source::Fields(&[("Slowest", Reading::Field("$.slowest_write_ms"))]),
+        source: Source::Fields(&[("Slowest", Reading::Field("$.slowest_write_secs"))]),
         chart: ShowChart::WithData,
     },
     Metric {

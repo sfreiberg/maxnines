@@ -90,7 +90,7 @@ impl Reading {
         let apart = self.offset.abs();
         let clock = json!({
             "difference_secs": apart.num_milliseconds() as f64 / 1000.0,
-            "round_trip_ms": u64::try_from(self.round_trip.as_millis()).unwrap_or(u64::MAX),
+            "round_trip_secs": self.round_trip.as_secs_f64(),
         });
         NewSample {
             host_id: host_id.to_string(),
@@ -164,7 +164,7 @@ mod tests {
         assert_eq!(saved.sample.time, noon());
         let clock = &saved.sample.metrics["clock"];
         assert_eq!(clock["difference_secs"], 7.5);
-        assert_eq!(clock["round_trip_ms"], 12);
+        assert_eq!(clock["round_trip_secs"], 0.012);
 
         let behind = Reading {
             offset: ms(-250),

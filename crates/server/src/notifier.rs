@@ -192,7 +192,7 @@ impl Notice {
             "error": run.error,
             "output": run.output,
             "truncated": run.truncated,
-            "duration_ms": run.duration.map(|duration| duration.as_millis()),
+            "duration_secs": run.duration.map(|duration| duration.as_secs_f64()),
         })
     }
 

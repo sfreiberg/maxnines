@@ -17,7 +17,7 @@ use maxnines_protocol::actions::{
     is_action_name,
 };
 use maxnines_protocol::time::{optional_seconds, seconds};
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -111,19 +111,6 @@ pub fn check_timeout(timeout: Duration) -> Result<()> {
         MAX_ACTION_TIMEOUT.as_secs()
     );
     Ok(())
-}
-
-/// For serde, how long a run took, in milliseconds, as the API gives it.
-fn optional_milliseconds<S: Serializer>(
-    length: &Option<Duration>,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    match length {
-        Some(length) => {
-            serializer.serialize_some(&u64::try_from(length.as_millis()).unwrap_or(u64::MAX))
-        }
-        None => serializer.serialize_none(),
-    }
 }
 
 /// Checks a rule's actions by themselves. Whether any host has them, and whether
@@ -264,7 +251,10 @@ pub struct ActionRun {
     pub output: String,
     pub truncated: bool,
     /// How long it took, as the agent timed it.
-    #[serde(rename = "duration_ms", serialize_with = "optional_milliseconds")]
+    #[serde(
+        rename = "duration_secs",
+        serialize_with = "crate::times::optional_fractional_seconds::serialize"
+    )]
     pub duration: Option<Duration>,
     pub finished_at: Option<Timestamp>,
 }

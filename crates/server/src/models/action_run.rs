@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
 #[sea_orm(table_name = "action_runs")]
 pub struct Model {
     #[sea_orm(primary_key)]
@@ -22,7 +22,7 @@ pub struct Model {
     pub error: Option<String>,
     pub output: String,
     pub truncated: bool,
-    pub duration_ms: Option<i64>,
+    pub duration_secs: Option<f64>,
     pub finished_at: Option<DateTimeUtc>,
 }
 

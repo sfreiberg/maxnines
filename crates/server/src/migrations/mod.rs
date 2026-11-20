@@ -17,6 +17,7 @@ impl MigratorTrait for Migrator {
             Box::new(KeysAndIndexes),
             Box::new(NamesAndUniqueness),
             Box::new(ExactFactsAndEndedAlerts),
+            Box::new(DurationsInSeconds),
         ]
     }
 }
@@ -2838,6 +2839,69 @@ async fn fact_text_collation(manager: &SchemaManager<'_>, collation: &str) -> Re
     Ok(())
 }
 
+struct DurationsInSeconds;
+
+impl MigrationName for DurationsInSeconds {
+    fn name(&self) -> &str {
+        "m20261119_000006_durations_in_seconds"
+    }
+}
+
+/// How long an action ran is a number of seconds, as every other length is, with a
+/// fraction, as many take less than one: `duration_secs` takes the place of
+/// `duration_ms`.
+///
+/// MySQL commits each change as it's made, so each can be made again.
+#[async_trait::async_trait]
+impl MigrationTrait for DurationsInSeconds {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(true)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let seconds = ColumnDef::new(ActionRuns::DurationSecs).double().to_owned();
+        let from_ms = "duration_ms / 1000.0";
+        move_column(manager, "duration_ms", seconds, from_ms).await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let ms = ColumnDef::new(ActionRuns::DurationMs)
+            .big_integer()
+            .to_owned();
+        let from_secs = "ROUND(duration_secs * 1000)";
+        move_column(manager, "duration_secs", ms, from_secs).await
+    }
+}
+
+/// Replaces an action run's column `old` with `new`, worked out from it by `value`.
+async fn move_column(
+    manager: &SchemaManager<'_>,
+    old: &str,
+    mut new: ColumnDef,
+    value: &str,
+) -> Result<(), DbErr> {
+    let db = manager.get_connection();
+    let is_mysql = manager.get_database_backend() == DatabaseBackend::MySql;
+    let name = new.get_column_name();
+    if !is_mysql || !mysql_has_column(db, "action_runs", &name).await? {
+        let add = Table::alter()
+            .table(ActionRuns::Table)
+            .add_column(&mut new)
+            .to_owned();
+        manager.alter_table(add).await?;
+    }
+    if !is_mysql || mysql_has_column(db, "action_runs", old).await? {
+        db.execute_unprepared(&format!("UPDATE action_runs SET {name} = {value}"))
+            .await?;
+        let drop = Table::alter()
+            .table(ActionRuns::Table)
+            .drop_column(Alias::new(old))
+            .to_owned();
+        manager.alter_table(drop).await?;
+    }
+    Ok(())
+}
+
 /// How SQLite's definition of a table writes a foreign key, before what it does on
 /// delete.
 fn sqlite_key(key: &KeyChange) -> String {
@@ -3500,6 +3564,7 @@ enum ActionRuns {
     Output,
     Truncated,
     DurationMs,
+    DurationSecs,
     FinishedAt,
 }
 
@@ -4115,5 +4180,58 @@ mod tests {
                        WHERE table_schema = DATABASE() AND index_name = 'idx_alerts_resolved'
                        ORDER BY seq_in_index";
         assert_eq!(texts(&connection, indexed).await, ["resolved_at", "id"]);
+    }
+
+    #[tokio::test]
+    async fn how_long_an_action_ran_is_kept_in_seconds_going_up_and_down() {
+        let connection = empty().await;
+        Migrator::up(&connection, Some(5)).await.unwrap();
+        let at = "'2026-11-19 00:00:00+00:00'";
+        run(
+            &connection,
+            &format!(
+                "INSERT INTO hosts (id, kind, hostname, state, first_seen_at)
+                 VALUES ('h1', 'agent', 'web', 'approved', {at})"
+            ),
+        )
+        .await;
+        for duration in ["1500", "NULL"] {
+            run(
+                &connection,
+                &format!(
+                    "INSERT INTO action_runs (host_id, action, run_on, variables, requested_at,
+                         timeout_secs, output, truncated, duration_ms)
+                     VALUES ('h1', 'restart', 'manual', '{{}}', {at}, 30, '', FALSE, {duration})"
+                ),
+            )
+            .await;
+        }
+
+        Migrator::up(&connection, None).await.unwrap();
+        let seconds = "SELECT CAST(duration_secs * 1000 AS CHAR(20)) FROM action_runs
+                       WHERE duration_secs IS NOT NULL";
+        let seconds = match connection.get_database_backend() {
+            DatabaseBackend::MySql => seconds.to_string(),
+            _ => seconds.replace("CHAR(20)", "TEXT"),
+        };
+        let kept: Vec<f64> = texts(&connection, &seconds)
+            .await
+            .iter()
+            .map(|text| text.parse().unwrap())
+            .collect();
+        assert_eq!(kept, [1500.0]);
+        let empty = "SELECT COUNT(*) FROM action_runs WHERE duration_secs IS NULL";
+        assert_eq!(number(&connection, empty).await, 1);
+
+        // Running it again where MySQL stopped partway changes nothing more.
+        if connection.get_database_backend() == DatabaseBackend::MySql {
+            DurationsInSeconds
+                .up(&SchemaManager::new(&connection))
+                .await
+                .unwrap();
+        }
+        Migrator::down(&connection, Some(1)).await.unwrap();
+        let ms = "SELECT duration_ms FROM action_runs WHERE duration_ms IS NOT NULL";
+        assert_eq!(number(&connection, ms).await, 1500);
     }
 }

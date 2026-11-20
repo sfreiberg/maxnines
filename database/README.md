@@ -19,6 +19,8 @@ MaxNines keeps its data in two places:
   - `m20261119_000005_exact_facts_and_ended_alerts` has MySQL and MariaDB compare
     facts' names and values exactly, as the others do, and indexes alerts by when
     they ended and their IDs, the order ended ones are listed in.
+  - `m20261119_000006_durations_in_seconds` keeps how long an action ran as
+    `duration_secs`, with a fraction, in place of `duration_ms`.
 - **The metrics store** holds the numbers hosts report. It's DuckDB for a single
   server or ClickHouse for a big one, and only one of them is used. Each has a
   migration, `0001_create_tables`, which makes its tables, and a second: in
@@ -221,7 +223,7 @@ erDiagram
         text error
         text output "what it printed"
         boolean truncated
-        int duration_ms
+        double duration_secs "how long it ran, with a fraction"
         timestamp finished_at
     }
     notifications {

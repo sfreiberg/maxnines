@@ -36,7 +36,7 @@ page, which the messages link to when the server knows its own address.
 | Telegram | A reply to the alert's message, with up to 3,000 characters |
 | Email and Resend | An email with all of it, in a fixed-width font for mail apps that show HTML |
 | Microsoft Teams | A card with up to 6,000 characters in a code block |
-| Webhook | The event `action`, with the run as `action`: its `name`, `outcome`, `exit_code`, `error`, `output`, `truncated` and `duration_ms` |
+| Webhook | The event `action`, with the run as `action`: its `name`, `outcome`, `exit_code`, `error`, `output`, `truncated` and `duration_secs` |
 | Custom webhook | The same event, but only if its body uses `action.` somewhere, as a body written for alerts alone would send what looks like another alert |
 | PagerDuty, AlertOps and SIGNL4 | Nothing, as it would only page someone again |
 
@@ -131,7 +131,7 @@ What a template can use:
 | `alert.acknowledged_by`, `alert.acknowledged` | Who acknowledged it, if anyone, and `alert.acknowledged_at` |
 | `action.name`, `action.outcome` | For the event `action`: which of the alert's [actions](#what-actions-print) ran, and `succeeded`, `failed`, `timed_out`, `not_defined` or `refused`. `action` is missing for other events, so test for it with `{% if action %}` |
 | `action.output`, `action.truncated` | What it printed, up to 64 KiB, and whether that was cut |
-| `action.exit_code`, `action.error`, `action.duration_ms` | How it ended, where there's something to say |
+| `action.exit_code`, `action.error`, `action.duration_secs` | How it ended, where there's something to say |
 
 Templates can also use Tera's `if` and `for`, and its filters, like
 `{{ alert.hostname | upper }}`.

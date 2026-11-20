@@ -24,7 +24,7 @@ A run looks like this, with `outcome` empty until the agent answers:
 | `error` | Why, when the outcome alone doesn't say |
 | `output` | What it printed, to standard output and then standard error, up to 64 KiB. Treat it as text from the host |
 | `truncated` | Whether it printed more than is kept |
-| `duration_ms` | How long it took on the host |
+| `duration_secs` | How long it took on the host, in seconds with a fraction |
 
 ## List a host's actions
 

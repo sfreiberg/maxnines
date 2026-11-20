@@ -237,7 +237,7 @@ fn server_page(stats: ServerStats, now: Timestamp) -> ServerPage {
         database_size: database
             .and_then(|d| d.size_bytes)
             .map(|size| bytes(size as f64)),
-        database_response: database.map(|d| format_value(Unit::Milliseconds, d.response_ms)),
+        database_response: database.map(|d| format_value(Unit::Seconds, d.response.as_secs_f64())),
         latest_migration: database.and_then(|d| d.latest_migration.clone()),
         tables: database.map_or_else(Vec::new, |d| {
             d.tables

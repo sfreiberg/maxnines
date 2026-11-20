@@ -192,7 +192,7 @@ async fn own_numbers(state: &AppState, recorded: &mut Recorded) -> Value {
         "samples_written": new_written,
         "samples_failed": new_failed,
         "values_written": new_values,
-        "slowest_write_ms": slowest_write_ms(&status.writes),
+        "slowest_write_secs": slowest_write_secs(&status.writes),
         "series": state.metrics.series_count().await.ok(),
         "write_queue": state.writer.max_capacity() - state.writer.capacity(),
         "hosts_online": real().filter(online).count(),
@@ -207,11 +207,10 @@ async fn own_numbers(state: &AppState, recorded: &mut Recorded) -> Value {
     })
 }
 
-/// The longest write since the last look, in milliseconds as charts show it, starting
-/// again for the next look.
-fn slowest_write_ms(writes: &WriteCounts) -> f64 {
+/// The longest write since the last look, in seconds, starting again for the next look.
+fn slowest_write_secs(writes: &WriteCounts) -> f64 {
     let micros = writes.slowest_write_micros.swap(0, Ordering::Relaxed);
-    micros as f64 / 1000.0
+    Duration::from_micros(micros).as_secs_f64()
 }
 
 pub async fn record_once(state: &AppState, recorded: &mut Recorded) {
