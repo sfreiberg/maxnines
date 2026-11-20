@@ -141,7 +141,7 @@ impl OpenMetricsCollector {
                 None => missing.push(json!({
                     "name": name,
                     "up": 0,
-                    "error": format!("agent.hcl has no OpenMetrics page named {name:?}"),
+                    "error": format!("the agent's config has no OpenMetrics page named {name:?}"),
                 })),
             }
         }
@@ -393,7 +393,7 @@ mod tests {
         let output = read(Vec::new(), &["nowhere"], &PageDefinitions::new());
         assert_eq!(
             output,
-            json!([{ "name": "nowhere", "up": 0, "error": "agent.hcl has no OpenMetrics page named \"nowhere\"" }])
+            json!([{ "name": "nowhere", "up": 0, "error": "the agent's config has no OpenMetrics page named \"nowhere\"" }])
         );
     }
 

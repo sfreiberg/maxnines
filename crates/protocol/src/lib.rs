@@ -71,7 +71,7 @@ pub const AGENT_SILENCE_LIMIT: Duration = Duration::from_secs(30);
 const MAX_PING_COUNT: u32 = 20;
 
 /// A check's name is a series name, which has to fit in chart labels.
-const MAX_CHECK_NAME_LEN: usize = 64;
+pub const MAX_CHECK_NAME_LEN: usize = 64;
 
 /// What git and the build tool report when they have no answer.
 const NO_BUILD_VALUE: &str = "VERGEN_IDEMPOTENT_OUTPUT";

@@ -375,8 +375,8 @@ async fn authenticate(socket: &mut Socket, connection: &Connection) -> Result<()
     let id = connection.identity.id();
     match status {
         RegistrationStatus::Approved => Ok(()),
-        RegistrationStatus::Pending => bail!("agent {id} is waiting for approval"),
-        RegistrationStatus::Rejected => bail!("agent {id} was rejected by the server"),
+        RegistrationStatus::Pending => bail!("waiting for the server to approve host ID {id}"),
+        RegistrationStatus::Rejected => bail!("the server rejected host ID {id}"),
     }
 }
 

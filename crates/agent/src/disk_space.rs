@@ -56,6 +56,8 @@ struct Scan {
     unreadable: u64,
     /// The first few that couldn't be read.
     unreadable_named: Vec<PathBuf>,
+    /// Folders nested too deep to be opened.
+    too_deep: u64,
     /// Whether it ran out of time, which leaves the sizes too small.
     stopped: bool,
 }
@@ -125,6 +127,7 @@ fn scan(root: &Path, own_line: Option<u64>, deadline: Instant) -> Result<Scan> {
         files: 0,
         unreadable: 0,
         unreadable_named: Vec::new(),
+        too_deep: 0,
         stopped: false,
     };
     let unreadable = |scan: &mut Scan, path: PathBuf| {
@@ -183,7 +186,7 @@ fn scan(root: &Path, own_line: Option<u64>, deadline: Instant) -> Result<Scan> {
         }
         let path = entry.path();
         if depth >= MAX_DEPTH {
-            unreadable(&mut scan, path);
+            scan.too_deep += 1;
             continue;
         }
         match fs::read_dir(&path) {
@@ -473,7 +476,7 @@ fn describe(
             .collect();
         let more = scan.unreadable - named.len() as u64;
         text.push_str(&format!(
-            "The agent's user couldn't read {}, so what's in them isn't counted: {}{}.\n",
+            "Couldn't read {}, so what's in them isn't counted: {}{}.\n",
             count(scan.unreadable, "folder"),
             named.join(", "),
             if more > 0 {
@@ -481,6 +484,13 @@ fn describe(
             } else {
                 String::new()
             }
+        ));
+    }
+    if scan.too_deep > 0 {
+        let are = if scan.too_deep == 1 { "is" } else { "are" };
+        text.push_str(&format!(
+            "{} {are} nested more than {MAX_DEPTH} deep, so what's in them isn't counted.\n",
+            count(scan.too_deep, "folder")
         ));
     }
     if !held.is_empty() {
@@ -670,7 +680,7 @@ mod tests {
         assert_eq!(scan.unreadable, 1);
         assert_eq!(scan.unreadable_named, [root.join("private")]);
         let text = describe(root, &scan, None, KIB, None, &[], Duration::from_secs(2));
-        assert!(text.contains("couldn't read 1 folder,"), "{text}");
+        assert!(text.contains("Couldn't read 1 folder,"), "{text}");
     }
 
     #[test]
@@ -703,6 +713,7 @@ mod tests {
             files: 12,
             unreadable: 0,
             unreadable_named: Vec::new(),
+            too_deep: 0,
             stopped: false,
         };
         let held = [HeldOpen {

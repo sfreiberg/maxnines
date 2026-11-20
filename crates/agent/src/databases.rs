@@ -103,7 +103,7 @@ pub fn check_database_definitions(definitions: &DatabaseDefinitions) -> Result<(
         "the config can define at most {MAX_DEFINED} databases"
     );
     for (name, definition) in definitions {
-        let problem = |what: &str| anyhow!("database {name:?} in agent.hcl {what}");
+        let problem = |what: &str| anyhow!("database {name:?} in the agent's config {what}");
         ensure!(is_page_name(name), problem("needs a name without spaces"));
         let database = definition
             .database(name)
@@ -141,7 +141,7 @@ impl DatabaseCollector {
             let name = &choice.name;
             let found = definitions
                 .get(name)
-                .context("agent.hcl has no database by that name")
+                .context("the agent's config has no database by that name")
                 .and_then(|definition| definition.database(name));
             match found {
                 Ok(database) => readers.push(Reader::new(name, database, &choice.extras)),
@@ -294,7 +294,7 @@ mod tests {
         assert_eq!(output["pg"][0]["up"], 0, "{output}");
         assert_eq!(
             output["unknown"][0],
-            json!({ "name": "nowhere", "up": 0, "error": "agent.hcl has no database by that name" })
+            json!({ "name": "nowhere", "up": 0, "error": "the agent's config has no database by that name" })
         );
     }
 }

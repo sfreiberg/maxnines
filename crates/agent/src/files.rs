@@ -3,6 +3,7 @@
 //! can't use this to see inside a host's files.
 
 use std::fs::{self, Metadata};
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -108,13 +109,20 @@ fn folder_totals(path: &Path) -> Option<(u64, u64)> {
     Some((entries, size))
 }
 
+/// Missing is a clear answer. Anything else, such as a dead network mount or a
+/// path through a file, says nothing about whether it exists, so it says why.
+fn unreadable(path: &String, error: &io::Error) -> Value {
+    match error.kind() {
+        io::ErrorKind::NotFound => json!({ "path": path, "exists": 0 }),
+        io::ErrorKind::PermissionDenied => json!({ "path": path, "error": "not allowed" }),
+        _ => json!({ "path": path, "error": error.to_string() }),
+    }
+}
+
 fn inspect(path: &String, now: DateTime<Utc>) -> Value {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return json!({ "path": path, "exists": 0 });
-        }
-        Err(_) => return json!({ "path": path, "error": "not allowed" }),
+        Err(error) => return unreadable(path, &error),
     };
 
     let mut output = json!({
@@ -220,7 +228,22 @@ mod tests {
             maxnines_protocol::time::now(),
         );
         assert!(output.get("exists").is_none(), "{output}");
-        assert_eq!(output["error"], "not allowed");
+        // Says what's wrong, which isn't a matter of permissions.
+        let error = output["error"].as_str().unwrap();
+        assert_eq!(
+            error,
+            io::Error::from_raw_os_error(libc::ENOTDIR).to_string()
+        );
+    }
+
+    #[test]
+    fn only_a_refusal_is_called_not_allowed() {
+        let refused = io::Error::from(io::ErrorKind::PermissionDenied);
+        let path = "/srv/backups".to_string();
+        assert_eq!(unreadable(&path, &refused)["error"], "not allowed");
+        let stale = io::Error::other("Stale NFS file handle");
+        assert_eq!(unreadable(&path, &stale)["error"], "Stale NFS file handle");
+        assert!(unreadable(&path, &stale).get("exists").is_none());
     }
 
     #[test]

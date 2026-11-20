@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use maxnines_checks::{Credentials, limit, run_signed_in, timed_out_report};
-use maxnines_protocol::{Check, CheckKind, LocalCheck, is_check_name};
+use maxnines_protocol::{Check, CheckKind, LocalCheck, MAX_CHECK_NAME_LEN, is_check_name};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -117,8 +117,14 @@ pub fn load_check_definitions(definitions: &mut CheckDefinitions) -> Result<()> 
         "the config can define at most {MAX_DEFINED} checks"
     );
     for (name, definition) in definitions.iter_mut() {
-        let problem = |what: &str| anyhow!("check {name:?} in agent.hcl {what}");
-        ensure!(is_check_name(name), problem("needs a shorter name"));
+        let problem = |what: &str| anyhow!("check {name:?} in the agent's config {what}");
+        ensure!(
+            is_check_name(name),
+            problem(&format!(
+                "needs a name of up to {MAX_CHECK_NAME_LEN} characters that isn't blank \
+                 and has no control characters, such as tabs"
+            ))
+        );
         let check = definition
             .check(name, &LocalCheck::new(name))
             .map_err(|error| problem(&format!("has a problem: {error:#}")))?;
@@ -178,7 +184,7 @@ impl Ready {
         let Some(definition) = definitions.get(name) else {
             return Self::Broken {
                 name: name.clone(),
-                why: format!("agent.hcl has no check named {name:?}"),
+                why: format!("the agent's config has no check named {name:?}"),
             };
         };
         match definition.check(name, choice) {
@@ -574,7 +580,7 @@ mod tests {
         assert!(reached.load(std::sync::atomic::Ordering::Relaxed) > 0);
         assert_eq!(
             row("nowhere"),
-            json!({ "name": "nowhere", "up": 0, "error": "agent.hcl has no check named \"nowhere\"" })
+            json!({ "name": "nowhere", "up": 0, "error": "the agent's config has no check named \"nowhere\"" })
         );
     }
 }
