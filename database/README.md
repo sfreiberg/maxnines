@@ -35,6 +35,9 @@ MaxNines keeps its data in two places:
     with `0005` and `0006` for its rollups, make timings that were kept in
     milliseconds seconds, and rename their metrics to match, such as a check's
     `response_ms` to `response_secs`. They change no table.
+  - DuckDB's `0004_postgres_metric_names` and ClickHouse's `0007_postgres_metric_names`
+    move PostgreSQL's stats from under `pg` to under `postgres`, as its check is
+    named, such as `pg.connections` to `postgres.connections`. They change no table.
 
 The two only meet through a host's ID: the main database's `hosts.id` is the
 metrics store's `host_id`.

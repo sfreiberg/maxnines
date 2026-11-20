@@ -47,6 +47,10 @@ const MIGRATIONS: &[Migration] = &[
         name: "0003_timings_in_seconds",
         sql: include_str!("migrations/0003_timings_in_seconds.sql"),
     },
+    Migration {
+        name: "0004_postgres_metric_names",
+        sql: include_str!("migrations/0004_postgres_metric_names.sql"),
+    },
 ];
 
 /// Only the bookkeeping table is created outside a migration, because it is
@@ -2742,6 +2746,54 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(rolled, [(0.1, 0.3, 0.4), (40.0, 60.0, 100.0)]);
+    }
+
+    /// PostgreSQL's stats kept under `pg` are found under `postgres`, rolled up too.
+    #[test]
+    fn postgres_stats_kept_as_pg_take_its_name() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("db");
+        let mut connection = Connection::open(&path).unwrap();
+        migrate(&mut connection, &MIGRATIONS[..3]).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO collectors VALUES (1, 'databases'), (2, 'other');
+                 INSERT INTO metrics VALUES (1, 1, 'pg.connections', 'int'),
+                     (2, 1, 'mysql.connections', 'int'), (3, 2, 'pg.connections', 'int');
+                 INSERT INTO rollups_hour VALUES
+                     ('pg.connections', 1, 'orders', '2026-11-20 10:00:00', 1, 3, 4, 2);
+                 INSERT INTO rollup_progress VALUES ('pg.connections', '2026-11-20 10:00:00');",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = DuckDbStore::open(&path, "1GB", Retention::default()).unwrap();
+        let names = |sql: &str| -> Vec<String> {
+            store
+                .connection
+                .prepare(sql)
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(
+            names("SELECT name FROM metrics ORDER BY id"),
+            [
+                "postgres.connections",
+                "mysql.connections",
+                "pg.connections"
+            ]
+        );
+        assert_eq!(
+            names("SELECT metric FROM rollups_hour"),
+            ["postgres.connections"]
+        );
+        assert_eq!(
+            names("SELECT metric FROM rollup_progress"),
+            ["postgres.connections"]
+        );
     }
 
     #[test]

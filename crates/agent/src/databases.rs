@@ -14,9 +14,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use maxnines_checks::Credentials;
-use maxnines_checks::databases::{
-    Database, Reader, Settle, TIMEOUT, by_kind, is_database, namespace,
-};
+use maxnines_checks::databases::{Database, Reader, Settle, TIMEOUT, by_kind, is_database};
 use maxnines_protocol::{Check, CheckKind, DatabaseChoice, is_page_name};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -160,7 +158,7 @@ impl DatabaseCollector {
                         .get(name)
                         .and_then(|definition| CheckKind::parse(&definition.kind))
                         .filter(|kind| is_database(*kind))
-                        .map(namespace);
+                        .map(CheckKind::as_str);
                     // Says so with every sample.
                     background.constant(json!({
                         "name": name,
@@ -273,15 +271,15 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         let output = loop {
             let output = collector.collect().unwrap();
-            if output["pg"].is_array() {
+            if output["postgres"].is_array() {
                 break output;
             }
             assert!(Instant::now() < deadline, "no rows");
             thread::sleep(Duration::from_millis(10));
         };
         // Each under its kind, so its values are its kind's own.
-        assert_eq!(output["pg"][0]["name"], "orders");
-        assert_eq!(output["pg"][0]["up"], 0, "{output}");
+        assert_eq!(output["postgres"][0]["name"], "orders");
+        assert_eq!(output["postgres"][0]["up"], 0, "{output}");
         assert_eq!(
             output["unknown"][0],
             json!({ "name": "nowhere", "up": 0, "error": "the agent's config has no database by that name" })

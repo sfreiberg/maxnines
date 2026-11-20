@@ -293,6 +293,50 @@ const MIGRATIONS: &[(&str, &[&str])] = &[
              'clickhouse.query_p95', 'clickhouse.query_p99']
          SETTINGS mutations_sync = 2"],
     ),
+    // PostgreSQL's database stats were kept under `pg`, and are now under
+    // `postgres`, as its check is named everywhere else. Names are in the tables'
+    // keys, so each row is copied under its new name and the old deleted, which can
+    // run again if it stops partway.
+    (
+        "0007_postgres_metric_names",
+        &[
+            "INSERT INTO samples (metric, host_id, labels, time, value, data_type)
+             SELECT concat('databases.postgres.', substring(metric, 14)),
+             host_id, labels, time, value, data_type
+             FROM samples WHERE startsWith(metric, 'databases.pg.')",
+            "ALTER TABLE samples DELETE WHERE startsWith(metric, 'databases.pg.')
+             SETTINGS mutations_sync = 2",
+            "INSERT INTO texts (metric, host_id, labels, time, value)
+             SELECT concat('databases.postgres.', substring(metric, 14)),
+             host_id, labels, time, value
+             FROM texts WHERE startsWith(metric, 'databases.pg.')",
+            "ALTER TABLE texts DELETE WHERE startsWith(metric, 'databases.pg.')
+             SETTINGS mutations_sync = 2",
+            "INSERT INTO series (host_id, metric, labels)
+             SELECT host_id,
+             concat('databases.postgres.', substring(metric, 14)), labels
+             FROM series WHERE startsWith(metric, 'databases.pg.')",
+            "ALTER TABLE series DELETE WHERE startsWith(metric, 'databases.pg.')
+             SETTINGS mutations_sync = 2",
+            "INSERT INTO rollups_five_minute
+             SELECT concat('postgres.', substring(metric, 4)), host_id, series, time,
+             low, high, summed, samples, version
+             FROM rollups_five_minute WHERE startsWith(metric, 'pg.')",
+            "ALTER TABLE rollups_five_minute DELETE WHERE startsWith(metric, 'pg.')
+             SETTINGS mutations_sync = 2",
+            "INSERT INTO rollups_hour
+             SELECT concat('postgres.', substring(metric, 4)), host_id, series, time,
+             low, high, summed, samples, version
+             FROM rollups_hour WHERE startsWith(metric, 'pg.')",
+            "ALTER TABLE rollups_hour DELETE WHERE startsWith(metric, 'pg.')
+             SETTINGS mutations_sync = 2",
+            "INSERT INTO rollup_progress
+             SELECT concat('postgres.', substring(metric, 4)), done_until, version
+             FROM rollup_progress WHERE startsWith(metric, 'pg.')",
+            "ALTER TABLE rollup_progress DELETE WHERE startsWith(metric, 'pg.')
+             SETTINGS mutations_sync = 2",
+        ],
+    ),
 ];
 
 /// One runtime for every store, as the client is async and stores aren't. It's never
@@ -2158,6 +2202,57 @@ mod tests {
                 ("check.response".to_string(), 0.1),
                 ("cpu.usage".to_string(), 40.0)
             ]
+        );
+    }
+
+    /// PostgreSQL's stats kept under `pg` are found under `postgres`, rolled up too.
+    #[test]
+    fn postgres_stats_kept_as_pg_take_its_name() {
+        let database = new_database();
+        let client = Client::default().with_url(url());
+        wait(async {
+            client
+                .query_raw(&format!("CREATE DATABASE `{database}`"))
+                .execute()
+                .await?;
+            let client = client.with_database(&database);
+            migrate(&client, &MIGRATIONS[..6]).await?;
+            for statement in [
+                "INSERT INTO samples (metric, host_id, labels, time, value, data_type) VALUES
+                 ('databases.pg.connections', 'a', map('name', 'orders'), fromUnixTimestamp64Milli(1000), 3, 'int'),
+                 ('databases.mysql.connections', 'a', map('name', 'shop'), fromUnixTimestamp64Milli(1000), 5, 'int')",
+                "INSERT INTO texts VALUES
+                 ('databases.pg.version', 'a', map('name', 'orders'), fromUnixTimestamp64Milli(1000), '16.4')",
+                "INSERT INTO series VALUES ('a', 'databases.pg.connections', map('name', 'orders'))",
+                "INSERT INTO rollups_hour VALUES
+                 ('pg.connections', 'a', 'orders', fromUnixTimestamp64Milli(0), 1, 3, 4, 2, 1)",
+                "INSERT INTO rollup_progress VALUES ('pg.connections', fromUnixTimestamp64Milli(0), 1)",
+            ] {
+                client.query_raw(statement).execute().await?;
+            }
+            anyhow::Ok(())
+        })
+        .unwrap();
+
+        let store = opened(&database);
+        for (table, renamed) in [
+            ("samples", "databases.postgres.connections"),
+            ("texts", "databases.postgres.version"),
+            ("series", "databases.postgres.connections"),
+            ("rollups_hour", "postgres.connections"),
+            ("rollup_progress", "postgres.connections"),
+        ] {
+            let sql = format!("SELECT count() FROM {table} FINAL WHERE metric = '{renamed}'");
+            assert_eq!(count(&store, &sql), 1, "{table}");
+            let sql = format!("SELECT count() FROM {table} WHERE metric LIKE '%pg.%'");
+            assert_eq!(count(&store, &sql), 0, "{table}");
+        }
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count() FROM samples WHERE metric = 'databases.mysql.connections'"
+            ),
+            1
         );
     }
 
