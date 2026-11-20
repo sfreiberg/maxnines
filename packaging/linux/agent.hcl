@@ -9,5 +9,5 @@ server {
   url = "ws://127.0.0.1:9000/ws"
 }
 
-# Its key, its last config and samples waiting to be sent, up to 64 MB.
+# Its key, its last config and samples waiting to be sent, up to 64 MiB.
 state_dir = "/var/lib/maxnines-agent"

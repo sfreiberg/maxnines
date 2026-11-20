@@ -13,5 +13,5 @@ server {
   url = "wss://monitor.example.com/ws"
 }
 
-# Its key, its last config and samples waiting to be sent, up to 64 MB.
+# Its key, its last config and samples waiting to be sent, up to 64 MiB.
 state_dir = "state"
