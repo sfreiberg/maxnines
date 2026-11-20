@@ -26,7 +26,7 @@ use crate::metrics::Unit;
 use crate::models::ConfigStatus;
 use crate::presence::Reach;
 use crate::registration::{HostRecord, HostState, short_id};
-use crate::rule_engine;
+use crate::rule_engine::Host;
 use crate::silences::{ActiveSilences, Cover, Silence, SilenceInput};
 use crate::times::{self, format_moment, lasting};
 
@@ -247,10 +247,12 @@ fn matches(filter: &str, listed: &Listed) -> bool {
 async fn page_rows(state: &AppState, listed: Vec<Listed>, as_table: bool) -> Result<Vec<HostRow>> {
     let ids: Vec<&str> = listed.iter().map(|item| item.host.id.as_str()).collect();
     let facts = state.database.facts_of(&ids).await?;
-    let rules = if as_table {
-        state.database.list_rules().await?
+    let configs = if as_table {
+        let rules = state.configs.rules().await?;
+        let reported = state.database.config_statuses(&ids).await?;
+        Some((rules, reported))
     } else {
-        Vec::new()
+        None
     };
 
     let mut rows = Vec::with_capacity(listed.len());
@@ -258,13 +260,12 @@ async fn page_rows(state: &AppState, listed: Vec<Listed>, as_table: bool) -> Res
         let id = item.host.id.clone();
         let mine = facts.get(&id);
         let mut row = row(state, item.host, mine, item.health);
-        if as_table {
-            let flat = mine.cloned().unwrap_or_default();
-            let desired = rule_engine::resolve(&rules, &unflatten(&flat), &id).ok();
-            let reported = state.database.config_status(&id).await.ok().flatten();
+        if let Some((rules, reported)) = &configs {
+            let shape = unflatten(&mine.cloned().unwrap_or_default());
+            let desired = rules.resolve(&Host::new(&shape, &id)).ok();
             row.config = Some(config_state(
                 desired.as_ref().map(|d| d.version.as_str()),
-                reported.as_ref(),
+                reported.get(&id),
             ));
         }
         rows.push(row);

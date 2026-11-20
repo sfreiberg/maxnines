@@ -4,13 +4,14 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use axum::extract::FromRef;
 use axum_csrf::CsrfConfig;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 use crate::actions::Actions;
+use crate::agent_configs::AgentConfigs;
 use crate::alerting::{self, AlertRuleInput};
 use crate::calculations::Sources;
 use crate::events::{EventInput, TimelineEvent};
-use crate::facts::{FlatFacts, unflatten};
+use crate::facts::unflatten;
 use crate::host_filter::HostFilter;
 use crate::maintenance::{self, MaintenanceWindowInput};
 use crate::metrics::Metrics;
@@ -21,7 +22,7 @@ use crate::passwords::SignInThrottle;
 use crate::presence::Presence;
 use crate::registration::{HostRecord, HostState, Registry};
 use crate::remote_checks::{self, LatestResults, RemoteCheckInput};
-use crate::rule_engine::{self, ResolvedConfig};
+use crate::rule_engine::ResolvedConfig;
 use crate::rule_preview::{self, Preview, PreviewHost};
 use crate::server_stats::ServerStatus;
 use crate::silences::{self, SilenceInput};
@@ -55,8 +56,9 @@ pub struct AppState {
     pub database: Database,
     /// Asks agents to run actions, and records how they went.
     pub actions: Arc<Actions>,
-    /// Bumped when rules change, so live connections work out their config again.
-    pub config_changes: Arc<watch::Sender<u64>>,
+    /// What each agent should be running, and telling live connections when that
+    /// changes.
+    pub configs: Arc<AgentConfigs>,
     pub writer: mpsc::Sender<WriterCommand>,
     pub metrics: Metrics,
     /// What sending notifications needs.
@@ -167,7 +169,6 @@ impl AppState {
         Ok(HostDeletion::Deleted)
     }
 
-    /// Works out what an agent should be running right now.
     /// Where calculations get their answers.
     pub fn sources(&self) -> Sources<'_> {
         Sources {
@@ -177,16 +178,9 @@ impl AppState {
         }
     }
 
+    /// Works out what an agent should be running right now.
     pub async fn config_for(&self, host_id: &str) -> Result<ResolvedConfig> {
-        let rules = self.database.list_rules().await?;
-        let facts: FlatFacts = self
-            .database
-            .current_facts(host_id)
-            .await?
-            .into_iter()
-            .map(|fact| (fact.name, fact.value))
-            .collect();
-        rule_engine::resolve(&rules, &unflatten(&facts), host_id)
+        self.configs.config_for(host_id).await
     }
 
     /// Works out what saving `rule` would do, without saving it. `id` is the
@@ -302,6 +296,6 @@ impl AppState {
 
     /// Tells live connections that rules changed.
     pub fn config_changed(&self) {
-        self.config_changes.send_modify(|revision| *revision += 1);
+        self.configs.changed();
     }
 }

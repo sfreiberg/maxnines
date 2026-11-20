@@ -386,7 +386,7 @@ async fn do_jobs(
 ) -> &'static str {
     let (agent, state) = (agent.as_ref(), &state);
     let mut changes = state.registry.subscribe();
-    let mut config_changes = state.config_changes.subscribe();
+    let mut config_changes = state.configs.subscribe();
     let mut sent_version = None;
     let mut known_boot = None;
 

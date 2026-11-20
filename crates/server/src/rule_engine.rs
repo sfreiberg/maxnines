@@ -4,8 +4,11 @@
 //! Matching rules apply from lowest priority to highest, and each one's settings
 //! are merged over the last. Maps merge key by key, and a list is replaced whole.
 
+use std::cell::OnceCell;
+use std::sync::{Arc, LazyLock};
+
 use anyhow::{Context, Result, anyhow, ensure};
-use cel::{Context as CelContext, Program, Value as CelValue};
+use cel::{Context as CelContext, Env, Program, Value as CelValue};
 use maxnines_protocol::AgentConfig;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -85,72 +88,153 @@ fn is_empty_map(value: &Value) -> bool {
     value.as_object().is_some_and(Map::is_empty)
 }
 
-/// Works out the config for one agent, given its facts in their natural shape.
-pub fn resolve(rules: &[ConfigRule], facts: &Value, host_id: &str) -> Result<ResolvedConfig> {
-    let mut merged = Value::Object(Map::new());
-    let mut matched_rules = Vec::new();
+/// The functions and macros every condition can use, made once, as making them takes
+/// far longer than checking a condition.
+static FUNCTIONS: LazyLock<Arc<Env>> = LazyLock::new(|| Arc::new(Env::stdlib()));
 
-    for rule in rules {
-        if matches(&rule.rule, facts, host_id) {
-            merge(&mut merged, &rule.rule.settings);
-            matched_rules.push(rule.rule.name.clone());
-        }
+/// A condition ready to check against any number of hosts.
+pub struct Condition(Program);
+
+impl Condition {
+    pub fn compile(text: &str) -> Result<Self> {
+        Program::compile(text)
+            .map(Self)
+            .map_err(|error| anyhow!("{error}"))
     }
 
-    let mut config: AgentConfig =
-        serde_json::from_value(merged).context("rules produced invalid settings")?;
-    let skipped_collectors = remove_unsupported(&mut config, facts);
-
-    Ok(ResolvedConfig {
-        version: config.version()?,
-        config,
-        matched_rules,
-        skipped_collectors,
-    })
+    /// Whether it's true of a host. Anything but `true` isn't.
+    pub fn check(&self, host: &Host) -> Result<bool> {
+        let result = self
+            .0
+            .execute(host.context()?)
+            .map_err(|error| anyhow!("{error}"))?;
+        Ok(result == CelValue::Bool(true))
+    }
 }
 
-/// A condition that can't be evaluated doesn't match. That's the normal case
-/// for a rule about a fact this agent doesn't have.
-pub fn matches(rule: &RuleInput, facts: &Value, host_id: &str) -> bool {
-    if !rule.enabled {
-        return false;
-    }
-    if !rule.operating_systems.is_empty() {
-        let family = facts["os"]["family"].as_str();
-        let listed = |family: &str| rule.operating_systems.iter().any(|system| system == family);
-        if !family.is_some_and(listed) {
-            return false;
-        }
-    }
-    let Some(condition) = &rule.condition else {
-        return true;
-    };
+/// A host as conditions see it: `facts`, which is what its agent reports, and
+/// `trusted`, which is what the server knows itself. They're made ready for conditions
+/// the first time one is checked, once however many are.
+pub struct Host<'a> {
+    pub facts: &'a Value,
+    pub id: &'a str,
+    context: OnceCell<Result<CelContext<'static, 'static>, String>>,
+}
 
-    match evaluate(condition, facts, host_id) {
-        Ok(result) => result,
-        Err(error) => {
-            debug!(rule = rule.name, %error, "condition didn't match");
-            false
+impl<'a> Host<'a> {
+    /// `facts` are in their natural shape, as [`unflatten`] gives them.
+    pub fn new(facts: &'a Value, id: &'a str) -> Self {
+        Self {
+            facts,
+            id,
+            context: OnceCell::new(),
         }
+    }
+
+    fn context(&self) -> Result<&CelContext<'static, 'static>> {
+        let made = self.context.get_or_init(|| {
+            let mut context = CelContext::with_env(FUNCTIONS.clone());
+            context
+                .add_variable("facts", self.facts)
+                .map_err(|error| error.to_string())?;
+            context
+                .add_variable("trusted", json!({ "host_id": self.id }))
+                .map_err(|error| error.to_string())?;
+            Ok(context)
+        });
+        made.as_ref().map_err(|error| anyhow!("{error}"))
     }
 }
 
 /// `facts` is what the agent reports. `trusted` is what the server knows itself.
 pub fn evaluate(condition: &str, facts: &Value, host_id: &str) -> Result<bool> {
-    let program = Program::compile(condition).map_err(|error| anyhow!("{error}"))?;
+    Condition::compile(condition)?.check(&Host::new(facts, host_id))
+}
 
-    let mut context = CelContext::default();
-    context
-        .add_variable("facts", facts)
-        .map_err(|error| anyhow!("{error}"))?;
-    context
-        .add_variable("trusted", json!({ "host_id": host_id }))
-        .map_err(|error| anyhow!("{error}"))?;
+/// A config rule with its condition compiled. One that doesn't compile never matches,
+/// which saving a rule doesn't allow, so it can only be one saved by an older server.
+pub struct CompiledRule {
+    pub rule: ConfigRule,
+    condition: Option<Result<Condition, String>>,
+}
 
-    let result = program
-        .execute(&context)
-        .map_err(|error| anyhow!("{error}"))?;
-    Ok(result == CelValue::Bool(true))
+impl CompiledRule {
+    pub fn new(rule: ConfigRule) -> Self {
+        let condition = rule
+            .rule
+            .condition
+            .as_deref()
+            .map(|text| Condition::compile(text).map_err(|error| format!("{error:#}")));
+        Self { rule, condition }
+    }
+
+    /// A condition that can't be evaluated doesn't match. That's the normal case
+    /// for a rule about a fact this agent doesn't have.
+    pub fn matches(&self, host: &Host) -> bool {
+        let rule = &self.rule.rule;
+        if !rule.enabled {
+            return false;
+        }
+        if !rule.operating_systems.is_empty() {
+            let family = host.facts["os"]["family"].as_str();
+            let listed =
+                |family: &str| rule.operating_systems.iter().any(|system| system == family);
+            if !family.is_some_and(listed) {
+                return false;
+            }
+        }
+        let checked = match &self.condition {
+            None => return true,
+            Some(Ok(condition)) => condition.check(host),
+            Some(Err(error)) => Err(anyhow!("{error}")),
+        };
+        match checked {
+            Ok(result) => result,
+            Err(error) => {
+                debug!(rule = rule.name, %error, "condition didn't match");
+                false
+            }
+        }
+    }
+}
+
+/// Config rules, compiled once to work out any number of agents' configs, in the order
+/// they apply.
+pub struct ConfigRules(Vec<CompiledRule>);
+
+impl ConfigRules {
+    pub fn new(rules: impl IntoIterator<Item = ConfigRule>) -> Self {
+        Self(rules.into_iter().map(CompiledRule::new).collect())
+    }
+
+    /// Works out the config for one agent.
+    pub fn resolve(&self, host: &Host) -> Result<ResolvedConfig> {
+        let mut merged = Value::Object(Map::new());
+        let mut matched_rules = Vec::new();
+
+        for compiled in &self.0 {
+            if compiled.matches(host) {
+                merge(&mut merged, &compiled.rule.rule.settings);
+                matched_rules.push(compiled.rule.rule.name.clone());
+            }
+        }
+
+        let mut config: AgentConfig =
+            serde_json::from_value(merged).context("rules produced invalid settings")?;
+        let skipped_collectors = remove_unsupported(&mut config, host.facts);
+
+        Ok(ResolvedConfig {
+            version: config.version()?,
+            config,
+            matched_rules,
+            skipped_collectors,
+        })
+    }
+}
+
+/// Works out the config for one agent, given its facts in their natural shape.
+pub fn resolve(rules: &[ConfigRule], facts: &Value, host_id: &str) -> Result<ResolvedConfig> {
+    ConfigRules::new(rules.iter().cloned()).resolve(&Host::new(facts, host_id))
 }
 
 fn merge(base: &mut Value, overlay: &Value) {

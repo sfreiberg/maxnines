@@ -22,7 +22,7 @@ use crate::condition_builder::Builder;
 use crate::facts::unflatten;
 use crate::models::{ConfigRule, RuleInput};
 use crate::registration::HostState;
-use crate::rule_engine::{self, OPERATING_SYSTEMS};
+use crate::rule_engine::{self, CompiledRule, Host, OPERATING_SYSTEMS};
 use crate::rule_preview::Preview;
 
 pub fn routes() -> Router<AppState> {
@@ -633,14 +633,23 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
         })
         .collect();
 
+    // Each host's facts are made ready for conditions once, for every rule.
+    let hosts: Vec<Host> = hosts
+        .iter()
+        .map(|(id, facts)| Host::new(facts, id))
+        .collect();
     let rows: Vec<RuleRow> = rules
         .into_iter()
-        .map(|rule| RuleRow {
+        .map(CompiledRule::new)
+        .map(|compiled| {
+            (
+                hosts.iter().filter(|host| compiled.matches(host)).count(),
+                compiled.rule,
+            )
+        })
+        .map(|(matching, rule)| RuleRow {
             id: rule.id,
-            hosts: hosts
-                .iter()
-                .filter(|(id, facts)| rule_engine::matches(&rule.rule, facts, id))
-                .count(),
+            hosts: matching,
             summary: summarize(&rule.rule.settings),
             systems: systems_label(&rule.rule.operating_systems),
             built_in: rule.built_in.is_some(),

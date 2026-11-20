@@ -2,12 +2,13 @@
 //! `resolve` that agents get their config from, once with the saved rules and
 //! once with the rule as it stands in the form, and compares the results.
 
+use anyhow::{Result, anyhow};
 use maxnines_protocol::{AgentConfig, Check, CollectorSettings, default_status_page};
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::models::{ConfigRule, RuleInput};
-use crate::rule_engine::{self, ResolvedConfig};
+use crate::rule_engine::{Condition, ConfigRules, Host, ResolvedConfig};
 
 /// Enough to see the pattern without a page that never ends. Counts still cover
 /// every agent, and the agents that change come first.
@@ -54,10 +55,14 @@ pub fn preview(
     rule: &RuleInput,
     hosts: &[PreviewHost],
 ) -> Preview {
-    let proposed = with_rule(rules, id, rule);
+    let compiled = Compiled {
+        before: ConfigRules::new(rules.iter().cloned()),
+        after: ConfigRules::new(with_rule(rules, id, rule)),
+        condition: rule.condition.as_deref().map(Condition::compile),
+    };
     let mut previews: Vec<HostPreview> = hosts
         .iter()
-        .map(|host| preview_host(rules, &proposed, rule, host))
+        .map(|host| preview_host(&compiled, host))
         .collect();
 
     previews.sort_by(|a, b| {
@@ -100,14 +105,19 @@ fn with_rule(rules: &[ConfigRule], id: Option<i64>, rule: &RuleInput) -> Vec<Con
     proposed
 }
 
-fn preview_host(
-    rules: &[ConfigRule],
-    proposed: &[ConfigRule],
-    rule: &RuleInput,
-    host: &PreviewHost,
-) -> HostPreview {
-    let check = match &rule.condition {
-        Some(condition) => rule_engine::evaluate(condition, &host.facts, &host.id),
+/// The rules before and after, and the rule's own condition, compiled once for every
+/// host.
+struct Compiled {
+    before: ConfigRules,
+    after: ConfigRules,
+    condition: Option<Result<Condition>>,
+}
+
+fn preview_host(compiled: &Compiled, host: &PreviewHost) -> HostPreview {
+    let shown = Host::new(&host.facts, &host.id);
+    let check = match &compiled.condition {
+        Some(Ok(condition)) => condition.check(&shown),
+        Some(Err(error)) => Err(anyhow!("{error:#}")),
         None => Ok(true),
     };
     let matches = *check.as_ref().unwrap_or(&false);
@@ -119,8 +129,8 @@ fn preview_host(
         Err(error) => Some(format!("Couldn't check this host: {error:#}")),
     };
 
-    let before = rule_engine::resolve(rules, &host.facts, &host.id);
-    let after = rule_engine::resolve(proposed, &host.facts, &host.id);
+    let before = compiled.before.resolve(&shown);
+    let after = compiled.after.resolve(&shown);
     let changes = match (before, after) {
         (Ok(before), Ok(after)) => describe_changes(&before, &after),
         (_, Err(error)) | (Err(error), _) => {
@@ -680,7 +690,7 @@ mod tests {
         let web = host("web-1", "web");
 
         let proposed = with_rule(&rules, None, &rule);
-        let resolved = rule_engine::resolve(&proposed, &web.facts, &web.id).unwrap();
+        let resolved = crate::rule_engine::resolve(&proposed, &web.facts, &web.id).unwrap();
 
         assert_eq!(resolved.matched_rules, ["Default", "r", "pinned"]);
         assert_eq!(resolved.config.interval, std::time::Duration::from_secs(5));

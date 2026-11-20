@@ -1,4 +1,5 @@
 mod actions;
+mod agent_configs;
 mod agent_versions;
 mod alert_charts;
 mod alert_evaluator;
@@ -62,7 +63,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tokio::net::TcpListener;
-use tokio::sync::watch;
 use tracing::info;
 
 use alert_evaluator::Evaluator;
@@ -411,8 +411,8 @@ async fn serve(path: &Path) -> Result<()> {
             database.clone(),
         )),
         actions: actions::Actions::new(database.clone()),
+        configs: Arc::new(agent_configs::AgentConfigs::new(database.clone())),
         database,
-        config_changes: Arc::new(watch::Sender::new(0)),
         writer: writer.clone(),
         metrics,
         senders: Senders::new(web_url(config.audience())),

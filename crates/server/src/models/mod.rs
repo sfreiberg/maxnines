@@ -975,6 +975,29 @@ impl Database {
         Ok(())
     }
 
+    /// What some agents last said about their config, in one query, by their IDs.
+    pub async fn config_statuses(
+        &self,
+        host_ids: &[&str],
+    ) -> Result<BTreeMap<String, ConfigStatus>> {
+        let rows = host_config_status::Entity::find()
+            .filter(host_config_status::Column::HostId.is_in(host_ids.iter().copied()))
+            .all(&self.connection)
+            .await
+            .context("loading config statuses")?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let status = ConfigStatus {
+                    version: row.version,
+                    error: row.error,
+                    reported_at: row.reported_at,
+                };
+                (row.host_id, status)
+            })
+            .collect())
+    }
+
     pub async fn config_status(&self, host_id: &str) -> Result<Option<ConfigStatus>> {
         let row = host_config_status::Entity::find_by_id(host_id)
             .one(&self.connection)
@@ -2048,7 +2071,12 @@ mod tests {
             reported_at: crate::times::from_ms(200),
         };
         database.save_config_status(host, &applied).await.unwrap();
-        assert_eq!(database.config_status(host).await.unwrap(), Some(applied));
+        assert_eq!(
+            database.config_status(host).await.unwrap(),
+            Some(applied.clone())
+        );
+        let several = database.config_statuses(&[host, "nobody"]).await.unwrap();
+        assert_eq!(several, BTreeMap::from([(host.to_string(), applied)]));
     }
 
     async fn exercise_facts(database: &Database, host: &str, other: &str) {

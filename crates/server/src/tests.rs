@@ -29,7 +29,6 @@ use maxnines_protocol::{AgentConfig, AgentMessage, RegistrationStatus, Sample, S
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
 use tokio::time::{Instant, sleep};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -235,8 +234,8 @@ async fn start_with_heartbeat(
             database.clone(),
         )),
         actions: crate::actions::Actions::new(database.clone()),
+        configs: Arc::new(crate::agent_configs::AgentConfigs::new(database.clone())),
         database,
-        config_changes: Arc::new(watch::Sender::new(0)),
         writer,
         metrics: Metrics::new(reader),
         senders: Default::default(),
@@ -2859,7 +2858,7 @@ async fn a_preview_shows_the_effect_and_saves_nothing() {
     let mut db_client = server.connect_approved(&db, "db-1").await;
     report_role(&server, &mut web_client, &web.id(), "web").await;
     report_role(&server, &mut db_client, &db.id(), "db").await;
-    let revision = *server.state.config_changes.borrow();
+    let revision = server.state.configs.revision();
 
     let mut browser = Browser::default();
     let page = browser
@@ -2877,7 +2876,7 @@ async fn a_preview_shows_the_effect_and_saves_nothing() {
     assert!(page.body.contains(r#"value="custom.role""#));
 
     assert_eq!(server.state.database.list_rules().await.unwrap().len(), 1);
-    assert_eq!(*server.state.config_changes.borrow(), revision);
+    assert_eq!(server.state.configs.revision(), revision);
 
     // Saving then does what the preview said.
     let saved = browser
