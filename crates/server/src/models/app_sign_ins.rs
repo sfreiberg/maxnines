@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, ensure};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, Set, TransactionTrait,
+    QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -116,11 +116,14 @@ const KEPT_AFTER_ENDING: chrono::TimeDelta = chrono::TimeDelta::days(90);
 
 /// The email address of the user with this ID, or nothing if they've gone.
 async fn owner_email<C: ConnectionTrait>(connection: &C, user_id: i64) -> Result<String> {
-    let row = user::Entity::find_by_id(user_id)
+    let email: Option<String> = user::Entity::find_by_id(user_id)
+        .select_only()
+        .column(user::Column::Email)
+        .into_tuple()
         .one(connection)
         .await
         .context("loading a signed in app's owner")?;
-    Ok(row.map(|row| row.email).unwrap_or_default())
+    Ok(email.unwrap_or_default())
 }
 
 fn new_tokens() -> Result<AppTokens> {
@@ -352,7 +355,7 @@ impl Database {
             .all(&self.connection)
             .await
             .context("loading signed in apps")?;
-        let owners = owner_emails(&self.connection).await?;
+        let owners = owner_emails(&self.connection, rows.iter().map(|row| row.user_id)).await?;
         Ok(rows
             .into_iter()
             .map(|row| {

@@ -16,6 +16,7 @@ impl MigratorTrait for Migrator {
             Box::new(AddNoMetricsRule),
             Box::new(KeysAndIndexes),
             Box::new(NamesAndUniqueness),
+            Box::new(ExactFacts),
         ]
     }
 }
@@ -2757,6 +2758,56 @@ async fn mysql_generates_from(
     Ok(count > 0)
 }
 
+struct ExactFacts;
+
+impl MigrationName for ExactFacts {
+    fn name(&self) -> &str {
+        "m20261119_000005_exact_facts"
+    }
+}
+
+/// The columns of `host_facts` that agents fill in.
+const FACT_TEXT: [&str; 2] = ["name", "value"];
+
+/// Facts are what agents report, so `os.Family` isn't `os.family`, and `Ubuntu` isn't
+/// `ubuntu`. PostgreSQL and SQLite compare them exactly. MySQL and MariaDB compared
+/// them by the table's collation, usually ignoring case and accents, so looking one
+/// up, or listing each value once, found or merged others. They compare them
+/// exactly now too, and going back gives them the table's collation again. Nothing
+/// changes on the other databases. Each change can be made again, as MySQL commits
+/// it as it's made.
+#[async_trait::async_trait]
+impl MigrationTrait for ExactFacts {
+    fn use_transaction(&self) -> Option<bool> {
+        Some(false)
+    }
+
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        fact_text_collation(manager, "CHARACTER SET utf8mb4 COLLATE utf8mb4_bin").await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        fact_text_collation(manager, "").await
+    }
+}
+
+/// Defines MySQL's fact names and values with `collation`, or the table's own when
+/// it's empty.
+async fn fact_text_collation(manager: &SchemaManager<'_>, collation: &str) -> Result<(), DbErr> {
+    if manager.get_database_backend() != DatabaseBackend::MySql {
+        return Ok(());
+    }
+    let changes: Vec<String> = FACT_TEXT
+        .iter()
+        .map(|column| format!("MODIFY {column} varchar(255) {collation} NOT NULL"))
+        .collect();
+    manager
+        .get_connection()
+        .execute_unprepared(&format!("ALTER TABLE host_facts {}", changes.join(", ")))
+        .await?;
+    Ok(())
+}
+
 /// How SQLite's definition of a table writes a foreign key, before what it does on
 /// delete.
 fn sqlite_key(key: &KeyChange) -> String {
@@ -3912,7 +3963,7 @@ mod tests {
         let connection = empty().await;
         Migrator::up(&connection, Some(3)).await.unwrap();
         fill_before_names_and_uniqueness(&connection).await;
-        Migrator::up(&connection, None).await.unwrap();
+        Migrator::up(&connection, Some(1)).await.unwrap();
 
         let rules = "SELECT name FROM alert_rules WHERE id > 8 ORDER BY id";
         assert_eq!(
@@ -3997,7 +4048,7 @@ mod tests {
         // Back down and up again, everything is still there.
         Migrator::down(&connection, Some(1)).await.unwrap();
         assert_eq!(count(&connection, "remote_checks").await, 3);
-        Migrator::up(&connection, None).await.unwrap();
+        Migrator::up(&connection, Some(1)).await.unwrap();
         assert_eq!(texts(&connection, open).await.len(), 4);
     }
 

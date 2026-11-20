@@ -458,7 +458,7 @@ pub async fn suggestions(state: &AppState, term: &str) -> anyhow::Result<Vec<Sug
     } else {
         state
             .database
-            .fact_values(value.fact(), value.partial, MAX_SUGGESTIONS as u64)
+            .fact_values(value.fact(), value.partial, MAX_SUGGESTIONS)
             .await?
     };
     Ok(values.iter().map(|text| value.suggestion(text)).collect())

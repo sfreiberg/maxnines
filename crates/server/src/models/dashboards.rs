@@ -1,9 +1,11 @@
 //! Dashboards and their widgets.
 
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result};
 use sea_orm::sea_query::{CaseStatement, Expr};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set,
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
     TransactionTrait,
 };
 use serde_json::{Map, Value, json};
@@ -139,20 +141,28 @@ impl Database {
             .all(&self.connection)
             .await
             .context("loading dashboards")?;
-        let mut dashboards = Vec::with_capacity(rows.len());
-        for row in rows {
-            let widgets = dashboard_widget::Entity::find()
-                .filter(dashboard_widget::Column::DashboardId.eq(row.id))
-                .count(&self.connection)
-                .await
-                .context("counting widgets")?;
-            dashboards.push(DashboardSummary {
-                id: row.id,
-                name: row.name,
-                widgets,
-            });
-        }
-        Ok(dashboards)
+        // Every dashboard's widgets counted at once, rather than each in turn.
+        let counts: BTreeMap<i64, i64> = dashboard_widget::Entity::find()
+            .select_only()
+            .column(dashboard_widget::Column::DashboardId)
+            .column_as(dashboard_widget::Column::Id.count(), "widgets")
+            .group_by(dashboard_widget::Column::DashboardId)
+            .into_tuple::<(i64, i64)>()
+            .all(&self.connection)
+            .await
+            .context("counting widgets")?
+            .into_iter()
+            .collect();
+        rows.into_iter()
+            .map(|row| {
+                let widgets = counts.get(&row.id).copied().unwrap_or_default();
+                Ok(DashboardSummary {
+                    id: row.id,
+                    name: row.name,
+                    widgets: u64::try_from(widgets).context("counting widgets")?,
+                })
+            })
+            .collect()
     }
 
     /// With its widgets, from the top of the page down.

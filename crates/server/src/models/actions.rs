@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use super::alerting::queue_action_output;
 use super::audit::record;
-use super::{Database, action_run, host, host_fact};
+use super::{Database, action_run, host, host_fact, starting_with};
 use crate::actions::{ActionRun, Finished, KnownActions, NewRun};
 use crate::audit::{Action, Change, Kind, Record, Subject};
 use crate::times::Timestamp;
@@ -72,10 +72,11 @@ fn known(facts: Vec<host_fact::Model>) -> KnownActions {
     known
 }
 
+/// The facts that say what actions an agent has. [`known`] checks each name exactly.
 fn action_facts() -> sea_orm::Condition {
     sea_orm::Condition::any()
-        .add(host_fact::Column::Name.starts_with(NAMES))
-        .add(host_fact::Column::Name.starts_with(VARIABLES))
+        .add(starting_with(host_fact::Column::Name, NAMES))
+        .add(starting_with(host_fact::Column::Name, VARIABLES))
 }
 
 impl Database {
@@ -228,10 +229,11 @@ impl Database {
             .collect()
     }
 
-    /// A host's runs, newest first.
+    /// A host's runs, newest first, in the order its index keeps them.
     pub async fn action_runs_for_host(&self, host_id: &str, limit: u64) -> Result<Vec<ActionRun>> {
         action_run::Entity::find()
             .filter(action_run::Column::HostId.eq(host_id))
+            .order_by_desc(action_run::Column::RequestedAt)
             .order_by_desc(action_run::Column::Id)
             .limit(limit)
             .all(&self.connection)

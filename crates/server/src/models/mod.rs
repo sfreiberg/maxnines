@@ -398,6 +398,10 @@ impl Database {
             .all(&self.connection)
             .await
             .context("loading facts")?;
+        let rows = rows
+            .into_iter()
+            .filter(|row| names.iter().any(|name| is_fact_or_item(&row.name, name)))
+            .collect();
         by_host(rows)
     }
 
@@ -416,36 +420,50 @@ impl Database {
         Ok(names.into_iter().collect())
     }
 
-    /// Different values a fact has containing some text, in order.
-    pub async fn fact_values(&self, name: &str, text: &str, limit: u64) -> Result<Vec<String>> {
-        host_fact::Entity::find()
+    /// Different values a fact has containing some text, ignoring case, in order.
+    /// They're matched and sorted here rather than by the database, as each compares
+    /// and sorts text its own way.
+    pub async fn fact_values(&self, name: &str, text: &str, limit: usize) -> Result<Vec<String>> {
+        let rows: Vec<(String, String)> = host_fact::Entity::find()
             .select_only()
+            .column(host_fact::Column::Name)
             .column(host_fact::Column::Value)
             .distinct()
             .filter(host_fact::Column::ValidTo.is_null())
             .filter(fact_or_its_items(&[name]))
-            .filter(host_fact::Column::Value.contains(text))
-            .order_by_asc(host_fact::Column::Value)
-            .limit(limit)
             .into_tuple()
             .all(&self.connection)
             .await
-            .context("loading fact values")
+            .context("loading fact values")?;
+        let wanted = text.to_lowercase();
+        let values: BTreeSet<String> = rows
+            .into_iter()
+            .filter(|(fact, value)| {
+                is_fact_or_item(fact, name) && value.to_lowercase().contains(&wanted)
+            })
+            .map(|(_, value)| value)
+            .collect();
+        Ok(values.into_iter().take(limit).collect())
     }
 
     /// Every fact name in use and how its values are written, for offering in
     /// forms. A list appears once under its own name, as a list item's type.
     pub async fn known_facts(&self) -> Result<BTreeMap<String, String>> {
-        let rows = host_fact::Entity::find()
+        let rows: Vec<(String, String)> = host_fact::Entity::find()
+            .select_only()
+            .column(host_fact::Column::Name)
+            .column(host_fact::Column::ValueType)
+            .distinct()
             .filter(host_fact::Column::ValidTo.is_null())
+            .into_tuple()
             .all(&self.connection)
             .await
             .context("loading fact names")?;
 
         let mut known = BTreeMap::new();
-        for row in rows {
-            if let Some(name) = simple_fact_name(row.name) {
-                known.insert(name, row.value_type);
+        for (name, value_type) in rows {
+            if let Some(name) = simple_fact_name(name) {
+                known.insert(name, value_type);
             }
         }
         Ok(known)
@@ -454,14 +472,23 @@ impl Database {
     /// The names any agent lists under one of its facts, such as the checks its
     /// own config allows, each once and in order.
     pub async fn listed_by_agents(&self, list: &str) -> Result<Vec<String>> {
-        let rows = host_fact::Entity::find()
+        let items = format!("{list}[");
+        let rows: Vec<(String, String)> = host_fact::Entity::find()
+            .select_only()
+            .column(host_fact::Column::Name)
+            .column(host_fact::Column::Value)
+            .distinct()
             .filter(host_fact::Column::ValidTo.is_null())
-            .filter(host_fact::Column::Name.starts_with(format!("{list}[")))
+            .filter(starting_with(host_fact::Column::Name, &items))
+            .into_tuple()
             .all(&self.connection)
             .await
             .context("loading what agents list")?;
-        let names: std::collections::BTreeSet<String> =
-            rows.into_iter().map(|row| row.value).collect();
+        let names: BTreeSet<String> = rows
+            .into_iter()
+            .filter(|(name, _)| name.starts_with(&items))
+            .map(|(_, value)| value)
+            .collect();
         Ok(names.into_iter().collect())
     }
 
@@ -591,16 +618,25 @@ pub fn expiry_after(lasting: Duration, now: Timestamp) -> Result<Timestamp> {
         .context("That's too long for a key to last. Leave it out for a key that never expires.")
 }
 
-/// Everyone's email address, by their ID, to name keys' owners.
-async fn owner_emails(connection: &impl ConnectionTrait) -> Result<BTreeMap<i64, String>> {
-    let users = user::Entity::find()
+/// These users' email addresses, by their ID, to name keys' and apps' owners.
+async fn owner_emails(
+    connection: &impl ConnectionTrait,
+    user_ids: impl IntoIterator<Item = i64>,
+) -> Result<BTreeMap<i64, String>> {
+    let wanted: BTreeSet<i64> = user_ids.into_iter().collect();
+    if wanted.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let emails: Vec<(i64, String)> = user::Entity::find()
+        .select_only()
+        .column(user::Column::Id)
+        .column(user::Column::Email)
+        .filter(user::Column::Id.is_in(wanted))
+        .into_tuple()
         .all(connection)
         .await
         .context("loading users")?;
-    Ok(users
-        .into_iter()
-        .map(|user| (user.id, user.email))
-        .collect())
+    Ok(emails.into_iter().collect())
 }
 
 /// A key as the audit log compares them. The key itself is never kept.
@@ -669,7 +705,7 @@ impl Database {
             .all(&self.connection)
             .await
             .context("loading API keys")?;
-        let owners = owner_emails(&self.connection).await?;
+        let owners = owner_emails(&self.connection, rows.iter().map(|row| row.user_id)).await?;
         Ok(rows
             .into_iter()
             .map(|row| {
@@ -697,7 +733,7 @@ impl Database {
             return Ok(false);
         };
         if row.revoked_at.is_none() {
-            let owner = owner_emails(&transaction)
+            let owner = owner_emails(&transaction, [row.user_id])
                 .await?
                 .remove(&row.user_id)
                 .unwrap_or_default();
@@ -1087,12 +1123,40 @@ fn simple_fact_name(name: String) -> Option<String> {
     (!name.contains('[')).then_some(name)
 }
 
+/// Facts with these names, or items of lists with them. Databases differ in whether
+/// they compare text ignoring case, so this can find more, which
+/// [`is_fact_or_item`] leaves out.
 fn fact_or_its_items(names: &[&str]) -> Condition {
     names.iter().fold(Condition::any(), |wanted, name| {
         wanted
             .add(host_fact::Column::Name.eq(*name))
-            .add(host_fact::Column::Name.starts_with(format!("{name}[")))
+            .add(starting_with(host_fact::Column::Name, &format!("{name}[")))
     })
+}
+
+/// Whether a fact is `name`, or an item of the list it is, exactly.
+fn is_fact_or_item(fact: &str, name: &str) -> bool {
+    fact.strip_prefix(name)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('['))
+}
+
+/// What LIKE escapes its wildcards with: one no database treats specially in a
+/// string, as `\` is to MySQL.
+const LIKE_ESCAPE: char = '!';
+
+/// A column starting with `prefix`, taking any `%` or `_` in it as itself. Whether
+/// case counts depends on the database, so what this finds needs checking.
+pub(super) fn starting_with(column: impl ColumnTrait, prefix: &str) -> Expr {
+    use sea_orm::sea_query::{ExprTrait, LikeExpr};
+    let mut pattern = String::with_capacity(prefix.len() + 1);
+    for character in prefix.chars() {
+        if matches!(character, '%' | '_' | LIKE_ESCAPE) {
+            pattern.push(LIKE_ESCAPE);
+        }
+        pattern.push(character);
+    }
+    pattern.push('%');
+    Expr::col(column).like(LikeExpr::new(pattern).escape(LIKE_ESCAPE))
 }
 
 fn by_host(rows: Vec<host_fact::Model>) -> Result<BTreeMap<String, FlatFacts>> {
@@ -1856,6 +1920,51 @@ mod tests {
                 ("custom.tags".to_string(), "string".to_string()),
                 ("os.family".to_string(), "string".to_string()),
             ])
+        );
+    }
+
+    /// Wildcards in what's searched for are only themselves, and case is ignored the
+    /// same way on every database.
+    #[tokio::test]
+    async fn fact_values_and_lists_match_what_was_typed_exactly() {
+        let database = Database::for_test().await;
+        for (host, version, check) in [
+            ("host-1", "Ubuntu 10.0", "web_1"),
+            ("host-2", "1000", "webx1"),
+            ("host-3", "10_0 build", "Web_1"),
+            ("host-4", "50%", "web_2"),
+        ] {
+            database.save_host(&record(host)).await.unwrap();
+            let facts = flatten(&json!({
+                "os": { "version": version },
+                "agent": { "checks": [check] },
+                "agent_x": { "checks": ["not a check"] },
+            }))
+            .unwrap();
+            database.record_facts(host, &facts, at(1)).await.unwrap();
+        }
+        let values = |text: &'static str| {
+            let database = database.clone();
+            async move { database.fact_values("os.version", text, 10).await.unwrap() }
+        };
+
+        assert_eq!(values("10_0").await, ["10_0 build"]);
+        assert_eq!(values("ubuntu").await, ["Ubuntu 10.0"]);
+        assert_eq!(values("%").await, ["50%"]);
+        assert_eq!(
+            values("").await,
+            ["1000", "10_0 build", "50%", "Ubuntu 10.0"]
+        );
+        assert_eq!(
+            database.listed_by_agents("agent.checks").await.unwrap(),
+            ["Web_1", "web_1", "web_2", "webx1"]
+        );
+        assert!(
+            database
+                .listed_by_agents("agent_checks")
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 

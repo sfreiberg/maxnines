@@ -555,8 +555,17 @@ impl Database {
             .await
             .context("loading alert rules")?;
 
+        // Only the links and actions of rules that aren't deleted.
+        let live = || {
+            Query::select()
+                .column(alert_rule::Column::Id)
+                .from(alert_rule::Entity)
+                .and_where(alert_rule::Column::DeletedAt.is_null())
+                .to_owned()
+        };
         let mut channels: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
         for link in alert_rule_channel::Entity::find()
+            .filter(alert_rule_channel::Column::RuleId.in_subquery(live()))
             .all(&self.connection)
             .await
             .context("loading alert rule channels")?
@@ -569,6 +578,7 @@ impl Database {
 
         let mut actions: BTreeMap<i64, Vec<RuleAction>> = BTreeMap::new();
         for row in alert_rule_action::Entity::find()
+            .filter(alert_rule_action::Column::RuleId.in_subquery(live()))
             .order_by_asc(alert_rule_action::Column::Position)
             .all(&self.connection)
             .await
@@ -645,18 +655,23 @@ impl Database {
     /// Every rule's name by its ID, deleted ones too, for what still points at them,
     /// like a silence that has ended. Deleted ones say so.
     pub async fn alert_rule_names(&self) -> Result<BTreeMap<i64, String>> {
-        let rows = alert_rule::Entity::find()
+        let rows: Vec<(i64, String, Option<Timestamp>)> = alert_rule::Entity::find()
+            .select_only()
+            .column(alert_rule::Column::Id)
+            .column(alert_rule::Column::Name)
+            .column(alert_rule::Column::DeletedAt)
+            .into_tuple()
             .all(&self.connection)
             .await
             .context("loading alert rules")?;
         Ok(rows
             .into_iter()
-            .map(|row| {
-                let name = match row.deleted_at {
-                    Some(_) => format!("{} (deleted)", row.name),
-                    None => row.name,
+            .map(|(id, name, deleted_at)| {
+                let name = match deleted_at {
+                    Some(_) => format!("{name} (deleted)"),
+                    None => name,
                 };
-                (row.id, name)
+                (id, name)
             })
             .collect())
     }
@@ -1037,6 +1052,16 @@ impl Database {
             .await
             .context("loading alerts")?;
         to_alerts(&self.connection, rows).await
+    }
+
+    /// How many alerts are open.
+    pub async fn open_alert_count(&self) -> Result<u64> {
+        use sea_orm::PaginatorTrait;
+        alert::Entity::find()
+            .filter(alert::Column::ResolvedAt.is_null())
+            .count(&self.connection)
+            .await
+            .context("counting alerts")
     }
 
     /// The newest alerts that have ended.
@@ -1700,8 +1725,12 @@ impl Database {
 
     /// The alerts behind what silences are keeping back, with what's kept back for each.
     pub async fn held_deliveries(&self) -> Result<Vec<(Alert, Vec<i64>)>> {
-        let rows = notification::Entity::find()
+        let rows: Vec<(i64, i64)> = notification::Entity::find()
+            .select_only()
+            .column(notification::Column::Id)
+            .column(notification::Column::AlertId)
             .filter(notification::Column::State.eq(HELD))
+            .into_tuple()
             .all(&self.connection)
             .await
             .context("loading notifications")?;
@@ -1710,8 +1739,8 @@ impl Database {
         }
 
         let mut held: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
-        for row in rows {
-            held.entry(row.alert_id).or_default().push(row.id);
+        for (id, alert_id) in rows {
+            held.entry(alert_id).or_default().push(id);
         }
         let alerts = alert::Entity::find()
             .filter(alert::Column::Id.is_in(held.keys().copied()))

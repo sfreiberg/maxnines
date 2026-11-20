@@ -4,17 +4,20 @@ MaxNines keeps its data in two places:
 
 - **The main database** holds everything people set up and everything the server
   decides: hosts, facts, rules, alerts, users and the rest. It's SQLite by default,
-  or PostgreSQL, MySQL or MariaDB, through sea-orm. One migration,
-  `m20261119_000001_create_tables`, makes its tables, in
-  [`crates/server/src/migrations`](../crates/server/src/migrations/mod.rs),
-  `m20261119_000002_add_no_metrics_rule` adds the built-in Host sending no metrics
-  rule, which the first doesn't have, `m20261119_000003_keys_and_indexes` makes
-  deleting a host or user delete what's theirs, adds the notifications' key to their
-  action runs, keeps names unique among rules and channels that aren't deleted, and
-  adds the indexes below that the first didn't have, and
-  `m20261119_000004_names_and_uniqueness` compares names ignoring case, the same way
-  on every database, keeps one current value of each fact and one open alert for
-  each problem, and adds the rest of the indexes below.
+  or PostgreSQL, MySQL or MariaDB, through sea-orm. Its migrations are in
+  [`crates/server/src/migrations`](../crates/server/src/migrations/mod.rs):
+  - `m20261119_000001_create_tables` makes its tables.
+  - `m20261119_000002_add_no_metrics_rule` adds the built-in Host sending no metrics
+    rule, which the first doesn't have.
+  - `m20261119_000003_keys_and_indexes` makes deleting a host or user delete what's
+    theirs, adds the notifications' key to their action runs, keeps names unique
+    among rules and channels that aren't deleted, and adds indexes the first didn't
+    have.
+  - `m20261119_000004_names_and_uniqueness` compares names ignoring case, the same
+    way on every database, keeps one current value of each fact and one open alert
+    for each problem, and adds the rest of the indexes below.
+  - `m20261119_000005_exact_facts` has MySQL and MariaDB compare facts' names and
+    values exactly, as the others do.
 - **The metrics store** holds the numbers hosts report. It's DuckDB for a single
   server or ClickHouse for a big one, and only one of them is used. Each has a
   migration, `0001_create_tables`, which makes its tables, and a second: in
@@ -40,7 +43,9 @@ the millisecond: `timestamptz` on PostgreSQL, `DATETIME(3)` on MySQL and MariaDB
 8601 text such as `2026-11-19T01:57:17.828+00:00` on SQLite, which has no type for it
 and sorts it as text. A length of time ending `_ms` or `_secs` is a number. `json` is
 `jsonb` on PostgreSQL, `json` on MySQL and MariaDB, and text on SQLite. A column that
-can be empty is NULL when it is, never an empty string.
+can be empty is NULL when it is, never an empty string. A fact's `name` and `value` are
+what agents report, compared exactly on every database: on MySQL and MariaDB by the
+`utf8mb4_bin` collation, rather than the table's.
 
 Names people give alert rules, channels, config rules and checks are compared ignoring
 case and the spaces around them, as people read them. Each of those tables has a

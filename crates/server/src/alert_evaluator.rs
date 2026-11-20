@@ -585,8 +585,10 @@ impl Evaluator {
 
         self.actions.give_up_on_unanswered(now).await?;
         self.trackers.retain(|key, _| checked.contains(key));
-        let firing = self.database.open_alerts().await?.len();
-        self.status.firing.store(firing, Ordering::Relaxed);
+        let firing = self.database.open_alert_count().await?;
+        self.status
+            .firing
+            .store(usize::try_from(firing)?, Ordering::Relaxed);
         self.status.alert_pass_finished(now);
         Ok(())
     }

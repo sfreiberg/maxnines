@@ -12,8 +12,8 @@ use lettre::Address;
 use maxnines_protocol::auth::new_nonce;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, SqlErr, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, JoinType, PaginatorTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, SqlErr, TransactionTrait,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -672,21 +672,21 @@ impl Database {
         user_agent: Option<&str>,
         now: Timestamp,
     ) -> Result<Option<(User, i64)>> {
-        let session = user_session::Entity::find()
+        // The session and its user together, as every request asks.
+        let of_user = user_session::Entity::belongs_to(user::Entity)
+            .from(user_session::Column::UserId)
+            .to(user::Column::Id)
+            .into();
+        let found = user_session::Entity::find()
+            .join(JoinType::InnerJoin, of_user)
+            .select_also(user::Entity)
             .filter(user_session::Column::TokenHash.eq(token_hash(token)))
             .filter(user_session::Column::ExpiresAt.gt(now))
-            .one(&self.connection)
-            .await
-            .context("checking a session")?;
-        let Some(session) = session else {
-            return Ok(None);
-        };
-        let row = user::Entity::find_by_id(session.user_id)
             .filter(user::Column::DisabledAt.is_null())
             .one(&self.connection)
             .await
-            .context("loading a session's user")?;
-        let Some(row) = row else {
+            .context("checking a session")?;
+        let Some((session, Some(row))) = found else {
             return Ok(None);
         };
         let id = session.id;
