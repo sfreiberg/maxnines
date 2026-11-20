@@ -7,6 +7,7 @@ use anyhow::{Context as _, Result};
 use serde::Deserialize;
 
 use crate::failure::Failure;
+use crate::tokens;
 
 /// What's in `config.hcl`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -68,15 +69,16 @@ impl Config {
         std::fs::create_dir_all(folder).with_context(|| format!("making {}", folder.display()))?;
         let path = file(folder);
         let partial = path.with_extension("hcl.new");
-        std::fs::write(&partial, self.to_hcl())
+        std::fs::write(&partial, self.to_hcl(tokens::system(folder).place()))
             .with_context(|| format!("writing {}", partial.display()))?;
         std::fs::rename(&partial, &path).with_context(|| format!("writing {}", path.display()))
     }
 
-    fn to_hcl(&self) -> String {
-        let mut text = String::from(
-            "# Servers maxnines knows, by name. Signing in keeps its tokens in the\n\
-             # system's key store, not here.\n",
+    /// The file, saying where tokens are kept: `tokens_kept`.
+    fn to_hcl(&self, tokens_kept: &str) -> String {
+        let mut text = format!(
+            "# Servers maxnines knows, by name. Signing in keeps a server's tokens in\n\
+             # {tokens_kept}, not here.\n"
         );
         if let Some(current) = &self.current {
             text.push_str(&format!("\ncurrent = {}\n", quote(current)));

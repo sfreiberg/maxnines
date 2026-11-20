@@ -27,6 +27,8 @@ pub trait Store {
     fn load(&self, context: &str) -> Result<Option<Tokens>>;
     fn save(&self, context: &str, tokens: &Tokens) -> Result<()>;
     fn forget(&self, context: &str) -> Result<()>;
+    /// Where they are, for the config file to say.
+    fn place(&self) -> &'static str;
 }
 
 /// The system's store, as described above. A folder chosen with MAXNINES_CONFIG_DIR
@@ -68,6 +70,10 @@ struct KeyStore;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 impl KeyStore {
     const SERVICE: &str = "maxnines-cli";
+    #[cfg(target_os = "macos")]
+    const PLACE: &str = "the Keychain";
+    #[cfg(target_os = "windows")]
+    const PLACE: &str = "Credential Manager";
 
     fn entry(context: &str) -> Result<keyring::Entry> {
         keyring::Entry::new(Self::SERVICE, context).context("opening the key store")
@@ -78,10 +84,20 @@ impl KeyStore {
 impl Store for KeyStore {
     fn load(&self, context: &str) -> Result<Option<Tokens>> {
         match Self::entry(context)?.get_password() {
-            Ok(text) => Ok(serde_json::from_str(&text).ok()),
+            Ok(text) => serde_json::from_str(&text).map(Some).with_context(|| {
+                format!(
+                    "reading {context}'s tokens, {} in {}",
+                    Self::SERVICE,
+                    Self::PLACE
+                )
+            }),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(error) => Err(error).context("reading the key store"),
         }
+    }
+
+    fn place(&self) -> &'static str {
+        Self::PLACE
     }
 
     fn save(&self, context: &str, tokens: &Tokens) -> Result<()> {
@@ -159,6 +175,10 @@ impl Store for FileStore {
             self.write(&all)?;
         }
         Ok(())
+    }
+
+    fn place(&self) -> &'static str {
+        "tokens.json beside this file, which only you can read"
     }
 }
 

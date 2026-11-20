@@ -134,22 +134,24 @@ impl Api {
                 // One refresh at a time across every maxnines running, and another may
                 // have just done it, so look again once it's ours.
                 let _lock = tokens::lock(folder)?;
-                let held = tokens.borrow().clone();
-                if let Some(saved) = store.load(context)?
-                    && saved.access_token != held.access_token
-                    && fresh(&saved)
-                {
+                // Gone means another command signed it out meanwhile, which stands.
+                let Some(saved) = store.load(context)? else {
+                    return Err(Failure::not_allowed(format!(
+                        "Not signed in to {context}: run maxnines login {context}"
+                    ))
+                    .into());
+                };
+                if saved.access_token != tokens.borrow().access_token && fresh(&saved) {
                     let token = saved.access_token.clone();
                     *tokens.borrow_mut() = saved;
                     return Ok(token);
                 }
-                let latest = store.load(context)?.unwrap_or(held);
                 let wait = |delay: Duration| std::thread::sleep(delay);
                 let quick = Http::with_timeout(signin::REFRESH_TIMEOUT);
                 match signin::refresh(
                     &quick,
                     &self.server,
-                    &latest.refresh_token,
+                    &saved.refresh_token,
                     &REFRESH_RETRIES,
                     &wait,
                 )? {
@@ -177,5 +179,56 @@ impl Api {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store another command has just signed out of.
+    struct SignedOutStore;
+
+    impl Store for SignedOutStore {
+        fn load(&self, _context: &str) -> Result<Option<Tokens>> {
+            Ok(None)
+        }
+        fn save(&self, _context: &str, _tokens: &Tokens) -> Result<()> {
+            panic!("a context signed out elsewhere was signed in again");
+        }
+        fn forget(&self, _context: &str) -> Result<()> {
+            Ok(())
+        }
+        fn place(&self) -> &'static str {
+            "nowhere"
+        }
+    }
+
+    #[test]
+    fn signing_out_elsewhere_stands_while_a_refresh_waits() {
+        let folder = tempfile::tempdir().unwrap();
+        // Nothing listens on port 0, so a refresh tried would fail as unreachable.
+        let api = Api::new(
+            Server::parse("http://127.0.0.1:0").unwrap(),
+            "lan".to_string(),
+            Auth::SignedIn {
+                context: "lan".to_string(),
+                folder: folder.path().to_path_buf(),
+                store: Box::new(SignedOutStore),
+                tokens: RefCell::new(Tokens {
+                    access_token: "mxa_1".to_string(),
+                    access_expires_at: DateTime::UNIX_EPOCH,
+                    refresh_token: "mxr_1".to_string(),
+                    user: "you@example.com".to_string(),
+                    role: "viewer".to_string(),
+                }),
+            },
+        );
+        let failed = api.get("/hosts").unwrap_err();
+        assert_eq!(crate::failure::exit_code(&failed), Failure::NOT_ALLOWED);
+        assert!(
+            failed.to_string().contains("maxnines login lan"),
+            "{failed}"
+        );
     }
 }
