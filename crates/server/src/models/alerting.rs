@@ -1832,8 +1832,9 @@ impl Database {
             .unwrap()
     }
 
-    /// The newest deliveries that haven't worked, whether given up on or not. A
-    /// deleted channel's problems are nobody's to fix any more.
+    /// The newest deliveries that haven't worked, whether given up on or not. One that
+    /// worked in the end has no error any more, so isn't one. A deleted channel's
+    /// problems are nobody's to fix any more.
     pub async fn delivery_problems(&self, limit: u64) -> Result<Vec<DeliveryProblem>> {
         #[derive(FromQueryResult)]
         struct Problem {

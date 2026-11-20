@@ -1152,13 +1152,7 @@ async fn list_delivery_problems(State(state): State<AppState>) -> Response {
         .delivery_problems(super::alerts::PROBLEMS)
         .await
     {
-        Ok(problems) => {
-            let problems: Vec<_> = problems
-                .into_iter()
-                .filter(|problem| problem.state != "sent")
-                .collect();
-            Json(problems).into_response()
-        }
+        Ok(problems) => Json(problems).into_response(),
         Err(error) => server_error(&error),
     }
 }

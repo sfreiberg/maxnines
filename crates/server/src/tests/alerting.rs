@@ -3075,6 +3075,9 @@ async fn pagerduty_being_busy_is_tried_again_with_the_same_incident() {
     let events = pagerduty.events();
     assert_eq!(events.len(), 2);
     assert_eq!(events[0]["dedup_key"], events[1]["dedup_key"]);
+    // Once it's arrived it's no longer a problem, though its last error is kept.
+    let problems = test.database().delivery_problems(10).await.unwrap();
+    assert!(problems.is_empty(), "{problems:?}");
 }
 
 #[tokio::test]
