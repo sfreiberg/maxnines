@@ -185,9 +185,8 @@ mod system {
         }
     }
 
-    /// Where the echoed data starts in an IPv6 reply: after the reply itself and
-    /// the ICMP header of the echo.
-    const ICMPV6_DATA_OFFSET: usize = std::mem::size_of::<ICMPV6_ECHO_REPLY_LH>() + 8;
+    /// Where the echoed data starts in an IPv6 reply: straight after the reply.
+    const ICMPV6_DATA_OFFSET: usize = std::mem::size_of::<ICMPV6_ECHO_REPLY_LH>();
 
     /// Whether the target itself replied, echoing the token.
     fn send(handle: &Handle, target: SocketAddr, token: &[u8; 8], wait: Duration) -> bool {

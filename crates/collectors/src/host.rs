@@ -381,10 +381,13 @@ mod tests {
     #[test]
     fn memory_reports_what_it_is_used_for() {
         let output = MemoryCollector::new().unwrap().collect().unwrap();
-        assert!(
-            output["detail"]["free_bytes"].as_u64().is_some(),
-            "{output}"
-        );
+        // Windows has no figure for truly free memory, only for its page files.
+        let reported = if cfg!(windows) {
+            "page_file_bytes"
+        } else {
+            "free_bytes"
+        };
+        assert!(output["detail"][reported].as_u64().is_some(), "{output}");
     }
 
     #[test]
