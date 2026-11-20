@@ -1572,8 +1572,8 @@ async fn a_stopped_process_alerts_from_what_an_agent_really_sends() {
             metrics: BTreeMap::from([(
                 "processes".to_string(),
                 json!([
-                    { "name": "nginx", "count": count, "cpu_percent": 0.0, "memory_percent": 0.0 },
-                    { "name": "sshd", "count": 0, "cpu_percent": 0.0, "memory_percent": 0.0 },
+                    { "name": "nginx", "count": count, "cpu_percent": 0.0, "memory_bytes": 0 },
+                    { "name": "sshd", "count": 0, "cpu_percent": 0.0, "memory_bytes": 0 },
                 ]),
             )]),
         })
@@ -1637,7 +1637,7 @@ async fn process_charts_only_appear_for_agents_that_report_processes() {
         time,
         metrics: BTreeMap::from([(
             "processes".to_string(),
-            json!([{ "name": "nginx", "count": 2, "cpu_percent": 1.0, "memory_percent": 1.0 }]),
+            json!([{ "name": "nginx", "count": 2, "cpu_percent": 1.0, "memory_bytes": 1024 }]),
         )]),
     });
     send(&mut client, &sample).await;

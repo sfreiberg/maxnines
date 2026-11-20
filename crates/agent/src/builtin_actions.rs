@@ -8,10 +8,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use sysinfo::{
-    Pid, Process, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind, Users,
-};
+use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind, Users};
 
+use crate::collector::{is_running, program_name};
 use crate::disk_space;
 
 /// How many processes a table lists.
@@ -146,16 +145,50 @@ pub fn table(headings: &[&str], rows: &[Vec<String>]) -> String {
     text
 }
 
+/// Who can see everything about other users' processes.
+pub const SEES_EVERYTHING: &str = if cfg!(windows) {
+    "an administrator"
+} else {
+    "root"
+};
+
 /// Whether the agent can see everything about other users' processes.
+#[cfg(unix)]
 pub fn sees_everything() -> bool {
-    #[cfg(unix)]
-    {
-        rustix::process::geteuid().is_root()
+    rustix::process::geteuid().is_root()
+}
+
+/// Whether the agent can see everything about other users' processes, which takes
+/// an administrator's rights, granted in full, as a service has them.
+#[cfg(windows)]
+pub fn sees_everything() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: the process's own handle needs no closing, and the token is only used
+    // once it's been opened.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return false;
     }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut length = 0;
+    // SAFETY: the struct is as big as it's said to be, and the token is closed once.
+    let asked = unsafe {
+        let asked = GetTokenInformation(
+            token,
+            TokenElevation,
+            std::ptr::from_mut(&mut elevation).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut length,
+        );
+        CloseHandle(token);
+        asked
+    };
+    asked != 0 && elevation.TokenIsElevated != 0
 }
 
 #[derive(Clone, Copy)]
@@ -166,14 +199,6 @@ enum By {
 
 fn refresh(system: &mut System, kind: ProcessRefreshKind) {
     system.refresh_processes_specifics(ProcessesToUpdate::All, true, kind.without_tasks());
-}
-
-fn is_running(process: &Process) -> bool {
-    process.thread_kind().is_none()
-        && !matches!(
-            process.status(),
-            ProcessStatus::Zombie | ProcessStatus::Dead
-        )
 }
 
 /// A process's user by name, or by number when the system doesn't know one.
@@ -187,8 +212,9 @@ pub fn owner(process: &Process, users: &Users) -> String {
     }
 }
 
+/// A program's name as the top_processes collector gives it.
 pub fn name(process: &Process) -> String {
-    process.name().to_string_lossy().into_owned()
+    program_name(process.name())
 }
 
 fn pid(pid: Pid) -> String {
@@ -298,10 +324,10 @@ fn disk_io() -> Result<String> {
         text
     };
     if !sees_everything() {
-        text.push_str(
-            "The agent isn't running as root, so it can only see what its own user's \
-             processes read and write.\n",
-        );
+        text.push_str(&format!(
+            "The agent isn't running as {SEES_EVERYTHING}, so it can only see what its own \
+             user's processes read and write.\n"
+        ));
     }
     Ok(text)
 }

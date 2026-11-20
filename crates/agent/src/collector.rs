@@ -1,14 +1,15 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
 use maxnines_protocol::{AgentConfig, COLLECTORS, CollectorSettings};
 use serde_json::{Value, json};
 use sysinfo::{
-    Components, CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, ProcessStatus,
-    ProcessesToUpdate, System, UpdateKind,
+    Components, CpuRefreshKind, Process, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate,
+    System, UpdateKind,
 };
 
 use maxnines_collectors::counters::CounterCollector;
@@ -84,13 +85,42 @@ impl Local<'static> {
 
 /// Builds everything a config turns on.
 pub fn build_all(config: &AgentConfig, local: Local<'_>) -> Result<Vec<Box<dyn Collector>>> {
+    let enabled = |name: &str| {
+        config
+            .collectors
+            .get(name)
+            .is_some_and(|settings| settings.enabled)
+    };
+    // Only the processes collector needs each program's file.
+    let mut processes = Processes {
+        table: None,
+        files: enabled("processes"),
+    };
     let interval = config.interval;
     config
         .collectors
         .iter()
         .filter(|(_, settings)| settings.enabled)
-        .map(|(name, settings)| build(name, settings, local, interval))
+        .map(|(name, settings)| build(name, settings, local, interval, &mut processes))
         .collect()
+}
+
+/// The process list, read once a sample for both collectors that use it, once the
+/// first of them is built.
+struct Processes {
+    table: Option<SharedProcesses>,
+    files: bool,
+}
+
+impl Processes {
+    fn table(&mut self) -> Result<SharedProcesses> {
+        if let Some(table) = &self.table {
+            return Ok(table.clone());
+        }
+        let table = ProcessTable::shared(self.files)?;
+        self.table = Some(table.clone());
+        Ok(table)
+    }
 }
 
 fn build(
@@ -98,6 +128,7 @@ fn build(
     config: &CollectorSettings,
     local: Local<'_>,
     interval: Duration,
+    processes: &mut Processes,
 ) -> Result<Box<dyn Collector>> {
     Ok(match name {
         "host" => Box::new(HostCollector),
@@ -105,8 +136,11 @@ fn build(
         "memory" => Box::new(MemoryCollector::new()?),
         "disk" => Box::new(DiskCollector::new(config.mount_points.clone())?),
         "network" => Box::new(NetworkCollector::new()?),
-        "processes" => Box::new(ProcessCollector::new(config.names.clone())?),
-        "top_processes" => Box::new(TopProcessCollector::new()?),
+        "processes" => Box::new(ProcessCollector::new(
+            config.names.clone().unwrap_or_default(),
+            processes.table()?,
+        )),
+        "top_processes" => Box::new(TopProcessCollector::new(processes.table()?)),
         "counters" => Box::new(CounterCollector::new(
             config.names.clone().unwrap_or_default(),
         )),
@@ -205,23 +239,70 @@ impl Collector for SensorCollector {
     }
 }
 
-/// Reports on the processes it's told to watch, and only those. A name with
-/// nothing running reports a count of 0, which is how a stopped service shows up.
-struct ProcessCollector {
+/// The process list, read once a sample however many collectors use it. CPU usage
+/// is measured between two reads, like the CPU collector's, so it's read once now.
+pub struct ProcessTable {
     system: System,
-    names: Vec<String>,
+    /// Whether each program's file is wanted too.
+    files: bool,
+    /// The sample it was last read for, counted by the collectors that use it.
+    read_for: u64,
 }
 
-/// What's needed from a process to count it.
-struct RunningProcess<'a> {
-    name: &'a OsStr,
-    exe: Option<&'a Path>,
+type SharedProcesses = Arc<Mutex<ProcessTable>>;
+
+impl ProcessTable {
+    fn shared(files: bool) -> Result<SharedProcesses> {
+        let mut system = System::new()?;
+        system.refresh_cpu_list(CpuRefreshKind::nothing());
+        let mut table = Self {
+            system,
+            files,
+            read_for: 0,
+        };
+        table.read();
+        Ok(Arc::new(Mutex::new(table)))
+    }
+
+    fn read(&mut self) {
+        let kind = ProcessRefreshKind::nothing()
+            .with_cpu()
+            .with_memory()
+            .without_tasks();
+        let kind = if self.files {
+            kind.with_exe(UpdateKind::OnlyIfNotSet)
+        } else {
+            kind
+        };
+        self.system
+            .refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
+    }
+
+    /// What's running for a collector's `sample`th sample. The collectors that share
+    /// the list are built together and asked for every sample, so they count alike,
+    /// and the first to ask reads it.
+    fn running_for(table: &SharedProcesses, sample: u64) -> Vec<RunningProcess> {
+        let mut table = table.lock().unwrap_or_else(PoisonError::into_inner);
+        if table.read_for < sample {
+            table.read();
+            table.read_for = sample;
+        }
+        running(&table.system)
+    }
+}
+
+/// What's needed from a process to count it, with its names as they're matched.
+struct RunningProcess {
+    name: String,
+    /// The name of its program's file, as Linux cuts a process's own name short.
+    file: Option<String>,
     cpu_percent: f64,
     memory_bytes: u64,
 }
 
-/// Windows adds `.exe`, which nobody thinks of as part of the name.
-fn base_name(name: &OsStr) -> String {
+/// A program's name as it's reported and matched: in lower case, and without the
+/// `.exe` Windows adds, which nobody thinks of as part of the name.
+pub fn program_name(name: &OsStr) -> String {
     let name = name.to_string_lossy().to_lowercase();
     match name.strip_suffix(".exe") {
         Some(base) => base.to_string(),
@@ -229,23 +310,27 @@ fn base_name(name: &OsStr) -> String {
     }
 }
 
-/// Matches whole names, ignoring case. The file name counts too, as Linux cuts
-/// a process's own name to 15 characters.
+/// Whether a process is running, leaving out threads and what has exited. A crashed
+/// service can linger as a zombie, which isn't running.
+pub fn is_running(process: &Process) -> bool {
+    process.thread_kind().is_none()
+        && !matches!(
+            process.status(),
+            ProcessStatus::Zombie | ProcessStatus::Dead
+        )
+}
+
+/// Matches whole names, ignoring case. `wanted` is a [`program_name`].
 fn is_named(process: &RunningProcess, wanted: &str) -> bool {
-    let wanted = base_name(OsStr::new(wanted));
-    base_name(process.name) == wanted
-        || process
-            .exe
-            .and_then(Path::file_name)
-            .is_some_and(|file| base_name(file) == wanted)
+    process.name == wanted || process.file.as_deref() == Some(wanted)
 }
 
 /// One entry per watched name, whether anything matched or not.
-fn tally(names: &[String], processes: &[RunningProcess], total_memory: u64) -> Vec<Value> {
+fn tally(names: &[(String, String)], processes: &[RunningProcess]) -> Vec<Value> {
     names
         .iter()
-        .map(|name| {
-            let matching = processes.iter().filter(|process| is_named(process, name));
+        .map(|(name, wanted)| {
+            let matching = processes.iter().filter(|process| is_named(process, wanted));
             let (count, cpu, memory) = matching.fold((0u64, 0.0, 0u64), |totals, process| {
                 (
                     totals.0 + 1,
@@ -257,64 +342,52 @@ fn tally(names: &[String], processes: &[RunningProcess], total_memory: u64) -> V
                 "name": name,
                 "count": count,
                 "cpu_percent": cpu,
-                "memory_percent": memory as f64 / total_memory.max(1) as f64 * 100.0,
+                "memory_bytes": memory,
             })
         })
         .collect()
 }
 
-/// A process list ready to measure: CPU usage is measured between two refreshes, like
-/// the CPU collector's, so it's refreshed once now.
-fn process_list() -> Result<System> {
-    let mut system = System::new()?;
-    system.refresh_cpu_list(CpuRefreshKind::nothing());
-    refresh_processes(&mut system);
-    Ok(system)
-}
-
-fn refresh_processes(system: &mut System) {
-    system.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::nothing()
-            .with_cpu()
-            .with_memory()
-            .with_exe(UpdateKind::OnlyIfNotSet)
-            .without_tasks(),
-    );
-}
-
-/// What's running, without threads or what has exited. A process's usage is per
-/// core, so it's scaled to match the CPU chart, where 100% is the whole host.
-fn running(system: &System) -> Vec<RunningProcess<'_>> {
+/// What's running. A process's usage is per core, so it's scaled to match the CPU
+/// chart, where 100% is the whole host.
+fn running(system: &System) -> Vec<RunningProcess> {
     let cores = system.cpus().len().max(1) as f64;
     system
         .processes()
         .values()
-        .filter(|process| process.thread_kind().is_none())
-        // A crashed service can linger as a zombie, which isn't running.
-        .filter(|process| {
-            !matches!(
-                process.status(),
-                ProcessStatus::Zombie | ProcessStatus::Dead
-            )
-        })
+        .filter(|process| is_running(process))
         .map(|process| RunningProcess {
-            name: process.name(),
-            exe: process.exe(),
+            name: program_name(process.name()),
+            file: process.exe().and_then(Path::file_name).map(program_name),
             cpu_percent: f64::from(process.cpu_usage()) / cores,
             memory_bytes: process.memory(),
         })
         .collect()
 }
 
+/// Reports on the processes it's told to watch, and only those. A name with
+/// nothing running reports a count of 0, which is how a stopped service shows up.
+struct ProcessCollector {
+    table: SharedProcesses,
+    samples: u64,
+    /// Each name as it's reported, and as it's matched.
+    names: Vec<(String, String)>,
+}
+
 impl ProcessCollector {
-    fn new(names: Option<Vec<String>>) -> Result<Self> {
-        Ok(Self {
-            system: process_list()?,
-            names: names.unwrap_or_default(),
-        })
+    fn new(names: Vec<String>, table: SharedProcesses) -> Self {
+        let names = names
+            .into_iter()
+            .map(|name| {
+                let wanted = program_name(OsStr::new(&name));
+                (name, wanted)
+            })
+            .collect();
+        Self {
+            table,
+            samples: 0,
+            names,
+        }
     }
 }
 
@@ -324,12 +397,9 @@ impl Collector for ProcessCollector {
     }
 
     fn collect(&mut self) -> Result<Value> {
-        refresh_processes(&mut self.system);
-        Ok(Value::Array(tally(
-            &self.names,
-            &running(&self.system),
-            self.system.total_memory(),
-        )))
+        self.samples += 1;
+        let running = ProcessTable::running_for(&self.table, self.samples);
+        Ok(Value::Array(tally(&self.names, &running)))
     }
 }
 
@@ -342,14 +412,13 @@ const TOP: usize = 5;
 /// config rule turns it on, as it says what's running where the processes collector
 /// only answers about names it's given.
 struct TopProcessCollector {
-    system: System,
+    table: SharedProcesses,
+    samples: u64,
 }
 
 impl TopProcessCollector {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            system: process_list()?,
-        })
+    fn new(table: SharedProcesses) -> Self {
+        Self { table, samples: 0 }
     }
 }
 
@@ -359,16 +428,17 @@ impl Collector for TopProcessCollector {
     }
 
     fn collect(&mut self) -> Result<Value> {
-        refresh_processes(&mut self.system);
-        Ok(Value::Array(top(&running(&self.system))))
+        self.samples += 1;
+        let running = ProcessTable::running_for(&self.table, self.samples);
+        Ok(Value::Array(top(running)))
     }
 }
 
 /// The top programs by CPU and by memory, together, each once, busiest first.
-fn top(processes: &[RunningProcess]) -> Vec<Value> {
+fn top(processes: Vec<RunningProcess>) -> Vec<Value> {
     let mut programs: HashMap<String, (u64, f64, u64)> = HashMap::new();
     for process in processes {
-        let program = programs.entry(base_name(process.name)).or_default();
+        let program = programs.entry(process.name).or_default();
         program.0 += 1;
         program.1 += process.cpu_percent;
         program.2 = program.2.saturating_add(process.memory_bytes);
@@ -434,17 +504,27 @@ mod tests {
         assert_eq!(built[0].name(), "cpu");
     }
 
-    fn process<'a>(name: &'a str, exe: Option<&'a str>) -> RunningProcess<'a> {
+    fn process(name: &str, exe: Option<&str>) -> RunningProcess {
         RunningProcess {
-            name: OsStr::new(name),
-            exe: exe.map(Path::new),
+            name: program_name(OsStr::new(name)),
+            file: exe
+                .and_then(|exe| Path::new(exe).file_name())
+                .map(program_name),
             cpu_percent: 2.5,
             memory_bytes: 100,
         }
     }
 
-    fn watching(names: &[&str]) -> Vec<String> {
-        names.iter().map(ToString::to_string).collect()
+    fn watching(names: &[&str]) -> Vec<(String, String)> {
+        names
+            .iter()
+            .map(|name| (name.to_string(), program_name(OsStr::new(name))))
+            .collect()
+    }
+
+    fn processes_watching(names: &[&str]) -> ProcessCollector {
+        let names = names.iter().map(ToString::to_string).collect();
+        ProcessCollector::new(names, ProcessTable::shared(true).unwrap())
     }
 
     #[test]
@@ -454,7 +534,7 @@ mod tests {
             process("nginx", None),
             process("sshd", None),
         ];
-        let tally = tally(&watching(&["nginx"]), &processes, 1000);
+        let tally = tally(&watching(&["nginx"]), &processes);
 
         assert_eq!(
             tally,
@@ -462,14 +542,14 @@ mod tests {
                 "name": "nginx",
                 "count": 2,
                 "cpu_percent": 5.0,
-                "memory_percent": 20.0,
+                "memory_bytes": 200,
             })]
         );
     }
 
     #[test]
     fn a_name_with_nothing_running_reports_zero() {
-        let tally = tally(&watching(&["nginx"]), &[process("sshd", None)], 1000);
+        let tally = tally(&watching(&["nginx"]), &[process("sshd", None)]);
 
         assert_eq!(tally[0]["count"], 0);
         assert_eq!(tally[0]["cpu_percent"], 0.0);
@@ -478,24 +558,30 @@ mod tests {
     #[test]
     fn only_watched_names_are_reported() {
         let processes = [process("nginx", None), process("secret-thing", None)];
-        let tally = tally(&watching(&["nginx"]), &processes, 1000);
+        let tally = tally(&watching(&["nginx"]), &processes);
 
         assert_eq!(tally.len(), 1);
         assert!(!Value::Array(tally).to_string().contains("secret-thing"));
     }
 
     #[test]
-    fn names_ignore_case_and_windows_extensions() {
-        assert!(is_named(&process("nginx.exe", None), "nginx"));
-        assert!(is_named(&process("NGINX.EXE", None), "nginx"));
-        assert!(is_named(&process("nginx", None), "nginx.exe"));
-        assert!(is_named(&process("Nginx", None), "nginx"));
+    fn a_watched_name_is_reported_as_it_was_given() {
+        let tally = tally(&watching(&["NGINX.exe"]), &[process("nginx", None)]);
+        assert_eq!(tally[0]["name"], "NGINX.exe");
+        assert_eq!(tally[0]["count"], 1);
     }
 
     #[test]
-    fn names_have_to_match_whole() {
-        assert!(!is_named(&process("nginx-exporter", None), "nginx"));
-        assert!(!is_named(&process("ng", None), "nginx"));
+    fn names_ignore_case_and_windows_extensions() {
+        let named = |process: &RunningProcess, wanted: &str| {
+            is_named(process, &program_name(OsStr::new(wanted)))
+        };
+        assert!(named(&process("nginx.exe", None), "nginx"));
+        assert!(named(&process("NGINX.EXE", None), "nginx"));
+        assert!(named(&process("nginx", None), "nginx.exe"));
+        assert!(named(&process("Nginx", None), "nginx"));
+        assert!(!named(&process("nginx-exporter", None), "nginx"));
+        assert!(!named(&process("ng", None), "nginx"));
     }
 
     #[test]
@@ -505,14 +591,8 @@ mod tests {
     }
 
     #[test]
-    fn a_host_reporting_no_memory_does_not_divide_by_zero() {
-        let tally = tally(&watching(&["nginx"]), &[process("nginx", None)], 0);
-        assert_eq!(tally[0]["memory_percent"], 10_000.0);
-    }
-
-    #[test]
     fn with_no_names_nothing_is_reported() {
-        let mut collector = ProcessCollector::new(None).unwrap();
+        let mut collector = processes_watching(&[]);
         assert_eq!(collector.collect().unwrap(), json!([]));
     }
 
@@ -527,7 +607,7 @@ mod tests {
             rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT;
         rustix::process::waitid(rustix::process::WaitId::Pid(pid), options).unwrap();
 
-        let mut collector = ProcessCollector::new(Some(vec!["true".to_string()])).unwrap();
+        let mut collector = processes_watching(&["true"]);
         let output = collector.collect().unwrap();
         child.wait().unwrap();
 
@@ -538,36 +618,48 @@ mod tests {
     fn this_test_can_see_itself_running() {
         let exe = std::env::current_exe().unwrap();
         let name = exe.file_name().unwrap().to_string_lossy().to_string();
-        let mut collector =
-            ProcessCollector::new(Some(vec![name, "no-such-process".to_string()])).unwrap();
+        let mut collector = processes_watching(&[&name, "no-such-process"]);
 
         let output = collector.collect().unwrap();
         assert!(output[0]["count"].as_u64().unwrap() >= 1, "{output}");
-        assert!(
-            output[0]["memory_percent"].as_f64().unwrap() > 0.0,
-            "{output}"
-        );
+        assert!(output[0]["memory_bytes"].as_u64().unwrap() > 0, "{output}");
         assert_eq!(output[1]["count"], 0);
     }
 
-    fn using(name: &'static str, cpu_percent: f64, memory_bytes: u64) -> RunningProcess<'static> {
+    #[test]
+    fn both_process_collectors_read_the_list_once_a_sample() {
+        let table = ProcessTable::shared(true).unwrap();
+        let mut watched = ProcessCollector::new(Vec::new(), table.clone());
+        let mut top = TopProcessCollector::new(table.clone());
+        let read_for = || table.lock().unwrap().read_for;
+
+        watched.collect().unwrap();
+        assert_eq!(read_for(), 1);
+        top.collect().unwrap();
+        assert_eq!(read_for(), 1, "the second collector reads it again");
+        top.collect().unwrap();
+        assert_eq!(read_for(), 2);
+        watched.collect().unwrap();
+        assert_eq!(read_for(), 2);
+    }
+
+    fn using(name: &str, cpu_percent: f64, memory_bytes: u64) -> RunningProcess {
         RunningProcess {
-            name: OsStr::new(name),
-            exe: None,
             cpu_percent,
             memory_bytes,
+            ..process(name, None)
         }
     }
 
     #[test]
     fn the_top_programs_add_up_every_process_of_one_name() {
-        let processes = [
+        let processes = vec![
             using("php-fpm", 10.0, 100),
             using("php-fpm", 15.0, 100),
             using("postgres", 20.0, 900),
             using("Chrome.exe", 1.0, 50),
         ];
-        let top = top(&processes);
+        let top = top(processes);
         assert_eq!(
             top[0],
             json!({ "name": "php-fpm", "count": 2, "cpu_percent": 25.0, "memory_bytes": 200 })
@@ -586,7 +678,7 @@ mod tests {
             .collect();
         // Idle, but the biggest.
         processes.push(using("cache", 0.0, 10_000));
-        let names: Vec<Value> = top(&processes)
+        let names: Vec<Value> = top(processes)
             .into_iter()
             .map(|program| program["name"].clone())
             .collect();
@@ -601,7 +693,7 @@ mod tests {
 
     #[test]
     fn the_top_processes_are_this_hosts_own() {
-        let mut collector = TopProcessCollector::new().unwrap();
+        let mut collector = TopProcessCollector::new(ProcessTable::shared(false).unwrap());
         let output = collector.collect().unwrap();
         let top = output.as_array().unwrap();
         assert!(!top.is_empty() && top.len() <= 2 * TOP, "{output}");

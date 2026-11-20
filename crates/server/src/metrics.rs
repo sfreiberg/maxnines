@@ -358,11 +358,11 @@ pub const METRICS: &[Metric] = &[
     Metric {
         name: "process.memory",
         title: "Process memory usage",
-        unit: Unit::Percent,
+        unit: Unit::Bytes,
         collector: "processes",
         source: Source::Items {
             name: "$.name",
-            reading: Reading::Field("$.memory_percent"),
+            reading: Reading::Field("$.memory_bytes"),
         },
         chart: ShowChart::WithData,
     },

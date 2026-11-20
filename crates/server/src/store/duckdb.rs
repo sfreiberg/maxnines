@@ -2468,7 +2468,7 @@ mod tests {
             ),
             (
                 "processes".to_string(),
-                json!([{ "name": "nginx", "count": 2, "cpu_percent": 5.0, "memory_percent": 1.5 }]),
+                json!([{ "name": "nginx", "count": 2, "cpu_percent": 5.0, "memory_bytes": 1536 }]),
             ),
             (
                 "sensors".to_string(),

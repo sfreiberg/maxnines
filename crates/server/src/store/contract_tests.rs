@@ -757,8 +757,8 @@ fn newest_handles_names_agents_choose() {
 fn process_metrics_keep_each_watched_name_apart() {
     let mut store = in_memory();
     let data = json!([
-        { "name": "nginx", "count": 3, "cpu_percent": 1.5, "memory_percent": 2.5 },
-        { "name": "postgres", "count": 0, "cpu_percent": 0.0, "memory_percent": 0.0 },
+        { "name": "nginx", "count": 3, "cpu_percent": 1.5, "memory_bytes": 2048 },
+        { "name": "postgres", "count": 0, "cpu_percent": 0.0, "memory_bytes": 0 },
     ]);
     write_metric(&mut store, "a", 1000, "processes", data);
 
@@ -767,7 +767,7 @@ fn process_metrics_keep_each_watched_name_apart() {
         [("a", "nginx", 1000, 3.0), ("a", "postgres", 1000, 0.0)]
     );
     assert_eq!(newest(&store, "process.cpu", 0, HOUR_MS)[0].value, 1.5);
-    assert_eq!(newest(&store, "process.memory", 0, HOUR_MS)[0].value, 2.5);
+    assert_eq!(newest(&store, "process.memory", 0, HOUR_MS)[0].value, 2048.0);
     assert_eq!(
         names(&query(&store, "a", "process.count", 10)),
         ["nginx", "postgres"]
