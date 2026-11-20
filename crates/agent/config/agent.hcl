@@ -7,6 +7,8 @@
 #   url = "wss://${env("MONITOR_HOST")}/ws"
 #
 # The agent won't start if a variable with no default isn't set.
+#
+# A relative path, in any setting, is from this file's folder.
 
 server {
   # Use wss:// for anything beyond this host.
@@ -20,8 +22,7 @@ server {
 }
 
 # Where the agent keeps its key, the last config it received, and samples while
-# the server can't be reached, up to 64 MiB. A relative path is from this file's
-# folder. Keep it out of synced folders.
+# the server can't be reached, up to 64 MiB. Keep it out of synced folders.
 state_dir = "data.nosync"
 
 # Your own facts, which server rules can match on. Reported under "custom".

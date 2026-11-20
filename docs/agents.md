@@ -27,8 +27,10 @@ Then start it:
 ./maxnines-agent
 ```
 
-It creates a key in `state`, logs its host ID, and waits to be approved. A relative
-`state_dir` is in the config file's folder, wherever the agent is started from. Approve it
+It creates a key in `state`, logs its host ID, and waits to be approved. Every
+relative path in `agent.hcl`, such as `state_dir`, `token_file`, `ca_file` or a
+check's `private_key_file`, is from the config file's folder, wherever the agent is
+started from. Approve it
 on the Hosts page, or from the command line with an API key:
 
 ```sh

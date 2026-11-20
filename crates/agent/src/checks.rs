@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -111,7 +111,8 @@ pub type CheckDefinitions = BTreeMap<String, CheckDefinition>;
 
 /// Checks each definition, and reads any key file, so a mistake stops the agent
 /// starting rather than every check failing later.
-pub fn load_check_definitions(definitions: &mut CheckDefinitions) -> Result<()> {
+/// A relative key file is from `folder`, the config file's.
+pub fn load_check_definitions(definitions: &mut CheckDefinitions, folder: &Path) -> Result<()> {
     ensure!(
         definitions.len() <= MAX_DEFINED,
         "the config can define at most {MAX_DEFINED} checks"
@@ -155,8 +156,9 @@ pub fn load_check_definitions(definitions: &mut CheckDefinitions) -> Result<()> 
             definition.private_key_file.is_none() || check.kind == CheckKind::Ssh,
             problem("can only sign in with a private key if it's an SSH check")
         );
-        if let Some(path) = &definition.private_key_file {
-            let key = std::fs::read_to_string(path).with_context(|| {
+        if let Some(path) = &mut definition.private_key_file {
+            *path = folder.join(&*path);
+            let key = std::fs::read_to_string(&*path).with_context(|| {
                 format!(
                     "reading the private key for check {name:?} from {}",
                     path.display()
@@ -425,7 +427,7 @@ mod tests {
                 },
             ),
         ]);
-        load_check_definitions(&mut definitions).unwrap();
+        load_check_definitions(&mut definitions, Path::new("")).unwrap();
         let read = definitions["bastion"].private_key.as_deref().unwrap();
         assert!(read.contains("OPENSSH"));
         assert!(!format!("{:?}", definitions["mail"]).contains("s3cret"));
@@ -469,10 +471,34 @@ mod tests {
             let mut definitions = CheckDefinitions::from([("x".to_string(), bad)]);
             let error = format!(
                 "{:#}",
-                load_check_definitions(&mut definitions).unwrap_err()
+                load_check_definitions(&mut definitions, Path::new("")).unwrap_err()
             );
             assert!(error.contains(why), "{error}");
         }
+    }
+
+    #[test]
+    fn a_relative_key_file_is_from_the_config_files_folder() {
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(
+            folder.path().join("key"),
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let mut definitions = CheckDefinitions::from([(
+            "bastion".to_string(),
+            CheckDefinition {
+                password: None,
+                private_key_file: Some(PathBuf::from("key")),
+                ..defined("ssh", "bastion.example.com:22")
+            },
+        )]);
+
+        load_check_definitions(&mut definitions, folder.path()).unwrap();
+
+        let bastion = &definitions["bastion"];
+        assert!(bastion.private_key.as_deref().unwrap().contains("OPENSSH"));
+        assert_eq!(bastion.private_key_file, Some(folder.path().join("key")));
     }
 
     fn collect_until(collector: &mut CheckCollector, done: impl Fn(&Value) -> bool) -> Value {

@@ -28,16 +28,6 @@ pub fn edit(
         .unwrap_or(TEMPLATE)
         .parse()
         .context("reading the config file")?;
-    if existing.is_none() {
-        // Relative paths would mean wherever a command was run from.
-        set(
-            &mut body,
-            "",
-            "state_dir",
-            path_text(&folder.join("state"))?,
-        );
-    }
-
     let server = block(&mut body, "", "server");
     set(server, "  ", "url", url);
     if let Some(token_file) = token_file {
@@ -45,7 +35,7 @@ pub fn edit(
     }
 
     let text = body.to_string();
-    Config::parse(&text).context("checking the new config")?;
+    Config::parse(&text, folder).context("checking the new config")?;
     Ok(text)
 }
 
@@ -74,12 +64,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_new_config_comes_from_the_template_with_absolute_paths() {
+    fn a_new_config_comes_from_the_template_with_its_state_beside_it() {
         let folder = Path::new("/data/MaxNines/Agent");
         let token = folder.join("enrollment.token");
         let text = edit(None, folder, "wss://m.example.com/ws", Some(&token)).unwrap();
 
-        let config = Config::parse(&text).unwrap();
+        let config = Config::parse(&text, folder).unwrap();
         assert_eq!(config.server.url, "wss://m.example.com/ws");
         assert_eq!(config.server.token_file, Some(token));
         assert_eq!(config.state_dir, folder.join("state"));

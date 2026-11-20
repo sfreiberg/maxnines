@@ -29,8 +29,8 @@ const MAX_FACT_NAME_LEN: usize = 255 - "custom.".len();
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub server: ServerConfig,
-    /// Where the agent keeps its key and the last config it received. A relative
-    /// path is from the config file's folder, wherever the agent was started.
+    /// Where the agent keeps its key and the last config it received. Like every
+    /// path here, a relative one is from the config file's folder.
     #[serde(default = "default_state_dir")]
     pub state_dir: PathBuf,
     /// Your own facts by full name, reported under `custom`. These are gathered
@@ -137,24 +137,26 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config file {}", path.display()))?;
-        let mut config = Self::parse(&text)
-            .with_context(|| format!("invalid config file {}", path.display()))?;
-        // The key in there is the host's identity, so it mustn't depend on where a
-        // command happened to be run from.
-        if let Some(folder) = path.parent() {
-            config.state_dir = folder.join(&config.state_dir);
-        }
-        Ok(config)
+        let folder = path.parent().unwrap_or(Path::new(""));
+        Self::parse(&text, folder)
+            .with_context(|| format!("invalid config file {}", path.display()))
     }
 
-    pub(crate) fn parse(text: &str) -> Result<Self> {
+    /// Relative paths in it are from `folder`, the config file's, so what they mean
+    /// doesn't depend on where a command happened to be run from. The key in
+    /// `state_dir` is the host's identity.
+    pub(crate) fn parse(text: &str, folder: &Path) -> Result<Self> {
         let body: Body = hcl::eval::from_str(text, &config_context())?;
         let (body, facts) = take_facts(body)?;
         let mut config: Config = hcl::from_body(body)?;
         config.facts = facts;
+        config.state_dir = folder.join(&config.state_dir);
+        let server = &mut config.server;
+        server.token_file = server.token_file.as_ref().map(|path| folder.join(path));
+        server.ca_file = server.ca_file.as_ref().map(|path| folder.join(path));
         check_definitions(&config.custom_metrics)?;
         check_commands(&config.check_commands)?;
-        load_check_definitions(&mut config.checks)?;
+        load_check_definitions(&mut config.checks, folder)?;
         check_actions(&config.actions)?;
         check_page_definitions(&config.metrics_pages)?;
         check_database_definitions(&config.databases)?;
@@ -281,20 +283,21 @@ mod env_tests {
     #[test]
     fn a_setting_can_come_from_the_environment() {
         let path = std::env::var("PATH").unwrap();
-        let config = Config::parse(&with_url("env(\"PATH\")")).unwrap();
+        let config = Config::parse(&with_url("env(\"PATH\")"), Path::new("")).unwrap();
         assert_eq!(config.server.url, path);
     }
 
     #[test]
     fn a_variable_can_be_part_of_a_longer_value() {
         let text = with_url(r#""wss://${env("MAXNINES_TEST_UNSET", "monitor")}.example.com/ws""#);
-        let config = Config::parse(&text).unwrap();
+        let config = Config::parse(&text, Path::new("")).unwrap();
         assert_eq!(config.server.url, "wss://monitor.example.com/ws");
     }
 
     #[test]
     fn an_unset_variable_stops_the_agent_and_says_which() {
-        let error = Config::parse(&with_url("env(\"MAXNINES_TEST_UNSET\")")).unwrap_err();
+        let error =
+            Config::parse(&with_url("env(\"MAXNINES_TEST_UNSET\")"), Path::new("")).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("MAXNINES_TEST_UNSET"), "{message}");
     }
@@ -319,7 +322,7 @@ mod env_tests {
             }}
             "#
         );
-        let config = Config::parse(&text).unwrap();
+        let config = Config::parse(&text, Path::new("")).unwrap();
         let pages: Vec<&str> = config.metrics_pages.keys().map(String::as_str).collect();
         assert_eq!(pages, ["app", "node"]);
         assert_eq!(config.allowed().openmetrics, ["app", "node"]);
@@ -329,10 +332,10 @@ mod env_tests {
         let unnamed = format!(
             "{server}\nopenmetrics \"two words\" {{\n url = \"http://a/metrics\"\n token = \"c\"\n}}\n"
         );
-        let error = format!("{:#}", Config::parse(&unnamed).unwrap_err());
+        let error = format!("{:#}", Config::parse(&unnamed, Path::new("")).unwrap_err());
         assert!(error.contains("no spaces"), "{error}");
         let nowhere = format!("{server}\nopenmetrics \"node\" {{\n token = \"c\"\n}}\n");
-        assert!(Config::parse(&nowhere).is_err());
+        assert!(Config::parse(&nowhere, Path::new("")).is_err());
     }
 
     #[test]
@@ -349,7 +352,7 @@ mod env_tests {
             }}
             "#
         );
-        let config = Config::parse(&text).unwrap();
+        let config = Config::parse(&text, Path::new("")).unwrap();
 
         assert_eq!(config.custom_metrics.len(), 2);
         let queue = &config.custom_metrics["queue"];
@@ -371,11 +374,16 @@ mod env_tests {
             }}
             "#
         );
-        let config = Config::parse(&text).unwrap();
+        let config = Config::parse(&text, Path::new("")).unwrap();
 
         assert_eq!(config.actions.len(), 2);
         assert_eq!(config.actions["disk_hogs"].command[3], "{disk}");
-        assert!(Config::parse(&reachable()).unwrap().actions.is_empty());
+        assert!(
+            Config::parse(&reachable(), Path::new(""))
+                .unwrap()
+                .actions
+                .is_empty()
+        );
     }
 
     #[test]
@@ -387,14 +395,14 @@ mod env_tests {
             "action \"a\" {\n  command = [\"/bin/true\"]\n  shell = true\n}\n",
         ] {
             let text = format!("{}{block}", reachable());
-            assert!(Config::parse(&text).is_err(), "{block}");
+            assert!(Config::parse(&text, Path::new("")).is_err(), "{block}");
         }
     }
 
     #[test]
     fn no_custom_metrics_is_fine() {
         assert!(
-            Config::parse(&reachable())
+            Config::parse(&reachable(), Path::new(""))
                 .unwrap()
                 .custom_metrics
                 .is_empty()
@@ -410,7 +418,7 @@ mod env_tests {
             "custom_metric \"a\" {\n  command = [\"/bin/true\"]\n  shell = true\n}\n",
         ] {
             let text = format!("{}{block}", reachable());
-            assert!(Config::parse(&text).is_err(), "{block}");
+            assert!(Config::parse(&text, Path::new("")).is_err(), "{block}");
         }
     }
 
@@ -421,7 +429,7 @@ mod env_tests {
              facts \"disk\" {{\n  kind = env(\"MAXNINES_TEST_UNSET\", \"ssd\")\n}}\n",
             with_url("\"ws://x/ws\"")
         );
-        let config = Config::parse(&text).unwrap();
+        let config = Config::parse(&text, Path::new("")).unwrap();
         assert_eq!(config.facts["role"], "web");
         assert_eq!(config.facts["disk.kind"], "ssd");
     }
@@ -434,12 +442,12 @@ mod tests {
     const SERVER: &str = "server {\n  url = \"ws://127.0.0.1:9000/ws\"\n}\n";
 
     fn parse(text: &str) -> Result<Config> {
-        Config::parse(&format!("{SERVER}{text}"))
+        Config::parse(&format!("{SERVER}{text}"), Path::new(""))
     }
 
     #[test]
     fn shipped_config_parses() {
-        let config = Config::parse(include_str!("../config/agent.hcl")).unwrap();
+        let config = Config::parse(include_str!("../config/agent.hcl"), Path::new("")).unwrap();
 
         assert_eq!(config.server.url, "ws://127.0.0.1:9000/ws");
         assert_eq!(config.server.token_file, None);
@@ -449,7 +457,11 @@ mod tests {
     /// What the Linux packages install.
     #[test]
     fn packaged_config_parses() {
-        let config = Config::parse(include_str!("../../../packaging/linux/agent.hcl")).unwrap();
+        let config = Config::parse(
+            include_str!("../../../packaging/linux/agent.hcl"),
+            Path::new(""),
+        )
+        .unwrap();
 
         assert_eq!(config.server.url, "ws://127.0.0.1:9000/ws");
         assert_eq!(
@@ -471,22 +483,47 @@ mod tests {
     }
 
     #[test]
-    fn a_relative_state_dir_is_beside_the_config_file() {
+    fn relative_paths_are_from_the_config_files_folder() {
         let folder = tempfile::tempdir().unwrap();
         let path = folder.path().join("agent.hcl");
-        std::fs::write(&path, SERVER).unwrap();
-        let config = Config::load(&path).unwrap();
-        assert_eq!(config.key_file(), folder.path().join("state/agent.key"));
-
-        let absolute = folder.path().join("elsewhere");
-        let text = format!("{SERVER}state_dir = {:?}\n", absolute.to_str().unwrap());
+        let text = "server {\n  url = \"ws://127.0.0.1:9000/ws\"\n  \
+                    token_file = \"enrollment.token\"\n  ca_file = \"certs/ca.pem\"\n}\n";
         std::fs::write(&path, text).unwrap();
-        assert_eq!(Config::load(&path).unwrap().state_dir, absolute);
+
+        let config = Config::load(&path).unwrap();
+
+        assert_eq!(config.key_file(), folder.path().join("state/agent.key"));
+        let server = &config.server;
+        assert_eq!(
+            server.token_file,
+            Some(folder.path().join("enrollment.token"))
+        );
+        assert_eq!(server.ca_file, Some(folder.path().join("certs/ca.pem")));
+    }
+
+    #[test]
+    fn absolute_paths_are_kept() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("agent.hcl");
+        let elsewhere = tempfile::tempdir().unwrap();
+        let (state, token) = (elsewhere.path().join("state"), elsewhere.path().join("t"));
+        let text = format!(
+            "server {{\n  url = \"ws://127.0.0.1:9000/ws\"\n  token_file = {:?}\n}}\n\
+             state_dir = {:?}\n",
+            token.to_str().unwrap(),
+            state.to_str().unwrap()
+        );
+        std::fs::write(&path, text).unwrap();
+
+        let config = Config::load(&path).unwrap();
+
+        assert_eq!(config.state_dir, state);
+        assert_eq!(config.server.token_file, Some(token));
     }
 
     #[test]
     fn the_server_is_required() {
-        assert!(Config::parse("").is_err());
+        assert!(Config::parse("", Path::new("")).is_err());
     }
 
     #[test]

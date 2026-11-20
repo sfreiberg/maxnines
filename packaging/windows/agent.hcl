@@ -13,5 +13,6 @@ server {
   url = "wss://monitor.example.com/ws"
 }
 
-# Its key, its last config and samples waiting to be sent, up to 64 MiB.
+# Its key, its last config and samples waiting to be sent, up to 64 MiB. A
+# relative path, here or in any setting, is from this file's folder.
 state_dir = "state"
