@@ -203,10 +203,13 @@ impl Database {
     ) -> Result<Vec<TimelineEvent>> {
         let mut timeline = Vec::new();
 
+        // Two recorded in the same moment are newest first by when they were added,
+        // as the list of annotations has them, and the sort below keeps that.
         let recorded = event::Entity::find()
             .filter(event::Column::OccurredAt.gte(from))
             .filter(event::Column::OccurredAt.lt(to))
             .order_by_desc(event::Column::OccurredAt)
+            .order_by_desc(event::Column::Id)
             .limit(MAX_CANDIDATES)
             .all(&self.connection)
             .await
