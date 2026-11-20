@@ -618,24 +618,33 @@ fn act(api: &Api, command: Command, format: Format) -> Result<u8> {
                 })
                 .collect::<Result<_, _>>()?;
             let reads = method == "GET" || method == "DELETE";
-            let (path, body) = match (data, reads) {
-                (Some(data), _) => {
-                    let body: Value = serde_json::from_str(&data)
-                        .map_err(|error| Failure::usage(format!("--data isn't JSON: {error}")))?;
-                    (path, Some(body))
-                }
-                (None, true) if !pairs.is_empty() => {
+            let data = data
+                .map(|data| {
+                    serde_json::from_str::<Value>(&data)
+                        .map_err(|error| Failure::usage(format!("--data isn't JSON: {error}")))
+                })
+                .transpose()?;
+            let (path, body) = match (reads, data) {
+                (true, data) if !pairs.is_empty() => {
+                    // Added to any query the path already has.
                     let query = serde_urlencoded::to_string(&pairs).unwrap_or_default();
-                    (format!("{path}?{query}"), None)
+                    let joint = if path.contains('?') { '&' } else { '?' };
+                    (format!("{path}{joint}{query}"), data)
                 }
-                (None, false) if !pairs.is_empty() => {
+                (false, Some(_)) if !pairs.is_empty() => {
+                    return Err(Failure::usage(
+                        "Give the body as name=value pairs or as --data, not both",
+                    )
+                    .into());
+                }
+                (false, None) if !pairs.is_empty() => {
                     let object: serde_json::Map<String, Value> = pairs
                         .into_iter()
                         .map(|(name, value)| (name, Value::String(value)))
                         .collect();
                     (path, Some(Value::Object(object)))
                 }
-                (None, _) => (path, None),
+                (_, data) => (path, data),
             };
             let answer = api.call(&method, &path, body.as_ref())?;
             if !answer.is_null() {

@@ -89,20 +89,27 @@ impl Http {
         let unreachable = |error: &dyn std::fmt::Display| {
             Failure::unreachable(format!("Couldn't reach {}: {error}", origin(url)))
         };
+        // A request that can't be made is the command's fault, never the network's.
+        let unusable =
+            |error: &dyn std::fmt::Display| Failure::usage(format!("Can't ask for {url}: {error}"));
         let response = match text {
             Some(text) => {
-                let request = request.body(text).map_err(|error| unreachable(&error))?;
+                let request = request.body(text).map_err(|error| unusable(&error))?;
                 self.agent.run(request)
             }
             None => {
-                let request = request.body(()).map_err(|error| unreachable(&error))?;
+                let request = request.body(()).map_err(|error| unusable(&error))?;
                 self.agent.run(request)
             }
         };
         let mut response = response.map_err(|error| unreachable(&error))?;
         let status = response.status().as_u16();
+        // Read whole, however big: ureq's own limit of 10 MB is for servers it doesn't
+        // trust, and this one's answers are what was asked for.
         let text = response
             .body_mut()
+            .with_config()
+            .limit(u64::MAX)
             .read_to_string()
             .map_err(|error| unreachable(&error))?;
         Ok(Answer { status, text })

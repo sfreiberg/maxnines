@@ -496,3 +496,51 @@ fn signing_in_with_a_code_keeps_the_tokens_refreshes_them_and_signs_out() {
     assert!(again.status.success(), "{}", stderr(&again));
     assert_eq!(server.requests_to("/oauth/device").len(), 2);
 }
+
+#[test]
+fn the_api_command_sends_what_it_was_given_and_reads_any_answer() {
+    let folder = tempfile::tempdir().unwrap();
+    let big = format!("\"{}\"", "x".repeat(11 << 20));
+    let server = FakeServer::start(move |seen| match seen.target.as_str() {
+        "/api/v1/big" => (200, big.clone()),
+        _ => (200, "{}".to_string()),
+    });
+
+    // Fields join a query the path already has.
+    let joined = maxnines(
+        folder.path(),
+        &with_key(&server.url),
+        &["api", "GET", "/hosts?filter=os%3Dlinux", "text=x"],
+    );
+    assert!(joined.status.success(), "{}", stderr(&joined));
+    assert_eq!(
+        server.seen()[0].target,
+        "/api/v1/hosts?filter=os%3Dlinux&text=x"
+    );
+
+    // A body is fields or --data, never both with one dropped.
+    let both = maxnines(
+        folder.path(),
+        &with_key(&server.url),
+        &["api", "POST", "/annotations", "--data", "{}", "kind=deploy"],
+    );
+    assert_eq!(both.status.code(), Some(2), "{}", stderr(&both));
+
+    // A path that can't be asked for is the command's fault, not the network's.
+    let spaced = maxnines(
+        folder.path(),
+        &with_key(&server.url),
+        &["api", "GET", "/hosts/filter options"],
+    );
+    assert_eq!(spaced.status.code(), Some(2), "{}", stderr(&spaced));
+    assert_eq!(server.seen().len(), 1);
+
+    // An answer bigger than ureq reads by default is still read whole.
+    let read = maxnines(
+        folder.path(),
+        &with_key(&server.url),
+        &["api", "GET", "/big"],
+    );
+    assert!(read.status.success(), "{}", stderr(&read));
+    assert_eq!(stdout(&read).len(), (11 << 20) + 2);
+}
