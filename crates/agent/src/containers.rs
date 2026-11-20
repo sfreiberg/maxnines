@@ -247,7 +247,6 @@ fn describe(
             if let (Some(total), Some(system)) = (total, cpu.system_cpu_usage) {
                 row.insert("cpu_total".into(), json!(total));
                 row.insert("system_total".into(), json!(system));
-                row.insert("cpus".into(), json!(cpu.online_cpus.unwrap_or(1)));
             }
         }
         if let Some(used) = memory_used(stats) {
@@ -277,8 +276,9 @@ fn describe(
     Value::Object(row)
 }
 
-/// Swaps a row's CPU totals for the share of one CPU it used since the last sample,
-/// as `docker stats` shows it. The first sample has nothing to compare with.
+/// Swaps a row's CPU totals for the share of the whole host it used since the last
+/// sample, as other CPU figures are, so one busy core of eight is 12.5%. Docker's
+/// host total counts every CPU. The first sample has nothing to compare with.
 fn settle_cpu(
     row: &mut Value,
     before: &HashMap<String, (u64, u64)>,
@@ -294,7 +294,6 @@ fn settle_cpu(
         .to_string();
     let total = fields.remove("cpu_total").and_then(|v| v.as_u64());
     let system = fields.remove("system_total").and_then(|v| v.as_u64());
-    let cpus = fields.remove("cpus").and_then(|v| v.as_u64()).unwrap_or(1);
     let (Some(total), Some(system)) = (total, system) else {
         return;
     };
@@ -304,7 +303,7 @@ fn settle_cpu(
             .checked_sub(*system_before)
             .filter(|passed| *passed > 0);
         if let (Some(used), Some(passed)) = (used, passed) {
-            let percent = used as f64 / passed as f64 * cpus as f64 * 100.0;
+            let percent = used as f64 / passed as f64 * 100.0;
             fields.insert("cpu_percent".into(), json!(percent));
         }
     }
@@ -487,8 +486,8 @@ mod tests {
         );
         let mut seen = HashMap::new();
         settle_cpu(&mut row, &before, &mut seen);
-        // 2,000 of 10,000 across 4 CPUs is 80% of one.
-        assert_eq!(row["cpu_percent"], 80.0);
+        // 2,000 of the host's 10,000, whatever its number of CPUs.
+        assert_eq!(row["cpu_percent"], 20.0);
         assert!(row.get("system_total").is_none());
     }
 
