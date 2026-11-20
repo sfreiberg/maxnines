@@ -1,7 +1,7 @@
 //! Hashing passwords and slowing down guessing. Hashing is slow and takes memory on
 //! purpose, so it runs away from the async threads and only a few at a time.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::num::NonZeroU32;
 use std::sync::LazyLock;
 
@@ -60,8 +60,9 @@ pub async fn password_matches(password: String, hash: Option<String>) -> Result<
     .context("checking a password")?
 }
 
-/// Limits how fast passwords can be guessed. Limiting one place trying one address
-/// means someone else can't lock a person out by guessing from elsewhere.
+/// Limits how fast passwords and two-factor codes can be guessed. Limiting one place
+/// trying one address means someone else can't lock a person out by guessing from
+/// elsewhere.
 pub struct SignInThrottle {
     accounts: DefaultKeyedRateLimiter<(IpAddr, String)>,
     sources: DefaultKeyedRateLimiter<IpAddr>,
@@ -79,9 +80,25 @@ impl Default for SignInThrottle {
     }
 }
 
+/// Where a try comes from, as far as limiting goes: an IPv4 address, or the /64 an IPv6
+/// address is in, as one network is usually given a whole /64 to pick addresses from.
+fn place(source: IpAddr) -> IpAddr {
+    match source {
+        IpAddr::V4(_) => source,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let network = u128::from(v6) & !u128::from(u64::MAX);
+                IpAddr::V6(Ipv6Addr::from(network))
+            }
+        },
+    }
+}
+
 impl SignInThrottle {
     /// Whether this try can go ahead. Every try counts, right or wrong.
     pub fn allow(&self, source: IpAddr, email: &str) -> bool {
+        let source = place(source);
         if self.accounts.len() > MAX_REMEMBERED {
             self.accounts.retain_recent();
         }
@@ -133,6 +150,26 @@ mod tests {
         assert!(!throttle.allow(attacker, "a@example.com"));
         assert!(throttle.allow(attacker, "b@example.com"));
         assert!(throttle.allow(owner, "a@example.com"));
+    }
+
+    #[test]
+    fn a_network_counts_as_one_place_whichever_of_its_addresses_it_uses() {
+        let throttle = SignInThrottle::default();
+        for number in 0..ACCOUNT_BURST {
+            let source: IpAddr = format!("2001:db8:1:2::{number:x}").parse().unwrap();
+            assert!(throttle.allow(source, "a@example.com"));
+        }
+        let elsewhere_in_it: IpAddr = "2001:db8:1:2:ffff::1".parse().unwrap();
+        assert!(!throttle.allow(elsewhere_in_it, "a@example.com"));
+        // The next network along is another place.
+        let next: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert!(throttle.allow(next, "a@example.com"));
+        // An IPv4 address written as IPv6 is the same place as itself.
+        for _ in 0..ACCOUNT_BURST {
+            assert!(throttle.allow("10.0.0.1".parse().unwrap(), "b@example.com"));
+        }
+        assert!(!throttle.allow("::ffff:10.0.0.1".parse().unwrap(), "b@example.com"));
+        assert!(throttle.allow("10.0.0.2".parse().unwrap(), "b@example.com"));
     }
 
     #[test]
