@@ -317,7 +317,8 @@ fn section_of(template: &str) -> &'static str {
 /// Identifies this exact build, so an open page can tell the server has changed.
 fn build_id() -> String {
     let build = maxnines_protocol::build_info!();
-    format!("{}-{}", build.commit, build.built_at)
+    let built = build.built_at.map(|built| built.timestamp_millis());
+    format!("{}-{}", build.commit, built.unwrap_or_default())
 }
 
 /// What the frame around a page shows of whoever's signed in.

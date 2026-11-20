@@ -264,7 +264,9 @@ fn server_page(stats: ServerStats, now: Timestamp) -> ServerPage {
         metrics: stats.metrics,
         version: stats.version,
         commit: stats.commit,
-        built_at: stats.built_at,
+        built_at: stats
+            .built_at
+            .map_or_else(|| "unknown".to_string(), local_time),
         rust_version: stats.rust_version,
         os: stats.os,
     }

@@ -8,7 +8,8 @@ How the server is doing, including its CPU, memory, databases and activity. Each
 is read on its own, so one that's unavailable is empty and the rest still answer.
 `cpu_percent` is a share of the whole host, and empty on the first request after a
 start. `memory_bytes` can read high on macOS, which counts memory that's been freed
-until something else needs it.
+until something else needs it. `built_at` is empty for a build that didn't record when
+it was made.
 
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/server"
@@ -18,7 +19,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/server"
 {
   "version": "0.1.0",
   "commit": "770de39",
-  "built_at": "2026-11-06T04:42:04.427542000Z",
+  "built_at": "2026-11-06T04:42:04.427542Z",
   "rust_version": "1.100.0",
   "started_at": "2026-11-06T04:44:24.095Z",
   "uptime_secs": 22,

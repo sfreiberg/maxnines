@@ -3068,7 +3068,9 @@ async fn every_page_shows_which_build_of_the_server_is_running() {
         let page = browser.get(&server, path).await;
         assert!(page.body.contains(&build.version), "{path}: {}", page.body);
         assert!(page.body.contains(&build.commit), "{path}: {}", page.body);
-        assert!(page.body.contains(&build.built_at), "{path}: {}", page.body);
+        let built = serde_json::to_value(build.built_at).unwrap();
+        let built = built.as_str().expect("this build says when it was built");
+        assert!(page.body.contains(built), "{path}: {}", page.body);
     }
 }
 

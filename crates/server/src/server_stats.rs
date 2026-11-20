@@ -290,7 +290,7 @@ pub struct Activity {
 pub struct ServerStats {
     pub version: String,
     pub commit: String,
-    pub built_at: String,
+    pub built_at: Option<Timestamp>,
     pub rust_version: String,
     pub started_at: Timestamp,
     pub uptime_secs: u64,
@@ -388,7 +388,7 @@ pub async fn gather(state: &AppState) -> ServerStats {
     ServerStats {
         version: build.version.to_string(),
         commit: build.commit.to_string(),
-        built_at: build.built_at.to_string(),
+        built_at: build.built_at,
         rust_version: build.rust_version.to_string(),
         started_at: status.started_at,
         uptime_secs: u64::try_from((now - status.started_at).num_seconds()).unwrap_or(0),

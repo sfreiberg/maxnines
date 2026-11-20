@@ -52,7 +52,7 @@
       <main id="page"{% block main_class %}{% endblock main_class %}{% block main_attributes %}{% endblock main_attributes %}>
         {% block content %}{% endblock content %}
       </main>
-      <footer class="site-footer">MaxNines {{ build.version }} · {{ build.commit }} · built {{ build.built_at }}</footer>
+      <footer class="site-footer">MaxNines {{ build.version }} · {{ build.commit }}{% if build.built_at %} · built {{ build.built_at }}{% endif %}</footer>
     </div>
   </div>
   {% endblock frame %}

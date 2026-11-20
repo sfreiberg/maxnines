@@ -56,7 +56,7 @@ const MAX_STATUS_PAGES: usize = 16;
 /// What the server can store for one setting.
 const MAX_SETTING_LEN: usize = 255;
 
-/// Checks each use a thread and reach out over the network, so fewer of them.
+/// Checks each run as a task and reach out over the network, so fewer of them.
 const MAX_CHECKS: usize = 32;
 
 /// A check runs inside a sampling round, so it can't take forever.
@@ -118,8 +118,8 @@ pub struct BuildInfo {
     pub version: String,
     /// The git commit, ending in `-dirty` if it had uncommitted changes.
     pub commit: String,
-    /// When it was compiled, in UTC.
-    pub built_at: String,
+    /// When it was compiled, if the build said.
+    pub built_at: Option<DateTime<Utc>>,
     /// The Rust compiler it was built with, such as `1.100.0`.
     pub rust_version: String,
 }
@@ -141,7 +141,8 @@ impl BuildInfo {
         Self {
             version: version.to_string(),
             commit: format!("{}{suffix}", known(commit)),
-            built_at: known(built_at),
+            // The build tool writes RFC 3339.
+            built_at: built_at.parse().ok(),
             rust_version: known(rust_version),
         }
     }
@@ -150,9 +151,13 @@ impl BuildInfo {
     /// which build it is and what it runs on.
     pub fn describe(&self, program: &str) -> String {
         let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+        let built = self.built_at.map_or_else(
+            || "unknown".to_string(),
+            |built| built.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        );
         format!(
-            "{program} {}\ncommit:   {}\nbuilt:    {}\nrust:     {}\nplatform: {platform}",
-            self.version, self.commit, self.built_at, self.rust_version
+            "{program} {}\ncommit:   {}\nbuilt:    {built}\nrust:     {}\nplatform: {platform}",
+            self.version, self.commit, self.rust_version
         )
     }
 }
@@ -272,28 +277,42 @@ impl LocalCheck {
     }
 
     fn validate(&self) -> Result<()> {
-        let name = &self.name;
-        ensure!(
-            is_check_name(name),
-            "{name:?} isn't a check's name, which is at most {MAX_CHECK_NAME_LEN} \
-             characters with no line breaks"
-        );
-        if let Some(timeout) = self.timeout {
-            ensure!(
-                (Duration::from_secs(1)..=MAX_CHECK_TIMEOUT).contains(&timeout),
-                "check {name:?} needs a timeout from 1 to {} seconds",
-                MAX_CHECK_TIMEOUT.as_secs()
-            );
-        }
-        if let Some(interval) = self.interval {
-            ensure!(
-                (Duration::from_secs(1)..=MAX_INTERVAL).contains(&interval),
-                "check {name:?} needs an interval from 1 to {} seconds, a day",
-                MAX_INTERVAL.as_secs()
-            );
-        }
-        Ok(())
+        validate_check_name(&self.name)?;
+        validate_check_timing(&self.name, self.timeout, self.interval)
     }
+}
+
+/// Refuses a name that can't be a check's, whoever defines the check.
+fn validate_check_name(name: &str) -> Result<()> {
+    ensure!(
+        is_check_name(name),
+        "{name:?} isn't a check's name, which is at most {MAX_CHECK_NAME_LEN} \
+         characters with no line breaks"
+    );
+    Ok(())
+}
+
+/// Refuses a time limit or interval out of range, whoever defines the check.
+fn validate_check_timing(
+    name: &str,
+    timeout: Option<Duration>,
+    interval: Option<Duration>,
+) -> Result<()> {
+    if let Some(timeout) = timeout {
+        ensure!(
+            (Duration::from_secs(1)..=MAX_CHECK_TIMEOUT).contains(&timeout),
+            "check {name:?} needs a timeout from 1 to {} seconds",
+            MAX_CHECK_TIMEOUT.as_secs()
+        );
+    }
+    if let Some(interval) = interval {
+        ensure!(
+            (Duration::from_secs(1)..=MAX_INTERVAL).contains(&interval),
+            "check {name:?} needs an interval from 1 to {} seconds, a day",
+            MAX_INTERVAL.as_secs()
+        );
+    }
+    Ok(())
 }
 
 /// What can be read from a database beyond what always is, each costing more:
@@ -618,11 +637,7 @@ impl Check {
 
     pub fn validate(&self) -> Result<()> {
         let name = &self.name;
-        ensure!(!name.trim().is_empty(), "a check needs a name");
-        ensure!(
-            name.len() <= MAX_CHECK_NAME_LEN,
-            "the check name {name:?} is too long"
-        );
+        validate_check_name(name)?;
         let target = &self.target;
         ensure!(
             !target.is_empty() && target.len() <= MAX_SETTING_LEN,
@@ -737,20 +752,7 @@ impl Check {
         only_for(self.record.is_some(), "record", &[CheckKind::Dns])?;
         only_for(self.count.is_some(), "count", &[CheckKind::Ping])?;
 
-        if let Some(timeout) = self.timeout {
-            ensure!(
-                (Duration::from_secs(1)..=MAX_CHECK_TIMEOUT).contains(&timeout),
-                "check {name:?} needs a timeout from 1 to {} seconds",
-                MAX_CHECK_TIMEOUT.as_secs()
-            );
-        }
-        if let Some(interval) = self.interval {
-            ensure!(
-                (Duration::from_secs(1)..=MAX_INTERVAL).contains(&interval),
-                "check {name:?} needs an interval from 1 to {} seconds, a day",
-                MAX_INTERVAL.as_secs()
-            );
-        }
+        validate_check_timing(name, self.timeout, self.interval)?;
         if let Some(method) = &self.method {
             ensure!(
                 !method.is_empty()
@@ -1409,6 +1411,8 @@ mod tests {
 
         assert!(checks(json!([one(""),])).validate().is_err());
         assert!(checks(json!([one(&"x".repeat(65))])).validate().is_err());
+        // A series name with a line break in it would break charts and alerts.
+        assert!(checks(json!([one("web\nprod")])).validate().is_err());
         assert!(checks(json!([one("a"), one("a")])).validate().is_err());
         checks(json!([one("a"), one("b")])).validate().unwrap();
 
@@ -1632,11 +1636,12 @@ mod tests {
         );
 
         assert_eq!(build.commit, "unknown");
-        assert_eq!(build.built_at, "2026-11-04");
+        assert_eq!(build.built_at, None);
         assert_eq!(build.rust_version, "unknown");
+        let built = BuildInfo::new("1.2.3", "abc", "false", "2026-11-04T10:00:00.5Z", "1.0.0");
         assert_eq!(
-            BuildInfo::new("1.2.3", "abc", "false", NO_BUILD_VALUE, "1.100.0").built_at,
-            "unknown"
+            built.built_at,
+            Some("2026-11-04T10:00:00.5Z".parse().unwrap())
         );
     }
 
