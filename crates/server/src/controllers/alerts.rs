@@ -149,7 +149,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
             .list_alert_rules()
             .await?
             .into_iter()
-            .filter(|rule| rule.rule.watched().is_some())
+            .filter(|rule| rule.watched().is_some())
             .map(|rule| rule.id)
             .collect();
         anyhow::Ok((open, resolved, problems, silences, charted))
@@ -285,7 +285,7 @@ async fn show(
     // The numbers behind the chart, where a host's page has them.
     let data_link = watched
         .as_ref()
-        .filter(|watched| !watched.rule.is_calculation())
+        .filter(|watched| !watched.rule.rule.is_calculation())
         .filter(|_| alert.host_id != FLEET_HOST_ID)
         .map(|watched| {
             let mut fields = vec![("range", selected.to_string())];

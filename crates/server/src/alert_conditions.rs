@@ -32,6 +32,10 @@ const SIZES: [(&str, f64); 4] = [
     ("tib", 1024.0 * 1024.0 * 1024.0 * 1024.0),
 ];
 const FORECAST: &str = "forecast";
+/// What every number a sum works on goes through, so whole numbers and metrics'
+/// fractions mix: CEL only adds two numbers of the same kind. Nobody can type it,
+/// as it isn't a name.
+const NUMBER: &str = "number:";
 
 /// What a metric's forecast is bound as, which nobody can type, as it isn't a name.
 fn heading_name(metric: &Metric) -> String {
@@ -47,8 +51,9 @@ pub enum Variable {
     Online,
     /// Whether a connected host's samples are arriving.
     Reporting,
-    /// The hostname.
-    Host,
+    /// The hostname. It isn't `host`, which some metrics' names start with, so
+    /// `host.uptime` can be shown in a summary as well.
+    Hostname,
     /// The series being looked at, such as a disk's mount point, or empty.
     Series,
     /// The calculated value, for a rule with a calculation.
@@ -60,7 +65,7 @@ impl Variable {
         Self::Facts,
         Self::Online,
         Self::Reporting,
-        Self::Host,
+        Self::Hostname,
         Self::Series,
         Self::Value,
     ];
@@ -70,7 +75,7 @@ impl Variable {
             Self::Facts => "facts",
             Self::Online => "online",
             Self::Reporting => "reporting",
-            Self::Host => "host",
+            Self::Hostname => "hostname",
             Self::Series => "series",
             Self::Value => "value",
         }
@@ -272,7 +277,7 @@ impl Reader {
             (None, _) => match closest_metric(&whole) {
                 Some(closest) => bail!("there's no metric called {whole}: did you mean {closest}?"),
                 None => bail!(
-                    "{whole} isn't a metric or anything else a condition knows: it can use metrics by their names, facts, online, reporting, host and series"
+                    "{whole} isn't a metric or anything else a condition knows: it can use metrics by their names, facts, online, reporting, hostname and series"
                 ),
             },
         }
@@ -355,7 +360,27 @@ impl Reader {
         if let Some(target) = &mut call.target {
             self.read(target)?;
         }
-        call.args.iter_mut().try_for_each(|arg| self.read(arg))
+        call.args.iter_mut().try_for_each(|arg| self.read(arg))?;
+        // A sum's whole numbers are made numbers with fractions as it's worked out,
+        // so `cpu.usage / 2` works as it reads. Comparisons mix them already.
+        let sums = matches!(
+            call.func_name.as_str(),
+            operators::ADD | operators::SUBSTRACT | operators::MULTIPLY | operators::DIVIDE
+        );
+        if sums && call.target.is_none() {
+            for arg in &mut call.args {
+                let inner = std::mem::take(arg);
+                *arg = IdedExpr {
+                    id: inner.id,
+                    expr: Expr::Call(CallExpr {
+                        func_name: NUMBER.to_string(),
+                        target: None,
+                        args: vec![inner],
+                    }),
+                };
+            }
+        }
+        Ok(())
     }
 }
 
@@ -399,6 +424,15 @@ fn seconds_of(value: &CelValue) -> Option<f64> {
     match value {
         CelValue::Duration(length) => Some(length.as_seconds_f64()),
         _ => None,
+    }
+}
+
+/// A host's facts as conditions see them. A host with none has none, rather than
+/// nothing at all, so a fact it lacks is missing like any other.
+pub fn facts_value(facts: &serde_json::Value) -> CelValue {
+    match facts {
+        serde_json::Value::Object(_) => cel::to_value(facts).unwrap_or(CelValue::Null),
+        _ => CelValue::Map(HashMap::<String, CelValue>::new().into()),
     }
 }
 
@@ -468,8 +502,20 @@ fn size(name: &'static str, factor: f64, args: &[CelValue]) -> Result<CelValue, 
     }
 }
 
-/// A context with the functions conditions have, and nothing bound yet.
-fn context() -> CelContext<'static, 'static> {
+/// A whole number as one with a fraction, and anything else as it is.
+fn number(Arguments(args): Arguments) -> Result<CelValue, ExecutionError> {
+    match args.as_slice() {
+        [CelValue::Int(whole)] => Ok(CelValue::Float(*whole as f64)),
+        [CelValue::UInt(whole)] => Ok(CelValue::Float(*whole as f64)),
+        [other] => Ok(other.clone()),
+        _ => Err(ExecutionError::invalid_argument_count(1, args.len())),
+    }
+}
+
+/// The functions conditions have, made once, as making them takes far longer than
+/// working a condition out. Each working out binds its values in a scope of its own
+/// under this one.
+static BASE: LazyLock<CelContext<'static, 'static>> = LazyLock::new(|| {
     let mut context = CelContext::with_env(FUNCTIONS.clone());
     for (name, factor) in SIZES {
         // The names aren't CEL's own, so adding them can't fail.
@@ -478,12 +524,12 @@ fn context() -> CelContext<'static, 'static> {
         });
     }
     let _ = context.add_function(FORECAST, forecast);
+    let _ = context.add_function(NUMBER, number);
     context
-}
+});
 
 /// Whether CEL, or what's added here, has a function by this name, called either way.
 fn is_function(name: &str) -> bool {
-    let context = context();
     let null = IdedExpr {
         id: 0,
         expr: Expr::Literal(LiteralValue::Null),
@@ -498,7 +544,7 @@ fn is_function(name: &str) -> bool {
             }),
         };
         !matches!(
-            context.resolve(&call),
+            BASE.resolve(&call),
             Err(ExecutionError::UndeclaredReference(_))
         )
     })
@@ -553,10 +599,10 @@ impl Condition {
         matches!(bindings.0.resolve(&self.expr), Ok(CelValue::Bool(true)))
     }
 
-    /// The level to draw across a chart of the metric it watches, for a condition
-    /// that only compares one metric with a number or length of time, such as
-    /// `disk.usage > 90`.
-    pub fn threshold(&self) -> Option<f64> {
+    /// The level to draw across a chart of what it watches, for a condition that
+    /// only compares one metric, or a calculation's value, with a number or length
+    /// of time, such as `disk.usage > 90`.
+    pub fn threshold(&self) -> Option<Threshold> {
         let Expr::Call(call) = &self.expr.expr else {
             return None;
         };
@@ -570,18 +616,17 @@ impl Condition {
         if !compares || call.target.is_some() || call.args.len() != 2 || self.uses.len() > 1 {
             return None;
         }
-        let watched = |expr: &IdedExpr| match &expr.expr {
-            Expr::Ident(name) => {
-                self.uses
-                    .iter()
-                    .any(|used| !used.forecast && used.metric.name == name)
-                    || name == Variable::Value.name()
+        let used = self.uses.first().filter(|used| !used.forecast);
+        let watched = |expr: &IdedExpr| match (&expr.expr, used) {
+            (Expr::Ident(name), Some(used)) if !used.bracketed && used.metric.name == name => {
+                Some((Some(used.metric.name), None))
             }
-            Expr::Call(call) if call.func_name == operators::INDEX => matches!(
-                &call.args[0].expr,
-                Expr::Ident(name) if self.uses.iter().any(|used| !used.forecast && used.metric.name == name)
-            ),
-            _ => false,
+            (Expr::Ident(name), None) if name == Variable::Value.name() => Some((None, None)),
+            (Expr::Call(call), Some(used)) if call.func_name == operators::INDEX => {
+                matches!(&call.args[0].expr, Expr::Ident(name) if *name == used.metric.name)
+                    .then(|| (Some(used.metric.name), used.picked.clone()))
+            }
+            _ => None,
         };
         let level = |expr: &IdedExpr| {
             let literal = match &expr.expr {
@@ -597,15 +642,31 @@ impl Condition {
             if !literal {
                 return None;
             }
-            let value = context().resolve(expr).ok()?;
+            let value = BASE.resolve(expr).ok()?;
             number_of(&value).or_else(|| seconds_of(&value))
         };
-        match (&call.args[0], &call.args[1]) {
-            (metric, number) if watched(metric) => level(number),
-            (number, metric) if watched(metric) => level(number),
-            _ => None,
-        }
+        let ((metric, picked), level) = match (&call.args[0], &call.args[1]) {
+            (watched_side, number) if watched(watched_side).is_some() => {
+                (watched(watched_side)?, level(number)?)
+            }
+            (number, watched_side) => (watched(watched_side)?, level(number)?),
+        };
+        Some(Threshold {
+            metric,
+            picked,
+            level,
+        })
     }
+}
+
+/// A level to draw across a chart, and what it's a level of.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Threshold {
+    /// The metric, or none for a calculation's value.
+    pub metric: Option<&'static str>,
+    /// The series picked out with brackets, if one is.
+    pub picked: Option<String>,
+    pub level: f64,
 }
 
 /// One metric's newest values on a host, as a condition sees them.
@@ -622,7 +683,7 @@ pub struct Inputs<'a> {
     /// The host's facts, made ready for CEL once for all its series. Null when no
     /// condition uses them.
     pub facts: CelValue,
-    pub host: &'a str,
+    pub hostname: &'a str,
     pub series: &'a str,
     pub online: bool,
     pub reporting: bool,
@@ -637,9 +698,9 @@ pub struct Bindings(CelContext<'static, 'static>);
 
 impl Inputs<'_> {
     pub fn bind(&self) -> Bindings {
-        let mut context = context();
+        let mut context = BASE.new_inner_scope();
         context.add_variable_from_value(Variable::Facts.name(), self.facts.clone());
-        context.add_variable_from_value(Variable::Host.name(), self.host.to_string());
+        context.add_variable_from_value(Variable::Hostname.name(), self.hostname.to_string());
         context.add_variable_from_value(Variable::Series.name(), self.series.to_string());
         context.add_variable_from_value(Variable::Online.name(), self.online);
         context.add_variable_from_value(Variable::Reporting.name(), self.reporting);
@@ -810,8 +871,8 @@ impl Conditions {
     /// Works both conditions out on made-up values of the right types, with `facts`
     /// from a real host if there is one, and says what's wrong in plain words. A fact
     /// that isn't there is fine, as hosts differ.
-    pub fn dry_run(&self, facts: &serde_json::Value) -> Result<()> {
-        let inputs = self.sample_inputs(facts);
+    pub fn dry_run(&self, facts: &serde_json::Value, value_unit: Unit) -> Result<()> {
+        let inputs = self.sample_inputs(facts, value_unit);
         let bindings = inputs.bind();
         for (severity, condition) in self.levels() {
             condition
@@ -821,7 +882,7 @@ impl Conditions {
         Ok(())
     }
 
-    fn sample_inputs(&self, facts: &serde_json::Value) -> Inputs<'static> {
+    fn sample_inputs(&self, facts: &serde_json::Value, value_unit: Unit) -> Inputs<'static> {
         // Every series a condition picks out by name, so a picked one is there.
         let mut picked: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
         for used in self.uses() {
@@ -839,12 +900,12 @@ impl Conditions {
                 .collect()
         };
         let mut inputs = Inputs {
-            facts: cel::to_value(facts).unwrap_or(CelValue::Null),
-            host: "web-1",
+            facts: facts_value(facts),
+            hostname: "web-1",
             series: "/",
             online: true,
             reporting: true,
-            value: Some(CelValue::Float(sample)),
+            value: Some(bind_value(value_unit, sample)),
             metrics: BTreeMap::new(),
             headings: BTreeMap::new(),
         };
@@ -936,16 +997,7 @@ fn doing(operator: &str) -> &str {
 
 /// A mistake found by working a condition out, in plain words.
 fn explain(error: &ExecutionError) -> Option<String> {
-    let whole = |kind: &str| matches!(kind, "int" | "uint");
     let pair = |operator: &str, kinds: &[String]| match kinds {
-        // CEL compares any numbers, but only does sums with two of a kind, and
-        // metrics have fractions.
-        [one, two] if (whole(one) && two == "double") || (one == "double" && whole(two)) => {
-            format!(
-                "can't {} a number with a fraction and a whole number, so write the whole number with a decimal point, like 2.0",
-                doing(operator)
-            )
-        }
         [one, two] => format!(
             "can't {} {} with {}",
             doing(operator),
@@ -1087,8 +1139,9 @@ mod tests {
     }
 
     fn error(text: &str) -> String {
-        let read = Conditions::compile(None, Some(text), Scope::Hosts)
-            .and_then(|conditions| conditions.dry_run(&json!({ "cpu": { "logical_cores": 8 } })));
+        let read = Conditions::compile(None, Some(text), Scope::Hosts).and_then(|conditions| {
+            conditions.dry_run(&json!({ "cpu": { "logical_cores": 8 } }), Unit::Number)
+        });
         format!("{:#}", read.unwrap_err())
     }
 
@@ -1098,7 +1151,7 @@ mod tests {
                 json!({ "os": { "family": "linux" }, "cpu": { "logical_cores": 4 } }),
             )
             .unwrap(),
-            host: "web-1",
+            hostname: "web-1",
             series: "/",
             online: true,
             reporting: true,
@@ -1166,7 +1219,7 @@ mod tests {
 
     #[test]
     fn host_series_online_and_reporting_can_be_used() {
-        let condition = hosts("series != '/boot' && host == 'web-1' && online && reporting && facts.os.family == 'linux'").unwrap();
+        let condition = hosts("series != '/boot' && hostname == 'web-1' && online && reporting && facts.os.family == 'linux'").unwrap();
         assert!(condition.holds(&inputs(&[]).bind()));
         let offline = hosts("!online").unwrap();
         let mut gone = inputs(&[]);
@@ -1212,7 +1265,10 @@ mod tests {
         let mut line = inputs(&[]);
         line.value = Some(CelValue::Float(85.0));
         assert!(busy.holds(&line.bind()));
-        assert_eq!(busy.threshold(), Some(80.0));
+        assert_eq!(
+            busy.threshold().map(|threshold| threshold.level),
+            Some(80.0)
+        );
 
         for (text, expected) in [
             ("cpu.usage > 80", "watches the calculated value"),
@@ -1271,8 +1327,8 @@ mod tests {
                 "has to be true or false, and this is a number",
             ),
             (
-                "cpu.usage / 2 > 40",
-                "can't divide a number with a fraction and a whole number, so write the whole number with a decimal point, like 2.0",
+                "clock.difference + 1 > duration('1s')",
+                "can't add a length of time with a number",
             ),
             ("cpu.usage > 'high'", "can't compare a number with text"),
             (
@@ -1302,8 +1358,22 @@ mod tests {
             Scope::Hosts,
         )
         .unwrap()
-        .dry_run(&json!({}))
+        .dry_run(&json!({}), Unit::Number)
         .unwrap();
+        // Nor is a host with no facts at all, as on a server with no hosts yet.
+        Conditions::compile(
+            None,
+            Some("cpu.load['5 minutes'] > facts.cpu.logical_cores"),
+            Scope::Hosts,
+        )
+        .unwrap()
+        .dry_run(&serde_json::Value::Null, Unit::Number)
+        .unwrap();
+        // A calculation's value is in its metric's unit.
+        let lag =
+            Conditions::compile(None, Some("value > duration('2s')"), Scope::Calculation).unwrap();
+        lag.dry_run(&json!({}), Unit::Seconds).unwrap();
+        assert!(lag.dry_run(&json!({}), Unit::Number).is_err());
     }
 
     #[test]
@@ -1339,6 +1409,39 @@ mod tests {
     }
 
     #[test]
+    fn whole_numbers_mix_with_metrics_and_facts() {
+        let at = |usage: f64| inputs(&[("cpu.usage", Values::One(usage))]).bind();
+        for text in [
+            "cpu.usage / 2 > 40",
+            "cpu.usage * 100 > 8000",
+            "cpu.usage + 1 >= 82",
+            "cpu.usage - 1 >= 80",
+            "cpu.usage > 80",
+            "cpu.usage == 81",
+            "cpu.usage / facts.cpu.logical_cores > 20",
+            "cpu.usage > facts.cpu.logical_cores * 20",
+            "1 + 1 == 2",
+            "[1, 2][1] == 2",
+            "process.memory > gib(1) || cpu.usage > 80",
+        ] {
+            let condition = hosts(text).unwrap_or_else(|error| panic!("{text}: {error:#}"));
+            assert!(condition.holds(&at(81.0)), "{text}");
+            Conditions::compile(None, Some(text), Scope::Hosts)
+                .unwrap()
+                .dry_run(&json!({ "cpu": { "logical_cores": 4 } }), Unit::Number)
+                .unwrap_or_else(|error| panic!("{text}: {error:#}"));
+        }
+        assert!(!hosts("cpu.usage / 2 > 40").unwrap().holds(&at(79.0)));
+        // Lengths of time and text still add up as they do.
+        assert!(
+            hosts("duration('1h') + duration('1m') == duration('61m')")
+                .unwrap()
+                .holds(&at(1.0))
+        );
+        assert!(hosts("hostname + '!' == 'web-1!'").unwrap().holds(&at(1.0)));
+    }
+
+    #[test]
     fn only_a_plain_comparison_has_a_level_to_draw() {
         for (text, level) in [
             ("disk.usage > 90", Some(90.0)),
@@ -1351,7 +1454,8 @@ mod tests {
             ("forecast(disk.usage, duration('4h')) >= 100", None),
             ("!online", None),
         ] {
-            assert_eq!(hosts(text).unwrap().threshold(), level, "{text}");
+            let threshold = hosts(text).unwrap().threshold();
+            assert_eq!(threshold.map(|threshold| threshold.level), level, "{text}");
         }
     }
 }

@@ -61,10 +61,10 @@ const NEW_COLUMNS: [&str; 5] = [
 ];
 
 /// The words the offline and no-metrics rules said before, which they keep.
-const OFFLINE: (&str, &str) = ("{{ host }} is offline", "{{ host }} is back online");
+const OFFLINE: (&str, &str) = ("{{ hostname }} is offline", "{{ hostname }} is back online");
 const NO_METRICS: (&str, &str) = (
-    "{{ host }} is connected but sending no metrics",
-    "{{ host }} is sending metrics again",
+    "{{ hostname }} is connected but sending no metrics",
+    "{{ hostname }} is sending metrics again",
 );
 
 /// Text in single quotes for CEL.
@@ -824,7 +824,7 @@ mod tests {
                 scope,
             )
             .unwrap()
-            .dry_run(&serde_json::Value::Null)
+            .dry_run(&serde_json::Value::Null, crate::metrics::Unit::Number)
             .unwrap_or_else(|error| panic!("{old:?}: {error:#}"));
             // And can be said the old way again, though several fixed series watched
             // each come back as the one rule they became.

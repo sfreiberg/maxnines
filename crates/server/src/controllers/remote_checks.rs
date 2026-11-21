@@ -862,7 +862,7 @@ async fn page(
             let input = &rule.rule;
             // A check's metric used by itself watches every check, and picked out
             // with brackets, the one it names.
-            let watches = input.conditions().is_ok_and(|conditions| {
+            let watches = rule.conditions.as_ref().is_some_and(|conditions| {
                 conditions.uses().any(|used| {
                     used.metric.name.starts_with("check.")
                         && (!used.bracketed || used.picked.as_ref() == Some(name))

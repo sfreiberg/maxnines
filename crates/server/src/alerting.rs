@@ -3,6 +3,7 @@
 //! alerts start and end, and [`crate::notifier`] delivers them.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use chrono::TimeDelta;
@@ -14,7 +15,7 @@ use crate::alert_conditions::{Conditions, MetricUse, Scope};
 use crate::calculations::{Calculation, Question};
 use crate::channels;
 use crate::metric_charts::format_value;
-use crate::metrics::{Metric, Source};
+use crate::metrics::{Metric, Source, Unit};
 use crate::times::Timestamp;
 
 /// Why an alert ends when its rule goes, however it goes.
@@ -70,6 +71,33 @@ pub struct AlertRule {
     pub id: i64,
     #[serde(flatten)]
     pub rule: AlertRuleInput,
+    /// Its conditions, read once as it's loaded. None for ones that can't be read,
+    /// which saving a rule doesn't allow.
+    #[serde(skip)]
+    pub conditions: Option<Arc<Conditions>>,
+}
+
+impl AlertRule {
+    pub fn new(id: i64, rule: AlertRuleInput) -> Self {
+        let conditions = rule.conditions().ok().map(Arc::new);
+        Self {
+            id,
+            rule,
+            conditions,
+        }
+    }
+
+    /// See [`AlertRuleInput::watched`].
+    pub fn watched(&self) -> Option<(&'static Metric, Option<String>)> {
+        self.rule.watched(self.conditions.as_deref()?)
+    }
+
+    /// See [`AlertRuleInput::thresholds`].
+    pub fn thresholds(&self) -> Vec<(Severity, f64)> {
+        self.conditions
+            .as_deref()
+            .map_or_else(Vec::new, |conditions| self.rule.thresholds(conditions))
+    }
 }
 
 /// What can be set on a rule. Validated by [`check_rule`].
@@ -84,7 +112,7 @@ pub struct AlertRuleInput {
     /// When it's critical, the same way.
     #[serde(default, deserialize_with = "crate::text::optional")]
     pub critical: Option<String>,
-    /// What an alert says, filled in like a custom webhook's body: `{{ host }}`,
+    /// What an alert says, filled in like a custom webhook's body: `{{ hostname }}`,
     /// `{{ series }}`, `{{ value }}` and the metrics the conditions use, such as
     /// `{{ disk.usage }}`. Without it, the rule's name and the reading.
     #[serde(default, deserialize_with = "crate::text::optional")]
@@ -153,13 +181,13 @@ const MIN_REMINDER: TimeDelta = TimeDelta::minutes(5);
 /// Checks a rule before it's saved, with no host's facts to try its conditions on.
 #[cfg(test)]
 pub fn check_rule(rule: &AlertRuleInput) -> Result<()> {
-    check_rule_with(rule, &Value::Null)
+    check_rule_with(rule, &Value::Null).map(|_| ())
 }
 
 /// Checks a rule before it's saved, trying its conditions on `facts`, a real host's
-/// if there is one. Whether its channels exist is up to the caller, which can see
-/// them.
-pub fn check_rule_with(rule: &AlertRuleInput, facts: &Value) -> Result<()> {
+/// if there is one, and gives its conditions, read. Whether its channels exist is up
+/// to the caller, which can see them.
+pub fn check_rule_with(rule: &AlertRuleInput, facts: &Value) -> Result<Conditions> {
     ensure!(!rule.name.trim().is_empty(), "a rule needs a name");
     ensure!(rule.name.len() <= MAX_NAME_LEN, "the rule name is too long");
     ensure!(
@@ -177,7 +205,11 @@ pub fn check_rule_with(rule: &AlertRuleInput, facts: &Value) -> Result<()> {
     );
 
     let conditions = rule.conditions()?;
-    conditions.dry_run(facts)?;
+    // A calculation's value is in the unit it's worked out in.
+    let value_unit = rule
+        .question()
+        .map_or(Unit::Number, |question| question.unit());
+    conditions.dry_run(facts, value_unit)?;
     if let Some(applies_to) = &rule.applies_to {
         ensure!(
             !rule.is_calculation(),
@@ -218,13 +250,13 @@ pub fn check_rule_with(rule: &AlertRuleInput, facts: &Value) -> Result<()> {
                 .map_err(|error| anyhow!("the {which}: {error:#}"))?;
         }
     }
-    Ok(())
+    Ok(conditions)
 }
 
 /// The readings a summary can show, written in their units, by where they go in the
 /// template: `disk.usage` as `{"disk": {"usage": "92%"}}`.
 pub struct SummaryValues {
-    pub host: String,
+    pub hostname: String,
     pub series: String,
     /// The first metric's reading, or the calculated value.
     pub value: Option<String>,
@@ -237,7 +269,7 @@ impl SummaryValues {
         for (name, value) in &self.metrics {
             insert_at(&mut fields, name, value.clone());
         }
-        fields.insert("host".to_string(), json!(self.host));
+        fields.insert("hostname".to_string(), json!(self.hostname));
         fields.insert("series".to_string(), json!(self.series));
         fields.insert("value".to_string(), json!(self.value));
         Value::Object(fields)
@@ -316,27 +348,34 @@ impl AlertRuleInput {
         }
     }
 
-    /// The levels to draw across a chart of what the rule watches, mildest first:
-    /// one for each condition that only compares the metric with a number, such as
-    /// `disk.usage > 90`.
-    pub fn thresholds(&self) -> Vec<(Severity, f64)> {
-        let Ok(conditions) = self.conditions() else {
-            return Vec::new();
+    /// The levels to draw across a chart of what the rule's alerts watch, mildest
+    /// first: one for each condition that only compares that metric, or the
+    /// calculated value, with a number, such as `disk.usage > 90`.
+    pub fn thresholds(&self, conditions: &Conditions) -> Vec<(Severity, f64)> {
+        let charted = match self.is_calculation() {
+            true => (None, None),
+            false => match conditions.primary() {
+                Some(primary) => (Some(primary.metric.name), primary.picked.clone()),
+                None => return Vec::new(),
+            },
         };
         conditions
             .levels()
             .into_iter()
-            .filter_map(|(severity, condition)| Some((severity, condition.threshold()?)))
+            .filter_map(|(severity, condition)| {
+                let threshold = condition.threshold()?;
+                ((threshold.metric, threshold.picked) == charted)
+                    .then_some((severity, threshold.level))
+            })
             .collect()
     }
 
     /// The metric the rule's alerts are about, which they chart: the calculation's,
     /// or the first one its conditions use, with the series that one picks out.
-    pub fn watched(&self) -> Option<(&'static Metric, Option<String>)> {
+    pub fn watched(&self, conditions: &Conditions) -> Option<(&'static Metric, Option<String>)> {
         if self.is_calculation() {
             return self.question().ok().map(|question| (question.metric, None));
         }
-        let conditions = self.conditions().ok()?;
         let primary: &MetricUse = conditions.primary()?;
         Some((primary.metric, primary.picked.clone()))
     }
@@ -388,7 +427,7 @@ impl AlertRuleInput {
             metrics.push((used.metric.name, value));
         }
         let example = SummaryValues {
-            host: "web-1".to_string(),
+            hostname: "web-1".to_string(),
             series: "/".to_string(),
             value: Some("50%".to_string()),
             metrics,
@@ -409,7 +448,7 @@ impl AlertRuleInput {
         let name = &self.name;
         let about = match self.is_calculation() {
             true => name.clone(),
-            false => format!("{name} on {}", values.host),
+            false => format!("{name} on {}", values.hostname),
         };
         match (&values.value, subject) {
             (Some(value), Some(subject)) => format!("{about}: {subject} is {value}"),
@@ -433,7 +472,7 @@ impl AlertRuleInput {
         let name = &self.name;
         let about = match self.is_calculation() {
             true => name.clone(),
-            false => format!("{name} on {}", values.host),
+            false => format!("{name} on {}", values.hostname),
         };
         let value = values.value.as_ref()?;
         Some(match subject {
@@ -948,6 +987,19 @@ mod tests {
     fn good_rules_pass() {
         check_rule(&metric_rule()).unwrap();
         check_rule(&calculation_rule()).unwrap();
+        // A calculation's value is in its metric's unit, here seconds.
+        let slow = AlertRuleInput {
+            critical: Some("value > duration('2s')".to_string()),
+            metric: Some("check.response".to_string()),
+            ..calculation_rule()
+        };
+        check_rule(&slow).unwrap();
+        let counted = AlertRuleInput {
+            critical: Some("value < 1".to_string()),
+            calculation: Some(Calculation::Count),
+            ..slow
+        };
+        check_rule(&counted).unwrap();
         for (warning, critical) in [
             (Some("disk.usage > 80"), Some("disk.usage > 90")),
             (Some("!reporting"), None),
@@ -960,7 +1012,7 @@ mod tests {
             let rule = AlertRuleInput {
                 warning: warning.map(str::to_string),
                 critical: critical.map(str::to_string),
-                summary: Some("{{ host }}: {{ series }} is {{ value }}".to_string()),
+                summary: Some("{{ hostname }}: {{ series }} is {{ value }}".to_string()),
                 ..metric_rule()
             };
             check_rule(&rule).unwrap_or_else(|error| panic!("{warning:?} {critical:?}: {error:#}"));
@@ -1094,7 +1146,7 @@ mod tests {
 
     fn values(series: &str, value: Option<&str>) -> SummaryValues {
         SummaryValues {
-            host: "web-1".to_string(),
+            hostname: "web-1".to_string(),
             series: series.to_string(),
             value: value.map(str::to_string),
             metrics: vec![
@@ -1134,10 +1186,10 @@ mod tests {
 
         let written = AlertRuleInput {
             summary: Some(
-                "{{ host }}: {{ series }} is {{ disk.usage }}, load {{ cpu.load['5 minutes'] }}\nsoon"
+                "{{ hostname }}: {{ series }} is {{ disk.usage }}, load {{ cpu.load['5 minutes'] }}\nsoon"
                     .to_string(),
             ),
-            resolved_summary: Some("{{ host }}: {{ series }} is fine at {{ value }}".to_string()),
+            resolved_summary: Some("{{ hostname }}: {{ series }} is fine at {{ value }}".to_string()),
             ..disk
         };
         assert_eq!(
@@ -1192,24 +1244,28 @@ mod tests {
 
     #[test]
     fn rules_describe_their_thresholds_and_what_they_chart() {
-        let disk = AlertRuleInput {
+        let stored = |rule: AlertRuleInput| AlertRule::new(1, rule);
+        let disk = stored(AlertRuleInput {
             warning: Some("disk.usage > 80".to_string()),
             critical: Some("disk.usage > 90 && series != '/boot'".to_string()),
             ..metric_rule()
-        };
+        });
         assert_eq!(disk.thresholds(), [(Severity::Warning, 80.0)]);
-        assert_eq!(disk.severities(), [Severity::Warning, Severity::Critical]);
-        assert_eq!(disk.worst_severity(), Severity::Critical);
+        assert_eq!(
+            disk.rule.severities(),
+            [Severity::Warning, Severity::Critical]
+        );
+        assert_eq!(disk.rule.worst_severity(), Severity::Critical);
         assert_eq!(disk.watched().unwrap().0.name, "disk.usage");
-        assert_eq!(disk.describe(), "for 5 minutes");
+        assert_eq!(disk.rule.describe(), "for 5 minutes");
 
-        let load = AlertRuleInput {
+        let load = stored(AlertRuleInput {
             warning: Some("cpu.load['5 minutes'] > 4".to_string()),
-            critical: None,
+            critical: Some("cpu.load['15 minutes'] > 8".to_string()),
             hold: TimeDelta::zero(),
             ..metric_rule()
-        };
-        assert_eq!(load.worst_severity(), Severity::Warning);
+        });
+        assert_eq!(load.rule.worst_severity(), Severity::Critical);
         assert_eq!(
             load.watched(),
             Some((
@@ -1217,20 +1273,30 @@ mod tests {
                 Some("5 minutes".to_string())
             ))
         );
-        assert_eq!(load.describe(), "");
+        // Only the level of the series charted is drawn on it.
+        assert_eq!(load.thresholds(), [(Severity::Warning, 4.0)]);
+        assert_eq!(load.rule.describe(), "");
 
-        let busy = calculation_rule();
+        // And only that metric's: a level of another would be at the wrong height.
+        let two = stored(AlertRuleInput {
+            warning: Some("disk.usage > 80".to_string()),
+            critical: Some("cpu.usage > 95".to_string()),
+            ..metric_rule()
+        });
+        assert_eq!(two.thresholds(), [(Severity::Warning, 80.0)]);
+
+        let busy = stored(calculation_rule());
         assert_eq!(busy.thresholds(), [(Severity::Critical, 80.0)]);
         assert_eq!(busy.watched().unwrap().0.name, "cpu.usage");
         assert_eq!(
-            busy.describe(),
+            busy.rule.describe(),
             "Average of CPU usage over 5 minutes, for 5 minutes"
         );
 
-        let offline = AlertRuleInput {
+        let offline = stored(AlertRuleInput {
             critical: Some("!online".to_string()),
             ..metric_rule()
-        };
+        });
         assert_eq!(offline.watched(), None);
         assert!(offline.thresholds().is_empty());
     }

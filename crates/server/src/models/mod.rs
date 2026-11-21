@@ -2463,8 +2463,8 @@ mod tests {
             .await
             .unwrap();
         let mut input = AlertRuleInput {
-            summary: Some("{{ host }} is busy".to_string()),
-            resolved_summary: Some("{{ host }} is fine".to_string()),
+            summary: Some("{{ hostname }} is busy".to_string()),
+            resolved_summary: Some("{{ hostname }} is fine".to_string()),
             hold: TimeDelta::seconds(120),
             applies_to: Some("true".to_string()),
             channels: vec![channel],

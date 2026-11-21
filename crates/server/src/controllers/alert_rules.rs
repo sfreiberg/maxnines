@@ -605,7 +605,7 @@ mod tests {
 
     fn rule() -> AlertRuleInput {
         AlertRuleInput {
-            summary: Some("{{ host }}: {{ series }} is {{ value }}".to_string()),
+            summary: Some("{{ hostname }}: {{ series }} is {{ value }}".to_string()),
             resolved_summary: Some("{{ series }} is fine".to_string()),
             hold: TimeDelta::seconds(60),
             applies_to: Some("true".to_string()),

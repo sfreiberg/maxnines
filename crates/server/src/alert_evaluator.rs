@@ -22,7 +22,7 @@ use tracing::{error, info};
 use crate::actions::Actions;
 use crate::agent_configs::AgentConfigs;
 use crate::alert_conditions::{
-    Conditions, Heading, Inputs, MetricUse, Values, Variable, bind_value,
+    Conditions, Heading, Inputs, MetricUse, Values, Variable, bind_value, facts_value,
 };
 use crate::alerting::{
     Alert, AlertRule, AlertRuleInput, NewAlert, RULE_GONE_REASON, Severity, SeverityChange,
@@ -245,13 +245,25 @@ struct Seen {
     since: Timestamp,
 }
 
+/// What a host reports of the series an alert is about.
+#[derive(Debug, Default)]
+struct Reported {
+    /// Any series of the metrics the rule is worked out for each of.
+    any: bool,
+    /// The alert's own.
+    this: bool,
+    /// The alert's own, with readings that are checked, such as a forecast that's
+    /// trusted.
+    checked: bool,
+}
+
 /// Everything one pass looks at, loaded once.
 struct Snapshot {
     now: Timestamp,
     in_grace: bool,
     rules: BTreeMap<i64, AlertRule>,
-    /// Each enabled rule's conditions, read once.
-    conditions: HashMap<i64, Conditions>,
+    /// Each enabled rule's conditions, read as it was loaded.
+    conditions: HashMap<i64, Arc<Conditions>>,
     hosts: BTreeMap<String, HostRecord>,
     /// For each rule with a condition for which hosts, the hosts it applies to.
     applies: HashMap<i64, HashSet<String>>,
@@ -262,9 +274,10 @@ struct Snapshot {
     readings: BTreeMap<&'static str, BTreeMap<String, Vec<NewestReading>>>,
     /// For forecasts, the same way.
     trends: HashMap<TrendKey, Trends>,
-    /// Whether each host is online, and reporting if a rule asks.
+    /// Whether each host is online, and reporting if a rule asks. Reporting is none
+    /// if it couldn't be read.
     online: HashMap<String, Seen>,
-    reporting: HashMap<String, Seen>,
+    reporting: Option<HashMap<String, Seen>>,
 }
 
 impl Snapshot {
@@ -303,25 +316,32 @@ impl Snapshot {
             .unwrap_or_default()
     }
 
-    /// Whether the host reports any series of what a rule works out for each one,
-    /// and whether it reports this one.
+    /// What the host reports of the series a rule works out for each one, as far as
+    /// an alert about `series` goes.
     fn reports_series(
         &self,
         rule: &AlertRuleInput,
         fanned: &[&MetricUse],
         alert: &Alert,
-    ) -> (bool, bool) {
-        let mut any = false;
-        let mut this = false;
+    ) -> Reported {
+        let mut reported = Reported::default();
         for used in fanned {
-            let series: Vec<String> = if used.forecast {
+            // Each series reported, and whether it's one that's checked.
+            let series: Vec<(String, bool)> = if used.forecast {
                 let Some(trends) = self.trends.get(&(used.metric.name, rule.window())) else {
                     continue;
                 };
                 let Some(trends) = trends.by_host.get(&alert.host_id) else {
                     continue;
                 };
-                trends.iter().map(|trend| clean(&trend.series)).collect()
+                let trusted = self.trusted_trends(rule, used.metric.name, &alert.host_id);
+                trends
+                    .iter()
+                    .map(|trend| {
+                        let checked = trusted.iter().any(|each| each.series == trend.series);
+                        (clean(&trend.series), checked)
+                    })
+                    .collect()
             } else {
                 let Some(readings) = self
                     .readings
@@ -332,15 +352,18 @@ impl Snapshot {
                 };
                 readings
                     .iter()
-                    .map(|reading| clean(&reading.series))
+                    .map(|reading| (clean(&reading.series), true))
                     .collect()
             };
-            any |= !series.is_empty();
-            this |= series
-                .iter()
-                .any(|series| alert_series(series) == alert.series);
+            reported.any |= !series.is_empty();
+            for (name, checked) in series {
+                if alert_series(&name) == alert.series {
+                    reported.this = true;
+                    reported.checked |= checked;
+                }
+            }
         }
-        (any, this)
+        reported
     }
 
     /// Why an open alert that nothing checked this time should end, if it should.
@@ -370,11 +393,17 @@ impl Snapshot {
         match (fanned.is_empty(), &alert.series) {
             (true, None) => None,
             (true, Some(_)) | (false, None) => Some("The rule changed"),
-            (false, Some(_)) => match self.reports_series(&rule.rule, &fanned, alert) {
-                (false, _) => None,
-                (true, false) => Some("This series is no longer reported"),
-                (true, true) => Some("This agent reports more series than a rule can watch"),
-            },
+            (false, Some(_)) => {
+                let reported = self.reports_series(&rule.rule, &fanned, alert);
+                if reported.any && !reported.this {
+                    Some("This series is no longer reported")
+                } else if reported.checked {
+                    Some("This agent reports more series than a rule can watch")
+                } else {
+                    // Reported but not trusted yet, as a forecast that's stale.
+                    None
+                }
+            }
         }
     }
 }
@@ -414,7 +443,7 @@ fn facts_for_conditions(
         .iter()
         .map(|id| {
             let shape = facts.get(id).map_or(Value::Null, unflatten);
-            (id.clone(), cel::to_value(&shape).unwrap_or(CelValue::Null))
+            (id.clone(), facts_value(&shape))
         })
         .collect()
 }
@@ -469,6 +498,9 @@ pub struct Evaluator {
     /// When each host that isn't `reporting` went quiet. It's quiet until something
     /// newer than that is stored, even if it reconnects meanwhile.
     silences: HashMap<String, Timestamp>,
+    /// Whether `silences` has been given those of the alerts open as the server
+    /// started.
+    silences_restored: bool,
 }
 
 impl Evaluator {
@@ -486,6 +518,7 @@ impl Evaluator {
             trends: HashMap::new(),
             newest_samples: HashMap::new(),
             silences: HashMap::new(),
+            silences_restored: false,
         }
     }
 
@@ -523,7 +556,7 @@ impl Evaluator {
         })
     }
 
-    async fn snapshot(&mut self, now: Timestamp) -> Result<Snapshot> {
+    async fn snapshot(&mut self, now: Timestamp, open: &HashMap<Key, Alert>) -> Result<Snapshot> {
         let rules: BTreeMap<i64, AlertRule> = self
             .database
             .list_alert_rules()
@@ -543,15 +576,21 @@ impl Evaluator {
 
         // Saving a rule checks its conditions can be read, so one that can't was
         // saved some other way, and is left alone rather than stopping every rule.
-        let mut conditions = HashMap::new();
+        let mut conditions: HashMap<i64, Arc<Conditions>> = HashMap::new();
         for rule in rules.values().filter(|rule| rule.rule.enabled) {
-            match rule.rule.conditions() {
-                Ok(read) => {
-                    conditions.insert(rule.id, read);
+            match &rule.conditions {
+                Some(read) => {
+                    conditions.insert(rule.id, read.clone());
                 }
-                Err(error) => error!(
+                None => error!(
                     rule = rule.rule.name,
-                    error = format!("{error:#}"),
+                    error = format!(
+                        "{:#}",
+                        rule.rule
+                            .conditions()
+                            .err()
+                            .unwrap_or_else(|| anyhow::anyhow!("unknown"))
+                    ),
                     "a saved rule's conditions can't be read"
                 ),
             }
@@ -630,8 +669,20 @@ impl Evaluator {
             .filter_map(|host| Some((host.id.clone(), self.online(host)?)))
             .collect();
         let reporting = match uses(Variable::Reporting) {
-            true => self.reporting(&hosts, &online, now).await,
-            false => HashMap::new(),
+            true => {
+                // The alerts of rules about reporting that are open, by when each began.
+                let quiet_before: Vec<(String, Timestamp)> = open
+                    .values()
+                    .filter(|alert| {
+                        conditions
+                            .get(&alert.rule_id)
+                            .is_some_and(|read| read.uses_variable(Variable::Reporting))
+                    })
+                    .map(|alert| (alert.host_id.clone(), alert.breached_at))
+                    .collect();
+                self.reporting(&hosts, &online, &quiet_before, now).await
+            }
+            false => Some(HashMap::new()),
         };
 
         Ok(Snapshot {
@@ -671,35 +722,56 @@ impl Evaluator {
         })
     }
 
-    /// Whether each connected host's samples are arriving, and since when they
-    /// stopped if they aren't. A host that isn't connected is left out, as the
-    /// question is about one that is: `online` covers the rest. The server reads
-    /// itself and hosts with no agent, so theirs never stop.
+    /// Whether each host's samples are arriving, and since when they stopped if they
+    /// aren't, or nothing if when hosts last sent can't be read. A connected host isn't
+    /// reporting once it's sent nothing for a few of its intervals, and then until
+    /// something newer than its silence is stored, even if it reconnects meanwhile. A
+    /// host that's away keeps what it was as it went: one that had gone quiet stays
+    /// quiet, and any other is reporting, as its going is `online`'s to say. The server
+    /// reads itself and hosts with no agent, so theirs never stop.
     async fn reporting(
         &mut self,
         hosts: &BTreeMap<String, HostRecord>,
         online: &HashMap<String, Seen>,
+        quiet_before: &[(String, Timestamp)],
         now: Timestamp,
-    ) -> HashMap<String, Seen> {
-        let Some(last_samples) = self.read_last_samples(now).await else {
-            return HashMap::new();
-        };
+    ) -> Option<HashMap<String, Seen>> {
+        let last_samples = self.read_last_samples(now).await?;
+        // Silences are only held in memory, so after a start, those of alerts still
+        // open carry on from when each began.
+        if !self.silences_restored {
+            for (host_id, began) in quiet_before {
+                self.silences.entry(host_id.clone()).or_insert(*began);
+            }
+            self.silences_restored = true;
+        }
         self.newest_samples
             .retain(|id, _| online.get(id).is_some_and(|seen| seen.yes));
         self.silences.retain(|id, _| hosts.contains_key(id));
         let mut reporting = HashMap::new();
         for host in hosts.values() {
-            let Some(connected) = online.get(&host.id).filter(|seen| seen.yes) else {
-                continue;
-            };
             if host.is_local() || host.is_agentless() {
                 let always = Seen {
                     yes: true,
-                    since: connected.since,
+                    since: self.started_at,
                 };
                 reporting.insert(host.id.clone(), always);
                 continue;
             }
+            let Some(connected) = online.get(&host.id).filter(|seen| seen.yes) else {
+                let as_it_went = match self.silences.get(&host.id) {
+                    Some(&began) => Seen {
+                        yes: false,
+                        since: began,
+                    },
+                    None => Seen {
+                        yes: true,
+                        since: self.started_at,
+                    },
+                };
+                reporting.insert(host.id.clone(), as_it_went);
+                continue;
+            };
             let newest = self.newest_samples.get(&host.id).copied();
             let newest = newest.max(last_samples.get(&host.id).copied());
             if let Some(newest) = newest {
@@ -735,7 +807,7 @@ impl Evaluator {
             };
             reporting.insert(host.id.clone(), seen);
         }
-        reporting
+        Some(reporting)
     }
 
     /// When each host's newest current sample was taken, in one query for them all.
@@ -811,12 +883,12 @@ impl Evaluator {
     /// Checks every rule once. Stopping partway is safe, as anything not done
     /// this time still needs doing next time.
     pub async fn evaluate(&mut self, now: Timestamp) -> Result<()> {
-        let snapshot = self.snapshot(now).await?;
         let open_alerts = self.database.open_alerts().await?;
         let mut open: HashMap<Key, Alert> = open_alerts
             .into_iter()
             .map(|alert| (Key::of(&alert), alert))
             .collect();
+        let snapshot = self.snapshot(now, &open).await?;
 
         let mut checked = HashSet::new();
         for rule in snapshot.rules.values() {
@@ -870,7 +942,11 @@ impl Evaluator {
         let uses_online = conditions.uses_variable(Variable::Online);
         let uses_reporting = conditions.uses_variable(Variable::Reporting);
         let online = snapshot.online.get(&host.id).copied();
-        let reporting = snapshot.reporting.get(&host.id).copied();
+        let reporting = snapshot
+            .reporting
+            .as_ref()
+            .and_then(|reporting| reporting.get(&host.id))
+            .copied();
         // What can't be told isn't guessed at: whatever is open stays open.
         if (uses_online && online.is_none()) || (uses_reporting && reporting.is_none()) {
             for key in open
@@ -945,7 +1021,7 @@ impl Evaluator {
 
             let inputs_with = |online: bool, reporting: bool| Inputs {
                 facts: facts.clone(),
-                host: &hostname,
+                hostname: &hostname,
                 series: &series,
                 online,
                 reporting,
@@ -990,7 +1066,7 @@ impl Evaluator {
             let subject =
                 primary.map(|primary| subject(primary.metric, &series, primary.picked.as_deref()));
             let values = SummaryValues {
-                host: hostname.clone(),
+                hostname: hostname.clone(),
                 series: series.clone(),
                 value: primary
                     .zip(gathered.value)
@@ -1110,6 +1186,20 @@ impl Evaluator {
                         .iter()
                         .map(|trend| (clean(&trend.series), heading_now(trend, snapshot.now)))
                         .collect();
+                    let now: BTreeMap<String, f64> = trends
+                        .iter()
+                        .map(|trend| (clean(&trend.series), trend.value))
+                        .collect();
+                    if first {
+                        gathered.value = used
+                            .picked
+                            .as_ref()
+                            .and_then(|picked| now.get(picked).copied());
+                    }
+                    // What summaries show of it, unless its readings are there too.
+                    if !gathered.shown.iter().any(|(name, _)| *name == metric.name) {
+                        gathered.shown.push((metric.name, shown_each(metric, &now)));
+                    }
                     Values::Each(each)
                 } else {
                     let trend = trends.iter().find(|trend| wanted(&trend.series))?;
@@ -1239,7 +1329,7 @@ impl Evaluator {
 
             let inputs = Inputs {
                 facts: CelValue::Null,
-                host: FLEET_HOSTNAME,
+                hostname: FLEET_HOSTNAME,
                 series: line,
                 online: true,
                 reporting: true,
@@ -1263,7 +1353,7 @@ impl Evaluator {
                 _ => line.clone(),
             };
             let values = SummaryValues {
-                host: FLEET_HOSTNAME.to_string(),
+                hostname: FLEET_HOSTNAME.to_string(),
                 series: line.clone(),
                 value: Some(format_value(unit, *value)),
                 metrics: Vec::new(),

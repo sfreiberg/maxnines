@@ -15,7 +15,7 @@ use chrono::TimeDelta;
 use chrono_tz::Tz;
 use resvg::{tiny_skia, usvg};
 
-use crate::alerting::{Alert, AlertRuleInput, Severity, clean};
+use crate::alerting::{Alert, AlertRule, Severity, clean};
 use crate::calculations::{self, Grouping, Sources};
 use crate::metric_charts::{self, Frame, MAX_SERIES, Marked};
 use crate::metrics::{Metric, Metrics, SeriesResult, Source, TimeRange, Unit};
@@ -105,7 +105,7 @@ impl ChartSources {
 /// What an alert is about over a time: the rule it fired by, the metric that rule
 /// watches, and the readings of just the alert's series.
 pub struct Watched {
-    pub rule: AlertRuleInput,
+    pub rule: AlertRule,
     pub metric: &'static Metric,
     pub unit: Unit,
     pub result: SeriesResult,
@@ -126,9 +126,8 @@ pub async fn watched(
     let Some(rule) = sources.database.get_alert_rule(alert.rule_id).await? else {
         return Ok(None);
     };
-    let rule = rule.rule;
-    let (metric, unit, mut result, picked) = if rule.is_calculation() {
-        let Ok(question) = rule.question() else {
+    let (metric, unit, mut result, only) = if rule.rule.is_calculation() {
+        let Ok(question) = rule.rule.question() else {
             return Ok(None);
         };
         let mut result = calculations::answer(sources, &question, range, EVERY_SERIES).await?;
@@ -139,7 +138,12 @@ pub async fn watched(
                 series.name = alert.series.clone().unwrap_or_default();
             }
         }
-        (question.metric, question.unit(), result, None)
+        (
+            question.metric,
+            question.unit(),
+            result,
+            alert.series.clone(),
+        )
     } else {
         // A rule about a host being there, with no metric, has nothing to chart.
         let Some((metric, picked)) = rule.watched() else {
@@ -149,10 +153,20 @@ pub async fn watched(
             .metrics
             .series(&alert.host_id, metric, range, EVERY_SERIES)
             .await?;
-        (metric, metric.unit, result, picked)
+        // The alert's own series, where its series are this metric's, or the one
+        // the rule picks out of it.
+        let fanned = rule.conditions.as_ref().is_some_and(|conditions| {
+            conditions
+                .fanned_out()
+                .iter()
+                .any(|used| used.metric.name == metric.name)
+        });
+        let only = match fanned {
+            true => alert.series.clone(),
+            false => picked,
+        };
+        (metric, metric.unit, result, only)
     };
-    // The alert's own series, or the one its rule picks out.
-    let only = alert.series.clone().or(picked);
     result.series.retain(|series| {
         only.as_ref()
             .is_none_or(|only| clean(&series.name) == *only)
@@ -247,7 +261,7 @@ fn svg(alert: &Alert, watched: &Watched, range: TimeRange) -> String {
         svg,
         r#"<text x="{PADDING}" y="48" font-size="12" fill="{}">The last hour, in UTC · {}</text>"#,
         colour("muted"),
-        xml(&rule.name)
+        xml(&rule.rule.name)
     );
 
     let _ = write!(svg, r#"<g transform="translate({PADDING} {HEADER})">"#);
@@ -396,6 +410,7 @@ fn png(svg: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alerting::AlertRuleInput;
     use crate::metrics::{self, Point, Series};
 
     fn alert() -> Alert {
@@ -456,7 +471,7 @@ mod tests {
     fn disk(result: SeriesResult) -> Watched {
         let metric = metrics::find("disk.usage").unwrap();
         Watched {
-            rule: rule(),
+            rule: AlertRule::new(1, rule()),
             metric,
             unit: metric.unit,
             result,

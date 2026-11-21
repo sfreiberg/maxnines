@@ -42,9 +42,9 @@ fn to_alert_rule(
     channels: Vec<i64>,
     actions: Vec<RuleAction>,
 ) -> Result<AlertRule> {
-    Ok(AlertRule {
-        id: row.id,
-        rule: AlertRuleInput {
+    Ok(AlertRule::new(
+        row.id,
+        AlertRuleInput {
             name: row.name,
             warning: row.warning,
             critical: row.critical,
@@ -71,7 +71,7 @@ fn to_alert_rule(
                 .context("invalid reminder")?,
             actions,
         },
-    })
+    ))
 }
 
 /// A length the database keeps in whole seconds, as rules are written. One that's

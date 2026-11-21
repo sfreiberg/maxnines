@@ -4551,7 +4551,7 @@ mod tests {
                 &["summary", "resolved_summary"]
             )
             .await,
-            "{{ host }} is offline | {{ host }} is back online"
+            "{{ hostname }} is offline | {{ hostname }} is back online"
         );
         assert_eq!(count(&connection, "alerts").await, 1);
 

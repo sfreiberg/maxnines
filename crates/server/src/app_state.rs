@@ -224,12 +224,14 @@ impl AppState {
                 let mut facts = self.database.facts_of(&[host.id.as_str()]).await?;
                 unflatten(&facts.remove(&host.id).unwrap_or_default())
             }
-            None => serde_json::Value::Null,
+            // With no host yet, conditions are tried on a host with no facts, so any
+            // fact they use is missing, as a host's are until its agent says.
+            None => serde_json::Value::Object(serde_json::Map::new()),
         };
-        alerting::check_rule_with(input, &facts)?;
+        let conditions = alerting::check_rule_with(input, &facts)?;
         if !input.actions.is_empty() {
             let known = self.database.known_actions().await?;
-            crate::actions::check_against_hosts(input, &known)?;
+            crate::actions::check_against_hosts(input, &conditions, &known)?;
         }
 
         // A name another rule has is refused as the rule is saved, as only the

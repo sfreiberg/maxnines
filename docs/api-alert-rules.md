@@ -5,7 +5,7 @@
 | `name` | Required. No two rules can have the same name, ignoring case, or saving gives `422` |
 | `warning` | When it's a warning: a [condition](alerts.md#conditions) in CEL, such as `disk.usage > 80`. A rule needs `warning`, `critical` or both |
 | `critical` | When it's critical, the same way. With both, one alert covers both, at the worse of the two, as in [warning, then critical](alerts.md#warning-then-critical) |
-| `summary` | What alerts say, filled in like a [custom webhook's body](notifications.md#custom-webhooks): `{{ host }}`, `{{ series }}`, `{{ value }}` and the metrics the conditions use, such as `{{ disk.usage }}`, each written in its unit. Without it, the rule's name, the host and the reading |
+| `summary` | What alerts say, filled in like a [custom webhook's body](notifications.md#custom-webhooks): `{{ hostname }}`, `{{ series }}`, `{{ value }}` and the metrics the conditions use, such as `{{ disk.usage }}`, each written in its unit. Without it, the rule's name, the host and the reading |
 | `resolved_summary` | What alerts say as they clear, the same way |
 | `for_secs` | Required. How long a problem lasts before firing. The alert resolves as soon as the problem is gone |
 | `applies_to` | A CEL expression over facts limiting which hosts this covers, such as `facts.os.family == "linux"` |
@@ -33,7 +33,7 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
   -d '{
     "name": "Host sending no metrics",
     "critical": "!reporting",
-    "summary": "{{ host }} is connected but sending no metrics",
+    "summary": "{{ hostname }} is connected but sending no metrics",
     "for_secs": 300,
     "all_channels": true
   }' \

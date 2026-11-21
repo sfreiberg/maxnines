@@ -158,7 +158,7 @@ async fn replay_calculation(
             let moments = line.points.iter().map(|point| {
                 let inputs = Inputs {
                     facts: CelValue::Null,
-                    host: FLEET_HOSTNAME,
+                    hostname: FLEET_HOSTNAME,
                     series: &line.name,
                     online: true,
                     reporting: true,
@@ -313,7 +313,7 @@ fn replay_host(
             }
             let inputs = Inputs {
                 facts: facts.clone(),
-                host: hostname,
+                hostname,
                 series,
                 online: true,
                 reporting: true,

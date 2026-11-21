@@ -61,7 +61,7 @@ metrics by their names in the [catalog](api-metrics.md#list-metrics):
   `'5 minutes'` and `'15 minutes'`, or `memory.usage` with `'Memory'` and `'Swap'`, always
   has one picked out with brackets.
 - **`series`** is the series being checked, such as `/data`, and empty for the host as a
-  whole. **`host`** is the hostname, and **`facts.`** are what the host's agent reports,
+  whole. **`hostname`** is the hostname, and **`facts.`** are what the host's agent reports,
   as in [config rules](agents.md#config-rules).
 - **`online`** is whether the host's agent is connected, and **`reporting`** whether a
   connected host's samples are arriving.
@@ -88,9 +88,9 @@ show. `forecast()` can't be tried on the past, and hosts are taken to have been
 Without a **Summary**, an alert says the rule's name, the host, and the first metric's
 reading, like *Disk filling up on web-1: / is 92%*, and as it clears, *Disk filling up on
 web-1: / is now 70%*. A summary can say anything else, filled in like a
-[custom webhook's body](notifications.md#custom-webhooks), with `{{ host }}`,
+[custom webhook's body](notifications.md#custom-webhooks), with `{{ hostname }}`,
 `{{ series }}`, `{{ value }}` and the metrics the conditions use, each written in its
-unit: `{{ host }}: {{ series }} is {{ disk.usage }} full` says *web-1: / is 92% full*.
+unit: `{{ hostname }}: {{ series }} is {{ disk.usage }} full` says *web-1: / is 92% full*.
 
 ## Connected but sending no metrics
 
@@ -105,10 +105,12 @@ connected but sending no metrics*, and resolves as soon as a sample is stored ag
 saying *web-1 is sending metrics again*.
 
 - A host that hasn't sent anything since it connected counts from when it connected.
-- Only connected agents are watched. One that's gone is the Host offline rule's to
-  alert on, and a host without an agent, or the server itself, never alerts. An alert
-  that's already open stays open while its agent is away and after it reconnects,
-  until a sample is stored.
+- A host that's gone keeps what it was as it went: one that had stopped sending
+  stays not `reporting`, and any other is `reporting`, as its going is the Host
+  offline rule's to alert on. So an alert that's already open stays open while its
+  agent is away, after it reconnects and after the server restarts, until a sample is
+  stored, and `!online || !reporting` alerts on either. A host without an agent, or the
+  server itself, is always `reporting`.
 - The server's own readings of a host's [clock](agents.md#clock) don't count, as
   they're saved whether or not anything the agent sends is.
 - Nothing starts in the first two minutes after the server starts, while agents

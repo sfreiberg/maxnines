@@ -236,8 +236,8 @@ pub(super) fn cpu_rule() -> AlertRuleInput {
 
 fn offline_rule() -> AlertRuleInput {
     AlertRuleInput {
-        summary: Some("{{ host }} is offline".to_string()),
-        resolved_summary: Some("{{ host }} is back online".to_string()),
+        summary: Some("{{ hostname }} is offline".to_string()),
+        resolved_summary: Some("{{ hostname }} is back online".to_string()),
         hold: TimeDelta::seconds(60),
         ..AlertRuleInput::with_conditions("Gone", None, Some("!online"))
     }
@@ -617,6 +617,18 @@ async fn a_rule_can_be_tried_on_the_last_day_before_it_is_saved() {
         "{}",
         page.body
     );
+}
+
+#[tokio::test]
+async fn a_condition_using_facts_can_be_saved_before_there_are_hosts() {
+    let server = start().await;
+    let rule = json!({
+        "name": "Loaded",
+        "warning": "cpu.load['5 minutes'] > facts.cpu.logical_cores",
+        "for_secs": 0,
+    });
+    let (status, body) = api(&server, "POST", "/api/v1/alert-rules", &rule).await;
+    assert_eq!(status, 201, "{body}");
 }
 
 #[tokio::test]
@@ -1124,7 +1136,8 @@ async fn every_server_starts_with_a_rule_for_failing_containers() {
     let rule = built_in("Container down").await;
     assert_eq!(rule.warning, None);
     assert_eq!(rule.critical.as_deref(), Some("container.up < 1"));
-    assert_eq!(rule.thresholds(), [(Severity::Critical, 1.0)]);
+    let stored = crate::alerting::AlertRule::new(1, rule.clone());
+    assert_eq!(stored.thresholds(), [(Severity::Critical, 1.0)]);
     assert_eq!(rule.hold, TimeDelta::seconds(60));
     assert!(rule.all_channels);
     check_rule(&rule).unwrap();
@@ -1214,10 +1227,10 @@ async fn every_server_starts_with_a_rule_for_agents_going_offline() {
     assert_eq!(rule.critical.as_deref(), Some("!online"));
     assert_eq!(rule.warning, None);
     assert_eq!(rule.hold, TimeDelta::seconds(60));
-    assert_eq!(rule.summary.as_deref(), Some("{{ host }} is offline"));
+    assert_eq!(rule.summary.as_deref(), Some("{{ hostname }} is offline"));
     assert_eq!(
         rule.resolved_summary.as_deref(),
-        Some("{{ host }} is back online")
+        Some("{{ hostname }} is back online")
     );
     assert!(rule.enabled);
     assert!(rule.all_channels);
@@ -1269,7 +1282,7 @@ async fn every_server_starts_with_a_warning_at_80_percent_full_and_critical_at_9
     assert_eq!(rule.warning.as_deref(), Some("disk.usage > 80"));
     assert_eq!(rule.critical.as_deref(), Some("disk.usage > 90"));
     assert_eq!(
-        rule.thresholds(),
+        crate::alerting::AlertRule::new(1, rule.clone()).thresholds(),
         [(Severity::Warning, 80.0), (Severity::Critical, 90.0)]
     );
     assert_eq!(rule.hold, TimeDelta::seconds(300));
@@ -2166,8 +2179,8 @@ fn no_metrics_rule() -> AlertRuleInput {
     AlertRuleInput {
         name: "Silent".to_string(),
         critical: Some("!reporting".to_string()),
-        summary: Some("{{ host }} is connected but sending no metrics".to_string()),
-        resolved_summary: Some("{{ host }} is sending metrics again".to_string()),
+        summary: Some("{{ hostname }} is connected but sending no metrics".to_string()),
+        resolved_summary: Some("{{ hostname }} is sending metrics again".to_string()),
         hold: TimeDelta::minutes(5),
         ..offline_rule()
     }
@@ -2265,6 +2278,73 @@ async fn a_no_metrics_alert_counts_from_the_newest_sample_and_resolves_once_they
         resolved[0].resolve_reason.as_deref(),
         Some("The problem cleared")
     );
+}
+
+#[tokio::test]
+async fn a_restart_leaves_a_no_metrics_alert_open_until_a_sample_is_stored() {
+    let mut test = Harness::start().await;
+    test.database()
+        .create_alert_rule(&no_metrics_rule())
+        .await
+        .unwrap();
+    let connected = test.connected_at();
+    test.evaluate_at(connected + MINUTE * 5, None).await;
+    assert_eq!(test.open().await.len(), 1);
+
+    // The server restarts, and the agent reconnects as it comes back.
+    test.go_offline().await;
+    let mut client = test.server.connect().await;
+    handshake(&mut client, &test.host, "web-1", None).await;
+    test.server.wait_for_online(&test.id(), true).await;
+    let back = test.connected_at();
+    test.evaluator = evaluator(&test.server, back - MINUTE * 10);
+    test.evaluate_at(back + TimeDelta::seconds(30), None).await;
+    assert_eq!(test.open().await.len(), 1, "{:?}", test.resolved().await);
+    assert!(test.resolved().await.is_empty());
+
+    test.evaluate_at(back + MINUTE, Some(back + TimeDelta::seconds(50)))
+        .await;
+    assert!(test.open().await.is_empty());
+}
+
+#[tokio::test]
+async fn an_offline_host_is_not_reporting_only_if_it_had_stopped_before_it_went() {
+    let mut test = Harness::start().await;
+    let either = AlertRuleInput {
+        name: "Gone or quiet".to_string(),
+        critical: Some("!online || !reporting".to_string()),
+        hold: TimeDelta::zero(),
+        ..cpu_rule()
+    };
+    let busy = AlertRuleInput {
+        name: "Busy while reporting".to_string(),
+        critical: Some("reporting && cpu.usage > 90".to_string()),
+        hold: TimeDelta::zero(),
+        ..cpu_rule()
+    };
+    for rule in [&either, &no_metrics_rule(), &busy] {
+        test.database().create_alert_rule(rule).await.unwrap();
+    }
+    let connected = test.connected_at();
+    test.script
+        .set(vec![test.reading("CPU", connected + MINUTE, 95.0)]);
+    test.evaluate_at(connected + MINUTE, Some(connected + MINUTE))
+        .await;
+    let names = |alerts: Vec<crate::alerting::Alert>| {
+        let mut names: Vec<String> = alerts.into_iter().map(|alert| alert.rule_name).collect();
+        names.sort();
+        names
+    };
+    assert_eq!(names(test.open().await), ["Busy while reporting"]);
+
+    // Gone, it fires the rule about either, and the one about the host being quiet
+    // leaves it to the offline rule. The CPU rule carries on, and clears.
+    test.go_offline().await;
+    let gone = test.connected_at();
+    test.script
+        .set(vec![test.reading("CPU", gone + MINUTE, 10.0)]);
+    test.evaluate_at(gone + MINUTE, None).await;
+    assert_eq!(names(test.open().await), ["Gone or quiet"]);
 }
 
 #[tokio::test]
@@ -5049,7 +5129,7 @@ async fn a_rule_can_warn_first_and_go_critical_later_from_the_form() {
     assert_eq!(page.status, 303, "{}", page.body);
     let rules = server.state.database.list_alert_rules().await.unwrap();
     assert_eq!(
-        rules[0].rule.thresholds(),
+        rules[0].thresholds(),
         [(Severity::Warning, 80.0), (Severity::Critical, 90.0)]
     );
 
@@ -5084,8 +5164,8 @@ async fn an_offline_rule_can_be_made_from_the_form() {
     fields[0] = ("name", "Gone");
     fields[2] = ("critical", "!online");
     fields[5] = ("for_secs", "60");
-    fields.push(("summary", "{{ host }} is offline"));
-    fields.push(("resolved_summary", "{{ host }} is back online"));
+    fields.push(("summary", "{{ hostname }} is offline"));
+    fields.push(("resolved_summary", "{{ hostname }} is back online"));
 
     let page = browser
         .submit(&server, "/alerts/rules/new", "/alerts/rules", &fields)
@@ -5103,8 +5183,14 @@ async fn a_no_metrics_rule_can_be_made_from_the_form() {
     fields[0] = ("name", "Silent");
     fields[2] = ("critical", "!reporting");
     fields[5] = ("for_secs", "300");
-    fields.push(("summary", "{{ host }} is connected but sending no metrics"));
-    fields.push(("resolved_summary", "{{ host }} is sending metrics again"));
+    fields.push((
+        "summary",
+        "{{ hostname }} is connected but sending no metrics",
+    ));
+    fields.push((
+        "resolved_summary",
+        "{{ hostname }} is sending metrics again",
+    ));
 
     let page = browser
         .submit(&server, "/alerts/rules/new", "/alerts/rules", &fields)
@@ -5867,7 +5953,7 @@ async fn alert_rules_can_be_managed_through_the_api() {
     let rule = json!({
         "name": "High CPU",
         "critical": "cpu.usage > 90",
-        "summary": "{{ host }} is busy",
+        "summary": "{{ hostname }} is busy",
         "for_secs": 120,
     });
 
@@ -5882,7 +5968,7 @@ async fn alert_rules_can_be_managed_through_the_api() {
 
     assert_eq!(shown["critical"], "cpu.usage > 90");
     assert_eq!(shown["warning"], Value::Null);
-    assert_eq!(shown["summary"], "{{ host }} is busy");
+    assert_eq!(shown["summary"], "{{ hostname }} is busy");
     assert_eq!(shown["applies_to"], Value::Null);
 
     let mut changed = rule.clone();
@@ -9472,12 +9558,87 @@ async fn quick_forecast(test: &Harness) -> i64 {
     let rule = AlertRuleInput {
         name: "Filling now".to_string(),
         critical: Some("forecast(disk.usage, duration('4h')) >= 100".to_string()),
-        summary: Some("{{ host }}: {{ series }} is {{ disk.usage }}".to_string()),
+        summary: Some("{{ hostname }}: {{ series }} is {{ disk.usage }}".to_string()),
         hold: TimeDelta::seconds(0),
         window: Some(TimeDelta::seconds(6 * 3600)),
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap()
+}
+
+#[tokio::test]
+async fn an_alerts_chart_shows_its_first_metric_whatever_series_it_is_about() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        critical: Some("cpu.usage > 90 && disk.usage > 95".to_string()),
+        hold: TimeDelta::zero(),
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    let open = readings_at(
+        &mut test,
+        0,
+        &[
+            ("cpu.usage", &[("CPU", 97.0)]),
+            ("disk.usage", &[("/", 99.0)]),
+        ],
+    )
+    .await;
+    assert_eq!(open[0].series.as_deref(), Some("/"));
+    let point = crate::metrics::Point {
+        time: test.now - MINUTE * 5,
+        avg: 97.0,
+        min: 97.0,
+        max: 97.0,
+    };
+    let cpu = crate::metrics::Series {
+        name: "CPU".to_string(),
+        points: vec![point],
+    };
+    test.script
+        .stored
+        .lock()
+        .unwrap()
+        .insert("cpu.usage".to_string(), vec![cpu]);
+
+    let path = format!("/api/v1/alerts/{}/series", open[0].id);
+    let (status, body) = api(&test.server, "GET", &path, &Value::Null).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["metric"], "cpu.usage");
+    assert_eq!(body["series"][0]["name"], "CPU", "{body}");
+}
+
+#[tokio::test]
+async fn a_forecast_that_goes_stale_stays_open() {
+    let mut test = Harness::start().await;
+    quick_forecast(&test).await;
+    assert_eq!(forecast_at(&mut test, 0, 95.0, 5.0).await.len(), 1);
+    // Its readings stop, so its line is no longer trusted: that's missing data.
+    let stale = crate::metrics::Trend {
+        time: test.now - MINUTE * 20 + MINUTE * 10,
+        ..disk_trend(&test, MINUTE * 10, 95.0, 5.0)
+    };
+    *test.script.trends.lock().unwrap() = vec![stale];
+    test.evaluate(MINUTE * 10).await;
+    assert_eq!(test.open().await.len(), 1, "{:?}", test.resolved().await);
+}
+
+#[tokio::test]
+async fn a_summary_can_show_a_forecast_picked_out_with_brackets() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        name: "Root filling".to_string(),
+        critical: Some("forecast(disk.usage['/'], duration('4h')) >= 100".to_string()),
+        summary: Some("{{ hostname }}: / is {{ disk.usage['/'] }}".to_string()),
+        hold: TimeDelta::zero(),
+        ..cpu_rule()
+    };
+    check_rule(&rule).unwrap();
+    test.database().create_alert_rule(&rule).await.unwrap();
+    let open = forecast_at(&mut test, 0, 95.0, 5.0).await;
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].summary, "web-1: / is 95%");
+    assert_eq!(open[0].value, Some(95.0));
 }
 
 #[tokio::test]

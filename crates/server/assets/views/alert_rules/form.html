@@ -24,7 +24,7 @@
 
     <label>Critical when
       <input type="text" name="critical" value="{{ rule.critical }}" maxlength="2000" spellcheck="false" autocomplete="off" placeholder="disk.usage > 90">
-      <small>Fill in either or both, in <a href="/docs/alerts#conditions">CEL</a>. With both, one alert starts as a warning and becomes critical, and only the worse of the two is sent. Use metrics by their names, <code>facts.</code>, <code>online</code>, <code>reporting</code>, <code>host</code> and <code>series</code>, such as:
+      <small>Fill in either or both, in <a href="/docs/alerts#conditions">CEL</a>. With both, one alert starts as a warning and becomes critical, and only the worse of the two is sent. Use metrics by their names, <code>facts.</code>, <code>online</code>, <code>reporting</code>, <code>hostname</code> and <code>series</code>, such as:
         <code>disk.usage &gt; 90</code>,
         <code>series != '/boot' &amp;&amp; disk.usage &gt; 90</code>,
         <code>cpu.load['5 minutes'] &gt; facts.cpu.logical_cores</code>,
@@ -37,12 +37,12 @@
     </label>
 
     <label>Summary
-      <input type="text" name="summary" value="{{ rule.summary }}" maxlength="1000" spellcheck="false" autocomplete="off" placeholder="{{ '{{' }} host }}: {{ '{{' }} series }} is {{ '{{' }} disk.usage }} full">
+      <input type="text" name="summary" value="{{ rule.summary }}" maxlength="1000" spellcheck="false" autocomplete="off" placeholder="{{ '{{' }} hostname }}: {{ '{{' }} series }} is {{ '{{' }} disk.usage }} full">
     </label>
 
     <label>Summary when it clears
       <input type="text" name="resolved_summary" value="{{ rule.resolved_summary }}" maxlength="1000" spellcheck="false" autocomplete="off">
-      <small>What alerts say, with <code>{{ '{{' }} host }}</code>, <code>{{ '{{' }} series }}</code>, <code>{{ '{{' }} value }}</code> and the metrics the conditions use, like <code>{{ '{{' }} disk.usage }}</code>, written in their units. Leave empty for the rule's name and the reading.</small>
+      <small>What alerts say, with <code>{{ '{{' }} hostname }}</code>, <code>{{ '{{' }} series }}</code>, <code>{{ '{{' }} value }}</code> and the metrics the conditions use, like <code>{{ '{{' }} disk.usage }}</code>, written in their units. Leave empty for the rule's name and the reading.</small>
     </label>
 
     <label>For at least (seconds)
