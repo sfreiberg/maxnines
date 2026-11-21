@@ -88,10 +88,13 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 `GET /api/v1/alerts/{id}/series`
 
 What an alert watches over a period of time, as its chart on the Alerts page shows it:
-only the alert's own series, with the rule's `thresholds`. Points are as for
+only the alert's own series of the first metric its rule's conditions use, with the
+rule's `thresholds`: a level for each condition that only compares the metric with a
+number, such as `disk.usage > 90`. Points are as for
 [a host's metric](api-hosts.md#get-a-hosts-metric), and for a calculation rule they're
 the calculation's answer. Returns `404` if there's no such alert, or nothing to chart:
-an offline or no-metrics alert, or one whose rule has been deleted.
+an alert from a rule that uses no metric, such as `!online`, or one whose rule has been
+deleted.
 
 | Parameter | Description |
 | --- | --- |

@@ -13,8 +13,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use super::*;
 use crate::alert_evaluator::Evaluator;
 use crate::alerting::{
-    AlertRuleInput, Channel, ChannelInput, ChannelKind, Comparison, Delivery, Event, Mail,
-    MailSecurity, MailServer, NameTaken, NewAlert, RuleKind, Severity, check_rule,
+    AlertRuleInput, Channel, ChannelInput, ChannelKind, Delivery, Event, Mail, MailSecurity,
+    MailServer, NameTaken, NewAlert, Severity, check_rule,
 };
 use crate::channels::slack::{ACKNOWLEDGE_ACTION, SILENCE_HOUR_ACTION};
 use crate::metrics::{Metric, NewestReading};
@@ -31,6 +31,8 @@ const MINUTE: TimeDelta = TimeDelta::minutes(1);
 #[derive(Clone, Default)]
 struct Script {
     readings: Arc<Mutex<Vec<NewestReading>>>,
+    /// Readings for one metric in particular, where every other has `readings`.
+    by_metric: Arc<Mutex<BTreeMap<String, Vec<NewestReading>>>>,
     trends: Arc<Mutex<Vec<crate::metrics::Trend>>>,
     /// What each collector last sent, by its name.
     outputs: Arc<Mutex<BTreeMap<String, serde_json::Value>>>,
@@ -42,6 +44,12 @@ struct Script {
 impl Script {
     fn set(&self, readings: Vec<NewestReading>) {
         *self.readings.lock().unwrap() = readings;
+    }
+
+    /// What `metric` says, while every other says what [`Self::set`] gave.
+    fn set_metric(&self, metric: &str, readings: Vec<NewestReading>) {
+        let mut by_metric = self.by_metric.lock().unwrap();
+        by_metric.insert(metric.to_string(), readings);
     }
 
     fn set_output(&self, collector: &str, output: serde_json::Value) {
@@ -94,12 +102,15 @@ impl MetricsReader for Script {
 
     fn newest(
         &self,
-        _metric: &Metric,
+        metric: &Metric,
         _since: Timestamp,
         _until: Timestamp,
     ) -> anyhow::Result<Vec<NewestReading>> {
         if *self.broken.lock().unwrap() {
             anyhow::bail!("deliberate test failure");
+        }
+        if let Some(readings) = self.by_metric.lock().unwrap().get(metric.name) {
+            return Ok(readings.clone());
         }
         Ok(self.readings.lock().unwrap().clone())
     }
@@ -212,39 +223,17 @@ fn evaluator(server: &TestServer, started: Timestamp) -> Evaluator {
 
 pub(super) fn cpu_rule() -> AlertRuleInput {
     AlertRuleInput {
-        name: "High CPU".to_string(),
-        kind: RuleKind::Metric,
-        metric: Some("cpu.usage".to_string()),
-        series: None,
-        comparison: Some(Comparison::Above),
-        threshold: Some(90.0),
-        warning_threshold: None,
         hold: TimeDelta::seconds(120),
-        severity: Severity::Critical,
-        condition: None,
-        enabled: true,
-        channels: Vec::new(),
-        all_channels: false,
-        calculation: None,
-        group_by: None,
-        filter: None,
-        window: None,
-        remind_every: None,
-        forecast: None,
-        warning_forecast: None,
-        actions: Vec::new(),
+        ..AlertRuleInput::with_conditions("High CPU", None, Some("cpu.usage > 90"))
     }
 }
 
 fn offline_rule() -> AlertRuleInput {
     AlertRuleInput {
-        name: "Gone".to_string(),
-        kind: RuleKind::Offline,
-        metric: None,
-        comparison: None,
-        threshold: None,
+        summary: Some("{{ host }} is offline".to_string()),
+        resolved_summary: Some("{{ host }} is back online".to_string()),
         hold: TimeDelta::seconds(60),
-        ..cpu_rule()
+        ..AlertRuleInput::with_conditions("Gone", None, Some("!online"))
     }
 }
 
@@ -268,10 +257,7 @@ async fn a_metric_alert_fires_once_and_resolves_when_it_clears() {
     assert_eq!(open[0].value, Some(96.5));
     assert_eq!(open[0].hostname, "web-1");
     assert_eq!(open[0].severity, Severity::Critical);
-    assert_eq!(
-        open[0].summary,
-        "CPU usage on web-1 is 96.5%, above 90% for 2 minutes"
-    );
+    assert_eq!(open[0].summary, "High CPU on web-1: CPU usage is 96.5%");
 
     test.cpu(MINUTE * 3, 97.0).await;
     assert_eq!(
@@ -292,7 +278,7 @@ async fn a_metric_alert_fires_once_and_resolves_when_it_clears() {
     );
     assert_eq!(
         resolved[0].resolved_summary.as_deref(),
-        Some("CPU usage on web-1 is now 10%, no longer above 90%")
+        Some("High CPU on web-1: CPU usage is now 10%")
     );
     assert_eq!(resolved[0].resolved_at, Some(test.now + MINUTE * 4));
 
@@ -340,8 +326,7 @@ async fn the_same_sample_is_not_counted_twice() {
 async fn below_rules_fire_on_low_readings() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
-        comparison: Some(Comparison::Below),
-        threshold: Some(5.0),
+        critical: Some("cpu.usage < 5".to_string()),
         hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
@@ -357,7 +342,7 @@ async fn below_rules_fire_on_low_readings() {
 async fn each_series_alerts_separately() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
-        metric: Some("disk.usage".to_string()),
+        critical: Some("disk.usage > 90".to_string()),
         hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
@@ -385,8 +370,7 @@ async fn each_series_alerts_separately() {
 async fn a_rule_can_be_limited_to_some_series() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
-        metric: Some("disk.usage".to_string()),
-        series: Some("/data*".to_string()),
+        critical: Some("series.startsWith('/data') && disk.usage > 90".to_string()),
         hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
@@ -402,6 +386,183 @@ async fn a_rule_can_be_limited_to_some_series() {
     let open = test.open().await;
     assert_eq!(open.len(), 1);
     assert_eq!(open[0].series.as_deref(), Some("/data/logs"));
+}
+
+/// Checks rules at `minute` with these readings of each metric, and gives what's
+/// open then.
+async fn readings_at(
+    test: &mut Harness,
+    minute: i32,
+    metrics: &[(&str, &[(&str, f64)])],
+) -> Vec<crate::alerting::Alert> {
+    let offset = MINUTE * minute;
+    for (metric, series) in metrics {
+        let readings = series
+            .iter()
+            .map(|(series, value)| test.reading(series, test.now + offset, *value))
+            .collect();
+        test.script.set_metric(metric, readings);
+    }
+    test.evaluate(offset).await;
+    test.open().await
+}
+
+#[tokio::test]
+async fn metrics_with_a_series_for_each_disk_pair_up_by_disk() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        summary: Some(
+            "{{ series }} is {{ disk.usage }} full with {{ disk.inodes }} of its inodes used"
+                .to_string(),
+        ),
+        hold: TimeDelta::zero(),
+        ..AlertRuleInput::with_conditions(
+            "Disk full",
+            Some("series != '/boot' && disk.usage > 80"),
+            Some("disk.usage > 90 && disk.inodes > 80"),
+        )
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+
+    let open = readings_at(
+        &mut test,
+        0,
+        &[
+            (
+                "disk.usage",
+                &[("/", 95.0), ("/data", 85.0), ("/boot", 99.0)],
+            ),
+            ("disk.inodes", &[("/", 85.0), ("/data", 95.0)]),
+        ],
+    )
+    .await;
+    let mut said: Vec<(String, Severity, String)> = open
+        .iter()
+        .map(|alert| {
+            (
+                alert.series.clone().unwrap(),
+                alert.severity,
+                alert.summary.clone(),
+            )
+        })
+        .collect();
+    said.sort();
+    assert_eq!(
+        said,
+        [
+            (
+                "/".to_string(),
+                Severity::Critical,
+                "/ is 95% full with 85% of its inodes used".to_string()
+            ),
+            (
+                "/data".to_string(),
+                Severity::Warning,
+                "/data is 85% full with 95% of its inodes used".to_string()
+            ),
+        ],
+        "/boot has no inodes reading, so it isn't checked, and is left out of the warning"
+    );
+    assert!(open.iter().all(|alert| alert.value.is_some()));
+
+    // A metric that stops being reported says nothing either way: what's open stays.
+    let open = readings_at(&mut test, 1, &[("disk.inodes", &[])]).await;
+    assert_eq!(open.len(), 2, "{open:?}");
+}
+
+#[tokio::test]
+async fn brackets_pick_one_series_and_alerts_are_about_the_host() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        hold: TimeDelta::zero(),
+        ..AlertRuleInput::with_conditions("Loaded", Some("cpu.load['5 minutes'] > 4.0 * 1.0"), None)
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+
+    let load = |five: f64| [("1 minute", 9.0), ("5 minutes", five), ("15 minutes", 1.0)];
+    assert!(
+        readings_at(&mut test, 0, &[("cpu.load", &load(3.0))])
+            .await
+            .is_empty()
+    );
+    let open = readings_at(&mut test, 1, &[("cpu.load", &load(5.0))]).await;
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].series, None);
+    assert_eq!(open[0].value, Some(5.0));
+    assert_eq!(
+        open[0].summary,
+        "Loaded on web-1: Load average (5 minutes) is 5"
+    );
+}
+
+#[tokio::test]
+async fn lengths_of_time_and_sizes_are_compared_in_their_units() {
+    let mut test = Harness::start().await;
+    for (name, critical) in [
+        ("Clock", "clock.difference > duration('30s')"),
+        ("Hungry", "process.memory > gib(2)"),
+    ] {
+        let rule = AlertRuleInput {
+            hold: TimeDelta::zero(),
+            ..AlertRuleInput::with_conditions(name, None, Some(critical))
+        };
+        test.database().create_alert_rule(&rule).await.unwrap();
+    }
+
+    let gib = 1024.0 * 1024.0 * 1024.0;
+    let open = readings_at(
+        &mut test,
+        0,
+        &[
+            ("clock.difference", &[("Difference", 29.0)]),
+            ("process.memory", &[("java", gib), ("postgres", 3.0 * gib)]),
+        ],
+    )
+    .await;
+    let said: Vec<&str> = open.iter().map(|alert| alert.summary.as_str()).collect();
+    assert_eq!(said, ["Hungry on web-1: postgres is 3 GiB"], "{open:?}");
+
+    let open = readings_at(
+        &mut test,
+        1,
+        &[("clock.difference", &[("Difference", 31.0)])],
+    )
+    .await;
+    let clock = open
+        .iter()
+        .find(|alert| alert.rule_name == "Clock")
+        .unwrap();
+    assert_eq!(
+        clock.summary,
+        "Clock on web-1: Clock difference from the server is 31 s"
+    );
+}
+
+#[tokio::test]
+async fn conditions_are_tried_on_a_real_hosts_facts_when_saved() {
+    let test = Harness::start().await;
+    let facts = FlatFacts::from([("cpu.logical_cores".to_string(), json!(8))]);
+    test.database()
+        .record_facts(&test.id(), &facts, crate::times::now())
+        .await
+        .unwrap();
+    let state = &test.server.state;
+    let fine = AlertRuleInput::with_conditions(
+        "Load",
+        None,
+        Some("cpu.load['5 minutes'] > facts.cpu.logical_cores"),
+    );
+    state.check_alert_rule(&fine).await.unwrap();
+    let wrong = AlertRuleInput::with_conditions(
+        "Load",
+        None,
+        Some("facts.cpu.logical_cores > duration('1m')"),
+    );
+    let error = format!("{:#}", state.check_alert_rule(&wrong).await.unwrap_err());
+    assert!(
+        error.contains("can't compare a number with a length of time"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -421,7 +582,7 @@ async fn a_condition_limits_which_agents_a_rule_watches() {
         .unwrap();
 
     let rule = AlertRuleInput {
-        condition: Some(r#"facts.custom.role == "db""#.to_string()),
+        applies_to: Some(r#"facts.custom.role == "db""#.to_string()),
         hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
@@ -564,7 +725,7 @@ async fn a_rule_that_stops_matching_closes_its_alerts() {
     test.cpu(TimeDelta::zero(), 95.0).await;
 
     let narrowed = AlertRuleInput {
-        condition: Some("false".to_string()),
+        applies_to: Some("false".to_string()),
         ..rule
     };
     test.database()
@@ -642,7 +803,7 @@ async fn a_failed_metrics_read_changes_nothing() {
 async fn a_series_that_disappears_closes_its_alert() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
-        metric: Some("disk.usage".to_string()),
+        critical: Some("disk.usage > 90".to_string()),
         hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
@@ -669,13 +830,13 @@ async fn a_series_that_disappears_closes_its_alert() {
     );
 }
 
-/// The disk is still there; the rule was changed to leave it out, and the reason
-/// should say so rather than blame the agent.
+/// The disk is still there; the rule was changed to leave it out, which is the
+/// problem clearing for it.
 #[tokio::test]
-async fn a_series_the_rule_stops_watching_closes_with_that_reason() {
+async fn a_series_the_rule_stops_watching_clears() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
-        metric: Some("disk.usage".to_string()),
+        critical: Some("disk.usage > 90".to_string()),
         hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
@@ -686,8 +847,8 @@ async fn a_series_the_rule_stops_watching_closes_with_that_reason() {
     assert_eq!(test.open().await.len(), 1);
 
     let narrowed = AlertRuleInput {
-        series: Some("/data*".to_string()),
-        ..rule
+        critical: Some("series.startsWith('/data') && disk.usage > 90".to_string()),
+        ..rule.clone()
     };
     test.database()
         .update_alert_rule(id, &narrowed)
@@ -696,11 +857,34 @@ async fn a_series_the_rule_stops_watching_closes_with_that_reason() {
     let time = test.now + MINUTE;
     test.script.set(vec![test.reading("/mnt/usb", time, 95.0)]);
     test.evaluate(MINUTE).await;
-
     assert!(test.open().await.is_empty());
     assert_eq!(
         test.resolved().await[0].resolve_reason.as_deref(),
-        Some("The rule no longer covers this series")
+        Some("The problem cleared")
+    );
+
+    // A rule changed to pick one disk out is about the host as a whole, so what
+    // was open for each disk closes, saying why.
+    test.database().update_alert_rule(id, &rule).await.unwrap();
+    let time = test.now + MINUTE * 2;
+    test.script.set(vec![test.reading("/mnt/usb", time, 95.0)]);
+    test.evaluate(MINUTE * 2).await;
+    assert_eq!(test.open().await.len(), 1);
+    let picked = AlertRuleInput {
+        critical: Some("disk.usage['/'] > 90".to_string()),
+        ..rule
+    };
+    test.database()
+        .update_alert_rule(id, &picked)
+        .await
+        .unwrap();
+    let time = test.now + MINUTE * 3;
+    test.script.set(vec![test.reading("/mnt/usb", time, 95.0)]);
+    test.evaluate(MINUTE * 3).await;
+    assert!(test.open().await.is_empty());
+    assert_eq!(
+        test.resolved().await[0].resolve_reason.as_deref(),
+        Some("The rule changed")
     );
 }
 
@@ -727,7 +911,7 @@ async fn a_restart_does_not_repeat_an_open_alert() {
 async fn names_agents_choose_are_cleaned_before_they_are_kept() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
-        metric: Some("disk.usage".to_string()),
+        critical: Some("disk.usage > 90".to_string()),
         hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
@@ -753,7 +937,7 @@ async fn names_agents_choose_are_cleaned_before_they_are_kept() {
 async fn an_agent_cannot_flood_alerts_by_inventing_series() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
-        metric: Some("disk.usage".to_string()),
+        critical: Some("disk.usage > 90".to_string()),
         hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
@@ -821,14 +1005,15 @@ async fn built_in_rules() -> Vec<AlertRuleInput> {
     rules.into_iter().map(|rule| rule.rule).collect()
 }
 
-async fn built_in_offline_rule() -> AlertRuleInput {
+/// The built-in rule of this name.
+async fn built_in(name: &str) -> AlertRuleInput {
     let rules = built_in_rules().await;
-    let mut offline = rules
-        .into_iter()
-        .filter(|rule| rule.kind == RuleKind::Offline);
-    let rule = offline.next().unwrap();
-    assert!(offline.next().is_none());
-    rule
+    let found = rules.into_iter().find(|rule| rule.name == name);
+    found.unwrap_or_else(|| panic!("no built-in rule {name:?}"))
+}
+
+async fn built_in_offline_rule() -> AlertRuleInput {
+    built_in("Host offline").await
 }
 
 #[tokio::test]
@@ -855,31 +1040,21 @@ async fn every_server_starts_with_rules_for_agents_going_offline_and_disks_filli
 
 #[tokio::test]
 async fn every_server_starts_with_a_rule_for_failing_containers() {
-    let rules = built_in_rules().await;
-    let rule = rules
-        .iter()
-        .find(|rule| rule.metric.as_deref() == Some("container.up"))
-        .unwrap();
-    assert_eq!(rule.name, "Container down");
-    assert_eq!(rule.comparison, Some(Comparison::Below));
-    assert_eq!(rule.levels(), [(Severity::Critical, 1.0)]);
+    let rule = built_in("Container down").await;
+    assert_eq!(rule.warning, None);
+    assert_eq!(rule.critical.as_deref(), Some("container.up < 1"));
+    assert_eq!(rule.thresholds(), [(Severity::Critical, 1.0)]);
     assert_eq!(rule.hold, TimeDelta::seconds(60));
     assert!(rule.all_channels);
-    check_rule(rule).unwrap();
+    check_rule(&rule).unwrap();
 }
 
 #[tokio::test]
 async fn a_stopped_service_alerts_in_its_service_managers_words() {
     let mut test = Harness::start().await;
-    let rule = built_in_rules()
-        .await
-        .into_iter()
-        .find(|rule| rule.metric.as_deref() == Some("service.running"))
-        .unwrap();
-    assert_eq!(
-        (rule.name.as_str(), rule.hold),
-        ("Service stopped", TimeDelta::seconds(60))
-    );
+    let rule = built_in("Service stopped").await;
+    assert_eq!(rule.critical.as_deref(), Some("service.running < 1"));
+    assert_eq!(rule.hold, TimeDelta::seconds(60));
     test.database().create_alert_rule(&rule).await.unwrap();
     let channel = webhook_channel("http://127.0.0.1:9/hook");
     test.database().create_channel(&channel).await.unwrap();
@@ -931,11 +1106,7 @@ async fn a_stopped_service_alerts_in_its_service_managers_words() {
 #[tokio::test]
 async fn a_failing_container_alerts_after_a_minute() {
     let mut test = Harness::start().await;
-    let rule = built_in_rules()
-        .await
-        .into_iter()
-        .find(|rule| rule.metric.as_deref() == Some("container.up"))
-        .unwrap();
+    let rule = built_in("Container down").await;
     test.database().create_alert_rule(&rule).await.unwrap();
 
     for minute in [0, 5] {
@@ -959,9 +1130,14 @@ async fn every_server_starts_with_a_rule_for_agents_going_offline() {
     let rule = built_in_offline_rule().await;
 
     assert_eq!(rule.name, "Host offline");
-    assert_eq!(rule.kind, RuleKind::Offline);
+    assert_eq!(rule.critical.as_deref(), Some("!online"));
+    assert_eq!(rule.warning, None);
     assert_eq!(rule.hold, TimeDelta::seconds(60));
-    assert_eq!(rule.severity, Severity::Critical);
+    assert_eq!(rule.summary.as_deref(), Some("{{ host }} is offline"));
+    assert_eq!(
+        rule.resolved_summary.as_deref(),
+        Some("{{ host }} is back online")
+    );
     assert!(rule.enabled);
     assert!(rule.all_channels);
     assert!(rule.channels.is_empty());
@@ -1008,47 +1184,28 @@ async fn the_built_in_rule_tells_every_channel_once_an_agent_is_gone_a_minute() 
 
 #[tokio::test]
 async fn every_server_starts_with_a_warning_at_80_percent_full_and_critical_at_90() {
-    let rules = built_in_rules().await;
-    let disk: Vec<&AlertRuleInput> = rules
-        .iter()
-        .filter(|rule| rule.metric.as_deref() == Some("disk.usage"))
-        .filter(|rule| rule.kind == RuleKind::Metric)
-        .collect();
-    let [rule] = disk[..] else {
-        panic!("{disk:?}");
-    };
-    assert_eq!(rule.name, "Disk filling up");
+    let rule = built_in("Disk filling up").await;
+    assert_eq!(rule.warning.as_deref(), Some("disk.usage > 80"));
+    assert_eq!(rule.critical.as_deref(), Some("disk.usage > 90"));
     assert_eq!(
-        rule.levels(),
+        rule.thresholds(),
         [(Severity::Warning, 80.0), (Severity::Critical, 90.0)]
     );
-    assert_eq!(rule.comparison, Some(Comparison::Above));
-    assert_eq!(rule.series, None);
     assert_eq!(rule.hold, TimeDelta::seconds(300));
     assert!(rule.enabled);
     assert!(rule.all_channels);
-    check_rule(rule).unwrap();
+    check_rule(&rule).unwrap();
 }
 
 #[tokio::test]
 async fn every_server_starts_with_a_rule_for_inodes_running_out() {
-    let rules = built_in_rules().await;
-    let rule = rules
-        .iter()
-        .find(|rule| rule.metric.as_deref() == Some("disk.inodes"))
-        .unwrap();
-    assert_eq!(rule.name, "Disk running out of inodes");
-    assert_eq!(rule.kind, RuleKind::Metric);
-    assert_eq!(
-        rule.levels(),
-        [(Severity::Warning, 80.0), (Severity::Critical, 90.0)]
-    );
-    assert_eq!(rule.comparison, Some(Comparison::Above));
-    assert_eq!(rule.series, None);
+    let rule = built_in("Disk running out of inodes").await;
+    assert_eq!(rule.warning.as_deref(), Some("disk.inodes > 80"));
+    assert_eq!(rule.critical.as_deref(), Some("disk.inodes > 90"));
     assert_eq!(rule.hold, TimeDelta::seconds(300));
     assert!(rule.enabled);
     assert!(rule.all_channels);
-    check_rule(rule).unwrap();
+    check_rule(&rule).unwrap();
 }
 
 /// Marks everything due as sent, as if it had been delivered, and says what it was.
@@ -1082,7 +1239,7 @@ async fn one_disk_alert_is_a_warning_then_critical_then_a_warning_again_until_it
     // The test store gives every metric the same reading, so only the disk space
     // rule is added.
     for rule in built_in_rules().await {
-        if rule.kind == RuleKind::Metric && rule.metric.as_deref() == Some("disk.usage") {
+        if rule.name == "Disk filling up" {
             test.database().create_alert_rule(&rule).await.unwrap();
         }
     }
@@ -1094,7 +1251,7 @@ async fn one_disk_alert_is_a_warning_then_critical_then_a_warning_again_until_it
     assert_eq!(open.len(), 1);
     let alert = &open[0];
     assert_eq!(alert.severity, Severity::Warning);
-    assert!(alert.summary.contains("above 80%"), "{}", alert.summary);
+    assert_eq!(alert.summary, "Disk filling up on web-1: / is 85%");
     assert_eq!(deliver_all(&test).await, [Event::Firing]);
     test.database()
         .acknowledge_alert(alert.id, "sam", test.now)
@@ -1106,7 +1263,7 @@ async fn one_disk_alert_is_a_warning_then_critical_then_a_warning_again_until_it
     assert_eq!(open.len(), 1, "one alert, not a warning and a critical one");
     assert_eq!(open[0].id, alert.id);
     assert_eq!(open[0].severity, Severity::Critical);
-    assert!(open[0].summary.contains("above 90%"), "{}", open[0].summary);
+    assert_eq!(open[0].summary, "Disk filling up on web-1: / is 95%");
     assert_eq!(
         open[0].acknowledged_by, None,
         "worse needs acknowledging again"
@@ -1127,9 +1284,8 @@ async fn one_disk_alert_is_a_warning_then_critical_then_a_warning_again_until_it
 async fn a_channel_not_told_yet_hears_of_the_alert_as_it_is_when_it_does() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
-        metric: Some("disk.usage".to_string()),
-        threshold: Some(90.0),
-        warning_threshold: Some(80.0),
+        warning: Some("disk.usage > 80".to_string()),
+        critical: Some("disk.usage > 90".to_string()),
         hold: TimeDelta::seconds(0),
         all_channels: true,
         ..cpu_rule()
@@ -1187,7 +1343,7 @@ async fn a_critical_only_channel_hears_of_an_alert_once_it_is_critical() {
     // The test store gives every metric the same reading, so only the disk space
     // rule is added.
     for rule in built_in_rules().await {
-        if rule.kind == RuleKind::Metric && rule.metric.as_deref() == Some("disk.usage") {
+        if rule.name == "Disk filling up" {
             test.database().create_alert_rule(&rule).await.unwrap();
         }
     }
@@ -1227,9 +1383,8 @@ async fn a_warnings_only_channel_follows_a_warning_that_goes_critical_but_not_on
 {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
-        metric: Some("disk.usage".to_string()),
-        threshold: Some(90.0),
-        warning_threshold: Some(80.0),
+        warning: Some("disk.usage > 80".to_string()),
+        critical: Some("disk.usage > 90".to_string()),
         hold: TimeDelta::seconds(0),
         all_channels: true,
         ..cpu_rule()
@@ -1258,9 +1413,8 @@ async fn a_warnings_only_channel_follows_a_warning_that_goes_critical_but_not_on
 async fn a_pager_is_not_sent_an_alert_that_eased_before_it_went() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
-        metric: Some("disk.usage".to_string()),
-        threshold: Some(90.0),
-        warning_threshold: Some(80.0),
+        warning: Some("disk.usage > 80".to_string()),
+        critical: Some("disk.usage > 90".to_string()),
         hold: TimeDelta::seconds(0),
         all_channels: true,
         ..cpu_rule()
@@ -1330,7 +1484,10 @@ async fn alerts_lead_with_the_host_and_keep_its_id_for_hovering() {
         .body
         .find(r#"class="host-name problem-host""#)
         .unwrap();
-    let summary = overview.body.find("CPU usage on web-1 is 95%").unwrap();
+    let summary = overview
+        .body
+        .find("High CPU on web-1: CPU usage is 95%")
+        .unwrap();
     assert!(hostname < summary, "{}", overview.body);
     assert!(overview.body.contains("os-linux"));
 }
@@ -1552,10 +1709,7 @@ async fn a_stopped_process_alerts_from_what_an_agent_really_sends() {
     let mut client = server.connect_approved(&host, "web-1").await;
     let rule = AlertRuleInput {
         name: "nginx down".to_string(),
-        metric: Some("process.count".to_string()),
-        series: Some("nginx".to_string()),
-        comparison: Some(Comparison::Below),
-        threshold: Some(1.0),
+        critical: Some("series == 'nginx' && process.count < 1".to_string()),
         hold: TimeDelta::seconds(0),
         ..cpu_rule()
     };
@@ -1619,10 +1773,7 @@ async fn a_stopped_process_alerts_from_what_an_agent_really_sends() {
 
     let open = server.state.database.open_alerts().await.unwrap();
     assert_eq!(open.len(), 1, "only the rule's own process");
-    assert_eq!(
-        open[0].summary,
-        "Running processes (nginx) on web-1 is 0, below 1"
-    );
+    assert_eq!(open[0].summary, "nginx down on web-1: nginx is 0");
 }
 
 #[tokio::test]
@@ -1933,7 +2084,9 @@ async fn charts_keep_the_catalog_order_however_their_queries_finish() {
 fn no_metrics_rule() -> AlertRuleInput {
     AlertRuleInput {
         name: "Silent".to_string(),
-        kind: RuleKind::NoMetrics,
+        critical: Some("!reporting".to_string()),
+        summary: Some("{{ host }} is connected but sending no metrics".to_string()),
+        resolved_summary: Some("{{ host }} is sending metrics again".to_string()),
         hold: TimeDelta::minutes(5),
         ..offline_rule()
     }
@@ -2074,8 +2227,11 @@ async fn a_no_metrics_alert_lasts_while_the_agent_is_away_and_after_it_reconnect
     test.evaluate_at(back + MINUTE, None).await;
     assert_eq!(test.open().await.len(), 1);
 
-    test.evaluate_at(back + MINUTE * 2, Some(back + MINUTE))
-        .await;
+    test.evaluate_at(
+        back + MINUTE * 2,
+        Some(back + MINUTE + TimeDelta::seconds(30)),
+    )
+    .await;
     assert!(test.open().await.is_empty());
     assert_eq!(test.resolved().await.len(), 1);
 }
@@ -2215,19 +2371,13 @@ async fn an_agent_that_sends_seldom_has_a_few_of_its_intervals_to_send_in() {
 
 #[tokio::test]
 async fn every_server_starts_with_a_rule_for_agents_sending_no_metrics() {
-    let rules = built_in_rules().await;
-    let rule = rules
-        .iter()
-        .find(|rule| rule.kind == RuleKind::NoMetrics)
-        .unwrap();
-
-    assert_eq!(rule.name, "Host sending no metrics");
+    let rule = built_in("Host sending no metrics").await;
+    assert_eq!(rule.critical.as_deref(), Some("!reporting"));
     assert_eq!(rule.hold, TimeDelta::minutes(5));
-    assert_eq!(rule.severity, Severity::Critical);
     assert!(rule.enabled);
     assert!(rule.all_channels);
-    assert_eq!(rule.condition, None);
-    check_rule(rule).unwrap();
+    assert_eq!(rule.applies_to, None);
+    check_rule(&rule).unwrap();
 }
 
 /// Waits until the store has the server's reading of a host's clock.
@@ -2252,11 +2402,7 @@ async fn an_agent_whose_samples_are_all_refused_alerts_until_they_are_stored_aga
     let server = start_with_metrics().await;
     let host = identity();
     let mut client = server.connect_approved(&host, "web-1").await;
-    let rule = built_in_rules()
-        .await
-        .into_iter()
-        .find(|rule| rule.kind == RuleKind::NoMetrics)
-        .unwrap();
+    let rule = built_in("Host sending no metrics").await;
     server
         .state
         .database
@@ -2461,10 +2607,10 @@ async fn a_webhook_hears_about_an_alert_starting_and_ending_once_each() {
     assert_eq!(received[0]["version"], 1);
     assert_eq!(received[0]["alert"]["hostname"], "web-1");
     assert_eq!(received[0]["alert"]["severity"], "critical");
-    assert_eq!(received[0]["text"], "CPU usage on web-1 is 95%, above 90%");
+    assert_eq!(received[0]["text"], "High CPU on web-1: CPU usage is 95%");
     assert_eq!(
         received[1]["text"],
-        "Resolved: CPU usage on web-1 is now 10%, no longer above 90%"
+        "Resolved: High CPU on web-1: CPU usage is now 10%"
     );
     assert_eq!(
         received[1]["alert"]["resolve_reason"],
@@ -2472,11 +2618,11 @@ async fn a_webhook_hears_about_an_alert_starting_and_ending_once_each() {
     );
     assert_eq!(
         received[1]["alert"]["resolved_summary"],
-        "CPU usage on web-1 is now 10%, no longer above 90%"
+        "High CPU on web-1: CPU usage is now 10%"
     );
     assert_eq!(
         received[1]["alert"]["summary"],
-        "CPU usage on web-1 is 95%, above 90%"
+        "High CPU on web-1: CPU usage is 95%"
     );
     assert_ne!(received[0]["id"], received[1]["id"]);
 }
@@ -2514,7 +2660,7 @@ async fn a_discord_channel_gets_discords_message_format() {
     assert_eq!(
         received[0],
         json!({
-            "content": "🔴 **CRITICAL** CPU usage on web-1 is 95%, above 90%",
+            "content": "🔴 **CRITICAL** High CPU on web-1: CPU usage is 95%",
             "allowed_mentions": { "parse": [] },
         })
     );
@@ -2583,7 +2729,7 @@ async fn a_teams_channel_gets_an_adaptive_card() {
     assert_eq!(card["type"], "AdaptiveCard", "{}", received[0]);
     assert_eq!(
         card["body"][1]["text"],
-        "CPU usage on web-1 is 95%, above 90%"
+        "High CPU on web-1: CPU usage is 95%"
     );
 }
 
@@ -2857,7 +3003,7 @@ async fn an_alert_opens_and_closes_in_alertops() {
     assert_eq!(events.len(), 2, "{events:?}");
     assert_eq!(events[0]["status"], "open");
     assert_eq!(events[0]["subject"], "High CPU");
-    assert_eq!(events[0]["message"], "CPU usage on web-1 is 95%, above 90%");
+    assert_eq!(events[0]["message"], "High CPU on web-1: CPU usage is 95%");
     assert_eq!(events[0]["severity"], "critical");
     assert_eq!(events[0]["hostname"], "web-1");
     assert_eq!(events[0]["link"], "https://monitor.example.com/alerts");
@@ -2880,7 +3026,7 @@ async fn an_alert_opens_and_closes_in_signl4() {
     assert_eq!(events.len(), 2, "{events:?}");
     assert_eq!(events[0]["X-S4-Status"], "new");
     assert_eq!(events[0]["Title"], "High CPU");
-    assert_eq!(events[0]["Message"], "CPU usage on web-1 is 95%, above 90%");
+    assert_eq!(events[0]["Message"], "High CPU on web-1: CPU usage is 95%");
     assert_eq!(events[0]["Severity"], "critical");
     assert_eq!(events[0]["Link"], "https://monitor.example.com/alerts");
     assert_eq!(events[1]["X-S4-Status"], "resolved");
@@ -3026,7 +3172,7 @@ async fn an_alert_opens_a_pagerduty_incident() {
     assert_eq!(event["event_action"], "trigger");
     assert_eq!(
         event["payload"]["summary"],
-        "CPU usage on web-1 is 95%, above 90%"
+        "High CPU on web-1: CPU usage is 95%"
     );
     assert_eq!(event["payload"]["source"], "web-1");
     assert_eq!(event["payload"]["severity"], "critical");
@@ -3265,7 +3411,7 @@ async fn an_alert_posts_to_telegram_and_resolving_replies_to_it() {
     assert_eq!(firing["parse_mode"], "HTML");
     let text = firing["text"].as_str().unwrap();
     assert!(
-        text.starts_with("<b>CRITICAL</b> CPU usage on web-1 is 95%, above 90%"),
+        text.starts_with("<b>CRITICAL</b> High CPU on web-1: CPU usage is 95%"),
         "{text}"
     );
     assert!(firing.get("reply_parameters").is_none());
@@ -3831,7 +3977,7 @@ async fn an_alert_posts_to_slack_with_the_bot_token() {
     assert_eq!(method, "post");
     assert_eq!(auth, "Bearer xoxb-secret-token");
     assert_eq!(body["channel"], "#alerts");
-    assert_eq!(body["text"], "CPU usage on web-1 is 95%, above 90%");
+    assert_eq!(body["text"], "High CPU on web-1: CPU usage is 95%");
     assert_eq!(body["attachments"][0]["color"], "#b3261e");
     assert_eq!(body["unfurl_links"], false);
     assert_eq!(body["unfurl_media"], false);
@@ -3870,10 +4016,7 @@ async fn resolving_updates_the_slack_message_and_replies_in_its_thread() {
     assert_eq!(update["attachments"][0]["color"], "#0b6b4b");
     let reply = &calls[2].2;
     assert_eq!(reply["thread_ts"], "1700000000.000100");
-    assert_eq!(
-        reply["text"],
-        "CPU usage on web-1 is now 10%, no longer above 90%"
-    );
+    assert_eq!(reply["text"], "High CPU on web-1: CPU usage is now 10%");
 }
 
 #[tokio::test]
@@ -4498,7 +4641,7 @@ async fn email_channels_send_a_message_to_every_address() {
     assert!(heard.contains("RCPT TO:<a@example.com>"), "{heard}");
     assert!(heard.contains("RCPT TO:<b@example.com>"), "{heard}");
     assert!(
-        heard.contains("Subject: [MaxNines CRITICAL] CPU usage on web-1 is 95%, above 90%"),
+        heard.contains("Subject: [MaxNines CRITICAL] High CPU on web-1: CPU usage is 95%"),
         "{heard}"
     );
     assert!(heard.contains("Rule: High CPU"), "{heard}");
@@ -4673,7 +4816,7 @@ async fn resend_channels_send_through_the_api_with_the_key() {
     assert!(lower.contains("user-agent: maxnines/"), "{heard}");
     assert!(heard.contains(r#""to":["a@example.com"]"#), "{heard}");
     assert!(
-        heard.contains("[MaxNines CRITICAL] CPU usage on web-1 is 95%"),
+        heard.contains("[MaxNines CRITICAL] High CPU on web-1: CPU usage is 95%"),
         "{heard}"
     );
     assert!(due(&test, test.now + MINUTE * 10).await.is_empty());
@@ -4705,15 +4848,13 @@ async fn a_resend_refusal_says_what_to_check_without_the_key() {
 
 // ---- pages
 
-const ALERT_RULE_FIELDS: [(&str, &str); 9] = [
+const ALERT_RULE_FIELDS: [(&str, &str); 7] = [
     ("name", "High CPU"),
-    ("kind", "metric"),
+    ("warning", ""),
+    ("critical", "cpu.usage > 90"),
+    ("calculation", ""),
     ("metric", "cpu.usage"),
-    ("comparison", "above"),
-    ("critical_threshold", "90"),
-    ("series", ""),
     ("for_secs", "120"),
-    ("severity", "critical"),
     ("enabled", "on"),
 ];
 
@@ -4779,20 +4920,25 @@ async fn an_alert_rule_can_be_created_changed_and_deleted_from_the_form() {
 
     let list = browser.get(&server, "/alerts/rules").await;
     assert!(
-        list.body.contains("CPU usage above 90% for 2 minutes"),
+        list.body.contains(
+            r#"<span class="badge bad">Critical</span> <code>cpu.usage &gt; 90</code></div><div class="hint">for 2 minutes</div>"#
+        ),
         "{}",
         list.body
     );
     assert!(list.body.contains("Every host"));
 
     let mut fields = ALERT_RULE_FIELDS.to_vec();
-    fields[4] = ("critical_threshold", "75.5");
+    fields[2] = ("critical", "cpu.usage > 75.5");
     let path = format!("/alerts/rules/{id}");
     let edit = format!("/alerts/rules/{id}/edit");
     let page = browser.submit(&server, &edit, &path, &fields).await;
     assert_eq!(page.status, 303, "{}", page.body);
     let rule = server.state.database.get_alert_rule(id).await.unwrap();
-    assert_eq!(rule.unwrap().rule.threshold, Some(75.5));
+    assert_eq!(
+        rule.unwrap().rule.critical.as_deref(),
+        Some("cpu.usage > 75.5")
+    );
 
     let page = browser
         .submit(&server, &edit, &format!("/alerts/rules/{id}/delete"), &[])
@@ -4814,7 +4960,7 @@ async fn a_rule_can_warn_first_and_go_critical_later_from_the_form() {
     let server = start().await;
     let mut browser = Browser::default();
     let mut fields = ALERT_RULE_FIELDS.to_vec();
-    fields.push(("warning_threshold", "80"));
+    fields[1] = ("warning", "cpu.usage > 80");
 
     let page = browser
         .submit(&server, "/alerts/rules/new", "/alerts/rules", &fields)
@@ -4822,27 +4968,30 @@ async fn a_rule_can_warn_first_and_go_critical_later_from_the_form() {
     assert_eq!(page.status, 303, "{}", page.body);
     let rules = server.state.database.list_alert_rules().await.unwrap();
     assert_eq!(
-        rules[0].rule.levels(),
+        rules[0].rule.thresholds(),
         [(Severity::Warning, 80.0), (Severity::Critical, 90.0)]
     );
 
     let list = browser.get(&server, "/alerts/rules").await;
     assert!(
-        list.body
-            .contains("CPU usage above 80% (warning), 90% (critical) for 2 minutes"),
+        list.body.contains(
+            r#"<span class="badge warn">Warning</span> <code>cpu.usage &gt; 80</code></div><div class="condition"><span class="badge bad">Critical</span> <code>cpu.usage &gt; 90</code>"#
+        ),
         "{}",
         list.body
     );
-    assert!(list.body.contains(
-        r#"<span class="badge warn">Warning</span> <span class="badge bad">Critical</span>"#
-    ));
 
     let edit = format!("/alerts/rules/{}/edit", rules[0].id);
     let form = browser.get(&server, &edit).await;
-    assert!(form.body.contains(r#"name="warning_threshold" value="80""#));
     assert!(
         form.body
-            .contains(r#"name="critical_threshold" value="90""#)
+            .contains(r#"name="warning" value="cpu.usage &gt; 80""#),
+        "{}",
+        form.body
+    );
+    assert!(
+        form.body
+            .contains(r#"name="critical" value="cpu.usage &gt; 90""#)
     );
 }
 
@@ -4852,9 +5001,10 @@ async fn an_offline_rule_can_be_made_from_the_form() {
     let mut browser = Browser::default();
     let mut fields = ALERT_RULE_FIELDS.to_vec();
     fields[0] = ("name", "Gone");
-    fields[1] = ("kind", "offline");
-    fields[4] = ("critical_threshold", "");
-    fields[6] = ("for_secs", "60");
+    fields[2] = ("critical", "!online");
+    fields[5] = ("for_secs", "60");
+    fields.push(("summary", "{{ host }} is offline"));
+    fields.push(("resolved_summary", "{{ host }} is back online"));
 
     let page = browser
         .submit(&server, "/alerts/rules/new", "/alerts/rules", &fields)
@@ -4868,17 +5018,12 @@ async fn an_offline_rule_can_be_made_from_the_form() {
 async fn a_no_metrics_rule_can_be_made_from_the_form() {
     let server = start().await;
     let mut browser = Browser::default();
-    let form = browser.get(&server, "/alerts/rules/new").await;
-    assert!(
-        form.body.contains(r#"<option value="no_metrics">"#),
-        "{}",
-        form.body
-    );
     let mut fields = ALERT_RULE_FIELDS.to_vec();
     fields[0] = ("name", "Silent");
-    fields[1] = ("kind", "no_metrics");
-    fields[4] = ("critical_threshold", "");
-    fields[6] = ("for_secs", "300");
+    fields[2] = ("critical", "!reporting");
+    fields[5] = ("for_secs", "300");
+    fields.push(("summary", "{{ host }} is connected but sending no metrics"));
+    fields.push(("resolved_summary", "{{ host }} is sending metrics again"));
 
     let page = browser
         .submit(&server, "/alerts/rules/new", "/alerts/rules", &fields)
@@ -4889,7 +5034,8 @@ async fn a_no_metrics_rule_can_be_made_from_the_form() {
 
     let list = browser.get(&server, "/alerts/rules").await;
     assert!(
-        list.body.contains("Sending no metrics for 5 minutes"),
+        list.body
+            .contains(r#"<code>!reporting</code></div><div class="hint">for 5 minutes</div>"#),
         "{}",
         list.body
     );
@@ -4897,8 +5043,7 @@ async fn a_no_metrics_rule_can_be_made_from_the_form() {
         .get(&server, &format!("/alerts/rules/{}/edit", rules[0].id))
         .await;
     assert!(
-        edit.body
-            .contains(r#"<option value="no_metrics" selected>"#),
+        edit.body.contains(r#"name="critical" value="!reporting""#),
         "{}",
         edit.body
     );
@@ -4910,20 +5055,21 @@ async fn a_rejected_rule_keeps_what_was_typed_and_says_why() {
     let mut browser = Browser::default();
     let mut fields = ALERT_RULE_FIELDS.to_vec();
     fields[0] = ("name", "Typed name");
-    fields[4] = ("critical_threshold", "lots");
+    fields[2] = ("critical", "cpu.usag > 90");
 
     let page = browser
         .submit(&server, "/alerts/rules/new", "/alerts/rules", &fields)
         .await;
     assert_eq!(page.status, 422);
     assert!(
-        page.body
-            .contains("the critical threshold must be a number"),
+        page.body.contains(
+            "the critical condition: there&#39;s no metric called cpu.usag: did you mean cpu.usage?"
+        ),
         "{}",
         page.body
     );
     assert!(page.body.contains(r#"value="Typed name""#));
-    assert!(page.body.contains(r#"value="lots""#));
+    assert!(page.body.contains(r#"value="cpu.usag &gt; 90""#));
     assert!(
         server
             .state
@@ -4992,7 +5138,7 @@ async fn the_condition_builder_works_on_alert_rules() {
     assert_eq!(page.status, 303, "{}", page.body);
     let rules = server.state.database.list_alert_rules().await.unwrap();
     assert_eq!(
-        rules[0].rule.condition.as_deref(),
+        rules[0].rule.applies_to.as_deref(),
         Some(r#"facts.custom.role == "web""#)
     );
 }
@@ -5071,7 +5217,7 @@ async fn a_rule_can_tell_every_channel_from_the_form() {
     assert!(page.body.contains("not both"), "{}", page.body);
 
     let body = json!({
-        "name": "Gone", "kind": "offline", "for_secs": 300, "severity": "critical",
+        "name": "Gone", "critical": "!online", "for_secs": 300,
         "all_channels": true,
     });
     let (status, created) = api(&server, "POST", "/api/v1/alert-rules", &body).await;
@@ -5087,7 +5233,7 @@ async fn a_rule_can_tell_every_channel_from_the_form() {
 async fn the_api_refuses_a_name_another_rule_or_channel_has() {
     let server = start().await;
     let rule = json!({
-        "name": "Gone", "kind": "offline", "for_secs": 300, "severity": "critical",
+        "name": "Gone", "critical": "!online", "for_secs": 300,
     });
     let (status, _) = api(&server, "POST", "/api/v1/alert-rules", &rule).await;
     assert_eq!(status, 201);
@@ -5407,7 +5553,7 @@ async fn the_alerts_page_shows_what_is_firing_and_what_ended() {
     test.cpu(TimeDelta::zero(), 95.0).await;
     let page = browser.get(&test.server, "/alerts").await;
     assert!(!page.body.contains("No alerts are open."));
-    assert!(page.body.contains("CPU usage on web-1 is 95%, above 90%"));
+    assert!(page.body.contains("High CPU on web-1: CPU usage is 95%"));
     assert!(page.body.contains("Critical"));
 
     test.cpu(MINUTE, 10.0).await;
@@ -5415,7 +5561,7 @@ async fn the_alerts_page_shows_what_is_firing_and_what_ended() {
     assert!(page.body.contains("No alerts are open."));
     assert!(
         page.body
-            .contains("CPU usage on web-1 is now 10%, no longer above 90%"),
+            .contains("High CPU on web-1: CPU usage is now 10%"),
         "{}",
         page.body
     );
@@ -5639,12 +5785,9 @@ async fn alert_rules_can_be_managed_through_the_api() {
     let server = start().await;
     let rule = json!({
         "name": "High CPU",
-        "kind": "metric",
-        "metric": "cpu.usage",
-        "comparison": "above",
-        "threshold": 90,
+        "critical": "cpu.usage > 90",
+        "summary": "{{ host }} is busy",
         "for_secs": 120,
-        "severity": "critical",
     });
 
     let (status, created) = api(&server, "POST", "/api/v1/alert-rules", &rule).await;
@@ -5656,11 +5799,16 @@ async fn alert_rules_can_be_managed_through_the_api() {
     assert_eq!(shown["name"], "High CPU");
     assert_eq!(shown["enabled"], true);
 
+    assert_eq!(shown["critical"], "cpu.usage > 90");
+    assert_eq!(shown["warning"], Value::Null);
+    assert_eq!(shown["summary"], "{{ host }} is busy");
+    assert_eq!(shown["applies_to"], Value::Null);
+
     let mut changed = rule.clone();
-    changed["threshold"] = json!(50);
+    changed["warning"] = json!("cpu.usage > 50");
     assert_eq!(api(&server, "PUT", &path, &changed).await.0, 204);
     let (_, shown) = api(&server, "GET", &path, &Value::Null).await;
-    assert_eq!(shown["threshold"], 50.0);
+    assert_eq!(shown["warning"], "cpu.usage > 50");
 
     let (status, list) = api(&server, "GET", "/api/v1/alert-rules", &Value::Null).await;
     assert_eq!(status, 200);
@@ -5684,16 +5832,15 @@ async fn a_no_metrics_rule_can_be_managed_through_the_api() {
     let server = start().await;
     let rule = json!({
         "name": "Silent",
-        "kind": "no_metrics",
+        "critical": "!reporting",
         "for_secs": 300,
-        "severity": "critical",
     });
 
     let (status, created) = api(&server, "POST", "/api/v1/alert-rules", &rule).await;
     assert_eq!(status, 201, "{created}");
     let path = format!("/api/v1/alert-rules/{}", created["id"]);
     let (_, shown) = api(&server, "GET", &path, &Value::Null).await;
-    assert_eq!(shown["kind"], "no_metrics");
+    assert_eq!(shown["critical"], "!reporting");
     assert_eq!(shown["for_secs"], 300);
     assert_eq!(shown["metric"], Value::Null);
 
@@ -5706,7 +5853,7 @@ async fn a_no_metrics_rule_can_be_managed_through_the_api() {
         body["error"]
             .as_str()
             .unwrap()
-            .contains("a no-metrics rule doesn't take a metric"),
+            .contains("only a rule with a calculation takes a metric"),
         "{body}"
     );
 }
@@ -5716,22 +5863,35 @@ async fn the_api_refuses_bad_rules_and_says_why() {
     let server = start().await;
     let rule = json!({
         "name": "Bad",
-        "kind": "metric",
-        "metric": "nonsense",
-        "comparison": "above",
-        "threshold": 1,
+        "warning": "nonsense.metric > 1",
         "for_secs": 0,
-        "severity": "warning",
     });
     let (status, body) = api(&server, "POST", "/api/v1/alert-rules", &rule).await;
     assert_eq!(status, 422);
     assert!(
-        body["error"].as_str().unwrap().contains("unknown metric"),
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("the warning condition: nonsense.metric isn't a metric"),
+        "{body}"
+    );
+    let rule = json!({
+        "name": "Bad",
+        "warning": "clock.difference > 30",
+        "for_secs": 0,
+    });
+    let (status, body) = api(&server, "POST", "/api/v1/alert-rules", &rule).await;
+    assert_eq!(status, 422);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("can't compare a length of time with a number"),
         "{body}"
     );
 
     let mut rule = rule;
-    rule["metric"] = json!("cpu.usage");
+    rule["warning"] = json!("cpu.usage > 1");
     rule["channels"] = json!([42]);
     let (status, body) = api(&server, "POST", "/api/v1/alert-rules", &rule).await;
     assert_eq!(status, 422);
@@ -6081,9 +6241,7 @@ mod remote {
             .unwrap();
         let rule = AlertRuleInput {
             name: "Check failing".to_string(),
-            metric: Some("check.up".to_string()),
-            comparison: Some(Comparison::Below),
-            threshold: Some(1.0),
+            critical: Some("check.up < 1".to_string()),
             hold: TimeDelta::seconds(0),
             ..cpu_rule()
         };
@@ -6115,10 +6273,7 @@ mod remote {
         let open = server.state.database.open_alerts().await.unwrap();
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].host_id, LOCAL_HOST_ID);
-        assert_eq!(
-            open[0].summary,
-            "Checks passing (db) on MaxNines server is 0, below 1"
-        );
+        assert_eq!(open[0].summary, "Check failing on MaxNines server: db is 0");
     }
 
     #[tokio::test]
@@ -7532,12 +7687,8 @@ mod reminders {
         let mut browser = Browser::default();
         let fields = [
             ("name", "Busy"),
-            ("kind", "metric"),
-            ("metric", "cpu.usage"),
-            ("comparison", "above"),
-            ("critical_threshold", "90"),
+            ("warning", "cpu.usage > 90"),
             ("for_secs", "60"),
-            ("severity", "warning"),
             ("enabled", "on"),
             ("remind_every_minutes", "30"),
         ];
@@ -7566,12 +7717,8 @@ mod reminders {
         let mut browser = Browser::default();
         let fields = [
             ("name", "Busy"),
-            ("kind", "metric"),
-            ("metric", "cpu.usage"),
-            ("comparison", "above"),
-            ("critical_threshold", "90"),
+            ("warning", "cpu.usage > 90"),
             ("for_secs", "60"),
-            ("severity", "warning"),
             ("remind_every_minutes", "1"),
         ];
 
@@ -7868,9 +8015,7 @@ mod pages {
         let mut client = server.connect_approved(&host, "web-1").await;
         let rule = AlertRuleInput {
             name: "Rebooted".to_string(),
-            metric: Some("host.uptime".to_string()),
-            comparison: Some(Comparison::Below),
-            threshold: Some(600.0),
+            critical: Some("host.uptime < duration('10m')".to_string()),
             hold: TimeDelta::seconds(0),
             ..cpu_rule()
         };
@@ -7905,7 +8050,7 @@ mod pages {
             .unwrap();
 
         let open = server.state.database.open_alerts().await.unwrap();
-        assert_eq!(open[0].summary, "Uptime on web-1 is 1.5 m, below 10 m");
+        assert_eq!(open[0].summary, "Rebooted on web-1: Uptime is 1.5 m");
     }
 
     #[tokio::test]
@@ -7915,9 +8060,7 @@ mod pages {
         let mut client = server.connect_approved(&host, "web-1").await;
         let rule = AlertRuleInput {
             name: "Agent restarted".to_string(),
-            metric: Some("agent.uptime".to_string()),
-            comparison: Some(Comparison::Below),
-            threshold: Some(600.0),
+            critical: Some("agent.uptime < duration('10m')".to_string()),
             hold: TimeDelta::seconds(0),
             ..cpu_rule()
         };
@@ -7954,7 +8097,7 @@ mod pages {
         let open = server.state.database.open_alerts().await.unwrap();
         assert_eq!(
             open[0].summary,
-            "Agent uptime on web-1 is 1.5 m, below 10 m"
+            "Agent restarted on web-1: Agent uptime is 1.5 m"
         );
     }
 
@@ -8371,9 +8514,8 @@ mod charts {
         let database = &server.state.database;
         let rule = AlertRuleInput {
             name: format!("Disk {series}"),
-            metric: Some("disk.usage".to_string()),
-            threshold: Some(90.0),
-            warning_threshold: Some(80.0),
+            warning: Some("disk.usage > 80".to_string()),
+            critical: Some("disk.usage > 90".to_string()),
             hold: TimeDelta::seconds(0),
             channels: channels.to_vec(),
             ..cpu_rule()
@@ -9200,12 +9342,16 @@ async fn forecast_at(
 #[tokio::test]
 async fn the_built_in_forecast_warns_a_day_ahead_and_goes_critical_four_hours_ahead() {
     let mut test = Harness::start().await;
-    let built_in = built_in_rules().await;
-    let forecast = built_in
-        .iter()
-        .find(|rule| rule.name == DISK_FORECAST)
-        .unwrap();
-    test.database().create_alert_rule(forecast).await.unwrap();
+    let forecast = built_in(DISK_FORECAST).await;
+    assert_eq!(
+        forecast.warning.as_deref(),
+        Some("forecast(disk.usage, duration('24h')) >= 100")
+    );
+    assert_eq!(
+        forecast.critical.as_deref(),
+        Some("forecast(disk.usage, duration('4h')) >= 100")
+    );
+    test.database().create_alert_rule(&forecast).await.unwrap();
 
     // Ten hours from full is a warning, once it's lasted half an hour.
     assert!(forecast_at(&mut test, 0, 90.0, 1.0).await.is_empty());
@@ -9216,10 +9362,7 @@ async fn the_built_in_forecast_warns_a_day_ahead_and_goes_critical_four_hours_ah
     assert_eq!(open[0].severity, Severity::Warning);
     assert_eq!(open[0].series.as_deref(), Some("/"));
     assert_eq!(open[0].value, Some(90.0));
-    assert_eq!(
-        open[0].summary,
-        "Disk usage (/) on web-1 is 90% and rising by 1% an hour, so it reaches 100% in about 10 hours"
-    );
+    assert_eq!(open[0].summary, "Disk will be full soon on web-1: / is 90%");
 
     // Readings are only fetched every 5 minutes, so faster filling shows then.
     let open = forecast_at(&mut test, 31, 91.0, 3.0).await;
@@ -9227,10 +9370,7 @@ async fn the_built_in_forecast_warns_a_day_ahead_and_goes_critical_four_hours_ah
     assert!(forecast_at(&mut test, 35, 91.0, 3.0).await[0].severity == Severity::Warning);
     let open = forecast_at(&mut test, 65, 92.0, 3.0).await;
     assert_eq!(open[0].severity, Severity::Critical);
-    assert_eq!(
-        open[0].summary,
-        "Disk usage (/) on web-1 is 92% and rising by 3% an hour, so it reaches 100% in about 3 hours"
-    );
+    assert_eq!(open[0].summary, "Disk will be full soon on web-1: / is 92%");
 
     // Once it stops filling, the alert ends.
     assert!(forecast_at(&mut test, 70, 92.0, 0.0).await.is_empty());
@@ -9241,20 +9381,7 @@ async fn the_built_in_forecast_warns_a_day_ahead_and_goes_critical_four_hours_ah
     );
     assert_eq!(
         resolved[0].resolved_summary.as_deref(),
-        Some("Disk usage (/) on web-1 is now 92% and steady")
-    );
-
-    // Filling slowly is no alert, but the end says when it would be full.
-    let open = forecast_at(&mut test, 100, 93.0, 1.0).await;
-    assert!(open.is_empty(), "{open:?}");
-    assert!(forecast_at(&mut test, 130, 93.0, 1.0).await.len() == 1);
-    assert!(forecast_at(&mut test, 135, 93.0, 0.2).await.is_empty());
-    let resolved = test.resolved().await;
-    assert_eq!(
-        resolved[0].resolved_summary.as_deref(),
-        Some(
-            "Disk usage (/) on web-1 is now 93% and rising by 0.2% an hour, so it reaches 100% in about 35 hours, no longer within 1 day"
-        )
+        Some("Disk will be full soon on web-1: / is now 92%")
     );
 }
 
@@ -9263,15 +9390,10 @@ async fn the_built_in_forecast_warns_a_day_ahead_and_goes_critical_four_hours_ah
 async fn quick_forecast(test: &Harness) -> i64 {
     let rule = AlertRuleInput {
         name: "Filling now".to_string(),
-        kind: RuleKind::Forecast,
-        metric: Some("disk.usage".to_string()),
-        comparison: Some(Comparison::Above),
-        threshold: Some(100.0),
-        warning_threshold: None,
+        critical: Some("forecast(disk.usage, duration('4h')) >= 100".to_string()),
+        summary: Some("{{ host }}: {{ series }} is {{ disk.usage }}".to_string()),
         hold: TimeDelta::seconds(0),
-        severity: Severity::Critical,
         window: Some(TimeDelta::seconds(6 * 3600)),
-        forecast: Some(TimeDelta::seconds(4 * 3600)),
         ..cpu_rule()
     };
     test.database().create_alert_rule(&rule).await.unwrap()
@@ -9304,10 +9426,7 @@ async fn a_forecast_needs_enough_recent_readings_to_trust() {
     let open = forecast_at(&mut test, 15, 95.0, 5.0).await;
     assert_eq!(open.len(), 1);
     assert_eq!(open[0].rule_name, "Filling now");
-    assert_eq!(
-        open[0].summary,
-        "Disk usage (/) on web-1 is 95% and rising by 5% an hour, so it reaches 100% in about 1 hour"
-    );
+    assert_eq!(open[0].summary, "web-1: / is 95%");
 }
 
 #[tokio::test]
@@ -9316,10 +9435,7 @@ async fn a_full_disk_is_already_there_and_a_falling_one_is_not_heading_there() {
     quick_forecast(&test).await;
     assert!(forecast_at(&mut test, 0, 60.0, -5.0).await.is_empty());
     let open = forecast_at(&mut test, 5, 100.0, 0.0).await;
-    assert_eq!(
-        open[0].summary,
-        "Disk usage (/) on web-1 is 100%, already above 100%"
-    );
+    assert_eq!(open.len(), 1);
 }
 
 #[tokio::test]
@@ -9327,16 +9443,18 @@ async fn a_forecast_rule_can_be_made_on_the_form_and_through_the_api() {
     let server = start().await;
     let fields = [
         ("name", "Logs filling"),
-        ("kind", "forecast"),
-        ("metric", "disk.usage"),
-        ("comparison", "above"),
-        ("series", "/var*"),
-        ("level", "95"),
-        ("warning_within_hours", "48"),
-        ("critical_within_hours", "2.5"),
-        ("forecast_window_hours", "12"),
+        (
+            "warning",
+            "series.startsWith('/var') && forecast(disk.usage, duration('48h')) >= 95",
+        ),
+        (
+            "critical",
+            "series.startsWith('/var') && forecast(disk.usage, duration('150m')) >= 95",
+        ),
+        ("calculation", ""),
+        ("metric", "cpu.usage"),
+        ("window_secs", "43200"),
         ("for_secs", "600"),
-        ("severity", "warning"),
         ("enabled", "on"),
     ];
     let mut browser = Browser::default();
@@ -9350,61 +9468,46 @@ async fn a_forecast_rule_can_be_made_on_the_form_and_through_the_api() {
         .iter()
         .find(|rule| rule.rule.name == "Logs filling")
         .unwrap();
-    assert_eq!(rule.rule.kind, RuleKind::Forecast);
-    assert_eq!(rule.rule.threshold, Some(95.0));
-    assert_eq!(rule.rule.severity, Severity::Critical);
-    assert_eq!(rule.rule.forecast, Some(TimeDelta::seconds(9000)));
-    assert_eq!(rule.rule.warning_forecast, Some(TimeDelta::hours(48)));
     assert_eq!(rule.rule.window, Some(TimeDelta::hours(12)));
-    assert_eq!(rule.rule.series.as_deref(), Some("/var*"));
+    assert_eq!(rule.rule.metric, None);
 
     let page = browser
         .get(&server, &format!("/alerts/rules/{}/edit", rule.id))
         .await;
-    for shown in [
-        r#"name="level" value="95""#,
-        r#"name="warning_within_hours" value="48""#,
-        r#"name="critical_within_hours" value="2.5""#,
-        r#"name="forecast_window_hours" value="12""#,
-        r#"<option value="forecast" selected>"#,
-    ] {
-        assert!(page.body.contains(shown), "{shown}: {}", page.body);
-    }
-    let page = browser.get(&server, "/alerts/rules").await;
-    let row = page.body.split("Logs filling").nth(1).unwrap();
-    let row = row.split("</tr>").next().unwrap();
-    assert!(row.contains("Warning") && row.contains("Critical"), "{row}");
     assert!(
-        page.body.contains("Disk usage (/var*) on course to rise to 95% within 2 days (warning), 150 minutes (critical), judging by the last 12 hours for 10 minutes"),
+        page.body.contains(r#"name="window_secs" value="43200""#),
         "{}",
         page.body
     );
 
-    // A warning has to look further ahead than critical.
+    // A forecast looks back at least an hour.
     let mut wrong = fields.to_vec();
-    wrong[6] = ("warning_within_hours", "1");
+    wrong[5] = ("window_secs", "600");
     let page = browser
         .submit(&server, "/alerts/rules/new", "/alerts/rules", &wrong)
         .await;
     assert_eq!(page.status, 422);
-    assert!(page.body.contains("further ahead"), "{}", page.body);
+    assert!(
+        page.body.contains("between an hour and a day"),
+        "{}",
+        page.body
+    );
 
     let body = json!({
-        "name": "Memory leak", "kind": "forecast", "metric": "memory.usage",
-        "comparison": "above", "threshold": 100, "for_secs": 0, "severity": "warning",
-        "forecast_secs": 86400,
+        "name": "Memory leak",
+        "warning": "forecast(memory.usage['Memory'], duration('24h')) >= 100",
+        "for_secs": 0,
     });
     let (status, created) = api(&server, "POST", "/api/v1/alert-rules", &body).await;
     assert_eq!(status, 201, "{created}");
     let path = format!("/api/v1/alert-rules/{}", created["id"]);
     let (_, rule) = api(&server, "GET", &path, &Value::Null).await;
-    assert_eq!(rule["kind"], "forecast", "{rule}");
-    assert_eq!(rule["forecast_secs"], 86400, "{rule}");
+    assert_eq!(rule["warning"], body["warning"], "{rule}");
+    assert_eq!(rule["critical"], Value::Null, "{rule}");
     assert_eq!(rule["window_secs"], Value::Null, "{rule}");
 
     let body = json!({
-        "name": "Nowhere", "kind": "forecast", "metric": "memory.usage",
-        "comparison": "above", "threshold": 100, "for_secs": 0, "severity": "warning",
+        "name": "Nowhere", "warning": "forecast(memory.usage['Memory']) >= 100", "for_secs": 0,
     });
     let (status, refused) = api(&server, "POST", "/api/v1/alert-rules", &body).await;
     assert_eq!(status, 422, "{refused}");
@@ -9931,7 +10034,7 @@ mod actions {
         let mut test = Harness::with_actions().await;
         let rule = AlertRuleInput {
             name: "Disk".to_string(),
-            metric: Some("disk.usage".to_string()),
+            critical: Some("disk.usage > 90".to_string()),
             actions: vec![run("disk_space", RunOn::First)],
             ..cpu_rule()
         };
@@ -9958,7 +10061,7 @@ mod actions {
     async fn an_action_for_critical_waits_until_the_alert_is_critical() {
         let mut test = Harness::with_actions().await;
         let rule = AlertRuleInput {
-            warning_threshold: Some(80.0),
+            warning: Some("cpu.usage > 80".to_string()),
             actions: vec![
                 run("top_cpu", RunOn::Warning),
                 run("restart_nginx", RunOn::Critical),
@@ -10143,8 +10246,7 @@ mod actions {
         };
         let cpu = |actions: Value| {
             json!({
-                "name": "CPU", "kind": "metric", "metric": "cpu.usage", "comparison": "above",
-                "threshold": 90.0, "for_secs": 60, "severity": "critical", "actions": actions,
+                "name": "CPU", "critical": "cpu.usage > 90", "for_secs": 60, "actions": actions,
             })
         };
 
@@ -10159,12 +10261,13 @@ mod actions {
         let too_long = save(cpu(json!([{ "action": "top_cpu", "timeout_secs": 601 }]))).await;
         assert!(too_long.starts_with("HTTP/1.1 422"), "{too_long}");
 
-        let offline = save(json!({
-            "name": "Gone", "kind": "offline", "for_secs": 60, "severity": "critical",
-            "actions": [{ "action": "top_cpu" }],
+        let fleet = save(json!({
+            "name": "Fleet", "calculation": "avg", "metric": "cpu.usage",
+            "critical": "value > 90", "for_secs": 60, "actions": [{ "action": "top_cpu" }],
         }))
         .await;
-        assert!(offline.starts_with("HTTP/1.1 422"), "{offline}");
+        assert!(fleet.starts_with("HTTP/1.1 422"), "{fleet}");
+        assert!(fleet.contains("calculation can"), "{fleet}");
 
         let wanted = json!([{ "action": "top_cpu", "run_on": "critical", "timeout_secs": 60 }]);
         let saved = save(cpu(wanted.clone())).await;
@@ -10180,12 +10283,8 @@ mod actions {
         let mut browser = Browser::default();
         let fields = [
             ("name", "CPU"),
-            ("kind", "metric"),
-            ("metric", "cpu.usage"),
-            ("comparison", "above"),
-            ("critical_threshold", "90"),
+            ("critical", "cpu.usage > 90"),
             ("for_secs", "60"),
-            ("severity", "critical"),
             ("enabled", "on"),
             (
                 "actions",
@@ -10229,7 +10328,7 @@ mod actions {
         );
 
         let bad = [("actions", "top_cpu when=later")];
-        let fields: Vec<(&str, &str)> = fields[..8].iter().copied().chain(bad).collect();
+        let fields: Vec<(&str, &str)> = fields[..4].iter().copied().chain(bad).collect();
         let page = browser
             .submit(&test.server, new, "/alerts/rules", &fields)
             .await;
@@ -10317,7 +10416,7 @@ mod deleted_channels {
     async fn a_deleted_channel_is_not_told_an_alert_got_worse() {
         let mut test = Harness::start().await;
         let rule = AlertRuleInput {
-            warning_threshold: Some(80.0),
+            warning: Some("cpu.usage > 80".to_string()),
             ..cpu_rule()
         };
         let (alert, channel) = told_then_deleted(&mut test, rule).await;
@@ -10531,7 +10630,7 @@ mod deleted_channels {
             unreachable!()
         };
         let rule = AlertRuleInput {
-            metric: Some("disk.usage".to_string()),
+            critical: Some("disk.usage > 90".to_string()),
             hold: TimeDelta::seconds(0),
             channels: channels.clone(),
             ..cpu_rule()

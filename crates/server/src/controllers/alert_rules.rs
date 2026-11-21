@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result};
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -16,9 +16,7 @@ use maxnines_protocol::actions::DEFAULT_ACTION_TIMEOUT;
 use super::condition_form::{ConditionForm, operators};
 use super::{CsrfForm, Page, server_error};
 use crate::actions::{RuleAction, RunOn};
-use crate::alerting::{
-    AlertRuleInput, Comparison, DEFAULT_FORECAST_WINDOW, NameTaken, RuleKind, Severity,
-};
+use crate::alerting::{AlertRuleInput, NameTaken};
 use crate::app_state::AppState;
 use crate::calculations::Calculation;
 use crate::condition_builder::Builder;
@@ -35,33 +33,27 @@ pub fn routes() -> Router<AppState> {
 }
 
 /// A rule as its form shows it, including whatever was just typed. The condition
-/// fields are flattened so the shared part of the form finds them.
+/// fields for which hosts are flattened so the shared part of the form finds them.
 #[derive(Serialize)]
 struct AlertRuleForm {
     name: String,
-    kind: String,
-    metric: String,
-    series: String,
-    comparison: String,
-    warning_threshold: String,
-    critical_threshold: String,
+    warning: String,
+    critical: String,
+    summary: String,
+    resolved_summary: String,
     for_secs: String,
-    severity: String,
     enabled: bool,
     channels: BTreeSet<i64>,
     all_channels: bool,
+    /// Empty for a rule about each host on its own.
     calculation: String,
+    metric: String,
     group_by: String,
     fact: String,
     filter: String,
+    /// Empty for the usual.
     window_secs: String,
     remind_every_minutes: String,
-    /// For a forecast: the level it's heading for, how many hours ahead is a
-    /// warning or critical, and how many hours back to judge by.
-    level: String,
-    warning_within_hours: String,
-    critical_within_hours: String,
-    forecast_window_hours: String,
     /// What to run on the alert's host, one per line.
     actions: String,
     #[serde(flatten)]
@@ -124,27 +116,21 @@ impl AlertRuleForm {
     fn blank() -> Self {
         Self {
             name: String::new(),
-            kind: RuleKind::Metric.as_str().to_string(),
-            metric: METRICS[0].name.to_string(),
-            series: String::new(),
-            comparison: Comparison::Above.as_str().to_string(),
-            warning_threshold: String::new(),
-            critical_threshold: String::new(),
+            warning: String::new(),
+            critical: String::new(),
+            summary: String::new(),
+            resolved_summary: String::new(),
             for_secs: "300".to_string(),
-            severity: Severity::Warning.as_str().to_string(),
             enabled: true,
             channels: BTreeSet::new(),
             all_channels: false,
-            calculation: Calculation::Avg.as_str().to_string(),
+            calculation: String::new(),
+            metric: METRICS[0].name.to_string(),
             group_by: "nothing".to_string(),
             fact: String::new(),
             filter: String::new(),
-            window_secs: "300".to_string(),
+            window_secs: String::new(),
             remind_every_minutes: String::new(),
-            level: String::new(),
-            warning_within_hours: "24".to_string(),
-            critical_within_hours: "4".to_string(),
-            forecast_window_hours: hours(DEFAULT_FORECAST_WINDOW),
             actions: String::new(),
             applies_to: ConditionForm::blank(),
         }
@@ -153,58 +139,28 @@ impl AlertRuleForm {
     fn from_rule(rule: &AlertRuleInput) -> Self {
         let blank = Self::blank();
         let (group_by, fact) = grouping_fields(rule.group_by.as_deref().unwrap_or_default());
-        let forecast = rule.kind == RuleKind::Forecast;
-        let within = |wanted: Severity| {
-            rule.forecast_levels()
-                .into_iter()
-                .find(|(severity, _)| *severity == wanted)
-                .map(|(_, ahead)| hours(ahead))
-                .unwrap_or_default()
-        };
-        let threshold = |wanted: Severity| {
-            if forecast {
-                return String::new();
-            }
-            rule.levels()
-                .iter()
-                .find(|(severity, _)| *severity == wanted)
-                .map(|(_, threshold)| threshold.to_string())
-                .unwrap_or_default()
-        };
+        let text = |text: &Option<String>| text.clone().unwrap_or_default();
         Self {
-            level: if forecast {
-                rule.threshold
-                    .map(|level| level.to_string())
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            },
-            warning_within_hours: if forecast {
-                within(Severity::Warning)
-            } else {
-                blank.warning_within_hours
-            },
-            critical_within_hours: if forecast {
-                within(Severity::Critical)
-            } else {
-                blank.critical_within_hours
-            },
-            forecast_window_hours: if forecast {
-                hours(rule.window())
-            } else {
-                blank.forecast_window_hours
-            },
+            name: rule.name.clone(),
+            warning: text(&rule.warning),
+            critical: text(&rule.critical),
+            summary: text(&rule.summary),
+            resolved_summary: text(&rule.resolved_summary),
+            for_secs: rule.hold.num_seconds().to_string(),
+            enabled: rule.enabled,
+            channels: rule.channels.iter().copied().collect(),
+            all_channels: rule.all_channels,
             calculation: rule
                 .calculation
-                .map_or(blank.calculation, |c| c.as_str().to_string()),
+                .map_or(String::new(), |c| c.as_str().to_string()),
+            metric: rule.metric.clone().unwrap_or(blank.metric),
             group_by,
             fact,
-            filter: rule.filter.clone().unwrap_or_default(),
-            window_secs: if forecast {
-                blank.window_secs
-            } else {
-                rule.window().num_seconds().to_string()
-            },
+            filter: text(&rule.filter),
+            window_secs: rule
+                .window
+                .map(|window| window.num_seconds().to_string())
+                .unwrap_or_default(),
             // Shown in minutes, with a fraction when the API set something finer.
             remind_every_minutes: rule
                 .remind_every
@@ -217,60 +173,39 @@ impl AlertRuleForm {
                     }
                 })
                 .unwrap_or_default(),
-            name: rule.name.clone(),
-            kind: rule.kind.as_str().to_string(),
-            metric: rule.metric.clone().unwrap_or(blank.metric),
-            series: rule.series.clone().unwrap_or_default(),
-            comparison: rule
-                .comparison
-                .map_or(blank.comparison, |c| c.as_str().to_string()),
-            warning_threshold: threshold(Severity::Warning),
-            critical_threshold: threshold(Severity::Critical),
-            for_secs: rule.hold.num_seconds().to_string(),
-            severity: rule.severity.as_str().to_string(),
-            enabled: rule.enabled,
-            channels: rule.channels.iter().copied().collect(),
-            all_channels: rule.all_channels,
             actions: action_lines(&rule.actions),
-            applies_to: ConditionForm::from_condition(rule.condition.as_deref()),
+            applies_to: ConditionForm::from_condition(rule.applies_to.as_deref()),
         }
     }
 
     fn from_fields(fields: &BTreeMap<String, String>) -> Self {
         let text = |name: &str| fields.get(name).cloned().unwrap_or_default();
         Self {
-            calculation: text("calculation"),
-            group_by: text("group_by"),
-            fact: text("fact").trim().to_string(),
-            filter: text("filter").trim().to_string(),
-            window_secs: text("window_secs"),
-            remind_every_minutes: text("remind_every_minutes").trim().to_string(),
-            level: text("level").trim().to_string(),
-            warning_within_hours: text("warning_within_hours").trim().to_string(),
-            critical_within_hours: text("critical_within_hours").trim().to_string(),
-            forecast_window_hours: text("forecast_window_hours").trim().to_string(),
             name: text("name"),
-            kind: text("kind"),
-            metric: text("metric"),
-            series: text("series"),
-            comparison: text("comparison"),
-            warning_threshold: text("warning_threshold"),
-            critical_threshold: text("critical_threshold"),
+            warning: text("warning"),
+            critical: text("critical"),
+            summary: text("summary"),
+            resolved_summary: text("resolved_summary"),
             for_secs: text("for_secs"),
-            severity: text("severity"),
             enabled: fields.contains_key("enabled"),
             channels: fields
                 .keys()
                 .filter_map(|name| name.strip_prefix("channel_")?.parse().ok())
                 .collect(),
             all_channels: fields.contains_key("all_channels"),
+            calculation: text("calculation"),
+            metric: text("metric"),
+            group_by: text("group_by"),
+            fact: text("fact").trim().to_string(),
+            filter: text("filter").trim().to_string(),
+            window_secs: text("window_secs").trim().to_string(),
+            remind_every_minutes: text("remind_every_minutes").trim().to_string(),
             actions: text("actions"),
             applies_to: ConditionForm::from_fields(fields),
         }
     }
 
     fn to_rule(&self, known: &BTreeMap<String, String>) -> Result<AlertRuleInput> {
-        let kind = RuleKind::parse(&self.kind)?;
         let hold = whole_seconds(&self.for_secs)
             .context("the duration must be a whole number of seconds")?;
         let remind_every = match self.remind_every_minutes.as_str() {
@@ -284,123 +219,53 @@ impl AlertRuleForm {
                 Some(rounded_seconds(minutes * 60.0).context("reminders are too far apart")?)
             }
         };
-
-        // The form always sends these, and they only mean something for metrics.
-        let (metric, series, comparison) = match kind {
-            RuleKind::Offline | RuleKind::NoMetrics => (None, None, None),
-            RuleKind::Calculation => (
-                Some(self.metric.clone()),
-                None,
-                Some(Comparison::parse(&self.comparison)?),
+        let calculation = match self.calculation.as_str() {
+            "" => None,
+            text => Some(
+                Calculation::parse(text)
+                    .with_context(|| format!("unknown calculation {text:?}"))?,
             ),
-            RuleKind::Metric | RuleKind::Forecast => {
-                let series = self.series.trim();
-                (
-                    Some(self.metric.clone()),
-                    (!series.is_empty()).then(|| series.to_string()),
-                    Some(Comparison::parse(&self.comparison)?),
-                )
-            }
         };
-        let mut forecast = None;
-        let mut warning_forecast = None;
-        let (threshold, warning_threshold, severity) = match kind {
-            RuleKind::Offline | RuleKind::NoMetrics => {
-                (None, None, Severity::parse(&self.severity)?)
-            }
-            RuleKind::Forecast => {
-                let level: f64 = match self.level.as_str() {
-                    "" => bail!("a forecast needs a level to watch for"),
-                    text => text.parse().context("the level must be a number")?,
-                };
-                let warning = hours_typed(&self.warning_within_hours, "warning")?;
-                let severity = match hours_typed(&self.critical_within_hours, "critical")? {
-                    None => {
-                        forecast = warning;
-                        Severity::Warning
-                    }
-                    Some(critical) => {
-                        forecast = Some(critical);
-                        warning_forecast = warning;
-                        Severity::Critical
-                    }
-                };
-                if forecast.is_none() {
-                    bail!(
-                        "a forecast needs how many hours ahead to warn, or to be critical, or both"
-                    );
-                }
-                (Some(level), None, severity)
-            }
-            RuleKind::Metric | RuleKind::Calculation => {
-                let warning = number(&self.warning_threshold, "warning")?;
-                match (warning, number(&self.critical_threshold, "critical")?) {
-                    (None, None) => bail!("a rule needs a warning or critical threshold, or both"),
-                    (Some(warning), None) => (Some(warning), None, Severity::Warning),
-                    (warning, Some(critical)) => (Some(critical), warning, Severity::Critical),
-                }
-            }
+        let window = match self.window_secs.as_str() {
+            "" => None,
+            text => Some(
+                whole_seconds(text).context("how far back has to be a whole number of seconds")?,
+            ),
         };
-
-        let is_calculation = kind == RuleKind::Calculation;
+        let is_calculation = calculation.is_some();
+        // The form always sends these, and they only mean something for a calculation.
         let only_for_calculations = |value: String| is_calculation.then_some(value);
         let group_by = if self.group_by == "fact" {
             format!("fact:{}", self.fact)
         } else {
             self.group_by.clone()
         };
-        let window = match kind {
-            RuleKind::Calculation => Some(
-                whole_seconds(&self.window_secs)
-                    .context("how far back has to be a whole number of seconds")?,
-            ),
-            RuleKind::Forecast => Some(
-                hours_typed(&self.forecast_window_hours, "looking back")?
-                    .context("a forecast needs how many hours back to judge by")?,
-            ),
-            _ => None,
-        };
-        let condition = if is_calculation {
+        let applies_to = if is_calculation {
             None
         } else {
             self.applies_to.expression(known)?
         };
+        let text = |text: &str| crate::text::trimmed(text);
 
         Ok(AlertRuleInput {
-            calculation: is_calculation
-                .then(|| Calculation::parse(&self.calculation))
-                .flatten(),
+            name: self.name.trim().to_string(),
+            warning: text(&self.warning),
+            critical: text(&self.critical),
+            summary: text(&self.summary),
+            resolved_summary: text(&self.resolved_summary),
+            hold,
+            applies_to,
+            enabled: self.enabled,
+            channels: self.channels.iter().copied().collect(),
+            all_channels: self.all_channels,
+            calculation,
+            metric: only_for_calculations(self.metric.clone()),
             group_by: only_for_calculations(group_by),
             filter: only_for_calculations(self.filter.clone()).filter(|text| !text.is_empty()),
             window,
             remind_every,
-            name: self.name.trim().to_string(),
-            kind,
-            metric,
-            series,
-            comparison,
-            threshold,
-            warning_threshold,
-            hold,
-            severity,
-            condition,
-            enabled: self.enabled,
-            channels: self.channels.iter().copied().collect(),
-            all_channels: self.all_channels,
-            forecast,
-            warning_forecast,
             actions: parse_actions(&self.actions)?,
         })
-    }
-}
-
-/// A length of time as hours for the form, with a fraction only when needed.
-fn hours(length: TimeDelta) -> String {
-    let secs = length.num_seconds();
-    if secs % 3600 == 0 {
-        (secs / 3600).to_string()
-    } else {
-        (secs as f64 / 3600.0).to_string()
     }
 }
 
@@ -416,34 +281,6 @@ fn rounded_seconds(secs: f64) -> Option<TimeDelta> {
     let secs = secs.round();
     // Far beyond anything a rule allows, and still a length chrono can hold.
     (secs < 1e15).then(|| TimeDelta::seconds(secs as i64))
-}
-
-/// Hours typed into the form, which may be left empty.
-fn hours_typed(text: &str, which: &str) -> Result<Option<TimeDelta>> {
-    match text.trim() {
-        "" => Ok(None),
-        text => {
-            let hours: f64 = text
-                .parse()
-                .ok()
-                .filter(|hours: &f64| hours.is_finite() && *hours > 0.0)
-                .with_context(|| format!("the {which} time must be a number of hours"))?;
-            rounded_seconds(hours * 3600.0)
-                .map(Some)
-                .with_context(|| format!("the {which} time is too long"))
-        }
-    }
-}
-
-/// A threshold typed into the form, which may be left empty.
-fn number(text: &str, which: &str) -> Result<Option<f64>> {
-    match text.trim() {
-        "" => Ok(None),
-        text => text
-            .parse()
-            .map(Some)
-            .with_context(|| format!("the {which} threshold must be a number")),
-    }
 }
 
 #[derive(Serialize)]
@@ -468,7 +305,7 @@ struct MetricOption {
     label: String,
 }
 
-/// The unit goes on the label, because thresholds are typed as plain numbers.
+/// The unit goes on the label, as a calculation's value is compared in it.
 fn metric_options() -> Vec<MetricOption> {
     METRICS
         .iter()
@@ -552,12 +389,19 @@ async fn form_page(
 struct RuleRow {
     id: i64,
     name: String,
+    /// Each condition with its severity, mildest first.
+    conditions: Vec<ConditionRow>,
+    /// The calculation, and how long the problem has to last.
     watches: String,
     applies_to: String,
-    /// Mildest first. A rule with a warning and a critical threshold has both.
-    severities: Vec<&'static str>,
     channels: String,
     enabled: bool,
+}
+
+#[derive(Serialize)]
+struct ConditionRow {
+    severity: &'static str,
+    text: String,
 }
 
 async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
@@ -579,31 +423,31 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
                 .filter(|channel| rule.rule.channels.contains(&channel.id))
                 .map(|channel| channel.channel.name.as_str())
                 .collect();
+            let conditions = [
+                ("warning", &rule.rule.warning),
+                ("critical", &rule.rule.critical),
+            ]
+            .into_iter()
+            .filter_map(|(severity, text)| {
+                Some(ConditionRow {
+                    severity,
+                    text: text.clone()?,
+                })
+            })
+            .collect();
             RuleRow {
                 id: rule.id,
+                conditions,
                 watches: rule.rule.describe(),
-                applies_to: match (rule.rule.kind, rule.rule.condition.as_deref()) {
+                applies_to: match (rule.rule.is_calculation(), rule.rule.applies_to.as_deref()) {
                     // A calculation picks its hosts with a filter, not a condition.
-                    (RuleKind::Calculation, _) => match rule.rule.filter.as_deref() {
+                    (true, _) => match rule.rule.filter.as_deref() {
                         None | Some("") => "Every host".to_string(),
                         Some(filter) => filter.to_string(),
                     },
-                    (_, None) => "Every host".to_string(),
-                    (_, Some(condition)) => Builder::from_expression(condition)
+                    (false, None) => "Every host".to_string(),
+                    (false, Some(condition)) => Builder::from_expression(condition)
                         .map_or_else(|| condition.to_string(), |builder| builder.describe()),
-                },
-                severities: {
-                    let levels: Vec<Severity> = if rule.rule.kind == RuleKind::Forecast {
-                        let levels = rule.rule.forecast_levels();
-                        levels.into_iter().map(|(severity, _)| severity).collect()
-                    } else {
-                        let levels = rule.rule.levels();
-                        levels.into_iter().map(|(severity, _)| severity).collect()
-                    };
-                    match levels.as_slice() {
-                        [] => vec![rule.rule.severity.as_str()],
-                        levels => levels.iter().map(|severity| severity.as_str()).collect(),
-                    }
                 },
                 channels: if rule.rule.all_channels {
                     "Every channel".to_string()
@@ -731,125 +575,92 @@ mod tests {
 
     fn rule() -> AlertRuleInput {
         AlertRuleInput {
-            name: "Disk full".to_string(),
-            kind: RuleKind::Metric,
-            metric: Some("disk.usage".to_string()),
-            series: Some("/data*".to_string()),
-            comparison: Some(Comparison::Below),
-            threshold: Some(12.5),
-            warning_threshold: None,
+            summary: Some("{{ host }}: {{ series }} is {{ value }}".to_string()),
+            resolved_summary: Some("{{ series }} is fine".to_string()),
             hold: TimeDelta::seconds(60),
-            severity: Severity::Critical,
-            condition: Some("true".to_string()),
+            applies_to: Some("true".to_string()),
             enabled: false,
             channels: vec![2, 5],
-            all_channels: false,
-            calculation: None,
-            group_by: None,
-            filter: None,
-            window: None,
-            remind_every: None,
-            forecast: None,
-            warning_forecast: None,
-            actions: Vec::new(),
+            window: Some(TimeDelta::hours(2)),
+            remind_every: Some(TimeDelta::seconds(90)),
+            ..AlertRuleInput::with_conditions(
+                "Disk full",
+                Some("disk.usage > 80"),
+                Some("forecast(disk.usage, duration('4h')) >= 100 && series != '/boot'"),
+            )
         }
+    }
+
+    fn through_the_form(original: &AlertRuleInput) -> AlertRuleInput {
+        let mut form = AlertRuleForm::from_rule(original);
+        if original.applies_to.is_some() {
+            form.applies_to.use_expression = true;
+            form.applies_to.condition = "true".to_string();
+        }
+        form.to_rule(&BTreeMap::new()).unwrap()
     }
 
     #[test]
     fn a_rule_survives_the_trip_through_its_form() {
         let original = rule();
-        let mut form = AlertRuleForm::from_rule(&original);
-        form.applies_to.use_expression = true;
-        form.applies_to.condition = "true".to_string();
-        assert_eq!(form.to_rule(&BTreeMap::new()).unwrap(), original);
-    }
-
-    #[test]
-    fn warning_and_critical_thresholds_survive_the_trip_through_the_form() {
-        let both = AlertRuleInput {
-            warning_threshold: Some(20.0),
-            ..rule()
-        };
+        assert_eq!(through_the_form(&original), original);
         let warning_only = AlertRuleInput {
-            severity: Severity::Warning,
+            critical: None,
+            summary: None,
+            resolved_summary: None,
+            window: None,
             ..rule()
         };
-        for original in [both, warning_only] {
-            let mut form = AlertRuleForm::from_rule(&original);
-            form.applies_to.use_expression = true;
-            form.applies_to.condition = "true".to_string();
-            assert_eq!(form.to_rule(&BTreeMap::new()).unwrap(), original);
-        }
-
-        let form = AlertRuleForm::from_rule(&AlertRuleInput {
-            warning_threshold: Some(20.0),
-            ..rule()
-        });
-        assert_eq!(form.warning_threshold, "20");
-        assert_eq!(form.critical_threshold, "12.5");
+        assert_eq!(through_the_form(&warning_only), warning_only);
     }
 
     #[test]
-    fn only_an_offline_rule_takes_its_severity_from_the_form() {
-        let mut form = AlertRuleForm::blank();
-        form.name = "Gone".to_string();
-        form.kind = "offline".to_string();
-        form.severity = "nonsense".to_string();
-        let error = format!("{:#}", form.to_rule(&BTreeMap::new()).unwrap_err());
-        assert!(error.contains("unknown severity"), "{error}");
-
-        form.kind = "metric".to_string();
-        form.warning_threshold = "80".to_string();
-        let input = form.to_rule(&BTreeMap::new()).unwrap();
-        assert_eq!(input.severity, Severity::Warning);
+    fn a_calculation_survives_the_trip_through_its_form() {
+        let original = AlertRuleInput {
+            calculation: Some(Calculation::Max),
+            metric: Some("cpu.usage".to_string()),
+            group_by: Some("fact:os.name".to_string()),
+            filter: Some("os=linux".to_string()),
+            window: Some(TimeDelta::minutes(10)),
+            ..AlertRuleInput::with_conditions("Busy", None, Some("value > 80"))
+        };
+        assert_eq!(through_the_form(&original), original);
     }
 
     #[test]
-    fn an_offline_rule_ignores_the_metric_fields_the_form_still_sends() {
+    fn a_rule_about_each_host_ignores_the_calculation_fields_the_form_still_sends() {
         let mut form = AlertRuleForm::blank();
         form.name = "Gone".to_string();
-        form.kind = "offline".to_string();
-        form.warning_threshold = "not a number".to_string();
-        form.critical_threshold = "nor this".to_string();
-        form.series = "/".to_string();
+        form.critical = "  !online ".to_string();
+        form.filter = "os=linux".to_string();
+        form.group_by = "host".to_string();
 
         let input = form.to_rule(&BTreeMap::new()).unwrap();
+        assert_eq!(input.critical.as_deref(), Some("!online"));
+        assert_eq!(input.warning, None);
         assert_eq!(input.metric, None);
-        assert_eq!(input.series, None);
-        assert_eq!(input.comparison, None);
-        assert_eq!(input.threshold, None);
+        assert_eq!(input.group_by, None);
+        assert_eq!(input.filter, None);
         crate::alerting::check_rule(&input).unwrap();
     }
 
     #[test]
     fn typing_mistakes_are_explained() {
         for (change, expected) in [
-            (
-                ("critical_threshold", ""),
-                "needs a warning or critical threshold",
-            ),
-            (
-                ("critical_threshold", "lots"),
-                "critical threshold must be a number",
-            ),
-            (
-                ("warning_threshold", "some"),
-                "warning threshold must be a number",
-            ),
             (("for_secs", "soon"), "whole number"),
             (("for_secs", "-1"), "whole number"),
-            (("kind", "nonsense"), "unknown rule kind"),
-            (("comparison", "nonsense"), "unknown comparison"),
+            (("calculation", "nonsense"), "unknown calculation"),
+            (("window_secs", "a while"), "whole number of seconds"),
+            (("remind_every_minutes", "often"), "number of minutes"),
         ] {
             let mut form = AlertRuleForm::blank();
-            form.critical_threshold = "90".to_string();
+            form.critical = "cpu.usage > 90".to_string();
             let (field, value) = change;
             let target = match field {
-                "critical_threshold" => &mut form.critical_threshold,
-                "warning_threshold" => &mut form.warning_threshold,
                 "for_secs" => &mut form.for_secs,
-                "kind" => &mut form.kind,
-                _ => &mut form.comparison,
+                "calculation" => &mut form.calculation,
+                "window_secs" => &mut form.window_secs,
+                _ => &mut form.remind_every_minutes,
             };
             *target = value.to_string();
             let error = format!("{:#}", form.to_rule(&BTreeMap::new()).unwrap_err());

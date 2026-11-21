@@ -438,7 +438,7 @@ async fn a_host_that_stops_answering_is_offline_and_one_with_nothing_to_read_is_
     let built_in = Database::for_test().await.list_alert_rules().await.unwrap();
     let offline = built_in
         .into_iter()
-        .find(|rule| rule.rule.kind == crate::alerting::RuleKind::Offline)
+        .find(|rule| rule.rule.critical.as_deref() == Some("!online"))
         .unwrap();
     state
         .database

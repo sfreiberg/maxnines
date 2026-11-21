@@ -241,7 +241,7 @@ pub fn preview(request: &WebhookRequest, web_url: Option<&str>) -> Preview {
 }
 
 /// Tera's error and what caused it, on one line.
-fn explain_tera(error: &tera::Error) -> String {
+pub(crate) fn explain_tera(error: &tera::Error) -> String {
     let mut words = vec![error.to_string()];
     let mut source = std::error::Error::source(error);
     while let Some(cause) = source {

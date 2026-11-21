@@ -9,15 +9,14 @@
 {% if rules %}
 <div class="tablebox"><table>
   <thead>
-    <tr><th>Name</th><th>Watches</th><th>Applies to</th><th>Severity</th><th>Notifies</th><th></th></tr>
+    <tr><th>Name</th><th>Alerts when</th><th>Applies to</th><th>Notifies</th><th></th></tr>
   </thead>
   <tbody>
     {% for rule in rules %}
     <tr{% if not rule.enabled %} class="disabled"{% endif %}>
       <td><a href="/alerts/rules/{{ rule.id }}/edit">{{ rule.name }}</a></td>
-      <td>{{ rule.watches }}</td>
+      <td>{% for condition in rule.conditions %}<div class="condition">{% if condition.severity == "critical" %}<span class="badge bad">Critical</span>{% else %}<span class="badge warn">Warning</span>{% endif %} <code>{{ condition.text }}</code></div>{% endfor %}{% if rule.watches %}<div class="hint">{{ rule.watches }}</div>{% endif %}</td>
       <td>{{ rule.applies_to }}</td>
-      <td>{% for severity in rule.severities %}{% if severity == "critical" %}<span class="badge bad">Critical</span>{% else %}<span class="badge warn">Warning</span>{% endif %}{% if not loop.last %} {% endif %}{% endfor %}</td>
       <td>{% if rule.channels %}{{ rule.channels }}{% else %}<span class="hint">Only this site</span>{% endif %}</td>
       <td>{% if not rule.enabled %}<span class="badge neutral">Disabled</span>{% endif %}</td>
     </tr>

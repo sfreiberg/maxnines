@@ -31,7 +31,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
     "action": "changed",
     "subject": { "kind": "alert_rule", "id": "3", "name": "Disk filling up" },
     "changes": [
-      { "field": "threshold", "before": 90.0, "after": 95.0 },
+      { "field": "critical", "before": "disk.usage > 90", "after": "disk.usage > 95" },
       { "field": "channels", "before": ["Ops email"], "after": ["Ops email", "PagerDuty"] }
     ]
   },

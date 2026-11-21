@@ -28,20 +28,76 @@ rule called Host sending no metrics when it upgraded keeps that one instead.
 Any rule can tell every channel this way, with **Every channel, including ones added
 later**, or tell only the channels chosen.
 
+## Conditions
+
+A rule alerts when its **Warning when** or **Critical when** condition is true, or both.
+Each is [CEL](https://cel.dev), the same language as a config rule's condition, over
+metrics by their names in the [catalog](api-metrics.md#list-metrics):
+
+| Condition | Alerts when |
+| --- | --- |
+| `disk.usage > 90` | A disk is over 90% full. Each disk is checked on its own |
+| `series != '/boot' && disk.usage > 90` | The same, leaving out `/boot` |
+| `disk.usage > 90 && disk.inodes > 80` | A disk is full and short of inodes. Metrics with a series for each disk pair up by disk |
+| `cpu.load['5 minutes'] > facts.cpu.logical_cores` | The 5-minute load is more than the host has cores |
+| `check.up['www'] == 0` | One check is failing, picked out by name |
+| `clock.difference > duration('30s')` | The clock is over 30 seconds out |
+| `process.memory > gib(2)` | A process uses over 2 GiB |
+| `!online` | The host's agent is gone |
+| `!reporting` | The host is [connected but sending no metrics](#connected-but-sending-no-metrics) |
+| `forecast(disk.usage, duration('4h')) >= 100` | A disk is on course to be full within 4 hours, as in [forecasts](#forecasts) |
+
+- **Metrics** are used by their names. One that's a length of time, such as
+  `clock.difference`, is compared with `duration('30s')`, `duration('5m')` or
+  `duration('2h')`. Sizes are in bytes, with `kib()`, `mib()`, `gib()` and `tib()` to
+  write them. Metrics that say whether something works, such as `check.up` or
+  `service.running`, are 1 or 0.
+- **A metric with a series for each disk, interface, service or such** is checked for
+  each one, and each has its own alert. Two such metrics in one condition pair up when
+  their series are of the same things, such as disks; metrics with series of different
+  things, such as disks and checks, can't be used together that way. `['name']` picks out
+  one series instead, and then the alert is about the host.
+- **A metric with a few fixed series**, such as `cpu.load` with `'1 minute'`,
+  `'5 minutes'` and `'15 minutes'`, or `memory.usage` with `'Memory'` and `'Swap'`, always
+  has one picked out with brackets.
+- **`series`** is the series being checked, such as `/data`, and empty for the host as a
+  whole. **`host`** is the hostname, and **`facts.`** are what the host's agent reports,
+  as in [config rules](agents.md#config-rules).
+- **`online`** is whether the host's agent is connected, and **`reporting`** whether a
+  connected host's samples are arriving.
+- **A missing reading** isn't a problem: a host or series that hasn't reported a metric a
+  condition uses isn't checked, and an alert that's open stays open until it reports
+  again.
+
+Each condition is checked when the rule is saved: a name that isn't a metric suggests the
+nearest one, and something that can't work, such as a length of time compared with a
+number, is refused with what's wrong.
+
+A rule with a calculation across hosts, as in the [API](api-alert-rules.md), has
+conditions about the calculated `value` instead, like `value > 80`.
+
+### What alerts say
+
+Without a **Summary**, an alert says the rule's name, the host, and the first metric's
+reading, like *Disk filling up on web-1: / is 92%*, and as it clears, *Disk filling up on
+web-1: / is now 70%*. A summary can say anything else, filled in like a
+[custom webhook's body](notifications.md#custom-webhooks), with `{{ host }}`,
+`{{ series }}`, `{{ value }}` and the metrics the conditions use, each written in its
+unit: `{{ host }}: {{ series }} is {{ disk.usage }} full` says *web-1: / is 92% full*.
+
 ## Connected but sending no metrics
 
 An agent can stay connected while nothing it sends is stored, such as when the server
 can't read samples from an agent on the other side of a change to them. It never goes
-offline, so the Host offline rule can't see it. A rule of the kind **A host stays
-connected but sends no metrics** alerts when the newest sample stored from a connected
-host is older than its **For at least** time, like *web-1 is connected but sending no
-metrics*, and resolves as soon as one is stored again, saying *web-1 is sending metrics
-again*.
+offline, so the Host offline rule can't see it. A connected host isn't `reporting` once
+the newest sample stored from it is three of its intervals old, from the
+[config rules](agents.md#config-rules) that apply to it, and at least a minute, so one
+set to send a sample every 10 minutes isn't reporting after 30 minutes. A rule with
+`!reporting` alerts once that's lasted its **For at least** time, like *web-1 is
+connected but sending no metrics*, and resolves as soon as a sample is stored again,
+saying *web-1 is sending metrics again*.
 
 - A host that hasn't sent anything since it connected counts from when it connected.
-- A host that sends seldom gets at least three of its intervals, from the
-  [config rules](agents.md#config-rules) that apply to it, so one set to send a sample
-  every 10 minutes alerts after 30 minutes, not after 5.
 - Only connected agents are watched. One that's gone is the Host offline rule's to
   alert on, and a host without an agent, or the server itself, never alerts. An alert
   that's already open stays open while its agent is away and after it reconnects,
@@ -53,37 +109,30 @@ again*.
 
 ## Forecasts
 
-A forecast rule alerts before a problem rather than once it's there, such as a disk that
-will be full in a few hours while it's still at 70%. It draws the straight line that best
-fits each series over the last few hours, carries it on, and alerts when that line
-reaches a level within the time you choose.
+A forecast alerts before a problem rather than once it's there, such as a disk that will
+be full in a few hours while it's still at 70%. `forecast(disk.usage, duration('4h'))` is
+where the metric will be in 4 hours, judging by the straight line that best fits each
+series over the last few hours, carried on. So a rule that warns when a disk is on
+course to be full within a day, and is critical within 4 hours, has:
 
-On the rule's page, choose **A metric is on course to reach a level soon**, then:
+- **Warning when** `forecast(disk.usage, duration('24h')) >= 100`
+- **Critical when** `forecast(disk.usage, duration('4h')) >= 100`
 
-- **Level** is what the metric is heading for, like 100 for a disk being full. Above
-  means rising to it, and below means falling to it.
-- **Warning if it gets there within** and **Critical if it gets there within** are in
-  hours. Fill in either or both. With both, one alert starts as a warning and becomes
-  critical once the level is closer, as with thresholds.
-- **Judging by the last** is how many hours the line is drawn through, from 1 to 24.
-  A longer time is steadier, and a shorter one notices a change sooner.
+**Looking back** is how much of the past the line is drawn through, from 1 to 24 hours,
+and 6 hours unless it's set. A longer time is steadier, and a shorter one notices a
+change sooner.
 
 Forecasts are worked out every 5 minutes. A series needs at least 10 readings, from at
 least half the time looked back over, and one in the last 10 minutes, before it has a
-forecast at all, so a new host waits a while. A series that's already reached the
-level counts as getting there now. When the line stops heading for the level, the
-alert clears once that's lasted the rule's **For at least** time.
-
-The alert says where the metric is and how fast it's moving, like *Disk usage (/) on
-web-1 is 92% and rising by 3% an hour, so it reaches 100% in about 3 hours*.
+forecast at all, so a new host waits a while.
 
 ## Warning, then critical
 
-A metric or calculation rule can have a warning threshold, a critical threshold, or
-both. With both, there's one alert for each thing it watches, at the worse of the two:
-a disk at 85% is a warning, and the same alert becomes critical when the disk passes
-90%. Each threshold has to be crossed for the rule's **For at least** time to count, and
-stops counting the moment it's clear.
+A rule can have a warning condition, a critical condition, or both. With both, there's
+one alert for each thing it watches, at the worse of the two: a disk at 85% is a
+warning, and the same alert becomes critical when the disk passes 90%. Each condition has
+to be true for the rule's **For at least** time to count, and stops counting the moment
+it isn't.
 
 - **Getting worse** sends a **Now critical** notification to every channel that heard
   the alert start, and clears any acknowledgement, so someone has to pick it up again.
@@ -108,17 +157,16 @@ then on of every change until it resolves:
 - **Both**, the default: everything.
 
 A resolved notification says where things stand as the problem cleared rather than
-repeating what was wrong, like `CPU usage on web-1 is now 42%, no longer above 90%`,
-`Disk usage (/) on web-1 is now 83.7% and steady`,
-`Disk usage (/) on web-1 is now 84% and rising by 0.6% an hour, so it reaches 100% in about 27 hours, no longer within 1 day`
-or `web-1 is back online`. Email,
+repeating what was wrong, like `High CPU on web-1: CPU usage is now 42%` or
+`web-1 is back online`, as the rule's [summary](#what-alerts-say) says. Email,
 Telegram and Teams add what it said when it fired. In Slack, the message the alert
 fired with is marked resolved and keeps its words, and the reply in its thread says
 where things stand now.
 
 ## Actions
 
-A metric or forecast rule can run actions on the alert's host, and what they print is
+A rule about hosts, rather than a calculation across them, can run actions on the
+alert's host, and what they print is
 kept with the alert: which processes are busiest when CPU is high, where the space
 has gone when a disk is filling up, or the result of restarting a service.
 
@@ -149,7 +197,8 @@ server can only ever ask a host for something its administrator put there.
 
 An action can use values from the alert: `{disk}`, `{interface}`, `{process}`,
 `{container}` or `{check}` for what the alert is about, or `{series}` for any of them,
-and `{hostname}`, `{rule}`, `{severity}`, `{metric}`, `{value}` and `{threshold}`. A
+and `{hostname}`, `{rule}`, `{severity}`, `{metric}` and `{value}`, the first metric the
+rule's conditions use and its reading. A
 rule can't be saved with an action that needs something its alerts don't have, such as
 `disk_space` on a CPU rule, or with one no host has. A host that lacks an action
 other hosts have records that it couldn't run it, and so does an alert about a whole
@@ -196,12 +245,12 @@ in the day when the clocks change.
 
 ## An alert's chart
 
-Press **Chart** on an open alert to see just what it's about: its own series, such as
-the one disk that's filling, with the rule's thresholds across it and lines where the
-alert started and, once it has, resolved. The chart reaches back past the start to
-show what led up to it, and the ranges above it look further. A forecast's chart has
-its level, such as 100%, across it instead. Offline and no-metrics alerts have no
-chart, as they don't watch a metric.
+Press **Chart** on an open alert to see just what it's about: the first metric its
+rule's conditions use, and its own series, such as the one disk that's filling, with
+lines where the alert started and, once it has, resolved. A condition that only compares
+the metric with a number, such as `disk.usage > 90`, is drawn across it too. The chart
+reaches back past the start to show what led up to it, and the ranges above it look
+further. A rule that uses no metric, such as `!online`, has no chart.
 
 ## Reminders and acknowledging
 

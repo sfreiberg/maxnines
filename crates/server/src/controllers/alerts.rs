@@ -15,7 +15,7 @@ use super::metrics::{
 };
 use super::{CsrfForm, Page, local_time, recorded_by, server_error, viewer_zone};
 use crate::alert_charts;
-use crate::alerting::{Alert, DeliveryProblem, RuleKind, Severity};
+use crate::alerting::{Alert, DeliveryProblem, Severity};
 use crate::app_state::AppState;
 use crate::events::{EventKind, TimelineEvent};
 use crate::metric_charts::{self, Frame};
@@ -149,7 +149,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
             .list_alert_rules()
             .await?
             .into_iter()
-            .filter(|rule| !rule.rule.kind.is_about_the_agent())
+            .filter(|rule| rule.rule.watched().is_some())
             .map(|rule| rule.id)
             .collect();
         anyhow::Ok((open, resolved, problems, silences, charted))
@@ -247,13 +247,11 @@ async fn show(
                 None => watched.metric.title.to_string(),
             },
         };
-        // A forecast's level is where it's heading, the same for either severity.
-        let forecast = watched.rule.kind == RuleKind::Forecast;
         let levels: Vec<(&'static str, f64)> = watched
             .rule
-            .levels()
+            .thresholds()
             .into_iter()
-            .map(|(severity, value)| (if forecast { "level" } else { severity.as_str() }, value))
+            .map(|(severity, value)| (severity.as_str(), value))
             .collect();
         let mut chart = metric_charts::build_with_thresholds(
             watched.metric,
@@ -287,7 +285,7 @@ async fn show(
     // The numbers behind the chart, where a host's page has them.
     let data_link = watched
         .as_ref()
-        .filter(|watched| watched.rule.kind != RuleKind::Calculation)
+        .filter(|watched| !watched.rule.is_calculation())
         .filter(|_| alert.host_id != FLEET_HOST_ID)
         .map(|watched| {
             let mut fields = vec![("range", selected.to_string())];

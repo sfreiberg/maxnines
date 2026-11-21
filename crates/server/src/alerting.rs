@@ -5,16 +5,16 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use cel::Program;
 use chrono::TimeDelta;
 use serde::{Deserialize, Serialize};
-use wildmatch::WildMatch;
+use serde_json::{Map, Value, json};
 
 use crate::actions::{ActionRun, RuleAction, check_rule_actions};
-use crate::calculations::{Calculation, Grouping, Question};
+use crate::alert_conditions::{Conditions, MetricUse, Scope};
+use crate::calculations::{Calculation, Question};
 use crate::channels;
 use crate::metric_charts::format_value;
-use crate::metrics::{self, Metric, Source, Unit};
+use crate::metrics::{Metric, Source};
 use crate::times::Timestamp;
 
 /// Why an alert ends when its rule goes, however it goes.
@@ -23,6 +23,8 @@ pub const RULE_GONE_REASON: &str = "The rule was deleted or disabled";
 /// What the database columns hold.
 const MAX_NAME_LEN: usize = 255;
 const MAX_TARGET_LEN: usize = 2048;
+/// Summaries are a line or two, and what's filled in is kept to that too.
+pub const MAX_SUMMARY_LEN: usize = 1000;
 
 /// A rule can't wait longer than this before firing.
 const MAX_HOLD: TimeDelta = TimeDelta::days(7);
@@ -36,85 +38,6 @@ const DEFAULT_WINDOW: TimeDelta = TimeDelta::minutes(5);
 /// mostly noise, and more than a day is a lot to read every few minutes.
 pub const DEFAULT_FORECAST_WINDOW: TimeDelta = TimeDelta::hours(6);
 const MIN_FORECAST_WINDOW: TimeDelta = TimeDelta::hours(1);
-/// How far ahead a forecast can look, from a minute to 30 days. A line through a day
-/// says little about a month.
-const MIN_FORECAST: TimeDelta = TimeDelta::minutes(1);
-const MAX_FORECAST: TimeDelta = TimeDelta::days(30);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuleKind {
-    Metric,
-    Offline,
-    /// Something worked out across a group of hosts, such as their average CPU.
-    Calculation,
-    /// A metric heading for a level soon, such as a disk filling up, judged by the
-    /// line through its recent readings.
-    Forecast,
-    /// A connected agent whose samples have stopped being stored, such as when the
-    /// server refuses everything it sends. One that isn't connected is offline.
-    NoMetrics,
-}
-
-impl RuleKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Metric => "metric",
-            Self::Offline => "offline",
-            Self::Calculation => "calculation",
-            Self::Forecast => "forecast",
-            Self::NoMetrics => "no_metrics",
-        }
-    }
-
-    /// Whether the rule is about a host's agent as a whole, so it has no metric,
-    /// threshold or series, and its alerts have no chart.
-    pub fn is_about_the_agent(self) -> bool {
-        matches!(self, Self::Offline | Self::NoMetrics)
-    }
-
-    pub fn parse(text: &str) -> Result<Self> {
-        match text {
-            "metric" => Ok(Self::Metric),
-            "offline" => Ok(Self::Offline),
-            "calculation" => Ok(Self::Calculation),
-            "forecast" => Ok(Self::Forecast),
-            "no_metrics" => Ok(Self::NoMetrics),
-            other => bail!("unknown rule kind {other:?}"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Comparison {
-    Above,
-    Below,
-}
-
-impl Comparison {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Above => "above",
-            Self::Below => "below",
-        }
-    }
-
-    pub fn parse(text: &str) -> Result<Self> {
-        match text {
-            "above" => Ok(Self::Above),
-            "below" => Ok(Self::Below),
-            other => bail!("unknown comparison {other:?}"),
-        }
-    }
-
-    pub fn is_breached(self, value: f64, threshold: f64) -> bool {
-        match self {
-            Self::Above => value > threshold,
-            Self::Below => value < threshold,
-        }
-    }
-}
 
 /// Mildest first, so the worse of two is the greater.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -153,31 +76,30 @@ pub struct AlertRule {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AlertRuleInput {
     pub name: String,
-    pub kind: RuleKind,
-    /// A name from the metric catalog, for metric rules.
-    #[serde(default)]
-    pub metric: Option<String>,
-    /// Limits a metric rule to matching series, with `*` and `?` wildcards.
-    /// Every series is watched separately, so none means each one.
+    /// When it's a warning: CEL over metrics by their names, such as
+    /// `disk.usage > 80`. A rule has this, `critical` or both, and one alert covers
+    /// both, at the worse of the two.
     #[serde(default, deserialize_with = "crate::text::optional")]
-    pub series: Option<String>,
-    #[serde(default)]
-    pub comparison: Option<Comparison>,
-    /// Where the rule's severity starts.
-    #[serde(default)]
-    pub threshold: Option<f64>,
-    /// For a critical rule on a metric or calculation, where it's a warning first.
-    /// One alert covers both, at the worse of the two.
-    #[serde(default)]
-    pub warning_threshold: Option<f64>,
+    pub warning: Option<String>,
+    /// When it's critical, the same way.
+    #[serde(default, deserialize_with = "crate::text::optional")]
+    pub critical: Option<String>,
+    /// What an alert says, filled in like a custom webhook's body: `{{ host }}`,
+    /// `{{ series }}`, `{{ value }}` and the metrics the conditions use, such as
+    /// `{{ disk.usage }}`. Without it, the rule's name and the reading.
+    #[serde(default, deserialize_with = "crate::text::optional")]
+    pub summary: Option<String>,
+    /// What an alert says as it clears, the same way.
+    #[serde(default, deserialize_with = "crate::text::optional")]
+    pub resolved_summary: Option<String>,
     /// How long the problem has to last before the alert fires. It resolves as
     /// soon as the problem is gone.
     #[serde(rename = "for_secs", with = "crate::times::whole_seconds")]
     pub hold: TimeDelta,
-    pub severity: Severity,
-    /// A CEL expression over facts. No condition matches every agent.
+    /// Which hosts, as CEL over facts. None is every host. A rule with a
+    /// calculation picks its hosts with `filter` instead.
     #[serde(default, deserialize_with = "crate::text::optional")]
-    pub condition: Option<String>,
+    pub applies_to: Option<String>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     /// Who to tell. With none, the alert only shows in the web interface.
@@ -186,16 +108,21 @@ pub struct AlertRuleInput {
     /// Tell every channel instead, including ones added later.
     #[serde(default)]
     pub all_channels: bool,
-    /// How to combine hosts, for calculation rules.
+    /// How to combine hosts, for a rule about a group of hosts rather than each
+    /// one, whose conditions are about the calculated `value`.
     #[serde(default)]
     pub calculation: Option<Calculation>,
+    /// What a calculation combines, by its name in the metric catalog.
+    #[serde(default, deserialize_with = "crate::text::optional")]
+    pub metric: Option<String>,
     /// What's watched separately, for calculation rules, as in a dashboard widget.
     #[serde(default, deserialize_with = "crate::text::optional")]
     pub group_by: Option<String>,
     /// Which hosts, for calculation rules, as on the Hosts list. None is all.
     #[serde(default, deserialize_with = "crate::text::optional")]
     pub filter: Option<String>,
-    /// How far back a calculation rule looks, so one busy moment isn't a problem.
+    /// How far back a calculation looks, so one busy moment isn't a problem, or
+    /// how much of a metric's past `forecast()` draws its line through.
     #[serde(
         default,
         rename = "window_secs",
@@ -210,24 +137,8 @@ pub struct AlertRuleInput {
         with = "crate::times::optional_whole_seconds"
     )]
     pub remind_every: Option<TimeDelta>,
-    /// For a forecast, how soon the metric has to be on course to reach `threshold`
-    /// for the rule's severity.
-    #[serde(
-        default,
-        rename = "forecast_secs",
-        with = "crate::times::optional_whole_seconds"
-    )]
-    pub forecast: Option<TimeDelta>,
-    /// For a critical forecast, a longer time ahead that's a warning first. One alert
-    /// covers both, as with thresholds.
-    #[serde(
-        default,
-        rename = "warning_forecast_secs",
-        with = "crate::times::optional_whole_seconds"
-    )]
-    pub warning_forecast: Option<TimeDelta>,
-    /// What to run on an alert's host, and when. Only for metric and forecast
-    /// rules, whose alerts are about one host.
+    /// What to run on an alert's host, and when. Not for a calculation, whose
+    /// alerts are about a group of hosts.
     #[serde(default)]
     pub actions: Vec<RuleAction>,
 }
@@ -239,9 +150,16 @@ fn default_enabled() -> bool {
 /// The shortest time between reminders. Any more often and people stop reading them.
 const MIN_REMINDER: TimeDelta = TimeDelta::minutes(5);
 
-/// Checks a rule before it's saved. Whether its channels exist is up to the
-/// caller, which can see them.
+/// Checks a rule before it's saved, with no host's facts to try its conditions on.
+#[cfg(test)]
 pub fn check_rule(rule: &AlertRuleInput) -> Result<()> {
+    check_rule_with(rule, &Value::Null)
+}
+
+/// Checks a rule before it's saved, trying its conditions on `facts`, a real host's
+/// if there is one. Whether its channels exist is up to the caller, which can see
+/// them.
+pub fn check_rule_with(rule: &AlertRuleInput, facts: &Value) -> Result<()> {
     ensure!(!rule.name.trim().is_empty(), "a rule needs a name");
     ensure!(rule.name.len() <= MAX_NAME_LEN, "the rule name is too long");
     ensure!(
@@ -258,141 +176,114 @@ pub fn check_rule(rule: &AlertRuleInput) -> Result<()> {
         "choose every channel or some of them, not both"
     );
 
-    if let Some(condition) = &rule.condition {
-        Program::compile(condition).map_err(|error| anyhow!("invalid condition: {error}"))?;
+    let conditions = rule.conditions()?;
+    conditions.dry_run(facts)?;
+    if let Some(applies_to) = &rule.applies_to {
+        ensure!(
+            !rule.is_calculation(),
+            "a rule with a calculation picks its hosts with a filter"
+        );
+        cel::Program::compile(applies_to)
+            .map_err(|error| anyhow!("invalid condition for which hosts: {error}"))?;
     }
+    if rule.is_calculation() {
+        rule.question().map_err(|error| anyhow!("{error}"))?;
+        ensure!(
+            (MIN_WINDOW..=MAX_WINDOW).contains(&rule.window()),
+            "the window has to be between a minute and a day"
+        );
+    } else {
+        ensure!(
+            rule.metric.is_none() && rule.group_by.is_none() && rule.filter.is_none(),
+            "only a rule with a calculation takes a metric, grouping or filter"
+        );
+        if conditions.forecast_metrics().is_empty() {
+            ensure!(
+                rule.window.is_none(),
+                "only a calculation or forecast() looks back over a window"
+            );
+        } else {
+            ensure!(
+                (MIN_FORECAST_WINDOW..=MAX_WINDOW).contains(&rule.window()),
+                "forecast() has to look back between an hour and a day"
+            );
+        }
+    }
+    for (template, which) in [
+        (&rule.summary, "summary"),
+        (&rule.resolved_summary, "resolved summary"),
+    ] {
+        if let Some(template) = template {
+            rule.check_summary(template, &conditions)
+                .map_err(|error| anyhow!("the {which}: {error:#}"))?;
+        }
+    }
+    Ok(())
+}
 
-    match rule.kind {
-        RuleKind::Metric => {
-            let name = rule.metric.as_deref().context("choose a metric")?;
-            metrics::find(name).with_context(|| format!("unknown metric {name:?}"))?;
-            ensure!(rule.comparison.is_some(), "choose above or below");
-            let threshold = rule.threshold.context("a metric rule needs a threshold")?;
-            ensure!(threshold.is_finite(), "the threshold must be a number");
-            if let Some(series) = &rule.series {
-                ensure!(series.len() <= MAX_NAME_LEN, "the series name is too long");
+/// The readings a summary can show, written in their units, by where they go in the
+/// template: `disk.usage` as `{"disk": {"usage": "92%"}}`.
+pub struct SummaryValues {
+    pub host: String,
+    pub series: String,
+    /// The first metric's reading, or the calculated value.
+    pub value: Option<String>,
+    pub metrics: Vec<(&'static str, Value)>,
+}
+
+impl SummaryValues {
+    fn context(&self) -> Value {
+        let mut fields = Map::new();
+        for (name, value) in &self.metrics {
+            insert_at(&mut fields, name, value.clone());
+        }
+        fields.insert("host".to_string(), json!(self.host));
+        fields.insert("series".to_string(), json!(self.series));
+        fields.insert("value".to_string(), json!(self.value));
+        Value::Object(fields)
+    }
+}
+
+/// Puts `value` at a dotted name, leaving anything already there.
+fn insert_at(fields: &mut Map<String, Value>, name: &str, value: Value) {
+    match name.split_once('.') {
+        None => {
+            fields.entry(name).or_insert(value);
+        }
+        Some((first, rest)) => {
+            let inner = fields
+                .entry(first)
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Value::Object(inner) = inner {
+                insert_at(inner, rest, value);
             }
         }
-        RuleKind::Calculation => {
-            rule.question().map_err(|error| anyhow!("{error}"))?;
-            ensure!(rule.comparison.is_some(), "choose above or below");
-            let threshold = rule.threshold.context("a rule needs a threshold")?;
-            ensure!(threshold.is_finite(), "the threshold must be a number");
-            ensure!(
-                (MIN_WINDOW..=MAX_WINDOW).contains(&rule.window()),
-                "the window has to be between a minute and a day"
-            );
-            ensure!(
-                rule.condition.is_none() && rule.series.is_none(),
-                "a calculation picks its hosts with a filter"
-            );
-        }
-        RuleKind::Offline | RuleKind::NoMetrics => {
-            ensure!(
-                rule.metric.is_none()
-                    && rule.series.is_none()
-                    && rule.comparison.is_none()
-                    && rule.threshold.is_none(),
-                "{} doesn't take a metric or threshold",
-                agent_rule(rule.kind)
-            );
-        }
-        RuleKind::Forecast => check_forecast(rule)?,
-    }
-    if rule.kind != RuleKind::Forecast {
-        ensure!(
-            rule.forecast.is_none() && rule.warning_forecast.is_none(),
-            "only a forecast looks ahead"
-        );
-    }
-    if let Some(warning) = rule.warning_threshold {
-        ensure!(
-            !rule.kind.is_about_the_agent(),
-            "{} doesn't take a warning threshold",
-            agent_rule(rule.kind)
-        );
-        ensure!(
-            warning.is_finite(),
-            "the warning threshold must be a number"
-        );
-        ensure!(
-            rule.severity == Severity::Critical,
-            "a warning threshold goes with a critical threshold"
-        );
-        if let (Some(comparison), Some(critical)) = (rule.comparison, rule.threshold) {
-            ensure!(
-                warning != critical && !comparison.is_breached(warning, critical),
-                "the warning threshold has to come before the critical one, so it's {} it",
-                match comparison {
-                    Comparison::Above => "below",
-                    Comparison::Below => "above",
-                }
-            );
-        }
-    }
-    if rule.kind != RuleKind::Calculation {
-        ensure!(
-            rule.calculation.is_none() && rule.group_by.is_none() && rule.filter.is_none(),
-            "only a calculation rule takes a calculation, grouping or filter"
-        );
-        ensure!(
-            rule.window.is_none() || rule.kind == RuleKind::Forecast,
-            "only a calculation or forecast looks back over a window"
-        );
-    }
-    Ok(())
-}
-
-/// A rule about a host's agent as a whole, in words, for what it's told it can't take.
-fn agent_rule(kind: RuleKind) -> &'static str {
-    match kind {
-        RuleKind::NoMetrics => "a no-metrics rule",
-        _ => "an offline rule",
     }
 }
 
-fn check_forecast(rule: &AlertRuleInput) -> Result<()> {
-    let name = rule.metric.as_deref().context("choose a metric")?;
-    metrics::find(name).with_context(|| format!("unknown metric {name:?}"))?;
-    ensure!(rule.comparison.is_some(), "choose rising or falling");
-    let level = rule
-        .threshold
-        .context("a forecast needs a level to watch for")?;
-    ensure!(level.is_finite(), "the level must be a number");
-    ensure!(
-        rule.warning_threshold.is_none(),
-        "a forecast takes how soon, not a warning threshold"
-    );
-    if let Some(series) = &rule.series {
-        ensure!(series.len() <= MAX_NAME_LEN, "the series name is too long");
-    }
-    let soon = rule
-        .forecast
-        .context("a forecast needs how far ahead to look")?;
-    for ahead in [Some(soon), rule.warning_forecast].into_iter().flatten() {
-        ensure!(
-            (MIN_FORECAST..=MAX_FORECAST).contains(&ahead),
-            "a forecast can look between a minute and 30 days ahead"
-        );
-    }
-    if let Some(warning) = rule.warning_forecast {
-        ensure!(
-            rule.severity == Severity::Critical,
-            "a warning goes with a critical forecast"
-        );
-        ensure!(
-            warning > soon,
-            "the warning has to look further ahead than the critical alert"
-        );
-    }
-    ensure!(
-        (MIN_FORECAST_WINDOW..=MAX_WINDOW).contains(&rule.window()),
-        "a forecast has to look back between an hour and a day"
-    );
-    Ok(())
+/// Fills in a summary template, which is plain text, so nothing is escaped, and
+/// control characters an agent sent can't start a line of their own.
+pub fn fill_summary(template: &str, values: &SummaryValues) -> Result<String> {
+    let context = tera::Context::from_serialize(&values.context())?;
+    let filled = tera::Tera::one_off(template, &context, false)
+        .map_err(|error| anyhow!("{}", crate::channels::custom_webhook::explain_tera(&error)))?;
+    Ok(clean_long(&filled, MAX_SUMMARY_LEN))
 }
 
 impl AlertRuleInput {
+    pub fn is_calculation(&self) -> bool {
+        self.calculation.is_some()
+    }
+
+    /// The rule's conditions, read. Saving a rule checks they can be.
+    pub fn conditions(&self) -> Result<Conditions> {
+        let scope = match self.is_calculation() {
+            true => Scope::Calculation,
+            false => Scope::Hosts,
+        };
+        Conditions::compile(self.warning.as_deref(), self.critical.as_deref(), scope)
+    }
+
     /// What a calculation rule asks. The error says what's wrong, to show whoever chose it.
     pub fn question(&self) -> Result<Question, String> {
         Question::new(
@@ -403,163 +294,152 @@ impl AlertRuleInput {
         )
     }
 
-    /// Each threshold with how bad crossing it is, mildest first. Empty for an
-    /// offline or no-metrics rule.
-    pub fn levels(&self) -> Vec<(Severity, f64)> {
-        let Some(threshold) = self.threshold else {
-            return Vec::new();
-        };
-        let warning = self
-            .warning_threshold
-            .map(|warning| (Severity::Warning, warning));
-        warning
-            .into_iter()
-            .chain([(self.severity, threshold)])
-            .collect()
-    }
-
-    fn threshold_for(&self, severity: Severity) -> Result<f64> {
-        self.levels()
-            .into_iter()
-            .find(|(level, _)| *level == severity)
-            .map(|(_, threshold)| threshold)
-            .with_context(|| format!("no {} threshold", severity.as_str()))
-    }
-
-    /// The thresholds, saying which is which when there are two.
-    fn thresholds_text(&self, unit: Unit) -> String {
-        let levels = self.levels();
-        match levels.as_slice() {
-            [(_, threshold)] => format_value(unit, *threshold),
-            _ => levels
-                .iter()
-                .map(|(severity, threshold)| {
-                    format!("{} ({})", format_value(unit, *threshold), severity.as_str())
-                })
-                .collect::<Vec<_>>()
-                .join(", "),
-        }
-    }
-
     pub fn window(&self) -> TimeDelta {
-        self.window.unwrap_or(match self.kind {
-            RuleKind::Forecast => DEFAULT_FORECAST_WINDOW,
-            _ => DEFAULT_WINDOW,
+        self.window.unwrap_or(match self.is_calculation() {
+            true => DEFAULT_WINDOW,
+            false => DEFAULT_FORECAST_WINDOW,
         })
     }
 
-    /// For a forecast, how far ahead each severity looks, mildest first.
-    pub fn forecast_levels(&self) -> Vec<(Severity, TimeDelta)> {
-        let Some(soon) = self.forecast else {
+    /// The severities the rule can alert at, mildest first.
+    pub fn severities(&self) -> Vec<Severity> {
+        let warning = self.warning.as_ref().map(|_| Severity::Warning);
+        let critical = self.critical.as_ref().map(|_| Severity::Critical);
+        warning.into_iter().chain(critical).collect()
+    }
+
+    /// The worst severity the rule can alert at.
+    pub fn worst_severity(&self) -> Severity {
+        match self.critical {
+            Some(_) => Severity::Critical,
+            None => Severity::Warning,
+        }
+    }
+
+    /// The levels to draw across a chart of what the rule watches, mildest first:
+    /// one for each condition that only compares the metric with a number, such as
+    /// `disk.usage > 90`.
+    pub fn thresholds(&self) -> Vec<(Severity, f64)> {
+        let Ok(conditions) = self.conditions() else {
             return Vec::new();
         };
-        let warning = self
-            .warning_forecast
-            .map(|ahead| (Severity::Warning, ahead));
-        warning.into_iter().chain([(self.severity, soon)]).collect()
+        conditions
+            .levels()
+            .into_iter()
+            .filter_map(|(severity, condition)| Some((severity, condition.threshold()?)))
+            .collect()
     }
 
-    pub fn metric(&self) -> Option<&'static Metric> {
-        metrics::find(self.metric.as_deref()?)
+    /// The metric the rule's alerts are about, which they chart: the calculation's,
+    /// or the first one its conditions use, with the series that one picks out.
+    pub fn watched(&self) -> Option<(&'static Metric, Option<String>)> {
+        if self.is_calculation() {
+            return self.question().ok().map(|question| (question.metric, None));
+        }
+        let conditions = self.conditions().ok()?;
+        let primary: &MetricUse = conditions.primary()?;
+        Some((primary.metric, primary.picked.clone()))
     }
 
-    pub fn watches_series(&self, series: &str) -> bool {
-        self.series_pattern()
-            .is_none_or(|pattern| pattern.matches(series))
-    }
-
-    /// Which series the rule watches, if not all of them, made ready to match many.
-    pub fn series_pattern(&self) -> Option<WildMatch> {
-        self.series.as_deref().map(WildMatch::new)
-    }
-
-    /// What the rule watches, in a few words.
+    /// What the rule watches, in a few words, beside its conditions.
     pub fn describe(&self) -> String {
-        let wait = |text: String| match self.hold {
-            hold if hold.is_zero() => text,
-            hold => format!("{text} for {}", format_duration(hold)),
-        };
-        if self.kind == RuleKind::NoMetrics {
-            return wait("Sending no metrics".to_string());
-        }
-        let (Some(metric), Some(comparison), Some(level)) =
-            (self.metric(), self.comparison, self.threshold)
-        else {
-            return wait("Offline".to_string());
-        };
-        if self.kind == RuleKind::Forecast {
-            let series = match &self.series {
-                Some(series) => format!(" ({series})"),
-                None => String::new(),
-            };
-            let ahead = self
-                .forecast_levels()
-                .iter()
-                .map(|(severity, ahead)| {
-                    let within = format_duration(*ahead);
-                    if self.warning_forecast.is_some() {
-                        format!("{within} ({})", severity.as_str())
-                    } else {
-                        within
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            return wait(format!(
-                "{}{series} on course to {} {} within {ahead}, judging by the last {}",
-                metric.title,
-                heading(comparison),
-                format_value(metric.unit, level),
-                format_duration(self.window())
-            ));
-        }
-        if let Ok(question) = self.question() {
-            return wait(format!(
-                "{} of {} {} {} over {}",
+        let mut words = Vec::new();
+        if self.is_calculation()
+            && let Ok(question) = self.question()
+        {
+            words.push(format!(
+                "{} of {} over {}",
                 question.calculation.label(),
-                metric.title,
-                comparison.as_str(),
-                self.thresholds_text(question.unit()),
+                question.metric.title,
                 format_duration(self.window())
             ));
         }
-        let series = match &self.series {
-            Some(series) => format!(" ({series})"),
-            None => String::new(),
-        };
-        wait(format!(
-            "{}{series} {} {}",
-            metric.title,
-            comparison.as_str(),
-            self.thresholds_text(metric.unit)
-        ))
+        if !self.hold.is_zero() {
+            words.push(format!("for {}", format_duration(self.hold)));
+        }
+        words.join(", ")
     }
 
-    /// What a metric alert says when it fires, or reaches `severity`.
-    pub fn metric_summary(
-        &self,
-        metric: &Metric,
-        hostname: &str,
-        series: &str,
-        value: f64,
-        severity: Severity,
-    ) -> Result<String> {
-        let comparison = self.comparison.context("no comparison")?;
-        let threshold = self.threshold_for(severity)?;
-        let name = match metric.source {
-            Source::Fields([_]) => metric.title.to_string(),
-            _ => format!("{} ({series})", metric.title),
-        };
-        let mut summary = format!(
-            "{name} on {hostname} is {}, {} {}",
-            format_value(metric.unit, value),
-            comparison.as_str(),
-            format_value(metric.unit, threshold)
+    /// Fills in a summary template with example values, to find mistakes when a
+    /// rule is saved: a metric the conditions don't use can't be shown.
+    fn check_summary(&self, template: &str, conditions: &Conditions) -> Result<()> {
+        ensure!(
+            template.len() <= MAX_SUMMARY_LEN,
+            "it can be up to {MAX_SUMMARY_LEN} characters"
         );
-        if self.hold > TimeDelta::zero() {
-            summary.push_str(&format!(" for {}", format_duration(self.hold)));
+        let mut metrics = Vec::new();
+        for used in conditions.uses() {
+            let example = format_value(used.metric.unit, 50.0);
+            let value = match used.metric.source {
+                Source::Fields(fields) if used.bracketed => Value::Object(
+                    fields
+                        .iter()
+                        .map(|(name, _)| (name.to_string(), json!(example)))
+                        .collect(),
+                ),
+                _ if used.bracketed => Value::Object(
+                    used.picked
+                        .iter()
+                        .map(|name| (name.clone(), json!(example)))
+                        .collect(),
+                ),
+                _ => json!(example),
+            };
+            metrics.push((used.metric.name, value));
         }
-        Ok(summary)
+        let example = SummaryValues {
+            host: "web-1".to_string(),
+            series: "/".to_string(),
+            value: Some("50%".to_string()),
+            metrics,
+        };
+        fill_summary(template, &example)?;
+        Ok(())
+    }
+
+    /// What an alert says when it fires, or changes severity: the rule's summary,
+    /// or its name and the reading. A summary that can't be filled in, such as one
+    /// showing a metric with no reading, says the usual instead.
+    pub fn summary_for(&self, values: &SummaryValues, subject: Option<&str>) -> String {
+        if let Some(template) = &self.summary
+            && let Ok(filled) = fill_summary(template, values)
+        {
+            return filled;
+        }
+        let name = &self.name;
+        let about = match self.is_calculation() {
+            true => name.clone(),
+            false => format!("{name} on {}", values.host),
+        };
+        match (&values.value, subject) {
+            (Some(value), Some(subject)) => format!("{about}: {subject} is {value}"),
+            (Some(value), None) => format!("{about}: {value}"),
+            (None, _) => about,
+        }
+    }
+
+    /// What an alert says as it clears, the same way, or nothing for a rule with
+    /// no reading to give.
+    pub fn resolved_summary_for(
+        &self,
+        values: &SummaryValues,
+        subject: Option<&str>,
+    ) -> Option<String> {
+        if let Some(template) = &self.resolved_summary
+            && let Ok(filled) = fill_summary(template, values)
+        {
+            return Some(filled);
+        }
+        let name = &self.name;
+        let about = match self.is_calculation() {
+            true => name.clone(),
+            false => format!("{name} on {}", values.host),
+        };
+        let value = values.value.as_ref()?;
+        Some(match subject {
+            Some(subject) => format!("{about}: {subject} is now {value}"),
+            None => format!("{about}: now {value}"),
+        })
     }
 
     /// What an alert says about something that describes its own state, such as a
@@ -567,210 +447,50 @@ impl AlertRuleInput {
     pub fn state_summary(noun: &str, hostname: &str, series: &str, state: &str) -> String {
         format!("{noun} {series} on {hostname} is {state}")
     }
+}
 
-    /// What a calculation alert says when it fires, or reaches `severity`. `line`
-    /// is what's being watched.
-    pub fn calculation_summary(
-        &self,
-        question: &Question,
-        line: &str,
-        value: f64,
-        severity: Severity,
-    ) -> Result<String> {
-        let comparison = self.comparison.context("no comparison")?;
-        let threshold = self.threshold_for(severity)?;
-        let unit = question.unit();
-        let mut summary = format!(
-            "{} of {}{} is {}, {} {}",
-            question.calculation.label(),
-            question.metric.title,
-            match question.grouping {
-                Grouping::Nothing => String::new(),
-                _ => format!(" for {line}"),
-            },
-            format_value(unit, value),
-            comparison.as_str(),
-            format_value(unit, threshold)
-        );
-        if self.hold > TimeDelta::zero() {
-            summary.push_str(&format!(" for {}", format_duration(self.hold)));
+#[cfg(test)]
+impl AlertRuleInput {
+    /// A rule with these conditions that tells nobody and waits for nothing, for
+    /// tests to change what they need.
+    pub fn with_conditions(name: &str, warning: Option<&str>, critical: Option<&str>) -> Self {
+        Self {
+            name: name.to_string(),
+            warning: warning.map(str::to_string),
+            critical: critical.map(str::to_string),
+            summary: None,
+            resolved_summary: None,
+            hold: TimeDelta::zero(),
+            applies_to: None,
+            enabled: true,
+            channels: Vec::new(),
+            all_channels: false,
+            calculation: None,
+            metric: None,
+            group_by: None,
+            filter: None,
+            window: None,
+            remind_every: None,
+            actions: Vec::new(),
         }
-        Ok(summary)
-    }
-
-    /// What a forecast alert says when it fires, or reaches `severity`, for a value
-    /// changing `slope_per_sec` each second and reaching the level in `eta`.
-    pub fn forecast_summary(
-        &self,
-        metric: &Metric,
-        hostname: &str,
-        series: &str,
-        value: f64,
-        slope_per_sec: f64,
-        eta: TimeDelta,
-    ) -> Result<String> {
-        let comparison = self.comparison.context("no comparison")?;
-        let level = self.threshold.context("no level")?;
-        let name = match metric.source {
-            Source::Fields([_]) => metric.title.to_string(),
-            _ => format!("{} ({series})", metric.title),
-        };
-        let now = format_value(metric.unit, value);
-        let goal = format_value(metric.unit, level);
-        if eta <= TimeDelta::zero() {
-            return Ok(format!(
-                "{name} on {hostname} is {now}, already {} {goal}",
-                comparison.as_str()
-            ));
-        }
-        let per_hour = format_value(metric.unit, (slope_per_sec * 3600.0).abs());
-        let direction = if slope_per_sec > 0.0 {
-            "rising"
-        } else {
-            "falling"
-        };
-        Ok(format!(
-            "{name} on {hostname} is {now} and {direction} by {per_hour} an hour, so it reaches {goal} in about {}",
-            format_eta(eta)
-        ))
-    }
-
-    /// What an offline alert says when it fires. It's kept as long as the alert
-    /// is open, so it says nothing about how long, which pages show from when the
-    /// problem began.
-    pub fn offline_summary(hostname: &str) -> String {
-        format!("{hostname} is offline")
-    }
-
-    /// What an offline alert says as it clears.
-    pub fn online_summary(hostname: &str) -> String {
-        format!("{hostname} is back online")
-    }
-
-    /// What a no-metrics alert says when it fires. Like an offline alert's, it says
-    /// nothing about how long, as it's kept while the alert is open.
-    pub fn no_metrics_summary(hostname: &str) -> String {
-        format!("{hostname} is connected but sending no metrics")
-    }
-
-    /// What a no-metrics alert says as it clears.
-    pub fn metrics_again_summary(hostname: &str) -> String {
-        format!("{hostname} is sending metrics again")
-    }
-
-    /// What a metric alert says as it clears: the reading now, beside the mildest
-    /// level it had crossed.
-    pub fn metric_cleared_summary(
-        &self,
-        metric: &Metric,
-        hostname: &str,
-        series: &str,
-        value: f64,
-    ) -> Result<String> {
-        let comparison = self.comparison.context("no comparison")?;
-        let (_, threshold) = *self.levels().first().context("no threshold")?;
-        let name = match metric.source {
-            Source::Fields([_]) => metric.title.to_string(),
-            _ => format!("{} ({series})", metric.title),
-        };
-        Ok(format!(
-            "{name} on {hostname} is now {}, no longer {} {}",
-            format_value(metric.unit, value),
-            comparison.as_str(),
-            format_value(metric.unit, threshold)
-        ))
-    }
-
-    /// What a calculation alert says as it clears, for `line`.
-    pub fn calculation_cleared_summary(
-        &self,
-        question: &Question,
-        line: &str,
-        value: f64,
-    ) -> Result<String> {
-        let comparison = self.comparison.context("no comparison")?;
-        let (_, threshold) = *self.levels().first().context("no threshold")?;
-        let unit = question.unit();
-        Ok(format!(
-            "{} of {}{} is now {}, no longer {} {}",
-            question.calculation.label(),
-            question.metric.title,
-            match question.grouping {
-                Grouping::Nothing => String::new(),
-                _ => format!(" for {line}"),
-            },
-            format_value(unit, value),
-            comparison.as_str(),
-            format_value(unit, threshold)
-        ))
-    }
-
-    /// What a forecast alert says as it clears: the reading now and which way it's
-    /// going, with when it would reach the level if it still would, just not soon.
-    pub fn forecast_cleared_summary(
-        &self,
-        metric: &Metric,
-        hostname: &str,
-        series: &str,
-        value: f64,
-        slope_per_sec: f64,
-        eta: Option<TimeDelta>,
-    ) -> Result<String> {
-        let level = self.threshold.context("no level")?;
-        let name = match metric.source {
-            Source::Fields([_]) => metric.title.to_string(),
-            _ => format!("{} ({series})", metric.title),
-        };
-        let now = format_value(metric.unit, value);
-        let per_hour = format_value(metric.unit, (slope_per_sec * 3600.0).abs());
-        if per_hour == format_value(metric.unit, 0.0) {
-            return Ok(format!("{name} on {hostname} is now {now} and steady"));
-        }
-        let direction = if slope_per_sec > 0.0 {
-            "rising"
-        } else {
-            "falling"
-        };
-        let mut summary =
-            format!("{name} on {hostname} is now {now} and {direction} by {per_hour} an hour");
-        if let Some(eta) = eta.filter(|eta| *eta > TimeDelta::zero()) {
-            summary.push_str(&format!(
-                ", so it reaches {} in about {}",
-                format_value(metric.unit, level),
-                format_eta(eta)
-            ));
-            // It cleared because that is further off than the rule looks, which
-            // the rounded time alone doesn't say.
-            if let Some(ahead) = self.forecast_levels().iter().map(|(_, ahead)| *ahead).max() {
-                summary.push_str(&format!(", no longer within {}", format_duration(ahead)));
-            }
-        }
-        Ok(summary)
     }
 }
 
-/// Which way a forecast watches a metric go, in words.
-fn heading(comparison: Comparison) -> &'static str {
-    match comparison {
-        Comparison::Above => "rise to",
-        Comparison::Below => "fall to",
+/// What a reading is of, in an alert's words: its series where it has one of
+/// several, or the metric's title, with the series picked out of it if any.
+pub fn subject(metric: &Metric, series: &str, picked: Option<&str>) -> String {
+    if !series.is_empty() {
+        return series.to_string();
+    }
+    match (metric.source, picked) {
+        (_, Some(picked)) => format!("{} ({picked})", metric.title),
+        _ => metric.title.to_string(),
     }
 }
 
-/// How long until something happens, roughly, as nobody can say to the minute
-/// when a line through the past will be right.
-pub fn format_eta(eta: TimeDelta) -> String {
-    let plural = |count: i64, unit: &str| match count {
-        1 => format!("1 {unit}"),
-        _ => format!("{count} {unit}s"),
-    };
-    let secs = eta.num_seconds().max(0);
-    let rounded = |unit: i64| (secs + unit / 2) / unit;
-    match secs {
-        _ if rounded(60) < 60 => plural(rounded(60).max(1), "minute"),
-        _ if rounded(3600) < 48 => plural(rounded(3600), "hour"),
-        _ => plural(rounded(86_400), "day"),
-    }
+/// Text from agents or a template, cleaned as [`clean`] does, to `max` characters.
+fn clean_long(text: &str, max: usize) -> String {
+    text.chars().filter(|c| !c.is_control()).take(max).collect()
 }
 
 /// Agents choose hostnames and series names, so anything kept from them loses
@@ -1187,85 +907,342 @@ pub struct DeliveryProblem {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_forecast_that_clears_says_which_way_it_is_going() {
-        let rule = AlertRuleInput {
-            kind: RuleKind::Forecast,
-            metric: Some("disk.usage".to_string()),
-            threshold: Some(100.0),
-            forecast: Some(TimeDelta::seconds(4 * 3600)),
-            warning_forecast: Some(TimeDelta::seconds(86_400)),
-            ..metric_rule()
-        };
-        let metric = crate::metrics::find("disk.usage").unwrap();
-        let said = |slope_per_hour: f64, eta: Option<i64>| {
-            let slope = slope_per_hour / 3600.0;
-            let eta = eta.map(TimeDelta::seconds);
-            rule.forecast_cleared_summary(metric, "web-1", "/", 83.6, slope, eta)
-                .unwrap()
-        };
-        assert_eq!(
-            said(0.0, None),
-            "Disk usage (/) on web-1 is now 83.6% and steady"
-        );
-        assert_eq!(
-            said(-0.5, None),
-            "Disk usage (/) on web-1 is now 83.6% and falling by 0.5% an hour"
-        );
-        assert_eq!(
-            said(0.1, Some(164 * 3600)),
-            "Disk usage (/) on web-1 is now 83.6% and rising by 0.1% an hour, so it reaches 100% in about 7 days, no longer within 1 day"
-        );
-        // Rounded, the time can look like it's still inside the day the rule watches.
-        assert_eq!(
-            said(0.6, Some(24 * 3600 + 600)),
-            "Disk usage (/) on web-1 is now 83.6% and rising by 0.6% an hour, so it reaches 100% in about 24 hours, no longer within 1 day"
-        );
-    }
-
     fn metric_rule() -> AlertRuleInput {
         AlertRuleInput {
             name: "High CPU".to_string(),
-            kind: RuleKind::Metric,
-            metric: Some("cpu.usage".to_string()),
-            series: None,
-            comparison: Some(Comparison::Above),
-            threshold: Some(90.0),
-            warning_threshold: None,
+            warning: None,
+            critical: Some("cpu.usage > 90".to_string()),
+            summary: None,
+            resolved_summary: None,
             hold: TimeDelta::seconds(300),
-            severity: Severity::Critical,
-            condition: None,
+            applies_to: None,
             enabled: true,
             channels: Vec::new(),
             all_channels: false,
             calculation: None,
+            metric: None,
             group_by: None,
             filter: None,
             window: None,
             remind_every: None,
-            forecast: None,
-            warning_forecast: None,
             actions: Vec::new(),
         }
     }
 
-    fn offline_rule() -> AlertRuleInput {
+    fn calculation_rule() -> AlertRuleInput {
         AlertRuleInput {
-            kind: RuleKind::Offline,
-            metric: None,
-            comparison: None,
-            threshold: None,
-            hold: TimeDelta::seconds(60),
+            name: "Busy fleet".to_string(),
+            critical: Some("value > 80".to_string()),
+            calculation: Some(Calculation::Avg),
+            metric: Some("cpu.usage".to_string()),
             ..metric_rule()
         }
     }
 
-    fn no_metrics_rule() -> AlertRuleInput {
-        AlertRuleInput {
-            kind: RuleKind::NoMetrics,
-            hold: TimeDelta::minutes(5),
-            ..offline_rule()
+    fn refused(rule: AlertRuleInput, expected: &str) {
+        let error = format!("{:#}", check_rule(&rule).unwrap_err());
+        assert!(error.contains(expected), "{expected:?}: {error}");
+    }
+
+    #[test]
+    fn good_rules_pass() {
+        check_rule(&metric_rule()).unwrap();
+        check_rule(&calculation_rule()).unwrap();
+        for (warning, critical) in [
+            (Some("disk.usage > 80"), Some("disk.usage > 90")),
+            (Some("!reporting"), None),
+            (None, Some("!online")),
+            (
+                Some("forecast(disk.usage, duration('24h')) >= 100"),
+                Some("forecast(disk.usage, duration('4h')) >= 100"),
+            ),
+        ] {
+            let rule = AlertRuleInput {
+                warning: warning.map(str::to_string),
+                critical: critical.map(str::to_string),
+                summary: Some("{{ host }}: {{ series }} is {{ value }}".to_string()),
+                ..metric_rule()
+            };
+            check_rule(&rule).unwrap_or_else(|error| panic!("{warning:?} {critical:?}: {error:#}"));
         }
+    }
+
+    #[test]
+    fn bad_rules_are_refused_with_a_reason() {
+        refused(
+            AlertRuleInput {
+                name: " ".to_string(),
+                ..metric_rule()
+            },
+            "needs a name",
+        );
+        refused(
+            AlertRuleInput {
+                critical: None,
+                ..metric_rule()
+            },
+            "needs a warning or critical condition",
+        );
+        refused(
+            AlertRuleInput {
+                warning: Some("cpu.usage >".to_string()),
+                ..metric_rule()
+            },
+            "the warning condition: ",
+        );
+        refused(
+            AlertRuleInput {
+                critical: Some("clock.difference > 30".to_string()),
+                ..metric_rule()
+            },
+            "the critical condition: can't compare a length of time with a number",
+        );
+        refused(
+            AlertRuleInput {
+                hold: TimeDelta::days(8),
+                ..metric_rule()
+            },
+            "longer than 7 days",
+        );
+        refused(
+            AlertRuleInput {
+                remind_every: Some(TimeDelta::minutes(1)),
+                ..metric_rule()
+            },
+            "every 5 minutes",
+        );
+        refused(
+            AlertRuleInput {
+                all_channels: true,
+                channels: vec![1],
+                ..metric_rule()
+            },
+            "not both",
+        );
+        refused(
+            AlertRuleInput {
+                applies_to: Some("facts.os ==".to_string()),
+                ..metric_rule()
+            },
+            "invalid condition for which hosts",
+        );
+        refused(
+            AlertRuleInput {
+                metric: Some("cpu.usage".to_string()),
+                ..metric_rule()
+            },
+            "only a rule with a calculation takes a metric",
+        );
+        refused(
+            AlertRuleInput {
+                window: Some(TimeDelta::hours(2)),
+                ..metric_rule()
+            },
+            "only a calculation or forecast() looks back",
+        );
+        refused(
+            AlertRuleInput {
+                critical: Some("forecast(disk.usage, duration('4h')) >= 100".to_string()),
+                window: Some(TimeDelta::minutes(10)),
+                ..metric_rule()
+            },
+            "between an hour and a day",
+        );
+        refused(
+            AlertRuleInput {
+                applies_to: Some("true".to_string()),
+                ..calculation_rule()
+            },
+            "picks its hosts with a filter",
+        );
+        refused(
+            AlertRuleInput {
+                window: Some(TimeDelta::seconds(10)),
+                ..calculation_rule()
+            },
+            "between a minute and a day",
+        );
+        refused(
+            AlertRuleInput {
+                critical: Some("cpu.usage > 80".to_string()),
+                ..calculation_rule()
+            },
+            "watches the calculated value",
+        );
+        refused(
+            AlertRuleInput {
+                metric: Some("cpu.nonsense".to_string()),
+                ..calculation_rule()
+            },
+            "Choose a metric",
+        );
+        refused(
+            AlertRuleInput {
+                summary: Some("{{ host ".to_string()),
+                ..metric_rule()
+            },
+            "the summary: ",
+        );
+        refused(
+            AlertRuleInput {
+                resolved_summary: Some("{{ disk.usage }}".to_string()),
+                ..metric_rule()
+            },
+            "the resolved summary: ",
+        );
+    }
+
+    fn values(series: &str, value: Option<&str>) -> SummaryValues {
+        SummaryValues {
+            host: "web-1".to_string(),
+            series: series.to_string(),
+            value: value.map(str::to_string),
+            metrics: vec![
+                ("disk.usage", json!("92%")),
+                ("cpu.load", json!({ "5 minutes": "4.2" })),
+            ],
+        }
+    }
+
+    #[test]
+    fn summaries_say_the_rule_and_the_reading_unless_the_rule_says_otherwise() {
+        let disk = AlertRuleInput {
+            name: "Disk filling up".to_string(),
+            critical: Some("disk.usage > 90".to_string()),
+            ..metric_rule()
+        };
+        let firing = values("/", Some("92%"));
+        assert_eq!(
+            disk.summary_for(&firing, Some("/")),
+            "Disk filling up on web-1: / is 92%"
+        );
+        assert_eq!(
+            disk.resolved_summary_for(&values("/", Some("70%")), Some("/"))
+                .unwrap(),
+            "Disk filling up on web-1: / is now 70%"
+        );
+        let offline = AlertRuleInput {
+            name: "Host offline".to_string(),
+            critical: Some("!online".to_string()),
+            ..metric_rule()
+        };
+        assert_eq!(
+            offline.summary_for(&values("", None), None),
+            "Host offline on web-1"
+        );
+        assert_eq!(offline.resolved_summary_for(&values("", None), None), None);
+
+        let written = AlertRuleInput {
+            summary: Some(
+                "{{ host }}: {{ series }} is {{ disk.usage }}, load {{ cpu.load['5 minutes'] }}\nsoon"
+                    .to_string(),
+            ),
+            resolved_summary: Some("{{ host }}: {{ series }} is fine at {{ value }}".to_string()),
+            ..disk
+        };
+        assert_eq!(
+            written.summary_for(&firing, Some("/")),
+            "web-1: / is 92%, load 4.2soon"
+        );
+        assert_eq!(
+            written.resolved_summary_for(&firing, Some("/")).unwrap(),
+            "web-1: / is fine at 92%"
+        );
+        // One that can't be filled in, such as with a reading missing, says the usual.
+        let missing = AlertRuleInput {
+            summary: Some("{{ disk.inodes }}".to_string()),
+            ..written
+        };
+        assert_eq!(
+            missing.summary_for(&firing, Some("/")),
+            "Disk filling up on web-1: / is 92%"
+        );
+        assert_eq!(
+            calculation_rule().summary_for(&values("linux", Some("85%")), Some("linux")),
+            "Busy fleet: linux is 85%"
+        );
+    }
+
+    #[test]
+    fn a_summary_can_show_the_metrics_the_conditions_use() {
+        let rule = AlertRuleInput {
+            warning: Some("cpu.load['5 minutes'] > 4".to_string()),
+            critical: Some("disk.usage > 90 && clock.difference > duration('1m')".to_string()),
+            summary: Some(
+                "{{ cpu.load['5 minutes'] }} {{ disk.usage }} {{ clock.difference }} {{ value }}"
+                    .to_string(),
+            ),
+            ..metric_rule()
+        };
+        check_rule(&rule).unwrap();
+    }
+
+    #[test]
+    fn a_metric_is_named_by_its_series_or_its_title() {
+        let disk = crate::metrics::find("disk.usage").unwrap();
+        let load = crate::metrics::find("cpu.load").unwrap();
+        let cpu = crate::metrics::find("cpu.usage").unwrap();
+        assert_eq!(subject(disk, "/", None), "/");
+        assert_eq!(
+            subject(load, "", Some("5 minutes")),
+            "Load average (5 minutes)"
+        );
+        assert_eq!(subject(cpu, "", None), "CPU usage");
+    }
+
+    #[test]
+    fn rules_describe_their_thresholds_and_what_they_chart() {
+        let disk = AlertRuleInput {
+            warning: Some("disk.usage > 80".to_string()),
+            critical: Some("disk.usage > 90 && series != '/boot'".to_string()),
+            ..metric_rule()
+        };
+        assert_eq!(disk.thresholds(), [(Severity::Warning, 80.0)]);
+        assert_eq!(disk.severities(), [Severity::Warning, Severity::Critical]);
+        assert_eq!(disk.worst_severity(), Severity::Critical);
+        assert_eq!(disk.watched().unwrap().0.name, "disk.usage");
+        assert_eq!(disk.describe(), "for 5 minutes");
+
+        let load = AlertRuleInput {
+            warning: Some("cpu.load['5 minutes'] > 4".to_string()),
+            critical: None,
+            hold: TimeDelta::zero(),
+            ..metric_rule()
+        };
+        assert_eq!(load.worst_severity(), Severity::Warning);
+        assert_eq!(
+            load.watched(),
+            Some((
+                crate::metrics::find("cpu.load").unwrap(),
+                Some("5 minutes".to_string())
+            ))
+        );
+        assert_eq!(load.describe(), "");
+
+        let busy = calculation_rule();
+        assert_eq!(busy.thresholds(), [(Severity::Critical, 80.0)]);
+        assert_eq!(busy.watched().unwrap().0.name, "cpu.usage");
+        assert_eq!(
+            busy.describe(),
+            "Average of CPU usage over 5 minutes, for 5 minutes"
+        );
+
+        let offline = AlertRuleInput {
+            critical: Some("!online".to_string()),
+            ..metric_rule()
+        };
+        assert_eq!(offline.watched(), None);
+        assert!(offline.thresholds().is_empty());
+    }
+
+    #[test]
+    fn forecasts_look_back_six_hours_unless_told_otherwise() {
+        let rule = AlertRuleInput {
+            critical: Some("forecast(disk.usage, duration('4h')) >= 100".to_string()),
+            ..metric_rule()
+        };
+        assert_eq!(rule.window(), DEFAULT_FORECAST_WINDOW);
+        assert_eq!(calculation_rule().window(), TimeDelta::minutes(5));
     }
 
     fn webhook(target: &str) -> ChannelInput {
@@ -1327,331 +1304,6 @@ mod tests {
         };
         let error = format!("{:#}", check_channel(&channel).unwrap_err());
         assert!(error.contains("only email channels"), "{error}");
-    }
-
-    #[test]
-    fn good_rules_pass() {
-        check_rule(&metric_rule()).unwrap();
-        check_rule(&offline_rule()).unwrap();
-        check_rule(&no_metrics_rule()).unwrap();
-    }
-
-    #[test]
-    fn a_no_metrics_rule_takes_no_metric_or_threshold() {
-        assert_eq!(RuleKind::parse("no_metrics").unwrap(), RuleKind::NoMetrics);
-        assert_eq!(RuleKind::NoMetrics.as_str(), "no_metrics");
-        for (rule, expected) in [
-            (
-                AlertRuleInput {
-                    metric: Some("cpu.usage".to_string()),
-                    ..no_metrics_rule()
-                },
-                "a no-metrics rule doesn't take a metric or threshold",
-            ),
-            (
-                AlertRuleInput {
-                    threshold: Some(1.0),
-                    ..no_metrics_rule()
-                },
-                "a no-metrics rule doesn't take a metric or threshold",
-            ),
-            (
-                AlertRuleInput {
-                    warning_threshold: Some(1.0),
-                    ..no_metrics_rule()
-                },
-                "a no-metrics rule doesn't take a warning threshold",
-            ),
-            (
-                AlertRuleInput {
-                    window: Some(TimeDelta::minutes(5)),
-                    ..no_metrics_rule()
-                },
-                "only a calculation or forecast looks back",
-            ),
-        ] {
-            let error = check_rule(&rule).unwrap_err().to_string();
-            assert!(error.contains(expected), "{error}");
-        }
-        assert!(no_metrics_rule().levels().is_empty());
-    }
-
-    #[test]
-    fn bad_rules_are_refused_with_a_reason() {
-        for (rule, expected) in [
-            (
-                AlertRuleInput {
-                    name: "  ".to_string(),
-                    ..metric_rule()
-                },
-                "needs a name",
-            ),
-            (
-                AlertRuleInput {
-                    name: "x".repeat(256),
-                    ..metric_rule()
-                },
-                "too long",
-            ),
-            (
-                AlertRuleInput {
-                    remind_every: Some(MIN_REMINDER - TimeDelta::seconds(1)),
-                    ..metric_rule()
-                },
-                "every 5 minutes",
-            ),
-            (
-                AlertRuleInput {
-                    metric: Some("cpu.nonsense".to_string()),
-                    ..metric_rule()
-                },
-                "unknown metric",
-            ),
-            (
-                AlertRuleInput {
-                    metric: None,
-                    ..metric_rule()
-                },
-                "choose a metric",
-            ),
-            (
-                AlertRuleInput {
-                    comparison: None,
-                    ..metric_rule()
-                },
-                "above or below",
-            ),
-            (
-                AlertRuleInput {
-                    threshold: None,
-                    ..metric_rule()
-                },
-                "needs a threshold",
-            ),
-            (
-                AlertRuleInput {
-                    threshold: Some(f64::NAN),
-                    ..metric_rule()
-                },
-                "must be a number",
-            ),
-            (
-                AlertRuleInput {
-                    hold: MAX_HOLD + TimeDelta::seconds(1),
-                    ..metric_rule()
-                },
-                "7 days",
-            ),
-            (
-                AlertRuleInput {
-                    condition: Some("facts.os ==".to_string()),
-                    ..metric_rule()
-                },
-                "invalid condition",
-            ),
-            (
-                AlertRuleInput {
-                    series: Some("x".repeat(256)),
-                    ..metric_rule()
-                },
-                "too long",
-            ),
-            (
-                AlertRuleInput {
-                    threshold: Some(1.0),
-                    ..offline_rule()
-                },
-                "doesn't take",
-            ),
-        ] {
-            let error = format!("{:#}", check_rule(&rule).unwrap_err());
-            assert!(error.contains(expected), "{error}");
-        }
-    }
-
-    #[test]
-    fn a_reading_equal_to_the_threshold_is_not_a_breach() {
-        assert!(Comparison::Above.is_breached(90.1, 90.0));
-        assert!(!Comparison::Above.is_breached(90.0, 90.0));
-        assert!(Comparison::Below.is_breached(9.9, 10.0));
-        assert!(!Comparison::Below.is_breached(10.0, 10.0));
-    }
-
-    #[test]
-    fn series_can_be_limited_with_wildcards() {
-        let rule = AlertRuleInput {
-            series: Some("/data*".to_string()),
-            ..metric_rule()
-        };
-        assert!(rule.watches_series("/data"));
-        assert!(rule.watches_series("/data/logs"));
-        assert!(!rule.watches_series("/"));
-        assert!(metric_rule().watches_series("anything"));
-    }
-
-    #[test]
-    fn rules_describe_themselves() {
-        assert_eq!(
-            metric_rule().describe(),
-            "CPU usage above 90% for 5 minutes"
-        );
-        assert_eq!(offline_rule().describe(), "Offline for 1 minute");
-        assert_eq!(
-            no_metrics_rule().describe(),
-            "Sending no metrics for 5 minutes"
-        );
-        let rule = AlertRuleInput {
-            metric: Some("disk.usage".to_string()),
-            series: Some("/".to_string()),
-            hold: TimeDelta::seconds(0),
-            ..metric_rule()
-        };
-        assert_eq!(rule.describe(), "Disk usage (/) above 90%");
-    }
-
-    fn disk_rule_with_a_warning() -> AlertRuleInput {
-        AlertRuleInput {
-            metric: Some("disk.usage".to_string()),
-            threshold: Some(90.0),
-            warning_threshold: Some(80.0),
-            ..metric_rule()
-        }
-    }
-
-    #[test]
-    fn a_rule_with_a_warning_describes_both_thresholds_and_says_each_in_its_alerts() {
-        let rule = disk_rule_with_a_warning();
-        assert_eq!(
-            rule.levels(),
-            [(Severity::Warning, 80.0), (Severity::Critical, 90.0)]
-        );
-        assert_eq!(
-            rule.describe(),
-            "Disk usage above 80% (warning), 90% (critical) for 5 minutes"
-        );
-        let metric = rule.metric().unwrap();
-        assert_eq!(
-            rule.metric_summary(metric, "web-1", "/", 85.0, Severity::Warning)
-                .unwrap(),
-            "Disk usage (/) on web-1 is 85%, above 80% for 5 minutes"
-        );
-        assert_eq!(
-            rule.metric_summary(metric, "web-1", "/", 95.0, Severity::Critical)
-                .unwrap(),
-            "Disk usage (/) on web-1 is 95%, above 90% for 5 minutes"
-        );
-        assert_eq!(metric_rule().levels(), [(Severity::Critical, 90.0)]);
-        assert!(offline_rule().levels().is_empty());
-    }
-
-    #[test]
-    fn a_warning_threshold_comes_before_the_critical_one() {
-        check_rule(&disk_rule_with_a_warning()).unwrap();
-        let below = AlertRuleInput {
-            comparison: Some(Comparison::Below),
-            threshold: Some(10.0),
-            warning_threshold: Some(20.0),
-            ..disk_rule_with_a_warning()
-        };
-        check_rule(&below).unwrap();
-
-        for (rule, expected) in [
-            (
-                AlertRuleInput {
-                    warning_threshold: Some(95.0),
-                    ..disk_rule_with_a_warning()
-                },
-                "below it",
-            ),
-            (
-                AlertRuleInput {
-                    warning_threshold: Some(90.0),
-                    ..disk_rule_with_a_warning()
-                },
-                "below it",
-            ),
-            (
-                AlertRuleInput {
-                    warning_threshold: Some(5.0),
-                    ..below
-                },
-                "above it",
-            ),
-            (
-                AlertRuleInput {
-                    severity: Severity::Warning,
-                    ..disk_rule_with_a_warning()
-                },
-                "goes with a critical threshold",
-            ),
-            (
-                AlertRuleInput {
-                    warning_threshold: Some(f64::NAN),
-                    ..disk_rule_with_a_warning()
-                },
-                "must be a number",
-            ),
-            (
-                AlertRuleInput {
-                    warning_threshold: Some(1.0),
-                    ..offline_rule()
-                },
-                "offline rule",
-            ),
-        ] {
-            let error = check_rule(&rule).unwrap_err().to_string();
-            assert!(error.contains(expected), "{error}");
-        }
-    }
-
-    #[test]
-    fn a_summary_only_names_the_series_when_there_are_several() {
-        let cpu = metric_rule();
-        assert_eq!(
-            cpu.metric_summary(
-                cpu.metric().unwrap(),
-                "web-1",
-                "CPU",
-                97.25,
-                Severity::Critical
-            )
-            .unwrap(),
-            "CPU usage on web-1 is 97.2%, above 90% for 5 minutes"
-        );
-
-        let disk = AlertRuleInput {
-            metric: Some("disk.usage".to_string()),
-            hold: TimeDelta::seconds(0),
-            ..metric_rule()
-        };
-        assert_eq!(
-            disk.metric_summary(
-                disk.metric().unwrap(),
-                "web-1",
-                "/data",
-                91.0,
-                Severity::Critical
-            )
-            .unwrap(),
-            "Disk usage (/data) on web-1 is 91%, above 90%"
-        );
-    }
-
-    #[test]
-    fn an_offline_summary_says_nothing_that_goes_stale() {
-        assert_eq!(AlertRuleInput::offline_summary("web-1"), "web-1 is offline");
-    }
-
-    #[test]
-    fn a_no_metrics_summary_says_nothing_that_goes_stale() {
-        assert_eq!(
-            AlertRuleInput::no_metrics_summary("web-1"),
-            "web-1 is connected but sending no metrics"
-        );
-        assert_eq!(
-            AlertRuleInput::metrics_again_summary("web-1"),
-            "web-1 is sending metrics again"
-        );
     }
 
     #[test]
@@ -1933,143 +1585,5 @@ mod tests {
         assert!(check_channel(&long).is_err());
         let huge = webhook(&format!("https://example.com/{}", "x".repeat(3000)));
         assert!(check_channel(&huge).is_err());
-    }
-
-    #[test]
-    fn a_time_ahead_is_rounded_to_what_a_forecast_can_say() {
-        let cases = [
-            (10, "1 minute"),
-            (29 * 60, "29 minutes"),
-            (3570, "1 hour"),
-            (5 * 3600 + 1700, "5 hours"),
-            (47 * 3600, "47 hours"),
-            (48 * 3600, "2 days"),
-            (10 * 86_400, "10 days"),
-        ];
-        for (secs, words) in cases {
-            assert_eq!(format_eta(TimeDelta::seconds(secs)), words, "{secs}");
-        }
-    }
-
-    fn forecast() -> AlertRuleInput {
-        AlertRuleInput {
-            actions: Vec::new(),
-            name: "Disk".to_string(),
-            kind: RuleKind::Forecast,
-            metric: Some("disk.usage".to_string()),
-            series: None,
-            comparison: Some(Comparison::Above),
-            threshold: Some(100.0),
-            warning_threshold: None,
-            hold: TimeDelta::seconds(0),
-            severity: Severity::Critical,
-            condition: None,
-            enabled: true,
-            channels: Vec::new(),
-            all_channels: false,
-            calculation: None,
-            group_by: None,
-            filter: None,
-            window: None,
-            remind_every: None,
-            forecast: Some(TimeDelta::seconds(4 * 3600)),
-            warning_forecast: Some(TimeDelta::seconds(24 * 3600)),
-        }
-    }
-
-    #[test]
-    fn forecasts_are_checked_like_any_rule() {
-        assert!(check_rule(&forecast()).is_ok());
-        assert_eq!(forecast().window(), DEFAULT_FORECAST_WINDOW);
-        assert_eq!(
-            forecast().forecast_levels(),
-            [
-                (Severity::Warning, TimeDelta::days(1)),
-                (Severity::Critical, TimeDelta::hours(4))
-            ]
-        );
-        let refused = |rule: AlertRuleInput, words: &str| {
-            let error = check_rule(&rule).unwrap_err().to_string();
-            assert!(error.contains(words), "{words}: {error}");
-        };
-        refused(
-            AlertRuleInput {
-                forecast: None,
-                ..forecast()
-            },
-            "how far ahead",
-        );
-        refused(
-            AlertRuleInput {
-                threshold: None,
-                ..forecast()
-            },
-            "a level",
-        );
-        refused(
-            AlertRuleInput {
-                threshold: Some(f64::NAN),
-                ..forecast()
-            },
-            "a number",
-        );
-        refused(
-            AlertRuleInput {
-                comparison: None,
-                ..forecast()
-            },
-            "rising or falling",
-        );
-        refused(
-            AlertRuleInput {
-                warning_forecast: Some(TimeDelta::seconds(3600)),
-                ..forecast()
-            },
-            "further ahead",
-        );
-        refused(
-            AlertRuleInput {
-                forecast: Some(TimeDelta::seconds(31 * 86_400)),
-                ..forecast()
-            },
-            "30 days",
-        );
-        refused(
-            AlertRuleInput {
-                window: Some(TimeDelta::seconds(600)),
-                ..forecast()
-            },
-            "an hour and a day",
-        );
-        refused(
-            AlertRuleInput {
-                warning_threshold: Some(90.0),
-                ..forecast()
-            },
-            "not a warning threshold",
-        );
-        refused(
-            AlertRuleInput {
-                severity: Severity::Warning,
-                ..forecast()
-            },
-            "goes with a critical",
-        );
-        refused(
-            AlertRuleInput {
-                kind: RuleKind::Metric,
-                ..forecast()
-            },
-            "only a forecast looks ahead",
-        );
-        let metric = AlertRuleInput {
-            kind: RuleKind::Metric,
-            forecast: None,
-            warning_forecast: None,
-            actions: Vec::new(),
-            window: Some(TimeDelta::seconds(3600)),
-            ..forecast()
-        };
-        refused(metric, "only a calculation or forecast");
     }
 }

@@ -213,7 +213,20 @@ impl AppState {
 
     /// Everything that has to be true for an alert rule to be saved.
     pub async fn check_alert_rule(&self, input: &AlertRuleInput) -> Result<()> {
-        alerting::check_rule(input)?;
+        // Conditions are tried on a real host's facts, so a fact used the wrong way
+        // shows, when there's a host with an agent to take them from.
+        let hosts = self.registry.list().await;
+        let example = hosts.iter().find(|host| {
+            host.state == HostState::Approved && !host.is_agentless() && !host.is_local()
+        });
+        let facts = match example {
+            Some(host) => {
+                let mut facts = self.database.facts_of(&[host.id.as_str()]).await?;
+                unflatten(&facts.remove(&host.id).unwrap_or_default())
+            }
+            None => serde_json::Value::Null,
+        };
+        alerting::check_rule_with(input, &facts)?;
         if !input.actions.is_empty() {
             let known = self.database.known_actions().await?;
             crate::actions::check_against_hosts(input, &known)?;

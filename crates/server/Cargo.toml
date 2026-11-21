@@ -59,6 +59,8 @@ base64 = "0.22"
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "rustls", "ring", "webpki-roots"] }
 wildmatch = "2.7.0"
 cel = "0.15"
+# Suggests the metric someone meant when a condition names one that doesn't exist.
+strsim = "0.11"
 tera = "2.4"
 axum_csrf = "0.12"
 rust-embed = { version = "8.13", features = ["include-exclude", "mime-guess"] }

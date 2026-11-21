@@ -2,6 +2,7 @@ mod actions;
 mod agent_configs;
 mod agent_versions;
 mod alert_charts;
+mod alert_conditions;
 mod alert_evaluator;
 mod alerting;
 mod app_sign_ins;

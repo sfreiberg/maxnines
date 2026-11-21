@@ -585,21 +585,15 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
   .preview td:last-child { grid-column: 1 / -1; }
 }
 
-/* An offline or no-metrics rule has no metric to choose, and a calculation picks its
-   hosts with a filter rather than a condition. Without :has() the fields just stay. */
-.alert-rule:has(select[name="kind"] option[value="offline"]:checked) .metric-fields,
-.alert-rule:has(select[name="kind"] option[value="no_metrics"]:checked) .metric-fields { display: none; }
-.alert-rule:has(select[name="kind"] option[value="calculation"]:checked) .applies-to { display: none; }
-.metric-fields { display: contents; }
+/* A rule about each host picks them with a condition, and a calculation with a
+   filter, so each shows only its own. Without :has() the fields just stay. */
+.alert-rule:has(select[name="calculation"] option[value=""]:checked) .calculation-fields { display: none; }
+.alert-rule:not(:has(select[name="calculation"] option[value=""]:checked)) .applies-to { display: none; }
+.calculation-fields { display: contents; }
 /* A metrics page's form shows only the boxes for the way of signing in chosen. */
 .sign-in .password-fields, .sign-in .token-fields { display: contents; }
 .sign-in:not(:has(option[value="password"]:checked)) .password-fields,
 .sign-in:not(:has(option[value="token"]:checked)) .token-fields { display: none; }
-/* A forecast watches for a level within some hours instead of thresholds. */
-.alert-rule:not(:has(select[name="kind"] option[value="forecast"]:checked)) .forecast-fields { display: none; }
-.alert-rule:has(select[name="kind"] option[value="forecast"]:checked) .threshold-fields { display: none; }
-.forecast-fields, .threshold-fields { display: contents; }
-
 /* Only the options a kind of check uses. Without :has() they all stay. */
 .remote-check:not(:has(option[value="http"]:checked)) .for-http { display: none; }
 .remote-check:not(:has(option[value="dns"]:checked)) .for-dns { display: none; }

@@ -923,32 +923,15 @@ mod variables {
 mod calculation_alerts {
     use super::*;
     use crate::alert_evaluator::Evaluator;
-    use crate::alerting::{AlertRuleInput, Comparison, RuleKind, Severity};
+    use crate::alerting::AlertRuleInput;
     use crate::calculations::Calculation;
 
-    fn rule(calculation: Calculation, comparison: Comparison, threshold: f64) -> AlertRuleInput {
+    fn rule(calculation: Calculation, warning: &str) -> AlertRuleInput {
         AlertRuleInput {
-            name: "Fleet".to_string(),
-            kind: RuleKind::Calculation,
-            metric: Some("cpu.usage".to_string()),
-            series: None,
-            comparison: Some(comparison),
-            threshold: Some(threshold),
-            warning_threshold: None,
-            hold: TimeDelta::zero(),
-            severity: Severity::Warning,
-            condition: None,
-            enabled: true,
-            channels: Vec::new(),
-            all_channels: false,
             calculation: Some(calculation),
-            group_by: None,
-            filter: None,
+            metric: Some("cpu.usage".to_string()),
             window: Some(TimeDelta::minutes(5)),
-            remind_every: None,
-            forecast: None,
-            warning_forecast: None,
-            actions: Vec::new(),
+            ..AlertRuleInput::with_conditions("Fleet", Some(warning), None)
         }
     }
 
@@ -972,7 +955,7 @@ mod calculation_alerts {
         let _hosts = three_hosts(&server).await;
         wait_for_all_three(&server).await;
         let database = &server.state.database;
-        let firing = rule(Calculation::Avg, Comparison::Above, 35.0);
+        let firing = rule(Calculation::Avg, "value > 35");
         database.create_alert_rule(&firing).await.unwrap();
 
         evaluator(&server, past_grace())
@@ -999,7 +982,7 @@ mod calculation_alerts {
     #[tokio::test]
     async fn the_rules_list_says_which_hosts_a_calculation_covers() {
         let server = start().await;
-        let mut narrowed = rule(Calculation::Avg, Comparison::Above, 90.0);
+        let mut narrowed = rule(Calculation::Avg, "value > 90");
         narrowed.name = "Web fleet".to_string();
         narrowed.filter = Some("role=web".to_string());
         let database = &server.state.database;
@@ -1017,7 +1000,7 @@ mod calculation_alerts {
         let server = start_with_metrics().await;
         let _hosts = three_hosts(&server).await;
         wait_for_all_three(&server).await;
-        let quiet = rule(Calculation::Avg, Comparison::Above, 90.0);
+        let quiet = rule(Calculation::Avg, "value > 90");
         server
             .state
             .database
@@ -1038,7 +1021,7 @@ mod calculation_alerts {
         let server = start_with_metrics().await;
         let _hosts = three_hosts(&server).await;
         wait_for_all_three(&server).await;
-        let mut grouped = rule(Calculation::Avg, Comparison::Above, 50.0);
+        let mut grouped = rule(Calculation::Avg, "value > 50");
         grouped.group_by = Some("fact:role".to_string());
         server
             .state
@@ -1062,7 +1045,7 @@ mod calculation_alerts {
         let server = start_with_metrics().await;
         let _hosts = three_hosts(&server).await;
         wait_for_all_three(&server).await;
-        let mut filtered = rule(Calculation::Max, Comparison::Above, 50.0);
+        let mut filtered = rule(Calculation::Max, "value > 50");
         filtered.filter = Some("role=web".to_string());
         server
             .state
@@ -1087,7 +1070,7 @@ mod calculation_alerts {
         let server = start_with_metrics().await;
         let (host, _client) = (identity(), ());
         server.connect_approved(&host, "web-1").await;
-        let counting = rule(Calculation::Count, Comparison::Below, 1.0);
+        let counting = rule(Calculation::Count, "value < 1");
         server
             .state
             .database
@@ -1108,7 +1091,7 @@ mod calculation_alerts {
     #[tokio::test]
     async fn a_restart_does_not_look_like_the_fleet_disappearing() {
         let server = start_with_metrics().await;
-        let counting = rule(Calculation::Count, Comparison::Below, 1.0);
+        let counting = rule(Calculation::Count, "value < 1");
         server
             .state
             .database
@@ -1131,7 +1114,7 @@ mod calculation_alerts {
         wait_for_all_three(&server).await;
         let database = &server.state.database;
         let id = database
-            .create_alert_rule(&rule(Calculation::Avg, Comparison::Above, 35.0))
+            .create_alert_rule(&rule(Calculation::Avg, "value > 35"))
             .await
             .unwrap();
         let mut evaluator = evaluator(&server, past_grace());
@@ -1139,7 +1122,7 @@ mod calculation_alerts {
         assert_eq!(open_alerts(&server).await.len(), 1);
 
         // Raising the threshold has the same effect as the number coming down.
-        let raised = rule(Calculation::Avg, Comparison::Above, 90.0);
+        let raised = rule(Calculation::Avg, "value > 90");
         database.update_alert_rule(id, &raised).await.unwrap();
         evaluator
             .evaluate(crate::times::now() + MINUTE)
@@ -1156,7 +1139,7 @@ mod calculation_alerts {
         let server = start_on("", store, Arc::new(FailingReader), saved, None).await;
         let host = identity();
         server.connect_approved(&host, "web-1").await;
-        let counting = rule(Calculation::Count, Comparison::Below, 1.0);
+        let counting = rule(Calculation::Count, "value < 1");
         server
             .state
             .database
@@ -1199,10 +1182,9 @@ mod calculation_alerts {
     async fn a_rule_can_be_made_through_the_api_and_the_pages() {
         let server = start().await;
         let body = json!({
-            "name": "Busy fleet", "kind": "calculation", "metric": "cpu.usage",
-            "calculation": "avg", "comparison": "above", "threshold": 80.0,
-            "filter": "os=linux", "group_by": "fact:role", "window_secs": 600,
-            "for_secs": 60, "severity": "warning",
+            "name": "Busy fleet", "metric": "cpu.usage", "calculation": "avg",
+            "warning": "value > 80", "filter": "os=linux", "group_by": "fact:role",
+            "window_secs": 600, "for_secs": 60,
         });
         let (status, made) = api(&server, "POST", "/api/v1/alert-rules", &body).await;
         assert_eq!(status, 201, "{made}");
@@ -1210,7 +1192,9 @@ mod calculation_alerts {
         let mut browser = Browser::default();
         let page = browser.get(&server, "/alerts/rules").await;
         assert!(
-            page.body.contains("Average of CPU usage above 80%"),
+            page.body
+                .contains("Average of CPU usage over 10 minutes, for 1 minute")
+                && page.body.contains("value &gt; 80"),
             "{}",
             page.body
         );
@@ -1228,8 +1212,8 @@ mod calculation_alerts {
     async fn a_rule_that_makes_no_sense_is_refused() {
         let server = start().await;
         let good = json!({
-            "name": "x", "kind": "calculation", "metric": "cpu.usage", "calculation": "avg",
-            "comparison": "above", "threshold": 80.0, "for_secs": 0, "severity": "warning",
+            "name": "x", "metric": "cpu.usage", "calculation": "avg",
+            "warning": "value > 80", "for_secs": 0,
         });
         for (field, value) in [
             ("metric", json!("nope")),
@@ -1237,9 +1221,10 @@ mod calculation_alerts {
             ("filter", json!("\"unfinished")),
             ("group_by", json!("colour")),
             ("window_secs", json!(5)),
-            ("comparison", Value::Null),
-            ("threshold", Value::Null),
-            ("condition", json!("true")),
+            ("warning", Value::Null),
+            ("warning", json!("cpu.usage > 80")),
+            ("warning", json!("value > duration('1m')")),
+            ("applies_to", json!("true")),
         ] {
             let mut body = good.clone();
             body[field] = value;
@@ -1247,9 +1232,7 @@ mod calculation_alerts {
             assert_eq!(status, 422, "{field}: {answer}");
         }
 
-        let mut offline = json!({
-            "name": "x", "kind": "offline", "for_secs": 0, "severity": "warning",
-        });
+        let mut offline = json!({ "name": "x", "warning": "!online", "for_secs": 0 });
         offline["filter"] = json!("os=linux");
         let (status, _) = api(&server, "POST", "/api/v1/alert-rules", &offline).await;
         assert_eq!(status, 422, "only calculations have filters");

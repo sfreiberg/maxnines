@@ -6,8 +6,9 @@ When an alert starts, a warning becomes critical, or an alert resolves, Discord,
 Telegram, Slack, email and Resend get a chart with it: the last hour of what the alert
 watches, on that host or for that calculation, with the rule's thresholds and the
 moments the alert started and resolved. Times on it are in UTC, like the rest of the
-message. Other notifications, and other channels, are text only. An alert about a host
-going offline or sending no metrics has nothing to chart.
+message. Other notifications, and other channels, are text only. An alert from a rule
+that uses no metric, such as a host going offline or sending no metrics, has nothing to
+chart.
 
 In Slack, a resolved alert's chart replaces the one in the message it fired with.
 
@@ -216,7 +217,7 @@ is on call. Keys and URLs work like passwords, so they can't be read back once s
 2. Add an integration, choose Events API V2, and copy its Integration Key.
 3. Use that key as the channel's destination.
 
-A rule's severity carries over.
+An alert's severity, warning or critical, carries over.
 
 ### AlertOps
 

@@ -97,7 +97,7 @@ case, yours is kept as it is and renamed, such as `Default (yours)`.
 Besides the host's total, an agent reports each core's usage, so one core stuck at
 100% shows up on a host with many, where it barely moves the total. Cores are
 numbered from 0. The **CPU usage by core** chart shows the 8 busiest, and an alert
-rule on it alerts on each core that crosses its threshold.
+rule on it, like `cpu.cores > 95`, alerts on each core.
 
 ## Disks
 

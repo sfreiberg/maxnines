@@ -22,9 +22,9 @@ use super::{
 };
 use crate::actions::{ActionRun, RuleAction, RunOn};
 use crate::alerting::{
-    Alert, AlertRule, AlertRuleInput, Channel, ChannelInput, ChannelKind, Comparison, Delivery,
+    Alert, AlertRule, AlertRuleInput, Channel, ChannelInput, ChannelKind, Delivery,
     DeliveryProblem, Event, Mail, MailSecurity, MailServer, NameTaken, NewAlert, RULE_GONE_REASON,
-    RuleKind, Severity, SeverityChange, WebhookMethod, WebhookRequest,
+    Severity, SeverityChange, WebhookMethod, WebhookRequest,
 };
 use crate::audit::{Action, Kind, Record, Snapshot, Subject};
 use crate::calculations::Calculation;
@@ -46,23 +46,17 @@ fn to_alert_rule(
         id: row.id,
         rule: AlertRuleInput {
             name: row.name,
-            kind: RuleKind::parse(&row.kind)?,
-            metric: row.metric,
-            series: row.series,
-            comparison: row
-                .comparison
-                .as_deref()
-                .map(Comparison::parse)
-                .transpose()?,
-            threshold: row.threshold,
-            warning_threshold: row.warning_threshold,
+            warning: row.warning,
+            critical: row.critical,
+            summary: row.summary,
+            resolved_summary: row.resolved_summary,
             hold: whole_seconds(row.for_secs).context("invalid duration")?,
-            severity: Severity::parse(&row.severity)?,
-            condition: row.condition_expr,
+            applies_to: row.applies_to,
             enabled: row.enabled,
             channels,
             all_channels: row.all_channels,
             calculation: row.calculation.as_deref().and_then(Calculation::parse),
+            metric: row.metric,
             group_by: row.group_by,
             filter: row.filter,
             window: row
@@ -75,16 +69,6 @@ fn to_alert_rule(
                 .map(whole_seconds)
                 .transpose()
                 .context("invalid reminder")?,
-            forecast: row
-                .forecast_secs
-                .map(whole_seconds)
-                .transpose()
-                .context("invalid forecast")?,
-            warning_forecast: row
-                .warning_forecast_secs
-                .map(whole_seconds)
-                .transpose()
-                .context("invalid forecast")?,
             actions,
         },
     })
@@ -103,24 +87,20 @@ fn alert_rule_row(input: &AlertRuleInput) -> Result<alert_rule::ActiveModel> {
     Ok(alert_rule::ActiveModel {
         name: Set(input.name.clone()),
         name_key: Set(name_key(&input.name)),
-        kind: Set(input.kind.as_str().to_string()),
-        metric: Set(input.metric.clone()),
-        series: Set(input.series.clone()),
-        comparison: Set(input.comparison.map(|c| c.as_str().to_string())),
-        threshold: Set(input.threshold),
-        warning_threshold: Set(input.warning_threshold),
+        warning: Set(input.warning.clone()),
+        critical: Set(input.critical.clone()),
+        summary: Set(input.summary.clone()),
+        resolved_summary: Set(input.resolved_summary.clone()),
         for_secs: Set(input.hold.num_seconds()),
-        severity: Set(input.severity.as_str().to_string()),
-        condition_expr: Set(input.condition.clone()),
+        applies_to: Set(input.applies_to.clone()),
         enabled: Set(input.enabled),
         calculation: Set(input.calculation.map(|c| c.as_str().to_string())),
+        metric: Set(input.metric.clone()),
         group_by: Set(input.group_by.clone()),
         filter: Set(input.filter.clone()),
         window_secs: Set(input.window.map(|window| window.num_seconds())),
         remind_every_secs: Set(input.remind_every.map(|every| every.num_seconds())),
         all_channels: Set(input.all_channels),
-        forecast_secs: Set(input.forecast.map(|ahead| ahead.num_seconds())),
-        warning_forecast_secs: Set(input.warning_forecast.map(|ahead| ahead.num_seconds())),
         ..Default::default()
     })
 }

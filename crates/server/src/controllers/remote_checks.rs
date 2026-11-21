@@ -20,7 +20,7 @@ use super::metrics::{
     CheckRow, RangeParams, check_row, one_series, range_links, selected_range, time_range,
 };
 use super::{CsrfForm, Page, recorded_by, server_error, viewer_zone};
-use crate::alerting::{NameTaken, RuleKind};
+use crate::alerting::NameTaken;
 use crate::app_state::AppState;
 use crate::check_history;
 use crate::host_filter;
@@ -860,19 +860,21 @@ async fn page(
         .into_iter()
         .filter(|rule| {
             let input = &rule.rule;
-            input.enabled
-                && matches!(input.kind, RuleKind::Metric | RuleKind::Forecast)
-                && input
-                    .metric
-                    .as_deref()
-                    .is_some_and(|metric| metric.starts_with("check."))
-                && input.watches_series(name)
+            // A check's metric used by itself watches every check, and picked out
+            // with brackets, the one it names.
+            let watches = input.conditions().is_ok_and(|conditions| {
+                conditions.uses().any(|used| {
+                    used.metric.name.starts_with("check.")
+                        && (!used.bracketed || used.picked.as_ref() == Some(name))
+                })
+            });
+            input.enabled && !input.is_calculation() && watches
         })
         .map(|rule| WatchingRule {
             id: rule.id,
-            conditional: rule.rule.condition.is_some(),
+            conditional: rule.rule.applies_to.is_some(),
+            severity: rule.rule.worst_severity().as_str(),
             name: rule.rule.name,
-            severity: rule.rule.severity.as_str(),
         })
         .collect();
 

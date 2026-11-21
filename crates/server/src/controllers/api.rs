@@ -1707,7 +1707,7 @@ async fn alert_series(
             unit: watched.unit,
             thresholds: watched
                 .rule
-                .levels()
+                .thresholds()
                 .into_iter()
                 .map(|(severity, value)| ThresholdView {
                     severity: severity.as_str(),

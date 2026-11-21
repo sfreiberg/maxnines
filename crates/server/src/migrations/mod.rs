@@ -7,6 +7,10 @@
 use sea_orm::{DatabaseBackend, Statement};
 use sea_orm_migration::prelude::*;
 
+mod alert_conditions;
+
+use alert_conditions::AlertConditions;
+
 pub struct Migrator;
 
 impl MigratorTrait for Migrator {
@@ -20,6 +24,7 @@ impl MigratorTrait for Migrator {
             Box::new(DurationsInSeconds),
             Box::new(RefusedAgents),
             Box::new(SkippedCollectors),
+            Box::new(AlertConditions),
         ]
     }
 }
@@ -3778,7 +3783,7 @@ mod tests {
     async fn a_server_made_before_the_no_metrics_rule_gets_it_on_upgrading() {
         let connection = empty().await;
         Migrator::up(&connection, Some(1)).await.unwrap();
-        Migrator::up(&connection, None).await.unwrap();
+        up_to(&connection, &AddNoMetricsRule).await;
 
         let added = "SELECT kind FROM alert_rules
                      WHERE name = 'Host sending no metrics' AND for_secs = 300
@@ -3798,7 +3803,7 @@ mod tests {
             .await
             .unwrap();
 
-        Migrator::up(&connection, None).await.unwrap();
+        up_to(&connection, &AddNoMetricsRule).await;
 
         let named = "SELECT kind FROM alert_rules WHERE name = 'Host sending no metrics'";
         assert_eq!(texts(&connection, named).await, ["metric"]);
@@ -4457,5 +4462,148 @@ mod tests {
         assert_eq!(count(&connection, "host_config_status").await, 1);
         Migrator::up(&connection, None).await.unwrap();
         assert_eq!(number(&connection, none).await, 1);
+    }
+
+    /// What `name`'s columns say, joined with " | ", NULL as "-".
+    async fn said(
+        connection: &sea_orm::DatabaseConnection,
+        name: &str,
+        columns: &[&str],
+    ) -> String {
+        let mut said = Vec::new();
+        for column in columns {
+            let sql = format!(
+                "SELECT COALESCE(CAST({column} AS CHAR(2000)), '-') FROM alert_rules WHERE name = '{name}'"
+            );
+            let sql = match connection.get_database_backend() {
+                DatabaseBackend::MySql => sql,
+                _ => sql.replace("CHAR(2000)", "TEXT"),
+            };
+            let found = texts(connection, &sql).await;
+            said.push(
+                found
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| "missing".to_string()),
+            );
+        }
+        said.join(" | ")
+    }
+
+    #[tokio::test]
+    async fn every_alert_rule_becomes_conditions_and_goes_back_again() {
+        let connection = empty().await;
+        up_to(&connection, &SkippedCollectors).await;
+        let at = "'2026-11-20 00:00:00+00:00'";
+        for sql in [
+            "INSERT INTO alert_rules (name, name_key, kind, metric, series, comparison, threshold,
+                 warning_threshold, for_secs, severity, condition_expr, enabled)
+             VALUES ('Data', 'data', 'metric', 'disk.usage', '/data*', 'above', 95, 85, 60,
+                 'critical', 'facts.os.family == ''linux''', TRUE)"
+                .to_string(),
+            "INSERT INTO alert_rules (name, name_key, kind, metric, comparison, threshold,
+                 for_secs, severity, enabled, calculation, group_by, window_secs)
+             VALUES ('Fleet', 'fleet', 'calculation', 'cpu.usage', 'above', 80, 0, 'warning',
+                 TRUE, 'avg', 'host', 600)"
+                .to_string(),
+            "INSERT INTO alert_rules (name, name_key, kind, metric, comparison, threshold,
+                 for_secs, severity, enabled, forecast_secs)
+             VALUES ('Shrinking', 'shrinking', 'forecast', 'disk.usage', 'below', 5, 0,
+                 'warning', TRUE, 3600)"
+                .to_string(),
+            format!(
+                "INSERT INTO alerts (rule_id, severity, host_id, summary, started_at, breached_at)
+                 VALUES (1, 'critical', 'server', 'gone', {at}, {at})"
+            ),
+        ] {
+            run(&connection, &sql).await;
+        }
+
+        Migrator::up(&connection, None).await.unwrap();
+        let columns = ["warning", "critical", "applies_to", "metric", "window_secs"];
+        for (name, expected) in [
+            (
+                "Data",
+                "series.matches('^/data.*$') && disk.usage > 85 | series.matches('^/data.*$') && disk.usage > 95 | facts.os.family == 'linux' | - | -",
+            ),
+            ("Fleet", "value > 80 | - | - | cpu.usage | 600"),
+            (
+                "Shrinking",
+                "forecast(disk.usage, duration('1h')) <= 5 | - | - | - | -",
+            ),
+            ("Host offline", "- | !online | - | - | -"),
+            ("Host sending no metrics", "- | !reporting | - | - | -"),
+            (
+                "Clock is wrong",
+                "clock.difference > duration('5s') | clock.difference > duration('30s') | - | - | -",
+            ),
+            (
+                "Disk will be full soon",
+                "forecast(disk.usage, duration('24h')) >= 100 | forecast(disk.usage, duration('4h')) >= 100 | - | - | 21600",
+            ),
+        ] {
+            assert_eq!(said(&connection, name, &columns).await, expected, "{name}");
+        }
+        assert_eq!(
+            said(
+                &connection,
+                "Host offline",
+                &["summary", "resolved_summary"]
+            )
+            .await,
+            "{{ host }} is offline | {{ host }} is back online"
+        );
+        assert_eq!(count(&connection, "alerts").await, 1);
+
+        // Running it again where MySQL stopped partway changes nothing more.
+        if connection.get_database_backend() == DatabaseBackend::MySql {
+            AlertConditions
+                .up(&SchemaManager::new(&connection))
+                .await
+                .unwrap();
+        }
+        // A rule only this version can say goes on the way down, with its alerts.
+        run(
+            &connection,
+            "UPDATE alert_rules SET critical = 'disk.usage > 90 && disk.inodes > 90'
+             WHERE name = 'Host offline'",
+        )
+        .await;
+        down_through(&connection, &AlertConditions).await;
+        let columns = [
+            "kind",
+            "metric",
+            "series",
+            "comparison",
+            "threshold",
+            "warning_threshold",
+            "severity",
+            "forecast_secs",
+            "condition_expr",
+        ];
+        let numbers = |text: String| text.replace(".0 ", " ").replace(".0 |", " |");
+        for (name, expected) in [
+            (
+                "Data",
+                "metric | disk.usage | /data* | above | 95 | 85 | critical | - | facts.os.family == 'linux'",
+            ),
+            (
+                "Fleet",
+                "calculation | cpu.usage | - | above | 80 | - | warning | - | -",
+            ),
+            (
+                "Shrinking",
+                "forecast | disk.usage | - | below | 5 | - | warning | 3600 | -",
+            ),
+            (
+                "Host offline",
+                "missing | missing | missing | missing | missing | missing | missing | missing | missing",
+            ),
+        ] {
+            let found = numbers(said(&connection, name, &columns).await);
+            assert_eq!(found, expected, "{name}");
+        }
+        assert_eq!(count(&connection, "alerts").await, 0);
+        Migrator::up(&connection, None).await.unwrap();
     }
 }

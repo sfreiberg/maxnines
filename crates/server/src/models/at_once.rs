@@ -19,7 +19,7 @@ use super::alerting::{HELD, PENDING, queue_for_live_channels};
 use super::{Database, alert, alert_rule, alert_rule_channel, api_key, notification};
 use super::{UserChange, host_fact, notification_channel, user};
 use crate::alerting::{
-    AlertRuleInput, ChannelInput, ChannelKind, Event, NewAlert, RuleKind, Severity, every_severity,
+    AlertRuleInput, ChannelInput, ChannelKind, Event, NewAlert, Severity, every_severity,
 };
 use crate::facts::FlatFacts;
 use crate::registration::{HostKind, HostRecord, HostState};
@@ -42,27 +42,10 @@ fn webhook() -> ChannelInput {
 
 fn offline_rule(channels: Vec<i64>) -> AlertRuleInput {
     AlertRuleInput {
-        name: "Gone".to_string(),
-        kind: RuleKind::Offline,
-        metric: None,
-        series: None,
-        comparison: None,
-        threshold: None,
-        warning_threshold: None,
         hold: TimeDelta::seconds(60),
-        severity: Severity::Critical,
-        condition: None,
-        enabled: true,
         channels,
-        all_channels: false,
-        calculation: None,
-        group_by: None,
-        filter: None,
-        window: None,
         remind_every: Some(TimeDelta::minutes(5)),
-        forecast: None,
-        warning_forecast: None,
-        actions: Vec::new(),
+        ..AlertRuleInput::with_conditions("Gone", None, Some("!online"))
     }
 }
 

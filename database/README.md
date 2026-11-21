@@ -26,6 +26,11 @@ MaxNines keeps its data in two places:
     and that protocol.
   - `m20261120_000002_skipped_collectors` keeps which collectors in its config a
     host's agent doesn't know, as it's older than the server.
+  - `m20261120_000003_alert_conditions` gives alert rules a `warning` and a `critical`
+    condition, in CEL over metrics by name, and summaries, in place of a kind, a
+    series, a comparison, thresholds, a severity and how far ahead a forecast looks.
+    Each rule is said the new way, `condition_expr` becomes `applies_to`, and only a
+    calculation keeps a metric.
 - **The metrics store** holds the numbers hosts report. It's DuckDB for a single
   server or ClickHouse for a big one, and only one of them is used. Each has a
   migration, `0001_create_tables`, which makes its tables, and a second: in
@@ -156,24 +161,20 @@ erDiagram
         int id PK
         string name
         string name_key "unique among those not deleted"
-        string kind "metric, calculation, forecast, offline or no_metrics"
-        string metric
-        string series
-        string comparison
-        double threshold
-        double warning_threshold
+        text warning "CEL over metrics by name, when it's a warning"
+        text critical "the same, when it's critical"
+        text summary "Tera, what alerts say, or NULL for the usual"
+        text resolved_summary "the same, as they clear"
         int for_secs
-        string severity
-        text condition_expr "CEL, over facts"
+        text applies_to "CEL, over facts"
         boolean enabled
         boolean all_channels
-        string calculation
+        string calculation "NULL for a rule about each host"
+        string metric "what a calculation combines"
         string group_by
         string filter
         int window_secs
         int remind_every_secs
-        int forecast_secs
-        int warning_forecast_secs
         timestamp deleted_at "kept so alerts can name it"
     }
     alerts {

@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::alerting::{Alert, AlertRule, AlertRuleInput, RuleKind, Severity};
+use crate::alerting::{Alert, AlertRule, AlertRuleInput, Severity};
 use crate::metrics::{Metric, Source};
 use crate::models::Database;
 use crate::times::Timestamp;
@@ -122,8 +122,8 @@ pub fn check_rule_actions(rule: &AlertRuleInput) -> Result<()> {
         return Ok(());
     }
     ensure!(
-        matches!(rule.kind, RuleKind::Metric | RuleKind::Forecast),
-        "only a metric or forecast rule can run actions, as they run on the alert's host"
+        !rule.is_calculation(),
+        "a rule with a calculation can't run actions, as they run on the alert's host"
     );
     ensure!(
         actions.len() <= MAX_RULE_ACTIONS,
@@ -186,15 +186,17 @@ pub fn series_variable(metric: &Metric) -> Option<&'static str> {
 /// Which variables an alert from this rule can give an action.
 pub fn rule_variables(rule: &AlertRuleInput) -> Vec<&'static str> {
     let mut given = vec!["hostname", "rule", "severity", "value"];
-    if rule.threshold.is_some() {
-        given.push("threshold");
-    }
-    if let Some(metric) = rule.metric() {
+    if rule.watched().is_some() {
         given.push("metric");
-        if !matches!(metric.source, Source::Fields(_)) {
-            given.push("series");
-        }
-        given.extend(series_variable(metric));
+    }
+    // Only a rule worked out for each disk or such has alerts about a series.
+    let conditions = rule.conditions().ok();
+    if let Some(each) = conditions
+        .as_ref()
+        .and_then(|c| c.fanned_out().first().map(|used| used.metric))
+    {
+        given.push("series");
+        given.extend(series_variable(each));
     }
     given
 }
@@ -213,17 +215,20 @@ pub fn alert_variables(rule: &AlertRuleInput, alert: &Alert) -> BTreeMap<String,
     if let Some(value) = alert.value {
         set("value", value.to_string());
     }
-    if let Some(threshold) = rule.threshold {
-        set("threshold", threshold.to_string());
-    }
-    if let Some(metric) = rule.metric() {
+    if let Some((metric, _)) = rule.watched() {
         set("metric", metric.name.to_string());
-        // An alert about the host as a whole has no series, so it gives none, and an
-        // action that needs one is refused for it, saying so, rather than run with
-        // nothing in its place.
+    }
+    // An alert about the host as a whole has no series, so it gives none, and an
+    // action that needs one is refused for it, saying so, rather than run with
+    // nothing in its place.
+    let conditions = rule.conditions().ok();
+    if let Some(each) = conditions
+        .as_ref()
+        .and_then(|c| c.fanned_out().first().map(|used| used.metric))
+    {
         let series = alert.series.clone().unwrap_or_default();
         set("series", series.clone());
-        if let Some(kind) = series_variable(metric) {
+        if let Some(kind) = series_variable(each) {
             set(kind, series);
         }
     }

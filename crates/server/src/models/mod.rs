@@ -2445,8 +2445,7 @@ mod tests {
     /// Names are unique per run, because real databases keep their rows.
     async fn exercise_alerting(database: &Database, host: &str) {
         use crate::alerting::{
-            AlertRuleInput, ChannelInput, ChannelKind, Comparison, Event, NewAlert, RuleKind,
-            Severity,
+            AlertRuleInput, ChannelInput, ChannelKind, Event, NewAlert, Severity,
         };
 
         let suffix = crate::times::now().timestamp_millis();
@@ -2464,27 +2463,16 @@ mod tests {
             .await
             .unwrap();
         let mut input = AlertRuleInput {
-            name: format!("High CPU {suffix}"),
-            kind: RuleKind::Metric,
-            metric: Some("cpu.usage".to_string()),
-            series: Some("/data*".to_string()),
-            comparison: Some(Comparison::Above),
-            threshold: Some(90.5),
-            warning_threshold: None,
+            summary: Some("{{ host }} is busy".to_string()),
+            resolved_summary: Some("{{ host }} is fine".to_string()),
             hold: TimeDelta::seconds(120),
-            severity: Severity::Critical,
-            condition: Some("true".to_string()),
-            enabled: true,
+            applies_to: Some("true".to_string()),
             channels: vec![channel],
-            all_channels: false,
-            calculation: None,
-            group_by: None,
-            filter: None,
-            window: None,
-            remind_every: None,
-            forecast: None,
-            warning_forecast: None,
-            actions: Vec::new(),
+            ..AlertRuleInput::with_conditions(
+                &format!("High CPU {suffix}"),
+                Some("cpu.usage > 80"),
+                Some("cpu.usage > 90.5"),
+            )
         };
         let rule = database.create_alert_rule(&input).await.unwrap();
         assert_eq!(
@@ -2492,7 +2480,14 @@ mod tests {
             input
         );
 
-        input.threshold = Some(75.25);
+        input.warning = None;
+        input.critical = Some("value > 75.25".to_string());
+        input.applies_to = None;
+        input.calculation = Some(crate::calculations::Calculation::Avg);
+        input.metric = Some("cpu.usage".to_string());
+        input.group_by = Some("host".to_string());
+        input.filter = Some("os=linux".to_string());
+        input.window = Some(TimeDelta::minutes(10));
         assert!(database.update_alert_rule(rule, &input).await.unwrap());
         assert_eq!(
             database.get_alert_rule(rule).await.unwrap().unwrap().rule,
@@ -2502,7 +2497,7 @@ mod tests {
         let started_at = at(suffix);
         let new = NewAlert {
             rule_id: rule,
-            severity: input.severity,
+            severity: Severity::Critical,
             host_id: host.to_string(),
             series: Some("é".repeat(255)),
             value: Some(91.5),

@@ -15,7 +15,7 @@ use chrono::TimeDelta;
 use chrono_tz::Tz;
 use resvg::{tiny_skia, usvg};
 
-use crate::alerting::{Alert, AlertRuleInput, RuleKind, Severity, clean};
+use crate::alerting::{Alert, AlertRuleInput, Severity, clean};
 use crate::calculations::{self, Grouping, Sources};
 use crate::metric_charts::{self, Frame, MAX_SERIES, Marked};
 use crate::metrics::{Metric, Metrics, SeriesResult, Source, TimeRange, Unit};
@@ -127,37 +127,34 @@ pub async fn watched(
         return Ok(None);
     };
     let rule = rule.rule;
-    let (metric, unit, mut result) = match rule.kind {
-        RuleKind::Offline | RuleKind::NoMetrics => return Ok(None),
-        RuleKind::Metric | RuleKind::Forecast => {
-            let Some(metric) = rule.metric() else {
-                return Ok(None);
-            };
-            let result = sources
-                .metrics
-                .series(&alert.host_id, metric, range, EVERY_SERIES)
-                .await?;
-            (metric, metric.unit, result)
-        }
-        RuleKind::Calculation => {
-            let Ok(question) = rule.question() else {
-                return Ok(None);
-            };
-            let mut result = calculations::answer(sources, &question, range, EVERY_SERIES).await?;
-            // One line for everything is named after the metric in the alert.
-            if question.grouping == Grouping::Nothing {
-                for series in &mut result.series {
-                    // A chart's line has a name, which is empty for the host as a whole.
-                    series.name = alert.series.clone().unwrap_or_default();
-                }
+    let (metric, unit, mut result, picked) = if rule.is_calculation() {
+        let Ok(question) = rule.question() else {
+            return Ok(None);
+        };
+        let mut result = calculations::answer(sources, &question, range, EVERY_SERIES).await?;
+        // One line for everything is named after the metric in the alert.
+        if question.grouping == Grouping::Nothing {
+            for series in &mut result.series {
+                // A chart's line has a name, which is empty for the host as a whole.
+                series.name = alert.series.clone().unwrap_or_default();
             }
-            (question.metric, question.unit(), result)
         }
+        (question.metric, question.unit(), result, None)
+    } else {
+        // A rule about a host being there, with no metric, has nothing to chart.
+        let Some((metric, picked)) = rule.watched() else {
+            return Ok(None);
+        };
+        let result = sources
+            .metrics
+            .series(&alert.host_id, metric, range, EVERY_SERIES)
+            .await?;
+        (metric, metric.unit, result, picked)
     };
+    // The alert's own series, or the one its rule picks out.
+    let only = alert.series.clone().or(picked);
     result.series.retain(|series| {
-        alert
-            .series
-            .as_ref()
+        only.as_ref()
             .is_none_or(|only| clean(&series.name) == *only)
     });
     result.series.truncate(MAX_SERIES);
@@ -217,7 +214,7 @@ fn svg(alert: &Alert, watched: &Watched, range: TimeRange) -> String {
         width: WIDTH - 2.0 * PADDING,
         height: HEIGHT - HEADER - PADDING,
     };
-    let levels = rule.levels();
+    let levels = rule.thresholds();
     let thresholds: Vec<f64> = levels.iter().map(|(_, threshold)| *threshold).collect();
     let Marked { chart, marks } = metric_charts::build_marked(
         metric,
@@ -399,7 +396,6 @@ fn png(svg: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alerting::Comparison;
     use crate::metrics::{self, Point, Series};
 
     fn alert() -> Alert {
@@ -425,27 +421,13 @@ mod tests {
 
     fn rule() -> AlertRuleInput {
         AlertRuleInput {
-            name: "Disk & more".to_string(),
-            kind: RuleKind::Metric,
-            metric: Some("disk.usage".to_string()),
-            series: None,
-            comparison: Some(Comparison::Above),
-            threshold: Some(90.0),
-            warning_threshold: Some(80.0),
             hold: TimeDelta::minutes(5),
-            severity: Severity::Critical,
-            condition: None,
-            enabled: true,
-            channels: Vec::new(),
             all_channels: true,
-            calculation: None,
-            group_by: None,
-            filter: None,
-            window: None,
-            remind_every: None,
-            forecast: None,
-            warning_forecast: None,
-            actions: Vec::new(),
+            ..AlertRuleInput::with_conditions(
+                "Disk & more",
+                Some("disk.usage > 80"),
+                Some("disk.usage > 90"),
+            )
         }
     }
 

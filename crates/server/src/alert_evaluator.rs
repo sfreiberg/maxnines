@@ -11,25 +11,30 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use cel::Value as CelValue;
 use chrono::TimeDelta;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info};
-use wildmatch::WildMatch;
 
 use crate::actions::Actions;
 use crate::agent_configs::AgentConfigs;
+use crate::alert_conditions::{
+    Conditions, Heading, Inputs, MetricUse, Values, Variable, bind_value,
+};
 use crate::alerting::{
-    Alert, AlertRule, NewAlert, RULE_GONE_REASON, RuleKind, Severity, SeverityChange, clean,
+    Alert, AlertRule, AlertRuleInput, NewAlert, RULE_GONE_REASON, Severity, SeverityChange,
+    SummaryValues, clean, subject,
 };
 use crate::app_state::AppState;
 use crate::calculations::{
     self, Calculation, Grouping, Question, SMALLEST_STEP, Sources, over_window,
 };
 use crate::facts::{FlatFacts, unflatten};
-use crate::metrics::{self, Metrics, NewestReading, TimeRange, Trend};
+use crate::metric_charts::format_value;
+use crate::metrics::{self, Metric, Metrics, NewestReading, Source, TimeRange, Trend};
 use crate::models::Database;
 use crate::presence::Presence;
 use crate::registration::{HostRecord, HostState, Registry};
@@ -66,11 +71,15 @@ const MIN_FORECAST_SAMPLES: u64 = 10;
 /// reading, which says nothing about whether anything is wrong.
 const FORECAST_FRESH: TimeDelta = TimeDelta::minutes(10);
 
-/// A no-metrics rule waits at least this many of an agent's intervals, so a host set to
-/// send a sample every ten minutes isn't silent between them. A first sample can take
-/// up to an interval longer than the rest, and a write can be held back to batch it,
-/// so this many means samples really have stopped, not that one is late.
+/// A connected host isn't `reporting` once it has sent nothing for this many of its
+/// intervals, so one set to send a sample every ten minutes isn't silent between
+/// them. A first sample can take up to an interval longer than the rest, and a
+/// write can be held back to batch it, so this many means samples really have
+/// stopped, not that one is late.
 const MISSED_SAMPLES: i32 = 3;
+/// Nor for less than this, however often it sends, so how often isn't worked out
+/// for every host on every pass.
+const MIN_SILENCE: TimeDelta = TimeDelta::minutes(1);
 
 /// What a forecast reads: a metric over how far back it looks.
 type TrendKey = (&'static str, TimeDelta);
@@ -121,9 +130,11 @@ struct Hold {
 }
 
 impl Hold {
-    fn observe(&mut self, breached: bool, now: Timestamp) {
+    /// `began` is when the problem began, if it's new: now, unless something says it
+    /// was earlier, such as when a host went offline.
+    fn observe(&mut self, breached: bool, began: Timestamp) {
         if breached {
-            self.breached_since.get_or_insert(now);
+            self.breached_since.get_or_insert(began);
         } else {
             self.breached_since = None;
         }
@@ -138,14 +149,18 @@ impl Hold {
     }
 }
 
+/// What a rule was last worked out on for a host or series: the newest reading's
+/// time, and whether the host was online and reporting.
+type Stamp = (Timestamp, bool, bool);
+
 /// How long each of a rule's levels has been crossed, or not.
 #[derive(Debug, Default)]
 struct Tracker {
     /// One for each level, mildest first.
     holds: Vec<Hold>,
     /// Each sample is only counted once, as checks run more often than some
-    /// agents report. For a no-metrics rule, the newest sample seen from the host.
-    last_sample: Option<Timestamp>,
+    /// agents report.
+    last_stamp: Option<Stamp>,
 }
 
 impl Tracker {
@@ -158,18 +173,13 @@ impl Tracker {
             .min()
     }
 
-    /// The hold for a rule with one level, which an offline rule sets for itself.
-    fn only_hold(&mut self) -> &mut Hold {
-        self.holds.resize_with(1, Hold::default);
-        &mut self.holds[0]
-    }
-
     /// Takes whether each of a rule's levels is crossed now, mildest first, and
     /// what the alert is at, if it's open. A level has to last `hold` to count,
     /// so a passing moment doesn't alert, and stops counting the moment it's gone:
     /// a recovery is said at once, and something going back and forth is seen
     /// doing it, not hidden behind a wait. The alert is at the worst level that
     /// counts, and resolves when the mildest is gone.
+    #[cfg(test)]
     fn observe(
         &mut self,
         levels: &[(Severity, bool)],
@@ -177,9 +187,22 @@ impl Tracker {
         hold: TimeDelta,
         open: Option<Severity>,
     ) -> Option<Change> {
+        let began = vec![now; levels.len()];
+        self.observe_from(levels, &began, now, hold, open)
+    }
+
+    /// As [`Self::observe`], with when each level's problem began if it's new.
+    fn observe_from(
+        &mut self,
+        levels: &[(Severity, bool)],
+        began: &[Timestamp],
+        now: Timestamp,
+        hold: TimeDelta,
+        open: Option<Severity>,
+    ) -> Option<Change> {
         self.holds.resize_with(levels.len(), Hold::default);
-        for (level, (_, breached)) in self.holds.iter_mut().zip(levels) {
-            level.observe(*breached, now);
+        for ((level, (_, breached)), began) in self.holds.iter_mut().zip(levels).zip(began) {
+            level.observe(*breached, *began);
         }
         let worst = |counts: &dyn Fn(&Hold) -> bool| {
             levels
@@ -214,39 +237,110 @@ impl Tracker {
     }
 }
 
+/// Whether a host is there, and since when, as `online` and `reporting` are. None
+/// when it can't be told, such as for a host with no agent that hasn't been read.
+#[derive(Debug, Clone, Copy)]
+struct Seen {
+    yes: bool,
+    since: Timestamp,
+}
+
 /// Everything one pass looks at, loaded once.
 struct Snapshot {
     now: Timestamp,
     in_grace: bool,
     rules: BTreeMap<i64, AlertRule>,
+    /// Each enabled rule's conditions, read once.
+    conditions: HashMap<i64, Conditions>,
     hosts: BTreeMap<String, HostRecord>,
-    /// For each rule with a condition, the hosts it applies to.
+    /// For each rule with a condition for which hosts, the hosts it applies to.
     applies: HashMap<i64, HashSet<String>>,
-    /// For each rule that watches only some series, which.
-    series: HashMap<i64, WildMatch>,
+    /// Each host's facts, ready for conditions, if any condition uses them.
+    facts: HashMap<String, CelValue>,
     /// By metric and agent. A metric that couldn't be read is missing, which
     /// says nothing about whether anything is wrong.
     readings: BTreeMap<&'static str, BTreeMap<String, Vec<NewestReading>>>,
     /// For forecasts, the same way.
     trends: HashMap<TrendKey, Trends>,
-    /// For no-metrics rules, when each host's newest current sample was taken. None
-    /// if that couldn't be read, which says nothing about whether anything is wrong.
-    last_samples: Option<BTreeMap<String, Timestamp>>,
+    /// Whether each host is online, and reporting if a rule asks.
+    online: HashMap<String, Seen>,
+    reporting: HashMap<String, Seen>,
 }
 
 impl Snapshot {
     fn rule_applies(&self, rule: &AlertRule, host_id: &str) -> bool {
-        rule.rule.condition.is_none()
+        rule.rule.applies_to.is_none()
             || self
                 .applies
                 .get(&rule.id)
                 .is_some_and(|hosts| hosts.contains(host_id))
     }
 
-    fn watches_series(&self, rule: &AlertRule, series: &str) -> bool {
-        self.series
-            .get(&rule.id)
-            .is_none_or(|pattern| pattern.matches(series))
+    /// The trusted trends of a metric on a host, as a forecast reads them.
+    fn trusted_trends(
+        &self,
+        rule: &AlertRuleInput,
+        metric: &'static str,
+        host_id: &str,
+    ) -> Vec<&Trend> {
+        let Some(trends) = self.trends.get(&(metric, rule.window())) else {
+            return Vec::new();
+        };
+        let window = rule.window();
+        trends
+            .by_host
+            .get(host_id)
+            .map(|trends_of_host| {
+                trends_of_host
+                    .iter()
+                    .filter(|trend| {
+                        trend.samples >= MIN_FORECAST_SAMPLES
+                            && trends.read_at - trend.first_time >= window / 2
+                            && trends.read_at - trend.time <= FORECAST_FRESH
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether the host reports any series of what a rule works out for each one,
+    /// and whether it reports this one.
+    fn reports_series(
+        &self,
+        rule: &AlertRuleInput,
+        fanned: &[&MetricUse],
+        alert: &Alert,
+    ) -> (bool, bool) {
+        let mut any = false;
+        let mut this = false;
+        for used in fanned {
+            let series: Vec<String> = if used.forecast {
+                let Some(trends) = self.trends.get(&(used.metric.name, rule.window())) else {
+                    continue;
+                };
+                let Some(trends) = trends.by_host.get(&alert.host_id) else {
+                    continue;
+                };
+                trends.iter().map(|trend| clean(&trend.series)).collect()
+            } else {
+                let Some(readings) = self
+                    .readings
+                    .get(used.metric.name)
+                    .and_then(|by_host| by_host.get(&alert.host_id))
+                else {
+                    continue;
+                };
+                readings
+                    .iter()
+                    .map(|reading| clean(&reading.series))
+                    .collect()
+            };
+            any |= !series.is_empty();
+            this |= series
+                .iter()
+                .any(|series| alert_series(series) == alert.series);
+        }
+        (any, this)
     }
 
     /// Why an open alert that nothing checked this time should end, if it should.
@@ -262,7 +356,7 @@ impl Snapshot {
         };
         // Checking a calculation deals with its own alerts. Getting here means it
         // couldn't be read, which says nothing about whether anything is wrong.
-        if rule.rule.kind == RuleKind::Calculation {
+        if rule.rule.is_calculation() {
             return None;
         }
         if !self.hosts.contains_key(&alert.host_id) {
@@ -271,45 +365,24 @@ impl Snapshot {
         if !self.rule_applies(rule, &alert.host_id) {
             return Some("The rule no longer applies to this host");
         }
-        match rule.rule.kind {
-            RuleKind::Offline if self.in_grace => None,
-            RuleKind::Offline => Some("The rule changed"),
-            // Only a connected agent is checked. One that's gone, or not back yet after
-            // a restart, still isn't sending anything: the offline rule says it's gone,
-            // and this alert ends once its samples are stored again.
-            RuleKind::NoMetrics => None,
-            RuleKind::Calculation => None,
-            RuleKind::Metric | RuleKind::Forecast => {
-                // The agent still reports the metric, so one of three things has
-                // happened to this series.
-                let metric = rule.rule.metric()?;
-                let reported = if rule.rule.kind == RuleKind::Forecast {
-                    let trends = self.trends.get(&(metric.name, rule.rule.window()))?;
-                    let trends = trends.by_host.get(&alert.host_id)?;
-                    trends
-                        .iter()
-                        .any(|trend| alert_series(&clean(&trend.series)) == alert.series)
-                } else {
-                    let readings = self.readings.get(metric.name)?.get(&alert.host_id)?;
-                    readings
-                        .iter()
-                        .any(|reading| alert_series(&clean(&reading.series)) == alert.series)
-                };
-                Some(if !reported {
-                    "This series is no longer reported"
-                } else if !self.watches_series(rule, alert.series.as_deref().unwrap_or_default()) {
-                    "The rule no longer covers this series"
-                } else {
-                    "This agent reports more series than a rule can watch"
-                })
-            }
+        let conditions = self.conditions.get(&rule.id)?;
+        let fanned = conditions.fanned_out();
+        match (fanned.is_empty(), &alert.series) {
+            (true, None) => None,
+            (true, Some(_)) | (false, None) => Some("The rule changed"),
+            (false, Some(_)) => match self.reports_series(&rule.rule, &fanned, alert) {
+                (false, _) => None,
+                (true, false) => Some("This series is no longer reported"),
+                (true, true) => Some("This agent reports more series than a rule can watch"),
+            },
         }
     }
 }
 
-/// For each rule's condition, by the rule's ID, the hosts it's true of. Each condition
-/// is compiled once, and each host's facts made ready for conditions once. One that
-/// can't be compiled or evaluated isn't true, as with config rules.
+/// For each rule's condition for which hosts, by the rule's ID, the hosts it's true
+/// of. Each condition is compiled once, and each host's facts made ready for
+/// conditions once. One that can't be compiled or evaluated isn't true, as with
+/// config rules.
 fn hosts_each_applies_to(
     conditions: &[(i64, String)],
     host_ids: &[String],
@@ -332,6 +405,49 @@ fn hosts_each_applies_to(
     applies
 }
 
+/// Each host's facts as conditions see them.
+fn facts_for_conditions(
+    host_ids: &[String],
+    facts: &BTreeMap<String, FlatFacts>,
+) -> HashMap<String, CelValue> {
+    host_ids
+        .iter()
+        .map(|id| {
+            let shape = facts.get(id).map_or(Value::Null, unflatten);
+            (id.clone(), cel::to_value(&shape).unwrap_or(CelValue::Null))
+        })
+        .collect()
+}
+
+/// What one host, or one of its series, gives a rule's conditions.
+struct Gathered {
+    metrics: BTreeMap<&'static str, Values<f64>>,
+    headings: BTreeMap<&'static str, Values<Heading>>,
+    /// The newest reading among them, if there's any.
+    newest: Option<Timestamp>,
+    /// The first metric's reading, as alerts keep it.
+    value: Option<f64>,
+    /// What summaries can show, in each metric's unit.
+    shown: Vec<(&'static str, Value)>,
+}
+
+/// Where a forecast starts from now: the line through the past, carried on to now.
+fn heading_now(trend: &Trend, now: Timestamp) -> Heading {
+    let since_newest = (now - trend.time).num_milliseconds() as f64 / 1000.0;
+    Heading {
+        value: trend.value + trend.slope_per_sec * since_newest,
+        slope_per_sec: trend.slope_per_sec,
+    }
+}
+
+fn shown_each(metric: &Metric, each: &BTreeMap<String, f64>) -> Value {
+    Value::Object(
+        each.iter()
+            .map(|(series, value)| (series.clone(), json!(format_value(metric.unit, *value))))
+            .collect(),
+    )
+}
+
 pub struct Evaluator {
     database: Database,
     /// What agents are set to run, for how often they send samples.
@@ -347,6 +463,12 @@ pub struct Evaluator {
     trackers: HashMap<Key, Tracker>,
     /// Kept between passes, as forecasts read less often than rules are checked.
     trends: HashMap<TrendKey, Trends>,
+    /// The newest sample seen from each host while it stays connected, as a sample
+    /// is only current for a few minutes and some hosts send less often than that.
+    newest_samples: HashMap<String, Timestamp>,
+    /// When each host that isn't `reporting` went quiet. It's quiet until something
+    /// newer than that is stored, even if it reconnects meanwhile.
+    silences: HashMap<String, Timestamp>,
 }
 
 impl Evaluator {
@@ -362,6 +484,8 @@ impl Evaluator {
             started_at,
             trackers: HashMap::new(),
             trends: HashMap::new(),
+            newest_samples: HashMap::new(),
+            silences: HashMap::new(),
         }
     }
 
@@ -417,30 +541,54 @@ impl Evaluator {
             .map(|host| (host.id.clone(), host))
             .collect();
 
-        let active = || rules.values().filter(|rule| rule.rule.enabled);
+        // Saving a rule checks its conditions can be read, so one that can't was
+        // saved some other way, and is left alone rather than stopping every rule.
+        let mut conditions = HashMap::new();
+        for rule in rules.values().filter(|rule| rule.rule.enabled) {
+            match rule.rule.conditions() {
+                Ok(read) => {
+                    conditions.insert(rule.id, read);
+                }
+                Err(error) => error!(
+                    rule = rule.rule.name,
+                    error = format!("{error:#}"),
+                    "a saved rule's conditions can't be read"
+                ),
+            }
+        }
+        let active = || {
+            rules
+                .values()
+                .filter(|rule| conditions.contains_key(&rule.id))
+        };
+        let uses =
+            |variable: Variable| active().any(|rule| conditions[&rule.id].uses_variable(variable));
 
-        let conditions: Vec<(i64, String)> = active()
-            .filter_map(|rule| Some((rule.id, rule.rule.condition.clone()?)))
+        let applies_to: Vec<(i64, String)> = active()
+            .filter_map(|rule| Some((rule.id, rule.rule.applies_to.clone()?)))
             .collect();
-        let applies = if conditions.is_empty() {
-            HashMap::new()
+        let wants_facts = uses(Variable::Facts);
+        let (applies, facts) = if applies_to.is_empty() && !wants_facts {
+            (HashMap::new(), HashMap::new())
         } else {
             let facts = self.database.all_current_facts().await?;
             let ids: Vec<String> = hosts.keys().cloned().collect();
             // Every condition against every host is work for a thread of its own.
-            tokio::task::spawn_blocking(move || hosts_each_applies_to(&conditions, &ids, &facts))
-                .await
-                .context("checking alert rules' conditions")?
+            tokio::task::spawn_blocking(move || {
+                let applies = hosts_each_applies_to(&applies_to, &ids, &facts);
+                let shaped = match wants_facts {
+                    true => facts_for_conditions(&ids, &facts),
+                    false => HashMap::new(),
+                };
+                (applies, shaped)
+            })
+            .await
+            .context("checking alert rules' conditions")?
         };
-        let series = rules
-            .values()
-            .filter_map(|rule| Some((rule.id, rule.rule.series_pattern()?)))
-            .collect();
 
-        let wanted: BTreeSet<&'static str> = active()
-            .filter(|rule| rule.rule.kind == RuleKind::Metric)
-            .filter_map(|rule| rule.rule.metric())
-            .map(|metric| metric.name)
+        let host_rules = || active().filter(|rule| !rule.rule.is_calculation());
+        let wanted: BTreeSet<&'static str> = host_rules()
+            .flat_map(|rule| conditions[&rule.id].read_metrics())
             .collect();
         let mut readings = BTreeMap::new();
         for name in wanted {
@@ -463,37 +611,135 @@ impl Evaluator {
             }
         }
 
-        let forecasts: BTreeSet<TrendKey> = active()
-            .filter(|rule| rule.rule.kind == RuleKind::Forecast)
-            .filter_map(|rule| Some((rule.rule.metric()?.name, rule.rule.window())))
+        let forecasts: BTreeSet<TrendKey> = host_rules()
+            .flat_map(|rule| {
+                let window = rule.rule.window();
+                conditions[&rule.id]
+                    .forecast_metrics()
+                    .into_iter()
+                    .map(move |name| (name, window))
+            })
             .collect();
         self.trends.retain(|key, _| forecasts.contains(key));
         for key in forecasts {
             self.read_trends(key, now).await?;
         }
 
-        let watches_samples = active().any(|rule| rule.rule.kind == RuleKind::NoMetrics);
-        let last_samples = if watches_samples {
-            self.read_last_samples(now).await
-        } else {
-            None
+        let online: HashMap<String, Seen> = hosts
+            .values()
+            .filter_map(|host| Some((host.id.clone(), self.online(host)?)))
+            .collect();
+        let reporting = match uses(Variable::Reporting) {
+            true => self.reporting(&hosts, &online, now).await,
+            false => HashMap::new(),
         };
 
         Ok(Snapshot {
             now,
             in_grace: now - self.started_at < STARTUP_GRACE,
             rules,
+            conditions,
             hosts,
             applies,
-            series,
+            facts,
             readings,
             trends: self.trends.clone(),
-            last_samples,
+            online,
+            reporting,
         })
     }
 
+    /// Whether a host is online, and since when. The server reads itself, so it's
+    /// always there, and a host with no agent is only as present as what the server
+    /// reads from it, so one with nothing read yet is neither on nor off.
+    fn online(&self, host: &HostRecord) -> Option<Seen> {
+        if host.is_local() {
+            return Some(Seen {
+                yes: true,
+                since: self.started_at,
+            });
+        }
+        let presence = self.presence.get(&host.id);
+        if host.is_agentless() && presence.is_none() {
+            return None;
+        }
+        // An agent that hasn't connected since the start has been gone at least
+        // that long, and may have been offline before it.
+        Some(Seen {
+            yes: presence.is_some_and(|p| p.online),
+            since: presence.map_or(self.started_at, |p| p.since),
+        })
+    }
+
+    /// Whether each connected host's samples are arriving, and since when they
+    /// stopped if they aren't. A host that isn't connected is left out, as the
+    /// question is about one that is: `online` covers the rest. The server reads
+    /// itself and hosts with no agent, so theirs never stop.
+    async fn reporting(
+        &mut self,
+        hosts: &BTreeMap<String, HostRecord>,
+        online: &HashMap<String, Seen>,
+        now: Timestamp,
+    ) -> HashMap<String, Seen> {
+        let Some(last_samples) = self.read_last_samples(now).await else {
+            return HashMap::new();
+        };
+        self.newest_samples
+            .retain(|id, _| online.get(id).is_some_and(|seen| seen.yes));
+        self.silences.retain(|id, _| hosts.contains_key(id));
+        let mut reporting = HashMap::new();
+        for host in hosts.values() {
+            let Some(connected) = online.get(&host.id).filter(|seen| seen.yes) else {
+                continue;
+            };
+            if host.is_local() || host.is_agentless() {
+                let always = Seen {
+                    yes: true,
+                    since: connected.since,
+                };
+                reporting.insert(host.id.clone(), always);
+                continue;
+            }
+            let newest = self.newest_samples.get(&host.id).copied();
+            let newest = newest.max(last_samples.get(&host.id).copied());
+            if let Some(newest) = newest {
+                self.newest_samples.insert(host.id.clone(), newest);
+            }
+            if let Some(&began) = self.silences.get(&host.id) {
+                if newest.is_some_and(|taken| taken > began) {
+                    self.silences.remove(&host.id);
+                } else {
+                    let quiet = Seen {
+                        yes: false,
+                        since: began,
+                    };
+                    reporting.insert(host.id.clone(), quiet);
+                    continue;
+                }
+            }
+            // The silence began with the newest sample, or with connecting if none
+            // has come since, as an agent that was away can't have sent anything.
+            let since = newest.map_or(connected.since, |taken| taken.max(connected.since));
+            let quiet_for = now - since;
+            let silent = quiet_for >= MIN_SILENCE
+                && match self.interval(&host.id).await {
+                    Some(every) => quiet_for >= every * MISSED_SAMPLES,
+                    None => true,
+                };
+            if silent {
+                self.silences.insert(host.id.clone(), since);
+            }
+            let seen = Seen {
+                yes: !silent,
+                since,
+            };
+            reporting.insert(host.id.clone(), seen);
+        }
+        reporting
+    }
+
     /// When each host's newest current sample was taken, in one query for them all.
-    /// If it can't be read, no-metrics rules wait until it can.
+    /// If it can't be read, `reporting` waits until it can.
     async fn read_last_samples(&self, now: Timestamp) -> Option<BTreeMap<String, Timestamp>> {
         match self.metrics.last_samples(now).await {
             Ok(rows) => Some(
@@ -573,40 +819,21 @@ impl Evaluator {
             .collect();
 
         let mut checked = HashSet::new();
-        for rule in snapshot.rules.values().filter(|rule| rule.rule.enabled) {
-            if rule.rule.kind == RuleKind::Calculation {
+        for rule in snapshot.rules.values() {
+            let Some(conditions) = snapshot.conditions.get(&rule.id) else {
+                continue;
+            };
+            if rule.rule.is_calculation() {
                 if !snapshot.in_grace {
-                    self.check_calculation(rule, &snapshot, &mut open, &mut checked)
+                    self.check_calculation(rule, conditions, &snapshot, &mut open, &mut checked)
                         .await?;
                 }
                 continue;
             }
             for host in snapshot.hosts.values() {
-                if !snapshot.rule_applies(rule, &host.id) {
-                    continue;
-                }
-                match rule.rule.kind {
-                    RuleKind::Offline if host.is_local() => {}
-                    RuleKind::Offline => {
-                        self.check_offline(rule, host, &snapshot, &mut open, &mut checked)
-                            .await?;
-                    }
-                    // The server reads what it has of these hosts itself, so there's
-                    // no agent whose samples could stop.
-                    RuleKind::NoMetrics if host.is_local() || host.is_agentless() => {}
-                    RuleKind::NoMetrics => {
-                        self.check_no_metrics(rule, host, &snapshot, &mut open, &mut checked)
-                            .await?;
-                    }
-                    RuleKind::Metric => {
-                        self.check_metric(rule, host, &snapshot, &mut open, &mut checked)
-                            .await?;
-                    }
-                    RuleKind::Forecast => {
-                        self.check_forecast(rule, host, &snapshot, &mut open, &mut checked)
-                            .await?;
-                    }
-                    RuleKind::Calculation => {}
+                if snapshot.rule_applies(rule, &host.id) {
+                    self.check_host(rule, conditions, host, &snapshot, &mut open, &mut checked)
+                        .await?;
                 }
             }
         }
@@ -629,122 +856,311 @@ impl Evaluator {
         Ok(())
     }
 
-    async fn check_offline(
+    /// Works a rule out for one host, and for each of its series where the rule's
+    /// metrics have one for each disk, interface or such.
+    async fn check_host(
         &mut self,
         rule: &AlertRule,
+        conditions: &Conditions,
         host: &HostRecord,
         snapshot: &Snapshot,
         open: &mut HashMap<Key, Alert>,
         checked: &mut HashSet<Key>,
     ) -> Result<()> {
-        let key = Key {
-            rule_id: rule.id,
-            host_id: host.id.clone(),
-            series: None,
-        };
-        checked.insert(key.clone());
-
-        // An agent that hasn't connected since the start has been gone at least
-        // that long, and may have been offline before it.
-        let presence = self.presence.get(&host.id);
-        // A host with no agent is only as present as what the server reads from it,
-        // so one with nothing to read, or not read yet, is neither on nor off.
-        if host.is_agentless() && presence.is_none() {
+        let uses_online = conditions.uses_variable(Variable::Online);
+        let uses_reporting = conditions.uses_variable(Variable::Reporting);
+        let online = snapshot.online.get(&host.id).copied();
+        let reporting = snapshot.reporting.get(&host.id).copied();
+        // What can't be told isn't guessed at: whatever is open stays open.
+        if (uses_online && online.is_none()) || (uses_reporting && reporting.is_none()) {
+            for key in open
+                .keys()
+                .filter(|key| key.rule_id == rule.id && key.host_id == host.id)
+            {
+                checked.insert(key.clone());
+            }
             return Ok(());
         }
-        let online = presence.is_some_and(|p| p.online);
-        let since = presence.map_or(self.started_at, |p| p.since);
-        // Just after a start, an agent that isn't back yet may only be slow to
-        // reconnect, so it's left as it was. One that is back is certainly online.
-        if snapshot.in_grace && !online {
-            return Ok(());
-        }
+        let is_online = online.is_none_or(|seen| seen.yes);
+        let is_reporting = reporting.is_none_or(|seen| seen.yes);
 
-        let tracker = self.trackers.entry(key.clone()).or_default();
-        let hold = tracker.only_hold();
-        hold.breached_since = (!online).then_some(since);
-        let levels = [(rule.rule.severity, !online)];
-        let current = open.get(&key).map(|alert| alert.severity);
-        let change = tracker.observe(&levels, snapshot.now, rule.rule.hold, current);
+        let fanned = conditions.fanned_out();
+        let mut series: Vec<String> = Vec::new();
+        for used in &fanned {
+            let names: Vec<String> = if used.forecast {
+                snapshot
+                    .trusted_trends(&rule.rule, used.metric.name, &host.id)
+                    .iter()
+                    .map(|trend| clean(&trend.series))
+                    .collect()
+            } else {
+                self.readings_of(snapshot, used.metric, &host.id)
+                    .iter()
+                    .map(|reading| clean(&reading.series))
+                    .collect()
+            };
+            for name in names {
+                if !series.contains(&name) {
+                    series.push(name);
+                }
+            }
+        }
+        if fanned.is_empty() {
+            series.push(String::new());
+        }
+        series.truncate(MAX_SERIES_PER_HOST);
 
         let hostname = clean(&host.hostname);
-        let summary = match change {
-            Some(Change::Resolve) => crate::alerting::AlertRuleInput::online_summary(&hostname),
-            _ => crate::alerting::AlertRuleInput::offline_summary(&hostname),
-        };
-        self.apply(change, rule, &hostname, key, None, summary, snapshot, open)
-            .await
+        let facts = snapshot
+            .facts
+            .get(&host.id)
+            .cloned()
+            .unwrap_or(CelValue::Null);
+        let described = conditions
+            .primary()
+            .filter(|primary| !primary.bracketed && !primary.forecast)
+            .and_then(|primary| metrics::described(primary.metric));
+        // What the collector last sent, read once and only if an alert needs its words.
+        let mut output = None;
+
+        for series in series {
+            let key = Key {
+                rule_id: rule.id,
+                host_id: host.id.clone(),
+                series: alert_series(&series),
+            };
+            checked.insert(key.clone());
+            // Missing data says nothing about whether anything is wrong.
+            let Some(gathered) = self.gather(rule, conditions, &host.id, &series, snapshot) else {
+                continue;
+            };
+            let tracker = self.trackers.entry(key.clone()).or_default();
+            if let Some(newest) = gathered.newest {
+                let stamp = (newest, is_online, is_reporting);
+                if tracker.last_stamp == Some(stamp) {
+                    continue;
+                }
+                tracker.last_stamp = Some(stamp);
+            }
+
+            let inputs_with = |online: bool, reporting: bool| Inputs {
+                facts: facts.clone(),
+                host: &hostname,
+                series: &series,
+                online,
+                reporting,
+                value: None,
+                metrics: gathered.metrics.clone(),
+                headings: gathered.headings.clone(),
+            };
+            let levels = holds(conditions, &inputs_with(is_online, is_reporting));
+            // A problem that's there because the host went offline or stopped
+            // sending began when it did, not when it was noticed.
+            let mut began = vec![snapshot.now; levels.len()];
+            let gone_since = [(online, is_online), (reporting, is_reporting)]
+                .into_iter()
+                .filter_map(|(seen, is_it)| seen.filter(|_| !is_it))
+                .map(|seen| seen.since)
+                .min();
+            if let Some(since) = gone_since
+                && levels.iter().any(|(_, breached)| *breached)
+            {
+                let otherwise = holds(conditions, &inputs_with(true, true));
+                for ((began, (_, now)), (_, then)) in began.iter_mut().zip(&levels).zip(&otherwise)
+                {
+                    if *now && !*then {
+                        *began = since.min(*began);
+                    }
+                }
+            }
+            let current = open.get(&key).map(|alert| alert.severity);
+            let tracker = self.trackers.entry(key.clone()).or_default();
+            let change =
+                tracker.observe_from(&levels, &began, snapshot.now, rule.rule.hold, current);
+            // Just after a start, agents are still reconnecting and sending what they
+            // kept meanwhile, so nothing about being there starts. Anything can end.
+            if snapshot.in_grace
+                && (uses_online || uses_reporting)
+                && matches!(change, Some(Change::Fire(_)))
+            {
+                continue;
+            }
+
+            let primary = conditions.primary();
+            let subject =
+                primary.map(|primary| subject(primary.metric, &series, primary.picked.as_deref()));
+            let values = SummaryValues {
+                host: hostname.clone(),
+                series: series.clone(),
+                value: primary
+                    .zip(gathered.value)
+                    .map(|(primary, value)| format_value(primary.metric.unit, value)),
+                metrics: gathered.shown.clone(),
+            };
+            // Said in the collector's own words where it has them, such as a
+            // service that's failed, as the alert starts, while it lasts, and as
+            // it clears, unless the rule says what to say.
+            let breached = levels.iter().any(|(_, breached)| *breached);
+            let resolving = matches!(change, Some(Change::Resolve));
+            let says = change.is_some() || (current.is_some() && breached);
+            let state = match described.filter(|_| says && rule.rule.summary.is_none()) {
+                Some(described) => {
+                    let metric = primary.map(|primary| primary.metric).context("no metric")?;
+                    if output.is_none() {
+                        let latest =
+                            self.metrics
+                                .latest_output(&host.id, metric.collector, snapshot.now);
+                        output = Some(latest.await.ok().flatten().unwrap_or(Value::Null));
+                    }
+                    let state =
+                        described.state_of(output.as_ref().unwrap_or(&Value::Null), &series);
+                    state.map(|state| {
+                        AlertRuleInput::state_summary(described.noun, &hostname, &series, &state)
+                    })
+                }
+                None => None,
+            };
+            let summary = match (change.as_ref().and_then(Change::severity), state) {
+                (None, Some(state)) if resolving => state,
+                (None, None) if resolving => rule
+                    .rule
+                    .resolved_summary_for(&values, subject.as_deref())
+                    .unwrap_or_default(),
+                (Some(_), Some(state)) => state,
+                (Some(_), None) => rule.rule.summary_for(&values, subject.as_deref()),
+                // Its state changed while it stayed down, which nobody needs telling.
+                (None, Some(state)) => {
+                    if let Some(alert) = open.get_mut(&key)
+                        && alert.summary != state
+                    {
+                        self.database.reword_alert(alert.id, &state).await?;
+                        alert.summary = state;
+                    }
+                    String::new()
+                }
+                (None, None) => String::new(),
+            };
+            self.apply(
+                change,
+                rule,
+                &hostname,
+                key,
+                gathered.value,
+                summary,
+                snapshot,
+                open,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
-    /// Alerts on a connected agent whose samples have stopped being stored, as when the
-    /// server refuses everything it sends. One that isn't connected is the offline
-    /// rule's to alert on, so it's left alone.
-    async fn check_no_metrics(
-        &mut self,
+    fn readings_of<'a>(
+        &self,
+        snapshot: &'a Snapshot,
+        metric: &Metric,
+        host_id: &str,
+    ) -> &'a [NewestReading] {
+        snapshot
+            .readings
+            .get(metric.name)
+            .and_then(|by_host| by_host.get(host_id))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// What a host gives a rule's conditions for one of its series, or nothing if
+    /// a metric they use has no reading for it.
+    fn gather(
+        &self,
         rule: &AlertRule,
-        host: &HostRecord,
+        conditions: &Conditions,
+        host_id: &str,
+        series: &str,
         snapshot: &Snapshot,
-        open: &mut HashMap<Key, Alert>,
-        checked: &mut HashSet<Key>,
-    ) -> Result<()> {
-        let Some(presence) = self.presence.get(&host.id).filter(|p| p.online) else {
-            return Ok(());
+    ) -> Option<Gathered> {
+        let mut gathered = Gathered {
+            metrics: BTreeMap::new(),
+            headings: BTreeMap::new(),
+            newest: None,
+            value: None,
+            shown: Vec::new(),
         };
-        let key = Key {
-            rule_id: rule.id,
-            host_id: host.id.clone(),
-            series: None,
-        };
-        checked.insert(key.clone());
-        let Some(last_samples) = &snapshot.last_samples else {
-            return Ok(());
-        };
-
-        // A sample is only current for a few minutes, so the newest one seen is kept
-        // while the agent stays connected, for one that sends less often than that.
-        let tracker = self.trackers.entry(key.clone()).or_default();
-        if let Some(&taken) = last_samples.get(&host.id) {
-            tracker.last_sample = tracker.last_sample.max(Some(taken));
-        }
-        let newest = tracker.last_sample;
-        // The silence began with the newest sample, or with connecting if none has
-        // come since, as an agent that was away can't have sent anything meanwhile.
-        let since = newest.map_or(presence.since, |taken| taken.max(presence.since));
-        let quiet_for = snapshot.now - since;
-        let silent = match open.get(&key) {
-            // It's over once anything newer than the silence is stored, even if the
-            // agent has reconnected since, which starts the count above again.
-            Some(alert) => !newest.is_some_and(|taken| taken > alert.breached_at),
-            // One that sends seldom gets a few of its intervals too. They're only
-            // worked out for a host quiet for longer than the hold, which is rare.
-            None if quiet_for >= rule.rule.hold => match self.interval(&host.id).await {
-                Some(every) => quiet_for >= every * MISSED_SAMPLES,
-                None => true,
-            },
-            None => false,
-        };
-
-        let tracker = self.trackers.entry(key.clone()).or_default();
-        let hold = tracker.only_hold();
-        hold.breached_since = silent.then_some(since);
-        let levels = [(rule.rule.severity, silent)];
-        let current = open.get(&key).map(|alert| alert.severity);
-        let change = tracker.observe(&levels, snapshot.now, rule.rule.hold, current);
-        // Just after a start, agents are still reconnecting and sending what they
-        // kept meanwhile, so nothing starts. Samples arriving still end an alert.
-        if snapshot.in_grace && matches!(change, Some(Change::Fire(_))) {
-            return Ok(());
-        }
-
-        let hostname = clean(&host.hostname);
-        let summary = match change {
-            Some(Change::Resolve) => {
-                crate::alerting::AlertRuleInput::metrics_again_summary(&hostname)
+        let mut seen: Vec<(&str, bool)> = Vec::new();
+        for used in conditions.uses() {
+            let metric = used.metric;
+            if seen.contains(&(metric.name, used.forecast)) {
+                continue;
             }
-            _ => crate::alerting::AlertRuleInput::no_metrics_summary(&hostname),
-        };
-        self.apply(change, rule, &hostname, key, None, summary, snapshot, open)
-            .await
+            seen.push((metric.name, used.forecast));
+            // A metric with one series has it whatever the series looked at is, and
+            // one with a series for each disk or such has the one looked at.
+            let wanted = |name: &str| match metric.source {
+                Source::Fields(_) => true,
+                _ => clean(name) == series,
+            };
+            let first = gathered.value.is_none()
+                && gathered.metrics.is_empty()
+                && gathered.headings.is_empty();
+            if used.forecast {
+                let trends = snapshot.trusted_trends(&rule.rule, metric.name, host_id);
+                let newest = trends.iter().map(|trend| trend.time).max()?;
+                gathered.newest = gathered.newest.max(Some(newest));
+                let bound = if used.bracketed {
+                    let each: BTreeMap<String, Heading> = trends
+                        .iter()
+                        .map(|trend| (clean(&trend.series), heading_now(trend, snapshot.now)))
+                        .collect();
+                    Values::Each(each)
+                } else {
+                    let trend = trends.iter().find(|trend| wanted(&trend.series))?;
+                    if first {
+                        gathered.value = Some(trend.value);
+                    }
+                    if !gathered.shown.iter().any(|(name, _)| *name == metric.name) {
+                        gathered
+                            .shown
+                            .push((metric.name, json!(format_value(metric.unit, trend.value))));
+                    }
+                    Values::One(heading_now(trend, snapshot.now))
+                };
+                gathered.headings.insert(metric.name, bound);
+                continue;
+            }
+            let readings = self.readings_of(snapshot, metric, host_id);
+            let newest = readings.iter().map(|reading| reading.time).max()?;
+            if used.bracketed {
+                let each: BTreeMap<String, f64> = readings
+                    .iter()
+                    .map(|reading| (clean(&reading.series), reading.value))
+                    .collect();
+                gathered.newest = gathered.newest.max(Some(newest));
+                if first {
+                    gathered.value = used
+                        .picked
+                        .as_ref()
+                        .and_then(|picked| each.get(picked).copied());
+                }
+                gathered.shown.retain(|(name, _)| *name != metric.name);
+                gathered
+                    .shown
+                    .push((metric.name, shown_each(metric, &each)));
+                gathered.metrics.insert(metric.name, Values::Each(each));
+            } else {
+                let reading = readings.iter().find(|reading| wanted(&reading.series))?;
+                gathered.newest = gathered.newest.max(Some(reading.time));
+                if first {
+                    gathered.value = Some(reading.value);
+                }
+                gathered.shown.retain(|(name, _)| *name != metric.name);
+                gathered
+                    .shown
+                    .push((metric.name, json!(format_value(metric.unit, reading.value))));
+                gathered
+                    .metrics
+                    .insert(metric.name, Values::One(reading.value));
+            }
+        }
+        Some(gathered)
     }
 
     /// The lines of a calculation with a number for each, or nothing if it couldn't
@@ -792,14 +1208,11 @@ impl Evaluator {
     async fn check_calculation(
         &mut self,
         rule: &AlertRule,
+        conditions: &Conditions,
         snapshot: &Snapshot,
         open: &mut HashMap<Key, Alert>,
         checked: &mut HashSet<Key>,
     ) -> Result<()> {
-        let Some(comparison) = rule.rule.comparison else {
-            return Ok(());
-        };
-        let thresholds = rule.rule.levels();
         let question = match rule.rule.question() {
             Ok(question) => question,
             Err(error) => {
@@ -814,6 +1227,7 @@ impl Evaluator {
             return Ok(());
         };
 
+        let unit = question.unit();
         let key_of = |line: &str| Key {
             rule_id: rule.id,
             host_id: FLEET_HOST_ID.to_string(),
@@ -823,18 +1237,45 @@ impl Evaluator {
             let key = key_of(line);
             checked.insert(key.clone());
 
+            let inputs = Inputs {
+                facts: CelValue::Null,
+                host: FLEET_HOSTNAME,
+                series: line,
+                online: true,
+                reporting: true,
+                value: Some(bind_value(unit, *value)),
+                metrics: BTreeMap::new(),
+                headings: BTreeMap::new(),
+            };
+            let levels = holds(conditions, &inputs);
             let tracker = self.trackers.entry(key.clone()).or_default();
             let current = open.get(&key).map(|alert| alert.severity);
-            let levels = crossed(&thresholds, comparison, *value);
-            let change = tracker.observe(&levels, snapshot.now, rule.rule.hold, current);
+            let began = vec![snapshot.now; levels.len()];
+            let change =
+                tracker.observe_from(&levels, &began, snapshot.now, rule.rule.hold, current);
 
+            let subject = match question.grouping {
+                Grouping::Nothing => format!(
+                    "{} of {}",
+                    question.calculation.label(),
+                    question.metric.title
+                ),
+                _ => line.clone(),
+            };
+            let values = SummaryValues {
+                host: FLEET_HOSTNAME.to_string(),
+                series: line.clone(),
+                value: Some(format_value(unit, *value)),
+                metrics: Vec::new(),
+            };
             let summary = match change {
                 Some(Change::Resolve) => rule
                     .rule
-                    .calculation_cleared_summary(&question, line, *value)?,
-                Some(Change::Fire(severity) | Change::Become(severity)) => rule
-                    .rule
-                    .calculation_summary(&question, line, *value, severity)?,
+                    .resolved_summary_for(&values, Some(&subject))
+                    .unwrap_or_default(),
+                Some(Change::Fire(_) | Change::Become(_)) => {
+                    rule.rule.summary_for(&values, Some(&subject))
+                }
                 None => String::new(),
             };
             self.apply(
@@ -864,206 +1305,6 @@ impl Evaluator {
                     self.close(&alert, snapshot.now, reason, None).await?;
                 }
             }
-        }
-        Ok(())
-    }
-
-    async fn check_metric(
-        &mut self,
-        rule: &AlertRule,
-        host: &HostRecord,
-        snapshot: &Snapshot,
-        open: &mut HashMap<Key, Alert>,
-        checked: &mut HashSet<Key>,
-    ) -> Result<()> {
-        let metric = rule.rule.metric().context("unknown metric")?;
-        let Some(comparison) = rule.rule.comparison else {
-            return Ok(());
-        };
-        let thresholds = rule.rule.levels();
-        let Some(readings) = snapshot
-            .readings
-            .get(metric.name)
-            .and_then(|by_host| by_host.get(&host.id))
-        else {
-            return Ok(());
-        };
-
-        let watched = readings
-            .iter()
-            .map(|reading| (clean(&reading.series), reading))
-            .filter(|(series, _)| snapshot.watches_series(rule, series))
-            .take(MAX_SERIES_PER_HOST);
-        // What the collector last sent, read once and only if an alert needs its words.
-        let described = metrics::described(metric);
-        let mut output = None;
-
-        for (series, reading) in watched {
-            let key = Key {
-                rule_id: rule.id,
-                host_id: host.id.clone(),
-                series: alert_series(&series),
-            };
-            checked.insert(key.clone());
-
-            let tracker = self.trackers.entry(key.clone()).or_default();
-            if tracker.last_sample == Some(reading.time) {
-                continue;
-            }
-            let current = open.get(&key).map(|alert| alert.severity);
-            let levels = crossed(&thresholds, comparison, reading.value);
-            let change = tracker.observe(&levels, snapshot.now, rule.rule.hold, current);
-            tracker.last_sample = Some(reading.time);
-
-            let hostname = clean(&host.hostname);
-            // Said in the collector's own words where it has them, such as a
-            // service that's failed, as the alert starts, while it lasts, and as
-            // it clears.
-            let breached = levels.iter().any(|(_, breached)| *breached);
-            let resolving = matches!(change, Some(Change::Resolve));
-            let says = change.is_some() || (current.is_some() && breached);
-            let state = match described.filter(|_| says) {
-                Some(described) => {
-                    if output.is_none() {
-                        let latest =
-                            self.metrics
-                                .latest_output(&host.id, metric.collector, snapshot.now);
-                        output = Some(latest.await.ok().flatten().unwrap_or(Value::Null));
-                    }
-                    let state =
-                        described.state_of(output.as_ref().unwrap_or(&Value::Null), &series);
-                    state.map(|state| {
-                        crate::alerting::AlertRuleInput::state_summary(
-                            described.noun,
-                            &hostname,
-                            &series,
-                            &state,
-                        )
-                    })
-                }
-                None => None,
-            };
-            let summary = match (change.as_ref().and_then(Change::severity), state) {
-                (None, Some(state)) if resolving => state,
-                (None, None) if resolving => {
-                    rule.rule
-                        .metric_cleared_summary(metric, &hostname, &series, reading.value)?
-                }
-                (Some(_), Some(state)) => state,
-                (Some(severity), None) => {
-                    rule.rule
-                        .metric_summary(metric, &hostname, &series, reading.value, severity)?
-                }
-                // Its state changed while it stayed down, which nobody needs telling.
-                (None, Some(state)) => {
-                    if let Some(alert) = open.get_mut(&key)
-                        && alert.summary != state
-                    {
-                        self.database.reword_alert(alert.id, &state).await?;
-                        alert.summary = state;
-                    }
-                    String::new()
-                }
-                (None, None) => String::new(),
-            };
-            self.apply(
-                change,
-                rule,
-                &hostname,
-                key,
-                Some(reading.value),
-                summary,
-                snapshot,
-                open,
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
-    async fn check_forecast(
-        &mut self,
-        rule: &AlertRule,
-        host: &HostRecord,
-        snapshot: &Snapshot,
-        open: &mut HashMap<Key, Alert>,
-        checked: &mut HashSet<Key>,
-    ) -> Result<()> {
-        let metric = rule.rule.metric().context("unknown metric")?;
-        let (Some(comparison), Some(level)) = (rule.rule.comparison, rule.rule.threshold) else {
-            return Ok(());
-        };
-        let Some(trends) = snapshot.trends.get(&(metric.name, rule.rule.window())) else {
-            return Ok(());
-        };
-        let Some(host_trends) = trends.by_host.get(&host.id) else {
-            return Ok(());
-        };
-        let window = rule.rule.window();
-        let watched = host_trends
-            .iter()
-            .map(|trend| (clean(&trend.series), trend))
-            .filter(|(series, _)| snapshot.watches_series(rule, series))
-            .take(MAX_SERIES_PER_HOST);
-
-        for (series, trend) in watched {
-            let key = Key {
-                rule_id: rule.id,
-                host_id: host.id.clone(),
-                series: alert_series(&series),
-            };
-            checked.insert(key.clone());
-            let trusted = trend.samples >= MIN_FORECAST_SAMPLES
-                && trends.read_at - trend.first_time >= window / 2
-                && trends.read_at - trend.time <= FORECAST_FRESH;
-            let tracker = self.trackers.entry(key.clone()).or_default();
-            if !trusted || tracker.last_sample == Some(trend.time) {
-                continue;
-            }
-            let eta = eta(trend, level, comparison, snapshot.now);
-            let levels: Vec<(Severity, bool)> = rule
-                .rule
-                .forecast_levels()
-                .into_iter()
-                .map(|(severity, soon)| (severity, eta.is_some_and(|eta| eta <= soon)))
-                .collect();
-            let current = open.get(&key).map(|alert| alert.severity);
-            let change = tracker.observe(&levels, snapshot.now, rule.rule.hold, current);
-            tracker.last_sample = Some(trend.time);
-
-            let hostname = clean(&host.hostname);
-            let summary = match (change.as_ref().and_then(Change::severity), eta) {
-                _ if matches!(change, Some(Change::Resolve)) => {
-                    rule.rule.forecast_cleared_summary(
-                        metric,
-                        &hostname,
-                        &series,
-                        trend.value,
-                        trend.slope_per_sec,
-                        eta,
-                    )?
-                }
-                (Some(_), Some(eta)) => rule.rule.forecast_summary(
-                    metric,
-                    &hostname,
-                    &series,
-                    trend.value,
-                    trend.slope_per_sec,
-                    eta,
-                )?,
-                _ => String::new(),
-            };
-            self.apply(
-                change,
-                rule,
-                &hostname,
-                key,
-                Some(trend.value),
-                summary,
-                snapshot,
-                open,
-            )
-            .await?;
         }
         Ok(())
     }
@@ -1205,46 +1446,14 @@ impl Change {
     }
 }
 
-/// Which of a rule's levels a value crosses, mildest first.
-fn crossed(
-    thresholds: &[(Severity, f64)],
-    comparison: crate::alerting::Comparison,
-    value: f64,
-) -> Vec<(Severity, bool)> {
-    thresholds
-        .iter()
-        .map(|(severity, threshold)| (*severity, comparison.is_breached(value, *threshold)))
+/// Whether each of a rule's conditions holds, mildest first.
+fn holds(conditions: &Conditions, inputs: &Inputs) -> Vec<(Severity, bool)> {
+    let bindings = inputs.bind();
+    conditions
+        .levels()
+        .into_iter()
+        .map(|(severity, condition)| (severity, condition.holds(&bindings)))
         .collect()
-}
-
-/// How long from `now` until a series reaches `level`, carrying on the way it has
-/// been going, to the second. Nothing if it's heading the other way or not moving,
-/// and none if it's already there.
-fn eta(
-    trend: &Trend,
-    level: f64,
-    comparison: crate::alerting::Comparison,
-    now: Timestamp,
-) -> Option<TimeDelta> {
-    if comparison.is_breached(trend.value, level) || trend.value == level {
-        return Some(TimeDelta::zero());
-    }
-    let towards = match comparison {
-        crate::alerting::Comparison::Above => trend.slope_per_sec,
-        crate::alerting::Comparison::Below => -trend.slope_per_sec,
-    };
-    if towards.is_nan() || towards <= 0.0 {
-        return None;
-    }
-    let from_newest = (level - trend.value).abs() / towards;
-    let since_newest = (now - trend.time).num_milliseconds() as f64 / 1000.0;
-    let from_now = (from_newest - since_newest).max(0.0).ceil();
-    // Something so slow it would take longer than a moment can be away is of no
-    // interest, and neither is anything that isn't a number.
-    if !from_now.is_finite() || from_now >= TimeDelta::MAX.num_seconds() as f64 {
-        return None;
-    }
-    Some(TimeDelta::seconds(from_now as i64))
 }
 
 #[cfg(test)]
@@ -1442,39 +1651,25 @@ mod tests {
         }
     }
 
-    fn trend(value: f64, per_hour: f64) -> Trend {
-        Trend {
+    #[test]
+    fn a_forecast_starts_from_the_line_carried_on_to_now() {
+        let trend = Trend {
             host_id: "a".to_string(),
             series: "/".to_string(),
             time: at(0),
-            value,
+            value: 90.0,
             first_time: at(-3600),
             samples: 100,
-            slope_per_sec: per_hour / 3600.0,
-        }
-    }
-
-    #[test]
-    fn eta_carries_the_line_on_from_the_newest_reading() {
-        use crate::alerting::Comparison::{Above, Below};
-        let hours = |count| Some(TimeDelta::hours(count));
-        assert_eq!(eta(&trend(90.0, 2.0), 100.0, Above, at(0)), hours(5));
-        // An hour after the reading, an hour of it has gone.
-        assert_eq!(eta(&trend(90.0, 2.0), 100.0, Above, at(3600)), hours(4));
-        assert_eq!(eta(&trend(90.0, 2.0), 100.0, Above, at(9 * 3600)), hours(0));
-        assert_eq!(eta(&trend(90.0, 0.0), 100.0, Above, at(0)), None);
-        assert_eq!(eta(&trend(90.0, -2.0), 100.0, Above, at(0)), None);
+            slope_per_sec: 2.0 / 3600.0,
+        };
         assert_eq!(
-            eta(&trend(100.0, -2.0), 100.0, Above, at(0)),
-            Some(TimeDelta::zero())
+            heading_now(&trend, at(0)),
+            Heading {
+                value: 90.0,
+                slope_per_sec: 2.0 / 3600.0
+            }
         );
-        assert_eq!(eta(&trend(20.0, -5.0), 10.0, Below, at(0)), hours(2));
-        assert_eq!(eta(&trend(20.0, 5.0), 10.0, Below, at(0)), None);
-        assert_eq!(
-            eta(&trend(5.0, 5.0), 10.0, Below, at(0)),
-            Some(TimeDelta::zero())
-        );
-        assert_eq!(eta(&trend(90.0, f64::NAN), 100.0, Above, at(0)), None);
-        assert_eq!(eta(&trend(0.0, 1e-300), 100.0, Above, at(0)), None);
+        // An hour after the reading, it's moved on by an hour.
+        assert_eq!(heading_now(&trend, at(3600)).value, 92.0);
     }
 }
